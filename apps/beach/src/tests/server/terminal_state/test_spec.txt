@@ -1,0 +1,342 @@
+This document outlines integration tests we want to create to test the behavior of terminal state storage and derived grid views.
+
+## Test Verification Framework
+
+### Dual-Mode Testing Architecture
+
+To ensure GridView accurately represents the actual terminal state, we'll implement a "Verification Mode" with the following design:
+
+1. **Ground Truth Capture System**:
+   - Inject a `VerificationPtyWrapper` between the PTY and our state tracker
+   - This wrapper simultaneously:
+     - Feeds output to our TerminalStateTracker 
+     - Feeds output to an independent `GroundTruthParser` (using a different ANSI parsing library like `vte` or `alacritty_terminal`)
+     - Optionally saves raw PTY output for debugging
+   
+2. **Snapshot Comparison Points**:
+   - At each test assertion point, capture:
+     - Our GridView representation
+     - Ground truth grid from independent parser
+     - Timestamp for correlation
+   - Compare cell-by-cell including: character, colors, attributes
+   
+3. **Visual Verification Mode** (optional, for debugging):
+   - Generate HTML/SVG representation of both grids
+   - Side-by-side diff view highlighting discrepancies
+   - Save to `test_output/` directory for manual inspection
+
+4. **Test Execution Modes**:
+   ```rust
+   enum TestMode {
+       Fast,        // Skip verification, trust our implementation
+       Verify,      // Run with ground truth comparison
+       Visual,      // Verify + generate visual outputs
+   }
+   ```
+
+## Core Test Suite
+
+### 1. Basic Test
+**Setup**: 
+- Terminal dimensions: 80x24
+- Commands to execute (with 100ms delay between each):
+  ```bash
+  echo -e "\033[44m"  # Blue background
+  echo "Hello World"
+  echo -e "\033[1mBold text\033[0m"
+  echo -e "\033[4mUnderlined text\033[0m"
+  echo "This is a very long line that will definitely wrap at 80 characters width for testing wrapping behavior"
+  sleep 0.2  # Ensure snapshot interval is triggered
+  echo "Line after snapshot"
+  ```
+
+**Assertions**:
+1. Initial grid: All cells default (space char, default colors)
+2. After first command: Background color changed to blue (RGB: 0,0,255)
+3. Delta reconstruction without snapshots matches final PTY state
+4. Snapshot + remaining deltas matches final PTY state
+5. Verify at least 2 snapshots were created (initial + one after 100 deltas or 5 seconds)
+
+**GridView Assertions**:
+- Realtime view (80x24): Exact match with PTY state
+- Wide view (120x24): Long line is unwrapped, occupies single row
+- Narrow view (40x24): Long line wraps to 3 rows
+- Historical view at t=150ms: Shows state before "Line after snapshot"
+- Line-based view from line 2: Starts at "Hello World"
+
+### 2. Unwrap Test
+**Setup**:
+- Terminal dimensions: 40x20 (narrow)
+- Commands:
+  ```bash
+  echo "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+  echo "The quick brown fox jumps over the lazy dog multiple times to create a very long line"
+  echo "🦀 Rust emoji test line that is also quite long and will wrap 🚀"
+  ```
+
+**GridView Assertions**:
+- Wide view (120x20): Each echo on single line, no wrapping
+- Verify character positions: 'A' at (row:0,col:0), '9' at (row:0,col:61)
+- Emoji handling: 🦀 takes 2 cells width, positioning preserved
+
+### 3. Rewrap Test  
+**Setup**:
+- Terminal dimensions: 80x24
+- Commands:
+  ```bash
+  echo "Normal width content here"
+  echo "Another normal line"
+  ```
+
+**GridView Assertions**:
+- Narrow view (20x24): 
+  - First line wraps to 2 rows: "Normal width content" / "here"
+  - Line counters adjusted correctly
+- Ultra-narrow (10x24): Multiple wraps per original line
+
+### 4. Resize Test
+**Setup**:
+- Initial dimensions: 80x24
+- Commands and resizes:
+  ```bash
+  echo "Initial size content"
+  # RESIZE to 60x20
+  echo "Smaller terminal"
+  # RESIZE to 100x30  
+  echo "Larger terminal"
+  ```
+
+**Assertions**:
+- Dimension changes captured in deltas
+- Content before resize maintains positioning
+- New content respects new dimensions
+- GridView at each dimension matches expected layout
+
+### 5. TUI Test
+**Setup**:
+- Dimensions: 80x24
+- Simulate simple TUI:
+  ```rust
+  // Clear screen, draw box, wait, clear, draw different box
+  write_ansi("\033[2J\033[H");  // Clear and home
+  draw_box(10, 10, 30, 10);     // Draw box at position
+  sleep(200ms);
+  write_ansi("\033[2J\033[H");  // Clear again
+  draw_box(20, 5, 40, 15);      // Different box
+  ```
+
+**Assertions**:
+- Start/end line counters remain constant (no scrolling)
+- GridView at t=100ms shows first box
+- GridView at t=300ms shows second box
+- No scrollback accumulated
+- Cursor position tracked correctly
+
+### 6. Memory Limit Test
+**Setup**:
+- Set max_size_bytes to 10KB (tiny)
+- Generate 1000 echo commands with timestamps
+
+**Assertions**:
+- Memory never exceeds 10KB
+- Initial grid gets reset when limit hit
+- Can still reconstruct recent history
+- Old history is lost (expected behavior)
+- Verify reset happens exactly once
+
+### 7. Rapid Update Test
+**Setup**:
+- Dimensions: 80x24
+- Rapid output (no delays):
+  ```rust
+  for i in 0..500 {
+      write!(pty, "Line {}\r\n", i);
+  }
+  ```
+
+**Assertions**:
+- Coalescing works (fewer than 500 deltas created)
+- Snapshots respect 5-second minimum interval
+- Final state matches PTY
+- Performance: Total processing < 1 second
+
+### 8. Unicode & Special Characters Test
+**Setup**:
+- Test various unicode scenarios:
+  ```bash
+  echo "Hello 世界"         # CJK characters (2 cells each)
+  echo "🏖️ Beach emoji"    # Emoji with modifier
+  echo -e "Tab\there"      # Tab character
+  echo -e "Line1\rOverwrite" # Carriage return
+  echo -e "\033[31m█\033[0m" # Block character with color
+  ```
+
+**Assertions**:
+- CJK characters occupy 2 cells each
+- Emoji width calculated correctly
+- Tabs expanded to correct positions
+- Carriage return overwrites correctly
+- Block characters preserve attributes
+
+### 9. Color Attributes Test
+**Setup**:
+- Test all color modes:
+  ```bash
+  echo -e "\033[31mRed\033[0m"           # Basic color
+  echo -e "\033[38;5;196mIndexed\033[0m" # 256-color
+  echo -e "\033[38;2;255;0;128mRGB\033[0m" # True color
+  echo -e "\033[1;4;7mBold Underline Reverse\033[0m"
+  ```
+
+**Assertions**:
+- Each color mode preserved in cells
+- Multiple attributes stack correctly
+- Reset sequence clears all attributes
+- Colors maintained through rewrap
+
+### 10. Cursor Tracking Test
+**Setup**:
+- Track cursor through operations:
+  ```bash
+  echo -n "No newline"     # Cursor at end of text
+  echo -e "\033[5;10H"     # Position cursor at row 5, col 10
+  echo -e "\033[?25l"      # Hide cursor
+  echo "Hidden cursor text"
+  echo -e "\033[?25h"      # Show cursor
+  ```
+
+**Assertions**:
+- Cursor position updates tracked in deltas
+- Hidden state preserved
+- GridView includes cursor position/visibility
+- Historical cursor positions retrievable
+
+### 11. Scrollback Behavior Test
+**Setup**:
+- Fill terminal beyond viewport:
+  ```bash
+  for i in 1..50; do echo "Line $i"; done
+  ```
+
+**Assertions**:
+- Lines 1-26 no longer in viewport
+- Can retrieve scrolled content via line-based lookup
+- GridView with larger height shows more history
+- Scrollback not duplicated in memory
+
+### 12. Edge Cases Test
+**Setup**:
+- Test boundary conditions:
+  ```bash
+  echo ""                  # Empty line
+  echo -n "No newline"     # No line terminator
+  printf "\0"              # Null character
+  echo -e "\033[J"         # Clear to end of screen
+  echo -e "\033[K"         # Clear to end of line
+  ```
+
+**Assertions**:
+- Empty lines preserved
+- Partial lines handled
+- Null characters filtered/handled
+- Clear operations create appropriate deltas
+
+### 13. Performance Benchmark Test
+**Setup**:
+- Measure performance metrics:
+  ```rust
+  let start = Instant::now();
+  // Generate 10000 lines
+  for i in 0..10000 {
+      writeln!(pty, "Performance test line {}", i);
+  }
+  let elapsed = start.elapsed();
+  ```
+
+**Assertions**:
+- Processing rate > 1000 lines/second
+- Memory growth < 10MB per 1000 lines
+- Snapshot creation < 10ms
+- GridView derivation < 50ms
+- Delta creation < 1ms average
+
+### 14. Concurrent Access Test
+**Setup**:
+- Multiple threads accessing history:
+  ```rust
+  // Thread 1: Writing new content
+  // Thread 2: Reading historical views  
+  // Thread 3: Requesting different dimensions
+  ```
+
+**Assertions**:
+- No data races
+- Consistent views
+- Proper synchronization
+- No deadlocks
+
+### 15. Recovery Test
+**Setup**:
+- Simulate partial state loss:
+  ```rust
+  // Corrupt a snapshot
+  // Remove some deltas
+  // Attempt recovery
+  ```
+
+**Assertions**:
+- Graceful degradation
+- Best-effort reconstruction
+- Error reporting accurate
+- No panics
+
+## Test Utilities
+
+### Helper Functions
+```rust
+fn assert_grids_equal(grid1: &Grid, grid2: &Grid, tolerance: CellDiff) {
+    // Cell-by-cell comparison with helpful diff output
+}
+
+fn capture_pty_state(pty: &PtyManager) -> Grid {
+    // Get current PTY state for comparison
+}
+
+fn wait_for_snapshot(tracker: &TerminalStateTracker, count: usize) {
+    // Wait until N snapshots exist
+}
+
+fn generate_ansi_sequence(ops: Vec<AnsiOp>) -> Vec<u8> {
+    // Generate complex ANSI sequences for testing
+}
+```
+
+### Test Configuration
+```rust
+struct TestConfig {
+    mode: TestMode,
+    save_outputs: bool,
+    snapshot_interval: u64,      // Override defaults for faster testing
+    min_snapshot_interval_ms: u64,  // Set to 100ms for tests
+    coalesce_window_ms: u64,    // Set to 10ms for tests
+}
+```
+
+## Success Criteria
+
+All tests must:
+1. Complete in < 5 seconds each
+2. Pass in all three modes (Fast, Verify, Visual)
+3. Maintain < 1% difference between GridView and ground truth
+4. Handle edge cases without panics
+5. Demonstrate practical performance for real-world usage
+
+## Debugging Output
+
+When tests fail in Verify mode:
+1. Save raw PTY output to `test_output/[test_name]_raw.txt`
+2. Save both grids as JSON to `test_output/[test_name]_comparison.json`
+3. Generate HTML diff view at `test_output/[test_name]_diff.html`
+4. Log all delta operations to `test_output/[test_name]_deltas.log`
+
+This comprehensive testing approach ensures the terminal state tracking system works correctly across all real-world scenarios while providing excellent debugging capabilities when issues arise.

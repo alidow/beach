@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Duration, Utc};
 use vte::Parser;
-use crate::server::terminal_state::{Grid, GridHistory, GridDelta, GridUpdater, TerminalInitializer};
+use crate::server::terminal_state::{Grid, GridHistory, GridDelta, GridUpdater, TerminalInitializer, Color, CellAttributes};
 
 pub struct TerminalStateTracker {
     current_grid: Grid,
@@ -10,6 +10,10 @@ pub struct TerminalStateTracker {
     last_update: DateTime<Utc>,
     update_interval: Duration,
     previous_grid: Option<Grid>,
+    // SGR state that persists across process_output calls
+    current_fg: Color,
+    current_bg: Color,
+    current_attrs: CellAttributes,
 }
 
 impl TerminalStateTracker {
@@ -34,6 +38,9 @@ impl TerminalStateTracker {
             last_update: Utc::now(),
             update_interval: Duration::milliseconds(50),
             previous_grid: Some(initial_grid),
+            current_fg: Color::Default,
+            current_bg: Color::Default,
+            current_attrs: CellAttributes::default(),
         }
     }
     
@@ -44,12 +51,22 @@ impl TerminalStateTracker {
         // Update timestamp for new grid state
         self.current_grid.timestamp = Utc::now();
         
-        // Parse ANSI sequences and update grid
-        let mut updater = GridUpdater::new(&mut self.current_grid);
+        // Parse ANSI sequences and update grid with persistent SGR state
+        let mut updater = GridUpdater::new_with_state(
+            &mut self.current_grid, 
+            self.current_fg.clone(), 
+            self.current_bg.clone(), 
+            self.current_attrs.clone()
+        );
         
         for byte in data {
             self.parser.advance(&mut updater, *byte);
         }
+        
+        // Save the SGR state back to the tracker for next call
+        self.current_fg = updater.current_fg.clone();
+        self.current_bg = updater.current_bg.clone();
+        self.current_attrs = updater.current_attrs.clone();
         
         // Always create a delta after processing to track changes
         // This ensures test assertions can see the changes

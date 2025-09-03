@@ -18,6 +18,15 @@ impl<'a> GridUpdater<'a> {
             current_bg: Color::Default,
         }
     }
+    
+    pub fn new_with_state(grid: &'a mut Grid, fg: Color, bg: Color, attrs: CellAttributes) -> Self {
+        GridUpdater {
+            grid,
+            current_attrs: attrs,
+            current_fg: fg,
+            current_bg: bg,
+        }
+    }
 }
 
 impl<'a> Perform for GridUpdater<'a> {

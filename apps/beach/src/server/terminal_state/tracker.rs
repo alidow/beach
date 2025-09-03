@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Duration, Utc};
 use vte::Parser;
-use crate::server::terminal_state::{Grid, GridHistory, GridDelta, GridUpdater};
+use crate::server::terminal_state::{Grid, GridHistory, GridDelta, GridUpdater, TerminalInitializer};
 
 pub struct TerminalStateTracker {
     current_grid: Grid,
@@ -13,8 +13,18 @@ pub struct TerminalStateTracker {
 }
 
 impl TerminalStateTracker {
+    /// Create a new tracker with environment-aware initial state
+    /// 
+    /// This uses TerminalInitializer to detect terminal colors from environment
+    /// variables and create a grid that better matches the terminal's appearance
     pub fn new(width: u16, height: u16) -> Self {
-        let initial_grid = Grid::new(width, height);
+        // Create initial grid with terminal-aware defaults
+        let initial_grid = TerminalInitializer::create_initial_grid(width, height);
+        Self::with_initial_grid(initial_grid)
+    }
+    
+    /// Create a new tracker with a custom initial grid
+    pub fn with_initial_grid(initial_grid: Grid) -> Self {
         let history = Arc::new(Mutex::new(GridHistory::new(initial_grid.clone())));
         
         TerminalStateTracker {

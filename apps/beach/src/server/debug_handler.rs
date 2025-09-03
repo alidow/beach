@@ -114,10 +114,21 @@ impl DebugHandler {
         if let Some(ref tracker_arc) = *guard {
             let tracker = tracker_arc.lock().unwrap();
             let history = tracker.get_history();
-            let view = GridView::new(history);
+            let view = GridView::new(Arc::clone(&history));
             
             // Get the grid with optional dimension override
-            let dimensions = width.zip(height).map(|(w, h)| (w, h));
+            // If only width or only height is provided, use the current grid's dimensions for the missing one
+            let dimensions = if width.is_some() || height.is_some() {
+                let history_lock = history.lock().unwrap();
+                let current_grid = history_lock.get_current()
+                    .map_err(|e| format!("Failed to get current grid: {:?}", e))?;
+                let w = width.unwrap_or(current_grid.width);
+                let h = height.unwrap_or(current_grid.height);
+                drop(history_lock); // Release lock before calling derive_realtime
+                Some((w, h))
+            } else {
+                None
+            };
             let grid = view.derive_realtime(dimensions)
                 .map_err(|e| format!("Failed to get grid view: {:?}", e))?;
             

@@ -11,6 +11,8 @@
 //! - `websocket`: WebSocket transport for browser compatibility
 
 pub mod webrtc;
+#[cfg(test)]
+pub mod mock;
 
 use anyhow::Result;
 use async_trait::async_trait;

@@ -2,6 +2,10 @@ pub mod client;
 pub mod handlers;
 pub mod signaling;
 pub mod websocket;
+pub mod multiplexer;
+pub mod view_registry;
+pub mod subscription_pool;
+pub mod message_router;
 
 use url::{Url, ParseError};
 use crate::transport::Transport;

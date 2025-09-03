@@ -158,3 +158,353 @@ impl GridView {
         Ok(new_grid)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use crate::server::terminal_state::{Grid, GridHistory, GridDelta, Cell, Color, CellAttributes};
+    
+    fn create_test_history() -> Arc<Mutex<GridHistory>> {
+        let mut grid = Grid::new(80, 24);
+        grid.timestamp = chrono::Utc::now();
+        Arc::new(Mutex::new(GridHistory::new(grid)))
+    }
+    
+    fn create_test_history_with_content(width: u16, height: u16, lines: Vec<&str>) -> Arc<Mutex<GridHistory>> {
+        let initial = Grid::new(width, height);
+        let history = Arc::new(Mutex::new(GridHistory::new(initial)));
+        
+        let grid = create_grid_with_text(width, height, lines);
+        
+        {
+            let mut hist = history.lock().unwrap();
+            // Get current state for diffing
+            let current = hist.get_current().unwrap_or_else(|_| Grid::new(width, height));
+            let delta = GridDelta::diff(&current, &grid);
+            hist.add_delta(delta);
+        }
+        
+        history
+    }
+    
+    fn create_grid_with_text(width: u16, height: u16, lines: Vec<&str>) -> Grid {
+        let mut grid = Grid::new(width, height);
+        
+        for (row_idx, line) in lines.iter().enumerate() {
+            for (col_idx, ch) in line.chars().enumerate() {
+                if row_idx < height as usize && col_idx < width as usize {
+                    grid.set_cell(row_idx as u16, col_idx as u16, Cell {
+                        char: ch,
+                        fg_color: Color::Default,
+                        bg_color: Color::Default,
+                        attributes: CellAttributes::default(),
+                    });
+                }
+            }
+        }
+        
+        grid
+    }
+    
+    #[test]
+    fn test_derive_realtime_no_dimensions() {
+        // Test deriving realtime view without dimension changes
+        let history = create_test_history_with_content(80, 24, vec![
+            "Hello World",
+            "Second Line",
+            "Third Line",
+        ]);
+        
+        let view = GridView::new(history.clone());
+        let result = view.derive_realtime(None).unwrap();
+        
+        assert_eq!(result.width, 80);
+        assert_eq!(result.height, 24);
+        
+        // Check content
+        let mut line = String::new();
+        for col in 0..11 {
+            if let Some(cell) = result.get_cell(0, col) {
+                line.push(cell.char);
+            }
+        }
+        assert_eq!(line.trim(), "Hello World");
+    }
+    
+    #[test]
+    fn test_derive_realtime_with_dimensions() {
+        // Test deriving realtime view with dimension changes
+        let history = create_test_history_with_content(80, 24, vec![
+            "This is a very long line that will wrap when we reduce the width",
+        ]);
+        
+        let view = GridView::new(history.clone());
+        
+        // Test with smaller width
+        let result = view.derive_realtime(Some((30, 24))).unwrap();
+        
+        assert_eq!(result.width, 30);
+        assert_eq!(result.height, 24);
+        
+        // Check that text wrapped to multiple lines
+        let mut first_line = String::new();
+        for col in 0..30 {
+            if let Some(cell) = result.get_cell(0, col) {
+                if cell.char != '\0' {
+                    first_line.push(cell.char);
+                }
+            }
+        }
+        // First line should contain part of the text
+        assert!(first_line.trim().len() > 0);
+        assert!(first_line.trim().len() <= 30);
+        
+        // Check second line has continuation
+        let mut second_line = String::new();
+        for col in 0..30 {
+            if let Some(cell) = result.get_cell(1, col) {
+                if cell.char != '\0' && cell.char != ' ' {
+                    second_line.push(cell.char);
+                }
+            }
+        }
+        assert!(!second_line.trim().is_empty());
+    }
+    
+    #[test]
+    fn test_rewrap_grid_basic() {
+        // Test basic text wrapping
+        let history = create_test_history();
+        let view = GridView::new(history.clone());
+        
+        let grid = create_grid_with_text(80, 24, vec![
+            "The quick brown fox jumps over the lazy dog",
+            "Second line here",
+        ]);
+        
+        let wrapped = view.rewrap_grid(grid, 20, 10).unwrap();
+        
+        assert_eq!(wrapped.width, 20);
+        assert_eq!(wrapped.height, 10);
+        
+        // First line should wrap to multiple lines
+        let mut line1 = String::new();
+        for col in 0..20 {
+            if let Some(cell) = wrapped.get_cell(0, col) {
+                if cell.char != '\0' {
+                    line1.push(cell.char);
+                }
+            }
+        }
+        assert_eq!(line1.trim(), "The quick brown fox");
+        
+        let mut line2 = String::new();
+        for col in 0..20 {
+            if let Some(cell) = wrapped.get_cell(1, col) {
+                if cell.char != '\0' {
+                    line2.push(cell.char);
+                }
+            }
+        }
+        assert_eq!(line2.trim(), "jumps over the lazy");
+    }
+    
+    #[test]
+    fn test_rewrap_grid_wider() {
+        // Test expanding to wider grid (no wrapping needed)
+        let history = create_test_history();
+        let view = GridView::new(history.clone());
+        
+        let grid = create_grid_with_text(40, 24, vec![
+            "Short line",
+            "Another one",
+        ]);
+        
+        let wrapped = view.rewrap_grid(grid, 100, 24).unwrap();
+        
+        assert_eq!(wrapped.width, 100);
+        assert_eq!(wrapped.height, 24);
+        
+        // Lines should remain on same rows
+        let mut line1 = String::new();
+        for col in 0..100 {
+            if let Some(cell) = wrapped.get_cell(0, col) {
+                if cell.char != '\0' && cell.char != ' ' {
+                    line1.push(cell.char);
+                }
+            }
+        }
+        assert_eq!(line1, "Shortline");
+    }
+    
+    #[test]
+    fn test_rewrap_preserves_colors() {
+        // Test that colors and attributes are preserved during rewrap
+        let history = create_test_history();
+        let view = GridView::new(history.clone());
+        
+        let mut grid = Grid::new(80, 24);
+        
+        // Create colored text
+        let text = "Colored text here";
+        for (idx, ch) in text.chars().enumerate() {
+            grid.set_cell(0, idx as u16, Cell {
+                char: ch,
+                fg_color: Color::Rgb(255, 0, 0),
+                bg_color: Color::Indexed(4),
+                attributes: CellAttributes {
+                    bold: true,
+                    italic: false,
+                    underline: true,
+                    ..Default::default()
+                },
+            });
+        }
+        
+        let wrapped = view.rewrap_grid(grid, 10, 24).unwrap();
+        
+        // Check first character still has colors
+        if let Some(cell) = wrapped.get_cell(0, 0) {
+            assert_eq!(cell.fg_color, Color::Rgb(255, 0, 0));
+            assert_eq!(cell.bg_color, Color::Indexed(4));
+            assert!(cell.attributes.bold);
+            assert!(cell.attributes.underline);
+        }
+    }
+    
+    #[test]
+    fn test_rewrap_empty_lines() {
+        // Test handling of empty lines
+        let history = create_test_history();
+        let view = GridView::new(history.clone());
+        
+        let grid = create_grid_with_text(80, 24, vec![
+            "First line",
+            "",
+            "Third line",
+            "",
+            "Fifth line",
+        ]);
+        
+        let wrapped = view.rewrap_grid(grid, 40, 24).unwrap();
+        
+        // Empty lines should be preserved
+        let mut line2 = String::new();
+        for col in 0..40 {
+            if let Some(cell) = wrapped.get_cell(1, col) {
+                if cell.char != '\0' && cell.char != ' ' {
+                    line2.push(cell.char);
+                }
+            }
+        }
+        assert!(line2.is_empty());
+        
+        let mut line3 = String::new();
+        for col in 0..40 {
+            if let Some(cell) = wrapped.get_cell(2, col) {
+                if cell.char != '\0' && cell.char != ' ' {
+                    line3.push(cell.char);
+                }
+            }
+        }
+        assert_eq!(line3, "Thirdline");
+    }
+    
+    #[test]
+    fn test_rewrap_very_long_line() {
+        // Test wrapping a very long line
+        let history = create_test_history();
+        let view = GridView::new(history.clone());
+        
+        let long_text = "A".repeat(200);
+        let grid = create_grid_with_text(250, 24, vec![&long_text]);
+        
+        let wrapped = view.rewrap_grid(grid, 50, 24).unwrap();
+        
+        // Should wrap to exactly 4 lines (200 / 50 = 4)
+        for row in 0..4 {
+            let mut line = String::new();
+            for col in 0..50 {
+                if let Some(cell) = wrapped.get_cell(row, col) {
+                    if cell.char != '\0' {
+                        line.push(cell.char);
+                    }
+                }
+            }
+            assert_eq!(line.len(), 50);
+            assert!(line.chars().all(|c| c == 'A'));
+        }
+    }
+    
+    #[test]
+    fn test_rewrap_cursor_position() {
+        // Test cursor position adjustment during rewrap
+        let history = create_test_history();
+        let view = GridView::new(history.clone());
+        
+        let mut grid = create_grid_with_text(80, 24, vec![
+            "Some text here",
+        ]);
+        grid.cursor.row = 0;
+        grid.cursor.col = 70; // Beyond new width
+        grid.cursor.visible = true;
+        
+        let wrapped = view.rewrap_grid(grid, 20, 24).unwrap();
+        
+        // Cursor should be adjusted to new position
+        assert!(wrapped.cursor.col < 20);
+        assert_eq!(wrapped.cursor.visible, true);
+    }
+    
+    #[test]
+    fn test_simple_truncate_for_large_grids() {
+        // Test that very large grids use simple truncation
+        let history = create_test_history();
+        let view = GridView::new(history.clone());
+        
+        let mut grid = Grid::new(600, 600); // Large grid
+        grid.set_cell(0, 0, Cell {
+            char: 'X',
+            fg_color: Color::Default,
+            bg_color: Color::Default,
+            attributes: CellAttributes::default(),
+        });
+        
+        let result = view.rewrap_grid(grid, 100, 100).unwrap();
+        
+        assert_eq!(result.width, 100);
+        assert_eq!(result.height, 100);
+        
+        // Should have truncated, preserving top-left content
+        if let Some(cell) = result.get_cell(0, 0) {
+            assert_eq!(cell.char, 'X');
+        }
+    }
+    
+    #[test]
+    fn test_unicode_handling() {
+        // Test handling of unicode characters
+        let history = create_test_history();
+        let view = GridView::new(history.clone());
+        
+        let grid = create_grid_with_text(80, 24, vec![
+            "Hello 世界 🦀 Rust",
+            "Émojis: 🏖️ 🚀 🎉",
+        ]);
+        
+        let wrapped = view.rewrap_grid(grid, 40, 24).unwrap();
+        
+        // Unicode should be preserved
+        let mut line1 = String::new();
+        for col in 0..40 {
+            if let Some(cell) = wrapped.get_cell(0, col) {
+                if cell.char != '\0' {
+                    line1.push(cell.char);
+                }
+            }
+        }
+        assert!(line1.contains('世'));
+        assert!(line1.contains('🦀'));
+    }
+}

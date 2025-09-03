@@ -121,13 +121,93 @@ impl<'a> Perform for GridUpdater<'a> {
                 match mode {
                     2 => {
                         // Clear entire screen
+                        // Create a blank cell with current background color
+                        let blank_cell = Cell {
+                            char: ' ',
+                            fg_color: self.current_fg.clone(),
+                            bg_color: self.current_bg.clone(),
+                            attributes: self.current_attrs.clone(),
+                        };
+                        
                         for row in 0..self.grid.height {
                             for col in 0..self.grid.width {
-                                self.grid.set_cell(row, col, Cell::default());
+                                self.grid.set_cell(row, col, blank_cell.clone());
                             }
                         }
                     }
-                    _ => {}
+                    1 => {
+                        // Clear from cursor to beginning of screen
+                        let blank_cell = Cell {
+                            char: ' ',
+                            fg_color: self.current_fg.clone(),
+                            bg_color: self.current_bg.clone(),
+                            attributes: self.current_attrs.clone(),
+                        };
+                        
+                        // Clear from start to cursor position
+                        for row in 0..=self.grid.cursor.row {
+                            let end_col = if row == self.grid.cursor.row {
+                                self.grid.cursor.col
+                            } else {
+                                self.grid.width - 1
+                            };
+                            for col in 0..=end_col {
+                                self.grid.set_cell(row, col, blank_cell.clone());
+                            }
+                        }
+                    }
+                    0 | _ => {
+                        // Clear from cursor to end of screen (default)
+                        let blank_cell = Cell {
+                            char: ' ',
+                            fg_color: self.current_fg.clone(),
+                            bg_color: self.current_bg.clone(),
+                            attributes: self.current_attrs.clone(),
+                        };
+                        
+                        // Clear from cursor position to end
+                        for row in self.grid.cursor.row..self.grid.height {
+                            let start_col = if row == self.grid.cursor.row {
+                                self.grid.cursor.col
+                            } else {
+                                0
+                            };
+                            for col in start_col..self.grid.width {
+                                self.grid.set_cell(row, col, blank_cell.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            'K' => {
+                // Erase line
+                let mode = params.iter().next().map(|p| p[0]).unwrap_or(0);
+                let blank_cell = Cell {
+                    char: ' ',
+                    fg_color: self.current_fg.clone(),
+                    bg_color: self.current_bg.clone(),
+                    attributes: self.current_attrs.clone(),
+                };
+                
+                match mode {
+                    2 => {
+                        // Clear entire line
+                        for col in 0..self.grid.width {
+                            self.grid.set_cell(self.grid.cursor.row, col, blank_cell.clone());
+                        }
+                    }
+                    1 => {
+                        // Clear from cursor to beginning of line
+                        for col in 0..=self.grid.cursor.col {
+                            self.grid.set_cell(self.grid.cursor.row, col, blank_cell.clone());
+                        }
+                    }
+                    0 | _ => {
+                        // Clear from cursor to end of line (default)
+                        for col in self.grid.cursor.col..self.grid.width {
+                            self.grid.set_cell(self.grid.cursor.row, col, blank_cell.clone());
+                        }
+                    }
                 }
             }
             'm' => {

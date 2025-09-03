@@ -45,7 +45,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.session_server, "localhost");
+        assert_eq!(config.session_server, "localhost:8080");
     }
 
     #[test]
@@ -57,7 +57,7 @@ mod tests {
             env::remove_var("BEACH_SESSION_SERVER");
         }
         let config = Config::from_env();
-        assert_eq!(config.session_server, "localhost");
+        assert_eq!(config.session_server, "localhost:8080");
     }
 
     #[test]

@@ -6,11 +6,10 @@ mod session;
 mod transport;
 
 use clap::Parser;
-use client::{Client, TerminalClient};
 use config::Config;
 use server::{Server, TerminalServer};
-use session::Session;
-use transport::webrtc::WebRTCTransport;
+use session::{Session, ServerSession, ClientSession};
+use transport::mock::MockTransport;
 
 #[derive(Parser, Debug)]
 #[command(name = "beach")]
@@ -20,6 +19,12 @@ struct Cli {
 
     #[arg(long, short = 'p')]
     passphrase: Option<String>,
+
+    #[arg(long, help = "Record all PTY I/O to a file for debugging")]
+    debug_recorder: Option<String>,
+
+    #[arg(long, help = "Write debug logs to a file")]
+    debug_log: Option<String>,
 
     // everything after `--`
     #[arg(trailing_var_arg = true)]
@@ -39,10 +44,12 @@ async fn main() {
         }
 
         // Join the session
-        match Session::join(session, WebRTCTransport::new(), cli.passphrase).await {
+        match Session::join(session, MockTransport::new(), cli.passphrase).await {
             Ok(client_session) => {
-                let client = TerminalClient::new(client_session);
-                client.start().await;
+                // TODO: Implement client
+                // let client = TerminalClient::new(client_session);
+                // client.start().await;
+                eprintln!("Client mode not yet implemented");
             }
             Err(e) => {
                 eprintln!("❌ {}", e);
@@ -51,12 +58,16 @@ async fn main() {
         }
     } else {
         // SERVER MODE
-        eprintln!("🏖️  Beach Server: Using session server: {}", config.session_server);
+        // Using session server silently
         
         // Create the session
-        match Session::create(&config, WebRTCTransport::new(), cli.passphrase, cli.cmd).await {
+        match Session::create(&config, MockTransport::new(), cli.passphrase, cli.cmd.clone()).await {
             Ok(server_session) => {
-                let server = TerminalServer::new(server_session);
+                let server = TerminalServer::new_with_debug(
+                    server_session,
+                    cli.debug_recorder,
+                    cli.debug_log
+                );
                 server.clone().setup_handlers().await;
                 server.start().await;
             }

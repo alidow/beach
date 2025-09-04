@@ -1,23 +1,23 @@
 use std::sync::{Arc, Mutex};
 use chrono::Utc;
-use crate::server::terminal_state::{GridView, GridHistory, TerminalStateTracker};
+use crate::server::terminal_state::{GridView, TerminalBackend};
 
 /// Handler for debug requests from the session server
 pub struct DebugHandler {
-    terminal_tracker: Arc<Mutex<Option<Arc<Mutex<TerminalStateTracker>>>>>,
+    terminal_backend: Arc<Mutex<Option<Arc<Mutex<Box<dyn TerminalBackend>>>>>>,
 }
 
 impl DebugHandler {
     pub fn new() -> Self {
         DebugHandler {
-            terminal_tracker: Arc::new(Mutex::new(None)),
+            terminal_backend: Arc::new(Mutex::new(None)),
         }
     }
     
-    /// Initialize with a terminal tracker
-    pub fn set_tracker(&self, tracker: Arc<Mutex<TerminalStateTracker>>) {
-        let mut guard = self.terminal_tracker.lock().unwrap();
-        *guard = Some(tracker);
+    /// Initialize with a terminal backend
+    pub fn set_backend(&self, backend: Arc<Mutex<Box<dyn TerminalBackend>>>) {
+        let mut guard = self.terminal_backend.lock().unwrap();
+        *guard = Some(backend);
     }
     
     /// Handle a debug request and return a response
@@ -27,7 +27,6 @@ impl DebugHandler {
         #[serde(tag = "type", rename_all = "snake_case")]
         enum DebugRequest {
             GetGridView {
-                width: Option<u16>,
                 height: Option<u16>,
                 at_time: Option<chrono::DateTime<Utc>>,
                 from_line: Option<u64>,
@@ -49,8 +48,8 @@ impl DebugHandler {
         
         // Handle different debug request types
         match debug_req {
-            DebugRequest::GetGridView { width, height, at_time, from_line } => {
-                match self.get_grid_view(width, height, at_time, from_line) {
+            DebugRequest::GetGridView { height, at_time, from_line } => {
+                match self.get_grid_view(height, at_time, from_line) {
                     Ok(response) => serde_json::json!({
                         "type": "grid_view",
                         "width": response.width,
@@ -104,32 +103,19 @@ impl DebugHandler {
     /// Get the current grid view
     pub fn get_grid_view(
         &self,
-        width: Option<u16>,
         height: Option<u16>,
         _at_time: Option<chrono::DateTime<Utc>>,
         _from_line: Option<u64>,
     ) -> Result<GridViewResponse, String> {
-        let guard = self.terminal_tracker.lock().unwrap();
+        let guard = self.terminal_backend.lock().unwrap();
         
-        if let Some(ref tracker_arc) = *guard {
-            let tracker = tracker_arc.lock().unwrap();
-            let history = tracker.get_history();
+        if let Some(ref backend_arc) = *guard {
+            let backend = backend_arc.lock().unwrap();
+            let history = backend.get_history();
             let view = GridView::new(Arc::clone(&history));
             
-            // Get the grid with optional dimension override
-            // If only width or only height is provided, use the current grid's dimensions for the missing one
-            let dimensions = if width.is_some() || height.is_some() {
-                let history_lock = history.lock().unwrap();
-                let current_grid = history_lock.get_current()
-                    .map_err(|e| format!("Failed to get current grid: {:?}", e))?;
-                let w = width.unwrap_or(current_grid.width);
-                let h = height.unwrap_or(current_grid.height);
-                drop(history_lock); // Release lock before calling derive_realtime
-                Some((w, h))
-            } else {
-                None
-            };
-            let grid = view.derive_realtime(dimensions)
+            // Get the grid with optional height limit
+            let grid = view.derive_realtime(height)
                 .map_err(|e| format!("Failed to get grid view: {:?}", e))?;
             
             // Convert grid to text rows
@@ -139,24 +125,20 @@ impl DebugHandler {
             for row in 0..grid.height {
                 let mut line = String::new();
                 let mut ansi_line = String::new();
-                
+
                 for col in 0..grid.width {
                     if let Some(cell) = grid.get_cell(row, col) {
                         // Skip null characters (wide character continuations)
                         if cell.char != '\0' {
                             line.push(cell.char);
-                            
+
                             // Build ANSI version with colors
                             let ansi_cell = format_cell_ansi(&cell);
                             ansi_line.push_str(&ansi_cell);
                         }
                     }
                 }
-                
-                // Trim trailing spaces for cleaner output
-                let line = line.trim_end().to_string();
-                let ansi_line = ansi_line.trim_end().to_string();
-                
+
                 rows.push(line);
                 ansi_rows.push(ansi_line);
             }
@@ -174,17 +156,17 @@ impl DebugHandler {
                 end_line: grid.height as u64 - 1,
             })
         } else {
-            Err("Terminal tracker not initialized".to_string())
+            Err("Terminal backend not initialized".to_string())
         }
     }
     
     /// Get terminal statistics
     pub fn get_stats(&self) -> Result<StatsResponse, String> {
-        let guard = self.terminal_tracker.lock().unwrap();
+        let guard = self.terminal_backend.lock().unwrap();
         
-        if let Some(ref tracker_arc) = *guard {
-            let tracker = tracker_arc.lock().unwrap();
-            let history = tracker.get_history();
+        if let Some(ref backend_arc) = *guard {
+            let backend = backend_arc.lock().unwrap();
+            let history = backend.get_history();
             let history_lock = history.lock().unwrap();
             
             // Calculate memory usage and stats
@@ -198,22 +180,22 @@ impl DebugHandler {
                 session_duration_secs: stats.session_duration.as_secs(),
             })
         } else {
-            Err("Terminal tracker not initialized".to_string())
+            Err("Terminal backend not initialized".to_string())
         }
     }
     
     /// Clear terminal history
     pub fn clear_history(&self) -> Result<(), String> {
-        let guard = self.terminal_tracker.lock().unwrap();
+        let guard = self.terminal_backend.lock().unwrap();
         
-        if let Some(ref tracker_arc) = *guard {
-            let tracker = tracker_arc.lock().unwrap();
-            let history = tracker.get_history();
+        if let Some(ref backend_arc) = *guard {
+            let backend = backend_arc.lock().unwrap();
+            let history = backend.get_history();
             let mut history_lock = history.lock().unwrap();
             history_lock.clear();
             Ok(())
         } else {
-            Err("Terminal tracker not initialized".to_string())
+            Err("Terminal backend not initialized".to_string())
         }
     }
 }

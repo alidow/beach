@@ -9,8 +9,8 @@ use crate::transport::Transport;
 use crate::protocol::{ClientMessage, ServerMessage, Dimensions, ViewMode};
 use crate::server::terminal_state::TerminalStateTracker;
 
-use super::handlers::ServerMessageHandler;
-use super::signaling::{AppMessage, PeerInfo};
+use super::ServerMessageHandler;
+use crate::protocol::signaling::{AppMessage, PeerInfo};
 
 /// Bridges WebSocket signaling with the subscription system
 pub struct SubscriptionHandler<T: Transport + Send + 'static> {

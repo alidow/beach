@@ -33,6 +33,7 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 unicode-width = "0.1"
 url = "2.5.7"
 uuid = { version = "1", features = ["v4"] }
+webrtc = "0.13.0"
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.3"

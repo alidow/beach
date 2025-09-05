@@ -1,7 +1,9 @@
-pub mod messages;
-pub mod client_messages;
-pub mod server_messages;
+pub mod signaling;
+pub mod subscription;
 
-pub use messages::{ViewMode, ViewPosition, Dimensions, CompressionType, ErrorCode, SubscriptionStatus, NotificationType};
-pub use client_messages::{ClientMessage, StateRequestType, ControlType};
-pub use server_messages::{ServerMessage, SubscriptionInfo};
+// Re-export subscription protocol types for backward compatibility
+pub use subscription::{
+    messages::{ViewMode, ViewPosition, Dimensions, CompressionType, ErrorCode, SubscriptionStatus, NotificationType},
+    client_messages::{ClientMessage, StateRequestType, ControlType},
+    server_messages::{ServerMessage, SubscriptionInfo},
+};

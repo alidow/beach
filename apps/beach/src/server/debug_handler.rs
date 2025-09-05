@@ -100,12 +100,12 @@ impl DebugHandler {
         }
     }
     
-    /// Get the current grid view
+    /// Get the current, historical, or line-based grid view
     pub fn get_grid_view(
         &self,
         height: Option<u16>,
-        _at_time: Option<chrono::DateTime<Utc>>,
-        _from_line: Option<u64>,
+        at_time: Option<chrono::DateTime<Utc>>,
+        from_line: Option<u64>,
     ) -> Result<GridViewResponse, String> {
         let guard = self.terminal_backend.lock().unwrap();
         
@@ -115,8 +115,20 @@ impl DebugHandler {
             let view = GridView::new(Arc::clone(&history));
             
             // Get the grid with optional height limit
-            let grid = view.derive_realtime(height)
-                .map_err(|e| format!("Failed to get grid view: {:?}", e))?;
+            // Priority: from_line > at_time > current
+            let grid = if let Some(line_num) = from_line {
+                // Get grid from specific line number
+                view.derive_from_line(line_num, height)
+                    .map_err(|e| format!("Failed to get grid view from line {}: {:?}", line_num, e))?
+            } else if let Some(timestamp) = at_time {
+                // Get grid from specific time
+                view.derive_at_time(timestamp, height)
+                    .map_err(|e| format!("Failed to get grid view at time: {:?}", e))?
+            } else {
+                // Get current grid
+                view.derive_realtime(height)
+                    .map_err(|e| format!("Failed to get grid view: {:?}", e))?
+            };
             
             // Convert grid to text rows
             let mut rows = Vec::new();
@@ -151,9 +163,9 @@ impl DebugHandler {
                 cursor_visible: grid.cursor.visible,
                 rows,
                 ansi_rows: Some(ansi_rows),
-                timestamp: Utc::now(),
-                start_line: 0, // TODO: Calculate from line counters
-                end_line: grid.height as u64 - 1,
+                timestamp: grid.timestamp,  // Use grid's timestamp, not current time
+                start_line: grid.start_line.to_u64().unwrap_or(0),  // Use actual line number
+                end_line: grid.end_line.to_u64().unwrap_or(grid.height as u64 - 1),  // Use actual line number
             })
         } else {
             Err("Terminal backend not initialized".to_string())
@@ -201,6 +213,7 @@ impl DebugHandler {
 }
 
 /// Response structure for grid view
+#[derive(Debug)]
 pub struct GridViewResponse {
     pub width: u16,
     pub height: u16,

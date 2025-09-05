@@ -28,7 +28,11 @@ use clap::Parser;
 
 #[tokio::main]
 async fn main() {
-    // Initialize tracing
+    // Initialize tracing with environment-based configuration
+    // Default to WARN level if RUST_LOG is not set
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "warn");
+    }
     tracing_subscriber::fmt::init();
 
     // Parse CLI arguments

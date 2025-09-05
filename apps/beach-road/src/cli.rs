@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{info, error};
+use tracing::{debug, error, info};
 use tokio::time::{timeout, Duration};
 use std::io::IsTerminal;
 
@@ -49,6 +49,10 @@ pub enum DebugCommands {
         /// Start from line number (optional)
         #[arg(short = 'l', long)]
         from_line: Option<u64>,
+        
+        /// Get grid from N seconds ago (optional)
+        #[arg(long)]
+        ago: Option<u64>,
     },
     
     /// Get terminal statistics
@@ -59,7 +63,7 @@ pub enum DebugCommands {
 }
 
 pub async fn run_debug_client(url: String, session: String, command: DebugCommands) -> Result<()> {
-    info!("Connecting to {} for session {}", url, session);
+    debug!("Connecting to {} for session {}", url, session);
     
     // Build WebSocket URL
     let ws_url = format!("{}/ws/{}", url, session);
@@ -111,7 +115,7 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
                             if found_server_id.is_empty() {
                                 return Err(anyhow::anyhow!("No server found in session"));
                             }
-                            info!("Successfully joined session, server peer: {}", found_server_id);
+                            debug!("Successfully joined session, server peer: {}", found_server_id);
                             return Ok::<_, anyhow::Error>(found_server_id);
                         }
                         ServerMessage::JoinError { reason } => {
@@ -142,10 +146,15 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
     
     // Send debug request based on command
     let debug_request = match command {
-        DebugCommands::GridView { height, from_line } => {
+        DebugCommands::GridView { height, from_line, ago } => {
+            // Calculate at_time if --ago is specified
+            let at_time = ago.map(|seconds| {
+                chrono::Utc::now() - chrono::Duration::seconds(seconds as i64)
+            });
+            
             DebugRequest::GetGridView {
                 height,
-                at_time: None,
+                at_time,
                 from_line,
             }
         }

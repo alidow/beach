@@ -500,6 +500,9 @@ trait JoinLines {
 
 impl JoinLines for Vec<String> {
     fn join(&self, separator: &str) -> String {
-        self.iter().cloned().collect::<Vec<_>>().join(separator)
+        self.iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(separator)
     }
 }

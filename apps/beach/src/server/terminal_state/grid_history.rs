@@ -144,6 +144,27 @@ impl GridHistory {
         self.reconstruct_from_sequence(self.current_sequence)
     }
     
+    /// Get grid state at a specific timestamp
+    pub fn get_at_time(&self, timestamp: DateTime<Utc>) -> Result<Grid, TerminalStateError> {
+        // Find the sequence number at or before the given timestamp
+        let target_seq = self.time_index
+            .range(..=timestamp)
+            .rev()
+            .next()
+            .map(|(_, seq)| *seq)
+            .unwrap_or(0); // If no entry found, use initial state
+        
+        self.reconstruct_from_sequence(target_seq)
+    }
+    
+    /// Get grid state containing a specific line number
+    /// Note: This returns the grid that contains the line, not necessarily starting at the line
+    pub fn get_from_line(&self, line_num: u64) -> Result<Grid, TerminalStateError> {
+        // For now, just return the current grid
+        // The view shifting is handled by GridView::derive_from_line
+        self.get_current()
+    }
+    
     /// Reconstruct grid from nearest snapshot
     fn reconstruct_from_sequence(&self, target_seq: u64) -> Result<Grid, TerminalStateError> {
         // Find nearest snapshot at or before target, or use initial grid

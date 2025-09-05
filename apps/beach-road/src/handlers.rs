@@ -6,7 +6,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::{
     session::{hash_passphrase, verify_passphrase},
@@ -51,7 +51,7 @@ pub async fn register_session(
     State(storage): State<SharedStorage>,
     Json(payload): Json<RegisterSessionRequest>,
 ) -> Result<Json<RegisterSessionResponse>, StatusCode> {
-    info!("Registering session: {}", payload.session_id);
+    debug!("Registering session: {}", payload.session_id);
 
     let mut storage = storage.lock().await;
 
@@ -82,7 +82,7 @@ pub async fn register_session(
 
     match storage.register_session(session).await {
         Ok(_) => {
-            info!("Session {} registered successfully", payload.session_id);
+            debug!("Session {} registered successfully", payload.session_id);
             
             // Get the session server from environment or use default
             let session_server = std::env::var("BEACH_SESSION_SERVER")
@@ -107,7 +107,7 @@ pub async fn join_session(
     Path(session_id): Path<String>,
     Json(payload): Json<JoinSessionRequest>,
 ) -> Result<Json<JoinSessionResponse>, StatusCode> {
-    info!("Client attempting to join session: {}", session_id);
+    debug!("Client attempting to join session: {}", session_id);
 
     let mut storage = storage.lock().await;
 
@@ -135,7 +135,7 @@ pub async fn join_session(
             // Update session TTL
             let _ = storage.update_session_ttl(&session_id).await;
 
-            info!("Client successfully joined session: {}", session_id);
+            debug!("Client successfully joined session: {}", session_id);
             Ok(Json(JoinSessionResponse {
                 success: true,
                 message: None,

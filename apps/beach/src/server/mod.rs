@@ -1,16 +1,15 @@
 mod pty;
 mod terminal;
 mod io;
-mod io_resize;
 pub mod terminal_state;
 pub mod debug_handler;
 
 use async_trait::async_trait;
 use std::io::IsTerminal;
 use crate::transport::Transport;
-use crate::session::{ServerSession, signaling::AppMessage};
-use crate::session::handlers::ServerMessageHandler;
-use crate::session::signaling::PeerInfo;
+use crate::session::ServerSession;
+use crate::protocol::signaling::{AppMessage, PeerInfo};
+use crate::session::message_handlers::ServerMessageHandler;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock as AsyncRwLock;
 use tokio::task::JoinHandle;
@@ -18,8 +17,7 @@ use anyhow::Result;
 
 use self::pty::PtyManager;
 use self::terminal::{get_pty_size, build_command, enable_raw_mode, disable_raw_mode};
-use self::io::{spawn_stdin_reader, spawn_pty_reader_with_tracker};
-use self::io_resize::spawn_pty_reader_with_resize;
+use self::io::{spawn_stdin_reader, spawn_pty_reader_with_resize};
 use self::terminal_state::{TerminalBackend, create_terminal_backend};
 use self::debug_handler::DebugHandler;
 
@@ -228,25 +226,14 @@ impl<T: Transport + Send + 'static> Server for TerminalServer<T> {
         // Enable raw mode for proper terminal interaction
         let _ = enable_raw_mode();
         
-        // Start reading from PTY in a background task with terminal state tracking
-        // Use the resize-aware reader if running in a terminal
+        // Start reading from PTY in a background task with terminal state tracking and resize support
         let debug_recorder_path = self.debug_recorder.lock().unwrap().clone();
-        let read_task = if std::io::stdout().is_terminal() {
-            // Use resize-aware reader when running in a terminal
-            spawn_pty_reader_with_resize(
-                self.pty_manager.master_reader.clone(),
-                self.terminal_backend.clone(),
-                Arc::new(self.pty_manager.clone()),
-                debug_recorder_path
-            )
-        } else {
-            // Fall back to regular reader when not in a terminal (e.g., piped output)
-            spawn_pty_reader_with_tracker(
-                self.pty_manager.master_reader.clone(),
-                self.terminal_backend.clone(),
-                debug_recorder_path
-            )
-        };
+        let read_task = spawn_pty_reader_with_resize(
+            self.pty_manager.master_reader.clone(),
+            self.terminal_backend.clone(),
+            Arc::new(self.pty_manager.clone()),
+            debug_recorder_path
+        );
         *self.read_task.lock().unwrap() = Some(read_task);
         
         // Start reading from stdin and writing to PTY (using spawn_blocking for blocking I/O)

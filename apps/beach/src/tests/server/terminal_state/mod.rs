@@ -3,6 +3,7 @@ mod background_color_test;
 mod test_utils;
 mod backend_test;
 mod debug_test;
+mod debug_view_test;
 mod utf8_test;
 #[cfg(feature = "alacritty-backend")]
 mod resize_test;

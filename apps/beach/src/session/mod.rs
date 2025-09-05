@@ -1,8 +1,6 @@
 pub mod client;
-pub mod handlers;
-pub mod signaling;
-pub mod websocket;
-pub mod subscription_handler;
+pub mod message_handlers;
+pub mod signaling_transport;
 
 use url::{Url, ParseError};
 use crate::transport::Transport;
@@ -11,9 +9,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use anyhow::Result;
 use crate::config::Config;
-use self::websocket::SignalingConnection;
-use self::signaling::{AppMessage, ClientMessage, ServerMessage, PeerRole};
-use self::handlers::{ServerMessageHandler, ClientMessageHandler};
+use self::signaling_transport::{SignalingTransport, create_websocket_signaling};
+use crate::transport::websocket::WebSocketTransport;
+use crate::protocol::signaling::{AppMessage, ClientMessage, ServerMessage, PeerRole};
+use self::message_handlers::{ServerMessageHandler, ClientMessageHandler};
 
 #[derive(Debug, Clone)]
 pub struct SessionUrl(Url);
@@ -52,7 +51,7 @@ pub struct ServerSession<T: Transport + Send + 'static> {
     session: Session<T>,
     cmd: Vec<String>,
     clients: Arc<RwLock<HashMap<String, bool>>>, // client id, connected
-    signaling: Option<Arc<SignalingConnection>>,
+    signaling: Option<Arc<SignalingTransport<WebSocketTransport>>>,
     handler: Option<Arc<dyn ServerMessageHandler>>,
     debug_handler: Option<Arc<crate::server::debug_handler::DebugHandler>>,
 }
@@ -71,7 +70,7 @@ impl<T: Transport + Send + 'static> ServerSession<T> {
 
     /// Connect to session server WebSocket
     pub async fn connect_signaling(&mut self, session_server: &str, session_id: &str) -> Result<()> {
-        let connection = SignalingConnection::connect(
+        let connection = create_websocket_signaling(
             session_server,
             session_id,
             self.session.id.clone(),
@@ -226,7 +225,7 @@ impl<T: Transport + Send + 'static> ServerSession<T> {
 pub struct ClientSession<T: Transport + Send + 'static> {
     session: Session<T>,
     client_instance_id: String,
-    signaling: Option<Arc<SignalingConnection>>,
+    signaling: Option<Arc<SignalingTransport<WebSocketTransport>>>,
     handler: Option<Arc<dyn ClientMessageHandler>>,
     server_peer_id: Option<String>,
 }
@@ -244,7 +243,7 @@ impl<T: Transport + Send + 'static> ClientSession<T> {
 
     /// Connect to session server WebSocket
     pub async fn connect_signaling(&mut self, session_server: &str, session_id: &str) -> Result<()> {
-        let connection = SignalingConnection::connect(
+        let connection = create_websocket_signaling(
             session_server,
             session_id,
             self.client_instance_id.clone(),

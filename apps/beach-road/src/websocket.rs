@@ -213,7 +213,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: SignalingSt
         debug!("Message sender task ended for peer {}", peer_id_clone);
     });
 
-    info!("WebSocket connected: peer={} session={}", peer_id, session_id);
+    debug!("WebSocket connected: peer={} session={}", peer_id, session_id);
 
     // Handle incoming messages
     while let Some(Ok(msg)) = receiver.next().await {
@@ -253,7 +253,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: SignalingSt
         peer_id: peer_id.clone(),
     }).await;
     
-    info!("WebSocket disconnected: peer={} session={}", peer_id, session_id);
+    debug!("WebSocket disconnected: peer={} session={}", peer_id, session_id);
 }
 
 /// Handle incoming client messages
@@ -333,7 +333,7 @@ async fn handle_client_message(
         }
         
         ClientMessage::Signal { to_peer, signal } => {
-            info!("Received Signal from {} to {}: {:?}", peer_id, to_peer, signal);
+            debug!("Received Signal from {} to {}: {:?}", peer_id, to_peer, signal);
             // Don't intercept debug responses - just forward them as-is
             // The CLI expects to receive debug responses as Signal messages, not Debug messages
             
@@ -355,7 +355,7 @@ async fn handle_client_message(
         }
         
         ClientMessage::Debug { request } => {
-            info!("Received debug request from peer {} for session {}", peer_id, session_id);
+            debug!("Received debug request from peer {} for session {}", peer_id, session_id);
             // Forward debug request to the beach server
             // Find the server peer in the session
             if let Some(peers) = state.sessions.get(session_id) {
@@ -363,7 +363,7 @@ async fn handle_client_message(
                     .find(|p| p.role == PeerRole::Server)
                     .map(|p| p.peer_id.clone());
                 
-                info!("Looking for server peer, found: {:?}", server_peer);
+                debug!("Looking for server peer, found: {:?}", server_peer);
                 if let Some(server_id) = server_peer {
                     // Forward the debug request to the server via Signal
                     // Package it as a Signal message with a debug payload
@@ -377,12 +377,12 @@ async fn handle_client_message(
                         },
                     });
                     
-                    info!("Sending debug signal to server peer {}", server_id);
+                    debug!("Sending debug signal to server peer {}", server_id);
                     state.send_to_peer(session_id, &server_id, ServerMessage::Signal {
                         from_peer: peer_id.to_string(),
                         signal: debug_signal,
                     }).await?;
-                    info!("Debug signal sent successfully");
+                    debug!("Debug signal sent successfully");
                 } else {
                     // No server found, send error response
                     tx.send(ServerMessage::Error {

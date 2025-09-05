@@ -20,6 +20,9 @@ pub enum TerminalStateError {
     #[error("Parse error: {0}")]
     ParseError(String),
     
+    #[error("Line {0} not found in terminal history")]
+    LineNotFound(u64),
+    
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 }

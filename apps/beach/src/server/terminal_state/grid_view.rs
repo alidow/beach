@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
-use crate::server::terminal_state::{Grid, GridHistory, TerminalStateError};
+use chrono::{DateTime, Utc};
+use crate::server::terminal_state::{Grid, GridHistory, TerminalStateError, LineCounter};
 
 pub struct GridView {
     history: Arc<Mutex<GridHistory>>,
@@ -23,6 +24,90 @@ impl GridView {
         }
         
         Ok(grid)
+    }
+    
+    /// Derive view at a specific timestamp with optional height limit
+    pub fn derive_at_time(&self, timestamp: DateTime<Utc>, max_height: Option<u16>) -> Result<Grid, TerminalStateError> {
+        let history = self.history.lock().unwrap();
+        let mut grid = history.get_at_time(timestamp)?;
+        
+        // If height is specified and less than grid height, truncate rows
+        if let Some(height) = max_height {
+            if height < grid.height {
+                grid = self.truncate_to_height(grid, height)?;
+            }
+        }
+        
+        Ok(grid)
+    }
+    
+    /// Derive view from a specific line number with optional height limit
+    pub fn derive_from_line(&self, line_num: u64, max_height: Option<u16>) -> Result<Grid, TerminalStateError> {
+        let history = self.history.lock().unwrap();
+        
+        // Get the current grid (most recent state)
+        let current_grid = history.get_current()?;
+        
+        // Check if the requested line is within the current terminal's range
+        let current_start = current_grid.start_line.to_u64().unwrap_or(0);
+        let current_end = current_grid.end_line.to_u64().unwrap_or(current_grid.height as u64 - 1);
+        
+        // If line_num is beyond the end, just return the current view
+        if line_num > current_end {
+            // Return the current view (can't scroll beyond what exists)
+            let mut grid = current_grid;
+            if let Some(height) = max_height {
+                if height < grid.height {
+                    grid = self.truncate_to_height(grid, height)?;
+                }
+            }
+            return Ok(grid);
+        }
+        
+        // Create a new grid starting from the requested line
+        let height = max_height.unwrap_or(current_grid.height);
+        let mut new_grid = Grid::new(current_grid.width, height);
+        new_grid.timestamp = current_grid.timestamp;
+        
+        // Calculate the offset to shift the view
+        let row_offset = if line_num >= current_start && line_num <= current_end {
+            // Line is within current view, shift accordingly
+            (line_num - current_start) as u16
+        } else if line_num < current_start {
+            // Line is before current view (shouldn't happen with current terminal model)
+            0
+        } else {
+            // Line is after current view (already handled above)
+            0
+        };
+        
+        // Copy the grid content starting from the requested line
+        for dst_row in 0..height {
+            let src_row = dst_row + row_offset;
+            if src_row < current_grid.height {
+                for col in 0..current_grid.width {
+                    if let Some(cell) = current_grid.get_cell(src_row, col) {
+                        new_grid.set_cell(dst_row, col, cell.clone());
+                    }
+                }
+            }
+        }
+        
+        // Update line numbers
+        new_grid.start_line = LineCounter::from_u64(line_num);
+        new_grid.end_line = LineCounter::from_u64(line_num + height as u64 - 1);
+        
+        // Adjust cursor position relative to new view
+        if current_grid.cursor.row >= row_offset {
+            new_grid.cursor = current_grid.cursor.clone();
+            new_grid.cursor.row -= row_offset;
+        } else {
+            // Cursor is above the new view
+            new_grid.cursor = current_grid.cursor.clone();
+            new_grid.cursor.visible = false;
+        }
+        
+        Ok(new_grid)
     }
     
     /// Truncate grid to specified number of rows

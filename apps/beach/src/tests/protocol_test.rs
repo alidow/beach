@@ -6,8 +6,7 @@ mod tests {
     use crate::protocol::{
         ClientMessage, ServerMessage, ViewMode, Dimensions, SubscriptionStatus
     };
-    use crate::session::multiplexer::SessionBroker;
-    use crate::session::view_registry::ViewKey;
+    use crate::subscription::manager::SubscriptionManager;
     use crate::server::terminal_state::TerminalStateTracker;
     use crate::transport::mock::MockTransport;
     
@@ -16,25 +15,23 @@ mod tests {
     async fn test_subscription_pooling() {
         let transport = MockTransport::new();
         let tracker = Arc::new(Mutex::new(TerminalStateTracker::new(80, 24)));
-        let broker = Arc::new(SessionBroker::new(transport, tracker));
+        let manager = Arc::new(SubscriptionManager::new(transport, tracker));
         
         let (tx1, mut rx1) = mpsc::channel::<ServerMessage>(100);
         let (tx2, mut rx2) = mpsc::channel::<ServerMessage>(100);
         
-        broker.add_client("client1".to_string(), tx1, false).await;
-        broker.add_client("client2".to_string(), tx2, false).await;
-        
         let dimensions = Dimensions { width: 80, height: 24 };
         
-        let subscribe1 = ClientMessage::Subscribe {
-            subscription_id: "sub1".to_string(),
-            dimensions: dimensions.clone(),
-            mode: ViewMode::Realtime,
-            position: None,
-            compression: None,
-        };
-        
-        broker.handle_client_message("client1".to_string(), subscribe1).await.unwrap();
+        // Add subscription for client1
+        manager.add_subscription(
+            "sub1".to_string(),
+            "client1".to_string(),
+            dimensions.clone(),
+            ViewMode::Realtime,
+            None,
+            tx1,
+            false,
+        ).await.unwrap();
         
         // First message should be SubscriptionAck
         if let Some(msg) = rx1.recv().await {
@@ -57,25 +54,25 @@ mod tests {
             }
         }
         
-        let subscribe2 = ClientMessage::Subscribe {
-            subscription_id: "sub2".to_string(),
+        // Add subscription for client2
+        manager.add_subscription(
+            "sub2".to_string(),
+            "client2".to_string(),
             dimensions,
-            mode: ViewMode::Realtime,
-            position: None,
-            compression: None,
-        };
+            ViewMode::Realtime,
+            None,
+            tx2,
+            false,
+        ).await.unwrap();
         
-        broker.handle_client_message("client2".to_string(), subscribe2).await.unwrap();
-        
-        // First message should be SubscriptionAck
+        // First message should be SubscriptionAck (now always Active, no sharing)
         if let Some(msg) = rx2.recv().await {
             match msg {
                 ServerMessage::SubscriptionAck { status, shared_with, .. } => {
-                    assert_eq!(status, SubscriptionStatus::Shared);
-                    assert!(shared_with.is_some());
-                    assert_eq!(shared_with.unwrap().len(), 1);
+                    assert_eq!(status, SubscriptionStatus::Active);
+                    assert!(shared_with.is_none());
                 }
-                _ => panic!("Expected SubscriptionAck with shared status, got {:?}", msg),
+                _ => panic!("Expected SubscriptionAck, got {:?}", msg),
             }
         }
         
@@ -95,20 +92,20 @@ mod tests {
     async fn test_view_transition() {
         let transport = MockTransport::new();
         let tracker = Arc::new(Mutex::new(TerminalStateTracker::new(80, 24)));
-        let broker = Arc::new(SessionBroker::new(transport, tracker));
+        let manager = Arc::new(SubscriptionManager::new(transport, tracker));
         
         let (tx, mut rx) = mpsc::channel::<ServerMessage>(100);
-        broker.add_client("client1".to_string(), tx, false).await;
         
-        let subscribe = ClientMessage::Subscribe {
-            subscription_id: "sub1".to_string(),
-            dimensions: Dimensions { width: 80, height: 24 },
-            mode: ViewMode::Realtime,
-            position: None,
-            compression: None,
-        };
-        
-        broker.handle_client_message("client1".to_string(), subscribe).await.unwrap();
+        // Start with realtime view
+        manager.add_subscription(
+            "sub1".to_string(),
+            "client1".to_string(),
+            Dimensions { width: 80, height: 24 },
+            ViewMode::Realtime,
+            None,
+            tx,
+            false,
+        ).await.unwrap();
         
         rx.recv().await;
         rx.recv().await;
@@ -120,19 +117,20 @@ mod tests {
             position: None,
         };
         
-        broker.handle_client_message("client1".to_string(), modify).await.unwrap();
+        manager.handle_client_message("client1".to_string(), modify).await.unwrap();
         
         if let Some(msg) = rx.recv().await {
             match msg {
-                ServerMessage::ViewTransition { from_mode, to_mode, .. } => {
-                    assert_eq!(from_mode, ViewMode::Realtime);
-                    assert_eq!(to_mode, ViewMode::Realtime);
+                ServerMessage::Snapshot { .. } => {
+                    // Modified subscription now sends a new snapshot
                 }
-                _ => panic!("Expected ViewTransition"),
+                _ => panic!("Expected Snapshot after modification"),
             }
         }
     }
     
+    // ViewKey tests removed - no longer needed with simplified architecture
+    /*
     #[test]
     fn test_view_key_equality() {
         let key1 = ViewKey::realtime(80, 24);
@@ -144,4 +142,5 @@ mod tests {
         assert_ne!(key1, key3);
         assert_ne!(key1, key4);
     }
+    */
 }

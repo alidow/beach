@@ -333,75 +333,11 @@ async fn handle_client_message(
         }
         
         ClientMessage::Signal { to_peer, signal } => {
-            // Check if this is a debug response from the server
-            if let crate::signaling::TransportSignal::Custom { transport_name, signal_type, payload } = &signal {
-                if transport_name == "debug" && signal_type == "debug_response" {
-                    // This is a debug response from the server, send it as a Debug message
-                    if let Some(response) = payload.get("response") {
-                        // Convert the response to proper DebugResponse format
-                        let debug_response = match response.get("type").and_then(|v| v.as_str()) {
-                            Some("grid_view") => {
-                                crate::signaling::DebugResponse::GridView {
-                                    width: response.get("width").and_then(|v| v.as_u64()).unwrap_or(80) as u16,
-                                    height: response.get("height").and_then(|v| v.as_u64()).unwrap_or(24) as u16,
-                                    cursor_row: response.get("cursor_row").and_then(|v| v.as_u64()).unwrap_or(0) as u16,
-                                    cursor_col: response.get("cursor_col").and_then(|v| v.as_u64()).unwrap_or(0) as u16,
-                                    cursor_visible: response.get("cursor_visible").and_then(|v| v.as_bool()).unwrap_or(true),
-                                    rows: response.get("rows")
-                                        .and_then(|v| v.as_array())
-                                        .map(|arr| arr.iter()
-                                            .filter_map(|v| v.as_str().map(String::from))
-                                            .collect())
-                                        .unwrap_or_default(),
-                                    ansi_rows: response.get("ansi_rows")
-                                        .and_then(|v| v.as_array())
-                                        .map(|arr| arr.iter()
-                                            .filter_map(|v| v.as_str().map(String::from))
-                                            .collect()),
-                                    timestamp: chrono::Utc::now(),
-                                    start_line: response.get("start_line").and_then(|v| v.as_u64()).unwrap_or(0),
-                                    end_line: response.get("end_line").and_then(|v| v.as_u64()).unwrap_or(0),
-                                }
-                            }
-                            Some("stats") => {
-                                crate::signaling::DebugResponse::Stats {
-                                    history_size_bytes: response.get("history_size_bytes").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-                                    total_deltas: response.get("total_deltas").and_then(|v| v.as_u64()).unwrap_or(0),
-                                    total_snapshots: response.get("total_snapshots").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-                                    current_dimensions: (
-                                        response.get("current_dimensions").and_then(|v| v.get(0)).and_then(|v| v.as_u64()).unwrap_or(80) as u16,
-                                        response.get("current_dimensions").and_then(|v| v.get(1)).and_then(|v| v.as_u64()).unwrap_or(24) as u16,
-                                    ),
-                                    session_duration_secs: response.get("session_duration_secs").and_then(|v| v.as_u64()).unwrap_or(0),
-                                }
-                            }
-                            Some("success") => {
-                                crate::signaling::DebugResponse::Success {
-                                    message: response.get("message").and_then(|v| v.as_str()).unwrap_or("Success").to_string(),
-                                }
-                            }
-                            Some("error") => {
-                                crate::signaling::DebugResponse::Error {
-                                    message: response.get("message").and_then(|v| v.as_str()).unwrap_or("Error").to_string(),
-                                }
-                            }
-                            _ => {
-                                crate::signaling::DebugResponse::Error {
-                                    message: "Unknown debug response type".to_string(),
-                                }
-                            }
-                        };
-                        
-                        // Send to the requesting peer
-                        state.send_to_peer(session_id, &to_peer, ServerMessage::Debug {
-                            response: debug_response,
-                        }).await?;
-                        return Ok(());
-                    }
-                }
-            }
+            info!("Received Signal from {} to {}: {:?}", peer_id, to_peer, signal);
+            // Don't intercept debug responses - just forward them as-is
+            // The CLI expects to receive debug responses as Signal messages, not Debug messages
             
-            // Normal signal forwarding
+            // Normal signal forwarding (including debug responses)
             state.send_to_peer(session_id, &to_peer, ServerMessage::Signal {
                 from_peer: peer_id.to_string(),
                 signal,
@@ -431,14 +367,15 @@ async fn handle_client_message(
                 if let Some(server_id) = server_peer {
                     // Forward the debug request to the server via Signal
                     // Package it as a Signal message with a debug payload
-                    let debug_signal = crate::signaling::TransportSignal::Custom {
-                        transport_name: "debug".to_string(),
-                        signal_type: "debug_request".to_string(),
-                        payload: serde_json::json!({
+                    let debug_signal = serde_json::json!({
+                        "transport": "custom",
+                        "transport_name": "debug",
+                        "signal_type": "debug_request",
+                        "payload": {
                             "from_peer": peer_id,
                             "request": request,
-                        }),
-                    };
+                        },
+                    });
                     
                     info!("Sending debug signal to server peer {}", server_id);
                     state.send_to_peer(session_id, &server_id, ServerMessage::Signal {

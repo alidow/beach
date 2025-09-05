@@ -12,10 +12,13 @@ pub struct Config {
 impl Config {
     /// Load configuration from environment variables
     pub fn from_env() -> Self {
-        Self {
-            session_server: env::var("BEACH_SESSION_SERVER")
-                .unwrap_or_else(|_| "localhost:8080".to_string()),
-        }
+        let server = env::var("BEACH_SESSION_SERVER")
+            .unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+        // Normalize localhost to IPv4 to avoid IPv6 (::1) preference on macOS
+        let server = if server.starts_with("localhost:") {
+            server.replacen("localhost", "127.0.0.1", 1)
+        } else { server };
+        Self { session_server: server }
     }
 
     /// Get the session server URL
@@ -28,9 +31,7 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            session_server: "localhost:8080".to_string(),
-        }
+        Self { session_server: "127.0.0.1:8080".to_string() }
     }
 }
 
@@ -45,7 +46,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.session_server, "localhost:8080");
+        assert_eq!(config.session_server, "127.0.0.1:8080");
     }
 
     #[test]
@@ -57,7 +58,7 @@ mod tests {
             env::remove_var("BEACH_SESSION_SERVER");
         }
         let config = Config::from_env();
-        assert_eq!(config.session_server, "localhost:8080");
+        assert_eq!(config.session_server, "127.0.0.1:8080");
     }
 
     #[test]

@@ -1,10 +1,12 @@
 mod pty;
 mod terminal;
 mod io;
+mod io_resize;
 pub mod terminal_state;
 pub mod debug_handler;
 
 use async_trait::async_trait;
+use std::io::IsTerminal;
 use crate::transport::Transport;
 use crate::session::{ServerSession, signaling::AppMessage};
 use crate::session::handlers::ServerMessageHandler;
@@ -16,8 +18,9 @@ use anyhow::Result;
 
 use self::pty::PtyManager;
 use self::terminal::{get_pty_size, build_command, enable_raw_mode, disable_raw_mode};
-use self::io::{spawn_pty_reader, spawn_stdin_reader, spawn_pty_reader_with_tracker};
-use self::terminal_state::TerminalStateTracker;
+use self::io::{spawn_stdin_reader, spawn_pty_reader_with_tracker};
+use self::io_resize::spawn_pty_reader_with_resize;
+use self::terminal_state::{TerminalBackend, create_terminal_backend};
 use self::debug_handler::DebugHandler;
 
 #[async_trait]
@@ -33,33 +36,116 @@ pub struct TerminalServer<T: Transport + Send + 'static> {
     pty_manager: PtyManager,
     read_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     stdin_task: Arc<Mutex<Option<JoinHandle<()>>>>,
-    terminal_tracker: Arc<Mutex<TerminalStateTracker>>,
+    terminal_backend: Arc<Mutex<Box<dyn TerminalBackend>>>,
     debug_handler: Arc<DebugHandler>,
+    debug_recorder: Arc<Mutex<Option<String>>>,
+    debug_log: Arc<Mutex<Option<std::fs::File>>>,
 }
 
 impl<T: Transport + Send + 'static> TerminalServer<T> {
+    /// Create a new terminal server with a session - this is the high-level API
+    pub async fn create(
+        config: &crate::config::Config,
+        transport: T,
+        passphrase: Option<String>,
+        cmd: Vec<String>,
+        debug_recorder: Option<String>,
+        debug_log: Option<String>,
+    ) -> Result<Arc<Self>> {
+        use crate::session::Session;
+        
+        // Create the session first (without handler)
+        let mut server_session = Session::create(config, transport, passphrase, cmd.clone()).await?;
+        
+        // Create the terminal server
+        let terminal_server = Self::new_with_debug(server_session, debug_recorder, debug_log);
+        
+        // Now set the handler and debug handler (breaking the circular dependency)
+        {
+            let mut session = terminal_server.session.write().await;
+            session.set_handler(terminal_server.clone()).await;
+            session.set_debug_handler(Arc::clone(&terminal_server.debug_handler));
+        }
+        
+        // Start the message router now that all handlers are set
+        {
+            let session = terminal_server.session.read().await;
+            session.start_router().await;
+        }
+        
+        Ok(terminal_server)
+    }
+
     pub fn new(session: ServerSession<T>) -> Arc<Self> {
-        // Create terminal state tracker with default size (will be updated when PTY starts)
-        let terminal_tracker = Arc::new(Mutex::new(TerminalStateTracker::new(80, 24)));
+        Self::new_with_debug_recorder(session, None)
+    }
+
+    pub fn new_with_debug_recorder(session: ServerSession<T>, debug_recorder: Option<String>) -> Arc<Self> {
+        Self::new_with_debug(session, debug_recorder, None)
+    }
+
+    pub fn new_with_debug(session: ServerSession<T>, debug_recorder: Option<String>, debug_log: Option<String>) -> Arc<Self> {
+        // Open debug log file if specified
+        let debug_log_file = debug_log.and_then(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok()
+        });
+        
+        // Detect terminal size FIRST before creating backend
+        let (term_cols, term_rows) = match self::terminal::get_terminal_size() {
+            Ok((cols, rows)) => {
+                if let Some(ref log_file) = debug_log_file {
+                    if let Ok(log_file) = log_file.try_clone() {
+                        let mut log = log_file;
+                        use std::io::Write;
+                        let _ = writeln!(log, "[{}] TerminalServer::new detected terminal size: {}x{}", 
+                                         chrono::Utc::now().format("%H:%M:%S%.3f"), cols, rows);
+                    }
+                }
+                (cols, rows)
+            },
+            Err(_) => {
+                if let Some(ref log_file) = debug_log_file {
+                    if let Ok(log_file) = log_file.try_clone() {
+                        let mut log = log_file;
+                        use std::io::Write;
+                        let _ = writeln!(log, "[{}] TerminalServer::new failed to detect terminal size, using defaults", 
+                                         chrono::Utc::now().format("%H:%M:%S%.3f"));
+                    }
+                }
+                (80, 24)
+            }
+        };
+        
+        // Create terminal backend with DETECTED size, not hardcoded
+        let terminal_backend = create_terminal_backend(term_cols, term_rows, debug_log_file.as_ref())
+            .expect("Failed to create terminal backend");
+        let terminal_backend = Arc::new(Mutex::new(terminal_backend));
         let debug_handler = Arc::new(DebugHandler::new());
+        
+        if let Some(ref _path) = debug_recorder {
+            // Debug recorder enabled silently
+        }
         
         Arc::new(TerminalServer { 
             session: Arc::new(AsyncRwLock::new(session)),
             pty_manager: PtyManager::new(),
             read_task: Arc::new(Mutex::new(None)),
             stdin_task: Arc::new(Mutex::new(None)),
-            terminal_tracker,
+            terminal_backend,
             debug_handler,
+            debug_recorder: Arc::new(Mutex::new(debug_recorder)),
+            debug_log: Arc::new(Mutex::new(debug_log_file)),
         })
     }
-    
-    pub async fn setup_handlers(self: Arc<Self>) {
-        // Set debug handler and message handler
-        eprintln!("🏖️  Beach Server: Setting up handlers...");
-        let mut session = self.session.write().await;
+
+    pub async fn set_session(&self, mut session: ServerSession<T>) {
+        // Store the session and set debug handler
         session.set_debug_handler(Arc::clone(&self.debug_handler));
-        session.set_handler(self.clone()).await;
-        eprintln!("🏖️  Beach Server: Handlers configured");
+        *self.session.write().await = session;
     }
 }
 
@@ -68,46 +154,108 @@ impl<T: Transport + Send + 'static> Server for TerminalServer<T> {
     type Transport = T;
 
     async fn start(&self) {
-        // Get terminal size
+        // Get terminal size using improved detection
         let pty_size = get_pty_size();
+        
+        // Log the detected PTY size and method
+        if let Some(debug_log) = self.debug_log.lock().unwrap().as_mut() {
+            use std::io::Write;
+            let _ = writeln!(debug_log, "[{}] Server::start detected terminal size: {}x{}", 
+                             chrono::Utc::now().format("%H:%M:%S%.3f"), 
+                             pty_size.cols, pty_size.rows);
+            
+            // Also log which detection method worked
+            if let Ok((cols, rows)) = crossterm::terminal::size() {
+                let _ = writeln!(debug_log, "[{}] Detection method: crossterm ({}x{})", 
+                                 chrono::Utc::now().format("%H:%M:%S%.3f"), cols, rows);
+            } else {
+                let _ = writeln!(debug_log, "[{}] Detection method: fallback (crossterm failed)", 
+                                 chrono::Utc::now().format("%H:%M:%S%.3f"));
+            }
+        }
 
         // Build command from session config
         let cmd = {
             let session = self.session.read().await;
-            build_command(session.cmd())
+            let cmd_vec = session.cmd();
+            
+            // Log the command being executed
+            if let Some(debug_log) = self.debug_log.lock().unwrap().as_mut() {
+                use std::io::Write;
+                let _ = writeln!(debug_log, "[{}] Server::start executing command: {:?}", 
+                                 chrono::Utc::now().format("%H:%M:%S%.3f"), cmd_vec);
+            }
+            
+            build_command(cmd_vec)
         };
        
         // Initialize PTY
         self.pty_manager.init(pty_size, cmd)
             .expect("Failed to initialize PTY");
         
-        // Update terminal tracker with actual size
+        // Resize terminal backend to match current PTY size (in case it changed)
         {
-            let mut tracker = self.terminal_tracker.lock().unwrap();
-            *tracker = TerminalStateTracker::new(pty_size.cols, pty_size.rows);
+            let mut backend = self.terminal_backend.lock().unwrap();
+            let (current_width, current_height) = backend.get_dimensions();
+            
+            // Only resize if dimensions differ
+            if current_width != pty_size.cols || current_height != pty_size.rows {
+                // Log the resize attempt
+                if let Some(debug_log) = self.debug_log.lock().unwrap().as_mut() {
+                    use std::io::Write;
+                    let _ = writeln!(debug_log, "[{}] Server::start resizing backend from {}x{} to {}x{}", 
+                                     chrono::Utc::now().format("%H:%M:%S%.3f"), 
+                                     current_width, current_height,
+                                     pty_size.cols, pty_size.rows);
+                }
+                
+                let _ = backend.resize(pty_size.cols, pty_size.rows);
+            } else {
+                if let Some(debug_log) = self.debug_log.lock().unwrap().as_mut() {
+                    use std::io::Write;
+                    let _ = writeln!(debug_log, "[{}] Server::start backend already at correct size {}x{}", 
+                                     chrono::Utc::now().format("%H:%M:%S%.3f"), 
+                                     pty_size.cols, pty_size.rows);
+                }
+            }
         }
         
-        // Initialize debug handler with the tracker
-        self.debug_handler.set_tracker(Arc::clone(&self.terminal_tracker));
+        // Initialize debug handler with the backend
+        self.debug_handler.set_backend(Arc::clone(&self.terminal_backend));
         
-        // Print messages before entering raw mode
-        eprintln!("🏖️  Beach Server: PTY initialized, setting up I/O...");
-        eprintln!("🏖️  Beach Server: Ready! You're now in the Beach shell.");
-        eprintln!("🏖️  Type 'exit' or press Ctrl+D to quit.");
-        eprintln!(); // Extra newline for clarity
+        // Server is ready, no need for verbose messages
         
         // Enable raw mode for proper terminal interaction
         let _ = enable_raw_mode();
         
         // Start reading from PTY in a background task with terminal state tracking
-        let read_task = spawn_pty_reader_with_tracker(
-            self.pty_manager.master_reader.clone(),
-            self.terminal_tracker.clone()
-        );
+        // Use the resize-aware reader if running in a terminal
+        let debug_recorder_path = self.debug_recorder.lock().unwrap().clone();
+        let read_task = if std::io::stdout().is_terminal() {
+            // Use resize-aware reader when running in a terminal
+            spawn_pty_reader_with_resize(
+                self.pty_manager.master_reader.clone(),
+                self.terminal_backend.clone(),
+                Arc::new(self.pty_manager.clone()),
+                debug_recorder_path
+            )
+        } else {
+            // Fall back to regular reader when not in a terminal (e.g., piped output)
+            spawn_pty_reader_with_tracker(
+                self.pty_manager.master_reader.clone(),
+                self.terminal_backend.clone(),
+                debug_recorder_path
+            )
+        };
         *self.read_task.lock().unwrap() = Some(read_task);
         
         // Start reading from stdin and writing to PTY (using spawn_blocking for blocking I/O)
-        let stdin_task = spawn_stdin_reader(self.pty_manager.master_writer.clone());
+        let stdin_recorder_path = self.debug_recorder.lock().unwrap().clone()
+            .map(|p| p.replace(".log", ".stdin.log"));
+        let stdin_task = spawn_stdin_reader(
+            self.pty_manager.master_writer.clone(), 
+            stdin_recorder_path
+        );
         
         // Store stdin task handle for cleanup
         let stdin_task_stored = {
@@ -138,7 +286,7 @@ impl<T: Transport + Send + 'static> Server for TerminalServer<T> {
         // Restore terminal first before printing
         let _ = disable_raw_mode();
         
-        eprintln!("\n🏖️  Beach Server: Shutting down...");
+        // Shutting down silently
         
         // Stop the read task
         if let Some(task) = self.read_task.lock().unwrap().take() {

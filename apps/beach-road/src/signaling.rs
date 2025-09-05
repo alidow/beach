@@ -94,7 +94,7 @@ pub enum ClientMessage {
     /// Send transport-specific signaling data
     Signal {
         to_peer: String,
-        signal: TransportSignal,
+        signal: serde_json::Value,
     },
     /// Heartbeat to keep connection alive
     Ping,
@@ -141,7 +141,7 @@ pub enum ServerMessage {
     /// Received transport-specific signal from another peer
     Signal {
         from_peer: String,
-        signal: TransportSignal,
+        signal: serde_json::Value,
     },
     /// Response to ping
     Pong,
@@ -184,8 +184,7 @@ pub fn generate_peer_id() -> String {
 pub enum DebugRequest {
     /// Request current grid view
     GetGridView {
-        /// Optional dimensions to rewrap to
-        width: Option<u16>,
+        /// Optional number of rows to return
         height: Option<u16>,
         /// Optional time to get historical view
         #[serde(skip_serializing_if = "Option::is_none")]

@@ -25,6 +25,10 @@ pub enum ClientMessage {
         signal: serde_json::Value, // Will be TransportSignal once implemented
     },
     Ping,
+    /// Debug request for terminal state
+    Debug {
+        request: serde_json::Value, // Will contain DebugRequest
+    },
 }
 
 /// Messages received from session server
@@ -53,6 +57,10 @@ pub enum ServerMessage {
     Pong,
     Error {
         message: String,
+    },
+    /// Debug response with terminal state
+    Debug {
+        response: serde_json::Value, // Will contain DebugResponse
     },
 }
 
@@ -89,8 +97,18 @@ pub enum AppMessage {
         cols: u16,
         rows: u16,
     },
+    /// Protocol message for subscription system
+    Protocol {
+        #[serde(flatten)]
+        message: serde_json::Value, // Will contain ClientMessage or ServerMessage
+    },
     /// Custom application message
     Custom {
         payload: serde_json::Value,
+    },
+    /// Debug message for terminal state
+    Debug {
+        request: serde_json::Value, // DebugRequest
+        response: Option<serde_json::Value>, // Optional DebugResponse
     },
 }

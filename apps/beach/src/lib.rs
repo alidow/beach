@@ -3,6 +3,7 @@ pub mod config;
 pub mod protocol;
 pub mod server;
 pub mod session;
+pub mod subscription;
 pub mod transport;
 
 #[cfg(test)]

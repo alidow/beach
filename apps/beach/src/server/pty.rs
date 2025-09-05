@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 
 /// Manages PTY lifecycle and operations
+#[derive(Clone)]
 pub struct PtyManager {
     pub pty_pair: Arc<Mutex<Option<PtyPair>>>,
     pub master_writer: Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
@@ -53,6 +54,23 @@ impl PtyManager {
             Ok(())
         } else {
             Err(anyhow::anyhow!("PTY writer not available"))
+        }
+    }
+
+    /// Resize the PTY
+    pub fn resize(&self, width: u16, height: u16) -> Result<()> {
+        let pty_pair_guard = self.pty_pair.lock().unwrap();
+        if let Some(pty_pair) = pty_pair_guard.as_ref() {
+            let pty_size = PtySize {
+                rows: height,
+                cols: width,
+                pixel_width: 0,
+                pixel_height: 0,
+            };
+            pty_pair.master.resize(pty_size)?;
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("PTY not initialized"))
         }
     }
 

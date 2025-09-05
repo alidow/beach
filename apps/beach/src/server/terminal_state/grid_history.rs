@@ -62,6 +62,31 @@ impl Default for HistoryConfig {
 }
 
 impl GridHistory {
+    #[cfg(test)]
+    pub fn clear_deltas(&mut self) {
+        self.deltas.clear();
+    }
+    
+    #[cfg(test)]
+    pub fn delta_count(&self) -> usize {
+        self.deltas.len()
+    }
+    
+    #[cfg(test)]
+    pub fn has_deltas(&self) -> bool {
+        !self.deltas.is_empty()
+    }
+    
+    #[cfg(test)]
+    pub fn iter_deltas(&self) -> impl Iterator<Item = &GridDelta> {
+        self.deltas.values()
+    }
+    
+    #[cfg(test)]
+    pub fn current_grid_mut(&mut self) -> &mut Grid {
+        &mut self.initial_grid
+    }
+    
     pub fn new(initial_grid: Grid) -> Self {
         let mut history = GridHistory {
             initial_grid: initial_grid.clone(),
@@ -106,6 +131,13 @@ impl GridHistory {
         // Check memory limits
         self.enforce_memory_limits();
     }
+
+    /// Add a snapshot of the current grid state
+    pub fn add_snapshot(&mut self, grid: Grid) {
+        self.snapshots.insert(self.current_sequence, grid.clone());
+        self.line_index.insert(grid.start_line.clone(), self.current_sequence);
+        self.last_snapshot_time = grid.timestamp;
+    }
     
     /// Get current grid state
     pub fn get_current(&self) -> Result<Grid, TerminalStateError> {
@@ -114,17 +146,19 @@ impl GridHistory {
     
     /// Reconstruct grid from nearest snapshot
     fn reconstruct_from_sequence(&self, target_seq: u64) -> Result<Grid, TerminalStateError> {
-        // Find nearest snapshot at or before target
+        // Find nearest snapshot at or before target, or use initial grid
         let (snapshot_seq, mut grid) = self.snapshots
             .range(..=target_seq)
             .rev()
             .next()
             .map(|(seq, grid)| (*seq, grid.clone()))
-            .ok_or_else(|| TerminalStateError::LookupError("No snapshot found".to_string()))?;
+            .unwrap_or((0, self.initial_grid.clone()));
         
         // Apply deltas from snapshot to target
-        for (_, delta) in self.deltas.range(snapshot_seq + 1..=target_seq) {
-            delta.apply(&mut grid)?;
+        if snapshot_seq < target_seq {
+            for (_, delta) in self.deltas.range(snapshot_seq + 1..=target_seq) {
+                delta.apply(&mut grid)?;
+            }
         }
         
         Ok(grid)

@@ -4,8 +4,9 @@ use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, error};
 use tokio::time::{timeout, Duration};
+use std::io::IsTerminal;
 
-use crate::signaling::{ClientMessage, ServerMessage, DebugRequest, DebugResponse, generate_peer_id, TransportType};
+use crate::signaling::{ClientMessage, ServerMessage, DebugRequest, DebugResponse, generate_peer_id, TransportType, PeerRole};
 
 #[derive(Parser, Debug)]
 #[command(name = "beach-road")]
@@ -41,21 +42,13 @@ pub enum Commands {
 pub enum DebugCommands {
     /// Get the current grid view
     GridView {
-        /// Width to rewrap to (optional)
-        #[arg(short, long)]
-        width: Option<u16>,
-        
-        /// Height to rewrap to (optional)
-        #[arg(short = 'e', long)]
+        /// Number of rows to display (optional)
+        #[arg(short = 'n', long)]
         height: Option<u16>,
         
         /// Start from line number (optional)
         #[arg(short = 'l', long)]
         from_line: Option<u64>,
-        
-        /// Use ANSI colors in output
-        #[arg(short, long)]
-        ansi: bool,
     },
     
     /// Get terminal statistics
@@ -106,9 +99,20 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
                 Message::Text(text) => {
                     let server_msg: ServerMessage = serde_json::from_str(&text)?;
                     match server_msg {
-                        ServerMessage::JoinSuccess { .. } => {
-                            info!("Successfully joined session");
-                            return Ok::<_, anyhow::Error>(());
+                        ServerMessage::JoinSuccess { peers, .. } => {
+                            // Find the server peer ID
+                            let mut found_server_id = String::new();
+                            for peer in peers {
+                                if peer.role == PeerRole::Server {
+                                    found_server_id = peer.id.clone();
+                                    break;
+                                }
+                            }
+                            if found_server_id.is_empty() {
+                                return Err(anyhow::anyhow!("No server found in session"));
+                            }
+                            info!("Successfully joined session, server peer: {}", found_server_id);
+                            return Ok::<_, anyhow::Error>(found_server_id);
                         }
                         ServerMessage::JoinError { reason } => {
                             error!("Failed to join session: {}", reason);
@@ -125,10 +129,8 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
         Err(anyhow::anyhow!("Connection closed unexpectedly"))
     }).await;
     
-    match join_timeout {
-        Ok(Ok(())) => {
-            // Successfully joined
-        }
+    let server_peer_id = match join_timeout {
+        Ok(Ok(peer_id)) => peer_id,
         Ok(Err(e)) => {
             return Err(e);
         }
@@ -136,13 +138,12 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
             error!("Timeout waiting for join response - session may not exist");
             return Err(anyhow::anyhow!("Session not found or not responding"));
         }
-    }
+    };
     
     // Send debug request based on command
     let debug_request = match command {
-        DebugCommands::GridView { width, height, from_line, .. } => {
+        DebugCommands::GridView { height, from_line } => {
             DebugRequest::GetGridView {
-                width,
                 height,
                 at_time: None,
                 from_line,
@@ -152,21 +153,58 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
         DebugCommands::Clear => DebugRequest::ClearHistory,
     };
     
-    let debug_msg = ClientMessage::Debug {
-        request: debug_request,
+    // Wrap debug request in a Custom transport signal to the server
+    // Beach expects signals as serde_json::Value, not TransportSignal enum
+    let debug_signal = serde_json::json!({
+        "transport": "custom",
+        "transport_name": "debug",
+        "signal_type": "debug_request",
+        "payload": {
+            "request": debug_request,
+        }
+    });
+    
+    let signal_msg = ClientMessage::Signal {
+        to_peer: server_peer_id.clone(), 
+        signal: debug_signal,
     };
     
-    let debug_text = serde_json::to_string(&debug_msg)?;
-    write.send(Message::Text(debug_text.into())).await?;
+    let signal_text = serde_json::to_string(&signal_msg)?;
+    write.send(Message::Text(signal_text.into())).await?;
     
-    // Wait for debug response with timeout
+    // Wait for debug response (or explicit error) with timeout
     let debug_timeout = timeout(Duration::from_secs(10), async {
         while let Some(msg) = read.next().await {
             match msg? {
                 Message::Text(text) => {
                     let server_msg: ServerMessage = serde_json::from_str(&text)?;
-                    if let ServerMessage::Debug { response } = server_msg {
-                        return Ok::<_, anyhow::Error>(response);
+                    match server_msg {
+                        ServerMessage::Signal { from_peer, signal } => {
+                            // Check if this is a debug response wrapped in Custom transport (now as serde_json::Value)
+                            if let Some(transport) = signal.get("transport").and_then(|v| v.as_str()) {
+                                if transport == "custom" {
+                                    if let (Some(transport_name), Some(signal_type)) = 
+                                        (signal.get("transport_name").and_then(|v| v.as_str()),
+                                         signal.get("signal_type").and_then(|v| v.as_str())) {
+                                        
+                                        if transport_name == "debug" && signal_type == "debug_response" {
+                                            if let Some(payload) = signal.get("payload") {
+                                                if let Some(response) = payload.get("response") {
+                                                    if !response.is_null() {
+                                                        let debug_response: DebugResponse = serde_json::from_value(response.clone())?;
+                                                        return Ok::<_, anyhow::Error>(debug_response);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        ServerMessage::Error { message } => {
+                            return Err(anyhow::anyhow!("Server error: {}", message));
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -177,7 +215,7 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
     
     match debug_timeout {
         Ok(Ok(response)) => {
-            handle_debug_response(response, matches!(command, DebugCommands::GridView { ansi: true, .. }))?;
+            handle_debug_response(response)?;
         }
         Ok(Err(e)) => {
             return Err(e);
@@ -194,7 +232,37 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
     Ok(())
 }
 
-fn handle_debug_response(response: DebugResponse, use_ansi: bool) -> Result<()> {
+/// Try to get terminal width if stdout is a TTY
+fn get_terminal_width() -> Option<u16> {
+    // Only check if stdout is a terminal
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+    
+    // Try to get terminal size using terminal_size crate or similar
+    // For now, we'll use a simple approach with stty command
+    use std::process::Command;
+    
+    let output = Command::new("stty")
+        .arg("size")
+        .output()
+        .ok()?;
+    
+    if !output.status.success() {
+        return None;
+    }
+    
+    let size = String::from_utf8(output.stdout).ok()?;
+    let parts: Vec<&str> = size.trim().split_whitespace().collect();
+    
+    if parts.len() == 2 {
+        parts[1].parse::<u16>().ok()
+    } else {
+        None
+    }
+}
+
+fn handle_debug_response(response: DebugResponse) -> Result<()> {
     match response {
         DebugResponse::GridView {
             width,
@@ -208,6 +276,17 @@ fn handle_debug_response(response: DebugResponse, use_ansi: bool) -> Result<()> 
             start_line,
             end_line,
         } => {
+            // Check terminal width and warn if too narrow
+            let term_width = get_terminal_width();
+            if let Some(tw) = term_width {
+                if tw < width {
+                    eprintln!();
+                    eprintln!("⚠️  Warning: Your terminal width ({}) is smaller than the grid width ({}).", tw, width);
+                    eprintln!("   Lines may wrap unexpectedly. Consider resizing your terminal or using a wider display.");
+                    eprintln!();
+                }
+            }
+            
             println!("╔══════════════════════════════════════════════════════════════╗");
             println!("║                      TERMINAL GRID VIEW                      ║");
             println!("╠══════════════════════════════════════════════════════════════╣");
@@ -220,14 +299,14 @@ fn handle_debug_response(response: DebugResponse, use_ansi: bool) -> Result<()> 
             println!("║ Timestamp: {}", timestamp);
             println!("╠══════════════════════════════════════════════════════════════╣");
             
-            // Print the grid content
-            if use_ansi && ansi_rows.is_some() {
+            // Print the grid content - always use ANSI colors if available
+            if let Some(ansi_rows) = ansi_rows {
                 // Use ANSI-colored version
-                for row in ansi_rows.unwrap() {
+                for row in ansi_rows {
                     println!("║{}║", row);
                 }
             } else {
-                // Use plain text version
+                // Fallback to plain text if ANSI not available
                 for row in rows {
                     println!("║{}║", row);
                 }

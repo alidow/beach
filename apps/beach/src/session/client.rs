@@ -1,5 +1,6 @@
 use anyhow::Result;
 use reqwest::Client;
+use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 
@@ -35,16 +36,27 @@ pub struct SessionClient {
 
 impl SessionClient {
     pub fn new(session_server: &str) -> Self {
-        let base_url = if session_server.starts_with("http://") || session_server.starts_with("https://") {
-            session_server.to_string()
+        // Normalize localhost to IPv4 to avoid IPv6 (::1) preference
+        let server = if session_server.contains("localhost") {
+            session_server.replace("localhost", "127.0.0.1")
+        } else { session_server.to_string() };
+
+        let base_url = if server.starts_with("http://") || server.starts_with("https://") {
+            server
         } else {
-            format!("http://{}", session_server)
+            format!("http://{}", server)
         };
         
-        Self {
-            client: Client::new(),
-            base_url,
-        }
+        // Build a client with conservative timeouts and no proxy to avoid
+        // hanging when localhost session server is unavailable or proxied.
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(4))
+            .no_proxy()
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
+        Self { client, base_url }
     }
 
     /// Register a new session with the session server

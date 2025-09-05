@@ -8,7 +8,9 @@ pub mod grid_view;
 pub mod init;
 pub mod line_counter;
 pub mod tracker;
-pub mod vte_perform;
+#[cfg(feature = "alacritty-backend")]
+pub mod alacritty_backend;
+pub mod backend;
 
 pub use cell::{Cell, CellAttributes, Color};
 pub use char_counter::CharCounter;
@@ -20,4 +22,6 @@ pub use grid_view::GridView;
 pub use init::TerminalInitializer;
 pub use line_counter::LineCounter;
 pub use tracker::TerminalStateTracker;
-pub use vte_perform::GridUpdater;
+#[cfg(feature = "alacritty-backend")]
+pub use alacritty_backend::AlacrittyTerminal;
+pub use backend::{TerminalBackend, create_terminal_backend};

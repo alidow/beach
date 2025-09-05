@@ -1,14 +1,15 @@
 mod client;
 mod config;
-mod protocol;
-mod server;
-mod session;
-mod transport;
+pub mod protocol;
+pub mod server;
+pub mod session;
+pub mod subscription;
+pub mod transport;
 
 use clap::Parser;
 use config::Config;
 use server::{Server, TerminalServer};
-use session::{Session, ServerSession, ClientSession};
+use session::Session;
 use transport::mock::MockTransport;
 
 #[derive(Parser, Debug)]
@@ -43,13 +44,22 @@ async fn main() {
             std::process::exit(2);
         }
 
-        // Join the session
+        // Join the session (but don't connect WebSocket yet)
         match Session::join(session, MockTransport::new(), cli.passphrase).await {
-            Ok(client_session) => {
-                // TODO: Implement client
-                // let client = TerminalClient::new(client_session);
+            Ok((mut client_session, server_addr, session_id)) => {
+                // TODO: Create client and set handler
+                // let client = TerminalClient::new(client_session.clone());
+                // client_session.set_handler(client.clone());
+                
+                // Now connect WebSocket with handler set
+                if let Err(e) = client_session.connect_signaling(&server_addr, &session_id).await {
+                    eprintln!("⚠️  Failed to establish WebSocket connection: {}", e);
+                    eprintln!("⚠️  Some features may not work without WebSocket connection");
+                }
+                
+                // TODO: Start the client
                 // client.start().await;
-                eprintln!("Client mode not yet implemented");
+                eprintln!("Client mode not yet fully implemented");
             }
             Err(e) => {
                 eprintln!("❌ {}", e);
@@ -58,17 +68,16 @@ async fn main() {
         }
     } else {
         // SERVER MODE
-        // Using session server silently
-        
-        // Create the session
-        match Session::create(&config, MockTransport::new(), cli.passphrase, cli.cmd.clone()).await {
-            Ok(server_session) => {
-                let server = TerminalServer::new_with_debug(
-                    server_session,
-                    cli.debug_recorder,
-                    cli.debug_log
-                );
-                server.clone().setup_handlers().await;
+        // Simply create the terminal server with everything configured
+        match TerminalServer::create(
+            &config,
+            MockTransport::new(),
+            cli.passphrase,
+            cli.cmd.clone(),
+            cli.debug_recorder,
+            cli.debug_log,
+        ).await {
+            Ok(server) => {
                 server.start().await;
             }
             Err(e) => {

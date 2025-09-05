@@ -159,15 +159,15 @@ fn test_grid_history() {
 }
 
 #[test]
-fn test_grid_view_rewrap() {
+fn test_grid_view_height_truncation() {
     let history = Arc::new(Mutex::new(GridHistory::new(Grid::new(80, 24))));
     let view = GridView::new(Arc::clone(&history));
     
-    // Get current view with different dimensions
-    let rewrapped = view.derive_realtime(Some((40, 12))).unwrap();
+    // Get current view with limited height
+    let truncated = view.derive_realtime(Some(12)).unwrap();
     
-    assert_eq!(rewrapped.width, 40);
-    assert_eq!(rewrapped.height, 12);
+    assert_eq!(truncated.width, 80);  // Width should remain original
+    assert_eq!(truncated.height, 12);  // Height should be limited
 }
 
 #[test]
@@ -261,6 +261,7 @@ fn test_emoji_handling() {
         }
     }
 }
+
 
 #[test]
 fn test_memory_limit() {

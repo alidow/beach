@@ -31,14 +31,19 @@ impl SignalingConnection {
         role: super::signaling::PeerRole,
     ) -> Result<Self> {
         // Build WebSocket URL
-        let ws_url = if session_server.starts_with("ws://") || session_server.starts_with("wss://") {
-            format!("{}/ws/{}", session_server, session_id)
+        // Normalize localhost to IPv4 to avoid IPv6 (::1) issues
+        let normalized = if session_server.contains("localhost") {
+            session_server.replace("localhost", "127.0.0.1")
+        } else { session_server.to_string() };
+
+        let ws_url = if normalized.starts_with("ws://") || normalized.starts_with("wss://") {
+            format!("{}/ws/{}", normalized, session_id)
         } else {
-            // Default to ws:// for localhost, wss:// for others
-            if session_server.contains("localhost") || session_server.contains("127.0.0.1") {
-                format!("ws://{}/ws/{}", session_server, session_id)
+            // Default to ws:// for local, wss:// for others
+            if normalized.contains("127.0.0.1") {
+                format!("ws://{}/ws/{}", normalized, session_id)
             } else {
-                format!("wss://{}/ws/{}", session_server, session_id)
+                format!("wss://{}/ws/{}", normalized, session_id)
             }
         };
 

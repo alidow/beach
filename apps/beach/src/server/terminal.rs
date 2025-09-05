@@ -4,18 +4,69 @@ use anyhow::Result;
 use crossterm::terminal;
 use portable_pty::{CommandBuilder, PtySize};
 
-/// Get terminal size using crossterm
+/// Get terminal size using crossterm (cross-platform)
 pub fn get_terminal_size() -> Result<(u16, u16)> {
     // Try to get terminal size using crossterm
     if std::io::stdout().is_terminal() {
-        // Use crossterm to get terminal size
-        match terminal::size() {
-            Ok((cols, rows)) => Ok((cols, rows)),
-            Err(_) => {
-                // Fallback to default if we can't get size
-                Ok((80, 24))
+        // First try crossterm - this should work on both Windows and Unix
+        if let Ok((cols, rows)) = terminal::size() {
+            return Ok((cols, rows));
+        }
+        
+        // Fallback: Try environment variables (works on both Windows and Unix)
+        if let (Ok(cols_str), Ok(rows_str)) = (env::var("COLUMNS"), env::var("LINES")) {
+            if let (Ok(cols), Ok(rows)) = (cols_str.parse::<u16>(), rows_str.parse::<u16>()) {
+                if cols > 0 && rows > 0 {
+                    return Ok((cols, rows));
+                }
             }
         }
+        
+        // Unix-specific fallbacks
+        #[cfg(unix)]
+        {
+            // Try TIOCGWINSZ ioctl directly
+            use libc::{ioctl, winsize, TIOCGWINSZ};
+            unsafe {
+                let mut ws = winsize {
+                    ws_row: 0,
+                    ws_col: 0,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                };
+                // Try stdout, stderr, and stdin
+                for fd in &[0, 1, 2] {
+                    if ioctl(*fd, TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+                        return Ok((ws.ws_col, ws.ws_row));
+                    }
+                }
+            }
+            
+            // Try tput command
+            use std::process::Command;
+            
+            let cols_output = Command::new("tput").arg("cols").output();
+            let rows_output = Command::new("tput").arg("lines").output();
+            
+            if let (Ok(cols_out), Ok(rows_out)) = (cols_output, rows_output) {
+                if let (Ok(cols_str), Ok(rows_str)) = (
+                    String::from_utf8(cols_out.stdout),
+                    String::from_utf8(rows_out.stdout)
+                ) {
+                    if let (Ok(cols), Ok(rows)) = (
+                        cols_str.trim().parse::<u16>(),
+                        rows_str.trim().parse::<u16>()
+                    ) {
+                        if cols > 0 && rows > 0 {
+                            return Ok((cols, rows));
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Last resort: Use common terminal defaults
+        Ok((80, 24))
     } else {
         Err(anyhow::anyhow!("Not running in a terminal"))
     }
@@ -64,11 +115,10 @@ pub fn build_command(cmd: &[String]) -> CommandBuilder {
     if cmd.is_empty() {
         // Get default shell
         let shell = get_default_shell();
-        eprintln!("🏖️  Beach Server: Starting shell: {}", shell);
+        // Starting shell silently
         CommandBuilder::new(shell)
     } else {
-        // Use provided command
-        eprintln!("🏖️  Beach Server: Starting command: {:?}", cmd);
+        // Use provided command silently
         let mut cmd_builder = CommandBuilder::new(&cmd[0]);
         for arg in cmd.iter().skip(1) {
             cmd_builder.arg(arg);

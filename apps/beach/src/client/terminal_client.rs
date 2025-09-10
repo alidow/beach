@@ -7,7 +7,7 @@ use crate::transport::Transport;
 use anyhow::Result;
 use async_trait::async_trait;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, EnableMouseCapture, DisableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -419,7 +419,7 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
         
         enable_raw_mode()?;
         let mut stdout = stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
@@ -446,7 +446,7 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
         
         // Cleanup terminal
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
         terminal.show_cursor()?;
         
         result
@@ -703,10 +703,16 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
             }
             loop_count += 1;
             tokio::select! {
-                // Handle keyboard events
+                // Handle keyboard and mouse events
                 Some(evt) = event_rx.recv() => {
-                    if let Event::Key(key) = evt {
-                        self.handle_key_event(key).await?;
+                    match evt {
+                        Event::Key(key) => {
+                            self.handle_key_event(key).await?;
+                        }
+                        Event::Mouse(mouse) => {
+                            self.handle_mouse_event(mouse).await?;
+                        }
+                        _ => {} // Ignore other events like Resize
                     }
                 }
                 
@@ -724,6 +730,33 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                 _ = render_interval.tick() => {
                     self.render(terminal).await?;
                 }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Handle mouse events (scrolling, clicking)
+    async fn handle_mouse_event(&self, mouse: crossterm::event::MouseEvent) -> Result<()> {
+        use crossterm::event::{MouseEventKind, MouseButton};
+        
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                // Scroll viewport up (show earlier content)
+                self.grid_renderer.lock().await.scroll_vertical(3);
+                // Note: We DON'T send this to the server - it's local viewport control
+            }
+            MouseEventKind::ScrollDown => {
+                // Scroll viewport down (show later content)
+                self.grid_renderer.lock().await.scroll_vertical(-3);
+                // Note: We DON'T send this to the server - it's local viewport control
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Could implement click-to-position-cursor in future
+                // For now, ignore clicks
+            }
+            _ => {
+                // Ignore other mouse events for now
             }
         }
         
@@ -903,7 +936,7 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
             KeyCode::PageUp => {
                 // Check if Shift is held for scrolling
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    self.grid_renderer.lock().await.scroll_vertical(-10);
+                    self.grid_renderer.lock().await.scroll_vertical(10);
                     self.handle_scroll_update().await?;
                 } else {
                     // Send Page Up escape sequence to server
@@ -921,7 +954,7 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
             KeyCode::PageDown => {
                 // Check if Shift is held for scrolling
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    self.grid_renderer.lock().await.scroll_vertical(10);
+                    self.grid_renderer.lock().await.scroll_vertical(-10);
                     self.handle_scroll_update().await?;
                 } else {
                     // Send Page Down escape sequence to server
@@ -1018,6 +1051,21 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
     
     /// Handle server messages
     async fn handle_server_message(&self, msg: ServerMessage) -> Result<()> {
+        // Debug log received message
+        if let Some(ref debug_log) = self.debug_log {
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                use std::io::Write;
+                let msg_type = match &msg {
+                    ServerMessage::Delta { changes, .. } => format!("Delta with {} changes", changes.cell_changes.len()),
+                    ServerMessage::Snapshot { grid, .. } => format!("Snapshot {}x{}", grid.width, grid.height),
+                    ServerMessage::Error { .. } => "Error".to_string(),
+                    _ => "Other".to_string(),
+                };
+                let _ = writeln!(file, "[{}] Client: Received ServerMessage: {}", 
+                    chrono::Utc::now().format("%H:%M:%S%.3f"), msg_type);
+            }
+        }
+        
         match msg {
             ServerMessage::Delta { changes, .. } => {
                 // Apply the delta to the grid

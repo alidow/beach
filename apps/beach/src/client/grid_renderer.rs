@@ -69,6 +69,10 @@ impl GridRenderer {
     
     /// Apply a snapshot from the server
     pub fn apply_snapshot(&mut self, snapshot: Grid) {
+        // Update server dimensions from snapshot
+        self.server_width = snapshot.width;
+        self.server_height = snapshot.height;
+        
         self.grid = snapshot.clone();
         self.last_snapshot = Some(snapshot);
         self.scroll_offset = 0; // Reset to bottom
@@ -97,14 +101,50 @@ impl GridRenderer {
         if let Some(dim_change) = &delta.dimension_change {
             self.server_width = dim_change.new_width;
             self.server_height = dim_change.new_height;
-            // Note: Grid resize would need to be implemented
+            
+            // Resize the grid if dimensions changed
+            let new_width = dim_change.new_width as usize;
+            let new_height = dim_change.new_height as usize;
+            
+            // Resize height (add/remove rows)
+            self.grid.cells.resize(new_height, vec![Cell::default(); new_width]);
+            
+            // Resize width of each row
+            for row in &mut self.grid.cells {
+                row.resize(new_width, Cell::default());
+            }
+            
+            // Update grid dimensions
+            self.grid.width = dim_change.new_width;
+            self.grid.height = dim_change.new_height;
         }
     }
     
     /// Scroll vertically
     pub fn scroll_vertical(&mut self, delta: i16) {
-        let new_offset = (self.scroll_offset as i16 + delta).max(0) as u16;
-        self.scroll_offset = new_offset.min(self.overscan_buffer.len() as u16);
+        // Delta convention:
+        // Positive delta = scroll content up (view earlier/older content)
+        // Negative delta = scroll content down (view later/newer content)
+        // scroll_offset = 0 means showing from row 0 (top/oldest)
+        // Higher offset means we've scrolled down to show later rows
+        
+        // Calculate visible height (accounting for status line)
+        let visible_height = (self.local_height - 1) as usize;
+        
+        // Calculate max scroll - can't scroll past the last row
+        let grid_height = self.grid.cells.len();
+        let max_scroll = grid_height.saturating_sub(visible_height) as u16;
+        
+        // Apply delta
+        let new_offset = if delta > 0 {
+            // Positive delta - scroll up to show earlier content (decrease offset)
+            self.scroll_offset.saturating_sub(delta as u16)
+        } else {
+            // Negative delta - scroll down to show later content (increase offset)  
+            (self.scroll_offset + delta.abs() as u16).min(max_scroll)
+        };
+        
+        self.scroll_offset = new_offset;
     }
     
     /// Scroll horizontally (when local width < server width)
@@ -147,7 +187,8 @@ impl GridRenderer {
             .split(area);
         
         // Render the terminal content with predictions
-        let content = self.render_content_with_predictions(predictions);
+        // Pass the actual content area height so we render the right number of lines
+        let content = self.render_content_with_predictions_for_area(predictions, chunks[0].height);
         let paragraph = Paragraph::new(content)
             .block(Block::default().borders(Borders::NONE))
             .wrap(Wrap { trim: false });
@@ -158,13 +199,105 @@ impl GridRenderer {
         frame.render_widget(status, chunks[1]);
     }
     
-    /// Render the grid content as text with predictive underlines
+    /// Render the grid content as text with predictive underlines for specific area height
+    fn render_content_with_predictions_for_area(&self, predictions: &[(u16, u16)], area_height: u16) -> Text<'static> {
+        let mut lines = Vec::new();
+        
+        // Debug output to file
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/render-debug.log") {
+            use std::io::Write;
+            let _ = writeln!(file, "=== Render Debug ===");
+            let _ = writeln!(file, "area_height: {}", area_height);
+            let _ = writeln!(file, "grid.cells.len(): {}", self.grid.cells.len());
+            let _ = writeln!(file, "local_height: {}", self.local_height);
+            let _ = writeln!(file, "scroll_offset: {}", self.scroll_offset);
+        }
+        
+        // Use the actual area height for visible rows
+        let visible_height = area_height as usize;
+        
+        // Calculate starting row
+        // IMPORTANT: In terminal grids, content often starts at the bottom with empty rows above
+        // We should always show from row 0 unless we're scrolling
+        let grid_height = self.grid.cells.len();
+        
+        // Always start from the beginning unless scrolled
+        let start_row = self.scroll_offset as usize;
+        
+        let end_row = (start_row + visible_height).min(grid_height);
+        
+        // More debug output
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/render-debug.log") {
+            use std::io::Write;
+            let _ = writeln!(file, "visible_height: {}", visible_height);
+            let _ = writeln!(file, "start_row: {}", start_row);
+            let _ = writeln!(file, "end_row: {}", end_row);
+            let _ = writeln!(file, "Rendering rows {} to {}", start_row, end_row);
+        }
+        
+        for row_idx in start_row..end_row {
+            if let Some(row) = self.grid.cells.get(row_idx) {
+                let mut spans = Vec::new();
+                
+                // Debug: Log first few chars of each row
+                if row_idx < 3 {
+                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/render-debug.log") {
+                        use std::io::Write;
+                        let row_text: String = row.iter().take(40).map(|c| c.char).collect();
+                        let _ = writeln!(file, "Row {}: '{}'", row_idx, row_text.trim_end());
+                    }
+                }
+                
+                // Handle horizontal scrolling
+                let start_col = self.horizontal_offset as usize;
+                let end_col = (start_col + self.local_width as usize).min(row.len());
+                
+                for col_idx in start_col..end_col {
+                    if let Some(cell) = row.get(col_idx) {
+                        let mut style = cell_to_style(cell);
+                        
+                        // Apply underline if this position has a prediction
+                        let row_pos = row_idx - start_row;
+                        let col_pos = col_idx - start_col;
+                        if predictions.contains(&(col_pos as u16, row_pos as u16)) {
+                            style = style.add_modifier(Modifier::UNDERLINED);
+                        }
+                        
+                        spans.push(Span::styled(cell.char.to_string(), style));
+                    }
+                }
+                
+                lines.push(Line::from(spans));
+            } else {
+                lines.push(Line::from(""));
+            }
+        }
+        
+        Text::from(lines)
+    }
+    
+    /// Render the grid content as text with predictive underlines (legacy)
     fn render_content_with_predictions(&self, predictions: &[(u16, u16)]) -> Text<'static> {
         let mut lines = Vec::new();
         
         // Calculate visible range with scroll offset
-        let start_row = self.scroll_offset as usize;
-        let end_row = (start_row + self.local_height as usize).min(self.grid.cells.len());
+        // Note: We render up to local_height - 1 to account for status line
+        // scroll_offset = 0 means showing the bottom (most recent)
+        // scroll_offset > 0 means we've scrolled up to show earlier content
+        let visible_height = (self.local_height - 1) as usize; // Reserve 1 line for status
+        
+        // Calculate starting row based on scroll offset from bottom
+        let grid_height = self.grid.cells.len();
+        let start_row = if grid_height > visible_height {
+            // If grid is larger than visible area, apply scroll offset
+            let bottom_start = grid_height - visible_height;
+            bottom_start.saturating_sub(self.scroll_offset as usize)
+        } else {
+            // If grid fits entirely, always start at 0
+            0
+        };
+        
+        let end_row = (start_row + visible_height).min(grid_height);
         
         for row_idx in start_row..end_row {
             if let Some(row) = self.grid.cells.get(row_idx) {
@@ -211,21 +344,27 @@ impl GridRenderer {
             ));
         }
         
-        // Show vertical scroll position
-        if !self.overscan_buffer.is_empty() {
-            status.push_str(&format!(
-                "Line {}/{}",
-                self.from_line + self.scroll_offset as u64,
-                self.from_line + self.overscan_buffer.len() as u64
-            ));
-        }
-        
         // Show server dimensions if different from local
         if self.server_width != self.local_width || self.server_height != self.local_height {
             status.push_str(&format!(
-                " | Server: {}×{}",
+                "Server: {}×{} | Local: {}×{}",
                 self.server_width,
-                self.server_height
+                self.server_height,
+                self.local_width,
+                self.local_height
+            ));
+        }
+        
+        // Show scroll position more subtly
+        if self.scroll_offset > 0 {
+            let grid_height = self.grid.cells.len();
+            let visible_height = (self.local_height - 1) as usize;
+            let max_scroll = grid_height.saturating_sub(visible_height) as u16;
+            
+            status.push_str(&format!(
+                " | Line {}/{}",
+                self.scroll_offset + 1,
+                max_scroll + 1
             ));
         }
         

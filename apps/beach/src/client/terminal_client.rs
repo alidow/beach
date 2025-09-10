@@ -41,6 +41,15 @@ enum QueuedMessage {
     RawInput { channel: String, data: Vec<u8> },
 }
 
+/// Mouse mode for smart selection
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MouseMode {
+    /// Normal mode - capture scroll and clicks
+    Normal,
+    /// Selection mode - let terminal handle selection
+    Selecting,
+}
+
 /// Main terminal client
 pub struct TerminalClient<T: Transport + Send + 'static> {
     /// Client session
@@ -78,6 +87,9 @@ pub struct TerminalClient<T: Transport + Send + 'static> {
     
     /// Shutdown receiver
     shutdown_rx: Arc<Mutex<mpsc::Receiver<()>>>,
+    
+    /// Mouse mode for smart selection
+    mouse_mode: Arc<RwLock<MouseMode>>,
     
     /// Debug log file path
     debug_log: Option<String>,
@@ -247,6 +259,7 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
             send_queue_tx,
             shutdown_tx,
             shutdown_rx: Arc::new(Mutex::new(shutdown_rx)),
+            mouse_mode: Arc::new(RwLock::new(MouseMode::Normal)),
             debug_log,
         });
         
@@ -445,6 +458,12 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                 let _ = writeln!(file, "[{}] Client: Event loops exited with result: {:?}", 
                                  chrono::Utc::now().format("%H:%M:%S%.3f"), result);
             }
+        }
+        
+        // Ensure we're not in selection mode when cleaning up
+        {
+            let mut mode = self.mouse_mode.write().await;
+            *mode = MouseMode::Normal;
         }
         
         // Cleanup terminal
@@ -757,8 +776,48 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                 self.handle_scroll_update().await?;
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // Could implement click-to-position-cursor in future
-                // For now, ignore clicks
+                // Start selection mode - disable mouse capture to let terminal handle selection
+                let mut mode = self.mouse_mode.write().await;
+                if *mode == MouseMode::Normal {
+                    *mode = MouseMode::Selecting;
+                    drop(mode); // Release lock before I/O
+                    
+                    // Disable mouse capture to allow native selection
+                    use std::io::stdout;
+                    let mut stdout = stdout();
+                    execute!(stdout, DisableMouseCapture)?;
+                    
+                    // Debug log
+                    if let Some(ref debug_log) = self.debug_log {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                            use std::io::Write;
+                            let _ = writeln!(file, "[{}] Entering selection mode", 
+                                chrono::Utc::now().format("%H:%M:%S%.3f"));
+                        }
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                // End selection mode - re-enable mouse capture
+                let mut mode = self.mouse_mode.write().await;
+                if *mode == MouseMode::Selecting {
+                    *mode = MouseMode::Normal;
+                    drop(mode); // Release lock before I/O
+                    
+                    // Re-enable mouse capture for scrolling
+                    use std::io::stdout;
+                    let mut stdout = stdout();
+                    execute!(stdout, EnableMouseCapture)?;
+                    
+                    // Debug log
+                    if let Some(ref debug_log) = self.debug_log {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                            use std::io::Write;
+                            let _ = writeln!(file, "[{}] Exiting selection mode", 
+                                chrono::Utc::now().format("%H:%M:%S%.3f"));
+                        }
+                    }
+                }
             }
             _ => {
                 // Ignore other mouse events for now
@@ -879,16 +938,39 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                 self.send_queue_tx.send(QueuedMessage::AppMessage(app_msg)).await?;
             }
             KeyCode::Esc => {
-                // Handle Escape key - send without predictive echo
-                let bytes = vec![0x1B]; // ESC character
-                let client_msg = crate::protocol::ClientMessage::TerminalInput {
-                    data: bytes,
-                    echo_local: None,
-                };
-                let app_msg = crate::protocol::signaling::AppMessage::Protocol {
-                    message: serde_json::to_value(&client_msg)?,
-                };
-                self.send_queue_tx.send(QueuedMessage::AppMessage(app_msg)).await?;
+                // Check if we're in selection mode and cancel it
+                let mode = self.mouse_mode.read().await;
+                if *mode == MouseMode::Selecting {
+                    drop(mode);
+                    let mut mode = self.mouse_mode.write().await;
+                    *mode = MouseMode::Normal;
+                    drop(mode);
+                    
+                    // Re-enable mouse capture
+                    use std::io::stdout;
+                    let mut stdout = stdout();
+                    execute!(stdout, EnableMouseCapture)?;
+                    
+                    // Debug log
+                    if let Some(ref debug_log) = self.debug_log {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                            use std::io::Write;
+                            let _ = writeln!(file, "[{}] Cancelled selection mode with Escape", 
+                                chrono::Utc::now().format("%H:%M:%S%.3f"));
+                        }
+                    }
+                } else {
+                    // Handle Escape key - send without predictive echo
+                    let bytes = vec![0x1B]; // ESC character
+                    let client_msg = crate::protocol::ClientMessage::TerminalInput {
+                        data: bytes,
+                        echo_local: None,
+                    };
+                    let app_msg = crate::protocol::signaling::AppMessage::Protocol {
+                        message: serde_json::to_value(&client_msg)?,
+                    };
+                    self.send_queue_tx.send(QueuedMessage::AppMessage(app_msg)).await?;
+                }
             }
             KeyCode::Up => {
                 // Send arrow key escape sequence to server

@@ -1,8 +1,9 @@
 use crate::transport::TransportMode;
+use crate::debug_log::DebugLogger;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 
 /// Configuration for WebRTC transport
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WebRTCConfig {
     /// Transport mode (Server or Client)
     pub mode: TransportMode,
@@ -14,6 +15,8 @@ pub struct WebRTCConfig {
     pub ordered: bool,
     /// Maximum number of retransmissions for unreliable channels
     pub max_retransmits: Option<u16>,
+    /// Optional debug logger
+    pub debug_logger: Option<DebugLogger>,
 }
 
 impl Default for WebRTCConfig {
@@ -30,6 +33,7 @@ impl Default for WebRTCConfig {
             data_channel_label: "beach-data".to_string(),
             ordered: true,
             max_retransmits: None, // Reliable channel by default
+            debug_logger: None,
         }
     }
 }
@@ -37,8 +41,21 @@ impl Default for WebRTCConfig {
 impl WebRTCConfig {
     /// Create a new WebRTC configuration
     pub fn new(mode: TransportMode) -> Self {
+        // Check if localhost-only mode is requested
+        let ice_servers = if std::env::var("BEACH_LOCALHOST_ONLY").is_ok() {
+            vec![] // No ICE servers for localhost
+        } else {
+            vec![
+                RTCIceServer {
+                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
+                    ..Default::default()
+                },
+            ]
+        };
+        
         Self {
             mode,
+            ice_servers,
             ..Default::default()
         }
     }
@@ -51,6 +68,12 @@ impl WebRTCConfig {
             ..Default::default()
         }
     }
+    
+    /// Set the debug logger
+    pub fn with_debug_logger(mut self, logger: DebugLogger) -> Self {
+        self.debug_logger = Some(logger);
+        self
+    }
 }
 
 /// Builder for WebRTC configuration
@@ -60,6 +83,7 @@ pub struct WebRTCConfigBuilder {
     data_channel_label: Option<String>,
     ordered: Option<bool>,
     max_retransmits: Option<u16>,
+    debug_logger: Option<DebugLogger>,
 }
 
 impl WebRTCConfigBuilder {
@@ -70,6 +94,7 @@ impl WebRTCConfigBuilder {
             data_channel_label: None,
             ordered: None,
             max_retransmits: None,
+            debug_logger: None,
         }
     }
     
@@ -116,6 +141,11 @@ impl WebRTCConfigBuilder {
         self
     }
     
+    pub fn debug_logger(mut self, logger: Option<DebugLogger>) -> Self {
+        self.debug_logger = logger;
+        self
+    }
+    
     pub fn build(self) -> Result<WebRTCConfig, String> {
         let mode = self.mode.ok_or("Transport mode is required")?;
         let mut config = WebRTCConfig::new(mode);
@@ -135,6 +165,8 @@ impl WebRTCConfigBuilder {
         if let Some(max_retransmits) = self.max_retransmits {
             config.max_retransmits = Some(max_retransmits);
         }
+        
+        config.debug_logger = self.debug_logger;
         
         Ok(config)
     }

@@ -3,9 +3,9 @@ mod terminal;
 mod io;
 pub mod terminal_state;
 pub mod debug_handler;
+mod pty_writer_impl;
 
 use async_trait::async_trait;
-use std::io::IsTerminal;
 use crate::transport::Transport;
 use crate::session::ServerSession;
 use crate::protocol::signaling::{AppMessage, PeerInfo};
@@ -18,7 +18,7 @@ use anyhow::Result;
 use self::pty::PtyManager;
 use self::terminal::{get_pty_size, build_command, enable_raw_mode, disable_raw_mode};
 use self::io::{spawn_stdin_reader, spawn_pty_reader_with_resize};
-use self::terminal_state::{TerminalBackend, create_terminal_backend};
+use self::terminal_state::{TerminalBackend, TerminalStateTracker, create_terminal_backend};
 use self::debug_handler::DebugHandler;
 
 #[async_trait]
@@ -38,6 +38,7 @@ pub struct TerminalServer<T: Transport + Send + 'static> {
     debug_handler: Arc<DebugHandler>,
     debug_recorder: Arc<Mutex<Option<String>>>,
     debug_log: Arc<Mutex<Option<std::fs::File>>>,
+    delta_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Sender<crate::server::terminal_state::GridDelta>>>>,
 }
 
 impl<T: Transport + Send + 'static> TerminalServer<T> {
@@ -53,17 +54,76 @@ impl<T: Transport + Send + 'static> TerminalServer<T> {
         use crate::session::Session;
         
         // Create the session first (without handler)
-        let mut server_session = Session::create(config, transport, passphrase, cmd.clone()).await?;
+        let server_session = Session::create(config, transport, passphrase, cmd.clone()).await?;
+        
+        // Clone debug_log path before moving to terminal server
+        let debug_log_path = debug_log.clone();
         
         // Create the terminal server
         let terminal_server = Self::new_with_debug(server_session, debug_recorder, debug_log);
         
-        // Now set the handler and debug handler (breaking the circular dependency)
+        // Create a TerminalStateTracker that uses the live terminal backend
+        let terminal_tracker = Arc::new(std::sync::Mutex::new(
+            TerminalStateTracker::from_backend(terminal_server.terminal_backend.clone())
+        ));
+        
+        // Get the subscription hub from the session
+        let subscription_hub = {
+            let session = terminal_server.session.read().await;
+            session.subscription_hub()
+        };
+        
+        // Create and attach the terminal data source
+        use crate::server::terminal_state::TrackerDataSource;
+        let (data_source, delta_tx) = TrackerDataSource::new(
+            terminal_tracker.clone(),
+            terminal_server.terminal_backend.clone(),
+        );
+        
+        // Log data source creation
+        if let Some(debug_log) = &mut *terminal_server.debug_log.lock().unwrap() {
+            use std::io::Write;
+            let _ = writeln!(debug_log, "[{}] Server: Created TrackerDataSource with delta channel", 
+                chrono::Local::now().format("%H:%M:%S%.3f"));
+        }
+        
+        subscription_hub.attach_source(Arc::new(data_source)).await;
+        
+        // Set debug log path if provided
+        if let Some(ref path) = debug_log_path {
+            subscription_hub.set_debug_log_path(path.clone()).await;
+        }
+        
+        // Store delta_tx for later use in spawn_pty_reader_with_resize
+        *terminal_server.delta_tx.lock().await = Some(delta_tx);
+
+        // Wire PTY writer so input from clients is forwarded to the shell
+        {
+            use crate::server::pty_writer_impl::PtyWriterFromManager;
+            subscription_hub.set_pty_writer(Arc::new(PtyWriterFromManager::new_with_debug(
+                terminal_server.pty_manager.clone(),
+                debug_log_path.clone()
+            ))).await;
+        }
+        
+        // Set the terminal server as the message handler directly
         {
             let mut session = terminal_server.session.write().await;
-            session.set_handler(terminal_server.clone()).await;
+            session.set_handler(terminal_server.clone() as Arc<dyn ServerMessageHandler>).await;
             session.set_debug_handler(Arc::clone(&terminal_server.debug_handler));
         }
+        
+        // Start the subscription hub's event streaming
+        let hub_clone = subscription_hub.clone();
+        
+        // Log streaming task start
+        if let Some(debug_log) = &mut *terminal_server.debug_log.lock().unwrap() {
+            use std::io::Write;
+            let _ = writeln!(debug_log, "[{}] Server: Starting subscription hub streaming task", 
+                chrono::Local::now().format("%H:%M:%S%.3f"));
+        }
+        
+        let _streaming_handle = hub_clone.start_streaming();
         
         // Start the message router now that all handlers are set
         {
@@ -137,6 +197,7 @@ impl<T: Transport + Send + 'static> TerminalServer<T> {
             debug_handler,
             debug_recorder: Arc::new(Mutex::new(debug_recorder)),
             debug_log: Arc::new(Mutex::new(debug_log_file)),
+            delta_tx: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -191,6 +252,11 @@ impl<T: Transport + Send + 'static> Server for TerminalServer<T> {
         self.pty_manager.init(pty_size, cmd)
             .expect("Failed to initialize PTY");
         
+        // PtyWriter functionality is now handled directly through pty_manager
+        // The subscription hub will call pty_manager.write() and pty_manager.resize()
+        // when needed. For now, we'll wire this up later when we refactor
+        // the message handling to use the subscription hub properly.
+        
         // Resize terminal backend to match current PTY size (in case it changed)
         {
             let mut backend = self.terminal_backend.lock().unwrap();
@@ -228,11 +294,13 @@ impl<T: Transport + Send + 'static> Server for TerminalServer<T> {
         
         // Start reading from PTY in a background task with terminal state tracking and resize support
         let debug_recorder_path = self.debug_recorder.lock().unwrap().clone();
+        let delta_tx_clone = self.delta_tx.lock().await.clone();
         let read_task = spawn_pty_reader_with_resize(
             self.pty_manager.master_reader.clone(),
             self.terminal_backend.clone(),
             Arc::new(self.pty_manager.clone()),
-            debug_recorder_path
+            debug_recorder_path,
+            delta_tx_clone
         );
         *self.read_task.lock().unwrap() = Some(read_task);
         
@@ -295,13 +363,126 @@ impl<T: Transport + Send + 'static> TerminalServer<T> {
     pub fn write_to_pty(&self, data: &[u8]) -> Result<()> {
         self.pty_manager.write(data)
     }
+
+    /// Wait for connections based on flags
+    async fn wait_for_connections(&self, wait_for_webrtc: bool) {
+        loop {
+            let session = self.session.read().await;
+            
+            if wait_for_webrtc {
+                if session.has_any_webrtc_connected().await {
+                    if let Some(ref mut debug_log) = *self.debug_log.lock().unwrap() {
+                        use std::io::Write;
+                        let _ = writeln!(debug_log, "[{}] Server: WebRTC connection established", 
+                                         chrono::Utc::now().format("%H:%M:%S%.3f"));
+                    }
+                    break;
+                }
+            } else {
+                if session.has_clients().await {
+                    if let Some(ref mut debug_log) = *self.debug_log.lock().unwrap() {
+                        use std::io::Write;
+                        let _ = writeln!(debug_log, "[{}] Server: Client connected", 
+                                         chrono::Utc::now().format("%H:%M:%S%.3f"));
+                    }
+                    break;
+                }
+            }
+            
+            drop(session); // Release lock before sleeping
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Start server with optional wait for clients
+    pub async fn start_with_wait(&self, wait_for_client: bool, wait_for_webrtc: bool, keep_alive: bool) {
+        if wait_for_client || wait_for_webrtc {
+            self.wait_for_connections(wait_for_webrtc).await;
+        }
+        
+        // Now start the server normally
+        self.start().await;
+        
+        // If keep_alive is set, stay running after command exits
+        if keep_alive {
+            // Disable raw mode before entering keep-alive loop
+            let _ = disable_raw_mode();
+            
+            if let Some(ref mut debug_log) = *self.debug_log.lock().unwrap() {
+                use std::io::Write;
+                let _ = writeln!(debug_log, "[{}] Server: Entering keep-alive mode", 
+                                 chrono::Utc::now().format("%H:%M:%S%.3f"));
+            }
+            
+            // Keep the server alive
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
 }
 
 // Implement ServerMessageHandler to handle WebSocket messages
 #[async_trait]
 impl<T: Transport + Send + Sync + 'static> ServerMessageHandler for TerminalServer<T> {
-    async fn handle_client_message(&self, _from_peer: &str, message: AppMessage) {
+    async fn handle_client_message(&self, from_peer: &str, message: AppMessage) {
         match message {
+            AppMessage::Protocol { message: msg_value } => {
+                // Parse and handle protocol messages through subscription hub
+                if let Ok(client_msg) = serde_json::from_value::<crate::protocol::ClientMessage>(msg_value) {
+                    // Special-case Subscribe to bind to the client's WebRTC transport and use provided ID
+                    use crate::protocol::ClientMessage as CMsg;
+                    match client_msg {
+                        CMsg::Subscribe { subscription_id, dimensions, mode, position, .. } => {
+                            // Debug log subscribe reception
+                            if let Some(ref mut debug_log) = *self.debug_log.lock().unwrap() {
+                                use std::io::Write;
+                                let _ = writeln!(debug_log, "[{}] Server: Received Subscribe {{ id: {} }} from {}",
+                                    chrono::Utc::now().format("%H:%M:%S%.3f"), subscription_id, from_peer);
+                            }
+                            let session = self.session.read().await;
+                            let hub = session.subscription_hub();
+                            // Look up the per-client WebRTC transport
+                            // Wait briefly for WebRTC transport to be ready
+                            let mut transport_ready = None;
+                            for _ in 0..50 { // up to ~5s
+                                if let Some(t) = session.get_webrtc_transport(from_peer).await {
+                                    if t.is_connected() { transport_ready = Some(t); break; }
+                                }
+                                drop(&session);
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                            if let Some(client_transport) = transport_ready {
+                                let transport_dyn = client_transport as Arc<dyn crate::transport::Transport>;
+                                let config = crate::subscription::SubscriptionConfig {
+                                    dimensions,
+                                    mode,
+                                    position,
+                                    is_controlling: true,
+                                };
+                                drop(session);
+                                let result = hub.subscribe_with_id(
+                                    from_peer.to_string(),
+                                    transport_dyn,
+                                    subscription_id,
+                                    config,
+                                ).await;
+                                if let Some(ref mut debug_log) = *self.debug_log.lock().unwrap() {
+                                    use std::io::Write;
+                                    let _ = writeln!(debug_log, "[{}] Server: subscribe_with_id result: {:?}",
+                                        chrono::Utc::now().format("%H:%M:%S%.3f"), result.as_ref().map(|_| "ok").unwrap_or("err"));
+                                }
+                            }
+                        }
+                        other => {
+                            let session = self.session.read().await;
+                            let hub = session.subscription_hub();
+                            drop(session);
+                            let _ = hub.handle_incoming(&from_peer.to_string(), other).await;
+                        }
+                    }
+                }
+            }
             AppMessage::TerminalInput { data } => {
                 // Handle terminal input from client
                 let _ = self.write_to_pty(&data);
@@ -319,14 +500,30 @@ impl<T: Transport + Send + Sync + 'static> ServerMessageHandler for TerminalServ
     }
     
     async fn handle_client_joined(&self, peer: &PeerInfo) {
-        // Don't print to stderr while terminal is active - it corrupts the display
-        // eprintln!("🏖️  Beach Server: Client {} joined the session", peer.id);
-        let _ = peer; // Suppress unused warning
+        // Log client join if debug logging is enabled
+        if let Some(ref mut debug_log) = *self.debug_log.lock().unwrap() {
+            use std::io::Write;
+            let _ = writeln!(debug_log, "[{}] Client {} joined", 
+                             chrono::Utc::now().format("%H:%M:%S%.3f"), peer.id);
+        }
+        
+        // Auto-subscribe is now handled in session/mod.rs when WebRTC connection is established
+        // This ensures the subscription happens exactly when the transport is ready
     }
     
     async fn handle_client_left(&self, peer_id: &str) {
-        // Don't print to stderr while terminal is active - it corrupts the display
-        // eprintln!("🏖️  Beach Server: Client {} left the session", peer_id);
-        let _ = peer_id; // Suppress unused warning
+        // Remove client's subscriptions from the hub
+        let session = self.session.read().await;
+        let hub = session.subscription_hub();
+        drop(session);
+        
+        let _ = hub.remove_client(&peer_id.to_string()).await;
+        
+        // Log client leave if debug logging is enabled
+        if let Some(ref mut debug_log) = *self.debug_log.lock().unwrap() {
+            use std::io::Write;
+            let _ = writeln!(debug_log, "[{}] Client {} left", 
+                             chrono::Utc::now().format("%H:%M:%S%.3f"), peer_id);
+        }
     }
 }

@@ -111,7 +111,7 @@ impl SessionClient {
 
         // TODO: Handle WebRTC offer when implemented
         if let Some(_offer) = resp.webrtc_offer {
-            eprintln!("🏖️  WebRTC signaling will be implemented in the future");
+            // eprintln!("🏖️  WebRTC signaling will be implemented in the future");
         }
 
         Ok(())

@@ -2,6 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## CRITICAL: Debugging Guidelines
+
+⚠️ **NEVER write debug output to stdout or stderr** when debugging beach applications!
+- The terminal UI will be corrupted if you print to stdout/stderr
+- ALWAYS use file-based debug logging with the `--debug-log` flag
+- Example: `cargo run -p beach -- --debug-log /tmp/beach-debug.log -- bash`
+- Set `BEACH_DEBUG_LOG` environment variable for additional logging
+- Any print statements, eprintln!, or println! will break the terminal display
+
 ## Development Commands
 
 ### Building

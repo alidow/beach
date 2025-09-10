@@ -11,6 +11,7 @@ pub mod tracker;
 #[cfg(feature = "alacritty-backend")]
 pub mod alacritty_backend;
 pub mod backend;
+pub mod data_source_impl;
 
 pub use cell::{Cell, CellAttributes, Color};
 pub use char_counter::CharCounter;
@@ -25,3 +26,4 @@ pub use tracker::TerminalStateTracker;
 #[cfg(feature = "alacritty-backend")]
 pub use alacritty_backend::AlacrittyTerminal;
 pub use backend::{TerminalBackend, create_terminal_backend};
+pub use data_source_impl::TrackerDataSource;

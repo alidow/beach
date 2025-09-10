@@ -12,6 +12,10 @@ path = "src/lib.rs"
 name = "beach"
 path = "src/main.rs"
 
+# [[bin]]
+# name = "test-subscription"
+# path = "src/test_subscription_client.rs"
+
 
 [dependencies]
 alacritty_terminal = { version = "0.21", optional = true }
@@ -20,9 +24,12 @@ async-trait = "0.1.89"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5.46", features = ["derive"] }
 crossterm = "0.28"
+futures = "0.3"
 futures-util = "0.3"
 num-bigint = { version = "0.4", features = ["serde"] }
 portable-pty = "0.8.1"
+rand = "0.8"
+ratatui = "0.28"
 reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

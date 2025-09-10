@@ -11,7 +11,7 @@ pub struct TerminalStateTracker {
     history: Arc<Mutex<GridHistory>>,
     #[cfg(feature = "vte-backend")]
     parser: Parser,
-    backend: Option<Box<dyn TerminalBackend>>,
+    backend: Option<Arc<Mutex<Box<dyn TerminalBackend>>>>,
     last_update: DateTime<Utc>,
     update_interval: Duration,
     previous_grid: Option<Grid>,
@@ -28,11 +28,12 @@ impl TerminalStateTracker {
     /// variables and create a grid that better matches the terminal's appearance
     pub fn new(width: u16, height: u16) -> Self {
         // Create the terminal backend
-        let backend = create_terminal_backend(width, height, None).ok();
+        let backend = create_terminal_backend(width, height, None).ok()
+            .map(|b| Arc::new(Mutex::new(b)));
         
         // Get the initial grid from backend if available, otherwise create default
         let initial_grid = if let Some(ref backend) = backend {
-            backend.get_current_grid()
+            backend.lock().unwrap().get_current_grid()
         } else {
             TerminalInitializer::create_initial_grid(width, height)
         };
@@ -79,9 +80,35 @@ impl TerminalStateTracker {
         }
     }
     
+    /// Create a new tracker that uses an existing backend for history
+    pub fn from_backend(backend: Arc<Mutex<Box<dyn TerminalBackend>>>) -> Self {
+        // Get initial grid and dimensions from the backend
+        let backend_box = backend.lock().unwrap();
+        let initial_grid = backend_box.get_current_grid();
+        drop(backend_box); // Release lock early
+        
+        // Create dummy history - we'll use the backend's history
+        let history = Arc::new(Mutex::new(GridHistory::new(initial_grid.clone())));
+        
+        TerminalStateTracker {
+            current_grid: initial_grid.clone(),
+            history,
+            #[cfg(feature = "vte-backend")]
+            parser: Parser::new(),
+            backend: Some(backend),
+            last_update: Utc::now(),
+            update_interval: Duration::milliseconds(50),
+            previous_grid: Some(initial_grid),
+            current_fg: Color::Default,
+            current_bg: Color::Default,
+            current_attrs: CellAttributes::default(),
+        }
+    }
+    
     pub fn process_output(&mut self, data: &[u8]) {
         // Use backend if available
-        if let Some(ref mut backend) = self.backend {
+        if let Some(ref backend) = self.backend {
+            let mut backend = backend.lock().unwrap();
             let _ = backend.process_output(data);
             // Update our cached grid
             self.current_grid = backend.get_current_grid();
@@ -161,7 +188,7 @@ impl TerminalStateTracker {
     pub fn get_history(&self) -> Arc<Mutex<GridHistory>> {
         // Always prefer backend's history if available
         if let Some(ref backend) = self.backend {
-            return backend.get_history();
+            return backend.lock().unwrap().get_history();
         }
         Arc::clone(&self.history)
     }

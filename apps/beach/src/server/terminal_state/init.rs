@@ -1,5 +1,5 @@
 use std::env;
-use crate::server::terminal_state::{Grid, Color, Cell};
+use crate::server::terminal_state::{Grid, Color};
 
 /// Initialize terminal grid with appropriate defaults based on environment
 pub struct TerminalInitializer;

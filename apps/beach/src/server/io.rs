@@ -2,8 +2,9 @@ use std::sync::{Arc, Mutex};
 use std::io::{Read, Write};
 use std::fs::OpenOptions;
 use tokio::task::JoinHandle;
+use tokio::sync::mpsc::Sender as TokioSender;
 use crossterm::terminal;
-use crate::server::terminal_state::TerminalBackend;
+use crate::server::terminal_state::{TerminalBackend, Grid, GridDelta};
 use crate::server::pty::PtyManager;
 
 #[cfg(unix)]
@@ -79,7 +80,8 @@ pub fn spawn_pty_reader_with_resize(
     master_reader: Arc<Mutex<Option<Box<dyn std::io::Read + Send>>>>,
     terminal_backend: Arc<Mutex<Box<dyn TerminalBackend>>>,
     pty_manager: Arc<PtyManager>,
-    debug_recorder_path: Option<String>
+    debug_recorder_path: Option<String>,
+    delta_tx: Option<TokioSender<GridDelta>>,
 ) -> JoinHandle<()> {
     // Platform-specific resize detection setup
     #[cfg(unix)]
@@ -107,6 +109,8 @@ pub fn spawn_pty_reader_with_resize(
         });
 
         let mut buffer = [0u8; 4096];
+        // Keep last grid to compute deltas
+        let mut last_grid: Option<Grid> = None;
         
         loop {
             // CRITICAL: Check for resize BEFORE reading next chunk
@@ -162,11 +166,46 @@ pub fn spawn_pty_reader_with_resize(
                         let _ = file.flush();
                     }
                     
-                    // Update terminal backend
-                    {
+                    // Update terminal backend and publish delta if changed
+                    let current_grid = {
                         let mut backend = terminal_backend.lock().unwrap();
                         let _ = backend.process_output(&data);
+                        backend.get_current_grid()
+                    };
+                    if let Some(prev) = &last_grid {
+                        let delta = GridDelta::diff(prev, &current_grid);
+                        // Send only if meaningful changes exist
+                        if !delta.cell_changes.is_empty() || delta.cursor_change.is_some() || delta.dimension_change.is_some() {
+                            if let Some(ref tx) = delta_tx {
+                                // Log to debug file
+                                if let Some(ref mut f) = debug_file {
+                                    let _ = writeln!(f, "[{}] [PTY Reader] Sending delta: {} cell changes, cursor: {:?}, dim: {:?}", 
+                                        chrono::Local::now().format("%H:%M:%S%.3f"),
+                                        delta.cell_changes.len(), delta.cursor_change.is_some(), delta.dimension_change.is_some());
+                                }
+                                match tx.try_send(delta) {
+                                    Ok(_) => {
+                                        if let Some(ref mut f) = debug_file {
+                                            let _ = writeln!(f, "[{}] [PTY Reader] Delta sent successfully", 
+                                                chrono::Local::now().format("%H:%M:%S%.3f"));
+                                        }
+                                    },
+                                    Err(e) => {
+                                        if let Some(ref mut f) = debug_file {
+                                            let _ = writeln!(f, "[{}] [PTY Reader] Failed to send delta: {:?}", 
+                                                chrono::Local::now().format("%H:%M:%S%.3f"), e);
+                                        }
+                                    },
+                                }
+                            } else {
+                                if let Some(ref mut f) = debug_file {
+                                    let _ = writeln!(f, "[{}] [PTY Reader] WARNING: No delta_tx channel available!", 
+                                        chrono::Local::now().format("%H:%M:%S%.3f"));
+                                }
+                            }
+                        }
                     }
+                    last_grid = Some(current_grid);
                     
                     // Write raw bytes to stdout to preserve UTF-8 sequences
                     use std::io::Write;

@@ -1,8 +1,6 @@
 use async_trait::async_trait;
 use crate::protocol::signaling::{AppMessage, PeerInfo};
 
-pub mod subscription_handler;
-
 /// Trait for handling messages in a beach server
 #[async_trait]
 pub trait ServerMessageHandler: Send + Sync {

@@ -216,32 +216,102 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: SignalingSt
     debug!("WebSocket connected: peer={} session={}", peer_id, session_id);
 
     // Handle incoming messages
-    while let Some(Ok(msg)) = receiver.next().await {
-        if let Message::Text(text) = msg {
-            match serde_json::from_str::<ClientMessage>(&text) {
-                Ok(client_msg) => {
-                    if let Err(e) = handle_client_message(
-                        client_msg,
-                        &peer_id,
-                        &session_id,
-                        &state,
-                        &tx,
-                    ).await {
-                        error!("Error handling message: {}", e);
+    while let Some(msg_result) = receiver.next().await {
+        debug!("Received WebSocket frame from peer {}", peer_id);
+        
+        let msg = match msg_result {
+            Ok(m) => m,
+            Err(e) => {
+                error!("WebSocket error from peer {}: {}", peer_id, e);
+                break;
+            }
+        };
+        
+        debug!("Received WebSocket message type: {:?} from peer {}", 
+            match &msg {
+                Message::Text(_) => "Text",
+                Message::Binary(_) => "Binary",
+                Message::Ping(_) => "Ping",
+                Message::Pong(_) => "Pong",
+                Message::Close(_) => "Close",
+            },
+            peer_id
+        );
+        
+        match msg {
+            Message::Text(text) => {
+                debug!("Text frame content from {}: {}", peer_id, text);
+                match serde_json::from_str::<ClientMessage>(&text) {
+                    Ok(client_msg) => {
+                        debug!("Successfully parsed ClientMessage from Text frame: {:?}", client_msg);
+                        if let Err(e) = handle_client_message(
+                            client_msg,
+                            &peer_id,
+                            &session_id,
+                            &state,
+                            &tx,
+                        ).await {
+                            error!("Error handling message: {}", e);
+                            let _ = tx.send(ServerMessage::Error {
+                                message: format!("Failed to process message: {}", e),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse client message from Text frame: {}", e);
                         let _ = tx.send(ServerMessage::Error {
-                            message: format!("Failed to process message: {}", e),
+                            message: format!("Invalid message format: {}", e),
                         });
                     }
                 }
-                Err(e) => {
-                    warn!("Failed to parse client message: {}", e);
-                    let _ = tx.send(ServerMessage::Error {
-                        message: format!("Invalid message format: {}", e),
-                    });
+            }
+            Message::Binary(data) => {
+                debug!("Binary frame size from {}: {} bytes", peer_id, data.len());
+                // Also try to handle Binary frames containing JSON (for compatibility)
+                if let Ok(text) = String::from_utf8(data.clone()) {
+                    debug!("Binary frame as UTF-8 from {}: {}", peer_id, text);
+                    match serde_json::from_str::<ClientMessage>(&text) {
+                        Ok(client_msg) => {
+                            debug!("Successfully parsed ClientMessage from Binary frame: {:?}", client_msg);
+                            if let Err(e) = handle_client_message(
+                                client_msg,
+                                &peer_id,
+                                &session_id,
+                                &state,
+                                &tx,
+                            ).await {
+                                error!("Error handling message: {}", e);
+                                let _ = tx.send(ServerMessage::Error {
+                                    message: format!("Failed to process message: {}", e),
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            debug!("Binary frame does not contain valid JSON: {}", e);
+                        }
+                    }
+                } else {
+                    debug!("Received non-UTF8 Binary frame from peer {} (first 100 bytes: {:?})", 
+                        peer_id, 
+                        &data[..std::cmp::min(100, data.len())]
+                    );
                 }
             }
-        } else if let Message::Close(_) = msg {
-            break;
+            Message::Close(_) => {
+                debug!("Received Close frame from peer {}", peer_id);
+                break;
+            }
+            _ => {
+                // Ignore Ping, Pong, and other message types
+                debug!("Ignoring {:?} message from peer {}", 
+                    match msg {
+                        Message::Ping(_) => "Ping",
+                        Message::Pong(_) => "Pong",
+                        _ => "Other",
+                    },
+                    peer_id
+                );
+            }
         }
     }
 
@@ -271,14 +341,19 @@ async fn handle_client_message(
             supported_transports,
             preferred_transport,
         } => {
+            info!("📥 RECEIVED Join message from peer {} (client_peer_id: {:?}) for session {}", 
+                peer_id, client_peer_id, session_id);
+            
             // Validate session exists and passphrase if required
             // TODO: Check with storage if session exists and passphrase matches
             
             // Determine role based on whether this is the first peer in the session
             // First peer is assumed to be the server
             let role = if state.get_peers(session_id).is_empty() {
+                info!("  → First peer in session, assigning role: Server");
                 PeerRole::Server
             } else {
+                info!("  → Session has existing peers, assigning role: Client");
                 PeerRole::Client
             };
             
@@ -293,18 +368,28 @@ async fn handle_client_message(
                 last_heartbeat: Arc::new(RwLock::new(std::time::Instant::now())),
             };
             state.add_peer(session_id.to_string(), peer_conn);
+            info!("  → Added peer {} to session {} with role {:?}", peer_id, session_id, role);
             
             // Get existing peers and available transports
             let peers = state.get_peers(session_id);
             let available_transports = state.get_available_transports(session_id);
+            info!("  → Session now has {} peers, available transports: {:?}", 
+                peers.len(), available_transports);
             
             // Send success response - use WebSocket connection's peer_id
-            tx.send(ServerMessage::JoinSuccess {
+            let join_success = ServerMessage::JoinSuccess {
                 session_id: session_id.to_string(),
                 peer_id: peer_id.to_string(),  // Use WebSocket connection's peer_id
                 peers: peers.clone(),
                 available_transports,
-            })?;
+            };
+            
+            info!("📤 SENDING JoinSuccess to peer {}: session={}, peer_id={}, peers={}, transports={:?}", 
+                peer_id, session_id, peer_id, peers.len(), 
+                state.get_available_transports(session_id));
+            
+            tx.send(join_success)?;
+            info!("  → JoinSuccess sent successfully to peer {}", peer_id);
             
             // Notify other peers - use WebSocket connection's peer_id
             state.broadcast_except(session_id, peer_id, ServerMessage::PeerJoined {

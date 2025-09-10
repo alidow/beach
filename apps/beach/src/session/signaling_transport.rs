@@ -3,64 +3,112 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 
-use crate::transport::{Transport, TransportMode, websocket::{WebSocketTransport, config::{WebSocketConfig, WebSocketConfigBuilder}}};
+use crate::transport::{Transport, TransportMode, websocket::{WebSocketTransport, config::WebSocketConfigBuilder}};
 use crate::protocol::signaling::{ClientMessage, ServerMessage, TransportType, PeerRole};
 
 /// Adapter that wraps a Transport for signaling protocol use
 pub struct SignalingTransport<T: Transport + Send + 'static> {
-    /// The underlying transport
-    transport: Arc<tokio::sync::Mutex<T>>,
     /// Channel for sending ClientMessages
     tx: mpsc::UnboundedSender<ClientMessage>,
-    /// Channel for receiving ServerMessages
+    /// Channel for receiving ServerMessages  
     rx: Arc<tokio::sync::RwLock<mpsc::UnboundedReceiver<ServerMessage>>>,
     /// Task handles
-    send_task: Option<tokio::task::JoinHandle<()>>,
-    recv_task: Option<tokio::task::JoinHandle<()>>,
+    bridge_task: Option<tokio::task::JoinHandle<()>>,
     heartbeat_task: Option<tokio::task::JoinHandle<()>>,
+    /// Keep phantom data for type parameter
+    _phantom: std::marker::PhantomData<T>,
 }
 
 impl<T: Transport + Send + 'static> SignalingTransport<T> {
     /// Create a new signaling transport from an existing transport
-    pub fn new(transport: T) -> Self {
-        let transport = Arc::new(tokio::sync::Mutex::new(transport));
+    pub fn new(mut transport: T) -> Self {
         let (tx_client, mut rx_client) = mpsc::unbounded_channel::<ClientMessage>();
         let (tx_server, rx_server) = mpsc::unbounded_channel::<ServerMessage>();
         
         let rx_server = Arc::new(tokio::sync::RwLock::new(rx_server));
         
-        // Spawn send task
-        let transport_send = transport.clone();
-        let send_task = tokio::spawn(async move {
-            while let Some(msg) = rx_client.recv().await {
-                if let Ok(json) = serde_json::to_string(&msg) {
-                    let bytes = json.into_bytes();
-                    let transport = transport_send.lock().await;
-                    if transport.send(&bytes).await.is_err() {
-                        break;
-                    }
-                }
+        // Spawn single bridge task that owns the transport
+        let bridge_task = tokio::spawn(async move {
+            if std::env::var("BEACH_VERBOSE").is_ok() {
+                // eprintln!("🔍 [VERBOSE] Bridge task starting");
             }
-        });
-        
-        // Spawn receive task
-        let transport_recv = transport.clone();
-        let recv_task = tokio::spawn(async move {
+            
             loop {
-                let mut transport = transport_recv.lock().await;
-                if let Some(data) = transport.recv().await {
-                    // Try to parse as JSON
-                    if let Ok(text) = String::from_utf8(data) {
-                        if let Ok(msg) = serde_json::from_str::<ServerMessage>(&text) {
-                            if tx_server.send(msg).is_err() {
+                tokio::select! {
+                    // Handle outgoing ClientMessages
+                    Some(msg) = rx_client.recv() => {
+                        if let Ok(json) = serde_json::to_string(&msg) {
+                            // if std::env::var("BEACH_VERBOSE").is_ok() {
+                            //     eprintln!("🔍 [VERBOSE] Bridge: Sending signaling message: {} (JSON: {})", 
+                            //         match &msg {
+                            //             ClientMessage::Join { .. } => "Join",
+                            //             ClientMessage::Ping => "Ping",
+                            //             ClientMessage::Signal { .. } => "Signal",
+                            //             ClientMessage::Debug { .. } => "Debug",
+                            //         },
+                            //         &json
+                            //     );
+                            // }
+                            let bytes = json.into_bytes();
+                            if std::env::var("BEACH_VERBOSE").is_ok() {
+                                // eprintln!("🔍 [VERBOSE] Bridge: Sending {} bytes to transport", bytes.len());
+                            }
+                            if let Err(e) = transport.send(&bytes).await {
+                                if std::env::var("BEACH_VERBOSE").is_ok() {
+                                    // eprintln!("🔍 [VERBOSE] Bridge: Failed to send: {}", e);
+                                }
                                 break;
+                            }
+                            if std::env::var("BEACH_VERBOSE").is_ok() {
+                                // eprintln!("🔍 [VERBOSE] Bridge: Successfully sent to transport");
                             }
                         }
                     }
-                } else {
-                    // No more data
-                    break;
+                    
+                    // Handle incoming data from transport
+                    data = transport.recv() => {
+                        if let Some(data) = data {
+                            if std::env::var("BEACH_VERBOSE").is_ok() {
+                                // eprintln!("🔍 [VERBOSE] Bridge: Received {} bytes from transport", data.len());
+                            }
+                            
+                            // Try to parse as JSON ServerMessage
+                            if let Ok(text) = String::from_utf8(data) {
+                                if let Ok(msg) = serde_json::from_str::<ServerMessage>(&text) {
+                                    // if std::env::var("BEACH_VERBOSE").is_ok() {
+                                    //     eprintln!("🔍 [VERBOSE] Bridge: Received signaling message: {}", 
+                                    //         match &msg {
+                                    //             ServerMessage::JoinSuccess { .. } => "JoinSuccess",
+                                    //             ServerMessage::JoinError { .. } => "JoinError",
+                                    //             ServerMessage::PeerJoined { .. } => "PeerJoined",
+                                    //             ServerMessage::PeerLeft { .. } => "PeerLeft",
+                                    //             ServerMessage::Signal { .. } => "Signal",
+                                    //             ServerMessage::Error { .. } => "Error",
+                                    //             ServerMessage::Pong => "Pong",
+                                    //             ServerMessage::Debug { .. } => "Debug",
+                                    //         }
+                                    //     );
+                                    // }
+                                    if tx_server.send(msg).is_err() {
+                                        if std::env::var("BEACH_VERBOSE").is_ok() {
+                                            // eprintln!("🔍 [VERBOSE] Bridge: Failed to forward ServerMessage");
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            if std::env::var("BEACH_VERBOSE").is_ok() {
+                                // eprintln!("🔍 [VERBOSE] Bridge: Transport recv returned None");
+                            }
+                            break;
+                        }
+                    }
                 }
+            }
+            
+            if std::env::var("BEACH_VERBOSE").is_ok() {
+                // eprintln!("🔍 [VERBOSE] Bridge task ending");
             }
         });
         
@@ -77,24 +125,23 @@ impl<T: Transport + Send + 'static> SignalingTransport<T> {
         });
         
         Self {
-            transport,
             tx: tx_client,
             rx: rx_server,
-            send_task: Some(send_task),
-            recv_task: Some(recv_task),
+            bridge_task: Some(bridge_task),
             heartbeat_task: Some(heartbeat_task),
+            _phantom: std::marker::PhantomData,
         }
     }
     
     /// Connect and perform initial handshake
     pub async fn connect_with_handshake(
-        mut transport: T,
+        transport: T,
         peer_id: String,
         passphrase: Option<String>,
-        role: PeerRole,
+        _role: PeerRole,
     ) -> Result<Self> {
         // Create the adapter
-        let mut adapter = Self::new(transport);
+        let adapter = Self::new(transport);
         
         // Send join message
         let join_msg = ClientMessage::Join {
@@ -105,25 +152,9 @@ impl<T: Transport + Send + 'static> SignalingTransport<T> {
         };
         adapter.send(join_msg).await?;
         
-        // Wait for response
-        let timeout_duration = Duration::from_secs(5);
-        match tokio::time::timeout(timeout_duration, adapter.recv()).await {
-            Ok(Some(ServerMessage::JoinSuccess { .. })) => {
-                // Success
-                Ok(adapter)
-            }
-            Ok(Some(ServerMessage::JoinError { reason })) => {
-                Err(anyhow::anyhow!("Failed to join session: {}", reason))
-            }
-            Ok(_) => {
-                // Unexpected message or None, but continue
-                Ok(adapter)
-            }
-            Err(_) => {
-                // Timeout, but continue
-                Ok(adapter)
-            }
-        }
+        // Don't consume the JoinSuccess - let the message router handle it
+        // The message router needs to see JoinSuccess to set server_peer_id
+        Ok(adapter)
     }
     
     /// Send a signaling message
@@ -140,8 +171,12 @@ impl<T: Transport + Send + 'static> SignalingTransport<T> {
     
     /// Check if transport is connected
     pub async fn is_connected(&self) -> bool {
-        let transport = self.transport.lock().await;
-        transport.is_connected()
+        // For now, check if bridge task is still running
+        if let Some(bridge_task) = &self.bridge_task {
+            !bridge_task.is_finished()
+        } else {
+            false
+        }
     }
     
     /// Close the signaling transport
@@ -150,10 +185,7 @@ impl<T: Transport + Send + 'static> SignalingTransport<T> {
         if let Some(task) = self.heartbeat_task.take() {
             task.abort();
         }
-        if let Some(task) = self.send_task.take() {
-            task.abort();
-        }
-        if let Some(task) = self.recv_task.take() {
+        if let Some(task) = self.bridge_task.take() {
             task.abort();
         }
     }
@@ -165,10 +197,7 @@ impl<T: Transport + Send + 'static> Drop for SignalingTransport<T> {
         if let Some(task) = self.heartbeat_task.take() {
             task.abort();
         }
-        if let Some(task) = self.send_task.take() {
-            task.abort();
-        }
-        if let Some(task) = self.recv_task.take() {
+        if let Some(task) = self.bridge_task.take() {
             task.abort();
         }
     }

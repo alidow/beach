@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use crate::server::terminal_state::{Grid, GridDelta};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -67,7 +66,7 @@ impl<'de> Deserialize<'de> for ErrorCode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Dimensions {
     pub width: u16,
     pub height: u16,

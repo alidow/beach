@@ -277,8 +277,23 @@ impl ResizablePtySession {
     }
 }
 
+// IMPORTANT: This test is skipped because it has a fundamental flaw in its assumptions.
+// 
+// The test expects that `echo` output will have different numbers of lines when the terminal
+// width changes, but this is incorrect because:
+// 1. The `echo` command always outputs a single line regardless of terminal width
+// 2. Line wrapping is a visual rendering feature of the terminal emulator, not part of the output stream
+// 3. When capturing PTY output, we get the raw bytes, not the visually wrapped representation
+// 4. The `.lines()` method counts actual newline characters, not visual line wraps
+//
+// To properly test terminal resizing with wrapping, we would need to:
+// - Inspect the terminal's internal grid state directly (not through shell commands)
+// - Or use a terminal-aware application that modifies its output based on terminal width
+// - Or test with the terminal state APIs that understand visual wrapping
+//
+// This test is kept for reference but should be redesigned if resize behavior testing is needed.
 #[tokio::test]
-#[ignore = "Resize tests may be flaky - run with --ignored to test"]
+#[ignore = "Test has incorrect assumptions about echo output and line wrapping - see comments above"]
 async fn test_terminal_resize_with_complex_content() {
     let session = ResizablePtySession::new(80, 24).await;
     session.clear_output();

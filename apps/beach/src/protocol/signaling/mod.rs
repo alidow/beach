@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Re-export transport types from session server protocol
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -8,6 +9,48 @@ pub enum TransportType {
     WebTransport,
     Direct,
     Custom(String),
+}
+
+/// WebRTC-specific signaling messages (mirrors beach-road structure)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "signal_type", rename_all = "snake_case")]
+pub enum WebRTCSignal {
+    Offer { sdp: String },
+    Answer { sdp: String },
+    IceCandidate {
+        candidate: String,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u32>,
+    },
+}
+
+/// Transport-specific signaling data (mirrors beach-road structure)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "transport", rename_all = "snake_case")]
+pub enum TransportSignal {
+    #[serde(rename = "webrtc")]
+    WebRTC {
+        signal: WebRTCSignal,
+    },
+}
+
+impl TransportSignal {
+    /// Convert to serde_json::Value for wire compatibility
+    pub fn to_value(&self) -> Result<Value, serde_json::Error> {
+        serde_json::to_value(self)
+    }
+    
+    /// Parse from serde_json::Value
+    pub fn from_value(value: &Value) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(value.clone())
+    }
+}
+
+impl WebRTCSignal {
+    /// Helper to create WebRTC transport signal
+    pub fn to_transport_signal(self) -> TransportSignal {
+        TransportSignal::WebRTC { signal: self }
+    }
 }
 
 /// Messages sent from beach to session server
@@ -99,7 +142,6 @@ pub enum AppMessage {
     },
     /// Protocol message for subscription system
     Protocol {
-        #[serde(flatten)]
         message: serde_json::Value, // Will contain ClientMessage or ServerMessage
     },
     /// Custom application message

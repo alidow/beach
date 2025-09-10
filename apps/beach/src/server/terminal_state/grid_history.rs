@@ -1,7 +1,6 @@
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
 use crate::server::terminal_state::{Grid, GridDelta, LineCounter, TerminalStateError};
 
 #[derive(Debug)]

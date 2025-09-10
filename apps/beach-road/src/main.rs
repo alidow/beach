@@ -93,6 +93,9 @@ async fn main() {
         .expect("Failed to bind to address");
 
     info!("Beach Road listening on {}", addr);
+    
+    // Always print to stdout so users know the server is ready
+    println!("🏖️  Beach Road listening on {}", addr);
 
     // Start the server
     axum::serve(listener, app)

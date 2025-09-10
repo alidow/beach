@@ -1,5 +1,6 @@
 /// Full terminal client with TUI, predictive echo, and resilience
 use crate::client::{grid_renderer::GridRenderer, predictive_echo::PredictiveEcho};
+use crate::debug_recorder::DebugRecorder;
 use crate::protocol::{ClientMessage, ServerMessage, Dimensions, ViewMode, ViewPosition, ControlMessage};
 use crate::protocol::signaling::{AppMessage, PeerInfo};
 use crate::session::{ClientSession, message_handlers::ClientMessageHandler};
@@ -93,6 +94,9 @@ pub struct TerminalClient<T: Transport + Send + 'static> {
     
     /// Debug log file path
     debug_log: Option<String>,
+    
+    /// Debug recorder for subscription events
+    debug_recorder: Arc<Mutex<Option<DebugRecorder>>>,
 }
 
 impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
@@ -103,6 +107,7 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
         session_str: &str,
         passphrase: Option<String>,
         debug_log: Option<String>,
+        debug_recorder: Option<String>,
     ) -> Result<Arc<Self>> {
         use crate::session::Session;
         
@@ -110,7 +115,7 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
         let (client_session, server_addr, session_id) = Session::join(session_str, transport, passphrase).await?;
         
         // Create the client
-        let client = Self::new(client_session, None, debug_log).await?;
+        let client = Self::new(client_session, None, debug_log, debug_recorder).await?;
         
         // Set the handler first so connect_signaling can immediately start the router
         client.set_as_handler().await;
@@ -143,6 +148,7 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
         session: ClientSession<T>,
         _passphrase: Option<String>,
         debug_log: Option<String>,
+        debug_recorder_path: Option<String>,
     ) -> Result<Arc<Self>> {
         // Get terminal dimensions
         let (width, height) = crossterm::terminal::size()?;
@@ -246,6 +252,22 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
             }
         });
         
+        // Initialize debug recorder if path provided
+        let debug_recorder = if let Some(path) = debug_recorder_path {
+            match DebugRecorder::new(&path) {
+                Ok(recorder) => {
+                    eprintln!("Debug recorder initialized: {}", path);
+                    Some(recorder)
+                },
+                Err(e) => {
+                    eprintln!("Failed to initialize debug recorder: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        
         let client = Arc::new(Self {
             session: session_arc,
             grid_renderer,
@@ -261,6 +283,7 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
             shutdown_rx: Arc::new(Mutex::new(shutdown_rx)),
             mouse_mode: Arc::new(RwLock::new(MouseMode::Normal)),
             debug_log,
+            debug_recorder: Arc::new(Mutex::new(debug_recorder)),
         });
         
         Ok(client)
@@ -557,6 +580,11 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
             position: None,  // Will be updated when scrolling
             compression: None,
         };
+        
+        // Record client message being sent
+        if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
+            let _ = recorder.record_client_message(&subscribe_msg);
+        }
         
         let app_msg = AppMessage::Protocol {
             message: serde_json::to_value(&subscribe_msg)?,
@@ -1138,6 +1166,11 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
     
     /// Handle server messages
     async fn handle_server_message(&self, msg: ServerMessage) -> Result<()> {
+        // Record incoming server message with debug recorder
+        if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
+            let _ = recorder.record_server_message(&msg);
+        }
+        
         // Debug log received message
         if let Some(ref debug_log) = self.debug_log {
             if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
@@ -1157,10 +1190,40 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
             ServerMessage::Delta { changes, .. } => {
                 // Apply the delta to the grid
                 self.grid_renderer.lock().await.apply_delta(&changes);
+                
+                // Record client grid state after applying delta
+                if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
+                    let renderer = self.grid_renderer.lock().await;
+                    let view_mode = if renderer.is_historical_mode() {
+                        "historical"
+                    } else {
+                        "realtime"
+                    };
+                    let _ = recorder.record_client_grid_state(
+                        &renderer.grid,
+                        renderer.scroll_offset as i64,
+                        view_mode
+                    );
+                }
             }
             ServerMessage::Snapshot { grid, .. } => {
                 // Apply the snapshot
-                self.grid_renderer.lock().await.apply_snapshot(grid);
+                self.grid_renderer.lock().await.apply_snapshot(grid.clone());
+                
+                // Record client grid state after applying snapshot
+                if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
+                    let renderer = self.grid_renderer.lock().await;
+                    let view_mode = if renderer.is_historical_mode() {
+                        "historical"
+                    } else {
+                        "realtime"
+                    };
+                    let _ = recorder.record_client_grid_state(
+                        &renderer.grid,
+                        renderer.scroll_offset as i64,
+                        view_mode
+                    );
+                }
             }
             ServerMessage::HistoryInfo { 
                 oldest_line, 
@@ -1360,6 +1423,11 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                 }),
             };
             
+            // Record client message being sent
+            if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
+                let _ = recorder.record_client_message(&modify_msg);
+            }
+            
             let app_msg = AppMessage::Protocol {
                 message: serde_json::to_value(&modify_msg)?,
             };
@@ -1376,6 +1444,11 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                 mode: Some(ViewMode::Realtime),
                 position: None,
             };
+            
+            // Record client message being sent
+            if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
+                let _ = recorder.record_client_message(&modify_msg);
+            }
             
             let app_msg = AppMessage::Protocol {
                 message: serde_json::to_value(&modify_msg)?,

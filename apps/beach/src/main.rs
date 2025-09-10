@@ -1,6 +1,7 @@
 mod client;
 mod config;
 mod debug_log;
+mod debug_recorder;
 pub mod protocol;
 pub mod server;
 pub mod session;
@@ -106,6 +107,7 @@ async fn main() {
             session,
             passphrase,
             cli.debug_log,
+            cli.debug_recorder,
         ).await {
             Ok(client) => {
                 client.start().await.unwrap_or_else(|e| {

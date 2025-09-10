@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use chrono::{DateTime, Utc};
 use super::messages::{
     ViewMode, SubscriptionStatus, ErrorCode, NotificationType
 };
@@ -65,6 +66,21 @@ pub enum ServerMessage {
         subscription_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         details: Option<serde_json::Value>,
+    },
+    HistoryInfo {
+        subscription_id: String,
+        /// Oldest available line number in history
+        oldest_line: u64,
+        /// Most recent line number
+        latest_line: u64,
+        /// Total number of lines in history
+        total_lines: u64,
+        /// Oldest available timestamp
+        #[serde(skip_serializing_if = "Option::is_none")]
+        oldest_timestamp: Option<i64>,
+        /// Most recent timestamp
+        #[serde(skip_serializing_if = "Option::is_none")]
+        latest_timestamp: Option<i64>,
     },
 }
 

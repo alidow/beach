@@ -5,6 +5,7 @@ mod backend_test;
 mod debug_test;
 mod debug_view_test;
 mod utf8_test;
+mod scrollback_test;
 #[cfg(feature = "alacritty-backend")]
 mod resize_test;
 #[cfg(feature = "alacritty-backend")]

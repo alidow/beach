@@ -41,6 +41,9 @@ pub struct HistoryConfig {
     /// Maximum history size in bytes
     pub max_size_bytes: usize,
     
+    /// Maximum number of lines to retain in history (0 = unlimited)
+    pub max_history_lines: u64,
+    
     /// Compression settings
     pub enable_compression: bool,
     
@@ -54,6 +57,7 @@ impl Default for HistoryConfig {
             snapshot_interval: 100,        // Snapshot every 100 deltas
             min_snapshot_interval_ms: 5000, // At least 5 seconds between snapshots
             max_size_bytes: 100_000_000,  // 100MB limit
+            max_history_lines: 10000,     // Keep 10,000 lines of history
             enable_compression: true,
             coalesce_window_ms: 50,       // Coalesce changes within 50ms
         }

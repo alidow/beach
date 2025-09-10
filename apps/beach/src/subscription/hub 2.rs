@@ -76,9 +76,6 @@ pub struct SubscriptionHub {
     
     // Channel for delta streaming task
     delta_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
-    
-    // Debug log path for verbose logging
-    debug_log_path: Arc<RwLock<Option<String>>>,
 }
 
 impl SubscriptionHub {
@@ -91,19 +88,7 @@ impl SubscriptionHub {
             pty_writer: Arc::new(RwLock::new(None)),
             handler: Arc::new(RwLock::new(None)),
             delta_tx: Arc::new(RwLock::new(None)),
-            debug_log_path: Arc::new(RwLock::new(None)),
         }
-    }
-
-    /// Check if any subscription exists for a given client
-    pub async fn has_any_for_client(&self, client_id: &ClientId) -> bool {
-        let clients = self.clients.read().await;
-        clients.get(client_id).map(|v| !v.is_empty()).unwrap_or(false)
-    }
-    
-    /// Set debug log path for verbose logging
-    pub async fn set_debug_log_path(&self, path: String) {
-        *self.debug_log_path.write().await = Some(path);
     }
     
     /// Attach a terminal data source (server-only)
@@ -151,20 +136,7 @@ impl SubscriptionHub {
         
         // Send initial snapshot if we have a data source
         if let Some(source) = self.terminal_source.read().await.as_ref() {
-            if let Some(ref debug_log_path) = *self.debug_log_path.read().await {
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log_path) {
-                    use std::io::Write;
-                    let _ = writeln!(f, "[{}] [SubscriptionHub] Sending initial snapshot for subscription {}", 
-                        chrono::Local::now().format("%H:%M:%S%.3f"), subscription_id);
-                }
-            }
-            
-            // Use snapshot_with_view to support different view modes from the start
-            let snapshot = source.snapshot_with_view(
-                config.dimensions,
-                config.mode.clone(),
-                config.position.clone()
-            ).await?;
+            let snapshot = source.snapshot(config.dimensions).await?;
             self.send_to_subscription(&subscription, ServerMessage::Snapshot {
                 subscription_id: subscription_id.clone(),
                 sequence: 0,
@@ -172,26 +144,6 @@ impl SubscriptionHub {
                 timestamp: chrono::Utc::now().timestamp(),
                 checksum: 0,
             }).await?;
-            
-            // Send history metadata if available
-            if let Ok(metadata) = source.get_history_metadata().await {
-                self.send_to_subscription(&subscription, ServerMessage::HistoryInfo {
-                    subscription_id: subscription_id.clone(),
-                    oldest_line: metadata.oldest_line,
-                    latest_line: metadata.latest_line,
-                    total_lines: metadata.total_lines,
-                    oldest_timestamp: metadata.oldest_timestamp.map(|dt| dt.timestamp()),
-                    latest_timestamp: metadata.latest_timestamp.map(|dt| dt.timestamp()),
-                }).await?;
-            }
-            
-            if let Some(ref debug_log_path) = *self.debug_log_path.read().await {
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log_path) {
-                    use std::io::Write;
-                    let _ = writeln!(f, "[{}] [SubscriptionHub] Snapshot sent successfully for {}", 
-                        chrono::Local::now().format("%H:%M:%S%.3f"), subscription_id);
-                }
-            }
         }
         
         // Store subscription
@@ -223,14 +175,7 @@ impl SubscriptionHub {
         config: SubscriptionConfig,
     ) -> Result<()> {
         // Debug: print subscribe call
-        if let Some(ref debug_log_path) = *self.debug_log_path.read().await {
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log_path) {
-                use std::io::Write;
-                let _ = writeln!(f, "[{}] [SubscriptionHub] subscribe_with_id called: client={}, subscription={}", 
-                    chrono::Local::now().format("%H:%M:%S%.3f"), client_id, subscription_id);
-            }
-        }
-        
+        eprintln!("[SubscriptionHub] subscribe_with_id: id={} client={}", subscription_id, client_id);
         let subscription = Subscription {
             id: subscription_id.clone(),
             client_id: client_id.clone(),
@@ -252,20 +197,7 @@ impl SubscriptionHub {
 
         // Send initial snapshot if we have a data source
         if let Some(source) = self.terminal_source.read().await.as_ref() {
-            if let Some(ref debug_log_path) = *self.debug_log_path.read().await {
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log_path) {
-                    use std::io::Write;
-                    let _ = writeln!(f, "[{}] [SubscriptionHub] Sending initial snapshot for subscription {}", 
-                        chrono::Local::now().format("%H:%M:%S%.3f"), subscription_id);
-                }
-            }
-            
-            // Use snapshot_with_view to support different view modes from the start
-            let snapshot = source.snapshot_with_view(
-                config.dimensions,
-                config.mode.clone(),
-                config.position.clone()
-            ).await?;
+            let snapshot = source.snapshot(config.dimensions).await?;
             self.send_to_subscription(&subscription, ServerMessage::Snapshot {
                 subscription_id: subscription_id.clone(),
                 sequence: 0,
@@ -273,26 +205,6 @@ impl SubscriptionHub {
                 timestamp: chrono::Utc::now().timestamp(),
                 checksum: 0,
             }).await?;
-            
-            // Send history metadata if available
-            if let Ok(metadata) = source.get_history_metadata().await {
-                self.send_to_subscription(&subscription, ServerMessage::HistoryInfo {
-                    subscription_id: subscription_id.clone(),
-                    oldest_line: metadata.oldest_line,
-                    latest_line: metadata.latest_line,
-                    total_lines: metadata.total_lines,
-                    oldest_timestamp: metadata.oldest_timestamp.map(|dt| dt.timestamp()),
-                    latest_timestamp: metadata.latest_timestamp.map(|dt| dt.timestamp()),
-                }).await?;
-            }
-            
-            if let Some(ref debug_log_path) = *self.debug_log_path.read().await {
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log_path) {
-                    use std::io::Write;
-                    let _ = writeln!(f, "[{}] [SubscriptionHub] Snapshot sent successfully for {}", 
-                        chrono::Local::now().format("%H:%M:%S%.3f"), subscription_id);
-                }
-            }
         }
 
         // Store subscription
@@ -322,7 +234,6 @@ impl SubscriptionHub {
             .ok_or_else(|| anyhow!("Subscription not found"))?;
         
         let dimensions_changed = patch.dimensions.is_some();
-        let view_changed = patch.mode.is_some() || patch.position.is_some();
             
         if let Some(dims) = patch.dimensions {
             subscription.dimensions = dims;
@@ -337,16 +248,10 @@ impl SubscriptionHub {
             subscription.is_controlling = ctrl;
         }
         
-        // Send updated snapshot if dimensions or view changed
-        if dimensions_changed || view_changed {
+        // Send updated snapshot if dimensions changed
+        if dimensions_changed {
             if let Some(source) = self.terminal_source.read().await.as_ref() {
-                // Use the new snapshot_with_view method to support historical views
-                let snapshot = source.snapshot_with_view(
-                    subscription.dimensions.clone(),
-                    subscription.mode.clone(),
-                    subscription.position.clone()
-                ).await?;
-                
+                let snapshot = source.snapshot(subscription.dimensions.clone()).await?;
                 subscription.current_sequence += 1;
                 self.send_to_subscription(subscription, ServerMessage::Snapshot {
                     subscription_id: id.clone(),
@@ -396,18 +301,7 @@ impl SubscriptionHub {
         
         // Start the streaming task
         tokio::spawn(async move {
-            // Log streaming task start
-            if let Some(ref path) = *self.debug_log_path.read().await {
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                    use std::io::Write;
-                    let _ = writeln!(f, "[{}] [SubscriptionHub] Delta streaming task started",
-                        chrono::Local::now().format("%H:%M:%S%.3f"));
-                }
-            }
-            
-            let mut iteration = 0;
             loop {
-                iteration += 1;
                 // Check if we should stop
                 if rx.try_recv().is_ok() {
                     break;
@@ -420,45 +314,13 @@ impl SubscriptionHub {
                 };
                 
                 if let Some(source) = source {
-                    // Log every 10th iteration to avoid spam
-                    if iteration % 10 == 0 {
-                        if let Some(ref path) = *self.debug_log_path.read().await {
-                            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
-                                use std::io::Write;
-                                let _ = writeln!(f, "[{}] [SubscriptionHub] Streaming loop iteration {}, waiting for delta...",
-                                    chrono::Local::now().format("%H:%M:%S%.3f"), iteration);
-                            }
-                        }
-                    }
-                    
                     // Wait for next delta
                     match source.next_delta().await {
                         Ok(delta) => {
-                            // Log delta received
-                            if let Some(ref path) = *self.debug_log_path.read().await {
-                                if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
-                                    use std::io::Write;
-                                    let _ = writeln!(f, "[{}] [SubscriptionHub] Received delta: {} cell changes, cursor: {:?}, dim: {:?}",
-                                        chrono::Local::now().format("%H:%M:%S%.3f"), 
-                                        delta.cell_changes.len(),
-                                        delta.cursor_change.is_some(),
-                                        delta.dimension_change.is_some());
-                                }
-                            }
-                            
                             // Broadcast delta to all subscriptions
                             let _ = self.push_delta(delta).await;
                         }
-                        Err(e) => {
-                            // Log error
-                            if let Some(ref path) = *self.debug_log_path.read().await {
-                                if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
-                                    use std::io::Write;
-                                    let _ = writeln!(f, "[{}] [SubscriptionHub] Error getting delta: {:?}",
-                                        chrono::Local::now().format("%H:%M:%S%.3f"), e);
-                                }
-                            }
-                            
+                        Err(_) => {
                             // Error getting delta, wait a bit before retrying
                             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         }
@@ -475,16 +337,6 @@ impl SubscriptionHub {
     pub async fn push_delta(&self, delta: crate::server::terminal_state::GridDelta) -> Result<()> {
         // Update per-subscription sequence numbers under a write lock
         let mut subscriptions = self.subscriptions.write().await;
-        
-        // Log number of active subscriptions
-        if let Some(ref path) = *self.debug_log_path.read().await {
-            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
-                use std::io::Write;
-                let _ = writeln!(f, "[{}] [SubscriptionHub] Broadcasting delta to {} subscriptions",
-                    chrono::Local::now().format("%H:%M:%S%.3f"), subscriptions.len());
-            }
-        }
-        
         for subscription in subscriptions.values_mut() {
             subscription.current_sequence = subscription.current_sequence.saturating_add(1);
             let msg = ServerMessage::Delta {
@@ -493,16 +345,6 @@ impl SubscriptionHub {
                 changes: delta.clone(),
                 timestamp: chrono::Utc::now().timestamp(),
             };
-            
-            // Log sending delta to each subscription
-            if let Some(ref path) = *self.debug_log_path.read().await {
-                if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
-                    use std::io::Write;
-                    let _ = writeln!(f, "[{}] [SubscriptionHub] Sending Delta to sub {} (seq {})",
-                        chrono::Local::now().format("%H:%M:%S%.3f"), subscription.id, subscription.current_sequence);
-                }
-            }
-            
             let _ = self.send_to_subscription(subscription, msg).await;
         }
         Ok(())
@@ -540,97 +382,26 @@ impl SubscriptionHub {
                 // No-op here to avoid partial subscriptions without transport.
             }
             ClientMessage::TerminalInput { data, .. } => {
-                // Debug log: Terminal input received
-                if let Some(ref path) = *self.debug_log_path.read().await {
-                    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
-                        use std::io::Write;
-                        let _ = writeln!(f, "[{}] [SubscriptionHub] Received TerminalInput from client {}: {} bytes",
-                            chrono::Local::now().format("%H:%M:%S%.3f"), client_id, data.len());
-                    }
-                }
-                
                 // Check if any subscription for this client is controlling
                 let subscriptions = self.subscriptions.read().await;
-                let controlling_sub = subscriptions.values()
-                    .find(|s| s.client_id == *client_id && s.is_controlling);
-                let has_any_sub = subscriptions.values()
-                    .any(|s| s.client_id == *client_id);
+                let is_controlling = subscriptions.values()
+                    .any(|s| s.client_id == *client_id && s.is_controlling);
                     
-                // Debug log: Subscription control state
-                if let Some(ref path) = *self.debug_log_path.read().await {
-                    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
-                        use std::io::Write;
-                        let _ = writeln!(f, "[{}] [SubscriptionHub] Client {} subscription state: has_any={}, is_controlling={}",
-                            chrono::Local::now().format("%H:%M:%S%.3f"), 
-                            client_id, 
-                            has_any_sub,
-                            controlling_sub.is_some());
-                        if let Some(sub) = controlling_sub {
-                            let _ = writeln!(f, "[{}] [SubscriptionHub] Controlling subscription: id={}", 
-                                chrono::Local::now().format("%H:%M:%S%.3f"), sub.id);
-                        }
-                    }
-                }
-                    
-                if let Some(sub) = controlling_sub {
+                if is_controlling {
                     // Forward to PTY writer if available
                     if let Some(writer) = self.pty_writer.read().await.as_ref() {
-                        // Debug log: Before PTY write
-                        let write_start = std::time::Instant::now();
-                        if let Some(ref path) = *self.debug_log_path.read().await {
-                            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
-                                use std::io::Write;
-                                let _ = writeln!(f, "[{}] [SubscriptionHub] Forwarding {} bytes to PTY writer",
-                                    chrono::Local::now().format("%H:%M:%S%.3f"), data.len());
-                            }
-                        }
-                        
-                        let write_result = writer.write(&data).await;
-                        
-                        // Debug log: After PTY write
-                        if let Some(ref path) = *self.debug_log_path.read().await {
-                            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
-                                use std::io::Write;
-                                let elapsed = write_start.elapsed();
-                                match &write_result {
-                                    Ok(_) => {
-                                        let _ = writeln!(f, "[{}] [SubscriptionHub] PTY write successful, took {}ms",
-                                            chrono::Local::now().format("%H:%M:%S%.3f"), elapsed.as_millis());
-                                    },
-                                    Err(e) => {
-                                        let _ = writeln!(f, "[{}] [SubscriptionHub] PTY write failed after {}ms: {:?}",
-                                            chrono::Local::now().format("%H:%M:%S%.3f"), elapsed.as_millis(), e);
-                                    }
-                                }
-                            }
-                        }
-                        
-                        write_result?;
-                    } else {
-                        // Debug log: No PTY writer
-                        if let Some(ref path) = *self.debug_log_path.read().await {
-                            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
-                                use std::io::Write;
-                                let _ = writeln!(f, "[{}] [SubscriptionHub] WARNING: No PTY writer available",
-                                    chrono::Local::now().format("%H:%M:%S%.3f"));
-                            }
-                        }
+                        writer.write(&data).await?;
                     }
                     
                     // Notify handler
                     if let Some(handler) = self.handler.read().await.as_ref() {
-                        handler.on_input(&sub.id, data).await?;
-                    }
-                } else {
-                    // Debug log: Input not allowed
-                    if let Some(ref path) = *self.debug_log_path.read().await {
-                        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
-                            use std::io::Write;
-                            let _ = writeln!(f, "[{}] [SubscriptionHub] INPUT_NOT_ALLOWED: Client {} does not have controlling subscription",
-                                chrono::Local::now().format("%H:%M:%S%.3f"), client_id);
+                        // Find the controlling subscription ID
+                        if let Some(sub) = subscriptions.values()
+                            .find(|s| s.client_id == *client_id && s.is_controlling) {
+                            handler.on_input(&sub.id, data).await?;
                         }
                     }
-                    
+                } else {
                     // Send error to client
                     if let Some(subscription) = subscriptions.values()
                         .find(|s| s.client_id == *client_id) {
@@ -683,55 +454,20 @@ impl SubscriptionHub {
     
     /// Send a message to a specific subscription with channel routing
     async fn send_to_subscription(&self, subscription: &Subscription, message: ServerMessage) -> Result<()> {
-        // Log what we're about to send
-        if let Some(ref path) = *self.debug_log_path.read().await {
-            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
-                use std::io::Write;
-                match &message {
-                    ServerMessage::Snapshot { subscription_id, .. } => {
-                        let _ = writeln!(f, "[{}] [SubscriptionHub] send_to_subscription: Sending Snapshot to {}",
-                            chrono::Local::now().format("%H:%M:%S%.3f"), subscription_id);
-                    }
-                    ServerMessage::Delta { subscription_id, sequence, .. } => {
-                        let _ = writeln!(f, "[{}] [SubscriptionHub] send_to_subscription: Sending Delta seq {} to {}",
-                            chrono::Local::now().format("%H:%M:%S%.3f"), sequence, subscription_id);
-                    }
-                    ServerMessage::SubscriptionAck { subscription_id, .. } => {
-                        let _ = writeln!(f, "[{}] [SubscriptionHub] send_to_subscription: Sending SubscriptionAck to {}",
-                            chrono::Local::now().format("%H:%M:%S%.3f"), subscription_id);
-                    }
-                    _ => {}
-                }
-            }
-        }
-        
         // Wrap in AppMessage::Protocol for client demux path
         let app_envelope = crate::protocol::signaling::AppMessage::Protocol {
             message: serde_json::to_value(&message)?,
         };
         let bytes = serde_json::to_vec(&app_envelope)?;
-        
-        // Send via transport
-        let send_result = subscription.transport.send(&bytes).await;
-        
-        // Log send result
-        if let Some(ref path) = *self.debug_log_path.read().await {
-            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
-                use std::io::Write;
-                match &send_result {
-                    Ok(_) => {
-                        let _ = writeln!(f, "[{}] [SubscriptionHub] send_to_subscription: Successfully sent message",
-                            chrono::Local::now().format("%H:%M:%S%.3f"));
-                    }
-                    Err(e) => {
-                        let _ = writeln!(f, "[{}] [SubscriptionHub] send_to_subscription: Failed to send: {:?}",
-                            chrono::Local::now().format("%H:%M:%S%.3f"), e);
-                    }
-                }
-            }
+        // Use default transport send (legacy single channel) for compatibility with current client recv
+        // Debug: mark what we are sending
+        if let ServerMessage::Snapshot { .. } = &message {
+            eprintln!("[SubscriptionHub] Sending Snapshot to sub {}", subscription.id);
         }
-        
-        send_result?;
+        if let ServerMessage::Delta { .. } = &message {
+            // keep deltas quiet
+        }
+        subscription.transport.send(&bytes).await?;
         Ok(())
     }
     

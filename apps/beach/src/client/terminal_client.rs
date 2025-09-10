@@ -7,7 +7,7 @@ use crate::transport::Transport;
 use anyhow::Result;
 use async_trait::async_trait;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, EnableMouseCapture, DisableMouseCapture},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, EnableMouseCapture, DisableMouseCapture, MouseEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -419,6 +419,9 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
         
         enable_raw_mode()?;
         let mut stdout = stdout();
+        // Note: EnableMouseCapture prevents native text selection. 
+        // Most terminals allow Shift+drag to bypass mouse capture for selection.
+        // TODO: Consider making mouse capture optional via a flag
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         
         let backend = CrosstermBackend::new(stdout);
@@ -744,12 +747,14 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
             MouseEventKind::ScrollUp => {
                 // Scroll viewport up (show earlier content)
                 self.grid_renderer.lock().await.scroll_vertical(3);
-                // Note: We DON'T send this to the server - it's local viewport control
+                // Trigger history update if needed
+                self.handle_scroll_update().await?;
             }
             MouseEventKind::ScrollDown => {
                 // Scroll viewport down (show later content)
                 self.grid_renderer.lock().await.scroll_vertical(-3);
-                // Note: We DON'T send this to the server - it's local viewport control
+                // Trigger history update if needed
+                self.handle_scroll_update().await?;
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 // Could implement click-to-position-cursor in future
@@ -1075,6 +1080,27 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                 // Apply the snapshot
                 self.grid_renderer.lock().await.apply_snapshot(grid);
             }
+            ServerMessage::HistoryInfo { 
+                oldest_line, 
+                latest_line, 
+                total_lines, 
+                oldest_timestamp, 
+                latest_timestamp,
+                ..
+            } => {
+                // Update history metadata in grid renderer
+                use crate::subscription::HistoryMetadata;
+                let metadata = HistoryMetadata {
+                    oldest_line,
+                    latest_line,
+                    total_lines,
+                    oldest_timestamp: oldest_timestamp.and_then(|ts| 
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)),
+                    latest_timestamp: latest_timestamp.and_then(|ts| 
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)),
+                };
+                self.grid_renderer.lock().await.set_history_metadata(metadata);
+            }
             ServerMessage::Error { code, message, .. } => {
                 // Handle error - potentially trigger reconnect
                 // eprintln!("Server error {}: {}", code.0, message);
@@ -1225,29 +1251,57 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
     
     /// Handle scroll position updates to update overscan subscription
     async fn handle_scroll_update(&self) -> Result<()> {
-        // Get current overscan parameters from grid renderer
-        let (from_line, height) = self.grid_renderer.lock().await.get_overscan_params();
+        let mut grid_renderer = self.grid_renderer.lock().await;
         
-        // Send ModifySubscription message to update view position
-        let modify_msg = ClientMessage::ModifySubscription {
-            subscription_id: self.subscription_id.clone(),
-            dimensions: Some(Dimensions { 
-                width: self.grid_renderer.lock().await.server_width, 
-                height 
-            }),
-            mode: Some(ViewMode::Historical),
-            position: Some(ViewPosition {
-                time: None,
-                line: Some(from_line),
-                offset: None,
-            }),
-        };
+        // Check if we need to fetch history
+        if let Some(history_request) = grid_renderer.calculate_history_needs() {
+            // Enter historical mode if not already in it
+            if !grid_renderer.is_historical_mode() {
+                // Get current line position from grid
+                let current_line = grid_renderer.grid.end_line.to_u64()
+                    .unwrap_or(0);
+                grid_renderer.enter_historical_mode(current_line);
+            }
+            
+            // Send ModifySubscription message to request historical view
+            let modify_msg = ClientMessage::ModifySubscription {
+                subscription_id: self.subscription_id.clone(),
+                dimensions: Some(Dimensions { 
+                    width: grid_renderer.server_width, 
+                    height: grid_renderer.server_height 
+                }),
+                mode: Some(ViewMode::Historical),
+                position: Some(ViewPosition {
+                    time: None,
+                    line: Some(history_request.start_line),
+                    offset: None,
+                }),
+            };
+            
+            let app_msg = AppMessage::Protocol {
+                message: serde_json::to_value(&modify_msg)?,
+            };
+            
+            self.session.write().await.send_to_server(app_msg).await?;
+        } else if grid_renderer.scroll_offset == 0 && grid_renderer.is_historical_mode() {
+            // Return to realtime mode when scrolled back to bottom
+            grid_renderer.enter_realtime_mode();
+            
+            // Send ModifySubscription to return to realtime
+            let modify_msg = ClientMessage::ModifySubscription {
+                subscription_id: self.subscription_id.clone(),
+                dimensions: None, // Keep current dimensions
+                mode: Some(ViewMode::Realtime),
+                position: None,
+            };
+            
+            let app_msg = AppMessage::Protocol {
+                message: serde_json::to_value(&modify_msg)?,
+            };
+            
+            self.session.write().await.send_to_server(app_msg).await?;
+        }
         
-        let app_msg = AppMessage::Protocol {
-            message: serde_json::to_value(&modify_msg)?,
-        };
-        
-        self.session.write().await.send_to_server(app_msg).await?;
         Ok(())
     }
     

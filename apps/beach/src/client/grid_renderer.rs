@@ -1,6 +1,7 @@
 /// Grid renderer for terminal client
 /// Maintains local terminal grid matching server dimensions
 use crate::server::terminal_state::{Grid, GridDelta, Cell, Color};
+use crate::subscription::HistoryMetadata;
 use crossterm::terminal;
 use ratatui::{
     layout::{Constraint, Direction, Layout},
@@ -9,7 +10,26 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
+use std::collections::{BTreeMap, HashSet};
 use std::io;
+
+/// Historical line data for cache
+#[derive(Clone, Debug)]
+pub struct HistoryLine {
+    /// The actual cell content
+    pub cells: Vec<Cell>,
+    /// Absolute line number in terminal history
+    pub line_number: u64,
+}
+
+/// Request for historical lines
+#[derive(Clone, Debug)]
+pub struct HistoryRequest {
+    /// Start line number (inclusive)
+    pub start_line: u64,
+    /// End line number (inclusive)
+    pub end_line: u64,
+}
 
 /// Manages the local terminal grid and rendering
 pub struct GridRenderer {
@@ -21,11 +41,24 @@ pub struct GridRenderer {
     local_width: u16,
     local_height: u16,
     
-    /// Current grid state
+    /// Current grid state (realtime view)
     pub grid: Grid,
     
+    /// History cache for scrollback (line_number -> HistoryLine)
+    history_cache: BTreeMap<u64, HistoryLine>,
+    
+    /// Pending history requests to avoid duplicates
+    pending_requests: HashSet<String>,
+    
+    /// History metadata from server
+    history_metadata: Option<HistoryMetadata>,
+    
+    /// Current view line number (for historical mode)
+    /// None = realtime mode, Some(n) = viewing from line n
+    view_line: Option<u64>,
+    
     /// Vertical scroll position (0 = bottom of output)
-    scroll_offset: u16,
+    pub scroll_offset: u16,
     
     /// Horizontal scroll position (for when local < server width)
     horizontal_offset: u16,
@@ -53,6 +86,10 @@ impl GridRenderer {
             local_width,
             local_height,
             grid,
+            history_cache: BTreeMap::new(),
+            pending_requests: HashSet::new(),
+            history_metadata: None,
+            view_line: None,
             scroll_offset: 0,
             horizontal_offset: 0,
             overscan_buffer: Vec::new(),
@@ -73,9 +110,30 @@ impl GridRenderer {
         self.server_width = snapshot.width;
         self.server_height = snapshot.height;
         
+        // Check if this is a historical snapshot
+        let is_historical = self.view_line.is_some();
+        
+        // If this is a historical snapshot, add lines to cache
+        if is_historical {
+            // Extract lines from the snapshot and add to cache
+            let start_line = snapshot.start_line.to_u64().unwrap_or(0);
+            for (i, row) in snapshot.cells.iter().enumerate() {
+                let line_num = start_line + i as u64;
+                let history_line = HistoryLine {
+                    cells: row.clone(),
+                    line_number: line_num,
+                };
+                self.history_cache.insert(line_num, history_line);
+            }
+        }
+        
         self.grid = snapshot.clone();
         self.last_snapshot = Some(snapshot);
-        self.scroll_offset = 0; // Reset to bottom
+        
+        // Only reset scroll offset if we're in realtime mode
+        if !is_historical {
+            self.scroll_offset = 0;
+        }
     }
     
     /// Apply a delta to the current grid
@@ -125,26 +183,44 @@ impl GridRenderer {
         // Delta convention:
         // Positive delta = scroll content up (view earlier/older content)
         // Negative delta = scroll content down (view later/newer content)
-        // scroll_offset = 0 means showing from row 0 (top/oldest)
-        // Higher offset means we've scrolled down to show later rows
         
-        // Calculate visible height (accounting for status line)
-        let visible_height = (self.local_height - 1) as usize;
-        
-        // Calculate max scroll - can't scroll past the last row
-        let grid_height = self.grid.cells.len();
-        let max_scroll = grid_height.saturating_sub(visible_height) as u16;
-        
-        // Apply delta
-        let new_offset = if delta > 0 {
-            // Positive delta - scroll up to show earlier content (decrease offset)
-            self.scroll_offset.saturating_sub(delta as u16)
+        // If we have history metadata, use it to determine scroll bounds
+        if let Some(metadata) = &self.history_metadata {
+            // We can scroll through the entire history
+            let current_line = self.grid.end_line.to_u64().unwrap_or(metadata.latest_line);
+            
+            if delta > 0 {
+                // Scrolling up (viewing older content)
+                // Increase scroll offset to show earlier lines
+                self.scroll_offset = self.scroll_offset.saturating_add(delta as u16);
+                
+                // Calculate target line
+                let target_line = current_line.saturating_sub(self.scroll_offset as u64);
+                
+                // Don't scroll past the oldest line
+                if target_line < metadata.oldest_line {
+                    let max_offset = (current_line - metadata.oldest_line) as u16;
+                    self.scroll_offset = max_offset;
+                }
+            } else {
+                // Scrolling down (viewing newer content)
+                // Decrease scroll offset
+                self.scroll_offset = self.scroll_offset.saturating_sub(delta.abs() as u16);
+            }
         } else {
-            // Negative delta - scroll down to show later content (increase offset)  
-            (self.scroll_offset + delta.abs() as u16).min(max_scroll)
-        };
-        
-        self.scroll_offset = new_offset;
+            // No history metadata, fall back to grid-based scrolling
+            let visible_height = (self.local_height - 1) as usize;
+            let grid_height = self.grid.cells.len();
+            let max_scroll = grid_height.saturating_sub(visible_height) as u16;
+            
+            let new_offset = if delta > 0 {
+                self.scroll_offset.saturating_add(delta as u16).min(max_scroll)
+            } else {
+                self.scroll_offset.saturating_sub(delta.abs() as u16)
+            };
+            
+            self.scroll_offset = new_offset;
+        }
     }
     
     /// Scroll horizontally (when local width < server width)
@@ -171,6 +247,87 @@ impl GridRenderer {
     /// Update the from_line based on scroll position
     pub fn update_from_line(&mut self, new_from_line: u64) {
         self.from_line = new_from_line;
+    }
+    
+    /// Update history metadata from server
+    pub fn set_history_metadata(&mut self, metadata: HistoryMetadata) {
+        self.history_metadata = Some(metadata);
+    }
+    
+    /// Add historical lines to cache
+    pub fn add_history_lines(&mut self, lines: Vec<HistoryLine>) {
+        for line in lines {
+            self.history_cache.insert(line.line_number, line);
+        }
+    }
+    
+    /// Calculate what history needs to be fetched for current scroll position
+    pub fn calculate_history_needs(&self) -> Option<HistoryRequest> {
+        // If we don't have metadata, we can't request history
+        let metadata = self.history_metadata.as_ref()?;
+        
+        // If in realtime mode and at bottom, no history needed
+        if self.view_line.is_none() && self.scroll_offset == 0 {
+            return None;
+        }
+        
+        // Calculate the range of lines we need
+        let visible_height = self.local_height.saturating_sub(1) as u64; // Account for status line
+        let prefetch_distance = 100; // Prefetch 100 lines ahead/behind
+        
+        // Determine the target line based on scroll position
+        let target_line = if let Some(view_line) = self.view_line {
+            // Already in historical mode
+            view_line.saturating_sub(self.scroll_offset as u64)
+        } else {
+            // Calculate from current grid's line numbers
+            let current_top_line = self.grid.start_line.to_u64().unwrap_or(metadata.latest_line);
+            current_top_line.saturating_sub(self.scroll_offset as u64)
+        };
+        
+        // Calculate range with prefetch
+        let start_line = target_line.saturating_sub(prefetch_distance);
+        let end_line = (target_line + visible_height + prefetch_distance)
+            .min(metadata.latest_line);
+        
+        // Check what we're missing in this range
+        let mut missing_start = None;
+        let mut missing_end = None;
+        
+        for line_num in start_line..=end_line {
+            if !self.history_cache.contains_key(&line_num) {
+                if missing_start.is_none() {
+                    missing_start = Some(line_num);
+                }
+                missing_end = Some(line_num);
+            }
+        }
+        
+        // If we have missing lines, request them
+        if let (Some(start), Some(end)) = (missing_start, missing_end) {
+            Some(HistoryRequest {
+                start_line: start,
+                end_line: end,
+            })
+        } else {
+            None
+        }
+    }
+    
+    /// Switch to historical view mode at a specific line
+    pub fn enter_historical_mode(&mut self, line_number: u64) {
+        self.view_line = Some(line_number);
+    }
+    
+    /// Return to realtime mode
+    pub fn enter_realtime_mode(&mut self) {
+        self.view_line = None;
+        self.scroll_offset = 0;
+    }
+    
+    /// Check if we're in historical view mode
+    pub fn is_historical_mode(&self) -> bool {
+        self.view_line.is_some()
     }
     
     /// Render the grid to a ratatui frame with optional predictive underlines

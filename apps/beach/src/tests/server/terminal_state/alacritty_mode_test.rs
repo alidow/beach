@@ -4,7 +4,7 @@ use crate::server::terminal_state::AlacrittyTerminal;
 #[cfg(feature = "alacritty-backend")]
 #[test]
 fn test_alacritty_line_feed_mode() {
-    let mut terminal = AlacrittyTerminal::new(80, 24, None).unwrap();
+    let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();
     
     // Process "Line 1\nLine 2"
     terminal.process_output(b"Line 1\nLine 2").unwrap();

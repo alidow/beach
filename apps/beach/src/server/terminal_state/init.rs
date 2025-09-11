@@ -60,7 +60,7 @@ impl TerminalInitializer {
         if let Ok(term_program) = env::var("TERM_PROGRAM") {
             // Terminal.app on macOS
             if term_program == "Apple_Terminal" {
-                if let Ok(profile) = env::var("TERM_PROGRAM_VERSION") {
+                if let Ok(_profile) = env::var("TERM_PROGRAM_VERSION") {
                     // Could check profile for theme hints
                 }
             }

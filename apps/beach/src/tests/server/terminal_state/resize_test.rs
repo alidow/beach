@@ -5,7 +5,7 @@ use chrono::Utc;
 #[test]
 fn test_terminal_resize_preserves_content() {
     // Create an AlacrittyTerminal with initial content
-    let mut terminal = AlacrittyTerminal::new(80, 24, None).unwrap();
+    let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();
     
     // Write some content
     let content = b"Line 1: Hello World\r\nLine 2: Testing resize\r\nLine 3: Content preservation";
@@ -61,7 +61,7 @@ fn test_terminal_resize_preserves_content() {
 
 #[test]
 fn test_resize_creates_dimension_change_delta() {
-    let mut terminal = AlacrittyTerminal::new(80, 24, None).unwrap();
+    let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();
     
     // Clear history
     {
@@ -100,7 +100,7 @@ fn test_resize_creates_dimension_change_delta() {
 
 #[test]
 fn test_resize_no_op_when_same_dimensions() {
-    let mut terminal = AlacrittyTerminal::new(80, 24, None).unwrap();
+    let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();
     
     // Process some content
     terminal.process_output(b"Test content").unwrap();
@@ -122,7 +122,7 @@ fn test_resize_no_op_when_same_dimensions() {
 
 #[test]
 fn test_multiple_resizes_tracked_correctly() {
-    let mut terminal = AlacrittyTerminal::new(80, 24, None).unwrap();
+    let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();
     
     // Clear history
     {
@@ -162,7 +162,7 @@ fn test_multiple_resizes_tracked_correctly() {
 
 #[test]
 fn test_resize_timing_in_output_sequence() {
-    let mut terminal = AlacrittyTerminal::new(80, 24, None).unwrap();
+    let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();
     
     // Clear history
     {
@@ -242,7 +242,7 @@ fn test_grid_view_respects_resize() {
 
 #[test]
 fn test_resize_with_content_at_boundaries() {
-    let mut terminal = AlacrittyTerminal::new(80, 24, None).unwrap();
+    let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();
     
     // Write content at the right edge
     let mut edge_content = vec![b' '; 79];
@@ -276,7 +276,7 @@ fn test_resize_with_content_at_boundaries() {
 #[test]
 fn test_resize_race_condition_simulation() {
     // This test simulates what happens when resize occurs between output chunks
-    let mut terminal = AlacrittyTerminal::new(80, 24, None).unwrap();
+    let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();
     
     // Simulate output being processed in chunks with resize in between
     terminal.process_output(b"First chunk of").unwrap();

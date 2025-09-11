@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 /// Create a test terminal backend based on features
 pub fn create_test_terminal(width: u16, height: u16) -> Box<dyn TerminalBackend> {
-    create_terminal_backend(width, height, None).expect("Failed to create terminal backend")
+    create_terminal_backend(width, height, None, None).expect("Failed to create terminal backend")
 }
 
 /// Helper struct to work with any backend in tests

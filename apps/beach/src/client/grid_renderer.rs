@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color as RatatuiColor, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 use std::collections::{BTreeMap, HashSet};
@@ -71,11 +71,14 @@ pub struct GridRenderer {
     
     /// Last rendered snapshot for resilience
     last_snapshot: Option<Grid>,
+    
+    /// Whether to show the debug size status line
+    debug_size: bool,
 }
 
 impl GridRenderer {
     /// Create a new grid renderer
-    pub fn new(server_width: u16, server_height: u16) -> io::Result<Self> {
+    pub fn new(server_width: u16, server_height: u16, debug_size: bool) -> io::Result<Self> {
         let (local_width, local_height) = terminal::size()?;
         
         let grid = Grid::new(server_width, server_height);
@@ -95,6 +98,7 @@ impl GridRenderer {
             overscan_buffer: Vec::new(),
             from_line: 0,
             last_snapshot: None,
+            debug_size,
         })
     }
     
@@ -334,74 +338,162 @@ impl GridRenderer {
     pub fn render(&self, frame: &mut Frame, predictions: &[(u16, u16)]) {
         let area = frame.area();
         
-        // Create main layout
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(1), // Status line
-            ])
-            .split(area);
+        // Check if we should show the status line (only when debug flag is set)
+        let show_status_line = self.debug_size;
+        
+        // Create main layout based on whether we show status line
+        let chunks = if show_status_line {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(1),
+                    Constraint::Length(1), // Status line
+                ])
+                .split(area)
+        } else {
+            // Use entire area for content when status line is hidden
+            std::rc::Rc::from(vec![area])
+        };
         
         // Render the terminal content with predictions
         // Pass the actual content area height so we render the right number of lines
-        let content = self.render_content_with_predictions_for_area(predictions, chunks[0].height);
+        let (content, render_start) = self.render_content_with_predictions_for_area_with_offset(predictions, chunks[0].height);
+        // Disable wrapping for sanity check: each grid row maps to exactly one drawn row
         let paragraph = Paragraph::new(content)
-            .block(Block::default().borders(Borders::NONE))
-            .wrap(Wrap { trim: false });
+            .block(Block::default().borders(Borders::NONE));
         frame.render_widget(paragraph, chunks[0]);
         
-        // Render status line
-        let status = self.render_status_line();
-        frame.render_widget(status, chunks[1]);
+        // Render cursor if visible
+        if self.grid.cursor.visible && self.scroll_offset == 0 {
+            // Calculate the cursor position accounting for scrolling
+            let cursor_row = self.grid.cursor.row;
+            let cursor_col = self.grid.cursor.col;
+            
+            // Calculate visible range
+            let visible_height = chunks[0].height as usize;
+            
+            // Check if cursor is within visible area using the actual render_start from content rendering
+            if cursor_row as usize >= render_start && (cursor_row as usize) < render_start + visible_height {
+                // Calculate screen position
+                let screen_row = cursor_row as usize - render_start;
+                let screen_col = cursor_col.saturating_sub(self.horizontal_offset);
+                
+                // Only set cursor if it's within the visible horizontal range
+                if screen_col < self.local_width {
+                    frame.set_cursor_position((
+                        chunks[0].x + screen_col,
+                        chunks[0].y + screen_row as u16,
+                    ));
+                }
+            }
+        }
+        
+        // Render status line only if debug flag is set
+        if show_status_line && chunks.len() > 1 {
+            let status = self.render_status_line();
+            frame.render_widget(status, chunks[1]);
+        }
     }
     
     /// Render the grid content as text with predictive underlines for specific area height
     fn render_content_with_predictions_for_area(&self, predictions: &[(u16, u16)], area_height: u16) -> Text<'static> {
         let mut lines = Vec::new();
         
-        // Debug output to file
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/render-debug.log") {
-            use std::io::Write;
-            let _ = writeln!(file, "=== Render Debug ===");
-            let _ = writeln!(file, "area_height: {}", area_height);
-            let _ = writeln!(file, "grid.cells.len(): {}", self.grid.cells.len());
-            let _ = writeln!(file, "local_height: {}", self.local_height);
-            let _ = writeln!(file, "scroll_offset: {}", self.scroll_offset);
+        let render_debug_enabled = std::env::var("BEACH_RENDER_DEBUG").ok().is_some();
+        // Debug output to file (gated)
+        if render_debug_enabled {
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/render-debug.log") {
+                use std::io::Write;
+                let _ = writeln!(file, "=== Render Debug ===");
+                let _ = writeln!(file, "area_height: {}", area_height);
+                let _ = writeln!(file, "grid.cells.len(): {}", self.grid.cells.len());
+                let _ = writeln!(file, "local_height: {}", self.local_height);
+                let _ = writeln!(file, "scroll_offset: {}", self.scroll_offset);
+            }
         }
         
         // Use the actual area height for visible rows
         let visible_height = area_height as usize;
         
         // Calculate starting row
-        // IMPORTANT: In terminal grids, content often starts at the bottom with empty rows above
-        // We should always show from row 0 unless we're scrolling
+        // IMPORTANT: Terminals anchor content at the BOTTOM, not the top
+        // When scroll_offset = 0, we should show the bottom-most content
         let grid_height = self.grid.cells.len();
         
-        // Always start from the beginning unless scrolled
-        let start_row = self.scroll_offset as usize;
+        // Determine start row based on content and scrolling
+        // Bottom-anchor the view like a terminal: when scroll_offset = 0, show the latest content
+        let start_row = if grid_height > visible_height {
+            let bottom_start = grid_height - visible_height;
+            bottom_start.saturating_sub(self.scroll_offset as usize)
+        } else {
+            0
+        };
         
-        let end_row = (start_row + visible_height).min(grid_height);
-        
-        // More debug output
-        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/render-debug.log") {
-            use std::io::Write;
-            let _ = writeln!(file, "visible_height: {}", visible_height);
-            let _ = writeln!(file, "start_row: {}", start_row);
-            let _ = writeln!(file, "end_row: {}", end_row);
-            let _ = writeln!(file, "Rendering rows {} to {}", start_row, end_row);
+        let mut render_start = start_row;
+        let mut render_end = (render_start + visible_height).min(grid_height);
+
+        // Reduce excess trailing blank rows at the bottom of the viewport
+        // to a maximum of 1 by shifting the window up when possible.
+        // This avoids showing an extra blank line visually compared to server terminals.
+        if render_end > render_start {
+            // Count trailing blank rows in current window
+            let mut trailing_blanks = 0usize;
+            'scan: for row_idx in (render_start..render_end).rev() {
+                if let Some(row) = self.grid.cells.get(row_idx) {
+                    let is_blank = row.iter().all(|cell| {
+                        let ch = cell.char;
+                        ch == ' ' || ch == '\0' || ch == '\u{00A0}'
+                    });
+                    if is_blank {
+                        trailing_blanks += 1;
+                    } else {
+                        break 'scan;
+                    }
+                } else {
+                    // Treat missing rows as blank
+                    trailing_blanks += 1;
+                }
+            }
+
+            if trailing_blanks > 1 {
+                // Shift window up by the extra blank count (leave 1 blank at bottom)
+                let extra = trailing_blanks - 1;
+                let shift = extra.min(render_start);
+                if shift > 0 {
+                    // Safe to shift the viewport up
+                    render_start -= shift;
+                    render_end -= shift;
+                }
+            }
         }
         
-        for row_idx in start_row..end_row {
+        // More debug output (gated)
+        if render_debug_enabled {
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/render-debug.log") {
+                use std::io::Write;
+                let _ = writeln!(file, "visible_height: {}", visible_height);
+                let _ = writeln!(file, "start_row: {}", render_start);
+                let _ = writeln!(file, "end_row: {}", render_end);
+                let _ = writeln!(file, "Rendering rows {} to {}", render_start, render_end);
+            }
+        }
+
+        // Detect a rule line (heavy box drawing) within the render window and log a small seam window
+        // Note: This is diagnostic-only to catch potential visual double-blanks
+        let mut rule_row_abs: Option<u16> = None;
+        
+        for row_idx in render_start..render_end {
             if let Some(row) = self.grid.cells.get(row_idx) {
                 let mut spans = Vec::new();
                 
                 // Debug: Log first few chars of each row
-                if row_idx < 3 {
-                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/render-debug.log") {
-                        use std::io::Write;
-                        let row_text: String = row.iter().take(40).map(|c| c.char).collect();
-                        let _ = writeln!(file, "Row {}: '{}'", row_idx, row_text.trim_end());
+                if render_debug_enabled {
+                    if row_idx < 3 {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/render-debug.log") {
+                            use std::io::Write;
+                            let row_text: String = row.iter().take(40).map(|c| c.char).collect();
+                            let _ = writeln!(file, "Row {}: '{}'", row_idx, row_text.trim_end());
+                        }
                     }
                 }
                 
@@ -409,12 +501,26 @@ impl GridRenderer {
                 let start_col = self.horizontal_offset as usize;
                 let end_col = (start_col + self.local_width as usize).min(row.len());
                 
+                // Build a small preview of row text for rule detection (first 120 chars)
+                if render_debug_enabled {
+                    let mut preview = String::new();
+                    for col in start_col..end_col.min(start_col + 120) {
+                        if let Some(cell) = row.get(col) {
+                            preview.push(cell.char);
+                        }
+                    }
+                    let trimmed = preview.trim_end();
+                    if trimmed.chars().filter(|&ch| ch == '─').count() > 10 {
+                        rule_row_abs.get_or_insert(row_idx as u16);
+                    }
+                }
+
                 for col_idx in start_col..end_col {
                     if let Some(cell) = row.get(col_idx) {
                         let mut style = cell_to_style(cell);
                         
                         // Apply underline if this position has a prediction
-                        let row_pos = row_idx - start_row;
+                        let row_pos = row_idx - render_start;
                         let col_pos = col_idx - start_col;
                         if predictions.contains(&(col_pos as u16, row_pos as u16)) {
                             style = style.add_modifier(Modifier::UNDERLINED);
@@ -429,8 +535,185 @@ impl GridRenderer {
                 lines.push(Line::from(""));
             }
         }
+
+        // If we found a rule row, log a seam window around it for visual debugging
+        if render_debug_enabled {
+            if let Some(r_abs) = rule_row_abs {
+                let start = r_abs.saturating_sub(2);
+                let end = (r_abs + 2).min(self.grid.height.saturating_sub(1));
+                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/render-debug.log") {
+                    use std::io::Write;
+                    let _ = writeln!(file, "Seam window around rule at row {} (abs):", r_abs);
+                    for row in start..=end {
+                        let mut line_text = String::new();
+                        for col in 0..self.grid.width.min(120) {
+                            if let Some(cell) = self.grid.get_cell(row, col) { line_text.push(cell.char); }
+                        }
+                        let _ = writeln!(file, "  Row {}: '{}'", row, line_text.trim_end());
+                    }
+                }
+            }
+        }
         
         Text::from(lines)
+    }
+    
+    /// Render the grid content as text with predictive underlines for specific area height, returning the render offset
+    fn render_content_with_predictions_for_area_with_offset(&self, predictions: &[(u16, u16)], area_height: u16) -> (Text<'static>, usize) {
+        let mut lines = Vec::new();
+        
+        let render_debug_enabled = std::env::var("BEACH_RENDER_DEBUG").ok().is_some();
+        // Debug output to file (gated)
+        if render_debug_enabled {
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/render-debug.log") {
+                use std::io::Write;
+                let _ = writeln!(file, "=== Render Debug ===");
+                let _ = writeln!(file, "area_height: {}", area_height);
+                let _ = writeln!(file, "grid.cells.len(): {}", self.grid.cells.len());
+                let _ = writeln!(file, "local_height: {}", self.local_height);
+                let _ = writeln!(file, "scroll_offset: {}", self.scroll_offset);
+            }
+        }
+        
+        // Use the actual area height for visible rows
+        let visible_height = area_height as usize;
+        
+        // Calculate starting row
+        // IMPORTANT: Terminals anchor content at the BOTTOM, not the top
+        // When scroll_offset = 0, we should show the bottom-most content
+        let grid_height = self.grid.cells.len();
+        
+        // Determine start row based on content and scrolling
+        // Bottom-anchor the view like a terminal: when scroll_offset = 0, show the latest content
+        let start_row = if grid_height > visible_height {
+            let bottom_start = grid_height - visible_height;
+            bottom_start.saturating_sub(self.scroll_offset as usize)
+        } else {
+            0
+        };
+        
+        let mut render_start = start_row;
+        let mut render_end = (render_start + visible_height).min(grid_height);
+        
+        // Adjust viewport to reduce trailing blank lines
+        if self.scroll_offset == 0 && grid_height > visible_height {
+            // Count trailing blank lines
+            let mut trailing_blanks = 0;
+            'scan: for row_idx in (render_start..render_end).rev() {
+                if let Some(row) = self.grid.cells.get(row_idx) {
+                    let is_blank = row.iter().all(|cell| {
+                        let ch = cell.char;
+                        ch == ' ' || ch == '\0' || ch == '\u{00A0}'
+                    });
+                    if is_blank {
+                        trailing_blanks += 1;
+                    } else {
+                        break 'scan;
+                    }
+                } else {
+                    // Treat missing rows as blank
+                    trailing_blanks += 1;
+                }
+            }
+
+            if trailing_blanks > 1 {
+                // Shift window up by the extra blank count (leave 1 blank at bottom)
+                let extra = trailing_blanks - 1;
+                let shift = extra.min(render_start);
+                if shift > 0 {
+                    // Safe to shift the viewport up
+                    render_start -= shift;
+                    render_end -= shift;
+                }
+            }
+        }
+        
+        // More debug output (gated)
+        if render_debug_enabled {
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/render-debug.log") {
+                use std::io::Write;
+                let _ = writeln!(file, "visible_height: {}", visible_height);
+                let _ = writeln!(file, "start_row: {}", render_start);
+                let _ = writeln!(file, "end_row: {}", render_end);
+                let _ = writeln!(file, "Rendering rows {} to {}", render_start, render_end);
+            }
+        }
+
+        // Detect a rule line (heavy box drawing) within the render window and log a small seam window
+        // Note: This is diagnostic-only to catch potential visual double-blanks
+        let mut rule_row_abs: Option<u16> = None;
+        
+        for row_idx in render_start..render_end {
+            if let Some(row) = self.grid.cells.get(row_idx) {
+                let mut spans = Vec::new();
+                
+                // Debug: Log first few chars of each row
+                if render_debug_enabled {
+                    if row_idx < 3 {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/render-debug.log") {
+                            use std::io::Write;
+                            let _ = writeln!(file, "Row {}: '{}...{}'", 
+                                row_idx,
+                                row.iter().take(5).map(|c| c.char).collect::<String>(),
+                                row.iter().rev().take(5).map(|c| c.char).collect::<String>()
+                            );
+                        }
+                    }
+                }
+                
+                // Detect box drawing rule line (for debug logging)
+                let has_rule = row.iter().any(|cell| {
+                    let ch = cell.char;
+                    ch == '━' || ch == '═' || ch == '─'
+                });
+                
+                if has_rule && rule_row_abs.is_none() {
+                    rule_row_abs = Some(row_idx as u16);
+                }
+                
+                for (col_idx, cell) in row.iter().enumerate() {
+                    let ch = if cell.char == '\0' { ' ' } else { cell.char };
+                    let mut style = cell_to_style(cell);
+                    
+                    // Check if this position is in the predictions list and apply underline
+                    let should_underline = predictions.iter().any(|&(pred_row, pred_col)| {
+                        pred_row as usize == row_idx && pred_col as usize == col_idx
+                    });
+                    
+                    if should_underline {
+                        style = style.add_modifier(Modifier::UNDERLINED);
+                    }
+                    
+                    spans.push(Span::styled(ch.to_string(), style));
+                }
+                
+                lines.push(Line::from(spans));
+            } else {
+                // Empty line for missing rows
+                lines.push(Line::from(""));
+            }
+        }
+        
+        // Log seam window around rule lines for diagnostic purposes (gated)
+        if render_debug_enabled {
+            if let Some(r_abs) = rule_row_abs {
+                let start = r_abs.saturating_sub(2);
+                let end = (r_abs + 2).min(self.grid.height - 1);
+                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/render-debug.log") {
+                    use std::io::Write;
+                    let _ = writeln!(file, "Seam window around rule at row {} (abs):", r_abs);
+                    for row in start..=end {
+                        let mut line_text = String::new();
+                        for col in 0..self.grid.width.min(120) {
+                            if let Some(cell) = self.grid.get_cell(row, col) { line_text.push(cell.char); }
+                        }
+                        let _ = writeln!(file, "  Row {}: '{}'", row, line_text.trim_end());
+                    }
+                }
+            }
+        }
+        
+        (Text::from(lines), render_start)
     }
     
     /// Render the grid content as text with predictive underlines (legacy)

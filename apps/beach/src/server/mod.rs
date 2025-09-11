@@ -36,7 +36,8 @@ pub struct TerminalServer<T: Transport + Send + 'static> {
     stdin_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     terminal_backend: Arc<Mutex<Box<dyn TerminalBackend>>>,
     debug_handler: Arc<DebugHandler>,
-    debug_recorder: Arc<Mutex<Option<String>>>,
+    debug_recorder: Arc<Mutex<Option<Arc<Mutex<crate::debug_recorder::DebugRecorder>>>>>,
+    debug_recorder_path: Arc<Mutex<Option<String>>>,
     debug_log: Arc<Mutex<Option<std::fs::File>>>,
     delta_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Sender<crate::server::terminal_state::GridDelta>>>>,
 }
@@ -75,10 +76,15 @@ impl<T: Transport + Send + 'static> TerminalServer<T> {
         
         // Create and attach the terminal data source
         use crate::server::terminal_state::TrackerDataSource;
-        let (data_source, delta_tx) = TrackerDataSource::new(
+        let (mut data_source, delta_tx) = TrackerDataSource::new(
             terminal_tracker.clone(),
             terminal_server.terminal_backend.clone(),
         );
+        
+        // Set debug recorder if available
+        if let Some(recorder) = terminal_server.debug_recorder.lock().unwrap().as_ref() {
+            data_source.set_debug_recorder(Some(recorder.clone()));
+        }
         
         // Log data source creation
         if let Some(debug_log) = &mut *terminal_server.debug_log.lock().unwrap() {
@@ -92,6 +98,11 @@ impl<T: Transport + Send + 'static> TerminalServer<T> {
         // Set debug log path if provided
         if let Some(ref path) = debug_log_path {
             subscription_hub.set_debug_log_path(path.clone()).await;
+        }
+        
+        // Set debug recorder if available
+        if let Some(recorder) = terminal_server.debug_recorder.lock().unwrap().as_ref() {
+            subscription_hub.set_debug_recorder(recorder.clone()).await;
         }
         
         // Store delta_tx for later use in spawn_pty_reader_with_resize
@@ -178,9 +189,35 @@ impl<T: Transport + Send + 'static> TerminalServer<T> {
             }
         };
         
+        // Create debug recorder if path provided (don't panic on failure)
+        let debug_recorder_arc: Option<Arc<Mutex<crate::debug_recorder::DebugRecorder>>> =
+            if let Some(path) = debug_recorder.as_ref() {
+                match crate::debug_recorder::DebugRecorder::new(path) {
+                    Ok(recorder) => Some(Arc::new(Mutex::new(recorder))),
+                    Err(e) => {
+                        // Log error and continue without debug recorder
+                        if let Some(ref log_file) = debug_log_file {
+                            if let Ok(log_file) = log_file.try_clone() {
+                                let mut log = log_file;
+                                use std::io::Write;
+                                let _ = writeln!(log, "[{}] Failed to create debug recorder: {}", 
+                                                 chrono::Utc::now().format("%H:%M:%S%.3f"), e);
+                            }
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        
         // Create terminal backend with DETECTED size, not hardcoded
-        let terminal_backend = create_terminal_backend(term_cols, term_rows, debug_log_file.as_ref())
-            .expect("Failed to create terminal backend");
+        let terminal_backend = create_terminal_backend(
+            term_cols, 
+            term_rows, 
+            debug_log_file.as_ref(),
+            debug_recorder_arc.clone()
+        ).expect("Failed to create terminal backend");
         let terminal_backend = Arc::new(Mutex::new(terminal_backend));
         let debug_handler = Arc::new(DebugHandler::new());
         
@@ -195,7 +232,8 @@ impl<T: Transport + Send + 'static> TerminalServer<T> {
             stdin_task: Arc::new(Mutex::new(None)),
             terminal_backend,
             debug_handler,
-            debug_recorder: Arc::new(Mutex::new(debug_recorder)),
+            debug_recorder: Arc::new(Mutex::new(debug_recorder_arc)),
+            debug_recorder_path: Arc::new(Mutex::new(debug_recorder.clone())),
             debug_log: Arc::new(Mutex::new(debug_log_file)),
             delta_tx: Arc::new(tokio::sync::Mutex::new(None)),
         })
@@ -293,19 +331,19 @@ impl<T: Transport + Send + 'static> Server for TerminalServer<T> {
         let _ = enable_raw_mode();
         
         // Start reading from PTY in a background task with terminal state tracking and resize support
-        let debug_recorder_path = self.debug_recorder.lock().unwrap().clone();
+        let debug_recorder = self.debug_recorder.lock().unwrap().clone();
         let delta_tx_clone = self.delta_tx.lock().await.clone();
         let read_task = spawn_pty_reader_with_resize(
             self.pty_manager.master_reader.clone(),
             self.terminal_backend.clone(),
             Arc::new(self.pty_manager.clone()),
-            debug_recorder_path,
+            debug_recorder,
             delta_tx_clone
         );
         *self.read_task.lock().unwrap() = Some(read_task);
         
         // Start reading from stdin and writing to PTY (using spawn_blocking for blocking I/O)
-        let stdin_recorder_path = self.debug_recorder.lock().unwrap().clone()
+        let stdin_recorder_path = self.debug_recorder_path.lock().unwrap().clone()
             .map(|p| p.replace(".log", ".stdin.log"));
         let stdin_task = spawn_stdin_reader(
             self.pty_manager.master_writer.clone(), 
@@ -396,8 +434,22 @@ impl<T: Transport + Send + 'static> TerminalServer<T> {
 
     /// Start server with optional wait for clients
     pub async fn start_with_wait(&self, wait_for_client: bool, wait_for_webrtc: bool, keep_alive: bool) {
+        // Log entry to start_with_wait
+        if let Some(ref mut debug_log) = *self.debug_log.lock().unwrap() {
+            use std::io::Write;
+            let _ = writeln!(debug_log, "[{}] Server: start_with_wait called - wait_for_client={}, wait_for_webrtc={}, keep_alive={}", 
+                             chrono::Utc::now().format("%H:%M:%S%.3f"), wait_for_client, wait_for_webrtc, keep_alive);
+        }
+        
         if wait_for_client || wait_for_webrtc {
             self.wait_for_connections(wait_for_webrtc).await;
+        }
+        
+        // Log before calling start
+        if let Some(ref mut debug_log) = *self.debug_log.lock().unwrap() {
+            use std::io::Write;
+            let _ = writeln!(debug_log, "[{}] Server: About to call start()", 
+                             chrono::Utc::now().format("%H:%M:%S%.3f"));
         }
         
         // Now start the server normally
@@ -449,7 +501,7 @@ impl<T: Transport + Send + Sync + 'static> ServerMessageHandler for TerminalServ
                                 if let Some(t) = session.get_webrtc_transport(from_peer).await {
                                     if t.is_connected() { transport_ready = Some(t); break; }
                                 }
-                                drop(&session);
+                                let _ = &session;
                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             }
                             if let Some(client_transport) = transport_ready {

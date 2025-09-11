@@ -4,7 +4,7 @@ fn test_pending_wrap_vs_immediate_wrap() {
     use crate::server::terminal_state::AlacrittyTerminal;
     
     // Test the specific PROMPT_EOL_MARK behavior on a 154-column terminal
-    let mut term = AlacrittyTerminal::new(154, 27, None).unwrap();
+    let mut term = AlacrittyTerminal::new(154, 27, None, None).unwrap();
     
     // First, output a line that doesn't end with newline to trigger PROMPT_EOL_MARK
     // Output "hello" which is 5 characters, putting cursor at column 5
@@ -113,7 +113,7 @@ fn test_wrap_at_exact_boundary() {
     use crate::server::terminal_state::AlacrittyTerminal;
     
     // Test wrap behavior when text exactly fills the line
-    let mut term = AlacrittyTerminal::new(10, 5, None).unwrap();
+    let mut term = AlacrittyTerminal::new(10, 5, None, None).unwrap();
     
     // Output exactly 10 characters (fills the line)
     term.process_output(b"0123456789").unwrap();

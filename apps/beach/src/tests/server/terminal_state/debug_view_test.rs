@@ -8,7 +8,7 @@ use chrono::Utc;
 #[test]
 fn test_basic_debug_view() {
     // Create a terminal and process some output
-    let backend = create_terminal_backend(80, 24, None).unwrap();
+    let backend = create_terminal_backend(80, 24, None, None).unwrap();
     let backend_arc = Arc::new(Mutex::new(backend));
     
     // Create debug handler and set backend
@@ -38,7 +38,7 @@ fn test_basic_debug_view() {
 
 #[test]
 fn test_debug_view_with_multiple_commands() {
-    let backend = create_terminal_backend(80, 24, None).unwrap();
+    let backend = create_terminal_backend(80, 24, None, None).unwrap();
     let backend_arc = Arc::new(Mutex::new(backend));
     
     let debug_handler = DebugHandler::new();
@@ -64,7 +64,7 @@ fn test_debug_view_with_multiple_commands() {
 
 #[test]
 fn test_debug_view_with_height_limit() {
-    let backend = create_terminal_backend(80, 24, None).unwrap();
+    let backend = create_terminal_backend(80, 24, None, None).unwrap();
     let backend_arc = Arc::new(Mutex::new(backend));
     
     let debug_handler = DebugHandler::new();
@@ -87,7 +87,7 @@ fn test_debug_view_with_height_limit() {
 
 #[test]
 fn test_debug_view_time_travel() {
-    let backend = create_terminal_backend(80, 24, None).unwrap();
+    let backend = create_terminal_backend(80, 24, None, None).unwrap();
     let backend_arc = Arc::new(Mutex::new(backend));
     
     let debug_handler = DebugHandler::new();
@@ -130,7 +130,7 @@ fn test_debug_view_time_travel() {
 
 #[test]
 fn test_debug_view_from_line() {
-    let backend = create_terminal_backend(80, 24, None).unwrap();
+    let backend = create_terminal_backend(80, 24, None, None).unwrap();
     let backend_arc = Arc::new(Mutex::new(backend));
     
     let debug_handler = DebugHandler::new();
@@ -156,7 +156,7 @@ fn test_debug_view_from_line() {
 
 #[test]
 fn test_debug_view_from_non_existent_line() {
-    let backend = create_terminal_backend(80, 24, None).unwrap();
+    let backend = create_terminal_backend(80, 24, None, None).unwrap();
     let backend_arc = Arc::new(Mutex::new(backend));
     
     let debug_handler = DebugHandler::new();
@@ -189,7 +189,7 @@ fn test_debug_view_from_non_existent_line() {
 
 #[test]
 fn test_debug_view_boundary_conditions() {
-    let backend = create_terminal_backend(80, 24, None).unwrap();
+    let backend = create_terminal_backend(80, 24, None, None).unwrap();
     let backend_arc = Arc::new(Mutex::new(backend));
     
     let debug_handler = DebugHandler::new();
@@ -222,7 +222,7 @@ fn test_debug_view_boundary_conditions() {
 
 #[test]
 fn test_debug_view_with_ansi_colors() {
-    let backend = create_terminal_backend(80, 24, None).unwrap();
+    let backend = create_terminal_backend(80, 24, None, None).unwrap();
     let backend_arc = Arc::new(Mutex::new(backend));
     
     let debug_handler = DebugHandler::new();
@@ -250,7 +250,7 @@ fn test_debug_view_with_ansi_colors() {
 
 #[test]
 fn test_line_tracking_across_scrolling() {
-    let backend = create_terminal_backend(80, 10, None).unwrap(); // Small terminal
+    let backend = create_terminal_backend(80, 10, None, None).unwrap(); // Small terminal
     let backend_arc = Arc::new(Mutex::new(backend));
     
     let debug_handler = DebugHandler::new();

@@ -53,7 +53,7 @@ impl<T: Transport + Send + 'static> SignalingTransport<T> {
                             if std::env::var("BEACH_VERBOSE").is_ok() {
                                 // eprintln!("🔍 [VERBOSE] Bridge: Sending {} bytes to transport", bytes.len());
                             }
-                            if let Err(e) = transport.send(&bytes).await {
+                            if let Err(_e) = transport.send(&bytes).await {
                                 if std::env::var("BEACH_VERBOSE").is_ok() {
                                     // eprintln!("🔍 [VERBOSE] Bridge: Failed to send: {}", e);
                                 }

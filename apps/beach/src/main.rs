@@ -12,8 +12,8 @@ use clap::Parser;
 use config::Config;
 use client::terminal_client::TerminalClient;
 use debug_log::DebugLogger;
-use server::{Server, TerminalServer};
-use transport::{TransportMode, webrtc::{WebRTCTransport, config::{WebRTCConfig, WebRTCConfigBuilder}}};
+use server::TerminalServer;
+use transport::{TransportMode, webrtc::{WebRTCTransport, config::WebRTCConfigBuilder}};
 
 #[derive(Parser, Debug)]
 #[command(name = "beach")]
@@ -41,6 +41,9 @@ struct Cli {
 
     #[arg(long, help = "Exit immediately after command finishes", default_value = "false")]
     exit_on_done: bool,
+
+    #[arg(long, help = "Show terminal size in status line", default_value = "false")]
+    debug_size: bool,
 
     // everything after `--`
     #[arg(trailing_var_arg = true)]
@@ -108,6 +111,7 @@ async fn main() {
             passphrase,
             cli.debug_log,
             cli.debug_recorder,
+            cli.debug_size,
         ).await {
             Ok(client) => {
                 client.start().await.unwrap_or_else(|e| {
@@ -170,8 +174,11 @@ async fn main() {
                 // Default behavior: wait for client, wait for WebRTC, keep alive
                 // Only skip if explicitly requested with --no-wait flags
                 let wait_for_client = !cli.no_wait;
-                let wait_for_webrtc = !cli.no_wait_webrtc;
-                let keep_alive = !cli.exit_on_done;
+                // If --no-wait is set, also skip WebRTC waiting
+                let wait_for_webrtc = !cli.no_wait && !cli.no_wait_webrtc;
+                // When --no-wait is used, don't keep alive (for local interactive use)
+                // unless --exit-on-done is explicitly false
+                let keep_alive = !cli.exit_on_done && !cli.no_wait;
                 server.start_with_wait(wait_for_client, wait_for_webrtc, keep_alive).await;
             }
             Err(e) => {

@@ -76,6 +76,22 @@ impl Grid {
         }
     }
     
+    /// Count the number of blank lines in the grid
+    pub fn count_blank_lines(&self) -> usize {
+        self.cells.iter().filter(|row| {
+            row.iter().all(|cell| cell.is_blank())
+        }).count()
+    }
+    
+    /// Get content distribution - returns a list of (row_index, has_content) pairs
+    /// to show where content vs blank lines are
+    pub fn get_content_distribution(&self) -> Vec<(u16, bool)> {
+        self.cells.iter().enumerate().map(|(row_idx, row)| {
+            let has_content = !row.iter().all(|cell| cell.is_blank());
+            (row_idx as u16, has_content)
+        }).collect()
+    }
+    
     /// Resize grid to new dimensions
     pub fn resize(&mut self, new_width: u16, new_height: u16) -> Result<(), crate::server::terminal_state::TerminalStateError> {
         if new_width == 0 || new_height == 0 {

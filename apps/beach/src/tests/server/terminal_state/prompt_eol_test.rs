@@ -4,7 +4,7 @@ fn test_prompt_eol_mark_sequence() {
     use crate::server::terminal_state::AlacrittyTerminal;
     
     // Create terminal with actual dimensions from the issue
-    let mut term = AlacrittyTerminal::new(154, 27, None).unwrap();
+    let mut term = AlacrittyTerminal::new(154, 27, None, None).unwrap();
     
     // Simulate: echo 'hi' followed by PROMPT_EOL_MARK with 153 spaces
     let mut sequence = Vec::new();

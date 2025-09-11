@@ -111,25 +111,35 @@ impl GridView {
     }
     
     /// Truncate grid to specified number of rows
+    /// Bottom-aligns the view: keeps the last `height` rows of the grid.
     fn truncate_to_height(&self, grid: Grid, height: u16) -> Result<Grid, TerminalStateError> {
         let mut new_grid = Grid::new(grid.width, height);
         new_grid.timestamp = grid.timestamp;
-        
-        // Copy only the first 'height' rows, preserving full width
-        for row in 0..height {
+
+        // Determine starting source row to keep the bottom `height` rows
+        let total = grid.height as usize;
+        let keep = height as usize;
+        let src_start = if total > keep { total - keep } else { 0 } as u16;
+
+        // Copy rows from src_start.. into destination 0..
+        for (dst_row, src_row) in (0..height).zip(src_start..grid.height) {
             for col in 0..grid.width {
-                if let Some(cell) = grid.get_cell(row, col) {
-                    new_grid.set_cell(row, col, cell.clone());
+                if let Some(cell) = grid.get_cell(src_row, col) {
+                    new_grid.set_cell(dst_row, col, cell.clone());
                 }
             }
         }
-        
+
         // Preserve cursor position (even if beyond visible area)
+        // Note: we keep the same semantics as before; cursor may be outside the visible window
         new_grid.cursor = grid.cursor.clone();
-        
-        new_grid.start_line = grid.start_line;
-        new_grid.end_line = grid.end_line;
-        
+
+        // Adjust line numbers to reflect the bottom-aligned slice
+        let end_line_u64 = grid.end_line.to_u64().unwrap_or_else(|| grid.height as u64 - 1);
+        let start_line_u64 = end_line_u64.saturating_sub(height as u64 - 1);
+        new_grid.start_line = LineCounter::from_u64(start_line_u64);
+        new_grid.end_line = LineCounter::from_u64(end_line_u64);
+
         Ok(new_grid)
     }
 }

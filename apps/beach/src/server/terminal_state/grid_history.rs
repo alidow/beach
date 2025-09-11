@@ -1,7 +1,9 @@
 use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use crate::server::terminal_state::{Grid, GridDelta, LineCounter, TerminalStateError};
+use crate::debug_recorder::{DebugRecorder, DebugEvent};
 
 #[derive(Debug)]
 pub struct GridHistory {
@@ -28,6 +30,9 @@ pub struct GridHistory {
     
     /// Configuration
     config: HistoryConfig,
+    
+    /// Optional debug recorder for logging delta applications
+    debug_recorder: Option<Arc<Mutex<DebugRecorder>>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -91,6 +96,10 @@ impl GridHistory {
     }
     
     pub fn new(initial_grid: Grid) -> Self {
+        Self::new_with_debug(initial_grid, None)
+    }
+    
+    pub fn new_with_debug(initial_grid: Grid, debug_recorder: Option<Arc<Mutex<DebugRecorder>>>) -> Self {
         let mut history = GridHistory {
             initial_grid: initial_grid.clone(),
             deltas: BTreeMap::new(),
@@ -100,6 +109,7 @@ impl GridHistory {
             current_sequence: 0,
             last_snapshot_time: initial_grid.timestamp,
             config: HistoryConfig::default(),
+            debug_recorder,
         };
         
         // Add initial grid as first snapshot
@@ -162,7 +172,7 @@ impl GridHistory {
     
     /// Get grid state containing a specific line number
     /// Note: This returns the grid that contains the line, not necessarily starting at the line
-    pub fn get_from_line(&self, line_num: u64) -> Result<Grid, TerminalStateError> {
+    pub fn get_from_line(&self, _line_num: u64) -> Result<Grid, TerminalStateError> {
         // For now, just return the current grid
         // The view shifting is handled by GridView::derive_from_line
         self.get_current()
@@ -178,10 +188,117 @@ impl GridHistory {
             .map(|(seq, grid)| (*seq, grid.clone()))
             .unwrap_or((0, self.initial_grid.clone()));
         
+        // Log the starting point for reconstruction
+        if let Some(ref recorder) = self.debug_recorder {
+            if let Ok(mut rec) = recorder.try_lock() {
+                let _ = rec.record_event(DebugEvent::Comment {
+                    timestamp: Utc::now(),
+                    text: format!(
+                        "reconstruct_from_sequence: Starting from seq {} (target {}), grid dims {}x{}, blank lines: {}",
+                        snapshot_seq, target_seq, grid.width, grid.height, grid.count_blank_lines()
+                    ),
+                });
+                
+                // Log content distribution at start
+                let content_dist = grid.get_content_distribution();
+                let content_lines: Vec<u16> = content_dist
+                    .iter()
+                    .filter(|(_, has_content)| *has_content)
+                    .map(|(row, _)| *row)
+                    .collect();
+                let _ = rec.record_event(DebugEvent::Comment {
+                    timestamp: Utc::now(),
+                    text: format!(
+                        "Starting content distribution: {} content lines at rows {:?}",
+                        content_lines.len(),
+                        &content_lines[..content_lines.len().min(10)]  // Show first 10
+                    ),
+                });
+            }
+        }
+        
         // Apply deltas from snapshot to target
         if snapshot_seq < target_seq {
-            for (_, delta) in self.deltas.range(snapshot_seq + 1..=target_seq) {
+            let delta_count = self.deltas.range(snapshot_seq + 1..=target_seq).count();
+            
+            // Log delta application summary
+            if let Some(ref recorder) = self.debug_recorder {
+                if let Ok(mut rec) = recorder.try_lock() {
+                    let _ = rec.record_event(DebugEvent::Comment {
+                        timestamp: Utc::now(),
+                        text: format!("Applying {} deltas from seq {} to {}", delta_count, snapshot_seq + 1, target_seq),
+                    });
+                }
+            }
+            
+            for (seq, delta) in self.deltas.range(snapshot_seq + 1..=target_seq) {
+                // Log delta application if debug recorder is available
+                if let Some(ref recorder) = self.debug_recorder {
+                    self.log_delta_application(recorder, &grid, delta, "reconstruct_from_sequence");
+                    
+                    // Log pre-application state for critical deltas
+                    if delta.cell_changes.len() > 100 || delta.dimension_change.is_some() {
+                        if let Ok(mut rec) = recorder.try_lock() {
+                            let _ = rec.record_event(DebugEvent::Comment {
+                                timestamp: Utc::now(),
+                                text: format!(
+                                    "Large delta at seq {}: {} cell changes, dimension change: {:?}",
+                                    seq, delta.cell_changes.len(), delta.dimension_change.is_some()
+                                ),
+                            });
+                        }
+                    }
+                }
+                
+                let blank_lines_before = grid.count_blank_lines();
                 delta.apply(&mut grid)?;
+                let blank_lines_after = grid.count_blank_lines();
+                
+                // Log if blank lines changed significantly
+                if blank_lines_after != blank_lines_before {
+                    if let Some(ref recorder) = self.debug_recorder {
+                        if let Ok(mut rec) = recorder.try_lock() {
+                            let _ = rec.record_event(DebugEvent::Comment {
+                                timestamp: Utc::now(),
+                                text: format!(
+                                    "Delta {} changed blank lines: {} -> {} (diff: {})",
+                                    seq, blank_lines_before, blank_lines_after, 
+                                    blank_lines_after as i32 - blank_lines_before as i32
+                                ),
+                            });
+                            
+                            // Log content distribution if there's a significant change
+                            if (blank_lines_after as i32 - blank_lines_before as i32).abs() > 3 {
+                                let content_dist = grid.get_content_distribution();
+                                let blank_rows: Vec<u16> = content_dist
+                                    .iter()
+                                    .filter(|(_, has_content)| !*has_content)
+                                    .map(|(row, _)| *row)
+                                    .collect();
+                                let _ = rec.record_event(DebugEvent::Comment {
+                                    timestamp: Utc::now(),
+                                    text: format!(
+                                        "New blank rows at: {:?}",
+                                        &blank_rows[..blank_rows.len().min(20)]  // Show first 20
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Log final state
+        if let Some(ref recorder) = self.debug_recorder {
+            if let Ok(mut rec) = recorder.try_lock() {
+                let _ = rec.record_event(DebugEvent::Comment {
+                    timestamp: Utc::now(),
+                    text: format!(
+                        "reconstruct_from_sequence: Completed. Final grid {}x{}, blank lines: {}",
+                        grid.width, grid.height, grid.count_blank_lines()
+                    ),
+                });
             }
         }
         
@@ -228,6 +345,109 @@ impl GridHistory {
         let snapshot_size = self.snapshots.len() * grid_size;
         let delta_size = self.deltas.len() * 200; // Average delta size
         snapshot_size + delta_size
+    }
+    
+    /// Log delta application for debugging
+    fn log_delta_application(
+        &self,
+        recorder: &Arc<Mutex<DebugRecorder>>,
+        grid: &Grid,
+        delta: &GridDelta,
+        context: &str,
+    ) {
+        // Count blank lines before applying delta
+        let blank_lines_before = self.count_blank_lines(grid);
+        
+        // Get sample of grid content before (first 5 lines)
+        let content_before: Vec<String> = (0..5.min(grid.height))
+            .map(|row| self.get_row_text(grid, row))
+            .collect();
+        
+        // Collect modified lines from cell changes
+        let mut modified_lines: Vec<u16> = delta.cell_changes
+            .iter()
+            .map(|c| c.row)
+            .collect();
+        modified_lines.sort();
+        modified_lines.dedup();
+        
+        // Create a temporary grid to count blank lines after
+        let mut temp_grid = grid.clone();
+        let _ = delta.apply(&mut temp_grid);
+        let blank_lines_after = self.count_blank_lines(&temp_grid);
+        
+        // Get sample of grid content after (first 5 lines)
+        let content_after: Vec<String> = (0..5.min(temp_grid.height))
+            .map(|row| self.get_row_text(&temp_grid, row))
+            .collect();
+        
+        // Prepare dimension change info
+        let dimension_change = delta.dimension_change.as_ref().map(|dc| {
+            (dc.old_width, dc.old_height, dc.new_width, dc.new_height)
+        });
+        
+        // Create and record the debug event
+        let event = DebugEvent::GridDeltaApplication {
+            timestamp: Utc::now(),
+            context: context.to_string(),
+            sequence: delta.sequence,
+            cell_changes_count: delta.cell_changes.len(),
+            modified_lines,
+            has_dimension_change: delta.dimension_change.is_some(),
+            dimension_change,
+            has_cursor_change: delta.cursor_change.is_some(),
+            before_dims: (grid.width, grid.height),
+            after_dims: (temp_grid.width, temp_grid.height),
+            blank_lines_before,
+            blank_lines_after,
+            content_before,
+            content_after,
+        };
+        
+        if let Ok(mut rec) = recorder.try_lock() {
+            let _ = rec.record_event(event);
+        }
+    }
+    
+    /// Count blank lines in a grid
+    fn count_blank_lines(&self, grid: &Grid) -> usize {
+        let mut count = 0;
+        for row in 0..grid.height {
+            if self.is_row_blank(grid, row) {
+                count += 1;
+            }
+        }
+        count
+    }
+    
+    /// Check if a row is blank (all spaces or default characters)
+    fn is_row_blank(&self, grid: &Grid, row: u16) -> bool {
+        for col in 0..grid.width {
+            if let Some(cell) = grid.get_cell(row, col) {
+                if cell.char != ' ' && cell.char != '\0' {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    
+    /// Get text content of a row
+    fn get_row_text(&self, grid: &Grid, row: u16) -> String {
+        let mut text = String::new();
+        for col in 0..grid.width {
+            if let Some(cell) = grid.get_cell(row, col) {
+                if cell.char != '\0' {
+                    text.push(cell.char);
+                } else {
+                    text.push(' ');
+                }
+            } else {
+                text.push(' ');
+            }
+        }
+        // Trim trailing spaces for readability
+        text.trim_end().to_string()
     }
     
     /// Get statistics about the history

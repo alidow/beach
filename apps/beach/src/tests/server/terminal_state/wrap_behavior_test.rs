@@ -4,7 +4,7 @@ fn test_prompt_eol_exact_sequence() {
     use crate::server::terminal_state::AlacrittyTerminal;
     
     // Recreate the EXACT sequence from zsh PROMPT_EOL_MARK
-    let mut term = AlacrittyTerminal::new(154, 27, None).unwrap();
+    let mut term = AlacrittyTerminal::new(154, 27, None, None).unwrap();
     
     // Initial state - empty terminal
     println!("\n=== Initial State ===");
@@ -121,7 +121,7 @@ fn test_wrap_with_one_extra_char() {
     use crate::server::terminal_state::AlacrittyTerminal;
     
     // Test what happens when we output exactly one character past line end
-    let mut term = AlacrittyTerminal::new(10, 3, None).unwrap();
+    let mut term = AlacrittyTerminal::new(10, 3, None, None).unwrap();
     
     // Output 10 chars (fills line) + 1 more
     term.process_output(b"0123456789X").unwrap();
@@ -142,7 +142,7 @@ fn test_wrap_then_cr_behavior() {
     use crate::server::terminal_state::AlacrittyTerminal;
     
     // Test CR behavior after actual wrap (not pending wrap)
-    let mut term = AlacrittyTerminal::new(10, 3, None).unwrap();
+    let mut term = AlacrittyTerminal::new(10, 3, None, None).unwrap();
     
     // Output 11 chars to cause wrap
     term.process_output(b"0123456789X").unwrap();

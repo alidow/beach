@@ -427,7 +427,7 @@ impl WebRTCTransport {
         let label_clone = label.clone();
         rtc_channel.on_open(Box::new(move || {
             let is_open = is_open_clone.clone();
-            let label = label_clone.clone();
+            let _label = label_clone.clone();
             Box::pin(async move {
                 // // eprintln!("Channel {} opened!", label);
                 *is_open.write().await = true;
@@ -438,7 +438,7 @@ impl WebRTCTransport {
         let label_clone = label.clone();
         rtc_channel.on_close(Box::new(move || {
             let is_open = is_open_clone.clone();
-            let label = label_clone.clone();
+            let _label = label_clone.clone();
             Box::pin(async move {
                 // // eprintln!("Channel {} closed!", label);
                 *is_open.write().await = false;
@@ -470,7 +470,7 @@ impl WebRTCTransport {
                 if data.len() <= MAX_MESSAGE_SIZE {
                     let msg = ChunkedMessage::Single(data);
                     let serialized = msg.serialize();
-                    if let Err(e) = dc.send(&serialized.into()).await {
+                    if let Err(_e) = dc.send(&serialized.into()).await {
                         // // eprintln!("Failed to send data: {}", e);
                     }
                 } else {
@@ -495,7 +495,7 @@ impl WebRTCTransport {
                         };
                         
                         let serialized = msg.serialize();
-                        if let Err(e) = dc.send(&serialized.into()).await {
+                        if let Err(_e) = dc.send(&serialized.into()).await {
                             // // eprintln!("Failed to send chunk: {}", e);
                             break;
                         }
@@ -621,7 +621,7 @@ impl WebRTCTransport {
     
     /// Connect using remote signaling via beach-road (ownership version)
     pub async fn connect_with_remote_signaling(
-        mut self,
+        self,
         signaling: Arc<RemoteSignalingChannel>,
         is_offerer: bool,
     ) -> Result<Self> {
@@ -752,7 +752,7 @@ impl WebRTCTransport {
                         username_fragment: None,
                     };
                     
-                    if let Err(e) = peer_connection_for_ice.add_ice_candidate(ice_candidate).await {
+                    if let Err(_e) = peer_connection_for_ice.add_ice_candidate(ice_candidate).await {
                         // // eprintln!("Failed to add ICE candidate: {}", e);
                     }
                 }
@@ -902,7 +902,7 @@ async fn setup_data_channel(
                 if std::env::var("BEACH_VERBOSE").is_ok() {
                     // // eprintln!("📤 [WebRTC DataChannel] Sending single message: {} bytes", serialized.len());
                 }
-                if let Err(e) = dc.send(&serialized.into()).await {
+                if let Err(_e) = dc.send(&serialized.into()).await {
                     // // eprintln!("Failed to send data: {}", e);
                 }
             } else {
@@ -930,7 +930,7 @@ async fn setup_data_channel(
                     
                     let serialized = msg.serialize();
                     // // eprintln!("Sending chunk {} of {}: {} bytes", index + 1, total_chunks, serialized.len());
-                    if let Err(e) = dc.send(&serialized.into()).await {
+                    if let Err(_e) = dc.send(&serialized.into()).await {
                         // // eprintln!("Failed to send chunk: {}", e);
                         break;
                     }
@@ -1008,7 +1008,7 @@ impl Transport for WebRTCTransport {
         } else {
             // Try to receive from control channel
             let channels = self.channels.read().await;
-            if let Some(channel) = channels.get(&ChannelPurpose::Control) {
+            if let Some(_channel) = channels.get(&ChannelPurpose::Control) {
                 // This is a bit tricky - we need mutable access to the channel
                 // For now, return None (will need to refactor this)
                 webrtc_log!(self, "Transport recv: channel-based recv not yet supported in legacy mode");

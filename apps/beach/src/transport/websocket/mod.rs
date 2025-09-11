@@ -82,7 +82,7 @@ impl Transport for WebSocketTransport {
         
         // Debug logging
         if std::env::var("BEACH_VERBOSE").is_ok() {
-            if let Ok(text) = String::from_utf8(data.to_vec()) {
+            if let Ok(_text) = String::from_utf8(data.to_vec()) {
                 // eprintln!("🔍 [VERBOSE] WebSocketTransport::send() - sending {} bytes: {}", data.len(), text);
             } else {
                 // eprintln!("🔍 [VERBOSE] WebSocketTransport::send() - sending {} bytes (binary)", data.len());
@@ -132,7 +132,7 @@ async fn handle_websocket(
         while let Some(data) = rx_out.recv().await {
             // Debug logging
             if std::env::var("BEACH_VERBOSE").is_ok() {
-                if let Ok(text) = String::from_utf8(data.clone()) {
+                if let Ok(_text) = String::from_utf8(data.clone()) {
                     // eprintln!("🔍 [VERBOSE] WebSocket send task - processing {} bytes: {}", data.len(), text);
                 } else {
                     // eprintln!("🔍 [VERBOSE] WebSocket send task - processing {} bytes (binary)", data.len());
@@ -163,14 +163,14 @@ async fn handle_websocket(
                 Message::Binary(data)
             };
             
-            if let Err(e) = ws_sender.send(message).await {
+            if let Err(_e) = ws_sender.send(message).await {
                 if std::env::var("BEACH_VERBOSE").is_ok() {
                     // eprintln!("🔍 [VERBOSE] WebSocket send failed: {}, breaking loop", e);
                 }
                 break;
             }
             // Flush to ensure message is sent immediately
-            if let Err(e) = ws_sender.flush().await {
+            if let Err(_e) = ws_sender.flush().await {
                 if std::env::var("BEACH_VERBOSE").is_ok() {
                     // eprintln!("🔍 [VERBOSE] WebSocket flush failed: {}, breaking loop", e);
                 }

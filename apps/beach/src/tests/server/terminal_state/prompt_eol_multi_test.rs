@@ -3,7 +3,7 @@
 fn test_multiple_commands_with_prompt_eol() {
     use crate::server::terminal_state::AlacrittyTerminal;
     
-    let mut term = AlacrittyTerminal::new(154, 27, None).unwrap();
+    let mut term = AlacrittyTerminal::new(154, 27, None, None).unwrap();
     
     // First command: echo 'hello'
     let mut seq1 = Vec::new();

@@ -3,7 +3,7 @@ use crate::server::terminal_state::*;
 #[test]
 fn test_unix_newline_behavior() {
     // Test what actually happens with Unix-style newlines (just \n)
-    let mut terminal = AlacrittyTerminal::new(80, 24, None).unwrap();
+    let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();
     
     // Simulate what a real shell outputs - just '\n' for Unix
     terminal.process_output(b"echo 'First line'").unwrap();
@@ -69,12 +69,12 @@ fn test_newline_vs_crlf_behavior() {
     // Compare \n vs \r\n behavior
     
     // Test 1: Just \n (Unix style)
-    let mut terminal1 = AlacrittyTerminal::new(80, 24, None).unwrap();
+    let mut terminal1 = AlacrittyTerminal::new(80, 24, None, None).unwrap();
     terminal1.process_output(b"Line1\nLine2\nLine3").unwrap();
     let grid1 = terminal1.get_current_grid();
     
     // Test 2: \r\n (Windows style)  
-    let mut terminal2 = AlacrittyTerminal::new(80, 24, None).unwrap();
+    let mut terminal2 = AlacrittyTerminal::new(80, 24, None, None).unwrap();
     terminal2.process_output(b"Line1\r\nLine2\r\nLine3").unwrap();
     let grid2 = terminal2.get_current_grid();
     

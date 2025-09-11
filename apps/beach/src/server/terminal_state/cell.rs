@@ -46,6 +46,13 @@ impl Default for Cell {
     }
 }
 
+impl Cell {
+    /// Check if cell is blank (space or null character)
+    pub fn is_blank(&self) -> bool {
+        self.char == ' ' || self.char == '\0'
+    }
+}
+
 impl Default for CellAttributes {
     fn default() -> Self {
         CellAttributes {

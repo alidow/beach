@@ -27,9 +27,14 @@ pub trait TerminalBackend: Send + Sync {
 }
 
 /// Factory function to create the appropriate backend based on features
-pub fn create_terminal_backend(width: u16, height: u16, debug_log: Option<&std::fs::File>) -> anyhow::Result<Box<dyn TerminalBackend>> {
+pub fn create_terminal_backend(
+    width: u16, 
+    height: u16, 
+    debug_log: Option<&std::fs::File>,
+    debug_recorder: Option<Arc<Mutex<crate::debug_recorder::DebugRecorder>>>,
+) -> anyhow::Result<Box<dyn TerminalBackend>> {
     use crate::server::terminal_state::AlacrittyTerminal;
-    Ok(Box::new(AlacrittyTerminal::new(width, height, debug_log)?))
+    Ok(Box::new(AlacrittyTerminal::new(width, height, debug_log, debug_recorder)?))
 }
 
 // Implement TerminalBackend for AlacrittyTerminal

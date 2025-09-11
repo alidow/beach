@@ -29,3 +29,6 @@ Thumbs.db
 
 # Session data
 sessions/
+
+# temp data
+tmp/

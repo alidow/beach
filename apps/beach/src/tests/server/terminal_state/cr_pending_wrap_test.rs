@@ -4,7 +4,7 @@ fn test_cr_clears_pending_wrap() {
     use crate::server::terminal_state::AlacrittyTerminal;
     
     // Test that CR clears pending wrap without advancing to next line
-    let mut term = AlacrittyTerminal::new(10, 3, None).unwrap();
+    let mut term = AlacrittyTerminal::new(10, 3, None, None).unwrap();
     
     // Output exactly 10 characters to fill the line
     term.process_output(b"0123456789").unwrap();

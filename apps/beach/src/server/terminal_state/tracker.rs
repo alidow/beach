@@ -1,24 +1,11 @@
 use std::sync::{Arc, Mutex};
-use chrono::{DateTime, Duration, Utc};
-#[cfg(feature = "vte-backend")]
-use vte::Parser;
-use crate::server::terminal_state::{Grid, GridHistory, GridDelta, TerminalInitializer, Color, CellAttributes, TerminalBackend, create_terminal_backend};
-#[cfg(feature = "vte-backend")]
-use crate::server::terminal_state::GridUpdater;
+use crate::server::terminal_state::{Grid, GridHistory, GridDelta, TerminalInitializer, TerminalBackend, create_terminal_backend};
 
 pub struct TerminalStateTracker {
     current_grid: Grid,
     history: Arc<Mutex<GridHistory>>,
-    #[cfg(feature = "vte-backend")]
-    parser: Parser,
     backend: Option<Arc<Mutex<Box<dyn TerminalBackend>>>>,
-    last_update: DateTime<Utc>,
-    update_interval: Duration,
     previous_grid: Option<Grid>,
-    // SGR state that persists across process_output calls
-    current_fg: Color,
-    current_bg: Color,
-    current_attrs: CellAttributes,
 }
 
 impl TerminalStateTracker {
@@ -28,7 +15,7 @@ impl TerminalStateTracker {
     /// variables and create a grid that better matches the terminal's appearance
     pub fn new(width: u16, height: u16) -> Self {
         // Create the terminal backend
-        let backend = create_terminal_backend(width, height, None).ok()
+        let backend = create_terminal_backend(width, height, None, None).ok()
             .map(|b| Arc::new(Mutex::new(b)));
         
         // Get the initial grid from backend if available, otherwise create default
@@ -49,15 +36,8 @@ impl TerminalStateTracker {
         TerminalStateTracker {
             current_grid: initial_grid.clone(),
             history,
-            #[cfg(feature = "vte-backend")]
-            parser: Parser::new(),
             backend,
-            last_update: Utc::now(),
-            update_interval: Duration::milliseconds(50),
             previous_grid: Some(initial_grid.clone()),
-            current_fg: Color::Default,
-            current_bg: Color::Default,
-            current_attrs: CellAttributes::default(),
         }
     }
     
@@ -68,15 +48,8 @@ impl TerminalStateTracker {
         TerminalStateTracker {
             current_grid: initial_grid.clone(),
             history,
-            #[cfg(feature = "vte-backend")]
-            parser: Parser::new(),
             backend: None,
-            last_update: Utc::now(),
-            update_interval: Duration::milliseconds(50),
             previous_grid: Some(initial_grid),
-            current_fg: Color::Default,
-            current_bg: Color::Default,
-            current_attrs: CellAttributes::default(),
         }
     }
     
@@ -93,15 +66,8 @@ impl TerminalStateTracker {
         TerminalStateTracker {
             current_grid: initial_grid.clone(),
             history,
-            #[cfg(feature = "vte-backend")]
-            parser: Parser::new(),
             backend: Some(backend),
-            last_update: Utc::now(),
-            update_interval: Duration::milliseconds(50),
             previous_grid: Some(initial_grid),
-            current_fg: Color::Default,
-            current_bg: Color::Default,
-            current_attrs: CellAttributes::default(),
         }
     }
     
@@ -116,63 +82,7 @@ impl TerminalStateTracker {
             return;
         }
         
-        #[cfg(feature = "vte-backend")]
-        {
-            // Clone the current grid state before modifying
-            let old_grid = self.current_grid.clone();
-            
-            // Update timestamp for new grid state
-            self.current_grid.timestamp = Utc::now();
-            
-            // Parse ANSI sequences and update grid with persistent SGR state
-            let mut updater = GridUpdater::new_with_state(
-                &mut self.current_grid, 
-                self.current_fg.clone(), 
-                self.current_bg.clone(), 
-                self.current_attrs.clone()
-            );
-            
-            for byte in data {
-                self.parser.advance(&mut updater, *byte);
-            }
-            
-            // Save the SGR state back to the tracker for next call
-            self.current_fg = updater.current_fg.clone();
-            self.current_bg = updater.current_bg.clone();
-            self.current_attrs = updater.current_attrs.clone();
-            
-            // Always create a delta after processing to track changes
-            // This ensures test assertions can see the changes
-            let now = Utc::now();
-            let should_create_delta = if let Some(prev) = &self.previous_grid {
-                // Check if anything actually changed
-                &old_grid != prev || self.current_grid != old_grid
-            } else {
-                true
-            };
-            
-            if should_create_delta {
-                // Create delta comparing old state to new state
-                let delta = GridDelta::diff(&old_grid, &self.current_grid);
-
-                // Only add delta if there are actual changes or enough time has passed
-                if !delta.cell_changes.is_empty() || 
-                   delta.cursor_change.is_some() || 
-                   delta.dimension_change.is_some() ||
-                   now - self.last_update > self.update_interval {
-                    
-                    let mut history = self.history.lock().unwrap();
-                    history.add_delta(delta);
-                    self.last_update = now;
-                    self.previous_grid = Some(self.current_grid.clone());
-                }
-            }
-        }
-        
-        #[cfg(not(feature = "vte-backend"))]
-        {
-            // No-op when vte backend is disabled
-        }
+        // No-op when no backend is available - vte-backend has been removed
     }
     
     fn create_delta(&mut self) {

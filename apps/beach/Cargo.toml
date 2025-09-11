@@ -2,7 +2,7 @@
 name = "beach"
 version = "0.1.0"
 edition = "2024"
-author = "Arel Lidow <arel@beach.sh>"
+authors = ["Arel Lidow <arel@beach.sh>"]
 
 [lib]
 name = "beach"

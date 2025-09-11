@@ -3,7 +3,7 @@
 fn test_clear_to_end_of_screen() {
     use crate::server::terminal_state::AlacrittyTerminal;
     
-    let mut term = AlacrittyTerminal::new(10, 5, None).unwrap();
+    let mut term = AlacrittyTerminal::new(10, 5, None, None).unwrap();
     
     // Fill the screen with content
     term.process_output(b"Line1\r\n").unwrap();
@@ -53,7 +53,7 @@ fn test_clear_to_end_of_screen() {
 fn test_clear_after_wrap() {
     use crate::server::terminal_state::AlacrittyTerminal;
     
-    let mut term = AlacrittyTerminal::new(10, 3, None).unwrap();
+    let mut term = AlacrittyTerminal::new(10, 3, None, None).unwrap();
     
     // Output text that wraps
     term.process_output(b"1234567890ABC").unwrap();

@@ -80,7 +80,7 @@ pub fn spawn_pty_reader_with_resize(
     master_reader: Arc<Mutex<Option<Box<dyn std::io::Read + Send>>>>,
     terminal_backend: Arc<Mutex<Box<dyn TerminalBackend>>>,
     pty_manager: Arc<PtyManager>,
-    debug_recorder_path: Option<String>,
+    debug_recorder: Option<Arc<Mutex<crate::debug_recorder::DebugRecorder>>>,
     delta_tx: Option<TokioSender<GridDelta>>,
 ) -> JoinHandle<()> {
     // Platform-specific resize detection setup
@@ -95,22 +95,13 @@ pub fn spawn_pty_reader_with_resize(
     };
     
     tokio::task::spawn_blocking(move || {
-        // Open debug recording file if specified
-        let mut debug_file = debug_recorder_path.and_then(|path| {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .ok()
-                .map(|f| {
-                    // Debug recording silently
-                    f
-                })
-        });
-
         let mut buffer = [0u8; 4096];
         // Keep last grid to compute deltas
         let mut last_grid: Option<Grid> = None;
+        
+        // Track PTY read sequence and hashes for duplicate detection
+        let mut pty_read_sequence: u64 = 0;
+        let mut seen_hashes = std::collections::HashSet::new();
         
         loop {
             // CRITICAL: Check for resize BEFORE reading next chunk
@@ -160,11 +151,24 @@ pub fn spawn_pty_reader_with_resize(
             // Process the result
             match read_result {
                 Some(Ok(data)) => {
-                    // Record to debug file if enabled
-                    if let Some(ref mut file) = debug_file {
-                        let _ = file.write_all(&data);
-                        let _ = file.flush();
+                    // Track PTY chunks for duplicate detection
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    
+                    let mut hasher = DefaultHasher::new();
+                    data.hash(&mut hasher);
+                    let hash = hasher.finish();
+                    let is_duplicate = seen_hashes.contains(&hash);
+                    seen_hashes.insert(hash);
+                    
+                    // Record PTY read chunk to debug recorder (non-blocking)
+                    if let Some(ref recorder) = debug_recorder {
+                        if let Ok(mut rec) = recorder.try_lock() {
+                            let _ = rec.record_pty_read_chunk(pty_read_sequence, &data, is_duplicate);
+                        }
                     }
+                    
+                    pty_read_sequence += 1;
                     
                     // Update terminal backend and publish delta if changed
                     let current_grid = {
@@ -177,31 +181,7 @@ pub fn spawn_pty_reader_with_resize(
                         // Send only if meaningful changes exist
                         if !delta.cell_changes.is_empty() || delta.cursor_change.is_some() || delta.dimension_change.is_some() {
                             if let Some(ref tx) = delta_tx {
-                                // Log to debug file
-                                if let Some(ref mut f) = debug_file {
-                                    let _ = writeln!(f, "[{}] [PTY Reader] Sending delta: {} cell changes, cursor: {:?}, dim: {:?}", 
-                                        chrono::Local::now().format("%H:%M:%S%.3f"),
-                                        delta.cell_changes.len(), delta.cursor_change.is_some(), delta.dimension_change.is_some());
-                                }
-                                match tx.try_send(delta) {
-                                    Ok(_) => {
-                                        if let Some(ref mut f) = debug_file {
-                                            let _ = writeln!(f, "[{}] [PTY Reader] Delta sent successfully", 
-                                                chrono::Local::now().format("%H:%M:%S%.3f"));
-                                        }
-                                    },
-                                    Err(e) => {
-                                        if let Some(ref mut f) = debug_file {
-                                            let _ = writeln!(f, "[{}] [PTY Reader] Failed to send delta: {:?}", 
-                                                chrono::Local::now().format("%H:%M:%S%.3f"), e);
-                                        }
-                                    },
-                                }
-                            } else {
-                                if let Some(ref mut f) = debug_file {
-                                    let _ = writeln!(f, "[{}] [PTY Reader] WARNING: No delta_tx channel available!", 
-                                        chrono::Local::now().format("%H:%M:%S%.3f"));
-                                }
+                                let _ = tx.try_send(delta);
                             }
                         }
                     }

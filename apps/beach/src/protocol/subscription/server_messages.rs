@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use chrono::{DateTime, Utc};
 use super::messages::{
     ViewMode, SubscriptionStatus, ErrorCode, NotificationType
 };

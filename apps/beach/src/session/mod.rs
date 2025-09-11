@@ -158,7 +158,7 @@ impl<T: Transport + Send + 'static> ServerSession<T> {
             let debug_handler = self.debug_handler.clone();
             let webrtc_channels = self.webrtc_channels.clone();
             let webrtc_transports = self.webrtc_transports.clone();
-            let transport = self.session.transport.clone();
+            let _transport = self.session.transport.clone();
             let subscription_hub = self.session.subscription_hub();
             
             tokio::spawn(async move {
@@ -251,7 +251,7 @@ impl<T: Transport + Send + 'static> ServerSession<T> {
                                         let channel_for_init = channel_arc.clone();
                                         let peer_id_for_log = peer.id.clone();
                                         // Use already captured subscription hub for auto-subscribe after connection
-                                        let hub_for_init = subscription_hub.clone();
+                                        let _hub_for_init = subscription_hub.clone();
                                         
                                         // Log WebRTC initiation
                                         if let Some(debug_log_path) = get_debug_log_path() {
@@ -324,20 +324,19 @@ impl<T: Transport + Send + 'static> ServerSession<T> {
                             webrtc_channels.write().await.remove(&peer_id);
                             handler.handle_client_left(&peer_id).await;
                         }
-                        ServerMessage::Debug { response } => {
+                        ServerMessage::Debug { response: _ } => {
                             // This shouldn't happen on the server side (Debug is sent TO us, not FROM signaling)
                             // But just in case...
                         }
                         ServerMessage::Signal { from_peer, signal } => {
                             // Check if this is a WebRTC signal
                             if let Ok(transport_signal) = TransportSignal::from_value(&signal) {
-                                if let TransportSignal::WebRTC { .. } = transport_signal {
-                                    // Handle WebRTC signaling
-                                    if let Some(channel) = webrtc_channels.read().await.get(&from_peer) {
-                                        let _ = channel.handle_signal(signal.clone()).await;
-                                    }
-                                    continue;
+                                let TransportSignal::WebRTC { .. } = transport_signal;
+                                // Handle WebRTC signaling
+                                if let Some(channel) = webrtc_channels.read().await.get(&from_peer) {
+                                    let _ = channel.handle_signal(signal.clone()).await;
                                 }
+                                continue;
                             }
                             
                             // Check if this is a debug request (Custom transport signal)
@@ -714,7 +713,7 @@ impl<T: Transport + Send + 'static> ClientSession<T> {
             let transport = self.session.transport.clone();
             
             tokio::spawn(async move {
-                let mut server_peer_id: Option<String> = None;
+                let mut _server_peer_id: Option<String> = None;
                 let mut webrtc_channel: Option<Arc<RemoteSignalingChannel>> = None;
                 
                 while let Some(msg) = signaling.recv().await {
@@ -742,7 +741,7 @@ impl<T: Transport + Send + 'static> ClientSession<T> {
                             // Find the server peer
                             for peer in &peers {
                                 if matches!(peer.role, PeerRole::Server) {
-                                    server_peer_id = Some(peer.id.clone());
+                                    _server_peer_id = Some(peer.id.clone());
                                     
                                     // Create WebRTC signaling channel for server
                                     let channel = RemoteSignalingChannel::new(
@@ -780,9 +779,9 @@ impl<T: Transport + Send + 'static> ClientSession<T> {
                             
                             // Check if this is a WebRTC signal
                             if let Ok(transport_signal) = TransportSignal::from_value(&signal) {
-                                if let TransportSignal::WebRTC { signal: webrtc_signal } = transport_signal {
-                                    // Log WebRTC signal type
-                                    if let Some(debug_log_path) = get_debug_log_path() {
+                                let TransportSignal::WebRTC { signal: webrtc_signal } = transport_signal;
+                                // Log WebRTC signal type
+                                if let Some(debug_log_path) = get_debug_log_path() {
                                         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&debug_log_path) {
                                             use std::io::Write;
                                             let signal_type = match &webrtc_signal {
@@ -819,7 +818,7 @@ impl<T: Transport + Send + 'static> ClientSession<T> {
                                             // Then initiate WebRTC as answerer with timeout
                                             tokio::spawn(async move {
                                                 let timeout_duration = std::time::Duration::from_secs(30);
-                                                let mut transport_guard = transport_clone.lock().await;
+                                                let transport_guard = transport_clone.lock().await;
                                                 let result = tokio::time::timeout(
                                                     timeout_duration,
                                                     transport_guard.initiate_webrtc_with_signaling(
@@ -868,7 +867,6 @@ impl<T: Transport + Send + 'static> ClientSession<T> {
                                     }
                                     continue;
                                 }
-                            }
                             
                             // Otherwise try to parse as app message
                             if let Ok(app_msg) = serde_json::from_value::<AppMessage>(signal) {
@@ -896,7 +894,6 @@ impl<T: Transport + Send + 'static> ClientSession<T> {
             let bytes = serde_json::to_vec(&message)?;
             
             // Determine which channel to use based on message type
-            use crate::transport::ChannelPurpose;
             use crate::protocol::subscription::ClientMessage;
             
             // Check if this is input/control data

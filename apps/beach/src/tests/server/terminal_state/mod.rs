@@ -10,8 +10,6 @@ mod scrollback_test;
 mod resize_test;
 #[cfg(feature = "alacritty-backend")]
 mod alacritty_debug_test;
-#[cfg(feature = "vte-backend")]
-mod vte_debug_test;
 #[cfg(feature = "alacritty-backend")]
 mod alacritty_mode_test;
 #[cfg(feature = "alacritty-backend")]

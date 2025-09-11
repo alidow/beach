@@ -7,12 +7,12 @@ use alacritty_terminal::{
     vte::ansi::Processor,
 };
 use std::sync::{Arc, Mutex};
-use std::io::Write;
 use chrono::{DateTime, Utc};
 use crate::server::terminal_state::{
     Grid, GridHistory, GridDelta, Cell, Color, CellAttributes, 
     CursorShape, CursorPosition, TerminalInitializer, DimensionChange
 };
+use crate::debug_recorder::DebugRecorder;
 
 /// Simple dimensions implementation for alacritty
 #[cfg(feature = "alacritty-backend")]
@@ -60,11 +60,18 @@ pub struct AlacrittyTerminal {
     width: u16,
     height: u16,
     debug_log: Option<Arc<Mutex<std::fs::File>>>,
+    debug_recorder: Option<Arc<Mutex<DebugRecorder>>>,
+    process_output_sequence: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(feature = "alacritty-backend")]
 impl AlacrittyTerminal {
-    pub fn new(width: u16, height: u16, debug_log: Option<&std::fs::File>) -> anyhow::Result<Self> {
+    pub fn new(
+        width: u16, 
+        height: u16, 
+        debug_log: Option<&std::fs::File>,
+        debug_recorder: Option<Arc<Mutex<DebugRecorder>>>,
+    ) -> anyhow::Result<Self> {
         let debug_log = debug_log.map(|f| {
             // Clone the file handle for thread-safe access
             Arc::new(Mutex::new(f.try_clone().expect("Failed to clone debug log file")))
@@ -109,7 +116,10 @@ impl AlacrittyTerminal {
         
         // Initialize our grid representation using TerminalInitializer
         let initial_grid = TerminalInitializer::create_initial_grid(width, height);
-        let history = Arc::new(Mutex::new(GridHistory::new(initial_grid.clone())));
+        let history = Arc::new(Mutex::new(GridHistory::new_with_debug(
+            initial_grid.clone(),
+            debug_recorder.clone(),
+        )));
         
         // Create the terminal instance
         let mut terminal = Self {
@@ -122,6 +132,8 @@ impl AlacrittyTerminal {
             width,
             height,
             debug_log,
+            debug_recorder,
+            process_output_sequence: std::sync::atomic::AtomicU64::new(0),
         };
         
         // Enable LINE_FEED_NEW_LINE mode (ESC[20h) 
@@ -132,34 +144,50 @@ impl AlacrittyTerminal {
         Ok(terminal)
     }
     
+    pub fn set_debug_recorder(&mut self, recorder: Arc<Mutex<DebugRecorder>>) {
+        self.debug_recorder = Some(recorder);
+    }
+    
     pub fn process_output(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        // Convert lone \n to \r\n for proper Unix terminal behavior
-        // This ensures \n performs both line feed and carriage return
-        let mut processed_data = Vec::with_capacity(data.len() * 2);
-        let mut i = 0;
-        while i < data.len() {
-            if data[i] == b'\n' {
-                // Check if it's not already preceded by \r
-                if i == 0 || data[i - 1] != b'\r' {
-                    processed_data.push(b'\r');
-                }
+        use std::sync::atomic::Ordering;
+        
+        // Get sequence number for this call
+        let sequence = self.process_output_sequence.fetch_add(1, Ordering::SeqCst);
+        
+        // Store grid before processing
+        let grid_before = self.current_grid.clone();
+        
+        // Log process output call and PTY output if debug recorder is available
+        if let Some(ref recorder) = self.debug_recorder {
+            if let Ok(mut rec) = recorder.try_lock() {
+                let _ = rec.record_process_output_call(sequence, data);
+                let _ = rec.record_pty_output(data);
             }
-            processed_data.push(data[i]);
-            i += 1;
         }
+        
+        // Pass PTY output directly to Alacritty without any transformation
+        // Alacritty handles terminal sequences correctly on its own
         
         // Process the ANSI data through alacritty's parser
         {
             let mut parser = self.parser.lock().unwrap();
             let mut term = self.term.lock().unwrap();
             
-            for byte in &processed_data {
+            for byte in data {
                 parser.advance(&mut *term, *byte);
             }
         }
         
         // Update our grid from alacritty's state
         self.sync_grid()?;
+        
+        // Log grid changes
+        if let Some(ref recorder) = self.debug_recorder {
+            if let Ok(mut rec) = recorder.try_lock() {
+                let _ = rec.record_grid_before_after(&grid_before, &self.current_grid);
+                let _ = rec.record_grid_bottom_context("server_backend_after_process_output", &self.current_grid, 6);
+            }
+        }
         
         Ok(())
     }
@@ -202,17 +230,69 @@ impl AlacrittyTerminal {
             }
         }
         
-        // Sync cursor position
-        let cursor_point = term.grid().cursor.point;
-        self.current_grid.cursor = CursorPosition {
-            row: cursor_point.line.0 as u16,
-            col: cursor_point.column.0 as u16,
-            visible: term.mode().contains(alacritty_terminal::term::TermMode::SHOW_CURSOR),
-            shape: self.map_cursor_shape(&term),
-        };
+        // Clear the grid first (fill with empty cells)
+        for row in 0..self.height {
+            for col in 0..self.width {
+                self.current_grid.set_cell(row, col, Cell::default());
+            }
+        }
         
-        // Sync cells from alacritty's grid
-        for line in 0..alac_lines.min(self.height as usize) {
+        // Copy all lines from Alacritty's grid (including blank lines in content)
+        // We should copy exactly what Alacritty has, not try to remove blank lines
+        let lines_to_copy = alac_lines.min(self.height as usize);
+        
+        // Log what we're copying and check for the joke content
+        if let Some(ref log) = self.debug_log {
+            if let Ok(mut f) = log.lock() {
+                use std::io::Write;
+                let _ = writeln!(f, "[{}] sync_grid: Copying {} lines from Alacritty ({}x{})", 
+                                 Utc::now().format("%H:%M:%S%.3f"), 
+                                 lines_to_copy, alac_cols, alac_lines);
+                
+                // Debug: Check for joke content in Alacritty's grid
+                for line in 0..lines_to_copy.min(50) {
+                    let _point = alacritty_terminal::index::Point {
+                        line: alacritty_terminal::index::Line(line as i32),
+                        column: alacritty_terminal::index::Column(0),
+                    };
+                    
+                    // Get first 60 chars of the line
+                    let mut line_text = String::new();
+                    for col in 0..60.min(alac_cols) {
+                        let point = alacritty_terminal::index::Point {
+                            line: alacritty_terminal::index::Line(line as i32),
+                            column: alacritty_terminal::index::Column(col),
+                        };
+                        let cell_ref = &term.grid()[point];
+                        line_text.push(cell_ref.c);
+                    }
+                    
+                    let trimmed = line_text.trim_end();
+                    if trimmed.contains("programmers") || trimmed.contains("bugs") || trimmed.contains("⏺") {
+                        let _ = writeln!(f, "[{}]   Alac Line {}: '{}'", 
+                                       Utc::now().format("%H:%M:%S%.3f"), 
+                                       line, trimmed);
+                    } else if !trimmed.is_empty() && line < 10 {
+                        // Safely truncate at character boundary
+                        let truncated = if trimmed.len() > 40 {
+                            let mut end = 40;
+                            while !trimmed.is_char_boundary(end) && end > 0 {
+                                end -= 1;
+                            }
+                            &trimmed[..end]
+                        } else {
+                            trimmed
+                        };
+                        let _ = writeln!(f, "[{}]   Alac Line {}: '{}'", 
+                                       Utc::now().format("%H:%M:%S%.3f"), 
+                                       line, truncated);
+                    }
+                }
+            }
+        }
+        
+        // Sync cells from alacritty's grid 
+        for line in 0..lines_to_copy {
             for col in 0..alac_cols.min(self.width as usize) {
                 let point = alacritty_terminal::index::Point {
                     line: alacritty_terminal::index::Line(line as i32),
@@ -226,14 +306,60 @@ impl AlacrittyTerminal {
             }
         }
         
-        // Fill any remaining cells with defaults (if our grid is larger than alacritty's)
-        if alac_cols < self.width as usize {
-            for line in 0..self.height {
-                for col in alac_cols as u16..self.width {
-                    self.current_grid.set_cell(line, col, Cell::default());
+        // Debug: Log what we're sending to client
+        if let Some(ref log) = self.debug_log {
+            if let Ok(mut f) = log.lock() {
+                use std::io::Write;
+                for row in 0..self.current_grid.height.min(50) {
+                    let mut line_text = String::new();
+                    for col in 0..self.current_grid.width.min(60) {
+                        if let Some(cell) = self.current_grid.get_cell(row, col) {
+                            line_text.push(cell.char);
+                        }
+                    }
+                    let trimmed = line_text.trim_end();
+                    if trimmed.contains("programmers") || trimmed.contains("bugs") || trimmed.contains("⏺") {
+                        let _ = writeln!(f, "[{}]   Grid Line {}: '{}'", 
+                                       Utc::now().format("%H:%M:%S%.3f"), 
+                                       row, trimmed);
+                        // Check next few lines for blanks
+                        for next_row in (row+1)..((row+5).min(self.current_grid.height)) {
+                            let mut next_line = String::new();
+                            for col in 0..self.current_grid.width.min(60) {
+                                if let Some(cell) = self.current_grid.get_cell(next_row, col) {
+                                    next_line.push(cell.char);
+                                }
+                            }
+                            if next_line.trim().is_empty() {
+                                let _ = writeln!(f, "[{}]   Grid Line {}: [BLANK]", 
+                                               Utc::now().format("%H:%M:%S%.3f"), 
+                                               next_row);
+                            } else {
+                                let _ = writeln!(f, "[{}]   Grid Line {}: '{}'", 
+                                               Utc::now().format("%H:%M:%S%.3f"), 
+                                               next_row, next_line.trim_end());
+                            }
+                        }
+                        break;
+                    }
                 }
             }
         }
+        
+        // Sync cursor position (no offset needed since content is at top)
+        let cursor_point = term.grid().cursor.point;
+        let cursor_row = if cursor_point.line.0 >= 0 && cursor_point.line.0 < lines_to_copy as i32 {
+            cursor_point.line.0 as u16
+        } else {
+            // Cursor is beyond copied content, clamp to last line
+            lines_to_copy.saturating_sub(1) as u16
+        };
+        self.current_grid.cursor = CursorPosition {
+            row: cursor_row,
+            col: cursor_point.column.0 as u16,
+            visible: term.mode().contains(alacritty_terminal::term::TermMode::SHOW_CURSOR),
+            shape: self.map_cursor_shape(&term),
+        };
         
         // Update timestamp
         self.current_grid.timestamp = Utc::now();
@@ -261,6 +387,65 @@ impl AlacrittyTerminal {
         // Always add a snapshot for now to ensure tests work
         // TODO: optimize this to only snapshot periodically in production
         history.add_snapshot(self.current_grid.clone());
+        
+        // Compare Alacritty grid with GridHistory reconstruction
+        if let Some(ref recorder) = self.debug_recorder {
+            if let Ok(mut rec) = recorder.try_lock() {
+                // Get the current GridHistory reconstruction
+                if let Ok(reconstructed) = history.get_current() {
+                    // Log the comparison
+                    let _ = rec.record_alacritty_vs_gridhistory(
+                        &self.current_grid,
+                        &reconstructed
+                    );
+                }
+                
+                // Also dump the Alacritty grid if it has non-blank content
+                let has_content = (0..self.current_grid.height).any(|row| {
+                    (0..self.current_grid.width).any(|col| {
+                        self.current_grid.get_cell(row, col)
+                            .map(|c| c.char != ' ' && c.char != '\0')
+                            .unwrap_or(false)
+                    })
+                });
+                
+                if has_content {
+                    let _ = rec.record_alacritty_grid_dump(&self.current_grid);
+                }
+            }
+        }
+        
+        // Log Alacritty state if debug recorder is available
+        if let Some(ref recorder) = self.debug_recorder {
+            if let Ok(mut rec) = recorder.try_lock() {
+                // Collect sample content - first 10 non-empty lines
+                let mut content_sample = Vec::new();
+                let mut blank_count = 0;
+                
+                for row in 0..self.current_grid.height.min(50) {
+                    let mut line_text = String::new();
+                    for col in 0..self.current_grid.width.min(80) {
+                        if let Some(cell) = self.current_grid.get_cell(row, col) {
+                            line_text.push(cell.char);
+                        } else {
+                            line_text.push(' ');
+                        }
+                    }
+                    let trimmed = line_text.trim_end();
+                    if trimmed.is_empty() {
+                        blank_count += 1;
+                    } else if content_sample.len() < 10 {
+                        content_sample.push(format!("Row {}: {}", row, trimmed));
+                    }
+                }
+                
+                let _ = rec.record_alacritty_state(
+                    (self.current_grid.width, self.current_grid.height),
+                    content_sample,
+                    blank_count,
+                );
+            }
+        }
         
         Ok(())
     }

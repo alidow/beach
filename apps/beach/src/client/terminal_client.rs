@@ -8,7 +8,7 @@ use crate::transport::Transport;
 use anyhow::Result;
 use async_trait::async_trait;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, EnableMouseCapture, DisableMouseCapture, MouseEvent},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, EnableMouseCapture, DisableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -102,12 +102,13 @@ pub struct TerminalClient<T: Transport + Send + 'static> {
 impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
     /// Create a new terminal client and join an existing session
     pub async fn create(
-        config: &crate::config::Config,
+        _config: &crate::config::Config,
         transport: T,
         session_str: &str,
         passphrase: Option<String>,
         debug_log: Option<String>,
         debug_recorder: Option<String>,
+        debug_size: bool,
     ) -> Result<Arc<Self>> {
         use crate::session::Session;
         
@@ -115,7 +116,7 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
         let (client_session, server_addr, session_id) = Session::join(session_str, transport, passphrase).await?;
         
         // Create the client
-        let client = Self::new(client_session, None, debug_log, debug_recorder).await?;
+        let client = Self::new(client_session, None, debug_log, debug_recorder, debug_size).await?;
         
         // Set the handler first so connect_signaling can immediately start the router
         client.set_as_handler().await;
@@ -149,12 +150,13 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
         _passphrase: Option<String>,
         debug_log: Option<String>,
         debug_recorder_path: Option<String>,
+        debug_size: bool,
     ) -> Result<Arc<Self>> {
         // Get terminal dimensions
         let (width, height) = crossterm::terminal::size()?;
         
         // Create grid renderer
-        let grid_renderer = Arc::new(Mutex::new(GridRenderer::new(width, height)?));
+        let grid_renderer = Arc::new(Mutex::new(GridRenderer::new(width, height, debug_size)?));
         
         // Create predictive echo
         let client_id = format!("client-{}", uuid::Uuid::new_v4());
@@ -357,7 +359,7 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
             
             // Render after any event
             terminal.draw(|f| {
-                let area = f.size();
+                let area = f.area();
                 
                 // Create centered layout
                 let chunks = Layout::default()
@@ -1168,7 +1170,9 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
     async fn handle_server_message(&self, msg: ServerMessage) -> Result<()> {
         // Record incoming server message with debug recorder
         if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
-            let _ = recorder.record_server_message(&msg);
+            if let Err(e) = recorder.record_server_message(&msg) {
+                eprintln!("Failed to record server message: {:?}", e);
+            }
         }
         
         // Debug log received message
@@ -1187,13 +1191,129 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
         }
         
         match msg {
-            ServerMessage::Delta { changes, .. } => {
-                // Apply the delta to the grid
-                self.grid_renderer.lock().await.apply_delta(&changes);
-                
-                // Record client grid state after applying delta
+            ServerMessage::Delta { changes, sequence, .. } => {
+                // Log delta application details
                 if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
+                    // Capture state BEFORE applying delta
                     let renderer = self.grid_renderer.lock().await;
+                    
+                    // Collect affected line numbers
+                    let mut affected_lines = std::collections::HashSet::new();
+                    for change in &changes.cell_changes {
+                        affected_lines.insert(change.row);
+                    }
+                    let mut modified_lines: Vec<u16> = affected_lines.into_iter().collect();
+                    modified_lines.sort();
+                    
+                    // Build a seam window around the first modified row (before applying delta)
+                    let seam_anchor = modified_lines.first().copied().unwrap_or(0);
+                    let seam_start = seam_anchor.saturating_sub(2);
+                    let seam_end = seam_anchor.saturating_add(6).min(renderer.grid.height.saturating_sub(1));
+                    let mut seam_before_lines: Vec<(u16, String)> = Vec::new();
+                    for row in seam_start..=seam_end {
+                        let mut line = String::new();
+                        for col in 0..renderer.grid.width.min(120) {
+                            if let Some(cell) = renderer.grid.get_cell(row, col) { line.push(cell.char); }
+                        }
+                        seam_before_lines.push((row, line.trim_end().to_string()));
+                    }
+
+                    // Count blank lines before
+                    let blank_lines_before = renderer.grid.cells.iter()
+                        .filter(|row| row.is_empty() || row.iter().all(|cell| cell.char == ' '))
+                        .count();
+                    
+                    // Get sample of lines that will be modified (before state)
+                    let lines_before: Vec<String> = modified_lines.iter()
+                        .take(5)
+                        .filter_map(|&line_num| {
+                            renderer.grid.cells.get(line_num as usize).map(|row| {
+                                format!("Line {}: {}", line_num, 
+                                    row.iter().map(|cell| cell.char).collect::<String>().trim_end())
+                            })
+                        })
+                        .collect();
+                    
+                    let before_dims = (renderer.server_width, renderer.server_height);
+                    drop(renderer);
+                    
+                    // Apply the delta
+                    self.grid_renderer.lock().await.apply_delta(&changes);
+                    
+                    // Capture state AFTER applying delta
+                    let renderer = self.grid_renderer.lock().await;
+                    let mut seam_after_lines: Vec<(u16, String)> = Vec::new();
+                    for row in seam_start..=seam_end {
+                        let mut line = String::new();
+                        for col in 0..renderer.grid.width.min(120) {
+                            if let Some(cell) = renderer.grid.get_cell(row, col) { line.push(cell.char); }
+                        }
+                        seam_after_lines.push((row, line.trim_end().to_string()));
+                    }
+                    
+                    // Count blank lines after
+                    let blank_lines_after = renderer.grid.cells.iter()
+                        .filter(|row| row.is_empty() || row.iter().all(|cell| cell.char == ' '))
+                        .count();
+                    
+                    // Get sample of lines after modification
+                    let lines_after: Vec<String> = modified_lines.iter()
+                        .take(5)
+                        .filter_map(|&line_num| {
+                            renderer.grid.cells.get(line_num as usize).map(|row| {
+                                format!("Line {}: {}", line_num, 
+                                    row.iter().map(|cell| cell.char).collect::<String>().trim_end())
+                            })
+                        })
+                        .collect();
+                    
+                    let after_dims = if changes.dimension_change.is_some() {
+                        Some((renderer.grid.width, renderer.grid.height))
+                    } else {
+                        None
+                    };
+                    
+                    // Log the delta application
+                    let _ = recorder.record_event(crate::debug_recorder::DebugEvent::ClientDeltaApplication {
+                        timestamp: chrono::Utc::now(),
+                        sequence,
+                        cell_changes_count: changes.cell_changes.len(),
+                        modified_lines: modified_lines.clone(),
+                        has_dimension_change: changes.dimension_change.is_some(),
+                        before_dims,
+                        after_dims,
+                        blank_lines_before,
+                        blank_lines_after,
+                        lines_before: lines_before.clone(),
+                        lines_after: lines_after.clone(),
+                    });
+                    let _ = recorder.record_client_seam_context(sequence, seam_start, &seam_before_lines, &seam_after_lines);
+                    // Record bottom context after delta applied
+                    let _ = recorder.record_grid_bottom_context("client_after_delta", &renderer.grid, 6);
+                    
+                    // Also log to debug file if blank line count changed
+                    if blank_lines_before != blank_lines_after {
+                        if let Some(ref path) = self.debug_log {
+                            if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+                                use std::io::Write;
+                                let _ = writeln!(file, "[{}] Client: Delta {} changed blank lines: {} -> {} (lines modified: {:?})",
+                                    chrono::Utc::now().format("%H:%M:%S%.3f"),
+                                    sequence,
+                                    blank_lines_before,
+                                    blank_lines_after,
+                                    modified_lines
+                                );
+                                if !lines_before.is_empty() {
+                                    let _ = writeln!(file, "  Before: {:?}", lines_before);
+                                }
+                                if !lines_after.is_empty() {
+                                    let _ = writeln!(file, "  After: {:?}", lines_after);
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Also record the full grid state after delta
                     let view_mode = if renderer.is_historical_mode() {
                         "historical"
                     } else {
@@ -1204,6 +1324,40 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                         renderer.scroll_offset as i64,
                         view_mode
                     );
+                    // Also log to debug file bottom context after delta (gated)
+                    if std::env::var("BEACH_SEAM_DEBUG").ok().is_some() {
+                        if let Some(ref path) = self.debug_log {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+                            use std::io::Write;
+                            let mut trailing_blanks = 0usize;
+                            for row in (0..renderer.grid.height).rev() {
+                                let is_blank = (0..renderer.grid.width).all(|col| {
+                                    renderer.grid.get_cell(row, col)
+                                        .map(|c| c.char == ' ' || c.char == '\0')
+                                        .unwrap_or(true)
+                                });
+                                if is_blank { trailing_blanks += 1; } else { break; }
+                            }
+                            let _ = writeln!(file, "[{}] Client: BottomContext after delta dims {}x{} trailing_blanks {}",
+                                chrono::Utc::now().format("%H:%M:%S%.3f"),
+                                renderer.grid.width,
+                                renderer.grid.height,
+                                trailing_blanks);
+                            let start = renderer.grid.height.saturating_sub(5);
+                            for row in start..renderer.grid.height {
+                                let mut line = String::new();
+                                for col in 0..renderer.grid.width.min(100) {
+                                    if let Some(cell) = renderer.grid.get_cell(row, col) { line.push(cell.char); }
+                                }
+                                let _ = writeln!(file, "[{}] Client:   Row {}: '{}'",
+                                    chrono::Utc::now().format("%H:%M:%S%.3f"), row, line.trim_end());
+                            }
+                        }
+                        }
+                    }
+                } else {
+                    // No debug recorder, just apply the delta
+                    self.grid_renderer.lock().await.apply_delta(&changes);
                 }
             }
             ServerMessage::Snapshot { grid, .. } => {
@@ -1223,6 +1377,38 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                         renderer.scroll_offset as i64,
                         view_mode
                     );
+                    let _ = recorder.record_grid_bottom_context("client_after_snapshot", &renderer.grid, 6);
+                    // And log to debug file bottom context after snapshot (gated)
+                    if std::env::var("BEACH_SEAM_DEBUG").ok().is_some() {
+                        if let Some(ref path) = self.debug_log {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(path) {
+                            use std::io::Write;
+                            let mut trailing_blanks = 0usize;
+                            for row in (0..renderer.grid.height).rev() {
+                                let is_blank = (0..renderer.grid.width).all(|col| {
+                                    renderer.grid.get_cell(row, col)
+                                        .map(|c| c.char == ' ' || c.char == '\0')
+                                        .unwrap_or(true)
+                                });
+                                if is_blank { trailing_blanks += 1; } else { break; }
+                            }
+                            let _ = writeln!(file, "[{}] Client: BottomContext after snapshot dims {}x{} trailing_blanks {}",
+                                chrono::Utc::now().format("%H:%M:%S%.3f"),
+                                renderer.grid.width,
+                                renderer.grid.height,
+                                trailing_blanks);
+                            let start = renderer.grid.height.saturating_sub(5);
+                            for row in start..renderer.grid.height {
+                                let mut line = String::new();
+                                for col in 0..renderer.grid.width.min(100) {
+                                    if let Some(cell) = renderer.grid.get_cell(row, col) { line.push(cell.char); }
+                                }
+                                let _ = writeln!(file, "[{}] Client:   Row {}: '{}'",
+                                    chrono::Utc::now().format("%H:%M:%S%.3f"), row, line.trim_end());
+                            }
+                        }
+                        }
+                    }
                 }
             }
             ServerMessage::HistoryInfo { 
@@ -1246,7 +1432,7 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                 };
                 self.grid_renderer.lock().await.set_history_metadata(metadata);
             }
-            ServerMessage::Error { code, message, .. } => {
+            ServerMessage::Error { code, .. } => {
                 // Handle error - potentially trigger reconnect
                 // eprintln!("Server error {}: {}", code.0, message);
                 if code.0 == 1001 || code.0 == 1002 {  // Connection errors
@@ -1353,7 +1539,7 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                     *self.state.write().await = ClientState::Connected;
                     return Ok(());
                 }
-                Err(e) => {
+                Err(_e) => {
                     // eprintln!("Reconnect failed: {}", e);
                     if attempt < max_attempts {
                         tokio::time::sleep(retry_delay).await;

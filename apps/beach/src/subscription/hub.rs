@@ -8,7 +8,7 @@ use crate::protocol::{
     ClientMessage, ServerMessage, ViewMode, ViewPosition, Dimensions,
     ErrorCode, SubscriptionStatus
 };
-use crate::transport::Transport;
+use crate::transport::{Transport, ChannelPurpose};
 use super::{SubscriptionId, ClientId};
 use super::data_source::{TerminalDataSource, PtyWriter};
 
@@ -1088,6 +1088,34 @@ impl SubscriptionHub {
                     }
                 }
                 
+                // After viewport mapping, send SnapshotRange if viewport is set
+                {
+                    let mut subscriptions = self.subscriptions.write().await;
+                    if let Some(subscription) = subscriptions.get_mut(&subscription_id) {
+                        if let Some(vp) = &subscription.viewport {
+                            if let Some(source) = self.terminal_source.read().await.as_ref() {
+                                let width = subscription.dimensions.width;
+                                let rows = (vp.end_line - vp.start_line + 1).min(u16::MAX as u64) as u16;
+                                
+                                if let Ok((grid, watermark)) = source.snapshot_range_with_watermark(
+                                    width, vp.start_line, rows
+                                ).await {
+                                    subscription.current_sequence = subscription.current_sequence.saturating_add(1);
+                                    let message = ServerMessage::SnapshotRange {
+                                        subscription_id: subscription_id.clone(),
+                                        sequence: subscription.current_sequence,
+                                        watermark_seq: watermark,
+                                        grid,
+                                        timestamp: chrono::Utc::now().timestamp(),
+                                        checksum: 0,
+                                    };
+                                    self.send_to_subscription(subscription, message).await?;
+                                }
+                            }
+                        }
+                    }
+                }
+                
                 // Notify handler about resize if dimensions changed
                 if let Some(dims) = dims_for_handler {
                     if let Some(handler) = self.handler.read().await.as_ref() {
@@ -1218,8 +1246,26 @@ impl SubscriptionHub {
         };
         let bytes = serde_json::to_vec(&app_envelope)?;
         
-        // Send via transport
-        let send_result = subscription.transport.send(&bytes).await;
+        // Determine channel based on message type
+        let channel_purpose = match &message {
+            ServerMessage::Delta { .. } => ChannelPurpose::Output,  // Deltas use unreliable Output channel
+            _ => ChannelPurpose::Control,  // Everything else uses reliable Control channel
+        };
+        
+        // Send via transport with channel routing if supported
+        let send_result = if subscription.transport.supports_multi_channel() {
+            // Transport supports multiple channels, use appropriate channel
+            match subscription.transport.channel(channel_purpose).await {
+                Ok(channel) => channel.send(&bytes).await,
+                Err(_) => {
+                    // Fallback to default send if channel creation fails
+                    subscription.transport.send(&bytes).await
+                }
+            }
+        } else {
+            // Transport doesn't support multi-channel, use default send
+            subscription.transport.send(&bytes).await
+        };
         
         // Log send result
         if let Some(ref path) = *self.debug_log_path.read().await {

@@ -44,6 +44,38 @@ mod tests {
         async fn invalidate(&self) -> Result<()> {
             Ok(())
         }
+        
+        async fn snapshot_with_view(
+            &self,
+            dims: Dimensions,
+            _mode: crate::protocol::subscription::ViewMode,
+            _position: Option<crate::protocol::subscription::ViewPosition>,
+        ) -> Result<Grid> {
+            // For testing, just return regular snapshot
+            self.snapshot(dims).await
+        }
+        
+        async fn snapshot_range_with_watermark(
+            &self,
+            width: u16,
+            _start_line: u64,
+            rows: u16,
+        ) -> Result<(Grid, u64)> {
+            // For testing, return a basic grid with watermark 0
+            let grid = Grid::new(width, rows);
+            Ok((grid, 0))
+        }
+        
+        async fn get_history_metadata(&self) -> Result<crate::subscription::HistoryMetadata> {
+            // For testing, return default metadata
+            Ok(crate::subscription::HistoryMetadata {
+                oldest_line: 0,
+                latest_line: 100,
+                total_lines: 100,
+                oldest_timestamp: None,
+                latest_timestamp: None,
+            })
+        }
     }
     
     // Mock implementation of PtyWriter for testing

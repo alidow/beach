@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 use crate::server::terminal_state::{
-    Grid, GridHistory, GridView, GridDelta, Cell, LineCounter, Color, CellAttributes
+    Grid, GridHistory, GridView, GridDelta, Cell, LineCounter, Color, CellAttributes, CellChange
 };
 
 #[test]
@@ -14,13 +14,23 @@ fn test_grid_history_basic() {
     
     // Add some test deltas
     for i in 0..10 {
-        let mut delta = GridDelta::new();
-        delta.add_cell_change(0, i as u16, Cell {
-            char: ('A' as u8 + (i % 26) as u8) as char,
-            fg_color: crate::server::terminal_state::Color::Default,
-            bg_color: crate::server::terminal_state::Color::Default,
-            attributes: crate::server::terminal_state::CellAttributes::default(),
-        });
+        let delta = GridDelta {
+            timestamp: chrono::Utc::now(),
+            cell_changes: vec![CellChange {
+                row: 0,
+                col: i as u16,
+                old_cell: Cell::default(),
+                new_cell: Cell {
+                    char: ('A' as u8 + (i % 26) as u8) as char,
+                    fg_color: crate::server::terminal_state::Color::Default,
+                    bg_color: crate::server::terminal_state::Color::Default,
+                    attributes: crate::server::terminal_state::CellAttributes::default(),
+                },
+            }],
+            dimension_change: None,
+            cursor_change: None,
+            sequence: i as u64,
+        };
         history.add_delta(delta);
     }
     
@@ -93,14 +103,23 @@ fn test_grid_view_time_based() {
     let later_time = initial_time + chrono::Duration::seconds(1);
     {
         let mut history = history_arc.lock().unwrap();
-        let mut delta = GridDelta::new();
-        delta.timestamp = later_time;
-        delta.add_cell_change(0, 0, Cell {
-            char: 'B',
-            fg_color: crate::server::terminal_state::Color::Default,
-            bg_color: crate::server::terminal_state::Color::Default,
-            attributes: crate::server::terminal_state::CellAttributes::default(),
-        });
+        let delta = GridDelta {
+            timestamp: later_time,
+            cell_changes: vec![CellChange {
+                row: 0,
+                col: 0,
+                old_cell: Cell::default(),
+                new_cell: Cell {
+                    char: 'B',
+                    fg_color: crate::server::terminal_state::Color::Default,
+                    bg_color: crate::server::terminal_state::Color::Default,
+                    attributes: crate::server::terminal_state::CellAttributes::default(),
+                },
+            }],
+            dimension_change: None,
+            cursor_change: None,
+            sequence: 1,
+        };
         history.add_delta(delta);
     }
     

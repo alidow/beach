@@ -43,6 +43,12 @@ struct Subscription {
     current_sequence: u64,
     /// Last grid sent to this subscription (for delta computation)
     previous_grid: Option<crate::server::terminal_state::Grid>,
+    /// Viewport-based subscription state
+    viewport: Option<crate::protocol::subscription::messages::Viewport>,
+    prefetch: Option<crate::protocol::subscription::messages::Prefetch>,
+    follow_tail: bool,
+    /// Watermark sequence for ordering guarantees
+    watermark_seq: u64,
 }
 
 /// Handler trait for subscription business logic
@@ -152,6 +158,10 @@ impl SubscriptionHub {
             last_sequence_acked: 0,
             current_sequence: 0,
             previous_grid: None,
+            viewport: None,
+            prefetch: None,
+            follow_tail: true,  // Default to following tail for realtime mode
+            watermark_seq: 0,
         };
         
         // Send acknowledgment
@@ -270,6 +280,10 @@ impl SubscriptionHub {
             last_sequence_acked: 0,
             current_sequence: 0,
             previous_grid: None,
+            viewport: None,
+            prefetch: None,
+            follow_tail: true,  // Default to following tail for realtime mode
+            watermark_seq: 0,
         };
 
         // Send subscription acknowledgment
@@ -1027,6 +1041,82 @@ impl SubscriptionHub {
             
             ClientMessage::RequestState { subscription_id, .. } => {
                 self.force_snapshot(&subscription_id).await?;
+            }
+            
+            ClientMessage::ViewportChanged { subscription_id, viewport, prefetch, follow_tail } => {
+                // Update the viewport for the subscription
+                let sub_clone = {
+                    let mut subscriptions = self.subscriptions.write().await;
+                    if let Some(subscription) = subscriptions.get_mut(&subscription_id) {
+                        subscription.viewport = Some(viewport.clone());
+                        subscription.prefetch = prefetch.clone();
+                        if let Some(follow) = follow_tail {
+                            subscription.follow_tail = follow;
+                        }
+                        
+                        // Clone the subscription for later use
+                        Some(Subscription {
+                            id: subscription.id.clone(),
+                            client_id: subscription.client_id.clone(),
+                            dimensions: subscription.dimensions.clone(),
+                            mode: subscription.mode.clone(),
+                            position: subscription.position.clone(),
+                            transport: subscription.transport.clone(),
+                            is_controlling: subscription.is_controlling,
+                            last_sequence_acked: subscription.last_sequence_acked,
+                            current_sequence: subscription.current_sequence + 1,
+                            previous_grid: subscription.previous_grid.clone(),
+                            viewport: Some(viewport.clone()),
+                            prefetch: prefetch.clone(),
+                            follow_tail: subscription.follow_tail,
+                            watermark_seq: subscription.watermark_seq,
+                        })
+                    } else {
+                        None
+                    }
+                };
+                
+                // If we have a subscription and data source, send the new viewport range
+                if let Some(sub) = sub_clone {
+                    if let Some(source) = self.terminal_source.read().await.as_ref() {
+                        // Calculate the visible range with prefetch
+                        let prefetch_before = prefetch.as_ref().map(|p| p.before).unwrap_or(0) as u64;
+                        let prefetch_after = prefetch.as_ref().map(|p| p.after).unwrap_or(0) as u64;
+                        
+                        let start_line = viewport.start_line.saturating_sub(prefetch_before);
+                        let end_line = viewport.end_line + prefetch_after;
+                        let rows = (end_line - start_line + 1).min(u16::MAX as u64) as u16;
+                        
+                        // Get the snapshot with watermark
+                        if let Ok((grid, watermark)) = source.snapshot_range_with_watermark(
+                            sub.dimensions.width,
+                            start_line,
+                            rows
+                        ).await {
+                            // Update watermark in the subscription
+                            {
+                                let mut subscriptions = self.subscriptions.write().await;
+                                if let Some(subscription) = subscriptions.get_mut(&subscription_id) {
+                                    subscription.watermark_seq = watermark;
+                                    subscription.current_sequence += 1;
+                                }
+                            }
+                            
+                            // Send SnapshotRange message
+                            let message = ServerMessage::SnapshotRange {
+                                subscription_id: subscription_id.clone(),
+                                sequence: sub.current_sequence,
+                                watermark_seq: watermark,
+                                grid,
+                                timestamp: chrono::Utc::now().timestamp_millis(),
+                                checksum: 0, // TODO: Calculate checksum
+                            };
+                            
+                            // TODO: Use Control channel when dual-channel is implemented
+                            self.send_to_subscription(&sub, message).await?;
+                        }
+                    }
+                }
             }
             
             _ => {

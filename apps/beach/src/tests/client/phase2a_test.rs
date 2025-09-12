@@ -37,7 +37,7 @@ mod tests {
     /// Test grid renderer with scrolling
     #[tokio::test]
     async fn test_scroll_prefetch() {
-        let mut grid_renderer = GridRenderer::new(80, 24).unwrap();
+        let mut grid_renderer = GridRenderer::new(80, 24, false).unwrap();
         
         // Test initial overscan parameters
         let (from_line, height) = grid_renderer.get_overscan_params();
@@ -58,7 +58,7 @@ mod tests {
     /// Test grid snapshot and delta application
     #[tokio::test]
     async fn test_reconnect_resync() {
-        let mut grid_renderer = GridRenderer::new(80, 24).unwrap();
+        let mut grid_renderer = GridRenderer::new(80, 24, false).unwrap();
         
         // Apply initial snapshot
         let mut snapshot = Grid::new(80, 24);
@@ -104,7 +104,7 @@ mod tests {
     /// Test order guarantees with sequential deltas
     #[tokio::test]
     async fn test_order_guarantees() {
-        let mut grid_renderer = GridRenderer::new(80, 24).unwrap();
+        let mut grid_renderer = GridRenderer::new(80, 24, false).unwrap();
         
         // Apply initial grid
         let grid = Grid::new(80, 24);
@@ -152,7 +152,7 @@ mod tests {
     #[tokio::test]
     async fn test_horizontal_scroll() {
         // Create renderer with server width > local width
-        let mut grid_renderer = GridRenderer::new(120, 24).unwrap();
+        let mut grid_renderer = GridRenderer::new(120, 24, false).unwrap();
         grid_renderer.resize_local(80, 24); // Local terminal is narrower
         
         // Verify horizontal scrolling is needed

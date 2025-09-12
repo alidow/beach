@@ -1,7 +1,10 @@
 /// Full terminal client with TUI, predictive echo, and resilience
 use crate::client::{grid_renderer::GridRenderer, predictive_echo::PredictiveEcho};
 use crate::debug_recorder::DebugRecorder;
-use crate::protocol::{ClientMessage, ServerMessage, Dimensions, ViewMode, ViewPosition, ControlMessage};
+use crate::protocol::{
+    ClientMessage, ServerMessage, Dimensions, ViewMode, ViewPosition, ControlMessage,
+    subscription::messages::{Viewport, Prefetch}
+};
 use crate::protocol::signaling::{AppMessage, PeerInfo};
 use crate::session::{ClientSession, message_handlers::ClientMessageHandler};
 use crate::transport::Transport;
@@ -588,7 +591,12 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
         let subscribe_msg = ClientMessage::Subscribe {
             subscription_id: self.subscription_id.clone(),
             dimensions,
-            mode: ViewMode::Realtime,
+            // New viewport-based fields
+            viewport: None,  // Will be set once we receive HistoryInfo
+            prefetch: Some(Prefetch { before: 100, after: 100 }),
+            follow_tail: Some(true),
+            // Deprecated fields for backward compatibility
+            mode: Some(ViewMode::Realtime),
             position: None,  // Will be updated when scrolling
             compression: None,
         };
@@ -1719,7 +1727,12 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
         let subscribe_msg = ClientMessage::Subscribe {
             subscription_id: self.subscription_id.clone(),
             dimensions,
-            mode: ViewMode::Realtime,
+            // New viewport-based fields
+            viewport: None,
+            prefetch: Some(Prefetch { before: 100, after: 100 }),
+            follow_tail: Some(true),
+            // Deprecated fields for backward compatibility
+            mode: Some(ViewMode::Realtime),
             position: None,
             compression: None,
         };

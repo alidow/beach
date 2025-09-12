@@ -353,4 +353,42 @@ impl TerminalDataSource for TrackerDataSource {
         
         Ok(metadata)
     }
+    
+    async fn snapshot_range_with_watermark(
+        &self,
+        width: u16,
+        start_line: u64,
+        rows: u16,
+    ) -> Result<(Grid, u64)> {
+        // Get tracker and history
+        let tracker = self.tracker.lock().unwrap();
+        let history = tracker.get_history();
+        drop(tracker);
+        
+        let history_guard = history.lock().unwrap();
+        
+        // Get the current sequence number as watermark
+        let watermark_seq = history_guard.get_current_sequence();
+        
+        // Create a grid view to derive the requested range
+        let view = GridView::new(history.clone());
+        drop(history_guard);
+        
+        // Derive grid for the requested line range
+        let grid = view.derive_from_line(start_line, Some(rows))?;
+        
+        // Log debug info if recorder is set
+        if let Some(ref recorder) = self.debug_recorder {
+            if let Ok(mut rec) = recorder.try_lock() {
+                let _ = rec.record_grid_bottom_context(
+                    &format!("snapshot_range_watermark_w{}_s{}_r{}_wm{}", 
+                        width, start_line, rows, watermark_seq),
+                    &grid, 
+                    3
+                );
+            }
+        }
+        
+        Ok((grid, watermark_seq))
+    }
 }

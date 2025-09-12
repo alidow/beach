@@ -8,9 +8,20 @@ use crate::server::terminal_state::{Grid, GridDelta};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    /// DEPRECATED: Use SnapshotRange for viewport-based snapshots
     Snapshot {
         subscription_id: String,
         sequence: u64,
+        grid: Grid,
+        timestamp: i64,
+        checksum: u32,
+    },
+    /// Snapshot for a specific line range with watermark
+    SnapshotRange {
+        subscription_id: String,
+        sequence: u64,
+        /// All deltas <= watermark_seq are included in this snapshot
+        watermark_seq: u64,
         grid: Grid,
         timestamp: i64,
         checksum: u32,

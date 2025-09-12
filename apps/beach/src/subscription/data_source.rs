@@ -12,12 +12,23 @@ pub trait TerminalDataSource: Send + Sync {
     async fn snapshot(&self, dims: Dimensions) -> Result<Grid>;
     
     /// Get a snapshot for a specific view mode and position
+    /// DEPRECATED: Use snapshot_range_with_watermark for viewport-based access
     async fn snapshot_with_view(
         &self, 
         dims: Dimensions, 
         mode: ViewMode, 
         position: Option<ViewPosition>
     ) -> Result<Grid>;
+    
+    /// Get a snapshot for a specific line range with watermark sequence
+    /// Returns a Grid for the requested range and the latest delta sequence
+    /// that has been applied to this snapshot (watermark)
+    async fn snapshot_range_with_watermark(
+        &self,
+        width: u16,
+        start_line: u64,
+        rows: u16,
+    ) -> Result<(Grid, u64)>;
     
     /// Wait for and return the next terminal state change
     /// This should coalesce rapid changes for efficiency

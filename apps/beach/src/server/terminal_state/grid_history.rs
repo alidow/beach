@@ -188,6 +188,11 @@ impl GridHistory {
         self.reconstruct_from_sequence(self.current_sequence)
     }
     
+    /// Get the current sequence number (watermark)
+    pub fn get_current_sequence(&self) -> u64 {
+        self.current_sequence
+    }
+    
     /// Get grid state at a specific timestamp
     pub fn get_at_time(&self, timestamp: DateTime<Utc>) -> Result<Grid, TerminalStateError> {
         // Find the sequence number at or before the given timestamp

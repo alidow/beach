@@ -508,7 +508,7 @@ impl<T: Transport + Send + Sync + 'static> ServerMessageHandler for TerminalServ
                                 let transport_dyn = client_transport as Arc<dyn crate::transport::Transport>;
                                 let config = crate::subscription::SubscriptionConfig {
                                     dimensions,
-                                    mode,
+                                    mode: mode.unwrap_or(crate::protocol::ViewMode::Realtime),
                                     position,
                                     is_controlling: true,
                                 };

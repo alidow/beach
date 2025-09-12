@@ -1,5 +1,34 @@
 use serde::{Deserialize, Serialize};
 
+/// Represents a viewport range in the terminal history
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Viewport {
+    /// Inclusive start line number
+    pub start_line: u64,
+    /// Inclusive end line number  
+    pub end_line: u64,
+}
+
+/// Prefetch configuration for lines around the viewport
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Prefetch {
+    /// Number of lines to prefetch before the viewport
+    pub before: u32,
+    /// Number of lines to prefetch after the viewport
+    pub after: u32,
+}
+
+impl Default for Prefetch {
+    fn default() -> Self {
+        Self {
+            before: 100,
+            after: 100,
+        }
+    }
+}
+
+/// DEPRECATED: Use viewport-based subscription instead
+/// Kept for backward compatibility with old clients
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ViewMode {
@@ -8,6 +37,8 @@ pub enum ViewMode {
     Anchored,
 }
 
+/// DEPRECATED: Use viewport-based subscription instead
+/// Kept for backward compatibility with old clients
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ViewPosition {
     #[serde(skip_serializing_if = "Option::is_none")]

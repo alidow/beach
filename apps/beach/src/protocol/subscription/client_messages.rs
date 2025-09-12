@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use super::messages::{ViewMode, ViewPosition, Dimensions, CompressionType};
+use super::messages::{ViewMode, ViewPosition, Viewport, Prefetch, Dimensions, CompressionType};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -7,12 +7,34 @@ pub enum ClientMessage {
     Subscribe {
         subscription_id: String,
         dimensions: Dimensions,
-        mode: ViewMode,
+        
+        // New viewport-based subscription fields
+        #[serde(skip_serializing_if = "Option::is_none")]
+        viewport: Option<Viewport>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prefetch: Option<Prefetch>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        follow_tail: Option<bool>,
+        
+        // DEPRECATED: kept for backward compatibility
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<ViewMode>,
         #[serde(skip_serializing_if = "Option::is_none")]
         position: Option<ViewPosition>,
+        
         #[serde(skip_serializing_if = "Option::is_none")]
         compression: Option<CompressionType>,
     },
+    /// Fast viewport update for scrolling
+    ViewportChanged {
+        subscription_id: String,
+        viewport: Viewport,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prefetch: Option<Prefetch>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        follow_tail: Option<bool>,
+    },
+    /// DEPRECATED: Use ViewportChanged instead
     ModifySubscription {
         subscription_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]

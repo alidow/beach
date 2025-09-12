@@ -300,6 +300,130 @@ pub enum DebugEvent {
         before_lines: Vec<(u16, String)>,
         after_lines: Vec<(u16, String)>,
     },
+    
+    // Scrollback debugging events
+    #[serde(rename = "history_lookup_requested")]
+    HistoryLookupRequested {
+        timestamp: DateTime<Utc>,
+        requested_line: u64,
+    },
+    
+    #[serde(rename = "history_lookup_candidate")]
+    HistoryLookupCandidate {
+        timestamp: DateTime<Utc>,
+        snapshot_index: usize,
+        snapshot_start_line: u64,
+        snapshot_end_line: u64,
+        contains_line: bool,
+    },
+    
+    #[serde(rename = "history_reconstruct_end")]
+    HistoryReconstructEnd {
+        timestamp: DateTime<Utc>,
+        target_line: u64,
+        found_snapshot: bool,
+        result_start_line: Option<u64>,
+        result_end_line: Option<u64>,
+        result_blank_count: Option<usize>,
+    },
+    
+    #[serde(rename = "reconstruction_path")]
+    ReconstructionPath {
+        timestamp: DateTime<Utc>,
+        starting_snapshot_index: usize,
+        starting_line: u64,
+        deltas_applied: usize,
+        final_line: u64,
+    },
+    
+    #[serde(rename = "historical_view_requested")]
+    HistoricalViewRequested {
+        timestamp: DateTime<Utc>,
+        requested_line: u64,
+        height: u16,
+    },
+    
+    #[serde(rename = "historical_view_returned")]
+    HistoricalViewReturned {
+        timestamp: DateTime<Utc>,
+        requested_line: u64,
+        returned_start_line: u64,
+        returned_end_line: u64,
+        blank_lines: usize,
+        sample_content: Vec<String>,
+    },
+    
+    #[serde(rename = "snapshot_with_view_request")]
+    SnapshotWithViewRequest {
+        timestamp: DateTime<Utc>,
+        mode: String,
+        position_line: Option<u64>,
+        position_time: Option<i64>,
+        dimensions: (u16, u16),
+    },
+    
+    #[serde(rename = "snapshot_with_view_response")]
+    SnapshotWithViewResponse {
+        timestamp: DateTime<Utc>,
+        mode: String,
+        result_start_line: u64,
+        result_end_line: u64,
+        result_blank_count: usize,
+        sample_content: Vec<String>,
+    },
+    
+    #[serde(rename = "modify_subscription_received")]
+    ModifySubscriptionReceived {
+        timestamp: DateTime<Utc>,
+        subscription_id: String,
+        mode: String,
+        position: Option<String>,
+    },
+    
+    // Client scrollback events
+    #[serde(rename = "client_scroll_event")]
+    ClientScrollEvent {
+        timestamp: DateTime<Utc>,
+        /// Direction: "up" or "down"
+        direction: String,
+        /// Current scroll offset
+        scroll_offset: usize,
+        /// View line if in historical mode
+        view_line: Option<u64>,
+    },
+    
+    #[serde(rename = "client_history_needs_check")]
+    ClientHistoryNeedsCheck {
+        timestamp: DateTime<Utc>,
+        /// Current scroll offset
+        scroll_offset: usize,
+        /// Whether metadata is available
+        has_metadata: bool,
+        /// Current view line
+        view_line: Option<u64>,
+        /// History request generated
+        request: Option<(u64, u64)>,
+    },
+    
+    #[serde(rename = "client_history_request_sent")]
+    ClientHistoryRequestSent {
+        timestamp: DateTime<Utc>,
+        /// View mode being requested
+        mode: String,
+        /// Start line for historical request
+        start_line: Option<u64>,
+        /// End line for historical request
+        end_line: Option<u64>,
+    },
+    
+    #[serde(rename = "modify_subscription_processed")]
+    ModifySubscriptionProcessed {
+        timestamp: DateTime<Utc>,
+        subscription_id: String,
+        mode: String,
+        result_grid_dims: (u16, u16),
+        result_blank_count: usize,
+    },
 }
 
 #[derive(Debug)]

@@ -1,14 +1,23 @@
 use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Utc};
 use crate::server::terminal_state::{Grid, GridHistory, TerminalStateError, LineCounter};
+use crate::debug_recorder::{DebugRecorder, DebugEvent};
 
 pub struct GridView {
     history: Arc<Mutex<GridHistory>>,
+    debug_recorder: Option<Arc<Mutex<DebugRecorder>>>,
 }
 
 impl GridView {
     pub fn new(history: Arc<Mutex<GridHistory>>) -> Self {
-        GridView { history }
+        GridView { 
+            history,
+            debug_recorder: None,
+        }
+    }
+    
+    pub fn set_debug_recorder(&mut self, recorder: Option<Arc<Mutex<DebugRecorder>>>) {
+        self.debug_recorder = recorder;
     }
     
     /// Derive realtime view with optional height limit
@@ -42,68 +51,112 @@ impl GridView {
     }
     
     /// Derive view from a specific line number with optional height limit
+    /// This now uses actual historical data from GridHistory
     pub fn derive_from_line(&self, line_num: u64, max_height: Option<u16>) -> Result<Grid, TerminalStateError> {
-        let history = self.history.lock().unwrap();
-        
-        // Get the current grid (most recent state)
-        let current_grid = history.get_current()?;
-        
-        // Check if the requested line is within the current terminal's range
-        let current_start = current_grid.start_line.to_u64().unwrap_or(0);
-        let current_end = current_grid.end_line.to_u64().unwrap_or(current_grid.height as u64 - 1);
-        
-        // If line_num is beyond the end, just return the current view
-        if line_num > current_end {
-            // Return the current view (can't scroll beyond what exists)
-            let mut grid = current_grid;
-            if let Some(height) = max_height {
-                if height < grid.height {
-                    grid = self.truncate_to_height(grid, height)?;
-                }
+        // Debug event: HistoricalViewRequested
+        if let Some(ref recorder) = self.debug_recorder {
+            if let Ok(mut rec) = recorder.try_lock() {
+                let _ = rec.record_event(DebugEvent::HistoricalViewRequested {
+                    timestamp: Utc::now(),
+                    requested_line: line_num,
+                    height: max_height.unwrap_or(24),
+                });
             }
-            return Ok(grid);
         }
         
-        // Create a new grid starting from the requested line
-        let height = max_height.unwrap_or(current_grid.height);
-        let mut new_grid = Grid::new(current_grid.width, height);
-        new_grid.timestamp = current_grid.timestamp;
+        let history = self.history.lock().unwrap();
         
-        // Calculate the offset to shift the view
-        let row_offset = if line_num >= current_start && line_num <= current_end {
-            // Line is within current view, shift accordingly
-            (line_num - current_start) as u16
-        } else if line_num < current_start {
-            // Line is before current view (shouldn't happen with current terminal model)
+        // Get the historical grid containing the requested line
+        let historical_grid = history.get_from_line(line_num)?;
+        
+        // Check if the requested line is within the historical grid's range
+        let hist_start = historical_grid.start_line.to_u64().unwrap_or(0);
+        let hist_end = historical_grid.end_line.to_u64().unwrap_or(historical_grid.height as u64 - 1);
+        
+        // Create a new grid with the requested height (top-anchored from line_num)
+        let height = max_height.unwrap_or(historical_grid.height);
+        let mut new_grid = Grid::new(historical_grid.width, height);
+        new_grid.timestamp = historical_grid.timestamp;
+        
+        // Calculate the offset within the historical grid
+        let row_offset = if line_num >= hist_start && line_num <= hist_end {
+            // Line is within the historical view
+            (line_num - hist_start) as u16
+        } else if line_num < hist_start {
+            // Requested line is before the historical grid (use start of grid)
             0
         } else {
-            // Line is after current view (already handled above)
-            0
+            // Requested line is after the historical grid (shouldn't happen with proper get_from_line)
+            // Fall back to showing from the end
+            historical_grid.height.saturating_sub(height)
         };
         
-        // Copy the grid content starting from the requested line
+        // Copy the grid content starting from the requested line (top-anchored)
         for dst_row in 0..height {
             let src_row = dst_row + row_offset;
-            if src_row < current_grid.height {
-                for col in 0..current_grid.width {
-                    if let Some(cell) = current_grid.get_cell(src_row, col) {
+            if src_row < historical_grid.height {
+                for col in 0..historical_grid.width {
+                    if let Some(cell) = historical_grid.get_cell(src_row, col) {
                         new_grid.set_cell(dst_row, col, cell.clone());
                     }
                 }
             }
         }
         
-        // Update line numbers
+        // Update line numbers to reflect the top-anchored view
         new_grid.start_line = LineCounter::from_u64(line_num);
         new_grid.end_line = LineCounter::from_u64(line_num + height as u64 - 1);
         
+        // Debug event: HistoricalViewReturned
+        if let Some(ref recorder) = self.debug_recorder {
+            if let Ok(mut rec) = recorder.try_lock() {
+                // Collect sample content
+                let mut sample_content = Vec::new();
+                let mut blank_lines = 0;
+                for row in 0..new_grid.height.min(10) {
+                    let mut line = String::new();
+                    for col in 0..new_grid.width {
+                        if let Some(cell) = new_grid.get_cell(row, col) {
+                            line.push(cell.char);
+                        } else {
+                            line.push(' ');
+                        }
+                    }
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        blank_lines += 1;
+                        sample_content.push(format!("Row {}: [BLANK]", row));
+                    } else {
+                        sample_content.push(format!("Row {}: {}", row, trimmed));
+                    }
+                }
+                
+                let _ = rec.record_event(DebugEvent::HistoricalViewReturned {
+                    timestamp: Utc::now(),
+                    requested_line: line_num,
+                    returned_start_line: new_grid.start_line.to_u64().unwrap_or(0),
+                    returned_end_line: new_grid.end_line.to_u64().unwrap_or(0),
+                    blank_lines,
+                    sample_content,
+                });
+            }
+        }
+        
         // Adjust cursor position relative to new view
-        if current_grid.cursor.row >= row_offset {
-            new_grid.cursor = current_grid.cursor.clone();
-            new_grid.cursor.row -= row_offset;
+        if historical_grid.cursor.row >= row_offset {
+            let cursor_in_view = historical_grid.cursor.row - row_offset;
+            if cursor_in_view < height {
+                // Cursor is within the new view
+                new_grid.cursor = historical_grid.cursor.clone();
+                new_grid.cursor.row = cursor_in_view;
+            } else {
+                // Cursor is below the new view
+                new_grid.cursor = historical_grid.cursor.clone();
+                new_grid.cursor.visible = false;
+            }
         } else {
             // Cursor is above the new view
-            new_grid.cursor = current_grid.cursor.clone();
+            new_grid.cursor = historical_grid.cursor.clone();
             new_grid.cursor.visible = false;
         }
         

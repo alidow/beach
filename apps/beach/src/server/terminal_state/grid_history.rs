@@ -5,6 +5,19 @@ use serde::{Deserialize, Serialize};
 use crate::server::terminal_state::{Grid, GridDelta, LineCounter, TerminalStateError};
 use crate::debug_recorder::{DebugRecorder, DebugEvent};
 
+/// Metadata about a snapshot for quick lookups
+#[derive(Debug, Clone)]
+struct SnapshotMeta {
+    /// Sequence number of this snapshot
+    seq: u64,
+    /// Starting line number visible in this snapshot
+    start_line: LineCounter,
+    /// Ending line number visible in this snapshot
+    end_line: LineCounter,
+    /// Timestamp when snapshot was taken
+    timestamp: DateTime<Utc>,
+}
+
 #[derive(Debug)]
 pub struct GridHistory {
     /// Initial grid state
@@ -15,6 +28,9 @@ pub struct GridHistory {
     
     /// Snapshot grids for faster reconstruction
     snapshots: BTreeMap<u64, Grid>,
+    
+    /// Metadata about snapshots for efficient line-based lookup
+    snapshot_meta: Vec<SnapshotMeta>,
     
     /// Index by timestamp for time-based lookup
     time_index: BTreeMap<DateTime<Utc>, u64>,
@@ -104,6 +120,7 @@ impl GridHistory {
             initial_grid: initial_grid.clone(),
             deltas: BTreeMap::new(),
             snapshots: BTreeMap::new(),
+            snapshot_meta: Vec::new(),
             time_index: BTreeMap::new(),
             line_index: BTreeMap::new(),
             current_sequence: 0,
@@ -112,8 +129,14 @@ impl GridHistory {
             debug_recorder,
         };
         
-        // Add initial grid as first snapshot
+        // Add initial grid as first snapshot with metadata
         history.snapshots.insert(0, initial_grid.clone());
+        history.snapshot_meta.push(SnapshotMeta {
+            seq: 0,
+            start_line: initial_grid.start_line.clone(),
+            end_line: initial_grid.end_line.clone(),
+            timestamp: initial_grid.timestamp,
+        });
         history.time_index.insert(initial_grid.timestamp, 0);
         history.line_index.insert(initial_grid.start_line.clone(), 0);
         
@@ -147,6 +170,14 @@ impl GridHistory {
 
     /// Add a snapshot of the current grid state
     pub fn add_snapshot(&mut self, grid: Grid) {
+        // Add snapshot metadata for efficient lookup
+        self.snapshot_meta.push(SnapshotMeta {
+            seq: self.current_sequence,
+            start_line: grid.start_line.clone(),
+            end_line: grid.end_line.clone(),
+            timestamp: grid.timestamp,
+        });
+        
         self.snapshots.insert(self.current_sequence, grid.clone());
         self.line_index.insert(grid.start_line.clone(), self.current_sequence);
         self.last_snapshot_time = grid.timestamp;
@@ -171,11 +202,134 @@ impl GridHistory {
     }
     
     /// Get grid state containing a specific line number
-    /// Note: This returns the grid that contains the line, not necessarily starting at the line
-    pub fn get_from_line(&self, _line_num: u64) -> Result<Grid, TerminalStateError> {
-        // For now, just return the current grid
-        // The view shifting is handled by GridView::derive_from_line
-        self.get_current()
+    /// Returns a grid from history whose visible window contains the requested line
+    pub fn get_from_line(&self, line_num: u64) -> Result<Grid, TerminalStateError> {
+        let _target_line = LineCounter::from_u64(line_num);
+        
+        // Debug event: HistoryLookupRequested
+        if let Some(ref recorder) = self.debug_recorder {
+            if let Ok(mut rec) = recorder.try_lock() {
+                let _ = rec.record_event(DebugEvent::HistoryLookupRequested {
+                    timestamp: Utc::now(),
+                    requested_line: line_num,
+                });
+            }
+        }
+        
+        // Find the best snapshot containing this line using binary search
+        let mut best_snapshot: Option<&SnapshotMeta> = None;
+        
+        // First, try to find a snapshot that contains the line within its window
+        for meta in &self.snapshot_meta {
+            let start_u64 = meta.start_line.to_u64().unwrap_or(0);
+            let end_u64 = meta.end_line.to_u64().unwrap_or(0);
+            
+            if line_num >= start_u64 && line_num <= end_u64 {
+                // Found a snapshot containing the line
+                best_snapshot = Some(meta);
+                break;
+            }
+        }
+        
+        // If no exact match, find the closest snapshot before the line
+        if best_snapshot.is_none() {
+            for meta in &self.snapshot_meta {
+                let start_u64 = meta.start_line.to_u64().unwrap_or(0);
+                
+                if start_u64 <= line_num {
+                    best_snapshot = Some(meta);
+                    // Continue searching for a closer one
+                } else {
+                    // We've gone past the target line
+                    break;
+                }
+            }
+        }
+        
+        // If still no snapshot found, use the initial grid
+        let seq_start = best_snapshot.map(|m| m.seq).unwrap_or(0);
+        
+        // Debug event: HistoryLookupCandidate
+        if let Some(ref recorder) = self.debug_recorder {
+            if let Ok(mut rec) = recorder.try_lock() {
+                let snapshot_start = best_snapshot.map(|m| m.start_line.to_u64().unwrap_or(0)).unwrap_or(0);
+                let snapshot_end = best_snapshot.map(|m| m.end_line.to_u64().unwrap_or(0)).unwrap_or(self.initial_grid.height as u64 - 1);
+                
+                let _ = rec.record_event(DebugEvent::HistoryLookupCandidate {
+                    timestamp: Utc::now(),
+                    snapshot_index: best_snapshot.map(|_| self.snapshots.len() - 1).unwrap_or(0),
+                    snapshot_start_line: snapshot_start,
+                    snapshot_end_line: snapshot_end,
+                    contains_line: line_num >= snapshot_start && line_num <= snapshot_end,
+                });
+            }
+        }
+        
+        // Reconstruct from the chosen snapshot
+        let mut grid = self.reconstruct_from_sequence(seq_start)?;
+        
+        // Check if the reconstructed grid contains the target line
+        let grid_start = grid.start_line.to_u64().unwrap_or(0);
+        let grid_end = grid.end_line.to_u64().unwrap_or(0);
+        
+        // If the line is not in the current window, try to find a better snapshot
+        // or apply more deltas to reach the target line
+        if line_num < grid_start || line_num > grid_end {
+            // Try applying deltas forward from this snapshot to reach the target line
+            if line_num > grid_end && seq_start < self.current_sequence {
+                // Apply deltas forward until we reach a grid containing the line
+                for (seq, delta) in self.deltas.range(seq_start + 1..=self.current_sequence) {
+                    delta.apply(&mut grid)?;
+                    
+                    let new_start = grid.start_line.to_u64().unwrap_or(0);
+                    let new_end = grid.end_line.to_u64().unwrap_or(0);
+                    
+                    if line_num >= new_start && line_num <= new_end {
+                        // Found it!
+                        if let Some(ref recorder) = self.debug_recorder {
+                            if let Ok(mut rec) = recorder.try_lock() {
+                                let _ = rec.record_event(DebugEvent::Comment {
+                                    timestamp: Utc::now(),
+                                    text: format!(
+                                        "get_from_line: Found line {} after applying deltas up to seq {}",
+                                        line_num, seq
+                                    ),
+                                });
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        
+        // Final check and debug logging
+        let final_start = grid.start_line.to_u64().unwrap_or(0);
+        let final_end = grid.end_line.to_u64().unwrap_or(0);
+        let contains_target = line_num >= final_start && line_num <= final_end;
+        
+        // Count applied deltas
+        let applied_deltas = if seq_start < self.current_sequence {
+            self.deltas.range(seq_start + 1..=self.current_sequence).count() as u64
+        } else {
+            0
+        };
+        
+        // Debug event: HistoryReconstructEnd
+        if let Some(ref recorder) = self.debug_recorder {
+            if let Ok(mut rec) = recorder.try_lock() {
+                let _ = rec.record_event(DebugEvent::HistoryReconstructEnd {
+                    timestamp: Utc::now(),
+                    target_line: line_num,
+                    found_snapshot: true,
+                    result_start_line: Some(final_start),
+                    result_end_line: Some(final_end),
+                    result_blank_count: Some(grid.count_blank_lines()),
+                });
+            }
+        }
+        
+        Ok(grid)
     }
     
     /// Reconstruct grid from nearest snapshot
@@ -187,6 +341,25 @@ impl GridHistory {
             .next()
             .map(|(seq, grid)| (*seq, grid.clone()))
             .unwrap_or((0, self.initial_grid.clone()));
+        
+        // Debug event: ReconstructionPath
+        if let Some(ref recorder) = self.debug_recorder {
+            if let Ok(mut rec) = recorder.try_lock() {
+                let delta_count = if snapshot_seq < target_seq {
+                    self.deltas.range(snapshot_seq + 1..=target_seq).count() as u64
+                } else {
+                    0
+                };
+                
+                let _ = rec.record_event(DebugEvent::ReconstructionPath {
+                    timestamp: Utc::now(),
+                    starting_snapshot_index: snapshot_seq as usize,
+                    starting_line: grid.start_line.to_u64().unwrap_or(0),
+                    deltas_applied: delta_count as usize,
+                    final_line: grid.end_line.to_u64().unwrap_or(0),
+                });
+            }
+        }
         
         // Log the starting point for reconstruction
         if let Some(ref recorder) = self.debug_recorder {
@@ -308,6 +481,14 @@ impl GridHistory {
     /// Create a new snapshot at current state
     fn create_snapshot(&mut self) {
         if let Ok(grid) = self.get_current() {
+            // Add snapshot metadata for efficient lookup
+            self.snapshot_meta.push(SnapshotMeta {
+                seq: self.current_sequence,
+                start_line: grid.start_line.clone(),
+                end_line: grid.end_line.clone(),
+                timestamp: grid.timestamp,
+            });
+            
             self.snapshots.insert(self.current_sequence, grid.clone());
             self.line_index.insert(grid.start_line.clone(), self.current_sequence);
         }
@@ -323,6 +504,7 @@ impl GridHistory {
                 // Clear all history
                 self.deltas.clear();
                 self.snapshots.clear();
+                self.snapshot_meta.clear();  // Clear metadata too
                 self.time_index.clear();
                 self.line_index.clear();
                 
@@ -331,8 +513,14 @@ impl GridHistory {
                 self.current_sequence = 0;
                 self.last_snapshot_time = current_grid.timestamp;
                 
-                // Add the new initial grid as first snapshot
+                // Add the new initial grid as first snapshot with metadata
                 self.snapshots.insert(0, current_grid.clone());
+                self.snapshot_meta.push(SnapshotMeta {
+                    seq: 0,
+                    start_line: current_grid.start_line.clone(),
+                    end_line: current_grid.end_line.clone(),
+                    timestamp: current_grid.timestamp,
+                });
                 self.time_index.insert(current_grid.timestamp, 0);
                 self.line_index.insert(current_grid.start_line.clone(), 0);
             }
@@ -481,6 +669,7 @@ impl GridHistory {
             // Clear all history
             self.deltas.clear();
             self.snapshots.clear();
+            self.snapshot_meta.clear();  // Clear metadata too
             self.time_index.clear();
             self.line_index.clear();
             
@@ -489,8 +678,14 @@ impl GridHistory {
             self.current_sequence = 0;
             self.last_snapshot_time = current_grid.timestamp;
             
-            // Add the new initial grid as first snapshot
+            // Add the new initial grid as first snapshot with metadata
             self.snapshots.insert(0, current_grid.clone());
+            self.snapshot_meta.push(SnapshotMeta {
+                seq: 0,
+                start_line: current_grid.start_line.clone(),
+                end_line: current_grid.end_line.clone(),
+                timestamp: current_grid.timestamp,
+            });
             self.time_index.insert(current_grid.timestamp, 0);
             self.line_index.insert(current_grid.start_line.clone(), 0);
         }

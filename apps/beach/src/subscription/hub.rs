@@ -383,6 +383,24 @@ impl SubscriptionHub {
         
         // Send updated snapshot if dimensions or view changed
         if dimensions_changed || view_changed {
+            // Debug log the modification
+            if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/beach-subscription.log")
+            {
+                use std::io::Write;
+                let _ = writeln!(debug_file, 
+                    "[{}] ModifySubscription: id={}, dims_changed={}, view_changed={}, mode={:?}, position={:?}",
+                    chrono::Utc::now(),
+                    id,
+                    dimensions_changed,
+                    view_changed,
+                    subscription.mode,
+                    subscription.position.as_ref().map(|p| format!("line={:?}", p.line))
+                );
+            }
+            
             if let Some(source) = self.terminal_source.read().await.as_ref() {
                 // Use the new snapshot_with_view method to support historical views
                 let snapshot = source.snapshot_with_view(
@@ -392,6 +410,24 @@ impl SubscriptionHub {
                 ).await?;
                 
                 subscription.current_sequence += 1;
+                
+                // Debug log the snapshot being sent
+                if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/beach-subscription.log")
+                {
+                    use std::io::Write;
+                    let _ = writeln!(debug_file, 
+                        "[{}] SENDING SNAPSHOT: id={}, seq={}, grid_dims={}x{}, start_line={:?}, end_line={:?}",
+                        chrono::Utc::now(),
+                        id,
+                        subscription.current_sequence,
+                        snapshot.width, snapshot.height,
+                        snapshot.start_line.to_u64(),
+                        snapshot.end_line.to_u64()
+                    );
+                }
                 
                 // Reset previous_grid when dimensions or view changes
                 subscription.previous_grid = Some(snapshot.clone());
@@ -929,6 +965,18 @@ impl SubscriptionHub {
             }
             
             ClientMessage::ModifySubscription { subscription_id, dimensions, mode, position } => {
+                // Debug event: ModifySubscriptionReceived
+                if let Some(recorder) = self.debug_recorder.read().await.as_ref() {
+                    if let Ok(mut rec) = recorder.lock() {
+                        let _ = rec.record_event(crate::debug_recorder::DebugEvent::ModifySubscriptionReceived {
+                            timestamp: chrono::Utc::now(),
+                            subscription_id: subscription_id.clone(),
+                            mode: format!("{:?}", mode),
+                            position: position.as_ref().map(|p| format!("{:?}", p)),
+                        });
+                    }
+                }
+                
                 // Clone dimensions before moving into update
                 let dims_for_handler = dimensions.clone();
                 
@@ -939,6 +987,31 @@ impl SubscriptionHub {
                     ..Default::default()
                 };
                 self.update(&subscription_id, update).await?;
+                
+                // Debug event: ModifySubscriptionProcessed
+                // Get the updated subscription to log its state
+                {
+                    let subscriptions = self.subscriptions.read().await;
+                    if let Some(sub) = subscriptions.get(&subscription_id) {
+                        let mode_str = format!("{:?}", sub.mode);
+                        let dims = (sub.dimensions.width, sub.dimensions.height);
+                        drop(subscriptions); // Drop the lock before recording event
+                        
+                        if let Some(recorder) = self.debug_recorder.read().await.as_ref() {
+                            if let Ok(mut rec) = recorder.lock() {
+                                // Note: We'd need to get the actual grid to count blank lines
+                                // For now, just record the dimensions and mode
+                                let _ = rec.record_event(crate::debug_recorder::DebugEvent::ModifySubscriptionProcessed {
+                                    timestamp: chrono::Utc::now(),
+                                    subscription_id: subscription_id.clone(),
+                                    mode: mode_str,
+                                    result_grid_dims: dims,
+                                    result_blank_count: 0, // TODO: Get actual blank count from grid
+                                });
+                            }
+                        }
+                    }
+                }
                 
                 // Notify handler about resize if dimensions changed
                 if let Some(dims) = dims_for_handler {

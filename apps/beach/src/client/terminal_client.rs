@@ -97,6 +97,13 @@ pub struct TerminalClient<T: Transport + Send + 'static> {
     
     /// Debug recorder for subscription events
     debug_recorder: Arc<Mutex<Option<DebugRecorder>>>,
+
+    /// Throttle: history request in-flight (start_line)
+    history_pending_line: Arc<Mutex<Option<u64>>>,
+    /// Throttle: last history request send time
+    history_last_sent: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Track last requested subscription mode
+    last_requested_mode: Arc<Mutex<crate::protocol::ViewMode>>,
 }
 
 impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
@@ -286,6 +293,9 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
             mouse_mode: Arc::new(RwLock::new(MouseMode::Normal)),
             debug_log,
             debug_recorder: Arc::new(Mutex::new(debug_recorder)),
+            history_pending_line: Arc::new(Mutex::new(None)),
+            history_last_sent: Arc::new(Mutex::new(None)),
+            last_requested_mode: Arc::new(Mutex::new(ViewMode::Realtime)),
         });
         
         Ok(client)
@@ -796,12 +806,36 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
             MouseEventKind::ScrollUp => {
                 // Scroll viewport up (show earlier content)
                 self.grid_renderer.lock().await.scroll_vertical(3);
+                
+                // Record debug event
+                if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
+                    let renderer = self.grid_renderer.lock().await;
+                    let _ = recorder.record_event(crate::debug_recorder::DebugEvent::ClientScrollEvent {
+                        timestamp: chrono::Utc::now(),
+                        direction: "up".to_string(),
+                        scroll_offset: renderer.scroll_offset as usize,
+                        view_line: if renderer.is_historical_mode() { Some(0) } else { None },
+                    });
+                }
+                
                 // Trigger history update if needed
                 self.handle_scroll_update().await?;
             }
             MouseEventKind::ScrollDown => {
                 // Scroll viewport down (show later content)
                 self.grid_renderer.lock().await.scroll_vertical(-3);
+                
+                // Record debug event
+                if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
+                    let renderer = self.grid_renderer.lock().await;
+                    let _ = recorder.record_event(crate::debug_recorder::DebugEvent::ClientScrollEvent {
+                        timestamp: chrono::Utc::now(),
+                        direction: "down".to_string(),
+                        scroll_offset: renderer.scroll_offset as usize,
+                        view_line: if renderer.is_historical_mode() { Some(0) } else { None },
+                    });
+                }
+                
                 // Trigger history update if needed
                 self.handle_scroll_update().await?;
             }
@@ -1361,8 +1395,130 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                 }
             }
             ServerMessage::Snapshot { grid, .. } => {
+                // Debug logging for snapshot reception
+                if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/beach-snapshot-debug.log")
+                {
+                    use std::io::Write;
+                    let mode = self.last_requested_mode.lock().await;
+                    let _ = writeln!(debug_file, 
+                        "[{}] [SNAPSHOT_RECEIVED] Processing snapshot:",
+                        chrono::Utc::now()
+                    );
+                    let _ = writeln!(debug_file, 
+                        "  grid.start_line: {:?}",
+                        grid.start_line.to_u64()
+                    );
+                    let _ = writeln!(debug_file, 
+                        "  grid.end_line: {:?}",
+                        grid.end_line.to_u64()
+                    );
+                    let _ = writeln!(debug_file, 
+                        "  last_requested_mode: {:?}",
+                        *mode
+                    );
+                    let _ = writeln!(debug_file, 
+                        "  Will call enter_historical_mode: {}",
+                        *mode == ViewMode::Historical && grid.start_line.to_u64().is_some()
+                    );
+                }
+                
+                // If we last requested Historical, set the client anchor to
+                // the snapshot's start line before applying so cache is populated.
+                {
+                    let mode = self.last_requested_mode.lock().await;
+                    if *mode == ViewMode::Historical {
+                        if let Some(start) = grid.start_line.to_u64() {
+                            // Log before and after enter_historical_mode
+                            if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open("/tmp/beach-snapshot-debug.log")
+                            {
+                                use std::io::Write;
+                                let _ = writeln!(debug_file, 
+                                    "[{}] [ENTER_HISTORICAL] Calling enter_historical_mode({})",
+                                    chrono::Utc::now(),
+                                    start
+                                );
+                            }
+                            
+                            self.grid_renderer.lock().await.enter_historical_mode(start);
+                            
+                            // Log state after calling enter_historical_mode
+                            if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open("/tmp/beach-snapshot-debug.log")
+                            {
+                                use std::io::Write;
+                                let renderer = self.grid_renderer.lock().await;
+                                let _ = writeln!(debug_file, 
+                                    "[{}] [ENTER_HISTORICAL] After call - is_historical_mode: {}",
+                                    chrono::Utc::now(),
+                                    renderer.is_historical_mode()
+                                );
+                            }
+                        } else {
+                            // Log if we skip enter_historical_mode
+                            if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open("/tmp/beach-snapshot-debug.log")
+                            {
+                                use std::io::Write;
+                                let _ = writeln!(debug_file, 
+                                    "[{}] [ENTER_HISTORICAL] SKIPPED - grid.start_line is None!",
+                                    chrono::Utc::now()
+                                );
+                            }
+                        }
+                    }
+                }
                 // Apply the snapshot
                 self.grid_renderer.lock().await.apply_snapshot(grid.clone());
+                // Debug: log a small sample of the top few lines we will render
+                if let Some(ref path) = self.debug_log {
+                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                        use std::io::Write;
+                        let renderer = self.grid_renderer.lock().await;
+                        let start_u64 = grid.start_line.to_u64().unwrap_or(0);
+                        let end_u64 = grid.end_line.to_u64().unwrap_or(0);
+                        let _ = writeln!(file, "[{}] Client: Snapshot applied (hist_mode={}, start_line={}, end_line={}, dims={}x{})",
+                            chrono::Utc::now().format("%H:%M:%S%.3f"),
+                            renderer.is_historical_mode(), start_u64, end_u64,
+                            renderer.grid.width, renderer.grid.height);
+                        for row in 0..renderer.grid.height.min(5) {
+                            let mut s = String::new();
+                            for col in 0..renderer.grid.width.min(80) {
+                                if let Some(c) = renderer.grid.get_cell(row, col) { s.push(c.char); }
+                            }
+                            let _ = writeln!(file, "[{}] Client:   Top Row {}: '{}'",
+                                chrono::Utc::now().format("%H:%M:%S%.3f"), row, s.trim_end());
+                        }
+                    }
+                }
+                // Clear pending history throttle (snapshot received)
+                {
+                    let mut pending = self.history_pending_line.lock().await;
+                    *pending = None;
+                }
+                // Refresh history metadata from the snapshot's line counters so
+                // scrollback math uses up-to-date absolute line numbers even when
+                // deltas don't carry line info.
+                if let (Some(start), Some(end)) = (grid.start_line.to_u64(), grid.end_line.to_u64()) {
+                    use crate::subscription::HistoryMetadata;
+                    let meta = HistoryMetadata {
+                        oldest_line: start,
+                        latest_line: end,
+                        total_lines: end.saturating_sub(start).saturating_add(1),
+                        oldest_timestamp: None,
+                        latest_timestamp: Some(grid.timestamp),
+                    };
+                    self.grid_renderer.lock().await.set_history_metadata(meta);
+                }
                 
                 // Record client grid state after applying snapshot
                 if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
@@ -1582,67 +1738,270 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
     
     /// Handle scroll position updates to update overscan subscription
     async fn handle_scroll_update(&self) -> Result<()> {
-        let mut grid_renderer = self.grid_renderer.lock().await;
+        // Debug logging to file
+        if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/beach-scroll-debug.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(debug_file, "[{}] handle_scroll_update: Starting", chrono::Utc::now());
+        }
         
-        // Check if we need to fetch history
-        if let Some(history_request) = grid_renderer.calculate_history_needs() {
-            // Enter historical mode if not already in it
-            if !grid_renderer.is_historical_mode() {
-                // Get current line position from grid
-                let current_line = grid_renderer.grid.end_line.to_u64()
-                    .unwrap_or(0);
-                grid_renderer.enter_historical_mode(current_line);
+        // Snapshot what we need without holding the renderer lock across awaits
+        let (calc_request, was_historical, scroll_at, srv_w, srv_h) = {
+            let mut gr = self.grid_renderer.lock().await;
+            let req = gr.calculate_history_needs();
+            let hist = gr.is_historical_mode();
+            let offset = gr.scroll_offset as usize;
+            let w = gr.server_width;
+            let h = gr.server_height;
+            (req, hist, offset, w, h)
+        };
+        
+        // Debug log the current state
+        if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/beach-scroll-debug.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(debug_file, 
+                "[{}] State: was_historical={}, scroll_offset={}, calc_request={:?}, srv_dims={}x{}",
+                chrono::Utc::now(), was_historical, scroll_at, 
+                calc_request.as_ref().map(|r| format!("lines {}-{}", r.start_line, r.end_line)),
+                srv_w, srv_h
+            );
+        }
+
+        // Record debug event with the computed request
+        if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
+            let _ = recorder.record_event(crate::debug_recorder::DebugEvent::ClientHistoryNeedsCheck {
+                timestamp: chrono::Utc::now(),
+                scroll_offset: scroll_at,
+                has_metadata: true,
+                view_line: if was_historical { Some(0) } else { None },
+                request: calc_request.as_ref().map(|r| (r.start_line, r.end_line)),
+            });
+        }
+
+        if let Some(history_request) = calc_request {
+            // Throttle duplicate/rapid requests
+            let mut should_send = true;
+            {
+                let mut last_sent = self.history_last_sent.lock().await;
+                let mut pending = self.history_pending_line.lock().await;
+                if let Some(p_line) = *pending {
+                    // If we already have a request for a nearby line, skip
+                    if (history_request.start_line as i64 - p_line as i64).abs() < (srv_h as i64 / 2) {
+                        should_send = false;
+                    }
+                }
+                if let Some(ts) = *last_sent {
+                    if ts.elapsed() < std::time::Duration::from_millis(75) {
+                        should_send = false;
+                    }
+                }
+                if should_send {
+                    *pending = Some(history_request.start_line);
+                    *last_sent = Some(std::time::Instant::now());
+                }
+            }
+            if !should_send { return Ok(()); }
+
+            // Log request
+            if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
+                let _ = recorder.record_event(crate::debug_recorder::DebugEvent::ClientHistoryRequestSent {
+                    timestamp: chrono::Utc::now(),
+                    mode: "Historical".to_string(),
+                    start_line: Some(history_request.start_line),
+                    end_line: Some(history_request.end_line),
+                });
             }
             
-            // Send ModifySubscription message to request historical view
+            // Debug log the Historical mode request
+            if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/beach-scroll-debug.log")
+            {
+                use std::io::Write;
+                let _ = writeln!(debug_file, 
+                    "[{}] SENDING HISTORICAL REQUEST: start_line={}, end_line={}, dimensions={}x{}",
+                    chrono::Utc::now(), history_request.start_line, history_request.end_line,
+                    srv_w, srv_h.saturating_mul(2)
+                );
+            }
+            
+            // Send ModifySubscription to request historical view (non-blocking)
             let modify_msg = ClientMessage::ModifySubscription {
                 subscription_id: self.subscription_id.clone(),
-                dimensions: Some(Dimensions { 
-                    width: grid_renderer.server_width, 
-                    height: grid_renderer.server_height 
-                }),
+                dimensions: Some(Dimensions { width: srv_w, height: srv_h.saturating_mul(2) }),
                 mode: Some(ViewMode::Historical),
-                position: Some(ViewPosition {
-                    time: None,
-                    line: Some(history_request.start_line),
-                    offset: None,
-                }),
+                position: Some(ViewPosition { time: None, line: Some(history_request.start_line), offset: None }),
             };
-            
-            // Record client message being sent
             if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
                 let _ = recorder.record_client_message(&modify_msg);
             }
+            let app_msg = AppMessage::Protocol { message: serde_json::to_value(&modify_msg)? };
+            self.send_queue_tx
+                .send(QueuedMessage::AppMessage(app_msg))
+                .await
+                .map_err(|_| anyhow::anyhow!("Send queue closed"))?;
+            return Ok(());
+        }
+
+        // No history request: if we are at bottom while in historical mode, return to realtime
+        if scroll_at == 0 && was_historical {
+            // Debug log the return to realtime
+            if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/beach-scroll-debug.log")
+            {
+                use std::io::Write;
+                let _ = writeln!(debug_file, 
+                    "[{}] RETURNING TO REALTIME MODE: scroll_offset=0, was_historical=true",
+                    chrono::Utc::now()
+                );
+            }
             
-            let app_msg = AppMessage::Protocol {
-                message: serde_json::to_value(&modify_msg)?,
-            };
-            
-            self.session.write().await.send_to_server(app_msg).await?;
-        } else if grid_renderer.scroll_offset == 0 && grid_renderer.is_historical_mode() {
-            // Return to realtime mode when scrolled back to bottom
-            grid_renderer.enter_realtime_mode();
-            
-            // Send ModifySubscription to return to realtime
+            {
+                let mut gr = self.grid_renderer.lock().await;
+                gr.enter_realtime_mode();
+            }
             let modify_msg = ClientMessage::ModifySubscription {
                 subscription_id: self.subscription_id.clone(),
-                dimensions: None, // Keep current dimensions
+                dimensions: None,
                 mode: Some(ViewMode::Realtime),
                 position: None,
             };
-            
-            // Record client message being sent
             if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
                 let _ = recorder.record_client_message(&modify_msg);
             }
+            // Debug logging for state transition to Realtime
+            if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/beach-state-flow.log")
+            {
+                use std::io::Write;
+                let mode_before = self.last_requested_mode.lock().await;
+                let _ = writeln!(debug_file, 
+                    "[{}] [CLIENT_STATE] BEFORE ModifySubscription send to Realtime:",
+                    chrono::Utc::now()
+                );
+                let _ = writeln!(debug_file, 
+                    "  last_requested_mode: {:?}",
+                    *mode_before
+                );
+                let _ = writeln!(debug_file, 
+                    "  new_mode: ViewMode::Realtime"
+                );
+            }
             
-            let app_msg = AppMessage::Protocol {
-                message: serde_json::to_value(&modify_msg)?,
-            };
-            
-            self.session.write().await.send_to_server(app_msg).await?;
+            let app_msg = AppMessage::Protocol { message: serde_json::to_value(&modify_msg)? };
+            self.send_queue_tx
+                .send(QueuedMessage::AppMessage(app_msg))
+                .await
+                .map_err(|_| anyhow::anyhow!("Send queue closed"))?;
+            {
+                let mut mode = self.last_requested_mode.lock().await;
+                *mode = ViewMode::Realtime;
+                
+                // Log after updating
+                if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/beach-state-flow.log")
+                {
+                    use std::io::Write;
+                    let _ = writeln!(debug_file, 
+                        "[{}] [CLIENT_STATE] AFTER updating last_requested_mode: {:?}",
+                        chrono::Utc::now(),
+                        *mode
+                    );
+                }
+            }
+            return Ok(());
         }
-        
+
+        // Failsafe: if user is scrolled (offset > 0) but we didn't generate a
+        // request (e.g., because client-side anchor is stale) and we haven't
+        // requested Historical yet, proactively send a Historical modify using
+        // the current end_line as a baseline.
+        if scroll_at > 0 {
+            let should_force = {
+                let mode = self.last_requested_mode.lock().await;
+                *mode != ViewMode::Historical
+            };
+            if should_force {
+                let (start_line_guess, width, height2) = {
+                    let gr = self.grid_renderer.lock().await;
+                    let end = gr.grid.end_line.to_u64().unwrap_or(0);
+                    (end.saturating_sub(scroll_at as u64), gr.server_width, gr.server_height.saturating_mul(2))
+                };
+                let modify_msg = ClientMessage::ModifySubscription {
+                    subscription_id: self.subscription_id.clone(),
+                    dimensions: Some(Dimensions { width, height: height2 }),
+                    mode: Some(ViewMode::Historical),
+                    position: Some(ViewPosition { time: None, line: Some(start_line_guess), offset: None }),
+                };
+                if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
+                    let _ = recorder.record_client_message(&modify_msg);
+                }
+                
+                // Debug logging for state transition to Historical
+                if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/beach-state-flow.log")
+                {
+                    use std::io::Write;
+                    let mode_before = self.last_requested_mode.lock().await;
+                    let _ = writeln!(debug_file, 
+                        "[{}] [CLIENT_STATE] BEFORE ModifySubscription send to Historical:",
+                        chrono::Utc::now()
+                    );
+                    let _ = writeln!(debug_file, 
+                        "  last_requested_mode: {:?}",
+                        *mode_before
+                    );
+                    let _ = writeln!(debug_file, 
+                        "  new_mode: ViewMode::Historical"
+                    );
+                    let _ = writeln!(debug_file, 
+                        "  line_number: {}",
+                        start_line_guess
+                    );
+                }
+                
+                let app_msg = AppMessage::Protocol { message: serde_json::to_value(&modify_msg)? };
+                self.send_queue_tx
+                    .send(QueuedMessage::AppMessage(app_msg))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("Send queue closed"))?;
+                {
+                    let mut mode = self.last_requested_mode.lock().await;
+                    *mode = ViewMode::Historical;
+                    
+                    // Log after updating
+                    if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/beach-state-flow.log")
+                    {
+                        use std::io::Write;
+                        let _ = writeln!(debug_file, 
+                            "[{}] [CLIENT_STATE] AFTER updating last_requested_mode: {:?}",
+                            chrono::Utc::now(),
+                            *mode
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
     

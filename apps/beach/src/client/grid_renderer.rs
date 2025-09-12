@@ -110,6 +110,31 @@ impl GridRenderer {
     
     /// Apply a snapshot from the server
     pub fn apply_snapshot(&mut self, snapshot: Grid) {
+        // Debug logging at start of apply_snapshot
+        if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/beach-snapshot-debug.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(debug_file, 
+                "[{}] [APPLY_SNAPSHOT] Starting:",
+                chrono::Utc::now()
+            );
+            let _ = writeln!(debug_file, 
+                "  self.view_line BEFORE: {:?}",
+                self.view_line
+            );
+            let _ = writeln!(debug_file, 
+                "  snapshot.start_line: {:?}",
+                snapshot.start_line.to_u64()
+            );
+            let _ = writeln!(debug_file, 
+                "  is_historical check: {}",
+                self.view_line.is_some()
+            );
+        }
+        
         // Update server dimensions from snapshot
         self.server_width = snapshot.width;
         self.server_height = snapshot.height;
@@ -129,14 +154,34 @@ impl GridRenderer {
                 };
                 self.history_cache.insert(line_num, history_line);
             }
+            // Update our historical anchor to the snapshot's start and reset local offset
+            if let Some(s) = snapshot.start_line.to_u64() {
+                self.view_line = Some(s);
+                self.scroll_offset = 0;
+            }
         }
         
         self.grid = snapshot.clone();
         self.last_snapshot = Some(snapshot);
         
-        // Only reset scroll offset if we're in realtime mode
-        if !is_historical {
+        // Only reset scroll offset if we're in realtime mode AND not currently scrolled
+        // This preserves user's attempt to scroll while waiting for history.
+        if !is_historical && self.scroll_offset == 0 {
             self.scroll_offset = 0;
+        }
+        
+        // Debug logging after apply_snapshot
+        if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/beach-snapshot-debug.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(debug_file, 
+                "[{}] [APPLY_SNAPSHOT] self.view_line AFTER: {:?}",
+                chrono::Utc::now(),
+                self.view_line
+            );
         }
     }
     
@@ -267,64 +312,176 @@ impl GridRenderer {
     
     /// Calculate what history needs to be fetched for current scroll position
     pub fn calculate_history_needs(&self) -> Option<HistoryRequest> {
-        // If we don't have metadata, we can't request history
-        let metadata = self.history_metadata.as_ref()?;
+        // Debug logging to file
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/calculate-history-debug.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(file, 
+                "[{}] calculate_history_needs: scroll_offset={}, view_line={:?}, has_metadata={}, grid_height={}, local_height={}",
+                chrono::Utc::now(),
+                self.scroll_offset,
+                self.view_line,
+                self.history_metadata.is_some(),
+                self.grid.height,
+                self.local_height
+            );
+        }
+        
+        // Metadata may be unavailable initially; allow fallback when scrolling
+        let metadata = self.history_metadata.as_ref();
         
         // If in realtime mode and at bottom, no history needed
         if self.view_line.is_none() && self.scroll_offset == 0 {
             return None;
         }
         
-        // Calculate the range of lines we need
-        let visible_height = self.local_height.saturating_sub(1) as u64; // Account for status line
-        let prefetch_distance = 100; // Prefetch 100 lines ahead/behind
-        
-        // Determine the target line based on scroll position
-        let target_line = if let Some(view_line) = self.view_line {
-            // Already in historical mode
-            view_line.saturating_sub(self.scroll_offset as u64)
-        } else {
-            // Calculate from current grid's line numbers
-            let current_top_line = self.grid.start_line.to_u64().unwrap_or(metadata.latest_line);
-            current_top_line.saturating_sub(self.scroll_offset as u64)
-        };
-        
-        // Calculate range with prefetch
-        let start_line = target_line.saturating_sub(prefetch_distance);
-        let end_line = (target_line + visible_height + prefetch_distance)
-            .min(metadata.latest_line);
-        
-        // Check what we're missing in this range
-        let mut missing_start = None;
-        let mut missing_end = None;
-        
-        for line_num in start_line..=end_line {
-            if !self.history_cache.contains_key(&line_num) {
-                if missing_start.is_none() {
-                    missing_start = Some(line_num);
-                }
-                missing_end = Some(line_num);
+        // If we have a scroll offset but NOT in historical mode yet, request to enter history
+        if self.view_line.is_none() && self.scroll_offset > 0 {
+            // Calculate the target line we want to view
+            let end_line_u64 = self.grid.end_line.to_u64();
+            
+            // Choose an effective end line using metadata if available
+            let effective_end_line = if let Some(meta) = metadata {
+                end_line_u64.unwrap_or(meta.latest_line)
+            } else {
+                end_line_u64.unwrap_or_else(|| self.grid.height.saturating_sub(1) as u64)
+            };
+            // Adjust for trailing blank rows at the bottom of the current grid
+            let mut trailing_blanks = 0u64;
+            for row in (0..self.grid.height).rev() {
+                let is_blank = (0..self.grid.width).all(|col| {
+                    self.grid.get_cell(row, col)
+                        .map(|c| c.char == ' ' || c.char == '\0' || c.char == '\u{00A0}')
+                        .unwrap_or(true)
+                });
+                if is_blank { trailing_blanks += 1; } else { break; }
             }
+            let effective_end_line_adj = effective_end_line.saturating_sub(trailing_blanks);
+            let current_top_line = effective_end_line_adj
+                .saturating_sub(self.local_height as u64 - 1); // Approximate top line
+            let target_line = current_top_line.saturating_sub(self.scroll_offset as u64);
+            
+            // Clamp if we know the history range
+            let mut start_line = if let Some(meta) = metadata {
+                target_line.max(meta.oldest_line).min(meta.latest_line)
+            } else {
+                target_line
+            };
+
+            // Fallback: if our computed start_line is at or below the last-known grid end
+            // (common when client line counters are stale), bump the request far enough
+            // forward to land on a newer snapshot. The server will pick the closest snapshot
+            // at or before this line, so requesting beyond our current end nudges us into
+            // the latest available history instead of the initial blank window.
+            if self.scroll_offset > 0 {
+                if let Some(grid_end) = self.grid.end_line.to_u64() {
+                    if start_line <= grid_end {
+                        start_line = grid_end
+                            .saturating_add(self.local_height as u64)
+                            .saturating_add(self.scroll_offset as u64);
+                    }
+                }
+            }
+            
+            // Request history for the scrolled position (server primarily uses start_line)
+            let end_line = if let Some(meta) = metadata {
+                (start_line + self.local_height as u64 + 100).min(meta.latest_line)
+            } else {
+                start_line + self.local_height as u64 + 100
+            };
+            let end_line = end_line.max(start_line); // never regress
+            let request = HistoryRequest { start_line, end_line };
+            
+            // Debug log the request
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/calculate-history-debug.log")
+            {
+                use std::io::Write;
+                let _ = writeln!(file, 
+                    "[{}] RETURNING HISTORY REQUEST (has_meta={}): start_line={}, end_line={}, eff_end={}, trailing_blanks={}, target_line={}",
+                    chrono::Utc::now(),
+                    metadata.is_some(),
+                    request.start_line,
+                    request.end_line,
+                    effective_end_line,
+                    trailing_blanks,
+                    target_line
+                );
+            }
+            
+            return Some(request);
         }
         
-        // If we have missing lines, request them
-        if let (Some(start), Some(end)) = (missing_start, missing_end) {
-            Some(HistoryRequest {
-                start_line: start,
-                end_line: end,
-            })
-        } else {
-            None
+        // Historical mode: compute target line relative to current anchor
+        if let Some(view_line) = self.view_line {
+            // No scroll in historical mode → no request
+            if self.scroll_offset == 0 {
+                return None;
+            }
+            let current_start = self.grid.start_line.to_u64().unwrap_or(0);
+            let mut target_line = view_line.saturating_sub(self.scroll_offset as u64);
+            if let Some(meta) = metadata {
+                target_line = target_line.max(meta.oldest_line).min(meta.latest_line);
+            }
+            // If target is within current snapshot window, no need to fetch
+            if target_line >= current_start {
+                return None;
+            }
+            let mut end_line = if let Some(meta) = metadata {
+                (target_line + self.local_height as u64 + 100).min(meta.latest_line)
+            } else {
+                target_line + self.local_height as u64 + 100
+            };
+            end_line = end_line.max(target_line);
+            return Some(HistoryRequest { start_line: target_line, end_line });
         }
+        
+        None
     }
     
     /// Switch to historical view mode at a specific line
     pub fn enter_historical_mode(&mut self, line_number: u64) {
+        // Debug logging for mode transition
+        if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/beach-state-flow.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(debug_file, 
+                "[{}] [ENTER_HISTORICAL_MODE] view_line: {:?} -> Some({})",
+                chrono::Utc::now(),
+                self.view_line,
+                line_number
+            );
+        }
+        
         self.view_line = Some(line_number);
+        // Reset local scroll so historical view starts anchored at requested line
+        self.scroll_offset = 0;
     }
     
     /// Return to realtime mode
     pub fn enter_realtime_mode(&mut self) {
+        // Debug logging for mode transition
+        if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/beach-state-flow.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(debug_file, 
+                "[{}] [ENTER_REALTIME_MODE] view_line: {:?} -> None",
+                chrono::Utc::now(),
+                self.view_line
+            );
+        }
+        
         self.view_line = None;
         self.scroll_offset = 0;
     }
@@ -337,6 +494,45 @@ impl GridRenderer {
     /// Render the grid to a ratatui frame with optional predictive underlines
     pub fn render(&self, frame: &mut Frame, predictions: &[(u16, u16)]) {
         let area = frame.area();
+        
+        // Enhanced render state logging
+        if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/beach-render-state.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(debug_file, 
+                "[{}] [RENDER] State check:",
+                chrono::Utc::now()
+            );
+            let _ = writeln!(debug_file, 
+                "  view_line: {:?}",
+                self.view_line
+            );
+            let _ = writeln!(debug_file, 
+                "  is_historical_mode(): {}",
+                self.is_historical_mode()
+            );
+            let _ = writeln!(debug_file, 
+                "  scroll_offset: {}",
+                self.scroll_offset
+            );
+            let _ = writeln!(debug_file, 
+                "  history_metadata: {:?}",
+                self.history_metadata
+            );
+            let _ = writeln!(debug_file, 
+                "  grid_dims: {}x{}, area_dims: {}x{}",
+                self.grid.width, self.grid.height,
+                area.width, area.height
+            );
+            let _ = writeln!(debug_file, 
+                "  grid.start_line: {:?}, grid.end_line: {:?}",
+                self.grid.start_line.to_u64(),
+                self.grid.end_line.to_u64()
+            );
+        }
         
         // Check if we should show the status line (only when debug flag is set)
         let show_status_line = self.debug_size;
@@ -421,16 +617,40 @@ impl GridRenderer {
         let grid_height = self.grid.cells.len();
         
         // Determine start row based on content and scrolling
-        // Bottom-anchor the view like a terminal: when scroll_offset = 0, show the latest content
+        // Bottom-anchor by default; in realtime mode clamp the local scroll
+        // within the available window so the user sees immediate feedback.
         let start_row = if grid_height > visible_height {
             let bottom_start = grid_height - visible_height;
-            bottom_start.saturating_sub(self.scroll_offset as usize)
+            if self.is_historical_mode() {
+                0
+            } else {
+                let effective_offset = (self.scroll_offset as usize).min(bottom_start);
+                bottom_start.saturating_sub(effective_offset)
+            }
         } else {
             0
         };
         
         let mut render_start = start_row;
         let mut render_end = (render_start + visible_height).min(grid_height);
+        
+        // Debug log the rendering range
+        if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/beach-render-debug.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(debug_file, 
+                "[{}] render_range: start_row={}, render_start={}, render_end={}, grid_height={}, visible_height={}",
+                chrono::Utc::now(),
+                start_row,
+                render_start,
+                render_end,
+                grid_height,
+                visible_height
+            );
+        }
 
         // Reduce excess trailing blank rows at the bottom of the viewport
         // to a maximum of 1 by shifting the window up when possible.
@@ -467,6 +687,65 @@ impl GridRenderer {
             }
         }
         
+        // If we're in historical mode, avoid showing leading blank rows when possible by
+        // shifting the window down to the first non-blank line (within bounds).
+        if self.is_historical_mode() && render_end > render_start {
+            let mut leading_blanks = 0usize;
+            for row_idx in render_start..render_end {
+                if let Some(row) = self.grid.cells.get(row_idx) {
+                    let is_blank = row.iter().all(|cell| {
+                        let ch = cell.char;
+                        ch == ' ' || ch == '\0' || ch == '\u{00A0}'
+                    });
+                    if is_blank {
+                        leading_blanks += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    leading_blanks += 1;
+                }
+            }
+            if leading_blanks > 0 {
+                let max_shift = grid_height.saturating_sub(visible_height).saturating_sub(render_start);
+                let shift = leading_blanks.min(max_shift);
+                if shift > 0 {
+                    render_start += shift;
+                    render_end = (render_start + visible_height).min(grid_height);
+                }
+            }
+        }
+
+        // If we're in historical mode, avoid showing leading blank rows when possible by
+        // shifting the window down to the first non-blank line (within bounds).
+        if self.is_historical_mode() && render_end > render_start {
+            let mut leading_blanks = 0usize;
+            for row_idx in render_start..render_end {
+                if let Some(row) = self.grid.cells.get(row_idx) {
+                    let is_blank = row.iter().all(|cell| {
+                        let ch = cell.char;
+                        ch == ' ' || ch == '\0' || ch == '\u{00A0}'
+                    });
+                    if is_blank {
+                        leading_blanks += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    leading_blanks += 1;
+                }
+            }
+            if leading_blanks > 0 {
+                let bottom_start = grid_height.saturating_sub(visible_height);
+                let max_shift = bottom_start.saturating_sub(render_start);
+                let shift = leading_blanks.min(max_shift);
+                if shift > 0 {
+                    render_start += shift;
+                    render_end = (render_start + visible_height).min(grid_height);
+                }
+            }
+        }
+
         // More debug output (gated)
         if render_debug_enabled {
             if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/render-debug.log") {
@@ -584,10 +863,15 @@ impl GridRenderer {
         let grid_height = self.grid.cells.len();
         
         // Determine start row based on content and scrolling
-        // Bottom-anchor the view like a terminal: when scroll_offset = 0, show the latest content
+        // Bottom-anchor by default; in realtime clamp local scroll within window
         let start_row = if grid_height > visible_height {
             let bottom_start = grid_height - visible_height;
-            bottom_start.saturating_sub(self.scroll_offset as usize)
+            if self.is_historical_mode() {
+                0
+            } else {
+                let effective_offset = (self.scroll_offset as usize).min(bottom_start);
+                bottom_start.saturating_sub(effective_offset)
+            }
         } else {
             0
         };
@@ -596,7 +880,7 @@ impl GridRenderer {
         let mut render_end = (render_start + visible_height).min(grid_height);
         
         // Adjust viewport to reduce trailing blank lines
-        if self.scroll_offset == 0 && grid_height > visible_height {
+        if grid_height > visible_height {
             // Count trailing blank lines
             let mut trailing_blanks = 0;
             'scan: for row_idx in (render_start..render_end).rev() {
@@ -729,9 +1013,10 @@ impl GridRenderer {
         // Calculate starting row based on scroll offset from bottom
         let grid_height = self.grid.cells.len();
         let start_row = if grid_height > visible_height {
-            // If grid is larger than visible area, apply scroll offset
+            // In realtime mode, show bottom of current grid; in historical mode, show from top
+            // of the returned snapshot. Local vertical scrolling is driven via history requests.
             let bottom_start = grid_height - visible_height;
-            bottom_start.saturating_sub(self.scroll_offset as usize)
+            if self.is_historical_mode() { 0 } else { bottom_start }
         } else {
             // If grid fits entirely, always start at 0
             0
@@ -806,6 +1091,11 @@ impl GridRenderer {
                 self.scroll_offset + 1,
                 max_scroll + 1
             ));
+        }
+        
+        // Indicate when scrollback is pending in realtime mode
+        if !self.is_historical_mode() && self.scroll_offset > 0 {
+            status.push_str(" | Loading history…");
         }
         
         Paragraph::new(status)

@@ -92,7 +92,10 @@ impl AlacrittyTerminal {
         };
         
         let event_proxy = EventProxy;
-        let config = Config::default();
+        let mut config = Config::default();
+        
+        // Enable scrollback with 10000 lines of history
+        config.scrolling_history = 10000;
         
         // Create terminal
         let term = Term::new(config, &dimensions, event_proxy.clone());
@@ -364,6 +367,30 @@ impl AlacrittyTerminal {
         // Update timestamp
         self.current_grid.timestamp = Utc::now();
         
+        // Debug: Track absolute line numbers for scrollback
+        // Alacritty's history_size gives us how many lines have scrolled off-screen
+        let history_size = term.history_size();
+        
+        // Log scrollback information
+        if let Some(ref recorder) = self.debug_recorder {
+            if let Ok(mut rec) = recorder.try_lock() {
+                if history_size > 0 {
+                    let _ = rec.record_event(crate::debug_recorder::DebugEvent::Comment {
+                        timestamp: Utc::now(),
+                        text: format!(
+                            "AlacrittyBackend: {} lines have scrolled into history",
+                            history_size
+                        ),
+                    });
+                }
+            }
+        }
+        
+        // Update line numbers to track absolute position including scrolled content
+        let total_lines_processed = history_size as u64 + self.height as u64;
+        self.current_grid.start_line = crate::server::terminal_state::LineCounter::from_u64(history_size as u64);
+        self.current_grid.end_line = crate::server::terminal_state::LineCounter::from_u64(total_lines_processed - 1);
+        
         // Create delta and update history
         let mut delta = GridDelta::diff(&old_grid, &self.current_grid);
         
@@ -384,9 +411,27 @@ impl AlacrittyTerminal {
         // Always add delta (even if empty) to keep history in sync
         history.add_delta(delta);
         
-        // Always add a snapshot for now to ensure tests work
-        // TODO: optimize this to only snapshot periodically in production
-        history.add_snapshot(self.current_grid.clone());
+        // Only add a snapshot when content has scrolled (line numbers changed)
+        // This preserves the historical content at different line ranges
+        // Check if the line range has changed significantly (scrolling occurred)
+        if old_grid.start_line != self.current_grid.start_line || 
+           old_grid.end_line != self.current_grid.end_line {
+            // Content has scrolled - preserve this snapshot
+            history.add_snapshot(self.current_grid.clone());
+            
+            if let Some(ref recorder) = self.debug_recorder {
+                if let Ok(mut rec) = recorder.try_lock() {
+                    let _ = rec.record_event(crate::debug_recorder::DebugEvent::Comment {
+                        timestamp: Utc::now(),
+                        text: format!(
+                            "AlacrittyBackend: Added snapshot for lines {}-{}",
+                            self.current_grid.start_line.to_u64().unwrap_or(0),
+                            self.current_grid.end_line.to_u64().unwrap_or(0)
+                        ),
+                    });
+                }
+            }
+        }
         
         // Compare Alacritty grid with GridHistory reconstruction
         if let Some(ref recorder) = self.debug_recorder {

@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 
 use crate::protocol::{Dimensions, ViewMode, ViewPosition};
 use crate::subscription::{TerminalDataSource, HistoryMetadata};
-use crate::debug_recorder::DebugRecorder;
+use crate::debug_recorder::{DebugRecorder, DebugEvent};
 use super::{Grid, GridDelta, GridView, TerminalStateTracker, TerminalBackend};
 
 /// Implementation of TerminalDataSource that wraps TerminalStateTracker
@@ -141,11 +141,40 @@ impl TerminalDataSource for TrackerDataSource {
         mode: ViewMode, 
         position: Option<ViewPosition>
     ) -> Result<Grid> {
+        // Debug event: SnapshotWithViewRequest
+        if let Some(ref recorder) = self.debug_recorder {
+            if let Ok(mut rec) = recorder.try_lock() {
+                let _ = rec.record_event(DebugEvent::SnapshotWithViewRequest {
+                    timestamp: chrono::Utc::now(),
+                    mode: format!("{:?}", mode),
+                    position_line: position.as_ref().and_then(|p| p.line),
+                    position_time: position.as_ref().and_then(|p| p.time),
+                    dimensions: (dims.width, dims.height),
+                });
+            }
+        }
+        
         let tracker = self.tracker.lock().unwrap();
         let history = tracker.get_history();
         drop(tracker);
         
         let view = GridView::new(history);
+        
+        // Debug log to file
+        if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/beach-server-history.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(debug_file, 
+                "[{}] snapshot_with_view: mode={:?}, dims={}x{}, position={:?}",
+                chrono::Utc::now(),
+                mode,
+                dims.width, dims.height,
+                position.as_ref().map(|p| format!("line={:?}, time={:?}", p.line, p.time))
+            );
+        }
         
         let grid = match mode {
             ViewMode::Realtime => {
@@ -154,6 +183,34 @@ impl TerminalDataSource for TrackerDataSource {
             ViewMode::Historical => {
                 if let Some(pos) = position {
                     if let Some(line_num) = pos.line {
+                        // Log the historical line request
+                        if let Some(ref recorder) = self.debug_recorder {
+                            if let Ok(mut rec) = recorder.try_lock() {
+                                let _ = rec.record_event(DebugEvent::Comment {
+                                    timestamp: chrono::Utc::now(),
+                                    text: format!(
+                                        "DataSource: Historical view requested for line {}",
+                                        line_num
+                                    ),
+                                });
+                            }
+                        }
+                        
+                        // Debug log to file
+                        if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/beach-server-history.log")
+                        {
+                            use std::io::Write;
+                            let _ = writeln!(debug_file, 
+                                "[{}] DERIVING HISTORICAL VIEW: line_num={}, height={}",
+                                chrono::Utc::now(),
+                                line_num,
+                                dims.height
+                            );
+                        }
+                        
                         // Derive view from specific line number
                         view.derive_from_line(line_num, Some(dims.height))?
                     } else if let Some(timestamp) = pos.time {
@@ -177,9 +234,79 @@ impl TerminalDataSource for TrackerDataSource {
             },
         };
         
-        // Log bottom context for snapshot_with_view
-        if let Some(recorder) = &self.debug_recorder {
+        // Debug log the result to file
+        if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/beach-server-history.log")
+        {
+            use std::io::Write;
+            // Count non-blank lines
+            let mut non_blank_count = 0;
+            let mut first_non_blank: Option<String> = None;
+            for row in 0..grid.height {
+                let mut line = String::new();
+                for col in 0..grid.width.min(80) {
+                    if let Some(cell) = grid.get_cell(row, col) {
+                        line.push(cell.char);
+                    } else {
+                        line.push(' ');
+                    }
+                }
+                let trimmed = line.trim_end();
+                if !trimmed.is_empty() {
+                    non_blank_count += 1;
+                    if first_non_blank.is_none() {
+                        first_non_blank = Some(trimmed.to_string());
+                    }
+                }
+            }
+            
+            let _ = writeln!(debug_file, 
+                "[{}] RESULT: grid_dims={}x{}, start_line={:?}, end_line={:?}, non_blank_lines={}, first_non_blank={:?}",
+                chrono::Utc::now(),
+                grid.width, grid.height,
+                grid.start_line.to_u64(),
+                grid.end_line.to_u64(),
+                non_blank_count,
+                first_non_blank
+            );
+        }
+        
+        // Debug event: SnapshotWithViewResponse
+        if let Some(ref recorder) = self.debug_recorder {
             if let Ok(mut rec) = recorder.try_lock() {
+                // Collect sample content
+                let mut sample_content = Vec::new();
+                let mut blank_count = 0;
+                for row in 0..grid.height.min(10) {
+                    let mut line = String::new();
+                    for col in 0..grid.width {
+                        if let Some(cell) = grid.get_cell(row, col) {
+                            line.push(cell.char);
+                        } else {
+                            line.push(' ');
+                        }
+                    }
+                    let trimmed = line.trim_end();
+                    if trimmed.is_empty() {
+                        blank_count += 1;
+                        sample_content.push(format!("Row {}: [BLANK]", row));
+                    } else {
+                        sample_content.push(format!("Row {}: {}", row, trimmed));
+                    }
+                }
+                
+                let _ = rec.record_event(DebugEvent::SnapshotWithViewResponse {
+                    timestamp: chrono::Utc::now(),
+                    mode: format!("{:?}", mode),
+                    result_start_line: grid.start_line.to_u64().unwrap_or(0),
+                    result_end_line: grid.end_line.to_u64().unwrap_or(0),
+                    result_blank_count: blank_count,
+                    sample_content,
+                });
+                
+                // Also log bottom context for additional debugging
                 let _ = rec.record_grid_bottom_context("server_data_source.snapshot_with_view", &grid, 6);
             }
         }

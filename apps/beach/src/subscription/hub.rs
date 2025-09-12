@@ -994,6 +994,10 @@ impl SubscriptionHub {
                 // Clone dimensions before moving into update
                 let dims_for_handler = dimensions.clone();
                 
+                // Clone mode and position for later use
+                let mode_clone = mode.clone();
+                let position_clone = position.clone();
+                
                 let update = SubscriptionUpdate {
                     dimensions,
                     mode,
@@ -1001,6 +1005,63 @@ impl SubscriptionHub {
                     ..Default::default()
                 };
                 self.update(&subscription_id, update).await?;
+                
+                // Map legacy ModifySubscription to viewport semantics
+                // This allows backward compatibility with clients using the old protocol
+                if mode_clone.is_some() || position_clone.is_some() {
+                    let mut subscriptions = self.subscriptions.write().await;
+                    if let Some(subscription) = subscriptions.get_mut(&subscription_id) {
+                        // Convert mode/position to viewport
+                        match subscription.mode {
+                            ViewMode::Realtime => {
+                                // For realtime mode, follow the tail
+                                subscription.follow_tail = true;
+                                subscription.viewport = None; // No specific viewport, follow tail
+                            }
+                            ViewMode::Anchored => {
+                                // Anchored mode: stay at current position
+                                subscription.follow_tail = false;
+                                // Keep existing viewport if any, otherwise no change
+                            }
+                            ViewMode::Historical => {
+                                // For historical mode, use position to determine viewport
+                                subscription.follow_tail = false;
+                                
+                                // Calculate viewport based on position
+                                if let Some(ref pos) = subscription.position {
+                                    let viewport_height = subscription.dimensions.height as u64;
+                                    let (start_line, end_line) = if let Some(line) = pos.line {
+                                        // Line-based position: center viewport around the requested line
+                                        let half_height = viewport_height / 2;
+                                        let start = line.saturating_sub(half_height);
+                                        let end = start + viewport_height - 1;
+                                        (start, end)
+                                    } else if pos.time.is_some() {
+                                        // Time-based position not yet supported in viewport model
+                                        // Default to showing from line 0
+                                        (0, viewport_height - 1)
+                                    } else {
+                                        // No specific position, default to beginning
+                                        (0, viewport_height - 1)
+                                    };
+                                    
+                                    subscription.viewport = Some(crate::protocol::subscription::messages::Viewport {
+                                        start_line,
+                                        end_line,
+                                    });
+                                    
+                                    // Set default prefetch for legacy clients
+                                    if subscription.prefetch.is_none() {
+                                        subscription.prefetch = Some(crate::protocol::subscription::messages::Prefetch {
+                                            before: 24,  // Prefetch one screen above
+                                            after: 24,   // Prefetch one screen below
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 
                 // Debug event: ModifySubscriptionProcessed
                 // Get the updated subscription to log its state
@@ -1108,7 +1169,7 @@ impl SubscriptionHub {
                                 sequence: sub.current_sequence,
                                 watermark_seq: watermark,
                                 grid,
-                                timestamp: chrono::Utc::now().timestamp_millis(),
+                                timestamp: chrono::Utc::now().timestamp(),
                                 checksum: 0, // TODO: Calculate checksum
                             };
                             

@@ -271,41 +271,31 @@ impl GridHistory {
         }
         
         // Reconstruct from the chosen snapshot
-        let mut grid = self.reconstruct_from_sequence(seq_start)?;
-        
-        // Check if the reconstructed grid contains the target line
-        let grid_start = grid.start_line.to_u64().unwrap_or(0);
-        let grid_end = grid.end_line.to_u64().unwrap_or(0);
-        
-        // If the line is not in the current window, try to find a better snapshot
-        // or apply more deltas to reach the target line
-        if line_num < grid_start || line_num > grid_end {
-            // Try applying deltas forward from this snapshot to reach the target line
-            if line_num > grid_end && seq_start < self.current_sequence {
-                // Apply deltas forward until we reach a grid containing the line
-                for (seq, delta) in self.deltas.range(seq_start + 1..=self.current_sequence) {
-                    delta.apply(&mut grid)?;
-                    
-                    let new_start = grid.start_line.to_u64().unwrap_or(0);
-                    let new_end = grid.end_line.to_u64().unwrap_or(0);
-                    
-                    if line_num >= new_start && line_num <= new_end {
-                        // Found it!
-                        if let Some(ref recorder) = self.debug_recorder {
-                            if let Ok(mut rec) = recorder.try_lock() {
-                                let _ = rec.record_event(DebugEvent::Comment {
-                                    timestamp: Utc::now(),
-                                    text: format!(
-                                        "get_from_line: Found line {} after applying deltas up to seq {}",
-                                        line_num, seq
-                                    ),
-                                });
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
+        if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/beach-history-debug.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(debug_file, "[{}] GET_FROM_LINE requesting line={} found_seq={} current_seq={}",
+                chrono::Utc::now().format("%H:%M:%S%.3f"), line_num, seq_start, self.current_sequence);
+        }
+
+        // Instead of using the snapshot sequence, always reconstruct from the CURRENT sequence
+        // to get the most up-to-date content. Historical lines don't change, but the grid
+        // grows over time, so we need current content to find the requested line.
+        let mut grid = self.reconstruct_from_sequence(self.current_sequence)?;
+
+        if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/beach-history-debug.log")
+        {
+            use std::io::Write;
+            let grid_start = grid.start_line.to_u64().unwrap_or(0);
+            let grid_end = grid.end_line.to_u64().unwrap_or(0);
+            let _ = writeln!(debug_file, "[{}] GET_FROM_LINE reconstructed current grid range=({},{}) dims={}x{} for line={}",
+                chrono::Utc::now().format("%H:%M:%S%.3f"), grid_start, grid_end, grid.width, grid.height, line_num);
         }
         
         // Final check and debug logging
@@ -333,10 +323,43 @@ impl GridHistory {
                 });
             }
         }
-        
+
+        // Debug: log what historical grid content is being returned
+        if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/beach-history-debug.log")
+        {
+            use std::io::Write;
+            let mut sample_content = Vec::new();
+            let mut non_blank_rows = 0;
+
+            // Sample first few rows to see actual content
+            for row in 0..grid.height.min(5) {
+                let mut line = String::new();
+                for col in 0..grid.width.min(80) {
+                    if let Some(cell) = grid.get_cell(row, col) {
+                        line.push(cell.char);
+                    }
+                }
+                let trimmed = line.trim_end();
+                if !trimmed.is_empty() { non_blank_rows += 1; }
+                sample_content.push(format!("row[{}]: '{}'", row, trimmed));
+            }
+
+            let _ = writeln!(debug_file, "[{}] HISTORY_RETRIEVED for line={} grid_range=({},{}) dims={}x{} non_blank={}/5 content=[{}]",
+                chrono::Utc::now().format("%H:%M:%S%.3f"),
+                line_num,
+                final_start, final_end,
+                grid.width, grid.height,
+                non_blank_rows,
+                sample_content.join(", ")
+            );
+        }
+
         Ok(grid)
     }
-    
+
     /// Reconstruct grid from nearest snapshot
     fn reconstruct_from_sequence(&self, target_seq: u64) -> Result<Grid, TerminalStateError> {
         // Find nearest snapshot at or before target, or use initial grid

@@ -995,28 +995,41 @@ impl Transport for WebRTCTransport {
     }
     
     async fn recv(&mut self) -> Option<Vec<u8>> {
-        // For backward compatibility, use single channel if available
+        // Prefer legacy single channel if present
         let dc = self.data_channel.read().await;
         if dc.is_some() {
-            // Use legacy single channel
             let mut rx = self.rx_in.write().await;
             let result = rx.recv().await;
             if let Some(ref data) = result {
                 webrtc_log!(self, "Transport recv (legacy): {} bytes", data.len());
             }
-            result
-        } else {
-            // Try to receive from control channel
-            let channels = self.channels.read().await;
-            if let Some(_channel) = channels.get(&ChannelPurpose::Control) {
-                // This is a bit tricky - we need mutable access to the channel
-                // For now, return None (will need to refactor this)
-                webrtc_log!(self, "Transport recv: channel-based recv not yet supported in legacy mode");
-                None
-            } else {
-                None
+            return result;
+        }
+
+        // Fall back to purpose-specific channels (Control first, then Output)
+        let channels = self.channels.read().await;
+        // Clone Arcs to drop the map lock before awaiting
+        let ctrl = channels.get(&ChannelPurpose::Control).cloned();
+        let outp = channels.get(&ChannelPurpose::Output).cloned();
+        drop(channels);
+
+        if let Some(ch) = ctrl {
+            // Access channel's rx_in directly (same module)
+            let mut rx = ch.rx_in.write().await;
+            if let Some(data) = rx.recv().await {
+                webrtc_log!(self, "Transport recv (control): {} bytes", data.len());
+                return Some(data);
             }
         }
+        if let Some(ch) = outp {
+            let mut rx = ch.rx_in.write().await;
+            if let Some(data) = rx.recv().await {
+                webrtc_log!(self, "Transport recv (output): {} bytes", data.len());
+                return Some(data);
+            }
+        }
+        webrtc_log!(self, "Transport recv: no data available on legacy/control/output channels");
+        None
     }
     
     fn is_connected(&self) -> bool {

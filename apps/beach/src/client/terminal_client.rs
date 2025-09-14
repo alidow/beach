@@ -2,8 +2,8 @@
 use crate::client::{grid_renderer::GridRenderer, predictive_echo::PredictiveEcho};
 use crate::debug_recorder::DebugRecorder;
 use crate::protocol::{
-    ClientMessage, ServerMessage, Dimensions, ViewMode, ViewPosition, ControlMessage,
-    subscription::messages::{Viewport, Prefetch}
+    ClientMessage, ServerMessage, Dimensions, ControlMessage,
+    subscription::messages::Prefetch
 };
 use crate::protocol::signaling::{AppMessage, PeerInfo};
 use crate::session::{ClientSession, message_handlers::ClientMessageHandler};
@@ -105,8 +105,18 @@ pub struct TerminalClient<T: Transport + Send + 'static> {
     history_pending_line: Arc<Mutex<Option<u64>>>,
     /// Throttle: last history request send time
     history_last_sent: Arc<Mutex<Option<std::time::Instant>>>,
-    /// Track last requested subscription mode
-    last_requested_mode: Arc<Mutex<crate::protocol::ViewMode>>,
+    
+    /// Latest line number from HistoryInfo (for viewport calculations)
+    latest_line: Arc<Mutex<Option<u64>>>,
+    /// Current viewport being displayed
+    current_viewport: Arc<Mutex<Option<crate::protocol::subscription::messages::Viewport>>>,
+    /// Current watermark sequence for delta ordering (history-based)
+    watermark_seq: Arc<Mutex<u64>>,
+    /// Last applied message sequence (subscription-based) 
+    last_applied_seq: Arc<Mutex<u64>>,
+    
+    /// Whether scrollback help has been shown this session
+    help_shown: Arc<Mutex<bool>>,
 }
 
 impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
@@ -201,7 +211,11 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                 
                 let result = match msg {
                     QueuedMessage::AppMessage(app_msg) => {
-                        session_for_send.write().await.send_to_server(app_msg).await
+                        // Use a read lock (non-exclusive) and avoid holding locks across await where possible
+                        let session = session_for_send.read().await;
+                        let result = session.send_to_server(app_msg).await;
+                        drop(session);
+                        result
                     },
                     QueuedMessage::RawInput { channel: _channel, data } => {
                         // Send raw bytes directly to Input channel
@@ -212,6 +226,8 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                         // Try to get Input channel
                         match transport.channel(crate::transport::ChannelPurpose::Input).await {
                             Ok(input_channel) => {
+                                // Drop transport lock before awaiting send on the channel
+                                drop(transport);
                                 input_channel.send(&data).await
                             },
                             Err(_) => {
@@ -234,7 +250,11 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                                     };
                                     drop(transport);
                                     drop(session);
-                                    session_for_send.write().await.send_to_server(app_msg).await
+                                    // Use read lock for sending to avoid blocking writers unnecessarily
+                                    let session = session_for_send.read().await;
+                                    let result = session.send_to_server(app_msg).await;
+                                    drop(session);
+                                    result
                                 } else {
                                     Err(anyhow::anyhow!("Invalid raw input message format"))
                                 }
@@ -298,7 +318,11 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
             debug_recorder: Arc::new(Mutex::new(debug_recorder)),
             history_pending_line: Arc::new(Mutex::new(None)),
             history_last_sent: Arc::new(Mutex::new(None)),
-            last_requested_mode: Arc::new(Mutex::new(ViewMode::Realtime)),
+            latest_line: Arc::new(Mutex::new(None)),
+            current_viewport: Arc::new(Mutex::new(None)),
+            watermark_seq: Arc::new(Mutex::new(0)),
+            last_applied_seq: Arc::new(Mutex::new(0)),
+            help_shown: Arc::new(Mutex::new(false)),
         });
         
         Ok(client)
@@ -596,8 +620,8 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
             prefetch: Some(Prefetch { before: 100, after: 100 }),
             follow_tail: Some(true),
             // Deprecated fields for backward compatibility
-            mode: Some(ViewMode::Realtime),
-            position: None,  // Will be updated when scrolling
+            mode: None,  // Using viewport-based subscription instead
+            position: None,
             compression: None,
         };
         
@@ -686,36 +710,83 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
             }
         }
         
-        // Wait for initial snapshot with timeout
-        let snapshot_result = tokio::time::timeout(
-            Duration::from_millis(snapshot_timeout_ms),
-            server_rx.recv()
-        ).await;
+        // Wait for initial snapshot with timeout, handling other messages along the way
+        let start_time = std::time::Instant::now();
+        let mut received_snapshot = false;
         
-        match snapshot_result {
-            Ok(Some(ServerMessage::Snapshot { grid, .. })) => {
-                self.grid_renderer.lock().await.apply_snapshot(grid);
-                
-                // Debug log successful snapshot
-                if let Some(ref debug_log) = self.debug_log {
-                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
-                        use std::io::Write;
-                        let _ = writeln!(file, "[{}] Client received initial Snapshot", 
-                                         chrono::Utc::now().format("%H:%M:%S%.3f"));
-                    }
-                }
-            }
-            Ok(Some(msg)) => {
-                return Err(anyhow::anyhow!("Expected Snapshot, got: {:?}", msg));
-            }
-            Ok(None) => {
-                return Err(anyhow::anyhow!("Server connection closed while waiting for Snapshot"));
-            }
-            Err(_) => {
+        while !received_snapshot {
+            let elapsed = start_time.elapsed().as_millis() as u64;
+            if elapsed >= snapshot_timeout_ms {
                 return Err(anyhow::anyhow!(
                     "Timeout waiting for initial Snapshot after {}ms. Server may be unresponsive.",
                     snapshot_timeout_ms
                 ));
+            }
+            
+            let remaining_timeout = snapshot_timeout_ms - elapsed;
+            let message_result = tokio::time::timeout(
+                Duration::from_millis(remaining_timeout),
+                server_rx.recv()
+            ).await;
+            
+            match message_result {
+                Ok(Some(ServerMessage::Snapshot { grid, sequence, .. })) => {
+                    // Update last applied sequence for initial snapshot
+                    *self.last_applied_seq.lock().await = sequence;
+                    self.grid_renderer.lock().await.apply_snapshot(grid);
+                    received_snapshot = true;
+                    
+                    // Debug log successful snapshot
+                    if let Some(ref debug_log) = self.debug_log {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                            use std::io::Write;
+                            let _ = writeln!(file, "[{}] Client received initial Snapshot", 
+                                             chrono::Utc::now().format("%H:%M:%S%.3f"));
+                        }
+                    }
+                }
+                Ok(Some(ServerMessage::HistoryInfo { oldest_line, latest_line, .. })) => {
+                    // Store history metadata for scrollback calculations
+                    let metadata = crate::subscription::HistoryMetadata {
+                        oldest_line,
+                        latest_line,
+                        total_lines: latest_line - oldest_line + 1,
+                        oldest_timestamp: None, // Not used for scrollback calculations
+                        latest_timestamp: None, // Not used for scrollback calculations
+                    };
+                    self.grid_renderer.lock().await.set_history_metadata(metadata);
+                    *self.latest_line.lock().await = Some(latest_line);
+                    
+                    // Debug log history info
+                    if let Some(ref debug_log) = self.debug_log {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                            use std::io::Write;
+                            let _ = writeln!(file, "[{}] Client received HistoryInfo: oldest={}, latest={}", 
+                                             chrono::Utc::now().format("%H:%M:%S%.3f"), oldest_line, latest_line);
+                        }
+                    }
+                    // Continue waiting for snapshot
+                }
+                Ok(Some(msg)) => {
+                    // Debug log unexpected message but continue waiting
+                    if let Some(ref debug_log) = self.debug_log {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                            use std::io::Write;
+                            let _ = writeln!(file, "[{}] Client received unexpected message while waiting for Snapshot: {:?}", 
+                                             chrono::Utc::now().format("%H:%M:%S%.3f"), msg);
+                        }
+                    }
+                    // Continue waiting for snapshot
+                }
+                Ok(None) => {
+                    return Err(anyhow::anyhow!("Server connection closed while waiting for Snapshot"));
+                }
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "Timeout waiting for initial Snapshot after {}ms. Server may be unresponsive.",
+                        snapshot_timeout_ms
+                    ));
+                }
             }
         }
         
@@ -822,9 +893,12 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                         timestamp: chrono::Utc::now(),
                         direction: "up".to_string(),
                         scroll_offset: renderer.scroll_offset as usize,
-                        view_line: if renderer.is_historical_mode() { Some(0) } else { None },
+                        view_line: None,  // Using viewport-based subscription instead of historical mode
                     });
                 }
+                
+                // Show help text on first scroll
+                self.show_scroll_help_if_needed().await;
                 
                 // Trigger history update if needed
                 self.handle_scroll_update().await?;
@@ -840,9 +914,12 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                         timestamp: chrono::Utc::now(),
                         direction: "down".to_string(),
                         scroll_offset: renderer.scroll_offset as usize,
-                        view_line: if renderer.is_historical_mode() { Some(0) } else { None },
+                        view_line: None,  // Using viewport-based subscription instead of historical mode
                     });
                 }
+                
+                // Show help text on first scroll
+                self.show_scroll_help_if_needed().await;
                 
                 // Trigger history update if needed
                 self.handle_scroll_update().await?;
@@ -945,15 +1022,11 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                     _ => return Ok(()),      // Ignore other control combinations
                 };
                 
-                // Control sequences go directly to server without predictive echo
-                let client_msg = crate::protocol::ClientMessage::TerminalInput {
-                    data: bytes,
-                    echo_local: None,
-                };
-                let app_msg = crate::protocol::signaling::AppMessage::Protocol {
-                    message: serde_json::to_value(&client_msg)?,
-                };
-                self.send_queue_tx.send(QueuedMessage::AppMessage(app_msg)).await?;
+                // Send as top-level AppMessage::TerminalInput for direct PTY routing
+                let app_msg = crate::protocol::signaling::AppMessage::TerminalInput { data: bytes };
+                self.send_queue_tx
+                    .send(QueuedMessage::AppMessage(app_msg))
+                    .await?;
                 return Ok(());
             }
         }
@@ -961,87 +1034,73 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
         // Handle regular keys without control modifier
         match key.code {
             KeyCode::Char(c) => {
-                // Regular character input - send directly without predictive echo for now
-                // Predictive echo is causing issues with position tracking
-                let bytes = vec![c as u8];
-                let client_msg = crate::protocol::ClientMessage::TerminalInput {
-                    data: bytes,
-                    echo_local: None,
-                };
-                let app_msg = crate::protocol::signaling::AppMessage::Protocol {
-                    message: serde_json::to_value(&client_msg)?,
-                };
+                let app_msg = crate::protocol::signaling::AppMessage::TerminalInput { data: vec![c as u8] };
                 self.send_queue_tx.send(QueuedMessage::AppMessage(app_msg)).await?;
             }
             KeyCode::Enter => {
-                // Handle Enter key - send directly without predictive echo
-                let bytes = vec![b'\r']; // Carriage return
-                let client_msg = crate::protocol::ClientMessage::TerminalInput {
-                    data: bytes,
-                    echo_local: None,
-                };
-                let app_msg = crate::protocol::signaling::AppMessage::Protocol {
-                    message: serde_json::to_value(&client_msg)?,
-                };
+                let app_msg = crate::protocol::signaling::AppMessage::TerminalInput { data: vec![b'\r'] };
                 self.send_queue_tx.send(QueuedMessage::AppMessage(app_msg)).await?;
             }
             KeyCode::Tab => {
-                // Handle Tab key - send directly without predictive echo
-                let bytes = vec![b'\t'];
-                let client_msg = crate::protocol::ClientMessage::TerminalInput {
-                    data: bytes,
-                    echo_local: None,
-                };
-                let app_msg = crate::protocol::signaling::AppMessage::Protocol {
-                    message: serde_json::to_value(&client_msg)?,
-                };
+                let app_msg = crate::protocol::signaling::AppMessage::TerminalInput { data: vec![b'\t'] };
                 self.send_queue_tx.send(QueuedMessage::AppMessage(app_msg)).await?;
             }
             KeyCode::Backspace => {
-                // Handle Backspace key - send without predictive echo for immediate response
-                let bytes = vec![0x7F]; // DEL character
-                let client_msg = crate::protocol::ClientMessage::TerminalInput {
-                    data: bytes,
-                    echo_local: None,
-                };
-                let app_msg = crate::protocol::signaling::AppMessage::Protocol {
-                    message: serde_json::to_value(&client_msg)?,
-                };
+                let app_msg = crate::protocol::signaling::AppMessage::TerminalInput { data: vec![0x7F] };
                 self.send_queue_tx.send(QueuedMessage::AppMessage(app_msg)).await?;
             }
             KeyCode::Esc => {
-                // Check if we're in selection mode and cancel it
-                let mode = self.mouse_mode.read().await;
-                if *mode == MouseMode::Selecting {
-                    drop(mode);
-                    let mut mode = self.mouse_mode.write().await;
-                    *mode = MouseMode::Normal;
-                    drop(mode);
+                // Check if we're scrolled back and exit scrollback mode first
+                let scroll_offset = self.grid_renderer.lock().await.scroll_offset;
+                if scroll_offset > 0 {
+                    // Exit scrollback mode - return to realtime
+                    self.grid_renderer.lock().await.enter_realtime_mode();
                     
-                    // Re-enable mouse capture
-                    use std::io::stdout;
-                    let mut stdout = stdout();
-                    execute!(stdout, EnableMouseCapture)?;
+                    // Send ViewportChanged to return to realtime subscription
+                    self.handle_scroll_update().await?;
                     
                     // Debug log
                     if let Some(ref debug_log) = self.debug_log {
                         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
                             use std::io::Write;
-                            let _ = writeln!(file, "[{}] Cancelled selection mode with Escape", 
+                            let _ = writeln!(file, "[{}] Exited scrollback mode with Escape", 
                                 chrono::Utc::now().format("%H:%M:%S%.3f"));
                         }
                     }
                 } else {
-                    // Handle Escape key - send without predictive echo
-                    let bytes = vec![0x1B]; // ESC character
-                    let client_msg = crate::protocol::ClientMessage::TerminalInput {
-                        data: bytes,
-                        echo_local: None,
-                    };
-                    let app_msg = crate::protocol::signaling::AppMessage::Protocol {
-                        message: serde_json::to_value(&client_msg)?,
-                    };
-                    self.send_queue_tx.send(QueuedMessage::AppMessage(app_msg)).await?;
+                    // Check if we're in selection mode and cancel it
+                    let mode = self.mouse_mode.read().await;
+                    if *mode == MouseMode::Selecting {
+                        drop(mode);
+                        let mut mode = self.mouse_mode.write().await;
+                        *mode = MouseMode::Normal;
+                        drop(mode);
+                        
+                        // Re-enable mouse capture
+                        use std::io::stdout;
+                        let mut stdout = stdout();
+                        execute!(stdout, EnableMouseCapture)?;
+                        
+                        // Debug log
+                        if let Some(ref debug_log) = self.debug_log {
+                            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                                use std::io::Write;
+                                let _ = writeln!(file, "[{}] Cancelled selection mode with Escape", 
+                                    chrono::Utc::now().format("%H:%M:%S%.3f"));
+                            }
+                        }
+                    } else {
+                        // Handle Escape key - send without predictive echo
+                        let bytes = vec![0x1B]; // ESC character
+                        let client_msg = crate::protocol::ClientMessage::TerminalInput {
+                            data: bytes,
+                            echo_local: None,
+                        };
+                        let app_msg = crate::protocol::signaling::AppMessage::Protocol {
+                            message: serde_json::to_value(&client_msg)?,
+                        };
+                        self.send_queue_tx.send(QueuedMessage::AppMessage(app_msg)).await?;
+                    }
                 }
             }
             KeyCode::Up => {
@@ -1096,6 +1155,8 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                 // Check if Shift is held for scrolling
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     self.grid_renderer.lock().await.scroll_vertical(10);
+                    // Show help text on first scroll
+                    self.show_scroll_help_if_needed().await;
                     self.handle_scroll_update().await?;
                 } else {
                     // Send Page Up escape sequence to server
@@ -1114,6 +1175,8 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                 // Check if Shift is held for scrolling
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     self.grid_renderer.lock().await.scroll_vertical(-10);
+                    // Show help text on first scroll
+                    self.show_scroll_help_if_needed().await;
                     self.handle_scroll_update().await?;
                 } else {
                     // Send Page Down escape sequence to server
@@ -1129,28 +1192,75 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                 }
             }
             KeyCode::Home => {
-                // Send Home key escape sequence
-                let bytes = vec![0x1B, b'[', b'H']; // ESC[H
-                let client_msg = crate::protocol::ClientMessage::TerminalInput {
-                    data: bytes,
-                    echo_local: None,
-                };
-                let app_msg = crate::protocol::signaling::AppMessage::Protocol {
-                    message: serde_json::to_value(&client_msg)?,
-                };
-                self.send_queue_tx.send(QueuedMessage::AppMessage(app_msg)).await?;
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    // Shift+Home: Jump to oldest available history
+                    let history_metadata = self.grid_renderer.lock().await.history_metadata.clone();
+                    if let Some(metadata) = history_metadata {
+                        // Calculate maximum scroll to reach oldest line
+                        let (_, display_height) = crossterm::terminal::size()?;
+                        let latest_line = metadata.latest_line;
+                        let oldest_line = metadata.oldest_line;
+                        
+                        // Set scroll offset to show the oldest content
+                        let max_scroll = (latest_line - oldest_line + display_height as u64).saturating_sub(1);
+                        {
+                            let mut renderer = self.grid_renderer.lock().await;
+                            renderer.scroll_offset = max_scroll as u16;
+                        }
+                        
+                        // Update subscription to show historical content
+                        self.handle_scroll_update().await?;
+                        
+                        // Debug log
+                        if let Some(ref debug_log) = self.debug_log {
+                            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                                use std::io::Write;
+                                let _ = writeln!(file, "[{}] Shift+Home: scrolled to oldest line {}", 
+                                    chrono::Utc::now().format("%H:%M:%S%.3f"), oldest_line);
+                            }
+                        }
+                    }
+                } else {
+                    // Send Home key escape sequence
+                    let bytes = vec![0x1B, b'[', b'H']; // ESC[H
+                    let client_msg = crate::protocol::ClientMessage::TerminalInput {
+                        data: bytes,
+                        echo_local: None,
+                    };
+                    let app_msg = crate::protocol::signaling::AppMessage::Protocol {
+                        message: serde_json::to_value(&client_msg)?,
+                    };
+                    self.send_queue_tx.send(QueuedMessage::AppMessage(app_msg)).await?;
+                }
             }
             KeyCode::End => {
-                // Send End key escape sequence
-                let bytes = vec![0x1B, b'[', b'F']; // ESC[F
-                let client_msg = crate::protocol::ClientMessage::TerminalInput {
-                    data: bytes,
-                    echo_local: None,
-                };
-                let app_msg = crate::protocol::signaling::AppMessage::Protocol {
-                    message: serde_json::to_value(&client_msg)?,
-                };
-                self.send_queue_tx.send(QueuedMessage::AppMessage(app_msg)).await?;
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    // Shift+End: Return to realtime mode (bottom)
+                    self.grid_renderer.lock().await.enter_realtime_mode();
+                    
+                    // Send ViewportChanged to return to realtime subscription
+                    self.handle_scroll_update().await?;
+                    
+                    // Debug log
+                    if let Some(ref debug_log) = self.debug_log {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                            use std::io::Write;
+                            let _ = writeln!(file, "[{}] Shift+End: returned to realtime mode", 
+                                chrono::Utc::now().format("%H:%M:%S%.3f"));
+                        }
+                    }
+                } else {
+                    // Send End key escape sequence
+                    let bytes = vec![0x1B, b'[', b'F']; // ESC[F
+                    let client_msg = crate::protocol::ClientMessage::TerminalInput {
+                        data: bytes,
+                        echo_local: None,
+                    };
+                    let app_msg = crate::protocol::signaling::AppMessage::Protocol {
+                        message: serde_json::to_value(&client_msg)?,
+                    };
+                    self.send_queue_tx.send(QueuedMessage::AppMessage(app_msg)).await?;
+                }
             }
             KeyCode::Delete => {
                 // Send Delete key escape sequence
@@ -1234,6 +1344,21 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
         
         match msg {
             ServerMessage::Delta { changes, sequence, .. } => {
+                if let Some(ref path) = self.debug_log {
+                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                        use std::io::Write;
+                        let _ = writeln!(file, "[{}] Client: Received Delta seq={} changes={}",
+                            chrono::Utc::now().format("%H:%M:%S%.3f"), sequence, changes.cell_changes.len());
+                    }
+                }
+                // Check sequence ordering using last applied sequence
+                let last_applied = *self.last_applied_seq.lock().await;
+                if sequence <= last_applied {
+                    // Skip this delta as it's older than our last applied
+                    return Ok(());
+                }
+                *self.last_applied_seq.lock().await = sequence;
+                
                 // Log delta application details
                 if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
                     // Capture state BEFORE applying delta
@@ -1356,11 +1481,7 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                     }
                     
                     // Also record the full grid state after delta
-                    let view_mode = if renderer.is_historical_mode() {
-                        "historical"
-                    } else {
-                        "realtime"
-                    };
+                    let view_mode = "realtime";  // Using viewport-based subscription
                     let _ = recorder.record_client_grid_state(
                         &renderer.grid,
                         renderer.scroll_offset as i64,
@@ -1401,90 +1522,31 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                     // No debug recorder, just apply the delta
                     self.grid_renderer.lock().await.apply_delta(&changes);
                 }
-            }
-            ServerMessage::Snapshot { grid, .. } => {
-                // Debug logging for snapshot reception
-                if let Ok(mut debug_file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/beach-snapshot-debug.log")
-                {
-                    use std::io::Write;
-                    let mode = self.last_requested_mode.lock().await;
-                    let _ = writeln!(debug_file, 
-                        "[{}] [SNAPSHOT_RECEIVED] Processing snapshot:",
-                        chrono::Utc::now()
-                    );
-                    let _ = writeln!(debug_file, 
-                        "  grid.start_line: {:?}",
-                        grid.start_line.to_u64()
-                    );
-                    let _ = writeln!(debug_file, 
-                        "  grid.end_line: {:?}",
-                        grid.end_line.to_u64()
-                    );
-                    let _ = writeln!(debug_file, 
-                        "  last_requested_mode: {:?}",
-                        *mode
-                    );
-                    let _ = writeln!(debug_file, 
-                        "  Will call enter_historical_mode: {}",
-                        *mode == ViewMode::Historical && grid.start_line.to_u64().is_some()
-                    );
-                }
                 
-                // If we last requested Historical, set the client anchor to
-                // the snapshot's start line before applying so cache is populated.
-                {
-                    let mode = self.last_requested_mode.lock().await;
-                    if *mode == ViewMode::Historical {
-                        if let Some(start) = grid.start_line.to_u64() {
-                            // Log before and after enter_historical_mode
-                            if let Ok(mut debug_file) = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open("/tmp/beach-snapshot-debug.log")
-                            {
-                                use std::io::Write;
-                                let _ = writeln!(debug_file, 
-                                    "[{}] [ENTER_HISTORICAL] Calling enter_historical_mode({})",
-                                    chrono::Utc::now(),
-                                    start
-                                );
-                            }
-                            
-                            self.grid_renderer.lock().await.enter_historical_mode(start);
-                            
-                            // Log state after calling enter_historical_mode
-                            if let Ok(mut debug_file) = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open("/tmp/beach-snapshot-debug.log")
-                            {
-                                use std::io::Write;
-                                let renderer = self.grid_renderer.lock().await;
-                                let _ = writeln!(debug_file, 
-                                    "[{}] [ENTER_HISTORICAL] After call - is_historical_mode: {}",
-                                    chrono::Utc::now(),
-                                    renderer.is_historical_mode()
-                                );
-                            }
-                        } else {
-                            // Log if we skip enter_historical_mode
-                            if let Ok(mut debug_file) = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open("/tmp/beach-snapshot-debug.log")
-                            {
-                                use std::io::Write;
-                                let _ = writeln!(debug_file, 
-                                    "[{}] [ENTER_HISTORICAL] SKIPPED - grid.start_line is None!",
-                                    chrono::Utc::now()
-                                );
-                            }
-                        }
+                // Debug log sequence tracking
+                if let Some(ref debug_log) = self.debug_log {
+                    if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(debug_log) {
+                        use std::io::Write;
+                        let _ = writeln!(file, "[{}] Applied delta seq={} (last_applied={})",
+                            chrono::Utc::now().format("%H:%M:%S%.3f"),
+                            sequence,
+                            last_applied
+                        );
                     }
                 }
+            }
+            ServerMessage::Snapshot { grid, sequence, .. } => {
+                if let Some(ref path) = self.debug_log {
+                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                        use std::io::Write;
+                        let _ = writeln!(file, "[{}] Client: Received Snapshot seq={} dims={}x{} start={:?} end={:?}",
+                            chrono::Utc::now().format("%H:%M:%S%.3f"), sequence, grid.width, grid.height,
+                            grid.start_line.to_u64(), grid.end_line.to_u64());
+                    }
+                }
+                // Update last applied sequence
+                *self.last_applied_seq.lock().await = sequence;
+                
                 // Apply the snapshot
                 self.grid_renderer.lock().await.apply_snapshot(grid.clone());
                 // Debug: log a small sample of the top few lines we will render
@@ -1494,9 +1556,9 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                         let renderer = self.grid_renderer.lock().await;
                         let start_u64 = grid.start_line.to_u64().unwrap_or(0);
                         let end_u64 = grid.end_line.to_u64().unwrap_or(0);
-                        let _ = writeln!(file, "[{}] Client: Snapshot applied (hist_mode={}, start_line={}, end_line={}, dims={}x{})",
+                        let _ = writeln!(file, "[{}] Client: Snapshot applied (viewport_mode, start_line={}, end_line={}, dims={}x{})",
                             chrono::Utc::now().format("%H:%M:%S%.3f"),
-                            renderer.is_historical_mode(), start_u64, end_u64,
+                            start_u64, end_u64,
                             renderer.grid.width, renderer.grid.height);
                         for row in 0..renderer.grid.height.min(5) {
                             let mut s = String::new();
@@ -1531,11 +1593,7 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                 // Record client grid state after applying snapshot
                 if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
                     let renderer = self.grid_renderer.lock().await;
-                    let view_mode = if renderer.is_historical_mode() {
-                        "historical"
-                    } else {
-                        "realtime"
-                    };
+                    let view_mode = "realtime";  // Using viewport-based subscription
                     let _ = recorder.record_client_grid_state(
                         &renderer.grid,
                         renderer.scroll_offset as i64,
@@ -1595,6 +1653,89 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                         chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)),
                 };
                 self.grid_renderer.lock().await.set_history_metadata(metadata);
+                
+                // Store latest_line for viewport calculations
+                *self.latest_line.lock().await = Some(latest_line);
+            }
+            ServerMessage::SnapshotRange { grid, sequence, .. } => {
+                if let Some(ref path) = self.debug_log {
+                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                        use std::io::Write;
+                        let _ = writeln!(file, "[{}] Client: Received SnapshotRange seq={} dims={}x{} start={:?} end={:?}",
+                            chrono::Utc::now().format("%H:%M:%S%.3f"), sequence, grid.width, grid.height,
+                            grid.start_line.to_u64(), grid.end_line.to_u64());
+                    }
+                }
+                // Update last applied sequence (use message sequence, not watermark)
+                *self.last_applied_seq.lock().await = sequence;
+                // Update latest_line for viewport math from snapshot range end_line
+                if let Some(end_line) = grid.end_line.to_u64() {
+                    *self.latest_line.lock().await = Some(end_line);
+                }
+                // Enter historical mode using the intended viewport start as anchor when available.
+                // SnapshotRange includes prefetch; anchoring at grid.start_line can pin to 0.
+                {
+                    // Determine anchor: use the actual viewport start that was requested
+                    let (_, display_height) = crossterm::terminal::size()?;
+                    let viewport_h = display_height as u64;
+                    let end = grid.end_line.to_u64().unwrap_or(0);
+                    let start = grid.start_line.to_u64().unwrap_or(0);
+                    let anchor = {
+                        let current_vp = self.current_viewport.lock().await.clone();
+                        let vp_debug = current_vp.as_ref().map(|vp| format!("({}, {})", vp.start_line, vp.end_line)).unwrap_or("None".to_string());
+
+                        let calculated_anchor = if let Some(vp) = current_vp {
+                            // Use the requested viewport start, but ensure it's within the returned range
+                            vp.start_line.max(start).min(end.saturating_sub(viewport_h.saturating_sub(1)))
+                        } else {
+                            // If no viewport is set, use a reasonable position avoiding the very beginning
+                            let safe_start = start.saturating_add(viewport_h);
+                            safe_start.min(end.saturating_sub(viewport_h.saturating_sub(1)))
+                        };
+
+                        // Debug log anchor calculation
+                        if let Some(ref path) = self.debug_log {
+                            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                                use std::io::Write;
+                                let _ = writeln!(file, "[{}] Client: ANCHOR_CALC current_vp={} grid_range=({}, {}) calculated_anchor={}",
+                                    chrono::Utc::now().format("%H:%M:%S%.3f"), vp_debug, start, end, calculated_anchor);
+                            }
+                        }
+                        calculated_anchor
+                    };
+                    let mut gr = self.grid_renderer.lock().await;
+                    gr.enter_historical_mode(anchor);
+                    // Apply grid from SnapshotRange after switching mode so apply_snapshot treats it as historical
+                    gr.apply_snapshot(grid);
+                    // Record bottom context and full grid state for diagnostics
+                    if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
+                        let _ = recorder.record_client_grid_state(&gr.grid, gr.scroll_offset as i64, "historical");
+                        let _ = recorder.record_grid_bottom_context("client_after_snapshot_range", &gr.grid, 6);
+                    }
+                    // Also log a top seam preview of the first 6 lines for quick inspection
+                    if let Some(ref path) = self.debug_log {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                            use std::io::Write;
+                            let _ = writeln!(file, "[{}] Client: SnapshotRange anchor set to {} (viewport_h={}) start={} end={}",
+                                chrono::Utc::now().format("%H:%M:%S%.3f"), anchor, viewport_h, start, end);
+                            let mut non_blank = 0usize;
+                            let preview_rows = (0..gr.grid.height.min(6)).collect::<Vec<_>>();
+                            for row in preview_rows {
+                                let mut line = String::new();
+                                for col in 0..gr.grid.width.min(100) {
+                                    if let Some(cell) = gr.grid.get_cell(row, col) { line.push(cell.char); }
+                                }
+                                let trimmed = line.trim_end();
+                                if !trimmed.is_empty() { non_blank += 1; }
+                                let _ = writeln!(file, "[{}] Client: SnapshotRange TOP row {}: '{}'",
+                                    chrono::Utc::now().format("%H:%M:%S%.3f"), row, trimmed);
+                            }
+                            let _ = writeln!(file, "[{}] Client: SnapshotRange TOP non_blank_count={} start_line={:?} end_line={:?}",
+                                chrono::Utc::now().format("%H:%M:%S%.3f"), non_blank,
+                                gr.grid.start_line.to_u64(), gr.grid.end_line.to_u64());
+                        }
+                    }
+                }
             }
             ServerMessage::Error { code, .. } => {
                 // Handle error - potentially trigger reconnect
@@ -1732,7 +1873,7 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
             prefetch: Some(Prefetch { before: 100, after: 100 }),
             follow_tail: Some(true),
             // Deprecated fields for backward compatibility
-            mode: Some(ViewMode::Realtime),
+            mode: None,  // Using viewport-based subscription instead
             position: None,
             compression: None,
         };
@@ -1749,272 +1890,154 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
         Ok(())
     }
     
-    /// Handle scroll position updates to update overscan subscription
-    async fn handle_scroll_update(&self) -> Result<()> {
-        // Debug logging to file
-        if let Ok(mut debug_file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/beach-scroll-debug.log")
-        {
-            use std::io::Write;
-            let _ = writeln!(debug_file, "[{}] handle_scroll_update: Starting", chrono::Utc::now());
+    /// Show scrollback help text on first scroll
+    async fn show_scroll_help_if_needed(&self) {
+        let mut help_shown = self.help_shown.lock().await;
+        if !*help_shown {
+            *help_shown = true;
+            drop(help_shown);
+            
+            // Show help text briefly in debug log (can be enhanced to show in UI later)
+            if let Some(ref debug_log) = self.debug_log {
+                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                    use std::io::Write;
+                    let _ = writeln!(file, "[{}] HELP: Scrollback controls - Shift+PageUp/Down: scroll | Shift+Home: top | Shift+End: bottom | ESC: exit | Mouse wheel: scroll", 
+                        chrono::Utc::now().format("%H:%M:%S%.3f"));
+                }
+            }
+            
+            // In a real implementation, we'd show this as a temporary overlay or notification
+            // For now, the overlay indicator showing "ESC to exit" provides the most critical info
         }
-        
-        // Snapshot what we need without holding the renderer lock across awaits
-        let (calc_request, was_historical, scroll_at, srv_w, srv_h) = {
-            let mut gr = self.grid_renderer.lock().await;
-            let req = gr.calculate_history_needs();
-            let hist = gr.is_historical_mode();
-            let offset = gr.scroll_offset as usize;
-            let w = gr.server_width;
-            let h = gr.server_height;
-            (req, hist, offset, w, h)
+    }
+    
+    /// Handle scroll position updates using viewport-based subscription
+    async fn handle_scroll_update(&self) -> Result<()> {
+        // Capture scroll state and mode
+        let (scroll_offset, view_line_opt) = {
+            let gr = self.grid_renderer.lock().await;
+            (gr.scroll_offset, gr.historical_anchor())
         };
         
-        // Debug log the current state
-        if let Ok(mut debug_file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/beach-scroll-debug.log")
-        {
-            use std::io::Write;
-            let _ = writeln!(debug_file, 
-                "[{}] State: was_historical={}, scroll_offset={}, calc_request={:?}, srv_dims={}x{}",
-                chrono::Utc::now(), was_historical, scroll_at, 
-                calc_request.as_ref().map(|r| format!("lines {}-{}", r.start_line, r.end_line)),
-                srv_w, srv_h
-            );
+        // Get current terminal dimensions for viewport height
+        let (_, display_height) = crossterm::terminal::size()?;
+        let viewport_height = display_height as u64;
+
+        // Get latest line from history info (used for realtime calculations)
+        let latest_line = {
+            let latest = self.latest_line.lock().await;
+            match *latest { Some(line) => line, None => 0 }
+        };
+
+        // Compute viewport based on mode
+        let (viewport_start, viewport_end, follow_tail) = if let Some(view_line) = view_line_opt {
+            // Historical mode: anchor at view_line and apply scroll_offset upwards
+            // view_line is the current historical anchor (start of last snapshot)
+            let start = view_line.saturating_sub(scroll_offset as u64);
+            let end = start.saturating_add(viewport_height.saturating_sub(1));
+            (start, end, false)
+        } else {
+            // Realtime mode: near tail; scroll_offset moves the window up from the latest line
+            let end = if scroll_offset == 0 {
+                latest_line
+            } else {
+                latest_line.saturating_sub(scroll_offset as u64)
+            };
+            let start = end.saturating_sub(viewport_height.saturating_sub(1));
+
+            // Ensure we don't request viewport starting from early blank lines
+            // If start is very small and we have significant latest_line content,
+            // clamp the start to avoid blank regions at the beginning of terminal history
+            let adjusted_start = if latest_line > viewport_height * 2 && start < viewport_height {
+                // If we have plenty of content and start is very low, move up to show content
+                let content_start = latest_line.saturating_sub(viewport_height * 3);
+                start.max(content_start)
+            } else {
+                start
+            };
+            let adjusted_end = adjusted_start.saturating_add(viewport_height.saturating_sub(1));
+
+            // Follow tail if close to bottom
+            let follow_tail = scroll_offset <= 3;
+            (adjusted_start, adjusted_end, follow_tail)
+        };
+
+        let new_viewport = crate::protocol::subscription::messages::Viewport { start_line: viewport_start, end_line: viewport_end };
+
+        // Debug log viewport calculation details
+        if let Some(ref debug_log) = self.debug_log {
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                use std::io::Write;
+                let mode = if view_line_opt.is_some() { "historical" } else { "realtime" };
+                let _ = writeln!(file, "[{}] Client: VIEWPORT_CALC mode={} inputs(latest_line={}, view_line={:?}, scroll_offset={}, viewport_height={}) -> viewport=({}, {})",
+                    chrono::Utc::now().format("%H:%M:%S%.3f"), mode, latest_line, view_line_opt, scroll_offset, viewport_height, viewport_start, viewport_end);
+            }
         }
 
-        // Record debug event with the computed request
-        if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
-            let _ = recorder.record_event(crate::debug_recorder::DebugEvent::ClientHistoryNeedsCheck {
-                timestamp: chrono::Utc::now(),
-                scroll_offset: scroll_at,
-                has_metadata: true,
-                view_line: if was_historical { Some(0) } else { None },
-                request: calc_request.as_ref().map(|r| (r.start_line, r.end_line)),
-            });
-        }
-
-        if let Some(history_request) = calc_request {
-            // Throttle duplicate/rapid requests
-            let mut should_send = true;
-            {
-                let mut last_sent = self.history_last_sent.lock().await;
-                let mut pending = self.history_pending_line.lock().await;
-                if let Some(p_line) = *pending {
-                    // If we already have a request for a nearby line, skip
-                    if (history_request.start_line as i64 - p_line as i64).abs() < (srv_h as i64 / 2) {
-                        should_send = false;
+        // Check if viewport changed and should send ViewportChanged message
+        let viewport_changed = {
+            let mut current = self.current_viewport.lock().await;
+            match &*current {
+                Some(old_viewport) => {
+                    // Check if viewport actually changed
+                    if old_viewport.start_line != new_viewport.start_line || 
+                       old_viewport.end_line != new_viewport.end_line {
+                        *current = Some(new_viewport.clone());
+                        true
+                    } else {
+                        false // No change
                     }
                 }
-                if let Some(ts) = *last_sent {
-                    if ts.elapsed() < std::time::Duration::from_millis(75) {
-                        should_send = false;
-                    }
-                }
-                if should_send {
-                    *pending = Some(history_request.start_line);
-                    *last_sent = Some(std::time::Instant::now());
+                None => {
+                    // First time setting viewport
+                    *current = Some(new_viewport.clone());
+                    true
                 }
             }
-            if !should_send { return Ok(()); }
+        };
 
-            // Log request
+        if viewport_changed {
+            // Debug log viewport change computation
+            if let Some(ref debug_log) = self.debug_log {
+                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                    use std::io::Write;
+                    let mode = if view_line_opt.is_some() { "historical" } else { "realtime" };
+                    let _ = writeln!(file, "[{}] Client: ViewportChanged computed mode={} scroll_offset={} latest_line={} viewport=({}, {}) follow_tail={}",
+                        chrono::Utc::now().format("%H:%M:%S%.3f"), mode, scroll_offset, latest_line, viewport_start, viewport_end, follow_tail);
+                }
+            }
+            
+            // Record debug event
             if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
-                let _ = recorder.record_event(crate::debug_recorder::DebugEvent::ClientHistoryRequestSent {
+                let _ = recorder.record_event(crate::debug_recorder::DebugEvent::ClientHistoryNeedsCheck {
                     timestamp: chrono::Utc::now(),
-                    mode: "Historical".to_string(),
-                    start_line: Some(history_request.start_line),
-                    end_line: Some(history_request.end_line),
+                    scroll_offset: scroll_offset as usize,
+                    has_metadata: true,
+                    view_line: Some(viewport_start),
+                    request: Some((viewport_start, viewport_end)),
                 });
             }
-            
-            // Debug log the Historical mode request
-            if let Ok(mut debug_file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/beach-scroll-debug.log")
-            {
-                use std::io::Write;
-                let _ = writeln!(debug_file, 
-                    "[{}] SENDING HISTORICAL REQUEST: start_line={}, end_line={}, dimensions={}x{}",
-                    chrono::Utc::now(), history_request.start_line, history_request.end_line,
-                    srv_w, srv_h.saturating_mul(2)
-                );
-            }
-            
-            // Send ModifySubscription to request historical view (non-blocking)
-            let modify_msg = ClientMessage::ModifySubscription {
+
+            // Send ViewportChanged message
+            let viewport_msg = ClientMessage::ViewportChanged {
                 subscription_id: self.subscription_id.clone(),
-                dimensions: Some(Dimensions { width: srv_w, height: srv_h.saturating_mul(2) }),
-                mode: Some(ViewMode::Historical),
-                position: Some(ViewPosition { time: None, line: Some(history_request.start_line), offset: None }),
+                viewport: new_viewport,
+                follow_tail: Some(follow_tail),
+                prefetch: Some(crate::protocol::subscription::messages::Prefetch::default())
             };
+
             if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
-                let _ = recorder.record_client_message(&modify_msg);
+                let _ = recorder.record_client_message(&viewport_msg);
             }
-            let app_msg = AppMessage::Protocol { message: serde_json::to_value(&modify_msg)? };
+
+            let app_msg = AppMessage::Protocol { message: serde_json::to_value(&viewport_msg)? };
             self.send_queue_tx
                 .send(QueuedMessage::AppMessage(app_msg))
                 .await
                 .map_err(|_| anyhow::anyhow!("Send queue closed"))?;
-            return Ok(());
         }
 
-        // No history request: if we are at bottom while in historical mode, return to realtime
-        if scroll_at == 0 && was_historical {
-            // Debug log the return to realtime
-            if let Ok(mut debug_file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/beach-scroll-debug.log")
-            {
-                use std::io::Write;
-                let _ = writeln!(debug_file, 
-                    "[{}] RETURNING TO REALTIME MODE: scroll_offset=0, was_historical=true",
-                    chrono::Utc::now()
-                );
-            }
-            
-            {
-                let mut gr = self.grid_renderer.lock().await;
-                gr.enter_realtime_mode();
-            }
-            let modify_msg = ClientMessage::ModifySubscription {
-                subscription_id: self.subscription_id.clone(),
-                dimensions: None,
-                mode: Some(ViewMode::Realtime),
-                position: None,
-            };
-            if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
-                let _ = recorder.record_client_message(&modify_msg);
-            }
-            // Debug logging for state transition to Realtime
-            if let Ok(mut debug_file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/beach-state-flow.log")
-            {
-                use std::io::Write;
-                let mode_before = self.last_requested_mode.lock().await;
-                let _ = writeln!(debug_file, 
-                    "[{}] [CLIENT_STATE] BEFORE ModifySubscription send to Realtime:",
-                    chrono::Utc::now()
-                );
-                let _ = writeln!(debug_file, 
-                    "  last_requested_mode: {:?}",
-                    *mode_before
-                );
-                let _ = writeln!(debug_file, 
-                    "  new_mode: ViewMode::Realtime"
-                );
-            }
-            
-            let app_msg = AppMessage::Protocol { message: serde_json::to_value(&modify_msg)? };
-            self.send_queue_tx
-                .send(QueuedMessage::AppMessage(app_msg))
-                .await
-                .map_err(|_| anyhow::anyhow!("Send queue closed"))?;
-            {
-                let mut mode = self.last_requested_mode.lock().await;
-                *mode = ViewMode::Realtime;
-                
-                // Log after updating
-                if let Ok(mut debug_file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/beach-state-flow.log")
-                {
-                    use std::io::Write;
-                    let _ = writeln!(debug_file, 
-                        "[{}] [CLIENT_STATE] AFTER updating last_requested_mode: {:?}",
-                        chrono::Utc::now(),
-                        *mode
-                    );
-                }
-            }
-            return Ok(());
-        }
-
-        // Failsafe: if user is scrolled (offset > 0) but we didn't generate a
-        // request (e.g., because client-side anchor is stale) and we haven't
-        // requested Historical yet, proactively send a Historical modify using
-        // the current end_line as a baseline.
-        if scroll_at > 0 {
-            let should_force = {
-                let mode = self.last_requested_mode.lock().await;
-                *mode != ViewMode::Historical
-            };
-            if should_force {
-                let (start_line_guess, width, height2) = {
-                    let gr = self.grid_renderer.lock().await;
-                    let end = gr.grid.end_line.to_u64().unwrap_or(0);
-                    (end.saturating_sub(scroll_at as u64), gr.server_width, gr.server_height.saturating_mul(2))
-                };
-                let modify_msg = ClientMessage::ModifySubscription {
-                    subscription_id: self.subscription_id.clone(),
-                    dimensions: Some(Dimensions { width, height: height2 }),
-                    mode: Some(ViewMode::Historical),
-                    position: Some(ViewPosition { time: None, line: Some(start_line_guess), offset: None }),
-                };
-                if let Some(ref mut recorder) = *self.debug_recorder.lock().await {
-                    let _ = recorder.record_client_message(&modify_msg);
-                }
-                
-                // Debug logging for state transition to Historical
-                if let Ok(mut debug_file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/beach-state-flow.log")
-                {
-                    use std::io::Write;
-                    let mode_before = self.last_requested_mode.lock().await;
-                    let _ = writeln!(debug_file, 
-                        "[{}] [CLIENT_STATE] BEFORE ModifySubscription send to Historical:",
-                        chrono::Utc::now()
-                    );
-                    let _ = writeln!(debug_file, 
-                        "  last_requested_mode: {:?}",
-                        *mode_before
-                    );
-                    let _ = writeln!(debug_file, 
-                        "  new_mode: ViewMode::Historical"
-                    );
-                    let _ = writeln!(debug_file, 
-                        "  line_number: {}",
-                        start_line_guess
-                    );
-                }
-                
-                let app_msg = AppMessage::Protocol { message: serde_json::to_value(&modify_msg)? };
-                self.send_queue_tx
-                    .send(QueuedMessage::AppMessage(app_msg))
-                    .await
-                    .map_err(|_| anyhow::anyhow!("Send queue closed"))?;
-                {
-                    let mut mode = self.last_requested_mode.lock().await;
-                    *mode = ViewMode::Historical;
-                    
-                    // Log after updating
-                    if let Ok(mut debug_file) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/beach-state-flow.log")
-                    {
-                        use std::io::Write;
-                        let _ = writeln!(debug_file, 
-                            "[{}] [CLIENT_STATE] AFTER updating last_requested_mode: {:?}",
-                            chrono::Utc::now(),
-                            *mode
-                        );
-                    }
-                }
-            }
-        }
-
+        
         Ok(())
     }
     

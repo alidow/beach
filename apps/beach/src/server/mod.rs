@@ -538,6 +538,15 @@ impl<T: Transport + Send + Sync + 'static> ServerMessageHandler for TerminalServ
             AppMessage::TerminalInput { data } => {
                 // Handle terminal input from client
                 let _ = self.write_to_pty(&data);
+
+                // After writing to PTY, proactively push terminal updates to all subscriptions
+                // to ensure clients render the latest output promptly (diagnostic aid)
+                {
+                    let session = self.session.read().await;
+                    let hub = session.subscription_hub();
+                    drop(session);
+                    let _ = hub.push_terminal_update().await;
+                }
             }
             AppMessage::TerminalResize { cols, rows } => {
                 // Handle terminal resize

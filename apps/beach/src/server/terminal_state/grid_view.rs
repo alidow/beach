@@ -91,6 +91,37 @@ impl GridView {
             historical_grid.height.saturating_sub(height)
         };
         
+        // Debug: log the copy operation details
+        if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/beach-gridview-debug.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(debug_file, "[{}] GRIDVIEW_COPY line_num={} hist_range=({},{}) row_offset={} height={}",
+                chrono::Utc::now().format("%H:%M:%S%.3f"),
+                line_num, hist_start, hist_end, row_offset, height);
+
+            // Sample the source content being copied
+            let mut source_sample = Vec::new();
+            let mut source_non_blank = 0;
+            for sample_row in row_offset..(row_offset + 3.min(height)) {
+                if sample_row < historical_grid.height {
+                    let mut line = String::new();
+                    for col in 0..historical_grid.width.min(80) {
+                        if let Some(cell) = historical_grid.get_cell(sample_row, col) {
+                            line.push(cell.char);
+                        }
+                    }
+                    let trimmed = line.trim_end();
+                    if !trimmed.is_empty() { source_non_blank += 1; }
+                    source_sample.push(format!("src[{}]: '{}'", sample_row, trimmed));
+                }
+            }
+            let _ = writeln!(debug_file, "[{}] GRIDVIEW_SOURCE: non_blank={}/3 content=[{}]",
+                chrono::Utc::now().format("%H:%M:%S%.3f"), source_non_blank, source_sample.join(", "));
+        }
+
         // Copy the grid content starting from the requested line (top-anchored)
         for dst_row in 0..height {
             let src_row = dst_row + row_offset;
@@ -103,9 +134,15 @@ impl GridView {
             }
         }
         
-        // Update line numbers to reflect the top-anchored view
-        new_grid.start_line = LineCounter::from_u64(line_num);
-        new_grid.end_line = LineCounter::from_u64(line_num + height as u64 - 1);
+        // Update line numbers to reflect the actual available view
+        // If requested line is before available history, clamp to start of history
+        let actual_start = if line_num < hist_start {
+            hist_start
+        } else {
+            line_num
+        };
+        new_grid.start_line = LineCounter::from_u64(actual_start);
+        new_grid.end_line = LineCounter::from_u64(actual_start + height as u64 - 1);
         
         // Debug event: HistoricalViewReturned
         if let Some(ref recorder) = self.debug_recorder {

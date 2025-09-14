@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, BinaryHeap};
 use std::sync::{Arc, Mutex};
+use std::cmp::Ordering;
 use tokio::sync::{RwLock, mpsc};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -8,7 +9,7 @@ use crate::protocol::{
     ClientMessage, ServerMessage, ViewMode, ViewPosition, Dimensions,
     ErrorCode, SubscriptionStatus
 };
-use crate::transport::{Transport, ChannelPurpose};
+use crate::transport::Transport;
 use super::{SubscriptionId, ClientId};
 use super::data_source::{TerminalDataSource, PtyWriter};
 
@@ -30,7 +31,68 @@ pub struct SubscriptionUpdate {
     pub is_controlling: Option<bool>,
 }
 
+/// Message priority levels for queue ordering
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MessagePriority {
+    /// P0: Highest priority - Immediate viewport snapshots
+    ViewportSnapshot = 0,
+    /// P0.5: High priority - Prefetch region snapshots for smooth scrolling
+    PrefetchSnapshot = 1,
+    /// P1: High priority - Delta updates within viewport region
+    ViewportDelta = 2, 
+    /// P2: Medium priority - Background snapshot requests outside prefetch regions
+    BackgroundSnapshot = 3,
+    /// P3: Lowest priority - Background delta updates outside viewport
+    BackgroundDelta = 4,
+}
+
+/// Regions for determining message priority
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineRegion {
+    /// Line is within the immediate viewport
+    Viewport,
+    /// Line is within the prefetch margin around viewport
+    Prefetch, 
+    /// Line is outside both viewport and prefetch regions
+    Background,
+}
+
+/// A prioritized message for the send queue
+#[derive(Debug, Clone)]
+pub struct PrioritizedMessage {
+    pub priority: MessagePriority,
+    pub subscription_id: SubscriptionId,
+    pub message: ServerMessage,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+impl PartialEq for PrioritizedMessage {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority && self.timestamp == other.timestamp
+    }
+}
+
+impl Eq for PrioritizedMessage {}
+
+impl PartialOrd for PrioritizedMessage {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PrioritizedMessage {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse ordering for BinaryHeap (max-heap) so that lower
+        // priority numbers are considered "greater" and popped first.
+        // Then, for equal priority, prefer OLDER timestamps first.
+        other.priority.cmp(&self.priority)
+            // Older (smaller) timestamp should be considered greater, so reverse compare
+            .then_with(|| other.timestamp.cmp(&self.timestamp))
+    }
+}
+
 /// A single subscription with its associated transport
+#[derive(Clone)]
 struct Subscription {
     id: SubscriptionId,
     client_id: ClientId,
@@ -49,6 +111,12 @@ struct Subscription {
     follow_tail: bool,
     /// Watermark sequence for ordering guarantees
     watermark_seq: u64,
+    /// Previous viewport for calculating scroll velocity
+    previous_viewport: Option<crate::protocol::subscription::messages::Viewport>,
+    /// Last viewport change timestamp for velocity calculation
+    last_viewport_change: Option<chrono::DateTime<chrono::Utc>>,
+    /// Calculated scroll velocity (lines per second)
+    scroll_velocity: f64,
 }
 
 /// Handler trait for subscription business logic
@@ -85,11 +153,20 @@ pub struct SubscriptionHub {
     // Channel for delta streaming task
     delta_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
     
+    // Channel for priority queue processing task (wake triggers)
+    queue_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
+    
+    // Channel for stopping priority queue processing task
+    queue_stop_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
+    
     // Debug log path for verbose logging
     debug_log_path: Arc<RwLock<Option<String>>>,
     
     // Debug recorder for structured logging
     debug_recorder: Arc<RwLock<Option<Arc<Mutex<crate::debug_recorder::DebugRecorder>>>>>,
+    
+    // Priority queue for message sending with backpressure control
+    send_queue: Arc<RwLock<BinaryHeap<PrioritizedMessage>>>,
 }
 
 impl SubscriptionHub {
@@ -102,8 +179,11 @@ impl SubscriptionHub {
             pty_writer: Arc::new(RwLock::new(None)),
             handler: Arc::new(RwLock::new(None)),
             delta_tx: Arc::new(RwLock::new(None)),
+            queue_tx: Arc::new(RwLock::new(None)),
+            queue_stop_tx: Arc::new(RwLock::new(None)),
             debug_log_path: Arc::new(RwLock::new(None)),
             debug_recorder: Arc::new(RwLock::new(None)),
+            send_queue: Arc::new(RwLock::new(BinaryHeap::new())),
         }
     }
 
@@ -162,6 +242,9 @@ impl SubscriptionHub {
             prefetch: None,
             follow_tail: true,  // Default to following tail for realtime mode
             watermark_seq: 0,
+            previous_viewport: None,
+            last_viewport_change: None,
+            scroll_velocity: 0.0,
         };
         
         // Send acknowledgment
@@ -284,6 +367,9 @@ impl SubscriptionHub {
             prefetch: None,
             follow_tail: true,  // Default to following tail for realtime mode
             watermark_seq: 0,
+            previous_viewport: None,
+            last_viewport_change: None,
+            scroll_velocity: 0.0,
         };
 
         // Send subscription acknowledgment
@@ -292,6 +378,12 @@ impl SubscriptionHub {
             status: SubscriptionStatus::Active,
             shared_with: None,
         }).await?;
+
+        // Store subscription BEFORE sending initial snapshot to avoid race condition
+        {
+            let mut subscriptions = self.subscriptions.write().await;
+            subscriptions.insert(subscription_id.clone(), subscription.clone());
+        }
 
         // Send initial snapshot if we have a data source
         if let Some(source) = self.terminal_source.read().await.as_ref() {
@@ -312,7 +404,7 @@ impl SubscriptionHub {
             
             // Store initial grid for future delta computation
             subscription.previous_grid = Some(snapshot.clone());
-            
+
             // Log snapshot to debug recorder if available (non-blocking)
             if let Some(ref recorder) = *self.debug_recorder.read().await {
                 if let Ok(mut rec) = recorder.try_lock() {
@@ -323,7 +415,7 @@ impl SubscriptionHub {
                     );
                 }
             }
-            
+
             self.send_to_subscription(&subscription, ServerMessage::Snapshot {
                 subscription_id: subscription_id.clone(),
                 sequence: 0,
@@ -331,6 +423,14 @@ impl SubscriptionHub {
                 timestamp: chrono::Utc::now().timestamp(),
                 checksum: 0,
             }).await?;
+
+            // Update stored subscription with the initial grid
+            {
+                let mut subscriptions = self.subscriptions.write().await;
+                if let Some(stored_sub) = subscriptions.get_mut(&subscription_id) {
+                    stored_sub.previous_grid = subscription.previous_grid.clone();
+                }
+            }
             
             // Send history metadata if available
             if let Ok(metadata) = source.get_history_metadata().await {
@@ -351,12 +451,6 @@ impl SubscriptionHub {
                         chrono::Local::now().format("%H:%M:%S%.3f"), subscription_id);
                 }
             }
-        }
-
-        // Store subscription
-        {
-            let mut subscriptions = self.subscriptions.write().await;
-            subscriptions.insert(subscription_id.clone(), subscription);
         }
 
         // Track client subscriptions
@@ -481,10 +575,93 @@ impl SubscriptionHub {
         Ok(())
     }
     
+    /// Start priority queue processing task
+    pub fn start_priority_queue_processing(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let (wake_tx, mut wake_rx) = mpsc::channel::<()>(100); // Buffer for wake signals
+        let (stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+        
+        // Store the senders for triggering/stopping the task later
+        let hub = self.clone();
+        tokio::spawn(async move {
+            *hub.queue_tx.write().await = Some(wake_tx);
+            *hub.queue_stop_tx.write().await = Some(stop_tx);
+        });
+        
+        // Start the priority queue processing task
+        tokio::spawn(async move {
+            // Log task start
+            if let Some(ref path) = *self.debug_log_path.read().await {
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    use std::io::Write;
+                    let _ = writeln!(f, "[{}] [SubscriptionHub] Priority queue processing task started",
+                        chrono::Local::now().format("%H:%M:%S%.3f"));
+                }
+            }
+            
+            let mut iteration_count = 0u64;
+            loop {
+                // Check if we should stop
+                if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+                
+                // Check for wake signals and drain the wake channel
+                let mut should_process = false;
+                while wake_rx.try_recv().is_ok() {
+                    should_process = true;
+                }
+                
+                // Process priority queue if triggered or periodically
+                if should_process {
+                    let _ = self.process_priority_queue().await;
+                } else {
+                    // Periodic processing for any missed messages
+                    let _ = self.process_priority_queue().await;
+                }
+                
+                // Periodically trigger background prefetch for historical mode subscriptions
+                // Do this every ~1 second (every 20 iterations at 50ms sleep)
+                iteration_count += 1;
+                if iteration_count % 20 == 0 {
+                    // Debug: log queue length approximately once per second
+                    if let Some(ref path) = *self.debug_log_path.read().await {
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                            use std::io::Write;
+                            let qlen = { self.send_queue.read().await.len() };
+                            let _ = writeln!(f, "[{}] [SubscriptionHub] PriorityQueue heartbeat: queue_len={}",
+                                chrono::Local::now().format("%H:%M:%S%.3f"), qlen);
+                        }
+                    }
+                    let subscriptions = self.subscriptions.read().await;
+                    for (id, sub) in subscriptions.iter() {
+                        if !sub.follow_tail && sub.viewport.is_some() {
+                            let _ = self.request_background_prefetch(id).await;
+                        }
+                    }
+                }
+                
+                // Sleep briefly to avoid busy-waiting
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            
+            // Log task stop
+            if let Some(ref path) = *self.debug_log_path.read().await {
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    use std::io::Write;
+                    let _ = writeln!(f, "[{}] [SubscriptionHub] Priority queue processing task stopped",
+                        chrono::Local::now().format("%H:%M:%S%.3f"));
+                }
+            }
+        })
+    }
+
     /// Start event-driven streaming (server-only)
     /// Returns a JoinHandle for the streaming task
     pub fn start_streaming(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         let (tx, mut rx) = mpsc::channel::<()>(1);
+        
+        // Start priority queue processing task
+        let _queue_handle = self.clone().start_priority_queue_processing();
         
         // Store the sender for stopping the task later
         let hub = self.clone();
@@ -544,7 +721,9 @@ impl SubscriptionHub {
                                 }
                             }
                             
-                            // Push terminal updates with per-subscription deltas
+                            // Push per-subscription updates with diffs/snapshots only
+                            // Note: Raw broadcast deltas are disabled to avoid coordinate/base mismatches
+                            // between global deltas and per-subscription views which can corrupt client state.
                             let _ = self.push_terminal_update().await;
                         }
                         Err(e) => {
@@ -582,11 +761,21 @@ impl SubscriptionHub {
         
         for subscription in subscriptions.values_mut() {
             // Get current snapshot for this subscription's dimensions and view mode
-            let current_snapshot = source.snapshot_with_view(
-                subscription.dimensions.clone(),
-                subscription.mode.clone(),
-                subscription.position.clone()
-            ).await?;
+            let current_snapshot = if let Some(ref viewport) = subscription.viewport {
+                // Use viewport-based snapshot for deltas when viewport is active
+                source.snapshot_range_with_watermark(
+                    subscription.dimensions.width,
+                    viewport.start_line,
+                    subscription.dimensions.height
+                ).await?.0  // Get the Grid from (Grid, u64) tuple
+            } else {
+                // Fallback to legacy mode/position for compatibility
+                source.snapshot_with_view(
+                    subscription.dimensions.clone(),
+                    subscription.mode.clone(),
+                    subscription.position.clone()
+                ).await?
+            };
             
             // Compute delta if we have a previous grid
             if let Some(ref previous_grid) = subscription.previous_grid {
@@ -661,12 +850,21 @@ impl SubscriptionHub {
                         timestamp: chrono::Utc::now().timestamp(),
                     };
                     
-                    // Log sending delta
+                    // Debug log delta details including viewport info
                     if let Some(ref path) = *self.debug_log_path.read().await {
                         if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
                             use std::io::Write;
-                            let _ = writeln!(f, "[{}] [SubscriptionHub] Sending custom delta to sub {} (seq {})",
-                                chrono::Local::now().format("%H:%M:%S%.3f"), subscription.id, subscription.current_sequence);
+                            let viewport_info = if let Some(ref vp) = subscription.viewport {
+                                format!("viewport[{}-{}]", vp.start_line, vp.end_line)
+                            } else {
+                                "no_viewport".to_string()
+                            };
+                            let _ = writeln!(f, "[{}] Delta seq={} sub={} {}",
+                                chrono::Local::now().format("%H:%M:%S%.3f"),
+                                subscription.current_sequence,
+                                subscription.id,
+                                viewport_info
+                            );
                             // Optional seam debug logging
                             if std::env::var("BEACH_SEAM_DEBUG").ok().is_some() {
                                 // Count trailing blank rows
@@ -699,6 +897,25 @@ impl SubscriptionHub {
                         }
                     }
                     
+                    // TEMPORARILY DISABLED: Skip background deltas filtering for debugging
+                    // TODO: Re-enable once basic synchronization is working
+                    // if let Some(_viewport) = &subscription.viewport {
+                    //     if !subscription.follow_tail {
+                    //         let priority = self.determine_message_priority(subscription, &msg);
+                    //         if matches!(priority, MessagePriority::BackgroundDelta | MessagePriority::BackgroundSnapshot) {
+                    //             continue;  // Skip this delta entirely
+                    //         }
+                    //     }
+                    // }
+                    
+                    // Debug: log enqueue of delta before calling send_to_subscription
+                    if let Some(ref path) = *self.debug_log_path.read().await {
+                        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
+                            use std::io::Write;
+                            let _ = writeln!(f, "[{}] [SubscriptionHub] push_terminal_update: enqueue Delta to sub {} (seq {})",
+                                chrono::Local::now().format("%H:%M:%S%.3f"), subscription.id, subscription.current_sequence);
+                        }
+                    }
                     let _ = self.send_to_subscription(subscription, msg).await;
                 }
             } else {
@@ -954,6 +1171,10 @@ impl SubscriptionHub {
                     if let Some(handler) = self.handler.read().await.as_ref() {
                         handler.on_input(&sub.id, data).await?;
                     }
+
+                    // Proactively send a fresh snapshot to ensure client render stays in sync
+                    // This helps when delta routing/ordering is under investigation
+                    let _ = self.force_snapshot(&sub.id).await;
                 } else {
                     // Debug log: Input not allowed
                     if let Some(ref path) = *self.debug_log_path.read().await {
@@ -1137,6 +1358,19 @@ impl SubscriptionHub {
                 let sub_clone = {
                     let mut subscriptions = self.subscriptions.write().await;
                     if let Some(subscription) = subscriptions.get_mut(&subscription_id) {
+                        // Calculate scroll velocity for adaptive prefetching
+                        let current_time = chrono::Utc::now();
+                        if let (Some(prev_viewport), Some(last_change)) = (&subscription.previous_viewport, subscription.last_viewport_change) {
+                            let time_diff = current_time.timestamp_millis() - last_change.timestamp_millis();
+                            if time_diff > 0 {
+                                let line_diff = (viewport.start_line as i64) - (prev_viewport.start_line as i64);
+                                subscription.scroll_velocity = (line_diff as f64 * 1000.0) / (time_diff as f64); // lines per second
+                            }
+                        }
+                        
+                        // Update viewport tracking fields
+                        subscription.previous_viewport = subscription.viewport.clone();
+                        subscription.last_viewport_change = Some(current_time);
                         subscription.viewport = Some(viewport.clone());
                         subscription.prefetch = prefetch.clone();
                         if let Some(follow) = follow_tail {
@@ -1159,6 +1393,9 @@ impl SubscriptionHub {
                             prefetch: prefetch.clone(),
                             follow_tail: subscription.follow_tail,
                             watermark_seq: subscription.watermark_seq,
+                            previous_viewport: subscription.previous_viewport.clone(),
+                            last_viewport_change: subscription.last_viewport_change,
+                            scroll_velocity: subscription.scroll_velocity,
                         })
                     } else {
                         None
@@ -1176,12 +1413,57 @@ impl SubscriptionHub {
                         let end_line = viewport.end_line + prefetch_after;
                         let rows = (end_line - start_line + 1).min(u16::MAX as u64) as u16;
                         
+                        // Debug: log incoming viewport change and derived request
+                        if let Some(ref path) = *self.debug_log_path.read().await {
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                                use std::io::Write;
+                                let _ = writeln!(f, "[{}] [SubscriptionHub] ViewportChanged recv sub={} vp=({}, {}) prefetch=({},{}) follow_tail={}",
+                                    chrono::Local::now().format("%H:%M:%S%.3f"),
+                                    subscription_id,
+                                    viewport.start_line, viewport.end_line,
+                                    prefetch_before, prefetch_after,
+                                    sub.follow_tail);
+                                let _ = writeln!(f, "[{}] [SubscriptionHub] SnapshotRange request: width={} start_line={} rows={}",
+                                    chrono::Local::now().format("%H:%M:%S%.3f"), sub.dimensions.width, start_line, rows);
+                            }
+                        }
+
                         // Get the snapshot with watermark
                         if let Ok((grid, watermark)) = source.snapshot_range_with_watermark(
                             sub.dimensions.width,
                             start_line,
                             rows
                         ).await {
+                            // Debug: log the actual grid content retrieved
+                            if let Some(ref path) = *self.debug_log_path.read().await {
+                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                                    use std::io::Write;
+
+                                    // Sample the first few rows of the retrieved grid
+                                    let mut sample_content = Vec::new();
+                                    let mut non_blank_rows = 0;
+                                    for row in 0..grid.height.min(5) {
+                                        let mut line = String::new();
+                                        for col in 0..grid.width.min(80) {
+                                            if let Some(cell) = grid.get_cell(row, col) {
+                                                line.push(cell.char);
+                                            }
+                                        }
+                                        let trimmed = line.trim_end();
+                                        if !trimmed.is_empty() { non_blank_rows += 1; }
+                                        sample_content.push(format!("row[{}]: '{}'", row, trimmed));
+                                    }
+
+                                    let _ = writeln!(f, "[{}] [SubscriptionHub] GRID_RETRIEVED for sub={} grid_range=({:?},{:?}) dims={}x{} non_blank_rows={}/5",
+                                        chrono::Local::now().format("%H:%M:%S%.3f"),
+                                        subscription_id,
+                                        grid.start_line.to_u64(), grid.end_line.to_u64(),
+                                        grid.width, grid.height,
+                                        non_blank_rows);
+                                    let _ = writeln!(f, "[{}] [SubscriptionHub] GRID_CONTENT: {}",
+                                        chrono::Local::now().format("%H:%M:%S%.3f"), sample_content.join(", "));
+                                }
+                            }
                             // Update watermark in the subscription
                             {
                                 let mut subscriptions = self.subscriptions.write().await;
@@ -1196,13 +1478,32 @@ impl SubscriptionHub {
                                 subscription_id: subscription_id.clone(),
                                 sequence: sub.current_sequence,
                                 watermark_seq: watermark,
-                                grid,
+                                grid: grid.clone(),
                                 timestamp: chrono::Utc::now().timestamp(),
                                 checksum: 0, // TODO: Calculate checksum
                             };
                             
                             // TODO: Use Control channel when dual-channel is implemented
                             self.send_to_subscription(&sub, message).await?;
+                            // Debug: log returned grid range
+                            if let Some(ref path) = *self.debug_log_path.read().await {
+                                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                                    use std::io::Write;
+                                    let _ = writeln!(f, "[{}] [SubscriptionHub] SnapshotRange result sub={} wm={} grid_range=({:?}, {:?}) dims={}x{} seq={}",
+                                        chrono::Local::now().format("%H:%M:%S%.3f"),
+                                        subscription_id,
+                                        watermark,
+                                        grid.start_line.to_u64(), grid.end_line.to_u64(),
+                                        grid.width, grid.height,
+                                        sub.current_sequence);
+                                }
+                            }
+                            
+                            // Trigger proactive background prefetch for smooth scrolling
+                            // Only prefetch if not following tail and have significant scroll velocity
+                            if !sub.follow_tail && sub.scroll_velocity.abs() > 0.5 {
+                                let _ = self.request_background_prefetch(&subscription_id).await;
+                            }
                         }
                     }
                 }
@@ -1217,7 +1518,281 @@ impl SubscriptionHub {
     }
     
     /// Send a message to a specific subscription with channel routing
+    /// Check which region a line falls into relative to viewport and prefetch
+    fn get_line_region(&self, line_num: u64, subscription: &Subscription) -> LineRegion {
+        if let Some(viewport) = &subscription.viewport {
+            // Check if line is in immediate viewport
+            if line_num >= viewport.start_line && line_num <= viewport.end_line {
+                return LineRegion::Viewport;
+            }
+            
+            // Check if line is in prefetch region
+            if let Some(prefetch) = &subscription.prefetch {
+                let prefetch_start = viewport.start_line.saturating_sub(prefetch.before as u64);
+                let prefetch_end = viewport.end_line + prefetch.after as u64;
+                
+                if line_num >= prefetch_start && line_num <= prefetch_end {
+                    return LineRegion::Prefetch;
+                }
+            }
+        }
+        
+        LineRegion::Background
+    }
+    
+    /// Determine priority for a message based on viewport and prefetch status
+    fn determine_message_priority(&self, subscription: &Subscription, message: &ServerMessage) -> MessagePriority {
+        match message {
+            ServerMessage::SnapshotRange { grid, .. } => {
+                // For SnapshotRange, determine priority based on which region they cover
+                {
+                    // Check the region covered by this snapshot
+                    let snapshot_start = grid.start_line.to_u64().unwrap_or(0);
+                    let snapshot_end = grid.end_line.to_u64().unwrap_or(0);
+                    
+                    // Determine the most important region this snapshot covers
+                    let mut has_viewport = false;
+                    let mut has_prefetch = false;
+                    
+                    for line in snapshot_start..=snapshot_end {
+                        match self.get_line_region(line, subscription) {
+                            LineRegion::Viewport => { has_viewport = true; break; }
+                            LineRegion::Prefetch => has_prefetch = true,
+                            LineRegion::Background => {}
+                        }
+                    }
+                    
+                    if has_viewport {
+                        MessagePriority::ViewportSnapshot
+                    } else if has_prefetch {
+                        MessagePriority::PrefetchSnapshot
+                    } else {
+                        MessagePriority::BackgroundSnapshot
+                    }
+                }
+            }
+            ServerMessage::Snapshot { .. } => {
+                // Initial snapshots (when no viewport is set) should always get highest priority
+                // to ensure client gets initial screen state immediately
+                MessagePriority::ViewportSnapshot
+            }
+            ServerMessage::Delta { changes, .. } => {
+                // If following tail (realtime mode), assume all deltas are viewport priority
+                if subscription.follow_tail {
+                    return MessagePriority::ViewportDelta;
+                }
+                
+                // Check if delta affects any lines and determine highest priority region
+                let mut highest_priority = MessagePriority::BackgroundDelta;
+                
+                for change in &changes.cell_changes {
+                    // For viewport-based deltas, the row is absolute within the current grid
+                    // We need to map it to actual line numbers based on the grid's line tracking
+                    let line_num = change.row as u64; // This is row within current snapshot
+                    
+                    match self.get_line_region(line_num, subscription) {
+                        LineRegion::Viewport => {
+                            return MessagePriority::ViewportDelta; // Highest possible, return immediately
+                        }
+                        LineRegion::Prefetch => {
+                            // Update but continue checking in case we find viewport
+                            if highest_priority < MessagePriority::PrefetchSnapshot {
+                                highest_priority = MessagePriority::PrefetchSnapshot;
+                            }
+                        }
+                        LineRegion::Background => {
+                            // Keep current priority
+                        }
+                    }
+                }
+                
+                highest_priority
+            }
+            // Control messages (acks, errors, etc.) use viewport priority to ensure delivery
+            _ => MessagePriority::ViewportSnapshot,
+        }
+    }
+
+    /// Queue a message for sending with priority
+    async fn enqueue_message(&self, subscription: &Subscription, message: ServerMessage) -> Result<()> {
+        let priority = self.determine_message_priority(subscription, &message);
+        // Debug: log enqueue intent with message kind and priority
+        if let Some(ref path) = *self.debug_log_path.read().await {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                use std::io::Write;
+                let msg_kind = match &message {
+                    ServerMessage::Snapshot { .. } => "Snapshot",
+                    ServerMessage::SnapshotRange { .. } => "SnapshotRange",
+                    ServerMessage::Delta { .. } => "Delta",
+                    ServerMessage::DeltaBatch { .. } => "DeltaBatch",
+                    ServerMessage::ViewTransition { .. } => "ViewTransition",
+                    ServerMessage::SubscriptionAck { .. } => "SubscriptionAck",
+                    ServerMessage::Error { .. } => "Error",
+                    ServerMessage::Pong { .. } => "Pong",
+                    ServerMessage::Notify { .. } => "Notify",
+                    ServerMessage::HistoryInfo { .. } => "HistoryInfo",
+                };
+                let _ = writeln!(f, "[{}] [SubscriptionHub] enqueue_message: sub={} kind={} priority={:?}",
+                    chrono::Local::now().format("%H:%M:%S%.3f"), subscription.id, msg_kind, priority);
+            }
+        }
+        let prioritized_msg = PrioritizedMessage {
+            priority,
+            subscription_id: subscription.id.clone(),
+            message,
+            timestamp: chrono::Utc::now(),
+        };
+        
+        let mut queue = self.send_queue.write().await;
+        queue.push(prioritized_msg);
+        // Debug: log queue length after push
+        if let Some(ref path) = *self.debug_log_path.read().await {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                use std::io::Write;
+                let _ = writeln!(f, "[{}] [SubscriptionHub] enqueue_message: queue_len={} (after push)",
+                    chrono::Local::now().format("%H:%M:%S%.3f"), queue.len());
+            }
+        }
+        
+        // Always trigger background processing via wake signal (avoid inline processing while holding locks)
+        drop(queue);
+        if let Some(queue_tx) = self.queue_tx.read().await.as_ref() {
+            let _ = queue_tx.try_send(());
+            // Debug: log background wake
+            if let Some(ref path) = *self.debug_log_path.read().await {
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    use std::io::Write;
+                    let _ = writeln!(f, "[{}] [SubscriptionHub] enqueue_message: wake sent for background processing",
+                        chrono::Local::now().format("%H:%M:%S%.3f"));
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Process messages from the priority queue
+    async fn process_priority_queue(&self) -> Result<()> {
+        // Debug: log entry and current queue length
+        if let Some(ref path) = *self.debug_log_path.read().await {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                use std::io::Write;
+                let qlen = { self.send_queue.read().await.len() };
+                let _ = writeln!(f, "[{}] [SubscriptionHub] process_priority_queue: start queue_len={}",
+                    chrono::Local::now().format("%H:%M:%S%.3f"), qlen);
+            }
+        }
+        // Process up to 10 messages at a time to avoid blocking
+        for _ in 0..10 {
+            let prioritized_msg = {
+                let mut queue = self.send_queue.write().await;
+                queue.pop()
+            };
+            
+            if let Some(msg) = prioritized_msg {
+                // Debug: log popped message info
+                if let Some(ref path) = *self.debug_log_path.read().await {
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                        use std::io::Write;
+                        let kind = match &msg.message {
+                            ServerMessage::Snapshot { .. } => "Snapshot",
+                            ServerMessage::SnapshotRange { .. } => "SnapshotRange",
+                            ServerMessage::Delta { .. } => "Delta",
+                            ServerMessage::DeltaBatch { .. } => "DeltaBatch",
+                            ServerMessage::ViewTransition { .. } => "ViewTransition",
+                            ServerMessage::SubscriptionAck { .. } => "SubscriptionAck",
+                            ServerMessage::Error { .. } => "Error",
+                            ServerMessage::Pong { .. } => "Pong",
+                            ServerMessage::Notify { .. } => "Notify",
+                            ServerMessage::HistoryInfo { .. } => "HistoryInfo",
+                        };
+                        let _ = writeln!(f, "[{}] [SubscriptionHub] process_priority_queue: pop sub={} kind={} priority={:?}",
+                            chrono::Local::now().format("%H:%M:%S%.3f"), msg.subscription_id, kind, msg.priority);
+                    }
+                }
+                let subscription = {
+                    let subscriptions = self.subscriptions.read().await;
+                    subscriptions.get(&msg.subscription_id).cloned()
+                };
+                
+                if let Some(sub) = subscription {
+                    // Debug: log about to send
+                    if let Some(ref path) = *self.debug_log_path.read().await {
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                            use std::io::Write;
+                            let _ = writeln!(f, "[{}] [SubscriptionHub] process_priority_queue: delivering to sub={}",
+                                chrono::Local::now().format("%H:%M:%S%.3f"), sub.id);
+                        }
+                    }
+                    let _ = self.send_message_direct(&sub, msg.message).await;
+                } else {
+                    // Subscription no longer exists, skip message
+                    if let Some(ref path) = *self.debug_log_path.read().await {
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                            use std::io::Write;
+                            let _ = writeln!(f, "[{}] [SubscriptionHub] process_priority_queue: missing sub={}, dropping message",
+                                chrono::Local::now().format("%H:%M:%S%.3f"), msg.subscription_id);
+                        }
+                    }
+                }
+            } else {
+                // Debug: queue empty
+                if let Some(ref path) = *self.debug_log_path.read().await {
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                        use std::io::Write;
+                        let _ = writeln!(f, "[{}] [SubscriptionHub] process_priority_queue: queue empty",
+                            chrono::Local::now().format("%H:%M:%S%.3f"));
+                    }
+                }
+                break;
+            }
+        }
+        
+        Ok(())
+    }
+
     async fn send_to_subscription(&self, subscription: &Subscription, message: ServerMessage) -> Result<()> {
+        // Use prioritized sending for delta and snapshot messages
+        match &message {
+            ServerMessage::Delta { .. } | ServerMessage::Snapshot { .. } | ServerMessage::SnapshotRange { .. } => {
+                // Debug: note prioritized path
+                if let Some(ref path) = *self.debug_log_path.read().await {
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                        use std::io::Write;
+                        let kind = match &message {
+                            ServerMessage::Snapshot { .. } => "Snapshot",
+                            ServerMessage::SnapshotRange { .. } => "SnapshotRange",
+                            ServerMessage::Delta { .. } => "Delta",
+                            _ => "Other",
+                        };
+                        let _ = writeln!(f, "[{}] [SubscriptionHub] send_to_subscription(prioritized): sub={} kind={}",
+                            chrono::Local::now().format("%H:%M:%S%.3f"), subscription.id, kind);
+                    }
+                }
+                self.enqueue_message(subscription, message).await
+            }
+            // Send control messages directly for immediate delivery
+            _ => {
+                // Debug: note direct path
+                if let Some(ref path) = *self.debug_log_path.read().await {
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                        use std::io::Write;
+                        let kind = match &message {
+                            ServerMessage::SubscriptionAck { .. } => "SubscriptionAck",
+                            ServerMessage::HistoryInfo { .. } => "HistoryInfo",
+                            ServerMessage::Error { .. } => "Error",
+                            _ => "Other",
+                        };
+                        let _ = writeln!(f, "[{}] [SubscriptionHub] send_to_subscription(direct): sub={} kind={}",
+                            chrono::Local::now().format("%H:%M:%S%.3f"), subscription.id, kind);
+                    }
+                }
+                self.send_message_direct(subscription, message).await
+            }
+        }
+    }
+
+    async fn send_message_direct(&self, subscription: &Subscription, message: ServerMessage) -> Result<()> {
         // Log what we're about to send
         if let Some(ref path) = *self.debug_log_path.read().await {
             if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
@@ -1245,27 +1820,29 @@ impl SubscriptionHub {
             message: serde_json::to_value(&message)?,
         };
         let bytes = serde_json::to_vec(&app_envelope)?;
-        
-        // Determine channel based on message type
-        let channel_purpose = match &message {
-            ServerMessage::Delta { .. } => ChannelPurpose::Output,  // Deltas use unreliable Output channel
-            _ => ChannelPurpose::Control,  // Everything else uses reliable Control channel
-        };
-        
-        // Send via transport with channel routing if supported
-        let send_result = if subscription.transport.supports_multi_channel() {
-            // Transport supports multiple channels, use appropriate channel
-            match subscription.transport.channel(channel_purpose).await {
-                Ok(channel) => channel.send(&bytes).await,
-                Err(_) => {
-                    // Fallback to default send if channel creation fails
-                    subscription.transport.send(&bytes).await
-                }
+        // Debug: message type + size
+        if let Some(ref path) = *self.debug_log_path.read().await {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                use std::io::Write;
+                let msg_kind = match &message {
+                    ServerMessage::Snapshot { .. } => "Snapshot",
+                    ServerMessage::SnapshotRange { .. } => "SnapshotRange",
+                    ServerMessage::Delta { .. } => "Delta",
+                    ServerMessage::DeltaBatch { .. } => "DeltaBatch",
+                    ServerMessage::ViewTransition { .. } => "ViewTransition",
+                    ServerMessage::SubscriptionAck { .. } => "SubscriptionAck",
+                    ServerMessage::Error { .. } => "Error",
+                    ServerMessage::Pong { .. } => "Pong",
+                    ServerMessage::Notify { .. } => "Notify",
+                    ServerMessage::HistoryInfo { .. } => "HistoryInfo",
+                };
+                let _ = writeln!(f, "[{}] [SubscriptionHub] send_to_subscription: {} bytes={} sub={}",
+                    chrono::Local::now().format("%H:%M:%S%.3f"), msg_kind, bytes.len(), subscription.id);
             }
-        } else {
-            // Transport doesn't support multi-channel, use default send
-            subscription.transport.send(&bytes).await
-        };
+        }
+        
+        // TEMP: Send via legacy/default transport to ensure client receive loop gets frames
+        let send_result = subscription.transport.send(&bytes).await;
         
         // Log send result
         if let Some(ref path) = *self.debug_log_path.read().await {
@@ -1288,6 +1865,81 @@ impl SubscriptionHub {
         Ok(())
     }
     
+    /// Request background prefetch snapshots for smooth scrolling
+    /// This proactively fetches data beyond the prefetch region to prepare for potential scrolling
+    pub async fn request_background_prefetch(&self, subscription_id: &str) -> Result<()> {
+        let subscription = {
+            let subscriptions = self.subscriptions.read().await;
+            subscriptions.get(subscription_id).cloned()
+        };
+
+        if let Some(sub) = subscription {
+            if let (Some(viewport), Some(prefetch)) = (&sub.viewport, &sub.prefetch) {
+                if let Some(source) = self.terminal_source.read().await.as_ref() {
+                    // Calculate adaptive prefetch regions based on scroll velocity
+                    let velocity_multiplier = (sub.scroll_velocity.abs() / 10.0).max(1.0).min(5.0); // Scale 1x-5x based on velocity
+                    let extended_prefetch_before = ((prefetch.before as f64) * velocity_multiplier) as u64;
+                    let extended_prefetch_after = ((prefetch.after as f64) * velocity_multiplier) as u64;
+                    
+                    // Request snapshots for extended regions beyond current prefetch
+                    let background_start = viewport.start_line.saturating_sub(extended_prefetch_before);
+                    let background_end = viewport.end_line + extended_prefetch_after;
+                    
+                    // Only fetch areas outside the current prefetch region
+                    let current_prefetch_start = viewport.start_line.saturating_sub(prefetch.before as u64);
+                    let current_prefetch_end = viewport.end_line + prefetch.after as u64;
+                    
+                    // Background region before current prefetch
+                    if background_start < current_prefetch_start {
+                        let rows = (current_prefetch_start - background_start).min(u16::MAX as u64) as u16;
+                        if let Ok((grid, watermark)) = source.snapshot_range_with_watermark(
+                            sub.dimensions.width,
+                            background_start,
+                            rows
+                        ).await {
+                            let message = ServerMessage::SnapshotRange {
+                                subscription_id: subscription_id.to_string(),
+                                sequence: sub.current_sequence + 1,
+                                watermark_seq: watermark,
+                                grid,
+                                timestamp: chrono::Utc::now().timestamp(),
+                                checksum: 0,
+                            };
+                            
+                            // Use background priority for this request
+                            self.enqueue_message(&sub, message).await?;
+                        }
+                    }
+                    
+                    // Background region after current prefetch
+                    if background_end > current_prefetch_end {
+                        let start = current_prefetch_end + 1;
+                        let rows = (background_end - start + 1).min(u16::MAX as u64) as u16;
+                        if let Ok((grid, watermark)) = source.snapshot_range_with_watermark(
+                            sub.dimensions.width,
+                            start,
+                            rows
+                        ).await {
+                            let message = ServerMessage::SnapshotRange {
+                                subscription_id: subscription_id.to_string(),
+                                sequence: sub.current_sequence + 2,
+                                watermark_seq: watermark,
+                                grid,
+                                timestamp: chrono::Utc::now().timestamp(),
+                                checksum: 0,
+                            };
+                            
+                            // Use background priority for this request
+                            self.enqueue_message(&sub, message).await?;
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+
     /// Remove all subscriptions for a client
     pub async fn remove_client(&self, client_id: &ClientId) -> Result<()> {
         let mut clients = self.clients.write().await;

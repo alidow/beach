@@ -41,10 +41,15 @@ impl LineCounter {
     }
     
     pub fn to_u64(&self) -> Option<u64> {
-        // Try to convert to u64, returns None if value is too large
-        self.value.to_u64_digits()
-            .first()
-            .copied()
+        // Convert to u64; return Some(0) for zero value; None if too large
+        let digits = self.value.to_u64_digits();
+        if digits.is_empty() {
+            Some(0)
+        } else if digits.len() == 1 {
+            Some(digits[0])
+        } else {
+            None
+        }
     }
 }
 

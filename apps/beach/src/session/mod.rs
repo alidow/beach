@@ -680,7 +680,31 @@ impl<T: Transport + Send + 'static> ClientSession<T> {
 
                 match recv_result {
                     Ok(Some(bytes)) => {
+                        // Debug log: received raw frame size
+                        if let Some(debug_log_path) = get_debug_log_path() {
+                            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&debug_log_path) {
+                                use std::io::Write;
+                                let _ = writeln!(file, "[{}] Client recv bytes: {}", 
+                                                 chrono::Utc::now().format("%H:%M:%S%.3f"), bytes.len());
+                            }
+                        }
                         if let Ok(app_msg) = serde_json::from_slice::<AppMessage>(&bytes) {
+                            // Debug log: AppMessage variant
+                            if let Some(debug_log_path) = get_debug_log_path() {
+                                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&debug_log_path) {
+                                    use std::io::Write;
+                                    let kind = match &app_msg {
+                                        AppMessage::Protocol { .. } => "Protocol",
+                                        AppMessage::TerminalOutput { .. } => "TerminalOutput",
+                                        AppMessage::TerminalInput { .. } => "TerminalInput",
+                                        AppMessage::TerminalResize { .. } => "TerminalResize",
+                                        AppMessage::Custom { .. } => "Custom",
+                                        AppMessage::Debug { .. } => "Debug",
+                                    };
+                                    let _ = writeln!(file, "[{}] Client parsed AppMessage: {}", 
+                                                     chrono::Utc::now().format("%H:%M:%S%.3f"), kind);
+                                }
+                            }
                             handler.handle_server_message(app_msg).await;
                         }
                     }

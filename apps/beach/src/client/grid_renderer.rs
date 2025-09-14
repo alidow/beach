@@ -51,7 +51,7 @@ pub struct GridRenderer {
     pending_requests: HashSet<String>,
     
     /// History metadata from server
-    history_metadata: Option<HistoryMetadata>,
+    pub history_metadata: Option<HistoryMetadata>,
     
     /// Current view line number (for historical mode)
     /// None = realtime mode, Some(n) = viewing from line n
@@ -490,6 +490,11 @@ impl GridRenderer {
     pub fn is_historical_mode(&self) -> bool {
         self.view_line.is_some()
     }
+
+    /// Get the current historical anchor (start line) if in historical mode
+    pub fn historical_anchor(&self) -> Option<u64> {
+        self.view_line
+    }
     
     /// Render the grid to a ratatui frame with optional predictive underlines
     pub fn render(&self, frame: &mut Frame, predictions: &[(u16, u16)]) {
@@ -584,6 +589,11 @@ impl GridRenderer {
             }
         }
         
+        // Render scrollback indicator overlay if scrolled (regardless of debug flag)
+        if self.scroll_offset > 0 {
+            self.render_scrollback_overlay(frame, chunks[0]);
+        }
+        
         // Render status line only if debug flag is set
         if show_status_line && chunks.len() > 1 {
             let status = self.render_status_line();
@@ -617,12 +627,22 @@ impl GridRenderer {
         let grid_height = self.grid.cells.len();
         
         // Determine start row based on content and scrolling
-        // Bottom-anchor by default; in realtime mode clamp the local scroll
-        // within the available window so the user sees immediate feedback.
+        // In realtime mode clamp the local scroll within the available window.
+        // In historical mode, calculate which rows of the grid to show based on viewport.
         let start_row = if grid_height > visible_height {
             let bottom_start = grid_height - visible_height;
             if self.is_historical_mode() {
-                0
+                // In historical mode, determine which part of the grid contains
+                // the content we want to show. The server may send a larger grid
+                // due to prefetch, so we need to find the right offset.
+                if let (Some(grid_start), Some(view_line)) = (self.grid.start_line.to_u64(), self.view_line) {
+                    // Calculate the offset within the grid for our view_line
+                    let line_offset_in_grid = view_line.saturating_sub(grid_start);
+                    (line_offset_in_grid as usize).min(bottom_start)
+                } else {
+                    // Fallback: bottom-anchor if we can't determine the offset
+                    bottom_start
+                }
             } else {
                 let effective_offset = (self.scroll_offset as usize).min(bottom_start);
                 bottom_start.saturating_sub(effective_offset)
@@ -633,7 +653,41 @@ impl GridRenderer {
         
         let mut render_start = start_row;
         let mut render_end = (render_start + visible_height).min(grid_height);
-        
+
+        // Debug log the rendering calculations
+        if let Ok(mut debug_file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/beach-render-debug.log")
+        {
+            use std::io::Write;
+            let mode = if self.is_historical_mode() { "historical" } else { "realtime" };
+            let grid_start = self.grid.start_line.to_u64().unwrap_or(0);
+            let grid_end = self.grid.end_line.to_u64().unwrap_or(0);
+            let _ = writeln!(debug_file,
+                "[{}] RENDER_CALC mode={} grid_dims={}x{} grid_range=({},{}) view_line={:?} scroll_offset={} -> start_row={} range=({},{})",
+                chrono::Utc::now().format("%H:%M:%S%.3f"),
+                mode, self.grid.width, grid_height, grid_start, grid_end,
+                self.view_line, self.scroll_offset, start_row, render_start, render_end
+            );
+
+            // Sample the actual content being rendered
+            let mut sample_rows = Vec::new();
+            for row in render_start..(render_start + 3.min(render_end - render_start)) {
+                if let Some(row_cells) = self.grid.cells.get(row) {
+                    let mut line = String::new();
+                    for col in 0..self.grid.width.min(80) {
+                        if let Some(cell) = row_cells.get(col as usize) {
+                            line.push(cell.char);
+                        }
+                    }
+                    sample_rows.push(format!("row[{}]: '{}'", row, line.trim_end()));
+                }
+            }
+            let _ = writeln!(debug_file, "[{}] RENDER_CONTENT: {}",
+                chrono::Utc::now().format("%H:%M:%S%.3f"), sample_rows.join(", "));
+        }
+
         // Debug log the rendering range
         if let Ok(mut debug_file) = std::fs::OpenOptions::new()
             .create(true)
@@ -863,11 +917,17 @@ impl GridRenderer {
         let grid_height = self.grid.cells.len();
         
         // Determine start row based on content and scrolling
-        // Bottom-anchor by default; in realtime clamp local scroll within window
+        // In realtime mode clamp local scroll within window; in historical mode map to grid content
         let start_row = if grid_height > visible_height {
             let bottom_start = grid_height - visible_height;
             if self.is_historical_mode() {
-                0
+                // In historical mode, find the right offset within the grid
+                if let (Some(grid_start), Some(view_line)) = (self.grid.start_line.to_u64(), self.view_line) {
+                    let line_offset_in_grid = view_line.saturating_sub(grid_start);
+                    (line_offset_in_grid as usize).min(bottom_start)
+                } else {
+                    bottom_start
+                }
             } else {
                 let effective_offset = (self.scroll_offset as usize).min(bottom_start);
                 bottom_start.saturating_sub(effective_offset)
@@ -1013,10 +1073,19 @@ impl GridRenderer {
         // Calculate starting row based on scroll offset from bottom
         let grid_height = self.grid.cells.len();
         let start_row = if grid_height > visible_height {
-            // In realtime mode, show bottom of current grid; in historical mode, show from top
-            // of the returned snapshot. Local vertical scrolling is driven via history requests.
+            // In realtime mode, show bottom of current grid; in historical mode, map to correct offset
             let bottom_start = grid_height - visible_height;
-            if self.is_historical_mode() { 0 } else { bottom_start }
+            if self.is_historical_mode() {
+                // Find the right offset within the grid based on view_line
+                if let (Some(grid_start), Some(view_line)) = (self.grid.start_line.to_u64(), self.view_line) {
+                    let line_offset_in_grid = view_line.saturating_sub(grid_start);
+                    (line_offset_in_grid as usize).min(bottom_start)
+                } else {
+                    0 // Fallback to top if we can't determine offset
+                }
+            } else {
+                bottom_start
+            }
         } else {
             // If grid fits entirely, always start at 0
             0
@@ -1082,15 +1151,30 @@ impl GridRenderer {
         
         // Show scroll position more subtly
         if self.scroll_offset > 0 {
-            let grid_height = self.grid.cells.len();
-            let visible_height = (self.local_height - 1) as usize;
-            let max_scroll = grid_height.saturating_sub(visible_height) as u16;
-            
-            status.push_str(&format!(
-                " | Line {}/{}",
-                self.scroll_offset + 1,
-                max_scroll + 1
-            ));
+            if let Some(metadata) = &self.history_metadata {
+                // Show actual line numbers when metadata is available
+                let current_top_line = if let Some(grid_end) = self.grid.end_line.to_u64() {
+                    grid_end.saturating_sub((self.local_height - 1) as u64).saturating_sub(self.scroll_offset as u64)
+                } else {
+                    metadata.latest_line.saturating_sub(self.scroll_offset as u64)
+                };
+                status.push_str(&format!(
+                    " | Scroll: Line {} (offset {})",
+                    current_top_line,
+                    self.scroll_offset
+                ));
+            } else {
+                // Fallback to offset-based display
+                let grid_height = self.grid.cells.len();
+                let visible_height = (self.local_height - 1) as usize;
+                let max_scroll = grid_height.saturating_sub(visible_height) as u16;
+                
+                status.push_str(&format!(
+                    " | Scroll: {}/{}",
+                    self.scroll_offset + 1,
+                    max_scroll + 1
+                ));
+            }
         }
         
         // Indicate when scrollback is pending in realtime mode
@@ -1100,6 +1184,56 @@ impl GridRenderer {
         
         Paragraph::new(status)
             .style(Style::default().fg(RatatuiColor::Gray))
+    }
+    
+    /// Render scrollback indicator overlay
+    fn render_scrollback_overlay(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        // Create overlay text with scroll information
+        let mut overlay_text = String::new();
+        
+        // Show current position info with better line calculation
+        if let Some(metadata) = &self.history_metadata {
+            // Calculate actual line being viewed
+            let current_top_line = if let Some(grid_end) = self.grid.end_line.to_u64() {
+                // Use grid end line and adjust for scroll
+                grid_end.saturating_sub((self.local_height - 1) as u64).saturating_sub(self.scroll_offset as u64)
+            } else {
+                // Fallback to metadata
+                metadata.latest_line.saturating_sub(self.scroll_offset as u64)
+            };
+            
+            // Show range of visible lines
+            let lines_shown = (self.local_height - 1) as u64;  // -1 for status line if any
+            let current_bottom_line = (current_top_line + lines_shown - 1).min(metadata.latest_line);
+            
+            if current_top_line == current_bottom_line {
+                overlay_text = format!("SCROLLBACK: Line {} | ESC to exit", current_top_line);
+            } else {
+                overlay_text = format!("SCROLLBACK: Lines {}-{} | ESC to exit", current_top_line, current_bottom_line);
+            }
+        } else {
+            overlay_text = format!("SCROLLBACK: Offset {} | ESC to exit", self.scroll_offset);
+        }
+        
+        // Calculate position for top-right corner
+        let overlay_width = overlay_text.len() as u16 + 2; // +2 for padding
+        if area.width > overlay_width {
+            let overlay_area = ratatui::layout::Rect {
+                x: area.x + area.width - overlay_width,
+                y: area.y,
+                width: overlay_width,
+                height: 1,
+            };
+            
+            // Create paragraph with dark background and light text for visibility
+            let overlay_paragraph = Paragraph::new(format!(" {} ", overlay_text))
+                .style(Style::default()
+                    .fg(RatatuiColor::White)
+                    .bg(RatatuiColor::DarkGray)
+                );
+            
+            frame.render_widget(overlay_paragraph, overlay_area);
+        }
     }
     
     /// Keep the last snapshot for resilience

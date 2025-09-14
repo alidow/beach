@@ -1,6 +1,6 @@
 [workspace]
 members = [
-  "apps/beach",
+  "apps/beach", "apps/beach-human",
   "apps/beach-road",
 ]
 resolver = "2"

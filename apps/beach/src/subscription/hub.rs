@@ -1172,9 +1172,10 @@ impl SubscriptionHub {
                         handler.on_input(&sub.id, data).await?;
                     }
 
+                    // FIXME: Commenting out force_snapshot workaround that was causing sync issues
                     // Proactively send a fresh snapshot to ensure client render stays in sync
                     // This helps when delta routing/ordering is under investigation
-                    let _ = self.force_snapshot(&sub.id).await;
+                    // let _ = self.force_snapshot(&sub.id).await;
                 } else {
                     // Debug log: Input not allowed
                     if let Some(ref path) = *self.debug_log_path.read().await {

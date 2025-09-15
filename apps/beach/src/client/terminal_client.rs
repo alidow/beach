@@ -978,6 +978,15 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
     
     /// Handle keyboard input
     async fn handle_key_event(&self, key: KeyEvent) -> Result<()> {
+        // Log all key events for debugging sync issues
+        if let Some(ref debug_log) = self.debug_log {
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                use std::io::Write;
+                let _ = writeln!(file, "[{}] Input Event: {:?}",
+                    chrono::Utc::now().format("%H:%M:%S%.3f"), key);
+            }
+        }
+
         // First check for control key combinations
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             if let KeyCode::Char(c) = key.code {
@@ -1118,6 +1127,16 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
             KeyCode::Down => {
                 // Send arrow key escape sequence to server
                 let bytes = vec![0x1B, b'[', b'B']; // ESC[B
+
+                // Log arrow key input
+                if let Some(ref debug_log) = self.debug_log {
+                    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                        use std::io::Write;
+                        let _ = writeln!(file, "[{}] Arrow Key DOWN: sending bytes {:?} (ESC[B)",
+                            chrono::Utc::now().format("%H:%M:%S%.3f"), bytes);
+                    }
+                }
+
                 let client_msg = crate::protocol::ClientMessage::TerminalInput {
                     data: bytes,
                     echo_local: None,
@@ -1402,13 +1421,49 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                         .collect();
                     
                     let before_dims = (renderer.server_width, renderer.server_height);
+                    let before_cursor = renderer.grid.cursor.clone();
                     drop(renderer);
-                    
+
+                    // Log cursor position before applying delta
+                    if let Some(ref debug_log) = self.debug_log {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                            use std::io::Write;
+                            let _ = writeln!(file, "[{}] Cursor BEFORE applying delta seq={}: row={}, col={}",
+                                chrono::Utc::now().format("%H:%M:%S%.3f"), sequence, before_cursor.row, before_cursor.col);
+
+                            // Log if this delta has cursor changes
+                            if let Some(ref cursor_change) = changes.cursor_change {
+                                let _ = writeln!(file, "[{}] Delta seq={} contains cursor change: old=({},{}) -> new=({},{})",
+                                    chrono::Utc::now().format("%H:%M:%S%.3f"), sequence,
+                                    cursor_change.old_position.row, cursor_change.old_position.col,
+                                    cursor_change.new_position.row, cursor_change.new_position.col);
+                            }
+                        }
+                    }
+
                     // Apply the delta
                     self.grid_renderer.lock().await.apply_delta(&changes);
                     
                     // Capture state AFTER applying delta
                     let renderer = self.grid_renderer.lock().await;
+
+                    // Log cursor position after applying delta
+                    if let Some(ref debug_log) = self.debug_log {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                            use std::io::Write;
+                            let _ = writeln!(file, "[{}] Cursor AFTER applying delta seq={}: row={}, col={}",
+                                chrono::Utc::now().format("%H:%M:%S%.3f"), sequence, renderer.grid.cursor.row, renderer.grid.cursor.col);
+
+                            // Log if cursor position actually changed
+                            if before_cursor.row != renderer.grid.cursor.row || before_cursor.col != renderer.grid.cursor.col {
+                                let _ = writeln!(file, "[{}] Cursor position CHANGED during delta seq={}: ({},{}) -> ({},{})",
+                                    chrono::Utc::now().format("%H:%M:%S%.3f"), sequence,
+                                    before_cursor.row, before_cursor.col,
+                                    renderer.grid.cursor.row, renderer.grid.cursor.col);
+                            }
+                        }
+                    }
+
                     let mut seam_after_lines: Vec<(u16, String)> = Vec::new();
                     for row in seam_start..=seam_end {
                         let mut line = String::new();
@@ -1519,14 +1574,69 @@ impl<T: Transport + Send + Sync + 'static> TerminalClient<T> {
                         }
                     }
                 } else {
-                    // No debug recorder, just apply the delta
+                    // No debug recorder, but still track cursor changes for debugging
+                    let before_cursor = {
+                        let renderer = self.grid_renderer.lock().await;
+                        renderer.grid.cursor.clone()
+                    };
+
+                    // Log cursor position before applying delta
+                    if let Some(ref debug_log) = self.debug_log {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                            use std::io::Write;
+                            let _ = writeln!(file, "[{}] Cursor BEFORE applying delta seq={}: row={}, col={}",
+                                chrono::Utc::now().format("%H:%M:%S%.3f"), sequence, before_cursor.row, before_cursor.col);
+
+                            // Log if this delta has cursor changes
+                            if let Some(ref cursor_change) = changes.cursor_change {
+                                let _ = writeln!(file, "[{}] Delta seq={} contains cursor change: old=({},{}) -> new=({},{})",
+                                    chrono::Utc::now().format("%H:%M:%S%.3f"), sequence,
+                                    cursor_change.old_position.row, cursor_change.old_position.col,
+                                    cursor_change.new_position.row, cursor_change.new_position.col);
+                            }
+                        }
+                    }
+
+                    // Apply the delta
                     self.grid_renderer.lock().await.apply_delta(&changes);
+
+                    // Log cursor position after applying delta
+                    if let Some(ref debug_log) = self.debug_log {
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(debug_log) {
+                            use std::io::Write;
+                            let renderer = self.grid_renderer.lock().await;
+                            let _ = writeln!(file, "[{}] Cursor AFTER applying delta seq={}: row={}, col={}",
+                                chrono::Utc::now().format("%H:%M:%S%.3f"), sequence, renderer.grid.cursor.row, renderer.grid.cursor.col);
+
+                            // Log if cursor position actually changed
+                            if before_cursor.row != renderer.grid.cursor.row || before_cursor.col != renderer.grid.cursor.col {
+                                let _ = writeln!(file, "[{}] Cursor position CHANGED during delta seq={}: ({},{}) -> ({},{})",
+                                    chrono::Utc::now().format("%H:%M:%S%.3f"), sequence,
+                                    before_cursor.row, before_cursor.col,
+                                    renderer.grid.cursor.row, renderer.grid.cursor.col);
+                            }
+                        }
+                    }
                 }
                 
-                // Debug log sequence tracking
+                // Enhanced sequence tracking and validation
                 if let Some(ref debug_log) = self.debug_log {
                     if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(debug_log) {
                         use std::io::Write;
+
+                        // Check for sequence gaps or out-of-order deltas
+                        if sequence != last_applied + 1 {
+                            if sequence > last_applied + 1 {
+                                let _ = writeln!(file, "[{}] SEQUENCE GAP DETECTED: Expected seq={}, got seq={} (gap of {})",
+                                    chrono::Utc::now().format("%H:%M:%S%.3f"),
+                                    last_applied + 1, sequence, sequence - last_applied - 1);
+                            } else if sequence <= last_applied {
+                                let _ = writeln!(file, "[{}] OUT-OF-ORDER DELTA: seq={} <= last_applied={} (duplicate or redelivery)",
+                                    chrono::Utc::now().format("%H:%M:%S%.3f"),
+                                    sequence, last_applied);
+                            }
+                        }
+
                         let _ = writeln!(file, "[{}] Applied delta seq={} (last_applied={})",
                             chrono::Utc::now().format("%H:%M:%S%.3f"),
                             sequence,

@@ -1,12 +1,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, Mutex as AsyncMutex, RwLock as AsyncRwLock};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
-use tokio::net::TcpStream;
 use std::sync::Arc;
+use tokio::net::TcpStream;
+use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock, mpsc};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
-use super::{Transport, TransportMode, ChannelPurpose, TransportChannel};
+use super::{ChannelPurpose, Transport, TransportChannel, TransportMode};
 
 pub mod config;
 use config::WebSocketConfig;
@@ -25,27 +25,27 @@ impl WebSocketTransport {
     pub async fn connect(config: WebSocketConfig) -> Result<Self> {
         let mode = config.mode.clone();
         let url = config.build_url();
-        
+
         // Log the URL we're connecting to
         if std::env::var("BEACH_VERBOSE").is_ok() {
             // eprintln!("🔍 [VERBOSE] Connecting to WebSocket URL: {}", url);
         }
-        
+
         // Connect to WebSocket
         let (ws_stream, _) = connect_async(&url).await?;
-        
+
         // Create channels for bidirectional communication
         let (tx_out, rx_out) = mpsc::unbounded_channel::<Vec<u8>>();
         let (tx_in, rx_in) = mpsc::unbounded_channel::<Vec<u8>>();
-        
+
         let connected = Arc::new(AsyncRwLock::new(true));
         let connected_clone = connected.clone();
-        
+
         // Spawn WebSocket handler task
         let ws_task = tokio::spawn(async move {
             handle_websocket(ws_stream, rx_out, tx_in, connected_clone).await;
         });
-        
+
         Ok(Self {
             mode,
             tx: Arc::new(AsyncMutex::new(tx_out)),
@@ -54,11 +54,11 @@ impl WebSocketTransport {
             ws_task: Some(ws_task),
         })
     }
-    
+
     /// Close the WebSocket connection
     pub async fn close(&mut self) {
         *self.connected.write().await = false;
-        
+
         // Abort the WebSocket task
         if let Some(task) = self.ws_task.take() {
             task.abort();
@@ -72,14 +72,16 @@ impl Transport for WebSocketTransport {
     async fn channel(&self, _purpose: ChannelPurpose) -> Result<Arc<dyn TransportChannel>> {
         // WebSocket doesn't support multiple channels yet
         // Return error to use default send/recv fallback
-        Err(anyhow::anyhow!("WebSocket transport does not support multiple channels"))
+        Err(anyhow::anyhow!(
+            "WebSocket transport does not support multiple channels"
+        ))
     }
-    
+
     async fn send(&self, data: &[u8]) -> Result<()> {
         if !self.is_connected() {
             return Err(anyhow::anyhow!("WebSocket not connected"));
         }
-        
+
         // Debug logging
         if std::env::var("BEACH_VERBOSE").is_ok() {
             if let Ok(_text) = String::from_utf8(data.to_vec()) {
@@ -88,25 +90,26 @@ impl Transport for WebSocketTransport {
                 // eprintln!("🔍 [VERBOSE] WebSocketTransport::send() - sending {} bytes (binary)", data.len());
             }
         }
-        
+
         let tx = self.tx.lock().await;
         tx.send(data.to_vec())
             .map_err(|e| anyhow::anyhow!("Failed to send data: {}", e))?;
         Ok(())
     }
-    
+
     async fn recv(&mut self) -> Option<Vec<u8>> {
         let mut rx = self.rx.write().await;
         rx.recv().await
     }
-    
+
     fn is_connected(&self) -> bool {
         // Use try_read to avoid blocking
-        self.connected.try_read()
+        self.connected
+            .try_read()
             .map(|guard| *guard)
             .unwrap_or(false)
     }
-    
+
     fn transport_mode(&self) -> TransportMode {
         self.mode.clone()
     }
@@ -123,7 +126,7 @@ async fn handle_websocket(
         // eprintln!("🔍 [VERBOSE] WebSocket handle_websocket started");
     }
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-    
+
     // Spawn task to forward outgoing messages to WebSocket
     let send_task = tokio::spawn(async move {
         if std::env::var("BEACH_VERBOSE").is_ok() {
@@ -138,7 +141,7 @@ async fn handle_websocket(
                     // eprintln!("🔍 [VERBOSE] WebSocket send task - processing {} bytes (binary)", data.len());
                 }
             }
-            
+
             // Check if data is valid JSON (signaling message) or binary data
             let message = if let Ok(text) = String::from_utf8(data.clone()) {
                 // Try to parse as JSON to detect signaling messages
@@ -162,7 +165,7 @@ async fn handle_websocket(
                 }
                 Message::Binary(data)
             };
-            
+
             if let Err(_e) = ws_sender.send(message).await {
                 if std::env::var("BEACH_VERBOSE").is_ok() {
                     // eprintln!("🔍 [VERBOSE] WebSocket send failed: {}, breaking loop", e);
@@ -184,7 +187,7 @@ async fn handle_websocket(
             // eprintln!("🔍 [VERBOSE] WebSocket send task ending");
         }
     });
-    
+
     // Handle incoming WebSocket messages
     if std::env::var("BEACH_VERBOSE").is_ok() {
         // eprintln!("🔍 [VERBOSE] WebSocket receive loop starting");
@@ -208,10 +211,10 @@ async fn handle_websocket(
             _ => {} // Ignore other message types (Ping, Pong, etc.)
         }
     }
-    
+
     // Mark as disconnected
     *connected.write().await = false;
-    
+
     // Stop send task
     send_task.abort();
     let _ = send_task.await;

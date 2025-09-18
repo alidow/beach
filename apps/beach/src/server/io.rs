@@ -1,21 +1,21 @@
-use std::sync::{Arc, Mutex};
-use std::io::{Read, Write};
-use std::fs::OpenOptions;
-use tokio::task::JoinHandle;
-use tokio::sync::mpsc::Sender as TokioSender;
-use crossterm::terminal;
-use crate::server::terminal_state::{TerminalBackend, Grid, GridDelta};
 use crate::server::pty::PtyManager;
+use crate::server::terminal_state::{Grid, GridDelta, TerminalBackend};
+use crossterm::terminal;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::Sender as TokioSender;
+use tokio::task::JoinHandle;
 
-#[cfg(unix)]
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
 use signal_hook::consts::SIGWINCH;
 #[cfg(unix)]
 use signal_hook::flag;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(windows)]
-use crossterm::event::{poll, read, Event};
+use crossterm::event::{Event, poll, read};
 #[cfg(windows)]
 use std::time::Duration;
 
@@ -24,7 +24,7 @@ use std::time::Duration;
 /// Handle stdin to PTY writing (byte by byte for raw mode)
 pub fn spawn_stdin_reader(
     master_writer: Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
-    debug_recorder_path: Option<String>
+    debug_recorder_path: Option<String>,
 ) -> JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         // Open debug recording file if specified
@@ -42,7 +42,7 @@ pub fn spawn_stdin_reader(
 
         let mut stdin = std::io::stdin();
         let mut buffer = [0u8; 1];
-        
+
         loop {
             match stdin.read_exact(&mut buffer) {
                 Ok(_) => {
@@ -93,16 +93,16 @@ pub fn spawn_pty_reader_with_resize(
         let _ = flag::register(SIGWINCH, Arc::clone(&flag));
         flag
     };
-    
+
     tokio::task::spawn_blocking(move || {
         let mut buffer = [0u8; 4096];
         // Keep last grid to compute deltas
         let mut last_grid: Option<Grid> = None;
-        
+
         // Track PTY read sequence and hashes for duplicate detection
         let mut pty_read_sequence: u64 = 0;
         let mut seen_hashes = std::collections::HashSet::new();
-        
+
         loop {
             // CRITICAL: Check for resize BEFORE reading next chunk
             #[cfg(unix)]
@@ -112,7 +112,7 @@ pub fn spawn_pty_reader_with_resize(
                     handle_resize(&terminal_backend, &pty_manager);
                 }
             }
-            
+
             #[cfg(windows)]
             {
                 // On Windows, poll for resize events with zero timeout (non-blocking)
@@ -122,7 +122,7 @@ pub fn spawn_pty_reader_with_resize(
                         if let Err(_e) = pty_manager.resize(cols, rows) {
                             // Silently handle resize error
                         }
-                        
+
                         // Resize backend (preserves content, records delta)
                         {
                             let mut backend = terminal_backend.lock().unwrap();
@@ -133,7 +133,7 @@ pub fn spawn_pty_reader_with_resize(
                     }
                 }
             }
-            
+
             // Read from PTY
             let read_result = {
                 let mut reader_guard = master_reader.lock().unwrap();
@@ -147,29 +147,30 @@ pub fn spawn_pty_reader_with_resize(
                     None
                 }
             };
-            
+
             // Process the result
             match read_result {
                 Some(Ok(data)) => {
                     // Track PTY chunks for duplicate detection
                     use std::collections::hash_map::DefaultHasher;
                     use std::hash::{Hash, Hasher};
-                    
+
                     let mut hasher = DefaultHasher::new();
                     data.hash(&mut hasher);
                     let hash = hasher.finish();
                     let is_duplicate = seen_hashes.contains(&hash);
                     seen_hashes.insert(hash);
-                    
+
                     // Record PTY read chunk to debug recorder (non-blocking)
                     if let Some(ref recorder) = debug_recorder {
                         if let Ok(mut rec) = recorder.try_lock() {
-                            let _ = rec.record_pty_read_chunk(pty_read_sequence, &data, is_duplicate);
+                            let _ =
+                                rec.record_pty_read_chunk(pty_read_sequence, &data, is_duplicate);
                         }
                     }
-                    
+
                     pty_read_sequence += 1;
-                    
+
                     // Update terminal backend and publish delta if changed
                     let current_grid = {
                         let mut backend = terminal_backend.lock().unwrap();
@@ -179,14 +180,17 @@ pub fn spawn_pty_reader_with_resize(
                     if let Some(prev) = &last_grid {
                         let delta = GridDelta::diff(prev, &current_grid);
                         // Send only if meaningful changes exist
-                        if !delta.cell_changes.is_empty() || delta.cursor_change.is_some() || delta.dimension_change.is_some() {
+                        if !delta.cell_changes.is_empty()
+                            || delta.cursor_change.is_some()
+                            || delta.dimension_change.is_some()
+                        {
                             if let Some(ref tx) = delta_tx {
                                 let _ = tx.try_send(delta);
                             }
                         }
                     }
                     last_grid = Some(current_grid);
-                    
+
                     // Write raw bytes to stdout to preserve UTF-8 sequences
                     use std::io::Write;
                     let _ = std::io::stdout().write_all(&data);
@@ -201,7 +205,7 @@ pub fn spawn_pty_reader_with_resize(
                     break;
                 }
             }
-            
+
             // Small yield to prevent tight loop
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -214,7 +218,7 @@ pub fn spawn_pty_reader_with_resize(
 #[cfg(unix)]
 fn handle_resize(
     terminal_backend: &Arc<Mutex<Box<dyn TerminalBackend>>>,
-    pty_manager: &Arc<PtyManager>
+    pty_manager: &Arc<PtyManager>,
 ) {
     // Get new terminal size
     match terminal::size() {
@@ -223,7 +227,7 @@ fn handle_resize(
             if let Err(_e) = pty_manager.resize(cols, rows) {
                 // Silently handle resize error
             }
-            
+
             // Resize backend (preserves content, records delta)
             {
                 let mut backend = terminal_backend.lock().unwrap();

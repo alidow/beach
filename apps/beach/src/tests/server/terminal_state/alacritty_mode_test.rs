@@ -5,13 +5,13 @@ use crate::server::terminal_state::AlacrittyTerminal;
 #[test]
 fn test_alacritty_line_feed_mode() {
     let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();
-    
+
     // Process "Line 1\nLine 2"
     terminal.process_output(b"Line 1\nLine 2").unwrap();
     terminal.force_snapshot();
-    
+
     let grid = terminal.get_current_grid();
-    
+
     // Debug print the grid
     println!("AlacrittyTerminal Grid after newline:");
     for row in 0..5 {
@@ -29,9 +29,9 @@ fn test_alacritty_line_feed_mode() {
         }
         println!();
     }
-    
+
     println!("Cursor: row={}, col={}", grid.cursor.row, grid.cursor.col);
-    
+
     // Check if Line 2 is on row 1
     if let Some(cell) = grid.get_cell(1, 0) {
         println!("Cell at (1,0): '{}'", cell.char);

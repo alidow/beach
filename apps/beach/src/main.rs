@@ -9,11 +9,14 @@ pub mod subscription;
 pub mod transport;
 
 use clap::Parser;
-use config::Config;
 use client::terminal_client::TerminalClient;
+use config::Config;
 use debug_log::DebugLogger;
 use server::TerminalServer;
-use transport::{TransportMode, webrtc::{WebRTCTransport, config::WebRTCConfigBuilder}};
+use transport::{
+    TransportMode,
+    webrtc::{WebRTCTransport, config::WebRTCConfigBuilder},
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "beach")]
@@ -33,16 +36,32 @@ struct Cli {
     #[arg(long, short = 'v', help = "Enable verbose logging for diagnostics")]
     verbose: bool,
 
-    #[arg(long, help = "Don't wait for clients before executing command", default_value = "false")]
+    #[arg(
+        long,
+        help = "Don't wait for clients before executing command",
+        default_value = "false"
+    )]
     no_wait: bool,
 
-    #[arg(long, help = "Don't wait for WebRTC connection (allow WebSocket fallback)", default_value = "false")]
+    #[arg(
+        long,
+        help = "Don't wait for WebRTC connection (allow WebSocket fallback)",
+        default_value = "false"
+    )]
     no_wait_webrtc: bool,
 
-    #[arg(long, help = "Exit immediately after command finishes", default_value = "false")]
+    #[arg(
+        long,
+        help = "Exit immediately after command finishes",
+        default_value = "false"
+    )]
     exit_on_done: bool,
 
-    #[arg(long, help = "Show terminal size in status line", default_value = "false")]
+    #[arg(
+        long,
+        help = "Show terminal size in status line",
+        default_value = "false"
+    )]
     debug_size: bool,
 
     // everything after `--`
@@ -85,7 +104,7 @@ async fn main() {
         } else {
             cli.passphrase
         };
-        
+
         // Create debug logger if needed
         let debug_logger = cli.debug_log.as_ref().map(|path| {
             let file = std::fs::OpenOptions::new()
@@ -95,14 +114,14 @@ async fn main() {
                 .ok();
             DebugLogger::new(file)
         });
-        
+
         // Create WebRTC config with debug logger
         let webrtc_config = WebRTCConfigBuilder::new()
             .mode(TransportMode::Client)
             .debug_logger(debug_logger)
             .build()
             .unwrap();
-        
+
         // Simply create the terminal client with everything configured
         match TerminalClient::create(
             &config,
@@ -112,7 +131,9 @@ async fn main() {
             cli.debug_log,
             cli.debug_recorder,
             cli.debug_size,
-        ).await {
+        )
+        .await
+        {
             Ok(client) => {
                 client.start().await.unwrap_or_else(|e| {
                     eprintln!("❌ Client error: {}", e);
@@ -132,7 +153,9 @@ async fn main() {
                 Some(p)
             } else {
                 // Generate a simple passphrase
-                let words = ["beach", "ocean", "wave", "surf", "sand", "shell", "coral", "tide"];
+                let words = [
+                    "beach", "ocean", "wave", "surf", "sand", "shell", "coral", "tide",
+                ];
                 let mut rng = rand::thread_rng();
                 use rand::seq::SliceRandom;
                 let word1 = words.choose(&mut rng).unwrap();
@@ -143,7 +166,7 @@ async fn main() {
                 Some(generated)
             }
         });
-        
+
         // Create debug logger if needed
         let debug_logger = cli.debug_log.as_ref().map(|path| {
             let file = std::fs::OpenOptions::new()
@@ -153,14 +176,14 @@ async fn main() {
                 .ok();
             DebugLogger::new(file)
         });
-        
+
         // Create WebRTC config with debug logger
         let webrtc_config = WebRTCConfigBuilder::new()
             .mode(TransportMode::Server)
             .debug_logger(debug_logger)
             .build()
             .unwrap();
-        
+
         // Simply create the terminal server with everything configured
         match TerminalServer::create(
             &config,
@@ -169,7 +192,9 @@ async fn main() {
             cli.cmd.clone(),
             cli.debug_recorder,
             cli.debug_log,
-        ).await {
+        )
+        .await
+        {
             Ok(server) => {
                 // Default behavior: wait for client, wait for WebRTC, keep alive
                 // Only skip if explicitly requested with --no-wait flags
@@ -179,7 +204,9 @@ async fn main() {
                 // When --no-wait is used, don't keep alive (for local interactive use)
                 // unless --exit-on-done is explicitly false
                 let keep_alive = !cli.exit_on_done && !cli.no_wait;
-                server.start_with_wait(wait_for_client, wait_for_webrtc, keep_alive).await;
+                server
+                    .start_with_wait(wait_for_client, wait_for_webrtc, keep_alive)
+                    .await;
             }
             Err(e) => {
                 eprintln!("❌ Failed to create session: {}", e);

@@ -63,17 +63,17 @@ impl ErrorCode {
     pub const INVALID_MESSAGE_FORMAT: Self = Self(1001);
     pub const UNKNOWN_SUBSCRIPTION: Self = Self(1002);
     pub const SEQUENCE_MISMATCH: Self = Self(1003);
-    
+
     pub const CHECKSUM_MISMATCH: Self = Self(2001);
     pub const INVALID_DIMENSIONS: Self = Self(2002);
     pub const HISTORY_NOT_AVAILABLE: Self = Self(2003);
-    
+
     pub const INPUT_NOT_ALLOWED: Self = Self(3001);
     pub const VIEW_NOT_PERMITTED: Self = Self(3002);
-    
+
     pub const TOO_MANY_SUBSCRIPTIONS: Self = Self(4001);
     pub const RATE_LIMIT_EXCEEDED: Self = Self(4002);
-    
+
     pub const INTERNAL_ERROR: Self = Self(5001);
     pub const SESSION_ENDING: Self = Self(5002);
 }
@@ -104,7 +104,7 @@ pub struct Dimensions {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")] 
+#[serde(rename_all = "snake_case")]
 pub enum SubscriptionStatus {
     Active,
     Pending,

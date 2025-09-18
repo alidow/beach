@@ -1,5 +1,5 @@
-use crate::transport::TransportMode;
 use crate::debug_log::DebugLogger;
+use crate::transport::TransportMode;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 
 /// Configuration for WebRTC transport
@@ -45,21 +45,19 @@ impl WebRTCConfig {
         let ice_servers = if std::env::var("BEACH_LOCALHOST_ONLY").is_ok() {
             vec![] // No ICE servers for localhost
         } else {
-            vec![
-                RTCIceServer {
-                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
-                    ..Default::default()
-                },
-            ]
+            vec![RTCIceServer {
+                urls: vec!["stun:stun.l.google.com:19302".to_string()],
+                ..Default::default()
+            }]
         };
-        
+
         Self {
             mode,
             ice_servers,
             ..Default::default()
         }
     }
-    
+
     /// Create a localhost-only configuration (no STUN/TURN)
     pub fn localhost(mode: TransportMode) -> Self {
         Self {
@@ -68,7 +66,7 @@ impl WebRTCConfig {
             ..Default::default()
         }
     }
-    
+
     /// Set the debug logger
     pub fn with_debug_logger(mut self, logger: DebugLogger) -> Self {
         self.debug_logger = Some(logger);
@@ -97,12 +95,12 @@ impl WebRTCConfigBuilder {
             debug_logger: None,
         }
     }
-    
+
     pub fn mode(mut self, mode: TransportMode) -> Self {
         self.mode = Some(mode);
         self
     }
-    
+
     pub fn add_ice_server(mut self, urls: Vec<String>) -> Self {
         self.ice_servers.push(RTCIceServer {
             urls,
@@ -110,12 +108,12 @@ impl WebRTCConfigBuilder {
         });
         self
     }
-    
+
     pub fn add_ice_server_with_credentials(
-        mut self, 
-        urls: Vec<String>, 
-        username: String, 
-        credential: String
+        mut self,
+        urls: Vec<String>,
+        username: String,
+        credential: String,
     ) -> Self {
         self.ice_servers.push(RTCIceServer {
             urls,
@@ -125,49 +123,49 @@ impl WebRTCConfigBuilder {
         });
         self
     }
-    
+
     pub fn data_channel_label(mut self, label: String) -> Self {
         self.data_channel_label = Some(label);
         self
     }
-    
+
     pub fn ordered(mut self, ordered: bool) -> Self {
         self.ordered = Some(ordered);
         self
     }
-    
+
     pub fn max_retransmits(mut self, max_retransmits: u16) -> Self {
         self.max_retransmits = Some(max_retransmits);
         self
     }
-    
+
     pub fn debug_logger(mut self, logger: Option<DebugLogger>) -> Self {
         self.debug_logger = logger;
         self
     }
-    
+
     pub fn build(self) -> Result<WebRTCConfig, String> {
         let mode = self.mode.ok_or("Transport mode is required")?;
         let mut config = WebRTCConfig::new(mode);
-        
+
         if !self.ice_servers.is_empty() {
             config.ice_servers = self.ice_servers;
         }
-        
+
         if let Some(label) = self.data_channel_label {
             config.data_channel_label = label;
         }
-        
+
         if let Some(ordered) = self.ordered {
             config.ordered = ordered;
         }
-        
+
         if let Some(max_retransmits) = self.max_retransmits {
             config.max_retransmits = Some(max_retransmits);
         }
-        
+
         config.debug_logger = self.debug_logger;
-        
+
         Ok(config)
     }
 }

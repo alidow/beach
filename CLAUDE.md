@@ -86,6 +86,27 @@ This is a Rust workspace containing two applications for terminal sharing functi
 - **Client Mode**: `beach --join <session-url>` connects to an existing session
 - Optional `--passphrase` flag for encryption in both modes
 
+## Terminal Content Caching Architecture
+
+Beach uses a viewport-based subscription model for efficient terminal content delivery:
+
+### How Terminal Caching Works
+
+1. **The Grid IS the Cache**: The `GridRenderer.grid` field stores ALL terminal content (both current and historical)
+2. **Viewport Subscriptions**: Client requests specific line ranges from server based on scroll position
+3. **SnapshotRange Messages**: Server responds with `SnapshotRange` containing the requested historical data
+4. **Single Source of Truth**: All rendering uses `grid.cells` - there are no separate caches
+
+### Data Flow for Scrollback
+
+1. User scrolls up → `scroll_offset` increases
+2. Client calculates needed viewport and sends `ViewportChanged` message to server
+3. Server retrieves historical data and sends back `SnapshotRange`
+4. Client calls `apply_snapshot()` to populate `grid` with historical content
+5. Renderer uses `scroll_offset` to determine which rows from `grid` to display
+
+**Important**: The `history_cache` field is deprecated and unused. All rendering accesses `grid.cells` directly.
+
 ## Configuration
 
 Beach supports configuration through environment variables:

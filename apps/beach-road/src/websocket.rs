@@ -1,6 +1,9 @@
 use anyhow::Result;
 use axum::{
-    extract::{ws::{Message, WebSocket}, Path, State, WebSocketUpgrade},
+    extract::{
+        ws::{Message, WebSocket},
+        Path, State, WebSocketUpgrade,
+    },
     response::Response,
 };
 use dashmap::DashMap;
@@ -9,10 +12,10 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
-use crate::signaling::{
-    ClientMessage, ServerMessage, PeerInfo, PeerRole, TransportType, generate_peer_id
-};
 use crate::handlers::SharedStorage;
+use crate::signaling::{
+    generate_peer_id, ClientMessage, PeerInfo, PeerRole, ServerMessage, TransportType,
+};
 
 /// Connection state for a single WebSocket peer
 #[derive(Clone)]
@@ -41,52 +44,61 @@ impl SignalingState {
             sessions: Arc::new(DashMap::new()),
             storage,
         };
-        
+
         // Start heartbeat monitor task
         let monitor_state = state.clone();
         tokio::spawn(async move {
             monitor_state.monitor_heartbeats().await;
         });
-        
+
         state
     }
-    
+
     /// Monitor heartbeats and clean up stale connections
     async fn monitor_heartbeats(&self) {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60)); // Check every minute
         let timeout = std::time::Duration::from_secs(600); // 10 minute timeout
-        
+
         loop {
             interval.tick().await;
-            
+
             let mut stale_peers = Vec::new();
-            
+
             // Find stale connections
             for session_entry in self.sessions.iter() {
                 let session_id = session_entry.key().clone();
                 let peers = session_entry.value();
-                
+
                 for peer_entry in peers.iter() {
                     let peer_id = peer_entry.key().clone();
                     let peer = peer_entry.value();
-                    
+
                     let last_heartbeat = *peer.last_heartbeat.read().await;
                     if last_heartbeat.elapsed() > timeout {
                         stale_peers.push((session_id.clone(), peer_id.clone()));
                     }
                 }
             }
-            
+
             // Remove stale peers
             for (session_id, peer_id) in stale_peers {
-                info!("Removing stale peer {} from session {} (heartbeat timeout)", peer_id, session_id);
+                info!(
+                    "Removing stale peer {} from session {} (heartbeat timeout)",
+                    peer_id, session_id
+                );
                 self.remove_peer(&session_id, &peer_id);
-                
+
                 // Notify other peers
-                let _ = self.broadcast_except(&session_id, &peer_id, ServerMessage::PeerLeft {
-                    peer_id: peer_id.clone(),
-                }).await;
-                
+                let _ = self
+                    .broadcast_except(
+                        &session_id,
+                        &peer_id,
+                        ServerMessage::PeerLeft {
+                            peer_id: peer_id.clone(),
+                        },
+                    )
+                    .await;
+
                 // TODO: Update session status in Redis storage
             }
         }
@@ -94,7 +106,9 @@ impl SignalingState {
 
     /// Add a peer to a session
     fn add_peer(&self, session_id: String, peer: PeerConnection) {
-        let peers = self.sessions.entry(session_id.clone())
+        let peers = self
+            .sessions
+            .entry(session_id.clone())
             .or_insert_with(|| DashMap::new());
         peers.insert(peer.peer_id.clone(), peer);
     }
@@ -112,9 +126,11 @@ impl SignalingState {
 
     /// Get all peers in a session
     fn get_peers(&self, session_id: &str) -> Vec<PeerInfo> {
-        self.sessions.get(session_id)
+        self.sessions
+            .get(session_id)
             .map(|peers| {
-                peers.iter()
+                peers
+                    .iter()
                     .map(|entry| PeerInfo {
                         id: entry.peer_id.clone(),
                         role: entry.role.clone(),
@@ -133,10 +149,10 @@ impl SignalingState {
             if peers.is_empty() {
                 return vec![];
             }
-            
+
             // Find intersection of all peer's supported transports
             let mut common_transports: Option<Vec<TransportType>> = None;
-            
+
             for peer in peers.iter() {
                 if let Some(ref mut common) = common_transports {
                     // Keep only transports that are in both lists
@@ -146,7 +162,7 @@ impl SignalingState {
                     common_transports = Some(peer.supported_transports.clone());
                 }
             }
-            
+
             common_transports.unwrap_or_default()
         } else {
             vec![]
@@ -154,10 +170,16 @@ impl SignalingState {
     }
 
     /// Send a message to a specific peer
-    async fn send_to_peer(&self, session_id: &str, peer_id: &str, message: ServerMessage) -> Result<()> {
+    async fn send_to_peer(
+        &self,
+        session_id: &str,
+        peer_id: &str,
+        message: ServerMessage,
+    ) -> Result<()> {
         if let Some(peers) = self.sessions.get(session_id) {
             if let Some(peer) = peers.get(peer_id) {
-                peer.tx.send(message)
+                peer.tx
+                    .send(message)
                     .map_err(|e| anyhow::anyhow!("Failed to send message: {}", e))?;
             } else {
                 warn!("Peer {} not found in session {}", peer_id, session_id);
@@ -171,7 +193,12 @@ impl SignalingState {
     }
 
     /// Broadcast a message to all peers in a session except the sender
-    async fn broadcast_except(&self, session_id: &str, sender_id: &str, message: ServerMessage) -> Result<()> {
+    async fn broadcast_except(
+        &self,
+        session_id: &str,
+        sender_id: &str,
+        message: ServerMessage,
+    ) -> Result<()> {
         if let Some(peers) = self.sessions.get(session_id) {
             for peer in peers.iter() {
                 if peer.peer_id != sender_id {
@@ -196,10 +223,10 @@ pub async fn websocket_handler(
 async fn handle_socket(socket: WebSocket, session_id: String, state: SignalingState) {
     let peer_id = generate_peer_id();
     let (mut sender, mut receiver) = socket.split();
-    
+
     // Create channel for sending messages to this peer
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
-    
+
     // Spawn task to forward messages from channel to WebSocket
     let peer_id_clone = peer_id.clone();
     tokio::spawn(async move {
@@ -213,12 +240,15 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: SignalingSt
         debug!("Message sender task ended for peer {}", peer_id_clone);
     });
 
-    debug!("WebSocket connected: peer={} session={}", peer_id, session_id);
+    debug!(
+        "WebSocket connected: peer={} session={}",
+        peer_id, session_id
+    );
 
     // Handle incoming messages
     while let Some(msg_result) = receiver.next().await {
         debug!("Received WebSocket frame from peer {}", peer_id);
-        
+
         let msg = match msg_result {
             Ok(m) => m,
             Err(e) => {
@@ -226,8 +256,9 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: SignalingSt
                 break;
             }
         };
-        
-        debug!("Received WebSocket message type: {:?} from peer {}", 
+
+        debug!(
+            "Received WebSocket message type: {:?} from peer {}",
             match &msg {
                 Message::Text(_) => "Text",
                 Message::Binary(_) => "Binary",
@@ -237,20 +268,20 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: SignalingSt
             },
             peer_id
         );
-        
+
         match msg {
             Message::Text(text) => {
                 debug!("Text frame content from {}: {}", peer_id, text);
                 match serde_json::from_str::<ClientMessage>(&text) {
                     Ok(client_msg) => {
-                        debug!("Successfully parsed ClientMessage from Text frame: {:?}", client_msg);
-                        if let Err(e) = handle_client_message(
-                            client_msg,
-                            &peer_id,
-                            &session_id,
-                            &state,
-                            &tx,
-                        ).await {
+                        debug!(
+                            "Successfully parsed ClientMessage from Text frame: {:?}",
+                            client_msg
+                        );
+                        if let Err(e) =
+                            handle_client_message(client_msg, &peer_id, &session_id, &state, &tx)
+                                .await
+                        {
                             error!("Error handling message: {}", e);
                             let _ = tx.send(ServerMessage::Error {
                                 message: format!("Failed to process message: {}", e),
@@ -272,14 +303,19 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: SignalingSt
                     debug!("Binary frame as UTF-8 from {}: {}", peer_id, text);
                     match serde_json::from_str::<ClientMessage>(&text) {
                         Ok(client_msg) => {
-                            debug!("Successfully parsed ClientMessage from Binary frame: {:?}", client_msg);
+                            debug!(
+                                "Successfully parsed ClientMessage from Binary frame: {:?}",
+                                client_msg
+                            );
                             if let Err(e) = handle_client_message(
                                 client_msg,
                                 &peer_id,
                                 &session_id,
                                 &state,
                                 &tx,
-                            ).await {
+                            )
+                            .await
+                            {
                                 error!("Error handling message: {}", e);
                                 let _ = tx.send(ServerMessage::Error {
                                     message: format!("Failed to process message: {}", e),
@@ -291,8 +327,9 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: SignalingSt
                         }
                     }
                 } else {
-                    debug!("Received non-UTF8 Binary frame from peer {} (first 100 bytes: {:?})", 
-                        peer_id, 
+                    debug!(
+                        "Received non-UTF8 Binary frame from peer {} (first 100 bytes: {:?})",
+                        peer_id,
                         &data[..std::cmp::min(100, data.len())]
                     );
                 }
@@ -303,7 +340,8 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: SignalingSt
             }
             _ => {
                 // Ignore Ping, Pong, and other message types
-                debug!("Ignoring {:?} message from peer {}", 
+                debug!(
+                    "Ignoring {:?} message from peer {}",
                     match msg {
                         Message::Ping(_) => "Ping",
                         Message::Pong(_) => "Pong",
@@ -317,13 +355,22 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: SignalingSt
 
     // Clean up on disconnect
     state.remove_peer(&session_id, &peer_id);
-    
+
     // Notify other peers
-    let _ = state.broadcast_except(&session_id, &peer_id, ServerMessage::PeerLeft {
-        peer_id: peer_id.clone(),
-    }).await;
-    
-    debug!("WebSocket disconnected: peer={} session={}", peer_id, session_id);
+    let _ = state
+        .broadcast_except(
+            &session_id,
+            &peer_id,
+            ServerMessage::PeerLeft {
+                peer_id: peer_id.clone(),
+            },
+        )
+        .await;
+
+    debug!(
+        "WebSocket disconnected: peer={} session={}",
+        peer_id, session_id
+    );
 }
 
 /// Handle incoming client messages
@@ -335,18 +382,20 @@ async fn handle_client_message(
     tx: &mpsc::UnboundedSender<ServerMessage>,
 ) -> Result<()> {
     match message {
-        ClientMessage::Join { 
-            peer_id: client_peer_id, 
-            passphrase: _, 
+        ClientMessage::Join {
+            peer_id: client_peer_id,
+            passphrase: _,
             supported_transports,
             preferred_transport,
         } => {
-            info!("📥 RECEIVED Join message from peer {} (client_peer_id: {:?}) for session {}", 
-                peer_id, client_peer_id, session_id);
-            
+            info!(
+                "📥 RECEIVED Join message from peer {} (client_peer_id: {:?}) for session {}",
+                peer_id, client_peer_id, session_id
+            );
+
             // Validate session exists and passphrase if required
             // TODO: Check with storage if session exists and passphrase matches
-            
+
             // Determine role based on whether this is the first peer in the session
             // First peer is assumed to be the server
             let role = if state.get_peers(session_id).is_empty() {
@@ -356,10 +405,10 @@ async fn handle_client_message(
                 info!("  → Session has existing peers, assigning role: Client");
                 PeerRole::Client
             };
-            
+
             // Add peer to session - use the WebSocket connection's peer_id
             let peer_conn = PeerConnection {
-                peer_id: peer_id.to_string(),  // Use WebSocket connection's peer_id
+                peer_id: peer_id.to_string(), // Use WebSocket connection's peer_id
                 session_id: session_id.to_string(),
                 role: role.clone(),
                 supported_transports: supported_transports.clone(),
@@ -368,67 +417,108 @@ async fn handle_client_message(
                 last_heartbeat: Arc::new(RwLock::new(std::time::Instant::now())),
             };
             state.add_peer(session_id.to_string(), peer_conn);
-            info!("  → Added peer {} to session {} with role {:?}", peer_id, session_id, role);
-            
+            info!(
+                "  → Added peer {} to session {} with role {:?}",
+                peer_id, session_id, role
+            );
+
             // Get existing peers and available transports
             let peers = state.get_peers(session_id);
             let available_transports = state.get_available_transports(session_id);
-            info!("  → Session now has {} peers, available transports: {:?}", 
-                peers.len(), available_transports);
-            
+            info!(
+                "  → Session now has {} peers, available transports: {:?}",
+                peers.len(),
+                available_transports
+            );
+
             // Send success response - use WebSocket connection's peer_id
             let join_success = ServerMessage::JoinSuccess {
                 session_id: session_id.to_string(),
-                peer_id: peer_id.to_string(),  // Use WebSocket connection's peer_id
+                peer_id: peer_id.to_string(), // Use WebSocket connection's peer_id
                 peers: peers.clone(),
                 available_transports,
             };
-            
-            info!("📤 SENDING JoinSuccess to peer {}: session={}, peer_id={}, peers={}, transports={:?}", 
-                peer_id, session_id, peer_id, peers.len(), 
-                state.get_available_transports(session_id));
-            
+
+            info!(
+                "📤 SENDING JoinSuccess to peer {}: session={}, peer_id={}, peers={}, transports={:?}",
+                peer_id,
+                session_id,
+                peer_id,
+                peers.len(),
+                state.get_available_transports(session_id)
+            );
+
             tx.send(join_success)?;
             info!("  → JoinSuccess sent successfully to peer {}", peer_id);
-            
+
             // Notify other peers - use WebSocket connection's peer_id
-            state.broadcast_except(session_id, peer_id, ServerMessage::PeerJoined {
-                peer: PeerInfo {
-                    id: peer_id.to_string(),  // Use WebSocket connection's peer_id
-                    role,
-                    joined_at: chrono::Utc::now().timestamp(),
-                    supported_transports,
-                    preferred_transport,
-                },
-            }).await?;
+            state
+                .broadcast_except(
+                    session_id,
+                    peer_id,
+                    ServerMessage::PeerJoined {
+                        peer: PeerInfo {
+                            id: peer_id.to_string(), // Use WebSocket connection's peer_id
+                            role,
+                            joined_at: chrono::Utc::now().timestamp(),
+                            supported_transports,
+                            preferred_transport,
+                        },
+                    },
+                )
+                .await?;
         }
-        
-        ClientMessage::NegotiateTransport { to_peer, proposed_transport } => {
-            state.send_to_peer(session_id, &to_peer, ServerMessage::TransportProposal {
-                from_peer: peer_id.to_string(),
-                proposed_transport,
-            }).await?;
+
+        ClientMessage::NegotiateTransport {
+            to_peer,
+            proposed_transport,
+        } => {
+            state
+                .send_to_peer(
+                    session_id,
+                    &to_peer,
+                    ServerMessage::TransportProposal {
+                        from_peer: peer_id.to_string(),
+                        proposed_transport,
+                    },
+                )
+                .await?;
         }
-        
+
         ClientMessage::AcceptTransport { to_peer, transport } => {
-            state.send_to_peer(session_id, &to_peer, ServerMessage::TransportAccepted {
-                from_peer: peer_id.to_string(),
-                transport,
-            }).await?;
+            state
+                .send_to_peer(
+                    session_id,
+                    &to_peer,
+                    ServerMessage::TransportAccepted {
+                        from_peer: peer_id.to_string(),
+                        transport,
+                    },
+                )
+                .await?;
         }
-        
+
         ClientMessage::Signal { to_peer, signal } => {
-            debug!("Received Signal from {} to {}: {:?}", peer_id, to_peer, signal);
+            debug!(
+                "Received Signal from {} to {}: {:?}",
+                peer_id, to_peer, signal
+            );
             // Don't intercept debug responses - just forward them as-is
             // The CLI expects to receive debug responses as Signal messages, not Debug messages
-            
+
             // Normal signal forwarding (including debug responses)
-            state.send_to_peer(session_id, &to_peer, ServerMessage::Signal {
-                from_peer: peer_id.to_string(),
-                signal,
-            }).await?;
+            state
+                .send_to_peer(
+                    session_id,
+                    &to_peer,
+                    ServerMessage::Signal {
+                        from_peer: peer_id.to_string(),
+                        signal,
+                    },
+                )
+                .await?;
         }
-        
+
         ClientMessage::Ping => {
             // Update heartbeat timestamp
             if let Some(peers) = state.sessions.get(session_id) {
@@ -438,16 +528,20 @@ async fn handle_client_message(
             }
             tx.send(ServerMessage::Pong)?;
         }
-        
+
         ClientMessage::Debug { request } => {
-            debug!("Received debug request from peer {} for session {}", peer_id, session_id);
+            debug!(
+                "Received debug request from peer {} for session {}",
+                peer_id, session_id
+            );
             // Forward debug request to the beach server
             // Find the server peer in the session
             if let Some(peers) = state.sessions.get(session_id) {
-                let server_peer = peers.iter()
+                let server_peer = peers
+                    .iter()
                     .find(|p| p.role == PeerRole::Server)
                     .map(|p| p.peer_id.clone());
-                
+
                 debug!("Looking for server peer, found: {:?}", server_peer);
                 if let Some(server_id) = server_peer {
                     // Forward the debug request to the server via Signal
@@ -461,12 +555,18 @@ async fn handle_client_message(
                             "request": request,
                         },
                     });
-                    
+
                     debug!("Sending debug signal to server peer {}", server_id);
-                    state.send_to_peer(session_id, &server_id, ServerMessage::Signal {
-                        from_peer: peer_id.to_string(),
-                        signal: debug_signal,
-                    }).await?;
+                    state
+                        .send_to_peer(
+                            session_id,
+                            &server_id,
+                            ServerMessage::Signal {
+                                from_peer: peer_id.to_string(),
+                                signal: debug_signal,
+                            },
+                        )
+                        .await?;
                     debug!("Debug signal sent successfully");
                 } else {
                     // No server found, send error response
@@ -481,6 +581,6 @@ async fn handle_client_message(
             }
         }
     }
-    
+
     Ok(())
 }

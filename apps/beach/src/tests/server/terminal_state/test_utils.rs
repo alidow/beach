@@ -1,4 +1,4 @@
-use crate::server::terminal_state::{TerminalBackend, create_terminal_backend, Grid, GridHistory};
+use crate::server::terminal_state::{Grid, GridHistory, TerminalBackend, create_terminal_backend};
 use std::sync::{Arc, Mutex};
 
 /// Create a test terminal backend based on features
@@ -17,19 +17,21 @@ impl TestTerminal {
             backend: create_test_terminal(width, height),
         }
     }
-    
+
     pub fn process_output(&mut self, data: &[u8]) {
-        self.backend.process_output(data).expect("Failed to process output");
+        self.backend
+            .process_output(data)
+            .expect("Failed to process output");
     }
-    
+
     pub fn force_snapshot(&mut self) {
         self.backend.force_snapshot();
     }
-    
+
     pub fn get_history(&self) -> Arc<Mutex<GridHistory>> {
         self.backend.get_history()
     }
-    
+
     pub fn get_current_grid(&self) -> Grid {
         self.backend.get_current_grid()
     }

@@ -1,12 +1,15 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
+use std::io::IsTerminal;
+use tokio::time::{timeout, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info};
-use tokio::time::{timeout, Duration};
-use std::io::IsTerminal;
 
-use crate::signaling::{ClientMessage, ServerMessage, DebugRequest, DebugResponse, generate_peer_id, TransportType, PeerRole};
+use crate::signaling::{
+    generate_peer_id, ClientMessage, DebugRequest, DebugResponse, PeerRole, ServerMessage,
+    TransportType,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "beach-road")]
@@ -14,7 +17,7 @@ use crate::signaling::{ClientMessage, ServerMessage, DebugRequest, DebugResponse
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
-    
+
     /// Run as server (default behavior if no command specified)
     #[arg(long)]
     pub server: bool,
@@ -27,11 +30,11 @@ pub enum Commands {
         /// Session server URL (e.g., ws://localhost:8080)
         #[arg(short, long, default_value = "ws://localhost:8080")]
         url: String,
-        
+
         /// Session ID to connect to
         #[arg(short, long)]
         session: String,
-        
+
         /// Debug command
         #[command(subcommand)]
         command: DebugCommands,
@@ -45,29 +48,29 @@ pub enum DebugCommands {
         /// Number of rows to display (optional)
         #[arg(short = 'n', long)]
         height: Option<u16>,
-        
+
         /// Start from line number (optional)
         #[arg(short = 'l', long)]
         from_line: Option<u64>,
-        
+
         /// Get grid from N seconds ago (optional)
         #[arg(long)]
         ago: Option<u64>,
     },
-    
+
     /// Get terminal statistics
     Stats,
-    
+
     /// Clear terminal history
     Clear,
 }
 
 pub async fn run_debug_client(url: String, session: String, command: DebugCommands) -> Result<()> {
     debug!("Connecting to {} for session {}", url, session);
-    
+
     // Build WebSocket URL
     let ws_url = format!("{}/ws/{}", url, session);
-    
+
     // Connect to the WebSocket with timeout
     let (ws_stream, _) = match timeout(Duration::from_secs(5), connect_async(&ws_url)).await {
         Ok(Ok(result)) => result,
@@ -77,14 +80,16 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
         }
         Err(_) => {
             error!("Connection timeout after 5 seconds");
-            return Err(anyhow::anyhow!("Connection timeout - is the session server running?"));
+            return Err(anyhow::anyhow!(
+                "Connection timeout - is the session server running?"
+            ));
         }
     };
     let (mut write, mut read) = ws_stream.split();
-    
+
     // Generate a peer ID
     let peer_id = generate_peer_id();
-    
+
     // Send join message
     let join_msg = ClientMessage::Join {
         peer_id: peer_id.clone(),
@@ -92,10 +97,10 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
         supported_transports: vec![TransportType::Direct],
         preferred_transport: Some(TransportType::Direct),
     };
-    
+
     let join_text = serde_json::to_string(&join_msg)?;
     write.send(Message::Text(join_text.into())).await?;
-    
+
     // Wait for join response with timeout
     let join_timeout = timeout(Duration::from_secs(5), async {
         while let Some(msg) = read.next().await {
@@ -115,7 +120,10 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
                             if found_server_id.is_empty() {
                                 return Err(anyhow::anyhow!("No server found in session"));
                             }
-                            debug!("Successfully joined session, server peer: {}", found_server_id);
+                            debug!(
+                                "Successfully joined session, server peer: {}",
+                                found_server_id
+                            );
                             return Ok::<_, anyhow::Error>(found_server_id);
                         }
                         ServerMessage::JoinError { reason } => {
@@ -131,8 +139,9 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
             }
         }
         Err(anyhow::anyhow!("Connection closed unexpectedly"))
-    }).await;
-    
+    })
+    .await;
+
     let server_peer_id = match join_timeout {
         Ok(Ok(peer_id)) => peer_id,
         Ok(Err(e)) => {
@@ -143,15 +152,18 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
             return Err(anyhow::anyhow!("Session not found or not responding"));
         }
     };
-    
+
     // Send debug request based on command
     let debug_request = match command {
-        DebugCommands::GridView { height, from_line, ago } => {
+        DebugCommands::GridView {
+            height,
+            from_line,
+            ago,
+        } => {
             // Calculate at_time if --ago is specified
-            let at_time = ago.map(|seconds| {
-                chrono::Utc::now() - chrono::Duration::seconds(seconds as i64)
-            });
-            
+            let at_time =
+                ago.map(|seconds| chrono::Utc::now() - chrono::Duration::seconds(seconds as i64));
+
             DebugRequest::GetGridView {
                 height,
                 at_time,
@@ -161,7 +173,7 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
         DebugCommands::Stats => DebugRequest::GetStats,
         DebugCommands::Clear => DebugRequest::ClearHistory,
     };
-    
+
     // Wrap debug request in a Custom transport signal to the server
     // Beach expects signals as serde_json::Value, not TransportSignal enum
     let debug_signal = serde_json::json!({
@@ -172,15 +184,15 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
             "request": debug_request,
         }
     });
-    
+
     let signal_msg = ClientMessage::Signal {
-        to_peer: server_peer_id.clone(), 
+        to_peer: server_peer_id.clone(),
         signal: debug_signal,
     };
-    
+
     let signal_text = serde_json::to_string(&signal_msg)?;
     write.send(Message::Text(signal_text.into())).await?;
-    
+
     // Wait for debug response (or explicit error) with timeout
     let debug_timeout = timeout(Duration::from_secs(10), async {
         while let Some(msg) = read.next().await {
@@ -190,18 +202,27 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
                     match server_msg {
                         ServerMessage::Signal { from_peer, signal } => {
                             // Check if this is a debug response wrapped in Custom transport (now as serde_json::Value)
-                            if let Some(transport) = signal.get("transport").and_then(|v| v.as_str()) {
+                            if let Some(transport) =
+                                signal.get("transport").and_then(|v| v.as_str())
+                            {
                                 if transport == "custom" {
-                                    if let (Some(transport_name), Some(signal_type)) = 
-                                        (signal.get("transport_name").and_then(|v| v.as_str()),
-                                         signal.get("signal_type").and_then(|v| v.as_str())) {
-                                        
-                                        if transport_name == "debug" && signal_type == "debug_response" {
+                                    if let (Some(transport_name), Some(signal_type)) = (
+                                        signal.get("transport_name").and_then(|v| v.as_str()),
+                                        signal.get("signal_type").and_then(|v| v.as_str()),
+                                    ) {
+                                        if transport_name == "debug"
+                                            && signal_type == "debug_response"
+                                        {
                                             if let Some(payload) = signal.get("payload") {
                                                 if let Some(response) = payload.get("response") {
                                                     if !response.is_null() {
-                                                        let debug_response: DebugResponse = serde_json::from_value(response.clone())?;
-                                                        return Ok::<_, anyhow::Error>(debug_response);
+                                                        let debug_response: DebugResponse =
+                                                            serde_json::from_value(
+                                                                response.clone(),
+                                                            )?;
+                                                        return Ok::<_, anyhow::Error>(
+                                                            debug_response,
+                                                        );
                                                     }
                                                 }
                                             }
@@ -219,9 +240,12 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
                 _ => {}
             }
         }
-        Err(anyhow::anyhow!("Connection closed before receiving debug response"))
-    }).await;
-    
+        Err(anyhow::anyhow!(
+            "Connection closed before receiving debug response"
+        ))
+    })
+    .await;
+
     match debug_timeout {
         Ok(Ok(response)) => {
             handle_debug_response(response)?;
@@ -231,13 +255,15 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
         }
         Err(_) => {
             error!("Timeout waiting for debug response after 10 seconds");
-            return Err(anyhow::anyhow!("Debug request timeout - the terminal may be busy or unresponsive"));
+            return Err(anyhow::anyhow!(
+                "Debug request timeout - the terminal may be busy or unresponsive"
+            ));
         }
     }
-    
+
     // Close connection
     write.send(Message::Close(None)).await?;
-    
+
     Ok(())
 }
 
@@ -247,23 +273,20 @@ fn get_terminal_width() -> Option<u16> {
     if !std::io::stdout().is_terminal() {
         return None;
     }
-    
+
     // Try to get terminal size using terminal_size crate or similar
     // For now, we'll use a simple approach with stty command
     use std::process::Command;
-    
-    let output = Command::new("stty")
-        .arg("size")
-        .output()
-        .ok()?;
-    
+
+    let output = Command::new("stty").arg("size").output().ok()?;
+
     if !output.status.success() {
         return None;
     }
-    
+
     let size = String::from_utf8(output.stdout).ok()?;
     let parts: Vec<&str> = size.trim().split_whitespace().collect();
-    
+
     if parts.len() == 2 {
         parts[1].parse::<u16>().ok()
     } else {
@@ -290,24 +313,31 @@ fn handle_debug_response(response: DebugResponse) -> Result<()> {
             if let Some(tw) = term_width {
                 if tw < width {
                     eprintln!();
-                    eprintln!("⚠️  Warning: Your terminal width ({}) is smaller than the grid width ({}).", tw, width);
-                    eprintln!("   Lines may wrap unexpectedly. Consider resizing your terminal or using a wider display.");
+                    eprintln!(
+                        "⚠️  Warning: Your terminal width ({}) is smaller than the grid width ({}).",
+                        tw, width
+                    );
+                    eprintln!(
+                        "   Lines may wrap unexpectedly. Consider resizing your terminal or using a wider display."
+                    );
                     eprintln!();
                 }
             }
-            
+
             println!("╔══════════════════════════════════════════════════════════════╗");
             println!("║                      TERMINAL GRID VIEW                      ║");
             println!("╠══════════════════════════════════════════════════════════════╣");
             println!("║ Dimensions: {}x{}", width, height);
-            println!("║ Cursor: ({}, {}) {}", 
-                cursor_row, cursor_col,
+            println!(
+                "║ Cursor: ({}, {}) {}",
+                cursor_row,
+                cursor_col,
                 if cursor_visible { "visible" } else { "hidden" }
             );
             println!("║ Lines: {} to {}", start_line, end_line);
             println!("║ Timestamp: {}", timestamp);
             println!("╠══════════════════════════════════════════════════════════════╣");
-            
+
             // Print the grid content - always use ANSI colors if available
             if let Some(ansi_rows) = ansi_rows {
                 // Use ANSI-colored version
@@ -320,10 +350,10 @@ fn handle_debug_response(response: DebugResponse) -> Result<()> {
                     println!("║{}║", row);
                 }
             }
-            
+
             println!("╚══════════════════════════════════════════════════════════════╝");
         }
-        
+
         DebugResponse::Stats {
             history_size_bytes,
             total_deltas,
@@ -337,19 +367,22 @@ fn handle_debug_response(response: DebugResponse) -> Result<()> {
             println!("║ History Size: {} bytes", history_size_bytes);
             println!("║ Total Deltas: {}", total_deltas);
             println!("║ Total Snapshots: {}", total_snapshots);
-            println!("║ Current Dimensions: {}x{}", current_dimensions.0, current_dimensions.1);
+            println!(
+                "║ Current Dimensions: {}x{}",
+                current_dimensions.0, current_dimensions.1
+            );
             println!("║ Session Duration: {} seconds", session_duration_secs);
             println!("╚══════════════════════════════════════════════════════════════╝");
         }
-        
+
         DebugResponse::Success { message } => {
             println!("✅ Success: {}", message);
         }
-        
+
         DebugResponse::Error { message } => {
             eprintln!("❌ Error: {}", message);
         }
     }
-    
+
     Ok(())
 }

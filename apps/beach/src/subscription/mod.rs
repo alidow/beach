@@ -5,5 +5,5 @@ pub mod data_source;
 pub mod hub;
 
 // Re-export key types
-pub use hub::{SubscriptionHub, SubscriptionConfig, SubscriptionUpdate, SubscriptionHandler};
-pub use data_source::{TerminalDataSource, PtyWriter, HistoryMetadata};
+pub use data_source::{HistoryMetadata, PtyWriter, TerminalDataSource};
+pub use hub::{SubscriptionConfig, SubscriptionHandler, SubscriptionHub, SubscriptionUpdate};

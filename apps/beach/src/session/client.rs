@@ -1,8 +1,8 @@
 use anyhow::Result;
 use reqwest::Client;
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
+use std::time::Duration;
 
 #[derive(Debug, Serialize)]
 struct RegisterSessionRequest {
@@ -39,14 +39,16 @@ impl SessionClient {
         // Normalize localhost to IPv4 to avoid IPv6 (::1) preference
         let server = if session_server.contains("localhost") {
             session_server.replace("localhost", "127.0.0.1")
-        } else { session_server.to_string() };
+        } else {
+            session_server.to_string()
+        };
 
         let base_url = if server.starts_with("http://") || server.starts_with("https://") {
             server
         } else {
             format!("http://{}", server)
         };
-        
+
         // Build a client with conservative timeouts and no proxy to avoid
         // hanging when localhost session server is unavailable or proxied.
         let client = Client::builder()
@@ -60,27 +62,37 @@ impl SessionClient {
     }
 
     /// Register a new session with the session server
-    pub async fn register_session(&self, session_id: &str, passphrase: Option<&str>) -> Result<String> {
+    pub async fn register_session(
+        &self,
+        session_id: &str,
+        passphrase: Option<&str>,
+    ) -> Result<String> {
         let request = RegisterSessionRequest {
             session_id: session_id.to_string(),
             passphrase: passphrase.map(|p| p.to_string()),
         };
 
-        let response = self.client
+        let response = self
+            .client
             .post(format!("{}/sessions", self.base_url))
             .json(&request)
             .send()
             .await?;
 
         if !response.status().is_success() {
-            return Err(anyhow::anyhow!("Failed to register session: {}", response.status()));
+            return Err(anyhow::anyhow!(
+                "Failed to register session: {}",
+                response.status()
+            ));
         }
 
         let resp: RegisterSessionResponse = response.json().await?;
-        
+
         if !resp.success {
-            return Err(anyhow::anyhow!("Session registration failed: {}", 
-                resp.message.unwrap_or_else(|| "Unknown error".to_string())));
+            return Err(anyhow::anyhow!(
+                "Session registration failed: {}",
+                resp.message.unwrap_or_else(|| "Unknown error".to_string())
+            ));
         }
 
         Ok(resp.session_url)
@@ -92,21 +104,27 @@ impl SessionClient {
             passphrase: passphrase.map(|p| p.to_string()),
         };
 
-        let response = self.client
+        let response = self
+            .client
             .post(format!("{}/sessions/{}/join", self.base_url, session_id))
             .json(&request)
             .send()
             .await?;
 
         if !response.status().is_success() {
-            return Err(anyhow::anyhow!("Failed to join session: {}", response.status()));
+            return Err(anyhow::anyhow!(
+                "Failed to join session: {}",
+                response.status()
+            ));
         }
 
         let resp: JoinSessionResponse = response.json().await?;
-        
+
         if !resp.success {
-            return Err(anyhow::anyhow!("Failed to join session: {}", 
-                resp.message.unwrap_or_else(|| "Unknown error".to_string())));
+            return Err(anyhow::anyhow!(
+                "Failed to join session: {}",
+                resp.message.unwrap_or_else(|| "Unknown error".to_string())
+            ));
         }
 
         // TODO: Handle WebRTC offer when implemented
@@ -119,7 +137,8 @@ impl SessionClient {
 
     /// Check if a session exists
     pub async fn session_exists(&self, session_id: &str) -> Result<bool> {
-        let response = self.client
+        let response = self
+            .client
             .get(format!("{}/sessions/{}", self.base_url, session_id))
             .send()
             .await?;

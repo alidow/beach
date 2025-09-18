@@ -1,11 +1,11 @@
-use std::sync::{Arc, Mutex};
-use async_trait::async_trait;
 use anyhow::Result;
+use async_trait::async_trait;
 use portable_pty::{Child, MasterPty, PtySize};
+use std::sync::{Arc, Mutex};
 
 use crate::protocol::Dimensions;
-use crate::subscription::PtyWriter;
 use crate::server::pty::PtyManager;
+use crate::subscription::PtyWriter;
 
 /// Implementation of PtyWriter that wraps a PTY
 pub struct PtyWriterImpl {
@@ -37,7 +37,7 @@ impl PtyWriter for PtyWriterImpl {
         writer.flush()?;
         Ok(())
     }
-    
+
     async fn resize(&self, dims: Dimensions) -> Result<()> {
         let master = self.master.lock().unwrap();
         let size = PtySize {
@@ -61,11 +61,17 @@ impl PtyWriterFromManager {
     pub fn new(manager: PtyManager) -> Self {
         // Check for debug log from environment or use default
         let debug_log_path = std::env::var("BEACH_DEBUG_LOG").ok();
-        Self { manager, debug_log_path }
+        Self {
+            manager,
+            debug_log_path,
+        }
     }
-    
+
     pub fn new_with_debug(manager: PtyManager, debug_log_path: Option<String>) -> Self {
-        Self { manager, debug_log_path }
+        Self {
+            manager,
+            debug_log_path,
+        }
     }
 }
 
@@ -77,35 +83,52 @@ impl PtyWriter for PtyWriterFromManager {
         if let Some(ref path) = self.debug_log_path {
             if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
                 use std::io::Write;
-                let _ = writeln!(f, "[{}] [PtyWriter] Writing {} bytes to PTY",
-                    chrono::Local::now().format("%H:%M:%S%.3f"), bytes.len());
+                let _ = writeln!(
+                    f,
+                    "[{}] [PtyWriter] Writing {} bytes to PTY",
+                    chrono::Local::now().format("%H:%M:%S%.3f"),
+                    bytes.len()
+                );
                 // Log the actual bytes for debugging (limit to first 50 chars)
                 let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(50)]);
-                let _ = writeln!(f, "[{}] [PtyWriter] Data preview: {:?}",
-                    chrono::Local::now().format("%H:%M:%S%.3f"), preview);
+                let _ = writeln!(
+                    f,
+                    "[{}] [PtyWriter] Data preview: {:?}",
+                    chrono::Local::now().format("%H:%M:%S%.3f"),
+                    preview
+                );
             }
         }
-        
+
         let result = self.manager.write(bytes);
         let elapsed = write_start.elapsed();
-        
+
         // Log after PTY write with timing
         if let Some(ref path) = self.debug_log_path {
             if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
                 use std::io::Write;
                 match &result {
                     Ok(_) => {
-                        let _ = writeln!(f, "[{}] [PtyWriter] Write successful, took {}μs",
-                            chrono::Local::now().format("%H:%M:%S%.3f"), elapsed.as_micros());
-                    },
+                        let _ = writeln!(
+                            f,
+                            "[{}] [PtyWriter] Write successful, took {}μs",
+                            chrono::Local::now().format("%H:%M:%S%.3f"),
+                            elapsed.as_micros()
+                        );
+                    }
                     Err(e) => {
-                        let _ = writeln!(f, "[{}] [PtyWriter] Write failed after {}μs: {:?}",
-                            chrono::Local::now().format("%H:%M:%S%.3f"), elapsed.as_micros(), e);
+                        let _ = writeln!(
+                            f,
+                            "[{}] [PtyWriter] Write failed after {}μs: {:?}",
+                            chrono::Local::now().format("%H:%M:%S%.3f"),
+                            elapsed.as_micros(),
+                            e
+                        );
                     }
                 }
             }
         }
-        
+
         result
     }
 

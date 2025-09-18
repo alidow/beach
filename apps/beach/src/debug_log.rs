@@ -1,7 +1,7 @@
-use std::sync::{Arc, Mutex};
+use chrono::Utc;
 use std::fs::File;
 use std::io::Write;
-use chrono::Utc;
+use std::sync::{Arc, Mutex};
 
 /// Thread-safe debug logger that writes to file when available
 #[derive(Clone)]
@@ -18,13 +18,13 @@ impl DebugLogger {
             verbose: std::env::var("BEACH_VERBOSE").is_ok(),
         }
     }
-    
+
     /// Log a debug message (only when verbose mode is enabled)
     pub fn log(&self, message: &str) {
         if !self.verbose {
             return;
         }
-        
+
         if let Ok(mut file_guard) = self.file.lock() {
             if let Some(ref mut file) = *file_guard {
                 let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
@@ -33,7 +33,7 @@ impl DebugLogger {
             }
         }
     }
-    
+
     /// Log an error message (always logged)
     pub fn error(&self, message: &str) {
         if let Ok(mut file_guard) = self.file.lock() {
@@ -44,7 +44,7 @@ impl DebugLogger {
             }
         }
     }
-    
+
     /// Check if verbose mode is enabled
     pub fn is_verbose(&self) -> bool {
         self.verbose

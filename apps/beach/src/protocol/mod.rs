@@ -4,8 +4,11 @@ pub mod subscription;
 
 // Re-export subscription protocol types for backward compatibility
 pub use subscription::{
-    messages::{ViewMode, ViewPosition, Dimensions, CompressionType, ErrorCode, SubscriptionStatus, NotificationType},
-    client_messages::{ClientMessage, StateRequestType, ControlType},
+    client_messages::{ClientMessage, ControlType, StateRequestType},
+    messages::{
+        CompressionType, Dimensions, ErrorCode, NotificationType, SubscriptionStatus, ViewMode,
+        ViewPosition,
+    },
     server_messages::{ServerMessage, SubscriptionInfo},
 };
 

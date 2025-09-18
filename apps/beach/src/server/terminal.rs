@@ -1,8 +1,8 @@
-use std::io::IsTerminal;
-use std::env;
 use anyhow::Result;
 use crossterm::terminal;
 use portable_pty::{CommandBuilder, PtySize};
+use std::env;
+use std::io::IsTerminal;
 
 /// Get terminal size using crossterm (cross-platform)
 pub fn get_terminal_size() -> Result<(u16, u16)> {
@@ -12,7 +12,7 @@ pub fn get_terminal_size() -> Result<(u16, u16)> {
         if let Ok((cols, rows)) = terminal::size() {
             return Ok((cols, rows));
         }
-        
+
         // Fallback: Try environment variables (works on both Windows and Unix)
         if let (Ok(cols_str), Ok(rows_str)) = (env::var("COLUMNS"), env::var("LINES")) {
             if let (Ok(cols), Ok(rows)) = (cols_str.parse::<u16>(), rows_str.parse::<u16>()) {
@@ -21,12 +21,12 @@ pub fn get_terminal_size() -> Result<(u16, u16)> {
                 }
             }
         }
-        
+
         // Unix-specific fallbacks
         #[cfg(unix)]
         {
             // Try TIOCGWINSZ ioctl directly
-            use libc::{ioctl, winsize, TIOCGWINSZ};
+            use libc::{TIOCGWINSZ, ioctl, winsize};
             unsafe {
                 let mut ws = winsize {
                     ws_row: 0,
@@ -41,21 +41,21 @@ pub fn get_terminal_size() -> Result<(u16, u16)> {
                     }
                 }
             }
-            
+
             // Try tput command
             use std::process::Command;
-            
+
             let cols_output = Command::new("tput").arg("cols").output();
             let rows_output = Command::new("tput").arg("lines").output();
-            
+
             if let (Ok(cols_out), Ok(rows_out)) = (cols_output, rows_output) {
                 if let (Ok(cols_str), Ok(rows_str)) = (
                     String::from_utf8(cols_out.stdout),
-                    String::from_utf8(rows_out.stdout)
+                    String::from_utf8(rows_out.stdout),
                 ) {
                     if let (Ok(cols), Ok(rows)) = (
                         cols_str.trim().parse::<u16>(),
-                        rows_str.trim().parse::<u16>()
+                        rows_str.trim().parse::<u16>(),
                     ) {
                         if cols > 0 && rows > 0 {
                             return Ok((cols, rows));
@@ -64,7 +64,7 @@ pub fn get_terminal_size() -> Result<(u16, u16)> {
                 }
             }
         }
-        
+
         // Last resort: Use common terminal defaults
         Ok((80, 24))
     } else {
@@ -98,14 +98,14 @@ pub fn get_default_shell() -> String {
     if let Ok(shell) = env::var("SHELL") {
         return shell;
     }
-    
+
     // Fallback to common shells
     for shell in &["/bin/bash", "/bin/zsh", "/bin/sh"] {
         if std::path::Path::new(shell).exists() {
             return shell.to_string();
         }
     }
-    
+
     // Last resort
     "/bin/sh".to_string()
 }

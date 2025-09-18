@@ -1,9 +1,7 @@
+use super::messages::{ErrorCode, NotificationType, SubscriptionStatus, ViewMode};
+use crate::server::terminal_state::{Cell, Grid, GridDelta};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use super::messages::{
-    ViewMode, SubscriptionStatus, ErrorCode, NotificationType
-};
-use crate::server::terminal_state::{Grid, GridDelta};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -91,6 +89,32 @@ pub enum ServerMessage {
         /// Most recent timestamp
         #[serde(skip_serializing_if = "Option::is_none")]
         latest_timestamp: Option<i64>,
+    },
+    /// NEW: Sent with initial subscription response to describe full terminal state
+    HistoryMetadata {
+        subscription_id: String,
+        /// Total lines in server history
+        total_lines: u64,
+        /// Oldest line number
+        oldest_line: u64,
+        /// Most recent line number
+        latest_line: u64,
+        /// Server terminal width
+        terminal_width: u16,
+        /// Server visible height
+        terminal_height: u16,
+    },
+    /// NEW: Streamed history chunks for unified grid loading
+    HistoryChunk {
+        subscription_id: String,
+        /// Starting line number for this chunk
+        start_line: u64,
+        /// Ending line number for this chunk
+        end_line: u64,
+        /// Row data for the chunk
+        rows: Vec<Vec<Cell>>,
+        /// True if this is the final chunk
+        is_final: bool,
     },
 }
 

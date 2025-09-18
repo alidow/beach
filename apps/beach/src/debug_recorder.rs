@@ -1,10 +1,10 @@
+use anyhow::Result;
+use chrono::{DateTime, Utc};
+use serde::Serialize;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use serde::Serialize;
-use chrono::{DateTime, Utc};
-use anyhow::Result;
 
-use crate::protocol::{ServerMessage, ClientMessage};
+use crate::protocol::{ClientMessage, ServerMessage};
 use crate::server::terminal_state::Grid;
 
 #[derive(Serialize)]
@@ -15,13 +15,13 @@ pub enum DebugEvent {
         timestamp: DateTime<Utc>,
         message: ClientMessage,
     },
-    
+
     #[serde(rename = "server_message")]
     ServerMessage {
         timestamp: DateTime<Utc>,
         message: ServerMessage,
     },
-    
+
     #[serde(rename = "client_grid_state")]
     ClientGridState {
         timestamp: DateTime<Utc>,
@@ -29,14 +29,14 @@ pub enum DebugEvent {
         scroll_offset: i64,
         view_mode: String,
     },
-    
+
     #[serde(rename = "server_backend_state")]
     ServerBackendState {
         timestamp: DateTime<Utc>,
         grid: Grid,
         cursor_pos: (u16, u16),
     },
-    
+
     #[serde(rename = "server_subscription_view")]
     ServerSubscriptionView {
         timestamp: DateTime<Utc>,
@@ -44,7 +44,7 @@ pub enum DebugEvent {
         grid: Grid,
         view_mode: String,
     },
-    
+
     #[serde(rename = "server_subscription_snapshot")]
     ServerSubscriptionSnapshot {
         timestamp: DateTime<Utc>,
@@ -61,7 +61,7 @@ pub enum DebugEvent {
         /// Cursor position and visibility
         cursor_info: Option<(u16, u16, bool)>, // (row, col, visible)
     },
-    
+
     #[serde(rename = "snapshot_transformation")]
     SnapshotTransformation {
         timestamp: DateTime<Utc>,
@@ -70,7 +70,7 @@ pub enum DebugEvent {
         blank_lines: Vec<u16>,
         content_sample: Vec<String>,
     },
-    
+
     #[serde(rename = "server_subscription_delta")]
     ServerSubscriptionDelta {
         timestamp: DateTime<Utc>,
@@ -85,7 +85,7 @@ pub enum DebugEvent {
         /// Lines that were modified
         modified_lines: Vec<u16>,
     },
-    
+
     #[serde(rename = "client_delta_application")]
     ClientDeltaApplication {
         timestamp: DateTime<Utc>,
@@ -110,7 +110,7 @@ pub enum DebugEvent {
         /// Sample of affected lines after change
         lines_after: Vec<String>,
     },
-    
+
     #[serde(rename = "server_pty_output")]
     ServerPtyOutput {
         timestamp: DateTime<Utc>,
@@ -119,7 +119,7 @@ pub enum DebugEvent {
         /// Human-readable representation with escape sequences visible
         readable: String,
     },
-    
+
     #[serde(rename = "server_alacritty_state")]
     ServerAlacrittyState {
         timestamp: DateTime<Utc>,
@@ -130,7 +130,7 @@ pub enum DebugEvent {
         /// Count of blank lines in the grid
         blank_line_count: usize,
     },
-    
+
     #[serde(rename = "process_output_call")]
     ProcessOutputCall {
         timestamp: DateTime<Utc>,
@@ -143,7 +143,7 @@ pub enum DebugEvent {
         /// Human-readable preview
         preview: String,
     },
-    
+
     #[serde(rename = "newline_conversion")]
     NewlineConversion {
         timestamp: DateTime<Utc>,
@@ -154,7 +154,7 @@ pub enum DebugEvent {
         /// Number of conversions made
         conversions_count: usize,
     },
-    
+
     #[serde(rename = "grid_before_after")]
     GridBeforeAfter {
         timestamp: DateTime<Utc>,
@@ -167,7 +167,7 @@ pub enum DebugEvent {
         /// New blank lines added
         new_blank_lines: Vec<u16>,
     },
-    
+
     #[serde(rename = "pty_read_chunk")]
     PtyReadChunk {
         timestamp: DateTime<Utc>,
@@ -180,7 +180,7 @@ pub enum DebugEvent {
         /// Whether this hash was seen before
         is_duplicate: bool,
     },
-    
+
     #[serde(rename = "alacritty_vs_gridhistory")]
     AlacrittyVsGridHistory {
         timestamp: DateTime<Utc>,
@@ -197,7 +197,7 @@ pub enum DebugEvent {
         /// Sample of differences (first 5)
         difference_samples: Vec<String>,
     },
-    
+
     #[serde(rename = "alacritty_grid_dump")]
     AlacrittyGridDump {
         timestamp: DateTime<Utc>,
@@ -208,13 +208,13 @@ pub enum DebugEvent {
         /// Total blank line count
         blank_line_count: usize,
     },
-    
+
     #[serde(rename = "comment")]
     Comment {
         timestamp: DateTime<Utc>,
         text: String,
     },
-    
+
     #[serde(rename = "grid_delta_application")]
     GridDeltaApplication {
         timestamp: DateTime<Utc>,
@@ -245,7 +245,7 @@ pub enum DebugEvent {
         /// Sample of content after (first few lines)
         content_after: Vec<String>,
     },
-    
+
     #[serde(rename = "snapshot_comparison")]
     SnapshotComparison {
         timestamp: DateTime<Utc>,
@@ -300,14 +300,14 @@ pub enum DebugEvent {
         before_lines: Vec<(u16, String)>,
         after_lines: Vec<(u16, String)>,
     },
-    
+
     // Scrollback debugging events
     #[serde(rename = "history_lookup_requested")]
     HistoryLookupRequested {
         timestamp: DateTime<Utc>,
         requested_line: u64,
     },
-    
+
     #[serde(rename = "history_lookup_candidate")]
     HistoryLookupCandidate {
         timestamp: DateTime<Utc>,
@@ -316,7 +316,7 @@ pub enum DebugEvent {
         snapshot_end_line: u64,
         contains_line: bool,
     },
-    
+
     #[serde(rename = "history_reconstruct_end")]
     HistoryReconstructEnd {
         timestamp: DateTime<Utc>,
@@ -326,7 +326,7 @@ pub enum DebugEvent {
         result_end_line: Option<u64>,
         result_blank_count: Option<usize>,
     },
-    
+
     #[serde(rename = "reconstruction_path")]
     ReconstructionPath {
         timestamp: DateTime<Utc>,
@@ -335,14 +335,14 @@ pub enum DebugEvent {
         deltas_applied: usize,
         final_line: u64,
     },
-    
+
     #[serde(rename = "historical_view_requested")]
     HistoricalViewRequested {
         timestamp: DateTime<Utc>,
         requested_line: u64,
         height: u16,
     },
-    
+
     #[serde(rename = "historical_view_returned")]
     HistoricalViewReturned {
         timestamp: DateTime<Utc>,
@@ -352,7 +352,7 @@ pub enum DebugEvent {
         blank_lines: usize,
         sample_content: Vec<String>,
     },
-    
+
     #[serde(rename = "snapshot_with_view_request")]
     SnapshotWithViewRequest {
         timestamp: DateTime<Utc>,
@@ -361,7 +361,7 @@ pub enum DebugEvent {
         position_time: Option<i64>,
         dimensions: (u16, u16),
     },
-    
+
     #[serde(rename = "snapshot_with_view_response")]
     SnapshotWithViewResponse {
         timestamp: DateTime<Utc>,
@@ -371,7 +371,7 @@ pub enum DebugEvent {
         result_blank_count: usize,
         sample_content: Vec<String>,
     },
-    
+
     #[serde(rename = "modify_subscription_received")]
     ModifySubscriptionReceived {
         timestamp: DateTime<Utc>,
@@ -379,7 +379,7 @@ pub enum DebugEvent {
         mode: String,
         position: Option<String>,
     },
-    
+
     // Client scrollback events
     #[serde(rename = "client_scroll_event")]
     ClientScrollEvent {
@@ -391,7 +391,7 @@ pub enum DebugEvent {
         /// View line if in historical mode
         view_line: Option<u64>,
     },
-    
+
     #[serde(rename = "client_history_needs_check")]
     ClientHistoryNeedsCheck {
         timestamp: DateTime<Utc>,
@@ -404,7 +404,7 @@ pub enum DebugEvent {
         /// History request generated
         request: Option<(u64, u64)>,
     },
-    
+
     #[serde(rename = "client_history_request_sent")]
     ClientHistoryRequestSent {
         timestamp: DateTime<Utc>,
@@ -415,7 +415,7 @@ pub enum DebugEvent {
         /// End line for historical request
         end_line: Option<u64>,
     },
-    
+
     #[serde(rename = "modify_subscription_processed")]
     ModifySubscriptionProcessed {
         timestamp: DateTime<Utc>,
@@ -437,8 +437,13 @@ impl DebugRecorder {
         let writer = BufWriter::new(file);
         Ok(Self { writer })
     }
-    
-    pub fn record_grid_bottom_context(&mut self, context: &str, grid: &Grid, last_n: u16) -> Result<()> {
+
+    pub fn record_grid_bottom_context(
+        &mut self,
+        context: &str,
+        grid: &Grid,
+        last_n: u16,
+    ) -> Result<()> {
         // Compute trailing blank rows
         let mut trailing_blank_count = 0usize;
         for row in (0..grid.height).rev() {
@@ -523,22 +528,27 @@ impl DebugRecorder {
         self.writer.flush()?;
         Ok(())
     }
-    
+
     pub fn record_client_message(&mut self, msg: &ClientMessage) -> Result<()> {
         self.record_event(DebugEvent::ClientMessage {
             timestamp: Utc::now(),
             message: msg.clone(),
         })
     }
-    
+
     pub fn record_server_message(&mut self, msg: &ServerMessage) -> Result<()> {
         self.record_event(DebugEvent::ServerMessage {
             timestamp: Utc::now(),
             message: msg.clone(),
         })
     }
-    
-    pub fn record_client_grid_state(&mut self, grid: &Grid, scroll_offset: i64, view_mode: &str) -> Result<()> {
+
+    pub fn record_client_grid_state(
+        &mut self,
+        grid: &Grid,
+        scroll_offset: i64,
+        view_mode: &str,
+    ) -> Result<()> {
         self.record_event(DebugEvent::ClientGridState {
             timestamp: Utc::now(),
             grid: grid.clone(),
@@ -546,16 +556,25 @@ impl DebugRecorder {
             view_mode: view_mode.to_string(),
         })
     }
-    
-    pub fn record_server_backend_state(&mut self, grid: &Grid, cursor_pos: (u16, u16)) -> Result<()> {
+
+    pub fn record_server_backend_state(
+        &mut self,
+        grid: &Grid,
+        cursor_pos: (u16, u16),
+    ) -> Result<()> {
         self.record_event(DebugEvent::ServerBackendState {
             timestamp: Utc::now(),
             grid: grid.clone(),
             cursor_pos,
         })
     }
-    
-    pub fn record_server_subscription_view(&mut self, subscription_id: &str, grid: &Grid, view_mode: &str) -> Result<()> {
+
+    pub fn record_server_subscription_view(
+        &mut self,
+        subscription_id: &str,
+        grid: &Grid,
+        view_mode: &str,
+    ) -> Result<()> {
         self.record_event(DebugEvent::ServerSubscriptionView {
             timestamp: Utc::now(),
             subscription_id: subscription_id.to_string(),
@@ -563,13 +582,13 @@ impl DebugRecorder {
             view_mode: view_mode.to_string(),
         })
     }
-    
+
     pub fn record_pty_output(&mut self, bytes: &[u8]) -> Result<()> {
         // Create readable representation showing escape sequences
         let mut readable = String::new();
         for &byte in bytes {
             match byte {
-                0x1B => readable.push_str("\\x1B"),  // ESC
+                0x1B => readable.push_str("\\x1B"), // ESC
                 b'\n' => readable.push_str("\\n"),
                 b'\r' => readable.push_str("\\r"),
                 b'\t' => readable.push_str("\\t"),
@@ -577,15 +596,20 @@ impl DebugRecorder {
                 _ => readable.push(byte as char),
             }
         }
-        
+
         self.record_event(DebugEvent::ServerPtyOutput {
             timestamp: Utc::now(),
             bytes: bytes.to_vec(),
             readable,
         })
     }
-    
-    pub fn record_alacritty_state(&mut self, dimensions: (u16, u16), content_sample: Vec<String>, blank_count: usize) -> Result<()> {
+
+    pub fn record_alacritty_state(
+        &mut self,
+        dimensions: (u16, u16),
+        content_sample: Vec<String>,
+        blank_count: usize,
+    ) -> Result<()> {
         self.record_event(DebugEvent::ServerAlacrittyState {
             timestamp: Utc::now(),
             dimensions,
@@ -593,22 +617,22 @@ impl DebugRecorder {
             blank_line_count: blank_count,
         })
     }
-    
+
     pub fn record_comment(&mut self, text: &str) -> Result<()> {
         self.record_event(DebugEvent::Comment {
             timestamp: Utc::now(),
             text: text.to_string(),
         })
     }
-    
+
     pub fn record_process_output_call(&mut self, sequence: u64, data: &[u8]) -> Result<()> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        
+
         let mut hasher = DefaultHasher::new();
         data.hash(&mut hasher);
         let hash = hasher.finish();
-        
+
         // Create preview (first 50 chars)
         let mut preview = String::new();
         for &byte in data.iter().take(50) {
@@ -624,7 +648,7 @@ impl DebugRecorder {
         if data.len() > 50 {
             preview.push_str("...");
         }
-        
+
         self.record_event(DebugEvent::ProcessOutputCall {
             timestamp: Utc::now(),
             sequence,
@@ -633,8 +657,13 @@ impl DebugRecorder {
             preview,
         })
     }
-    
-    pub fn record_newline_conversion(&mut self, original: &[u8], converted: &[u8], conversions: usize) -> Result<()> {
+
+    pub fn record_newline_conversion(
+        &mut self,
+        original: &[u8],
+        converted: &[u8],
+        conversions: usize,
+    ) -> Result<()> {
         self.record_event(DebugEvent::NewlineConversion {
             timestamp: Utc::now(),
             original: original.to_vec(),
@@ -642,26 +671,36 @@ impl DebugRecorder {
             conversions_count: conversions,
         })
     }
-    
-    pub fn record_grid_before_after(&mut self, before: &crate::server::terminal_state::Grid, after: &crate::server::terminal_state::Grid) -> Result<()> {
+
+    pub fn record_grid_before_after(
+        &mut self,
+        before: &crate::server::terminal_state::Grid,
+        after: &crate::server::terminal_state::Grid,
+    ) -> Result<()> {
         let mut changed_lines = Vec::new();
         let mut new_blank_lines = Vec::new();
-        
+
         for row in 0..after.height.min(before.height) {
             let before_empty = (0..before.width).all(|col| {
-                before.get_cell(row, col).map(|c| c.char == ' ' || c.char == '\0').unwrap_or(true)
+                before
+                    .get_cell(row, col)
+                    .map(|c| c.char == ' ' || c.char == '\0')
+                    .unwrap_or(true)
             });
             let after_empty = (0..after.width).all(|col| {
-                after.get_cell(row, col).map(|c| c.char == ' ' || c.char == '\0').unwrap_or(true)
+                after
+                    .get_cell(row, col)
+                    .map(|c| c.char == ' ' || c.char == '\0')
+                    .unwrap_or(true)
             });
-            
+
             // Check if line changed
             let changed = (0..before.width.min(after.width)).any(|col| {
                 let before_cell = before.get_cell(row, col);
                 let after_cell = after.get_cell(row, col);
                 before_cell != after_cell
             });
-            
+
             if changed {
                 changed_lines.push(row);
             }
@@ -669,7 +708,7 @@ impl DebugRecorder {
                 new_blank_lines.push(row);
             }
         }
-        
+
         self.record_event(DebugEvent::GridBeforeAfter {
             timestamp: Utc::now(),
             before_dims: (before.width, before.height),
@@ -678,15 +717,20 @@ impl DebugRecorder {
             new_blank_lines,
         })
     }
-    
-    pub fn record_pty_read_chunk(&mut self, sequence: u64, data: &[u8], is_duplicate: bool) -> Result<()> {
+
+    pub fn record_pty_read_chunk(
+        &mut self,
+        sequence: u64,
+        data: &[u8],
+        is_duplicate: bool,
+    ) -> Result<()> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        
+
         let mut hasher = DefaultHasher::new();
         data.hash(&mut hasher);
         let hash = hasher.finish();
-        
+
         self.record_event(DebugEvent::PtyReadChunk {
             timestamp: Utc::now(),
             sequence,
@@ -695,21 +739,16 @@ impl DebugRecorder {
             is_duplicate,
         })
     }
-    
-    pub fn record_snapshot_transformation(&mut self,
-        stage: &str,
-        grid: &Grid
-    ) -> Result<()> {
+
+    pub fn record_snapshot_transformation(&mut self, stage: &str, grid: &Grid) -> Result<()> {
         let mut blank_lines = Vec::new();
         let mut content_sample = Vec::new();
-        
+
         for row in 0..grid.height.min(10) {
-            let line_content: String = (0..grid.width).map(|col| {
-                grid.get_cell(row, col)
-                    .map(|c| c.char)
-                    .unwrap_or(' ')
-            }).collect();
-            
+            let line_content: String = (0..grid.width)
+                .map(|col| grid.get_cell(row, col).map(|c| c.char).unwrap_or(' '))
+                .collect();
+
             let trimmed = line_content.trim_end();
             if trimmed.is_empty() {
                 blank_lines.push(row);
@@ -718,7 +757,7 @@ impl DebugRecorder {
                 content_sample.push(format!("Row {}: {}", row, trimmed));
             }
         }
-        
+
         self.record_event(DebugEvent::SnapshotTransformation {
             timestamp: Utc::now(),
             stage: stage.to_string(),
@@ -727,40 +766,35 @@ impl DebugRecorder {
             content_sample,
         })
     }
-    
-    pub fn record_server_subscription_snapshot(&mut self, 
+
+    pub fn record_server_subscription_snapshot(
+        &mut self,
         subscription_id: &str,
         sequence: u64,
-        grid: &Grid
+        grid: &Grid,
     ) -> Result<()> {
         let mut non_blank_lines = Vec::new();
         let mut blank_count = 0;
         let mut content_sample = Vec::new();
-        
+
         for row in 0..grid.height {
-            let line_content: String = (0..grid.width).map(|col| {
-                grid.get_cell(row, col)
-                    .map(|c| c.char)
-                    .unwrap_or(' ')
-            }).collect();
-            
+            let line_content: String = (0..grid.width)
+                .map(|col| grid.get_cell(row, col).map(|c| c.char).unwrap_or(' '))
+                .collect();
+
             let trimmed = line_content.trim_end();
             if trimmed.is_empty() {
                 blank_count += 1;
                 // For debugging blank line issue, show blank lines near content
                 if row > 0 && row < grid.height - 1 {
                     // Check if there's content nearby
-                    let prev_line: String = (0..grid.width).map(|col| {
-                        grid.get_cell(row - 1, col)
-                            .map(|c| c.char)
-                            .unwrap_or(' ')
-                    }).collect();
-                    let next_line: String = (0..grid.width).map(|col| {
-                        grid.get_cell(row + 1, col)
-                            .map(|c| c.char)
-                            .unwrap_or(' ')
-                    }).collect();
-                    
+                    let prev_line: String = (0..grid.width)
+                        .map(|col| grid.get_cell(row - 1, col).map(|c| c.char).unwrap_or(' '))
+                        .collect();
+                    let next_line: String = (0..grid.width)
+                        .map(|col| grid.get_cell(row + 1, col).map(|c| c.char).unwrap_or(' '))
+                        .collect();
+
                     if !prev_line.trim_end().is_empty() || !next_line.trim_end().is_empty() {
                         // This blank line is between content
                         if content_sample.len() < 20 {
@@ -775,7 +809,7 @@ impl DebugRecorder {
                 }
             }
         }
-        
+
         self.record_event(DebugEvent::ServerSubscriptionSnapshot {
             timestamp: Utc::now(),
             subscription_id: subscription_id.to_string(),
@@ -787,18 +821,16 @@ impl DebugRecorder {
             cursor_info: Some((grid.cursor.row, grid.cursor.col, grid.cursor.visible)),
         })
     }
-    
+
     pub fn record_alacritty_grid_dump(&mut self, grid: &Grid) -> Result<()> {
         let mut non_blank_lines = Vec::new();
         let mut blank_count = 0;
-        
+
         for row in 0..grid.height {
-            let line_content: String = (0..grid.width).map(|col| {
-                grid.get_cell(row, col)
-                    .map(|c| c.char)
-                    .unwrap_or(' ')
-            }).collect();
-            
+            let line_content: String = (0..grid.width)
+                .map(|col| grid.get_cell(row, col).map(|c| c.char).unwrap_or(' '))
+                .collect();
+
             let trimmed = line_content.trim_end();
             if trimmed.is_empty() {
                 blank_count += 1;
@@ -806,7 +838,7 @@ impl DebugRecorder {
                 non_blank_lines.push((row, trimmed.to_string()));
             }
         }
-        
+
         self.record_event(DebugEvent::AlacrittyGridDump {
             timestamp: Utc::now(),
             dimensions: (grid.width, grid.height),
@@ -814,54 +846,67 @@ impl DebugRecorder {
             blank_line_count: blank_count,
         })
     }
-    
-    pub fn record_alacritty_vs_gridhistory(&mut self, 
+
+    pub fn record_alacritty_vs_gridhistory(
+        &mut self,
         alacritty_grid: &Grid,
-        gridhistory_grid: &Grid
+        gridhistory_grid: &Grid,
     ) -> Result<()> {
         // Count blank lines in each grid
-        let alacritty_blank = (0..alacritty_grid.height).filter(|&row| {
-            (0..alacritty_grid.width).all(|col| {
-                alacritty_grid.get_cell(row, col)
-                    .map(|c| c.char == ' ' || c.char == '\0')
-                    .unwrap_or(true)
+        let alacritty_blank = (0..alacritty_grid.height)
+            .filter(|&row| {
+                (0..alacritty_grid.width).all(|col| {
+                    alacritty_grid
+                        .get_cell(row, col)
+                        .map(|c| c.char == ' ' || c.char == '\0')
+                        .unwrap_or(true)
+                })
             })
-        }).count();
-        
-        let gridhistory_blank = (0..gridhistory_grid.height).filter(|&row| {
-            (0..gridhistory_grid.width).all(|col| {
-                gridhistory_grid.get_cell(row, col)
-                    .map(|c| c.char == ' ' || c.char == '\0')
-                    .unwrap_or(true)
+            .count();
+
+        let gridhistory_blank = (0..gridhistory_grid.height)
+            .filter(|&row| {
+                (0..gridhistory_grid.width).all(|col| {
+                    gridhistory_grid
+                        .get_cell(row, col)
+                        .map(|c| c.char == ' ' || c.char == '\0')
+                        .unwrap_or(true)
+                })
             })
-        }).count();
-        
+            .count();
+
         // Find differing lines
         let mut differing_lines = Vec::new();
         let mut difference_samples = Vec::new();
-        
+
         let max_rows = alacritty_grid.height.max(gridhistory_grid.height);
         for row in 0..max_rows {
             let alac_line = if row < alacritty_grid.height {
-                (0..alacritty_grid.width).map(|col| {
-                    alacritty_grid.get_cell(row, col)
-                        .map(|c| c.char)
-                        .unwrap_or(' ')
-                }).collect::<String>()
+                (0..alacritty_grid.width)
+                    .map(|col| {
+                        alacritty_grid
+                            .get_cell(row, col)
+                            .map(|c| c.char)
+                            .unwrap_or(' ')
+                    })
+                    .collect::<String>()
             } else {
                 String::new()
             };
-            
+
             let gh_line = if row < gridhistory_grid.height {
-                (0..gridhistory_grid.width).map(|col| {
-                    gridhistory_grid.get_cell(row, col)
-                        .map(|c| c.char)
-                        .unwrap_or(' ')
-                }).collect::<String>()
+                (0..gridhistory_grid.width)
+                    .map(|col| {
+                        gridhistory_grid
+                            .get_cell(row, col)
+                            .map(|c| c.char)
+                            .unwrap_or(' ')
+                    })
+                    .collect::<String>()
             } else {
                 String::new()
             };
-            
+
             if alac_line.trim_end() != gh_line.trim_end() {
                 differing_lines.push(row);
                 if difference_samples.len() < 5 {
@@ -874,7 +919,7 @@ impl DebugRecorder {
                 }
             }
         }
-        
+
         self.record_event(DebugEvent::AlacrittyVsGridHistory {
             timestamp: Utc::now(),
             alacritty_dims: (alacritty_grid.width, alacritty_grid.height),

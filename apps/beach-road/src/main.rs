@@ -14,13 +14,16 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{info, error};
+use tracing::{error, info};
 use tracing_subscriber;
 
 use crate::{
     cli::{Cli, Commands},
     config::Config,
-    handlers::{get_session_status, health_check, join_session, register_session, SharedStorage},
+    handlers::{
+        get_session_status, get_webrtc_answer, get_webrtc_offer, health_check, join_session,
+        post_webrtc_answer, post_webrtc_offer, register_session, SharedStorage,
+    },
     storage::Storage,
     websocket::{websocket_handler, SignalingState},
 };
@@ -37,16 +40,21 @@ async fn main() {
 
     // Parse CLI arguments
     let cli = Cli::parse();
-    
+
     // Check if running as debug client
-    if let Some(Commands::Debug { url, session, command }) = cli.command {
+    if let Some(Commands::Debug {
+        url,
+        session,
+        command,
+    }) = cli.command
+    {
         if let Err(e) = cli::run_debug_client(url, session, command).await {
             error!("Debug client error: {}", e);
             std::process::exit(1);
         }
         return;
     }
-    
+
     // Otherwise, run as server
     // Load configuration
     let config = Config::from_env();
@@ -74,12 +82,20 @@ async fn main() {
         .route("/sessions", post(register_session))
         .route("/sessions/:id", get(get_session_status))
         .route("/sessions/:id/join", post(join_session))
+        .route(
+            "/sessions/:id/webrtc/offer",
+            get(get_webrtc_offer).post(post_webrtc_offer),
+        )
+        .route(
+            "/sessions/:id/webrtc/answer",
+            get(get_webrtc_answer).post(post_webrtc_answer),
+        )
         .with_state(shared_storage);
-    
+
     let ws_routes = Router::new()
         .route("/ws/:session_id", get(websocket_handler))
         .with_state(signaling_state);
-    
+
     let app = Router::new()
         .merge(http_routes)
         .merge(ws_routes)
@@ -93,7 +109,7 @@ async fn main() {
         .expect("Failed to bind to address");
 
     info!("Beach Road listening on {}", addr);
-    
+
     // Always print to stdout so users know the server is ready
     println!("🏖️  Beach Road listening on {}", addr);
 

@@ -1,6 +1,6 @@
-use portable_pty::{CommandBuilder, PtySize, native_pty_system, Child, PtyPair};
-use std::sync::{Arc, Mutex};
 use anyhow::Result;
+use portable_pty::{Child, CommandBuilder, PtyPair, PtySize, native_pty_system};
+use std::sync::{Arc, Mutex};
 
 /// Manages PTY lifecycle and operations
 #[derive(Clone)]
@@ -25,23 +25,23 @@ impl PtyManager {
     pub fn init(&self, pty_size: PtySize, cmd: CommandBuilder) -> Result<()> {
         // Create PTY system
         let pty_system = native_pty_system();
-        
+
         // Create PTY pair with size
         let pty_pair = pty_system.openpty(pty_size)?;
-        
+
         // Spawn the command in the PTY
         let child = pty_pair.slave.spawn_command(cmd)?;
-        
+
         // Get reader and writer from master
         let master_reader = pty_pair.master.try_clone_reader()?;
         let master_writer = pty_pair.master.take_writer()?;
-        
+
         // Store everything
         *self.child.lock().unwrap() = Some(child);
         *self.pty_pair.lock().unwrap() = Some(pty_pair);
         *self.master_writer.lock().unwrap() = Some(master_writer);
         *self.master_reader.lock().unwrap() = Some(master_reader);
-        
+
         Ok(())
     }
 
@@ -81,7 +81,7 @@ impl PtyManager {
             let _ = child.kill();
             let _ = child.wait();
         }
-        
+
         // Clear all resources
         *self.pty_pair.lock().unwrap() = None;
         *self.master_writer.lock().unwrap() = None;

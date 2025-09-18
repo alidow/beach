@@ -1,4 +1,4 @@
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// Generate a new session ID
@@ -35,7 +35,7 @@ mod tests {
         let passphrase = "test_passphrase";
         let hash1 = hash_passphrase(passphrase);
         let hash2 = hash_passphrase(passphrase);
-        
+
         assert_eq!(hash1, hash2);
         assert_ne!(hash1, passphrase);
     }
@@ -44,7 +44,7 @@ mod tests {
     fn test_passphrase_verification() {
         let passphrase = "correct_pass";
         let hash = hash_passphrase(passphrase);
-        
+
         assert!(verify_passphrase("correct_pass", &hash));
         assert!(!verify_passphrase("wrong_pass", &hash));
     }

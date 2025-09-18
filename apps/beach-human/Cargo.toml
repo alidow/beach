@@ -4,3 +4,31 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "process"] }
+webrtc = "0.13"
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+url = "2"
+once_cell = "1.19"
+bytes = "1"
+bincode = "1"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+rand = "0.8"
+uuid = { version = "1", features = ["v4"] }
+serde_json = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+portable-pty = "0.8"
+crossterm = "0.28"
+base64 = "0.21"
+ratatui = "0.28"
+copypasta = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-appender = "0.2"
+
+[dev-dependencies]
+hyper = { version = "0.14", features = ["server"] }

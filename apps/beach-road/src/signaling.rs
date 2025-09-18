@@ -1,6 +1,6 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
 
 /// Supported P2P transport types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -8,8 +8,8 @@ use chrono::{DateTime, Utc};
 pub enum TransportType {
     WebRTC,
     WebTransport,
-    Direct,  // Direct TCP/UDP connection
-    Custom(String),  // For future extensions
+    Direct,         // Direct TCP/UDP connection
+    Custom(String), // For future extensions
 }
 
 /// Transport-specific signaling data
@@ -47,9 +47,17 @@ pub enum TransportSignal {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "signal_type", rename_all = "snake_case")]
 pub enum WebRTCSignal {
-    Offer { sdp: String },
-    Answer { sdp: String },
-    IceCandidate { candidate: String, sdp_mid: Option<String>, sdp_mline_index: Option<u32> },
+    Offer {
+        sdp: String,
+    },
+    Answer {
+        sdp: String,
+    },
+    IceCandidate {
+        candidate: String,
+        sdp_mid: Option<String>,
+        sdp_mline_index: Option<u32>,
+    },
 }
 
 /// WebTransport-specific signaling messages
@@ -99,9 +107,7 @@ pub enum ClientMessage {
     /// Heartbeat to keep connection alive
     Ping,
     /// Debug request for terminal state
-    Debug {
-        request: DebugRequest,
-    },
+    Debug { request: DebugRequest },
 }
 
 /// Messages sent from session server to client
@@ -117,17 +123,11 @@ pub enum ServerMessage {
         available_transports: Vec<TransportType>,
     },
     /// Join failed
-    JoinError {
-        reason: String,
-    },
+    JoinError { reason: String },
     /// New peer joined the session
-    PeerJoined {
-        peer: PeerInfo,
-    },
+    PeerJoined { peer: PeerInfo },
     /// Peer left the session
-    PeerLeft {
-        peer_id: String,
-    },
+    PeerLeft { peer_id: String },
     /// Transport negotiation request from another peer
     TransportProposal {
         from_peer: String,
@@ -146,13 +146,9 @@ pub enum ServerMessage {
     /// Response to ping
     Pong,
     /// Error message
-    Error {
-        message: String,
-    },
+    Error { message: String },
     /// Debug response with terminal state
-    Debug {
-        response: DebugResponse,
-    },
+    Debug { response: DebugResponse },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,11 +226,7 @@ pub enum DebugResponse {
         session_duration_secs: u64,
     },
     /// Success response
-    Success {
-        message: String,
-    },
+    Success { message: String },
     /// Error response
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }

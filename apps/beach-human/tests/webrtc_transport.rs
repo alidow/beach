@@ -9,7 +9,7 @@ use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::time::{Instant, sleep};
-use tracing_subscriber::fmt::SubscriberBuilder;
+use tracing_subscriber::{EnvFilter, fmt::SubscriberBuilder};
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 
 fn payload_text(message: TransportMessage) -> Option<String> {
@@ -44,7 +44,11 @@ async fn recv_with_timeout(transport: &Box<dyn Transport>, timeout: Duration) ->
 
 #[tokio::test]
 async fn webrtc_bidirectional_transport_delivers_messages() {
-    let _ = SubscriberBuilder::default().with_test_writer().try_init();
+    let _ = SubscriberBuilder::default()
+        .with_test_writer()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_max_level(tracing::Level::TRACE)
+        .try_init();
     let pair = create_test_pair().await.expect("create webrtc pair");
     let client = pair.client;
     let server = pair.server;

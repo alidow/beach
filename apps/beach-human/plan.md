@@ -41,6 +41,33 @@ This document tracks the remaining milestones for the new `beach-human` stack. E
 - Capture keystroke-to-render timings, steady-state frame cadence, and bandwidth utilisation, exporting CSV summaries.
 - Integrate with `BEACH_HUMAN_PROFILE=1` so emulator/sync timings feed the benchmark reports.
 
+## ✅ 7. Immediate Performance Optimisations
+
+- Server diff pipeline now batches row segments and coalesces frames per transport.
+- Client records render-to-paint latency and avoids redundant redraws.
+- Vim benchmark regressions cleared; keep running perf harnesses to guard the ≥30 % latency win target.
+
+## 🚧 8. Full Tmux Parity (Next Priority)
+
+### 8a. Scrollback Capture & Sync
+- **Server**: re-enable Alacritty scrollback (currently forced to `0` in `server/terminal/emulator.rs`) and persist scrolled-off rows into a history buffer (`TerminalGrid` should freeze/archive rows instead of discarding them).
+- **Sync layer**: expose the archived rows through a dedicated history lane so clients can request/backfill them.
+- **Client renderer**: allow paging through the expanded history while preserving viewport/follow-tail behaviour.
+- **Validation**: add transcript-driven tests comparing tmux vs. beach snapshots after long outputs (e.g. 150-line loops).
+
+### 8b. Copy/Scroll UX polish
+- Solidify tmux-style prefix handling (`Ctrl-B` window) and vi/emacs bindings in copy-mode, matching tmux’s expectations for start/stop selection, yank, and exit.
+- Ensure selection and cursor overlays match tmux visuals (preserve cell color, only tint background/underline as tmux does).
+- Guarantee scrollback navigation mirrors tmux: `PgUp/PgDn`, `Ctrl-B PgUp`, mouse wheel (if/when supported).
+
+### 8c. Clipboard & Input Fidelity
+- Keep the system clipboard integration (done) and mirror tmux’s paste buffers; flesh out tests for `Ctrl-B ]`, multi-line paste, and Windows/macOS modifier quirks.
+- Map tmux’s default key tables (vi/emacs) so users can opt-in via config; document the bindings in `docs/tmux-parity.md`.
+
+### 8d. Regression Tests & Docs
+- Expand `tests/client_transcripts.rs` with tmux-reference fixtures for scrollback/copy-mode scenarios.
+- Record the gap analysis and how to refresh fixtures in `docs/tmux-parity.md` so future agents can extend parity.
+
 ---
 
 ## Client Runtime Testing Plan

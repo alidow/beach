@@ -12,6 +12,15 @@ static PERF_ENABLED: Lazy<bool> = Lazy::new(|| {
 static STATS: Lazy<Mutex<HashMap<&'static str, PerfStat>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+static GAUGES: Lazy<Mutex<HashMap<&'static str, GaugeStat>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Default)]
+struct GaugeStat {
+    last: u64,
+    samples: u64,
+}
+
 #[derive(Default)]
 struct PerfStat {
     total_ns: u128,
@@ -38,6 +47,22 @@ pub fn record_duration(label: &'static str, duration: Duration) {
     }
     if entry.count % 200 == 0 {
         print_stat(label, entry);
+    }
+}
+
+pub fn record_gauge(label: &'static str, value: u64) {
+    if !enabled() {
+        return;
+    }
+    let mut gauges = GAUGES.lock().unwrap();
+    let entry = gauges.entry(label).or_default();
+    entry.last = value;
+    entry.samples = entry.samples.saturating_add(1);
+    if entry.samples % 200 == 0 {
+        eprintln!(
+            "[perf] {label}: gauge={} samples={}",
+            entry.last, entry.samples
+        );
     }
 }
 
@@ -120,7 +145,6 @@ pub mod logging {
                 LogLevel::Trace => LevelFilter::TRACE,
             }
         }
-
     }
 
     impl Default for LogLevel {

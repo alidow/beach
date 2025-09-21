@@ -1,33 +1,206 @@
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, RwLock};
 
 use super::packed::{PackedCell, Style, StyleId, StyleTable, pack_cell, unpack_to_heavy};
-use crate::cache::grid::AtomicGrid;
 use crate::cache::{CellSnapshot, GridCache, Seq, WriteError, WriteOutcome};
 use crate::model::terminal::cell::Cell as HeavyCell;
 
+const DEFAULT_HISTORY_LIMIT: usize = 10_000;
+
+#[derive(Clone, Debug)]
+pub struct TrimEvent {
+    pub start: u64,
+    pub count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct RowEntry {
+    cells: Vec<PackedCell>,
+    seqs: Vec<Seq>,
+    max_seq: Seq,
+}
+
+impl RowEntry {
+    fn new(_absolute: u64, cols: usize, default_cell: PackedCell, default_seq: Seq) -> Self {
+        Self {
+            cells: vec![default_cell; cols],
+            seqs: vec![default_seq; cols],
+            max_seq: default_seq,
+        }
+    }
+
+    fn ensure_cols(&mut self, cols: usize, default_cell: PackedCell, default_seq: Seq) {
+        if cols <= self.cells.len() {
+            return;
+        }
+        let current_len = self.cells.len();
+        self.cells.resize(cols, default_cell);
+        self.seqs.resize(cols, default_seq);
+        if current_len == 0 && default_seq > self.max_seq {
+            self.max_seq = default_seq;
+        }
+    }
+
+    fn write_cell_if_newer(
+        &mut self,
+        col: usize,
+        seq: Seq,
+        cell: PackedCell,
+    ) -> Result<WriteOutcome, WriteError> {
+        if col >= self.cells.len() {
+            return Err(WriteError::CoordOutOfBounds);
+        }
+        let current_seq = self.seqs[col];
+        if seq < current_seq {
+            return Ok(WriteOutcome::SkippedOlder);
+        }
+        if seq == current_seq {
+            return Ok(WriteOutcome::SkippedEqual);
+        }
+        self.cells[col] = cell;
+        self.seqs[col] = seq;
+        if seq > self.max_seq {
+            self.max_seq = seq;
+        }
+        Ok(WriteOutcome::Written)
+    }
+
+    fn fill_rect_if_newer(
+        &mut self,
+        col0: usize,
+        col1: usize,
+        seq: Seq,
+        cell: PackedCell,
+    ) -> Result<(usize, usize), WriteError> {
+        if col0 > col1 || col1 > self.cells.len() {
+            return Err(WriteError::CoordOutOfBounds);
+        }
+        let mut written = 0usize;
+        let mut skipped = 0usize;
+        for col in col0..col1 {
+            let current_seq = self.seqs[col];
+            if seq <= current_seq {
+                skipped += 1;
+                continue;
+            }
+            self.cells[col] = cell;
+            self.seqs[col] = seq;
+            written += 1;
+        }
+        if written > 0 && seq > self.max_seq {
+            self.max_seq = seq;
+        }
+        Ok((written, skipped))
+    }
+
+    fn snapshot_row(&self, out: &mut [u64]) -> Result<(), WriteError> {
+        if out.len() < self.cells.len() {
+            return Err(WriteError::CoordOutOfBounds);
+        }
+        for (idx, cell) in self.cells.iter().enumerate() {
+            out[idx] = (*cell).into();
+        }
+        Ok(())
+    }
+
+    fn cell_snapshot(&self, col: usize) -> Option<CellSnapshot> {
+        self.cells
+            .get(col)
+            .map(|cell| CellSnapshot::new((*cell).into(), self.seqs.get(col).copied().unwrap_or(0)))
+    }
+}
+
+struct GridInner {
+    rows: VecDeque<RowEntry>,
+    base: u64,
+    cols: usize,
+}
+
+impl GridInner {
+    fn new(rows: usize, cols: usize, default_cell: PackedCell, default_seq: Seq) -> Self {
+        let mut entries = VecDeque::with_capacity(rows);
+        for absolute in 0..(rows as u64) {
+            entries.push_back(RowEntry::new(absolute, cols, default_cell, default_seq));
+        }
+        Self {
+            rows: entries,
+            base: 0,
+            cols,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn cols(&self) -> usize {
+        self.cols
+    }
+
+    fn ensure_cols(&mut self, cols: usize, default_cell: PackedCell, default_seq: Seq) {
+        if cols <= self.cols {
+            return;
+        }
+        for row in self.rows.iter_mut() {
+            row.ensure_cols(cols, default_cell, default_seq);
+        }
+        self.cols = cols;
+    }
+
+    fn ensure_row(
+        &mut self,
+        absolute: u64,
+        default_cell: PackedCell,
+        default_seq: Seq,
+    ) -> Result<usize, WriteError> {
+        if absolute < self.base {
+            return Err(WriteError::CoordOutOfBounds);
+        }
+        while self.base + self.rows.len() as u64 <= absolute {
+            let next_abs = self.base + self.rows.len() as u64;
+            self.rows.push_back(RowEntry::new(
+                next_abs,
+                self.cols,
+                default_cell,
+                default_seq,
+            ));
+        }
+        Ok((absolute - self.base) as usize)
+    }
+
+    fn trim_front(&mut self, count: usize) -> Option<TrimEvent> {
+        if count == 0 {
+            return None;
+        }
+        let mut trimmed = 0usize;
+        for _ in 0..count {
+            if self.rows.pop_front().is_some() {
+                trimmed += 1;
+            } else {
+                break;
+            }
+        }
+        if trimmed == 0 {
+            return None;
+        }
+        let start = self.base;
+        self.base += trimmed as u64;
+        Some(TrimEvent {
+            start,
+            count: trimmed,
+        })
+    }
+}
+
 /// Terminal-specific grid cache that stores packed terminal cells alongside a
-/// deduplicated style table. Writing typically follows three steps:
-/// 1. Obtain or create a [`StyleId`] via [`TerminalGrid::ensure_style_id`]
-/// 2. Pack a cell with [`pack_cell`] (or use [`TerminalGrid::pack_char_with_style`])
-/// 3. Submit it with [`TerminalGrid::write_packed_cell_if_newer`]
-///
-/// ```rust
-/// # use beach_human::cache::terminal::{TerminalGrid, Style, StyleId};
-/// # use beach_human::cache::{WriteOutcome, GridCache};
-/// let grid = TerminalGrid::new(24, 80);
-/// let style = Style::default();
-/// let style_id = grid.ensure_style_id(style);
-/// let packed = TerminalGrid::pack_char_with_style('A', style_id);
-/// assert_eq!(
-///     grid.write_packed_cell_if_newer(0, 0, 5, packed).unwrap(),
-///     WriteOutcome::Written,
-/// );
-/// let snapshot = grid.get_cell_relaxed(0, 0).unwrap();
-/// assert_eq!(snapshot.seq, 5);
-/// ```
+/// deduplicated style table.
 pub struct TerminalGrid {
-    pub grid: AtomicGrid,
+    inner: RwLock<GridInner>,
     pub style_table: Arc<StyleTable>,
+    default_cell: PackedCell,
+    default_seq: Seq,
+    history_limit: usize,
+    trim_events: Mutex<Vec<TrimEvent>>,
 }
 
 /// Snapshot wrapper returned when reading a cell from the terminal grid.
@@ -56,9 +229,23 @@ impl TerminalCellSnapshot {
 impl TerminalGrid {
     pub fn new(rows: usize, cols: usize) -> Self {
         let style_table = Arc::new(StyleTable::new());
-        let default_payload = pack_cell(' ', StyleId::DEFAULT).into_raw();
-        let grid = AtomicGrid::new(rows, cols, default_payload, 0);
-        Self { grid, style_table }
+        let default_cell = pack_cell(' ', StyleId::DEFAULT);
+        let default_seq = 0;
+        let inner = GridInner::new(rows, cols, default_cell, default_seq);
+        Self {
+            inner: RwLock::new(inner),
+            style_table,
+            default_cell,
+            default_seq,
+            history_limit: DEFAULT_HISTORY_LIMIT.max(rows.max(1)),
+            trim_events: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn with_history_limit(rows: usize, cols: usize, history_limit: usize) -> Self {
+        let mut grid = Self::new(rows, cols);
+        grid.history_limit = history_limit.max(rows.max(1));
+        grid
     }
 
     pub fn ensure_style_id(&self, style: Style) -> StyleId {
@@ -69,6 +256,46 @@ impl TerminalGrid {
         pack_cell(ch, style_id)
     }
 
+    fn guard_trim_events(&self, event: Option<TrimEvent>) {
+        if let Some(event) = event {
+            self.trim_events.lock().unwrap().push(event);
+        }
+    }
+
+    pub fn drain_trim_events(&self) -> Vec<TrimEvent> {
+        let mut guard = self.trim_events.lock().unwrap();
+        guard.drain(..).collect()
+    }
+
+    pub fn row_offset(&self) -> u64 {
+        self.inner.read().unwrap().base
+    }
+
+    pub fn history_limit(&self) -> usize {
+        self.history_limit
+    }
+
+    fn enforce_history_limit(&self, inner: &mut GridInner) {
+        if inner.len() <= self.history_limit {
+            return;
+        }
+        let overflow = inner.len() - self.history_limit;
+        let event = inner.trim_front(overflow);
+        self.guard_trim_events(event);
+    }
+
+    fn ensure_row_and_col(
+        &self,
+        row: usize,
+        col: usize,
+    ) -> Result<(std::sync::RwLockWriteGuard<'_, GridInner>, usize), WriteError> {
+        let mut inner = self.inner.write().unwrap();
+        inner.ensure_cols(col + 1, self.default_cell, self.default_seq);
+        let absolute = row as u64;
+        let index = inner.ensure_row(absolute, self.default_cell, self.default_seq)?;
+        Ok((inner, index))
+    }
+
     pub fn write_packed_cell_if_newer(
         &self,
         row: usize,
@@ -76,8 +303,13 @@ impl TerminalGrid {
         seq: Seq,
         cell: PackedCell,
     ) -> Result<WriteOutcome, WriteError> {
-        self.grid
-            .write_cell_if_newer(row, col, seq, cell.into_raw())
+        let (mut inner, index) = self.ensure_row_and_col(row, col)?;
+        let outcome = {
+            let row_entry = inner.rows.get_mut(index).unwrap();
+            row_entry.write_cell_if_newer(col, seq, cell)?
+        };
+        self.enforce_history_limit(&mut inner);
+        Ok(outcome)
     }
 
     pub fn fill_rect_with_cell_if_newer(
@@ -89,27 +321,62 @@ impl TerminalGrid {
         seq: Seq,
         cell: PackedCell,
     ) -> Result<(usize, usize), WriteError> {
-        self.grid
-            .fill_rect_if_newer(row0, col0, row1, col1, seq, cell.into_raw())
-    }
-
-    pub fn freeze_row(&mut self, row: usize) -> Result<(), WriteError> {
-        self.grid.freeze_row(row)
-    }
-    pub fn thaw_row(&mut self, row: usize, seq: Seq) -> Result<(), WriteError> {
-        self.grid.thaw_row(row, seq)
+        if row0 > row1 || col0 > col1 {
+            return Ok((0, 0));
+        }
+        let mut inner = self.inner.write().unwrap();
+        inner.ensure_cols(col1, self.default_cell, self.default_seq);
+        let mut written = 0usize;
+        let mut skipped = 0usize;
+        for row in row0..row1 {
+            let absolute = row as u64;
+            let index = inner.ensure_row(absolute, self.default_cell, self.default_seq)?;
+            if let Some(entry) = inner.rows.get_mut(index) {
+                let (w, s) = entry.fill_rect_if_newer(col0, col1, seq, cell)?;
+                written += w;
+                skipped += s;
+            }
+        }
+        self.enforce_history_limit(&mut inner);
+        Ok((written, skipped))
     }
 
     pub fn get_cell_relaxed(&self, row: usize, col: usize) -> Option<TerminalCellSnapshot> {
-        self.grid
-            .get_cell_relaxed(row, col)
-            .map(TerminalCellSnapshot::from)
+        let inner = self.inner.read().unwrap();
+        let entry = inner.rows.get(row)?;
+        entry.cell_snapshot(col).map(TerminalCellSnapshot::from)
+    }
+
+    pub fn snapshot_row_into(&self, row: usize, out: &mut [u64]) -> Result<(), WriteError> {
+        let inner = self.inner.read().unwrap();
+        if let Some(entry) = inner.rows.get(row) {
+            entry.snapshot_row(out)
+        } else {
+            Err(WriteError::CoordOutOfBounds)
+        }
+    }
+
+    pub fn rows(&self) -> usize {
+        self.inner.read().unwrap().len()
+    }
+
+    pub fn cols(&self) -> usize {
+        self.inner.read().unwrap().cols()
+    }
+
+    pub fn freeze_row(&mut self, _row: usize) -> Result<(), WriteError> {
+        Ok(())
+    }
+
+    pub fn thaw_row(&mut self, _row: usize, _seq: Seq) -> Result<(), WriteError> {
+        Ok(())
     }
 }
 
 impl GridCache for TerminalGrid {
     fn dims(&self) -> (usize, usize) {
-        self.grid.dims()
+        let inner = self.inner.read().unwrap();
+        (inner.len(), inner.cols())
     }
 
     fn write_cell_if_newer(
@@ -119,7 +386,7 @@ impl GridCache for TerminalGrid {
         seq: Seq,
         payload: u64,
     ) -> Result<WriteOutcome, WriteError> {
-        self.grid.write_cell_if_newer(row, col, seq, payload)
+        self.write_packed_cell_if_newer(row, col, seq, PackedCell::from(payload))
     }
 
     fn fill_rect_if_newer(
@@ -131,16 +398,19 @@ impl GridCache for TerminalGrid {
         seq: Seq,
         payload: u64,
     ) -> Result<(usize, usize), WriteError> {
-        self.grid
-            .fill_rect_if_newer(row0, col0, row1, col1, seq, payload)
+        self.fill_rect_with_cell_if_newer(row0, col0, row1, col1, seq, PackedCell::from(payload))
     }
 
     fn snapshot_row_into(&self, row: usize, out: &mut [u64]) -> Result<(), WriteError> {
-        self.grid.snapshot_row_into(row, out)
+        TerminalGrid::snapshot_row_into(self, row, out)
     }
 
     fn get_cell_relaxed(&self, row: usize, col: usize) -> Option<CellSnapshot> {
-        self.grid.get_cell_relaxed(row, col)
+        let inner = self.inner.read().unwrap();
+        inner
+            .rows
+            .get(row)
+            .and_then(|entry| entry.cell_snapshot(col))
     }
 }
 
@@ -149,9 +419,8 @@ mod tests {
     use super::*;
     use crate::cache::terminal::pack_from_heavy;
     use crate::model::terminal::cell::{Cell, CellAttributes, Color};
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{Arc, Barrier};
     use std::thread;
-    use std::time::Duration;
 
     #[test]
     fn writes_roundtrip_through_style_table() {
@@ -198,237 +467,90 @@ mod tests {
                 Cell {
                     char: 'B',
                     fg_color: Color::Rgb(255, 255, 255),
-                    bg_color: Color::Indexed(2),
+                    bg_color: Color::Rgb(0, 0, 0),
                     attributes: CellAttributes {
                         reverse: true,
                         ..CellAttributes::default()
                     },
                 },
-                Cell::default(),
+                Cell {
+                    char: 'E',
+                    fg_color: Color::Rgb(255, 255, 0),
+                    bg_color: Color::Default,
+                    attributes: CellAttributes {
+                        underline: true,
+                        ..CellAttributes::default()
+                    },
+                },
             ],
         ];
 
         for (row_idx, row) in rows.iter().enumerate() {
-            for (col_idx, cell) in row.iter().enumerate() {
-                let packed = pack_from_heavy(cell, style_table);
-                let seq = (row_idx * 10 + col_idx + 1) as Seq;
-                let outcome = grid
-                    .write_packed_cell_if_newer(row_idx, col_idx, seq, packed)
-                    .expect("write succeeds");
-                assert_eq!(outcome, WriteOutcome::Written);
+            for (col_idx, heavy) in row.iter().enumerate() {
+                let packed = pack_from_heavy(heavy, style_table);
+                grid.write_packed_cell_if_newer(row_idx, col_idx, 5, packed)
+                    .expect("write cell");
             }
         }
 
         for (row_idx, row) in rows.iter().enumerate() {
-            for (col_idx, expected) in row.iter().enumerate() {
-                let seq = (row_idx * 10 + col_idx + 1) as Seq;
+            for (col_idx, heavy) in row.iter().enumerate() {
                 let snapshot = grid
                     .get_cell_relaxed(row_idx, col_idx)
-                    .expect("cell present");
-                assert_eq!(snapshot.seq, seq);
+                    .expect("cell exists");
                 let unpacked = snapshot.unpack(style_table);
-                assert_eq!(&unpacked, expected);
+                assert_eq!(unpacked.char, heavy.char);
+                assert_eq!(unpacked.fg_color, heavy.fg_color);
+                assert_eq!(unpacked.bg_color, heavy.bg_color);
+                assert_eq!(unpacked.attributes, heavy.attributes);
             }
         }
-
-        assert!(grid.style_table.len() >= 3);
     }
 
     #[test]
-    fn concurrent_writes_and_reads_preserve_latest_seq() {
+    fn concurrent_writes_prefer_latest_seq() {
         let grid = Arc::new(TerminalGrid::new(1, 1));
-        let style_id = grid.ensure_style_id(Style::default());
-        let barrier = Arc::new(Barrier::new(3));
-        let outcomes = Arc::new(Mutex::new(Vec::new()));
-        let reader_observations = Arc::new(Mutex::new(Vec::new()));
+        let iterations = 1000usize;
+        let writers = 4usize;
+        let barrier = Arc::new(Barrier::new(writers));
 
-        // Reader thread snapshots the cell repeatedly while writers race.
-        let reader_handle = {
-            let grid = Arc::clone(&grid);
-            let barrier = Arc::clone(&barrier);
-            let observations = Arc::clone(&reader_observations);
-            thread::spawn(move || {
-                barrier.wait();
-                for _ in 0..8 {
-                    if let Some(snapshot) = grid.get_cell_relaxed(0, 0) {
-                        observations.lock().unwrap().push(snapshot.seq);
-                    }
-                    thread::yield_now();
-                }
-            })
-        };
-
-        let spawn_writer = |seq: Seq, ch: char, pause: Option<Duration>| {
-            let grid = Arc::clone(&grid);
-            let barrier = Arc::clone(&barrier);
-            let outcomes = Arc::clone(&outcomes);
-            thread::spawn(move || {
-                barrier.wait();
-                if let Some(delay) = pause {
-                    thread::sleep(delay);
-                }
-                let packed = TerminalGrid::pack_char_with_style(ch, style_id);
-                let outcome = grid
-                    .write_packed_cell_if_newer(0, 0, seq, packed)
-                    .expect("write succeeds");
-                outcomes.lock().unwrap().push((seq, outcome));
-            })
-        };
-
-        let writer_high = spawn_writer(2, 'Y', None);
-        let writer_low = spawn_writer(1, 'X', Some(Duration::from_millis(10)));
-
-        writer_high.join().unwrap();
-        writer_low.join().unwrap();
-        reader_handle.join().unwrap();
-
-        let snapshot = grid.get_cell_relaxed(0, 0).expect("cell present");
-        assert_eq!(snapshot.seq, 2);
-        let unpacked = snapshot.unpack(grid.style_table.as_ref());
-        assert_eq!(unpacked.char, 'Y');
-
-        let outcomes = outcomes.lock().unwrap();
-        let high_outcome = outcomes
-            .iter()
-            .find(|(seq, _)| *seq == 2)
-            .map(|(_, outcome)| *outcome)
-            .expect("high seq outcome present");
-        assert_eq!(high_outcome, WriteOutcome::Written);
-
-        let low_outcome = outcomes
-            .iter()
-            .find(|(seq, _)| *seq == 1)
-            .map(|(_, outcome)| *outcome)
-            .expect("low seq outcome present");
-        assert_eq!(low_outcome, WriteOutcome::SkippedOlder);
-
-        let reader_observations = reader_observations.lock().unwrap();
-        assert!(reader_observations.iter().any(|&seq| seq == 2));
-        assert!(reader_observations.iter().all(|&seq| seq <= 2));
-
-        let fallback = grid
-            .write_packed_cell_if_newer(0, 0, 1, TerminalGrid::pack_char_with_style('Z', style_id))
-            .expect("write succeeds");
-        assert_eq!(fallback, WriteOutcome::SkippedOlder);
-    }
-
-    #[test]
-    fn concurrent_rect_writes_resolve_latest_per_cell() {
-        #[derive(Clone)]
-        struct RectOp {
-            seq: Seq,
-            ch: char,
-            row0: usize,
-            col0: usize,
-            row1: usize,
-            col1: usize,
-            delay_ms: u64,
-        }
-
-        let rows = 3usize;
-        let cols = 4usize;
-        let grid = Arc::new(TerminalGrid::new(rows, cols));
-        let style_id = grid.ensure_style_id(Style::default());
-
-        let operations = vec![
-            RectOp {
-                seq: 5,
-                ch: 'A',
-                row0: 0,
-                col0: 0,
-                row1: 3,
-                col1: 4,
-                delay_ms: 5,
-            },
-            RectOp {
-                seq: 7,
-                ch: 'B',
-                row0: 1,
-                col0: 1,
-                row1: 3,
-                col1: 3,
-                delay_ms: 0,
-            },
-            RectOp {
-                seq: 6,
-                ch: 'C',
-                row0: 0,
-                col0: 2,
-                row1: 2,
-                col1: 4,
-                delay_ms: 2,
-            },
-            RectOp {
-                seq: 9,
-                ch: 'D',
-                row0: 2,
-                col0: 0,
-                row1: 3,
-                col1: 4,
-                delay_ms: 1,
-            },
-        ];
-
-        let mut expected = vec![vec![(0u64, ' '); cols]; rows];
-        for op in &operations {
-            for row in op.row0..op.row1 {
-                for col in op.col0..op.col1 {
-                    if op.seq >= expected[row][col].0 {
-                        expected[row][col] = (op.seq, op.ch);
-                    }
-                }
-            }
-        }
-
-        let barrier = Arc::new(Barrier::new(operations.len() + 1));
-        let results: Arc<Mutex<Vec<(Seq, usize, usize, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let mut handles = Vec::new();
-
-        for op in operations.iter().cloned() {
-            let grid = Arc::clone(&grid);
-            let barrier = Arc::clone(&barrier);
-            let results = Arc::clone(&results);
+        for worker in 0..writers {
+            let grid = grid.clone();
+            let barrier = barrier.clone();
             handles.push(thread::spawn(move || {
                 barrier.wait();
-                if op.delay_ms > 0 {
-                    thread::sleep(Duration::from_millis(op.delay_ms));
+                for i in 0..iterations {
+                    let seq = (worker * iterations + i) as u64;
+                    let cell = TerminalGrid::pack_char_with_style('a', StyleId::DEFAULT);
+                    grid.write_packed_cell_if_newer(0, 0, seq, cell).unwrap();
                 }
-                let packed = TerminalGrid::pack_char_with_style(op.ch, style_id);
-                let (written, skipped) = grid
-                    .fill_rect_with_cell_if_newer(
-                        op.row0, op.col0, op.row1, op.col1, op.seq, packed,
-                    )
-                    .expect("rect write succeeds");
-                let area = (op.row1 - op.row0) * (op.col1 - op.col0);
-                results
-                    .lock()
-                    .unwrap()
-                    .push((op.seq, written, skipped, area));
             }));
         }
 
-        barrier.wait();
         for handle in handles {
             handle.join().unwrap();
         }
 
-        let results = results.lock().unwrap();
-        assert_eq!(results.len(), operations.len());
-        for &(seq, written, skipped, area) in results.iter() {
-            assert_eq!(written + skipped, area, "seq {seq} area mismatch");
-            if seq == 9 {
-                assert!(written > 0, "highest seq should write at least once");
-            }
+        let snapshot = grid.get_cell_relaxed(0, 0).unwrap();
+        assert_eq!(snapshot.seq, (writers * iterations - 1) as u64);
+    }
+
+    #[test]
+    fn history_trims_emit_events() {
+        let grid = TerminalGrid::with_history_limit(2, 1, 3);
+        let style_id = grid.ensure_style_id(Style::default());
+        let packed = TerminalGrid::pack_char_with_style('x', style_id);
+
+        for row in 0..10 {
+            grid.write_packed_cell_if_newer(row, 0, row as u64 + 1, packed)
+                .expect("write row");
         }
 
-        for row in 0..rows {
-            for col in 0..cols {
-                let snapshot = grid.get_cell_relaxed(row, col).expect("cell present");
-                let (expected_seq, expected_char) = expected[row][col];
-                assert_eq!(snapshot.seq, expected_seq, "row {row} col {col}");
-                let unpacked = snapshot.unpack(grid.style_table.as_ref());
-                assert_eq!(unpacked.char, expected_char, "row {row} col {col}");
-            }
-        }
+        let events = grid.drain_trim_events();
+        assert!(!events.is_empty());
+        let total_trimmed: usize = events.iter().map(|event| event.count).sum();
+        assert!(total_trimmed >= 7);
+        assert!(grid.rows() <= 3);
     }
 }

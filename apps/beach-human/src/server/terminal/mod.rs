@@ -2,7 +2,7 @@ mod emulator;
 mod pty;
 
 pub use emulator::{AlacrittyEmulator, EmulatorResult, SimpleTerminalEmulator, TerminalEmulator};
-pub use pty::{resize_pty, Command, PtyProcess, PtyReader, PtyWriter, SpawnConfig};
+pub use pty::{Command, PtyProcess, PtyReader, PtyWriter, SpawnConfig, resize_pty};
 
 use crate::cache::terminal::TerminalGrid;
 use crate::model::terminal::diff::CacheUpdate;
@@ -221,6 +221,9 @@ fn apply_update(grid: &TerminalGrid, update: &CacheUpdate) {
                 let _ = grid.write_packed_cell_if_newer(row.row, offset, row.seq, *cell);
             }
         }
+        CacheUpdate::Trim(_) => {
+            // grid already applied trim when emitting the event
+        }
     }
 }
 
@@ -228,12 +231,13 @@ fn apply_update(grid: &TerminalGrid, update: &CacheUpdate) {
 mod tests {
     use super::*;
     use crate::cache::terminal::TerminalGrid;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{Duration, sleep};
 
     #[tokio::test]
     async fn runtime_captures_command_output() {
         let grid = Arc::new(TerminalGrid::new(4, 20));
-        let emulator = Box::new(SimpleTerminalEmulator::new(&grid));
+        let emulator: Box<dyn TerminalEmulator + Send> =
+            Box::new(SimpleTerminalEmulator::new(&grid));
         let command = Command::new("/usr/bin/env").arg("printf").arg("hello");
         let config = SpawnConfig::new(command, 80, 24);
 

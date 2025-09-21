@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::cache::terminal::TerminalGrid;
 use crate::cache::{GridCache, Seq};
-use crate::model::terminal::diff::{CacheUpdate, RowSnapshot};
+use crate::model::terminal::diff::{CacheUpdate, HistoryTrim, RowSnapshot};
 use crate::sync::{
     DeltaSlice, DeltaSource, PriorityLane, SnapshotSlice, SnapshotSource, SyncConfig, SyncUpdate,
     Watermark,
@@ -46,8 +46,14 @@ impl TerminalSync {
 
     fn collect_row(&self, row: usize) -> Option<CacheUpdate> {
         let (_, cols) = self.grid.dims();
+        let base_offset = self.grid.row_offset() as usize;
+        let absolute_row = base_offset + row;
         if cols == 0 {
-            return Some(CacheUpdate::Row(RowSnapshot::new(row, 0, Vec::new())));
+            return Some(CacheUpdate::Row(RowSnapshot::new(
+                absolute_row,
+                0,
+                Vec::new(),
+            )));
         }
         let mut cells = Vec::with_capacity(cols);
         let mut max_seq = 0;
@@ -56,7 +62,11 @@ impl TerminalSync {
             max_seq = max_seq.max(snapshot.seq);
             cells.push(snapshot.cell);
         }
-        Some(CacheUpdate::Row(RowSnapshot::new(row, max_seq, cells)))
+        Some(CacheUpdate::Row(RowSnapshot::new(
+            absolute_row,
+            max_seq,
+            cells,
+        )))
     }
 
     fn max_seq_from_grid(&self) -> Seq {
@@ -196,12 +206,45 @@ impl DeltaSource<CacheUpdate> for TerminalSync {
         if budget == 0 {
             return None;
         }
-        let updates = self.delta_stream.collect_since(since, budget);
+        let mut updates = Vec::new();
+        let mut remaining = budget;
+
+        let trim_events = self.grid.drain_trim_events();
+        if !trim_events.is_empty() {
+            let mut total = 0usize;
+            let mut start = trim_events.first().map(|e| e.start).unwrap_or(0) as usize;
+            if let Some(first) = trim_events.first() {
+                start = first.start as usize;
+            }
+            for event in trim_events {
+                total += event.count;
+            }
+            if total > 0 {
+                updates.push(CacheUpdate::Trim(HistoryTrim::new(start, total)));
+                if remaining > 0 {
+                    remaining -= 1;
+                }
+            }
+        }
+
+        if remaining == 0 {
+            let watermark = updates.iter().map(|u| u.seq()).max().unwrap_or(since);
+            return Some(DeltaSlice {
+                updates,
+                watermark: Watermark(watermark),
+                has_more: true,
+            });
+        }
+
+        let delta_updates = self.delta_stream.collect_since(since, remaining);
+        let has_more_delta =
+            delta_updates.len() == remaining && self.delta_stream.latest_seq() > since;
+        updates.extend(delta_updates);
         if updates.is_empty() {
             return None;
         }
         let watermark = updates.iter().map(|u| u.seq()).max().unwrap_or(since);
-        let has_more = updates.len() == budget && self.delta_stream.latest_seq() > watermark;
+        let has_more = has_more_delta || updates.len() == budget;
         Some(DeltaSlice {
             updates,
             watermark: Watermark(watermark),
@@ -220,6 +263,7 @@ impl SyncUpdate for CacheUpdate {
             CacheUpdate::Cell(_) => 1,
             CacheUpdate::Rect(rect) => rect.area(),
             CacheUpdate::Row(row) => row.width(),
+            CacheUpdate::Trim(_) => 1,
         }
     }
 }

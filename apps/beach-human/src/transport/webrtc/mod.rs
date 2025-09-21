@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -7,7 +7,7 @@ use once_cell::sync::Lazy;
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
-use tokio::sync::{Mutex as AsyncMutex, mpsc as tokio_mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc as tokio_mpsc, oneshot};
 use tokio::time::{sleep, timeout};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
@@ -43,11 +43,7 @@ fn spawn_runtime_task<F>(future: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(future);
-    } else {
-        RUNTIME.spawn(future);
-    }
+    RUNTIME.spawn(future);
 }
 
 fn build_api(setting: SettingEngine) -> Result<API, TransportError> {
@@ -110,29 +106,81 @@ impl WebRtcTransport {
         pc: Arc<RTCPeerConnection>,
         dc: Arc<RTCDataChannel>,
         router: Option<Arc<AsyncMutex<Router>>>,
+        dc_ready: Option<Arc<Notify>>,
     ) -> Self {
         let (inbound_tx, inbound_rx) = mpsc::channel();
         let tx_clone = inbound_tx.clone();
+        eprintln!("transport {:?} registering data channel handler", id);
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
             let sender = tx_clone.clone();
             Box::pin(async move {
                 let bytes = msg.data.to_vec();
                 if let Some(message) = decode_message(&bytes) {
-                    let _ = sender.send(message);
+                    eprintln!(
+                        "transport {:?} received frame len={} seq={}",
+                        id,
+                        bytes.len(),
+                        message.sequence
+                    );
+                    if let Err(err) = sender.send(message) {
+                        eprintln!(
+                            "transport {:?} failed to enqueue inbound message: {}",
+                            id, err
+                        );
+                    }
+                } else {
+                    eprintln!("failed to decode message len={}", bytes.len());
                 }
+            })
+        }));
+        dc.on_error(Box::new(move |err| {
+            let id = id;
+            Box::pin(async move {
+                eprintln!("transport {:?} data channel error: {err}", id);
+            })
+        }));
+        dc.on_close(Box::new(move || {
+            let id = id;
+            Box::pin(async move {
+                eprintln!("transport {:?} data channel closed", id);
             })
         }));
 
         let (outbound_tx, mut outbound_rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
         let dc_clone = dc.clone();
+        let transport_id = id;
+        let dc_ready_signal = dc_ready.clone();
         spawn_runtime_task(async move {
+            if let Some(notify) = dc_ready_signal {
+                notify.notified().await;
+                eprintln!("transport {:?} dc ready triggered", transport_id);
+            } else {
+                eprintln!("transport {:?} dc ready immediate", transport_id);
+            }
+            eprintln!("transport {:?} sender loop start", transport_id);
             while let Some(bytes) = outbound_rx.recv().await {
                 let data = Bytes::from(bytes);
-                if let Err(err) = dc_clone.send(&data).await {
-                    eprintln!("webrtc send error: {err}");
-                    break;
+                match timeout(CONNECT_TIMEOUT, dc_clone.send(&data)).await {
+                    Ok(Ok(bytes_written)) => {
+                        eprintln!(
+                            "transport {:?} webrtc sent frame len={} state={:?} payload={:?}",
+                            transport_id,
+                            bytes_written,
+                            dc_clone.ready_state(),
+                            &data[..]
+                        );
+                    }
+                    Ok(Err(err)) => {
+                        eprintln!("transport {:?} webrtc send error: {err}", transport_id);
+                        break;
+                    }
+                    Err(_) => {
+                        eprintln!("transport {:?} webrtc send timed out", transport_id);
+                        break;
+                    }
                 }
             }
+            eprintln!("transport {:?} sender loop ended", transport_id);
         });
 
         Self {
@@ -162,6 +210,12 @@ impl Transport for WebRtcTransport {
 
     fn send(&self, message: TransportMessage) -> Result<(), TransportError> {
         let bytes = encode_message(&message);
+        eprintln!(
+            "transport {:?} queueing outbound message len={} seq={}",
+            self.id,
+            bytes.len(),
+            message.sequence
+        );
         self.outbound_tx
             .send(bytes)
             .map_err(|_| TransportError::ChannelClosed)
@@ -180,13 +234,29 @@ impl Transport for WebRtcTransport {
     }
 
     fn recv(&self, timeout_duration: Duration) -> Result<TransportMessage, TransportError> {
+        eprintln!(
+            "transport {:?} waiting for message with timeout {:?}",
+            self.id, timeout_duration
+        );
         let receiver = self.inbound_rx.lock().unwrap();
-        receiver
-            .recv_timeout(timeout_duration)
-            .map_err(|err| match err {
-                mpsc::RecvTimeoutError::Timeout => TransportError::Timeout,
-                mpsc::RecvTimeoutError::Disconnected => TransportError::ChannelClosed,
-            })
+        let result = receiver.recv_timeout(timeout_duration);
+        match result {
+            Ok(message) => {
+                eprintln!(
+                    "transport {:?} received message seq={} payload={:?}",
+                    self.id, message.sequence, message.payload
+                );
+                Ok(message)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                eprintln!("transport {:?} recv timed out", self.id);
+                Err(TransportError::Timeout)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                eprintln!("transport {:?} recv channel closed", self.id);
+                Err(TransportError::ChannelClosed)
+            }
+        }
     }
 
     fn try_recv(&self) -> Result<Option<TransportMessage>, TransportError> {
@@ -229,6 +299,8 @@ async fn connect_offerer(
 ) -> Result<Arc<dyn Transport>, TransportError> {
     let client = Client::new();
 
+    let signaling = signaling_url.trim_end_matches('/').to_string();
+
     let mut setting = SettingEngine::default();
     setting.set_ice_timeouts(
         Some(Duration::from_secs(3)),
@@ -244,6 +316,41 @@ async fn connect_offerer(
             .map_err(to_setup_error)?,
     );
 
+    let offer_candidate_client = client.clone();
+    let offer_candidate_signaling = signaling.clone();
+    let offer_candidate_done = Arc::new(AtomicBool::new(false));
+    let offer_candidate_done_clone = offer_candidate_done.clone();
+    pc.on_ice_candidate(Box::new(move |candidate| {
+        let client = offer_candidate_client.clone();
+        let signaling = offer_candidate_signaling.clone();
+        let done_flag = offer_candidate_done_clone.clone();
+        Box::pin(async move {
+            let candidate_init = match candidate {
+                Some(cand) => match cand.to_json() {
+                    Ok(json) => Some(json),
+                    Err(err) => {
+                        eprintln!("⚠️  webrtc offerer candidate serialize error: {err}");
+                        return;
+                    }
+                },
+                None => {
+                    if done_flag.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    None
+                }
+            };
+
+            if let Err(err) =
+                post_candidate(&client, &signaling, "offer/candidates", candidate_init).await
+            {
+                if !matches!(err, TransportError::Timeout | TransportError::ChannelClosed) {
+                    eprintln!("⚠️  webrtc offerer candidate post error: {err}");
+                }
+            }
+        })
+    }));
+
     let dc_init = RTCDataChannelInit {
         ordered: Some(true),
         ..Default::default()
@@ -252,6 +359,18 @@ async fn connect_offerer(
         .create_data_channel("beach-human", Some(dc_init))
         .await
         .map_err(to_setup_error)?;
+
+    let dc_open_notify = Arc::new(Notify::new());
+    let open_signal = dc_open_notify.clone();
+    dc.on_open(Box::new(move || {
+        let notify = open_signal.clone();
+        Box::pin(async move {
+            tracing::debug!(target = "webrtc", "data channel opened (offerer)");
+            eprintln!("offerer data channel open");
+            notify.notify_waiters();
+            notify.notify_one();
+        })
+    }));
 
     let offer = pc.create_offer(None).await.map_err(to_setup_error)?;
     pc.set_local_description(offer)
@@ -266,12 +385,17 @@ async fn connect_offerer(
     let payload = payload_from_description(&local_desc);
     post_sdp(&client, signaling_url, "offer", &payload).await?;
 
-    let signaling = signaling_url.trim_end_matches('/').to_string();
     let pc_for_answer = pc.clone();
     let client_for_answer = client.clone();
+    let signaling_for_answer = signaling.clone();
     spawn_runtime_task(async move {
-        if let Err(err) =
-            wait_for_answer(client_for_answer, signaling, poll_interval, pc_for_answer).await
+        if let Err(err) = wait_for_answer(
+            client_for_answer,
+            signaling_for_answer,
+            poll_interval,
+            pc_for_answer,
+        )
+        .await
         {
             if !matches!(err, TransportError::Timeout | TransportError::ChannelClosed) {
                 eprintln!("⚠️  webrtc offerer handshake error: {err}");
@@ -279,8 +403,32 @@ async fn connect_offerer(
         }
     });
 
+    let pc_for_candidates = pc.clone();
+    let client_for_candidates = client.clone();
+    let signaling_for_candidates = signaling.clone();
+    spawn_runtime_task(async move {
+        if let Err(err) = poll_remote_candidates(
+            client_for_candidates,
+            signaling_for_candidates,
+            "answer/candidates",
+            pc_for_candidates,
+            poll_interval,
+            "offerer",
+        )
+        .await
+        {
+            if !matches!(err, TransportError::Timeout | TransportError::ChannelClosed) {
+                eprintln!("⚠️  webrtc offerer candidate poll error: {err}");
+            }
+        }
+    });
+
     let local_id = next_transport_id();
     let remote_id = next_transport_id();
+    eprintln!(
+        "offerer allocating transport ids: local={:?} peer={:?}",
+        local_id, remote_id
+    );
     let transport = WebRtcTransport::new(
         TransportKind::WebRtc,
         local_id,
@@ -288,7 +436,21 @@ async fn connect_offerer(
         pc.clone(),
         dc,
         None,
+        Some(dc_open_notify),
     );
+    eprintln!("offerer transport initialized with id {:?}", local_id);
+
+    if let Ok(message) = transport.recv(CONNECT_TIMEOUT) {
+        if message.payload.as_text() != Some("__ready__") {
+            eprintln!("unexpected handshake message: {:?}", message.payload);
+        }
+    } else {
+        eprintln!("⚠️  offerer did not receive readiness ack");
+    }
+
+    if let Err(err) = transport.send_text("__offer_ready__") {
+        eprintln!("⚠️  offerer readiness signal failed: {err}");
+    }
 
     Ok(Arc::new(transport) as Arc<dyn Transport>)
 }
@@ -298,6 +460,7 @@ async fn connect_answerer(
     poll_interval: Duration,
 ) -> Result<Arc<dyn Transport>, TransportError> {
     let client = Client::new();
+    let signaling = signaling_url.trim_end_matches('/').to_string();
 
     let offer_payload = loop {
         match fetch_sdp(&client, signaling_url, "offer").await? {
@@ -322,24 +485,89 @@ async fn connect_answerer(
             .map_err(to_setup_error)?,
     );
 
-    let answer_dc_holder = Arc::new(tokio::sync::Mutex::new(None::<Arc<RTCDataChannel>>));
-    let (dc_open_tx, dc_open_rx) = oneshot::channel();
-    let dc_open_signal = Arc::new(Mutex::new(Some(dc_open_tx)));
-    let holder_clone = answer_dc_holder.clone();
-    let signal_clone = dc_open_signal.clone();
-    pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
-        let holder = holder_clone.clone();
-        let signal = signal_clone.clone();
+    let answer_candidate_client = client.clone();
+    let answer_candidate_signaling = signaling.clone();
+    let answer_candidate_done = Arc::new(AtomicBool::new(false));
+    let answer_candidate_done_clone = answer_candidate_done.clone();
+    pc.on_ice_candidate(Box::new(move |candidate| {
+        let client = answer_candidate_client.clone();
+        let signaling = answer_candidate_signaling.clone();
+        let done_flag = answer_candidate_done_clone.clone();
         Box::pin(async move {
-            holder.lock().await.replace(dc.clone());
-            dc.on_open(Box::new(move || {
-                let signal = signal.clone();
-                Box::pin(async move {
-                    if let Some(tx) = signal.lock().unwrap().take() {
-                        let _ = tx.send(());
+            let candidate_init = match candidate {
+                Some(cand) => match cand.to_json() {
+                    Ok(json) => Some(json),
+                    Err(err) => {
+                        eprintln!("⚠️  webrtc answerer candidate serialize error: {err}");
+                        return;
                     }
+                },
+                None => {
+                    if done_flag.swap(true, Ordering::SeqCst) {
+                        return;
+                    }
+                    None
+                }
+            };
+
+            if let Err(err) =
+                post_candidate(&client, &signaling, "answer/candidates", candidate_init).await
+            {
+                if !matches!(err, TransportError::Timeout | TransportError::ChannelClosed) {
+                    eprintln!("⚠️  webrtc answerer candidate post error: {err}");
+                }
+            }
+        })
+    }));
+
+    let dc_open_notify = Arc::new(Notify::new());
+    let transport_slot: Arc<AsyncMutex<Option<Arc<dyn Transport>>>> =
+        Arc::new(AsyncMutex::new(None));
+    let pc_for_dc = pc.clone();
+    let notify_clone = dc_open_notify.clone();
+    let slot_clone = transport_slot.clone();
+    let client_id = next_transport_id();
+    let peer_id = next_transport_id();
+    eprintln!(
+        "answerer allocating transport ids: local={:?} peer={:?}",
+        client_id, peer_id
+    );
+    pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+        let pc = pc_for_dc.clone();
+        let notify = notify_clone.clone();
+        let slot = slot_clone.clone();
+        Box::pin(async move {
+            let notify_for_open = notify.clone();
+            dc.on_open(Box::new(move || {
+                let notify = notify_for_open.clone();
+                Box::pin(async move {
+                    tracing::debug!(target = "webrtc", "data channel opened (answerer)");
+                    eprintln!("answerer data channel open");
+                    notify.notify_waiters();
+                    notify.notify_one();
                 })
             }));
+
+            let mut slot_guard = slot.lock().await;
+            if slot_guard.is_none() {
+                let transport = WebRtcTransport::new(
+                    TransportKind::WebRtc,
+                    client_id,
+                    peer_id,
+                    pc.clone(),
+                    dc,
+                    None,
+                    Some(notify.clone()),
+                );
+                let transport_arc = Arc::new(transport) as Arc<dyn Transport>;
+                slot_guard.replace(transport_arc.clone());
+                drop(slot_guard);
+
+                if let Err(err) = transport_arc.send_text("__ready__") {
+                    eprintln!("⚠️  answerer readiness ack failed: {err}");
+                }
+                return;
+            }
         })
     }));
 
@@ -360,30 +588,40 @@ async fn connect_answerer(
     let payload = payload_from_description(&local_desc);
     post_sdp(&client, signaling_url, "answer", &payload).await?;
 
+    let pc_for_offer_candidates = pc.clone();
+    let client_for_offer_candidates = client.clone();
+    let signaling_for_offer_candidates = signaling.clone();
+    spawn_runtime_task(async move {
+        if let Err(err) = poll_remote_candidates(
+            client_for_offer_candidates,
+            signaling_for_offer_candidates,
+            "offer/candidates",
+            pc_for_offer_candidates,
+            poll_interval,
+            "answerer",
+        )
+        .await
+        {
+            if !matches!(err, TransportError::Timeout | TransportError::ChannelClosed) {
+                eprintln!("⚠️  webrtc answerer candidate poll error: {err}");
+            }
+        }
+    });
+
+    let transport = loop {
+        if let Some(transport) = transport_slot.lock().await.clone() {
+            break transport;
+        }
+        sleep(Duration::from_millis(10)).await;
+    };
+    eprintln!("answerer transport ready with id {:?}", client_id);
+
     wait_for_connection(&pc).await?;
-    timeout(CONNECT_TIMEOUT, dc_open_rx)
+    timeout(CONNECT_TIMEOUT, dc_open_notify.notified())
         .await
-        .map_err(|_| TransportError::Timeout)?
-        .map_err(|_| TransportError::ChannelClosed)?;
+        .map_err(|_| TransportError::Timeout)?;
 
-    let dc = answer_dc_holder
-        .lock()
-        .await
-        .take()
-        .ok_or_else(|| TransportError::Setup("data channel not established".into()))?;
-
-    let local_id = next_transport_id();
-    let remote_id = next_transport_id();
-    let transport = WebRtcTransport::new(
-        TransportKind::WebRtc,
-        local_id,
-        remote_id,
-        pc.clone(),
-        dc,
-        None,
-    );
-
-    Ok(Arc::new(transport) as Arc<dyn Transport>)
+    Ok(transport)
 }
 
 fn endpoint(base: &str, suffix: &str) -> String {
@@ -459,6 +697,94 @@ async fn fetch_sdp(
             "unexpected signaling status {}",
             status
         ))),
+    }
+}
+
+async fn post_candidate(
+    client: &Client,
+    base: &str,
+    suffix: &str,
+    candidate: Option<RTCIceCandidateInit>,
+) -> Result<(), TransportError> {
+    let url = endpoint(base, suffix);
+    let response = client
+        .post(url)
+        .json(&candidate)
+        .send()
+        .await
+        .map_err(http_error)?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(TransportError::Setup(format!(
+            "unexpected signaling status {}",
+            response.status()
+        )))
+    }
+}
+
+async fn fetch_candidate_batch(
+    client: &Client,
+    base: &str,
+    suffix: &str,
+) -> Result<Vec<Option<RTCIceCandidateInit>>, TransportError> {
+    let url = endpoint(base, suffix);
+    let response = client.get(url).send().await.map_err(http_error)?;
+
+    if response.status().is_success() {
+        let candidates = response
+            .json::<Vec<Option<RTCIceCandidateInit>>>()
+            .await
+            .map_err(http_error)?;
+        Ok(candidates)
+    } else if response.status() == StatusCode::NOT_FOUND {
+        Ok(Vec::new())
+    } else {
+        Err(TransportError::Setup(format!(
+            "unexpected signaling status {}",
+            response.status()
+        )))
+    }
+}
+
+async fn poll_remote_candidates(
+    client: Client,
+    base: String,
+    suffix: &str,
+    pc: Arc<RTCPeerConnection>,
+    poll_interval: Duration,
+    label: &'static str,
+) -> Result<(), TransportError> {
+    loop {
+        if pc.remote_description().await.is_none() {
+            sleep(poll_interval).await;
+            continue;
+        }
+        let mut received_any = false;
+        let batch = fetch_candidate_batch(&client, &base, suffix).await?;
+        for candidate in batch {
+            received_any = true;
+            match candidate {
+                Some(init) => {
+                    eprintln!("{label} received candidate: {}", init.candidate.clone());
+                    pc.add_ice_candidate(init).await.map_err(to_setup_error)?;
+                }
+                None => {
+                    eprintln!("{label} received end-of-candidates");
+                    return Ok(());
+                }
+            }
+        }
+
+        if pc.connection_state() == RTCPeerConnectionState::Connected {
+            eprintln!("{label} connection already connected");
+            return Ok(());
+        }
+
+        if !received_any {
+            sleep(poll_interval).await;
+        }
     }
 }
 
@@ -717,6 +1043,7 @@ async fn create_webrtc_pair() -> Result<TransportPair, TransportError> {
         offer_pc.clone(),
         offer_dc.clone(),
         router_keepalive.clone(),
+        None,
     );
 
     let server_transport = WebRtcTransport::new(
@@ -726,12 +1053,18 @@ async fn create_webrtc_pair() -> Result<TransportPair, TransportError> {
         answer_pc.clone(),
         answer_dc.clone(),
         router_keepalive,
+        None,
     );
 
     Ok(TransportPair {
         client: Box::new(client_transport),
         server: Box::new(server_transport),
     })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn create_test_pair() -> Result<TransportPair, TransportError> {
+    create_webrtc_pair().await
 }
 
 async fn wait_for_local_description(pc: &Arc<RTCPeerConnection>) -> Result<(), TransportError> {
@@ -759,6 +1092,7 @@ async fn wait_for_connection(pc: &Arc<RTCPeerConnection>) -> Result<(), Transpor
     pc.on_peer_connection_state_change(Box::new(move |state| {
         let signal = signal_clone.clone();
         Box::pin(async move {
+            tracing::debug!(target = "webrtc", ?state, "peer connection state changed");
             if state == RTCPeerConnectionState::Connected {
                 if let Some(tx) = signal.lock().unwrap().take() {
                     let _ = tx.send(());

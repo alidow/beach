@@ -88,10 +88,17 @@ struct CellUpdate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrimUpdate {
+    start: usize,
+    count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum WireUpdate {
     Row(RowUpdate),
     Rect(RectUpdate),
     Cell(CellUpdate),
+    Trim(TrimUpdate),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +141,10 @@ fn cache_update_to_wire(update: &CacheUpdate) -> WireUpdate {
             seq: cell.seq,
             cell: cell.cell.into_raw(),
         }),
+        CacheUpdate::Trim(trim) => WireUpdate::Trim(TrimUpdate {
+            start: trim.start,
+            count: trim.count,
+        }),
     }
 }
 
@@ -154,6 +165,9 @@ fn wire_update_apply(update: &WireUpdate, grid: &TerminalGrid) {
         WireUpdate::Cell(cell) => {
             let packed = PackedCell::from_raw(cell.cell);
             let _ = grid.write_packed_cell_if_newer(cell.row, cell.col, cell.seq, packed);
+        }
+        WireUpdate::Trim(_) => {
+            // trimming is applied via client-side renderer; cache grid ignores
         }
     }
 }
@@ -177,6 +191,9 @@ fn apply_cache_update(update: &CacheUpdate, grid: &TerminalGrid) {
         }
         CacheUpdate::Cell(cell) => {
             let _ = grid.write_packed_cell_if_newer(cell.row, cell.col, cell.seq, cell.cell);
+        }
+        CacheUpdate::Trim(_) => {
+            // grid state ignores trim events in this harness
         }
     }
 }

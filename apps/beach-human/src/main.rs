@@ -1,5 +1,5 @@
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use beach_human::cache::terminal::{unpack_cell, TerminalGrid};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use beach_human::cache::terminal::{TerminalGrid, unpack_cell};
 use beach_human::cache::{GridCache, Seq};
 use beach_human::client::terminal::{ClientError, TerminalClient};
 use beach_human::model::terminal::diff::CacheUpdate;
@@ -16,14 +16,14 @@ use beach_human::sync::{
     DeltaBatch, LaneBudget, PriorityLane, ServerHello, ServerSynchronizer, SnapshotChunk,
     SubscriptionId, SyncConfig,
 };
-use beach_human::telemetry::{self, PerfGuard};
 use beach_human::telemetry::logging::{self as logctl, LogConfig, LogLevel};
+use beach_human::telemetry::{self, PerfGuard};
 use beach_human::transport::webrtc::WebRtcRole;
 use beach_human::transport::{self, Transport, TransportError, TransportKind};
 use clap::{Args, Parser, Subcommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Read, Write};
@@ -36,9 +36,9 @@ use thiserror::Error;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep};
+use tracing::{Level, debug, error, info, trace, warn};
 use url::Url;
 use uuid::Uuid;
-use tracing::{debug, error, info, trace, warn, Level};
 
 #[tokio::main]
 async fn main() {
@@ -1015,11 +1015,26 @@ fn spawn_update_forwarder(
                             timeline.record(&update);
                             trace!(target = "sync::timeline", seq = update.seq(), "recorded cache update");
 
+                            let mut drained = 1usize;
+                            while let Ok(extra) = updates.try_recv() {
+                                trace!(target = "sync::timeline", seq = extra.seq(), "recorded coalesced update");
+                                timeline.record(&extra);
+                                drained = drained.saturating_add(1);
+                            }
+                            telemetry::record_gauge("sync_updates_batch", drained as u64);
+
                             for sink in sinks.iter_mut().filter(|s| s.active && s.handshake_complete) {
-                                if let Some(batch) = sink.synchronizer.delta_batch(subscription, sink.last_seq) {
+                                let mut batches_sent = 0usize;
+                                loop {
+                                    let Some(batch) = sink.synchronizer.delta_batch(subscription, sink.last_seq) else { break; };
                                     if batch.updates.is_empty() {
-                                        continue;
+                                        if batch.has_more {
+                                            continue;
+                                        }
+                                        break;
                                     }
+                                    telemetry::record_gauge("sync_delta_batch_updates", batch.updates.len() as u64);
+                                    let _guard = PerfGuard::new("sync_send_delta");
                                     if !send_json(&sink.transport, encode_delta_batch(&batch)) {
                                         sink.handshake_complete = false;
                                         warn!(
@@ -1028,19 +1043,25 @@ fn spawn_update_forwarder(
                                             transport = ?sink.transport.kind(),
                                             "delta send failed, marking handshake incomplete"
                                         );
-                                    } else {
-                                        sink.last_seq = batch.watermark.0;
-                                        sink.last_handshake = Instant::now();
-                                        trace!(
-                                            target = "sync::timeline",
-                                            transport_id = sink.transport.id().0,
-                                            transport = ?sink.transport.kind(),
-                                            watermark = batch.watermark.0,
-                                            updates = batch.updates.len(),
-                                            "delta batch delivered"
-                                        );
+                                        break;
+                                    }
+                                    sink.last_seq = batch.watermark.0;
+                                    sink.last_handshake = Instant::now();
+                                    batches_sent = batches_sent.saturating_add(1);
+                                    trace!(
+                                        target = "sync::timeline",
+                                        transport_id = sink.transport.id().0,
+                                        transport = ?sink.transport.kind(),
+                                        watermark = batch.watermark.0,
+                                        updates = batch.updates.len(),
+                                        has_more = batch.has_more,
+                                        "delta batch delivered"
+                                    );
+                                    if !batch.has_more || batches_sent > 32 {
+                                        break;
                                     }
                                 }
+                                telemetry::record_gauge("sync_delta_batches_sent", batches_sent as u64);
                             }
                         }
                         None => break,
@@ -1137,6 +1158,13 @@ fn encode_update(update: &CacheUpdate) -> Value {
                 "seq": row.seq,
                 "text": text,
                 "cells": cells,
+            })
+        }
+        CacheUpdate::Trim(trim) => {
+            json!({
+                "kind": "trim",
+                "start": trim.start,
+                "count": trim.count,
             })
         }
     }
@@ -1253,6 +1281,54 @@ fn encode_snapshot_chunk(chunk: &SnapshotChunk<CacheUpdate>) -> Value {
     })
 }
 
+fn encode_delta_updates(updates: &[CacheUpdate]) -> Vec<Value> {
+    use serde_json::Value;
+
+    let mut out = Vec::with_capacity(updates.len());
+    let mut segment_row: Option<usize> = None;
+    let mut segment_cells: Vec<Value> = Vec::new();
+
+    fn flush_segment(out: &mut Vec<Value>, row: &mut Option<usize>, cells: &mut Vec<Value>) {
+        if let Some(r) = row.take() {
+            if !cells.is_empty() {
+                let taken = std::mem::take(cells);
+                out.push(json!({
+                    "kind": "segment",
+                    "row": r,
+                    "cells": taken,
+                }));
+            }
+        } else {
+            cells.clear();
+        }
+    }
+
+    for update in updates {
+        match update {
+            CacheUpdate::Cell(cell) => {
+                let (ch, style) = unpack_cell(cell.cell);
+                if segment_row != Some(cell.row) {
+                    flush_segment(&mut out, &mut segment_row, &mut segment_cells);
+                    segment_row = Some(cell.row);
+                }
+                segment_cells.push(json!({
+                    "col": cell.col,
+                    "seq": cell.seq,
+                    "char": ch.to_string(),
+                    "style": style.0,
+                }));
+            }
+            other => {
+                flush_segment(&mut out, &mut segment_row, &mut segment_cells);
+                out.push(encode_update(other));
+            }
+        }
+    }
+
+    flush_segment(&mut out, &mut segment_row, &mut segment_cells);
+    out
+}
+
 fn encode_snapshot_complete(subscription: SubscriptionId, lane: PriorityLane) -> Value {
     json!({
         "type": "snapshot_complete",
@@ -1267,7 +1343,7 @@ fn encode_delta_batch(batch: &DeltaBatch<CacheUpdate>) -> Value {
         "subscription": batch.subscription_id.0,
         "watermark": batch.watermark.0,
         "has_more": batch.has_more,
-        "updates": batch.updates.iter().map(encode_update).collect::<Vec<_>>(),
+        "updates": encode_delta_updates(&batch.updates),
     })
 }
 
@@ -1348,12 +1424,56 @@ fn display_cmd(cmd: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::transport::{TransportKind, TransportPair};
-    use beach_human::cache::terminal::Style;
-    use beach_human::sync::terminal::NullTerminalDeltaStream;
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+    use beach_human::cache::terminal::{Style, StyleId};
     use beach_human::model::terminal::diff::RowSnapshot;
-    use serde_json::Value;
+    use beach_human::sync::terminal::NullTerminalDeltaStream;
+    use serde_json::{Value, json};
     use std::sync::Arc;
     use std::time::{Duration as StdDuration, Instant};
+    use tokio::time::{Instant as TokioInstant, sleep, timeout};
+
+    fn emit_row_update(
+        grid: &Arc<TerminalGrid>,
+        style_id: StyleId,
+        seq: Seq,
+        row: usize,
+        cols: usize,
+        text: &str,
+    ) -> CacheUpdate {
+        let chars: Vec<char> = text.chars().collect();
+        let mut packed_row = Vec::with_capacity(cols);
+        for col in 0..cols {
+            let ch = chars.get(col).copied().unwrap_or(' ');
+            let packed = TerminalGrid::pack_char_with_style(ch, style_id);
+            grid.write_packed_cell_if_newer(row, col, seq, packed)
+                .expect("write cell");
+            packed_row.push(packed);
+        }
+        CacheUpdate::Row(RowSnapshot::new(row, seq, packed_row))
+    }
+
+    async fn recv_json_frame(transport: &Arc<dyn Transport>, timeout: StdDuration) -> Value {
+        let deadline = TokioInstant::now() + timeout;
+        loop {
+            match transport.try_recv() {
+                Ok(Some(message)) => {
+                    if let Some(text) = message.payload.as_text() {
+                        return serde_json::from_str(text).expect("json frame");
+                    }
+                }
+                Ok(None) => {}
+                Err(TransportError::ChannelClosed) => {
+                    panic!("transport channel closed")
+                }
+                Err(err) => panic!("transport error: {err}"),
+            }
+            if TokioInstant::now() >= deadline {
+                panic!("timed out waiting for frame");
+            }
+            sleep(StdDuration::from_millis(10)).await;
+        }
+    }
 
     #[test]
     fn parse_plain_session_id() {
@@ -1385,6 +1505,172 @@ mod tests {
     fn reject_non_uuid_target() {
         let err = interpret_session_target("not-a-session").unwrap_err();
         assert!(matches!(err, CliError::InvalidSessionTarget { .. }));
+    }
+
+    #[tokio::test]
+    async fn webrtc_mock_session_flow() {
+        timeout(StdDuration::from_secs(30), async {
+            let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+            let pair = transport::webrtc::create_test_pair()
+                .await
+                .expect("create webrtc pair");
+            let client: Arc<dyn Transport> = Arc::from(pair.client);
+            let server: Arc<dyn Transport> = Arc::from(pair.server);
+
+            let rows = 24usize;
+            let cols = 80usize;
+            let grid = Arc::new(TerminalGrid::new(rows, cols));
+            let style_id = grid.ensure_style_id(Style::default());
+
+            // Seed prompt prior to handshake.
+            let initial_prompt = "(base) host% ";
+            let prompt_trimmed = initial_prompt.trim_end();
+            emit_row_update(&grid, style_id, 1, rows - 1, cols, initial_prompt);
+
+            let timeline = Arc::new(TimelineDeltaStream::new());
+            let delta_stream: Arc<dyn TerminalDeltaStream> = timeline.clone();
+            let sync_config = SyncConfig::default();
+            let terminal_sync = Arc::new(TerminalSync::new(
+                grid.clone(),
+                delta_stream,
+                sync_config.clone(),
+            ));
+
+            let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
+            let forwarder = spawn_update_forwarder(
+                vec![Arc::clone(&server)],
+                update_rx,
+                timeline.clone(),
+                terminal_sync.clone(),
+                sync_config.clone(),
+            );
+
+            // Consume handshake frames until all lanes report completion.
+            let hello = recv_json_frame(&client, StdDuration::from_secs(5)).await;
+            events.lock().unwrap().push("received_hello".into());
+            assert_eq!(hello["type"], "hello");
+            let grid_frame = recv_json_frame(&client, StdDuration::from_secs(5)).await;
+            events.lock().unwrap().push("received_grid".into());
+            assert_eq!(grid_frame["type"], "grid");
+
+            let mut saw_prompt = false;
+            let mut foreground_complete = false;
+            while !foreground_complete {
+                let frame = recv_json_frame(&client, StdDuration::from_secs(5)).await;
+                match frame["type"].as_str().unwrap_or("") {
+                    "snapshot" => {
+                        if frame["lane"] == "foreground" {
+                            if let Some(updates) = frame["updates"].as_array() {
+                                for update in updates {
+                                    if update["kind"] == "row" {
+                                        if let Some(text) = update["text"].as_str() {
+                                            if text.trim_end() == prompt_trimmed {
+                                                saw_prompt = true;
+                                                events
+                                                    .lock()
+                                                    .unwrap()
+                                                    .push("foreground_prompt".into());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "snapshot_complete" => {
+                        if frame["lane"] == "foreground" {
+                            foreground_complete = true;
+                            events.lock().unwrap().push("foreground_complete".into());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert!(saw_prompt, "foreground snapshot missing prompt");
+
+            // Emit server-side deltas.
+            let mut seq: Seq = 2;
+            let command_update = emit_row_update(
+                &grid,
+                style_id,
+                seq,
+                rows - 1,
+                cols,
+                "(base) host% echo hello",
+            );
+            timeline.record(&command_update);
+            update_tx
+                .send(command_update)
+                .expect("queue command update");
+            events.lock().unwrap().push("server_command_sent".into());
+            seq += 1;
+            let output_update = emit_row_update(&grid, style_id, seq, rows - 2, cols, "hello");
+            timeline.record(&output_update);
+            update_tx.send(output_update).expect("queue output update");
+            events.lock().unwrap().push("server_output_sent".into());
+
+            let deadline = TokioInstant::now() + StdDuration::from_secs(5);
+            let mut saw_command = false;
+            let mut saw_output = false;
+            while TokioInstant::now() < deadline && !(saw_command && saw_output) {
+                let frame = recv_json_frame(&client, StdDuration::from_secs(5)).await;
+                match frame["type"].as_str().unwrap_or("") {
+                    "delta" => {
+                        if let Some(updates) = frame["updates"].as_array() {
+                            for update in updates {
+                                if let Some(text) = update["text"].as_str() {
+                                    let trimmed = text.trim_end();
+                                    if trimmed.contains("echo hello") {
+                                        saw_command = true;
+                                        events.lock().unwrap().push("client_saw_command".into());
+                                    }
+                                    if trimmed == "hello" {
+                                        saw_output = true;
+                                        events.lock().unwrap().push("client_saw_output".into());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "heartbeat" => continue,
+                    _ => {}
+                }
+            }
+            assert!(saw_command, "delta missing command text");
+            assert!(saw_output, "delta missing command output");
+
+            // Client -> server input travels over the same transport.
+            let input_payload = json!({
+                "type": "input",
+                "seq": 1,
+                "data": BASE64.encode(b"echo world\n"),
+            })
+            .to_string();
+            client.send_text(&input_payload).expect("client send input");
+            events.lock().unwrap().push("client_sent_input".into());
+
+            let server_clone = Arc::clone(&server);
+            let inbound =
+                tokio::task::spawn_blocking(move || server_clone.recv(StdDuration::from_secs(5)))
+                    .await
+                    .expect("recv join")
+                    .expect("server recv");
+            let inbound_text = inbound.payload.as_text().expect("text payload").to_string();
+            assert_eq!(inbound_text, input_payload);
+            events.lock().unwrap().push("server_received_input".into());
+
+            drop(update_tx);
+            forwarder.await.expect("forwarder join");
+            let summary = events.lock().unwrap();
+            println!("webrtc_mock_session_flow events: {}", summary.join(", "));
+            assert!(summary.contains(&"foreground_prompt".to_string()));
+            assert!(summary.contains(&"client_saw_command".to_string()));
+            assert!(summary.contains(&"client_saw_output".to_string()));
+            assert!(summary.contains(&"server_received_input".to_string()));
+        })
+        .await
+        .expect("webrtc mock session timed out");
     }
 
     #[tokio::test]
@@ -1480,15 +1766,44 @@ mod tests {
                                         if let Some(updates) =
                                             value.get("updates").and_then(Value::as_array)
                                         {
-                                            if updates.iter().any(|entry| {
-                                                entry.get("kind").and_then(Value::as_str)
-                                                    == Some("row")
-                                                    && entry
-                                                        .get("text")
-                                                        .and_then(Value::as_str)
-                                                        .map(|s| s.trim_end())
-                                                        == Some("host%")
-                                            }) {
+                                            let mut match_found = false;
+                                            for entry in updates {
+                                                match entry.get("kind").and_then(Value::as_str) {
+                                                    Some("row") => {
+                                                        if entry
+                                                            .get("text")
+                                                            .and_then(Value::as_str)
+                                                            .map(|s| s.trim_end())
+                                                            == Some("host%")
+                                                        {
+                                                            match_found = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                    Some("segment") => {
+                                                        if let Some(cells) = entry
+                                                            .get("cells")
+                                                            .and_then(Value::as_array)
+                                                        {
+                                                            let mut buffer = String::new();
+                                                            for cell in cells {
+                                                                if let Some(ch) = cell
+                                                                    .get("char")
+                                                                    .and_then(Value::as_str)
+                                                                {
+                                                                    buffer.push_str(ch);
+                                                                }
+                                                            }
+                                                            if buffer.trim_end() == "host%" {
+                                                                match_found = true;
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            if match_found {
                                                 saw_prompt = true;
                                                 break;
                                             }
@@ -1524,8 +1839,7 @@ mod tests {
         let prompt = "host% ";
         for (col, ch) in prompt.chars().enumerate() {
             let packed = TerminalGrid::pack_char_with_style(ch, style_id);
-            grid
-                .write_packed_cell_if_newer(rows - 1, col, (col as Seq) + 1, packed)
+            grid.write_packed_cell_if_newer(rows - 1, col, (col as Seq) + 1, packed)
                 .expect("write prompt cell");
         }
 
@@ -1542,17 +1856,18 @@ mod tests {
         let client_transport: Arc<dyn Transport> = Arc::from(pair.client);
 
         let subscription = SubscriptionId(1);
-        let mut synchronizer =
-            ServerSynchronizer::new(terminal_sync.clone(), sync_config.clone());
+        let mut synchronizer = ServerSynchronizer::new(terminal_sync.clone(), sync_config.clone());
         let hello = synchronizer.hello(subscription);
         assert!(send_json(&host_transport, encode_server_hello(&hello)));
         assert!(send_json(
             &host_transport,
             encode_grid_descriptor(rows, cols)
         ));
-        assert!(
-            transmit_initial_snapshots(&host_transport, &mut synchronizer, subscription)
-        );
+        assert!(transmit_initial_snapshots(
+            &host_transport,
+            &mut synchronizer,
+            subscription
+        ));
 
         let mut saw_prompt = false;
         for _ in 0..6 {
@@ -1573,7 +1888,10 @@ mod tests {
                                             let row: String = cells
                                                 .iter()
                                                 .map(|cell| {
-                                                    cell["ch"].as_str().and_then(|s| s.chars().next()).unwrap_or(' ')
+                                                    cell["ch"]
+                                                        .as_str()
+                                                        .and_then(|s| s.chars().next())
+                                                        .unwrap_or(' ')
                                                 })
                                                 .collect();
                                             if row.trim_end() == prompt {

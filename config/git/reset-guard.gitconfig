@@ -1,0 +1,10 @@
+[alias]
+  reset = "!f() {
+    for arg in \"$@\"; do
+      if [ \"$arg\" = \"--hard\" ]; then
+        echo 'Refusing to run `git reset --hard` directly. Use scripts/git-safe-reset.sh instead.' >&2
+        exit 1
+      fi
+    done
+    command git reset \"$@\"
+  }; f"

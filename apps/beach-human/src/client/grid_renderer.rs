@@ -6,7 +6,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use std::collections::HashMap;
 
-/// Minimal style-aware cell state tracked by the unified grid renderer.
 #[derive(Clone, Copy, Debug)]
 struct CellState {
     ch: char,
@@ -34,12 +33,6 @@ pub struct SelectionPosition {
 struct SelectionRange {
     anchor: SelectionPosition,
     head: SelectionPosition,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PredictedCell {
-    ch: char,
-    seq: Seq,
 }
 
 impl SelectionRange {
@@ -75,9 +68,14 @@ impl SelectionRange {
     }
 }
 
-/// Unified grid renderer with scrollback, basic selection, and status overlays.
+#[derive(Clone, Copy, Debug)]
+struct PredictedCell {
+    ch: char,
+    seq: Seq,
+}
+
 pub struct GridRenderer {
-    rows: usize,
+    base_row: usize,
     cols: usize,
     cells: Vec<Vec<CellState>>,
     scroll_top: usize,
@@ -86,13 +84,14 @@ pub struct GridRenderer {
     selection: Option<SelectionRange>,
     needs_redraw: bool,
     predictions: HashMap<(usize, usize), PredictedCell>,
+    status_message: Option<String>,
 }
 
 impl GridRenderer {
     pub fn new(rows: usize, cols: usize) -> Self {
         let mut renderer = Self {
-            rows,
-            cols,
+            base_row: 0,
+            cols: cols.max(1),
             cells: Vec::new(),
             scroll_top: 0,
             viewport_height: 0,
@@ -100,88 +99,156 @@ impl GridRenderer {
             selection: None,
             needs_redraw: true,
             predictions: HashMap::new(),
+            status_message: None,
         };
-        renderer.ensure_size(rows, cols);
+        renderer.ensure_capacity(rows, cols);
         renderer
     }
 
-    pub fn ensure_size(&mut self, rows: usize, cols: usize) {
-        if rows > self.rows {
-            for _ in self.rows..rows {
+    fn ensure_capacity(&mut self, rows: usize, cols: usize) {
+        if rows > self.cells.len() {
+            for _ in self.cells.len()..rows {
                 self.cells
                     .push(vec![CellState::blank(); self.cols.max(cols).max(1)]);
             }
-            self.rows = rows;
         }
-
         if cols > self.cols {
             for row in &mut self.cells {
                 row.resize(cols, CellState::blank());
             }
             self.cols = cols;
         }
+    }
 
-        if self.cells.len() < self.rows {
-            for _ in self.cells.len()..self.rows {
+    fn ensure_row(&mut self, absolute_row: usize) {
+        if absolute_row < self.base_row {
+            return;
+        }
+        let required_len = absolute_row - self.base_row + 1;
+        if required_len > self.cells.len() {
+            let missing = required_len - self.cells.len();
+            for _ in 0..missing {
                 self.cells.push(vec![CellState::blank(); self.cols.max(1)]);
             }
         }
     }
 
+    pub fn ensure_size(&mut self, rows: usize, cols: usize) {
+        self.ensure_capacity(rows, cols);
+    }
+
+    fn ensure_col(&mut self, col: usize) {
+        if col < self.cols {
+            return;
+        }
+        let new_cols = col + 1;
+        for row in &mut self.cells {
+            row.resize(new_cols, CellState::blank());
+        }
+        self.cols = new_cols;
+    }
+
+    fn relative_row(&self, absolute_row: usize) -> Option<usize> {
+        if absolute_row < self.base_row {
+            None
+        } else {
+            let idx = absolute_row - self.base_row;
+            if idx < self.cells.len() {
+                Some(idx)
+            } else {
+                None
+            }
+        }
+    }
+
+    fn touch_row(&mut self, absolute_row: usize) -> Option<usize> {
+        if absolute_row < self.base_row {
+            return None;
+        }
+        self.ensure_row(absolute_row);
+        Some(absolute_row - self.base_row)
+    }
+
     pub fn apply_cell(
         &mut self,
-        row: usize,
+        absolute_row: usize,
         col: usize,
         seq: Seq,
         ch: char,
         style_id: Option<u32>,
     ) {
-        self.ensure_size(row + 1, col + 1);
-        self.clear_prediction_at(row, col);
-        let cell = &mut self.cells[row][col];
-        if seq >= cell.seq {
-            cell.ch = ch;
-            cell.seq = seq;
-            cell.style_id = style_id;
-            self.mark_dirty();
-        }
-        if self.follow_tail {
-            self.scroll_to_tail();
+        if let Some(rel) = self.touch_row(absolute_row) {
+            self.ensure_col(col);
+            self.clear_prediction_at(absolute_row, col);
+            let row = &mut self.cells[rel];
+            let cell = &mut row[col];
+            if seq >= cell.seq {
+                cell.ch = ch;
+                cell.seq = seq;
+                cell.style_id = style_id;
+                self.mark_dirty();
+            }
+            if self.follow_tail {
+                self.scroll_to_tail();
+            }
         }
     }
 
-    pub fn apply_row_from_text(&mut self, row: usize, seq: Seq, text: &str) {
-        let width = text.chars().count();
-        self.ensure_size(row + 1, self.cols.max(width));
-        for (col, ch) in text.chars().enumerate() {
-            self.apply_cell(row, col, seq, ch, None);
-        }
-        for col in width..self.cols {
-            let cell = &mut self.cells[row][col];
-            if seq >= cell.seq {
-                cell.ch = ' ';
-                cell.seq = seq;
-                self.mark_dirty();
+    pub fn apply_row_from_text(&mut self, absolute_row: usize, seq: Seq, text: &str) {
+        if self.touch_row(absolute_row).is_some() {
+            let width = text.chars().count();
+            self.ensure_col(width);
+            for (col, ch) in text.chars().enumerate() {
+                self.apply_cell(absolute_row, col, seq, ch, None);
             }
-            self.clear_prediction_at(row, col);
+            if let Some(rel) = self.relative_row(absolute_row) {
+                for col in width..self.cols {
+                    let mut marked = false;
+                    {
+                        let cell = &mut self.cells[rel][col];
+                        if seq >= cell.seq {
+                            cell.ch = ' ';
+                            cell.seq = seq;
+                            cell.style_id = None;
+                            marked = true;
+                        }
+                    }
+                    if self.predictions.remove(&(absolute_row, col)).is_some() || marked {
+                        self.mark_dirty();
+                    }
+                }
+            }
         }
     }
 
-    pub fn apply_row_from_cells(&mut self, row: usize, seq: Seq, cells: &[(char, Option<u32>)]) {
-        let width = cells.len();
-        self.ensure_size(row + 1, self.cols.max(width));
-        for (col, (ch, style_id)) in cells.iter().enumerate() {
-            self.apply_cell(row, col, seq, *ch, *style_id);
-        }
-        for col in width..self.cols {
-            let cell = &mut self.cells[row][col];
-            if seq >= cell.seq {
-                cell.ch = ' ';
-                cell.seq = seq;
-                cell.style_id = None;
-                self.mark_dirty();
+    pub fn apply_row_from_cells(
+        &mut self,
+        absolute_row: usize,
+        seq: Seq,
+        cells: &[(char, Option<u32>)],
+    ) {
+        if self.touch_row(absolute_row).is_some() {
+            self.ensure_col(cells.len());
+            for (col, (ch, style_id)) in cells.iter().enumerate() {
+                self.apply_cell(absolute_row, col, seq, *ch, *style_id);
             }
-            self.clear_prediction_at(row, col);
+            if let Some(rel) = self.relative_row(absolute_row) {
+                for col in cells.len()..self.cols {
+                    let mut marked = false;
+                    {
+                        let cell = &mut self.cells[rel][col];
+                        if seq >= cell.seq {
+                            cell.ch = ' ';
+                            cell.seq = seq;
+                            cell.style_id = None;
+                            marked = true;
+                        }
+                    }
+                    if self.predictions.remove(&(absolute_row, col)).is_some() || marked {
+                        self.mark_dirty();
+                    }
+                }
+            }
         }
     }
 
@@ -193,17 +260,71 @@ impl GridRenderer {
         ch: char,
         style_id: Option<u32>,
     ) {
-        self.ensure_size(rows.end, cols.end);
-        for row in rows.clone() {
-            for col in cols.clone() {
-                self.apply_cell(row, col, seq, ch, style_id);
+        for absolute_row in rows.clone() {
+            if let Some(rel) = self.touch_row(absolute_row) {
+                self.ensure_col(cols.end);
+                for col in cols.clone() {
+                    self.apply_cell(absolute_row, col, seq, ch, style_id);
+                    let cell = &mut self.cells[rel][col];
+                    cell.seq = seq;
+                }
+            }
+        }
+        self.mark_dirty();
+    }
+
+    pub fn apply_segment(
+        &mut self,
+        absolute_row: usize,
+        cells: &[(usize, Seq, char, Option<u32>)],
+    ) {
+        if cells.is_empty() {
+            return;
+        }
+        for (col, seq, ch, style_id) in cells {
+            self.apply_cell(absolute_row, *col, *seq, *ch, *style_id);
+        }
+    }
+
+    pub fn apply_trim(&mut self, start: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let new_base = start.saturating_add(count);
+        if new_base <= self.base_row {
+            return;
+        }
+        let trim_count = new_base.saturating_sub(self.base_row).min(self.cells.len());
+        if trim_count == 0 {
+            return;
+        }
+        self.cells.drain(0..trim_count);
+        self.base_row = self.base_row.saturating_add(trim_count);
+        self.scroll_top = self.scroll_top.saturating_sub(trim_count);
+        if self.follow_tail {
+            self.scroll_to_tail();
+        }
+        self.predictions.retain(|(row, _), _| *row >= self.base_row);
+        if let Some(range) = &mut self.selection {
+            let (anchor, head) = range.bounds();
+            if anchor.row < self.base_row && head.row < self.base_row {
+                self.clear_selection();
+            } else {
+                let new_anchor = SelectionPosition {
+                    row: anchor.row.max(self.base_row),
+                    col: anchor.col,
+                };
+                let new_head = SelectionPosition {
+                    row: head.row.max(self.base_row),
+                    col: head.col,
+                };
+                self.selection = Some(SelectionRange::new(new_anchor, new_head));
             }
         }
         self.mark_dirty();
     }
 
     pub fn add_prediction(&mut self, row: usize, col: usize, seq: Seq, ch: char) {
-        self.ensure_size(row + 1, col + 1);
         self.predictions
             .insert((row, col), PredictedCell { ch, seq });
         self.mark_dirty();
@@ -234,7 +355,7 @@ impl GridRenderer {
         if self.viewport_height == 0 {
             return;
         }
-        let max_scroll = self.rows.saturating_sub(self.viewport_height);
+        let max_scroll = self.cells.len().saturating_sub(self.viewport_height);
         if delta.is_positive() {
             let delta = delta as usize;
             self.scroll_top = (self.scroll_top + delta).min(max_scroll);
@@ -255,11 +376,11 @@ impl GridRenderer {
     }
 
     pub fn scroll_to_tail(&mut self) {
-        if self.viewport_height == 0 || self.rows == 0 {
+        if self.viewport_height == 0 || self.cells.is_empty() {
             self.scroll_top = 0;
             return;
         }
-        self.scroll_top = self.rows.saturating_sub(self.viewport_height);
+        self.scroll_top = self.cells.len().saturating_sub(self.viewport_height);
         self.follow_tail = true;
         self.mark_dirty();
     }
@@ -283,7 +404,7 @@ impl GridRenderer {
     }
 
     pub fn viewport_top(&self) -> usize {
-        self.scroll_top
+        self.base_row + self.scroll_top
     }
 
     pub fn viewport_height(&self) -> usize {
@@ -291,24 +412,33 @@ impl GridRenderer {
     }
 
     pub fn total_rows(&self) -> usize {
-        self.rows
+        self.base_row + self.cells.len()
     }
 
     pub fn total_cols(&self) -> usize {
         self.cols
     }
 
+    pub fn contains_row(&self, row: usize) -> bool {
+        row >= self.base_row && row < self.base_row + self.cells.len()
+    }
+
     pub fn clamp_position(&self, row: isize, col: isize) -> SelectionPosition {
-        if self.rows == 0 || self.cols == 0 {
-            return SelectionPosition { row: 0, col: 0 };
+        if self.cells.is_empty() {
+            return SelectionPosition {
+                row: self.base_row,
+                col: 0,
+            };
         }
-        let max_row = (self.rows - 1) as isize;
-        let clamped_row = row.clamp(0, max_row) as usize;
-        let mut max_col = (self.cols - 1) as isize;
+        let min_row = self.base_row as isize;
+        let max_row = (self.base_row + self.cells.len() - 1) as isize;
+        let clamped_row = row.clamp(min_row, max_row) as usize;
         let row_width = self.row_display_width(clamped_row);
-        if row_width > 0 {
-            max_col = max_col.min((row_width - 1) as isize);
-        }
+        let max_col = if row_width == 0 {
+            0
+        } else {
+            row_width.saturating_sub(1)
+        } as isize;
         let clamped_col = col.clamp(0, max_col.max(0)) as usize;
         SelectionPosition {
             row: clamped_row,
@@ -318,46 +448,55 @@ impl GridRenderer {
 
     pub fn selection_text(&self) -> Option<String> {
         let range = self.selection.as_ref()?;
-        if self.rows == 0 || self.cols == 0 {
+        if self.cells.is_empty() {
             return None;
         }
         let (start, end) = range.bounds();
+        if end.row < self.base_row {
+            return None;
+        }
         let mut output = String::new();
-        for row in start.row..=end.row {
-            if row >= self.rows {
+        let mut current = start.row;
+        while current <= end.row {
+            if current < self.base_row {
+                current += 1;
+                continue;
+            }
+            if current >= self.base_row + self.cells.len() {
                 break;
             }
-            let mut row_start = if row == start.row { start.col } else { 0 };
-            let mut row_end = if row == end.row {
+            let mut row_start = if current == start.row { start.col } else { 0 };
+            let mut row_end = if current == end.row {
                 end.col
             } else {
                 self.cols.saturating_sub(1)
             };
             row_start = row_start.min(self.cols.saturating_sub(1));
             row_end = row_end.min(self.cols.saturating_sub(1));
-            if row_end < row_start {
-                continue;
+            if row_end >= row_start {
+                for col in row_start..=row_end {
+                    let (ch, _, _) = self.cell_for_render(current, col);
+                    output.push(ch);
+                }
             }
-            for col in row_start..=row_end {
-                let (ch, _, _) = self.cell_for_render(row, col);
-                output.push(ch);
-            }
-            if row != end.row {
+            if current != end.row {
                 output.push('\n');
             }
+            current += 1;
         }
         Some(output)
     }
 
-    pub fn row_display_width(&self, row: usize) -> usize {
-        if row >= self.rows {
-            return 0;
+    pub fn row_display_width(&self, absolute_row: usize) -> usize {
+        if let Some(rel) = self.relative_row(absolute_row) {
+            self.cells[rel]
+                .iter()
+                .rposition(|cell| cell.ch != ' ')
+                .map(|idx| idx + 1)
+                .unwrap_or(0)
+        } else {
+            0
         }
-        self.cells[row]
-            .iter()
-            .rposition(|cell| cell.ch != ' ')
-            .map(|idx| idx + 1)
-            .unwrap_or(0)
     }
 
     pub fn set_selection(&mut self, anchor: SelectionPosition, head: SelectionPosition) {
@@ -372,12 +511,20 @@ impl GridRenderer {
         }
     }
 
+    pub fn set_status_message<S: Into<String>>(&mut self, message: Option<S>) {
+        self.status_message = message.map(Into::into);
+        self.mark_dirty();
+    }
+
     pub fn on_resize(&mut self, _cols: u16, rows: u16) {
         let usable = rows.saturating_sub(2) as usize;
         if usable != self.viewport_height {
             self.viewport_height = usable;
             if self.follow_tail {
                 self.scroll_to_tail();
+            } else {
+                let max_scroll = self.cells.len().saturating_sub(self.viewport_height);
+                self.scroll_top = self.scroll_top.min(max_scroll);
             }
             self.mark_dirty();
         }
@@ -401,7 +548,7 @@ impl GridRenderer {
         if self.follow_tail {
             self.scroll_to_tail();
         } else {
-            let max_scroll = self.rows.saturating_sub(self.viewport_height);
+            let max_scroll = self.cells.len().saturating_sub(self.viewport_height);
             self.scroll_top = self.scroll_top.min(max_scroll);
         }
 
@@ -437,17 +584,17 @@ impl GridRenderer {
         let height = self.viewport_height.max(1);
         let mut lines = Vec::with_capacity(height);
         for row_idx in 0..height {
-            let absolute = self.scroll_top + row_idx;
-            if absolute >= self.rows {
+            let absolute = self.base_row + self.scroll_top + row_idx;
+            if let Some(_rel) = self.relative_row(absolute) {
+                let mut line = String::with_capacity(self.cols.max(1));
+                for col in 0..self.cols.max(1) {
+                    let (ch, _, _) = self.cell_for_render(absolute, col);
+                    line.push(ch);
+                }
+                lines.push(line);
+            } else {
                 lines.push(String::new());
-                continue;
             }
-            let mut line = String::with_capacity(self.cols.max(1));
-            for col in 0..self.cols.max(1) {
-                let (ch, _, _) = self.cell_for_render(absolute, col);
-                line.push(ch);
-            }
-            lines.push(line);
         }
         lines
     }
@@ -455,22 +602,22 @@ impl GridRenderer {
     fn render_body(&self) -> Paragraph<'_> {
         let mut lines: Vec<Line> = Vec::with_capacity(self.viewport_height.max(1));
         for row_idx in 0..self.viewport_height.max(1) {
-            let absolute = self.scroll_top + row_idx;
-            if absolute >= self.rows {
+            let absolute = self.base_row + self.scroll_top + row_idx;
+            if let Some(_rel) = self.relative_row(absolute) {
+                let mut spans = Vec::with_capacity(self.cols.max(1));
+                for col in 0..self.cols.max(1) {
+                    let (ch, style_id, predicted) = self.cell_for_render(absolute, col);
+                    let selected = self
+                        .selection
+                        .as_ref()
+                        .map(|sel| sel.contains(SelectionPosition { row: absolute, col }))
+                        .unwrap_or(false);
+                    spans.push(self.span_for_cell(ch, style_id, selected, predicted));
+                }
+                lines.push(Line::from(spans));
+            } else {
                 lines.push(Line::from(""));
-                continue;
             }
-            let mut spans = Vec::with_capacity(self.cols.max(1));
-            for col in 0..self.cols.max(1) {
-                let (ch, style_id, predicted) = self.cell_for_render(absolute, col);
-                let selected = self
-                    .selection
-                    .as_ref()
-                    .map(|sel| sel.contains(SelectionPosition { row: absolute, col }))
-                    .unwrap_or(false);
-                spans.push(self.span_for_cell(ch, style_id, selected, predicted));
-            }
-            lines.push(Line::from(spans));
         }
 
         Paragraph::new(lines)
@@ -505,22 +652,35 @@ impl GridRenderer {
         Span::styled(ch.to_string(), style)
     }
 
-    fn cell_for_render(&self, row: usize, col: usize) -> (char, Option<u32>, bool) {
-        if let Some(predicted) = self.predictions.get(&(row, col)) {
+    fn cell_for_render(&self, absolute_row: usize, col: usize) -> (char, Option<u32>, bool) {
+        if let Some(predicted) = self.predictions.get(&(absolute_row, col)) {
             (predicted.ch, None, true)
+        } else if let Some(rel) = self.relative_row(absolute_row) {
+            let row = &self.cells[rel];
+            if col < row.len() {
+                let cell = row[col];
+                (cell.ch, cell.style_id, false)
+            } else {
+                (' ', None, false)
+            }
         } else {
-            let cell = self.cells[row][col];
-            (cell.ch, cell.style_id, false)
+            (' ', None, false)
         }
     }
 
     fn render_status_line(&self) -> Paragraph<'_> {
-        let total_rows = self.rows;
-        let displayed = self.viewport_height.min(total_rows);
+        let total_rows = self.total_rows();
+        let displayed = self.viewport_height.min(self.cells.len());
         let follow = if self.follow_tail { "tail" } else { "manual" };
+        let status = self
+            .status_message
+            .as_deref()
+            .unwrap_or("alt+[ copy • alt+f follow • alt+End tail");
         let text = format!(
-            "rows {total_rows} • showing {displayed} • scroll {} • mode {}",
-            self.scroll_top, follow,
+            "rows {total_rows} • showing {displayed} • scroll {} • mode {} • {}",
+            self.viewport_top(),
+            follow,
+            status
         );
         Paragraph::new(text).block(Block::default())
     }

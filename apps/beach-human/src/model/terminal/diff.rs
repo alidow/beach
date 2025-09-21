@@ -75,10 +75,31 @@ impl RowSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryTrim {
+    pub start: usize,
+    pub count: usize,
+}
+
+impl HistoryTrim {
+    pub fn new(start: usize, count: usize) -> Self {
+        Self { start, count }
+    }
+
+    pub fn end(&self) -> usize {
+        self.start.saturating_add(self.count)
+    }
+
+    pub fn seq(&self) -> Seq {
+        self.end() as Seq
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CacheUpdate {
     Cell(CellWrite),
     Rect(RectFill),
     Row(RowSnapshot),
+    Trim(HistoryTrim),
 }
 
 impl CacheUpdate {
@@ -87,6 +108,7 @@ impl CacheUpdate {
             CacheUpdate::Cell(cell) => cell.seq,
             CacheUpdate::Rect(rect) => rect.seq,
             CacheUpdate::Row(row) => row.seq,
+            CacheUpdate::Trim(trim) => trim.seq(),
         }
     }
 }

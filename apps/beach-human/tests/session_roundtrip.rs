@@ -2,14 +2,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use beach_human::cache::terminal::{self, Style, StyleId, TerminalGrid};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use beach_human::cache::GridCache;
+use beach_human::cache::terminal::{self, Style, StyleId, TerminalGrid};
 use beach_human::model::terminal::diff::{CacheUpdate, RowSnapshot};
 use beach_human::sync::terminal::{TerminalDeltaStream, TerminalSync};
 use beach_human::sync::{PriorityLane, ServerSynchronizer, SubscriptionId, SyncConfig};
 use beach_human::transport::{Transport, TransportKind, TransportMessage, TransportPair};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[test]
 fn late_joiner_receives_snapshot_and_roundtrips_input() {
@@ -511,6 +511,13 @@ fn encode_update(update: &CacheUpdate) -> Value {
                         })
                     })
                     .collect::<Vec<_>>(),
+            })
+        }
+        CacheUpdate::Trim(trim) => {
+            json!({
+                "kind": "trim",
+                "start": trim.start,
+                "count": trim.count,
             })
         }
     }

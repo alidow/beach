@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use portable_pty::{native_pty_system, Child, CommandBuilder, PtyPair, PtySize};
+use portable_pty::{Child, CommandBuilder, PtyPair, PtySize, native_pty_system};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::task;
@@ -141,17 +141,19 @@ impl PtyReader {
 
     pub async fn read_chunk(&self) -> Result<Option<Vec<u8>>> {
         let reader = self.reader.clone();
-        task::spawn_blocking(move || loop {
-            let mut guard = reader.lock().unwrap();
-            let mut buffer = vec![0u8; Self::CHUNK];
-            match guard.read(&mut buffer) {
-                Ok(0) => return Ok(None),
-                Ok(n) => {
-                    buffer.truncate(n);
-                    return Ok(Some(buffer));
+        task::spawn_blocking(move || {
+            loop {
+                let mut guard = reader.lock().unwrap();
+                let mut buffer = vec![0u8; Self::CHUNK];
+                match guard.read(&mut buffer) {
+                    Ok(0) => return Ok(None),
+                    Ok(n) => {
+                        buffer.truncate(n);
+                        return Ok(Some(buffer));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) => return Err(err.into()),
                 }
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(err) => return Err(err.into()),
             }
         })
         .await

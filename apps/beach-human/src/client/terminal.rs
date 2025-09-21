@@ -23,8 +23,8 @@ use std::sync::{
     Arc,
     mpsc::{Receiver, TryRecvError},
 };
-use std::time::Duration;
-use tracing::{debug, trace, Level};
+use std::time::{Duration, Instant};
+use tracing::{Level, debug, trace};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ClientError {
@@ -49,6 +49,9 @@ pub struct TerminalClient {
     cursor_col: usize,
     pending_predictions: HashMap<Seq, Vec<(usize, usize)>>,
     copy_mode: Option<CopyModeState>,
+    last_render_at: Option<Instant>,
+    render_interval: Duration,
+    pending_render: bool,
 }
 
 impl TerminalClient {
@@ -69,6 +72,9 @@ impl TerminalClient {
             cursor_col: 0,
             pending_predictions: HashMap::new(),
             copy_mode: None,
+            last_render_at: None,
+            render_interval: Duration::from_millis(16),
+            pending_render: false,
         }
     }
 
@@ -166,6 +172,11 @@ impl TerminalClient {
                 let target_col = cols.get(1).copied().unwrap_or(cols[0]);
                 Some(Exact(target_row, target_col))
             }
+            UpdateEntry::Segment { row, cells } => cells
+                .iter()
+                .map(|cell| Exact(*row, cell.col.saturating_add(1)))
+                .last(),
+            UpdateEntry::Trim { .. } => None,
         };
 
         match update {
@@ -209,6 +220,29 @@ impl TerminalClient {
                 self.renderer
                     .apply_rect(row_range, col_range, seq, ch, style);
             }
+            UpdateEntry::Segment { row, cells } => {
+                if !cells.is_empty() {
+                    let mut segment = Vec::with_capacity(cells.len());
+                    for cell in cells {
+                        let ch = cell.ch.chars().next().unwrap_or(' ');
+                        segment.push((cell.col, cell.seq, ch, cell.style));
+                    }
+                    self.renderer.apply_segment(row, &segment);
+                }
+            }
+            UpdateEntry::Trim { start, count } => {
+                self.renderer.apply_trim(start, count);
+                self.pending_predictions.values_mut().for_each(|positions| {
+                    positions.retain(|(row, _)| *row >= start + count);
+                });
+                self.pending_predictions
+                    .retain(|_, positions| !positions.is_empty());
+                if self.cursor_row >= start && self.cursor_row < start + count {
+                    self.cursor_row = start + count;
+                    self.cursor_col = 0;
+                }
+                self.force_render = true;
+            }
         }
 
         if let Some(hint) = cursor_hint {
@@ -229,9 +263,38 @@ impl TerminalClient {
         if !self.render_enabled {
             return Ok(());
         }
-        if self.force_render || self.renderer.take_dirty() {
+
+        if self.pending_render {
+            let ready = self
+                .last_render_at
+                .map(|last| last.elapsed() >= self.render_interval)
+                .unwrap_or(true);
+            if ready {
+                self.pending_render = false;
+                self.force_render = false;
+                self.render()?;
+                self.last_render_at = Some(Instant::now());
+            }
+            return Ok(());
+        }
+
+        let dirty = self.renderer.take_dirty();
+        if self.force_render || dirty {
+            let now = Instant::now();
+            if !self.force_render {
+                if let Some(last) = self.last_render_at {
+                    if now.duration_since(last) < self.render_interval {
+                        self.pending_render = true;
+                        if dirty {
+                            self.renderer.mark_dirty();
+                        }
+                        return Ok(());
+                    }
+                }
+            }
             self.force_render = false;
             self.render()?;
+            self.last_render_at = Some(now);
         }
         Ok(())
     }
@@ -603,6 +666,10 @@ impl TerminalClient {
         if bytes.len() > 32 {
             return;
         }
+        if self.pending_predictions.len() > 256 {
+            self.pending_predictions.clear();
+            self.renderer.clear_all_predictions();
+        }
         let mut positions = Vec::new();
         for &byte in bytes {
             match byte {
@@ -775,6 +842,24 @@ enum UpdateEntry {
         #[serde(default)]
         style: Option<u32>,
     },
+    Segment {
+        row: usize,
+        cells: Vec<SegmentCell>,
+    },
+    Trim {
+        start: usize,
+        count: usize,
+    },
+}
+
+#[derive(Deserialize, Clone)]
+struct SegmentCell {
+    col: usize,
+    seq: Seq,
+    #[serde(default)]
+    ch: String,
+    #[serde(default)]
+    style: Option<u32>,
 }
 
 #[derive(Deserialize, Clone)]

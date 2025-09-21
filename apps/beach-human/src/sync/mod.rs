@@ -223,6 +223,7 @@ where
     source: Arc<S>,
     cursor: S::Cursor,
     lane_initialized: [bool; 3],
+    lane_complete: [bool; 3],
     config: SyncConfig,
     _marker: PhantomData<U>,
 }
@@ -237,6 +238,7 @@ where
             source,
             cursor: Default::default(),
             lane_initialized: [false, false, false],
+            lane_complete: [false, false, false],
             config,
             _marker: PhantomData,
         }
@@ -260,14 +262,26 @@ where
             return None;
         }
         let idx = lane.as_index();
+        if self.lane_complete[idx] {
+            return None;
+        }
         if !self.lane_initialized[idx] {
             SnapshotSource::reset_lane(&*self.source, &mut self.cursor, lane);
             self.lane_initialized[idx] = true;
         }
-        let slice = SnapshotSource::next_slice(&*self.source, &mut self.cursor, lane, budget)?;
+        let slice = match SnapshotSource::next_slice(&*self.source, &mut self.cursor, lane, budget)
+        {
+            Some(slice) => slice,
+            None => {
+                self.lane_initialized[idx] = false;
+                self.lane_complete[idx] = true;
+                return None;
+            }
+        };
         let has_more = slice.has_more;
         if !has_more {
             self.lane_initialized[idx] = false;
+            self.lane_complete[idx] = true;
         }
         Some(SnapshotChunk::from_slice(subscription_id, lane, slice))
     }

@@ -85,11 +85,11 @@ fn extract_output_lines(raw_output: &str) -> Vec<String> {
     raw_output
         .lines()
         .filter(|line| {
-            !line.trim().is_empty() 
-            && !line.contains('%')  // zsh prompt
-            && !line.contains('$')  // bash prompt  
-            && !line.contains('#')  // root prompt
-            && !line.starts_with("echo ") // command echo
+            !line.trim().is_empty()
+                && !line.contains('%') // zsh prompt
+                && !line.contains('$') // bash prompt
+                && !line.contains('#') // root prompt
+                && !line.starts_with("echo ") // command echo
         })
         .map(|s| s.trim().to_string())
         .collect()

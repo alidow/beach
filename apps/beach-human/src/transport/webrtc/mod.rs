@@ -65,6 +65,13 @@ where
     }
 }
 
+fn spawn_on_global<F>(future: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    RUNTIME.spawn(future);
+}
+
 fn build_api(setting: SettingEngine) -> Result<API, TransportError> {
     let mut media_engine = MediaEngine::default();
     media_engine
@@ -126,7 +133,6 @@ impl WebRtcTransport {
         dc: Arc<RTCDataChannel>,
         router: Option<Arc<AsyncMutex<Router>>>,
         dc_ready: Option<Arc<Notify>>,
-        spawn_handle: Option<Handle>,
     ) -> Self {
         let (inbound_tx, inbound_rx) = crossbeam_unbounded();
         let handler_id = id;
@@ -180,20 +186,97 @@ impl WebRtcTransport {
         let dc_clone = dc.clone();
         let transport_id = id;
         let dc_ready_signal = dc_ready.clone();
-        spawn_with_handle(spawn_handle.clone(), async move {
+        spawn_on_global(async move {
             if let Some(notify) = dc_ready_signal {
+                tracing::trace!(
+                    target = "beach_human::transport::webrtc",
+                    transport_id = ?transport_id,
+                    await = "dc_ready.notified",
+                    state = "start"
+                );
                 notify.notified().await;
+                tracing::trace!(
+                    target = "beach_human::transport::webrtc",
+                    transport_id = ?transport_id,
+                    await = "dc_ready.notified",
+                    state = "end"
+                );
                 tracing::trace!(target = "webrtc", transport_id = ?transport_id, "dc ready triggered");
             } else {
                 tracing::trace!(target = "webrtc", transport_id = ?transport_id, "dc ready immediate");
             }
             tracing::trace!(target = "webrtc", transport_id = ?transport_id, "sender loop start");
-            while let Some(bytes) = outbound_rx.recv().await {
+            loop {
+                tracing::trace!(
+                    target = "beach_human::transport::webrtc",
+                    transport_id = ?transport_id,
+                    await = "outbound_rx.recv",
+                    state = "start"
+                );
+                let maybe_bytes = outbound_rx.recv().await;
+                tracing::trace!(
+                    target = "beach_human::transport::webrtc",
+                    transport_id = ?transport_id,
+                    await = "outbound_rx.recv",
+                    state = "end",
+                    has_bytes = maybe_bytes.is_some()
+                );
+                let bytes = match maybe_bytes {
+                    Some(bytes) => bytes,
+                    None => break,
+                };
+                tracing::trace!(
+                    target = "webrtc",
+                    transport_id = ?transport_id,
+                    queued_len = bytes.len(),
+                    "dequeued outbound"
+                );
                 let data = Bytes::from(bytes);
+                tracing::trace!(
+                    target = "beach_human::transport::webrtc",
+                    transport_id = ?transport_id,
+                    await = "dc.buffered_amount.before",
+                    state = "start"
+                );
                 let before = dc_clone.buffered_amount().await;
-                match timeout(CONNECT_TIMEOUT, dc_clone.send(&data)).await {
+                tracing::trace!(
+                    target = "beach_human::transport::webrtc",
+                    transport_id = ?transport_id,
+                    await = "dc.buffered_amount.before",
+                    state = "end",
+                    buffered_before = before
+                );
+                tracing::trace!(
+                    target = "beach_human::transport::webrtc",
+                    transport_id = ?transport_id,
+                    await = "dc.send",
+                    state = "start",
+                    payload_len = data.len()
+                );
+                let send_result = timeout(CONNECT_TIMEOUT, dc_clone.send(&data)).await;
+                tracing::trace!(
+                    target = "beach_human::transport::webrtc",
+                    transport_id = ?transport_id,
+                    await = "dc.send",
+                    state = "end",
+                    result = ?send_result
+                );
+                match send_result {
                     Ok(Ok(bytes_written)) => {
+                        tracing::trace!(
+                            target = "beach_human::transport::webrtc",
+                            transport_id = ?transport_id,
+                            await = "dc.buffered_amount.after",
+                            state = "start"
+                        );
                         let after = dc_clone.buffered_amount().await;
+                        tracing::trace!(
+                            target = "beach_human::transport::webrtc",
+                            transport_id = ?transport_id,
+                            await = "dc.buffered_amount.after",
+                            state = "end",
+                            buffered_after = after
+                        );
                         tracing::trace!(
                             target = "webrtc",
                             transport_id = ?transport_id,
@@ -368,11 +451,21 @@ async fn connect_offerer(
     let api = build_api(setting)?;
     let config = RTCConfiguration::default();
 
-    let pc = Arc::new(
-        api.new_peer_connection(config)
-            .await
-            .map_err(to_setup_error)?,
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "offerer",
+        await = "api.new_peer_connection",
+        state = "start"
     );
+    let pc_result = api.new_peer_connection(config).await;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "offerer",
+        await = "api.new_peer_connection",
+        state = "end",
+        result = ?pc_result
+    );
+    let pc = Arc::new(pc_result.map_err(to_setup_error)?);
 
     let spawn_handle = Handle::try_current().ok();
 
@@ -423,10 +516,21 @@ async fn connect_offerer(
         ordered: Some(true),
         ..Default::default()
     };
-    let dc = pc
-        .create_data_channel("beach-human", Some(dc_init))
-        .await
-        .map_err(to_setup_error)?;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "offerer",
+        await = "pc.create_data_channel",
+        state = "start"
+    );
+    let dc_result = pc.create_data_channel("beach-human", Some(dc_init)).await;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "offerer",
+        await = "pc.create_data_channel",
+        state = "end",
+        result = ?dc_result.as_ref().map(|_| "ok")
+    );
+    let dc = dc_result.map_err(to_setup_error)?;
 
     let dc_open_notify = Arc::new(Notify::new());
     let open_signal = dc_open_notify.clone();
@@ -440,18 +544,70 @@ async fn connect_offerer(
         })
     }));
 
-    let offer = pc.create_offer(None).await.map_err(to_setup_error)?;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "offerer",
+        await = "pc.create_offer",
+        state = "start"
+    );
+    let offer_result = pc.create_offer(None).await;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "offerer",
+        await = "pc.create_offer",
+        state = "end",
+        result = ?offer_result
+    );
+    let offer = offer_result.map_err(to_setup_error)?;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "offerer",
+        await = "pc.set_local_description",
+        state = "start"
+    );
     pc.set_local_description(offer)
         .await
         .map_err(to_setup_error)?;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "offerer",
+        await = "pc.set_local_description",
+        state = "end"
+    );
     wait_for_local_description(&pc).await?;
 
-    let local_desc = pc
-        .local_description()
-        .await
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "offerer",
+        await = "pc.local_description",
+        state = "start"
+    );
+    let maybe_local_desc = pc.local_description().await;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "offerer",
+        await = "pc.local_description",
+        state = "end",
+        has_description = maybe_local_desc.is_some()
+    );
+    let local_desc = maybe_local_desc
         .ok_or_else(|| TransportError::Setup("missing local description".into()))?;
     let payload = payload_from_description(&local_desc);
-    post_sdp(&client, signaling_url, "offer", &payload).await?;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "offerer",
+        await = "post_sdp.offer",
+        state = "start"
+    );
+    let post_result = post_sdp(&client, signaling_url, "offer", &payload).await;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "offerer",
+        await = "post_sdp.offer",
+        state = "end",
+        result = ?post_result
+    );
+    post_result?;
 
     let pc_for_answer = pc.clone();
     let client_for_answer = client.clone();
@@ -507,7 +663,7 @@ async fn connect_offerer(
         ?remote_id,
         "offerer allocating transport ids"
     );
-    let transport = WebRtcTransport::new(
+    let transport = Arc::new(WebRtcTransport::new(
         TransportKind::WebRtc,
         local_id,
         remote_id,
@@ -515,15 +671,34 @@ async fn connect_offerer(
         dc,
         None,
         Some(dc_open_notify),
-        spawn_handle,
-    );
+    ));
     tracing::trace!(
         target = "webrtc",
         ?local_id,
         "offerer transport initialized"
     );
 
-    if let Ok(message) = transport.recv(CONNECT_TIMEOUT) {
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "offerer",
+        await = "spawn_blocking.recv_ready",
+        state = "start"
+    );
+    let readiness_join = tokio::task::spawn_blocking({
+        let transport = Arc::clone(&transport);
+        move || transport.recv(CONNECT_TIMEOUT)
+    })
+    .await;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "offerer",
+        await = "spawn_blocking.recv_ready",
+        state = "end",
+        result = ?readiness_join
+    );
+    let readiness = readiness_join.map_err(|err| TransportError::Setup(err.to_string()))?;
+
+    if let Ok(message) = readiness {
         if message.payload.as_text() != Some("__ready__") {
             tracing::warn!(
                 target = "webrtc",
@@ -543,7 +718,7 @@ async fn connect_offerer(
         );
     }
 
-    Ok(Arc::new(transport) as Arc<dyn Transport>)
+    Ok(transport as Arc<dyn Transport>)
 }
 
 async fn connect_answerer(
@@ -554,9 +729,38 @@ async fn connect_answerer(
     let signaling = signaling_url.trim_end_matches('/').to_string();
 
     let offer_payload = loop {
-        match fetch_sdp(&client, signaling_url, "offer").await? {
+        tracing::trace!(
+            target = "beach_human::transport::webrtc",
+            role = "answerer",
+            await = "fetch_sdp.offer",
+            state = "start"
+        );
+        let fetch_attempt = fetch_sdp(&client, signaling_url, "offer").await;
+        tracing::trace!(
+            target = "beach_human::transport::webrtc",
+            role = "answerer",
+            await = "fetch_sdp.offer",
+            state = "end",
+            result = ?fetch_attempt
+        );
+        match fetch_attempt? {
             Some(payload) => break payload,
-            None => sleep(poll_interval).await,
+            None => {
+                tracing::trace!(
+                    target = "beach_human::transport::webrtc",
+                    role = "answerer",
+                    await = "sleep.poll_interval",
+                    state = "start",
+                    poll_ms = poll_interval.as_millis() as u64
+                );
+                sleep(poll_interval).await;
+                tracing::trace!(
+                    target = "beach_human::transport::webrtc",
+                    role = "answerer",
+                    await = "sleep.poll_interval",
+                    state = "end"
+                );
+            }
         }
     };
     let offer_desc = session_description_from_payload(&offer_payload)?;
@@ -570,14 +774,23 @@ async fn connect_answerer(
     let api = build_api(setting)?;
     let config = RTCConfiguration::default();
 
-    let pc = Arc::new(
-        api.new_peer_connection(config)
-            .await
-            .map_err(to_setup_error)?,
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "answerer",
+        await = "api.new_peer_connection",
+        state = "start"
     );
+    let pc_result = api.new_peer_connection(config).await;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "answerer",
+        await = "api.new_peer_connection",
+        state = "end",
+        result = ?pc_result
+    );
+    let pc = Arc::new(pc_result.map_err(to_setup_error)?);
 
     let spawn_handle = Handle::try_current().ok();
-    let spawn_handle_for_channel = spawn_handle.clone();
 
     let answer_candidate_client = client.clone();
     let answer_candidate_signaling = signaling.clone();
@@ -640,7 +853,6 @@ async fn connect_answerer(
         let pc = pc_for_dc.clone();
         let notify = notify_clone.clone();
         let slot = slot_clone.clone();
-        let spawn_handle = spawn_handle_for_channel.clone();
         Box::pin(async move {
             let notify_for_open = notify.clone();
             dc.on_open(Box::new(move || {
@@ -653,7 +865,20 @@ async fn connect_answerer(
                 })
             }));
 
+            tracing::trace!(
+                target = "beach_human::transport::webrtc",
+                role = "answerer",
+                await = "slot.lock",
+                state = "start"
+            );
             let mut slot_guard = slot.lock().await;
+            tracing::trace!(
+                target = "beach_human::transport::webrtc",
+                role = "answerer",
+                await = "slot.lock",
+                state = "end",
+                is_populated = slot_guard.is_some()
+            );
             if slot_guard.is_none() {
                 let transport = WebRtcTransport::new(
                     TransportKind::WebRtc,
@@ -663,7 +888,6 @@ async fn connect_answerer(
                     dc,
                     None,
                     Some(notify.clone()),
-                    spawn_handle.clone(),
                 );
                 let transport_arc = Arc::new(transport) as Arc<dyn Transport>;
                 slot_guard.replace(transport_arc.clone());
@@ -681,14 +905,52 @@ async fn connect_answerer(
         })
     }));
 
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "answerer",
+        await = "pc.set_remote_description",
+        state = "start"
+    );
     pc.set_remote_description(offer_desc)
         .await
         .map_err(to_setup_error)?;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "answerer",
+        await = "pc.set_remote_description",
+        state = "end"
+    );
 
-    let answer = pc.create_answer(None).await.map_err(to_setup_error)?;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "answerer",
+        await = "pc.create_answer",
+        state = "start"
+    );
+    let answer_result = pc.create_answer(None).await;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "answerer",
+        await = "pc.create_answer",
+        state = "end",
+        result = ?answer_result
+    );
+    let answer = answer_result.map_err(to_setup_error)?;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "answerer",
+        await = "pc.set_local_description",
+        state = "start"
+    );
     pc.set_local_description(answer)
         .await
         .map_err(to_setup_error)?;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "answerer",
+        await = "pc.set_local_description",
+        state = "end"
+    );
     wait_for_local_description(&pc).await?;
 
     let local_desc = pc
@@ -696,7 +958,21 @@ async fn connect_answerer(
         .await
         .ok_or_else(|| TransportError::Setup("missing local description".into()))?;
     let payload = payload_from_description(&local_desc);
-    post_sdp(&client, signaling_url, "answer", &payload).await?;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "answerer",
+        await = "post_sdp.answer",
+        state = "start"
+    );
+    let post_result = post_sdp(&client, signaling_url, "answer", &payload).await;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "answerer",
+        await = "post_sdp.answer",
+        state = "end",
+        result = ?post_result
+    );
+    post_result?;
 
     let pc_for_offer_candidates = pc.clone();
     let client_for_offer_candidates = client.clone();
@@ -723,17 +999,73 @@ async fn connect_answerer(
     });
 
     let transport = loop {
-        if let Some(transport) = transport_slot.lock().await.clone() {
+        tracing::trace!(
+            target = "beach_human::transport::webrtc",
+            role = "answerer",
+            await = "transport_slot.lock",
+            state = "start"
+        );
+        let mut transport_guard = transport_slot.lock().await;
+        tracing::trace!(
+            target = "beach_human::transport::webrtc",
+            role = "answerer",
+            await = "transport_slot.lock",
+            state = "end",
+            has_transport = transport_guard.is_some()
+        );
+        if let Some(transport) = transport_guard.as_ref().cloned() {
+            drop(transport_guard);
             break transport;
         }
+        transport_guard.take();
+        drop(transport_guard);
+        tracing::trace!(
+            target = "beach_human::transport::webrtc",
+            role = "answerer",
+            await = "sleep.retry",
+            state = "start",
+            poll_ms = 10_u64
+        );
         sleep(Duration::from_millis(10)).await;
+        tracing::trace!(
+            target = "beach_human::transport::webrtc",
+            role = "answerer",
+            await = "sleep.retry",
+            state = "end"
+        );
     };
     tracing::trace!(target = "webrtc", ?client_id, "answerer transport ready");
 
-    wait_for_connection(&pc).await?;
-    timeout(CONNECT_TIMEOUT, dc_open_notify.notified())
-        .await
-        .map_err(|_| TransportError::Timeout)?;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "answerer",
+        await = "wait_for_connection",
+        state = "start"
+    );
+    let wait_result = wait_for_connection(&pc).await;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "answerer",
+        await = "wait_for_connection",
+        state = "end",
+        result = ?wait_result
+    );
+    wait_result?;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "answerer",
+        await = "dc_open_notify.timeout",
+        state = "start"
+    );
+    let notify_result = timeout(CONNECT_TIMEOUT, dc_open_notify.notified()).await;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "answerer",
+        await = "dc_open_notify.timeout",
+        state = "end",
+        result = ?notify_result
+    );
+    notify_result.map_err(|_| TransportError::Timeout)?;
 
     Ok(transport)
 }
@@ -749,17 +1081,72 @@ async fn wait_for_answer(
     pc: Arc<RTCPeerConnection>,
 ) -> Result<(), TransportError> {
     let answer_payload = loop {
-        match fetch_sdp(&client, &signaling_url, "answer").await? {
+        tracing::trace!(
+            target = "beach_human::transport::webrtc",
+            role = "offerer",
+            await = "fetch_sdp.answer",
+            state = "start"
+        );
+        let fetch_attempt = fetch_sdp(&client, &signaling_url, "answer").await;
+        tracing::trace!(
+            target = "beach_human::transport::webrtc",
+            role = "offerer",
+            await = "fetch_sdp.answer",
+            state = "end",
+            result = ?fetch_attempt
+        );
+        match fetch_attempt? {
             Some(payload) => break payload,
-            None => sleep(poll_interval).await,
+            None => {
+                tracing::trace!(
+                    target = "beach_human::transport::webrtc",
+                    role = "offerer",
+                    await = "sleep.poll_interval",
+                    state = "start",
+                    poll_ms = poll_interval.as_millis() as u64
+                );
+                sleep(poll_interval).await;
+                tracing::trace!(
+                    target = "beach_human::transport::webrtc",
+                    role = "offerer",
+                    await = "sleep.poll_interval",
+                    state = "end"
+                );
+            }
         }
     };
 
     let answer_desc = session_description_from_payload(&answer_payload)?;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "offerer",
+        await = "pc.set_remote_description",
+        state = "start"
+    );
     pc.set_remote_description(answer_desc)
         .await
         .map_err(to_setup_error)?;
-    wait_for_connection(&pc).await
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "offerer",
+        await = "pc.set_remote_description",
+        state = "end"
+    );
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "offerer",
+        await = "wait_for_connection",
+        state = "start"
+    );
+    let result = wait_for_connection(&pc).await;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        role = "offerer",
+        await = "wait_for_connection",
+        state = "end",
+        result = ?result
+    );
+    result
 }
 
 async fn post_sdp(
@@ -769,12 +1156,23 @@ async fn post_sdp(
     payload: &WebRtcSdpPayload,
 ) -> Result<(), TransportError> {
     let url = endpoint(base, suffix);
-    let response = client
-        .post(url)
-        .json(payload)
-        .send()
-        .await
-        .map_err(http_error)?;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        phase = "post_sdp",
+        suffix,
+        await = "client.send",
+        state = "start"
+    );
+    let send_attempt = client.post(url).json(payload).send().await;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        phase = "post_sdp",
+        suffix,
+        await = "client.send",
+        state = "end",
+        result = ?send_attempt.as_ref().map(reqwest::Response::status)
+    );
+    let response = send_attempt.map_err(http_error)?;
 
     if response.status().is_success() {
         Ok(())
@@ -792,14 +1190,43 @@ async fn fetch_sdp(
     suffix: &str,
 ) -> Result<Option<WebRtcSdpPayload>, TransportError> {
     let url = endpoint(base, suffix);
-    let response = client.get(url).send().await.map_err(http_error)?;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        phase = "fetch_sdp",
+        suffix,
+        await = "client.send",
+        state = "start"
+    );
+    let send_attempt = client.get(url).send().await;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        phase = "fetch_sdp",
+        suffix,
+        await = "client.send",
+        state = "end",
+        result = ?send_attempt.as_ref().map(reqwest::Response::status)
+    );
+    let response = send_attempt.map_err(http_error)?;
 
     match response.status() {
         StatusCode::OK => {
-            let payload = response
-                .json::<WebRtcSdpPayload>()
-                .await
-                .map_err(http_error)?;
+            tracing::trace!(
+                target = "beach_human::transport::webrtc",
+                phase = "fetch_sdp",
+                suffix,
+                await = "response.json",
+                state = "start"
+            );
+            let payload_attempt = response.json::<WebRtcSdpPayload>().await;
+            tracing::trace!(
+                target = "beach_human::transport::webrtc",
+                phase = "fetch_sdp",
+                suffix,
+                await = "response.json",
+                state = "end",
+                success = payload_attempt.is_ok()
+            );
+            let payload = payload_attempt.map_err(http_error)?;
             Ok(Some(payload))
         }
         StatusCode::NOT_FOUND => Ok(None),
@@ -821,12 +1248,24 @@ async fn post_candidate(
     candidate: Option<RTCIceCandidateInit>,
 ) -> Result<(), TransportError> {
     let url = endpoint(base, suffix);
-    let response = client
-        .post(url)
-        .json(&candidate)
-        .send()
-        .await
-        .map_err(http_error)?;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        phase = "post_candidate",
+        suffix,
+        await = "client.send",
+        state = "start",
+        has_candidate = candidate.is_some()
+    );
+    let send_attempt = client.post(url).json(&candidate).send().await;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        phase = "post_candidate",
+        suffix,
+        await = "client.send",
+        state = "end",
+        result = ?send_attempt.as_ref().map(reqwest::Response::status)
+    );
+    let response = send_attempt.map_err(http_error)?;
 
     if response.status().is_success() {
         Ok(())
@@ -844,13 +1283,42 @@ async fn fetch_candidate_batch(
     suffix: &str,
 ) -> Result<Vec<Option<RTCIceCandidateInit>>, TransportError> {
     let url = endpoint(base, suffix);
-    let response = client.get(url).send().await.map_err(http_error)?;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        phase = "fetch_candidate_batch",
+        suffix,
+        await = "client.send",
+        state = "start"
+    );
+    let send_attempt = client.get(url).send().await;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        phase = "fetch_candidate_batch",
+        suffix,
+        await = "client.send",
+        state = "end",
+        result = ?send_attempt.as_ref().map(reqwest::Response::status)
+    );
+    let response = send_attempt.map_err(http_error)?;
 
     if response.status().is_success() {
-        let candidates = response
-            .json::<Vec<Option<RTCIceCandidateInit>>>()
-            .await
-            .map_err(http_error)?;
+        tracing::trace!(
+            target = "beach_human::transport::webrtc",
+            phase = "fetch_candidate_batch",
+            suffix,
+            await = "response.json",
+            state = "start"
+        );
+        let candidates_attempt = response.json::<Vec<Option<RTCIceCandidateInit>>>().await;
+        tracing::trace!(
+            target = "beach_human::transport::webrtc",
+            phase = "fetch_candidate_batch",
+            suffix,
+            await = "response.json",
+            state = "end",
+            success = candidates_attempt.is_ok()
+        );
+        let candidates = candidates_attempt.map_err(http_error)?;
         Ok(candidates)
     } else if response.status() == StatusCode::NOT_FOUND {
         Ok(Vec::new())
@@ -871,12 +1339,53 @@ async fn poll_remote_candidates(
     label: &'static str,
 ) -> Result<(), TransportError> {
     loop {
-        if pc.remote_description().await.is_none() {
+        tracing::trace!(
+            target = "beach_human::transport::webrtc",
+            label,
+            await = "pc.remote_description",
+            state = "start"
+        );
+        let remote_description_missing = pc.remote_description().await.is_none();
+        tracing::trace!(
+            target = "beach_human::transport::webrtc",
+            label,
+            await = "pc.remote_description",
+            state = "end",
+            missing = remote_description_missing
+        );
+        if remote_description_missing {
+            tracing::trace!(
+                target = "beach_human::transport::webrtc",
+                label,
+                await = "sleep.poll_interval",
+                state = "start",
+                poll_ms = poll_interval.as_millis() as u64
+            );
             sleep(poll_interval).await;
+            tracing::trace!(
+                target = "beach_human::transport::webrtc",
+                label,
+                await = "sleep.poll_interval",
+                state = "end"
+            );
             continue;
         }
         let mut received_any = false;
-        let batch = fetch_candidate_batch(&client, &base, suffix).await?;
+        tracing::trace!(
+            target = "beach_human::transport::webrtc",
+            label,
+            await = "fetch_candidate_batch",
+            state = "start"
+        );
+        let fetch_attempt = fetch_candidate_batch(&client, &base, suffix).await;
+        tracing::trace!(
+            target = "beach_human::transport::webrtc",
+            label,
+            await = "fetch_candidate_batch",
+            state = "end",
+            result = ?fetch_attempt
+        );
+        let batch = fetch_attempt?;
         for candidate in batch {
             received_any = true;
             match candidate {
@@ -888,7 +1397,19 @@ async fn poll_remote_candidates(
                         candidate = candidate_value,
                         "received candidate"
                     );
+                    tracing::trace!(
+                        target = "beach_human::transport::webrtc",
+                        label,
+                        await = "pc.add_ice_candidate",
+                        state = "start"
+                    );
                     pc.add_ice_candidate(init).await.map_err(to_setup_error)?;
+                    tracing::trace!(
+                        target = "beach_human::transport::webrtc",
+                        label,
+                        await = "pc.add_ice_candidate",
+                        state = "end"
+                    );
                 }
                 None => {
                     tracing::trace!(target = "webrtc", label, "received end-of-candidates");
@@ -903,7 +1424,20 @@ async fn poll_remote_candidates(
         }
 
         if !received_any {
+            tracing::trace!(
+                target = "beach_human::transport::webrtc",
+                label,
+                await = "sleep.poll_interval",
+                state = "start",
+                poll_ms = poll_interval.as_millis() as u64
+            );
             sleep(poll_interval).await;
+            tracing::trace!(
+                target = "beach_human::transport::webrtc",
+                label,
+                await = "sleep.poll_interval",
+                state = "end"
+            );
         }
     }
 }
@@ -1000,8 +1534,6 @@ async fn create_webrtc_pair() -> Result<TransportPair, TransportError> {
             .await
             .map_err(to_setup_error)?,
     );
-
-    let spawn_handle = Handle::try_current().ok();
 
     let dc_init = RTCDataChannelInit {
         ordered: Some(true),
@@ -1166,7 +1698,6 @@ async fn create_webrtc_pair() -> Result<TransportPair, TransportError> {
         offer_dc.clone(),
         router_keepalive.clone(),
         None,
-        spawn_handle.clone(),
     );
 
     let server_transport = WebRtcTransport::new(
@@ -1177,7 +1708,6 @@ async fn create_webrtc_pair() -> Result<TransportPair, TransportError> {
         answer_dc.clone(),
         router_keepalive,
         None,
-        spawn_handle,
     );
 
     Ok(TransportPair {
@@ -1192,12 +1722,64 @@ pub async fn create_test_pair() -> Result<TransportPair, TransportError> {
 }
 
 async fn wait_for_local_description(pc: &Arc<RTCPeerConnection>) -> Result<(), TransportError> {
-    if pc.local_description().await.is_some() {
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        phase = "wait_for_local_description",
+        await = "pc.local_description.initial",
+        state = "start"
+    );
+    let already_present = pc.local_description().await.is_some();
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        phase = "wait_for_local_description",
+        await = "pc.local_description.initial",
+        state = "end",
+        has_description = already_present
+    );
+    if already_present {
         return Ok(());
     }
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        phase = "wait_for_local_description",
+        await = "pc.gathering_complete_promise",
+        state = "start"
+    );
     let mut gather = pc.gathering_complete_promise().await;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        phase = "wait_for_local_description",
+        await = "pc.gathering_complete_promise",
+        state = "end"
+    );
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        phase = "wait_for_local_description",
+        await = "gather.recv",
+        state = "start"
+    );
     let _ = gather.recv().await;
-    if pc.local_description().await.is_some() {
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        phase = "wait_for_local_description",
+        await = "gather.recv",
+        state = "end"
+    );
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        phase = "wait_for_local_description",
+        await = "pc.local_description.final",
+        state = "start"
+    );
+    let final_present = pc.local_description().await.is_some();
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        phase = "wait_for_local_description",
+        await = "pc.local_description.final",
+        state = "end",
+        has_description = final_present
+    );
+    if final_present {
         Ok(())
     } else {
         Err(TransportError::Setup(
@@ -1225,8 +1807,21 @@ async fn wait_for_connection(pc: &Arc<RTCPeerConnection>) -> Result<(), Transpor
         })
     }));
 
-    timeout(CONNECT_TIMEOUT, rx)
-        .await
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        phase = "wait_for_connection",
+        await = "timeout(rx)",
+        state = "start"
+    );
+    let wait_result = timeout(CONNECT_TIMEOUT, rx).await;
+    tracing::trace!(
+        target = "beach_human::transport::webrtc",
+        phase = "wait_for_connection",
+        await = "timeout(rx)",
+        state = "end",
+        result = ?wait_result
+    );
+    wait_result
         .map_err(|_| TransportError::Timeout)?
         .map_err(|_| TransportError::ChannelClosed)?;
     Ok(())

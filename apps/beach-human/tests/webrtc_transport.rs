@@ -42,6 +42,14 @@ async fn recv_with_timeout(transport: &Box<dyn Transport>, timeout: Duration) ->
     }
 }
 
+async fn recv_via_blocking(transport: &Arc<dyn Transport>, timeout: Duration) -> TransportMessage {
+    let transport_clone = Arc::clone(transport);
+    tokio::task::spawn_blocking(move || transport_clone.recv(timeout))
+        .await
+        .expect("spawn_blocking panicked")
+        .expect("transport recv")
+}
+
 #[tokio::test]
 async fn webrtc_bidirectional_transport_delivers_messages() {
     let _ = SubscriberBuilder::default()
@@ -226,9 +234,7 @@ async fn webrtc_signaling_end_to_end() {
 
     offer_transport.send_text("ping").expect("offer send");
     let pong = loop {
-        let message = answer_transport
-            .recv(Duration::from_secs(5))
-            .expect("answer recv");
+        let message = recv_via_blocking(&answer_transport, Duration::from_secs(5)).await;
         if payload_text(message.clone()).as_deref() == Some("__offer_ready__") {
             continue;
         }
@@ -237,9 +243,7 @@ async fn webrtc_signaling_end_to_end() {
     assert_eq!(payload_text(pong).as_deref(), Some("ping"));
 
     answer_transport.send_text("pong").expect("answer send");
-    let ping = offer_transport
-        .recv(Duration::from_secs(5))
-        .expect("offer recv");
+    let ping = recv_via_blocking(&offer_transport, Duration::from_secs(5)).await;
     assert_eq!(payload_text(ping).as_deref(), Some("pong"));
 
     shutdown_tx.send(()).ok();

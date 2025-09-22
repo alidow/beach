@@ -264,6 +264,7 @@ impl SyncUpdate for CacheUpdate {
             CacheUpdate::Rect(rect) => rect.area(),
             CacheUpdate::Row(row) => row.width(),
             CacheUpdate::Trim(_) => 1,
+            CacheUpdate::Style(_) => 1,
         }
     }
 }

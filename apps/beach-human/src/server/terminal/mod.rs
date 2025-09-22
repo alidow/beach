@@ -224,6 +224,9 @@ fn apply_update(grid: &TerminalGrid, update: &CacheUpdate) {
         CacheUpdate::Trim(_) => {
             // grid already applied trim when emitting the event
         }
+        CacheUpdate::Style(style) => {
+            let _ = grid.style_table.set(style.id, style.style);
+        }
     }
 }
 

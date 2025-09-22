@@ -1,10 +1,11 @@
 use crate::cache::GridCache;
 use crate::cache::Seq;
 use crate::cache::terminal::{
-    PackedCell, Style, StyleId, StyleTable, TerminalGrid, pack_cell, pack_from_heavy,
+    PackedCell, Style, StyleId, StyleTable, TerminalGrid, attrs_to_byte, pack_cell,
+    pack_color_from_heavy,
 };
 use crate::model::terminal::cell::{Cell as HeavyCell, CellAttributes, Color as HeavyColor};
-use crate::model::terminal::diff::{CacheUpdate, CellWrite, RowSnapshot};
+use crate::model::terminal::diff::{CacheUpdate, CellWrite, RowSnapshot, StyleDefinition};
 use alacritty_terminal::{
     Term,
     event::{Event, EventListener},
@@ -272,34 +273,33 @@ impl AlacrittyEmulator {
         display_offset: usize,
         style_table: &StyleTable,
     ) -> EmulatorResult {
-        let mut updates = Vec::with_capacity(rows);
+        let mut style_updates = Vec::new();
+        let mut emitted_styles = std::collections::HashSet::new();
+        let mut cell_updates = Vec::with_capacity(rows * cols);
         for visible_line in 0..rows {
             let absolute_row = viewport_top + visible_line;
-            let cells = self.snapshot_visible_line(visible_line, cols, display_offset, style_table);
-            let seq = self.next_seq();
-            updates.push(CacheUpdate::Row(RowSnapshot::new(absolute_row, seq, cells)));
+            let line_index = visible_line as isize - display_offset as isize;
+            let line = Line(line_index as i32);
+            for col in 0..cols {
+                let point = Point::new(line, Column(col));
+                let (packed, style_id, style, is_new) = self.pack_point(point, style_table);
+                if is_new || emitted_styles.insert(style_id.0) {
+                    let seq = self.next_seq();
+                    style_updates.push(CacheUpdate::Style(StyleDefinition::new(
+                        style_id, seq, style,
+                    )));
+                }
+                let seq = self.next_seq();
+                cell_updates.push(CacheUpdate::Cell(CellWrite::new(
+                    absolute_row,
+                    col,
+                    seq,
+                    packed,
+                )));
+            }
         }
-        updates
-    }
-
-    fn snapshot_visible_line(
-        &mut self,
-        visible_line: usize,
-        cols: usize,
-        display_offset: usize,
-        style_table: &StyleTable,
-    ) -> Vec<PackedCell> {
-        let mut row = Vec::with_capacity(cols);
-        let line_index = visible_line as isize - display_offset as isize;
-        let line = Line(line_index as i32);
-        let grid = self.term.grid();
-        for col in 0..cols {
-            let point = Point::new(line, Column(col));
-            let cell = &grid[point];
-            let heavy = convert_cell(cell);
-            row.push(pack_from_heavy(&heavy, style_table));
-        }
-        row
+        style_updates.extend(cell_updates);
+        style_updates
     }
 
     fn collect_updates(&mut self, grid: &TerminalGrid) -> EmulatorResult {
@@ -317,8 +317,11 @@ impl AlacrittyEmulator {
         let history_size = total_lines.saturating_sub(rows);
         let viewport_top = history_size.saturating_sub(display_offset);
         let forced_full = self.need_full_redraw;
-        let mut updates = Vec::new();
-        let mut damaged_lines: Vec<usize> = Vec::new();
+        let mut cell_updates = Vec::new();
+        let mut style_updates = Vec::new();
+        let mut emitted_styles = std::collections::HashSet::new();
+        let mut damaged_lines: Vec<(usize, usize, usize)> = Vec::new();
+        let mut touched_cells = 0usize;
 
         match self.term.damage() {
             alacritty_terminal::term::TermDamage::Full => {
@@ -327,10 +330,17 @@ impl AlacrittyEmulator {
             alacritty_terminal::term::TermDamage::Partial(iter) if !forced_full => {
                 for bounds in iter {
                     let visible_line = bounds.line.saturating_sub(display_offset);
-                    if visible_line >= rows || damaged_lines.contains(&visible_line) {
+                    if visible_line >= rows {
                         continue;
                     }
-                    damaged_lines.push(visible_line);
+                    let left = bounds.left.min(cols.saturating_sub(1));
+                    let right = bounds.right.min(cols.saturating_sub(1));
+                    if left > right {
+                        continue;
+                    }
+                    touched_cells =
+                        touched_cells.saturating_add(right.saturating_sub(left).saturating_add(1));
+                    damaged_lines.push((visible_line, left, right));
                 }
             }
             _ => {}
@@ -338,32 +348,62 @@ impl AlacrittyEmulator {
 
         self.term.reset_damage();
 
-        if self.need_full_redraw || forced_full {
+        if self.need_full_redraw || forced_full || touched_cells >= rows.saturating_mul(cols) / 2 {
             let style_table = grid.style_table.clone();
-            updates = self.render_full_internal(
+            let updates = self.render_full_internal(
                 rows,
                 cols,
                 viewport_top,
                 display_offset,
                 style_table.as_ref(),
             );
+            style_updates.extend(updates);
             self.need_full_redraw = false;
         } else if !damaged_lines.is_empty() {
             let style_table = grid.style_table.clone();
-            for visible_line in damaged_lines {
-                let cells = self.snapshot_visible_line(
-                    visible_line,
-                    cols,
-                    display_offset,
-                    style_table.as_ref(),
-                );
-                let seq = self.next_seq();
+            for (visible_line, left, right) in damaged_lines {
                 let absolute_row = viewport_top + visible_line;
-                updates.push(CacheUpdate::Row(RowSnapshot::new(absolute_row, seq, cells)));
+                let line_index = visible_line as isize - display_offset as isize;
+                let line = Line(line_index as i32);
+                for col in left..=right {
+                    let point = Point::new(line, Column(col));
+                    let (packed, style_id, style, is_new) =
+                        self.pack_point(point, style_table.as_ref());
+                    if is_new && emitted_styles.insert(style_id.0) {
+                        let seq = self.next_seq();
+                        style_updates.push(CacheUpdate::Style(StyleDefinition::new(
+                            style_id, seq, style,
+                        )));
+                    }
+                    let seq = self.next_seq();
+                    cell_updates.push(CacheUpdate::Cell(CellWrite::new(
+                        absolute_row,
+                        col,
+                        seq,
+                        packed,
+                    )));
+                }
             }
         }
 
-        updates
+        style_updates.extend(cell_updates);
+        style_updates
+    }
+}
+
+impl AlacrittyEmulator {
+    fn pack_point(
+        &mut self,
+        point: Point,
+        style_table: &StyleTable,
+    ) -> (PackedCell, StyleId, Style, bool) {
+        let grid = self.term.grid();
+        let cell = &grid[point];
+        let heavy = convert_cell(cell);
+        let style = style_from_heavy(&heavy);
+        let (style_id, is_new) = style_table.ensure_id_with_new(style);
+        let packed = pack_cell(heavy.char, style_id);
+        (packed, style_id, style, is_new)
     }
 }
 
@@ -432,6 +472,14 @@ fn convert_attributes(flags: CellFlags) -> CellAttributes {
         blink: false,
         dim: flags.contains(CellFlags::DIM) || flags.contains(CellFlags::DIM_BOLD),
         hidden: flags.contains(CellFlags::HIDDEN),
+    }
+}
+
+fn style_from_heavy(cell: &HeavyCell) -> Style {
+    Style {
+        fg: pack_color_from_heavy(&cell.fg_color),
+        bg: pack_color_from_heavy(&cell.bg_color),
+        attrs: attrs_to_byte(&cell.attributes),
     }
 }
 

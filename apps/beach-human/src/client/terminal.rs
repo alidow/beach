@@ -195,6 +195,7 @@ impl TerminalClient {
                 .map(|cell| Exact(*row, cell.col.saturating_add(1)))
                 .last(),
             UpdateEntry::Trim { .. } => None,
+            UpdateEntry::Style { .. } => None,
         };
 
         match update {
@@ -260,6 +261,16 @@ impl TerminalClient {
                     self.cursor_col = 0;
                 }
                 self.force_render = true;
+            }
+            UpdateEntry::Style {
+                id,
+                seq,
+                fg,
+                bg,
+                attrs,
+            } => {
+                self.renderer.set_style(id, fg, bg, attrs);
+                self.last_seq = cmp::max(self.last_seq, seq);
             }
         }
 
@@ -867,6 +878,13 @@ enum UpdateEntry {
     Trim {
         start: usize,
         count: usize,
+    },
+    Style {
+        id: u32,
+        seq: Seq,
+        fg: u32,
+        bg: u32,
+        attrs: u8,
     },
 }
 

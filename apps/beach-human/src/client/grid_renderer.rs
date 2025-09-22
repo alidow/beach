@@ -1,9 +1,11 @@
 use crate::cache::Seq;
+use crate::cache::terminal::StyleId;
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Widget};
 use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug)]
@@ -74,6 +76,11 @@ struct PredictedCell {
     seq: Seq,
 }
 
+#[derive(Clone, Debug)]
+struct CachedStyle {
+    style: Style,
+}
+
 pub struct GridRenderer {
     base_row: usize,
     cols: usize,
@@ -85,6 +92,7 @@ pub struct GridRenderer {
     needs_redraw: bool,
     predictions: HashMap<(usize, usize), PredictedCell>,
     status_message: Option<String>,
+    styles: HashMap<u32, CachedStyle>,
 }
 
 impl GridRenderer {
@@ -100,7 +108,14 @@ impl GridRenderer {
             needs_redraw: true,
             predictions: HashMap::new(),
             status_message: None,
+            styles: HashMap::new(),
         };
+        renderer.styles.insert(
+            StyleId::DEFAULT.0,
+            CachedStyle {
+                style: Style::default(),
+            },
+        );
         renderer.ensure_capacity(rows, cols);
         renderer
     }
@@ -351,6 +366,12 @@ impl GridRenderer {
         }
     }
 
+    pub fn set_style(&mut self, id: u32, fg: u32, bg: u32, attrs: u8) {
+        let style = decode_packed_style(fg, bg, attrs);
+        self.styles.insert(id, CachedStyle { style });
+        self.mark_dirty();
+    }
+
     pub fn scroll_lines(&mut self, delta: isize) {
         if self.viewport_height == 0 {
             return;
@@ -599,8 +620,8 @@ impl GridRenderer {
         lines
     }
 
-    fn render_body(&self) -> Paragraph<'_> {
-        let mut lines: Vec<Line> = Vec::with_capacity(self.viewport_height.max(1));
+    fn render_body(&self) -> TerminalBodyWidget {
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.viewport_height.max(1));
         for row_idx in 0..self.viewport_height.max(1) {
             let absolute = self.base_row + self.scroll_top + row_idx;
             if let Some(_rel) = self.relative_row(absolute) {
@@ -616,15 +637,10 @@ impl GridRenderer {
                 }
                 lines.push(Line::from(spans));
             } else {
-                lines.push(Line::from(""));
+                lines.push(Line::from(" ".repeat(self.cols.max(1))));
             }
         }
-
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::NONE))
-            .scroll((0, 0))
-            .alignment(Alignment::Left)
+        TerminalBodyWidget { lines }
     }
 
     fn span_for_cell(
@@ -634,10 +650,9 @@ impl GridRenderer {
         selected: bool,
         predicted: bool,
     ) -> Span<'static> {
-        let mut style = match style_id {
-            Some(_) => Style::default(),
-            None => Style::default(),
-        };
+        let mut style = style_id
+            .and_then(|id| self.styles.get(&id).map(|cached| cached.style.clone()))
+            .unwrap_or_else(Style::default);
         if predicted {
             style = style
                 .fg(Color::Yellow)
@@ -688,5 +703,85 @@ impl GridRenderer {
     fn render_instructions(&self) -> Paragraph<'_> {
         let text = "alt+↑/↓ line • alt+PgUp/PgDn page • alt+End tail • alt+f follow";
         Paragraph::new(text).block(Block::default())
+    }
+}
+
+fn decode_packed_style(fg: u32, bg: u32, attrs: u8) -> Style {
+    let mut style = Style::default();
+    if let Some(color) = decode_color(fg) {
+        style = style.fg(color);
+    }
+    if let Some(color) = decode_color(bg) {
+        style = style.bg(color);
+    }
+    let modifiers = decode_modifiers(attrs);
+    if !modifiers.is_empty() {
+        style = style.add_modifier(modifiers);
+    }
+    style
+}
+
+fn decode_color(packed: u32) -> Option<Color> {
+    match (packed >> 24) as u8 {
+        0 => None,
+        1 => Some(Color::Indexed((packed & 0xFF) as u8)),
+        2 => Some(Color::Rgb(
+            ((packed >> 16) & 0xFF) as u8,
+            ((packed >> 8) & 0xFF) as u8,
+            (packed & 0xFF) as u8,
+        )),
+        _ => None,
+    }
+}
+
+fn decode_modifiers(attrs: u8) -> Modifier {
+    let mut modifiers = Modifier::empty();
+    if attrs & (1 << 0) != 0 {
+        modifiers |= Modifier::BOLD;
+    }
+    if attrs & (1 << 1) != 0 {
+        modifiers |= Modifier::ITALIC;
+    }
+    if attrs & (1 << 2) != 0 {
+        modifiers |= Modifier::UNDERLINED;
+    }
+    if attrs & (1 << 3) != 0 {
+        modifiers |= Modifier::CROSSED_OUT;
+    }
+    if attrs & (1 << 4) != 0 {
+        modifiers |= Modifier::REVERSED;
+    }
+    if attrs & (1 << 5) != 0 {
+        modifiers |= Modifier::SLOW_BLINK;
+    }
+    if attrs & (1 << 6) != 0 {
+        modifiers |= Modifier::DIM;
+    }
+    if attrs & (1 << 7) != 0 {
+        modifiers |= Modifier::HIDDEN;
+    }
+    modifiers
+}
+
+struct TerminalBodyWidget {
+    lines: Vec<Line<'static>>,
+}
+
+impl Widget for TerminalBodyWidget {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let mut blank_line: Option<Line<'static>> = None;
+        let max_rows = area.height as usize;
+        let lines = self.lines;
+        for (idx, line) in lines.iter().enumerate().take(max_rows) {
+            buf.set_line(area.x, area.y + idx as u16, line, area.width);
+        }
+        let rendered = lines.len().min(max_rows);
+        for row in rendered..max_rows {
+            let blank = blank_line.get_or_insert_with(|| {
+                let repeated: String = std::iter::repeat(' ').take(area.width as usize).collect();
+                Line::from(repeated)
+            });
+            buf.set_line(area.x, area.y + row as u16, blank, area.width);
+        }
     }
 }

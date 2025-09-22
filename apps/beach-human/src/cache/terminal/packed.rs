@@ -128,17 +128,22 @@ impl StyleTable {
 
     /// Returns an existing ID for `style` or inserts it.
     pub fn ensure_id(&self, style: Style) -> StyleId {
+        self.ensure_id_with_new(style).0
+    }
+
+    /// Returns the ID for `style` and whether the table inserted a new entry.
+    pub fn ensure_id_with_new(&self, style: Style) -> (StyleId, bool) {
         if let Some(id) = self.inner.read().unwrap().get_id(&style) {
-            return id;
+            return (id, false);
         }
         let mut inner = self.inner.write().unwrap();
         if let Some(id) = inner.get_id(&style) {
-            return id;
+            return (id, false);
         }
         let id = StyleId(inner.vec.len() as u32);
         inner.vec.push(style);
         inner.map.insert(style, id);
-        id
+        (id, true)
     }
 
     pub fn get(&self, id: StyleId) -> Option<Style> {

@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use crate::cache::Seq;
-use crate::cache::terminal::PackedCell;
+use crate::cache::terminal::{PackedCell, Style, StyleId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CellWrite {
@@ -95,11 +95,29 @@ impl HistoryTrim {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StyleDefinition {
+    pub id: StyleId,
+    pub seq: Seq,
+    pub style: Style,
+}
+
+impl StyleDefinition {
+    pub fn new(id: StyleId, seq: Seq, style: Style) -> Self {
+        Self { id, seq, style }
+    }
+
+    pub fn seq(&self) -> Seq {
+        self.seq
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CacheUpdate {
     Cell(CellWrite),
     Rect(RectFill),
     Row(RowSnapshot),
     Trim(HistoryTrim),
+    Style(StyleDefinition),
 }
 
 impl CacheUpdate {
@@ -109,6 +127,7 @@ impl CacheUpdate {
             CacheUpdate::Rect(rect) => rect.seq,
             CacheUpdate::Row(row) => row.seq,
             CacheUpdate::Trim(trim) => trim.seq(),
+            CacheUpdate::Style(style) => style.seq(),
         }
     }
 }

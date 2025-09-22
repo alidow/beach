@@ -1,7 +1,18 @@
 use crate::cache::GridCache;
 use crate::cache::Seq;
-use crate::cache::terminal::{PackedCell, Style, StyleId, TerminalGrid, pack_cell};
+use crate::cache::terminal::{
+    PackedCell, Style, StyleId, StyleTable, TerminalGrid, pack_cell, pack_from_heavy,
+};
+use crate::model::terminal::cell::{Cell as HeavyCell, CellAttributes, Color as HeavyColor};
 use crate::model::terminal::diff::{CacheUpdate, CellWrite, RowSnapshot};
+use alacritty_terminal::{
+    Term,
+    event::{Event, EventListener},
+    grid::Dimensions,
+    index::{Column, Line, Point},
+    term::{Config, cell::Cell as AlacrittyCell, cell::Flags as CellFlags},
+    vte::ansi::{Color as AnsiColor, NamedColor, Processor},
+};
 use std::borrow::Cow;
 
 pub type EmulatorResult = Vec<CacheUpdate>;
@@ -156,31 +167,271 @@ impl TerminalEmulator for SimpleTerminalEmulator {
     }
 }
 
+struct TermDimensions {
+    columns: usize,
+    screen_lines: usize,
+    total_lines: usize,
+}
+
+impl TermDimensions {
+    fn new(columns: usize, screen_lines: usize) -> Self {
+        Self {
+            columns,
+            screen_lines,
+            total_lines: screen_lines,
+        }
+    }
+}
+
+impl Dimensions for TermDimensions {
+    fn total_lines(&self) -> usize {
+        self.total_lines
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.screen_lines
+    }
+
+    fn columns(&self) -> usize {
+        self.columns
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct EventProxy;
+
+impl EventListener for EventProxy {
+    fn send_event(&self, _event: Event) {}
+}
+
 pub struct AlacrittyEmulator {
-    inner: SimpleTerminalEmulator,
+    term: Term<EventProxy>,
+    parser: Processor,
+    seq: Seq,
+    need_full_redraw: bool,
 }
 
 unsafe impl Send for AlacrittyEmulator {}
 
 impl AlacrittyEmulator {
     pub fn new(grid: &TerminalGrid) -> Self {
-        Self {
-            inner: SimpleTerminalEmulator::new(grid),
+        let (rows, cols) = grid.dims();
+        let dimensions = TermDimensions::new(cols.max(1), rows.max(1));
+        let config = Config::default();
+        let mut term = Term::new(config, &dimensions, EventProxy::default());
+        let mut parser = Processor::new();
+        // Enable standard LF behavior so shells that rely on ESC[20h behave normally.
+        for byte in b"\x1b[20h" {
+            parser.advance(&mut term, *byte);
         }
+        term.reset_damage();
+        Self {
+            term,
+            parser,
+            seq: 0,
+            need_full_redraw: true,
+        }
+    }
+
+    fn next_seq(&mut self) -> Seq {
+        self.seq = self.seq.saturating_add(1);
+        self.seq
+    }
+
+    fn render_full(&mut self, grid: &TerminalGrid) -> EmulatorResult {
+        let term_grid = self.term.grid();
+        let cols = term_grid.columns();
+        let rows = term_grid.screen_lines();
+        if cols == 0 || rows == 0 {
+            self.need_full_redraw = false;
+            return Vec::new();
+        }
+        let display_offset = term_grid.display_offset();
+        let total_lines = term_grid.total_lines();
+        let history_size = total_lines.saturating_sub(rows);
+        let viewport_top = history_size.saturating_sub(display_offset);
+        let style_table = grid.style_table.clone();
+
+        let updates = self.render_full_internal(
+            rows,
+            cols,
+            viewport_top,
+            display_offset,
+            style_table.as_ref(),
+        );
+        self.need_full_redraw = false;
+        self.term.reset_damage();
+        updates
+    }
+
+    fn render_full_internal(
+        &mut self,
+        rows: usize,
+        cols: usize,
+        viewport_top: usize,
+        display_offset: usize,
+        style_table: &StyleTable,
+    ) -> EmulatorResult {
+        let mut updates = Vec::with_capacity(rows);
+        for visible_line in 0..rows {
+            let absolute_row = viewport_top + visible_line;
+            let cells = self.snapshot_visible_line(visible_line, cols, display_offset, style_table);
+            let seq = self.next_seq();
+            updates.push(CacheUpdate::Row(RowSnapshot::new(absolute_row, seq, cells)));
+        }
+        updates
+    }
+
+    fn snapshot_visible_line(
+        &mut self,
+        visible_line: usize,
+        cols: usize,
+        display_offset: usize,
+        style_table: &StyleTable,
+    ) -> Vec<PackedCell> {
+        let mut row = Vec::with_capacity(cols);
+        let line_index = visible_line as isize - display_offset as isize;
+        let line = Line(line_index as i32);
+        let grid = self.term.grid();
+        for col in 0..cols {
+            let point = Point::new(line, Column(col));
+            let cell = &grid[point];
+            let heavy = convert_cell(cell);
+            row.push(pack_from_heavy(&heavy, style_table));
+        }
+        row
+    }
+
+    fn collect_updates(&mut self, grid: &TerminalGrid) -> EmulatorResult {
+        let term_grid = self.term.grid();
+        let cols = term_grid.columns();
+        let rows = term_grid.screen_lines();
+        if cols == 0 || rows == 0 {
+            self.term.reset_damage();
+            self.need_full_redraw = false;
+            return Vec::new();
+        }
+
+        let display_offset = term_grid.display_offset();
+        let total_lines = term_grid.total_lines();
+        let history_size = total_lines.saturating_sub(rows);
+        let viewport_top = history_size.saturating_sub(display_offset);
+        let forced_full = self.need_full_redraw;
+        let mut updates = Vec::new();
+        let mut damaged_lines: Vec<usize> = Vec::new();
+
+        match self.term.damage() {
+            alacritty_terminal::term::TermDamage::Full => {
+                self.need_full_redraw = true;
+            }
+            alacritty_terminal::term::TermDamage::Partial(iter) if !forced_full => {
+                for bounds in iter {
+                    let visible_line = bounds.line.saturating_sub(display_offset);
+                    if visible_line >= rows || damaged_lines.contains(&visible_line) {
+                        continue;
+                    }
+                    damaged_lines.push(visible_line);
+                }
+            }
+            _ => {}
+        }
+
+        self.term.reset_damage();
+
+        if self.need_full_redraw || forced_full {
+            let style_table = grid.style_table.clone();
+            updates = self.render_full_internal(
+                rows,
+                cols,
+                viewport_top,
+                display_offset,
+                style_table.as_ref(),
+            );
+            self.need_full_redraw = false;
+        } else if !damaged_lines.is_empty() {
+            let style_table = grid.style_table.clone();
+            for visible_line in damaged_lines {
+                let cells = self.snapshot_visible_line(
+                    visible_line,
+                    cols,
+                    display_offset,
+                    style_table.as_ref(),
+                );
+                let seq = self.next_seq();
+                let absolute_row = viewport_top + visible_line;
+                updates.push(CacheUpdate::Row(RowSnapshot::new(absolute_row, seq, cells)));
+            }
+        }
+
+        updates
     }
 }
 
 impl TerminalEmulator for AlacrittyEmulator {
     fn handle_output(&mut self, chunk: &[u8], grid: &TerminalGrid) -> EmulatorResult {
-        self.inner.handle_output(chunk, grid)
+        if !chunk.is_empty() {
+            for byte in chunk {
+                self.parser.advance(&mut self.term, *byte);
+            }
+        }
+        self.collect_updates(grid)
     }
 
     fn flush(&mut self, grid: &TerminalGrid) -> EmulatorResult {
-        self.inner.flush(grid)
+        self.need_full_redraw = true;
+        self.render_full(grid)
     }
 
     fn resize(&mut self, rows: usize, cols: usize) {
-        self.inner.resize(rows, cols);
+        let dims = TermDimensions::new(cols.max(1), rows.max(1));
+        self.term.resize(dims);
+        self.need_full_redraw = true;
+    }
+}
+
+fn convert_cell(cell: &AlacrittyCell) -> HeavyCell {
+    HeavyCell {
+        char: cell.c,
+        fg_color: convert_color(&cell.fg),
+        bg_color: convert_color(&cell.bg),
+        attributes: convert_attributes(cell.flags),
+    }
+}
+
+fn convert_color(color: &AnsiColor) -> HeavyColor {
+    match color {
+        AnsiColor::Spec(rgb) => HeavyColor::Rgb(rgb.r, rgb.g, rgb.b),
+        AnsiColor::Indexed(idx) => HeavyColor::Indexed(*idx),
+        AnsiColor::Named(name) => match name {
+            NamedColor::Foreground
+            | NamedColor::BrightForeground
+            | NamedColor::DimForeground
+            | NamedColor::Background
+            | NamedColor::Cursor => HeavyColor::Default,
+            other => {
+                let value = *other as usize;
+                if value <= u8::MAX as usize {
+                    HeavyColor::Indexed(value as u8)
+                } else {
+                    HeavyColor::Default
+                }
+            }
+        },
+    }
+}
+
+fn convert_attributes(flags: CellFlags) -> CellAttributes {
+    CellAttributes {
+        bold: flags.contains(CellFlags::BOLD)
+            || flags.contains(CellFlags::DIM_BOLD)
+            || flags.contains(CellFlags::BOLD_ITALIC),
+        italic: flags.contains(CellFlags::ITALIC) || flags.contains(CellFlags::BOLD_ITALIC),
+        underline: flags.intersects(CellFlags::ALL_UNDERLINES),
+        strikethrough: flags.contains(CellFlags::STRIKEOUT),
+        reverse: flags.contains(CellFlags::INVERSE),
+        blink: false,
+        dim: flags.contains(CellFlags::DIM) || flags.contains(CellFlags::DIM_BOLD),
+        hidden: flags.contains(CellFlags::HIDDEN),
     }
 }
 

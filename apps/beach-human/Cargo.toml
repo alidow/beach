@@ -26,6 +26,7 @@ crossterm = "0.28"
 base64 = "0.21"
 ratatui = "0.28"
 copypasta = "0.8"
+alacritty_terminal = "0.21"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tracing-appender = "0.2"

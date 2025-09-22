@@ -5,7 +5,7 @@ use std::time::Duration;
 use bincode;
 use serde::{Deserialize, Serialize};
 
-use beach_human::cache::terminal::{PackedCell, StyleId, TerminalGrid};
+use beach_human::cache::terminal::{PackedCell, Style, StyleId, TerminalGrid};
 use beach_human::cache::{GridCache, Seq, WriteOutcome};
 use beach_human::model::terminal::diff::{CacheUpdate, CellWrite, RectFill};
 use beach_human::sync::terminal::sync::{TerminalDeltaStream, TerminalSync};
@@ -94,11 +94,21 @@ struct TrimUpdate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct StyleUpdate {
+    id: u32,
+    seq: Seq,
+    fg: u32,
+    bg: u32,
+    attrs: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum WireUpdate {
     Row(RowUpdate),
     Rect(RectUpdate),
     Cell(CellUpdate),
     Trim(TrimUpdate),
+    Style(StyleUpdate),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +155,13 @@ fn cache_update_to_wire(update: &CacheUpdate) -> WireUpdate {
             start: trim.start,
             count: trim.count,
         }),
+        CacheUpdate::Style(style) => WireUpdate::Style(StyleUpdate {
+            id: style.id.0,
+            seq: style.seq,
+            fg: style.style.fg,
+            bg: style.style.bg,
+            attrs: style.style.attrs,
+        }),
     }
 }
 
@@ -168,6 +185,16 @@ fn wire_update_apply(update: &WireUpdate, grid: &TerminalGrid) {
         }
         WireUpdate::Trim(_) => {
             // trimming is applied via client-side renderer; cache grid ignores
+        }
+        WireUpdate::Style(style) => {
+            let _ = grid.style_table.set(
+                StyleId(style.id),
+                Style {
+                    fg: style.fg,
+                    bg: style.bg,
+                    attrs: style.attrs,
+                },
+            );
         }
     }
 }
@@ -194,6 +221,9 @@ fn apply_cache_update(update: &CacheUpdate, grid: &TerminalGrid) {
         }
         CacheUpdate::Trim(_) => {
             // grid state ignores trim events in this harness
+        }
+        CacheUpdate::Style(style) => {
+            let _ = grid.style_table.set(style.id, style.style);
         }
     }
 }

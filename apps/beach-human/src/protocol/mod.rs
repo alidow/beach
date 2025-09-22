@@ -3,6 +3,17 @@ use thiserror::Error;
 
 pub const PROTOCOL_VERSION: u8 = 1;
 
+pub mod wire;
+
+pub use wire::{
+    binary_protocol_enabled,
+    decode_client_frame_binary,
+    decode_host_frame_binary,
+    encode_client_frame_binary,
+    encode_host_frame_binary,
+    WireError,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Lane {

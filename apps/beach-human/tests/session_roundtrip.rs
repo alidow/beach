@@ -520,5 +520,15 @@ fn encode_update(update: &CacheUpdate) -> Value {
                 "count": trim.count,
             })
         }
+        CacheUpdate::Style(style) => {
+            json!({
+                "kind": "style",
+                "id": style.id.0,
+                "seq": style.seq,
+                "fg": style.style.fg,
+                "bg": style.style.bg,
+                "attrs": style.style.attrs,
+            })
+        }
     }
 }

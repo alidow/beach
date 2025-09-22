@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 #[cfg(test)]
 mod tests {
     use crate::transport::webrtc::{
@@ -7,7 +9,7 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Barrier;
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_full_localhost_integration() {
         // Create configs for server and client
         let server_config = WebRTCConfig::localhost(TransportMode::Server);
@@ -111,7 +113,7 @@ mod tests {
         assert!(client_transport.is_connected());
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_large_data_transfer() {
         // Create configs for server and client
         let server_config = WebRTCConfig::localhost(TransportMode::Server);

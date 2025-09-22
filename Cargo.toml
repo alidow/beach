@@ -2,5 +2,6 @@
 members = [
   "apps/beach", "apps/beach-human",
   "apps/beach-road",
+  "crates/test-timeout",
 ]
 resolver = "2"

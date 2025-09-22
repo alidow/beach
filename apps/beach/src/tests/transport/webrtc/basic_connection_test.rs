@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 #[cfg(test)]
 mod tests {
     use crate::transport::webrtc::{
@@ -5,7 +7,7 @@ mod tests {
     };
     use crate::transport::{Transport, TransportMode};
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_webrtc_connection_establishment() {
         // Create configs for server and client
         let server_config = WebRTCConfig::localhost(TransportMode::Server);
@@ -46,7 +48,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_transport_modes() {
         let server_config = WebRTCConfig::localhost(TransportMode::Server);
         let client_config = WebRTCConfig::localhost(TransportMode::Client);

@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 #[cfg(test)]
 mod tests {
     use crate::transport::webrtc::{
@@ -5,7 +7,7 @@ mod tests {
     };
     use crate::transport::{Transport, TransportMode};
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_bidirectional_data_transfer() {
         // Create configs for server and client
         let server_config = WebRTCConfig::localhost(TransportMode::Server);
@@ -63,7 +65,7 @@ mod tests {
         assert_eq!(received.unwrap(), test_data2.to_vec(), "Data should match");
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_multiple_messages() {
         // Create configs for server and client
         let server_config = WebRTCConfig::localhost(TransportMode::Server);

@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 #[cfg(test)]
 mod tests {
     use crate::transport::webrtc::{
@@ -6,7 +8,7 @@ mod tests {
     use crate::transport::{Transport, TransportMode};
     use tokio::time::{Duration, timeout};
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_webrtc_echo() {
         // Create local signaling channel pair
         let (server_signaling, client_signaling) = LocalSignalingChannel::create_pair();
@@ -103,7 +105,7 @@ mod tests {
         assert_eq!(received_large, large_data, "Large message data mismatch");
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_webrtc_multiple_messages() {
         let (server_signaling, client_signaling) = LocalSignalingChannel::create_pair();
 

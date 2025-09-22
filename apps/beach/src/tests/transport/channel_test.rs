@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 #[cfg(test)]
 mod tests {
     use crate::transport::{
@@ -7,7 +9,7 @@ mod tests {
     };
     use anyhow::Result;
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_channel_creation() -> Result<()> {
         let transport = MockTransport::new();
 
@@ -25,7 +27,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_channel_purpose_routing() -> Result<()> {
         let transport = MockTransport::new();
 
@@ -47,7 +49,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_multiple_channels() -> Result<()> {
         let transport = MockTransport::new();
 
@@ -62,7 +64,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_channel_send_receive() -> Result<()> {
         let transport = MockTransport::new();
         let channel = transport.channel(ChannelPurpose::Control).await?;
@@ -77,7 +79,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_channel_reliability_settings() {
         // Test reliability enum
         let reliable = ChannelReliability::Reliable;
@@ -103,7 +105,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_channel_options() {
         // Test channel options builder
         let control_opts = ChannelOptions::control();
@@ -120,14 +122,14 @@ mod tests {
         assert_eq!(output_opts.label, Some("custom-label".to_string()));
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_channel_labels() {
         assert_eq!(ChannelPurpose::Control.label(), "beach/ctrl/1");
         assert_eq!(ChannelPurpose::Output.label(), "beach/term/1");
         assert_eq!(ChannelPurpose::Custom(42).label(), "beach/custom/42");
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_backward_compatibility() -> Result<()> {
         let transport = MockTransport::new();
 

@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
@@ -92,14 +94,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_subscription_hub_creation() {
         let hub = SubscriptionHub::new();
         // Hub starts with no data source or writer
         // We can test this by trying to use them
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_subscription_hub_attach_source() {
         let hub = SubscriptionHub::new();
         let source = Arc::new(MockDataSource::new());
@@ -108,7 +110,7 @@ mod tests {
         // Source is now attached and can be used
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_subscription_hub_set_writer() {
         let hub = SubscriptionHub::new();
         let writer = Arc::new(MockPtyWriter);
@@ -117,7 +119,7 @@ mod tests {
         // Writer is now set and can be used
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_subscription_creation() {
         use crate::protocol::subscription::{ViewMode, ViewPosition};
         use crate::subscription::SubscriptionConfig;

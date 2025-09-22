@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 use portable_pty::{CommandBuilder, MasterPty, PtyPair, PtySize, native_pty_system};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -95,7 +97,7 @@ fn extract_output_lines(raw_output: &str) -> Vec<String> {
         .collect()
 }
 
-#[tokio::test]
+#[test_timeout::tokio_timeout_test]
 async fn test_default_shell_basic_echo() {
     // Test basic echo commands
     let output = run_commands_in_pty(vec!["echo 'hello'", "echo 'world'"], 80).await;
@@ -114,7 +116,7 @@ async fn test_default_shell_basic_echo() {
     );
 }
 
-#[tokio::test]
+#[test_timeout::tokio_timeout_test]
 async fn test_default_shell_line_wrapping() {
     // Create a string that exceeds 40 columns
     let long_text = "a".repeat(100);
@@ -155,7 +157,7 @@ async fn test_default_shell_line_wrapping() {
     assert!(output.contains("echo"), "Should see the echo command");
 }
 
-#[tokio::test]
+#[test_timeout::tokio_timeout_test]
 async fn test_pty_preserves_output_order() {
     // Test that multiple commands maintain order
     let commands = vec!["echo 'first'", "echo 'second'", "echo 'third'"];
@@ -172,7 +174,7 @@ async fn test_pty_preserves_output_order() {
     assert!(second_pos < third_pos, "Second should come before third");
 }
 
-#[tokio::test]
+#[test_timeout::tokio_timeout_test]
 async fn test_pty_handles_special_characters() {
     // Test echo with special characters
     let output = run_commands_in_pty(vec!["echo 'hello\\nworld'", "echo 'tab\\there'"], 80).await;
@@ -321,7 +323,7 @@ impl ResizablePtySession {
 // - Or test with the terminal state APIs that understand visual wrapping
 //
 // This test is kept for reference but should be redesigned if resize behavior testing is needed.
-#[tokio::test]
+#[test_timeout::tokio_timeout_test]
 #[ignore = "Test has incorrect assumptions about echo output and line wrapping - see comments above"]
 async fn test_terminal_resize_with_complex_content() {
     let session = ResizablePtySession::new(80, 24).await;
@@ -405,7 +407,7 @@ async fn test_terminal_resize_with_complex_content() {
     }
 }
 
-#[tokio::test]
+#[test_timeout::tokio_timeout_test]
 #[ignore = "Vim tests are complex and may hang - run with --ignored to test"]
 async fn test_vim_tui_interaction() {
     let session = ResizablePtySession::new(80, 24).await;
@@ -457,7 +459,7 @@ async fn test_vim_tui_interaction() {
     session.send_command(&format!("rm {}", test_file)).await;
 }
 
-#[tokio::test]
+#[test_timeout::tokio_timeout_test]
 #[ignore = "Vim tests are complex and may hang - run with --ignored to test"]
 async fn test_vim_with_terminal_resize() {
     let session = ResizablePtySession::new(80, 24).await;
@@ -518,7 +520,7 @@ async fn test_vim_with_terminal_resize() {
     session.send_command(&format!("rm {}", test_file)).await;
 }
 
-#[tokio::test]
+#[test_timeout::tokio_timeout_test]
 async fn test_special_key_sequences() {
     let session = ResizablePtySession::new(80, 24).await;
     session.clear_output();

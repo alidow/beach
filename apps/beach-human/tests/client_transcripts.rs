@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +13,7 @@ fn send_text(transport: &dyn Transport, value: serde_json::Value) {
     transport.send_text(&text).expect("send frame");
 }
 
-#[tokio::test]
+#[test_timeout::tokio_timeout_test]
 async fn client_replays_basic_snapshot() {
     let pair = TransportPair::new(TransportKind::Ipc);
     let transport: Arc<dyn Transport> = Arc::from(pair.client);
@@ -69,7 +71,7 @@ async fn client_replays_basic_snapshot() {
         .expect("client thread");
 }
 
-#[tokio::test]
+#[test_timeout::tokio_timeout_test]
 async fn client_applies_deltas() {
     let pair = TransportPair::new(TransportKind::Ipc);
     let transport: Arc<dyn Transport> = Arc::from(pair.client);
@@ -135,7 +137,7 @@ async fn client_applies_deltas() {
         .expect("client thread");
 }
 
-#[tokio::test]
+#[test_timeout::tokio_timeout_test]
 async fn client_emits_input_events() {
     let pair = TransportPair::new(TransportKind::Ipc);
     let transport: Arc<dyn Transport> = Arc::from(pair.client);

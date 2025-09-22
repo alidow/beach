@@ -233,7 +233,7 @@ mod tests {
     use crate::cache::terminal::TerminalGrid;
     use tokio::time::{Duration, sleep};
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn runtime_captures_command_output() {
         let grid = Arc::new(TerminalGrid::new(4, 20));
         let emulator: Box<dyn TerminalEmulator + Send> =

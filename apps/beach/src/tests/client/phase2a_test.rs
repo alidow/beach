@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 /// Phase 2a Client Tests
 /// Tests for the minimal client implementation with control channel and fallback
 
@@ -8,7 +10,7 @@ mod tests {
     use crate::server::terminal_state::{Cell, CellAttributes, CellChange, Color, Grid, GridDelta};
 
     /// Test predictive echo basic functionality
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_predictive_input() {
         let client_id = "test-client".to_string();
         let mut predictive_echo = PredictiveEcho::new(client_id.clone());
@@ -39,7 +41,7 @@ mod tests {
     }
 
     /// Test grid renderer with scrolling
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_scroll_prefetch() {
         let mut grid_renderer = GridRenderer::new(80, 24, false).unwrap();
 
@@ -60,7 +62,7 @@ mod tests {
     }
 
     /// Test grid snapshot and delta application
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_reconnect_resync() {
         let mut grid_renderer = GridRenderer::new(80, 24, false).unwrap();
 
@@ -104,7 +106,7 @@ mod tests {
     }
 
     /// Test order guarantees with sequential deltas
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_order_guarantees() {
         let mut grid_renderer = GridRenderer::new(80, 24, false).unwrap();
 
@@ -149,7 +151,7 @@ mod tests {
     }
 
     /// Test horizontal scrolling for server width enforcement
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn test_horizontal_scroll() {
         // Create renderer with server width > local width
         let mut grid_renderer = GridRenderer::new(120, 24, false).unwrap();

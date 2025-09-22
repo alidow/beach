@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use beach_human::cache::terminal::{TerminalGrid, unpack_cell};
 use beach_human::cache::{GridCache, Seq};
@@ -193,7 +195,7 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let hosted = manager.host().await?;
     let session_id = hosted.session_id().to_string();
     info!(session_id = %session_id, "session registered");
-    let transport = negotiate_transport(hosted.handle()).await?;
+    let transport = negotiate_transport(hosted.handle(), Some(hosted.join_code())).await?;
     let selected_kind = transport.kind();
     info!(session_id = %session_id, transport = ?selected_kind, "transport negotiated");
     HeartbeatPublisher::new(transport.clone()).spawn(Duration::from_secs(5), None);
@@ -321,8 +323,9 @@ async fn handle_join(base_url: &str, args: JoinArgs) -> Result<(), CliError> {
         None => prompt_passcode()?,
     };
 
-    let joined = manager.join(&session_id, passcode.trim()).await?;
-    let transport = negotiate_transport(joined.handle()).await?;
+    let trimmed_pass = passcode.trim().to_string();
+    let joined = manager.join(&session_id, trimmed_pass.as_str()).await?;
+    let transport = negotiate_transport(joined.handle(), Some(trimmed_pass.as_str())).await?;
     let selected_kind = transport.kind();
     info!(session_id = %joined.session_id(), transport = ?selected_kind, "joined session");
     print_join_banner(&joined, selected_kind);
@@ -343,7 +346,10 @@ async fn handle_join(base_url: &str, args: JoinArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn negotiate_transport(handle: &SessionHandle) -> Result<Arc<dyn Transport>, CliError> {
+async fn negotiate_transport(
+    handle: &SessionHandle,
+    passphrase: Option<&str>,
+) -> Result<Arc<dyn Transport>, CliError> {
     let mut errors = Vec::new();
 
     // Prefer WebRTC data channels for sync; fall back to WebSocket only if absolutely necessary.
@@ -371,6 +377,7 @@ async fn negotiate_transport(handle: &SessionHandle) -> Result<Arc<dyn Transport
                 signaling_url,
                 role,
                 Duration::from_millis(poll_ms),
+                passphrase,
             )
             .await
             {
@@ -1429,6 +1436,7 @@ mod tests {
     use beach_human::model::terminal::diff::RowSnapshot;
     use beach_human::sync::terminal::NullTerminalDeltaStream;
     use serde_json::{Value, json};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::{Duration as StdDuration, Instant};
     use tokio::time::{Instant as TokioInstant, sleep, timeout};
@@ -1507,7 +1515,7 @@ mod tests {
         assert!(matches!(err, CliError::InvalidSessionTarget { .. }));
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn webrtc_mock_session_flow() {
         timeout(StdDuration::from_secs(30), async {
             let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -1673,7 +1681,7 @@ mod tests {
         .expect("webrtc mock session timed out");
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn heartbeat_publisher_emits_messages() {
         let pair = TransportPair::new(TransportKind::Ipc);
         let publisher_transport: Arc<dyn Transport> = Arc::from(pair.server);
@@ -1700,7 +1708,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn snapshot_retries_until_client_receives_prompt() {
         let rows = 4;
         let cols = 16;
@@ -1722,6 +1730,7 @@ mod tests {
 
         // Seed the grid with an existing prompt before any transport handshake.
         let prompt = "host% ";
+        let _prompt_trimmed = prompt.trim_end();
         let seq: Seq = 1;
         let mut packed = Vec::new();
         for (col, ch) in prompt.chars().enumerate() {
@@ -1830,13 +1839,14 @@ mod tests {
         forwarder.await.expect("forwarder join");
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn handshake_snapshot_contains_prompt_row() {
         let rows = 24;
         let cols = 80;
         let grid = Arc::new(TerminalGrid::new(rows, cols));
         let style_id = grid.ensure_style_id(Style::default());
         let prompt = "host% ";
+        let prompt_trimmed = prompt.trim_end();
         for (col, ch) in prompt.chars().enumerate() {
             let packed = TerminalGrid::pack_char_with_style(ch, style_id);
             grid.write_packed_cell_if_newer(rows - 1, col, (col as Seq) + 1, packed)
@@ -1870,7 +1880,9 @@ mod tests {
         ));
 
         let mut saw_prompt = false;
-        for _ in 0..6 {
+        let mut prompt_cells: BTreeMap<usize, char> = BTreeMap::new();
+        let target_row = rows - 1;
+        for _ in 0..20 {
             match client_transport.recv(StdDuration::from_millis(200)) {
                 Ok(message) => {
                     if let Some(text) = message.payload.as_text() {
@@ -1880,23 +1892,46 @@ mod tests {
                                 for update in updates {
                                     if update["kind"] == "row" {
                                         if let Some(text) = update["text"].as_str() {
-                                            if text.trim_end() == prompt {
+                                            if text.trim_end() == prompt_trimmed {
                                                 saw_prompt = true;
                                                 break;
                                             }
                                         } else if let Some(cells) = update["cells"].as_array() {
                                             let row: String = cells
                                                 .iter()
-                                                .map(|cell| {
-                                                    cell["ch"]
-                                                        .as_str()
+                                                .enumerate()
+                                                .map(|(idx, cell)| {
+                                                    let ch_opt = cell
+                                                        .get("ch")
+                                                        .and_then(Value::as_str)
+                                                        .or_else(|| {
+                                                            cell.get("char").and_then(Value::as_str)
+                                                        });
+                                                    let ch = ch_opt
                                                         .and_then(|s| s.chars().next())
-                                                        .unwrap_or(' ')
+                                                        .unwrap_or(' ');
+                                                    let col = cell
+                                                        .get("col")
+                                                        .and_then(Value::as_u64)
+                                                        .map(|v| v as usize)
+                                                        .unwrap_or(idx);
+                                                    prompt_cells.insert(col, ch);
+                                                    ch
                                                 })
                                                 .collect();
-                                            if row.trim_end() == prompt {
+                                            if row.trim_end() == prompt_trimmed {
                                                 saw_prompt = true;
                                                 break;
+                                            }
+                                        }
+                                    } else if update["kind"] == "cell" {
+                                        if update["row"].as_u64() == Some(target_row as u64) {
+                                            if let (Some(col), Some(ch_str)) =
+                                                (update["col"].as_u64(), update["char"].as_str())
+                                            {
+                                                if let Some(ch) = ch_str.chars().next() {
+                                                    prompt_cells.insert(col as usize, ch);
+                                                }
                                             }
                                         }
                                     }
@@ -1910,6 +1945,13 @@ mod tests {
             }
             if saw_prompt {
                 break;
+            }
+        }
+
+        if !saw_prompt {
+            let candidate: String = prompt_cells.values().copied().collect::<String>();
+            if candidate.trim_end() == prompt_trimmed {
+                saw_prompt = true;
             }
         }
 

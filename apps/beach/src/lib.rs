@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 pub mod client;
 pub mod config;
 pub mod debug_log;

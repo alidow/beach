@@ -33,3 +33,5 @@ crossbeam-channel = "0.5"
 
 [dev-dependencies]
 hyper = { version = "0.14", features = ["server"] }
+test-timeout = { path = "../../crates/test-timeout" }
+axum = { version = "0.7", features = ["ws"] }

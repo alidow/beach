@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 mod client;
 mod config;
 mod debug_log;

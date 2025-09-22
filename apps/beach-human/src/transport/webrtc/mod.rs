@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -37,6 +37,10 @@ use crate::transport::{
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+mod signaling;
+
+use signaling::{SignalingClient, WebRTCSignal};
+
 pub fn build_pair() -> Result<TransportPair, TransportError> {
     RUNTIME.block_on(async { create_webrtc_pair().await })
 }
@@ -65,11 +69,11 @@ where
     }
 }
 
-fn spawn_on_global<F>(future: F)
+fn spawn_on_global<F>(future: F) -> tokio::task::JoinHandle<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    RUNTIME.spawn(future);
+    RUNTIME.spawn(future)
 }
 
 fn build_api(setting: SettingEngine) -> Result<API, TransportError> {
@@ -122,6 +126,7 @@ struct WebRtcTransport {
     _pc: Arc<RTCPeerConnection>,
     _dc: Arc<RTCDataChannel>,
     _router: Option<Arc<AsyncMutex<Router>>>,
+    _signaling: Option<Arc<SignalingClient>>,
 }
 
 impl WebRtcTransport {
@@ -133,6 +138,7 @@ impl WebRtcTransport {
         dc: Arc<RTCDataChannel>,
         router: Option<Arc<AsyncMutex<Router>>>,
         dc_ready: Option<Arc<Notify>>,
+        signaling: Option<Arc<SignalingClient>>,
     ) -> Self {
         let (inbound_tx, inbound_rx) = crossbeam_unbounded();
         let handler_id = id;
@@ -320,6 +326,7 @@ impl WebRtcTransport {
             _pc: pc,
             _dc: dc,
             _router: router,
+            _signaling: signaling,
         }
     }
 }
@@ -427,16 +434,18 @@ pub async fn connect_via_signaling(
     signaling_url: &str,
     role: WebRtcRole,
     poll_interval: Duration,
+    passphrase: Option<&str>,
 ) -> Result<Arc<dyn Transport>, TransportError> {
     match role {
-        WebRtcRole::Offerer => connect_offerer(signaling_url, poll_interval).await,
-        WebRtcRole::Answerer => connect_answerer(signaling_url, poll_interval).await,
+        WebRtcRole::Offerer => connect_offerer(signaling_url, poll_interval, passphrase).await,
+        WebRtcRole::Answerer => connect_answerer(signaling_url, poll_interval, passphrase).await,
     }
 }
 
 async fn connect_offerer(
     signaling_url: &str,
     poll_interval: Duration,
+    passphrase: Option<&str>,
 ) -> Result<Arc<dyn Transport>, TransportError> {
     let client = Client::new();
 
@@ -469,48 +478,51 @@ async fn connect_offerer(
 
     let spawn_handle = Handle::try_current().ok();
 
-    let offer_candidate_client = client.clone();
-    let offer_candidate_signaling = signaling.clone();
-    let offer_candidate_done = Arc::new(AtomicBool::new(false));
-    let offer_candidate_done_clone = offer_candidate_done.clone();
-    pc.on_ice_candidate(Box::new(move |candidate| {
-        let client = offer_candidate_client.clone();
-        let signaling = offer_candidate_signaling.clone();
-        let done_flag = offer_candidate_done_clone.clone();
-        Box::pin(async move {
-            let candidate_init = match candidate {
-                Some(cand) => match cand.to_json() {
-                    Ok(json) => Some(json),
-                    Err(err) => {
-                        tracing::warn!(
-                            target = "webrtc",
-                            error = %err,
-                            "offerer candidate serialize error"
-                        );
-                        return;
-                    }
-                },
-                None => {
-                    if done_flag.swap(true, Ordering::SeqCst) {
-                        return;
-                    }
-                    None
-                }
-            };
+    let signaling_client =
+        SignalingClient::connect(signaling_url, WebRtcRole::Offerer, passphrase).await?;
 
-            if let Err(err) =
-                post_candidate(&client, &signaling, "offer/candidates", candidate_init).await
-            {
-                if !matches!(err, TransportError::Timeout | TransportError::ChannelClosed) {
+    let signaling_for_candidates = Arc::clone(&signaling_client);
+    pc.on_ice_candidate(Box::new(move |candidate| {
+        let signaling = Arc::clone(&signaling_for_candidates);
+        Box::pin(async move {
+            if let Some(cand) = candidate {
+                if let Err(err) = signaling.send_ice_candidate(cand).await {
                     tracing::warn!(
                         target = "webrtc",
                         error = %err,
-                        "offerer candidate post error"
+                        "offerer candidate send error"
                     );
                 }
             }
         })
     }));
+
+    let pc_for_incoming = pc.clone();
+    let signaling_for_incoming = Arc::clone(&signaling_client);
+    spawn_on_global(async move {
+        while let Some(signal) = signaling_for_incoming.recv_webrtc_signal().await {
+            if let WebRTCSignal::IceCandidate {
+                candidate,
+                sdp_mid,
+                sdp_mline_index,
+            } = signal
+            {
+                let init = RTCIceCandidateInit {
+                    candidate,
+                    sdp_mid,
+                    sdp_mline_index: sdp_mline_index.map(|idx| idx as u16),
+                    username_fragment: None,
+                };
+                if let Err(err) = pc_for_incoming.add_ice_candidate(init).await {
+                    tracing::warn!(
+                        target = "webrtc",
+                        error = %err,
+                        "offerer failed to add remote ice candidate"
+                    );
+                }
+            }
+        }
+    });
 
     let dc_init = RTCDataChannelInit {
         ordered: Some(true),
@@ -631,30 +643,6 @@ async fn connect_offerer(
         }
     });
 
-    let pc_for_candidates = pc.clone();
-    let client_for_candidates = client.clone();
-    let signaling_for_candidates = signaling.clone();
-    spawn_with_handle(spawn_handle.clone(), async move {
-        if let Err(err) = poll_remote_candidates(
-            client_for_candidates,
-            signaling_for_candidates,
-            "answer/candidates",
-            pc_for_candidates,
-            poll_interval,
-            "offerer",
-        )
-        .await
-        {
-            if !matches!(err, TransportError::Timeout | TransportError::ChannelClosed) {
-                tracing::warn!(
-                    target = "webrtc",
-                    error = %err,
-                    "offerer candidate poll error"
-                );
-            }
-        }
-    });
-
     let local_id = next_transport_id();
     let remote_id = next_transport_id();
     tracing::trace!(
@@ -671,6 +659,7 @@ async fn connect_offerer(
         dc,
         None,
         Some(dc_open_notify),
+        Some(signaling_client.clone()),
     ));
     tracing::trace!(
         target = "webrtc",
@@ -724,9 +713,9 @@ async fn connect_offerer(
 async fn connect_answerer(
     signaling_url: &str,
     poll_interval: Duration,
+    passphrase: Option<&str>,
 ) -> Result<Arc<dyn Transport>, TransportError> {
     let client = Client::new();
-    let signaling = signaling_url.trim_end_matches('/').to_string();
 
     let offer_payload = loop {
         tracing::trace!(
@@ -790,50 +779,51 @@ async fn connect_answerer(
     );
     let pc = Arc::new(pc_result.map_err(to_setup_error)?);
 
-    let spawn_handle = Handle::try_current().ok();
+    let signaling_client =
+        SignalingClient::connect(signaling_url, WebRtcRole::Answerer, passphrase).await?;
 
-    let answer_candidate_client = client.clone();
-    let answer_candidate_signaling = signaling.clone();
-    let answer_candidate_done = Arc::new(AtomicBool::new(false));
-    let answer_candidate_done_clone = answer_candidate_done.clone();
+    let signaling_for_candidates = Arc::clone(&signaling_client);
     pc.on_ice_candidate(Box::new(move |candidate| {
-        let client = answer_candidate_client.clone();
-        let signaling = answer_candidate_signaling.clone();
-        let done_flag = answer_candidate_done_clone.clone();
+        let signaling = Arc::clone(&signaling_for_candidates);
         Box::pin(async move {
-            let candidate_init = match candidate {
-                Some(cand) => match cand.to_json() {
-                    Ok(json) => Some(json),
-                    Err(err) => {
-                        tracing::warn!(
-                            target = "webrtc",
-                            error = %err,
-                            "answerer candidate serialize error"
-                        );
-                        return;
-                    }
-                },
-                None => {
-                    if done_flag.swap(true, Ordering::SeqCst) {
-                        return;
-                    }
-                    None
-                }
-            };
-
-            if let Err(err) =
-                post_candidate(&client, &signaling, "answer/candidates", candidate_init).await
-            {
-                if !matches!(err, TransportError::Timeout | TransportError::ChannelClosed) {
+            if let Some(cand) = candidate {
+                if let Err(err) = signaling.send_ice_candidate(cand).await {
                     tracing::warn!(
                         target = "webrtc",
                         error = %err,
-                        "answerer candidate post error"
+                        "answerer candidate send error"
                     );
                 }
             }
         })
     }));
+
+    let signaling_for_incoming = Arc::clone(&signaling_client);
+    let pc_for_incoming = pc.clone();
+    spawn_on_global(async move {
+        while let Some(signal) = signaling_for_incoming.recv_webrtc_signal().await {
+            if let WebRTCSignal::IceCandidate {
+                candidate,
+                sdp_mid,
+                sdp_mline_index,
+            } = signal
+            {
+                let init = RTCIceCandidateInit {
+                    candidate,
+                    sdp_mid,
+                    sdp_mline_index: sdp_mline_index.map(|idx| idx as u16),
+                    username_fragment: None,
+                };
+                if let Err(err) = pc_for_incoming.add_ice_candidate(init).await {
+                    tracing::warn!(
+                        target = "webrtc",
+                        error = %err,
+                        "answerer failed to add remote ice candidate"
+                    );
+                }
+            }
+        }
+    });
 
     let dc_open_notify = Arc::new(Notify::new());
     let transport_slot: Arc<AsyncMutex<Option<Arc<dyn Transport>>>> =
@@ -849,10 +839,12 @@ async fn connect_answerer(
         ?peer_id,
         "answerer allocating transport ids"
     );
+    let signaling_for_dc = Arc::clone(&signaling_client);
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let pc = pc_for_dc.clone();
         let notify = notify_clone.clone();
         let slot = slot_clone.clone();
+        let signaling_for_transport = Arc::clone(&signaling_for_dc);
         Box::pin(async move {
             let notify_for_open = notify.clone();
             dc.on_open(Box::new(move || {
@@ -888,6 +880,7 @@ async fn connect_answerer(
                     dc,
                     None,
                     Some(notify.clone()),
+                    Some(signaling_for_transport),
                 );
                 let transport_arc = Arc::new(transport) as Arc<dyn Transport>;
                 slot_guard.replace(transport_arc.clone());
@@ -973,30 +966,6 @@ async fn connect_answerer(
         result = ?post_result
     );
     post_result?;
-
-    let pc_for_offer_candidates = pc.clone();
-    let client_for_offer_candidates = client.clone();
-    let signaling_for_offer_candidates = signaling.clone();
-    spawn_with_handle(spawn_handle.clone(), async move {
-        if let Err(err) = poll_remote_candidates(
-            client_for_offer_candidates,
-            signaling_for_offer_candidates,
-            "offer/candidates",
-            pc_for_offer_candidates,
-            poll_interval,
-            "answerer",
-        )
-        .await
-        {
-            if !matches!(err, TransportError::Timeout | TransportError::ChannelClosed) {
-                tracing::warn!(
-                    target = "webrtc",
-                    error = %err,
-                    "answerer candidate poll error"
-                );
-            }
-        }
-    });
 
     let transport = loop {
         tracing::trace!(
@@ -1238,207 +1207,6 @@ async fn fetch_sdp(
             "unexpected signaling status {}",
             status
         ))),
-    }
-}
-
-async fn post_candidate(
-    client: &Client,
-    base: &str,
-    suffix: &str,
-    candidate: Option<RTCIceCandidateInit>,
-) -> Result<(), TransportError> {
-    let url = endpoint(base, suffix);
-    tracing::trace!(
-        target = "beach_human::transport::webrtc",
-        phase = "post_candidate",
-        suffix,
-        await = "client.send",
-        state = "start",
-        has_candidate = candidate.is_some()
-    );
-    let send_attempt = client.post(url).json(&candidate).send().await;
-    tracing::trace!(
-        target = "beach_human::transport::webrtc",
-        phase = "post_candidate",
-        suffix,
-        await = "client.send",
-        state = "end",
-        result = ?send_attempt.as_ref().map(reqwest::Response::status)
-    );
-    let response = send_attempt.map_err(http_error)?;
-
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(TransportError::Setup(format!(
-            "unexpected signaling status {}",
-            response.status()
-        )))
-    }
-}
-
-async fn fetch_candidate_batch(
-    client: &Client,
-    base: &str,
-    suffix: &str,
-) -> Result<Vec<Option<RTCIceCandidateInit>>, TransportError> {
-    let url = endpoint(base, suffix);
-    tracing::trace!(
-        target = "beach_human::transport::webrtc",
-        phase = "fetch_candidate_batch",
-        suffix,
-        await = "client.send",
-        state = "start"
-    );
-    let send_attempt = client.get(url).send().await;
-    tracing::trace!(
-        target = "beach_human::transport::webrtc",
-        phase = "fetch_candidate_batch",
-        suffix,
-        await = "client.send",
-        state = "end",
-        result = ?send_attempt.as_ref().map(reqwest::Response::status)
-    );
-    let response = send_attempt.map_err(http_error)?;
-
-    if response.status().is_success() {
-        tracing::trace!(
-            target = "beach_human::transport::webrtc",
-            phase = "fetch_candidate_batch",
-            suffix,
-            await = "response.json",
-            state = "start"
-        );
-        let candidates_attempt = response.json::<Vec<Option<RTCIceCandidateInit>>>().await;
-        tracing::trace!(
-            target = "beach_human::transport::webrtc",
-            phase = "fetch_candidate_batch",
-            suffix,
-            await = "response.json",
-            state = "end",
-            success = candidates_attempt.is_ok()
-        );
-        let candidates = candidates_attempt.map_err(http_error)?;
-        Ok(candidates)
-    } else if response.status() == StatusCode::NOT_FOUND {
-        Ok(Vec::new())
-    } else {
-        Err(TransportError::Setup(format!(
-            "unexpected signaling status {}",
-            response.status()
-        )))
-    }
-}
-
-async fn poll_remote_candidates(
-    client: Client,
-    base: String,
-    suffix: &str,
-    pc: Arc<RTCPeerConnection>,
-    poll_interval: Duration,
-    label: &'static str,
-) -> Result<(), TransportError> {
-    loop {
-        tracing::trace!(
-            target = "beach_human::transport::webrtc",
-            label,
-            await = "pc.remote_description",
-            state = "start"
-        );
-        let remote_description_missing = pc.remote_description().await.is_none();
-        tracing::trace!(
-            target = "beach_human::transport::webrtc",
-            label,
-            await = "pc.remote_description",
-            state = "end",
-            missing = remote_description_missing
-        );
-        if remote_description_missing {
-            tracing::trace!(
-                target = "beach_human::transport::webrtc",
-                label,
-                await = "sleep.poll_interval",
-                state = "start",
-                poll_ms = poll_interval.as_millis() as u64
-            );
-            sleep(poll_interval).await;
-            tracing::trace!(
-                target = "beach_human::transport::webrtc",
-                label,
-                await = "sleep.poll_interval",
-                state = "end"
-            );
-            continue;
-        }
-        let mut received_any = false;
-        tracing::trace!(
-            target = "beach_human::transport::webrtc",
-            label,
-            await = "fetch_candidate_batch",
-            state = "start"
-        );
-        let fetch_attempt = fetch_candidate_batch(&client, &base, suffix).await;
-        tracing::trace!(
-            target = "beach_human::transport::webrtc",
-            label,
-            await = "fetch_candidate_batch",
-            state = "end",
-            result = ?fetch_attempt
-        );
-        let batch = fetch_attempt?;
-        for candidate in batch {
-            received_any = true;
-            match candidate {
-                Some(init) => {
-                    let candidate_value = init.candidate.clone();
-                    tracing::trace!(
-                        target = "webrtc",
-                        label,
-                        candidate = candidate_value,
-                        "received candidate"
-                    );
-                    tracing::trace!(
-                        target = "beach_human::transport::webrtc",
-                        label,
-                        await = "pc.add_ice_candidate",
-                        state = "start"
-                    );
-                    pc.add_ice_candidate(init).await.map_err(to_setup_error)?;
-                    tracing::trace!(
-                        target = "beach_human::transport::webrtc",
-                        label,
-                        await = "pc.add_ice_candidate",
-                        state = "end"
-                    );
-                }
-                None => {
-                    tracing::trace!(target = "webrtc", label, "received end-of-candidates");
-                    return Ok(());
-                }
-            }
-        }
-
-        if pc.connection_state() == RTCPeerConnectionState::Connected {
-            tracing::trace!(target = "webrtc", label, "connection already connected");
-            return Ok(());
-        }
-
-        if !received_any {
-            tracing::trace!(
-                target = "beach_human::transport::webrtc",
-                label,
-                await = "sleep.poll_interval",
-                state = "start",
-                poll_ms = poll_interval.as_millis() as u64
-            );
-            sleep(poll_interval).await;
-            tracing::trace!(
-                target = "beach_human::transport::webrtc",
-                label,
-                await = "sleep.poll_interval",
-                state = "end"
-            );
-        }
     }
 }
 
@@ -1698,6 +1466,7 @@ async fn create_webrtc_pair() -> Result<TransportPair, TransportError> {
         offer_dc.clone(),
         router_keepalive.clone(),
         None,
+        None,
     );
 
     let server_transport = WebRtcTransport::new(
@@ -1707,6 +1476,7 @@ async fn create_webrtc_pair() -> Result<TransportPair, TransportError> {
         answer_pc.clone(),
         answer_dc.clone(),
         router_keepalive,
+        None,
         None,
     );
 

@@ -633,7 +633,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn host_session_returns_join_code_and_offers() {
         let backend = Arc::new(MockSessionBackend::new());
         let config = SessionConfig::new("http://mock.server").unwrap();
@@ -648,7 +648,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn join_session_with_valid_code_yields_webrtc_offer() {
         let backend = Arc::new(MockSessionBackend::new());
         let config = SessionConfig::new("http://mock.server").unwrap();
@@ -674,7 +674,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[test_timeout::tokio_timeout_test]
     async fn join_session_with_invalid_code_fails() {
         let backend = Arc::new(MockSessionBackend::new());
         let config = SessionConfig::new("http://mock.server").unwrap();

@@ -40,14 +40,37 @@ This document tracks the remaining milestones for the new `beach-human` stack. E
 - Automate latency/throughput benchmarks comparing beach-human vs. `ssh $USER@localhost` + tmux, targeting ≥30% lower echo latency.
 - Capture keystroke-to-render timings, steady-state frame cadence, and bandwidth utilisation, exporting CSV summaries.
 - Integrate with `BEACH_HUMAN_PROFILE=1` so emulator/sync timings feed the benchmark reports.
+- Add loopback packet capture hooks so binary protocol payloads can be diffed against mosh baselines.
 
-## ✅ 7. Immediate Performance Optimisations
+## 🆕 7. Binary Protocol + Diff Precision
+
+### 7a. Wire Format & Compatibility Layer
+- Define the packed binary envelope in `protocol::wire` (frame headers, varint lengths, packed cells/styles).
+- Implement host/client encode + decode helpers alongside a temporary JSON fallback flag for incremental rollout.
+- Update transport abstractions/tests so `Payload::Binary` is the primary path, base64/text only when a legacy websocket demands it.
+
+### 7b. Server Pipeline Rework
+- Swap the sync pipeline to use the new encoder, adding per-subscriber transmitter caches for diff dedupe.
+- Teach the timeline/emulator path to emit `RowSegment` updates derived from Alacritty damage + cache comparisons.
+- Convert heartbeats, input acks, and resize/grid descriptors to the binary format; keep telemetry on frame size/latency.
+
+### 7c. Client Decoder & Renderer
+- Consume binary frames end-to-end, wiring zero-copy decode into the predictive echo and cursor update logic.
+- Update `GridRenderer` helpers for segment-aware patches and compact style-table diffs (12-bit ids, packed payloads).
+- Make local prediction invalidation span-aware so speculative cells disappear immediately when authoritative data arrives.
+
+### 7d. Tests, Fixtures & Perf Harness
+- Refresh unit/integration tests to cover both binary and fallback JSON paths; add regression cases for transmitter cache dedupe.
+- Update transcript fixtures/golden frames to the new wire format and document refresh steps.
+- Extend the perf harness to report payload size + echo latency deltas pre/post migration, enforcing the ≥20 % win target.
+
+## ✅ 8. Immediate Performance Optimisations
 
 - Server diff pipeline now batches row segments and coalesces frames per transport.
 - Client records render-to-paint latency and avoids redundant redraws.
 - Vim benchmark regressions cleared; keep running perf harnesses to guard the ≥30 % latency win target.
 
-## 🚧 8. Full Tmux Parity (Next Priority)
+## 🚧 9. Full Tmux Parity (Next Priority)
 
 ### 8a. Scrollback Capture & Sync
 - **Server**: re-enable Alacritty scrollback (currently forced to `0` in `server/terminal/emulator.rs`) and persist scrolled-off rows into a history buffer (`TerminalGrid` should freeze/archive rows instead of discarding them).

@@ -195,6 +195,8 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let hosted = manager.host().await?;
     let session_id = hosted.session_id().to_string();
     info!(session_id = %session_id, "session registered");
+    print_host_banner(&hosted, &normalized_base, TransportKind::WebRtc);
+    info!(session_id = %session_id, "waiting for WebRTC transport");
     let transport = negotiate_transport(hosted.handle(), Some(hosted.join_code())).await?;
     let selected_kind = transport.kind();
     info!(session_id = %session_id, transport = ?selected_kind, "transport negotiated");
@@ -226,7 +228,6 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let process_handle = runtime.process_handle();
     let emulator_handle = runtime.emulator_handle();
 
-    print_host_banner(&hosted, &normalized_base, selected_kind);
     info!(session_id = %session_id, "host ready");
 
     let mut input_handles = Vec::new();
@@ -255,7 +256,7 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         ));
 
         local_preview_task = Some(tokio::task::spawn_blocking(move || {
-            let client = TerminalClient::new(local_client_transport);
+            let client = TerminalClient::new(local_client_transport).with_predictive_input(true);
             match client.run() {
                 Ok(()) | Err(ClientError::Shutdown) => {}
                 Err(err) => eprintln!("⚠️  preview client error: {err}"),

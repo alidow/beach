@@ -43,9 +43,14 @@ struct WebSocketTransport {
     id: TransportId,
     peer: TransportId,
     outbound_seq: AtomicU64,
-    outbound_tx: tokio_mpsc::UnboundedSender<Vec<u8>>,
+    outbound_tx: tokio_mpsc::UnboundedSender<OutboundFrame>,
     inbound_rx: Mutex<mpsc::Receiver<TransportMessage>>,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+enum OutboundFrame {
+    Text(String),
+    Binary(Vec<u8>),
 }
 
 impl WebSocketTransport {
@@ -59,7 +64,7 @@ impl WebSocketTransport {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let (inbound_tx, inbound_rx) = mpsc::channel();
-        let (outbound_tx, mut outbound_rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
+        let (outbound_tx, mut outbound_rx) = tokio_mpsc::unbounded_channel::<OutboundFrame>();
 
         let (mut write_half, mut read_half) = stream.split();
 
@@ -90,8 +95,12 @@ impl WebSocketTransport {
         });
 
         let write_task = RUNTIME.spawn(async move {
-            while let Some(bytes) = outbound_rx.recv().await {
-                if let Err(err) = write_half.send(Message::Binary(bytes)).await {
+            while let Some(frame) = outbound_rx.recv().await {
+                let result = match frame {
+                    OutboundFrame::Text(text) => write_half.send(Message::Text(text)).await,
+                    OutboundFrame::Binary(bytes) => write_half.send(Message::Binary(bytes)).await,
+                };
+                if let Err(err) = result {
                     eprintln!("websocket send error: {err}");
                     break;
                 }
@@ -122,10 +131,18 @@ impl Transport for WebSocketTransport {
     }
 
     fn send(&self, message: TransportMessage) -> Result<(), TransportError> {
-        let bytes = encode_message(&message);
-        self.outbound_tx
-            .send(bytes)
-            .map_err(|_| TransportError::ChannelClosed)
+        match &message.payload {
+            Payload::Text(text) => self
+                .outbound_tx
+                .send(OutboundFrame::Text(text.clone()))
+                .map_err(|_| TransportError::ChannelClosed),
+            Payload::Binary(_) => {
+                let bytes = encode_message(&message);
+                self.outbound_tx
+                    .send(OutboundFrame::Binary(bytes))
+                    .map_err(|_| TransportError::ChannelClosed)
+            }
+        }
     }
 
     fn send_text(&self, text: &str) -> Result<u64, TransportError> {
@@ -203,15 +220,13 @@ mod tests {
         assert_eq!(client.kind(), TransportKind::WebSocket);
         assert_eq!(server.kind(), TransportKind::WebSocket);
 
-        let seq_client = client.send_text("ping from client").expect("client send");
-        let seq_server = server.send_text("pong from server").expect("server send");
+        client.send_text("ping from client").expect("client send");
+        server.send_text("pong from server").expect("server send");
 
         let server_msg = server.recv(timeout).expect("server recv");
-        assert_eq!(server_msg.sequence, seq_client);
         assert_eq!(server_msg.payload.as_text(), Some("ping from client"));
 
         let client_msg = client.recv(timeout).expect("client recv");
-        assert_eq!(client_msg.sequence, seq_server);
         assert_eq!(client_msg.payload.as_text(), Some("pong from server"));
     }
 }

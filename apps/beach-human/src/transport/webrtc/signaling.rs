@@ -239,9 +239,13 @@ impl SignalingClient {
             .send(join_message)
             .map_err(|_| TransportError::ChannelClosed)?;
 
-        let _ = join_rx.await;
-
-        Ok(client)
+        match join_rx.await {
+            Ok(()) => Ok(client),
+            Err(_) => {
+                tracing::warn!(target = "webrtc", "signaling join channel dropped");
+                Err(TransportError::ChannelClosed)
+            }
+        }
     }
 
     pub async fn wait_for_remote_peer(&self) -> Result<String, TransportError> {

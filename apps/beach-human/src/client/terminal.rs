@@ -52,6 +52,7 @@ pub struct TerminalClient {
     last_render_at: Option<Instant>,
     render_interval: Duration,
     pending_render: bool,
+    predictive_input: bool,
 }
 
 impl TerminalClient {
@@ -75,6 +76,7 @@ impl TerminalClient {
             last_render_at: None,
             render_interval: Duration::from_millis(16),
             pending_render: false,
+            predictive_input: false,
         }
     }
 
@@ -85,6 +87,11 @@ impl TerminalClient {
 
     pub fn with_input(mut self, rx: Receiver<Vec<u8>>) -> Self {
         self.input_rx = Some(rx);
+        self
+    }
+
+    pub fn with_predictive_input(mut self, enabled: bool) -> Self {
+        self.predictive_input = enabled;
         self
     }
 
@@ -122,6 +129,17 @@ impl TerminalClient {
         if tracing::enabled!(Level::TRACE) {
             trace!(target = "client::frame", payload = text, "raw frame");
         }
+
+        let trimmed = text.trim();
+        if trimmed == "__ready__" || trimmed == "__offer_ready__" {
+            trace!(
+                target = "client::frame",
+                payload = trimmed,
+                "ignoring handshake sentinel"
+            );
+            return Ok(());
+        }
+
         let _guard = PerfGuard::new("client_handle_frame");
         let frame: ServerFrame = serde_json::from_str(text)?;
         if tracing::enabled!(Level::DEBUG) {
@@ -660,7 +678,7 @@ impl TerminalClient {
     }
 
     fn register_prediction(&mut self, seq: Seq, bytes: &[u8]) {
-        if !self.render_enabled {
+        if !self.render_enabled || !self.predictive_input {
             return;
         }
         if bytes.len() > 32 {

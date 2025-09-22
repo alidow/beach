@@ -1,7 +1,11 @@
 use crate::cache::Seq;
+use crate::cache::terminal::{PackedCell, StyleId, unpack_cell};
 use crate::client::grid_renderer::{GridRenderer, SelectionPosition};
+use crate::protocol::{
+    self, ClientFrame as WireClientFrame, HostFrame as WireHostFrame, Update as WireUpdate,
+};
 use crate::telemetry::{self, PerfGuard};
-use crate::transport::{Transport, TransportError};
+use crate::transport::{Payload, Transport, TransportError};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use copypasta::{ClipboardContext, ClipboardProvider};
 use crossterm::{
@@ -30,8 +34,10 @@ use tracing::{Level, debug, trace};
 pub enum ClientError {
     #[error("transport error: {0}")]
     Transport(TransportError),
-    #[error("decode error: {0}")]
-    Decode(#[from] serde_json::Error),
+    #[error("json decode error: {0}")]
+    JsonDecode(#[from] serde_json::Error),
+    #[error("protocol error: {0}")]
+    Protocol(#[from] protocol::WireError),
     #[error("shutdown requested")]
     Shutdown,
 }
@@ -108,12 +114,38 @@ impl TerminalClient {
             };
 
             if let Some(message) = message {
-                if let Some(text) = message.payload.as_text() {
-                    telemetry::record_bytes("client_frame_bytes", text.len());
-                    match self.handle_frame(text) {
-                        Ok(()) => {}
-                        Err(ClientError::Shutdown) => break,
-                        Err(err) => return Err(err),
+                match message.payload {
+                    Payload::Binary(bytes) => {
+                        telemetry::record_bytes("client_frame_bytes", bytes.len());
+                        match protocol::decode_host_frame_binary(&bytes) {
+                            Ok(frame) => match self.handle_binary_frame(frame) {
+                                Ok(()) => {}
+                                Err(ClientError::Shutdown) => break,
+                                Err(err) => return Err(err),
+                            },
+                            Err(err) => {
+                                if protocol::binary_protocol_enabled() {
+                                    return Err(ClientError::Protocol(err));
+                                }
+                                if let Ok(text) = std::str::from_utf8(&bytes) {
+                                    match self.handle_json_frame(text) {
+                                        Ok(()) => {}
+                                        Err(ClientError::Shutdown) => break,
+                                        Err(err) => return Err(err),
+                                    }
+                                } else {
+                                    return Err(ClientError::Protocol(err));
+                                }
+                            }
+                        }
+                    }
+                    Payload::Text(text) => {
+                        telemetry::record_bytes("client_frame_bytes", text.len());
+                        match self.handle_json_frame(&text) {
+                            Ok(()) => {}
+                            Err(ClientError::Shutdown) => break,
+                            Err(err) => return Err(err),
+                        }
                     }
                 }
             }
@@ -125,7 +157,7 @@ impl TerminalClient {
         Ok(())
     }
 
-    fn handle_frame(&mut self, text: &str) -> Result<(), ClientError> {
+    fn handle_json_frame(&mut self, text: &str) -> Result<(), ClientError> {
         if tracing::enabled!(Level::TRACE) {
             trace!(target = "client::frame", payload = text, "raw frame");
         }
@@ -175,6 +207,61 @@ impl TerminalClient {
             ServerFrame::SnapshotComplete { .. } => {}
             ServerFrame::Shutdown => return Err(ClientError::Shutdown),
             ServerFrame::Unknown => {}
+        }
+        Ok(())
+    }
+
+    fn handle_binary_frame(&mut self, frame: WireHostFrame) -> Result<(), ClientError> {
+        if tracing::enabled!(Level::DEBUG) {
+            let frame_type = match &frame {
+                WireHostFrame::Heartbeat { .. } => "heartbeat",
+                WireHostFrame::Hello { .. } => "hello",
+                WireHostFrame::Grid { .. } => "grid",
+                WireHostFrame::Snapshot { .. } => "snapshot",
+                WireHostFrame::SnapshotComplete { .. } => "snapshot_complete",
+                WireHostFrame::Delta { .. } => "delta",
+                WireHostFrame::InputAck { .. } => "input_ack",
+                WireHostFrame::Shutdown => "shutdown",
+            };
+            debug!(
+                target = "client::frame",
+                frame = frame_type,
+                "processing binary frame"
+            );
+        }
+
+        let _guard = PerfGuard::new("client_handle_frame_binary");
+        match frame {
+            WireHostFrame::Heartbeat { .. } => {}
+            WireHostFrame::Hello { .. } => {}
+            WireHostFrame::Grid { rows, cols } => {
+                let rows = rows as usize;
+                let cols = cols as usize;
+                self.renderer.ensure_size(rows, cols);
+                self.renderer.mark_dirty();
+                self.force_render = true;
+                self.cursor_row = rows.saturating_sub(1);
+                self.cursor_col = 0;
+                self.renderer.clear_all_predictions();
+                self.pending_predictions.clear();
+            }
+            WireHostFrame::Snapshot {
+                updates, watermark, ..
+            }
+            | WireHostFrame::Delta {
+                updates, watermark, ..
+            } => {
+                for update in &updates {
+                    self.apply_wire_update(update);
+                }
+                self.last_seq = cmp::max(self.last_seq, watermark);
+                self.force_render = true;
+            }
+            WireHostFrame::InputAck { seq } => {
+                self.handle_input_ack(seq);
+            }
+            WireHostFrame::SnapshotComplete { .. } => {}
+            WireHostFrame::Shutdown => return Err(ClientError::Shutdown),
         }
         Ok(())
     }
@@ -271,6 +358,120 @@ impl TerminalClient {
             } => {
                 self.renderer.set_style(id, fg, bg, attrs);
                 self.last_seq = cmp::max(self.last_seq, seq);
+            }
+        }
+
+        if let Some(hint) = cursor_hint {
+            match hint {
+                Exact(row, col) => {
+                    self.cursor_row = row;
+                    self.cursor_col = col;
+                }
+                RowWidth(row) => {
+                    self.cursor_row = row;
+                    self.cursor_col = self.renderer.row_display_width(row);
+                }
+            }
+        }
+    }
+
+    fn apply_wire_update(&mut self, update: &WireUpdate) {
+        use CursorHint::*;
+
+        let cursor_hint = match update {
+            WireUpdate::Cell { row, col, .. } => {
+                Some(Exact(*row as usize, (*col as usize).saturating_add(1)))
+            }
+            WireUpdate::Row { row, .. } => Some(RowWidth(*row as usize)),
+            WireUpdate::Rect { rows, cols, .. } => {
+                let target_row = rows[1] as usize;
+                let target_col = cols[1] as usize;
+                Some(Exact(target_row.saturating_sub(1), target_col))
+            }
+            WireUpdate::RowSegment {
+                row,
+                start_col,
+                cells,
+                ..
+            } => cells
+                .iter()
+                .enumerate()
+                .map(|(idx, _)| Exact(*row as usize, (*start_col as usize).saturating_add(idx + 1)))
+                .last(),
+            WireUpdate::Trim { .. } => None,
+            WireUpdate::Style { .. } => None,
+        };
+
+        match update {
+            WireUpdate::Cell {
+                row,
+                col,
+                seq,
+                cell,
+            } => {
+                let (ch, style) = decode_wire_cell(*cell);
+                self.renderer
+                    .apply_cell(*row as usize, *col as usize, *seq, ch, style);
+            }
+            WireUpdate::Row { row, seq, cells } => {
+                let row_index = *row as usize;
+                for (col, cell) in cells.iter().enumerate() {
+                    let (ch, style) = decode_wire_cell(*cell);
+                    self.renderer.apply_cell(row_index, col, *seq, ch, style);
+                }
+            }
+            WireUpdate::Rect {
+                rows,
+                cols,
+                seq,
+                cell,
+            } => {
+                let row_range = rows[0] as usize..rows[1] as usize;
+                let col_range = cols[0] as usize..cols[1] as usize;
+                let (ch, style) = decode_wire_cell(*cell);
+                self.renderer
+                    .apply_rect(row_range, col_range, *seq, ch, style);
+            }
+            WireUpdate::RowSegment {
+                row,
+                start_col,
+                seq,
+                cells,
+            } => {
+                if !cells.is_empty() {
+                    let mut segment = Vec::with_capacity(cells.len());
+                    for (idx, cell) in cells.iter().enumerate() {
+                        let (ch, style) = decode_wire_cell(*cell);
+                        let col = *start_col as usize + idx;
+                        segment.push((col, *seq, ch, style));
+                    }
+                    self.renderer.apply_segment(*row as usize, &segment);
+                }
+            }
+            WireUpdate::Trim { start, count, .. } => {
+                let start = *start as usize;
+                let count = *count as usize;
+                self.renderer.apply_trim(start, count);
+                self.pending_predictions.values_mut().for_each(|positions| {
+                    positions.retain(|(row, _)| *row >= start + count);
+                });
+                self.pending_predictions
+                    .retain(|_, positions| !positions.is_empty());
+                if self.cursor_row >= start && self.cursor_row < start + count {
+                    self.cursor_row = start + count;
+                    self.cursor_col = 0;
+                }
+                self.force_render = true;
+            }
+            WireUpdate::Style {
+                id,
+                seq,
+                fg,
+                bg,
+                attrs,
+            } => {
+                self.renderer.set_style(*id, *fg, *bg, *attrs);
+                self.last_seq = cmp::max(self.last_seq, *seq);
             }
         }
 
@@ -649,11 +850,23 @@ impl TerminalClient {
             "seq": self.input_seq,
             "data": BASE64.encode(bytes),
         });
-        let text = serde_json::to_string(&payload)?;
-        telemetry::record_bytes("client_input_frames", text.len());
-        self.transport
-            .send_text(&text)
-            .map_err(ClientError::Transport)?;
+        if protocol::binary_protocol_enabled() {
+            let frame = WireClientFrame::Input {
+                seq: self.input_seq,
+                data: bytes.to_vec(),
+            };
+            let encoded = protocol::encode_client_frame_binary(&frame);
+            telemetry::record_bytes("client_input_frames", encoded.len());
+            self.transport
+                .send_bytes(&encoded)
+                .map_err(ClientError::Transport)?;
+        } else {
+            let text = serde_json::to_string(&payload)?;
+            telemetry::record_bytes("client_input_frames", text.len());
+            self.transport
+                .send_text(&text)
+                .map_err(ClientError::Transport)?;
+        }
         if tracing::enabled!(Level::TRACE) {
             trace!(
                 target = "client::outgoing",
@@ -673,11 +886,20 @@ impl TerminalClient {
             "cols": cols,
             "rows": rows,
         });
-        let text = serde_json::to_string(&payload)?;
-        telemetry::record_bytes("client_input_frames", text.len());
-        self.transport
-            .send_text(&text)
-            .map_err(ClientError::Transport)?;
+        if protocol::binary_protocol_enabled() {
+            let frame = WireClientFrame::Resize { cols, rows };
+            let encoded = protocol::encode_client_frame_binary(&frame);
+            telemetry::record_bytes("client_input_frames", encoded.len());
+            self.transport
+                .send_bytes(&encoded)
+                .map_err(ClientError::Transport)?;
+        } else {
+            let text = serde_json::to_string(&payload)?;
+            telemetry::record_bytes("client_input_frames", text.len());
+            self.transport
+                .send_text(&text)
+                .map_err(ClientError::Transport)?;
+        }
         debug!(target = "client::outgoing", cols, rows, "resize sent");
         Ok(())
     }
@@ -775,6 +997,16 @@ impl TerminalClient {
         execute!(stdout, LeaveAlternateScreen)
             .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
         Ok(())
+    }
+}
+
+fn decode_wire_cell(cell: u64) -> (char, Option<u32>) {
+    let packed = PackedCell::from(cell);
+    let (ch, style_id) = unpack_cell(packed);
+    if style_id == StyleId::DEFAULT {
+        (ch, None)
+    } else {
+        (ch, Some(style_id.0))
     }
 }
 

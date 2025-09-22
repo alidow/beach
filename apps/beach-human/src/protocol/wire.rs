@@ -1,4 +1,6 @@
-use super::{ClientFrame, HostFrame, Lane, LaneBudgetFrame, SyncConfigFrame, Update, PROTOCOL_VERSION};
+use super::{
+    ClientFrame, HostFrame, Lane, LaneBudgetFrame, PROTOCOL_VERSION, SyncConfigFrame, Update,
+};
 
 const VERSION_BITS: u8 = 3;
 const VERSION_MASK: u8 = 0b1110_0000;
@@ -17,7 +19,8 @@ const UPDATE_KIND_CELL: u8 = 0;
 const UPDATE_KIND_RECT: u8 = 1;
 const UPDATE_KIND_ROW: u8 = 2;
 const UPDATE_KIND_SEGMENT: u8 = 3;
-const UPDATE_KIND_STYLE: u8 = 4;
+const UPDATE_KIND_TRIM: u8 = 4;
+const UPDATE_KIND_STYLE: u8 = 5;
 
 const CLIENT_KIND_INPUT: u8 = 0;
 const CLIENT_KIND_RESIZE: u8 = 1;
@@ -29,10 +32,16 @@ const ENV_BINARY_PROTOCOL: &str = "BEACH_PROTO_BINARY";
 ///
 /// By default the binary protocol is disabled until the server/client pipelines are migrated.
 pub fn binary_protocol_enabled() -> bool {
-    match std::env::var(ENV_BINARY_PROTOCOL) {
-        Ok(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
-        Err(_) => false,
-    }
+    std::env::var(ENV_BINARY_PROTOCOL)
+        .map(|value| parse_flag(&value))
+        .unwrap_or(false)
+}
+
+fn parse_flag(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -225,7 +234,12 @@ fn encode_updates(buf: &mut Vec<u8>, updates: &[Update]) {
     write_var_u32(buf, updates.len() as u32);
     for update in updates {
         match update {
-            Update::Cell { row, col, seq, cell } => {
+            Update::Cell {
+                row,
+                col,
+                seq,
+                cell,
+            } => {
                 buf.push(UPDATE_KIND_CELL);
                 write_var_u32(buf, *row);
                 write_var_u32(buf, *col);
@@ -270,7 +284,19 @@ fn encode_updates(buf: &mut Vec<u8>, updates: &[Update]) {
                     write_var_u64(buf, *cell);
                 }
             }
-            Update::Style { id, seq, fg, bg, attrs } => {
+            Update::Trim { start, count, seq } => {
+                buf.push(UPDATE_KIND_TRIM);
+                write_var_u32(buf, *start);
+                write_var_u32(buf, *count);
+                write_var_u64(buf, *seq);
+            }
+            Update::Style {
+                id,
+                seq,
+                fg,
+                bg,
+                attrs,
+            } => {
                 buf.push(UPDATE_KIND_STYLE);
                 write_var_u32(buf, *id);
                 write_var_u64(buf, *seq);
@@ -293,7 +319,12 @@ fn decode_updates(cursor: &mut Cursor<'_>) -> Result<Vec<Update>, WireError> {
                 let col = cursor.read_var_u32()?;
                 let seq = cursor.read_var_u64()?;
                 let cell = cursor.read_var_u64()?;
-                Update::Cell { row, col, seq, cell }
+                Update::Cell {
+                    row,
+                    col,
+                    seq,
+                    cell,
+                }
             }
             UPDATE_KIND_RECT => {
                 let row_start = cursor.read_var_u32()?;
@@ -334,6 +365,12 @@ fn decode_updates(cursor: &mut Cursor<'_>) -> Result<Vec<Update>, WireError> {
                     seq,
                     cells,
                 }
+            }
+            UPDATE_KIND_TRIM => {
+                let start = cursor.read_var_u32()?;
+                let count = cursor.read_var_u32()?;
+                let seq = cursor.read_var_u64()?;
+                Update::Trim { start, count, seq }
             }
             UPDATE_KIND_STYLE => {
                 let id = cursor.read_var_u32()?;
@@ -551,6 +588,11 @@ mod tests {
                     bg: 0x040506,
                     attrs: 0b10101010,
                 },
+                Update::Trim {
+                    start: 1,
+                    count: 2,
+                    seq: 15,
+                },
             ],
         };
         let encoded = encode_host_frame_binary(&frame);
@@ -577,10 +619,11 @@ mod tests {
 
     #[test]
     fn env_toggle_respects_flag() {
-        std::env::set_var(ENV_BINARY_PROTOCOL, "true");
-        assert!(binary_protocol_enabled());
-        std::env::set_var(ENV_BINARY_PROTOCOL, "0");
-        assert!(!binary_protocol_enabled());
-        std::env::remove_var(ENV_BINARY_PROTOCOL);
+        assert!(parse_flag("true"));
+        assert!(parse_flag("YES"));
+        assert!(parse_flag("1"));
+        assert!(!parse_flag("false"));
+        assert!(!parse_flag("0"));
+        assert!(!parse_flag(""));
     }
 }

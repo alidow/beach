@@ -1,17 +1,12 @@
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 pub const PROTOCOL_VERSION: u8 = 1;
 
 pub mod wire;
 
 pub use wire::{
-    binary_protocol_enabled,
-    decode_client_frame_binary,
-    decode_host_frame_binary,
-    encode_client_frame_binary,
-    encode_host_frame_binary,
-    WireError,
+    WireError, binary_protocol_enabled, decode_client_frame_binary, decode_host_frame_binary,
+    encode_client_frame_binary, encode_host_frame_binary,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +60,11 @@ pub enum Update {
         start_col: u32,
         seq: u64,
         cells: Vec<u64>,
+    },
+    Trim {
+        start: u32,
+        count: u32,
+        seq: u64,
     },
     Style {
         id: u32,
@@ -127,28 +127,4 @@ pub enum ClientFrame {
     },
     #[serde(other)]
     Unknown,
-}
-
-#[derive(Debug, Error)]
-pub enum FrameError {
-    #[error("encode error: {0}")]
-    Encode(#[from] rmp_serde::encode::Error),
-    #[error("decode error: {0}")]
-    Decode(#[from] rmp_serde::decode::Error),
-}
-
-pub fn encode_host_frame(frame: &HostFrame) -> Result<Vec<u8>, FrameError> {
-    rmp_serde::to_vec_named(frame).map_err(FrameError::from)
-}
-
-pub fn decode_host_frame(bytes: &[u8]) -> Result<HostFrame, FrameError> {
-    rmp_serde::from_slice(bytes).map_err(FrameError::from)
-}
-
-pub fn encode_client_frame(frame: &ClientFrame) -> Result<Vec<u8>, FrameError> {
-    rmp_serde::to_vec_named(frame).map_err(FrameError::from)
-}
-
-pub fn decode_client_frame(bytes: &[u8]) -> Result<ClientFrame, FrameError> {
-    rmp_serde::from_slice(bytes).map_err(FrameError::from)
 }

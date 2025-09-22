@@ -5,6 +5,10 @@ use beach_human::cache::terminal::{TerminalGrid, unpack_cell};
 use beach_human::cache::{GridCache, Seq};
 use beach_human::client::terminal::{ClientError, TerminalClient};
 use beach_human::model::terminal::diff::CacheUpdate;
+use beach_human::protocol::{
+    self, HostFrame, Lane as WireLane, LaneBudgetFrame as WireLaneBudget,
+    SyncConfigFrame as WireSyncConfig, Update as WireUpdate,
+};
 use beach_human::server::terminal::{
     AlacrittyEmulator, Command as PtyCommand, LocalEcho, PtyProcess, PtyWriter, SpawnConfig,
     TerminalEmulator, TerminalRuntime,
@@ -26,7 +30,7 @@ use clap::{Args, Parser, Subcommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -292,9 +296,17 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     // redraws cleanly (mirrors the legacy apps/beach behaviour).
     drop(raw_guard);
 
-    let _ = send_json(&transport, json!({"type": "shutdown"}));
+    let _ = send_host_frame_with_fallback(
+        &transport,
+        || HostFrame::Shutdown,
+        || json!({"type": "shutdown"}),
+    );
     if let Some(server) = &local_server_transport {
-        let _ = send_json(server, json!({"type": "shutdown"}));
+        let _ = send_host_frame_with_fallback(
+            server,
+            || HostFrame::Shutdown,
+            || json!({"type": "shutdown"}),
+        );
     }
 
     if let Err(err) = updates_task.await {
@@ -620,15 +632,21 @@ impl HeartbeatPublisher {
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis();
-                let payload = json!({
-                    "type": "heartbeat",
-                    "seq": count as u64,
-                    "timestamp_ms": now,
-                })
-                .to_string();
-
-                if let Err(err) = self.transport.send_text(&payload) {
-                    eprintln!("⚠️  heartbeat send failed: {err}");
+                if !send_host_frame_with_fallback(
+                    &self.transport,
+                    || HostFrame::Heartbeat {
+                        seq: count as u64,
+                        timestamp_ms: now as u64,
+                    },
+                    || {
+                        json!({
+                            "type": "heartbeat",
+                            "seq": count as u64,
+                            "timestamp_ms": now,
+                        })
+                    },
+                ) {
+                    eprintln!("⚠️  heartbeat send failed");
                     break;
                 }
 
@@ -750,12 +768,15 @@ fn spawn_input_listener(
                                             );
                                         }
                                         last_seq = seq;
-                                        let _ = send_json(
+                                        let _ = send_host_frame_with_fallback(
                                             &transport,
-                                            json!({
-                                                "type": "input_ack",
-                                                "seq": seq,
-                                            }),
+                                            || HostFrame::InputAck { seq },
+                                            || {
+                                                json!({
+                                                    "type": "input_ack",
+                                                    "seq": seq,
+                                                })
+                                            },
                                         );
                                         debug!(
                                             target = "sync::incoming",
@@ -792,9 +813,13 @@ fn spawn_input_listener(
                                 if let Ok(mut guard) = emulator.lock() {
                                     guard.resize(rows as usize, cols as usize);
                                 }
-                                let _ = send_json(
+                                let _ = send_host_frame_with_fallback(
                                     &transport,
-                                    encode_grid_descriptor(rows as usize, cols as usize),
+                                    || HostFrame::Grid {
+                                        rows: rows as u32,
+                                        cols: cols as u32,
+                                    },
+                                    || encode_grid_descriptor(rows as usize, cols as usize),
                                 );
                                 debug!(
                                     target = "sync::incoming",
@@ -894,6 +919,138 @@ impl TimelineDeltaStream {
     }
 }
 
+#[derive(Debug, Default)]
+struct TransmitterCache {
+    cols: usize,
+    rows: HashMap<usize, Vec<u64>>,
+    styles: HashMap<u32, (u32, u32, u8)>,
+}
+
+impl TransmitterCache {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset(&mut self, cols: usize) {
+        self.cols = cols;
+        self.rows.clear();
+        self.styles.clear();
+    }
+
+    fn apply_updates(&mut self, updates: &[CacheUpdate], dedupe: bool) -> Vec<WireUpdate> {
+        let mut out = Vec::with_capacity(updates.len());
+        for update in updates {
+            match update {
+                CacheUpdate::Row(row) => {
+                    let cells: Vec<u64> = row.cells.iter().map(|c| (*c).into()).collect();
+                    let changed = if dedupe {
+                        self.rows
+                            .get(&row.row)
+                            .map(|existing| existing != &cells)
+                            .unwrap_or(true)
+                    } else {
+                        true
+                    };
+                    self.cols = self.cols.max(cells.len());
+                    self.rows.insert(row.row, cells.clone());
+                    if changed {
+                        out.push(WireUpdate::Row {
+                            row: usize_to_u32(row.row),
+                            seq: row.seq,
+                            cells,
+                        });
+                    }
+                }
+                CacheUpdate::Rect(rect) => {
+                    let mut changed = !dedupe;
+                    let value: u64 = rect.cell.into();
+                    self.cols = self.cols.max(rect.cols.end);
+                    for r in rect.rows.clone() {
+                        let row_vec = self.ensure_row_capacity(r, rect.cols.end);
+                        for c in rect.cols.clone() {
+                            if dedupe && !changed && row_vec[c] != value {
+                                changed = true;
+                            }
+                            row_vec[c] = value;
+                        }
+                    }
+                    if changed {
+                        out.push(WireUpdate::Rect {
+                            rows: [usize_to_u32(rect.rows.start), usize_to_u32(rect.rows.end)],
+                            cols: [usize_to_u32(rect.cols.start), usize_to_u32(rect.cols.end)],
+                            seq: rect.seq,
+                            cell: value,
+                        });
+                    }
+                }
+                CacheUpdate::Cell(cell) => {
+                    let value: u64 = cell.cell.into();
+                    let row_vec = self.ensure_row_capacity(cell.row, cell.col + 1);
+                    let previous = row_vec[cell.col];
+                    row_vec[cell.col] = value;
+                    if !dedupe || previous != value {
+                        out.push(WireUpdate::Cell {
+                            row: usize_to_u32(cell.row),
+                            col: usize_to_u32(cell.col),
+                            seq: cell.seq,
+                            cell: value,
+                        });
+                    }
+                }
+                CacheUpdate::Trim(trim) => {
+                    self.trim_rows(trim.start, trim.count);
+                    out.push(WireUpdate::Trim {
+                        start: usize_to_u32(trim.start),
+                        count: usize_to_u32(trim.count),
+                        seq: trim.seq(),
+                    });
+                }
+                CacheUpdate::Style(style) => {
+                    let current = (style.style.fg, style.style.bg, style.style.attrs);
+                    let prev = self.styles.insert(style.id.0, current);
+                    if !dedupe || prev.map_or(true, |value| value != current) {
+                        out.push(WireUpdate::Style {
+                            id: style.id.0,
+                            seq: style.seq,
+                            fg: style.style.fg,
+                            bg: style.style.bg,
+                            attrs: style.style.attrs,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn ensure_row_capacity(&mut self, row: usize, min_cols: usize) -> &mut Vec<u64> {
+        let columns = self.cols.max(min_cols);
+        let entry = self
+            .rows
+            .entry(row)
+            .or_insert_with(|| vec![0; columns.max(1)]);
+        if entry.len() < columns {
+            entry.resize(columns, 0);
+        }
+        if entry.len() < min_cols {
+            entry.resize(min_cols, 0);
+        }
+        entry
+    }
+
+    fn trim_rows(&mut self, start: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let end = start.saturating_add(count);
+        self.rows.retain(|row, _| *row >= end);
+    }
+}
+
+fn usize_to_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
 impl TerminalDeltaStream for TimelineDeltaStream {
     fn collect_since(&self, since: Seq, budget: usize) -> Vec<CacheUpdate> {
         let history = self.history.lock().unwrap();
@@ -930,6 +1087,7 @@ fn spawn_update_forwarder(
             handshake_complete: bool,
             last_handshake: Instant,
             handshake_attempts: u32,
+            cache: TransmitterCache,
         }
 
         const HANDSHAKE_REFRESH: Duration = Duration::from_millis(200);
@@ -945,6 +1103,7 @@ fn spawn_update_forwarder(
                 handshake_complete: false,
                 last_handshake: Instant::now(),
                 handshake_attempts: 0,
+                cache: TransmitterCache::new(),
             })
             .collect();
 
@@ -954,6 +1113,7 @@ fn spawn_update_forwarder(
                 subscription,
                 &terminal_sync,
                 &sync_config,
+                &mut sink.cache,
             ) {
                 sink.synchronizer = sync;
                 sink.last_seq = seq;
@@ -982,6 +1142,7 @@ fn spawn_update_forwarder(
                 subscription,
                 terminal_sync,
                 sync_config,
+                &mut sink.cache,
             ) {
                 sink.synchronizer = sync;
                 sink.last_seq = seq;
@@ -1042,8 +1203,24 @@ fn spawn_update_forwarder(
                                         break;
                                     }
                                     telemetry::record_gauge("sync_delta_batch_updates", batch.updates.len() as u64);
+                                    let converted_updates = sink.cache.apply_updates(&batch.updates, true);
                                     let _guard = PerfGuard::new("sync_send_delta");
-                                    if !send_json(&sink.transport, encode_delta_batch(&batch)) {
+                                    let sent = send_host_frame_with_fallback(
+                                        &sink.transport,
+                                        {
+                                            let subscription_id = batch.subscription_id.0;
+                                            let watermark = batch.watermark.0;
+                                            let has_more = batch.has_more;
+                                            move || HostFrame::Delta {
+                                                subscription: subscription_id,
+                                                watermark,
+                                                has_more,
+                                                updates: converted_updates,
+                                            }
+                                        },
+                                        || encode_delta_batch(&batch),
+                                    );
+                                    if !sent {
                                         sink.handshake_complete = false;
                                         warn!(
                                             target = "sync::handshake",
@@ -1085,6 +1262,7 @@ fn initialize_transport_snapshot(
     subscription: SubscriptionId,
     terminal_sync: &Arc<TerminalSync>,
     sync_config: &SyncConfig,
+    cache: &mut TransmitterCache,
 ) -> Option<(ServerSynchronizer<TerminalSync, CacheUpdate>, Seq)> {
     let mut synchronizer = ServerSynchronizer::new(terminal_sync.clone(), sync_config.clone());
     let hello = synchronizer.hello(subscription);
@@ -1094,10 +1272,24 @@ fn initialize_transport_snapshot(
         transport = ?transport.kind(),
         "sending server hello"
     );
-    if !send_json(transport, encode_server_hello(&hello)) {
+    if !send_host_frame_with_fallback(
+        transport,
+        {
+            let subscription = hello.subscription_id.0;
+            let max_seq = hello.max_seq.0;
+            let config = sync_config_to_wire(&hello.config);
+            move || HostFrame::Hello {
+                subscription,
+                max_seq,
+                config,
+            }
+        },
+        || encode_server_hello(&hello),
+    ) {
         return None;
     }
     let (rows, cols) = terminal_sync.grid().dims();
+    cache.reset(cols);
     debug!(
         target = "sync::handshake",
         transport_id = transport.id().0,
@@ -1106,10 +1298,17 @@ fn initialize_transport_snapshot(
         cols,
         "sending grid descriptor"
     );
-    if !send_json(transport, encode_grid_descriptor(rows, cols)) {
+    if !send_host_frame_with_fallback(
+        transport,
+        move || HostFrame::Grid {
+            rows: rows as u32,
+            cols: cols as u32,
+        },
+        || encode_grid_descriptor(rows, cols),
+    ) {
         return None;
     }
-    if !transmit_initial_snapshots(transport, &mut synchronizer, subscription) {
+    if !transmit_initial_snapshots(transport, &mut synchronizer, cache, subscription) {
         return None;
     }
     trace!(
@@ -1196,7 +1395,70 @@ fn lane_label(lane: PriorityLane) -> &'static str {
     }
 }
 
-fn send_json(transport: &Arc<dyn Transport>, value: Value) -> bool {
+fn send_host_frame_with_fallback<F, G>(
+    transport: &Arc<dyn Transport>,
+    frame_builder: F,
+    json_builder: G,
+) -> bool
+where
+    F: FnOnce() -> HostFrame,
+    G: FnOnce() -> Value,
+{
+    if protocol::binary_protocol_enabled() {
+        let frame = frame_builder();
+        send_host_frame_binary(transport, &frame)
+    } else {
+        let value = json_builder();
+        send_json_value(transport, value)
+    }
+}
+
+fn send_host_frame_binary(transport: &Arc<dyn Transport>, frame: &HostFrame) -> bool {
+    let frame_type = host_frame_type(frame);
+    if tracing::enabled!(Level::DEBUG) {
+        let transport_id = transport.id().0;
+        let transport_kind = transport.kind();
+        debug!(
+            target = "sync::outgoing",
+            transport_id,
+            transport = ?transport_kind,
+            frame = frame_type,
+            "sending frame"
+        );
+    }
+
+    let bytes = protocol::encode_host_frame_binary(frame);
+    telemetry::record_bytes("sync_send_bytes", bytes.len());
+    let _guard = PerfGuard::new("sync_send_binary");
+    if tracing::enabled!(Level::TRACE) {
+        trace!(
+            target = "sync::outgoing",
+            transport_id = transport.id().0,
+            transport = ?transport.kind(),
+            frame = frame_type,
+            bytes = bytes.len(),
+            payload = %logctl::hexdump(&bytes),
+            "frame payload"
+        );
+    }
+    match transport.send_bytes(&bytes) {
+        Ok(_) => true,
+        Err(TransportError::ChannelClosed) => false,
+        Err(err) => {
+            warn!(
+                target = "sync::outgoing",
+                transport_id = transport.id().0,
+                transport = ?transport.kind(),
+                frame = frame_type,
+                error = %err,
+                "transport send failed"
+            );
+            false
+        }
+    }
+}
+
+fn send_json_value(transport: &Arc<dyn Transport>, value: Value) -> bool {
     let frame_type = value
         .get("type")
         .and_then(Value::as_str)
@@ -1249,6 +1511,44 @@ fn send_json(transport: &Arc<dyn Transport>, value: Value) -> bool {
             error!(target = "sync::outgoing", frame = %frame_type, error = %err, "failed to encode message");
             false
         }
+    }
+}
+
+fn host_frame_type(frame: &HostFrame) -> &'static str {
+    match frame {
+        HostFrame::Heartbeat { .. } => "heartbeat",
+        HostFrame::Hello { .. } => "hello",
+        HostFrame::Grid { .. } => "grid",
+        HostFrame::Snapshot { .. } => "snapshot",
+        HostFrame::SnapshotComplete { .. } => "snapshot_complete",
+        HostFrame::Delta { .. } => "delta",
+        HostFrame::InputAck { .. } => "input_ack",
+        HostFrame::Shutdown => "shutdown",
+    }
+}
+
+fn map_lane(lane: PriorityLane) -> WireLane {
+    match lane {
+        PriorityLane::Foreground => WireLane::Foreground,
+        PriorityLane::Recent => WireLane::Recent,
+        PriorityLane::History => WireLane::History,
+    }
+}
+
+fn sync_config_to_wire(config: &SyncConfig) -> WireSyncConfig {
+    let snapshot_budgets = config
+        .snapshot_budgets
+        .iter()
+        .map(|LaneBudget { lane, max_updates }| WireLaneBudget {
+            lane: map_lane(*lane),
+            max_updates: *max_updates as u32,
+        })
+        .collect();
+
+    WireSyncConfig {
+        snapshot_budgets,
+        delta_budget: config.delta_budget as u32,
+        heartbeat_ms: config.heartbeat_interval.as_millis() as u64,
     }
 }
 
@@ -1383,6 +1683,7 @@ enum ClientFrame {
 fn transmit_initial_snapshots(
     transport: &Arc<dyn Transport>,
     synchronizer: &mut ServerSynchronizer<TerminalSync, CacheUpdate>,
+    cache: &mut TransmitterCache,
     subscription: SubscriptionId,
 ) -> bool {
     let transport_id = transport.id().0;
@@ -1401,7 +1702,19 @@ fn transmit_initial_snapshots(
                 updates = chunk.updates.len(),
                 "sending snapshot chunk"
             );
-            if !send_json(transport, encode_snapshot_chunk(&chunk)) {
+            let lane_copy = lane;
+            let updates = cache.apply_updates(&chunk.updates, false);
+            if !send_host_frame_with_fallback(
+                transport,
+                move || HostFrame::Snapshot {
+                    subscription: chunk.subscription_id.0,
+                    lane: map_lane(lane_copy),
+                    watermark: chunk.watermark.0,
+                    has_more: chunk.has_more,
+                    updates,
+                },
+                || encode_snapshot_chunk(&chunk),
+            ) {
                 return false;
             }
             if !chunk.has_more {
@@ -1412,7 +1725,14 @@ fn transmit_initial_snapshots(
                     lane = ?lane,
                     "lane snapshot complete"
                 );
-                if !send_json(transport, encode_snapshot_complete(subscription, lane)) {
+                if !send_host_frame_with_fallback(
+                    transport,
+                    move || HostFrame::SnapshotComplete {
+                        subscription: subscription.0,
+                        lane: map_lane(lane),
+                    },
+                    || encode_snapshot_complete(subscription, lane),
+                ) {
                     return false;
                 }
             }
@@ -1879,14 +2199,19 @@ mod tests {
         let subscription = SubscriptionId(1);
         let mut synchronizer = ServerSynchronizer::new(terminal_sync.clone(), sync_config.clone());
         let hello = synchronizer.hello(subscription);
-        assert!(send_json(&host_transport, encode_server_hello(&hello)));
-        assert!(send_json(
+        assert!(send_json_value(
+            &host_transport,
+            encode_server_hello(&hello)
+        ));
+        assert!(send_json_value(
             &host_transport,
             encode_grid_descriptor(rows, cols)
         ));
+        let mut cache = TransmitterCache::new();
         assert!(transmit_initial_snapshots(
             &host_transport,
             &mut synchronizer,
+            &mut cache,
             subscription
         ));
 

@@ -75,6 +75,7 @@ pub struct TerminalClient {
     last_backfill_request_at: Option<Instant>,
     known_base_row: Option<u64>,
     has_loaded_rows: bool,
+    highest_loaded_row: Option<u64>,
 }
 
 impl TerminalClient {
@@ -105,6 +106,7 @@ impl TerminalClient {
             last_backfill_request_at: None,
             known_base_row: None,
             has_loaded_rows: false,
+            highest_loaded_row: None,
         }
     }
 
@@ -217,6 +219,7 @@ impl TerminalClient {
                 self.last_backfill_request_at = None;
                 self.known_base_row = None;
                 self.has_loaded_rows = false;
+                self.highest_loaded_row = None;
             }
             WireHostFrame::Grid { rows, cols } => {
                 let rows = rows as usize;
@@ -300,6 +303,13 @@ impl TerminalClient {
         }
     }
 
+    fn note_loaded_row(&mut self, row: u64) {
+        self.highest_loaded_row = Some(match self.highest_loaded_row {
+            Some(existing) => existing.max(row),
+            None => row,
+        });
+    }
+
     fn prune_backfill_requests(&mut self) {
         let mut removed = false;
         self.pending_backfills.retain(|req| {
@@ -343,9 +353,14 @@ impl TerminalClient {
         if capped == 0 {
             return Ok(());
         }
-        let request_start = match self.known_base_row {
-            Some(base) => start.max(base),
-            None => start,
+        let tail_hint = self
+            .highest_loaded_row
+            .map(|row| row.saturating_sub(BACKFILL_LOOKAHEAD_ROWS as u64));
+        let request_start = match (self.known_base_row, tail_hint) {
+            (Some(base), Some(tail)) => start.max(base).max(tail),
+            (Some(base), None) => start.max(base),
+            (None, Some(tail)) => start.max(tail),
+            (None, None) => start,
         };
         let request_end = request_start.saturating_add(capped as u64);
         if self.is_range_pending(request_start, request_end) {
@@ -542,6 +557,7 @@ impl TerminalClient {
                 let (ch, style) = decode_wire_cell(*cell);
                 self.renderer
                     .apply_cell(*row as usize, *col as usize, *seq, ch, style);
+                self.note_loaded_row(*row as u64);
             }
             WireUpdate::Row { row, seq, cells } => {
                 trace!(
@@ -556,6 +572,7 @@ impl TerminalClient {
                     let (ch, style) = decode_wire_cell(*cell);
                     self.renderer.apply_cell(row_index, col, *seq, ch, style);
                 }
+                self.note_loaded_row(*row as u64);
             }
             WireUpdate::Rect {
                 rows,
@@ -575,6 +592,9 @@ impl TerminalClient {
                 let (ch, style) = decode_wire_cell(*cell);
                 self.renderer
                     .apply_rect(row_range, col_range, *seq, ch, style);
+                for r in rows[0]..rows[1] {
+                    self.note_loaded_row(r as u64);
+                }
             }
             WireUpdate::RowSegment {
                 row,
@@ -598,6 +618,7 @@ impl TerminalClient {
                         segment.push((col, *seq, ch, style));
                     }
                     self.renderer.apply_segment(*row as usize, &segment);
+                    self.note_loaded_row(*row as u64);
                 }
             }
             WireUpdate::Trim { start, count, .. } => {
@@ -610,6 +631,12 @@ impl TerminalClient {
                 let start = *start as usize;
                 let count = *count as usize;
                 self.renderer.apply_trim(start, count);
+                if let Some(highest) = self.highest_loaded_row {
+                    let trimmed_end = (start + count) as u64;
+                    if highest < trimmed_end {
+                        self.highest_loaded_row = None;
+                    }
+                }
                 self.pending_predictions.values_mut().for_each(|positions| {
                     positions.retain(|(row, _)| *row >= start + count);
                 });

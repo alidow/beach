@@ -504,7 +504,7 @@ impl TerminalClient {
                 self.renderer.mark_row_missing(row);
             }
         }
-        if bounds_start < bounds_end {
+        if bounds_start <= self.renderer.base_row() && bounds_start < bounds_end {
             self.renderer.set_base_row(bounds_start);
         }
     }

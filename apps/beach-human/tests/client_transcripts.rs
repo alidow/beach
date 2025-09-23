@@ -76,6 +76,20 @@ async fn client_replays_basic_snapshot() {
             lane: Lane::Foreground,
         },
     );
+    send_host_frame(
+        &*server,
+        HostFrame::SnapshotComplete {
+            subscription: 1,
+            lane: Lane::Recent,
+        },
+    );
+    send_host_frame(
+        &*server,
+        HostFrame::SnapshotComplete {
+            subscription: 1,
+            lane: Lane::History,
+        },
+    );
     send_host_frame(&*server, HostFrame::Shutdown);
 
     tokio::time::timeout(Duration::from_secs(2), handle)
@@ -360,7 +374,7 @@ async fn client_requests_backfill_using_absolute_rows() {
             },
         },
     );
-    send_host_frame(&*server, HostFrame::Grid { rows: 24, cols: 80 });
+    send_host_frame(&*server, HostFrame::Grid { rows: 400, cols: 80 });
     send_host_frame(
         &*server,
         HostFrame::Snapshot {
@@ -673,6 +687,129 @@ async fn client_retries_history_when_initial_backfill_empty() {
     }
 
     assert!(observed_retry, "client never retried backfill after empty response");
+
+    send_host_frame(&*server, HostFrame::Shutdown);
+
+    tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("client join timeout")
+        .expect("client thread");
+}
+
+#[test_timeout::tokio_timeout_test]
+async fn client_targets_tail_history_after_large_delta() {
+    let pair = TransportPair::new(TransportKind::Ipc);
+    let transport: Arc<dyn Transport> = Arc::from(pair.client);
+    let server = pair.server;
+
+    let handle = tokio::task::spawn_blocking(move || {
+        let client = TerminalClient::new(transport).with_render(false);
+        if let Err(err) = client.run() {
+            panic!("client error: {err}");
+        }
+    });
+
+    let subscription = 1;
+
+    send_host_frame(
+        &*server,
+        HostFrame::Hello {
+            subscription,
+            max_seq: 0,
+            config: SyncConfigFrame {
+                snapshot_budgets: vec![LaneBudgetFrame {
+                    lane: Lane::Foreground,
+                    max_updates: 32,
+                }],
+                delta_budget: 512,
+                heartbeat_ms: 250,
+                initial_snapshot_lines: 32,
+            },
+        },
+    );
+    send_host_frame(&*server, HostFrame::Grid { rows: 400, cols: 80 });
+    // Provide a minimal snapshot so the renderer seeds a baseline but leaves most rows pending.
+    send_host_frame(
+        &*server,
+        HostFrame::Snapshot {
+            subscription: 1,
+            lane: Lane::Foreground,
+            watermark: 1,
+            has_more: false,
+            updates: vec![Update::Row {
+                row: 0,
+                seq: 1,
+                cells: "seed".chars().map(pack_char).collect(),
+            }],
+        },
+    );
+    send_host_frame(
+        &*server,
+        HostFrame::SnapshotComplete {
+            subscription,
+            lane: Lane::Foreground,
+        },
+    );
+    send_host_frame(
+        &*server,
+        HostFrame::SnapshotComplete {
+            subscription,
+            lane: Lane::Recent,
+        },
+    );
+    send_host_frame(
+        &*server,
+        HostFrame::SnapshotComplete {
+            subscription,
+            lane: Lane::History,
+        },
+    );
+
+    // Stream a large block of output far beyond the earlier rows.
+    let high_base: u32 = 360;
+    let mut delta_updates = Vec::new();
+    for row in high_base..high_base + 40 {
+        let text = format!("tail-{row:03}");
+        delta_updates.push(Update::Row {
+            row,
+            seq: (2000 + row) as u64,
+            cells: text.chars().map(pack_char).collect(),
+        });
+    }
+    send_host_frame(
+        &*server,
+        HostFrame::Delta {
+            subscription,
+            watermark: (2000 + high_base + 39) as u64,
+            has_more: false,
+            updates: delta_updates,
+        },
+    );
+
+    // Expect a follow-up history request targeting a range near the new tail.
+    let mut retry_start: Option<u64> = None;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        match server.recv(Duration::from_millis(200)) {
+            Ok(message) => {
+                if let Payload::Binary(bytes) = message.payload {
+                    if let Ok(WireClientFrame::RequestBackfill { start_row, .. }) =
+                        protocol::decode_client_frame_binary(&bytes)
+                    {
+                        retry_start = Some(start_row);
+                        break;
+                    }
+                }
+            }
+            Err(TransportError::Timeout) => continue,
+            Err(err) => panic!("transport error: {err}"),
+        }
+    }
+
+    let retry_start = retry_start.expect("client never retried history for tail rows");
+    assert!(
+        retry_start >= (high_base as u64).saturating_sub(150),
+        "expected retry to target high tail, got start={retry_start}");
 
     send_host_frame(&*server, HostFrame::Shutdown);
 

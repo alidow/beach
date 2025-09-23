@@ -1,9 +1,9 @@
 #![recursion_limit = "1024"]
 
-use beach_human::cache::terminal::TerminalGrid;
+use beach_human::cache::terminal::{PackedCell, StyleId, TerminalGrid, unpack_cell};
 use beach_human::cache::{GridCache, Seq};
 use beach_human::client::terminal::{ClientError, TerminalClient};
-use beach_human::model::terminal::diff::CacheUpdate;
+use beach_human::model::terminal::diff::{CacheUpdate, RowSnapshot, StyleDefinition};
 use beach_human::protocol::{
     self, ClientFrame as WireClientFrame, HostFrame, Lane as WireLane,
     LaneBudgetFrame as WireLaneBudget, SyncConfigFrame as WireSyncConfig, Update as WireUpdate,
@@ -27,7 +27,7 @@ use beach_human::transport::{
 use clap::{Args, Parser, Subcommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{self, Write as _};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -37,7 +37,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep};
 use tracing::{Level, debug, error, info, trace, warn};
@@ -224,6 +224,7 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         delta_stream,
         sync_config.clone(),
     ));
+    let (backfill_tx, backfill_rx) = mpsc::unbounded_channel();
 
     let emulator = Box::new(AlacrittyEmulator::new(&grid));
     let local_echo = Arc::new(LocalEcho::new());
@@ -247,7 +248,7 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         writer.clone(),
         process_handle.clone(),
         emulator_handle.clone(),
-        grid.clone(),
+        backfill_tx.clone(),
     ));
 
     let mut forward_transports: Vec<(Arc<dyn Transport>, Option<Arc<TransportSupervisor>>)> =
@@ -266,7 +267,7 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
             writer.clone(),
             process_handle.clone(),
             emulator_handle.clone(),
-            grid.clone(),
+            backfill_tx.clone(),
         ));
 
         local_preview_task = Some(tokio::task::spawn_blocking(move || {
@@ -295,6 +296,7 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         timeline.clone(),
         terminal_sync.clone(),
         sync_config.clone(),
+        backfill_rx,
     );
 
     runtime
@@ -701,41 +703,101 @@ fn detect_terminal_size() -> (u16, u16) {
 }
 
 const MAX_BACKFILL_ROWS_PER_REQUEST: u32 = 256;
+const SERVER_BACKFILL_CHUNK_ROWS: u32 = 64;
+const SERVER_BACKFILL_THROTTLE: Duration = Duration::from_millis(50);
 
-fn collect_backfill_updates(grid: &TerminalGrid, start_row: u64, count: u32) -> Vec<WireUpdate> {
-    if count == 0 {
-        return Vec::new();
+struct BackfillChunk {
+    updates: Vec<CacheUpdate>,
+    attempted: u32,
+    delivered: u32,
+}
+
+#[derive(Clone, Debug)]
+struct BackfillCommand {
+    transport_id: TransportId,
+    subscription: u64,
+    request_id: u64,
+    start_row: u64,
+    count: u32,
+}
+
+#[derive(Debug)]
+struct BackfillJob {
+    subscription: u64,
+    request_id: u64,
+    next_row: u64,
+    end_row: u64,
+}
+
+fn collect_backfill_chunk(grid: &TerminalGrid, start_row: u64, max_rows: u32) -> BackfillChunk {
+    if max_rows == 0 {
+        return BackfillChunk {
+            updates: Vec::new(),
+            attempted: 0,
+            delivered: 0,
+        };
     }
+
+    let cols = grid.cols();
+    if cols == 0 {
+        return BackfillChunk {
+            updates: Vec::new(),
+            attempted: max_rows,
+            delivered: 0,
+        };
+    }
+
     let mut updates = Vec::new();
-    let mut buffer: Vec<u64> = Vec::new();
-    for offset in 0..count as u64 {
+    let mut buffer: Vec<u64> = vec![0; cols];
+    let mut style_ids: HashSet<StyleId> = HashSet::new();
+    let mut delivered = 0u32;
+
+    for offset in 0..max_rows as u64 {
         let absolute = start_row.saturating_add(offset);
         let Some(index) = grid.index_of_row(absolute) else {
             continue;
         };
-        let cols = grid.cols();
-        if cols == 0 {
-            continue;
-        }
-        if buffer.len() < cols {
-            buffer.resize(cols, 0);
-        }
+
         if grid.snapshot_row_into(index, &mut buffer[..cols]).is_err() {
             continue;
         }
+
         let mut max_seq = 0;
+        let mut packed_cells: Vec<PackedCell> = Vec::with_capacity(cols);
         for col in 0..cols {
             if let Some(snapshot) = grid.get_cell_relaxed(index, col) {
                 max_seq = max_seq.max(snapshot.seq);
             }
+            let packed = PackedCell::from(buffer[col]);
+            let (_, style_id) = unpack_cell(packed);
+            style_ids.insert(style_id);
+            packed_cells.push(packed);
         }
-        updates.push(WireUpdate::Row {
-            row: absolute.min(u32::MAX as u64) as u32,
-            seq: max_seq,
-            cells: buffer[..cols].to_vec(),
-        });
+
+        updates.push(CacheUpdate::Row(RowSnapshot::new(
+            absolute as usize,
+            max_seq,
+            packed_cells,
+        )));
+        delivered = delivered.saturating_add(1);
     }
-    updates
+
+    if delivered > 0 {
+        let style_table = grid.style_table.clone();
+        for style_id in style_ids {
+            if let Some(style) = style_table.get(style_id) {
+                updates.push(CacheUpdate::Style(StyleDefinition::new(
+                    style_id, start_row, style,
+                )));
+            }
+        }
+    }
+
+    BackfillChunk {
+        updates,
+        attempted: max_rows,
+        delivered,
+    }
 }
 
 fn host_frame_label(frame: &HostFrame) -> &'static str {
@@ -919,7 +981,6 @@ impl TransportSupervisor {
             *guard = false;
         });
     }
-
 }
 
 fn map_lane(lane: PriorityLane) -> WireLane {
@@ -961,12 +1022,11 @@ fn spawn_input_listener(
     writer: PtyWriter,
     process: Arc<PtyProcess>,
     emulator: Arc<Mutex<Box<dyn TerminalEmulator + Send>>>,
-    grid: Arc<TerminalGrid>,
+    backfill_tx: UnboundedSender<BackfillCommand>,
 ) -> thread::JoinHandle<()> {
     let transport_id = transport.id().0;
     let transport_kind = transport.kind();
     thread::spawn(move || {
-        let backfill_grid = grid;
         let mut last_seq: Seq = 0;
         debug!(
             target = "sync::incoming",
@@ -1059,29 +1119,36 @@ fn spawn_input_listener(
                             count,
                         }) => {
                             let capped = count.min(MAX_BACKFILL_ROWS_PER_REQUEST);
-                            let updates =
-                                collect_backfill_updates(&backfill_grid, start_row, capped);
-                            let _ = send_host_frame(
-                                &transport,
-                                HostFrame::HistoryBackfill {
-                                    subscription,
-                                    request_id,
-                                    start_row,
-                                    count: capped,
-                                    updates,
-                                    more: false,
-                                },
-                            );
-                            trace!(
-                                target = "sync::incoming",
-                                transport_id,
-                                transport = ?transport_kind,
+                            if capped == 0 {
+                                continue;
+                            }
+                            if let Err(err) = backfill_tx.send(BackfillCommand {
+                                transport_id: transport.id(),
+                                subscription,
                                 request_id,
                                 start_row,
-                                requested = count,
-                                sent = capped,
-                                "history backfill dispatched"
-                            );
+                                count: capped,
+                            }) {
+                                warn!(
+                                    target = "sync::incoming",
+                                    transport_id,
+                                    transport = ?transport_kind,
+                                    request_id,
+                                    error = %err,
+                                    "failed to enqueue backfill request"
+                                );
+                            } else {
+                                trace!(
+                                    target = "sync::incoming",
+                                    transport_id,
+                                    transport = ?transport_kind,
+                                    request_id,
+                                    start_row,
+                                    requested = count,
+                                    enqueued = capped,
+                                    "queued history backfill request"
+                                );
+                            }
                         }
                         Ok(WireClientFrame::Unknown) => {}
                         Err(err) => {
@@ -1353,6 +1420,7 @@ fn spawn_update_forwarder(
     timeline: Arc<TimelineDeltaStream>,
     terminal_sync: Arc<TerminalSync>,
     sync_config: SyncConfig,
+    mut backfill_rx: UnboundedReceiver<BackfillCommand>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if transports.is_empty() {
@@ -1369,11 +1437,15 @@ fn spawn_update_forwarder(
             last_handshake: Instant,
             handshake_attempts: u32,
             cache: TransmitterCache,
+            backfill_queue: VecDeque<BackfillJob>,
+            last_backfill_sent: Option<Instant>,
         }
 
         const HANDSHAKE_REFRESH: Duration = Duration::from_millis(200);
 
         let subscription = SubscriptionId(1);
+        let grid = terminal_sync.grid().clone();
+        let mut next_backfill_index: usize = 0;
         let mut sinks: Vec<Sink> = transports
             .into_iter()
             .map(|(transport, supervisor)| Sink {
@@ -1386,6 +1458,8 @@ fn spawn_update_forwarder(
                 last_handshake: Instant::now(),
                 handshake_attempts: 0,
                 cache: TransmitterCache::new(),
+                backfill_queue: VecDeque::new(),
+                last_backfill_sent: None,
             })
             .collect();
 
@@ -1535,6 +1609,126 @@ fn spawn_update_forwarder(
                         }
                         None => break,
                     }
+                }
+                maybe_command = backfill_rx.recv() => {
+                    match maybe_command {
+                        Some(command) => {
+                            let end_row = command.start_row.saturating_add(command.count as u64);
+                            if end_row <= command.start_row {
+                                continue;
+                            }
+                            if let Some(sink) = sinks
+                                .iter_mut()
+                                .find(|s| s.transport.id() == command.transport_id)
+                            {
+                                sink.backfill_queue.push_back(BackfillJob {
+                                    subscription: command.subscription,
+                                    request_id: command.request_id,
+                                    next_row: command.start_row,
+                                    end_row,
+                                });
+                                trace!(
+                                    target = "sync::backfill",
+                                    transport_id = sink.transport.id().0,
+                                    request_id = command.request_id,
+                                    start_row = command.start_row,
+                                    count = command.count,
+                                    queued = sink.backfill_queue.len(),
+                                    "enqueued backfill request"
+                                );
+                            } else {
+                                debug!(
+                                    target = "sync::backfill",
+                                    transport = command.transport_id.0,
+                                    "backfill request dropped: transport not found"
+                                );
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+
+            let sink_count = sinks.len();
+            if sink_count > 0 {
+                if next_backfill_index >= sink_count {
+                    next_backfill_index = 0;
+                }
+                for _ in 0..sink_count {
+                    if sinks.is_empty() {
+                        break;
+                    }
+                    if next_backfill_index >= sinks.len() {
+                        next_backfill_index = 0;
+                    }
+                    let idx = next_backfill_index;
+                    next_backfill_index = (next_backfill_index + 1) % sinks.len().max(1);
+                    let sink = &mut sinks[idx];
+                    if !sink.active || !sink.handshake_complete {
+                        continue;
+                    }
+                    if sink.backfill_queue.is_empty() {
+                        continue;
+                    }
+                    if let Some(last) = sink.last_backfill_sent {
+                        if last.elapsed() < SERVER_BACKFILL_THROTTLE {
+                            continue;
+                        }
+                    }
+                    let mut job = match sink.backfill_queue.pop_front() {
+                        Some(job) => job,
+                        None => continue,
+                    };
+                    if job.next_row >= job.end_row {
+                        continue;
+                    }
+                    let chunk_start = job.next_row;
+                    let remaining = job.end_row.saturating_sub(chunk_start);
+                    let chunk_rows = remaining
+                        .min(MAX_BACKFILL_ROWS_PER_REQUEST as u64)
+                        .min(SERVER_BACKFILL_CHUNK_ROWS as u64)
+                        as u32;
+                    let chunk = collect_backfill_chunk(&grid, chunk_start, chunk_rows);
+                    let chunk_advance = chunk.attempted as u64;
+                    let next_row = chunk_start.saturating_add(chunk_advance);
+                    let more_pending = next_row < job.end_row;
+                    let request_id = job.request_id;
+                    let updates = sink.cache.apply_updates(&chunk.updates, true);
+                    let sent = send_host_frame(
+                        &sink.transport,
+                        HostFrame::HistoryBackfill {
+                            subscription: job.subscription,
+                            request_id: job.request_id,
+                            start_row: chunk_start,
+                            count: chunk.attempted,
+                            updates,
+                            more: more_pending,
+                        },
+                    );
+                    if !sent {
+                        sink.handshake_complete = false;
+                        sink.backfill_queue.push_front(job);
+                        if let Some(supervisor) = &sink.supervisor {
+                            supervisor.schedule_reconnect();
+                        }
+                    } else {
+                        sink.last_backfill_sent = Some(Instant::now());
+                        job.next_row = next_row;
+                        if more_pending {
+                            sink.backfill_queue.push_back(job);
+                        }
+                        trace!(
+                            target = "sync::backfill",
+                            transport_id = sink.transport.id().0,
+                            request_id,
+                            start_row = chunk_start,
+                            count = chunk.attempted,
+                            delivered = chunk.delivered,
+                            more = more_pending,
+                            "sent backfill chunk"
+                        );
+                    }
+                    break;
                 }
             }
         }
@@ -2042,12 +2236,14 @@ mod tests {
             ));
 
             let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (_backfill_tx, backfill_rx) = tokio::sync::mpsc::unbounded_channel();
             let forwarder = spawn_update_forwarder(
                 vec![(Arc::clone(&server), None)],
                 update_rx,
                 timeline.clone(),
                 terminal_sync.clone(),
                 sync_config.clone(),
+                backfill_rx,
             );
 
             let mut client_view = ClientGrid::new(rows, cols);
@@ -2282,12 +2478,14 @@ mod tests {
         timeline.record(&update);
 
         let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_backfill_tx, backfill_rx) = tokio::sync::mpsc::unbounded_channel();
         let forwarder = spawn_update_forwarder(
             vec![(host_transport.clone(), None)],
             update_rx,
             timeline.clone(),
             terminal_sync.clone(),
             sync_config.clone(),
+            backfill_rx,
         );
 
         // Intentionally drop the first few handshake frames (hello, grid, snapshot,

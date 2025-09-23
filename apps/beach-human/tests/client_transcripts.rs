@@ -332,6 +332,219 @@ async fn client_requests_backfill_and_hydrates_rows() {
 }
 
 #[test_timeout::tokio_timeout_test]
+async fn client_requests_backfill_using_absolute_rows() {
+    const HIGH_BASE: u64 = 33_000;
+
+    let pair = TransportPair::new(TransportKind::Ipc);
+    let transport: Arc<dyn Transport> = Arc::from(pair.client);
+    let server = pair.server;
+
+    let handle = tokio::task::spawn_blocking(move || {
+        let client = TerminalClient::new(transport).with_render(false);
+        if let Err(err) = client.run() {
+            panic!("client error: {err}");
+        }
+    });
+
+    // Complete minimal handshake with a snapshot whose rows live at a high absolute offset.
+    send_host_frame(
+        &*server,
+        HostFrame::Hello {
+            subscription: 1,
+            max_seq: 1,
+            config: SyncConfigFrame {
+                snapshot_budgets: vec![],
+                delta_budget: 512,
+                heartbeat_ms: 250,
+                initial_snapshot_lines: 128,
+            },
+        },
+    );
+    send_host_frame(&*server, HostFrame::Grid { rows: 24, cols: 80 });
+    send_host_frame(
+        &*server,
+        HostFrame::Snapshot {
+            subscription: 1,
+            lane: Lane::Foreground,
+            watermark: 1,
+            has_more: false,
+            updates: vec![Update::Row {
+                row: HIGH_BASE as u32,
+                seq: 1,
+                cells: "prompt".chars().map(pack_char).collect(),
+            }],
+        },
+    );
+    send_host_frame(
+        &*server,
+        HostFrame::SnapshotComplete {
+            subscription: 1,
+            lane: Lane::Foreground,
+        },
+    );
+
+    let (request_id, start_row, count) = loop {
+        let message = server
+            .recv(Duration::from_secs(5))
+            .expect("receive client frame");
+        match message.payload {
+            Payload::Binary(bytes) => match protocol::decode_client_frame_binary(&bytes) {
+                Ok(WireClientFrame::RequestBackfill {
+                    request_id,
+                    start_row,
+                    count,
+                    ..
+                }) => break (request_id, start_row, count),
+                Ok(_) => continue,
+                Err(err) => panic!("decode client frame: {err}"),
+            },
+            Payload::Text(text) => panic!("unexpected text payload: {text}"),
+        }
+    };
+
+    assert!(
+        start_row >= HIGH_BASE,
+        "backfill start_row should respect absolute base: {start_row} < {HIGH_BASE}"
+    );
+
+    send_host_frame(
+        &*server,
+        HostFrame::HistoryBackfill {
+            subscription: 1,
+            request_id,
+            start_row,
+            count,
+            updates: vec![Update::Row {
+                row: start_row as u32,
+                seq: 3,
+                cells: "prompt".chars().map(pack_char).collect(),
+            }],
+            more: false,
+        },
+    );
+
+    send_host_frame(&*server, HostFrame::Shutdown);
+
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("client join timeout")
+        .expect("client thread");
+}
+
+#[test_timeout::tokio_timeout_test]
+async fn client_requests_history_after_delta_when_handshake_empty() {
+    let pair = TransportPair::new(TransportKind::Ipc);
+    let transport: Arc<dyn Transport> = Arc::from(pair.client);
+    let server = pair.server;
+
+    let handle = tokio::task::spawn_blocking(move || {
+        let client = TerminalClient::new(transport).with_render(false);
+        if let Err(err) = client.run() {
+            panic!("client error: {err}");
+        }
+    });
+
+    send_host_frame(
+        &*server,
+        HostFrame::Hello {
+            subscription: 1,
+            max_seq: 0,
+            config: SyncConfigFrame {
+                snapshot_budgets: vec![LaneBudgetFrame {
+                    lane: Lane::Foreground,
+                    max_updates: 0,
+                }],
+                delta_budget: 512,
+                heartbeat_ms: 250,
+                initial_snapshot_lines: 0,
+            },
+        },
+    );
+    send_host_frame(&*server, HostFrame::Grid { rows: 24, cols: 80 });
+    // Simulate an empty snapshot handshake.
+    send_host_frame(
+        &*server,
+        HostFrame::SnapshotComplete {
+            subscription: 1,
+            lane: Lane::Foreground,
+        },
+    );
+    send_host_frame(
+        &*server,
+        HostFrame::SnapshotComplete {
+            subscription: 1,
+            lane: Lane::Recent,
+        },
+    );
+    send_host_frame(
+        &*server,
+        HostFrame::SnapshotComplete {
+            subscription: 1,
+            lane: Lane::History,
+        },
+    );
+
+    let first_row: u32 = 100;
+    let mut updates = Vec::new();
+    for i in 0..50u32 {
+        let label = format!("line-{}", first_row + i);
+        updates.push(Update::Row {
+            row: first_row + i,
+            seq: (i + 1) as u64,
+            cells: label.chars().map(pack_char).collect(),
+        });
+    }
+    send_host_frame(
+        &*server,
+        HostFrame::Delta {
+            subscription: 1,
+            watermark: 50,
+            has_more: false,
+            updates,
+        },
+    );
+
+    let (request_start, request_count) = loop {
+        match server.recv(Duration::from_secs(2)) {
+            Ok(message) => match message.payload {
+                Payload::Binary(bytes) => match protocol::decode_client_frame_binary(&bytes) {
+                    Ok(WireClientFrame::RequestBackfill {
+                        start_row,
+                        count,
+                        ..
+                    }) => break (start_row, count),
+                    Ok(_) => continue,
+                    Err(err) => panic!("decode client frame: {err}"),
+                },
+                Payload::Text(text) => {
+                    let trimmed = text.trim();
+                    if trimmed == "__ready__" || trimmed == "__offer_ready__" {
+                        continue;
+                    }
+                }
+            },
+            Err(TransportError::Timeout) => {
+                panic!("client failed to request history after delta");
+            }
+            Err(err) => panic!("transport error: {err}"),
+        }
+    };
+
+    assert!(
+        request_start < first_row as u64,
+        "expected backfill start row below first delta row; got {request_start} (delta row {first_row})"
+    );
+    assert!(request_count > 0);
+
+    send_host_frame(&*server, HostFrame::Shutdown);
+
+    tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("client join timeout")
+        .expect("client thread");
+}
+
+#[test_timeout::tokio_timeout_test]
 async fn client_resolves_missing_rows_after_empty_backfill() {
     let pair = TransportPair::new(TransportKind::Ipc);
     let client_transport: Arc<dyn Transport> = Arc::from(pair.client);

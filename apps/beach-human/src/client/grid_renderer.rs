@@ -81,6 +81,7 @@ struct CachedStyle {
     style: Style,
 }
 
+#[derive(Clone)]
 struct RowState {
     cells: Vec<CellState>,
     latest_seq: Seq,
@@ -101,6 +102,7 @@ impl RowState {
     }
 }
 
+#[derive(Clone)]
 enum RowSlot {
     Pending,
     Loaded(RowState),
@@ -144,6 +146,35 @@ impl GridRenderer {
         );
         renderer.ensure_capacity(rows, cols);
         renderer
+    }
+
+    pub fn set_base_row(&mut self, base_row: u64) {
+        if base_row == self.base_row {
+            return;
+        }
+        if base_row > self.base_row {
+            let drop = (base_row - self.base_row) as usize;
+            let current_len = self.rows.len();
+            if drop >= current_len {
+                let preserve = current_len
+                    .max(self.viewport_height)
+                    .max(1);
+                self.rows.clear();
+                self.rows.resize(preserve, RowSlot::Pending);
+                self.scroll_top = 0;
+            } else {
+                self.rows.drain(0..drop);
+                self.scroll_top = self.scroll_top.saturating_sub(drop);
+            }
+        } else {
+            let add = (self.base_row - base_row) as usize;
+            for _ in 0..add {
+                self.rows.insert(0, RowSlot::Pending);
+            }
+            self.scroll_top = self.scroll_top.saturating_add(add);
+        }
+        self.base_row = base_row;
+        self.mark_dirty();
     }
 
     fn ensure_capacity(&mut self, rows: usize, cols: usize) {

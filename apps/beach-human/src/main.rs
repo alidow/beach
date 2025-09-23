@@ -1531,12 +1531,11 @@ fn spawn_update_forwarder(
         loop {
             tokio::select! {
                 _ = handshake_timer.tick() => {
-                    for sink in sinks.iter_mut().filter(|s| s.active) {
-                        let needs_refresh = !sink.handshake_complete
-                            || sink.last_handshake.elapsed() >= HANDSHAKE_REFRESH;
-                        if needs_refresh {
-                            attempt_handshake(sink, subscription, &terminal_sync, &sync_config);
+                    for sink in sinks.iter_mut().filter(|s| s.active && !s.handshake_complete) {
+                        if sink.last_handshake.elapsed() < HANDSHAKE_REFRESH {
+                            continue;
                         }
+                        attempt_handshake(sink, subscription, &terminal_sync, &sync_config);
                     }
                 }
                 maybe_update = updates.recv() => {
@@ -1693,7 +1692,7 @@ fn spawn_update_forwarder(
                     let next_row = chunk_start.saturating_add(chunk_advance);
                     let more_pending = next_row < job.end_row;
                     let request_id = job.request_id;
-                    let updates = sink.cache.apply_updates(&chunk.updates, true);
+                    let updates = sink.cache.apply_updates(&chunk.updates, false);
                     let sent = send_host_frame(
                         &sink.transport,
                         HostFrame::HistoryBackfill {
@@ -2444,7 +2443,7 @@ mod tests {
     }
 
     #[test_timeout::tokio_timeout_test]
-    async fn snapshot_retries_until_client_receives_prompt() {
+    async fn handshake_refresh_stops_after_completion() {
         let rows = 4;
         let cols = 16;
 
@@ -2488,58 +2487,64 @@ mod tests {
             backfill_rx,
         );
 
-        // Intentionally drop the first few handshake frames (hello, grid, snapshot,
-        // snapshot_complete) to mimic a client that misses the initial burst.
         tokio::task::spawn_blocking(move || {
-            let mut dropped = 0;
-            while dropped < 4 {
-                match client_transport.recv(StdDuration::from_millis(200)) {
-                    Ok(_) => dropped += 1,
-                    Err(TransportError::Timeout) => continue,
-                    Err(err) => panic!("transport error while dropping frames: {err:?}"),
-                }
-            }
-
-            let deadline = Instant::now() + StdDuration::from_secs(3);
-            let mut saw_prompt = false;
             let mut view = ClientGrid::new(rows as usize, cols as usize);
-            while Instant::now() < deadline {
-                match client_transport.recv(StdDuration::from_millis(200)) {
-                    Ok(message) => match message.payload {
-                        Payload::Binary(bytes) => {
-                            match protocol::decode_host_frame_binary(&bytes).expect("host frame") {
-                                WireHostFrame::Snapshot { updates, .. }
-                                | WireHostFrame::Delta { updates, .. } => {
+            let mut saw_prompt = false;
+            let mut foreground_complete = false;
+            let mut recent_complete = false;
+            let mut history_complete = false;
+
+            while !(foreground_complete && recent_complete && history_complete) {
+                let message = client_transport
+                    .recv(StdDuration::from_secs(1))
+                    .expect("handshake frame");
+                match message.payload {
+                    Payload::Binary(bytes) => {
+                        match protocol::decode_host_frame_binary(&bytes).expect("host frame") {
+                            WireHostFrame::Hello { .. } => {}
+                            WireHostFrame::Grid { .. } => {}
+                            WireHostFrame::Snapshot { lane, updates, .. } => {
+                                if lane == WireLane::Foreground {
                                     for update in &updates {
                                         view.apply_update(update);
                                     }
                                     if view.contains_row("host%") {
                                         saw_prompt = true;
-                                        break;
                                     }
                                 }
-                                _ => {}
                             }
+                            WireHostFrame::SnapshotComplete { lane, .. } => match lane {
+                                WireLane::Foreground => foreground_complete = true,
+                                WireLane::Recent => recent_complete = true,
+                                WireLane::History => history_complete = true,
+                            },
+                            WireHostFrame::Delta { .. }
+                            | WireHostFrame::HistoryBackfill { .. }
+                            | WireHostFrame::Heartbeat { .. }
+                            | WireHostFrame::InputAck { .. }
+                            | WireHostFrame::Shutdown => {}
                         }
-                        Payload::Text(text) => {
-                            let trimmed = text.trim();
-                            if trimmed == "__ready__" || trimmed == "__offer_ready__" {
-                                continue;
-                            }
+                    }
+                    Payload::Text(text) => {
+                        let trimmed = text.trim();
+                        if trimmed == "__ready__" || trimmed == "__offer_ready__" {
+                            continue;
                         }
-                    },
-                    Err(TransportError::Timeout) => continue,
-                    Err(err) => panic!("transport error while waiting for retry: {err:?}"),
+                        panic!("unexpected text payload during handshake: {trimmed}");
+                    }
                 }
             }
 
-            assert!(
-                saw_prompt,
-                "client never received prompt snapshot after retries"
-            );
+            assert!(saw_prompt, "foreground snapshot missing prompt");
+
+            match client_transport.recv(StdDuration::from_millis(750)) {
+                Err(TransportError::Timeout) => {}
+                Ok(message) => panic!("unexpected post-handshake frame: {message:?}"),
+                Err(err) => panic!("transport error while waiting for refresh: {err:?}"),
+            }
         })
         .await
-        .expect("snapshot retry assertion");
+        .expect("handshake refresh assertion");
 
         drop(update_tx);
         forwarder.await.expect("forwarder join");

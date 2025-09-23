@@ -73,6 +73,7 @@ pub struct TerminalClient {
     next_backfill_request_id: u64,
     pending_backfills: Vec<BackfillRequestState>,
     last_backfill_request_at: Option<Instant>,
+    known_base_row: Option<u64>,
 }
 
 impl TerminalClient {
@@ -101,6 +102,7 @@ impl TerminalClient {
             next_backfill_request_id: 1,
             pending_backfills: Vec::new(),
             last_backfill_request_at: None,
+            known_base_row: None,
         }
     }
 
@@ -211,6 +213,7 @@ impl TerminalClient {
                 self.pending_backfills.clear();
                 self.next_backfill_request_id = 1;
                 self.last_backfill_request_at = None;
+                self.known_base_row = None;
             }
             WireHostFrame::Grid { rows, cols } => {
                 let rows = rows as usize;
@@ -230,6 +233,7 @@ impl TerminalClient {
                 updates, watermark, ..
             } => {
                 for update in &updates {
+                    self.observe_update_bounds(update);
                     self.apply_wire_update(update);
                 }
                 self.last_seq = cmp::max(self.last_seq, watermark);
@@ -243,6 +247,9 @@ impl TerminalClient {
                 updates,
                 more,
             } => {
+                for update in &updates {
+                    self.observe_update_bounds(update);
+                }
                 self.handle_history_backfill(
                     subscription,
                     request_id,
@@ -259,6 +266,24 @@ impl TerminalClient {
             WireHostFrame::Shutdown => return Err(ClientError::Shutdown),
         }
         Ok(())
+    }
+
+    fn observe_update_bounds(&mut self, update: &WireUpdate) {
+        let min_row = match update {
+            WireUpdate::Cell { row, .. }
+            | WireUpdate::Row { row, .. }
+            | WireUpdate::RowSegment { row, .. } => Some(*row as u64),
+            WireUpdate::Rect { rows, .. } => rows.first().map(|r| *r as u64),
+            WireUpdate::Trim { .. } => None,
+            WireUpdate::Style { .. } => None,
+        };
+        if let Some(row) = min_row {
+            let base = self.known_base_row.map_or(row, |current| current.min(row));
+            if Some(base) != self.known_base_row {
+                self.known_base_row = Some(base);
+                self.renderer.set_base_row(base);
+            }
+        }
     }
 
     fn prune_backfill_requests(&mut self) {
@@ -282,6 +307,10 @@ impl TerminalClient {
             None => return Ok(()),
         };
         self.prune_backfill_requests();
+        let base_row = match self.known_base_row {
+            Some(row) => row,
+            None => return Ok(()),
+        };
         if self.pending_backfills.len() >= BACKFILL_MAX_PENDING_REQUESTS {
             return Ok(());
         }
@@ -301,11 +330,12 @@ impl TerminalClient {
         if capped == 0 {
             return Ok(());
         }
-        let end = start.saturating_add(capped as u64);
-        if self.is_range_pending(start, end) {
+        let request_start = start.max(base_row);
+        let request_end = request_start.saturating_add(capped as u64);
+        if self.is_range_pending(request_start, request_end) {
             return Ok(());
         }
-        self.send_backfill_request(subscription, start, capped)?;
+        self.send_backfill_request(subscription, request_start, capped)?;
         Ok(())
     }
 
@@ -339,7 +369,7 @@ impl TerminalClient {
         let end = start.saturating_add(count as u64);
         self.pending_backfills.push(BackfillRequestState {
             id: request_id,
-            start,
+            start: start,
             end,
             issued_at: Instant::now(),
             more_expected: false,
@@ -422,10 +452,24 @@ impl TerminalClient {
         if start >= end {
             return;
         }
+        let mut bounds_start = start;
+        let mut bounds_end = end;
+        if let Some(&first) = touched_rows.first() {
+            bounds_start = bounds_start.min(first);
+        }
+        if let Some(&last) = touched_rows.last() {
+            bounds_end = bounds_end.max(last.saturating_add(1));
+        }
+        if let Some(base) = self.known_base_row {
+            bounds_start = bounds_start.max(base);
+        }
         for row in start..end {
             if touched_rows.binary_search(&row).is_err() {
                 self.renderer.mark_row_missing(row);
             }
+        }
+        if bounds_start < bounds_end {
+            self.renderer.set_base_row(bounds_start);
         }
     }
 

@@ -1763,8 +1763,10 @@ mod tests {
     use super::*;
     use crate::transport::{TransportKind, TransportPair};
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-    use beach_human::cache::terminal::{Style, StyleId};
-    use beach_human::model::terminal::diff::RowSnapshot;
+    use beach_human::cache::terminal::{PackedCell, Style, StyleId};
+    use beach_human::model::terminal::diff::{
+        CellWrite, HistoryTrim, RectFill, RowSnapshot, StyleDefinition,
+    };
     use beach_human::sync::terminal::NullTerminalDeltaStream;
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
@@ -1820,6 +1822,54 @@ mod tests {
         let (parsed, base) = interpret_session_target(&id).unwrap();
         assert_eq!(parsed, id);
         assert!(base.is_none());
+    }
+
+    #[test]
+    fn transmitter_cache_dedupes_rows_and_styles() {
+        fn pack_cell(ch: char) -> PackedCell {
+            PackedCell::from_raw(((ch as u32 as u64) << 32) | StyleId::DEFAULT.0 as u64)
+        }
+
+        let mut cache = TransmitterCache::new();
+        cache.reset(4);
+
+        let row_update =
+            CacheUpdate::Row(RowSnapshot::new(0, 1, vec![pack_cell('h'), pack_cell('i')]));
+        let first_emit = cache.apply_updates(&[row_update.clone()], false);
+        assert_eq!(first_emit.len(), 1, "initial row should emit");
+
+        let second_emit = cache.apply_updates(&[row_update.clone()], true);
+        assert!(second_emit.is_empty(), "duplicate row should dedupe");
+
+        let cell_update = CacheUpdate::Cell(CellWrite::new(0, 1, 2, pack_cell('o')));
+        let cell_emit = cache.apply_updates(&[cell_update.clone()], true);
+        assert_eq!(cell_emit.len(), 1, "cell change should emit once");
+        let repeat_cell = cache.apply_updates(&[cell_update], true);
+        assert!(repeat_cell.is_empty(), "repeated cell should dedupe");
+
+        let style = StyleDefinition::new(
+            StyleId(5),
+            3,
+            Style {
+                fg: 0x00FF00,
+                bg: 0x000000,
+                attrs: 0b0000_0010,
+            },
+        );
+        let style_emit = cache.apply_updates(&[CacheUpdate::Style(style.clone())], true);
+        assert_eq!(style_emit.len(), 1);
+        let style_repeat = cache.apply_updates(&[CacheUpdate::Style(style)], true);
+        assert!(style_repeat.is_empty(), "duplicate style should dedupe");
+
+        let trim = CacheUpdate::Trim(HistoryTrim::new(0, 1));
+        let trim_emit = cache.apply_updates(&[trim.clone()], true);
+        assert_eq!(trim_emit.len(), 1, "trim should always emit");
+
+        let rect = CacheUpdate::Rect(RectFill::new(0..1, 0..2, 4, pack_cell('x')));
+        let rect_emit = cache.apply_updates(&[rect.clone()], true);
+        assert_eq!(rect_emit.len(), 1, "rect change should emit");
+        let rect_repeat = cache.apply_updates(&[rect], true);
+        assert!(rect_repeat.is_empty(), "identical rect should dedupe");
     }
 
     #[test]

@@ -4,13 +4,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use beach_human::client::terminal::TerminalClient;
+use beach_human::cache::terminal::PackedCell;
+use beach_human::client::terminal::{ClientError, TerminalClient};
+use beach_human::protocol::{self, HostFrame, Lane, LaneBudgetFrame, SyncConfigFrame, Update};
 use beach_human::transport::{Transport, TransportKind, TransportPair};
 use serde_json::json;
 
 fn send_text(transport: &dyn Transport, value: serde_json::Value) {
     let text = serde_json::to_string(&value).expect("serialize frame");
     transport.send_text(&text).expect("send frame");
+}
+
+fn send_binary(transport: &dyn Transport, frame: HostFrame) {
+    let bytes = protocol::encode_host_frame_binary(&frame);
+    transport.send_bytes(&bytes).expect("send frame");
+}
+
+fn pack_char(ch: char) -> u64 {
+    let packed = PackedCell::from_raw((ch as u32 as u64) << 32);
+    packed.into()
 }
 
 #[test_timeout::tokio_timeout_test]
@@ -180,6 +192,81 @@ async fn client_emits_input_events() {
     assert_eq!(decoded, b"a");
 
     send_text(&*server, json!({"type": "shutdown"}));
+
+    tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("client join timeout")
+        .expect("client thread");
+}
+
+#[test_timeout::tokio_timeout_test]
+async fn client_handles_binary_snapshot_and_delta() {
+    let pair = TransportPair::new(TransportKind::Ipc);
+    let transport: Arc<dyn Transport> = Arc::from(pair.client);
+    let server = pair.server;
+
+    let handle = tokio::task::spawn_blocking(move || {
+        let client = TerminalClient::new(transport).with_render(false);
+        match client.run() {
+            Ok(()) | Err(ClientError::Shutdown) => {}
+            Err(err) => panic!("client error: {err}"),
+        }
+    });
+
+    let sync_config = SyncConfigFrame {
+        snapshot_budgets: vec![LaneBudgetFrame {
+            lane: Lane::Foreground,
+            max_updates: 64,
+        }],
+        delta_budget: 512,
+        heartbeat_ms: 250,
+    };
+
+    send_binary(
+        &*server,
+        HostFrame::Hello {
+            subscription: 1,
+            max_seq: 0,
+            config: sync_config.clone(),
+        },
+    );
+    send_binary(&*server, HostFrame::Grid { rows: 4, cols: 10 });
+    send_binary(
+        &*server,
+        HostFrame::Snapshot {
+            subscription: 1,
+            lane: Lane::Foreground,
+            watermark: 1,
+            has_more: false,
+            updates: vec![Update::Row {
+                row: 0,
+                seq: 1,
+                cells: "hello".chars().map(pack_char).collect(),
+            }],
+        },
+    );
+    send_binary(
+        &*server,
+        HostFrame::SnapshotComplete {
+            subscription: 1,
+            lane: Lane::Foreground,
+        },
+    );
+    send_binary(
+        &*server,
+        HostFrame::Delta {
+            subscription: 1,
+            watermark: 2,
+            has_more: false,
+            updates: vec![Update::Cell {
+                row: 0,
+                col: 5,
+                seq: 2,
+                cell: pack_char('!'),
+            }],
+        },
+    );
+    send_binary(&*server, HostFrame::Shutdown);
 
     tokio::time::timeout(Duration::from_secs(2), handle)
         .await

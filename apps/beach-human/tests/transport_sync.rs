@@ -544,7 +544,7 @@ where
     assert_grids_match(&server_grid, &client_grid);
 }
 
-#[test]
+#[test_timeout::timeout]
 fn terminal_sync_over_all_transports() {
     run_transport_integration(WebRtcBuilder, TransportKind::WebRtc);
     run_transport_integration(WebSocketBuilder, TransportKind::WebSocket);

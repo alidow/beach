@@ -502,7 +502,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    #[test]
+    #[test_timeout::timeout]
     fn writes_roundtrip_through_style_table() {
         let grid = TerminalGrid::new(2, 3);
         let style_table = grid.style_table.as_ref();
@@ -587,7 +587,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn concurrent_writes_prefer_latest_seq() {
         let grid = Arc::new(TerminalGrid::new(1, 1));
         let iterations = 1000usize;
@@ -616,7 +616,7 @@ mod tests {
         assert_eq!(snapshot.seq, (writers * iterations - 1) as u64);
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn history_trims_emit_events() {
         let grid = TerminalGrid::with_history_limit(2, 1, 3);
         let style_id = grid.ensure_style_id(Style::default());

@@ -209,7 +209,7 @@ async fn create_websocket_pair() -> Result<TransportPair, TransportError> {
 mod tests {
     use super::*;
 
-    #[test]
+    #[test_timeout::timeout]
     fn websocket_pair_round_trip() {
         let pair = build_pair().expect("create websocket pair");
         let timeout = Duration::from_secs(2);

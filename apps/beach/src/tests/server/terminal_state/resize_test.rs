@@ -2,7 +2,7 @@ use crate::server::terminal_state::*;
 use chrono::Utc;
 use std::sync::{Arc, Mutex};
 
-#[test]
+#[test_timeout::timeout]
 fn test_terminal_resize_preserves_content() {
     // Create an AlacrittyTerminal with initial content
     let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();
@@ -62,7 +62,7 @@ fn test_terminal_resize_preserves_content() {
     );
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_resize_creates_dimension_change_delta() {
     let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();
 
@@ -107,7 +107,7 @@ fn test_resize_creates_dimension_change_delta() {
     }
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_resize_no_op_when_same_dimensions() {
     let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();
 
@@ -130,7 +130,7 @@ fn test_resize_no_op_when_same_dimensions() {
     assert!(!history_lock.has_deltas(), "Delta created for no-op resize");
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_multiple_resizes_tracked_correctly() {
     let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();
 
@@ -172,7 +172,7 @@ fn test_multiple_resizes_tracked_correctly() {
     assert_eq!(dimension_changes[2].new_height, 40);
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_resize_timing_in_output_sequence() {
     let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();
 
@@ -222,7 +222,7 @@ fn test_resize_timing_in_output_sequence() {
     );
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_grid_view_respects_resize() {
     let initial_grid = Grid::new(80, 24);
     let history = Arc::new(Mutex::new(GridHistory::new(initial_grid)));
@@ -258,7 +258,7 @@ fn test_grid_view_respects_resize() {
     assert_eq!(grid.height, 30);
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_resize_with_content_at_boundaries() {
     let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();
 
@@ -291,7 +291,7 @@ fn test_resize_with_content_at_boundaries() {
     assert_eq!(grid.height, 36);
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_resize_race_condition_simulation() {
     // This test simulates what happens when resize occurs between output chunks
     let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();

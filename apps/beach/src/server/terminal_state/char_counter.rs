@@ -38,7 +38,7 @@ impl Default for CharCounter {
 mod tests {
     use super::*;
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_char_counter() {
         let mut counter = CharCounter::new();
         assert_eq!(counter.value, BigUint::from(0u32));

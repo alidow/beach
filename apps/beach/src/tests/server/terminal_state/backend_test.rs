@@ -1,7 +1,7 @@
 use super::test_utils::TestTerminal;
 use crate::server::terminal_state::Color;
 
-#[test]
+#[test_timeout::timeout]
 fn test_background_color_preserved_on_clear_with_backend() {
     let mut terminal = TestTerminal::new(80, 24);
 
@@ -49,7 +49,7 @@ fn test_background_color_preserved_on_clear_with_backend() {
     );
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_erase_line_preserves_background_with_backend() {
     let mut terminal = TestTerminal::new(80, 24);
 
@@ -85,7 +85,7 @@ fn test_erase_line_preserves_background_with_backend() {
     }
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_basic_text_output_with_backend() {
     let mut terminal = TestTerminal::new(80, 24);
 
@@ -110,7 +110,7 @@ fn test_basic_text_output_with_backend() {
     }
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_cursor_movement_with_backend() {
     let mut terminal = TestTerminal::new(80, 24);
 
@@ -123,7 +123,7 @@ fn test_cursor_movement_with_backend() {
     assert_eq!(grid.cursor.col, 10, "Cursor col should be 10");
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_sgr_attributes_with_backend() {
     let mut terminal = TestTerminal::new(80, 24);
 
@@ -141,7 +141,7 @@ fn test_sgr_attributes_with_backend() {
     }
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_newline_and_carriage_return_with_backend() {
     let mut terminal = TestTerminal::new(80, 24);
 

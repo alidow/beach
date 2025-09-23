@@ -1605,7 +1605,7 @@ fn to_setup_error<E: std::fmt::Display>(err: E) -> TransportError {
 mod tests {
     use super::*;
 
-    #[test]
+    #[test_timeout::timeout]
     fn webrtc_pair_round_trip() {
         let pair = match build_pair() {
             Ok(pair) => pair,

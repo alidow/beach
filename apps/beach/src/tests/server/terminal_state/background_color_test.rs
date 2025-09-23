@@ -1,6 +1,6 @@
 use crate::server::terminal_state::{Color, TerminalStateTracker};
 
-#[test]
+#[test_timeout::timeout]
 fn test_background_color_preserved_on_clear() {
     let mut tracker = TerminalStateTracker::new(80, 24);
 
@@ -49,7 +49,7 @@ fn test_background_color_preserved_on_clear() {
     );
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_erase_line_preserves_background() {
     let mut tracker = TerminalStateTracker::new(80, 24);
 
@@ -85,7 +85,7 @@ fn test_erase_line_preserves_background() {
     }
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_partial_clear_preserves_background() {
     let mut tracker = TerminalStateTracker::new(80, 24);
 
@@ -125,7 +125,7 @@ fn test_partial_clear_preserves_background() {
     }
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_sgr_reset_clears_background() {
     let mut tracker = TerminalStateTracker::new(80, 24);
 

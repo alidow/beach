@@ -1,6 +1,6 @@
 use crate::server::terminal_state::*;
 
-#[test]
+#[test_timeout::timeout]
 fn test_unix_newline_behavior() {
     // Test what actually happens with Unix-style newlines (just \n)
     let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();
@@ -64,7 +64,7 @@ fn test_unix_newline_behavior() {
     }
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_newline_vs_crlf_behavior() {
     // Compare \n vs \r\n behavior
 

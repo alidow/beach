@@ -1,5 +1,5 @@
 #[cfg(feature = "alacritty-backend")]
-#[test]
+#[test_timeout::timeout]
 fn test_prompt_eol_mark_sequence() {
     use crate::server::terminal_state::AlacrittyTerminal;
 

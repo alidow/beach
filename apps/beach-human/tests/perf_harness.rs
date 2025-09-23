@@ -4,7 +4,7 @@ fn pack_char(ch: char) -> u64 {
     (ch as u32 as u64) << 32
 }
 
-#[test]
+#[test_timeout::timeout]
 #[ignore]
 fn report_binary_vs_json_payload_sizes() {
     let sync_config = SyncConfigFrame {

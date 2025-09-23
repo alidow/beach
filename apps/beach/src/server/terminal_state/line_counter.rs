@@ -63,7 +63,7 @@ impl Default for LineCounter {
 mod tests {
     use super::*;
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_line_counter_basic() {
         let mut counter = LineCounter::new();
         assert_eq!(counter.value, BigUint::from(0u32));
@@ -75,7 +75,7 @@ mod tests {
         assert_eq!(counter.value, BigUint::from(100u32));
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_line_counter_wrapping() {
         let counter = LineCounter::from_u64(10);
         let content = "This is a very long line that will wrap when displayed in a narrow terminal";

@@ -59,3 +59,67 @@ fn is_tokio_test_attribute(attr: &Attribute) -> bool {
             if first.ident == "tokio" && second.ident == "test"
     )
 }
+
+#[proc_macro_attribute]
+pub fn timeout(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut timeout_secs: u64 = 60;
+
+    if !attr.is_empty() {
+        let lit = parse_macro_input!(attr as LitInt);
+        timeout_secs = lit
+            .base10_parse()
+            .unwrap_or_else(|err| panic!("invalid timeout value: {err}"));
+        if timeout_secs == 0 {
+            panic!("timeout must be greater than zero");
+        }
+    }
+
+    let ItemFn {
+        attrs,
+        vis,
+        sig,
+        block,
+    } = parse_macro_input!(item as ItemFn);
+
+    if sig.asyncness.is_some() {
+        return syn::Error::new_spanned(
+            &sig.ident,
+            "timeout attribute expects a synchronous test function",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let filtered_attrs: Vec<Attribute> = attrs
+        .into_iter()
+        .filter(|attr| !is_test_attribute(attr))
+        .collect();
+
+    let timeout = timeout_secs;
+
+    TokenStream::from(quote! {
+        #[test]
+        #(#filtered_attrs)*
+        #vis #sig {
+            let timeout_duration = std::time::Duration::from_secs(#timeout);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| #block ));
+                let _ = sender.send(result);
+            });
+            match receiver.recv_timeout(timeout_duration) {
+                Ok(Ok(_)) => {}
+                Ok(Err(payload)) => std::panic::resume_unwind(payload),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("test timed out"),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("test thread failed before reporting result")
+                }
+            }
+        }
+    })
+}
+
+fn is_test_attribute(attr: &Attribute) -> bool {
+    let mut segments = attr.path().segments.iter();
+    matches!((segments.next(), segments.next()), (Some(first), None) if first.ident == "test")
+}

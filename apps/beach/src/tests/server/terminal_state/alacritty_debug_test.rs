@@ -2,7 +2,7 @@
 use crate::server::terminal_state::AlacrittyTerminal;
 
 #[cfg(feature = "alacritty-backend")]
-#[test]
+#[test_timeout::timeout]
 fn test_debug_alacritty_grid_direct() {
     use alacritty_terminal::event::{Event, EventListener};
     use alacritty_terminal::vte::ansi::{CharsetIndex, Handler, StandardCharset};

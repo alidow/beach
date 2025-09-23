@@ -3,7 +3,7 @@ use crate::server::terminal_state::{
 };
 use std::sync::{Arc, Mutex};
 
-#[test]
+#[test_timeout::timeout]
 fn test_grid_history_basic() {
     // Create initial grid
     let mut grid = Grid::new(80, 24);
@@ -40,7 +40,7 @@ fn test_grid_history_basic() {
     assert_eq!(current.height, 24);
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_grid_view_historical_mode() {
     // Create initial grid with some content
     let mut grid = Grid::new(80, 24);
@@ -84,7 +84,7 @@ fn test_grid_view_historical_mode() {
     assert_eq!(first_cell.char, '5'); // (105 % 10) = 5
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_grid_view_time_based() {
     // Create initial grid
     let mut grid = Grid::new(80, 24);
@@ -143,7 +143,7 @@ fn test_grid_view_time_based() {
     assert_eq!(later_view.get_cell(0, 0).unwrap().char, 'B');
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_scrollback_line_calculation() {
     // Create a grid with known line numbers
     let mut grid = Grid::new(80, 24);

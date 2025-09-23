@@ -17,7 +17,7 @@ use beach_human::transport::{
 };
 use tokio::time::{Instant as TokioInstant, sleep};
 
-#[test]
+#[test_timeout::timeout]
 fn late_joiner_receives_snapshot_and_roundtrips_input() {
     let rows = 20;
     let cols = 32;

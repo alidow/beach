@@ -2,7 +2,7 @@
 use crate::server::terminal_state::AlacrittyTerminal;
 
 #[cfg(feature = "alacritty-backend")]
-#[test]
+#[test_timeout::timeout]
 fn test_alacritty_line_feed_mode() {
     let mut terminal = AlacrittyTerminal::new(80, 24, None, None).unwrap();
 

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-#[test]
+#[test_timeout::timeout]
 fn test_basic_debug_view() {
     // Create a terminal and process some output
     let backend = create_terminal_backend(80, 24, None, None).unwrap();
@@ -39,7 +39,7 @@ fn test_basic_debug_view() {
     assert!(full_text.contains("$ "), "Should contain prompt");
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_debug_view_with_multiple_commands() {
     let backend = create_terminal_backend(80, 24, None, None).unwrap();
     let backend_arc = Arc::new(Mutex::new(backend));
@@ -65,7 +65,7 @@ fn test_debug_view_with_multiple_commands() {
     assert!(full_text.contains("world"), "Should contain second output");
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_debug_view_with_height_limit() {
     let backend = create_terminal_backend(80, 24, None, None).unwrap();
     let backend_arc = Arc::new(Mutex::new(backend));
@@ -90,7 +90,7 @@ fn test_debug_view_with_height_limit() {
     assert_eq!(response.rows.len(), 5, "Should have 5 rows");
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_debug_view_time_travel() {
     let backend = create_terminal_backend(80, 24, None, None).unwrap();
     let backend_arc = Arc::new(Mutex::new(backend));
@@ -141,7 +141,7 @@ fn test_debug_view_time_travel() {
     );
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_debug_view_from_line() {
     let backend = create_terminal_backend(80, 24, None, None).unwrap();
     let backend_arc = Arc::new(Mutex::new(backend));
@@ -169,7 +169,7 @@ fn test_debug_view_from_line() {
     assert!(response.height > 0);
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_debug_view_from_non_existent_line() {
     let backend = create_terminal_backend(80, 24, None, None).unwrap();
     let backend_arc = Arc::new(Mutex::new(backend));
@@ -207,7 +207,7 @@ fn test_debug_view_from_non_existent_line() {
     );
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_debug_view_boundary_conditions() {
     let backend = create_terminal_backend(80, 24, None, None).unwrap();
     let backend_arc = Arc::new(Mutex::new(backend));
@@ -248,7 +248,7 @@ fn test_debug_view_boundary_conditions() {
     );
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_debug_view_with_ansi_colors() {
     let backend = create_terminal_backend(80, 24, None, None).unwrap();
     let backend_arc = Arc::new(Mutex::new(backend));
@@ -283,7 +283,7 @@ fn test_debug_view_with_ansi_colors() {
     );
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_line_tracking_across_scrolling() {
     let backend = create_terminal_backend(80, 10, None, None).unwrap(); // Small terminal
     let backend_arc = Arc::new(Mutex::new(backend));

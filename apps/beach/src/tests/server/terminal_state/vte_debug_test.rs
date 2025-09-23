@@ -1,6 +1,6 @@
 use crate::server::terminal_state::{TerminalStateTracker};
 
-#[test]
+#[test_timeout::timeout]
 fn test_debug_vte_newline() {
     let mut tracker = TerminalStateTracker::new(80, 24);
     

@@ -1,5 +1,5 @@
 #[cfg(feature = "alacritty-backend")]
-#[test]
+#[test_timeout::timeout]
 fn test_clear_to_end_of_screen() {
     use crate::server::terminal_state::AlacrittyTerminal;
 
@@ -67,7 +67,7 @@ fn test_clear_to_end_of_screen() {
 }
 
 #[cfg(feature = "alacritty-backend")]
-#[test]
+#[test_timeout::timeout]
 fn test_clear_after_wrap() {
     use crate::server::terminal_state::AlacrittyTerminal;
 

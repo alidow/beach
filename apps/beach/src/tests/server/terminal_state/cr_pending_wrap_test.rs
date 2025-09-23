@@ -1,5 +1,5 @@
 #[cfg(feature = "alacritty-backend")]
-#[test]
+#[test_timeout::timeout]
 fn test_cr_clears_pending_wrap() {
     use crate::server::terminal_state::AlacrittyTerminal;
 

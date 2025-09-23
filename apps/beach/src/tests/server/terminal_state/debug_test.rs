@@ -1,7 +1,7 @@
 use super::test_utils::TestTerminal;
 use crate::server::terminal_state::Color;
 
-#[test]
+#[test_timeout::timeout]
 fn test_debug_newline_alacritty() {
     let mut terminal = TestTerminal::new(80, 24);
 

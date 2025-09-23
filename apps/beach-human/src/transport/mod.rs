@@ -292,17 +292,17 @@ mod tests {
         assert_eq!(server.peer(), client.id());
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn webrtc_transport_round_trip() {
         round_trip(&WebRtcBuilder);
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn websocket_transport_round_trip() {
         round_trip(&WebSocketBuilder);
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn ipc_transport_round_trip() {
         round_trip(&IpcBuilder);
     }

@@ -364,7 +364,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn snapshot_and_delta_streaming() {
         let rows = 200;
         let cols = 10;

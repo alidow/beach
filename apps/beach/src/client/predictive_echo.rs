@@ -143,7 +143,7 @@ impl PredictiveEcho {
 mod tests {
     use super::*;
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_prediction_tracking() {
         let mut echo = PredictiveEcho::new("client-1".to_string());
 
@@ -163,7 +163,7 @@ mod tests {
         assert_eq!(echo.active_predictions().len(), 1);
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_underline_check() {
         let mut echo = PredictiveEcho::new("client-1".to_string());
 
@@ -174,7 +174,7 @@ mod tests {
         assert!(!echo.should_underline((6, 0)));
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_timeout_removal() {
         let mut echo = PredictiveEcho::new("client-1".to_string());
         echo.prediction_timeout = Duration::from_millis(0); // Immediate timeout

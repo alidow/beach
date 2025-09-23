@@ -509,7 +509,7 @@ mod tests {
     use super::*;
     use crate::cache::terminal::unpack_cell;
 
-    #[test]
+    #[test_timeout::timeout]
     fn ascii_output_produces_cell_updates() {
         let grid = TerminalGrid::new(4, 10);
         let mut emulator = SimpleTerminalEmulator::new(&grid);

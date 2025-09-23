@@ -223,7 +223,7 @@ impl CellAttributes {
 mod tests {
     use super::*;
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_cell_serialization() {
         let cell = Cell {
             char: 'A',
@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(cell, decoded);
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_emoji_serialization() {
         // Test with emoji character
         let cell = Cell {
@@ -259,7 +259,7 @@ mod tests {
         assert_eq!(cell.char, decoded.char);
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_default_cell() {
         let cell = Cell::default();
         assert_eq!(cell.char, ' ');

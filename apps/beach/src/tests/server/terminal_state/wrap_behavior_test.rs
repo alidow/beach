@@ -1,5 +1,5 @@
 #[cfg(feature = "alacritty-backend")]
-#[test]
+#[test_timeout::timeout]
 fn test_prompt_eol_exact_sequence() {
     use crate::server::terminal_state::AlacrittyTerminal;
 
@@ -150,7 +150,7 @@ fn test_prompt_eol_exact_sequence() {
 }
 
 #[cfg(feature = "alacritty-backend")]
-#[test]
+#[test_timeout::timeout]
 fn test_wrap_with_one_extra_char() {
     use crate::server::terminal_state::AlacrittyTerminal;
 
@@ -175,7 +175,7 @@ fn test_wrap_with_one_extra_char() {
 }
 
 #[cfg(feature = "alacritty-backend")]
-#[test]
+#[test_timeout::timeout]
 fn test_wrap_then_cr_behavior() {
     use crate::server::terminal_state::AlacrittyTerminal;
 

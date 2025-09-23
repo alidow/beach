@@ -49,13 +49,13 @@ mod tests {
     // Mutex to ensure environment variable tests don't run in parallel
     static ENV_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.session_server, "127.0.0.1:8080");
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_config_from_env_default() {
         let _lock = ENV_MUTEX.lock().unwrap();
 
@@ -67,7 +67,7 @@ mod tests {
         assert_eq!(config.session_server, "127.0.0.1:8080");
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_config_from_env_custom() {
         let _lock = ENV_MUTEX.lock().unwrap();
 

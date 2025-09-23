@@ -2130,7 +2130,7 @@ mod tests {
         terminal::unpack_cell(packed).0
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn parse_plain_session_id() {
         let id = Uuid::new_v4().to_string();
         let (parsed, base) = interpret_session_target(&id).unwrap();
@@ -2138,7 +2138,7 @@ mod tests {
         assert!(base.is_none());
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn transmitter_cache_dedupes_rows_and_styles() {
         fn pack_cell(ch: char) -> PackedCell {
             PackedCell::from_raw(((ch as u32 as u64) << 32) | StyleId::DEFAULT.0 as u64)
@@ -2186,7 +2186,7 @@ mod tests {
         assert!(rect_repeat.is_empty(), "identical rect should dedupe");
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn parse_url_with_join_suffix() {
         let id = Uuid::new_v4();
         let url = format!("https://example.com/api/sessions/{}/join", id);
@@ -2195,7 +2195,7 @@ mod tests {
         assert_eq!(base.unwrap(), "https://example.com/api/");
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn parse_url_without_sessions_segment() {
         let id = Uuid::new_v4();
         let url = format!("https://example.com/{id}");
@@ -2204,7 +2204,7 @@ mod tests {
         assert_eq!(base.unwrap(), "https://example.com/");
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn reject_non_uuid_target() {
         let err = interpret_session_target("not-a-session").unwrap_err();
         assert!(matches!(err, CliError::InvalidSessionTarget { .. }));

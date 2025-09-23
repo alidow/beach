@@ -634,6 +634,10 @@ impl GridRenderer {
         self.set_follow_tail(follow);
     }
 
+    pub fn is_following_tail(&self) -> bool {
+        self.follow_tail
+    }
+
     fn last_loaded_row_index(&self) -> Option<usize> {
         self.rows
             .iter()
@@ -1138,7 +1142,7 @@ mod tests {
         text.chars().map(|ch| (ch, None)).collect()
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn tail_render_does_not_leave_missing_gaps_after_new_rows() {
         let mut renderer = GridRenderer::new(0, 80);
         renderer.on_resize(80, 24);

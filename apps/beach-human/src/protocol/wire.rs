@@ -581,7 +581,7 @@ fn decode_lane(cursor: &mut Cursor<'_>) -> Result<Lane, WireError> {
 mod tests {
     use super::*;
 
-    #[test]
+    #[test_timeout::timeout]
     fn encode_decode_heartbeat() {
         let frame = HostFrame::Heartbeat {
             seq: 42,
@@ -592,7 +592,7 @@ mod tests {
         assert_eq!(frame, decoded);
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn encode_decode_hello() {
         let frame = HostFrame::Hello {
             subscription: 7,
@@ -618,7 +618,7 @@ mod tests {
         assert_eq!(frame, decoded);
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn encode_decode_snapshot_with_updates() {
         let frame = HostFrame::Snapshot {
             subscription: 1,
@@ -662,7 +662,7 @@ mod tests {
         assert_eq!(frame, decoded);
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn encode_decode_client_frames() {
         let input = ClientFrame::Input {
             seq: 99,
@@ -679,7 +679,7 @@ mod tests {
         assert_eq!(resize, decoded_resize);
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn env_toggle_respects_flag() {
         assert!(parse_flag("true"));
         assert!(parse_flag("YES"));

@@ -2,7 +2,7 @@ use crate::server::terminal_state::*;
 use chrono::Utc;
 use std::sync::{Arc, Mutex};
 
-#[test]
+#[test_timeout::timeout]
 fn test_basic_terminal_state() {
     // Create a 80x24 terminal
     let mut tracker = TerminalStateTracker::new(80, 24);
@@ -83,7 +83,7 @@ fn test_basic_terminal_state() {
     }
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_grid_delta() {
     let mut grid1 = Grid::new(10, 10);
     let mut grid2 = grid1.clone();
@@ -119,7 +119,7 @@ fn test_grid_delta() {
     assert_eq!(cell.fg_color, Color::Rgb(255, 0, 0));
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_grid_history() {
     let initial_grid = Grid::new(10, 10);
     let mut history = GridHistory::new(initial_grid);
@@ -162,7 +162,7 @@ fn test_grid_history() {
     assert_eq!(cell.char, expected_char);
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_grid_view_height_truncation() {
     let history = Arc::new(Mutex::new(GridHistory::new(Grid::new(80, 24))));
     let view = GridView::new(Arc::clone(&history));
@@ -174,7 +174,7 @@ fn test_grid_view_height_truncation() {
     assert_eq!(truncated.height, 12); // Height should be limited
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_cursor_movement() {
     let mut tracker = TerminalStateTracker::new(80, 24);
 
@@ -205,7 +205,7 @@ fn test_cursor_movement() {
     }
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_clear_screen() {
     let mut tracker = TerminalStateTracker::new(80, 24);
 
@@ -235,7 +235,7 @@ fn test_clear_screen() {
     }
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_emoji_handling() {
     let mut tracker = TerminalStateTracker::new(80, 24);
 
@@ -280,7 +280,7 @@ fn test_emoji_handling() {
     }
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_memory_limit() {
     let initial_grid = Grid::new(80, 24);
     let mut history = GridHistory::new(initial_grid);

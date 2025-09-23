@@ -1,7 +1,7 @@
 use crate::server::terminal_state::{Cell, CellAttributes, Color, Grid, GridHistory, GridView};
 use std::sync::{Arc, Mutex};
 
-#[test]
+#[test_timeout::timeout]
 fn test_grid_view_utf8_height_truncation() {
     // Create a grid with multi-byte UTF-8 characters
     let mut grid = Grid::new(100, 10);
@@ -41,7 +41,7 @@ fn test_grid_view_utf8_height_truncation() {
     }
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_grid_view_mixed_utf8_with_height() {
     // Test with mixed ASCII and multi-byte UTF-8 characters
     let mut grid = Grid::new(80, 10);

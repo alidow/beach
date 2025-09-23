@@ -191,7 +191,7 @@ fn to_setup_error<E: std::fmt::Display>(err: E) -> TransportError {
 mod tests {
     use super::*;
 
-    #[test]
+    #[test_timeout::timeout]
     fn ipc_pair_round_trip() {
         let pair = build_pair().expect("create ipc pair");
         let timeout = Duration::from_secs(1);

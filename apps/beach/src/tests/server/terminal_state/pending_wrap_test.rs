@@ -1,5 +1,5 @@
 #[cfg(feature = "alacritty-backend")]
-#[test]
+#[test_timeout::timeout]
 fn test_pending_wrap_vs_immediate_wrap() {
     use crate::server::terminal_state::AlacrittyTerminal;
 
@@ -126,7 +126,7 @@ fn test_pending_wrap_vs_immediate_wrap() {
 }
 
 #[cfg(feature = "alacritty-backend")]
-#[test]
+#[test_timeout::timeout]
 fn test_wrap_at_exact_boundary() {
     use crate::server::terminal_state::AlacrittyTerminal;
 

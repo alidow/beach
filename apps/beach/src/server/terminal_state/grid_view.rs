@@ -322,7 +322,7 @@ mod tests {
         grid
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_derive_realtime_no_height() {
         // Test that without height parameter, full grid is returned
         let history = create_test_history_with_content(
@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(first_line, "First line ");
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_derive_realtime_with_height_truncation() {
         // Test that height parameter truncates grid
         let history = create_test_history_with_content(
@@ -373,7 +373,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_derive_realtime_height_larger_than_grid() {
         // Test that requesting more height than available returns full grid
         let history = create_test_history_with_content(80, 10, vec!["Line 1", "Line 2"]);
@@ -385,7 +385,7 @@ mod tests {
         assert_eq!(result.height, 10); // Original height preserved
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_truncate_preserves_cursor_position() {
         // Test that cursor position is preserved even if beyond visible area
         let initial = Grid::new(80, 24);
@@ -417,7 +417,7 @@ mod tests {
         assert_eq!(result.cursor.visible, true);
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_truncate_preserves_full_width() {
         // Test that width is always preserved, including trailing spaces
         let history = create_test_history_with_content(
@@ -444,7 +444,7 @@ mod tests {
         assert_eq!(line_length, 100); // All columns should have cells (even if spaces)
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_preserves_colors_and_attributes() {
         // Test that colors and attributes are preserved
         let initial = Grid::new(80, 24);

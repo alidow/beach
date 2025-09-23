@@ -144,7 +144,7 @@ impl TerminalInitializer {
 mod tests {
     use super::*;
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_initial_grid_creation() {
         let grid = TerminalInitializer::create_initial_grid(80, 24);
         assert_eq!(grid.width, 80);
@@ -158,7 +158,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_colorfgbg_parsing() {
         // This would need to mock environment variables in a real test
         // For now, just verify the grid creation doesn't panic

@@ -22,7 +22,7 @@ pub fn verify_passphrase(passphrase: &str, hash: &str) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_session_id_generation() {
         let id1 = generate_session_id();
         let id2 = generate_session_id();
@@ -30,7 +30,7 @@ mod tests {
         assert_eq!(id1.len(), 36); // UUID v4 format
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_passphrase_hashing() {
         let passphrase = "test_passphrase";
         let hash1 = hash_passphrase(passphrase);
@@ -40,7 +40,7 @@ mod tests {
         assert_ne!(hash1, passphrase);
     }
 
-    #[test]
+    #[test_timeout::timeout]
     fn test_passphrase_verification() {
         let passphrase = "correct_pass";
         let hash = hash_passphrase(passphrase);

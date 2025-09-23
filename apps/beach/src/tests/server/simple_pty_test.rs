@@ -1,7 +1,7 @@
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
 
-#[test]
+#[test_timeout::timeout]
 fn test_pty_echo_command() {
     // Create a PTY
     let pty_system = native_pty_system();
@@ -60,7 +60,7 @@ fn test_pty_echo_command() {
     child.wait().ok();
 }
 
-#[test]
+#[test_timeout::timeout]
 fn test_pty_cat_command() {
     let pty_system = native_pty_system();
     let mut pty_pair = pty_system

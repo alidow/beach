@@ -452,6 +452,32 @@ impl GridRenderer {
         for (col, seq, ch, style_id) in cells {
             self.apply_cell(absolute_row, *col, *seq, *ch, *style_id);
         }
+
+        if let Some((first_col, _, _, _)) = cells.first() {
+            if *first_col == 0 {
+                let absolute = absolute_row as u64;
+                if let Some(rel) = self.relative_row(absolute) {
+                    if let Some(RowSlot::Loaded(state)) = self.rows.get_mut(rel) {
+                        let last_seq = cells.last().map(|(_, seq, _, _)| *seq).unwrap_or(0);
+                        let end_col = cells
+                            .last()
+                            .map(|(col, _, _, _)| col.saturating_add(1))
+                            .unwrap_or(0);
+                        if end_col < state.cells.len() {
+                            for cell in state.cells.iter_mut().skip(end_col) {
+                                if last_seq >= cell.seq {
+                                    cell.ch = ' ';
+                                    cell.seq = last_seq;
+                                    cell.style_id = None;
+                                }
+                            }
+                            state.latest_seq = state.latest_seq.max(last_seq);
+                            self.mark_dirty();
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn mark_row_missing(&mut self, absolute_row: u64) {
@@ -935,6 +961,22 @@ impl GridRenderer {
             }
         } else {
             (' ', None, false)
+        }
+    }
+
+    #[cfg(test)]
+    pub fn row_text_for_test(&self, absolute_row: u64) -> Option<String> {
+        let rel = self.relative_row(absolute_row)?;
+        match self.rows.get(rel)? {
+            RowSlot::Loaded(state) => {
+                let mut line = String::new();
+                for cell in &state.cells {
+                    line.push(cell.ch);
+                }
+                Some(line)
+            }
+            RowSlot::Pending => Some("·".repeat(self.cols)),
+            RowSlot::Missing => Some(" ".repeat(self.cols)),
         }
     }
 

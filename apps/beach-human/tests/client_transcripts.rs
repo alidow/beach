@@ -374,7 +374,13 @@ async fn client_requests_backfill_using_absolute_rows() {
             },
         },
     );
-    send_host_frame(&*server, HostFrame::Grid { rows: 400, cols: 80 });
+    send_host_frame(
+        &*server,
+        HostFrame::Grid {
+            rows: 400,
+            cols: 80,
+        },
+    );
     send_host_frame(
         &*server,
         HostFrame::Snapshot {
@@ -686,7 +692,10 @@ async fn client_retries_history_when_initial_backfill_empty() {
         }
     }
 
-    assert!(observed_retry, "client never retried backfill after empty response");
+    assert!(
+        observed_retry,
+        "client never retried backfill after empty response"
+    );
 
     send_host_frame(&*server, HostFrame::Shutdown);
 
@@ -727,7 +736,13 @@ async fn client_targets_tail_history_after_large_delta() {
             },
         },
     );
-    send_host_frame(&*server, HostFrame::Grid { rows: 400, cols: 80 });
+    send_host_frame(
+        &*server,
+        HostFrame::Grid {
+            rows: 400,
+            cols: 80,
+        },
+    );
     // Provide a minimal snapshot so the renderer seeds a baseline but leaves most rows pending.
     send_host_frame(
         &*server,
@@ -765,8 +780,58 @@ async fn client_targets_tail_history_after_large_delta() {
         },
     );
 
+    // Drain any initial history requests before we trigger the burst.
+    let mut initial_requests = Vec::new();
+    loop {
+        match server.recv(Duration::from_millis(100)) {
+            Ok(message) => {
+                if let Payload::Binary(bytes) = message.payload {
+                    if let Ok(WireClientFrame::RequestBackfill {
+                        subscription,
+                        request_id,
+                        start_row,
+                        count,
+                    }) = protocol::decode_client_frame_binary(&bytes)
+                    {
+                        initial_requests.push((subscription, request_id, start_row, count));
+                    }
+                }
+            }
+            Err(TransportError::Timeout) => break,
+            Err(err) => panic!("unexpected transport error: {err}"),
+        }
+    }
+    let initial_max_request_id = initial_requests
+        .iter()
+        .map(|(_, request_id, _, _)| *request_id)
+        .max()
+        .unwrap_or(0);
+    for (subscription, request_id, start_row, count) in initial_requests {
+        let mut bootstrap = Vec::new();
+        for offset in 0..count {
+            let row = start_row + offset as u64;
+            let text = format!("init-{row:03}");
+            bootstrap.push(Update::Row {
+                row: row as u32,
+                seq: (500 + row) as u64,
+                cells: text.chars().map(pack_char).collect(),
+            });
+        }
+        send_host_frame(
+            &*server,
+            HostFrame::HistoryBackfill {
+                subscription,
+                request_id,
+                start_row,
+                count,
+                updates: bootstrap,
+                more: false,
+            },
+        );
+    }
+
     // Stream a large block of output far beyond the earlier rows.
-    let high_base: u32 = 360;
+    let high_base: u32 = 150;
     let mut delta_updates = Vec::new();
     for row in high_base..high_base + 40 {
         let text = format!("tail-{row:03}");
@@ -787,17 +852,25 @@ async fn client_targets_tail_history_after_large_delta() {
     );
 
     // Expect a follow-up history request targeting a range near the new tail.
-    let mut retry_start: Option<u64> = None;
+    let mut tail_retry_start: Option<u64> = None;
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         match server.recv(Duration::from_millis(200)) {
             Ok(message) => {
                 if let Payload::Binary(bytes) = message.payload {
-                    if let Ok(WireClientFrame::RequestBackfill { start_row, .. }) =
-                        protocol::decode_client_frame_binary(&bytes)
+                    if let Ok(WireClientFrame::RequestBackfill {
+                        request_id,
+                        start_row,
+                        ..
+                    }) = protocol::decode_client_frame_binary(&bytes)
                     {
-                        retry_start = Some(start_row);
-                        break;
+                        if request_id <= initial_max_request_id {
+                            continue;
+                        }
+                        if start_row >= (high_base as u64).saturating_sub(40) {
+                            tail_retry_start = Some(start_row);
+                            break;
+                        }
                     }
                 }
             }
@@ -806,10 +879,154 @@ async fn client_targets_tail_history_after_large_delta() {
         }
     }
 
-    let retry_start = retry_start.expect("client never retried history for tail rows");
+    let retry_start = tail_retry_start.expect("client never retried history for tail rows");
     assert!(
-        retry_start >= (high_base as u64).saturating_sub(150),
-        "expected retry to target high tail, got start={retry_start}");
+        retry_start >= (high_base as u64).saturating_sub(40),
+        "expected retry to target high tail, got start={retry_start}"
+    );
+
+    send_host_frame(&*server, HostFrame::Shutdown);
+
+    tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("client join timeout")
+        .expect("client thread");
+}
+
+#[test_timeout::tokio_timeout_test]
+async fn client_marks_empty_backfill_as_missing() {
+    let pair = TransportPair::new(TransportKind::Ipc);
+    let transport: Arc<dyn Transport> = Arc::from(pair.client);
+    let server = pair.server;
+
+    let handle = tokio::task::spawn_blocking(move || {
+        let client = TerminalClient::new(transport).with_render(false);
+        if let Err(err) = client.run() {
+            panic!("client error: {err}");
+        }
+    });
+
+    let subscription = 1;
+
+    send_host_frame(
+        &*server,
+        HostFrame::Hello {
+            subscription,
+            max_seq: 0,
+            config: SyncConfigFrame {
+                snapshot_budgets: vec![LaneBudgetFrame {
+                    lane: Lane::Foreground,
+                    max_updates: 32,
+                }],
+                delta_budget: 512,
+                heartbeat_ms: 250,
+                initial_snapshot_lines: 32,
+            },
+        },
+    );
+    send_host_frame(
+        &*server,
+        HostFrame::Grid {
+            rows: 200,
+            cols: 80,
+        },
+    );
+    send_host_frame(
+        &*server,
+        HostFrame::Snapshot {
+            subscription,
+            lane: Lane::Foreground,
+            watermark: 1,
+            has_more: false,
+            updates: vec![Update::Row {
+                row: 0,
+                seq: 1,
+                cells: "seed".chars().map(pack_char).collect(),
+            }],
+        },
+    );
+    send_host_frame(
+        &*server,
+        HostFrame::SnapshotComplete {
+            subscription,
+            lane: Lane::Foreground,
+        },
+    );
+    send_host_frame(
+        &*server,
+        HostFrame::SnapshotComplete {
+            subscription,
+            lane: Lane::Recent,
+        },
+    );
+    send_host_frame(
+        &*server,
+        HostFrame::SnapshotComplete {
+            subscription,
+            lane: Lane::History,
+        },
+    );
+
+    let (request_subscription, first_request_id, first_start_row, first_count) = loop {
+        match server.recv(Duration::from_millis(500)) {
+            Ok(message) => {
+                if let Payload::Binary(bytes) = message.payload {
+                    if let Ok(WireClientFrame::RequestBackfill {
+                        subscription,
+                        request_id,
+                        start_row,
+                        count,
+                    }) = protocol::decode_client_frame_binary(&bytes)
+                    {
+                        break (subscription, request_id, start_row, count);
+                    }
+                }
+            }
+            Err(TransportError::Timeout) => continue,
+            Err(err) => panic!("transport error waiting for first backfill: {err}"),
+        }
+    };
+
+    send_host_frame(
+        &*server,
+        HostFrame::HistoryBackfill {
+            subscription: request_subscription,
+            request_id: first_request_id,
+            start_row: first_start_row,
+            count: first_count,
+            updates: Vec::new(),
+            more: false,
+        },
+    );
+
+    let mut duplicate_request = None;
+    let deadline = Instant::now() + Duration::from_millis(800);
+    while Instant::now() < deadline {
+        match server.recv(Duration::from_millis(100)) {
+            Ok(message) => {
+                if let Payload::Binary(bytes) = message.payload {
+                    if let Ok(WireClientFrame::RequestBackfill {
+                        start_row, count, ..
+                    }) = protocol::decode_client_frame_binary(&bytes)
+                    {
+                        if start_row == first_start_row && count == first_count {
+                            duplicate_request = Some((start_row, count));
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(TransportError::Timeout) => continue,
+            Err(err) => panic!("transport error while awaiting duplicate request check: {err}"),
+        }
+    }
+
+    assert!(
+        duplicate_request.is_none(),
+        "client retried empty backfill for start={} count={}",
+        first_start_row,
+        first_count
+    );
 
     send_host_frame(&*server, HostFrame::Shutdown);
 

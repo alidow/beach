@@ -76,6 +76,7 @@ pub struct TerminalClient {
     known_base_row: Option<u64>,
     has_loaded_rows: bool,
     highest_loaded_row: Option<u64>,
+    last_tail_backfill_start: Option<u64>,
 }
 
 impl TerminalClient {
@@ -107,6 +108,7 @@ impl TerminalClient {
             known_base_row: None,
             has_loaded_rows: false,
             highest_loaded_row: None,
+            last_tail_backfill_start: None,
         }
     }
 
@@ -220,6 +222,7 @@ impl TerminalClient {
                 self.known_base_row = None;
                 self.has_loaded_rows = false;
                 self.highest_loaded_row = None;
+                self.last_tail_backfill_start = None;
             }
             WireHostFrame::Grid { rows, cols } => {
                 let rows = rows as usize;
@@ -334,6 +337,38 @@ impl TerminalClient {
         if !self.has_loaded_rows {
             return Ok(());
         }
+
+        if self.pending_backfills.is_empty() {
+            if let Some(highest) = self.highest_loaded_row {
+                let mut tail_start = highest.saturating_sub(BACKFILL_LOOKAHEAD_ROWS as u64);
+                if let Some(base) = self.known_base_row {
+                    tail_start = tail_start.max(base);
+                }
+                if self
+                    .last_tail_backfill_start
+                    .map_or(true, |prev| prev != tail_start)
+                    && !self.is_range_pending(
+                        tail_start,
+                        tail_start.saturating_add(BACKFILL_MAX_ROWS_PER_REQUEST as u64),
+                    )
+                {
+                    if let Some(last) = self.last_backfill_request_at {
+                        if last.elapsed() < BACKFILL_MIN_INTERVAL {
+                            return Ok(());
+                        }
+                    }
+                    self.send_backfill_request(
+                        subscription,
+                        tail_start,
+                        BACKFILL_MAX_ROWS_PER_REQUEST,
+                    )?;
+                    self.last_tail_backfill_start = Some(tail_start);
+                    self.last_backfill_request_at = Some(Instant::now());
+                    return Ok(());
+                }
+            }
+        }
+
         if self.pending_backfills.len() >= BACKFILL_MAX_PENDING_REQUESTS {
             return Ok(());
         }
@@ -367,6 +402,15 @@ impl TerminalClient {
             return Ok(());
         }
         self.send_backfill_request(subscription, request_start, capped)?;
+        self.last_backfill_request_at = Some(Instant::now());
+        if self
+            .last_tail_backfill_start
+            .is_some_and(|prev| prev == request_start)
+        {
+            // keep marker until response arrives
+        } else {
+            self.last_tail_backfill_start = None;
+        }
         Ok(())
     }
 
@@ -470,8 +514,17 @@ impl TerminalClient {
 
         if !more {
             let end = start_row.saturating_add(count as u64);
+            let had_rows = !touched_rows.is_empty();
             self.finalize_backfill_range(start_row, end, &touched_rows);
             self.last_backfill_request_at = None;
+            if had_rows {
+                if self
+                    .last_tail_backfill_start
+                    .is_some_and(|prev| prev == start_row)
+                {
+                    self.last_tail_backfill_start = None;
+                }
+            }
         }
 
         self.force_render = true;
@@ -484,7 +537,7 @@ impl TerminalClient {
         }
         if touched_rows.is_empty() {
             for row in start..end {
-                self.renderer.mark_row_pending(row);
+                self.renderer.mark_row_missing(row);
             }
             return;
         }
@@ -1170,6 +1223,18 @@ impl TerminalClient {
             .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
         Ok(())
     }
+
+    #[cfg(test)]
+    pub fn test_row_text(&self, row: u64) -> Option<String> {
+        self.renderer.row_text_for_test(row)
+    }
+
+    #[cfg(test)]
+    pub fn test_rows_text(&self, start: u64, end: u64) -> Vec<Option<String>> {
+        (start..end)
+            .map(|row| self.renderer.row_text_for_test(row))
+            .collect()
+    }
 }
 
 fn decode_wire_cell(cell: u64) -> (char, Option<u32>) {
@@ -1236,5 +1301,226 @@ fn encode_key_event(key: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
         KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::terminal::PackedCell;
+    use crate::transport::{
+        Transport, TransportError, TransportId, TransportKind, TransportMessage,
+    };
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct NullTransport;
+
+    impl Transport for NullTransport {
+        fn kind(&self) -> TransportKind {
+            TransportKind::Ipc
+        }
+
+        fn id(&self) -> TransportId {
+            TransportId(0)
+        }
+
+        fn peer(&self) -> TransportId {
+            TransportId(0)
+        }
+
+        fn send(&self, _message: TransportMessage) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn send_text(&self, _text: &str) -> Result<u64, TransportError> {
+            Ok(0)
+        }
+
+        fn send_bytes(&self, _bytes: &[u8]) -> Result<u64, TransportError> {
+            Ok(0)
+        }
+
+        fn recv(&self, _timeout: Duration) -> Result<TransportMessage, TransportError> {
+            Err(TransportError::Timeout)
+        }
+
+        fn try_recv(&self) -> Result<Option<TransportMessage>, TransportError> {
+            Ok(None)
+        }
+    }
+
+    fn pack_char(ch: char) -> u64 {
+        let packed = PackedCell::from_raw((ch as u32 as u64) << 32);
+        packed.into()
+    }
+
+    fn pack_text_row(absolute_row: u32, label: u32) -> WireUpdate {
+        let text = format!("Line {}: Test", label);
+        let cells = text.chars().map(pack_char).collect();
+        WireUpdate::Row {
+            row: absolute_row,
+            seq: (absolute_row as u64).saturating_add(1),
+            cells,
+        }
+    }
+
+    fn pack_row(absolute_row: u32, seq: u64, text: &str) -> WireUpdate {
+        WireUpdate::Row {
+            row: absolute_row,
+            seq,
+            cells: text.chars().map(pack_char).collect(),
+        }
+    }
+
+    fn pack_row_segment(absolute_row: u32, start_col: u32, seq: u64, text: &str) -> WireUpdate {
+        WireUpdate::RowSegment {
+            row: absolute_row,
+            start_col,
+            seq,
+            cells: text.chars().map(pack_char).collect(),
+        }
+    }
+
+    fn seed_request(
+        client: &mut TerminalClient,
+        id: u64,
+        start: u64,
+        count: u32,
+        more_expected: bool,
+    ) {
+        client.pending_backfills.push(BackfillRequestState {
+            id,
+            start,
+            end: start.saturating_add(count as u64),
+            issued_at: Instant::now(),
+            more_expected,
+        });
+    }
+
+    #[test]
+    fn history_backfill_loads_rows_across_sparse_chunks() {
+        let transport: Arc<dyn Transport> = Arc::new(NullTransport::default());
+        let mut client = TerminalClient::new(transport).with_render(false);
+
+        let base: u32 = 12000;
+
+        client.subscription_id = Some(1);
+        client.known_base_row = Some(base as u64);
+        client.renderer.ensure_size(400, 80);
+
+        seed_request(&mut client, 1, 0, 64, true);
+        let updates: Vec<WireUpdate> = (0..24)
+            .map(|idx| pack_text_row(base + idx, idx + 1))
+            .collect();
+        client
+            .handle_history_backfill(1, 1, 0, 64, updates, true)
+            .expect("first chunk");
+
+        client
+            .handle_history_backfill(1, 1, 64, 64, Vec::new(), true)
+            .expect("second chunk empty");
+        client
+            .handle_history_backfill(1, 1, 128, 64, Vec::new(), true)
+            .expect("third chunk empty");
+        client
+            .handle_history_backfill(1, 1, 192, 64, Vec::new(), false)
+            .expect("final chunk empty");
+
+        let delta_updates: Vec<WireUpdate> = (0..150)
+            .map(|idx| pack_text_row(base + idx, idx + 1))
+            .collect();
+        client
+            .handle_host_frame(WireHostFrame::Delta {
+                subscription: 1,
+                watermark: 150,
+                has_more: false,
+                updates: delta_updates,
+            })
+            .expect("apply tail delta");
+
+        seed_request(&mut client, 2, 24, 28, false);
+        let updates: Vec<WireUpdate> = (24..52)
+            .map(|idx| pack_text_row(base + idx, idx + 1))
+            .collect();
+        client
+            .handle_history_backfill(1, 2, 24, 28, updates, false)
+            .expect("backfill range 24-51");
+
+        seed_request(&mut client, 3, 37, 256, true);
+        let updates: Vec<WireUpdate> = (37..101)
+            .map(|idx| pack_text_row(base + idx, idx + 1))
+            .collect();
+        client
+            .handle_history_backfill(1, 3, 37, 64, updates, true)
+            .expect("range 37-100");
+
+        let updates: Vec<WireUpdate> = (101..158)
+            .map(|idx| pack_text_row(base + idx, idx + 1))
+            .collect();
+        client
+            .handle_history_backfill(1, 3, 101, 64, updates, true)
+            .expect("range 101-157");
+
+        client
+            .handle_history_backfill(1, 3, 165, 64, Vec::new(), true)
+            .expect("empty tail chunk");
+        client
+            .handle_history_backfill(1, 3, 229, 64, Vec::new(), false)
+            .expect("final tail chunk");
+
+        for row in 0..150u64 {
+            let text = client
+                .test_row_text(base as u64 + row)
+                .unwrap_or_else(|| "".to_string())
+                .trim_end()
+                .to_string();
+            assert!(
+                text.contains(&format!("Line {}", row + 1)),
+                "row {row} missing expected text, got '{text}'"
+            );
+        }
+    }
+
+    #[test]
+    fn row_segment_overwrites_shrinks_row() {
+        let transport: Arc<dyn Transport> = Arc::new(NullTransport::default());
+        let mut client = TerminalClient::new(transport).with_render(false);
+
+        client.subscription_id = Some(1);
+        client.known_base_row = Some(5000);
+        client.renderer.ensure_size(20, 80);
+
+        // Seed row with a long command line.
+        client
+            .handle_host_frame(WireHostFrame::Delta {
+                subscription: 1,
+                watermark: 1,
+                has_more: false,
+                updates: vec![pack_row(
+                    5000,
+                    1,
+                    "world                                  for",
+                )],
+            })
+            .expect("seed row");
+
+        // Apply a shorter update that should replace the trailing text.
+        client
+            .handle_host_frame(WireHostFrame::Delta {
+                subscription: 1,
+                watermark: 2,
+                has_more: false,
+                updates: vec![pack_row_segment(5000, 0, 2, "world")],
+            })
+            .expect("apply shorter row");
+
+        let text = client
+            .test_row_text(5000)
+            .unwrap_or_default()
+            .trim_end()
+            .to_string();
+
+        assert_eq!(text, "world", "row retained stale suffix: '{text}'");
     }
 }

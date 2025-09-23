@@ -1,15 +1,21 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Duration as StdDuration, Instant};
 
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use beach_human::cache::GridCache;
 use beach_human::cache::terminal::{self, Style, StyleId, TerminalGrid};
 use beach_human::model::terminal::diff::{CacheUpdate, RowSnapshot};
+use beach_human::protocol::{
+    self, ClientFrame as WireClientFrame, HostFrame, Lane as WireLane,
+    LaneBudgetFrame as WireLaneBudget, SyncConfigFrame as WireSyncConfig, Update as WireUpdate,
+};
 use beach_human::sync::terminal::{TerminalDeltaStream, TerminalSync};
-use beach_human::sync::{PriorityLane, ServerSynchronizer, SubscriptionId, SyncConfig};
-use beach_human::transport::{Transport, TransportKind, TransportMessage, TransportPair};
-use serde_json::{Value, json};
+use beach_human::sync::{LaneBudget, PriorityLane, ServerSynchronizer, SubscriptionId, SyncConfig};
+use beach_human::transport::{
+    Payload, Transport, TransportError, TransportKind, TransportMessage, TransportPair,
+};
+use tokio::time::{Instant as TokioInstant, sleep};
 
 #[test]
 fn late_joiner_receives_snapshot_and_roundtrips_input() {
@@ -60,18 +66,23 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
     let subscription = SubscriptionId(1);
     let mut synchronizer = ServerSynchronizer::new(terminal_sync.clone(), sync_config.clone());
     let hello = synchronizer.hello(subscription);
-    send_json(
+    let mut tx_cache = TransmitterCache::new();
+    tx_cache.reset(cols);
+
+    send_host_frame(
         host_transport.as_ref(),
-        json!({
-            "type": "hello",
-            "subscription": subscription.0,
-            "max_seq": hello.max_seq.0,
-            "config": encode_sync_config(&hello.config),
-        }),
+        HostFrame::Hello {
+            subscription: subscription.0,
+            max_seq: hello.max_seq.0,
+            config: sync_config_to_wire(&hello.config),
+        },
     );
-    send_json(
+    send_host_frame(
         host_transport.as_ref(),
-        json!({"type": "grid", "rows": rows, "cols": cols}),
+        HostFrame::Grid {
+            rows: rows as u32,
+            cols: cols as u32,
+        },
     );
 
     for lane in [
@@ -80,15 +91,24 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
         PriorityLane::History,
     ] {
         while let Some(chunk) = synchronizer.snapshot_chunk(subscription, lane) {
-            send_json(host_transport.as_ref(), encode_snapshot_chunk(&chunk));
+            let updates = tx_cache.apply_updates(&chunk.updates, false);
+            send_host_frame(
+                host_transport.as_ref(),
+                HostFrame::Snapshot {
+                    subscription: chunk.subscription_id.0,
+                    lane: map_lane(lane),
+                    watermark: chunk.watermark.0,
+                    has_more: chunk.has_more,
+                    updates,
+                },
+            );
             if !chunk.has_more {
-                send_json(
+                send_host_frame(
                     host_transport.as_ref(),
-                    json!({
-                        "type": "snapshot_complete",
-                        "subscription": subscription.0,
-                        "lane": lane_label(lane),
-                    }),
+                    HostFrame::SnapshotComplete {
+                        subscription: subscription.0,
+                        lane: map_lane(lane),
+                    },
                 );
                 break;
             }
@@ -99,31 +119,27 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
     let mut history_complete = false;
 
     while !history_complete {
-        let message = client_transport
-            .recv(Duration::from_secs(1))
-            .expect("snapshot message");
-        let text = message.payload.as_text().expect("text frame");
-        let value: Value = serde_json::from_str(text).expect("valid json");
-        match value["type"].as_str().unwrap_or("") {
-            "hello" => {}
-            "grid" => {
-                client_view = Some(ClientGrid::new(
-                    value["rows"].as_u64().unwrap() as usize,
-                    value["cols"].as_u64().unwrap() as usize,
-                ));
+        let frame = recv_host_frame(client_transport.as_ref(), Duration::from_secs(1));
+        match frame {
+            HostFrame::Hello { .. } => {}
+            HostFrame::Grid { rows, cols } => {
+                client_view = Some(ClientGrid::new(rows as usize, cols as usize));
             }
-            "snapshot" => {
+            HostFrame::Snapshot { updates, lane, .. } => {
                 let view = client_view.as_mut().expect("grid message before snapshot");
-                for update in value["updates"].as_array().unwrap() {
+                for update in &updates {
                     view.apply_update(update);
                 }
+                if lane == WireLane::History {
+                    // wait for completion frame
+                }
             }
-            "snapshot_complete" => {
-                if value["lane"].as_str() == Some("history") {
+            HostFrame::SnapshotComplete { lane, .. } => {
+                if lane == WireLane::History {
                     history_complete = true;
                 }
             }
-            other => panic!("unexpected snapshot message type: {other}"),
+            other => panic!("unexpected snapshot message: {other:?}"),
         }
     }
 
@@ -133,26 +149,30 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
     assert!(view.contains_row("host% "));
 
     let input_bytes = b"echo world\r";
-    let payload = json!({
-        "type": "input",
-        "seq": 1,
-        "data": BASE64.encode(input_bytes),
-    })
-    .to_string();
+    let client_input = WireClientFrame::Input {
+        seq: 1,
+        data: input_bytes.to_vec(),
+    };
     client_transport
-        .send(TransportMessage::text(0, payload))
+        .send(TransportMessage::binary(
+            0,
+            protocol::encode_client_frame_binary(&client_input),
+        ))
         .expect("send input");
 
     let inbound = host_transport
         .recv(Duration::from_secs(1))
         .expect("receive input frame");
-    let input_text = inbound.payload.as_text().expect("input json");
-    let parsed: Value = serde_json::from_str(input_text).expect("input payload json");
-    assert_eq!(parsed["type"], "input");
-    let decoded = BASE64
-        .decode(parsed["data"].as_str().unwrap().as_bytes())
-        .expect("decode input payload");
-    assert_eq!(decoded.as_slice(), input_bytes);
+    let ack_seq = match inbound.payload {
+        Payload::Binary(bytes) => match protocol::decode_client_frame_binary(&bytes) {
+            Ok(WireClientFrame::Input { seq, data }) => {
+                assert_eq!(data.as_slice(), input_bytes);
+                seq
+            }
+            other => panic!("unexpected client frame: {other:?}"),
+        },
+        Payload::Text(text) => panic!("unexpected text payload: {text}"),
+    };
 
     apply_row(
         &grid,
@@ -179,17 +199,37 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
         delta_stream.as_ref(),
     );
 
-    send_json(
+    send_host_frame(
         host_transport.as_ref(),
-        json!({"type": "input_ack", "seq": parsed["seq"].clone()}),
+        HostFrame::InputAck { seq: ack_seq },
     );
 
     let mut last_seq = hello.max_seq.0;
     while let Some(batch) = synchronizer.delta_batch(subscription, last_seq) {
         if batch.updates.is_empty() {
+            if batch.has_more {
+                last_seq = batch.watermark.0;
+                continue;
+            }
             break;
         }
-        send_json(host_transport.as_ref(), encode_delta_batch(&batch));
+        let updates = tx_cache.apply_updates(&batch.updates, true);
+        if updates.is_empty() {
+            last_seq = batch.watermark.0;
+            if !batch.has_more {
+                break;
+            }
+            continue;
+        }
+        send_host_frame(
+            host_transport.as_ref(),
+            HostFrame::Delta {
+                subscription: batch.subscription_id.0,
+                watermark: batch.watermark.0,
+                has_more: batch.has_more,
+                updates,
+            },
+        );
         last_seq = batch.watermark.0;
         if !batch.has_more {
             break;
@@ -200,19 +240,20 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
     let mut saw_ack = false;
     let mut saw_world = false;
     for _ in 0..6 {
-        let message = client_transport
-            .recv(Duration::from_secs(1))
-            .expect("delta or ack");
-        let text = message.payload.as_text().expect("text frame");
-        let value: Value = serde_json::from_str(text).expect("json");
-        match value["type"].as_str().unwrap_or("") {
-            "input_ack" => saw_ack = true,
-            "delta" => {
-                for update in value["updates"].as_array().unwrap() {
+        let frame = recv_host_frame(client_transport.as_ref(), Duration::from_secs(1));
+        match frame {
+            HostFrame::InputAck { .. } => saw_ack = true,
+            HostFrame::Delta { updates, .. } => {
+                for update in &updates {
                     view.apply_update(update);
                 }
             }
-            other => panic!("unexpected post-input message: {other}"),
+            HostFrame::Heartbeat { .. }
+            | HostFrame::Hello { .. }
+            | HostFrame::Grid { .. }
+            | HostFrame::Snapshot { .. }
+            | HostFrame::SnapshotComplete { .. }
+            | HostFrame::Shutdown => {}
         }
         if view.contains_row("host% echo world") && view.contains_row("world") {
             saw_world = true;
@@ -267,6 +308,163 @@ impl TerminalDeltaStream for BufferedDeltaStream {
     }
 }
 
+#[derive(Debug, Default)]
+struct TransmitterCache {
+    cols: usize,
+    rows: HashMap<usize, Vec<u64>>,
+    styles: HashMap<u32, (u32, u32, u8)>,
+}
+
+impl TransmitterCache {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn reset(&mut self, cols: usize) {
+        self.cols = cols;
+        self.rows.clear();
+        self.styles.clear();
+    }
+
+    fn apply_updates(&mut self, updates: &[CacheUpdate], dedupe: bool) -> Vec<WireUpdate> {
+        let mut out = Vec::with_capacity(updates.len());
+        for update in updates {
+            match update {
+                CacheUpdate::Row(row) => {
+                    let cells: Vec<u64> = row.cells.iter().map(|c| (*c).into()).collect();
+                    let changed = if dedupe {
+                        self.rows
+                            .get(&row.row)
+                            .map(|existing| existing != &cells)
+                            .unwrap_or(true)
+                    } else {
+                        true
+                    };
+                    self.cols = self.cols.max(cells.len());
+                    self.rows.insert(row.row, cells.clone());
+                    if changed {
+                        out.push(WireUpdate::Row {
+                            row: usize_to_u32(row.row),
+                            seq: row.seq,
+                            cells,
+                        });
+                    }
+                }
+                CacheUpdate::Rect(rect) => {
+                    let mut changed = !dedupe;
+                    let value: u64 = rect.cell.into();
+                    self.cols = self.cols.max(rect.cols.end);
+                    for r in rect.rows.clone() {
+                        let row_vec = self.ensure_row_capacity(r, rect.cols.end);
+                        for c in rect.cols.clone() {
+                            if dedupe && !changed && row_vec[c] != value {
+                                changed = true;
+                            }
+                            row_vec[c] = value;
+                        }
+                    }
+                    if changed {
+                        out.push(WireUpdate::Rect {
+                            rows: [usize_to_u32(rect.rows.start), usize_to_u32(rect.rows.end)],
+                            cols: [usize_to_u32(rect.cols.start), usize_to_u32(rect.cols.end)],
+                            seq: rect.seq,
+                            cell: value,
+                        });
+                    }
+                }
+                CacheUpdate::Cell(cell) => {
+                    let value: u64 = cell.cell.into();
+                    let row_vec = self.ensure_row_capacity(cell.row, cell.col + 1);
+                    let previous = row_vec[cell.col];
+                    row_vec[cell.col] = value;
+                    if !dedupe || previous != value {
+                        out.push(WireUpdate::Cell {
+                            row: usize_to_u32(cell.row),
+                            col: usize_to_u32(cell.col),
+                            seq: cell.seq,
+                            cell: value,
+                        });
+                    }
+                }
+                CacheUpdate::Trim(trim) => {
+                    self.trim_rows(trim.start, trim.count);
+                    out.push(WireUpdate::Trim {
+                        start: usize_to_u32(trim.start),
+                        count: usize_to_u32(trim.count),
+                        seq: trim.seq(),
+                    });
+                }
+                CacheUpdate::Style(style) => {
+                    let current = (style.style.fg, style.style.bg, style.style.attrs);
+                    let prev = self.styles.insert(style.id.0, current);
+                    if !dedupe || prev.map_or(true, |value| value != current) {
+                        out.push(WireUpdate::Style {
+                            id: style.id.0,
+                            seq: style.seq,
+                            fg: style.style.fg,
+                            bg: style.style.bg,
+                            attrs: style.style.attrs,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn ensure_row_capacity(&mut self, row: usize, min_cols: usize) -> &mut Vec<u64> {
+        let columns = self.cols.max(min_cols);
+        let entry = self
+            .rows
+            .entry(row)
+            .or_insert_with(|| vec![0; columns.max(1)]);
+        if entry.len() < columns {
+            entry.resize(columns, 0);
+        }
+        if entry.len() < min_cols {
+            entry.resize(min_cols, 0);
+        }
+        entry
+    }
+
+    fn trim_rows(&mut self, start: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let end = start.saturating_add(count);
+        self.rows.retain(|row, _| *row >= end);
+    }
+}
+
+fn usize_to_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn map_lane(lane: PriorityLane) -> WireLane {
+    match lane {
+        PriorityLane::Foreground => WireLane::Foreground,
+        PriorityLane::Recent => WireLane::Recent,
+        PriorityLane::History => WireLane::History,
+    }
+}
+
+fn sync_config_to_wire(config: &SyncConfig) -> WireSyncConfig {
+    let snapshot_budgets = config
+        .snapshot_budgets
+        .iter()
+        .map(|LaneBudget { lane, max_updates }| WireLaneBudget {
+            lane: map_lane(*lane),
+            max_updates: *max_updates as u32,
+        })
+        .collect();
+
+    WireSyncConfig {
+        snapshot_budgets,
+        delta_budget: config.delta_budget as u32,
+        heartbeat_ms: config.heartbeat_interval.as_millis() as u64,
+    }
+}
+
 struct ClientGrid {
     rows: usize,
     cols: usize,
@@ -282,68 +480,56 @@ impl ClientGrid {
         }
     }
 
-    fn apply_update(&mut self, update: &Value) {
-        match update["kind"].as_str().unwrap_or("") {
-            "row" => self.apply_row(update),
-            "cell" => self.apply_cell(update),
-            "rect" => self.apply_rect(update),
-            other => panic!("unknown update kind: {other}"),
-        }
-    }
-
-    fn apply_row(&mut self, update: &Value) {
-        let row = update["row"].as_u64().unwrap() as usize;
-        if row >= self.rows {
-            return;
-        }
-        if let Some(text) = update["text"].as_str() {
-            let mut chars = text.chars();
-            for col in 0..self.cols {
-                self.cells[row][col] = chars.next().unwrap_or(' ');
+    fn apply_update(&mut self, update: &WireUpdate) {
+        match update {
+            WireUpdate::Row { row, cells, .. } => {
+                let row = *row as usize;
+                if row >= self.rows {
+                    return;
+                }
+                for (col, cell) in cells.iter().enumerate().take(self.cols) {
+                    self.cells[row][col] = decode_cell(*cell);
+                }
             }
-        } else if let Some(cells) = update["cells"].as_array() {
-            for col in 0..self.cols {
-                let ch = cells
-                    .get(col)
-                    .and_then(|entry| entry["ch"].as_str())
-                    .and_then(|s| s.chars().next())
-                    .unwrap_or(' ');
-                self.cells[row][col] = ch;
+            WireUpdate::Cell { row, col, cell, .. } => {
+                let row = *row as usize;
+                let col = *col as usize;
+                if row < self.rows && col < self.cols {
+                    self.cells[row][col] = decode_cell(*cell);
+                }
             }
-        }
-    }
-
-    fn apply_cell(&mut self, update: &Value) {
-        let row = update["row"].as_u64().unwrap() as usize;
-        let col = update["col"].as_u64().unwrap() as usize;
-        if row < self.rows && col < self.cols {
-            let ch = update["char"]
-                .as_str()
-                .unwrap()
-                .chars()
-                .next()
-                .unwrap_or(' ');
-            self.cells[row][col] = ch;
-        }
-    }
-
-    fn apply_rect(&mut self, update: &Value) {
-        let rows = update["rows"].as_array().unwrap();
-        let cols = update["cols"].as_array().unwrap();
-        let row0 = rows[0].as_u64().unwrap() as usize;
-        let row1 = rows[1].as_u64().unwrap() as usize;
-        let col0 = cols[0].as_u64().unwrap() as usize;
-        let col1 = cols[1].as_u64().unwrap() as usize;
-        let ch = update["char"]
-            .as_str()
-            .unwrap()
-            .chars()
-            .next()
-            .unwrap_or(' ');
-        for row in row0..row1.min(self.rows) {
-            for col in col0..col1.min(self.cols) {
-                self.cells[row][col] = ch;
+            WireUpdate::Rect {
+                rows, cols, cell, ..
+            } => {
+                let row0 = rows[0] as usize;
+                let row1 = rows[1] as usize;
+                let col0 = cols[0] as usize;
+                let col1 = cols[1] as usize;
+                let ch = decode_cell(*cell);
+                for row in row0..row1.min(self.rows) {
+                    for col in col0..col1.min(self.cols) {
+                        self.cells[row][col] = ch;
+                    }
+                }
             }
+            WireUpdate::RowSegment {
+                row,
+                start_col,
+                cells,
+                ..
+            } => {
+                let row = *row as usize;
+                if row >= self.rows {
+                    return;
+                }
+                for (idx, cell) in cells.iter().enumerate() {
+                    let col = *start_col as usize + idx;
+                    if col < self.cols {
+                        self.cells[row][col] = decode_cell(*cell);
+                    }
+                }
+            }
+            WireUpdate::Trim { .. } | WireUpdate::Style { .. } => {}
         }
     }
 
@@ -407,128 +593,65 @@ fn row_string(grid: &TerminalGrid, row: usize) -> String {
     text
 }
 
-fn send_json(transport: &dyn Transport, value: Value) {
-    let text = value.to_string();
-    transport
-        .send_text(&text)
-        .expect("transport send should succeed");
+fn send_host_frame(transport: &dyn Transport, frame: HostFrame) {
+    let bytes = protocol::encode_host_frame_binary(&frame);
+    transport.send_bytes(&bytes).expect("send frame");
 }
 
-fn encode_snapshot_chunk(chunk: &beach_human::sync::SnapshotChunk<CacheUpdate>) -> Value {
-    json!({
-        "type": "snapshot",
-        "subscription": chunk.subscription_id.0,
-        "lane": lane_label(chunk.lane),
-        "watermark": chunk.watermark.0,
-        "has_more": chunk.has_more,
-        "updates": chunk
-            .updates
-            .iter()
-            .map(encode_update)
-            .collect::<Vec<_>>(),
-    })
+fn recv_host_frame(transport: &dyn Transport, timeout: StdDuration) -> HostFrame {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match transport.recv(timeout) {
+            Ok(message) => match message.payload {
+                Payload::Binary(bytes) => {
+                    return protocol::decode_host_frame_binary(&bytes).expect("host frame");
+                }
+                Payload::Text(text) => {
+                    let trimmed = text.trim();
+                    if trimmed == "__ready__" || trimmed == "__offer_ready__" {
+                        continue;
+                    }
+                }
+            },
+            Err(TransportError::Timeout) => {
+                if Instant::now() >= deadline {
+                    panic!("timed out waiting for frame");
+                }
+                continue;
+            }
+            Err(TransportError::ChannelClosed) => panic!("transport channel closed"),
+            Err(err) => panic!("transport error: {err}"),
+        }
+    }
 }
 
-fn encode_delta_batch(batch: &beach_human::sync::DeltaBatch<CacheUpdate>) -> Value {
-    json!({
-        "type": "delta",
-        "subscription": batch.subscription_id.0,
-        "watermark": batch.watermark.0,
-        "has_more": batch.has_more,
-        "updates": batch
-            .updates
-            .iter()
-            .map(encode_update)
-            .collect::<Vec<_>>(),
-    })
-}
-
-fn encode_sync_config(config: &SyncConfig) -> Value {
-    json!({
-        "snapshot_budgets": config
-            .snapshot_budgets
-            .iter()
-            .map(|budget| json!({
-                "lane": lane_label(budget.lane),
-                "max_updates": budget.max_updates,
-            }))
-            .collect::<Vec<_>>(),
-        "delta_budget": config.delta_budget,
-        "heartbeat_ms": config.heartbeat_interval.as_millis(),
-    })
-}
-
-fn lane_label(lane: PriorityLane) -> &'static str {
-    match lane {
-        PriorityLane::Foreground => "foreground",
-        PriorityLane::Recent => "recent",
-        PriorityLane::History => "history",
+async fn recv_host_frame_async(transport: &Arc<dyn Transport>, timeout: StdDuration) -> HostFrame {
+    let deadline = TokioInstant::now() + timeout;
+    loop {
+        match transport.try_recv() {
+            Ok(Some(message)) => match message.payload {
+                Payload::Binary(bytes) => {
+                    return protocol::decode_host_frame_binary(&bytes).expect("host frame");
+                }
+                Payload::Text(text) => {
+                    let trimmed = text.trim();
+                    if trimmed == "__ready__" || trimmed == "__offer_ready__" {
+                        continue;
+                    }
+                }
+            },
+            Ok(None) => {}
+            Err(TransportError::ChannelClosed) => panic!("transport channel closed"),
+            Err(err) => panic!("transport error: {err}"),
+        }
+        if TokioInstant::now() >= deadline {
+            panic!("timed out waiting for frame");
+        }
+        sleep(StdDuration::from_millis(10)).await;
     }
 }
 
-fn encode_update(update: &CacheUpdate) -> Value {
-    match update {
-        CacheUpdate::Cell(cell) => {
-            let (ch, style) = terminal::unpack_cell(cell.cell);
-            json!({
-                "kind": "cell",
-                "row": cell.row,
-                "col": cell.col,
-                "seq": cell.seq,
-                "char": ch.to_string(),
-                "style": style.0,
-            })
-        }
-        CacheUpdate::Rect(rect) => {
-            let (ch, style) = terminal::unpack_cell(rect.cell);
-            json!({
-                "kind": "rect",
-                "rows": [rect.rows.start, rect.rows.end],
-                "cols": [rect.cols.start, rect.cols.end],
-                "seq": rect.seq,
-                "char": ch.to_string(),
-                "style": style.0,
-            })
-        }
-        CacheUpdate::Row(row) => {
-            json!({
-                "kind": "row",
-                "row": row.row,
-                "seq": row.seq,
-                "text": row
-                    .cells
-                    .iter()
-                    .map(|cell| terminal::unpack_cell(*cell).0)
-                    .collect::<String>(),
-                "cells": row
-                    .cells
-                    .iter()
-                    .map(|cell| {
-                        let (ch, style) = terminal::unpack_cell(*cell);
-                        json!({
-                            "ch": ch.to_string(),
-                            "style": style.0,
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            })
-        }
-        CacheUpdate::Trim(trim) => {
-            json!({
-                "kind": "trim",
-                "start": trim.start,
-                "count": trim.count,
-            })
-        }
-        CacheUpdate::Style(style) => {
-            json!({
-                "kind": "style",
-                "id": style.id.0,
-                "seq": style.seq,
-                "fg": style.style.fg,
-                "bg": style.style.bg,
-                "attrs": style.style.attrs,
-            })
-        }
-    }
+fn decode_cell(cell: u64) -> char {
+    let packed = terminal::PackedCell::from(cell);
+    terminal::unpack_cell(packed).0
 }

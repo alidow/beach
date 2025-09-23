@@ -1,13 +1,12 @@
 #![recursion_limit = "1024"]
 
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use beach_human::cache::terminal::{TerminalGrid, unpack_cell};
+use beach_human::cache::terminal::TerminalGrid;
 use beach_human::cache::{GridCache, Seq};
 use beach_human::client::terminal::{ClientError, TerminalClient};
 use beach_human::model::terminal::diff::CacheUpdate;
 use beach_human::protocol::{
-    self, HostFrame, Lane as WireLane, LaneBudgetFrame as WireLaneBudget,
-    SyncConfigFrame as WireSyncConfig, Update as WireUpdate,
+    self, ClientFrame as WireClientFrame, HostFrame, Lane as WireLane,
+    LaneBudgetFrame as WireLaneBudget, SyncConfigFrame as WireSyncConfig, Update as WireUpdate,
 };
 use beach_human::server::terminal::{
     AlacrittyEmulator, Command as PtyCommand, LocalEcho, PtyProcess, PtyWriter, SpawnConfig,
@@ -18,18 +17,14 @@ use beach_human::session::{
     TransportOffer,
 };
 use beach_human::sync::terminal::{TerminalDeltaStream, TerminalSync};
-use beach_human::sync::{
-    DeltaBatch, LaneBudget, PriorityLane, ServerHello, ServerSynchronizer, SnapshotChunk,
-    SubscriptionId, SyncConfig,
-};
+use beach_human::sync::{LaneBudget, PriorityLane, ServerSynchronizer, SubscriptionId, SyncConfig};
 use beach_human::telemetry::logging::{self as logctl, LogConfig, LogLevel};
 use beach_human::telemetry::{self, PerfGuard};
 use beach_human::transport::webrtc::WebRtcRole;
-use beach_human::transport::{self, Transport, TransportError, TransportKind};
+use beach_human::transport::{self, Payload, Transport, TransportError, TransportKind};
 use clap::{Args, Parser, Subcommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Read, Write};
@@ -296,17 +291,9 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     // redraws cleanly (mirrors the legacy apps/beach behaviour).
     drop(raw_guard);
 
-    let _ = send_host_frame_with_fallback(
-        &transport,
-        || HostFrame::Shutdown,
-        || json!({"type": "shutdown"}),
-    );
+    let _ = send_host_frame(&transport, HostFrame::Shutdown);
     if let Some(server) = &local_server_transport {
-        let _ = send_host_frame_with_fallback(
-            server,
-            || HostFrame::Shutdown,
-            || json!({"type": "shutdown"}),
-        );
+        let _ = send_host_frame(server, HostFrame::Shutdown);
     }
 
     if let Err(err) = updates_task.await {
@@ -632,18 +619,11 @@ impl HeartbeatPublisher {
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis();
-                if !send_host_frame_with_fallback(
+                if !send_host_frame(
                     &self.transport,
-                    || HostFrame::Heartbeat {
+                    HostFrame::Heartbeat {
                         seq: count as u64,
                         timestamp_ms: now as u64,
-                    },
-                    || {
-                        json!({
-                            "type": "heartbeat",
-                            "seq": count as u64,
-                            "timestamp_ms": now,
-                        })
                     },
                 ) {
                     eprintln!("⚠️  heartbeat send failed");
@@ -683,6 +663,26 @@ fn detect_terminal_size() -> (u16, u16) {
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(24);
     (cols.max(20), rows.max(10))
+}
+
+fn send_host_frame(transport: &Arc<dyn Transport>, frame: HostFrame) -> bool {
+    let encode_start = Instant::now();
+    let bytes = protocol::encode_host_frame_binary(&frame);
+    let elapsed = encode_start.elapsed();
+    match &frame {
+        HostFrame::Snapshot { .. } => telemetry::record_duration("sync_encode_snapshot", elapsed),
+        HostFrame::Delta { .. } => telemetry::record_duration("sync_encode_delta", elapsed),
+        _ => telemetry::record_duration("sync_encode_frame", elapsed),
+    }
+    transport.send_bytes(&bytes).is_ok()
+}
+
+fn map_lane(lane: PriorityLane) -> WireLane {
+    match lane {
+        PriorityLane::Foreground => WireLane::Foreground,
+        PriorityLane::Recent => WireLane::Recent,
+        PriorityLane::History => WireLane::History,
+    }
 }
 
 struct RawModeGuard(bool);
@@ -729,111 +729,113 @@ fn spawn_input_listener(
         );
         loop {
             match transport.recv(Duration::from_millis(250)) {
-                Ok(message) => {
-                    if let Some(text) = message.payload.as_text() {
-                        match serde_json::from_str::<ClientFrame>(text) {
-                            Ok(ClientFrame::Input { seq, data }) => {
-                                if seq <= last_seq {
-                                    trace!(
-                                        target = "sync::incoming",
-                                        transport_id,
-                                        transport = ?transport_kind,
-                                        seq,
-                                        "dropping duplicate input sequence"
-                                    );
-                                    continue;
-                                }
-                                match BASE64.decode(data.as_bytes()) {
-                                    Ok(bytes) => {
-                                        if let Err(err) = writer.write(&bytes) {
-                                            error!(
-                                                target = "sync::incoming",
-                                                transport_id,
-                                                transport = ?transport_kind,
-                                                seq,
-                                                error = %err,
-                                                "pty write failed"
-                                            );
-                                            break;
-                                        }
-                                        if tracing::enabled!(Level::TRACE) {
-                                            trace!(
-                                                target = "sync::incoming",
-                                                transport_id,
-                                                transport = ?transport_kind,
-                                                seq,
-                                                bytes = bytes.len(),
-                                                dump = %logctl::hexdump(&bytes),
-                                                "client input bytes"
-                                            );
-                                        }
-                                        last_seq = seq;
-                                        let _ = send_host_frame_with_fallback(
-                                            &transport,
-                                            || HostFrame::InputAck { seq },
-                                            || {
-                                                json!({
-                                                    "type": "input_ack",
-                                                    "seq": seq,
-                                                })
-                                            },
-                                        );
-                                        debug!(
-                                            target = "sync::incoming",
-                                            transport_id,
-                                            transport = ?transport_kind,
-                                            seq,
-                                            "input applied and acked"
-                                        );
-                                    }
-                                    Err(err) => {
-                                        warn!(
-                                            target = "sync::incoming",
-                                            transport_id,
-                                            transport = ?transport_kind,
-                                            seq,
-                                            error = %err,
-                                            "invalid input payload"
-                                        );
-                                    }
-                                }
-                            }
-                            Ok(ClientFrame::Resize { cols, rows }) => {
-                                if let Err(err) = process.resize(cols, rows) {
-                                    warn!(
-                                        target = "sync::incoming",
-                                        transport_id,
-                                        transport = ?transport_kind,
-                                        error = %err,
-                                        cols,
-                                        rows,
-                                        "pty resize failed"
-                                    );
-                                }
-                                if let Ok(mut guard) = emulator.lock() {
-                                    guard.resize(rows as usize, cols as usize);
-                                }
-                                let _ = send_host_frame_with_fallback(
-                                    &transport,
-                                    || HostFrame::Grid {
-                                        rows: rows as u32,
-                                        cols: cols as u32,
-                                    },
-                                    || encode_grid_descriptor(rows as usize, cols as usize),
-                                );
-                                debug!(
+                Ok(message) => match message.payload {
+                    Payload::Binary(bytes) => match protocol::decode_client_frame_binary(&bytes) {
+                        Ok(WireClientFrame::Input { seq, data }) => {
+                            if seq <= last_seq {
+                                trace!(
                                     target = "sync::incoming",
                                     transport_id,
                                     transport = ?transport_kind,
-                                    cols,
-                                    rows,
-                                    "processed resize request"
+                                    seq,
+                                    "dropping duplicate input sequence"
+                                );
+                                continue;
+                            }
+                            if let Err(err) = writer.write(&data) {
+                                error!(
+                                    target = "sync::incoming",
+                                    transport_id,
+                                    transport = ?transport_kind,
+                                    seq,
+                                    error = %err,
+                                    "pty write failed"
+                                );
+                                break;
+                            }
+                            if tracing::enabled!(Level::TRACE) {
+                                trace!(
+                                    target = "sync::incoming",
+                                    transport_id,
+                                    transport = ?transport_kind,
+                                    seq,
+                                    bytes = data.len(),
+                                    dump = %logctl::hexdump(&data),
+                                    "client input bytes"
                                 );
                             }
-                            Ok(ClientFrame::Unknown) | Err(_) => {}
+                            last_seq = seq;
+                            let _ = send_host_frame(&transport, HostFrame::InputAck { seq });
+                            debug!(
+                                target = "sync::incoming",
+                                transport_id,
+                                transport = ?transport_kind,
+                                seq,
+                                "input applied and acked"
+                            );
+                        }
+                        Ok(WireClientFrame::Resize { cols, rows }) => {
+                            if let Err(err) = process.resize(cols, rows) {
+                                warn!(
+                                    target = "sync::incoming",
+                                    transport_id,
+                                    transport = ?transport_kind,
+                                    error = %err,
+                                    cols,
+                                    rows,
+                                    "pty resize failed"
+                                );
+                            }
+                            if let Ok(mut guard) = emulator.lock() {
+                                guard.resize(rows as usize, cols as usize);
+                            }
+                            let _ = send_host_frame(
+                                &transport,
+                                HostFrame::Grid {
+                                    rows: rows as u32,
+                                    cols: cols as u32,
+                                },
+                            );
+                            debug!(
+                                target = "sync::incoming",
+                                transport_id,
+                                transport = ?transport_kind,
+                                cols,
+                                rows,
+                                "processed resize request"
+                            );
+                        }
+                        Ok(WireClientFrame::Unknown) => {}
+                        Err(err) => {
+                            warn!(
+                                target = "sync::incoming",
+                                transport_id,
+                                transport = ?transport_kind,
+                                error = %err,
+                                "failed to decode client frame"
+                            );
+                        }
+                    },
+                    Payload::Text(text) => {
+                        let trimmed = text.trim();
+                        if trimmed == "__ready__" || trimmed == "__offer_ready__" {
+                            trace!(
+                                target = "sync::incoming",
+                                transport_id,
+                                transport = ?transport_kind,
+                                "ignoring handshake sentinel"
+                            );
+                        } else {
+                            debug!(
+                                target = "sync::incoming",
+                                transport_id,
+                                transport = ?transport_kind,
+                                payload = %trimmed,
+                                "ignoring unexpected text payload"
+                            );
                         }
                     }
-                }
+                },
                 Err(TransportError::Timeout) => continue,
                 Err(TransportError::ChannelClosed) => break,
                 Err(err) => {
@@ -1205,20 +1207,14 @@ fn spawn_update_forwarder(
                                     telemetry::record_gauge("sync_delta_batch_updates", batch.updates.len() as u64);
                                     let converted_updates = sink.cache.apply_updates(&batch.updates, true);
                                     let _guard = PerfGuard::new("sync_send_delta");
-                                    let sent = send_host_frame_with_fallback(
+                                    let sent = send_host_frame(
                                         &sink.transport,
-                                        {
-                                            let subscription_id = batch.subscription_id.0;
-                                            let watermark = batch.watermark.0;
-                                            let has_more = batch.has_more;
-                                            move || HostFrame::Delta {
-                                                subscription: subscription_id,
-                                                watermark,
-                                                has_more,
-                                                updates: converted_updates,
-                                            }
+                                        HostFrame::Delta {
+                                            subscription: batch.subscription_id.0,
+                                            watermark: batch.watermark.0,
+                                            has_more: batch.has_more,
+                                            updates: converted_updates,
                                         },
-                                        || encode_delta_batch(&batch),
                                     );
                                     if !sent {
                                         sink.handshake_complete = false;
@@ -1272,19 +1268,13 @@ fn initialize_transport_snapshot(
         transport = ?transport.kind(),
         "sending server hello"
     );
-    if !send_host_frame_with_fallback(
+    if !send_host_frame(
         transport,
-        {
-            let subscription = hello.subscription_id.0;
-            let max_seq = hello.max_seq.0;
-            let config = sync_config_to_wire(&hello.config);
-            move || HostFrame::Hello {
-                subscription,
-                max_seq,
-                config,
-            }
+        HostFrame::Hello {
+            subscription: hello.subscription_id.0,
+            max_seq: hello.max_seq.0,
+            config: sync_config_to_wire(&hello.config),
         },
-        || encode_server_hello(&hello),
     ) {
         return None;
     }
@@ -1298,13 +1288,12 @@ fn initialize_transport_snapshot(
         cols,
         "sending grid descriptor"
     );
-    if !send_host_frame_with_fallback(
+    if !send_host_frame(
         transport,
-        move || HostFrame::Grid {
+        HostFrame::Grid {
             rows: rows as u32,
             cols: cols as u32,
         },
-        || encode_grid_descriptor(rows, cols),
     ) {
         return None;
     }
@@ -1319,220 +1308,6 @@ fn initialize_transport_snapshot(
         "initial snapshots transmitted"
     );
     Some((synchronizer, hello.max_seq.0))
-}
-
-fn encode_update(update: &CacheUpdate) -> Value {
-    match update {
-        CacheUpdate::Cell(cell) => {
-            let (ch, style) = unpack_cell(cell.cell);
-            json!({
-                "kind": "cell",
-                "row": cell.row,
-                "col": cell.col,
-                "seq": cell.seq,
-                "char": ch.to_string(),
-                "style": style.0,
-            })
-        }
-        CacheUpdate::Rect(rect) => {
-            let (ch, style) = unpack_cell(rect.cell);
-            json!({
-                "kind": "rect",
-                "rows": [rect.rows.start, rect.rows.end],
-                "cols": [rect.cols.start, rect.cols.end],
-                "seq": rect.seq,
-                "char": ch.to_string(),
-                "style": style.0,
-            })
-        }
-        CacheUpdate::Row(row) => {
-            let mut text = String::with_capacity(row.cells.len());
-            let cells: Vec<Value> = row
-                .cells
-                .iter()
-                .map(|cell| {
-                    let (ch, style) = unpack_cell(*cell);
-                    text.push(ch);
-                    json!({
-                        "ch": ch.to_string(),
-                        "style": style.0,
-                    })
-                })
-                .collect();
-            json!({
-                "kind": "row",
-                "row": row.row,
-                "seq": row.seq,
-                "text": text,
-                "cells": cells,
-            })
-        }
-        CacheUpdate::Trim(trim) => {
-            json!({
-                "kind": "trim",
-                "start": trim.start,
-                "count": trim.count,
-            })
-        }
-        CacheUpdate::Style(style) => {
-            json!({
-                "kind": "style",
-                "id": style.id.0,
-                "seq": style.seq,
-                "fg": style.style.fg,
-                "bg": style.style.bg,
-                "attrs": style.style.attrs,
-            })
-        }
-    }
-}
-
-fn lane_label(lane: PriorityLane) -> &'static str {
-    match lane {
-        PriorityLane::Foreground => "foreground",
-        PriorityLane::Recent => "recent",
-        PriorityLane::History => "history",
-    }
-}
-
-fn send_host_frame_with_fallback<F, G>(
-    transport: &Arc<dyn Transport>,
-    frame_builder: F,
-    json_builder: G,
-) -> bool
-where
-    F: FnOnce() -> HostFrame,
-    G: FnOnce() -> Value,
-{
-    if protocol::binary_protocol_enabled() {
-        let frame = frame_builder();
-        send_host_frame_binary(transport, &frame)
-    } else {
-        let value = json_builder();
-        send_json_value(transport, value)
-    }
-}
-
-fn send_host_frame_binary(transport: &Arc<dyn Transport>, frame: &HostFrame) -> bool {
-    let frame_type = host_frame_type(frame);
-    if tracing::enabled!(Level::DEBUG) {
-        let transport_id = transport.id().0;
-        let transport_kind = transport.kind();
-        debug!(
-            target = "sync::outgoing",
-            transport_id,
-            transport = ?transport_kind,
-            frame = frame_type,
-            "sending frame"
-        );
-    }
-
-    let bytes = protocol::encode_host_frame_binary(frame);
-    telemetry::record_bytes("sync_send_bytes", bytes.len());
-    let _guard = PerfGuard::new("sync_send_binary");
-    if tracing::enabled!(Level::TRACE) {
-        trace!(
-            target = "sync::outgoing",
-            transport_id = transport.id().0,
-            transport = ?transport.kind(),
-            frame = frame_type,
-            bytes = bytes.len(),
-            payload = %logctl::hexdump(&bytes),
-            "frame payload"
-        );
-    }
-    match transport.send_bytes(&bytes) {
-        Ok(_) => true,
-        Err(TransportError::ChannelClosed) => false,
-        Err(err) => {
-            warn!(
-                target = "sync::outgoing",
-                transport_id = transport.id().0,
-                transport = ?transport.kind(),
-                frame = frame_type,
-                error = %err,
-                "transport send failed"
-            );
-            false
-        }
-    }
-}
-
-fn send_json_value(transport: &Arc<dyn Transport>, value: Value) -> bool {
-    let frame_type = value
-        .get("type")
-        .and_then(Value::as_str)
-        .map(|s| s.to_owned())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    match serde_json::to_string(&value) {
-        Ok(text) => {
-            if tracing::enabled!(Level::DEBUG) {
-                let transport_id = transport.id().0;
-                let transport_kind = transport.kind();
-                debug!(
-                    target = "sync::outgoing",
-                    transport_id,
-                    transport = ?transport_kind,
-                    frame = %frame_type,
-                    "sending frame"
-                );
-                if tracing::enabled!(Level::TRACE) {
-                    trace!(
-                        target = "sync::outgoing",
-                        transport_id,
-                        transport = ?transport_kind,
-                        frame = %frame_type,
-                        payload = %text,
-                        "frame payload"
-                    );
-                }
-            }
-
-            telemetry::record_bytes("sync_send_bytes", text.len());
-            let _guard = PerfGuard::new("sync_send_json");
-            match transport.send_text(&text) {
-                Ok(_) => true,
-                Err(TransportError::ChannelClosed) => false,
-                Err(err) => {
-                    warn!(
-                        target = "sync::outgoing",
-                        transport_id = transport.id().0,
-                        transport = ?transport.kind(),
-                        frame = %frame_type,
-                        error = %err,
-                        "transport send failed"
-                    );
-                    false
-                }
-            }
-        }
-        Err(err) => {
-            error!(target = "sync::outgoing", frame = %frame_type, error = %err, "failed to encode message");
-            false
-        }
-    }
-}
-
-fn host_frame_type(frame: &HostFrame) -> &'static str {
-    match frame {
-        HostFrame::Heartbeat { .. } => "heartbeat",
-        HostFrame::Hello { .. } => "hello",
-        HostFrame::Grid { .. } => "grid",
-        HostFrame::Snapshot { .. } => "snapshot",
-        HostFrame::SnapshotComplete { .. } => "snapshot_complete",
-        HostFrame::Delta { .. } => "delta",
-        HostFrame::InputAck { .. } => "input_ack",
-        HostFrame::Shutdown => "shutdown",
-    }
-}
-
-fn map_lane(lane: PriorityLane) -> WireLane {
-    match lane {
-        PriorityLane::Foreground => WireLane::Foreground,
-        PriorityLane::Recent => WireLane::Recent,
-        PriorityLane::History => WireLane::History,
-    }
 }
 
 fn sync_config_to_wire(config: &SyncConfig) -> WireSyncConfig {
@@ -1550,134 +1325,6 @@ fn sync_config_to_wire(config: &SyncConfig) -> WireSyncConfig {
         delta_budget: config.delta_budget as u32,
         heartbeat_ms: config.heartbeat_interval.as_millis() as u64,
     }
-}
-
-fn encode_sync_config(config: &SyncConfig) -> Value {
-    let budgets: Vec<Value> = config
-        .snapshot_budgets
-        .iter()
-        .map(|LaneBudget { lane, max_updates }| {
-            json!({
-                "lane": lane_label(*lane),
-                "max_updates": max_updates,
-            })
-        })
-        .collect();
-
-    json!({
-        "snapshot_budgets": budgets,
-        "delta_budget": config.delta_budget,
-        "heartbeat_ms": config.heartbeat_interval.as_millis(),
-    })
-}
-
-fn encode_grid_descriptor(rows: usize, cols: usize) -> Value {
-    json!({
-        "type": "grid",
-        "rows": rows,
-        "cols": cols,
-    })
-}
-
-fn encode_server_hello(hello: &ServerHello) -> Value {
-    json!({
-        "type": "hello",
-        "subscription": hello.subscription_id.0,
-        "max_seq": hello.max_seq.0,
-        "config": encode_sync_config(&hello.config),
-    })
-}
-
-fn encode_snapshot_chunk(chunk: &SnapshotChunk<CacheUpdate>) -> Value {
-    json!({
-        "type": "snapshot",
-        "subscription": chunk.subscription_id.0,
-        "lane": lane_label(chunk.lane),
-        "watermark": chunk.watermark.0,
-        "has_more": chunk.has_more,
-        "updates": chunk.updates.iter().map(encode_update).collect::<Vec<_>>(),
-    })
-}
-
-fn encode_delta_updates(updates: &[CacheUpdate]) -> Vec<Value> {
-    use serde_json::Value;
-
-    let mut out = Vec::with_capacity(updates.len());
-    let mut segment_row: Option<usize> = None;
-    let mut segment_cells: Vec<Value> = Vec::new();
-
-    fn flush_segment(out: &mut Vec<Value>, row: &mut Option<usize>, cells: &mut Vec<Value>) {
-        if let Some(r) = row.take() {
-            if !cells.is_empty() {
-                let taken = std::mem::take(cells);
-                out.push(json!({
-                    "kind": "segment",
-                    "row": r,
-                    "cells": taken,
-                }));
-            }
-        } else {
-            cells.clear();
-        }
-    }
-
-    for update in updates {
-        match update {
-            CacheUpdate::Cell(cell) => {
-                let (ch, style) = unpack_cell(cell.cell);
-                if segment_row != Some(cell.row) {
-                    flush_segment(&mut out, &mut segment_row, &mut segment_cells);
-                    segment_row = Some(cell.row);
-                }
-                segment_cells.push(json!({
-                    "col": cell.col,
-                    "seq": cell.seq,
-                    "char": ch.to_string(),
-                    "style": style.0,
-                }));
-            }
-            other => {
-                flush_segment(&mut out, &mut segment_row, &mut segment_cells);
-                out.push(encode_update(other));
-            }
-        }
-    }
-
-    flush_segment(&mut out, &mut segment_row, &mut segment_cells);
-    out
-}
-
-fn encode_snapshot_complete(subscription: SubscriptionId, lane: PriorityLane) -> Value {
-    json!({
-        "type": "snapshot_complete",
-        "subscription": subscription.0,
-        "lane": lane_label(lane),
-    })
-}
-
-fn encode_delta_batch(batch: &DeltaBatch<CacheUpdate>) -> Value {
-    json!({
-        "type": "delta",
-        "subscription": batch.subscription_id.0,
-        "watermark": batch.watermark.0,
-        "has_more": batch.has_more,
-        "updates": encode_delta_updates(&batch.updates),
-    })
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ClientFrame {
-    Input {
-        seq: Seq,
-        data: String,
-    },
-    Resize {
-        cols: u16,
-        rows: u16,
-    },
-    #[serde(other)]
-    Unknown,
 }
 
 fn transmit_initial_snapshots(
@@ -1704,16 +1351,15 @@ fn transmit_initial_snapshots(
             );
             let lane_copy = lane;
             let updates = cache.apply_updates(&chunk.updates, false);
-            if !send_host_frame_with_fallback(
+            if !send_host_frame(
                 transport,
-                move || HostFrame::Snapshot {
+                HostFrame::Snapshot {
                     subscription: chunk.subscription_id.0,
                     lane: map_lane(lane_copy),
                     watermark: chunk.watermark.0,
                     has_more: chunk.has_more,
                     updates,
                 },
-                || encode_snapshot_chunk(&chunk),
             ) {
                 return false;
             }
@@ -1725,13 +1371,12 @@ fn transmit_initial_snapshots(
                     lane = ?lane,
                     "lane snapshot complete"
                 );
-                if !send_host_frame_with_fallback(
+                if !send_host_frame(
                     transport,
-                    move || HostFrame::SnapshotComplete {
+                    HostFrame::SnapshotComplete {
                         subscription: subscription.0,
                         lane: map_lane(lane),
                     },
-                    || encode_snapshot_complete(subscription, lane),
                 ) {
                     return false;
                 }
@@ -1761,15 +1406,16 @@ fn display_cmd(cmd: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::{TransportKind, TransportPair};
-    use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-    use beach_human::cache::terminal::{PackedCell, Style, StyleId};
+    use crate::transport::{Payload, TransportKind, TransportPair};
+    use beach_human::cache::terminal::{self, PackedCell, Style, StyleId};
     use beach_human::model::terminal::diff::{
         CellWrite, HistoryTrim, RectFill, RowSnapshot, StyleDefinition,
     };
+    use beach_human::protocol::{
+        self, ClientFrame as WireClientFrame, HostFrame as WireHostFrame, Lane as WireLane,
+        Update as WireUpdate,
+    };
     use beach_human::sync::terminal::NullTerminalDeltaStream;
-    use serde_json::{Value, json};
-    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::{Duration as StdDuration, Instant};
     use tokio::time::{Instant as TokioInstant, sleep, timeout};
@@ -1794,19 +1440,31 @@ mod tests {
         CacheUpdate::Row(RowSnapshot::new(row, seq, packed_row))
     }
 
-    async fn recv_json_frame(transport: &Arc<dyn Transport>, timeout: StdDuration) -> Value {
+    fn send_host_frame(transport: &dyn Transport, frame: HostFrame) {
+        let bytes = protocol::encode_host_frame_binary(&frame);
+        transport.send_bytes(&bytes).expect("send frame");
+    }
+
+    async fn recv_host_frame_async(
+        transport: &Arc<dyn Transport>,
+        timeout: StdDuration,
+    ) -> WireHostFrame {
         let deadline = TokioInstant::now() + timeout;
         loop {
             match transport.try_recv() {
-                Ok(Some(message)) => {
-                    if let Some(text) = message.payload.as_text() {
-                        return serde_json::from_str(text).expect("json frame");
+                Ok(Some(message)) => match message.payload {
+                    Payload::Binary(bytes) => {
+                        return protocol::decode_host_frame_binary(&bytes).expect("host frame");
                     }
-                }
+                    Payload::Text(text) => {
+                        let trimmed = text.trim();
+                        if trimmed == "__ready__" || trimmed == "__offer_ready__" {
+                            continue;
+                        }
+                    }
+                },
                 Ok(None) => {}
-                Err(TransportError::ChannelClosed) => {
-                    panic!("transport channel closed")
-                }
+                Err(TransportError::ChannelClosed) => panic!("transport channel closed"),
                 Err(err) => panic!("transport error: {err}"),
             }
             if TokioInstant::now() >= deadline {
@@ -1814,6 +1472,161 @@ mod tests {
             }
             sleep(StdDuration::from_millis(10)).await;
         }
+    }
+
+    fn recv_host_frame(transport: &dyn Transport, timeout: StdDuration) -> WireHostFrame {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match transport.recv(timeout) {
+                Ok(message) => match message.payload {
+                    Payload::Binary(bytes) => {
+                        return protocol::decode_host_frame_binary(&bytes).expect("host frame");
+                    }
+                    Payload::Text(text) => {
+                        let trimmed = text.trim();
+                        if trimmed == "__ready__" || trimmed == "__offer_ready__" {
+                            continue;
+                        }
+                    }
+                },
+                Err(TransportError::Timeout) => {
+                    if Instant::now() >= deadline {
+                        panic!("timed out waiting for frame");
+                    }
+                    continue;
+                }
+                Err(TransportError::ChannelClosed) => panic!("transport channel closed"),
+                Err(err) => panic!("transport error: {err}"),
+            }
+        }
+    }
+
+    fn send_client_frame(transport: &Arc<dyn Transport>, frame: WireClientFrame) {
+        let bytes = protocol::encode_client_frame_binary(&frame);
+        transport.send_bytes(&bytes).expect("send client frame");
+    }
+
+    fn recv_client_frame(transport: &dyn Transport, timeout: StdDuration) -> WireClientFrame {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match transport.recv(timeout) {
+                Ok(message) => match message.payload {
+                    Payload::Binary(bytes) => {
+                        return protocol::decode_client_frame_binary(&bytes).expect("client frame");
+                    }
+                    Payload::Text(text) => {
+                        let trimmed = text.trim();
+                        if trimmed == "__ready__" || trimmed == "__offer_ready__" {
+                            continue;
+                        }
+                    }
+                },
+                Err(TransportError::Timeout) => {
+                    if Instant::now() >= deadline {
+                        panic!("timed out waiting for client frame");
+                    }
+                    continue;
+                }
+                Err(TransportError::ChannelClosed) => panic!("transport channel closed"),
+                Err(err) => panic!("transport error: {err}"),
+            }
+        }
+    }
+
+    struct ClientGrid {
+        rows: usize,
+        cols: usize,
+        cells: Vec<Vec<char>>,
+    }
+
+    impl ClientGrid {
+        fn new(rows: usize, cols: usize) -> Self {
+            Self {
+                rows,
+                cols,
+                cells: vec![vec![' '; cols]; rows],
+            }
+        }
+
+        fn apply_update(&mut self, update: &WireUpdate) {
+            match update {
+                WireUpdate::Row { row, cells, .. } => {
+                    let row = *row as usize;
+                    if row >= self.rows {
+                        return;
+                    }
+                    for (col, cell) in cells.iter().enumerate().take(self.cols) {
+                        self.cells[row][col] = decode_cell(*cell);
+                    }
+                }
+                WireUpdate::Cell { row, col, cell, .. } => {
+                    let row = *row as usize;
+                    let col = *col as usize;
+                    if row < self.rows && col < self.cols {
+                        self.cells[row][col] = decode_cell(*cell);
+                    }
+                }
+                WireUpdate::Rect {
+                    rows, cols, cell, ..
+                } => {
+                    let row0 = rows[0] as usize;
+                    let row1 = rows[1] as usize;
+                    let col0 = cols[0] as usize;
+                    let col1 = cols[1] as usize;
+                    let ch = decode_cell(*cell);
+                    for row in row0..row1.min(self.rows) {
+                        for col in col0..col1.min(self.cols) {
+                            self.cells[row][col] = ch;
+                        }
+                    }
+                }
+                WireUpdate::RowSegment {
+                    row,
+                    start_col,
+                    cells,
+                    ..
+                } => {
+                    let row = *row as usize;
+                    if row >= self.rows {
+                        return;
+                    }
+                    for (idx, cell) in cells.iter().enumerate() {
+                        let col = *start_col as usize + idx;
+                        if col < self.cols {
+                            self.cells[row][col] = decode_cell(*cell);
+                        }
+                    }
+                }
+                WireUpdate::Trim { .. } | WireUpdate::Style { .. } => {}
+            }
+        }
+
+        fn contains_row(&self, needle: &str) -> bool {
+            self.cells.iter().any(|row| {
+                let mut needle_chars: Vec<char> = needle.chars().collect();
+                if matches!(needle_chars.last(), Some(' ')) {
+                    while matches!(needle_chars.last(), Some(' ')) {
+                        needle_chars.pop();
+                    }
+                    let prefix_len = needle_chars.len();
+                    let prefix_matches = row
+                        .iter()
+                        .take(prefix_len)
+                        .copied()
+                        .eq(needle_chars.into_iter());
+                    let suffix_blank = row.iter().skip(prefix_len).all(|&ch| ch == ' ');
+                    prefix_matches && suffix_blank
+                } else {
+                    let text: String = row.iter().collect();
+                    text.trim_end_matches(' ') == needle
+                }
+            })
+        }
+    }
+
+    fn decode_cell(cell: u64) -> char {
+        let packed = PackedCell::from_raw(cell);
+        terminal::unpack_cell(packed).0
     }
 
     #[test]
@@ -1935,45 +1748,60 @@ mod tests {
                 sync_config.clone(),
             );
 
+            let mut client_view = ClientGrid::new(rows, cols);
+
             // Consume handshake frames until all lanes report completion.
-            let hello = recv_json_frame(&client, StdDuration::from_secs(5)).await;
-            events.lock().unwrap().push("received_hello".into());
-            assert_eq!(hello["type"], "hello");
-            let grid_frame = recv_json_frame(&client, StdDuration::from_secs(5)).await;
-            events.lock().unwrap().push("received_grid".into());
-            assert_eq!(grid_frame["type"], "grid");
+            match recv_host_frame_async(&client, StdDuration::from_secs(5)).await {
+                WireHostFrame::Hello { .. } => {
+                    events.lock().unwrap().push("received_hello".into());
+                }
+                other => panic!("expected hello frame, got {other:?}"),
+            }
+
+            match recv_host_frame_async(&client, StdDuration::from_secs(5)).await {
+                WireHostFrame::Grid {
+                    rows: grid_rows,
+                    cols: grid_cols,
+                } => {
+                    assert_eq!(grid_rows as usize, rows);
+                    assert_eq!(grid_cols as usize, cols);
+                    events.lock().unwrap().push("received_grid".into());
+                }
+                other => panic!("expected grid frame, got {other:?}"),
+            }
 
             let mut saw_prompt = false;
             let mut foreground_complete = false;
             while !foreground_complete {
-                let frame = recv_json_frame(&client, StdDuration::from_secs(5)).await;
-                match frame["type"].as_str().unwrap_or("") {
-                    "snapshot" => {
-                        if frame["lane"] == "foreground" {
-                            if let Some(updates) = frame["updates"].as_array() {
-                                for update in updates {
-                                    if update["kind"] == "row" {
-                                        if let Some(text) = update["text"].as_str() {
-                                            if text.trim_end() == prompt_trimmed {
-                                                saw_prompt = true;
-                                                events
-                                                    .lock()
-                                                    .unwrap()
-                                                    .push("foreground_prompt".into());
-                                            }
-                                        }
-                                    }
-                                }
+                let frame = recv_host_frame_async(&client, StdDuration::from_secs(5)).await;
+                match frame {
+                    WireHostFrame::Snapshot { lane, updates, .. } => {
+                        if lane == WireLane::Foreground {
+                            for update in &updates {
+                                client_view.apply_update(update);
+                            }
+                            if client_view.contains_row(prompt_trimmed) && !saw_prompt {
+                                saw_prompt = true;
+                                events.lock().unwrap().push("foreground_prompt".into());
                             }
                         }
                     }
-                    "snapshot_complete" => {
-                        if frame["lane"] == "foreground" {
+                    WireHostFrame::SnapshotComplete { lane, .. } => {
+                        if lane == WireLane::Foreground {
                             foreground_complete = true;
                             events.lock().unwrap().push("foreground_complete".into());
                         }
                     }
-                    _ => {}
+                    WireHostFrame::Delta { updates, .. } => {
+                        for update in &updates {
+                            client_view.apply_update(update);
+                        }
+                    }
+                    WireHostFrame::Heartbeat { .. } => {}
+                    WireHostFrame::Hello { .. }
+                    | WireHostFrame::Grid { .. }
+                    | WireHostFrame::InputAck { .. }
+                    | WireHostFrame::Shutdown => {}
                 }
             }
             assert!(saw_prompt, "foreground snapshot missing prompt");
@@ -2003,40 +1831,43 @@ mod tests {
             let mut saw_command = false;
             let mut saw_output = false;
             while TokioInstant::now() < deadline && !(saw_command && saw_output) {
-                let frame = recv_json_frame(&client, StdDuration::from_secs(5)).await;
-                match frame["type"].as_str().unwrap_or("") {
-                    "delta" => {
-                        if let Some(updates) = frame["updates"].as_array() {
-                            for update in updates {
-                                if let Some(text) = update["text"].as_str() {
-                                    let trimmed = text.trim_end();
-                                    if trimmed.contains("echo hello") {
-                                        saw_command = true;
-                                        events.lock().unwrap().push("client_saw_command".into());
-                                    }
-                                    if trimmed == "hello" {
-                                        saw_output = true;
-                                        events.lock().unwrap().push("client_saw_output".into());
-                                    }
-                                }
-                            }
+                let frame = recv_host_frame_async(&client, StdDuration::from_secs(5)).await;
+                match frame {
+                    WireHostFrame::Delta { updates, .. }
+                    | WireHostFrame::Snapshot { updates, .. } => {
+                        for update in &updates {
+                            client_view.apply_update(update);
+                        }
+                        if !saw_command && client_view.contains_row("(base) host% echo hello") {
+                            saw_command = true;
+                            events.lock().unwrap().push("client_saw_command".into());
+                        }
+                        if !saw_output && client_view.contains_row("hello") {
+                            saw_output = true;
+                            events.lock().unwrap().push("client_saw_output".into());
                         }
                     }
-                    "heartbeat" => continue,
-                    _ => {}
+                    WireHostFrame::Heartbeat { .. } => continue,
+                    WireHostFrame::SnapshotComplete { .. }
+                    | WireHostFrame::Hello { .. }
+                    | WireHostFrame::Grid { .. }
+                    | WireHostFrame::InputAck { .. }
+                    | WireHostFrame::Shutdown => {}
                 }
             }
             assert!(saw_command, "delta missing command text");
             assert!(saw_output, "delta missing command output");
 
             // Client -> server input travels over the same transport.
-            let input_payload = json!({
-                "type": "input",
-                "seq": 1,
-                "data": BASE64.encode(b"echo world\n"),
-            })
-            .to_string();
-            client.send_text(&input_payload).expect("client send input");
+            send_client_frame(
+                &client,
+                WireClientFrame::Input {
+                    seq: 1,
+                    data: b"echo world
+"
+                    .to_vec(),
+                },
+            );
             events.lock().unwrap().push("client_sent_input".into());
 
             let server_clone = Arc::clone(&server);
@@ -2045,8 +1876,22 @@ mod tests {
                     .await
                     .expect("recv join")
                     .expect("server recv");
-            let inbound_text = inbound.payload.as_text().expect("text payload").to_string();
-            assert_eq!(inbound_text, input_payload);
+            let client_frame = match inbound.payload {
+                Payload::Binary(bytes) => {
+                    protocol::decode_client_frame_binary(&bytes).expect("client frame")
+                }
+                Payload::Text(text) => panic!("unexpected text payload: {text}"),
+            };
+            match client_frame {
+                WireClientFrame::Input { data, .. } => {
+                    assert_eq!(
+                        data.as_slice(),
+                        b"echo world
+"
+                    );
+                }
+                other => panic!("unexpected client frame: {other:?}"),
+            }
             events.lock().unwrap().push("server_received_input".into());
 
             drop(update_tx);
@@ -2071,21 +1916,29 @@ mod tests {
         HeartbeatPublisher::new(publisher_transport).spawn(StdDuration::from_millis(10), Some(3));
 
         let handle = tokio::task::spawn_blocking(move || {
-            let mut results = Vec::new();
+            let mut frames = Vec::new();
             for _ in 0..3 {
                 let message = client
                     .recv(StdDuration::from_secs(1))
                     .expect("heartbeat message");
-                let text = message.payload.as_text().expect("text payload");
-                results.push(text.to_string());
+                match message.payload {
+                    Payload::Binary(bytes) => {
+                        frames.push(
+                            protocol::decode_host_frame_binary(&bytes).expect("heartbeat frame"),
+                        );
+                    }
+                    Payload::Text(text) => panic!("unexpected text payload: {text}"),
+                }
             }
-            results
+            frames
         });
 
-        let payloads = handle.await.expect("join blocking task");
-        for payload in payloads {
-            let parsed: Value = serde_json::from_str(&payload).expect("json payload");
-            assert_eq!(parsed["type"], "heartbeat");
+        let frames = handle.await.expect("join blocking task");
+        for frame in frames {
+            match frame {
+                WireHostFrame::Heartbeat { .. } => {}
+                other => panic!("unexpected frame: {other:?}"),
+            }
         }
     }
 
@@ -2146,63 +1999,32 @@ mod tests {
 
             let deadline = Instant::now() + StdDuration::from_secs(3);
             let mut saw_prompt = false;
+            let mut view = ClientGrid::new(rows as usize, cols as usize);
             while Instant::now() < deadline {
                 match client_transport.recv(StdDuration::from_millis(200)) {
-                    Ok(message) => {
-                        if let Some(text) = message.payload.as_text() {
-                            if let Ok(value) = serde_json::from_str::<Value>(text) {
-                                if let Some(kind) = value.get("type").and_then(Value::as_str) {
-                                    if kind == "snapshot" || kind == "delta" {
-                                        if let Some(updates) =
-                                            value.get("updates").and_then(Value::as_array)
-                                        {
-                                            let mut match_found = false;
-                                            for entry in updates {
-                                                match entry.get("kind").and_then(Value::as_str) {
-                                                    Some("row") => {
-                                                        if entry
-                                                            .get("text")
-                                                            .and_then(Value::as_str)
-                                                            .map(|s| s.trim_end())
-                                                            == Some("host%")
-                                                        {
-                                                            match_found = true;
-                                                            break;
-                                                        }
-                                                    }
-                                                    Some("segment") => {
-                                                        if let Some(cells) = entry
-                                                            .get("cells")
-                                                            .and_then(Value::as_array)
-                                                        {
-                                                            let mut buffer = String::new();
-                                                            for cell in cells {
-                                                                if let Some(ch) = cell
-                                                                    .get("char")
-                                                                    .and_then(Value::as_str)
-                                                                {
-                                                                    buffer.push_str(ch);
-                                                                }
-                                                            }
-                                                            if buffer.trim_end() == "host%" {
-                                                                match_found = true;
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                            if match_found {
-                                                saw_prompt = true;
-                                                break;
-                                            }
-                                        }
+                    Ok(message) => match message.payload {
+                        Payload::Binary(bytes) => {
+                            match protocol::decode_host_frame_binary(&bytes).expect("host frame") {
+                                WireHostFrame::Snapshot { updates, .. }
+                                | WireHostFrame::Delta { updates, .. } => {
+                                    for update in &updates {
+                                        view.apply_update(update);
+                                    }
+                                    if view.contains_row("host%") {
+                                        saw_prompt = true;
+                                        break;
                                     }
                                 }
+                                _ => {}
                             }
                         }
-                    }
+                        Payload::Text(text) => {
+                            let trimmed = text.trim();
+                            if trimmed == "__ready__" || trimmed == "__offer_ready__" {
+                                continue;
+                            }
+                        }
+                    },
                     Err(TransportError::Timeout) => continue,
                     Err(err) => panic!("transport error while waiting for retry: {err:?}"),
                 }
@@ -2249,14 +2071,21 @@ mod tests {
         let subscription = SubscriptionId(1);
         let mut synchronizer = ServerSynchronizer::new(terminal_sync.clone(), sync_config.clone());
         let hello = synchronizer.hello(subscription);
-        assert!(send_json_value(
-            &host_transport,
-            encode_server_hello(&hello)
-        ));
-        assert!(send_json_value(
-            &host_transport,
-            encode_grid_descriptor(rows, cols)
-        ));
+        send_host_frame(
+            host_transport.as_ref(),
+            HostFrame::Hello {
+                subscription: hello.subscription_id.0,
+                max_seq: hello.max_seq.0,
+                config: sync_config_to_wire(&hello.config),
+            },
+        );
+        send_host_frame(
+            host_transport.as_ref(),
+            HostFrame::Grid {
+                rows: rows as u32,
+                cols: cols as u32,
+            },
+        );
         let mut cache = TransmitterCache::new();
         assert!(transmit_initial_snapshots(
             &host_transport,
@@ -2266,78 +2095,34 @@ mod tests {
         ));
 
         let mut saw_prompt = false;
-        let mut prompt_cells: BTreeMap<usize, char> = BTreeMap::new();
-        let target_row = rows - 1;
+        let mut view = ClientGrid::new(rows, cols);
         for _ in 0..20 {
             match client_transport.recv(StdDuration::from_millis(200)) {
-                Ok(message) => {
-                    if let Some(text) = message.payload.as_text() {
-                        let frame: Value = serde_json::from_str(text).expect("json frame");
-                        if frame["type"] == "snapshot" {
-                            if let Some(updates) = frame["updates"].as_array() {
-                                for update in updates {
-                                    if update["kind"] == "row" {
-                                        if let Some(text) = update["text"].as_str() {
-                                            if text.trim_end() == prompt_trimmed {
-                                                saw_prompt = true;
-                                                break;
-                                            }
-                                        } else if let Some(cells) = update["cells"].as_array() {
-                                            let row: String = cells
-                                                .iter()
-                                                .enumerate()
-                                                .map(|(idx, cell)| {
-                                                    let ch_opt = cell
-                                                        .get("ch")
-                                                        .and_then(Value::as_str)
-                                                        .or_else(|| {
-                                                            cell.get("char").and_then(Value::as_str)
-                                                        });
-                                                    let ch = ch_opt
-                                                        .and_then(|s| s.chars().next())
-                                                        .unwrap_or(' ');
-                                                    let col = cell
-                                                        .get("col")
-                                                        .and_then(Value::as_u64)
-                                                        .map(|v| v as usize)
-                                                        .unwrap_or(idx);
-                                                    prompt_cells.insert(col, ch);
-                                                    ch
-                                                })
-                                                .collect();
-                                            if row.trim_end() == prompt_trimmed {
-                                                saw_prompt = true;
-                                                break;
-                                            }
-                                        }
-                                    } else if update["kind"] == "cell" {
-                                        if update["row"].as_u64() == Some(target_row as u64) {
-                                            if let (Some(col), Some(ch_str)) =
-                                                (update["col"].as_u64(), update["char"].as_str())
-                                            {
-                                                if let Some(ch) = ch_str.chars().next() {
-                                                    prompt_cells.insert(col as usize, ch);
-                                                }
-                                            }
-                                        }
-                                    }
+                Ok(message) => match message.payload {
+                    Payload::Binary(bytes) => {
+                        match protocol::decode_host_frame_binary(&bytes).expect("host frame") {
+                            WireHostFrame::Snapshot { updates, .. }
+                            | WireHostFrame::Delta { updates, .. } => {
+                                for update in &updates {
+                                    view.apply_update(update);
+                                }
+                                if view.contains_row(prompt_trimmed) {
+                                    saw_prompt = true;
+                                    break;
                                 }
                             }
+                            _ => {}
                         }
                     }
-                }
+                    Payload::Text(text) => {
+                        let trimmed = text.trim();
+                        if trimmed == "__ready__" || trimmed == "__offer_ready__" {
+                            continue;
+                        }
+                    }
+                },
                 Err(TransportError::Timeout) => {}
                 Err(err) => panic!("transport error: {err}"),
-            }
-            if saw_prompt {
-                break;
-            }
-        }
-
-        if !saw_prompt {
-            let candidate: String = prompt_cells.values().copied().collect::<String>();
-            if candidate.trim_end() == prompt_trimmed {
-                saw_prompt = true;
             }
         }
 

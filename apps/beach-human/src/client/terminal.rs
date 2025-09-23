@@ -6,7 +6,6 @@ use crate::protocol::{
 };
 use crate::telemetry::{self, PerfGuard};
 use crate::transport::{Payload, Transport, TransportError};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use copypasta::{ClipboardContext, ClipboardProvider};
 use crossterm::{
     cursor::MoveTo,
@@ -18,8 +17,6 @@ use crossterm::{
     },
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
-use serde::Deserialize;
-use serde_json::{Value, json};
 use std::cmp;
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
@@ -34,8 +31,6 @@ use tracing::{Level, debug, trace};
 pub enum ClientError {
     #[error("transport error: {0}")]
     Transport(TransportError),
-    #[error("json decode error: {0}")]
-    JsonDecode(#[from] serde_json::Error),
     #[error("protocol error: {0}")]
     Protocol(#[from] protocol::WireError),
     #[error("shutdown requested")]
@@ -117,34 +112,35 @@ impl TerminalClient {
                 match message.payload {
                     Payload::Binary(bytes) => {
                         telemetry::record_bytes("client_frame_bytes", bytes.len());
-                        match protocol::decode_host_frame_binary(&bytes) {
-                            Ok(frame) => match self.handle_binary_frame(frame) {
-                                Ok(()) => {}
-                                Err(ClientError::Shutdown) => break,
-                                Err(err) => return Err(err),
-                            },
-                            Err(err) => {
-                                if protocol::binary_protocol_enabled() {
-                                    return Err(ClientError::Protocol(err));
-                                }
-                                if let Ok(text) = std::str::from_utf8(&bytes) {
-                                    match self.handle_json_frame(text) {
-                                        Ok(()) => {}
-                                        Err(ClientError::Shutdown) => break,
-                                        Err(err) => return Err(err),
-                                    }
-                                } else {
-                                    return Err(ClientError::Protocol(err));
-                                }
+                        let decode_start = Instant::now();
+                        let frame = protocol::decode_host_frame_binary(&bytes)?;
+                        let decode_elapsed = decode_start.elapsed();
+                        match &frame {
+                            WireHostFrame::Snapshot { .. } => {
+                                telemetry::record_duration("client_decode_snapshot", decode_elapsed)
                             }
+                            WireHostFrame::Delta { .. } => {
+                                telemetry::record_duration("client_decode_delta", decode_elapsed)
+                            }
+                            _ => telemetry::record_duration("client_decode_frame", decode_elapsed),
+                        }
+                        match self.handle_host_frame(frame) {
+                            Ok(()) => {}
+                            Err(ClientError::Shutdown) => break,
+                            Err(err) => return Err(err),
                         }
                     }
                     Payload::Text(text) => {
                         telemetry::record_bytes("client_frame_bytes", text.len());
-                        match self.handle_json_frame(&text) {
-                            Ok(()) => {}
-                            Err(ClientError::Shutdown) => break,
-                            Err(err) => return Err(err),
+                        let trimmed = text.trim();
+                        if trimmed == "__ready__" || trimmed == "__offer_ready__" {
+                            trace!(
+                                target = "client::frame",
+                                payload = trimmed,
+                                "ignoring handshake sentinel"
+                            );
+                        } else {
+                            debug!(target = "client::frame", payload = %trimmed, "unexpected text payload");
                         }
                     }
                 }
@@ -157,61 +153,7 @@ impl TerminalClient {
         Ok(())
     }
 
-    fn handle_json_frame(&mut self, text: &str) -> Result<(), ClientError> {
-        if tracing::enabled!(Level::TRACE) {
-            trace!(target = "client::frame", payload = text, "raw frame");
-        }
-
-        let trimmed = text.trim();
-        if trimmed == "__ready__" || trimmed == "__offer_ready__" {
-            trace!(
-                target = "client::frame",
-                payload = trimmed,
-                "ignoring handshake sentinel"
-            );
-            return Ok(());
-        }
-
-        let _guard = PerfGuard::new("client_handle_frame");
-        let frame: ServerFrame = serde_json::from_str(text)?;
-        if tracing::enabled!(Level::DEBUG) {
-            debug!(target = "client::frame", frame = %frame.type_name(), "processing frame");
-        }
-        match frame {
-            ServerFrame::Heartbeat => {}
-            ServerFrame::Hello { .. } => {}
-            ServerFrame::Grid { rows, cols } => {
-                self.renderer.ensure_size(rows, cols);
-                self.renderer.mark_dirty();
-                self.force_render = true;
-                self.cursor_row = rows.saturating_sub(1);
-                self.cursor_col = 0;
-                self.renderer.clear_all_predictions();
-                self.pending_predictions.clear();
-            }
-            ServerFrame::Snapshot {
-                updates, watermark, ..
-            }
-            | ServerFrame::Delta {
-                updates, watermark, ..
-            } => {
-                for update in updates {
-                    self.apply_update(update);
-                }
-                self.last_seq = cmp::max(self.last_seq, watermark);
-                self.force_render = true;
-            }
-            ServerFrame::InputAck { seq } => {
-                self.handle_input_ack(seq);
-            }
-            ServerFrame::SnapshotComplete { .. } => {}
-            ServerFrame::Shutdown => return Err(ClientError::Shutdown),
-            ServerFrame::Unknown => {}
-        }
-        Ok(())
-    }
-
-    fn handle_binary_frame(&mut self, frame: WireHostFrame) -> Result<(), ClientError> {
+    fn handle_host_frame(&mut self, frame: WireHostFrame) -> Result<(), ClientError> {
         if tracing::enabled!(Level::DEBUG) {
             let frame_type = match &frame {
                 WireHostFrame::Heartbeat { .. } => "heartbeat",
@@ -264,115 +206,6 @@ impl TerminalClient {
             WireHostFrame::Shutdown => return Err(ClientError::Shutdown),
         }
         Ok(())
-    }
-
-    fn apply_update(&mut self, update: UpdateEntry) {
-        use CursorHint::*;
-
-        let cursor_hint = match &update {
-            UpdateEntry::Cell { row, col, .. } => Some(Exact(*row, col.saturating_add(1))),
-            UpdateEntry::Row { row, .. } => Some(RowWidth(*row)),
-            UpdateEntry::Rect { rows, cols, .. } => {
-                let target_row = rows.get(1).copied().unwrap_or(rows[0]).saturating_sub(1);
-                let target_col = cols.get(1).copied().unwrap_or(cols[0]);
-                Some(Exact(target_row, target_col))
-            }
-            UpdateEntry::Segment { row, cells } => cells
-                .iter()
-                .map(|cell| Exact(*row, cell.col.saturating_add(1)))
-                .last(),
-            UpdateEntry::Trim { .. } => None,
-            UpdateEntry::Style { .. } => None,
-        };
-
-        match update {
-            UpdateEntry::Cell {
-                row,
-                col,
-                seq,
-                char,
-                style,
-            } => {
-                let ch = char.chars().next().unwrap_or(' ');
-                self.renderer.apply_cell(row, col, seq, ch, style);
-            }
-            UpdateEntry::Row {
-                row,
-                seq,
-                text,
-                cells,
-            } => {
-                if let Some(entries) = cells {
-                    let mut packed = Vec::with_capacity(entries.len());
-                    for entry in entries {
-                        let ch = entry.ch.chars().next().unwrap_or_else(|| ' ');
-                        packed.push((ch, entry.style));
-                    }
-                    self.renderer.apply_row_from_cells(row, seq, &packed);
-                } else if let Some(text) = text {
-                    self.renderer.apply_row_from_text(row, seq, &text);
-                }
-            }
-            UpdateEntry::Rect {
-                rows,
-                cols,
-                seq,
-                char,
-                style,
-            } => {
-                let ch = char.chars().next().unwrap_or(' ');
-                let row_range = rows[0]..rows[1];
-                let col_range = cols[0]..cols[1];
-                self.renderer
-                    .apply_rect(row_range, col_range, seq, ch, style);
-            }
-            UpdateEntry::Segment { row, cells } => {
-                if !cells.is_empty() {
-                    let mut segment = Vec::with_capacity(cells.len());
-                    for cell in cells {
-                        let ch = cell.ch.chars().next().unwrap_or(' ');
-                        segment.push((cell.col, cell.seq, ch, cell.style));
-                    }
-                    self.renderer.apply_segment(row, &segment);
-                }
-            }
-            UpdateEntry::Trim { start, count } => {
-                self.renderer.apply_trim(start, count);
-                self.pending_predictions.values_mut().for_each(|positions| {
-                    positions.retain(|(row, _)| *row >= start + count);
-                });
-                self.pending_predictions
-                    .retain(|_, positions| !positions.is_empty());
-                if self.cursor_row >= start && self.cursor_row < start + count {
-                    self.cursor_row = start + count;
-                    self.cursor_col = 0;
-                }
-                self.force_render = true;
-            }
-            UpdateEntry::Style {
-                id,
-                seq,
-                fg,
-                bg,
-                attrs,
-            } => {
-                self.renderer.set_style(id, fg, bg, attrs);
-                self.last_seq = cmp::max(self.last_seq, seq);
-            }
-        }
-
-        if let Some(hint) = cursor_hint {
-            match hint {
-                Exact(row, col) => {
-                    self.cursor_row = row;
-                    self.cursor_col = col;
-                }
-                RowWidth(row) => {
-                    self.cursor_row = row;
-                    self.cursor_col = self.renderer.row_display_width(row);
-                }
-            }
-        }
     }
 
     fn apply_wire_update(&mut self, update: &WireUpdate) {
@@ -845,28 +678,15 @@ impl TerminalClient {
         }
         self.input_seq = self.input_seq.saturating_add(1);
         telemetry::record_bytes("client_input_bytes", bytes.len());
-        let payload = json!({
-            "type": "input",
-            "seq": self.input_seq,
-            "data": BASE64.encode(bytes),
-        });
-        if protocol::binary_protocol_enabled() {
-            let frame = WireClientFrame::Input {
-                seq: self.input_seq,
-                data: bytes.to_vec(),
-            };
-            let encoded = protocol::encode_client_frame_binary(&frame);
-            telemetry::record_bytes("client_input_frames", encoded.len());
-            self.transport
-                .send_bytes(&encoded)
-                .map_err(ClientError::Transport)?;
-        } else {
-            let text = serde_json::to_string(&payload)?;
-            telemetry::record_bytes("client_input_frames", text.len());
-            self.transport
-                .send_text(&text)
-                .map_err(ClientError::Transport)?;
-        }
+        let frame = WireClientFrame::Input {
+            seq: self.input_seq,
+            data: bytes.to_vec(),
+        };
+        let encoded = protocol::encode_client_frame_binary(&frame);
+        telemetry::record_bytes("client_input_frames", encoded.len());
+        self.transport
+            .send_bytes(&encoded)
+            .map_err(ClientError::Transport)?;
         if tracing::enabled!(Level::TRACE) {
             trace!(
                 target = "client::outgoing",
@@ -881,25 +701,12 @@ impl TerminalClient {
     }
 
     fn send_resize(&mut self, cols: u16, rows: u16) -> Result<(), ClientError> {
-        let payload = json!({
-            "type": "resize",
-            "cols": cols,
-            "rows": rows,
-        });
-        if protocol::binary_protocol_enabled() {
-            let frame = WireClientFrame::Resize { cols, rows };
-            let encoded = protocol::encode_client_frame_binary(&frame);
-            telemetry::record_bytes("client_input_frames", encoded.len());
-            self.transport
-                .send_bytes(&encoded)
-                .map_err(ClientError::Transport)?;
-        } else {
-            let text = serde_json::to_string(&payload)?;
-            telemetry::record_bytes("client_input_frames", text.len());
-            self.transport
-                .send_text(&text)
-                .map_err(ClientError::Transport)?;
-        }
+        let frame = WireClientFrame::Resize { cols, rows };
+        let encoded = protocol::encode_client_frame_binary(&frame);
+        telemetry::record_bytes("client_input_frames", encoded.len());
+        self.transport
+            .send_bytes(&encoded)
+            .map_err(ClientError::Transport)?;
         debug!(target = "client::outgoing", cols, rows, "resize sent");
         Ok(())
     }
@@ -1008,134 +815,6 @@ fn decode_wire_cell(cell: u64) -> (char, Option<u32>) {
     } else {
         (ch, Some(style_id.0))
     }
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ServerFrame {
-    Heartbeat,
-    Hello {
-        #[serde(default)]
-        _subscription: u64,
-        #[serde(default)]
-        _max_seq: u64,
-        #[serde(default)]
-        _config: Value,
-    },
-    Grid {
-        rows: usize,
-        cols: usize,
-    },
-    Snapshot {
-        #[serde(default)]
-        _subscription: u64,
-        #[serde(default)]
-        _lane: String,
-        watermark: Seq,
-        #[serde(default)]
-        _has_more: bool,
-        updates: Vec<UpdateEntry>,
-    },
-    SnapshotComplete {
-        #[serde(default)]
-        _subscription: u64,
-        #[serde(default)]
-        _lane: String,
-    },
-    Delta {
-        #[serde(default)]
-        _subscription: u64,
-        watermark: Seq,
-        #[serde(default)]
-        _has_more: bool,
-        updates: Vec<UpdateEntry>,
-    },
-    InputAck {
-        seq: Seq,
-    },
-    Shutdown,
-    #[serde(other)]
-    Unknown,
-}
-
-impl ServerFrame {
-    fn type_name(&self) -> &'static str {
-        match self {
-            ServerFrame::Heartbeat => "heartbeat",
-            ServerFrame::Hello { .. } => "hello",
-            ServerFrame::Grid { .. } => "grid",
-            ServerFrame::Snapshot { .. } => "snapshot",
-            ServerFrame::SnapshotComplete { .. } => "snapshot_complete",
-            ServerFrame::Delta { .. } => "delta",
-            ServerFrame::InputAck { .. } => "input_ack",
-            ServerFrame::Shutdown => "shutdown",
-            ServerFrame::Unknown => "unknown",
-        }
-    }
-}
-
-#[derive(Deserialize, Clone)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum UpdateEntry {
-    Cell {
-        row: usize,
-        col: usize,
-        seq: Seq,
-        #[serde(default)]
-        char: String,
-        #[serde(default)]
-        style: Option<u32>,
-    },
-    Row {
-        row: usize,
-        seq: Seq,
-        #[serde(default)]
-        text: Option<String>,
-        #[serde(default)]
-        cells: Option<Vec<StyledCell>>,
-    },
-    Rect {
-        rows: [usize; 2],
-        cols: [usize; 2],
-        seq: Seq,
-        #[serde(default)]
-        char: String,
-        #[serde(default)]
-        style: Option<u32>,
-    },
-    Segment {
-        row: usize,
-        cells: Vec<SegmentCell>,
-    },
-    Trim {
-        start: usize,
-        count: usize,
-    },
-    Style {
-        id: u32,
-        seq: Seq,
-        fg: u32,
-        bg: u32,
-        attrs: u8,
-    },
-}
-
-#[derive(Deserialize, Clone)]
-struct SegmentCell {
-    col: usize,
-    seq: Seq,
-    #[serde(default)]
-    ch: String,
-    #[serde(default)]
-    style: Option<u32>,
-}
-
-#[derive(Deserialize, Clone)]
-struct StyledCell {
-    #[serde(default)]
-    ch: String,
-    #[serde(default)]
-    style: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug)]

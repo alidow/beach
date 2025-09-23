@@ -20,20 +20,29 @@ use tokio::time::{Instant, sleep, timeout};
 use tracing::debug;
 use tracing_subscriber::{EnvFilter, fmt::SubscriberBuilder};
 
+use beach_human::protocol::{self, ClientFrame as WireClientFrame, HostFrame};
 use beach_human::transport::webrtc::{WebRtcRole, connect_via_signaling, create_test_pair};
 use beach_human::transport::{Payload, Transport, TransportKind, TransportMessage};
 
-fn payload_text(message: TransportMessage) -> Option<String> {
-    match message.payload {
+const HANDSHAKE_SENTINELS: [&str; 2] = ["__ready__", "__offer_ready__"];
+
+fn is_handshake_sentinel(text: &str) -> bool {
+    HANDSHAKE_SENTINELS
+        .iter()
+        .any(|sentinel| text.trim() == *sentinel)
+}
+
+fn payload_text(message: &TransportMessage) -> Option<&str> {
+    match &message.payload {
         Payload::Text(text) => Some(text),
         Payload::Binary(_) => None,
     }
 }
 
-fn payload_bytes(message: TransportMessage) -> Vec<u8> {
-    match message.payload {
-        Payload::Binary(bytes) => bytes,
-        Payload::Text(text) => text.into_bytes(),
+fn payload_bytes(message: &TransportMessage) -> Vec<u8> {
+    match &message.payload {
+        Payload::Binary(bytes) => bytes.clone(),
+        Payload::Text(text) => panic!("expected binary payload, got text: {text}"),
     }
 }
 
@@ -50,6 +59,24 @@ async fn recv_with_timeout(transport: &Box<dyn Transport>, timeout: Duration) ->
             }
             Err(err) => panic!("transport receive error: {err}"),
         }
+    }
+}
+
+async fn recv_data_message(transport: &Arc<dyn Transport>, timeout: Duration) -> TransportMessage {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            panic!("receive timed out");
+        }
+        let remaining = deadline - now;
+        let message = recv_via_blocking(transport, remaining).await;
+        if let Payload::Text(text) = &message.payload {
+            if is_handshake_sentinel(text) {
+                continue;
+            }
+        }
+        return message;
     }
 }
 
@@ -81,24 +108,22 @@ async fn webrtc_bidirectional_transport_delivers_messages() {
         .send_text("hello from client")
         .expect("send client text");
     let server_msg = recv_with_timeout(&server, Duration::from_secs(5)).await;
-    assert_eq!(
-        payload_text(server_msg).as_deref(),
-        Some("hello from client")
-    );
+    assert_eq!(payload_text(&server_msg), Some("hello from client"));
 
     server
         .send_text("hello from server")
         .expect("send server text");
     let client_msg = recv_with_timeout(&client, Duration::from_secs(5)).await;
-    assert_eq!(
-        payload_text(client_msg).as_deref(),
-        Some("hello from server")
-    );
+    assert_eq!(payload_text(&client_msg), Some("hello from server"));
 
     let bytes = vec![1u8, 2, 3, 4, 5];
     server.send_bytes(&bytes).expect("send server binary");
     let binary_msg = recv_with_timeout(&client, Duration::from_secs(5)).await;
-    assert_eq!(payload_bytes(binary_msg), bytes);
+    assert_eq!(payload_bytes(&binary_msg), bytes);
+    match binary_msg.payload {
+        Payload::Binary(_) => {}
+        Payload::Text(text) => panic!("expected binary payload, got text: {text}"),
+    }
 
     for idx in 0..10 {
         client
@@ -108,7 +133,7 @@ async fn webrtc_bidirectional_transport_delivers_messages() {
     for idx in 0..10 {
         let expected = format!("msg-{idx}");
         let received = recv_with_timeout(&server, Duration::from_secs(5)).await;
-        assert_eq!(payload_text(received).as_deref(), Some(expected.as_str()));
+        assert_eq!(payload_text(&received), Some(expected.as_str()));
     }
 }
 
@@ -493,19 +518,40 @@ async fn webrtc_signaling_end_to_end() {
         .expect("answer signaling timeout")
         .expect("answer transport");
 
-    offer_transport.send_text("ping").expect("offer send");
-    let pong = loop {
-        let message = recv_via_blocking(&answer_transport, Duration::from_secs(5)).await;
-        if payload_text(message.clone()).as_deref() == Some("__offer_ready__") {
-            continue;
-        }
-        break message;
+    let server_heartbeat = HostFrame::Heartbeat {
+        seq: 1,
+        timestamp_ms: 42,
     };
-    assert_eq!(payload_text(pong).as_deref(), Some("ping"));
+    offer_transport
+        .send_bytes(&protocol::encode_host_frame_binary(&server_heartbeat))
+        .expect("offer send heartbeat");
+    let heartbeat_msg = recv_data_message(&answer_transport, Duration::from_secs(5)).await;
+    let heartbeat_bytes = match heartbeat_msg.payload {
+        Payload::Binary(bytes) => bytes,
+        Payload::Text(text) => panic!("unexpected text payload: {text}"),
+    };
+    let decoded_heartbeat =
+        protocol::decode_host_frame_binary(&heartbeat_bytes).expect("heartbeat frame");
+    assert!(matches!(
+        decoded_heartbeat,
+        HostFrame::Heartbeat { seq, .. } if seq == 1
+    ));
 
-    answer_transport.send_text("pong").expect("answer send");
-    let ping = recv_via_blocking(&offer_transport, Duration::from_secs(5)).await;
-    assert_eq!(payload_text(ping).as_deref(), Some("pong"));
+    let client_frame = WireClientFrame::Input {
+        seq: 7,
+        data: b"echo from client".to_vec(),
+    };
+    answer_transport
+        .send_bytes(&protocol::encode_client_frame_binary(&client_frame))
+        .expect("answer send client frame");
+    let inbound_client = recv_data_message(&offer_transport, Duration::from_secs(5)).await;
+    match inbound_client.payload {
+        Payload::Binary(bytes) => {
+            let decoded = protocol::decode_client_frame_binary(&bytes).expect("client frame");
+            assert!(matches!(decoded, WireClientFrame::Input { seq, .. } if seq == 7));
+        }
+        Payload::Text(text) => panic!("unexpected text payload: {text}"),
+    }
 
     shutdown_tx.send(()).ok();
 }

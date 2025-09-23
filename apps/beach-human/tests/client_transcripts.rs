@@ -1,7 +1,7 @@
 #![recursion_limit = "1024"]
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use beach_human::cache::terminal::PackedCell;
 use beach_human::client::terminal::{ClientError, TerminalClient};
@@ -509,9 +509,7 @@ async fn client_requests_history_after_delta_when_handshake_empty() {
             Ok(message) => match message.payload {
                 Payload::Binary(bytes) => match protocol::decode_client_frame_binary(&bytes) {
                     Ok(WireClientFrame::RequestBackfill {
-                        start_row,
-                        count,
-                        ..
+                        start_row, count, ..
                     }) => break (start_row, count),
                     Ok(_) => continue,
                     Err(err) => panic!("decode client frame: {err}"),
@@ -535,6 +533,146 @@ async fn client_requests_history_after_delta_when_handshake_empty() {
         "expected backfill start row below first delta row; got {request_start} (delta row {first_row})"
     );
     assert!(request_count > 0);
+
+    send_host_frame(&*server, HostFrame::Shutdown);
+
+    tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("client join timeout")
+        .expect("client thread");
+}
+
+#[test_timeout::tokio_timeout_test]
+async fn client_retries_history_when_initial_backfill_empty() {
+    let pair = TransportPair::new(TransportKind::Ipc);
+    let transport: Arc<dyn Transport> = Arc::from(pair.client);
+    let server = pair.server;
+
+    let handle = tokio::task::spawn_blocking(move || {
+        let client = TerminalClient::new(transport).with_render(false);
+        if let Err(err) = client.run() {
+            panic!("client error: {err}");
+        }
+    });
+
+    send_host_frame(
+        &*server,
+        HostFrame::Hello {
+            subscription: 1,
+            max_seq: 0,
+            config: SyncConfigFrame {
+                snapshot_budgets: vec![LaneBudgetFrame {
+                    lane: Lane::Foreground,
+                    max_updates: 0,
+                }],
+                delta_budget: 512,
+                heartbeat_ms: 250,
+                initial_snapshot_lines: 0,
+            },
+        },
+    );
+    send_host_frame(&*server, HostFrame::Grid { rows: 24, cols: 80 });
+    send_host_frame(
+        &*server,
+        HostFrame::SnapshotComplete {
+            subscription: 1,
+            lane: Lane::Foreground,
+        },
+    );
+
+    let (subscription, first_request_id, start_row, count) = loop {
+        // Trigger the client's initial request by delivering some tail output.
+        let mut seed_updates = Vec::new();
+        for row in 0..10u32 {
+            let text = format!("seed-{row:03}");
+            seed_updates.push(Update::Row {
+                row,
+                seq: (row + 1) as u64,
+                cells: text.chars().map(pack_char).collect(),
+            });
+        }
+        send_host_frame(
+            &*server,
+            HostFrame::Delta {
+                subscription: 1,
+                watermark: 10,
+                has_more: false,
+                updates: seed_updates,
+            },
+        );
+
+        let message = server
+            .recv(Duration::from_secs(2))
+            .expect("receive first backfill request");
+        if let Payload::Binary(bytes) = message.payload {
+            if let Ok(WireClientFrame::RequestBackfill {
+                subscription,
+                request_id,
+                start_row,
+                count,
+            }) = protocol::decode_client_frame_binary(&bytes)
+            {
+                break (subscription, request_id, start_row, count);
+            }
+        }
+    };
+
+    // Respond with no history so the client still has a gap.
+    send_host_frame(
+        &*server,
+        HostFrame::HistoryBackfill {
+            subscription,
+            request_id: first_request_id,
+            start_row,
+            count,
+            updates: Vec::new(),
+            more: false,
+        },
+    );
+
+    // Deliver a burst of new output beyond the initial seed.
+    let mut updates = Vec::new();
+    for row in 10..150u32 {
+        let text = format!("line-{row:03}");
+        updates.push(Update::Row {
+            row,
+            seq: (row + 1) as u64,
+            cells: text.chars().map(pack_char).collect(),
+        });
+    }
+    send_host_frame(
+        &*server,
+        HostFrame::Delta {
+            subscription,
+            watermark: 150,
+            has_more: false,
+            updates,
+        },
+    );
+
+    // Expect the client to retry a history request after noticing the gap.
+    let mut observed_retry = false;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match server.recv(Duration::from_millis(200)) {
+            Ok(message) => {
+                if let Payload::Binary(bytes) = message.payload {
+                    if let Ok(WireClientFrame::RequestBackfill { request_id, .. }) =
+                        protocol::decode_client_frame_binary(&bytes)
+                    {
+                        if request_id != first_request_id {
+                            observed_retry = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(TransportError::Timeout) => continue,
+            Err(err) => panic!("transport error while awaiting retry: {err}"),
+        }
+    }
+
+    assert!(observed_retry, "client never retried backfill after empty response");
 
     send_host_frame(&*server, HostFrame::Shutdown);
 
@@ -630,6 +768,7 @@ async fn client_resolves_missing_rows_after_empty_backfill() {
         },
     );
 
+    let mut saw_retry = false;
     for _ in 0..5 {
         match server.recv(Duration::from_millis(500)) {
             Err(TransportError::Timeout) => break,
@@ -640,10 +779,11 @@ async fn client_resolves_missing_rows_after_empty_backfill() {
                         ..
                     }) = protocol::decode_client_frame_binary(bytes)
                     {
-                        assert!(
-                            next_start > start_row,
-                            "empty backfill did not retire range; received start {next_start}"
+                        assert_eq!(
+                            next_start, start_row,
+                            "retry should target same range after empty response"
                         );
+                        saw_retry = true;
                         break;
                     }
                 }
@@ -651,6 +791,7 @@ async fn client_resolves_missing_rows_after_empty_backfill() {
             Err(err) => panic!("unexpected transport error: {err}"),
         }
     }
+    assert!(saw_retry, "client did not retry after empty backfill");
 
     send_host_frame(&*server, HostFrame::Shutdown);
 

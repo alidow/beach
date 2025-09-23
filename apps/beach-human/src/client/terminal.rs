@@ -74,6 +74,7 @@ pub struct TerminalClient {
     pending_backfills: Vec<BackfillRequestState>,
     last_backfill_request_at: Option<Instant>,
     known_base_row: Option<u64>,
+    has_loaded_rows: bool,
 }
 
 impl TerminalClient {
@@ -103,6 +104,7 @@ impl TerminalClient {
             pending_backfills: Vec::new(),
             last_backfill_request_at: None,
             known_base_row: None,
+            has_loaded_rows: false,
         }
     }
 
@@ -214,6 +216,7 @@ impl TerminalClient {
                 self.next_backfill_request_id = 1;
                 self.last_backfill_request_at = None;
                 self.known_base_row = None;
+                self.has_loaded_rows = false;
             }
             WireHostFrame::Grid { rows, cols } => {
                 let rows = rows as usize;
@@ -228,12 +231,19 @@ impl TerminalClient {
             }
             WireHostFrame::Snapshot {
                 updates, watermark, ..
+            } => {
+                for update in &updates {
+                    self.observe_update_bounds(update, true);
+                    self.apply_wire_update(update);
+                }
+                self.last_seq = cmp::max(self.last_seq, watermark);
+                self.force_render = true;
             }
-            | WireHostFrame::Delta {
+            WireHostFrame::Delta {
                 updates, watermark, ..
             } => {
                 for update in &updates {
-                    self.observe_update_bounds(update);
+                    self.observe_update_bounds(update, false);
                     self.apply_wire_update(update);
                 }
                 self.last_seq = cmp::max(self.last_seq, watermark);
@@ -248,7 +258,7 @@ impl TerminalClient {
                 more,
             } => {
                 for update in &updates {
-                    self.observe_update_bounds(update);
+                    self.observe_update_bounds(update, true);
                 }
                 self.handle_history_backfill(
                     subscription,
@@ -268,7 +278,7 @@ impl TerminalClient {
         Ok(())
     }
 
-    fn observe_update_bounds(&mut self, update: &WireUpdate) {
+    fn observe_update_bounds(&mut self, update: &WireUpdate, authoritative: bool) {
         let min_row = match update {
             WireUpdate::Cell { row, .. }
             | WireUpdate::Row { row, .. }
@@ -278,10 +288,14 @@ impl TerminalClient {
             WireUpdate::Style { .. } => None,
         };
         if let Some(row) = min_row {
-            let base = self.known_base_row.map_or(row, |current| current.min(row));
-            if Some(base) != self.known_base_row {
-                self.known_base_row = Some(base);
+            if authoritative {
+                let base = self.known_base_row.map_or(row, |current| current.min(row));
+                if Some(base) != self.known_base_row {
+                    self.known_base_row = Some(base);
+                }
                 self.renderer.set_base_row(base);
+            } else if row < self.renderer.base_row() {
+                self.renderer.set_base_row(row);
             }
         }
     }
@@ -307,10 +321,9 @@ impl TerminalClient {
             None => return Ok(()),
         };
         self.prune_backfill_requests();
-        let base_row = match self.known_base_row {
-            Some(row) => row,
-            None => return Ok(()),
-        };
+        if !self.has_loaded_rows {
+            return Ok(());
+        }
         if self.pending_backfills.len() >= BACKFILL_MAX_PENDING_REQUESTS {
             return Ok(());
         }
@@ -330,7 +343,10 @@ impl TerminalClient {
         if capped == 0 {
             return Ok(());
         }
-        let request_start = start.max(base_row);
+        let request_start = match self.known_base_row {
+            Some(base) => start.max(base),
+            None => start,
+        };
         let request_end = request_start.saturating_add(capped as u64);
         if self.is_range_pending(request_start, request_end) {
             return Ok(());
@@ -369,12 +385,11 @@ impl TerminalClient {
         let end = start.saturating_add(count as u64);
         self.pending_backfills.push(BackfillRequestState {
             id: request_id,
-            start: start,
+            start,
             end,
             issued_at: Instant::now(),
             more_expected: false,
         });
-        self.last_backfill_request_at = Some(Instant::now());
         trace!(
             target = "client::backfill",
             request_id, subscription, start, count, "requesting history backfill"
@@ -452,6 +467,12 @@ impl TerminalClient {
         if start >= end {
             return;
         }
+        if touched_rows.is_empty() {
+            for row in start..end {
+                self.renderer.mark_row_pending(row);
+            }
+            return;
+        }
         let mut bounds_start = start;
         let mut bounds_end = end;
         if let Some(&first) = touched_rows.first() {
@@ -511,11 +532,25 @@ impl TerminalClient {
                 seq,
                 cell,
             } => {
+                trace!(
+                    target = "client::render",
+                    row = *row,
+                    col = *col,
+                    seq = *seq,
+                    kind = "cell"
+                );
                 let (ch, style) = decode_wire_cell(*cell);
                 self.renderer
                     .apply_cell(*row as usize, *col as usize, *seq, ch, style);
             }
             WireUpdate::Row { row, seq, cells } => {
+                trace!(
+                    target = "client::render",
+                    row = *row,
+                    seq = *seq,
+                    cols = cells.len(),
+                    kind = "row"
+                );
                 let row_index = *row as usize;
                 for (col, cell) in cells.iter().enumerate() {
                     let (ch, style) = decode_wire_cell(*cell);
@@ -528,6 +563,13 @@ impl TerminalClient {
                 seq,
                 cell,
             } => {
+                trace!(
+                    target = "client::render",
+                    rows = ?rows,
+                    cols = ?cols,
+                    seq = *seq,
+                    kind = "rect"
+                );
                 let row_range = rows[0] as usize..rows[1] as usize;
                 let col_range = cols[0] as usize..cols[1] as usize;
                 let (ch, style) = decode_wire_cell(*cell);
@@ -541,6 +583,14 @@ impl TerminalClient {
                 cells,
             } => {
                 if !cells.is_empty() {
+                    trace!(
+                        target = "client::render",
+                        row = *row,
+                        start_col = *start_col,
+                        len = cells.len(),
+                        seq = *seq,
+                        kind = "segment"
+                    );
                     let mut segment = Vec::with_capacity(cells.len());
                     for (idx, cell) in cells.iter().enumerate() {
                         let (ch, style) = decode_wire_cell(*cell);
@@ -551,6 +601,12 @@ impl TerminalClient {
                 }
             }
             WireUpdate::Trim { start, count, .. } => {
+                trace!(
+                    target = "client::render",
+                    start = *start,
+                    count = *count,
+                    kind = "trim"
+                );
                 let start = *start as usize;
                 let count = *count as usize;
                 self.renderer.apply_trim(start, count);
@@ -575,6 +631,16 @@ impl TerminalClient {
                 self.renderer.set_style(*id, *fg, *bg, *attrs);
                 self.last_seq = cmp::max(self.last_seq, *seq);
             }
+        }
+
+        if matches!(
+            update,
+            WireUpdate::Cell { .. }
+                | WireUpdate::Row { .. }
+                | WireUpdate::Rect { .. }
+                | WireUpdate::RowSegment { .. }
+        ) {
+            self.has_loaded_rows = true;
         }
 
         if let Some(hint) = cursor_hint {

@@ -148,6 +148,10 @@ impl GridRenderer {
         renderer
     }
 
+    pub fn base_row(&self) -> u64 {
+        self.base_row
+    }
+
     pub fn set_base_row(&mut self, base_row: u64) {
         if base_row == self.base_row {
             return;
@@ -156,9 +160,7 @@ impl GridRenderer {
             let drop = (base_row - self.base_row) as usize;
             let current_len = self.rows.len();
             if drop >= current_len {
-                let preserve = current_len
-                    .max(self.viewport_height)
-                    .max(1);
+                let preserve = current_len.max(self.viewport_height).max(1);
                 self.rows.clear();
                 self.rows.resize(preserve, RowSlot::Pending);
                 self.scroll_top = 0;
@@ -456,6 +458,21 @@ impl GridRenderer {
         if let Some(rel) = self.relative_row(absolute_row) {
             if !matches!(self.rows.get(rel), Some(RowSlot::Missing)) {
                 self.rows[rel] = RowSlot::Missing;
+                self.mark_dirty();
+            }
+        }
+    }
+
+    pub fn mark_row_pending(&mut self, absolute_row: u64) {
+        if let Some(rel) = self.relative_row(absolute_row) {
+            if !matches!(self.rows.get(rel), Some(RowSlot::Pending)) {
+                self.rows[rel] = RowSlot::Pending;
+                self.mark_dirty();
+            }
+        } else {
+            self.touch_row(absolute_row);
+            if let Some(rel) = self.relative_row(absolute_row) {
+                self.rows[rel] = RowSlot::Pending;
                 self.mark_dirty();
             }
         }
@@ -1027,5 +1044,39 @@ impl Widget for TerminalBodyWidget {
             });
             buf.set_line(area.x, area.y + row as u16, blank, area.width);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode_line(text: &str) -> Vec<(char, Option<u32>)> {
+        text.chars().map(|ch| (ch, None)).collect()
+    }
+
+    #[test]
+    fn tail_render_does_not_leave_missing_gaps_after_new_rows() {
+        let mut renderer = GridRenderer::new(0, 80);
+        renderer.on_resize(80, 24);
+        renderer.set_base_row(0);
+        for row in 0..120u64 {
+            renderer.mark_row_missing(row);
+        }
+        for (idx, row) in (121u64..151).enumerate() {
+            let text = format!("Line {:03}", idx + 121);
+            renderer.apply_row_from_cells(row as usize, row as Seq, &decode_line(&text));
+        }
+        renderer.scroll_to_tail();
+        let lines = renderer.visible_lines();
+        assert!(
+            lines.iter().any(|line| line.contains("Line 150")),
+            "tail missing expected content"
+        );
+        let non_blank = lines.iter().filter(|line| !line.trim().is_empty()).count();
+        assert!(
+            non_blank >= 24.min(lines.len()),
+            "viewport still blank after filling rows"
+        );
     }
 }

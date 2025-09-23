@@ -43,6 +43,7 @@ async fn client_replays_basic_snapshot() {
                 snapshot_budgets: vec![],
                 delta_budget: 512,
                 heartbeat_ms: 250,
+                initial_snapshot_lines: 500,
             },
         },
     );
@@ -103,6 +104,7 @@ async fn client_applies_deltas() {
                 snapshot_budgets: vec![],
                 delta_budget: 512,
                 heartbeat_ms: 250,
+                initial_snapshot_lines: 500,
             },
         },
     );
@@ -174,6 +176,7 @@ async fn client_emits_input_events() {
                 snapshot_budgets: vec![],
                 delta_budget: 512,
                 heartbeat_ms: 250,
+                initial_snapshot_lines: 500,
             },
         },
     );
@@ -222,6 +225,7 @@ async fn client_handles_binary_snapshot_and_delta() {
         }],
         delta_budget: 512,
         heartbeat_ms: 250,
+        initial_snapshot_lines: 64,
     };
 
     send_host_frame(

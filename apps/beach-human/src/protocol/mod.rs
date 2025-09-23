@@ -34,6 +34,7 @@ pub struct SyncConfigFrame {
     pub snapshot_budgets: Vec<LaneBudgetFrame>,
     pub delta_budget: u32,
     pub heartbeat_ms: u64,
+    pub initial_snapshot_lines: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +109,14 @@ pub enum HostFrame {
         has_more: bool,
         updates: Vec<Update>,
     },
+    HistoryBackfill {
+        subscription: u64,
+        request_id: u64,
+        start_row: u64,
+        count: u32,
+        updates: Vec<Update>,
+        more: bool,
+    },
     InputAck {
         seq: u64,
     },
@@ -124,6 +133,12 @@ pub enum ClientFrame {
     Resize {
         cols: u16,
         rows: u16,
+    },
+    RequestBackfill {
+        subscription: u64,
+        request_id: u64,
+        start_row: u64,
+        count: u32,
     },
     #[serde(other)]
     Unknown,

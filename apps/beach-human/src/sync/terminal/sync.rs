@@ -1,4 +1,5 @@
 use std::cmp;
+use std::convert::TryFrom;
 use std::sync::Arc;
 
 use crate::cache::terminal::TerminalGrid;
@@ -44,13 +45,13 @@ impl TerminalSync {
         }
     }
 
-    fn collect_row(&self, row: usize) -> Option<CacheUpdate> {
+    fn collect_row(&self, row_index: usize) -> Option<CacheUpdate> {
         let (_, cols) = self.grid.dims();
-        let base_offset = self.grid.row_offset() as usize;
-        let absolute_row = base_offset + row;
+        let absolute_row = self.grid.row_id_at(row_index)?;
+        let absolute_row_usize = usize::try_from(absolute_row).ok()?;
         if cols == 0 {
             return Some(CacheUpdate::Row(RowSnapshot::new(
-                absolute_row,
+                absolute_row_usize,
                 0,
                 Vec::new(),
             )));
@@ -58,15 +59,31 @@ impl TerminalSync {
         let mut cells = Vec::with_capacity(cols);
         let mut max_seq = 0;
         for col in 0..cols {
-            let snapshot = self.grid.get_cell_relaxed(row, col)?;
+            let snapshot = self.grid.get_cell_relaxed(row_index, col)?;
             max_seq = max_seq.max(snapshot.seq);
             cells.push(snapshot.cell);
         }
         Some(CacheUpdate::Row(RowSnapshot::new(
-            absolute_row,
+            absolute_row_usize,
             max_seq,
             cells,
         )))
+    }
+
+    fn collect_row_by_absolute(&self, absolute_row: u64) -> Option<CacheUpdate> {
+        let index = self.grid.index_of_row(absolute_row)?;
+        self.collect_row(index)
+    }
+
+    fn initial_snapshot_floor(&self, first: u64, last: u64) -> u64 {
+        let initial = self.config.initial_snapshot_lines;
+        if initial == 0 {
+            last.checked_add(1).unwrap_or(u64::MAX)
+        } else {
+            let span = (initial.saturating_sub(1)) as u64;
+            let candidate = last.saturating_sub(span);
+            candidate.max(first)
+        }
     }
 
     fn max_seq_from_grid(&self) -> Seq {
@@ -85,10 +102,11 @@ impl TerminalSync {
 
 #[derive(Debug, Default)]
 pub struct TerminalSnapshotCursor {
-    next_foreground_row: Option<isize>,
-    next_recent_row: Option<isize>,
-    next_history_row: usize,
-    history_progress: usize,
+    next_foreground_row: Option<u64>,
+    foreground_floor: u64,
+    next_recent_row: Option<u64>,
+    recent_floor: u64,
+    next_history_row: Option<u64>,
 }
 
 impl SnapshotSource<CacheUpdate> for TerminalSync {
@@ -99,23 +117,36 @@ impl SnapshotSource<CacheUpdate> for TerminalSync {
     }
 
     fn reset_lane(&self, cursor: &mut Self::Cursor, lane: PriorityLane) {
-        let (rows, _) = self.grid.dims();
+        let first_row_id = self.grid.first_row_id();
+        let last_row_id = self.grid.last_row_id();
         match lane {
             PriorityLane::Foreground => {
-                cursor.next_foreground_row = rows.checked_sub(1).map(|r| r as isize);
+                if let Some(last) = last_row_id {
+                    let first = first_row_id.unwrap_or(last);
+                    let floor = self.initial_snapshot_floor(first, last);
+                    cursor.foreground_floor = floor;
+                    cursor.next_foreground_row = if floor <= last { Some(last) } else { None };
+                } else {
+                    cursor.foreground_floor = 0;
+                    cursor.next_foreground_row = None;
+                }
             }
             PriorityLane::Recent => {
-                let viewport_rows = self.config.budget_for(PriorityLane::Foreground).min(rows);
-                let start = rows.saturating_sub(viewport_rows).saturating_sub(1);
-                cursor.next_recent_row = if rows <= viewport_rows {
-                    None
+                if let (Some(first), Some(last)) = (first_row_id, last_row_id) {
+                    cursor.recent_floor = first;
+                    let floor = self.initial_snapshot_floor(first, last);
+                    cursor.next_recent_row = if floor > first {
+                        floor.checked_sub(1)
+                    } else {
+                        None
+                    };
                 } else {
-                    Some(start as isize)
-                };
+                    cursor.recent_floor = 0;
+                    cursor.next_recent_row = None;
+                }
             }
             PriorityLane::History => {
-                cursor.next_history_row = 0;
-                cursor.history_progress = 0;
+                cursor.next_history_row = None;
             }
         }
     }
@@ -129,57 +160,63 @@ impl SnapshotSource<CacheUpdate> for TerminalSync {
         if budget == 0 {
             return None;
         }
-        let (rows, _) = self.grid.dims();
-        if rows == 0 {
-            return None;
-        }
         let mut updates = Vec::new();
         let mut max_seq = 0;
 
         match lane {
             PriorityLane::Foreground => {
-                let mut row = cursor.next_foreground_row?;
-                for _ in 0..budget {
-                    if row < 0 {
+                while updates.len() < budget {
+                    let absolute = match cursor.next_foreground_row {
+                        Some(row) => row,
+                        None => break,
+                    };
+                    if absolute < cursor.foreground_floor {
+                        cursor.next_foreground_row = None;
                         break;
                     }
-                    if let Some(update) = self.collect_row(row as usize) {
+                    let next_value = if absolute == cursor.foreground_floor {
+                        None
+                    } else {
+                        absolute.checked_sub(1)
+                    };
+                    if let Some(update) = self.collect_row_by_absolute(absolute) {
                         max_seq = max_seq.max(update.seq());
                         updates.push(update);
                     }
-                    row -= 1;
+                    cursor.next_foreground_row = next_value;
+                    if cursor.next_foreground_row.is_none() {
+                        break;
+                    }
                 }
-                cursor.next_foreground_row = if row < 0 { None } else { Some(row) };
             }
             PriorityLane::Recent => {
-                let mut row = cursor.next_recent_row?;
-                let floor = cursor.history_progress as isize;
-                for _ in 0..budget {
-                    if row < floor {
+                while updates.len() < budget {
+                    let absolute = match cursor.next_recent_row {
+                        Some(row) => row,
+                        None => break,
+                    };
+                    if absolute < cursor.recent_floor {
+                        cursor.next_recent_row = None;
                         break;
                     }
-                    if let Some(update) = self.collect_row(row as usize) {
+                    let reached_floor = absolute == cursor.recent_floor;
+                    let next_value = if reached_floor {
+                        None
+                    } else {
+                        absolute.checked_sub(1)
+                    };
+                    if let Some(update) = self.collect_row_by_absolute(absolute) {
                         max_seq = max_seq.max(update.seq());
                         updates.push(update);
                     }
-                    row -= 1;
+                    cursor.next_recent_row = next_value;
+                    if cursor.next_recent_row.is_none() {
+                        break;
+                    }
                 }
-                cursor.next_recent_row = if row < floor { None } else { Some(row) };
             }
             PriorityLane::History => {
-                let mut row = cursor.next_history_row;
-                for _ in 0..budget {
-                    if row >= rows {
-                        break;
-                    }
-                    if let Some(update) = self.collect_row(row) {
-                        max_seq = max_seq.max(update.seq());
-                        updates.push(update);
-                    }
-                    row += 1;
-                }
-                cursor.next_history_row = row;
-                cursor.history_progress = row;
+                return None;
             }
         }
 
@@ -190,7 +227,7 @@ impl SnapshotSource<CacheUpdate> for TerminalSync {
         let has_more = match lane {
             PriorityLane::Foreground => cursor.next_foreground_row.is_some(),
             PriorityLane::Recent => cursor.next_recent_row.is_some(),
-            PriorityLane::History => cursor.next_history_row < rows,
+            PriorityLane::History => cursor.next_history_row.is_some(),
         };
 
         Some(SnapshotSlice {
@@ -361,6 +398,7 @@ mod tests {
             LaneBudget::new(PriorityLane::History, 12),
         ];
         config.delta_budget = 2;
+        config.initial_snapshot_lines = 5;
 
         let terminal_sync = Arc::new(TerminalSync::new(
             grid.clone(),
@@ -400,7 +438,7 @@ mod tests {
                 break;
             }
         }
-        assert!(foreground_total >= config.budget_for(PriorityLane::Foreground));
+        assert_eq!(foreground_total, config.initial_snapshot_lines.min(rows));
         assert_eq!(
             foreground_first_chunk.unwrap_or(0),
             config.budget_for(PriorityLane::Foreground)
@@ -421,26 +459,13 @@ mod tests {
                 break;
             }
         }
-        assert!(recent_rows > 0);
+        assert_eq!(recent_rows, rows - foreground_total);
 
-        let mut history_seen = 0;
         while let Some(chunk) = server_sync.snapshot_chunk(subscription_id, PriorityLane::History) {
-            if chunk.updates.is_empty() {
-                break;
-            }
-            for update in &chunk.updates {
-                if let CacheUpdate::Row(row) = update {
-                    history_rows += 1;
-                    history_seen = history_seen.max(row.row + 1);
-                }
-            }
-            assert!(chunk.updates.len() <= config.budget_for(PriorityLane::History));
-            if !chunk.has_more {
-                break;
-            }
+            assert!(chunk.updates.is_empty());
+            history_rows += chunk.updates.len();
         }
-        assert_eq!(history_seen, rows);
-        assert!(history_rows >= rows);
+        assert_eq!(history_rows, 0);
 
         let since = last_foreground_watermark;
         if let Some(delata_batch) = server_sync.delta_batch(subscription_id, since) {

@@ -58,6 +58,8 @@ pub struct SyncConfig {
     /// Upper bound on the number of updates emitted in a delta batch.
     pub delta_budget: usize,
     pub heartbeat_interval: Duration,
+    /// Number of rows prioritized in the initial snapshot lane.
+    pub initial_snapshot_lines: usize,
 }
 
 impl SyncConfig {
@@ -70,16 +72,20 @@ impl SyncConfig {
     }
 }
 
+const DEFAULT_INITIAL_SNAPSHOT_LINES: usize = 500;
+
 impl Default for SyncConfig {
     fn default() -> Self {
+        let initial = DEFAULT_INITIAL_SNAPSHOT_LINES;
         Self {
             snapshot_budgets: vec![
-                LaneBudget::new(PriorityLane::Foreground, 64),
-                LaneBudget::new(PriorityLane::Recent, 256),
-                LaneBudget::new(PriorityLane::History, 512),
+                LaneBudget::new(PriorityLane::Foreground, initial),
+                LaneBudget::new(PriorityLane::Recent, initial),
+                LaneBudget::new(PriorityLane::History, initial),
             ],
             delta_budget: 512,
             heartbeat_interval: Duration::from_millis(250),
+            initial_snapshot_lines: initial,
         }
     }
 }

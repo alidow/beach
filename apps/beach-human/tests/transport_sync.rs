@@ -207,6 +207,7 @@ fn sync_config_to_wire(config: &SyncConfig) -> WireSyncConfig {
         snapshot_budgets,
         delta_budget: config.delta_budget as u32,
         heartbeat_ms: config.heartbeat_interval.as_millis() as u64,
+        initial_snapshot_lines: config.initial_snapshot_lines as u32,
     }
 }
 
@@ -407,6 +408,7 @@ where
         ],
         delta_budget: 8,
         heartbeat_interval: Duration::from_millis(50),
+        initial_snapshot_lines: 4,
     };
 
     let terminal_sync = Arc::new(TerminalSync::new(
@@ -530,6 +532,7 @@ where
                 | HostFrame::Hello { .. }
                 | HostFrame::Grid { .. }
                 | HostFrame::Heartbeat { .. }
+                | HostFrame::HistoryBackfill { .. }
                 | HostFrame::InputAck { .. } => {}
             }
         }

@@ -15,14 +15,16 @@ pub struct TrimEvent {
 
 #[derive(Clone, Debug)]
 struct RowEntry {
+    absolute: u64,
     cells: Vec<PackedCell>,
     seqs: Vec<Seq>,
     max_seq: Seq,
 }
 
 impl RowEntry {
-    fn new(_absolute: u64, cols: usize, default_cell: PackedCell, default_seq: Seq) -> Self {
+    fn new(absolute: u64, cols: usize, default_cell: PackedCell, default_seq: Seq) -> Self {
         Self {
+            absolute,
             cells: vec![default_cell; cols],
             seqs: vec![default_seq; cols],
             max_seq: default_seq,
@@ -114,6 +116,7 @@ struct GridInner {
     rows: VecDeque<RowEntry>,
     base: u64,
     cols: usize,
+    next_row_id: u64,
 }
 
 impl GridInner {
@@ -126,6 +129,7 @@ impl GridInner {
             rows: entries,
             base: 0,
             cols,
+            next_row_id: rows as u64,
         }
     }
 
@@ -156,16 +160,24 @@ impl GridInner {
         if absolute < self.base {
             return Err(WriteError::CoordOutOfBounds);
         }
-        while self.base + self.rows.len() as u64 <= absolute {
-            let next_abs = self.base + self.rows.len() as u64;
+        while absolute >= self.next_row_id {
+            let next_abs = self.next_row_id;
             self.rows.push_back(RowEntry::new(
                 next_abs,
                 self.cols,
                 default_cell,
                 default_seq,
             ));
+            self.next_row_id = self.next_row_id.saturating_add(1);
         }
-        Ok((absolute - self.base) as usize)
+        let offset = absolute
+            .checked_sub(self.base)
+            .ok_or(WriteError::CoordOutOfBounds)?;
+        let index = offset as usize;
+        if index >= self.rows.len() {
+            return Err(WriteError::CoordOutOfBounds);
+        }
+        Ok(index)
     }
 
     fn trim_front(&mut self, count: usize) -> Option<TrimEvent> {
@@ -184,7 +196,11 @@ impl GridInner {
             return None;
         }
         let start = self.base;
-        self.base += trimmed as u64;
+        self.base = self
+            .rows
+            .front()
+            .map(|entry| entry.absolute)
+            .unwrap_or(self.next_row_id);
         Some(TrimEvent {
             start,
             count: trimmed,
@@ -269,6 +285,50 @@ impl TerminalGrid {
 
     pub fn row_offset(&self) -> u64 {
         self.inner.read().unwrap().base
+    }
+
+    pub fn first_row_id(&self) -> Option<u64> {
+        self.inner
+            .read()
+            .unwrap()
+            .rows
+            .front()
+            .map(|entry| entry.absolute)
+    }
+
+    pub fn last_row_id(&self) -> Option<u64> {
+        self.inner
+            .read()
+            .unwrap()
+            .rows
+            .back()
+            .map(|entry| entry.absolute)
+    }
+
+    pub fn row_id_at(&self, index: usize) -> Option<u64> {
+        self.inner
+            .read()
+            .unwrap()
+            .rows
+            .get(index)
+            .map(|entry| entry.absolute)
+    }
+
+    pub fn index_of_row(&self, absolute: u64) -> Option<usize> {
+        let inner = self.inner.read().unwrap();
+        if absolute < inner.base {
+            return None;
+        }
+        let offset = (absolute - inner.base) as usize;
+        if offset < inner.rows.len() {
+            Some(offset)
+        } else {
+            None
+        }
+    }
+
+    pub fn next_row_id(&self) -> u64 {
+        self.inner.read().unwrap().next_row_id
     }
 
     pub fn history_limit(&self) -> usize {

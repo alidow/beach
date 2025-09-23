@@ -14,6 +14,7 @@ fn report_binary_vs_json_payload_sizes() {
         }],
         delta_budget: 512,
         heartbeat_ms: 250,
+        initial_snapshot_lines: 128,
     };
 
     let frames = vec![

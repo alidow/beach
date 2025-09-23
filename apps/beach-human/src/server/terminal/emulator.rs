@@ -15,6 +15,7 @@ use alacritty_terminal::{
     vte::ansi::{Color as AnsiColor, NamedColor, Processor},
 };
 use std::borrow::Cow;
+use std::convert::TryFrom;
 
 pub type EmulatorResult = Vec<CacheUpdate>;
 
@@ -45,10 +46,11 @@ impl SimpleTerminalEmulator {
         let viewport_rows = rows.max(1);
         let viewport_cols = cols.max(1);
         let default_style = grid.ensure_style_id(Style::default());
+        let absolute_row = usize::try_from(grid.row_offset()).unwrap_or(usize::MAX);
         Self {
             viewport_rows,
             viewport_cols,
-            absolute_row: 0,
+            absolute_row,
             col: 0,
             seq: 0,
             default_style,
@@ -218,7 +220,8 @@ impl AlacrittyEmulator {
     pub fn new(grid: &TerminalGrid) -> Self {
         let (rows, cols) = grid.dims();
         let dimensions = TermDimensions::new(cols.max(1), rows.max(1));
-        let config = Config::default();
+        let mut config = Config::default();
+        config.scrolling_history = grid.history_limit();
         let mut term = Term::new(config, &dimensions, EventProxy::default());
         let mut parser = Processor::new();
         // Enable standard LF behavior so shells that rely on ESC[20h behave normally.
@@ -252,10 +255,12 @@ impl AlacrittyEmulator {
         let history_size = total_lines.saturating_sub(rows);
         let viewport_top = history_size.saturating_sub(display_offset);
         let style_table = grid.style_table.clone();
+        let base_row = grid.row_offset();
 
         let updates = self.render_full_internal(
             rows,
             cols,
+            base_row,
             viewport_top,
             display_offset,
             style_table.as_ref(),
@@ -269,6 +274,7 @@ impl AlacrittyEmulator {
         &mut self,
         rows: usize,
         cols: usize,
+        base_row: u64,
         viewport_top: usize,
         display_offset: usize,
         style_table: &StyleTable,
@@ -277,7 +283,10 @@ impl AlacrittyEmulator {
         let mut emitted_styles = std::collections::HashSet::new();
         let mut cell_updates = Vec::with_capacity(rows * cols);
         for visible_line in 0..rows {
-            let absolute_row = viewport_top + visible_line;
+            let Some(absolute_row) = Self::absolute_row_id(base_row, viewport_top, visible_line)
+            else {
+                continue;
+            };
             let line_index = visible_line as isize - display_offset as isize;
             let line = Line(line_index as i32);
             for col in 0..cols {
@@ -302,6 +311,13 @@ impl AlacrittyEmulator {
         style_updates
     }
 
+    #[inline]
+    fn absolute_row_id(base_row: u64, viewport_top: usize, visible_line: usize) -> Option<usize> {
+        let relative = viewport_top.checked_add(visible_line)? as u64;
+        let absolute = base_row.checked_add(relative)?;
+        usize::try_from(absolute).ok()
+    }
+
     fn collect_updates(&mut self, grid: &TerminalGrid) -> EmulatorResult {
         let term_grid = self.term.grid();
         let cols = term_grid.columns();
@@ -316,6 +332,7 @@ impl AlacrittyEmulator {
         let total_lines = term_grid.total_lines();
         let history_size = total_lines.saturating_sub(rows);
         let viewport_top = history_size.saturating_sub(display_offset);
+        let base_row = grid.row_offset();
         let forced_full = self.need_full_redraw;
         let mut cell_updates = Vec::new();
         let mut style_updates = Vec::new();
@@ -353,6 +370,7 @@ impl AlacrittyEmulator {
             let updates = self.render_full_internal(
                 rows,
                 cols,
+                base_row,
                 viewport_top,
                 display_offset,
                 style_table.as_ref(),
@@ -362,7 +380,11 @@ impl AlacrittyEmulator {
         } else if !damaged_lines.is_empty() {
             let style_table = grid.style_table.clone();
             for (visible_line, left, right) in damaged_lines {
-                let absolute_row = viewport_top + visible_line;
+                let Some(absolute_row) =
+                    Self::absolute_row_id(base_row, viewport_top, visible_line)
+                else {
+                    continue;
+                };
                 let line_index = visible_line as isize - display_offset as isize;
                 let line = Line(line_index as i32);
                 for col in left..=right {

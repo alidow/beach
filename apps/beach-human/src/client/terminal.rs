@@ -27,6 +27,21 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tracing::{Level, debug, trace};
 
+const BACKFILL_LOOKAHEAD_ROWS: usize = 120;
+const BACKFILL_MAX_ROWS_PER_REQUEST: u32 = 256;
+const BACKFILL_MAX_PENDING_REQUESTS: usize = 4;
+const BACKFILL_MIN_INTERVAL: Duration = Duration::from_millis(250);
+const BACKFILL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug)]
+struct BackfillRequestState {
+    id: u64,
+    start: u64,
+    end: u64,
+    issued_at: Instant,
+    more_expected: bool,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum ClientError {
     #[error("transport error: {0}")]
@@ -54,6 +69,10 @@ pub struct TerminalClient {
     render_interval: Duration,
     pending_render: bool,
     predictive_input: bool,
+    subscription_id: Option<u64>,
+    next_backfill_request_id: u64,
+    pending_backfills: Vec<BackfillRequestState>,
+    last_backfill_request_at: Option<Instant>,
 }
 
 impl TerminalClient {
@@ -78,6 +97,10 @@ impl TerminalClient {
             render_interval: Duration::from_millis(16),
             pending_render: false,
             predictive_input: false,
+            subscription_id: None,
+            next_backfill_request_id: 1,
+            pending_backfills: Vec::new(),
+            last_backfill_request_at: None,
         }
     }
 
@@ -101,6 +124,7 @@ impl TerminalClient {
         debug!(target = "client::loop", "client loop started");
         loop {
             self.pump_input()?;
+            self.maybe_request_backfill()?;
             let message = match self.transport.recv(Duration::from_millis(25)) {
                 Ok(message) => Some(message),
                 Err(TransportError::Timeout) => None,
@@ -129,6 +153,7 @@ impl TerminalClient {
                             Err(ClientError::Shutdown) => break,
                             Err(err) => return Err(err),
                         }
+                        self.maybe_request_backfill()?;
                     }
                     Payload::Text(text) => {
                         telemetry::record_bytes("client_frame_bytes", text.len());
@@ -162,6 +187,7 @@ impl TerminalClient {
                 WireHostFrame::Snapshot { .. } => "snapshot",
                 WireHostFrame::SnapshotComplete { .. } => "snapshot_complete",
                 WireHostFrame::Delta { .. } => "delta",
+                WireHostFrame::HistoryBackfill { .. } => "history_backfill",
                 WireHostFrame::InputAck { .. } => "input_ack",
                 WireHostFrame::Shutdown => "shutdown",
             };
@@ -175,7 +201,17 @@ impl TerminalClient {
         let _guard = PerfGuard::new("client_handle_frame_binary");
         match frame {
             WireHostFrame::Heartbeat { .. } => {}
-            WireHostFrame::Hello { .. } => {}
+            WireHostFrame::Hello {
+                subscription,
+                max_seq,
+                ..
+            } => {
+                self.subscription_id = Some(subscription);
+                self.last_seq = cmp::max(self.last_seq, max_seq);
+                self.pending_backfills.clear();
+                self.next_backfill_request_id = 1;
+                self.last_backfill_request_at = None;
+            }
             WireHostFrame::Grid { rows, cols } => {
                 let rows = rows as usize;
                 let cols = cols as usize;
@@ -199,6 +235,23 @@ impl TerminalClient {
                 self.last_seq = cmp::max(self.last_seq, watermark);
                 self.force_render = true;
             }
+            WireHostFrame::HistoryBackfill {
+                subscription,
+                request_id,
+                start_row,
+                count,
+                updates,
+                more,
+            } => {
+                self.handle_history_backfill(
+                    subscription,
+                    request_id,
+                    start_row,
+                    count,
+                    updates,
+                    more,
+                )?;
+            }
             WireHostFrame::InputAck { seq } => {
                 self.handle_input_ack(seq);
             }
@@ -206,6 +259,178 @@ impl TerminalClient {
             WireHostFrame::Shutdown => return Err(ClientError::Shutdown),
         }
         Ok(())
+    }
+
+    fn prune_backfill_requests(&mut self) {
+        let mut removed = false;
+        self.pending_backfills.retain(|req| {
+            if req.issued_at.elapsed() > BACKFILL_REQUEST_TIMEOUT {
+                removed = true;
+                false
+            } else {
+                true
+            }
+        });
+        if removed {
+            self.last_backfill_request_at = None;
+        }
+    }
+
+    fn maybe_request_backfill(&mut self) -> Result<(), ClientError> {
+        let subscription = match self.subscription_id {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+        self.prune_backfill_requests();
+        if self.pending_backfills.len() >= BACKFILL_MAX_PENDING_REQUESTS {
+            return Ok(());
+        }
+        if let Some(last) = self.last_backfill_request_at {
+            if last.elapsed() < BACKFILL_MIN_INTERVAL {
+                return Ok(());
+            }
+        }
+        let Some((start, span)) = self.renderer.first_unloaded_range(BACKFILL_LOOKAHEAD_ROWS)
+        else {
+            return Ok(());
+        };
+        if span == 0 {
+            return Ok(());
+        }
+        let capped = span.min(BACKFILL_MAX_ROWS_PER_REQUEST);
+        if capped == 0 {
+            return Ok(());
+        }
+        let end = start.saturating_add(capped as u64);
+        if self.is_range_pending(start, end) {
+            return Ok(());
+        }
+        self.send_backfill_request(subscription, start, capped)?;
+        Ok(())
+    }
+
+    fn is_range_pending(&self, start: u64, end: u64) -> bool {
+        self.pending_backfills
+            .iter()
+            .any(|req| Self::ranges_overlap(start, end, req.start, req.end))
+    }
+
+    fn send_backfill_request(
+        &mut self,
+        subscription: u64,
+        start: u64,
+        count: u32,
+    ) -> Result<(), ClientError> {
+        if count == 0 {
+            return Ok(());
+        }
+        let request_id = self.next_backfill_request_id;
+        self.next_backfill_request_id = self.next_backfill_request_id.saturating_add(1);
+        let frame = WireClientFrame::RequestBackfill {
+            subscription,
+            request_id,
+            start_row: start,
+            count,
+        };
+        let bytes = protocol::encode_client_frame_binary(&frame);
+        self.transport
+            .send_bytes(&bytes)
+            .map_err(ClientError::Transport)?;
+        let end = start.saturating_add(count as u64);
+        self.pending_backfills.push(BackfillRequestState {
+            id: request_id,
+            start,
+            end,
+            issued_at: Instant::now(),
+            more_expected: false,
+        });
+        self.last_backfill_request_at = Some(Instant::now());
+        trace!(
+            target = "client::backfill",
+            request_id, subscription, start, count, "requesting history backfill"
+        );
+        Ok(())
+    }
+
+    fn handle_history_backfill(
+        &mut self,
+        _subscription: u64,
+        request_id: u64,
+        start_row: u64,
+        count: u32,
+        updates: Vec<WireUpdate>,
+        more: bool,
+    ) -> Result<(), ClientError> {
+        trace!(
+            target = "client::backfill",
+            request_id,
+            start_row,
+            count,
+            updates = updates.len(),
+            more,
+            "received history backfill"
+        );
+        let mut touched_rows: Vec<u64> = Vec::new();
+        for update in &updates {
+            match update {
+                WireUpdate::Cell { row, .. }
+                | WireUpdate::Row { row, .. }
+                | WireUpdate::RowSegment { row, .. } => {
+                    touched_rows.push(*row as u64);
+                }
+                WireUpdate::Rect { rows, .. } => {
+                    let start = rows[0] as u64;
+                    let end = rows[1] as u64;
+                    for r in start..end {
+                        touched_rows.push(r);
+                    }
+                }
+                WireUpdate::Trim { .. } | WireUpdate::Style { .. } => {}
+            }
+            self.apply_wire_update(update);
+        }
+        touched_rows.sort_unstable();
+        touched_rows.dedup();
+
+        if let Some(pos) = self
+            .pending_backfills
+            .iter_mut()
+            .position(|req| req.id == request_id)
+        {
+            if more {
+                let state = &mut self.pending_backfills[pos];
+                state.issued_at = Instant::now();
+                state.start = start_row;
+                state.end = start_row.saturating_add(count as u64);
+                state.more_expected = true;
+            } else {
+                self.pending_backfills.remove(pos);
+            }
+        }
+
+        if !more {
+            let end = start_row.saturating_add(count as u64);
+            self.finalize_backfill_range(start_row, end, &touched_rows);
+            self.last_backfill_request_at = None;
+        }
+
+        self.force_render = true;
+        Ok(())
+    }
+
+    fn finalize_backfill_range(&mut self, start: u64, end: u64, touched_rows: &[u64]) {
+        if start >= end {
+            return;
+        }
+        for row in start..end {
+            if touched_rows.binary_search(&row).is_err() {
+                self.renderer.mark_row_missing(row);
+            }
+        }
+    }
+
+    fn ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+        a_start < b_end && b_start < a_end
     }
 
     fn apply_wire_update(&mut self, update: &WireUpdate) {
@@ -316,7 +541,7 @@ impl TerminalClient {
                 }
                 RowWidth(row) => {
                     self.cursor_row = row;
-                    self.cursor_col = self.renderer.row_display_width(row);
+                    self.cursor_col = self.renderer.row_display_width(row as u64);
                 }
             }
         }
@@ -522,9 +747,12 @@ impl TerminalClient {
         }
         let viewport_top = self.renderer.viewport_top();
         let viewport_height = self.renderer.viewport_height();
+        let viewport_height_u64 = viewport_height as u64;
         let max_row = total_rows.saturating_sub(1);
-        let start_row = (viewport_top + viewport_height.saturating_sub(1)).min(max_row);
-        let start_pos = self.renderer.clamp_position(start_row as isize, 0);
+        let start_row = viewport_top
+            .saturating_add(viewport_height_u64.saturating_sub(1))
+            .min(max_row);
+        let start_pos = self.renderer.clamp_position(start_row as i64, 0);
         self.copy_mode = Some(CopyModeState::new(start_pos));
         self.renderer.set_follow_tail(false);
         self.renderer.set_selection(start_pos, start_pos);
@@ -542,7 +770,7 @@ impl TerminalClient {
 
     fn move_copy_cursor(&mut self, delta_row: isize, delta_col: isize) {
         if let Some(state) = &mut self.copy_mode {
-            let new_row = state.cursor.row as isize + delta_row;
+            let new_row = state.cursor.row as i64 + delta_row as i64;
             let new_col = state.cursor.col as isize + delta_col;
             let new_pos = self.renderer.clamp_position(new_row, new_col);
             state.cursor = new_pos;
@@ -565,7 +793,7 @@ impl TerminalClient {
 
     fn move_copy_cursor_line_start(&mut self) {
         if let Some(state) = &mut self.copy_mode {
-            let new_pos = self.renderer.clamp_position(state.cursor.row as isize, 0);
+            let new_pos = self.renderer.clamp_position(state.cursor.row as i64, 0);
             state.cursor = new_pos;
             self.renderer.set_selection(state.anchor, new_pos);
             self.force_render = true;
@@ -579,7 +807,7 @@ impl TerminalClient {
             let target_col = if row_width == 0 { 0 } else { row_width - 1 };
             let new_pos = self
                 .renderer
-                .clamp_position(row as isize, target_col as isize);
+                .clamp_position(row as i64, target_col as isize);
             state.cursor = new_pos;
             self.renderer.set_selection(state.anchor, new_pos);
             self.force_render = true;

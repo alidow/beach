@@ -20,24 +20,28 @@ use beach_human::sync::terminal::{TerminalDeltaStream, TerminalSync};
 use beach_human::sync::{LaneBudget, PriorityLane, ServerSynchronizer, SubscriptionId, SyncConfig};
 use beach_human::telemetry::logging::{self as logctl, LogConfig, LogLevel};
 use beach_human::telemetry::{self, PerfGuard};
-use beach_human::transport::webrtc::WebRtcRole;
-use beach_human::transport::{self, Payload, Transport, TransportError, TransportKind};
+use beach_human::transport as transport_mod;
+use beach_human::transport::{
+    Payload, Transport, TransportError, TransportId, TransportKind, TransportMessage,
+};
 use clap::{Args, Parser, Subcommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep};
 use tracing::{Level, debug, error, info, trace, warn};
+use transport_mod::webrtc::WebRtcRole;
 use url::Url;
 use uuid::Uuid;
 
@@ -196,10 +200,18 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     info!(session_id = %session_id, "session registered");
     print_host_banner(&hosted, &normalized_base, TransportKind::WebRtc);
     info!(session_id = %session_id, "waiting for WebRTC transport");
-    let transport = negotiate_transport(hosted.handle(), Some(hosted.join_code())).await?;
-    let selected_kind = transport.kind();
+    let initial_transport = negotiate_transport(hosted.handle(), Some(hosted.join_code())).await?;
+    let selected_kind = initial_transport.kind();
     info!(session_id = %session_id, transport = ?selected_kind, "transport negotiated");
-    HeartbeatPublisher::new(transport.clone()).spawn(Duration::from_secs(5), None);
+    let shared_transport = Arc::new(SharedTransport::new(initial_transport.clone()));
+    let supervisor = Arc::new(TransportSupervisor::new(
+        shared_transport.clone(),
+        hosted.handle().clone(),
+        Some(hosted.join_code().to_string()),
+    ));
+    let primary_transport: Arc<dyn Transport> = shared_transport.clone();
+    HeartbeatPublisher::new(primary_transport.clone(), Some(supervisor.clone()))
+        .spawn(Duration::from_secs(10), None);
 
     let command = resolve_launch_command(&args)?;
     let command_display = display_cmd(&command);
@@ -231,19 +243,21 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
 
     let mut input_handles = Vec::new();
     input_handles.push(spawn_input_listener(
-        transport.clone(),
+        primary_transport.clone(),
         writer.clone(),
         process_handle.clone(),
         emulator_handle.clone(),
+        grid.clone(),
     ));
 
-    let mut forward_transports: Vec<Arc<dyn Transport>> = vec![transport.clone()];
+    let mut forward_transports: Vec<(Arc<dyn Transport>, Option<Arc<TransportSupervisor>>)> =
+        vec![(primary_transport.clone(), Some(supervisor.clone()))];
 
     let mut local_preview_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut local_server_transport: Option<Arc<dyn Transport>> = None;
 
     if local_preview_enabled {
-        let pair = transport::TransportPair::new(TransportKind::Ipc);
+        let pair = transport_mod::TransportPair::new(TransportKind::Ipc);
         let local_client_transport: Arc<dyn Transport> = Arc::from(pair.client);
         let local_server: Arc<dyn Transport> = Arc::from(pair.server);
 
@@ -252,6 +266,7 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
             writer.clone(),
             process_handle.clone(),
             emulator_handle.clone(),
+            grid.clone(),
         ));
 
         local_preview_task = Some(tokio::task::spawn_blocking(move || {
@@ -262,7 +277,7 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
             }
         }));
 
-        forward_transports.push(local_server.clone());
+        forward_transports.push((local_server.clone(), None));
         local_server_transport = Some(local_server);
         debug!(session_id = %session_id, "local preview transport attached");
     }
@@ -291,7 +306,7 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     // redraws cleanly (mirrors the legacy apps/beach behaviour).
     drop(raw_guard);
 
-    let _ = send_host_frame(&transport, HostFrame::Shutdown);
+    let _ = send_host_frame(&primary_transport, HostFrame::Shutdown);
     if let Some(server) = &local_server_transport {
         let _ = send_host_frame(server, HostFrame::Shutdown);
     }
@@ -373,7 +388,7 @@ async fn negotiate_transport(
                 .unwrap_or(250);
 
             debug!(transport = "webrtc", signaling_url = %signaling_url, ?role, "attempting webrtc transport");
-            match transport::webrtc::connect_via_signaling(
+            match transport_mod::webrtc::connect_via_signaling(
                 signaling_url,
                 role,
                 Duration::from_millis(poll_ms),
@@ -396,7 +411,7 @@ async fn negotiate_transport(
     for offer in handle.offers() {
         if let TransportOffer::WebSocket { url } = offer {
             debug!(transport = "websocket", url = %url, "attempting websocket transport");
-            match transport::websocket::connect(url).await {
+            match transport_mod::websocket::connect(url).await {
                 Ok(transport) => {
                     info!(transport = "websocket", url = %url, "transport established");
                     return Ok(Arc::from(transport));
@@ -598,11 +613,15 @@ fn kind_label(kind: TransportKind) -> &'static str {
 #[derive(Clone)]
 struct HeartbeatPublisher {
     transport: Arc<dyn Transport>,
+    supervisor: Option<Arc<TransportSupervisor>>,
 }
 
 impl HeartbeatPublisher {
-    fn new(transport: Arc<dyn Transport>) -> Self {
-        Self { transport }
+    fn new(transport: Arc<dyn Transport>, supervisor: Option<Arc<TransportSupervisor>>) -> Self {
+        Self {
+            transport,
+            supervisor,
+        }
     }
 
     fn spawn(self, interval: Duration, limit: Option<usize>) {
@@ -619,15 +638,31 @@ impl HeartbeatPublisher {
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis();
-                if !send_host_frame(
-                    &self.transport,
-                    HostFrame::Heartbeat {
-                        seq: count as u64,
-                        timestamp_ms: now as u64,
-                    },
-                ) {
-                    eprintln!("⚠️  heartbeat send failed");
-                    break;
+                let frame = HostFrame::Heartbeat {
+                    seq: count as u64,
+                    timestamp_ms: now as u64,
+                };
+
+                if !send_host_frame(&self.transport, frame) {
+                    debug!(
+                        target = "transport_mod::heartbeat",
+                        transport_id = self.transport.id().0,
+                        transport = ?self.transport.kind(),
+                        "heartbeat send failed; scheduling reconnect"
+                    );
+                    if let Some(supervisor) = &self.supervisor {
+                        supervisor.schedule_reconnect();
+                        sleep(interval).await;
+                        continue;
+                    } else {
+                        warn!(
+                            target = "transport_mod::heartbeat",
+                            transport_id = self.transport.id().0,
+                            transport = ?self.transport.kind(),
+                            "heartbeat publisher stopping after failed send"
+                        );
+                        break;
+                    }
                 }
 
                 count += 1;
@@ -665,8 +700,61 @@ fn detect_terminal_size() -> (u16, u16) {
     (cols.max(20), rows.max(10))
 }
 
+const MAX_BACKFILL_ROWS_PER_REQUEST: u32 = 256;
+
+fn collect_backfill_updates(grid: &TerminalGrid, start_row: u64, count: u32) -> Vec<WireUpdate> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut updates = Vec::new();
+    let mut buffer: Vec<u64> = Vec::new();
+    for offset in 0..count as u64 {
+        let absolute = start_row.saturating_add(offset);
+        let Some(index) = grid.index_of_row(absolute) else {
+            continue;
+        };
+        let cols = grid.cols();
+        if cols == 0 {
+            continue;
+        }
+        if buffer.len() < cols {
+            buffer.resize(cols, 0);
+        }
+        if grid.snapshot_row_into(index, &mut buffer[..cols]).is_err() {
+            continue;
+        }
+        let mut max_seq = 0;
+        for col in 0..cols {
+            if let Some(snapshot) = grid.get_cell_relaxed(index, col) {
+                max_seq = max_seq.max(snapshot.seq);
+            }
+        }
+        updates.push(WireUpdate::Row {
+            row: absolute.min(u32::MAX as u64) as u32,
+            seq: max_seq,
+            cells: buffer[..cols].to_vec(),
+        });
+    }
+    updates
+}
+
+fn host_frame_label(frame: &HostFrame) -> &'static str {
+    match frame {
+        HostFrame::Heartbeat { .. } => "heartbeat",
+        HostFrame::Hello { .. } => "hello",
+        HostFrame::Grid { .. } => "grid",
+        HostFrame::Snapshot { .. } => "snapshot",
+        HostFrame::SnapshotComplete { .. } => "snapshot_complete",
+        HostFrame::Delta { .. } => "delta",
+        HostFrame::HistoryBackfill { .. } => "history_backfill",
+        HostFrame::InputAck { .. } => "input_ack",
+        HostFrame::Shutdown => "shutdown",
+    }
+}
+
 fn send_host_frame(transport: &Arc<dyn Transport>, frame: HostFrame) -> bool {
     let encode_start = Instant::now();
+    let frame_label = host_frame_label(&frame);
     let bytes = protocol::encode_host_frame_binary(&frame);
     let elapsed = encode_start.elapsed();
     match &frame {
@@ -674,7 +762,164 @@ fn send_host_frame(transport: &Arc<dyn Transport>, frame: HostFrame) -> bool {
         HostFrame::Delta { .. } => telemetry::record_duration("sync_encode_delta", elapsed),
         _ => telemetry::record_duration("sync_encode_frame", elapsed),
     }
-    transport.send_bytes(&bytes).is_ok()
+    match transport.send_bytes(&bytes) {
+        Ok(_) => true,
+        Err(err) => {
+            debug!(
+                target = "sync::transport",
+                transport_id = transport.id().0,
+                transport = ?transport.kind(),
+                frame = frame_label,
+                error = %err,
+                "failed to send host frame"
+            );
+            false
+        }
+    }
+}
+
+struct SharedTransport {
+    inner: RwLock<Arc<dyn Transport>>,
+}
+
+impl SharedTransport {
+    fn new(initial: Arc<dyn Transport>) -> Self {
+        Self {
+            inner: RwLock::new(initial),
+        }
+    }
+
+    fn swap(&self, next: Arc<dyn Transport>) {
+        let mut guard = self.inner.write().expect("shared transport poisoned");
+        *guard = next;
+    }
+
+    fn current(&self) -> Arc<dyn Transport> {
+        self.inner
+            .read()
+            .expect("shared transport poisoned")
+            .clone()
+    }
+}
+
+impl fmt::Debug for SharedTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let current = self.current();
+        f.debug_struct("SharedTransport")
+            .field("transport_id", &current.id())
+            .field("transport_kind", &current.kind())
+            .finish()
+    }
+}
+
+impl Transport for SharedTransport {
+    fn kind(&self) -> TransportKind {
+        self.current().kind()
+    }
+
+    fn id(&self) -> TransportId {
+        self.current().id()
+    }
+
+    fn peer(&self) -> TransportId {
+        self.current().peer()
+    }
+
+    fn send(&self, message: TransportMessage) -> Result<(), TransportError> {
+        self.current().send(message)
+    }
+
+    fn send_text(&self, text: &str) -> Result<u64, TransportError> {
+        self.current().send_text(text)
+    }
+
+    fn send_bytes(&self, bytes: &[u8]) -> Result<u64, TransportError> {
+        self.current().send_bytes(bytes)
+    }
+
+    fn recv(&self, timeout: Duration) -> Result<TransportMessage, TransportError> {
+        self.current().recv(timeout)
+    }
+
+    fn try_recv(&self) -> Result<Option<TransportMessage>, TransportError> {
+        self.current().try_recv()
+    }
+}
+
+#[derive(Clone)]
+struct TransportSupervisor {
+    shared: Arc<SharedTransport>,
+    session_handle: SessionHandle,
+    passphrase: Option<String>,
+    reconnecting: Arc<AsyncMutex<bool>>,
+}
+
+impl TransportSupervisor {
+    fn new(
+        shared: Arc<SharedTransport>,
+        session_handle: SessionHandle,
+        passphrase: Option<String>,
+    ) -> Self {
+        Self {
+            shared,
+            session_handle,
+            passphrase,
+            reconnecting: Arc::new(AsyncMutex::new(false)),
+        }
+    }
+
+    fn schedule_reconnect(&self) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut guard = this.reconnecting.lock().await;
+            if *guard {
+                return;
+            }
+            *guard = true;
+            drop(guard);
+
+            const MAX_ATTEMPTS: usize = 5;
+            let mut delay = Duration::from_millis(250);
+            for attempt in 1..=MAX_ATTEMPTS {
+                match negotiate_transport(&this.session_handle, this.passphrase.as_deref()).await {
+                    Ok(new_transport) => {
+                        let kind = new_transport.kind();
+                        let id = new_transport.id().0;
+                        this.shared.swap(new_transport);
+                        info!(
+                            target = "transport_mod::failover",
+                            ?kind,
+                            transport_id = id,
+                            attempt,
+                            "transport failover completed"
+                        );
+                        break;
+                    }
+                    Err(err) => {
+                        warn!(
+                            target = "transport_mod::failover",
+                            attempt,
+                            error = %err,
+                            "transport failover attempt failed"
+                        );
+                        if attempt == MAX_ATTEMPTS {
+                            error!(
+                                target = "transport_mod::failover",
+                                "exhausted transport failover attempts"
+                            );
+                            break;
+                        }
+                        sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(5));
+                    }
+                }
+            }
+
+            let mut guard = this.reconnecting.lock().await;
+            *guard = false;
+        });
+    }
+
 }
 
 fn map_lane(lane: PriorityLane) -> WireLane {
@@ -716,10 +961,12 @@ fn spawn_input_listener(
     writer: PtyWriter,
     process: Arc<PtyProcess>,
     emulator: Arc<Mutex<Box<dyn TerminalEmulator + Send>>>,
+    grid: Arc<TerminalGrid>,
 ) -> thread::JoinHandle<()> {
     let transport_id = transport.id().0;
     let transport_kind = transport.kind();
     thread::spawn(move || {
+        let backfill_grid = grid;
         let mut last_seq: Seq = 0;
         debug!(
             target = "sync::incoming",
@@ -803,6 +1050,37 @@ fn spawn_input_listener(
                                 cols,
                                 rows,
                                 "processed resize request"
+                            );
+                        }
+                        Ok(WireClientFrame::RequestBackfill {
+                            subscription,
+                            request_id,
+                            start_row,
+                            count,
+                        }) => {
+                            let capped = count.min(MAX_BACKFILL_ROWS_PER_REQUEST);
+                            let updates =
+                                collect_backfill_updates(&backfill_grid, start_row, capped);
+                            let _ = send_host_frame(
+                                &transport,
+                                HostFrame::HistoryBackfill {
+                                    subscription,
+                                    request_id,
+                                    start_row,
+                                    count: capped,
+                                    updates,
+                                    more: false,
+                                },
+                            );
+                            trace!(
+                                target = "sync::incoming",
+                                transport_id,
+                                transport = ?transport_kind,
+                                request_id,
+                                start_row,
+                                requested = count,
+                                sent = capped,
+                                "history backfill dispatched"
                             );
                         }
                         Ok(WireClientFrame::Unknown) => {}
@@ -1070,7 +1348,7 @@ impl TerminalDeltaStream for TimelineDeltaStream {
 }
 
 fn spawn_update_forwarder(
-    transports: Vec<Arc<dyn Transport>>,
+    transports: Vec<(Arc<dyn Transport>, Option<Arc<TransportSupervisor>>)>,
     mut updates: UnboundedReceiver<CacheUpdate>,
     timeline: Arc<TimelineDeltaStream>,
     terminal_sync: Arc<TerminalSync>,
@@ -1083,6 +1361,7 @@ fn spawn_update_forwarder(
 
         struct Sink {
             transport: Arc<dyn Transport>,
+            supervisor: Option<Arc<TransportSupervisor>>,
             synchronizer: ServerSynchronizer<TerminalSync, CacheUpdate>,
             last_seq: Seq,
             active: bool,
@@ -1097,9 +1376,10 @@ fn spawn_update_forwarder(
         let subscription = SubscriptionId(1);
         let mut sinks: Vec<Sink> = transports
             .into_iter()
-            .map(|transport| Sink {
+            .map(|(transport, supervisor)| Sink {
                 synchronizer: ServerSynchronizer::new(terminal_sync.clone(), sync_config.clone()),
                 transport,
+                supervisor,
                 last_seq: 0,
                 active: true,
                 handshake_complete: false,
@@ -1120,6 +1400,8 @@ fn spawn_update_forwarder(
                 sink.synchronizer = sync;
                 sink.last_seq = seq;
                 sink.handshake_complete = true;
+            } else if let Some(supervisor) = &sink.supervisor {
+                supervisor.schedule_reconnect();
             }
             sink.last_handshake = Instant::now();
         }
@@ -1164,6 +1446,9 @@ fn spawn_update_forwarder(
                     transport = ?sink.transport.kind(),
                     "handshake attempt did not complete"
                 );
+                if let Some(supervisor) = &sink.supervisor {
+                    supervisor.schedule_reconnect();
+                }
             }
         }
 
@@ -1224,6 +1509,9 @@ fn spawn_update_forwarder(
                                             transport = ?sink.transport.kind(),
                                             "delta send failed, marking handshake incomplete"
                                         );
+                                        if let Some(supervisor) = &sink.supervisor {
+                                            supervisor.schedule_reconnect();
+                                        }
                                         break;
                                     }
                                     sink.last_seq = batch.watermark.0;
@@ -1324,6 +1612,7 @@ fn sync_config_to_wire(config: &SyncConfig) -> WireSyncConfig {
         snapshot_budgets,
         delta_budget: config.delta_budget as u32,
         heartbeat_ms: config.heartbeat_interval.as_millis() as u64,
+        initial_snapshot_lines: config.initial_snapshot_lines as u32,
     }
 }
 
@@ -1340,7 +1629,9 @@ fn transmit_initial_snapshots(
         PriorityLane::Recent,
         PriorityLane::History,
     ] {
+        let mut emitted_chunk = false;
         while let Some(chunk) = synchronizer.snapshot_chunk(subscription, lane) {
+            emitted_chunk = true;
             debug!(
                 target = "sync::handshake",
                 transport_id,
@@ -1382,6 +1673,17 @@ fn transmit_initial_snapshots(
                 }
             }
         }
+        if !emitted_chunk {
+            if !send_host_frame(
+                transport,
+                HostFrame::SnapshotComplete {
+                    subscription: subscription.0,
+                    lane: map_lane(lane),
+                },
+            ) {
+                return false;
+            }
+        }
     }
     true
 }
@@ -1406,7 +1708,6 @@ fn display_cmd(cmd: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::{Payload, TransportKind, TransportPair};
     use beach_human::cache::terminal::{self, PackedCell, Style, StyleId};
     use beach_human::model::terminal::diff::{
         CellWrite, HistoryTrim, RectFill, RowSnapshot, StyleDefinition,
@@ -1416,6 +1717,7 @@ mod tests {
         Update as WireUpdate,
     };
     use beach_human::sync::terminal::NullTerminalDeltaStream;
+    use beach_human::transport::{Payload, TransportKind, TransportPair};
     use std::sync::Arc;
     use std::time::{Duration as StdDuration, Instant};
     use tokio::time::{Instant as TokioInstant, sleep, timeout};
@@ -1714,7 +2016,7 @@ mod tests {
         timeout(StdDuration::from_secs(30), async {
             let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
 
-            let pair = transport::webrtc::create_test_pair()
+            let pair = transport_mod::webrtc::create_test_pair()
                 .await
                 .expect("create webrtc pair");
             let client: Arc<dyn Transport> = Arc::from(pair.client);
@@ -1741,7 +2043,7 @@ mod tests {
 
             let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
             let forwarder = spawn_update_forwarder(
-                vec![Arc::clone(&server)],
+                vec![(Arc::clone(&server), None)],
                 update_rx,
                 timeline.clone(),
                 terminal_sync.clone(),
@@ -1797,6 +2099,7 @@ mod tests {
                             client_view.apply_update(update);
                         }
                     }
+                    WireHostFrame::HistoryBackfill { .. } => {}
                     WireHostFrame::Heartbeat { .. } => {}
                     WireHostFrame::Hello { .. }
                     | WireHostFrame::Grid { .. }
@@ -1851,6 +2154,7 @@ mod tests {
                     WireHostFrame::SnapshotComplete { .. }
                     | WireHostFrame::Hello { .. }
                     | WireHostFrame::Grid { .. }
+                    | WireHostFrame::HistoryBackfill { .. }
                     | WireHostFrame::InputAck { .. }
                     | WireHostFrame::Shutdown => {}
                 }
@@ -1913,7 +2217,8 @@ mod tests {
         let publisher_transport: Arc<dyn Transport> = Arc::from(pair.server);
         let client = pair.client;
 
-        HeartbeatPublisher::new(publisher_transport).spawn(StdDuration::from_millis(10), Some(3));
+        HeartbeatPublisher::new(publisher_transport, None)
+            .spawn(StdDuration::from_millis(10), Some(3));
 
         let handle = tokio::task::spawn_blocking(move || {
             let mut frames = Vec::new();
@@ -1978,7 +2283,7 @@ mod tests {
 
         let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
         let forwarder = spawn_update_forwarder(
-            vec![host_transport.clone()],
+            vec![(host_transport.clone(), None)],
             update_rx,
             timeline.clone(),
             terminal_sync.clone(),

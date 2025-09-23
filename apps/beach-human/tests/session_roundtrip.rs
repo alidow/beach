@@ -90,7 +90,9 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
         PriorityLane::Recent,
         PriorityLane::History,
     ] {
+        let mut emitted_chunk = false;
         while let Some(chunk) = synchronizer.snapshot_chunk(subscription, lane) {
+            emitted_chunk = true;
             let updates = tx_cache.apply_updates(&chunk.updates, false);
             send_host_frame(
                 host_transport.as_ref(),
@@ -112,6 +114,15 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
                 );
                 break;
             }
+        }
+        if !emitted_chunk {
+            send_host_frame(
+                host_transport.as_ref(),
+                HostFrame::SnapshotComplete {
+                    subscription: subscription.0,
+                    lane: map_lane(lane),
+                },
+            );
         }
     }
 
@@ -253,6 +264,7 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
             | HostFrame::Grid { .. }
             | HostFrame::Snapshot { .. }
             | HostFrame::SnapshotComplete { .. }
+            | HostFrame::HistoryBackfill { .. }
             | HostFrame::Shutdown => {}
         }
         if view.contains_row("host% echo world") && view.contains_row("world") {
@@ -462,6 +474,7 @@ fn sync_config_to_wire(config: &SyncConfig) -> WireSyncConfig {
         snapshot_budgets,
         delta_budget: config.delta_budget as u32,
         heartbeat_ms: config.heartbeat_interval.as_millis() as u64,
+        initial_snapshot_lines: config.initial_snapshot_lines as u32,
     }
 }
 

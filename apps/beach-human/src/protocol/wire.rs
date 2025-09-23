@@ -14,6 +14,7 @@ const HOST_KIND_SNAPSHOT_COMPLETE: u8 = 4;
 const HOST_KIND_DELTA: u8 = 5;
 const HOST_KIND_INPUT_ACK: u8 = 6;
 const HOST_KIND_SHUTDOWN: u8 = 7;
+const HOST_KIND_HISTORY_BACKFILL: u8 = 8;
 
 const UPDATE_KIND_CELL: u8 = 0;
 const UPDATE_KIND_RECT: u8 = 1;
@@ -24,6 +25,7 @@ const UPDATE_KIND_STYLE: u8 = 5;
 
 const CLIENT_KIND_INPUT: u8 = 0;
 const CLIENT_KIND_RESIZE: u8 = 1;
+const CLIENT_KIND_REQUEST_BACKFILL: u8 = 2;
 const CLIENT_KIND_UNKNOWN: u8 = TYPE_MASK;
 
 const ENV_BINARY_PROTOCOL: &str = "BEACH_PROTO_BINARY";
@@ -114,6 +116,22 @@ pub fn encode_host_frame_binary(frame: &HostFrame) -> Vec<u8> {
             buf.push(*has_more as u8);
             encode_updates(&mut buf, updates);
         }
+        HostFrame::HistoryBackfill {
+            subscription,
+            request_id,
+            start_row,
+            count,
+            updates,
+            more,
+        } => {
+            write_header(&mut buf, HOST_KIND_HISTORY_BACKFILL);
+            write_var_u64(&mut buf, *subscription);
+            write_var_u64(&mut buf, *request_id);
+            write_var_u64(&mut buf, *start_row);
+            write_var_u32(&mut buf, *count);
+            buf.push(*more as u8);
+            encode_updates(&mut buf, updates);
+        }
         HostFrame::InputAck { seq } => {
             write_header(&mut buf, HOST_KIND_INPUT_ACK);
             write_var_u64(&mut buf, *seq);
@@ -180,6 +198,22 @@ pub fn decode_host_frame_binary(bytes: &[u8]) -> Result<HostFrame, WireError> {
                 updates,
             })
         }
+        HOST_KIND_HISTORY_BACKFILL => {
+            let subscription = cursor.read_var_u64()?;
+            let request_id = cursor.read_var_u64()?;
+            let start_row = cursor.read_var_u64()?;
+            let count = cursor.read_var_u32()?;
+            let more = cursor.read_bool()?;
+            let updates = decode_updates(&mut cursor)?;
+            Ok(HostFrame::HistoryBackfill {
+                subscription,
+                request_id,
+                start_row,
+                count,
+                updates,
+                more,
+            })
+        }
         HOST_KIND_INPUT_ACK => {
             let seq = cursor.read_var_u64()?;
             Ok(HostFrame::InputAck { seq })
@@ -203,6 +237,18 @@ pub fn encode_client_frame_binary(frame: &ClientFrame) -> Vec<u8> {
             write_var_u32(&mut buf, (*cols).into());
             write_var_u32(&mut buf, (*rows).into());
         }
+        ClientFrame::RequestBackfill {
+            subscription,
+            request_id,
+            start_row,
+            count,
+        } => {
+            write_header(&mut buf, CLIENT_KIND_REQUEST_BACKFILL);
+            write_var_u64(&mut buf, *subscription);
+            write_var_u64(&mut buf, *request_id);
+            write_var_u64(&mut buf, *start_row);
+            write_var_u32(&mut buf, *count);
+        }
         ClientFrame::Unknown => {
             write_header(&mut buf, CLIENT_KIND_UNKNOWN);
         }
@@ -224,6 +270,18 @@ pub fn decode_client_frame_binary(bytes: &[u8]) -> Result<ClientFrame, WireError
             let cols = cursor.read_var_u32()? as u16;
             let rows = cursor.read_var_u32()? as u16;
             Ok(ClientFrame::Resize { cols, rows })
+        }
+        CLIENT_KIND_REQUEST_BACKFILL => {
+            let subscription = cursor.read_var_u64()?;
+            let request_id = cursor.read_var_u64()?;
+            let start_row = cursor.read_var_u64()?;
+            let count = cursor.read_var_u32()?;
+            Ok(ClientFrame::RequestBackfill {
+                subscription,
+                request_id,
+                start_row,
+                count,
+            })
         }
         CLIENT_KIND_UNKNOWN => Ok(ClientFrame::Unknown),
         other => Err(WireError::UnknownFrameType(other)),
@@ -401,6 +459,7 @@ fn encode_sync_config(buf: &mut Vec<u8>, config: &SyncConfigFrame) {
     }
     write_var_u32(buf, config.delta_budget);
     write_var_u64(buf, config.heartbeat_ms);
+    write_var_u32(buf, config.initial_snapshot_lines);
 }
 
 fn decode_sync_config(cursor: &mut Cursor<'_>) -> Result<SyncConfigFrame, WireError> {
@@ -413,10 +472,12 @@ fn decode_sync_config(cursor: &mut Cursor<'_>) -> Result<SyncConfigFrame, WireEr
     }
     let delta_budget = cursor.read_var_u32()?;
     let heartbeat_ms = cursor.read_var_u64()?;
+    let initial_snapshot_lines = cursor.read_var_u32()?;
     Ok(SyncConfigFrame {
         snapshot_budgets: budgets,
         delta_budget,
         heartbeat_ms,
+        initial_snapshot_lines,
     })
 }
 
@@ -549,6 +610,7 @@ mod tests {
                 ],
                 delta_budget: 128,
                 heartbeat_ms: 250,
+                initial_snapshot_lines: 8,
             },
         };
         let encoded = encode_host_frame_binary(&frame);

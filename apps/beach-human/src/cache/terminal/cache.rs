@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::packed::{PackedCell, Style, StyleId, StyleTable, pack_cell, unpack_to_heavy};
@@ -217,6 +218,8 @@ pub struct TerminalGrid {
     default_seq: Seq,
     history_limit: usize,
     trim_events: Mutex<Vec<TrimEvent>>,
+    viewport_rows: AtomicUsize,
+    viewport_cols: AtomicUsize,
 }
 
 /// Snapshot wrapper returned when reading a cell from the terminal grid.
@@ -248,6 +251,9 @@ impl TerminalGrid {
         let default_cell = pack_cell(' ', StyleId::DEFAULT);
         let default_seq = 0;
         let inner = GridInner::new(rows, cols, default_cell, default_seq);
+        let visible_rows = rows.max(1);
+        let visible_cols = cols.max(1);
+
         Self {
             inner: RwLock::new(inner),
             style_table,
@@ -255,6 +261,8 @@ impl TerminalGrid {
             default_seq,
             history_limit: DEFAULT_HISTORY_LIMIT.max(rows.max(1)),
             trim_events: Mutex::new(Vec::new()),
+            viewport_rows: AtomicUsize::new(visible_rows),
+            viewport_cols: AtomicUsize::new(visible_cols),
         }
     }
 
@@ -262,6 +270,18 @@ impl TerminalGrid {
         let mut grid = Self::new(rows, cols);
         grid.history_limit = history_limit.max(rows.max(1));
         grid
+    }
+
+    pub fn viewport_size(&self) -> (usize, usize) {
+        (
+            self.viewport_rows.load(Ordering::Relaxed),
+            self.viewport_cols.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn set_viewport_size(&self, rows: usize, cols: usize) {
+        self.viewport_rows.store(rows.max(1), Ordering::Relaxed);
+        self.viewport_cols.store(cols.max(1), Ordering::Relaxed);
     }
 
     pub fn ensure_style_id(&self, style: Style) -> StyleId {

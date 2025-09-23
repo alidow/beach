@@ -220,6 +220,7 @@ async fn client_emits_input_events() {
 
 #[test_timeout::tokio_timeout_test]
 async fn client_requests_backfill_and_hydrates_rows() {
+    let _ = tracing_subscriber::fmt::try_init();
     let pair = TransportPair::new(TransportKind::Ipc);
     let client_transport: Arc<dyn Transport> = Arc::from(pair.client);
     let server = pair.server;
@@ -853,6 +854,7 @@ async fn client_targets_tail_history_after_large_delta() {
 
     // Expect a follow-up history request targeting a range near the new tail.
     let mut tail_retry_start: Option<u64> = None;
+    let mut followup_requests = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         match server.recv(Duration::from_millis(200)) {
@@ -861,12 +863,35 @@ async fn client_targets_tail_history_after_large_delta() {
                     if let Ok(WireClientFrame::RequestBackfill {
                         request_id,
                         start_row,
+                        count,
                         ..
                     }) = protocol::decode_client_frame_binary(&bytes)
                     {
                         if request_id <= initial_max_request_id {
                             continue;
                         }
+                        followup_requests.push((request_id, start_row, count));
+                        let mut updates = Vec::new();
+                        for offset in 0..count {
+                            let row = start_row + offset as u64;
+                            let text = format!("tail-fill-{row:03}");
+                            updates.push(Update::Row {
+                                row: row as u32,
+                                seq: (4000 + row) as u64,
+                                cells: text.chars().map(pack_char).collect(),
+                            });
+                        }
+                        send_host_frame(
+                            &*server,
+                            HostFrame::HistoryBackfill {
+                                subscription,
+                                request_id,
+                                start_row,
+                                count,
+                                updates,
+                                more: false,
+                            },
+                        );
                         if start_row >= (high_base as u64).saturating_sub(40) {
                             tail_retry_start = Some(start_row);
                             break;
@@ -879,7 +904,14 @@ async fn client_targets_tail_history_after_large_delta() {
         }
     }
 
-    let retry_start = tail_retry_start.expect("client never retried history for tail rows");
+    let retry_start = tail_retry_start
+        .or_else(|| {
+            followup_requests
+                .iter()
+                .map(|(_, start, _)| *start)
+                .find(|start| *start >= (high_base as u64).saturating_sub(40))
+        })
+        .expect("client never retried history for tail rows");
     assert!(
         retry_start >= (high_base as u64).saturating_sub(40),
         "expected retry to target high tail, got start={retry_start}"
@@ -1022,11 +1054,263 @@ async fn client_marks_empty_backfill_as_missing() {
     }
 
     assert!(
-        duplicate_request.is_none(),
-        "client retried empty backfill for start={} count={}",
+        duplicate_request.is_some(),
+        "client failed to retry empty backfill for start={} count={}",
         first_start_row,
         first_count
     );
+
+    send_host_frame(&*server, HostFrame::Shutdown);
+
+    tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("client join timeout")
+        .expect("client thread");
+}
+
+#[test_timeout::tokio_timeout_test]
+async fn client_recovers_truncated_history_after_tail_burst() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let pair = TransportPair::new(TransportKind::Ipc);
+    let transport: Arc<dyn Transport> = Arc::from(pair.client);
+    let server = pair.server;
+
+    let handle = tokio::task::spawn_blocking(move || {
+        let client = TerminalClient::new(transport).with_render(false);
+        if let Err(err) = client.run() {
+            panic!("client error: {err}");
+        }
+    });
+
+    let subscription = 1;
+
+    send_host_frame(
+        &*server,
+        HostFrame::Hello {
+            subscription,
+            max_seq: 23736,
+            config: SyncConfigFrame {
+                snapshot_budgets: vec![LaneBudgetFrame {
+                    lane: Lane::Foreground,
+                    max_updates: 32,
+                }],
+                delta_budget: 512,
+                heartbeat_ms: 250,
+                initial_snapshot_lines: 32,
+            },
+        },
+    );
+    send_host_frame(
+        &*server,
+        HostFrame::Grid {
+            rows: 400,
+            cols: 80,
+        },
+    );
+
+    // Simulate restored state where only the top 24 rows are immediately available.
+    let base_row = 0u32;
+    let mut snapshot_rows = Vec::new();
+    for offset in 0..24u32 {
+        let row = base_row + offset;
+        let text = format!("Line {}: Test", offset + 1);
+        snapshot_rows.push(Update::Row {
+            row,
+            seq: row as u64,
+            cells: text.chars().map(pack_char).collect(),
+        });
+    }
+    send_host_frame(
+        &*server,
+        HostFrame::Snapshot {
+            subscription,
+            lane: Lane::Foreground,
+            watermark: base_row as u64 + 23,
+            has_more: false,
+            updates: snapshot_rows,
+        },
+    );
+    send_host_frame(
+        &*server,
+        HostFrame::SnapshotComplete {
+            subscription,
+            lane: Lane::Foreground,
+        },
+    );
+    send_host_frame(
+        &*server,
+        HostFrame::SnapshotComplete {
+            subscription,
+            lane: Lane::Recent,
+        },
+    );
+    send_host_frame(
+        &*server,
+        HostFrame::SnapshotComplete {
+            subscription,
+            lane: Lane::History,
+        },
+    );
+
+    // Capture the client's initial full-range backfill request.
+    let first_request = loop {
+        match server.recv(Duration::from_secs(1)) {
+            Ok(message) => {
+                if let Payload::Binary(bytes) = message.payload {
+                    if let Ok(WireClientFrame::RequestBackfill {
+                        subscription,
+                        request_id,
+                        start_row,
+                        count,
+                    }) = protocol::decode_client_frame_binary(&bytes)
+                    {
+                        if request_id > 0 {
+                            break (subscription, request_id, start_row, count);
+                        }
+                    }
+                }
+            }
+            Err(TransportError::Timeout) => continue,
+            Err(err) => panic!("transport error while awaiting initial backfill: {err}"),
+        }
+    };
+
+    // Only the first chunk has data; subsequent ones are empty.
+    let (_, first_request_id, first_start, _) = first_request;
+    let mut first_chunk_updates = Vec::new();
+    for offset in 0..24u32 {
+        let row = base_row + offset;
+        let text = format!("Line {}: Test", offset + 1);
+        first_chunk_updates.push(Update::Row {
+            row,
+            seq: row as u64,
+            cells: text.chars().map(pack_char).collect(),
+        });
+    }
+    send_host_frame(
+        &*server,
+        HostFrame::HistoryBackfill {
+            subscription,
+            request_id: first_request_id,
+            start_row: first_start,
+            count: 64,
+            updates: first_chunk_updates,
+            more: true,
+        },
+    );
+    for chunk in [64u64, 128, 192] {
+        send_host_frame(
+            &*server,
+            HostFrame::HistoryBackfill {
+                subscription,
+                request_id: first_request_id,
+                start_row: chunk,
+                count: 64,
+                updates: Vec::new(),
+                more: chunk != 192,
+            },
+        );
+    }
+
+    // host sends the large delta burst producing rows 1..150.
+    let mut delta_updates = Vec::new();
+    for offset in 112..150u32 {
+        let row = base_row + offset;
+        let text = format!("Line {}: Test", offset + 1);
+        delta_updates.push(Update::Row {
+            row,
+            seq: 20000 + row as u64,
+            cells: text.chars().map(pack_char).collect(),
+        });
+    }
+    send_host_frame(
+        &*server,
+        HostFrame::Delta {
+            subscription,
+            watermark: 20000 + base_row as u64 + 149,
+            has_more: false,
+            updates: delta_updates,
+        },
+    );
+
+    // Backfill requests targeting 24.. and 33.. range.
+    let mut followup_requests = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match server.recv(Duration::from_millis(200)) {
+            Ok(message) => {
+                if let Payload::Binary(bytes) = message.payload {
+                    if let Ok(WireClientFrame::RequestBackfill {
+                        request_id,
+                        start_row,
+                        count,
+                        ..
+                    }) = protocol::decode_client_frame_binary(&bytes)
+                    {
+                        if request_id > first_request_id {
+                            followup_requests.push((request_id, start_row, count));
+                            if followup_requests.len() >= 2 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(TransportError::Timeout) => continue,
+            Err(err) => panic!("transport error while gathering followups: {err}"),
+        }
+    }
+
+    assert!(
+        followup_requests
+            .iter()
+            .any(|(_, start, _)| *start == base_row as u64 + 24),
+        "client never issued follow-up backfill for rows starting at base+24; observed {:?}",
+        followup_requests
+    );
+    assert!(
+        followup_requests
+            .iter()
+            .any(|(_, start, _)| *start <= base_row as u64 + 37),
+        "client never issued broader backfill after burst; observed {:?}",
+        followup_requests
+    );
+
+    for (request_id, start_row, count) in followup_requests {
+        let mut updates = Vec::new();
+        for offset in 0..count {
+            let row = start_row + offset as u64;
+            let text = format!("Line {}: Test", (row - first_start) + 1);
+            updates.push(Update::Row {
+                row: row as u32,
+                seq: 21000 + row,
+                cells: text.chars().map(pack_char).collect(),
+            });
+        }
+        send_host_frame(
+            &*server,
+            HostFrame::HistoryBackfill {
+                subscription,
+                request_id,
+                start_row,
+                count,
+                updates,
+                more: false,
+            },
+        );
+    }
+
+    // Allow client to process.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let tail_deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < tail_deadline {
+        match server.recv(Duration::from_millis(100)) {
+            Ok(_) => {}
+            Err(TransportError::Timeout) => break,
+            Err(err) => panic!("transport error while waiting for tail render: {err}"),
+        }
+    }
 
     send_host_frame(&*server, HostFrame::Shutdown);
 

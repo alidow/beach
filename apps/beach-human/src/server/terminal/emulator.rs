@@ -1,4 +1,3 @@
-use crate::cache::GridCache;
 use crate::cache::Seq;
 use crate::cache::terminal::{
     PackedCell, Style, StyleId, StyleTable, TerminalGrid, attrs_to_byte, pack_cell,
@@ -42,9 +41,9 @@ unsafe impl Send for SimpleTerminalEmulator {}
 
 impl SimpleTerminalEmulator {
     pub fn new(grid: &TerminalGrid) -> Self {
-        let (rows, cols) = grid.dims();
-        let viewport_rows = rows.max(1);
-        let viewport_cols = cols.max(1);
+        let (viewport_rows, viewport_cols) = grid.viewport_size();
+        let viewport_rows = viewport_rows.max(1);
+        let viewport_cols = viewport_cols.max(1);
         let default_style = grid.ensure_style_id(Style::default());
         let absolute_row = usize::try_from(grid.row_offset()).unwrap_or(usize::MAX);
         Self {
@@ -218,8 +217,8 @@ unsafe impl Send for AlacrittyEmulator {}
 
 impl AlacrittyEmulator {
     pub fn new(grid: &TerminalGrid) -> Self {
-        let (rows, cols) = grid.dims();
-        let dimensions = TermDimensions::new(cols.max(1), rows.max(1));
+        let (viewport_rows, viewport_cols) = grid.viewport_size();
+        let dimensions = TermDimensions::new(viewport_cols.max(1), viewport_rows.max(1));
         let mut config = Config::default();
         config.scrolling_history = grid.history_limit();
         let mut term = Term::new(config, &dimensions, EventProxy::default());

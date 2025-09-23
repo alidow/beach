@@ -606,7 +606,12 @@ impl GridRenderer {
             self.scroll_top = 0;
             return;
         }
-        self.scroll_top = self.rows.len().saturating_sub(self.viewport_height);
+        let max_scroll = self.rows.len().saturating_sub(self.viewport_height);
+        let target = self
+            .last_loaded_row_index()
+            .map(|idx| idx.saturating_sub(self.viewport_height.saturating_sub(1)))
+            .unwrap_or(max_scroll);
+        self.scroll_top = target.min(max_scroll);
         self.follow_tail = true;
         self.mark_dirty();
     }
@@ -627,6 +632,12 @@ impl GridRenderer {
     pub fn toggle_follow_tail(&mut self) {
         let follow = !self.follow_tail;
         self.set_follow_tail(follow);
+    }
+
+    fn last_loaded_row_index(&self) -> Option<usize> {
+        self.rows
+            .iter()
+            .rposition(|slot| matches!(slot, RowSlot::Loaded(_)))
     }
 
     pub fn viewport_top(&self) -> u64 {
@@ -978,6 +989,36 @@ impl GridRenderer {
             RowSlot::Pending => Some("·".repeat(self.cols)),
             RowSlot::Missing => Some(" ".repeat(self.cols)),
         }
+    }
+
+    pub fn first_gap_between(&self, start: u64, end: u64) -> Option<(u64, u32)> {
+        if start >= end {
+            return None;
+        }
+        let mut gap_start: Option<u64> = None;
+        let mut gap_len: u32 = 0;
+        let mut absolute = start;
+        while absolute < end {
+            if absolute < self.base_row {
+                absolute = self.base_row;
+            }
+            if absolute >= self.base_row + self.rows.len() as u64 {
+                break;
+            }
+            let rel = (absolute - self.base_row) as usize;
+            let loaded = matches!(self.rows.get(rel), Some(RowSlot::Loaded(_)));
+            if !loaded {
+                if gap_start.is_none() {
+                    gap_start = Some(absolute);
+                    gap_len = 0;
+                }
+                gap_len = gap_len.saturating_add(1);
+            } else if let Some(start_row) = gap_start {
+                return Some((start_row, gap_len));
+            }
+            absolute = absolute.saturating_add(1);
+        }
+        gap_start.map(|row| (row, gap_len))
     }
 
     fn render_status_line(&self) -> Paragraph<'_> {

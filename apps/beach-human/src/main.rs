@@ -1,7 +1,7 @@
 #![recursion_limit = "1024"]
 
+use beach_human::cache::Seq;
 use beach_human::cache::terminal::{PackedCell, StyleId, TerminalGrid, unpack_cell};
-use beach_human::cache::{GridCache, Seq};
 use beach_human::client::terminal::{ClientError, TerminalClient};
 use beach_human::model::terminal::diff::{CacheUpdate, RowSnapshot, StyleDefinition};
 use beach_human::protocol::{
@@ -248,6 +248,7 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         writer.clone(),
         process_handle.clone(),
         emulator_handle.clone(),
+        grid.clone(),
         backfill_tx.clone(),
     ));
 
@@ -267,6 +268,7 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
             writer.clone(),
             process_handle.clone(),
             emulator_handle.clone(),
+            grid.clone(),
             backfill_tx.clone(),
         ));
 
@@ -1022,6 +1024,7 @@ fn spawn_input_listener(
     writer: PtyWriter,
     process: Arc<PtyProcess>,
     emulator: Arc<Mutex<Box<dyn TerminalEmulator + Send>>>,
+    grid: Arc<TerminalGrid>,
     backfill_tx: UnboundedSender<BackfillCommand>,
 ) -> thread::JoinHandle<()> {
     let transport_id = transport.id().0;
@@ -1096,6 +1099,7 @@ fn spawn_input_listener(
                             if let Ok(mut guard) = emulator.lock() {
                                 guard.resize(rows as usize, cols as usize);
                             }
+                            grid.set_viewport_size(rows as usize, cols as usize);
                             let _ = send_host_frame(
                                 &transport,
                                 HostFrame::Grid {
@@ -1759,7 +1763,7 @@ fn initialize_transport_snapshot(
     ) {
         return None;
     }
-    let (rows, cols) = terminal_sync.grid().dims();
+    let (rows, cols) = terminal_sync.grid().viewport_size();
     cache.reset(cols);
     debug!(
         target = "sync::handshake",
@@ -1940,6 +1944,7 @@ mod tests {
         transport.send_bytes(&bytes).expect("send frame");
     }
 
+    #[allow(dead_code)]
     async fn recv_host_frame_async(
         transport: &Arc<dyn Transport>,
         timeout: StdDuration,
@@ -2001,6 +2006,7 @@ mod tests {
         transport.send_bytes(&bytes).expect("send client frame");
     }
 
+    #[allow(dead_code)]
     fn recv_client_frame(transport: &dyn Transport, timeout: StdDuration) -> WireClientFrame {
         let deadline = Instant::now() + timeout;
         loop {
@@ -2635,5 +2641,70 @@ mod tests {
         }
 
         assert!(saw_prompt, "snapshot did not include prompt row");
+    }
+
+    #[test_timeout::tokio_timeout_test]
+    async fn handshake_advertises_viewport_height_even_with_history() {
+        let viewport_rows = 24;
+        let viewport_cols = 80;
+        let grid = Arc::new(TerminalGrid::new(viewport_rows, viewport_cols));
+        let style_id = grid.ensure_style_id(Style::default());
+        let packed = TerminalGrid::pack_char_with_style('X', style_id);
+        // Extend history beyond the viewport to mimic long-running sessions.
+        for row in viewport_rows..(viewport_rows + 120) {
+            grid.write_packed_cell_if_newer(row, 0, (row as Seq) + 1, packed)
+                .expect("extend history row");
+        }
+        let total_rows = grid.rows();
+        assert!(
+            total_rows > viewport_rows,
+            "expected history beyond viewport"
+        );
+
+        let sync_config = SyncConfig::default();
+        let terminal_sync = Arc::new(TerminalSync::new(
+            grid.clone(),
+            Arc::new(NullTerminalDeltaStream),
+            sync_config.clone(),
+        ));
+
+        let pair = TransportPair::new(TransportKind::Ipc);
+        let host_transport: Arc<dyn Transport> = Arc::from(pair.server);
+        let client_transport: Arc<dyn Transport> = Arc::from(pair.client);
+
+        let subscription = SubscriptionId(99);
+        let mut cache = TransmitterCache::new();
+        let handshake = initialize_transport_snapshot(
+            &host_transport,
+            subscription,
+            &terminal_sync,
+            &sync_config,
+            &mut cache,
+        );
+        assert!(handshake.is_some(), "handshake failed");
+
+        let mut advertised: Option<(u32, u32)> = None;
+        for _ in 0..10 {
+            match recv_host_frame(client_transport.as_ref(), StdDuration::from_millis(200)) {
+                WireHostFrame::Grid { rows, cols } => {
+                    advertised = Some((rows, cols));
+                    break;
+                }
+                WireHostFrame::Hello { .. }
+                | WireHostFrame::Snapshot { .. }
+                | WireHostFrame::SnapshotComplete { .. }
+                | WireHostFrame::Delta { .. }
+                | WireHostFrame::HistoryBackfill { .. }
+                | WireHostFrame::Heartbeat { .. }
+                | WireHostFrame::InputAck { .. } => {
+                    continue;
+                }
+                WireHostFrame::Shutdown => break,
+            }
+        }
+
+        let (rows, cols) = advertised.expect("grid frame missing from handshake");
+        assert_eq!(rows as usize, viewport_rows, "handshake rows mismatch");
+        assert_eq!(cols as usize, viewport_cols, "handshake cols mismatch");
     }
 }

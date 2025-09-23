@@ -638,6 +638,7 @@ fn recv_host_frame(transport: &dyn Transport, timeout: StdDuration) -> HostFrame
     }
 }
 
+#[allow(dead_code)]
 async fn recv_host_frame_async(transport: &Arc<dyn Transport>, timeout: StdDuration) -> HostFrame {
     let deadline = TokioInstant::now() + timeout;
     loop {

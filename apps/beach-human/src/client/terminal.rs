@@ -77,6 +77,7 @@ pub struct TerminalClient {
     has_loaded_rows: bool,
     highest_loaded_row: Option<u64>,
     last_tail_backfill_start: Option<u64>,
+    last_gap_backfill_start: Option<u64>,
 }
 
 impl TerminalClient {
@@ -109,6 +110,7 @@ impl TerminalClient {
             has_loaded_rows: false,
             highest_loaded_row: None,
             last_tail_backfill_start: None,
+            last_gap_backfill_start: None,
         }
     }
 
@@ -223,6 +225,7 @@ impl TerminalClient {
                 self.has_loaded_rows = false;
                 self.highest_loaded_row = None;
                 self.last_tail_backfill_start = None;
+                self.last_gap_backfill_start = None;
             }
             WireHostFrame::Grid { rows, cols } => {
                 let rows = rows as usize;
@@ -339,32 +342,100 @@ impl TerminalClient {
         }
 
         if self.pending_backfills.is_empty() {
-            if let Some(highest) = self.highest_loaded_row {
-                let mut tail_start = highest.saturating_sub(BACKFILL_LOOKAHEAD_ROWS as u64);
-                if let Some(base) = self.known_base_row {
-                    tail_start = tail_start.max(base);
-                }
-                if self
-                    .last_tail_backfill_start
-                    .map_or(true, |prev| prev != tail_start)
-                    && !self.is_range_pending(
-                        tail_start,
-                        tail_start.saturating_add(BACKFILL_MAX_ROWS_PER_REQUEST as u64),
-                    )
-                {
-                    if let Some(last) = self.last_backfill_request_at {
-                        if last.elapsed() < BACKFILL_MIN_INTERVAL {
+            if let (Some(base), Some(highest)) = (self.known_base_row, self.highest_loaded_row) {
+                if base < highest && highest.saturating_sub(base) > BACKFILL_LOOKAHEAD_ROWS as u64 {
+                    if let Some((gap_start, gap_span)) = self
+                        .renderer
+                        .first_gap_between(base, highest.saturating_add(1))
+                    {
+                        let distance = highest.saturating_sub(gap_start);
+                        trace!(
+                            target = "client::backfill",
+                            base, highest, gap_start, gap_span, "detected history gap"
+                        );
+                        if gap_span > 0
+                            && distance > BACKFILL_LOOKAHEAD_ROWS as u64
+                            && self
+                                .last_gap_backfill_start
+                                .map_or(true, |prev| prev != gap_start)
+                            && !self.is_range_pending(
+                                gap_start,
+                                gap_start.saturating_add(BACKFILL_MAX_ROWS_PER_REQUEST as u64),
+                            )
+                        {
+                            if let Some(last) = self.last_backfill_request_at {
+                                if last.elapsed() < BACKFILL_MIN_INTERVAL {
+                                    return Ok(());
+                                }
+                            }
+                            let count = gap_span.min(BACKFILL_MAX_ROWS_PER_REQUEST).max(1);
+                            self.send_backfill_request(subscription, gap_start, count)?;
+                            self.last_backfill_request_at = Some(Instant::now());
+                            self.last_gap_backfill_start = Some(gap_start);
                             return Ok(());
                         }
                     }
-                    self.send_backfill_request(
-                        subscription,
-                        tail_start,
-                        BACKFILL_MAX_ROWS_PER_REQUEST,
-                    )?;
-                    self.last_tail_backfill_start = Some(tail_start);
-                    self.last_backfill_request_at = Some(Instant::now());
-                    return Ok(());
+                }
+            }
+
+            if let Some(highest) = self.highest_loaded_row {
+                if let Some(base) = self.known_base_row {
+                    if highest.saturating_sub(base) <= BACKFILL_LOOKAHEAD_ROWS as u64 {
+                        // Not far enough from base to justify tail backfill
+                        // continue to general gap handling below
+                    } else {
+                        let mut tail_start = highest.saturating_sub(BACKFILL_LOOKAHEAD_ROWS as u64);
+                        if let Some(base) = self.known_base_row {
+                            tail_start = tail_start.max(base);
+                        }
+                        if self
+                            .last_tail_backfill_start
+                            .map_or(true, |prev| prev != tail_start)
+                            && !self.is_range_pending(
+                                tail_start,
+                                tail_start.saturating_add(BACKFILL_MAX_ROWS_PER_REQUEST as u64),
+                            )
+                        {
+                            if let Some(last) = self.last_backfill_request_at {
+                                if last.elapsed() < BACKFILL_MIN_INTERVAL {
+                                    return Ok(());
+                                }
+                            }
+                            self.send_backfill_request(
+                                subscription,
+                                tail_start,
+                                BACKFILL_MAX_ROWS_PER_REQUEST,
+                            )?;
+                            self.last_tail_backfill_start = Some(tail_start);
+                            self.last_backfill_request_at = Some(Instant::now());
+                            return Ok(());
+                        }
+                        // fall through if tail request already pending
+                    }
+                } else {
+                    let tail_start = highest.saturating_sub(BACKFILL_LOOKAHEAD_ROWS as u64);
+                    if self
+                        .last_tail_backfill_start
+                        .map_or(true, |prev| prev != tail_start)
+                        && !self.is_range_pending(
+                            tail_start,
+                            tail_start.saturating_add(BACKFILL_MAX_ROWS_PER_REQUEST as u64),
+                        )
+                    {
+                        if let Some(last) = self.last_backfill_request_at {
+                            if last.elapsed() < BACKFILL_MIN_INTERVAL {
+                                return Ok(());
+                            }
+                        }
+                        self.send_backfill_request(
+                            subscription,
+                            tail_start,
+                            BACKFILL_MAX_ROWS_PER_REQUEST,
+                        )?;
+                        self.last_tail_backfill_start = Some(tail_start);
+                        self.last_backfill_request_at = Some(Instant::now());
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -391,12 +462,30 @@ impl TerminalClient {
         let tail_hint = self
             .highest_loaded_row
             .map(|row| row.saturating_sub(BACKFILL_LOOKAHEAD_ROWS as u64));
-        let request_start = match (self.known_base_row, tail_hint) {
+        let mut request_start = match (self.known_base_row, tail_hint) {
             (Some(base), Some(tail)) => start.max(base).max(tail),
             (Some(base), None) => start.max(base),
             (None, Some(tail)) => start.max(tail),
             (None, None) => start,
         };
+        if let (Some(base), Some(highest)) = (self.known_base_row, self.highest_loaded_row) {
+            if base < highest && request_start > base {
+                if let Some((gap_start, _)) = self.renderer.first_gap_between(base, request_start) {
+                    if gap_start < request_start
+                        && highest.saturating_sub(base) > BACKFILL_LOOKAHEAD_ROWS as u64
+                        && highest.saturating_sub(gap_start) > BACKFILL_LOOKAHEAD_ROWS as u64
+                    {
+                        request_start = gap_start;
+                    }
+                }
+            }
+        }
+        if let Some(highest) = self.highest_loaded_row {
+            let max_start = highest.saturating_add(1);
+            if request_start > max_start {
+                request_start = max_start;
+            }
+        }
         let request_end = request_start.saturating_add(capped as u64);
         if self.is_range_pending(request_start, request_end) {
             return Ok(());
@@ -514,16 +603,19 @@ impl TerminalClient {
 
         if !more {
             let end = start_row.saturating_add(count as u64);
-            let had_rows = !touched_rows.is_empty();
             self.finalize_backfill_range(start_row, end, &touched_rows);
             self.last_backfill_request_at = None;
-            if had_rows {
-                if self
-                    .last_tail_backfill_start
-                    .is_some_and(|prev| prev == start_row)
-                {
-                    self.last_tail_backfill_start = None;
-                }
+            if self
+                .last_tail_backfill_start
+                .is_some_and(|prev| prev == start_row)
+            {
+                self.last_tail_backfill_start = None;
+            }
+            if self
+                .last_gap_backfill_start
+                .is_some_and(|prev| prev == start_row)
+            {
+                self.last_gap_backfill_start = None;
             }
         }
 
@@ -537,7 +629,7 @@ impl TerminalClient {
         }
         if touched_rows.is_empty() {
             for row in start..end {
-                self.renderer.mark_row_missing(row);
+                self.renderer.mark_row_pending(row);
             }
             return;
         }
@@ -1311,6 +1403,7 @@ mod tests {
     use crate::transport::{
         Transport, TransportError, TransportId, TransportKind, TransportMessage,
     };
+    use std::sync::Mutex;
     use std::time::Duration;
 
     #[derive(Default)]
@@ -1339,6 +1432,52 @@ mod tests {
 
         fn send_bytes(&self, _bytes: &[u8]) -> Result<u64, TransportError> {
             Ok(0)
+        }
+
+        fn recv(&self, _timeout: Duration) -> Result<TransportMessage, TransportError> {
+            Err(TransportError::Timeout)
+        }
+
+        fn try_recv(&self) -> Result<Option<TransportMessage>, TransportError> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingTransport {
+        sent: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl RecordingTransport {
+        fn take(&self) -> Vec<Vec<u8>> {
+            self.sent.lock().expect("sent mutex").drain(..).collect()
+        }
+    }
+
+    impl Transport for RecordingTransport {
+        fn kind(&self) -> TransportKind {
+            TransportKind::Ipc
+        }
+
+        fn id(&self) -> TransportId {
+            TransportId(0)
+        }
+
+        fn peer(&self) -> TransportId {
+            TransportId(0)
+        }
+
+        fn send(&self, _message: TransportMessage) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn send_text(&self, text: &str) -> Result<u64, TransportError> {
+            self.send_bytes(text.as_bytes())
+        }
+
+        fn send_bytes(&self, bytes: &[u8]) -> Result<u64, TransportError> {
+            self.sent.lock().expect("sent mutex").push(bytes.to_vec());
+            Ok(bytes.len() as u64)
         }
 
         fn recv(&self, _timeout: Duration) -> Result<TransportMessage, TransportError> {
@@ -1522,5 +1661,94 @@ mod tests {
             .to_string();
 
         assert_eq!(text, "world", "row retained stale suffix: '{text}'");
+    }
+
+    #[test]
+    fn follow_tail_prefers_loaded_rows_after_empty_tail_backfill() {
+        let transport: Arc<dyn Transport> = Arc::new(NullTransport::default());
+        let mut client = TerminalClient::new(transport).with_render(false);
+
+        client.subscription_id = Some(1);
+        client.renderer.ensure_size(320, 80);
+        client.renderer.on_resize(80, 12);
+        client.renderer.set_follow_tail(true);
+
+        client.finalize_backfill_range(250, 280, &[]);
+        client.renderer.scroll_to_tail();
+
+        let updates: Vec<WireUpdate> = (140..145)
+            .map(|row| {
+                let text = format!("Tail row {row:03}");
+                pack_row(row as u32, row as u64 + 10_000, &text)
+            })
+            .collect();
+
+        client
+            .handle_host_frame(WireHostFrame::Delta {
+                subscription: 1,
+                watermark: 20_000,
+                has_more: false,
+                updates,
+            })
+            .expect("apply tail delta");
+
+        client.renderer.scroll_to_tail();
+        let lines = client.renderer.visible_lines();
+        let all_pending = lines.iter().all(|line| line.chars().all(|ch| ch == '·'));
+        assert!(!all_pending, "tail view stuck on pending rows: {lines:?}");
+        assert!(
+            lines.iter().any(|line| line.contains("Tail row")),
+            "tail view missing loaded content: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn gap_detection_prefers_lower_history_after_tail_burst() {
+        let transport: Arc<RecordingTransport> = Arc::new(RecordingTransport::default());
+        let mut client = TerminalClient::new(transport.clone()).with_render(false);
+
+        client.subscription_id = Some(1);
+        client.known_base_row = Some(0);
+        client.renderer.ensure_size(400, 80);
+
+        for row in 0..24u64 {
+            client.renderer.apply_row_from_text(
+                row as usize,
+                row,
+                &format!("Line {}: Test", row as usize + 1),
+            );
+        }
+        for row in 24..112u64 {
+            client.renderer.mark_row_missing(row);
+        }
+        for row in 112..150u64 {
+            client.renderer.apply_row_from_text(
+                row as usize,
+                1000 + row,
+                &format!("Line {}: Test", row as usize + 1),
+            );
+        }
+        client.highest_loaded_row = Some(149);
+        client.has_loaded_rows = true;
+        client.pending_backfills.clear();
+        client.last_tail_backfill_start = None;
+        client.last_gap_backfill_start = None;
+        client.last_backfill_request_at = None;
+        transport.take();
+
+        client
+            .maybe_request_backfill()
+            .expect("trigger gap backfill");
+
+        let frames = transport.take();
+        assert_eq!(frames.len(), 1, "expected one backfill request");
+        let frame =
+            protocol::decode_client_frame_binary(&frames[0]).expect("decode backfill frame");
+        match frame {
+            WireClientFrame::RequestBackfill { start_row, .. } => {
+                assert_eq!(start_row, 24, "expected gap request at row 24");
+            }
+            other => panic!("expected RequestBackfill, got {other:?}"),
+        }
     }
 }

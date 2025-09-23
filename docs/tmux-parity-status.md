@@ -2,6 +2,16 @@
 
  _Last updated: 2025-09-24 (midday)_
 
+## CRITICAL: Actual vs Desired Tail Behaviour
+- **What we want**: After the handshake snapshot (a handful of rows), the host pushes every new line as a delta. The client applies those deltas in order, keeps the tail visible, and only issues history backfill requests when the user scrolls into an unloaded region.
+- **What we do today**: As soon as the snapshot completes we aggressively request history (e.g. `start=33`, `start=154`) even while following the live tail. The host often responds with empty chunks, which our renderer treats as authoritative; it advances `base_row` past the missing span and leaves the freshly pushed rows wedged above a wall of `Pending` placeholders. We then keep re-requesting the same empty ranges and never show the full burst.
+
+**Plan of Record (Sep 24 afternoon)**
+1. Capture the misbehaviour in an integration test: simulate a minimal snapshot followed by a large burst of PTY output. Assert that the client stays on the pushed deltas (no redundant backfill requests) and renders all new rows.
+2. Adjust the client pipeline so tail-follow mode relies on the streaming deltas, backfills only when the user scrolls into an unknown region, and never advances the base row on empty tail replies.
+3. Re-run the live server/client burst once the test passes to confirm parity.
+
+
 ## Overview
 Our original goal for this pass was straightforward: deliver a tmux-equivalent experience for beach-human so that the client behaves like a "dumb" view onto the host terminal buffer. The beach client should spin up quickly, mirror the host's scrollback accurately, stay responsive to input, and keep latency on par with tmux+ssh.
 

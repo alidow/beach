@@ -47,7 +47,14 @@ async fn client_replays_basic_snapshot() {
             },
         },
     );
-    send_host_frame(&*server, HostFrame::Grid { rows: 4, cols: 10 });
+    send_host_frame(
+        &*server,
+        HostFrame::Grid {
+            viewport_rows: 4,
+            cols: 10,
+            history_rows: 4,
+        },
+    );
     send_host_frame(
         &*server,
         HostFrame::Snapshot {
@@ -122,7 +129,14 @@ async fn client_applies_deltas() {
             },
         },
     );
-    send_host_frame(&*server, HostFrame::Grid { rows: 2, cols: 5 });
+    send_host_frame(
+        &*server,
+        HostFrame::Grid {
+            viewport_rows: 2,
+            cols: 5,
+            history_rows: 2,
+        },
+    );
     send_host_frame(
         &*server,
         HostFrame::Snapshot {
@@ -194,7 +208,14 @@ async fn client_emits_input_events() {
             },
         },
     );
-    send_host_frame(&*server, HostFrame::Grid { rows: 1, cols: 5 });
+    send_host_frame(
+        &*server,
+        HostFrame::Grid {
+            viewport_rows: 1,
+            cols: 5,
+            history_rows: 1,
+        },
+    );
 
     tx.send(b"a".to_vec()).expect("send input");
 
@@ -246,7 +267,14 @@ async fn client_requests_backfill_and_hydrates_rows() {
             },
         },
     );
-    send_host_frame(&*server, HostFrame::Grid { rows: 4, cols: 6 });
+    send_host_frame(
+        &*server,
+        HostFrame::Grid {
+            viewport_rows: 4,
+            cols: 6,
+            history_rows: 4,
+        },
+    );
     send_host_frame(
         &*server,
         HostFrame::Snapshot {
@@ -378,8 +406,9 @@ async fn client_requests_backfill_using_absolute_rows() {
     send_host_frame(
         &*server,
         HostFrame::Grid {
-            rows: 400,
+            viewport_rows: 400,
             cols: 80,
+            history_rows: 400,
         },
     );
     send_host_frame(
@@ -481,7 +510,14 @@ async fn client_requests_history_after_delta_when_handshake_empty() {
             },
         },
     );
-    send_host_frame(&*server, HostFrame::Grid { rows: 24, cols: 80 });
+    send_host_frame(
+        &*server,
+        HostFrame::Grid {
+            viewport_rows: 24,
+            cols: 80,
+            history_rows: 24,
+        },
+    );
     // Simulate an empty snapshot handshake.
     send_host_frame(
         &*server,
@@ -592,7 +628,14 @@ async fn client_retries_history_when_initial_backfill_empty() {
             },
         },
     );
-    send_host_frame(&*server, HostFrame::Grid { rows: 24, cols: 80 });
+    send_host_frame(
+        &*server,
+        HostFrame::Grid {
+            viewport_rows: 24,
+            cols: 80,
+            history_rows: 24,
+        },
+    );
     send_host_frame(
         &*server,
         HostFrame::SnapshotComplete {
@@ -740,8 +783,9 @@ async fn client_targets_tail_history_after_large_delta() {
     send_host_frame(
         &*server,
         HostFrame::Grid {
-            rows: 400,
+            viewport_rows: 400,
             cols: 80,
+            history_rows: 400,
         },
     );
     // Provide a minimal snapshot so the renderer seeds a baseline but leaves most rows pending.
@@ -959,8 +1003,9 @@ async fn client_marks_empty_backfill_as_missing() {
     send_host_frame(
         &*server,
         HostFrame::Grid {
-            rows: 200,
+            viewport_rows: 200,
             cols: 80,
+            history_rows: 200,
         },
     );
     send_host_frame(
@@ -1103,8 +1148,9 @@ async fn client_recovers_truncated_history_after_tail_burst() {
     send_host_frame(
         &*server,
         HostFrame::Grid {
-            rows: 400,
+            viewport_rows: 400,
             cols: 80,
+            history_rows: 400,
         },
     );
 
@@ -1347,7 +1393,14 @@ async fn client_resolves_missing_rows_after_empty_backfill() {
             },
         },
     );
-    send_host_frame(&*server, HostFrame::Grid { rows: 6, cols: 8 });
+    send_host_frame(
+        &*server,
+        HostFrame::Grid {
+            viewport_rows: 6,
+            cols: 8,
+            history_rows: 6,
+        },
+    );
     send_host_frame(
         &*server,
         HostFrame::Snapshot {
@@ -1471,7 +1524,14 @@ async fn client_handles_binary_snapshot_and_delta() {
             config: sync_config.clone(),
         },
     );
-    send_host_frame(&*server, HostFrame::Grid { rows: 4, cols: 10 });
+    send_host_frame(
+        &*server,
+        HostFrame::Grid {
+            viewport_rows: 4,
+            cols: 10,
+            history_rows: 4,
+        },
+    );
     send_host_frame(
         &*server,
         HostFrame::Snapshot {

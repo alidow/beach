@@ -754,14 +754,48 @@ fn collect_backfill_chunk(grid: &TerminalGrid, start_row: u64, max_rows: u32) ->
     let mut style_ids: HashSet<StyleId> = HashSet::new();
     let mut delivered = 0u32;
 
+    let base_offset = grid.row_offset();
+    trace!(
+        target = "sync::backfill",
+        start_row, max_rows, base_offset, cols, "collecting backfill chunk"
+    );
+
+    let default_cell = TerminalGrid::pack_char_with_style(' ', StyleId::DEFAULT);
+    let first_id = grid.first_row_id();
+    let last_id = grid.last_row_id();
+    trace!(
+        target = "sync::backfill",
+        start_row,
+        max_rows,
+        base_offset,
+        cols,
+        first_id,
+        last_id,
+        total_rows = grid.rows(),
+        "collecting backfill chunk"
+    );
+
     for offset in 0..max_rows as u64 {
         let absolute = start_row.saturating_add(offset);
         let Some(index) = grid.index_of_row(absolute) else {
+            trace!(target = "sync::backfill", absolute, "row missing from grid");
             continue;
         };
 
         if grid.snapshot_row_into(index, &mut buffer[..cols]).is_err() {
             continue;
+        }
+
+        if tracing::enabled!(Level::TRACE) && offset < 4 {
+            let preview: String = buffer
+                .iter()
+                .map(|cell| unpack_cell(PackedCell::from(*cell)).0)
+                .collect();
+            trace!(
+                target = "sync::backfill",
+                row = absolute,
+                text = %preview.trim_end_matches(' ')
+            );
         }
 
         let mut max_seq = 0;
@@ -774,6 +808,19 @@ fn collect_backfill_chunk(grid: &TerminalGrid, start_row: u64, max_rows: u32) ->
             let (_, style_id) = unpack_cell(packed);
             style_ids.insert(style_id);
             packed_cells.push(packed);
+        }
+
+        if max_seq == 0
+            && packed_cells
+                .iter()
+                .all(|cell| u64::from(*cell) == u64::from(default_cell))
+        {
+            trace!(
+                target = "sync::backfill",
+                row = absolute,
+                "skipping default row with no seq"
+            );
+            continue;
         }
 
         updates.push(CacheUpdate::Row(RowSnapshot::new(
@@ -1100,11 +1147,13 @@ fn spawn_input_listener(
                                 guard.resize(rows as usize, cols as usize);
                             }
                             grid.set_viewport_size(rows as usize, cols as usize);
+                            let history_rows = grid.rows();
                             let _ = send_host_frame(
                                 &transport,
                                 HostFrame::Grid {
-                                    rows: rows as u32,
+                                    viewport_rows: rows as u32,
                                     cols: cols as u32,
+                                    history_rows: history_rows as u32,
                                 },
                             );
                             debug!(
@@ -1763,21 +1812,24 @@ fn initialize_transport_snapshot(
     ) {
         return None;
     }
-    let (rows, cols) = terminal_sync.grid().viewport_size();
+    let (viewport_rows, cols) = terminal_sync.grid().viewport_size();
+    let history_rows = terminal_sync.grid().rows();
     cache.reset(cols);
     debug!(
         target = "sync::handshake",
         transport_id = transport.id().0,
         transport = ?transport.kind(),
-        rows,
+        viewport_rows,
         cols,
+        history_rows,
         "sending grid descriptor"
     );
     if !send_host_frame(
         transport,
         HostFrame::Grid {
-            rows: rows as u32,
+            viewport_rows: viewport_rows as u32,
             cols: cols as u32,
+            history_rows: history_rows as u32,
         },
     ) {
         return None;
@@ -2263,11 +2315,16 @@ mod tests {
 
             match recv_host_frame_async(&client, StdDuration::from_secs(5)).await {
                 WireHostFrame::Grid {
-                    rows: grid_rows,
+                    viewport_rows: grid_rows,
                     cols: grid_cols,
+                    history_rows,
                 } => {
                     assert_eq!(grid_rows as usize, rows);
                     assert_eq!(grid_cols as usize, cols);
+                    assert!(
+                        history_rows as usize >= rows,
+                        "history rows should cover viewport"
+                    );
                     events.lock().unwrap().push("received_grid".into());
                 }
                 other => panic!("expected grid frame, got {other:?}"),
@@ -2596,8 +2653,9 @@ mod tests {
         send_host_frame(
             host_transport.as_ref(),
             HostFrame::Grid {
-                rows: rows as u32,
+                viewport_rows: rows as u32,
                 cols: cols as u32,
+                history_rows: rows as u32,
             },
         );
         let mut cache = TransmitterCache::new();
@@ -2683,11 +2741,15 @@ mod tests {
         );
         assert!(handshake.is_some(), "handshake failed");
 
-        let mut advertised: Option<(u32, u32)> = None;
+        let mut advertised: Option<(u32, u32, u32)> = None;
         for _ in 0..10 {
             match recv_host_frame(client_transport.as_ref(), StdDuration::from_millis(200)) {
-                WireHostFrame::Grid { rows, cols } => {
-                    advertised = Some((rows, cols));
+                WireHostFrame::Grid {
+                    viewport_rows,
+                    cols,
+                    history_rows,
+                } => {
+                    advertised = Some((viewport_rows, cols, history_rows));
                     break;
                 }
                 WireHostFrame::Hello { .. }
@@ -2703,8 +2765,69 @@ mod tests {
             }
         }
 
-        let (rows, cols) = advertised.expect("grid frame missing from handshake");
+        let (rows, cols, total) = advertised.expect("grid frame missing from handshake");
         assert_eq!(rows as usize, viewport_rows, "handshake rows mismatch");
         assert_eq!(cols as usize, viewport_cols, "handshake cols mismatch");
+        assert_eq!(total as usize, total_rows, "handshake history mismatch");
+    }
+
+    #[test_timeout::timeout]
+    fn history_backfill_contains_line_text() {
+        let rows = 200usize;
+        let cols = 80usize;
+        let grid = TerminalGrid::new(rows, cols);
+        let style_id = grid.ensure_style_id(Style::default());
+
+        for row in 0..150usize {
+            let text = format!("Line {}: Test", row + 1);
+            let seq = (row as Seq) + 1;
+            for (col, ch) in text.chars().enumerate() {
+                let packed = TerminalGrid::pack_char_with_style(ch, style_id);
+                grid.write_packed_cell_if_newer(row, col, seq, packed)
+                    .expect("write cell");
+            }
+        }
+
+        let chunk = collect_backfill_chunk(&grid, 112, 24);
+        assert!(
+            chunk.delivered >= 24,
+            "expected delivered rows, got {}",
+            chunk.delivered
+        );
+
+        let mut cache = TransmitterCache::new();
+        cache.reset(cols);
+        let wire_updates = cache.apply_updates(&chunk.updates, false);
+
+        let mut seen_rows = Vec::new();
+        for update in wire_updates {
+            if let WireUpdate::Row { row, cells, .. } = update {
+                let text: String = cells
+                    .iter()
+                    .map(|cell| {
+                        let packed = PackedCell::from_raw(*cell);
+                        terminal::unpack_cell(packed).0
+                    })
+                    .collect();
+                seen_rows.push((row, text.trim_end().to_string()));
+            }
+        }
+
+        assert!(
+            seen_rows.iter().any(|(_, text)| text == "Line 113: Test"),
+            "expected row text in backfill, got {:?}",
+            seen_rows
+        );
+    }
+
+    #[test_timeout::timeout]
+    fn history_backfill_skips_default_rows() {
+        let grid = TerminalGrid::new(24, 80);
+        let chunk = collect_backfill_chunk(&grid, 10, 5);
+        assert_eq!(chunk.delivered, 0);
+        let mut cache = TransmitterCache::new();
+        cache.reset(80);
+        let updates = cache.apply_updates(&chunk.updates, false);
+        assert!(updates.is_empty(), "expected no updates for default rows");
     }
 }

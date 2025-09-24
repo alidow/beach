@@ -80,8 +80,9 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
     send_host_frame(
         host_transport.as_ref(),
         HostFrame::Grid {
-            rows: rows as u32,
+            viewport_rows: rows as u32,
             cols: cols as u32,
+            history_rows: rows as u32,
         },
     );
 
@@ -133,8 +134,12 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
         let frame = recv_host_frame(client_transport.as_ref(), Duration::from_secs(1));
         match frame {
             HostFrame::Hello { .. } => {}
-            HostFrame::Grid { rows, cols } => {
-                client_view = Some(ClientGrid::new(rows as usize, cols as usize));
+            HostFrame::Grid {
+                viewport_rows: _viewport,
+                cols,
+                history_rows,
+            } => {
+                client_view = Some(ClientGrid::new(history_rows as usize, cols as usize));
             }
             HostFrame::Snapshot { updates, lane, .. } => {
                 let view = client_view.as_mut().expect("grid message before snapshot");

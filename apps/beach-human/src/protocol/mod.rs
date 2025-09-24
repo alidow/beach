@@ -89,8 +89,9 @@ pub enum HostFrame {
         config: SyncConfigFrame,
     },
     Grid {
-        rows: u32,
+        viewport_rows: u32,
         cols: u32,
+        history_rows: u32,
     },
     Snapshot {
         subscription: u64,

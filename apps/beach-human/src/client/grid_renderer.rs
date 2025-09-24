@@ -7,6 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
 use std::collections::HashMap;
+use tracing::trace;
 
 #[derive(Clone, Copy, Debug)]
 struct CellState {
@@ -206,6 +207,13 @@ impl GridRenderer {
             for _ in 0..missing {
                 self.rows.push(RowSlot::Pending);
             }
+            trace!(
+                target = "client::render",
+                absolute_row,
+                rows = self.rows.len(),
+                base_row = self.base_row,
+                "ensure_row_extend"
+            );
         }
     }
 
@@ -292,6 +300,13 @@ impl GridRenderer {
                     cell.style_id = style_id;
                     state.latest_seq = state.latest_seq.max(seq);
                     self.mark_dirty();
+                    trace!(
+                        target = "client::render",
+                        row = absolute_row,
+                        col,
+                        seq,
+                        "apply_cell"
+                    );
                 }
                 if self.follow_tail {
                     self.scroll_to_tail();
@@ -329,6 +344,10 @@ impl GridRenderer {
                         cell.style_id = None;
                         changed = true;
                         columns_to_clear.push(col);
+                        trace!(
+                            target = "client::render",
+                            absolute_row, col, seq, "apply_row_from_text"
+                        );
                     }
                 }
                 for col in width..total_cols {
@@ -387,6 +406,13 @@ impl GridRenderer {
                         cell.style_id = *style_id;
                         changed = true;
                         columns_to_clear.push(col);
+                        trace!(
+                            target = "client::render",
+                            row = absolute_row,
+                            col,
+                            seq,
+                            "apply_row_from_cells"
+                        );
                     }
                 }
                 for col in cells.len()..total_cols {
@@ -431,6 +457,13 @@ impl GridRenderer {
                             cell.ch = ch;
                             cell.seq = seq;
                             cell.style_id = style_id;
+                            trace!(
+                                target = "client::render",
+                                row = absolute_row,
+                                col,
+                                seq,
+                                "apply_rect"
+                            );
                         }
                     }
                     state.latest_seq = state.latest_seq.max(seq);
@@ -450,6 +483,13 @@ impl GridRenderer {
             return;
         }
         for (col, seq, ch, style_id) in cells {
+            trace!(
+                target = "client::render",
+                row = absolute_row,
+                col,
+                seq,
+                "apply_segment_cell"
+            );
             self.apply_cell(absolute_row, *col, *seq, *ch, *style_id);
         }
 
@@ -485,6 +525,11 @@ impl GridRenderer {
             if !matches!(self.rows.get(rel), Some(RowSlot::Missing)) {
                 self.rows[rel] = RowSlot::Missing;
                 self.mark_dirty();
+                trace!(
+                    target = "client::render",
+                    row = absolute_row,
+                    "mark_row_missing"
+                );
             }
         }
     }
@@ -494,12 +539,22 @@ impl GridRenderer {
             if !matches!(self.rows.get(rel), Some(RowSlot::Pending)) {
                 self.rows[rel] = RowSlot::Pending;
                 self.mark_dirty();
+                trace!(
+                    target = "client::render",
+                    row = absolute_row,
+                    "mark_row_pending"
+                );
             }
         } else {
             self.touch_row(absolute_row);
             if let Some(rel) = self.relative_row(absolute_row) {
                 self.rows[rel] = RowSlot::Pending;
                 self.mark_dirty();
+                trace!(
+                    target = "client::render",
+                    row = absolute_row,
+                    "mark_row_pending_touch"
+                );
             }
         }
     }
@@ -614,6 +669,14 @@ impl GridRenderer {
         self.scroll_top = target.min(max_scroll);
         self.follow_tail = true;
         self.mark_dirty();
+        trace!(
+            target = "client::render",
+            base_row = self.base_row,
+            scroll_top = self.scroll_top,
+            viewport_height = self.viewport_height,
+            rows = self.rows.len(),
+            "scroll_to_tail"
+        );
     }
 
     pub fn scroll_to_top(&mut self) {
@@ -627,6 +690,13 @@ impl GridRenderer {
         if follow {
             self.scroll_to_tail();
         }
+        trace!(
+            target = "client::render",
+            follow_tail = self.follow_tail,
+            base_row = self.base_row,
+            scroll_top = self.scroll_top,
+            "set_follow_tail"
+        );
     }
 
     pub fn toggle_follow_tail(&mut self) {

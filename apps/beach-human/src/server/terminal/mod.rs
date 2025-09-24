@@ -4,7 +4,7 @@ mod pty;
 pub use emulator::{AlacrittyEmulator, EmulatorResult, SimpleTerminalEmulator, TerminalEmulator};
 pub use pty::{Command, PtyProcess, PtyReader, PtyWriter, SpawnConfig, resize_pty};
 
-use crate::cache::terminal::TerminalGrid;
+use crate::cache::terminal::{PackedCell, TerminalGrid, unpack_cell};
 use crate::model::terminal::diff::CacheUpdate;
 use crate::telemetry::{self, PerfGuard};
 use anyhow::Result;
@@ -12,6 +12,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
+use tracing::{self, Level, trace};
 
 #[derive(Debug, Default)]
 pub struct LocalEcho {
@@ -171,6 +172,7 @@ async fn read_loop(
                     emulator.handle_output(&chunk, &grid)
                 };
                 for update in updates {
+                    log_update_sample(&update);
                     apply_update(&grid, &update);
                     let _ = tx.send(update);
                 }
@@ -185,6 +187,7 @@ async fn read_loop(
                     emulator.flush(&grid)
                 };
                 for update in flushes {
+                    log_update_sample(&update);
                     apply_update(&grid, &update);
                     let _ = tx.send(update);
                 }
@@ -198,6 +201,28 @@ async fn read_loop(
                 break;
             }
         }
+    }
+}
+
+fn log_update_sample(update: &CacheUpdate) {
+    if !tracing::enabled!(Level::TRACE) {
+        return;
+    }
+    match update {
+        CacheUpdate::Row(row) => {
+            let text: String = row.cells.iter().map(|cell| unpack_cell(*cell).0).collect();
+            let trimmed = text.trim_end();
+            if !trimmed.is_empty() {
+                trace!(target = "server::grid", row = row.row, seq = row.seq, sample = %trimmed);
+            }
+        }
+        CacheUpdate::Cell(cell) => {
+            let (ch, _) = unpack_cell(cell.cell.into());
+            if ch != ' ' {
+                trace!(target = "server::grid", row = cell.row, col = cell.col, seq = cell.seq, ch = %ch);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -217,6 +242,21 @@ fn apply_update(grid: &TerminalGrid, update: &CacheUpdate) {
             );
         }
         CacheUpdate::Row(row) => {
+            if tracing::enabled!(Level::TRACE) {
+                let text: String = row
+                    .cells
+                    .iter()
+                    .map(|cell| unpack_cell(PackedCell::from(*cell)).0)
+                    .collect();
+                if text.contains("Line ") {
+                    trace!(
+                        target = "server::grid",
+                        row = row.row,
+                        seq = row.seq,
+                        sample = %text.trim_end_matches(' ')
+                    );
+                }
+            }
             for (offset, cell) in row.cells.iter().enumerate() {
                 let _ = grid.write_packed_cell_if_newer(row.row, offset, row.seq, *cell);
             }
@@ -233,14 +273,13 @@ fn apply_update(grid: &TerminalGrid, update: &CacheUpdate) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::terminal::TerminalGrid;
+    use crate::cache::terminal::{PackedCell, TerminalGrid, unpack_cell};
     use tokio::time::{Duration, sleep};
 
     #[test_timeout::tokio_timeout_test]
     async fn runtime_captures_command_output() {
         let grid = Arc::new(TerminalGrid::new(4, 20));
-        let emulator: Box<dyn TerminalEmulator + Send> =
-            Box::new(SimpleTerminalEmulator::new(&grid));
+        let emulator: Box<dyn TerminalEmulator + Send> = Box::new(AlacrittyEmulator::new(&grid));
         let command = Command::new("/usr/bin/env").arg("printf").arg("hello");
         let config = SpawnConfig::new(command, 80, 24);
 
@@ -277,5 +316,61 @@ mod tests {
         assert!(collected.contains('h'));
 
         runtime.wait().await.expect("wait runtime");
+    }
+
+    #[test_timeout::tokio_timeout_test]
+    async fn terminal_grid_retains_long_burst_output() {
+        let rows = 24;
+        let cols = 80;
+        let grid = Arc::new(TerminalGrid::new(rows, cols));
+        let emulator: Box<dyn TerminalEmulator + Send> =
+            Box::new(SimpleTerminalEmulator::new(&grid));
+
+        let command = Command::new("/bin/bash")
+            .arg("-lc")
+            .arg("for i in {1..150}; do echo \"Line $i: Test\"; done");
+        let config = SpawnConfig::new(command, cols as u16, rows as u16);
+
+        let spawn_result = TerminalRuntime::spawn(config, emulator, grid.clone(), false, None);
+        let (runtime, mut updates) = match spawn_result {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!("skipping terminal_grid_retains_long_burst_output: {err}");
+                return;
+            }
+        };
+
+        // Drain update stream until runtime completes.
+        while let Some(update) = updates.recv().await {
+            apply_update(&grid, &update);
+        }
+        runtime.wait().await.expect("wait runtime");
+
+        let first_row = grid.first_row_id().unwrap_or(0);
+        let last_row = grid.last_row_id().unwrap_or(first_row);
+        let mut buffer = vec![0u64; grid.cols()];
+        let mut missing: Vec<u64> = Vec::new();
+
+        for absolute in first_row..=last_row {
+            let Some(index) = grid.index_of_row(absolute) else {
+                continue;
+            };
+            if grid.snapshot_row_into(index, &mut buffer).is_err() {
+                continue;
+            }
+            let text: String = buffer
+                .iter()
+                .map(|cell| unpack_cell(PackedCell::from(*cell)).0)
+                .collect();
+            let trimmed = text.trim_end();
+            if trimmed.starts_with("Line ") {
+                continue;
+            }
+            if trimmed.is_empty() {
+                missing.push(absolute);
+            }
+        }
+
+        assert!(missing.is_empty(), "missing burst rows: {missing:?}");
     }
 }

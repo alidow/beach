@@ -441,8 +441,9 @@ where
         send_host_frame(
             server_transport.as_ref(),
             HostFrame::Grid {
-                rows: rows as u32,
+                viewport_rows: rows as u32,
                 cols: cols as u32,
+                history_rows: rows as u32,
             },
         );
 

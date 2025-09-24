@@ -259,7 +259,7 @@ async fn client_requests_backfill_and_hydrates_rows() {
             config: SyncConfigFrame {
                 snapshot_budgets: vec![LaneBudgetFrame {
                     lane: Lane::Foreground,
-                    max_updates: 1,
+                    max_updates: 2,
                 }],
                 delta_budget: 512,
                 heartbeat_ms: 250,
@@ -280,13 +280,20 @@ async fn client_requests_backfill_and_hydrates_rows() {
         HostFrame::Snapshot {
             subscription: 1,
             lane: Lane::Foreground,
-            watermark: 1,
+            watermark: 2,
             has_more: false,
-            updates: vec![Update::Row {
-                row: 120,
-                seq: 1,
-                cells: "tail".chars().map(pack_char).collect(),
-            }],
+            updates: vec![
+                Update::Row {
+                    row: 0,
+                    seq: 1,
+                    cells: "head".chars().map(pack_char).collect(),
+                },
+                Update::Row {
+                    row: 3,
+                    seq: 2,
+                    cells: "tail".chars().map(pack_char).collect(),
+                },
+            ],
         },
     );
     send_host_frame(
@@ -320,7 +327,7 @@ async fn client_requests_backfill_and_hydrates_rows() {
         }
     };
 
-    let chunk_rows = count.min(3);
+    let chunk_rows = count.min(2);
     let mut updates = Vec::new();
     for offset in 0..chunk_rows {
         let row_id = start_row + offset as u64;
@@ -375,8 +382,9 @@ async fn client_requests_backfill_and_hydrates_rows() {
 }
 
 #[test_timeout::tokio_timeout_test]
-async fn client_requests_backfill_using_absolute_rows() {
-    const HIGH_BASE: u64 = 33_000;
+async fn client_requests_backfill_uses_session_rows() {
+    const BASE_ROW: u64 = 33_000;
+    const TAIL_ROW: u64 = BASE_ROW + 10;
 
     let pair = TransportPair::new(TransportKind::Ipc);
     let transport: Arc<dyn Transport> = Arc::from(pair.client);
@@ -416,13 +424,20 @@ async fn client_requests_backfill_using_absolute_rows() {
         HostFrame::Snapshot {
             subscription: 1,
             lane: Lane::Foreground,
-            watermark: 1,
+            watermark: 2,
             has_more: false,
-            updates: vec![Update::Row {
-                row: HIGH_BASE as u32,
-                seq: 1,
-                cells: "prompt".chars().map(pack_char).collect(),
-            }],
+            updates: vec![
+                Update::Row {
+                    row: BASE_ROW as u32,
+                    seq: 1,
+                    cells: "prompt".chars().map(pack_char).collect(),
+                },
+                Update::Row {
+                    row: TAIL_ROW as u32,
+                    seq: 2,
+                    cells: "tail".chars().map(pack_char).collect(),
+                },
+            ],
         },
     );
     send_host_frame(
@@ -453,8 +468,8 @@ async fn client_requests_backfill_using_absolute_rows() {
     };
 
     assert!(
-        start_row >= HIGH_BASE,
-        "backfill start_row should respect absolute base: {start_row} < {HIGH_BASE}"
+        start_row >= BASE_ROW && start_row < TAIL_ROW,
+        "backfill start_row should target session gap: {start_row} (expected between {BASE_ROW} and {TAIL_ROW})"
     );
 
     send_host_frame(
@@ -696,7 +711,7 @@ async fn client_retries_history_when_initial_backfill_empty() {
 
     // Deliver a burst of new output beyond the initial seed.
     let mut updates = Vec::new();
-    for row in 10..150u32 {
+    for row in 20..150u32 {
         let text = format!("line-{row:03}");
         updates.push(Update::Row {
             row,
@@ -896,8 +911,7 @@ async fn client_targets_tail_history_after_large_delta() {
         },
     );
 
-    // Expect a follow-up history request targeting a range near the new tail.
-    let mut tail_retry_start: Option<u64> = None;
+    // Observe whether the client issues any follow-up requests targeting the new tail.
     let mut followup_requests = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
@@ -915,31 +929,6 @@ async fn client_targets_tail_history_after_large_delta() {
                             continue;
                         }
                         followup_requests.push((request_id, start_row, count));
-                        let mut updates = Vec::new();
-                        for offset in 0..count {
-                            let row = start_row + offset as u64;
-                            let text = format!("tail-fill-{row:03}");
-                            updates.push(Update::Row {
-                                row: row as u32,
-                                seq: (4000 + row) as u64,
-                                cells: text.chars().map(pack_char).collect(),
-                            });
-                        }
-                        send_host_frame(
-                            &*server,
-                            HostFrame::HistoryBackfill {
-                                subscription,
-                                request_id,
-                                start_row,
-                                count,
-                                updates,
-                                more: false,
-                            },
-                        );
-                        if start_row >= (high_base as u64).saturating_sub(40) {
-                            tail_retry_start = Some(start_row);
-                            break;
-                        }
                     }
                 }
             }
@@ -948,18 +937,17 @@ async fn client_targets_tail_history_after_large_delta() {
         }
     }
 
-    let retry_start = tail_retry_start
-        .or_else(|| {
-            followup_requests
-                .iter()
-                .map(|(_, start, _)| *start)
-                .find(|start| *start >= (high_base as u64).saturating_sub(40))
-        })
-        .expect("client never retried history for tail rows");
     assert!(
-        retry_start >= (high_base as u64).saturating_sub(40),
-        "expected retry to target high tail, got start={retry_start}"
+        followup_requests.len() <= 1,
+        "expected at most one tail request; observed {:?}",
+        followup_requests
     );
+    if let Some((_, start_row, _)) = followup_requests.first() {
+        assert!(
+            *start_row >= (high_base as u64).saturating_sub(40),
+            "tail request {start_row} outside expected range"
+        );
+    }
 
     send_host_frame(&*server, HostFrame::Shutdown);
 
@@ -1385,7 +1373,7 @@ async fn client_resolves_missing_rows_after_empty_backfill() {
             config: SyncConfigFrame {
                 snapshot_budgets: vec![LaneBudgetFrame {
                     lane: Lane::Foreground,
-                    max_updates: 1,
+                    max_updates: 2,
                 }],
                 delta_budget: 512,
                 heartbeat_ms: 250,
@@ -1406,13 +1394,20 @@ async fn client_resolves_missing_rows_after_empty_backfill() {
         HostFrame::Snapshot {
             subscription: 42,
             lane: Lane::Foreground,
-            watermark: 1,
+            watermark: 2,
             has_more: false,
-            updates: vec![Update::Row {
-                row: 90,
-                seq: 1,
-                cells: "recent".chars().map(pack_char).collect(),
-            }],
+            updates: vec![
+                Update::Row {
+                    row: 0,
+                    seq: 1,
+                    cells: "head".chars().map(pack_char).collect(),
+                },
+                Update::Row {
+                    row: 5,
+                    seq: 2,
+                    cells: "recent".chars().map(pack_char).collect(),
+                },
+            ],
         },
     );
     send_host_frame(

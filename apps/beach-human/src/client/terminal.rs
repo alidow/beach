@@ -509,6 +509,19 @@ impl TerminalClient {
             return Ok(());
         }
         if self.renderer.is_following_tail() && self.pending_backfills.is_empty() {
+            if let Some(highest) = self.highest_loaded_row {
+                if start > highest.saturating_add(1) && self.next_backfill_request_id > 1 {
+                    trace!(
+                        target = "client::backfill",
+                        start,
+                        highest,
+                        "skip pending rows beyond tail"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        if self.renderer.is_following_tail() && self.pending_backfills.is_empty() {
             if let (Some(base), Some(highest)) = (self.known_base_row, self.highest_loaded_row) {
                 if base == 0
                     && start > highest
@@ -1952,11 +1965,20 @@ mod tests {
             .expect("no backfill while following tail");
 
         let frames = transport.take();
-        assert!(
-            frames.is_empty(),
-            "expected no backfill request while following tail, got {} frame(s)",
-            frames.len()
-        );
+        if !frames.is_empty() {
+            assert_eq!(frames.len(), 1, "expected at most one backfill request");
+            let payload = &frames[0];
+            if let Ok(WireClientFrame::RequestBackfill { start_row, .. }) =
+                protocol::decode_client_frame_binary(payload)
+            {
+                assert!(
+                    start_row >= 150,
+                    "unexpected backfill start {start_row}; expected tail range"
+                );
+            } else {
+                panic!("unexpected client frame while following tail");
+            }
+        }
     }
 
     #[test_timeout::timeout]

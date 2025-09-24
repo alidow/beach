@@ -30,7 +30,8 @@ pub trait TerminalEmulator: Send {
 pub struct SimpleTerminalEmulator {
     viewport_rows: usize,
     viewport_cols: usize,
-    absolute_row: usize,
+    absolute_row: u64,
+    origin_row: u64,
     col: usize,
     seq: Seq,
     default_style: StyleId,
@@ -45,11 +46,12 @@ impl SimpleTerminalEmulator {
         let viewport_rows = viewport_rows.max(1);
         let viewport_cols = viewport_cols.max(1);
         let default_style = grid.ensure_style_id(Style::default());
-        let absolute_row = usize::try_from(grid.row_offset()).unwrap_or(usize::MAX);
+        let absolute_row = grid.row_offset();
         Self {
             viewport_rows,
             viewport_cols,
             absolute_row,
+            origin_row: absolute_row,
             col: 0,
             seq: 0,
             default_style,
@@ -63,13 +65,19 @@ impl SimpleTerminalEmulator {
         self.line_buffer.clear();
     }
 
+    fn relative_row(&self) -> usize {
+        let rel = self.absolute_row.saturating_sub(self.origin_row);
+        rel.min(usize::MAX as u64) as usize
+    }
+
     fn push_char(&mut self, ch: char) -> CacheUpdate {
         if self.col >= self.viewport_cols {
             self.advance_row();
         }
         self.seq = self.seq.saturating_add(1);
         let cell = pack_cell(ch, self.default_style);
-        let update = CacheUpdate::Cell(CellWrite::new(self.absolute_row, self.col, self.seq, cell));
+        let row = self.relative_row();
+        let update = CacheUpdate::Cell(CellWrite::new(row, self.col, self.seq, cell));
         self.col = self.col.saturating_add(1);
         update
     }
@@ -79,7 +87,8 @@ impl SimpleTerminalEmulator {
             None
         } else {
             self.seq = self.seq.saturating_add(1);
-            let snapshot = RowSnapshot::new(self.absolute_row, self.seq, self.line_buffer.clone());
+            let row = self.relative_row();
+            let snapshot = RowSnapshot::new(row, self.seq, self.line_buffer.clone());
             self.line_buffer.clear();
             Some(CacheUpdate::Row(snapshot))
         }
@@ -211,6 +220,7 @@ pub struct AlacrittyEmulator {
     parser: Processor,
     seq: Seq,
     need_full_redraw: bool,
+    session_origin: Option<u64>,
 }
 
 unsafe impl Send for AlacrittyEmulator {}
@@ -233,12 +243,31 @@ impl AlacrittyEmulator {
             parser,
             seq: 0,
             need_full_redraw: true,
+            session_origin: None,
         }
     }
 
     fn next_seq(&mut self) -> Seq {
         self.seq = self.seq.saturating_add(1);
         self.seq
+    }
+
+    fn ensure_session_origin(&mut self, base_row: u64, viewport_top: usize) -> u64 {
+        let candidate = base_row.saturating_add(viewport_top as u64);
+        match self.session_origin {
+            Some(origin) if candidate <= origin => origin,
+            _ => {
+                self.session_origin = Some(candidate);
+                candidate
+            }
+        }
+    }
+
+    fn rebase_row(&self, absolute_row: usize) -> usize {
+        let origin = self.session_origin.unwrap_or(0);
+        let abs = absolute_row as u64;
+        let rel = abs.saturating_sub(origin);
+        rel.min(usize::MAX as u64) as usize
     }
 
     fn render_full(&mut self, grid: &TerminalGrid) -> EmulatorResult {
@@ -255,6 +284,7 @@ impl AlacrittyEmulator {
         let viewport_top = history_size.saturating_sub(display_offset);
         let style_table = grid.style_table.clone();
         let base_row = grid.row_offset();
+        let _ = self.ensure_session_origin(base_row, viewport_top);
 
         let updates = self.render_full_internal(
             rows,
@@ -281,6 +311,7 @@ impl AlacrittyEmulator {
         let mut style_updates = Vec::new();
         let mut emitted_styles = std::collections::HashSet::new();
         let mut cell_updates = Vec::with_capacity(rows * cols);
+        let _ = self.ensure_session_origin(base_row, viewport_top);
         for visible_line in 0..rows {
             let Some(absolute_row) = Self::absolute_row_id(base_row, viewport_top, visible_line)
             else {
@@ -288,6 +319,7 @@ impl AlacrittyEmulator {
             };
             let line_index = visible_line as isize - display_offset as isize;
             let line = Line(line_index as i32);
+            let relative_row = self.rebase_row(absolute_row);
             for col in 0..cols {
                 let point = Point::new(line, Column(col));
                 let (packed, style_id, style, is_new) = self.pack_point(point, style_table);
@@ -299,7 +331,7 @@ impl AlacrittyEmulator {
                 }
                 let seq = self.next_seq();
                 cell_updates.push(CacheUpdate::Cell(CellWrite::new(
-                    absolute_row,
+                    relative_row,
                     col,
                     seq,
                     packed,
@@ -333,6 +365,7 @@ impl AlacrittyEmulator {
         let viewport_top = history_size.saturating_sub(display_offset);
         let base_row = grid.row_offset();
         let forced_full = self.need_full_redraw;
+        let _ = self.ensure_session_origin(base_row, viewport_top);
         let mut cell_updates = Vec::new();
         let mut style_updates = Vec::new();
         let mut emitted_styles = std::collections::HashSet::new();
@@ -386,6 +419,7 @@ impl AlacrittyEmulator {
                 };
                 let line_index = visible_line as isize - display_offset as isize;
                 let line = Line(line_index as i32);
+                let relative_row = self.rebase_row(absolute_row);
                 for col in left..=right {
                     let point = Point::new(line, Column(col));
                     let (packed, style_id, style, is_new) =
@@ -398,7 +432,7 @@ impl AlacrittyEmulator {
                     }
                     let seq = self.next_seq();
                     cell_updates.push(CacheUpdate::Cell(CellWrite::new(
-                        absolute_row,
+                        relative_row,
                         col,
                         seq,
                         packed,
@@ -523,5 +557,23 @@ mod tests {
             }
             _ => panic!("expected cell update"),
         }
+    }
+
+    #[test_timeout::timeout]
+    fn session_origin_updates_when_viewport_shifts() {
+        let grid = TerminalGrid::new(24, 80);
+        let mut emulator = AlacrittyEmulator::new(&grid);
+
+        // Initial call sees no scrollback.
+        let origin0 = emulator.ensure_session_origin(0, 0);
+        assert_eq!(origin0, 0, "expected initial origin to be zero");
+
+        // Later the viewport reveals that the PTY started at row 160.
+        let origin1 = emulator.ensure_session_origin(0, 160);
+        assert_eq!(origin1, 160, "origin should update to the first absolute row");
+
+        // Rows rebased after the adjustment should now anchor at zero.
+        let relative = emulator.rebase_row(160);
+        assert_eq!(relative, 0, "row 160 should map to relative zero after rebasing");
     }
 }

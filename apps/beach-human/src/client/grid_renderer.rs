@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Widget};
 use std::collections::HashMap;
-use tracing::trace;
+use tracing::{Level, trace};
 
 #[derive(Clone, Copy, Debug)]
 struct CellState {
@@ -161,9 +161,7 @@ impl GridRenderer {
             let drop = (base_row - self.base_row) as usize;
             let current_len = self.rows.len();
             if drop >= current_len {
-                let preserve = current_len.max(self.viewport_height).max(1);
                 self.rows.clear();
-                self.rows.resize(preserve, RowSlot::Pending);
                 self.scroll_top = 0;
             } else {
                 self.rows.drain(0..drop);
@@ -940,16 +938,16 @@ impl GridRenderer {
 
     pub fn visible_lines(&self) -> Vec<String> {
         let height = self.viewport_height.max(1);
-        let mut lines = Vec::with_capacity(height);
+        let mut entries: Vec<(String, bool, u64)> = Vec::with_capacity(height);
         for row_idx in 0..height {
             let absolute = self.base_row + self.scroll_top as u64 + row_idx as u64;
             if let Some(rel) = self.relative_row(absolute) {
                 match &self.rows[rel] {
                     RowSlot::Pending => {
-                        lines.push("·".repeat(self.cols.max(1)));
+                        entries.push(("·".repeat(self.cols.max(1)), true, absolute))
                     }
                     RowSlot::Missing => {
-                        lines.push(" ".repeat(self.cols.max(1)));
+                        entries.push((" ".repeat(self.cols.max(1)), true, absolute))
                     }
                     RowSlot::Loaded(_) => {
                         let mut line = String::with_capacity(self.cols.max(1));
@@ -957,19 +955,66 @@ impl GridRenderer {
                             let (ch, _, _) = self.cell_for_render(absolute, col);
                             line.push(ch);
                         }
-                        lines.push(line);
+                        entries.push((line, false, absolute));
                     }
                 }
             } else {
-                lines.push(String::new());
+                entries.push((String::new(), true, absolute));
+            }
+        }
+        if self.follow_tail && (self.base_row > 0 || self.scroll_top > 0) {
+            let mut trimmed_absolute: Option<u64> = None;
+            let mut trimmed = 0usize;
+            while let Some((_, is_pending, abs)) = entries.last() {
+                if *is_pending {
+                    trimmed_absolute = Some(*abs);
+                    entries.pop();
+                    trimmed += 1;
+                } else {
+                    break;
+                }
+            }
+            if trimmed > 0 {
+                trace!(
+                    target = "client::tail",
+                    event = "trim_pending_suffix",
+                    trimmed,
+                    last_trimmed = trimmed_absolute,
+                    base_row = self.base_row,
+                    scroll_top = self.scroll_top,
+                    viewport = self.viewport_height,
+                    rows = self.rows.len()
+                );
+            }
+        }
+        let mut lines = Vec::with_capacity(height);
+        let blanks_needed = height.saturating_sub(entries.len());
+        for _ in 0..blanks_needed {
+            lines.push(" ".repeat(self.cols.max(1)));
+        }
+        lines.extend(entries.into_iter().map(|(line, _, _)| line));
+        lines.truncate(height);
+        if tracing::enabled!(Level::TRACE) {
+            if let Some(last) = lines.last() {
+                trace!(
+                    target = "client::tail",
+                    event = "visible_lines",
+                    base_row = self.base_row,
+                    scroll_top = self.scroll_top,
+                    viewport = self.viewport_height,
+                    rows = self.rows.len(),
+                    follow = self.follow_tail,
+                    last_line = %last.trim()
+                );
             }
         }
         lines
     }
 
     fn render_body(&self) -> TerminalBodyWidget {
-        let mut lines: Vec<Line<'static>> = Vec::with_capacity(self.viewport_height.max(1));
-        for row_idx in 0..self.viewport_height.max(1) {
+        let height = self.viewport_height.max(1);
+        let mut entries: Vec<(Line<'static>, bool, u64)> = Vec::with_capacity(height);
+        for row_idx in 0..height {
             let absolute = self.base_row + self.scroll_top as u64 + row_idx as u64;
             if let Some(rel) = self.relative_row(absolute) {
                 match &self.rows[rel] {
@@ -978,10 +1023,14 @@ impl GridRenderer {
                         let style = Style::default()
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::DIM);
-                        lines.push(Line::from(vec![Span::styled(placeholder, style)]));
+                        entries.push((
+                            Line::from(vec![Span::styled(placeholder, style)]),
+                            true,
+                            absolute,
+                        ));
                     }
                     RowSlot::Missing => {
-                        lines.push(Line::from(" ".repeat(self.cols.max(1))));
+                        entries.push((Line::from(" ".repeat(self.cols.max(1))), true, absolute))
                     }
                     RowSlot::Loaded(_) => {
                         let mut spans = Vec::with_capacity(self.cols.max(1));
@@ -994,13 +1043,42 @@ impl GridRenderer {
                                 .unwrap_or(false);
                             spans.push(self.span_for_cell(ch, style_id, selected, predicted));
                         }
-                        lines.push(Line::from(spans));
+                        entries.push((Line::from(spans), false, absolute));
                     }
                 }
             } else {
-                lines.push(Line::from(" ".repeat(self.cols.max(1))));
+                entries.push((Line::from(" ".repeat(self.cols.max(1))), true, absolute));
             }
         }
+        if self.follow_tail && (self.base_row > 0 || self.scroll_top > 0) {
+            let mut trimmed = 0usize;
+            while let Some((_, is_pending, _)) = entries.last() {
+                if *is_pending {
+                    entries.pop();
+                    trimmed += 1;
+                } else {
+                    break;
+                }
+            }
+            if trimmed > 0 {
+                trace!(
+                    target = "client::tail",
+                    event = "render_body_trim",
+                    trimmed,
+                    base_row = self.base_row,
+                    scroll_top = self.scroll_top,
+                    viewport = self.viewport_height,
+                    rows = self.rows.len()
+                );
+            }
+        }
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
+        let blanks_needed = height.saturating_sub(entries.len());
+        for _ in 0..blanks_needed {
+            lines.push(Line::from(" ".repeat(self.cols.max(1))));
+        }
+        lines.extend(entries.into_iter().map(|(line, _, _)| line));
+        lines.truncate(height);
         TerminalBodyWidget { lines }
     }
 
@@ -1235,5 +1313,38 @@ mod tests {
             non_blank >= 24.min(lines.len()),
             "viewport still blank after filling rows"
         );
+    }
+
+    #[test_timeout::timeout]
+    fn tail_short_buffer_stays_top_aligned() {
+        let mut renderer = GridRenderer::new(0, 10);
+        renderer.on_resize(10, 8); // viewport_height reduced by status lines
+        renderer.set_base_row(0);
+        for row in 0..3u64 {
+            let text = format!("Row {row}");
+            renderer.apply_row_from_cells(row as usize, row as Seq, &decode_line(&text));
+        }
+        renderer.scroll_to_tail();
+        renderer.viewport_height = 6;
+        let lines = renderer.visible_lines();
+        assert_eq!(lines.len(), 6);
+        assert!(lines[0].starts_with("Row 0"));
+    }
+
+    #[test_timeout::timeout]
+    fn tail_short_buffer_bottom_aligns_when_history_trimmed() {
+        let mut renderer = GridRenderer::new(0, 10);
+        renderer.on_resize(10, 8);
+        renderer.set_base_row(120);
+        for idx in 0..3u64 {
+            let abs = 120 + idx;
+            let text = format!("Row {abs}");
+            renderer.apply_row_from_cells(abs as usize, abs as Seq, &decode_line(&text));
+        }
+        renderer.scroll_to_tail();
+        renderer.viewport_height = 6;
+        let lines = renderer.visible_lines();
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines.last().unwrap().trim(), "Row 122");
     }
 }

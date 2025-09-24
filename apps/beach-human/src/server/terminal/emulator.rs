@@ -221,6 +221,7 @@ pub struct AlacrittyEmulator {
     seq: Seq,
     need_full_redraw: bool,
     session_origin: Option<u64>,
+    last_seeded_tail: Option<usize>,
 }
 
 unsafe impl Send for AlacrittyEmulator {}
@@ -244,6 +245,7 @@ impl AlacrittyEmulator {
             seq: 0,
             need_full_redraw: true,
             session_origin: None,
+            last_seeded_tail: None,
         }
     }
 
@@ -258,6 +260,7 @@ impl AlacrittyEmulator {
             Some(origin) if candidate <= origin => origin,
             _ => {
                 self.session_origin = Some(candidate);
+                self.last_seeded_tail = None;
                 candidate
             }
         }
@@ -268,6 +271,45 @@ impl AlacrittyEmulator {
         let abs = absolute_row as u64;
         let rel = abs.saturating_sub(origin);
         rel.min(usize::MAX as u64) as usize
+    }
+
+    fn tail_blank_candidate(
+        &self,
+        base_row: u64,
+        viewport_top: usize,
+        rows: usize,
+    ) -> Option<usize> {
+        if rows == 0 {
+            return None;
+        }
+        let tail_index = rows.saturating_sub(1);
+        let tail_absolute = Self::absolute_row_id(base_row, viewport_top, tail_index)? as u64;
+        let next_absolute = tail_absolute.saturating_add(1);
+        let origin = self.session_origin.unwrap_or(0);
+        let relative = next_absolute.saturating_sub(origin);
+        Some(relative.min(usize::MAX as u64) as usize)
+    }
+
+    fn seed_tail_blank_row(
+        &mut self,
+        candidate: Option<usize>,
+        cell_updates: &mut Vec<CacheUpdate>,
+    ) {
+        let Some(next_relative) = candidate else {
+            return;
+        };
+        if self.last_seeded_tail == Some(next_relative) {
+            return;
+        }
+        let seq = self.next_seq();
+        let blank = pack_cell(' ', StyleId::DEFAULT);
+        cell_updates.push(CacheUpdate::Cell(CellWrite::new(
+            next_relative,
+            0,
+            seq,
+            blank,
+        )));
+        self.last_seeded_tail = Some(next_relative);
     }
 
     fn render_full(&mut self, grid: &TerminalGrid) -> EmulatorResult {
@@ -338,6 +380,8 @@ impl AlacrittyEmulator {
                 )));
             }
         }
+        let tail_candidate = self.tail_blank_candidate(base_row, viewport_top, rows);
+        self.seed_tail_blank_row(tail_candidate, &mut cell_updates);
         style_updates.extend(cell_updates);
         style_updates
     }
@@ -439,6 +483,12 @@ impl AlacrittyEmulator {
                     )));
                 }
             }
+        }
+
+        if !(self.need_full_redraw || forced_full || touched_cells >= rows.saturating_mul(cols) / 2)
+        {
+            let tail_candidate = self.tail_blank_candidate(base_row, viewport_top, rows);
+            self.seed_tail_blank_row(tail_candidate, &mut cell_updates);
         }
 
         style_updates.extend(cell_updates);
@@ -570,10 +620,36 @@ mod tests {
 
         // Later the viewport reveals that the PTY started at row 160.
         let origin1 = emulator.ensure_session_origin(0, 160);
-        assert_eq!(origin1, 160, "origin should update to the first absolute row");
+        assert_eq!(
+            origin1, 160,
+            "origin should update to the first absolute row"
+        );
 
         // Rows rebased after the adjustment should now anchor at zero.
         let relative = emulator.rebase_row(160);
-        assert_eq!(relative, 0, "row 160 should map to relative zero after rebasing");
+        assert_eq!(
+            relative, 0,
+            "row 160 should map to relative zero after rebasing"
+        );
+    }
+
+    #[test_timeout::timeout]
+    fn newline_triggers_tail_blank_seed() {
+        let grid = TerminalGrid::new(4, 10);
+        let mut emulator = AlacrittyEmulator::new(&grid);
+
+        let updates = emulator.handle_output(b"hello\n", &grid);
+        let mut saw_blank = false;
+        for update in updates {
+            if let CacheUpdate::Cell(cell) = update {
+                let (ch, _) = unpack_cell(cell.cell);
+                if cell.row == 1 && cell.col == 0 && ch == ' ' {
+                    saw_blank = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(saw_blank, "expected blank cell for tail row");
     }
 }

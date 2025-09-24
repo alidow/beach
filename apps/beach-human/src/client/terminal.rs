@@ -513,9 +513,7 @@ impl TerminalClient {
                 if start > highest.saturating_add(1) && self.next_backfill_request_id > 1 {
                     trace!(
                         target = "client::backfill",
-                        start,
-                        highest,
-                        "skip pending rows beyond tail"
+                        start, highest, "skip pending rows beyond tail"
                     );
                     return Ok(());
                 }

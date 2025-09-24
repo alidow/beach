@@ -129,6 +129,7 @@ Follow-up fix: `GridRenderer::scroll_to_tail` now walks back from the last *load
 - Client issues backfills: `start=24 count=256`, `start=78 count=178`, ...
 - Every reply logs `updates=0`, so the renderer stays `Pending` and our next request keeps marching backward (`start=0`).
 - UI shows dots, `loading hist`, stdin appears unresponsive because the event loop is waiting on history to settle.
+- Tail rows hover mid-screen when shells emit a fresh prompt/blank line after large bursts. When the PTY advances into a brand-new row that still contains default spaces the emulator reports no damage, so the server never sends an update for that row and the client keeps it `Pending`. Fix: after advancing into a new absolute row, push a single default `CellWrite` (e.g. column 0, packed blank) so the renderer knows the row exists without shipping a full snapshot.
 
 This transcript is from the pre-fix run; repeat it once we validate the new scheduler against the real host.
 

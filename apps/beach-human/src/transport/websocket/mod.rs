@@ -87,7 +87,11 @@ impl WebSocketTransport {
                     Ok(Message::Close(_)) => break,
                     Ok(_) => {}
                     Err(err) => {
-                        eprintln!("websocket recv error: {err}");
+                        tracing::debug!(
+                            target = "transport::websocket",
+                            error = %err,
+                            "websocket recv error"
+                        );
                         break;
                     }
                 }
@@ -101,7 +105,11 @@ impl WebSocketTransport {
                     OutboundFrame::Binary(bytes) => write_half.send(Message::Binary(bytes)).await,
                 };
                 if let Err(err) = result {
-                    eprintln!("websocket send error: {err}");
+                    tracing::debug!(
+                        target = "transport::websocket",
+                        error = %err,
+                        "websocket send error"
+                    );
                     break;
                 }
             }

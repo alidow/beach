@@ -32,18 +32,36 @@ pub struct SelectionPosition {
     pub col: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionMode {
+    Character,
+    Line,
+    Block,
+}
+
 #[derive(Clone, Debug)]
 struct SelectionRange {
     anchor: SelectionPosition,
     head: SelectionPosition,
+    mode: SelectionMode,
 }
 
 impl SelectionRange {
-    fn new(anchor: SelectionPosition, head: SelectionPosition) -> Self {
-        Self { anchor, head }
+    fn new(anchor: SelectionPosition, head: SelectionPosition, mode: SelectionMode) -> Self {
+        Self { anchor, head, mode }
     }
 
-    fn bounds(&self) -> (SelectionPosition, SelectionPosition) {
+    fn mode(&self) -> SelectionMode {
+        self.mode
+    }
+
+    fn row_bounds(&self) -> (u64, u64) {
+        let min = self.anchor.row.min(self.head.row);
+        let max = self.anchor.row.max(self.head.row);
+        (min, max)
+    }
+
+    fn ordered_positions(&self) -> (SelectionPosition, SelectionPosition) {
         if self.anchor.row < self.head.row
             || (self.anchor.row == self.head.row && self.anchor.col <= self.head.col)
         {
@@ -53,21 +71,43 @@ impl SelectionRange {
         }
     }
 
+    fn block_col_bounds(&self) -> (usize, usize) {
+        let min = self.anchor.col.min(self.head.col);
+        let max = self.anchor.col.max(self.head.col);
+        (min, max)
+    }
+
     fn contains(&self, pos: SelectionPosition) -> bool {
-        let (start, end) = self.bounds();
-        if pos.row < start.row || pos.row > end.row {
-            return false;
+        match self.mode {
+            SelectionMode::Character => {
+                let (start, end) = self.ordered_positions();
+                if pos.row < start.row || pos.row > end.row {
+                    return false;
+                }
+                if start.row == end.row {
+                    return pos.col >= start.col && pos.col <= end.col;
+                }
+                if pos.row == start.row {
+                    return pos.col >= start.col;
+                }
+                if pos.row == end.row {
+                    return pos.col <= end.col;
+                }
+                true
+            }
+            SelectionMode::Line => {
+                let (min_row, max_row) = self.row_bounds();
+                pos.row >= min_row && pos.row <= max_row
+            }
+            SelectionMode::Block => {
+                let (min_row, max_row) = self.row_bounds();
+                if pos.row < min_row || pos.row > max_row {
+                    return false;
+                }
+                let (min_col, max_col) = self.block_col_bounds();
+                pos.col >= min_col && pos.col <= max_col
+            }
         }
-        if start.row == end.row {
-            return pos.col >= start.col && pos.col <= end.col;
-        }
-        if pos.row == start.row {
-            return pos.col >= start.col;
-        }
-        if pos.row == end.row {
-            return pos.col <= end.col;
-        }
-        true
     }
 }
 
@@ -587,20 +627,19 @@ impl GridRenderer {
             self.history_trimmed = true;
         }
         self.predictions.retain(|(row, _), _| *row >= self.base_row);
-        if let Some(range) = &mut self.selection {
-            let (anchor, head) = range.bounds();
-            if anchor.row < self.base_row && head.row < self.base_row {
-                self.clear_selection();
+        if let Some(mut range) = self.selection.take() {
+            let (_, max_row) = range.row_bounds();
+            if max_row < self.base_row {
+                self.mark_dirty();
             } else {
-                let new_anchor = SelectionPosition {
-                    row: anchor.row.max(self.base_row),
-                    col: anchor.col,
-                };
-                let new_head = SelectionPosition {
-                    row: head.row.max(self.base_row),
-                    col: head.col,
-                };
-                self.selection = Some(SelectionRange::new(new_anchor, new_head));
+                if range.anchor.row < self.base_row {
+                    range.anchor.row = self.base_row;
+                }
+                if range.head.row < self.base_row {
+                    range.head.row = self.base_row;
+                }
+                self.selection = Some(range);
+                self.mark_dirty();
             }
         }
         self.mark_dirty();
@@ -653,6 +692,31 @@ impl GridRenderer {
         }
         self.follow_tail = self.scroll_top >= max_scroll;
         self.mark_dirty();
+    }
+
+    pub fn ensure_row_visible(&mut self, absolute_row: u64) {
+        if self.viewport_height == 0 {
+            return;
+        }
+        if absolute_row < self.base_row {
+            return;
+        }
+        let rel = match self.relative_row(absolute_row) {
+            Some(rel) => rel,
+            None => return,
+        };
+        let viewport = self.viewport_height.max(1);
+        if rel < self.scroll_top {
+            self.scroll_top = rel;
+            self.follow_tail = false;
+            self.mark_dirty();
+        } else if rel >= self.scroll_top.saturating_add(viewport) {
+            let desired = rel.saturating_sub(viewport.saturating_sub(1));
+            let max_scroll = self.rows.len().saturating_sub(viewport);
+            self.scroll_top = desired.min(max_scroll);
+            self.follow_tail = false;
+            self.mark_dirty();
+        }
     }
 
     pub fn scroll_pages(&mut self, delta_pages: isize) {
@@ -771,40 +835,111 @@ impl GridRenderer {
         if self.rows.is_empty() {
             return None;
         }
-        let (start, end) = range.bounds();
-        if end.row < self.base_row {
-            return None;
-        }
-        let mut output = String::new();
-        let mut current = start.row;
-        while current <= end.row {
-            if current < self.base_row {
-                current += 1;
-                continue;
-            }
-            if current >= self.base_row + self.rows.len() as u64 {
-                break;
-            }
-            let mut row_start = if current == start.row { start.col } else { 0 };
-            let mut row_end = if current == end.row {
-                end.col
-            } else {
-                self.cols.saturating_sub(1)
-            };
-            row_start = row_start.min(self.cols.saturating_sub(1));
-            row_end = row_end.min(self.cols.saturating_sub(1));
-            if row_end >= row_start {
-                for col in row_start..=row_end {
-                    let (ch, _, _) = self.cell_for_render(current, col);
-                    output.push(ch);
+        match range.mode() {
+            SelectionMode::Character => {
+                let (start, end) = range.ordered_positions();
+                if end.row < self.base_row {
+                    return None;
                 }
+                let mut output = String::new();
+                let mut current = start.row;
+                while current <= end.row {
+                    if current < self.base_row {
+                        current += 1;
+                        continue;
+                    }
+                    if current >= self.base_row + self.rows.len() as u64 {
+                        break;
+                    }
+                    let mut row_start = if current == start.row { start.col } else { 0 };
+                    let mut row_end = if current == end.row {
+                        end.col
+                    } else {
+                        self.cols.saturating_sub(1)
+                    };
+                    row_start = row_start.min(self.cols.saturating_sub(1));
+                    row_end = row_end.min(self.cols.saturating_sub(1));
+                    if row_end >= row_start {
+                        for col in row_start..=row_end {
+                            let (ch, _, _) = self.cell_for_render(current, col);
+                            output.push(ch);
+                        }
+                    }
+                    if current != end.row {
+                        output.push('\n');
+                    }
+                    current += 1;
+                }
+                Some(output)
             }
-            if current != end.row {
-                output.push('\n');
+            SelectionMode::Line => {
+                let (min_row, max_row) = range.row_bounds();
+                if max_row < self.base_row {
+                    return None;
+                }
+                let mut output = String::new();
+                let mut row = min_row;
+                while row <= max_row {
+                    if row < self.base_row {
+                        row += 1;
+                        continue;
+                    }
+                    if row >= self.base_row + self.rows.len() as u64 {
+                        break;
+                    }
+                    let width = self.row_display_width(row);
+                    if width == 0 {
+                        // Preserve blank line for empty row selections
+                    } else {
+                        for col in 0..width {
+                            let (ch, _, _) = self.cell_for_render(row, col);
+                            output.push(ch);
+                        }
+                    }
+                    if row != max_row {
+                        output.push('\n');
+                    }
+                    row += 1;
+                }
+                Some(output)
             }
-            current += 1;
+            SelectionMode::Block => {
+                let (min_row, max_row) = range.row_bounds();
+                if max_row < self.base_row {
+                    return None;
+                }
+                let (mut min_col, mut max_col) = range.block_col_bounds();
+                if self.cols == 0 {
+                    return Some(String::new());
+                }
+                let max_valid_col = self.cols.saturating_sub(1);
+                min_col = min_col.min(max_valid_col);
+                max_col = max_col.min(max_valid_col);
+                if max_col < min_col {
+                    return Some(String::new());
+                }
+                let mut output = String::new();
+                let mut row = min_row;
+                while row <= max_row {
+                    if row < self.base_row {
+                        row += 1;
+                        continue;
+                    }
+                    if row >= self.base_row + self.rows.len() as u64 {
+                        break;
+                    }
+                    for col in min_col..=max_col {
+                        let (ch, _, _) = self.cell_for_render(row, col);
+                        output.push(ch);
+                    }
+                    if row != max_row {
+                        output.push('\n');
+                    }
+                    row += 1;
+                }
+                Some(output)
+            }
         }
-        Some(output)
     }
 
     pub fn row_display_width(&self, absolute_row: u64) -> usize {
@@ -823,8 +958,13 @@ impl GridRenderer {
         }
     }
 
-    pub fn set_selection(&mut self, anchor: SelectionPosition, head: SelectionPosition) {
-        self.selection = Some(SelectionRange::new(anchor, head));
+    pub fn set_selection(
+        &mut self,
+        anchor: SelectionPosition,
+        head: SelectionPosition,
+        mode: SelectionMode,
+    ) {
+        self.selection = Some(SelectionRange::new(anchor, head, mode));
         self.mark_dirty();
     }
 
@@ -1168,8 +1308,7 @@ impl GridRenderer {
         }
     }
 
-    #[cfg(test)]
-    pub fn row_text_for_test(&self, absolute_row: u64) -> Option<String> {
+    pub fn row_text(&self, absolute_row: u64) -> Option<String> {
         let rel = self.relative_row(absolute_row)?;
         match self.rows.get(rel)? {
             RowSlot::Loaded(state) => {
@@ -1179,8 +1318,20 @@ impl GridRenderer {
                 }
                 Some(line)
             }
+            RowSlot::Pending | RowSlot::Missing => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn row_text_for_test(&self, absolute_row: u64) -> Option<String> {
+        if let Some(line) = self.row_text(absolute_row) {
+            return Some(line);
+        }
+        let rel = self.relative_row(absolute_row)?;
+        match self.rows.get(rel)? {
             RowSlot::Pending => Some("·".repeat(self.cols)),
             RowSlot::Missing => Some(" ".repeat(self.cols)),
+            _ => None,
         }
     }
 

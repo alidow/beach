@@ -1,6 +1,22 @@
 # beach-human tmux Parity: Status & Next Steps
 
- _Last updated: 2025-09-24 (midday)_
+ _Last updated: 2025-01-07 (afternoon)_
+
+## Update (2025-01-07)
+- ✅ **Step 1 — Mouse pipeline**: beach-human now enables crossterm mouse reporting, handles wheel input locally, and forwards ANSI SGR mouse frames to the host. Copy mode auto-engages on upward scroll and drops out when the viewport snaps back to tail, matching tmux's feel.
+- ✅ **Step 2 — Copy mode engine**: vi/emacs key tables now drive a tmux-style command dispatcher with search prompts (`/`, `?`, `n`, `N`), status messaging, and mouse selection. Line (`V`) and rectangle (`Ctrl+V`) selections mirror tmux behaviour, system clipboard shortcuts (`Cmd+C`, `Ctrl+Shift+C`, `Ctrl+Insert`) work across platforms, and `Esc`/`q` cleanly exit copy mode. Regression coverage exercises word/half-page motions, copy-mode exits, and the new selection modes.
+- 🔜 **Step 3 — Key tables & modifiers**: generalise input processing to a tmux-style binding table and extend key encoding to `tty-keys` parity (SGR-modified arrows, function keys, etc.).
+- 🔜 **Step 4 — Scrollback cohesion**: align renderer history semantics with tmux's grid so half-page jumps, gap detection, and rectangle copies behave consistently.
+- 🔜 **Step 5 — Status line parity**: replace the static help footer with a dynamic status/mode line fed by the command engine (copy-mode indicators, prompts, transient messages).
+- 🔜 **Step 6 — Transport polish**: audit backfill cadence, cursor hints, and alternate-screen swaps once the UX layer stabilises to ensure the wire protocol keeps up with tmux expectations.
+
+### Recent highlights
+- Copy mode state now tracks vi/emacs bindings, selection state, and last search; status line reflects mode and pending prompts.
+- Mouse wheel + drag gestures route through the command surface, so selecting with the pointer mirrors tmux copy-mode UX.
+- Rectangle (`Ctrl+V`) and line (`V`) selection modes feed the renderer’s new selection pipeline, so copied text matches tmux’s block and line semantics without manual trimming.
+- Searches advance the viewport, with placeholder messaging when patterns are not found. Follow-up work will add history-aware wrapping and tests once the workspace manifest issues are resolved.
+
+This document will track completion and risks across the remaining steps; see `docs/tmux-parity.md` for the original scope and acceptance criteria.
 
 ## CRITICAL: Actual vs Desired Tail Behaviour
 - **What we want**: After the handshake snapshot (a handful of rows), the host pushes every new line as a delta. The client applies those deltas in order, keeps the tail visible, and only issues history backfill requests when the user scrolls into an unloaded region.

@@ -1,6 +1,6 @@
 use crate::cache::Seq;
 use crate::cache::terminal::{PackedCell, StyleId, unpack_cell};
-use crate::client::grid_renderer::{GridRenderer, SelectionPosition};
+use crate::client::grid_renderer::{GridRenderer, SelectionMode, SelectionPosition};
 use crate::protocol::{
     self, ClientFrame as WireClientFrame, HostFrame as WireHostFrame, Update as WireUpdate,
 };
@@ -9,7 +9,10 @@ use crate::transport::{Payload, Transport, TransportError};
 use copypasta::{ClipboardContext, ClipboardProvider};
 use crossterm::{
     cursor::MoveTo,
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
@@ -19,6 +22,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::cmp;
 use std::collections::HashMap;
+use std::env;
 use std::io::{self, IsTerminal, Write};
 use std::sync::{
     Arc,
@@ -32,6 +36,69 @@ const BACKFILL_MAX_ROWS_PER_REQUEST: u32 = 256;
 const BACKFILL_MAX_PENDING_REQUESTS: usize = 4;
 const BACKFILL_MIN_INTERVAL: Duration = Duration::from_millis(250);
 const BACKFILL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const MOUSE_SCROLL_LINES: isize = 5;
+const COPY_MODE_KEYSET_ENV: &str = "BEACH_COPY_MODE_KEYS";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyModeKeySet {
+    Vi,
+    Emacs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyModeSearchDirection {
+    Forward,
+    Backward,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WordMotion {
+    NextStart,
+    NextEnd,
+    PrevStart,
+}
+
+#[derive(Clone, Debug)]
+enum CopyModePendingInput {
+    Search {
+        direction: CopyModeSearchDirection,
+        buffer: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForwardWordKind {
+    Start,
+    End,
+}
+
+#[derive(Clone, Debug)]
+struct CopyModeSearch {
+    direction: CopyModeSearchDirection,
+    pattern: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CopyModeCommand {
+    Move { rows: isize, cols: isize },
+    MoveToLineStart,
+    MoveToLineEnd,
+    Page { delta: isize },
+    HalfPage { delta: isize },
+    JumpTop,
+    JumpBottom,
+    MoveWord(WordMotion),
+    BeginSelection,
+    ClearSelection,
+    ToggleSelection,
+    SetSelectionMode(SelectionMode),
+    CopySelection,
+    CopySelectionAndExit,
+    Cancel,
+    SetMode(CopyModeKeySet),
+    Search(CopyModeSearchDirection),
+    RepeatLastSearch(CopyModeSearchDirection),
+}
 
 #[derive(Clone, Debug)]
 struct BackfillRequestState {
@@ -77,6 +144,7 @@ pub struct TerminalClient {
     render_interval: Duration,
     pending_render: bool,
     predictive_input: bool,
+    forward_mouse_to_host: bool,
     subscription_id: Option<u64>,
     next_backfill_request_id: u64,
     pending_backfills: Vec<BackfillRequestState>,
@@ -111,6 +179,7 @@ impl TerminalClient {
             render_interval: Duration::from_millis(16),
             pending_render: false,
             predictive_input: false,
+            forward_mouse_to_host: false,
             subscription_id: None,
             next_backfill_request_id: 1,
             pending_backfills: Vec::new(),
@@ -151,60 +220,78 @@ impl TerminalClient {
     pub fn run(mut self) -> Result<(), ClientError> {
         self.setup_tui()?;
         debug!(target = "client::loop", "client loop started");
-        loop {
-            self.pump_input()?;
-            self.maybe_request_backfill()?;
-            let message = match self.transport.recv(Duration::from_millis(25)) {
-                Ok(message) => Some(message),
-                Err(TransportError::Timeout) => None,
-                Err(TransportError::ChannelClosed) => break,
-                Err(err) => return Err(ClientError::Transport(err)),
-            };
 
-            if let Some(message) = message {
-                match message.payload {
-                    Payload::Binary(bytes) => {
-                        telemetry::record_bytes("client_frame_bytes", bytes.len());
-                        let decode_start = Instant::now();
-                        let frame = protocol::decode_host_frame_binary(&bytes)?;
-                        let decode_elapsed = decode_start.elapsed();
-                        match &frame {
-                            WireHostFrame::Snapshot { .. } => {
-                                telemetry::record_duration("client_decode_snapshot", decode_elapsed)
+        let run_result = (|| -> Result<(), ClientError> {
+            loop {
+                self.pump_input()?;
+                self.maybe_request_backfill()?;
+                let message = match self.transport.recv(Duration::from_millis(25)) {
+                    Ok(message) => Some(message),
+                    Err(TransportError::Timeout) => None,
+                    Err(TransportError::ChannelClosed) => return Ok(()),
+                    Err(err) => return Err(ClientError::Transport(err)),
+                };
+
+                if let Some(message) = message {
+                    match message.payload {
+                        Payload::Binary(bytes) => {
+                            telemetry::record_bytes("client_frame_bytes", bytes.len());
+                            let decode_start = Instant::now();
+                            let frame = protocol::decode_host_frame_binary(&bytes)?;
+                            let decode_elapsed = decode_start.elapsed();
+                            match &frame {
+                                WireHostFrame::Snapshot { .. } => telemetry::record_duration(
+                                    "client_decode_snapshot",
+                                    decode_elapsed,
+                                ),
+                                WireHostFrame::Delta { .. } => telemetry::record_duration(
+                                    "client_decode_delta",
+                                    decode_elapsed,
+                                ),
+                                _ => telemetry::record_duration(
+                                    "client_decode_frame",
+                                    decode_elapsed,
+                                ),
                             }
-                            WireHostFrame::Delta { .. } => {
-                                telemetry::record_duration("client_decode_delta", decode_elapsed)
+                            match self.handle_host_frame(frame) {
+                                Ok(()) => {}
+                                Err(ClientError::Shutdown) => return Ok(()),
+                                Err(err) => return Err(err),
                             }
-                            _ => telemetry::record_duration("client_decode_frame", decode_elapsed),
+                            self.maybe_request_backfill()?;
                         }
-                        match self.handle_host_frame(frame) {
-                            Ok(()) => {}
-                            Err(ClientError::Shutdown) => break,
-                            Err(err) => return Err(err),
-                        }
-                        self.maybe_request_backfill()?;
-                    }
-                    Payload::Text(text) => {
-                        telemetry::record_bytes("client_frame_bytes", text.len());
-                        let trimmed = text.trim();
-                        if trimmed == "__ready__" || trimmed == "__offer_ready__" {
-                            trace!(
-                                target = "client::frame",
-                                payload = trimmed,
-                                "ignoring handshake sentinel"
-                            );
-                        } else {
-                            debug!(target = "client::frame", payload = %trimmed, "unexpected text payload");
+                        Payload::Text(text) => {
+                            telemetry::record_bytes("client_frame_bytes", text.len());
+                            let trimmed = text.trim();
+                            if trimmed == "__ready__" || trimmed == "__offer_ready__" {
+                                trace!(
+                                    target = "client::frame",
+                                    payload = trimmed,
+                                    "ignoring handshake sentinel"
+                                );
+                            } else {
+                                debug!(
+                                    target = "client::frame",
+                                    payload = %trimmed,
+                                    "unexpected text payload"
+                                );
+                            }
                         }
                     }
                 }
-            }
 
-            self.maybe_render()?;
-        }
-        self.teardown_tui()?;
+                self.maybe_render()?;
+            }
+        })();
+
+        let teardown_result = self.teardown_tui();
         debug!(target = "client::loop", "client loop stopped");
-        Ok(())
+
+        match (run_result, teardown_result) {
+            (Err(err), _) => Err(err),
+            (Ok(()), Err(err)) => Err(err),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 
     fn handle_host_frame(&mut self, frame: WireHostFrame) -> Result<(), ClientError> {
@@ -1138,7 +1225,16 @@ impl TerminalClient {
                         self.force_render = true;
                         self.send_resize(cols, rows)?;
                     }
-                    Ok(Event::Mouse(_)) => {}
+                    Ok(Event::Mouse(mouse)) => {
+                        if self.handle_mouse_event(&mouse)? {
+                            continue;
+                        }
+                        if self.forward_mouse_to_host {
+                            if let Some(encoded) = encode_mouse_event(&mouse) {
+                                pending.push(encoded);
+                            }
+                        }
+                    }
                     Err(err) => {
                         eprintln!("⚠️  input read error: {err}");
                         break;
@@ -1160,59 +1256,25 @@ impl TerminalClient {
 
     fn process_copy_mode_key(&mut self, key: &KeyEvent) -> bool {
         if self.copy_mode.is_some() {
-            if key.code == KeyCode::Esc
-                || (key.modifiers.contains(KeyModifiers::ALT)
-                    && matches!(key.code, KeyCode::Char(']') | KeyCode::Char('}')))
-            {
-                self.exit_copy_mode();
+            if self.consume_copy_mode_pending_input(key) {
                 return true;
             }
-            if key.modifiers.contains(KeyModifiers::ALT) {
-                if let KeyCode::Char(c) = key.code {
-                    if c.to_ascii_lowercase() == 'y' {
-                        self.copy_selection_to_clipboard();
-                        return true;
-                    }
-                }
+            if is_copy_shortcut(key) {
+                self.copy_selection_to_clipboard(true);
+                return true;
             }
-            match key.code {
-                KeyCode::Up => {
-                    self.move_copy_cursor(-1, 0);
-                    return true;
-                }
-                KeyCode::Down => {
-                    self.move_copy_cursor(1, 0);
-                    return true;
-                }
-                KeyCode::Left => {
-                    self.move_copy_cursor(0, -1);
-                    return true;
-                }
-                KeyCode::Right => {
-                    self.move_copy_cursor(0, 1);
-                    return true;
-                }
-                KeyCode::PageUp => {
-                    self.move_copy_cursor_page(-1);
-                    return true;
-                }
-                KeyCode::PageDown => {
-                    self.move_copy_cursor_page(1);
-                    return true;
-                }
-                KeyCode::Home => {
-                    self.move_copy_cursor_line_start();
-                    return true;
-                }
-                KeyCode::End => {
-                    self.move_copy_cursor_line_end();
-                    return true;
-                }
-                _ => {}
+            let (mode, selection_active) = {
+                let state = self.copy_mode.as_ref().unwrap();
+                (state.mode, state.selection_active)
+            };
+            if let Some(command) = copy_mode_command_for_key(mode, selection_active, key) {
+                self.execute_copy_mode_command(command);
+                return true;
             }
+            return false;
+        }
 
-            // If copy mode active but key not handled, fall through to default handling
-        } else if key.modifiers.contains(KeyModifiers::ALT) {
+        if key.modifiers.contains(KeyModifiers::ALT) {
             if let KeyCode::Char(c) = key.code {
                 if c.to_ascii_lowercase() == '[' {
                     self.enter_copy_mode();
@@ -1222,6 +1284,475 @@ impl TerminalClient {
         }
 
         false
+    }
+
+    fn consume_copy_mode_pending_input(&mut self, key: &KeyEvent) -> bool {
+        let pending = match self.copy_mode.as_mut() {
+            Some(state) => match state.pending_input.as_mut() {
+                Some(pending) => pending,
+                None => return false,
+            },
+            None => return false,
+        };
+
+        match pending {
+            CopyModePendingInput::Search { direction, buffer } => match key.code {
+                KeyCode::Esc => {
+                    if let Some(state) = self.copy_mode.as_mut() {
+                        state.pending_input = None;
+                    }
+                    self.update_copy_mode_status();
+                    self.force_render = true;
+                    true
+                }
+                KeyCode::Enter => {
+                    let pattern = buffer.clone();
+                    let direction = *direction;
+                    if let Some(state) = self.copy_mode.as_mut() {
+                        state.pending_input = None;
+                    }
+                    let found = self.perform_copy_mode_search(direction, &pattern);
+                    if !found {
+                        self.renderer.set_status_message(Some(format!(
+                            "copy-mode: \"{}\" not found",
+                            pattern
+                        )));
+                    }
+                    self.update_copy_mode_status();
+                    self.force_render = true;
+                    true
+                }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                    self.update_copy_mode_prompt();
+                    self.force_render = true;
+                    true
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    buffer.push(c);
+                    self.update_copy_mode_prompt();
+                    self.force_render = true;
+                    true
+                }
+                _ => false,
+            },
+        }
+    }
+
+    fn update_copy_mode_prompt(&mut self) {
+        if let Some(state) = &self.copy_mode {
+            if let Some(CopyModePendingInput::Search { direction, buffer }) = &state.pending_input {
+                let prefix = match direction {
+                    CopyModeSearchDirection::Forward => '/',
+                    CopyModeSearchDirection::Backward => '?',
+                };
+                let text = format!("{}{}", prefix, buffer);
+                self.renderer.set_status_message(Some(text));
+            }
+        }
+    }
+
+    fn execute_copy_mode_command(&mut self, command: CopyModeCommand) {
+        match command {
+            CopyModeCommand::Move { rows, cols } => self.move_copy_cursor(rows, cols),
+            CopyModeCommand::MoveToLineStart => self.move_copy_cursor_line_start(),
+            CopyModeCommand::MoveToLineEnd => self.move_copy_cursor_line_end(),
+            CopyModeCommand::Page { delta } => self.move_copy_cursor_page(delta),
+            CopyModeCommand::HalfPage { delta } => self.move_copy_cursor_half_page(delta),
+            CopyModeCommand::JumpTop => self.jump_copy_cursor_to_top(),
+            CopyModeCommand::JumpBottom => self.jump_copy_cursor_to_bottom(),
+            CopyModeCommand::MoveWord(motion) => self.move_copy_cursor_word(motion),
+            CopyModeCommand::BeginSelection => {
+                if let Some(state) = self.copy_mode.as_mut() {
+                    state.begin_selection(SelectionMode::Character);
+                }
+                self.renderer.set_follow_tail(false);
+                self.update_copy_mode_selection();
+                self.update_copy_mode_status();
+            }
+            CopyModeCommand::ClearSelection => {
+                if let Some(state) = self.copy_mode.as_mut() {
+                    state.clear_selection();
+                    state.selection_mode = SelectionMode::Character;
+                }
+                self.update_copy_mode_selection();
+                self.update_copy_mode_status();
+            }
+            CopyModeCommand::ToggleSelection => {
+                if let Some(state) = self.copy_mode.as_mut() {
+                    state.toggle_selection();
+                    if state.selection_active {
+                        self.renderer.set_follow_tail(false);
+                    }
+                }
+                self.update_copy_mode_selection();
+                self.update_copy_mode_status();
+            }
+            CopyModeCommand::SetSelectionMode(selection_mode) => {
+                if let Some(state) = self.copy_mode.as_mut() {
+                    if state.selection_active {
+                        if state.selection_mode == selection_mode {
+                            state.selection_mode = SelectionMode::Character;
+                        } else {
+                            state.selection_mode = selection_mode;
+                        }
+                    } else {
+                        state.selection_mode = selection_mode;
+                        state.selection_active = true;
+                        state.anchor = state.cursor;
+                    }
+                }
+                self.update_copy_mode_selection();
+                self.renderer.set_follow_tail(false);
+                self.update_copy_mode_status();
+            }
+            CopyModeCommand::CopySelection => self.copy_selection_to_clipboard(false),
+            CopyModeCommand::CopySelectionAndExit => self.copy_selection_to_clipboard(true),
+            CopyModeCommand::Cancel => self.exit_copy_mode(),
+            CopyModeCommand::SetMode(mode) => {
+                if let Some(state) = self.copy_mode.as_mut() {
+                    state.mode = mode;
+                }
+                self.update_copy_mode_status();
+            }
+            CopyModeCommand::Search(direction) => {
+                self.start_copy_mode_search(direction);
+            }
+            CopyModeCommand::RepeatLastSearch(direction_hint) => {
+                self.repeat_last_search(direction_hint);
+            }
+        }
+    }
+
+    fn start_copy_mode_search(&mut self, direction: CopyModeSearchDirection) {
+        if let Some(state) = self.copy_mode.as_mut() {
+            state.pending_input = Some(CopyModePendingInput::Search {
+                direction,
+                buffer: String::new(),
+            });
+        }
+        self.update_copy_mode_prompt();
+        self.force_render = true;
+    }
+
+    fn repeat_last_search(&mut self, direction_hint: CopyModeSearchDirection) {
+        let (pattern, base_direction) = match self.copy_mode.as_ref() {
+            Some(state) => match &state.last_search {
+                Some(search) => (search.pattern.clone(), search.direction),
+                None => return,
+            },
+            None => return,
+        };
+
+        let direction = match direction_hint {
+            CopyModeSearchDirection::Forward => base_direction,
+            CopyModeSearchDirection::Backward => reverse_search_direction(base_direction),
+        };
+
+        if !self.perform_copy_mode_search(direction, &pattern) {
+            self.renderer
+                .set_status_message(Some(format!("copy-mode: \"{}\" not found", pattern)));
+            self.force_render = true;
+        }
+    }
+
+    fn perform_copy_mode_search(
+        &mut self,
+        direction: CopyModeSearchDirection,
+        pattern: &str,
+    ) -> bool {
+        if pattern.is_empty() {
+            return false;
+        }
+        let (start_row, start_col) = match self.copy_mode.as_ref() {
+            Some(state) => (state.cursor.row, state.cursor.col),
+            None => return false,
+        };
+        let total_rows = self.renderer.total_rows();
+        if total_rows == 0 {
+            return false;
+        }
+
+        let mut found: Option<SelectionPosition> = None;
+        match direction {
+            CopyModeSearchDirection::Forward => {
+                let mut row = start_row;
+                let last_row = total_rows.saturating_sub(1);
+                let mut first = true;
+                while row <= last_row {
+                    if let Some(text) = self.renderer.row_text(row) {
+                        let start_idx = if first {
+                            start_col.saturating_add(1)
+                        } else {
+                            0
+                        };
+                        if start_idx < text.len() {
+                            if let Some(offset) = text[start_idx..].find(pattern) {
+                                let col = start_idx + offset;
+                                found = Some(SelectionPosition { row, col });
+                                break;
+                            }
+                        }
+                    }
+                    if row == last_row {
+                        break;
+                    }
+                    row = row.saturating_add(1);
+                    first = false;
+                }
+            }
+            CopyModeSearchDirection::Backward => {
+                let mut row = start_row;
+                let lower_bound = self.renderer.base_row();
+                let mut first = true;
+                loop {
+                    if let Some(text) = self.renderer.row_text(row) {
+                        let end_idx = if first { start_col } else { text.len() };
+                        if end_idx > 0 && end_idx <= text.len() {
+                            if let Some(offset) = text[..end_idx].rfind(pattern) {
+                                found = Some(SelectionPosition { row, col: offset });
+                                break;
+                            }
+                        }
+                    }
+                    if row <= lower_bound {
+                        break;
+                    }
+                    if row == 0 {
+                        break;
+                    }
+                    row -= 1;
+                    first = false;
+                }
+            }
+        }
+
+        let pattern_owned = pattern.to_string();
+        if let Some(position) = found {
+            if let Some(state) = self.copy_mode.as_mut() {
+                state.selection_active = false;
+                state.last_search = Some(CopyModeSearch {
+                    direction,
+                    pattern: pattern_owned.clone(),
+                });
+            }
+            self.set_copy_cursor_position(position);
+            self.update_copy_mode_status();
+            true
+        } else {
+            if let Some(state) = self.copy_mode.as_mut() {
+                state.last_search = Some(CopyModeSearch {
+                    direction,
+                    pattern: pattern_owned,
+                });
+            }
+            false
+        }
+    }
+
+    fn set_copy_cursor_position(&mut self, position: SelectionPosition) {
+        let (selection_active, anchor, mode) = match self.copy_mode.as_mut() {
+            Some(state) => {
+                state.cursor = position;
+                if !state.selection_active {
+                    state.anchor = position;
+                }
+                (state.selection_active, state.anchor, state.selection_mode)
+            }
+            None => return,
+        };
+
+        if selection_active {
+            self.renderer.set_selection(anchor, position, mode);
+        } else {
+            self.renderer.clear_selection();
+        }
+        self.renderer.set_follow_tail(false);
+        self.renderer.ensure_row_visible(position.row);
+        self.force_render = true;
+    }
+
+    fn update_copy_mode_selection(&mut self) {
+        if let Some(state) = &self.copy_mode {
+            if state.selection_active {
+                self.renderer
+                    .set_selection(state.anchor, state.cursor, state.selection_mode);
+            } else {
+                self.renderer.clear_selection();
+            }
+            self.force_render = true;
+        }
+    }
+
+    fn update_copy_mode_status(&mut self) {
+        let Some(state) = &self.copy_mode else {
+            self.renderer.set_status_message::<String>(None);
+            return;
+        };
+        if state.pending_input.is_some() {
+            self.update_copy_mode_prompt();
+            return;
+        }
+        let mode_label = match state.mode {
+            CopyModeKeySet::Vi => "vi",
+            CopyModeKeySet::Emacs => "emacs",
+        };
+        let focus = if state.selection_active {
+            match state.selection_mode {
+                SelectionMode::Character => "select (char)",
+                SelectionMode::Line => "select (line)",
+                SelectionMode::Block => "select (block)",
+            }
+        } else {
+            "cursor"
+        };
+        let last_search = state
+            .last_search
+            .as_ref()
+            .map(|search| {
+                let prefix = match search.direction {
+                    CopyModeSearchDirection::Forward => '/',
+                    CopyModeSearchDirection::Backward => '?',
+                };
+                format!(" • last {prefix}{}", search.pattern)
+            })
+            .unwrap_or_default();
+        let selection_hint = if state.selection_active {
+            "Space unmark"
+        } else {
+            "Space mark"
+        };
+        let text = format!(
+            "copy-mode ({mode_label}) • {focus} • {selection_hint} • V line • Ctrl+V block • Cmd/Ctrl+Shift+C copy • n/N repeat • Esc/q exit{last_search}"
+        );
+        self.renderer.set_status_message(Some(text));
+    }
+
+    fn handle_mouse_event(&mut self, mouse: &MouseEvent) -> Result<bool, ClientError> {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.handle_mouse_scroll(-MOUSE_SCROLL_LINES);
+                return Ok(true);
+            }
+            MouseEventKind::ScrollDown => {
+                self.handle_mouse_scroll(MOUSE_SCROLL_LINES);
+                return Ok(true);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.copy_mode.is_some() {
+                    self.handle_mouse_primary_down(mouse);
+                    return Ok(true);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.copy_mode.is_some() {
+                    self.handle_mouse_primary_drag(mouse);
+                    return Ok(true);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.copy_mode.is_some() {
+                    self.handle_mouse_primary_up();
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn handle_mouse_scroll(&mut self, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+
+        if delta < 0 && self.copy_mode.is_none() {
+            self.enter_copy_mode();
+        }
+
+        self.renderer.scroll_lines(delta);
+
+        if self.copy_mode.is_some() {
+            let (row, col) = {
+                let state = self.copy_mode.as_ref().unwrap();
+                (state.cursor.row, state.cursor.col)
+            };
+            let target_row = row as i64 + delta as i64;
+            let new_pos = self.renderer.clamp_position(target_row, col as isize);
+            self.set_copy_cursor_position(new_pos);
+        } else if delta > 0 && self.renderer.is_following_tail() {
+            self.renderer.scroll_to_tail();
+        }
+
+        if self.copy_mode.is_some() && delta > 0 && self.renderer.is_following_tail() {
+            self.exit_copy_mode();
+        }
+
+        self.force_render = true;
+    }
+
+    fn handle_mouse_primary_down(&mut self, mouse: &MouseEvent) {
+        if let Some(position) = self.mouse_position_to_selection(mouse) {
+            if let Some(state) = self.copy_mode.as_mut() {
+                state.cursor = position;
+                state.anchor = position;
+                state.selection_active = true;
+                state.selection_mode = SelectionMode::Character;
+                self.renderer
+                    .set_selection(position, position, SelectionMode::Character);
+                self.renderer.set_follow_tail(false);
+                self.renderer.ensure_row_visible(position.row);
+                self.update_copy_mode_status();
+                self.force_render = true;
+            }
+        }
+    }
+
+    fn handle_mouse_primary_drag(&mut self, mouse: &MouseEvent) {
+        if let Some(position) = self.mouse_position_to_selection(mouse) {
+            if let Some(state) = self.copy_mode.as_mut() {
+                if !state.selection_active {
+                    state.begin_selection(SelectionMode::Character);
+                }
+                state.cursor = position;
+            }
+            if let Some(state) = &self.copy_mode {
+                self.renderer
+                    .set_selection(state.anchor, position, state.selection_mode);
+            } else {
+                self.renderer
+                    .set_selection(position, position, SelectionMode::Character);
+            }
+            self.renderer.ensure_row_visible(position.row);
+            self.force_render = true;
+        }
+    }
+
+    fn handle_mouse_primary_up(&mut self) {
+        self.update_copy_mode_status();
+    }
+
+    fn mouse_position_to_selection(&self, mouse: &MouseEvent) -> Option<SelectionPosition> {
+        let viewport_height = self.renderer.viewport_height();
+        if viewport_height == 0 {
+            return None;
+        }
+        let row_offset = mouse.row as usize;
+        if row_offset >= viewport_height {
+            return None;
+        }
+        let absolute_row = self
+            .renderer
+            .viewport_top()
+            .saturating_add(row_offset as u64);
+        Some(
+            self.renderer
+                .clamp_position(absolute_row as i64, mouse.column as isize),
+        )
     }
 
     fn enter_copy_mode(&mut self) {
@@ -1241,15 +1772,18 @@ impl TerminalClient {
             .saturating_add(viewport_height_u64.saturating_sub(1))
             .min(max_row);
         let start_pos = self.renderer.clamp_position(start_row as i64, 0);
-        self.copy_mode = Some(CopyModeState::new(start_pos));
+        let mode = default_copy_mode_keyset();
+        self.copy_mode = Some(CopyModeState::new(start_pos, mode));
         self.renderer.set_follow_tail(false);
-        self.renderer.set_selection(start_pos, start_pos);
+        self.renderer.clear_selection();
+        self.update_copy_mode_status();
         self.force_render = true;
     }
 
     fn exit_copy_mode(&mut self) {
         if self.copy_mode.take().is_some() {
             self.renderer.clear_selection();
+            self.renderer.set_status_message::<String>(None);
             self.renderer.set_follow_tail(true);
             self.renderer.mark_dirty();
             self.force_render = true;
@@ -1257,15 +1791,17 @@ impl TerminalClient {
     }
 
     fn move_copy_cursor(&mut self, delta_row: isize, delta_col: isize) {
-        if let Some(state) = &mut self.copy_mode {
-            let new_row = state.cursor.row as i64 + delta_row as i64;
-            let new_col = state.cursor.col as isize + delta_col;
-            let new_pos = self.renderer.clamp_position(new_row, new_col);
-            state.cursor = new_pos;
-            self.renderer.set_selection(state.anchor, new_pos);
-            self.renderer.set_follow_tail(false);
-            self.force_render = true;
+        if self.copy_mode.is_none() {
+            return;
         }
+        let (row, col) = {
+            let state = self.copy_mode.as_ref().unwrap();
+            (state.cursor.row, state.cursor.col)
+        };
+        let target_row = row as i64 + delta_row as i64;
+        let target_col = col as isize + delta_col;
+        let new_pos = self.renderer.clamp_position(target_row, target_col);
+        self.set_copy_cursor_position(new_pos);
     }
 
     fn move_copy_cursor_page(&mut self, pages: isize) {
@@ -1279,30 +1815,147 @@ impl TerminalClient {
         self.move_copy_cursor(pages * step, 0);
     }
 
-    fn move_copy_cursor_line_start(&mut self) {
-        if let Some(state) = &mut self.copy_mode {
-            let new_pos = self.renderer.clamp_position(state.cursor.row as i64, 0);
-            state.cursor = new_pos;
-            self.renderer.set_selection(state.anchor, new_pos);
-            self.force_render = true;
+    fn move_copy_cursor_half_page(&mut self, delta: isize) {
+        if delta == 0 || self.copy_mode.is_none() {
+            return;
         }
+        let height = self.renderer.viewport_height() as isize;
+        if height == 0 {
+            return;
+        }
+        let step = (height / 2).max(1);
+        self.move_copy_cursor(delta * step, 0);
+    }
+
+    fn move_copy_cursor_word(&mut self, motion: WordMotion) {
+        let Some(state) = self.copy_mode.as_ref() else {
+            return;
+        };
+        let start = state.cursor;
+        let target = match motion {
+            WordMotion::NextStart => self.find_word_forward(start, ForwardWordKind::Start),
+            WordMotion::NextEnd => self.find_word_forward(start, ForwardWordKind::End),
+            WordMotion::PrevStart => self.find_word_backward(start),
+        };
+        if let Some(position) = target {
+            self.set_copy_cursor_position(position);
+        }
+    }
+
+    fn find_word_forward(
+        &self,
+        start: SelectionPosition,
+        kind: ForwardWordKind,
+    ) -> Option<SelectionPosition> {
+        let total_rows = self.renderer.total_rows();
+        if total_rows == 0 {
+            return None;
+        }
+        let mut row = start.row;
+        let mut first = true;
+        while row < total_rows {
+            let text = self.renderer.row_text(row).unwrap_or_default();
+            let chars: Vec<char> = text.chars().collect();
+            let result = match kind {
+                ForwardWordKind::Start => {
+                    find_next_word_start_in_line(&chars, if first { Some(start.col) } else { None })
+                }
+                ForwardWordKind::End => {
+                    find_next_word_end_in_line(&chars, if first { Some(start.col) } else { None })
+                }
+            };
+            if let Some(col) = result {
+                return Some(SelectionPosition { row, col });
+            }
+            if row >= total_rows.saturating_sub(1) {
+                break;
+            }
+            row = row.saturating_add(1);
+            first = false;
+        }
+        None
+    }
+
+    fn find_word_backward(&self, start: SelectionPosition) -> Option<SelectionPosition> {
+        let base_row = self.renderer.base_row();
+        let mut row = start.row;
+        let mut first = true;
+        loop {
+            if row < base_row {
+                break;
+            }
+            let text = self.renderer.row_text(row).unwrap_or_default();
+            let chars: Vec<char> = text.chars().collect();
+            if let Some(col) =
+                find_prev_word_start_in_line(&chars, if first { Some(start.col) } else { None })
+            {
+                return Some(SelectionPosition { row, col });
+            }
+            if row == base_row || row == 0 {
+                break;
+            }
+            row -= 1;
+            first = false;
+        }
+        None
+    }
+
+    fn move_copy_cursor_line_start(&mut self) {
+        if self.copy_mode.is_none() {
+            return;
+        }
+        let row = self.copy_mode.as_ref().unwrap().cursor.row;
+        let new_pos = self.renderer.clamp_position(row as i64, 0);
+        self.set_copy_cursor_position(new_pos);
     }
 
     fn move_copy_cursor_line_end(&mut self) {
-        if let Some(state) = &mut self.copy_mode {
-            let row = state.cursor.row;
-            let row_width = self.renderer.row_display_width(row);
-            let target_col = if row_width == 0 { 0 } else { row_width - 1 };
-            let new_pos = self
-                .renderer
-                .clamp_position(row as i64, target_col as isize);
-            state.cursor = new_pos;
-            self.renderer.set_selection(state.anchor, new_pos);
-            self.force_render = true;
+        if self.copy_mode.is_none() {
+            return;
         }
+        let row = self.copy_mode.as_ref().unwrap().cursor.row;
+        let row_width = self.renderer.row_display_width(row);
+        let target_col = if row_width == 0 { 0 } else { row_width - 1 };
+        let new_pos = self
+            .renderer
+            .clamp_position(row as i64, target_col as isize);
+        self.set_copy_cursor_position(new_pos);
     }
 
-    fn copy_selection_to_clipboard(&mut self) {
+    fn jump_copy_cursor_to_top(&mut self) {
+        if self.copy_mode.is_none() {
+            return;
+        }
+        let top = self.renderer.base_row();
+        let position = self.renderer.clamp_position(top as i64, 0);
+        self.set_copy_cursor_position(position);
+    }
+
+    fn jump_copy_cursor_to_bottom(&mut self) {
+        if self.copy_mode.is_none() {
+            return;
+        }
+        let last_row = self.renderer.total_rows().saturating_sub(1);
+        let position = self.renderer.clamp_position(last_row as i64, 0);
+        self.set_copy_cursor_position(position);
+    }
+
+    fn copy_selection_to_clipboard(&mut self, exit_after: bool) {
+        let selection_active = self
+            .copy_mode
+            .as_ref()
+            .map(|state| state.selection_active)
+            .unwrap_or(false);
+        if !selection_active {
+            self.renderer
+                .set_status_message(Some("copy-mode: no active selection"));
+            self.force_render = true;
+            if exit_after {
+                self.exit_copy_mode();
+            }
+            return;
+        }
+
         if let Some(text) = self.renderer.selection_text() {
             match ClipboardContext::new() {
                 Ok(mut ctx) => {
@@ -1313,7 +1966,14 @@ impl TerminalClient {
                 Err(err) => eprintln!("⚠️  clipboard unavailable: {err}"),
             }
         }
-        self.exit_copy_mode();
+
+        if exit_after {
+            self.exit_copy_mode();
+        } else {
+            self.update_copy_mode_status();
+        }
+
+        self.force_render = true;
     }
 
     fn handle_control_shortcuts(&mut self, key: &KeyEvent) -> Result<bool, ClientError> {
@@ -1380,8 +2040,18 @@ impl TerminalClient {
                 true
             }
             KeyCode::Char(_) if lower == 'c' => {
-                self.renderer.clear_selection();
+                if let Some(state) = self.copy_mode.as_mut() {
+                    state.clear_selection();
+                    self.update_copy_mode_selection();
+                    self.update_copy_mode_status();
+                } else {
+                    self.renderer.clear_selection();
+                }
                 self.force_render = true;
+                true
+            }
+            KeyCode::Char(_) if lower == 'y' => {
+                self.copy_selection_to_clipboard(true);
                 true
             }
             _ => false,
@@ -1489,7 +2159,7 @@ impl TerminalClient {
         enable_raw_mode()
             .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
             .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)
@@ -1517,7 +2187,7 @@ impl TerminalClient {
         disable_raw_mode()
             .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
         let mut stdout = io::stdout();
-        execute!(stdout, LeaveAlternateScreen)
+        execute!(stdout, DisableMouseCapture, LeaveAlternateScreen)
             .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
         Ok(())
     }
@@ -1545,17 +2215,45 @@ fn decode_wire_cell(cell: u64) -> (char, Option<u32>) {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct CopyModeState {
     anchor: SelectionPosition,
     cursor: SelectionPosition,
+    selection_active: bool,
+    selection_mode: SelectionMode,
+    mode: CopyModeKeySet,
+    pending_input: Option<CopyModePendingInput>,
+    last_search: Option<CopyModeSearch>,
 }
 
 impl CopyModeState {
-    fn new(anchor: SelectionPosition) -> Self {
+    fn new(anchor: SelectionPosition, mode: CopyModeKeySet) -> Self {
         Self {
             anchor,
             cursor: anchor,
+            selection_active: false,
+            selection_mode: SelectionMode::Character,
+            mode,
+            pending_input: None,
+            last_search: None,
+        }
+    }
+
+    fn begin_selection(&mut self, mode: SelectionMode) {
+        self.selection_active = true;
+        self.selection_mode = mode;
+        self.anchor = self.cursor;
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection_active = false;
+    }
+
+    fn toggle_selection(&mut self) {
+        if self.selection_active {
+            self.selection_active = false;
+        } else {
+            self.begin_selection(SelectionMode::Character);
         }
     }
 }
@@ -1602,6 +2300,299 @@ fn encode_key_event(key: KeyEvent) -> Option<Vec<u8>> {
     }
 }
 
+fn is_copy_shortcut(key: &KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char(c) => {
+            let lower = c.to_ascii_lowercase();
+            (key.modifiers.contains(KeyModifiers::SUPER) && lower == 'c')
+                || (key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT)
+                    && lower == 'c')
+        }
+        KeyCode::Insert => key.modifiers.contains(KeyModifiers::CONTROL),
+        _ => false,
+    }
+}
+
+fn copy_mode_command_for_key(
+    mode: CopyModeKeySet,
+    selection_active: bool,
+    key: &KeyEvent,
+) -> Option<CopyModeCommand> {
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        if let KeyCode::Char(c) = key.code {
+            match c.to_ascii_lowercase() {
+                'y' => return Some(CopyModeCommand::CopySelectionAndExit),
+                'c' => return Some(CopyModeCommand::ClearSelection),
+                'v' => return Some(CopyModeCommand::SetMode(CopyModeKeySet::Vi)),
+                'e' => return Some(CopyModeCommand::SetMode(CopyModeKeySet::Emacs)),
+                ']' | '}' => return Some(CopyModeCommand::Cancel),
+                _ => {}
+            }
+        }
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if let KeyCode::Char(c) = key.code {
+            if c.to_ascii_lowercase() == 'g' {
+                return Some(CopyModeCommand::Cancel);
+            }
+        }
+    }
+
+    match key.code {
+        KeyCode::Esc => Some(CopyModeCommand::Cancel),
+        KeyCode::Enter => Some(CopyModeCommand::CopySelectionAndExit),
+        KeyCode::Up => Some(CopyModeCommand::Move { rows: -1, cols: 0 }),
+        KeyCode::Down => Some(CopyModeCommand::Move { rows: 1, cols: 0 }),
+        KeyCode::Left => Some(CopyModeCommand::Move { rows: 0, cols: -1 }),
+        KeyCode::Right => Some(CopyModeCommand::Move { rows: 0, cols: 1 }),
+        KeyCode::PageUp => Some(CopyModeCommand::Page { delta: -1 }),
+        KeyCode::PageDown => Some(CopyModeCommand::Page { delta: 1 }),
+        KeyCode::Home => Some(CopyModeCommand::MoveToLineStart),
+        KeyCode::End => Some(CopyModeCommand::MoveToLineEnd),
+        _ => match mode {
+            CopyModeKeySet::Vi => copy_mode_command_vi(selection_active, key),
+            CopyModeKeySet::Emacs => copy_mode_command_emacs(selection_active, key),
+        },
+    }
+}
+
+fn copy_mode_command_vi(selection_active: bool, key: &KeyEvent) -> Option<CopyModeCommand> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if let KeyCode::Char(c) = key.code {
+            return match c.to_ascii_lowercase() {
+                'b' => Some(CopyModeCommand::Page { delta: -1 }),
+                'f' => Some(CopyModeCommand::Page { delta: 1 }),
+                'u' => Some(CopyModeCommand::HalfPage { delta: -1 }),
+                'd' => Some(CopyModeCommand::HalfPage { delta: 1 }),
+                'c' => Some(CopyModeCommand::Cancel),
+                'v' => Some(CopyModeCommand::SetSelectionMode(SelectionMode::Block)),
+                _ => None,
+            };
+        }
+    }
+
+    match key.code {
+        KeyCode::Char('G') => Some(CopyModeCommand::JumpBottom),
+        KeyCode::Char('N') => Some(CopyModeCommand::RepeatLastSearch(
+            CopyModeSearchDirection::Backward,
+        )),
+        KeyCode::Char('0') => Some(CopyModeCommand::MoveToLineStart),
+        KeyCode::Char('$') => Some(CopyModeCommand::MoveToLineEnd),
+        KeyCode::Char('^') => Some(CopyModeCommand::MoveToLineStart),
+        KeyCode::Char('V') => Some(CopyModeCommand::SetSelectionMode(SelectionMode::Line)),
+        KeyCode::Char(' ') => {
+            if selection_active {
+                Some(CopyModeCommand::ToggleSelection)
+            } else {
+                Some(CopyModeCommand::BeginSelection)
+            }
+        }
+        KeyCode::Char('/') => Some(CopyModeCommand::Search(CopyModeSearchDirection::Forward)),
+        KeyCode::Char('?') => Some(CopyModeCommand::Search(CopyModeSearchDirection::Backward)),
+        KeyCode::Char(c) => {
+            let lower = c.to_ascii_lowercase();
+            match lower {
+                'h' => Some(CopyModeCommand::Move { rows: 0, cols: -1 }),
+                'j' => Some(CopyModeCommand::Move { rows: 1, cols: 0 }),
+                'k' => Some(CopyModeCommand::Move { rows: -1, cols: 0 }),
+                'l' => Some(CopyModeCommand::Move { rows: 0, cols: 1 }),
+                'g' => Some(CopyModeCommand::JumpTop),
+                'w' => Some(CopyModeCommand::MoveWord(WordMotion::NextStart)),
+                'e' => Some(CopyModeCommand::MoveWord(WordMotion::NextEnd)),
+                'b' => Some(CopyModeCommand::MoveWord(WordMotion::PrevStart)),
+                'y' => Some(CopyModeCommand::CopySelectionAndExit),
+                'v' => Some(CopyModeCommand::ToggleSelection),
+                'q' => Some(CopyModeCommand::Cancel),
+                'n' => Some(CopyModeCommand::RepeatLastSearch(
+                    CopyModeSearchDirection::Forward,
+                )),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn copy_mode_command_emacs(selection_active: bool, key: &KeyEvent) -> Option<CopyModeCommand> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    if ctrl {
+        if let KeyCode::Char(c) = key.code {
+            return match c.to_ascii_lowercase() {
+                'f' => Some(CopyModeCommand::Move { rows: 0, cols: 1 }),
+                'b' => Some(CopyModeCommand::Move { rows: 0, cols: -1 }),
+                'n' => Some(CopyModeCommand::Move { rows: 1, cols: 0 }),
+                'p' => Some(CopyModeCommand::Move { rows: -1, cols: 0 }),
+                'a' => Some(CopyModeCommand::MoveToLineStart),
+                'e' => Some(CopyModeCommand::MoveToLineEnd),
+                'v' => Some(CopyModeCommand::Page { delta: 1 }),
+                'w' => Some(CopyModeCommand::CopySelectionAndExit),
+                'y' => Some(CopyModeCommand::CopySelection),
+                's' => Some(CopyModeCommand::Search(CopyModeSearchDirection::Forward)),
+                'r' => Some(CopyModeCommand::Search(CopyModeSearchDirection::Backward)),
+                'g' => Some(CopyModeCommand::Cancel),
+                ' ' => {
+                    if selection_active {
+                        Some(CopyModeCommand::ToggleSelection)
+                    } else {
+                        Some(CopyModeCommand::BeginSelection)
+                    }
+                }
+                _ => None,
+            };
+        }
+    }
+
+    if alt {
+        if let KeyCode::Char(c) = key.code {
+            return match c.to_ascii_lowercase() {
+                'f' => Some(CopyModeCommand::MoveWord(WordMotion::NextStart)),
+                'b' => Some(CopyModeCommand::MoveWord(WordMotion::PrevStart)),
+                'd' => Some(CopyModeCommand::MoveWord(WordMotion::NextEnd)),
+                'v' => Some(CopyModeCommand::Page { delta: -1 }),
+                'w' => Some(CopyModeCommand::CopySelection),
+                'y' => Some(CopyModeCommand::CopySelectionAndExit),
+                _ => None,
+            };
+        }
+    }
+
+    match key.code {
+        KeyCode::Char(' ') => {
+            if selection_active {
+                Some(CopyModeCommand::ToggleSelection)
+            } else {
+                Some(CopyModeCommand::BeginSelection)
+            }
+        }
+        KeyCode::Char('y') => Some(CopyModeCommand::CopySelection),
+        _ => None,
+    }
+}
+
+fn default_copy_mode_keyset() -> CopyModeKeySet {
+    match env::var(COPY_MODE_KEYSET_ENV) {
+        Ok(value) if value.eq_ignore_ascii_case("emacs") => CopyModeKeySet::Emacs,
+        _ => CopyModeKeySet::Vi,
+    }
+}
+
+fn reverse_search_direction(direction: CopyModeSearchDirection) -> CopyModeSearchDirection {
+    match direction {
+        CopyModeSearchDirection::Forward => CopyModeSearchDirection::Backward,
+        CopyModeSearchDirection::Backward => CopyModeSearchDirection::Forward,
+    }
+}
+
+fn find_next_word_start_in_line(chars: &[char], start_col: Option<usize>) -> Option<usize> {
+    if chars.is_empty() {
+        return None;
+    }
+    let mut idx = start_col.and_then(|col| col.checked_add(1)).unwrap_or(0);
+    if let Some(col) = start_col {
+        if col < chars.len() && is_word_char(chars[col]) {
+            idx = col.saturating_add(1);
+            while idx < chars.len() && is_word_char(chars[idx]) {
+                idx += 1;
+            }
+        }
+    }
+    if idx > chars.len() {
+        idx = chars.len();
+    }
+    while idx < chars.len() && !is_word_char(chars[idx]) {
+        idx += 1;
+    }
+    if idx < chars.len() { Some(idx) } else { None }
+}
+
+fn find_next_word_end_in_line(chars: &[char], start_col: Option<usize>) -> Option<usize> {
+    if chars.is_empty() {
+        return None;
+    }
+    let mut idx = match start_col {
+        Some(col) if col < chars.len() => col,
+        Some(_) => return None,
+        None => 0,
+    };
+    if !is_word_char(chars[idx]) {
+        while idx < chars.len() && !is_word_char(chars[idx]) {
+            idx += 1;
+        }
+        if idx >= chars.len() {
+            return None;
+        }
+    }
+    let mut end = idx;
+    while end + 1 < chars.len() && is_word_char(chars[end + 1]) {
+        end += 1;
+    }
+    Some(end)
+}
+
+fn find_prev_word_start_in_line(chars: &[char], start_col: Option<usize>) -> Option<usize> {
+    if chars.is_empty() {
+        return None;
+    }
+    let mut idx = match start_col {
+        Some(0) => return None,
+        Some(col) if col > chars.len() => chars.len().saturating_sub(1),
+        Some(col) => col.saturating_sub(1),
+        None => chars.len().saturating_sub(1),
+    };
+    while idx > 0 && !is_word_char(chars[idx]) {
+        idx -= 1;
+    }
+    if !is_word_char(chars[idx]) {
+        return None;
+    }
+    while idx > 0 && is_word_char(chars[idx - 1]) {
+        idx -= 1;
+    }
+    Some(idx)
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn encode_mouse_event(mouse: &MouseEvent) -> Option<Vec<u8>> {
+    let (mut code, suffix) = match mouse.kind {
+        MouseEventKind::Down(button) => (mouse_button_code(button)?, 'M'),
+        MouseEventKind::Up(_) => (3, 'm'),
+        MouseEventKind::Drag(button) => (mouse_button_code(button)? + 32, 'M'),
+        MouseEventKind::ScrollUp => (64, 'M'),
+        MouseEventKind::ScrollDown => (65, 'M'),
+        _ => return None,
+    };
+
+    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+        code += 4;
+    }
+    if mouse.modifiers.contains(KeyModifiers::ALT) {
+        code += 8;
+    }
+    if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+        code += 16;
+    }
+
+    let column = mouse.column.saturating_add(1);
+    let row = mouse.row.saturating_add(1);
+    let sequence = format!("\u{1b}[<{};{};{}{}", code, column, row, suffix);
+    Some(sequence.into_bytes())
+}
+
+fn mouse_button_code(button: MouseButton) -> Option<u16> {
+    match button {
+        MouseButton::Left => Some(0),
+        MouseButton::Middle => Some(1),
+        MouseButton::Right => Some(2),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1610,7 +2601,7 @@ mod tests {
     use crate::transport::{
         Transport, TransportError, TransportId, TransportKind, TransportMessage, TransportPair,
     };
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     #[derive(Default)]
@@ -1726,6 +2717,149 @@ mod tests {
             seq,
             cells: text.chars().map(pack_char).collect(),
         }
+    }
+
+    fn new_client() -> TerminalClient {
+        TerminalClient::new(Arc::new(NullTransport::default())).with_render(false)
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn vi_word_motions_navigate_between_words() {
+        let mut client = new_client();
+        client.renderer.ensure_size(3, 32);
+        client
+            .renderer
+            .apply_row_from_text(0, 1, "alpha beta  gamma");
+        client.copy_mode = Some(CopyModeState::new(
+            SelectionPosition { row: 0, col: 0 },
+            CopyModeKeySet::Vi,
+        ));
+        client.renderer.set_follow_tail(false);
+        client.update_copy_mode_status();
+
+        client.process_copy_mode_key(&key(KeyCode::Char('w'), KeyModifiers::NONE));
+        let cursor = client.copy_mode.as_ref().unwrap().cursor;
+        assert_eq!(cursor.row, 0);
+        assert_eq!(cursor.col, 6);
+
+        client.process_copy_mode_key(&key(KeyCode::Char('b'), KeyModifiers::NONE));
+        let cursor = client.copy_mode.as_ref().unwrap().cursor;
+        assert_eq!(cursor.row, 0);
+        assert_eq!(cursor.col, 0);
+
+        client.process_copy_mode_key(&key(KeyCode::Char('e'), KeyModifiers::NONE));
+        let cursor = client.copy_mode.as_ref().unwrap().cursor;
+        assert_eq!(cursor.row, 0);
+        assert_eq!(cursor.col, 4);
+    }
+
+    #[test]
+    fn vi_half_page_motions_respect_viewport() {
+        let mut client = new_client();
+        client.renderer.on_resize(80, 8);
+        client.renderer.ensure_size(12, 32);
+        for row in 0..12 {
+            let text = format!("line {row:02}");
+            client
+                .renderer
+                .apply_row_from_text(row, (row + 1) as u64, &text);
+        }
+        client.copy_mode = Some(CopyModeState::new(
+            SelectionPosition { row: 6, col: 0 },
+            CopyModeKeySet::Vi,
+        ));
+        client.renderer.set_follow_tail(false);
+        client.update_copy_mode_status();
+
+        client.process_copy_mode_key(&key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        let cursor = client.copy_mode.as_ref().unwrap().cursor;
+        assert_eq!(cursor.row, 3);
+
+        client.process_copy_mode_key(&key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        let cursor = client.copy_mode.as_ref().unwrap().cursor;
+        assert_eq!(cursor.row, 6);
+    }
+
+    #[test]
+    fn vi_ctrl_v_switches_to_block_selection() {
+        let mut client = new_client();
+        client.renderer.ensure_size(2, 8);
+        client.renderer.apply_row_from_text(0, 1, "abcd");
+        client.renderer.apply_row_from_text(1, 2, "efgh");
+        client.copy_mode = Some(CopyModeState::new(
+            SelectionPosition { row: 1, col: 3 },
+            CopyModeKeySet::Vi,
+        ));
+        client.renderer.set_follow_tail(false);
+        client.update_copy_mode_status();
+
+        // Begin selection, move to the opposite corner, then toggle block mode.
+        client.process_copy_mode_key(&key(KeyCode::Char('v'), KeyModifiers::NONE));
+        client.process_copy_mode_key(&key(KeyCode::Char('k'), KeyModifiers::NONE));
+        for _ in 0..3 {
+            client.process_copy_mode_key(&key(KeyCode::Char('h'), KeyModifiers::NONE));
+        }
+        client.process_copy_mode_key(&key(KeyCode::Char('v'), KeyModifiers::CONTROL));
+
+        let selected = client.renderer.selection_text().unwrap();
+        assert_eq!(selected, "abcd\nefgh");
+    }
+
+    #[test]
+    fn vi_shift_v_enters_line_selection() {
+        let mut client = new_client();
+        client.renderer.ensure_size(2, 16);
+        client.renderer.apply_row_from_text(0, 1, "alpha");
+        client.renderer.apply_row_from_text(1, 2, "beta");
+        client.copy_mode = Some(CopyModeState::new(
+            SelectionPosition { row: 1, col: 2 },
+            CopyModeKeySet::Vi,
+        ));
+        client.renderer.set_follow_tail(false);
+        client.update_copy_mode_status();
+
+        client.process_copy_mode_key(&key(KeyCode::Char('V'), KeyModifiers::SHIFT));
+        client.process_copy_mode_key(&key(KeyCode::Char('k'), KeyModifiers::NONE));
+
+        let selected = client.renderer.selection_text().unwrap();
+        assert_eq!(selected, "alpha\nbeta");
+    }
+
+    #[test]
+    fn copy_mode_cmd_shortcut_exits_when_no_selection() {
+        let mut client = new_client();
+        client.renderer.ensure_size(1, 32);
+        client.renderer.apply_row_from_text(0, 1, "sample text");
+        client.copy_mode = Some(CopyModeState::new(
+            SelectionPosition { row: 0, col: 0 },
+            CopyModeKeySet::Vi,
+        ));
+        client.renderer.set_follow_tail(false);
+        client.update_copy_mode_status();
+
+        assert!(client.copy_mode.is_some());
+        client.process_copy_mode_key(&key(KeyCode::Char('c'), KeyModifiers::SUPER));
+        assert!(client.copy_mode.is_none());
+    }
+
+    #[test]
+    fn vi_q_exits_copy_mode() {
+        let mut client = new_client();
+        client.renderer.ensure_size(1, 16);
+        client.renderer.apply_row_from_text(0, 1, "hello world");
+        client.copy_mode = Some(CopyModeState::new(
+            SelectionPosition { row: 0, col: 5 },
+            CopyModeKeySet::Vi,
+        ));
+        client.renderer.set_follow_tail(false);
+        client.update_copy_mode_status();
+
+        client.process_copy_mode_key(&key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(client.copy_mode.is_none());
     }
 
     fn seed_request(

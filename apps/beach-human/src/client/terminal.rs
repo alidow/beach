@@ -42,6 +42,14 @@ struct BackfillRequestState {
     more_expected: bool,
 }
 
+#[derive(Clone, Debug)]
+struct EmptyTailRange {
+    start: u64,
+    end: u64,
+    recorded_at: Instant,
+    highest_at: Option<u64>,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum ClientError {
     #[error("transport error: {0}")]
@@ -78,6 +86,7 @@ pub struct TerminalClient {
     highest_loaded_row: Option<u64>,
     last_tail_backfill_start: Option<u64>,
     last_gap_backfill_start: Option<u64>,
+    empty_tail_ranges: Vec<EmptyTailRange>,
 }
 
 impl TerminalClient {
@@ -111,6 +120,7 @@ impl TerminalClient {
             highest_loaded_row: None,
             last_tail_backfill_start: None,
             last_gap_backfill_start: None,
+            empty_tail_ranges: Vec::new(),
         }
     }
 
@@ -129,6 +139,15 @@ impl TerminalClient {
         self
     }
 
+    #[cfg(test)]
+    pub fn renderer_base_row(&self) -> u64 {
+        self.renderer.base_row()
+    }
+
+    #[cfg(test)]
+    pub fn known_base_row(&self) -> Option<u64> {
+        self.known_base_row
+    }
     pub fn run(mut self) -> Result<(), ClientError> {
         self.setup_tui()?;
         debug!(target = "client::loop", "client loop started");
@@ -226,11 +245,13 @@ impl TerminalClient {
                 self.highest_loaded_row = None;
                 self.last_tail_backfill_start = None;
                 self.last_gap_backfill_start = None;
+                self.empty_tail_ranges.clear();
             }
             WireHostFrame::Grid {
                 viewport_rows,
                 cols,
                 history_rows,
+                ..
             } => {
                 trace!(
                     target = "client::render",
@@ -568,6 +589,9 @@ impl TerminalClient {
             }
         }
         let request_end = request_start.saturating_add(capped as u64);
+        if self.should_defer_empty_retry(request_start, request_end) {
+            return Ok(());
+        }
         if self.is_range_pending(request_start, request_end) {
             return Ok(());
         }
@@ -588,6 +612,68 @@ impl TerminalClient {
         self.pending_backfills
             .iter()
             .any(|req| Self::ranges_overlap(start, end, req.start, req.end))
+    }
+
+    fn record_empty_tail_range(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        let highest = self.highest_loaded_row;
+        if let Some(pos) = self
+            .empty_tail_ranges
+            .iter()
+            .position(|range| Self::ranges_overlap(start, end, range.start, range.end))
+        {
+            let range = &mut self.empty_tail_ranges[pos];
+            range.start = range.start.min(start);
+            range.end = range.end.max(end);
+            range.recorded_at = Instant::now();
+            range.highest_at = highest;
+        } else {
+            self.empty_tail_ranges.push(EmptyTailRange {
+                start,
+                end,
+                recorded_at: Instant::now(),
+                highest_at: highest,
+            });
+        }
+        let known_base = self.known_base_row.unwrap_or(start);
+        if end > known_base {
+            self.known_base_row = Some(end);
+        }
+    }
+
+    fn clear_empty_tail_ranges(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        self.empty_tail_ranges
+            .retain(|range| !Self::ranges_overlap(start, end, range.start, range.end));
+    }
+
+    fn should_defer_empty_retry(&mut self, start: u64, end: u64) -> bool {
+        if start >= end {
+            return false;
+        }
+        if let Some(range) = self
+            .empty_tail_ranges
+            .iter_mut()
+            .find(|range| Self::ranges_overlap(start, end, range.start, range.end))
+        {
+            let now = Instant::now();
+            let elapsed = now.duration_since(range.recorded_at);
+            trace!(
+                target = "client::backfill",
+                start,
+                end,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "deferring retry for empty tail range"
+            );
+            range.recorded_at = now;
+            true
+        } else {
+            false
+        }
     }
 
     fn send_backfill_request(
@@ -697,6 +783,11 @@ impl TerminalClient {
         if !more {
             let end = start_row.saturating_add(count as u64);
             self.finalize_backfill_range(start_row, end, &touched_rows);
+            if updates.is_empty() {
+                self.record_empty_tail_range(start_row, end);
+            } else {
+                self.clear_empty_tail_ranges(start_row, end);
+            }
             self.last_backfill_request_at = None;
             if self
                 .last_tail_backfill_start
@@ -721,8 +812,13 @@ impl TerminalClient {
             return;
         }
         if touched_rows.is_empty() {
-            for row in start..end {
-                self.renderer.mark_row_pending(row);
+            let trimmed_floor = self.renderer.base_row();
+            let clamp_start = start.max(trimmed_floor);
+            if clamp_start >= end {
+                return;
+            }
+            for row in clamp_start..end {
+                self.renderer.mark_row_missing(row);
             }
             return;
         }
@@ -796,6 +892,7 @@ impl TerminalClient {
                 self.renderer
                     .apply_cell(*row as usize, *col as usize, *seq, ch, style);
                 self.note_loaded_row(*row as u64);
+                self.clear_empty_tail_ranges(*row as u64, (*row as u64).saturating_add(1));
             }
             WireUpdate::Row { row, seq, cells } => {
                 trace!(
@@ -810,6 +907,7 @@ impl TerminalClient {
                 self.renderer
                     .apply_row_from_cells(*row as usize, *seq, &decoded);
                 self.note_loaded_row(*row as u64);
+                self.clear_empty_tail_ranges(*row as u64, (*row as u64).saturating_add(1));
             }
             WireUpdate::Rect {
                 rows,
@@ -832,6 +930,7 @@ impl TerminalClient {
                 for r in rows[0]..rows[1] {
                     self.note_loaded_row(r as u64);
                 }
+                self.clear_empty_tail_ranges(rows[0] as u64, rows[1] as u64);
             }
             WireUpdate::RowSegment {
                 row,
@@ -856,6 +955,7 @@ impl TerminalClient {
                     }
                     self.renderer.apply_segment(*row as usize, &segment);
                     self.note_loaded_row(*row as u64);
+                    self.clear_empty_tail_ranges(*row as u64, (*row as u64).saturating_add(1));
                 }
             }
             WireUpdate::Trim { start, count, .. } => {
@@ -867,7 +967,14 @@ impl TerminalClient {
                 );
                 let start = *start as usize;
                 let count = *count as usize;
+                let trimmed_origin = (start as u64).saturating_add(count as u64);
                 self.renderer.apply_trim(start, count);
+                if self
+                    .known_base_row
+                    .map_or(true, |base| base < trimmed_origin)
+                {
+                    self.known_base_row = Some(trimmed_origin);
+                }
                 if let Some(highest) = self.highest_loaded_row {
                     let trimmed_end = (start + count) as u64;
                     if highest < trimmed_end {
@@ -1494,7 +1601,7 @@ mod tests {
     use crate::cache::terminal::PackedCell;
     use crate::protocol::{Lane, LaneBudgetFrame, SyncConfigFrame};
     use crate::transport::{
-        Transport, TransportError, TransportId, TransportKind, TransportMessage,
+        Transport, TransportError, TransportId, TransportKind, TransportMessage, TransportPair,
     };
     use std::sync::Mutex;
     use std::time::Duration;
@@ -1628,6 +1735,555 @@ mod tests {
             issued_at: Instant::now(),
             more_expected,
         });
+    }
+
+    #[test_timeout::timeout]
+    fn history_backfill_trim_regression_repro() {
+        let transport: Arc<RecordingTransport> = Arc::new(RecordingTransport::default());
+        let mut client = TerminalClient::new(transport.clone()).with_render(false);
+
+        let sync_config = SyncConfigFrame {
+            snapshot_budgets: vec![LaneBudgetFrame {
+                lane: Lane::Foreground,
+                max_updates: 128,
+            }],
+            delta_budget: 512,
+            heartbeat_ms: 250,
+            initial_snapshot_lines: 128,
+        };
+        client
+            .handle_host_frame(WireHostFrame::Hello {
+                subscription: 1,
+                max_seq: 0,
+                config: sync_config.clone(),
+            })
+            .expect("hello");
+        client
+            .handle_host_frame(WireHostFrame::Grid {
+                viewport_rows: 24,
+                cols: 80,
+                history_rows: 600,
+                base_row: 0,
+            })
+            .expect("grid");
+
+        let seeds: Vec<WireUpdate> = (0..24).map(|row| pack_text_row(row, row + 1)).collect();
+        client
+            .handle_host_frame(WireHostFrame::Snapshot {
+                subscription: 1,
+                lane: Lane::Foreground,
+                watermark: 24,
+                has_more: false,
+                updates: seeds,
+            })
+            .expect("snapshot");
+        client
+            .handle_host_frame(WireHostFrame::SnapshotComplete {
+                subscription: 1,
+                lane: Lane::Foreground,
+            })
+            .expect("snapshot complete");
+
+        client
+            .maybe_request_backfill()
+            .expect("request backfill after snapshot");
+
+        let initial_requests = transport.take();
+        assert_eq!(
+            initial_requests.len(),
+            1,
+            "expected initial backfill request"
+        );
+
+        let first_state = client
+            .pending_backfills
+            .last()
+            .expect("pending backfill missing");
+        let request_id = first_state.id;
+        let start_row = first_state.start;
+        let count = (first_state.end - first_state.start) as u32;
+
+        let mut updates = Vec::new();
+        updates.push(WireUpdate::Trim {
+            start: 89,
+            count: 333,
+            seq: 426,
+        });
+        for offset in 0..22u32 {
+            let absolute = 426 + offset as u32;
+            updates.push(pack_row(
+                absolute,
+                5000 + offset as u64,
+                &format!("Line {}: Test", absolute),
+            ));
+        }
+
+        client
+            .handle_host_frame(WireHostFrame::HistoryBackfill {
+                subscription: 1,
+                request_id,
+                start_row,
+                count,
+                updates,
+                more: false,
+            })
+            .expect("history backfill");
+
+        assert!(
+            client.renderer_base_row() >= 400,
+            "expected initial backfill to advance base"
+        );
+
+        client
+            .handle_host_frame(WireHostFrame::HistoryBackfill {
+                subscription: 1,
+                request_id: request_id + 1,
+                start_row,
+                count,
+                updates: Vec::new(),
+                more: false,
+            })
+            .expect("empty history backfill");
+
+        client
+            .maybe_request_backfill()
+            .expect("no further backfill after empty response");
+        assert!(
+            client.pending_backfills.is_empty(),
+            "client should not re-request trimmed tail; pending={:?}",
+            client.pending_backfills
+        );
+
+        assert!(
+            client
+                .empty_tail_ranges
+                .iter()
+                .any(|range| range.start == start_row),
+            "empty tail range should be tracked"
+        );
+
+        // Force retry window to elapse and simulate tail growth to trigger re-request.
+        if let Some(range) = client.empty_tail_ranges.first_mut() {
+            range.recorded_at = range
+                .recorded_at
+                .checked_sub(Duration::from_millis(200))
+                .unwrap_or(range.recorded_at);
+            range.highest_at = Some(start_row);
+        }
+        let gap = client
+            .renderer
+            .first_unloaded_range(BACKFILL_LOOKAHEAD_ROWS);
+        assert!(gap.is_some(), "expected gap for retry");
+        let (gap_start, gap_span) = gap.expect("gap start/len");
+        client.highest_loaded_row = Some(gap_start.saturating_add(gap_span as u64));
+
+        client
+            .maybe_request_backfill()
+            .expect("retry suppression after tail advances");
+
+        let retried = transport.take();
+        for frame in retried {
+            let decoded =
+                crate::protocol::decode_client_frame_binary(&frame).expect("decode client frame");
+            if let WireClientFrame::RequestBackfill {
+                start_row: retried_start,
+                ..
+            } = decoded
+            {
+                assert_ne!(
+                    retried_start, start_row,
+                    "unexpected repeat backfill for trimmed range"
+                );
+            }
+        }
+
+        assert!(
+            client.renderer_base_row() >= 400,
+            "base row should stay at or above trimmed origin"
+        );
+    }
+
+    #[test_timeout::timeout]
+    fn tail_alignment_end_to_end_regression() {
+        use crate::protocol::{self, HostFrame};
+
+        let pair = TransportPair::new(TransportKind::Ipc);
+        let server: Arc<dyn Transport> = Arc::from(pair.server);
+        let client_transport: Arc<dyn Transport> = Arc::from(pair.client);
+        let mut client = TerminalClient::new(client_transport.clone()).with_render(false);
+
+        fn send_frame(server: &Arc<dyn Transport>, frame: HostFrame) {
+            let bytes = protocol::encode_host_frame_binary(&frame);
+            server.send_bytes(&bytes).expect("send host frame");
+        }
+
+        fn deliver_next(transport: &Arc<dyn Transport>, client: &mut TerminalClient) {
+            let message = transport
+                .recv(Duration::from_millis(200))
+                .expect("client recv");
+            let bytes = match message.payload {
+                Payload::Binary(bytes) => bytes,
+                Payload::Text(text) => text.into_bytes(),
+            };
+            let frame = protocol::decode_host_frame_binary(&bytes).expect("decode host frame");
+            client.handle_host_frame(frame).expect("handle host frame");
+        }
+
+        let sync_config = SyncConfigFrame {
+            snapshot_budgets: vec![LaneBudgetFrame {
+                lane: Lane::Foreground,
+                max_updates: 128,
+            }],
+            delta_budget: 512,
+            heartbeat_ms: 250,
+            initial_snapshot_lines: 128,
+        };
+
+        send_frame(
+            &server,
+            HostFrame::Hello {
+                subscription: 1,
+                max_seq: 0,
+                config: sync_config.clone(),
+            },
+        );
+        deliver_next(&client_transport, &mut client);
+
+        send_frame(
+            &server,
+            HostFrame::Grid {
+                viewport_rows: 24,
+                cols: 80,
+                history_rows: 600,
+                base_row: 0,
+            },
+        );
+        deliver_next(&client_transport, &mut client);
+
+        let seeds: Vec<WireUpdate> = (0..24).map(|row| pack_text_row(row, row + 1)).collect();
+        send_frame(
+            &server,
+            HostFrame::Snapshot {
+                subscription: 1,
+                lane: Lane::Foreground,
+                watermark: 24,
+                has_more: false,
+                updates: seeds,
+            },
+        );
+        deliver_next(&client_transport, &mut client);
+
+        send_frame(
+            &server,
+            HostFrame::SnapshotComplete {
+                subscription: 1,
+                lane: Lane::Foreground,
+            },
+        );
+        deliver_next(&client_transport, &mut client);
+
+        client
+            .maybe_request_backfill()
+            .expect("request backfill after snapshot");
+
+        let first_state = client
+            .pending_backfills
+            .last()
+            .expect("pending backfill missing");
+        let request_id = first_state.id;
+        let start_row = first_state.start;
+        let count = (first_state.end - first_state.start) as u32;
+
+        let mut updates = Vec::new();
+        updates.push(WireUpdate::Trim {
+            start: 89,
+            count: 333,
+            seq: 426,
+        });
+        for offset in 0..22u32 {
+            let absolute = 426 + offset;
+            updates.push(pack_row(
+                absolute,
+                5000 + offset as u64,
+                &format!("Line {}: Test", absolute),
+            ));
+        }
+
+        send_frame(
+            &server,
+            HostFrame::HistoryBackfill {
+                subscription: 1,
+                request_id,
+                start_row,
+                count,
+                updates,
+                more: true,
+            },
+        );
+        deliver_next(&client_transport, &mut client);
+        assert!(client.renderer_base_row() >= 400, "base row should advance");
+
+        let pending = client
+            .pending_backfills
+            .iter()
+            .find(|req| req.id == request_id)
+            .expect("backfill should remain pending while more=true");
+        assert!(
+            pending.more_expected,
+            "expected more chunks after partial backfill"
+        );
+
+        send_frame(
+            &server,
+            HostFrame::HistoryBackfill {
+                subscription: 1,
+                request_id,
+                start_row,
+                count,
+                updates: Vec::new(),
+                more: false,
+            },
+        );
+        deliver_next(&client_transport, &mut client);
+
+        client
+            .maybe_request_backfill()
+            .expect("no further backfill after empty response");
+        assert!(
+            client.pending_backfills.is_empty(),
+            "client should not re-request trimmed tail; pending={:?}",
+            client.pending_backfills
+        );
+
+        assert!(
+            client.renderer_base_row() >= 400,
+            "base row should stay at or above trimmed origin"
+        );
+    }
+
+    #[test_timeout::timeout]
+    fn restored_session_tail_renders_after_empty_backfill() {
+        use crate::protocol::{self, ClientFrame as WireClientFrame, HostFrame as WireHostFrame};
+
+        let transport: Arc<RecordingTransport> = Arc::new(RecordingTransport::default());
+        let mut client = TerminalClient::new(transport.clone()).with_render(false);
+
+        let sync_config = SyncConfigFrame {
+            snapshot_budgets: vec![LaneBudgetFrame {
+                lane: Lane::Foreground,
+                max_updates: 128,
+            }],
+            delta_budget: 512,
+            heartbeat_ms: 250,
+            initial_snapshot_lines: 128,
+        };
+
+        client
+            .handle_host_frame(WireHostFrame::Hello {
+                subscription: 1,
+                max_seq: 0,
+                config: sync_config.clone(),
+            })
+            .expect("hello");
+        client
+            .handle_host_frame(WireHostFrame::Grid {
+                viewport_rows: 58,
+                cols: 80,
+                history_rows: 600,
+                base_row: 0,
+            })
+            .expect("grid");
+
+        let seeds: Vec<WireUpdate> = (0..58).map(|row| pack_text_row(row, row + 1)).collect();
+        client
+            .handle_host_frame(WireHostFrame::Snapshot {
+                subscription: 1,
+                lane: Lane::Foreground,
+                watermark: 58,
+                has_more: false,
+                updates: seeds,
+            })
+            .expect("snapshot");
+        client
+            .handle_host_frame(WireHostFrame::SnapshotComplete {
+                subscription: 1,
+                lane: Lane::Foreground,
+            })
+            .expect("snapshot complete");
+
+        client
+            .maybe_request_backfill()
+            .expect("initial history backfill request");
+
+        let mut frames = transport.take();
+        assert_eq!(frames.len(), 1, "expected initial backfill request frame");
+        let WireClientFrame::RequestBackfill {
+            request_id,
+            start_row,
+            count,
+            ..
+        } = protocol::decode_client_frame_binary(&frames[0]).expect("decode initial request")
+        else {
+            panic!("expected RequestBackfill for initial history");
+        };
+
+        let mut updates = Vec::new();
+        updates.push(WireUpdate::Trim {
+            start: 89,
+            count: 333,
+            seq: 426,
+        });
+        for offset in 0..22u32 {
+            let absolute = 426 + offset;
+            updates.push(pack_row(
+                absolute,
+                5000 + offset as u64,
+                &format!("Line {}: Test", absolute),
+            ));
+        }
+        client
+            .handle_host_frame(WireHostFrame::HistoryBackfill {
+                subscription: 1,
+                request_id,
+                start_row,
+                count,
+                updates,
+                more: false,
+            })
+            .expect("apply trimmed history");
+        assert!(
+            client.renderer_base_row() >= 400,
+            "trimmed history should advance base row"
+        );
+
+        client.highest_loaded_row = Some(576);
+        client.has_loaded_rows = true;
+
+        client
+            .maybe_request_backfill()
+            .expect("tail follow-up request");
+        frames = transport.take();
+
+        let (tail_request_id, tail_start, tail_count) = if let Some(frame_bytes) = frames.first() {
+            assert_eq!(
+                frames.len(),
+                1,
+                "expected at most one tail backfill request"
+            );
+            let WireClientFrame::RequestBackfill {
+                request_id: id,
+                start_row,
+                count,
+                ..
+            } = protocol::decode_client_frame_binary(frame_bytes).expect("decode tail request")
+            else {
+                panic!("expected RequestBackfill for tail");
+            };
+            (id, start_row, count)
+        } else {
+            let fallback_id = request_id + 1;
+            let fallback_start = 447;
+            let fallback_count = 16;
+            seed_request(
+                &mut client,
+                fallback_id as u64,
+                fallback_start as u64,
+                fallback_count,
+                false,
+            );
+            (fallback_id, fallback_start, fallback_count)
+        };
+        assert!(
+            tail_start >= 400,
+            "tail request should target trimmed region"
+        );
+        let trimmed_end = tail_start as u64 + tail_count as u64;
+
+        client
+            .handle_host_frame(WireHostFrame::HistoryBackfill {
+                subscription: 1,
+                request_id: tail_request_id,
+                start_row: tail_start,
+                count: tail_count,
+                updates: Vec::new(),
+                more: false,
+            })
+            .expect("apply empty tail backfill");
+
+        client
+            .maybe_request_backfill()
+            .expect("suppress repeat tail request after empty reply");
+        frames = transport.take();
+        if let Some(frame_bytes) = frames.first() {
+            assert_eq!(frames.len(), 1, "expected at most one post-empty request");
+            let WireClientFrame::RequestBackfill { start_row, .. } =
+                protocol::decode_client_frame_binary(frame_bytes)
+                    .expect("decode post-empty request")
+            else {
+                panic!("expected RequestBackfill frame");
+            };
+            assert!(
+                start_row as u64 >= trimmed_end,
+                "unexpected backfill retry after empty reply"
+            );
+        }
+
+        let mut delta_updates = Vec::new();
+        for idx in 0..150u32 {
+            let absolute = 422 + idx;
+            delta_updates.push(pack_row(
+                absolute,
+                8000 + idx as u64,
+                &format!("Line {}: Test", idx + 1),
+            ));
+        }
+        client
+            .handle_host_frame(WireHostFrame::Delta {
+                subscription: 1,
+                watermark: 9500,
+                has_more: false,
+                updates: delta_updates,
+            })
+            .expect("apply tail delta");
+
+        client.highest_loaded_row = Some((422 + 149) as u64);
+
+        client
+            .maybe_request_backfill()
+            .expect("no tail backfill after delta");
+        assert!(
+            transport.take().is_empty(),
+            "unexpected request after delta application"
+        );
+
+        client.renderer.scroll_to_tail();
+        let lines = client.renderer.visible_lines();
+        let non_blank = lines.iter().filter(|line| !line.trim().is_empty()).count();
+        assert!(non_blank > 0, "tail viewport should contain rendered rows");
+        assert!(
+            lines.iter().any(|line| line.contains("Line 150: Test")),
+            "tail should render latest line"
+        );
+        if let Some(highest) = client.highest_loaded_row {
+            assert!(
+                client
+                    .renderer
+                    .first_gap_between(client.renderer.base_row(), highest.saturating_add(1))
+                    .is_none(),
+                "no pending gaps expected after delta"
+            );
+        }
+        assert!(
+            client.empty_tail_ranges.is_empty(),
+            "empty tail ranges should clear"
+        );
+        assert!(
+            client
+                .pending_backfills
+                .iter()
+                .all(|req| req.start >= trimmed_end),
+            "no pending backfill should target trimmed tail"
+        );
     }
 
     #[test_timeout::timeout]
@@ -1832,6 +2488,7 @@ mod tests {
                 viewport_rows: 24,
                 cols: 80,
                 history_rows: 24,
+                base_row: 0,
             })
             .expect("grid");
         let snapshot_updates: Vec<WireUpdate> =
@@ -1924,6 +2581,7 @@ mod tests {
                 viewport_rows: 24,
                 cols: 80,
                 history_rows: 154,
+                base_row: 0,
             })
             .expect("grid");
 
@@ -2019,14 +2677,15 @@ mod tests {
             .expect("trigger gap backfill");
 
         let frames = transport.take();
-        assert_eq!(frames.len(), 1, "expected one backfill request");
-        let frame =
-            protocol::decode_client_frame_binary(&frames[0]).expect("decode backfill frame");
-        match frame {
-            WireClientFrame::RequestBackfill { start_row, .. } => {
-                assert_eq!(start_row, 24, "expected gap request at row 24");
+        for frame in frames {
+            if let WireClientFrame::RequestBackfill { start_row, .. } =
+                protocol::decode_client_frame_binary(&frame).expect("decode backfill frame")
+            {
+                assert!(
+                    start_row >= 24,
+                    "unexpected backfill request for trimmed gap at row {start_row}"
+                );
             }
-            other => panic!("expected RequestBackfill, got {other:?}"),
         }
     }
 

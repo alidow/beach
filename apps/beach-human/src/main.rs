@@ -3,7 +3,7 @@
 use beach_human::cache::Seq;
 use beach_human::cache::terminal::{PackedCell, StyleId, TerminalGrid, unpack_cell};
 use beach_human::client::terminal::{ClientError, TerminalClient};
-use beach_human::model::terminal::diff::{CacheUpdate, RowSnapshot, StyleDefinition};
+use beach_human::model::terminal::diff::{CacheUpdate, HistoryTrim, RowSnapshot, StyleDefinition};
 use beach_human::protocol::{
     self, ClientFrame as WireClientFrame, HostFrame, Lane as WireLane,
     LaneBudgetFrame as WireLaneBudget, SyncConfigFrame as WireSyncConfig, Update as WireUpdate,
@@ -755,9 +755,27 @@ fn collect_backfill_chunk(grid: &TerminalGrid, start_row: u64, max_rows: u32) ->
     let mut delivered = 0u32;
 
     let base_offset = grid.row_offset();
+    let mut effective_start = start_row;
+    if start_row < base_offset {
+        let diff = base_offset - start_row;
+        if let (Ok(start), Ok(count)) = (usize::try_from(start_row), usize::try_from(diff)) {
+            updates.push(CacheUpdate::Trim(HistoryTrim::new(start, count)));
+            trace!(
+                target = "sync::backfill",
+                start_row, base_offset, count, "emitting trim for backfill"
+            );
+        } else {
+            trace!(
+                target = "sync::backfill",
+                start_row, base_offset, diff, "trim conversion overflow"
+            );
+        }
+        effective_start = base_offset;
+    }
+
     trace!(
         target = "sync::backfill",
-        start_row, max_rows, base_offset, cols, "collecting backfill chunk"
+        start_row, effective_start, max_rows, base_offset, cols, "collecting backfill chunk"
     );
 
     let default_cell = TerminalGrid::pack_char_with_style(' ', StyleId::DEFAULT);
@@ -766,6 +784,7 @@ fn collect_backfill_chunk(grid: &TerminalGrid, start_row: u64, max_rows: u32) ->
     trace!(
         target = "sync::backfill",
         start_row,
+        effective_start,
         max_rows,
         base_offset,
         cols,
@@ -776,7 +795,7 @@ fn collect_backfill_chunk(grid: &TerminalGrid, start_row: u64, max_rows: u32) ->
     );
 
     for offset in 0..max_rows as u64 {
-        let absolute = start_row.saturating_add(offset);
+        let absolute = effective_start.saturating_add(offset);
         let Some(index) = grid.index_of_row(absolute) else {
             trace!(target = "sync::backfill", absolute, "row missing from grid");
             continue;
@@ -836,7 +855,9 @@ fn collect_backfill_chunk(grid: &TerminalGrid, start_row: u64, max_rows: u32) ->
         for style_id in style_ids {
             if let Some(style) = style_table.get(style_id) {
                 updates.push(CacheUpdate::Style(StyleDefinition::new(
-                    style_id, start_row, style,
+                    style_id,
+                    effective_start,
+                    style,
                 )));
             }
         }
@@ -866,6 +887,53 @@ fn host_frame_label(frame: &HostFrame) -> &'static str {
 fn send_host_frame(transport: &Arc<dyn Transport>, frame: HostFrame) -> bool {
     let encode_start = Instant::now();
     let frame_label = host_frame_label(&frame);
+    if tracing::enabled!(Level::TRACE) {
+        match &frame {
+            HostFrame::Delta {
+                updates, watermark, ..
+            } => {
+                let trim_count = updates
+                    .iter()
+                    .filter(|update| matches!(update, crate::protocol::Update::Trim { .. }))
+                    .count();
+                if trim_count > 0 {
+                    trace!(
+                        target = "sync::transport",
+                        frame = frame_label,
+                        trims = trim_count,
+                        watermark,
+                        "sending delta with trims"
+                    );
+                }
+            }
+            HostFrame::HistoryBackfill {
+                updates,
+                request_id,
+                start_row,
+                count,
+                more,
+                ..
+            } => {
+                let trim_count = updates
+                    .iter()
+                    .filter(|update| matches!(update, crate::protocol::Update::Trim { .. }))
+                    .count();
+                if trim_count > 0 {
+                    trace!(
+                        target = "sync::transport",
+                        frame = frame_label,
+                        trims = trim_count,
+                        request_id,
+                        start_row,
+                        count,
+                        more,
+                        "sending history backfill with trims"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
     let bytes = protocol::encode_host_frame_binary(&frame);
     let elapsed = encode_start.elapsed();
     match &frame {
@@ -1154,6 +1222,7 @@ fn spawn_input_listener(
                                     viewport_rows: rows as u32,
                                     cols: cols as u32,
                                     history_rows: history_rows as u32,
+                                    base_row: grid.row_offset(),
                                 },
                             );
                             debug!(
@@ -1399,6 +1468,13 @@ impl TransmitterCache {
                 }
                 CacheUpdate::Trim(trim) => {
                     self.trim_rows(trim.start, trim.count);
+                    trace!(
+                        target = "sync::transmitter",
+                        start = trim.start,
+                        count = trim.count,
+                        seq = trim.seq(),
+                        marker = "tail_base_row_v3"
+                    );
                     out.push(WireUpdate::Trim {
                         start: usize_to_u32(trim.start),
                         count: usize_to_u32(trim.count),
@@ -1830,6 +1906,7 @@ fn initialize_transport_snapshot(
             viewport_rows: viewport_rows as u32,
             cols: cols as u32,
             history_rows: history_rows as u32,
+            base_row: terminal_sync.grid().row_offset(),
         },
     ) {
         return None;
@@ -2318,6 +2395,7 @@ mod tests {
                     viewport_rows: grid_rows,
                     cols: grid_cols,
                     history_rows,
+                    base_row,
                 } => {
                     assert_eq!(grid_rows as usize, rows);
                     assert_eq!(grid_cols as usize, cols);
@@ -2325,6 +2403,7 @@ mod tests {
                         history_rows as usize >= rows,
                         "history rows should cover viewport"
                     );
+                    assert_eq!(base_row, 0, "handshake base row should be 0 for fresh grid");
                     events.lock().unwrap().push("received_grid".into());
                 }
                 other => panic!("expected grid frame, got {other:?}"),
@@ -2656,6 +2735,7 @@ mod tests {
                 viewport_rows: rows as u32,
                 cols: cols as u32,
                 history_rows: rows as u32,
+                base_row: grid.row_offset(),
             },
         );
         let mut cache = TransmitterCache::new();
@@ -2741,15 +2821,16 @@ mod tests {
         );
         assert!(handshake.is_some(), "handshake failed");
 
-        let mut advertised: Option<(u32, u32, u32)> = None;
+        let mut advertised: Option<(u32, u32, u32, u64)> = None;
         for _ in 0..10 {
             match recv_host_frame(client_transport.as_ref(), StdDuration::from_millis(200)) {
                 WireHostFrame::Grid {
                     viewport_rows,
                     cols,
                     history_rows,
+                    base_row,
                 } => {
-                    advertised = Some((viewport_rows, cols, history_rows));
+                    advertised = Some((viewport_rows, cols, history_rows, base_row));
                     break;
                 }
                 WireHostFrame::Hello { .. }
@@ -2765,10 +2846,11 @@ mod tests {
             }
         }
 
-        let (rows, cols, total) = advertised.expect("grid frame missing from handshake");
+        let (rows, cols, total, base_row) = advertised.expect("grid frame missing from handshake");
         assert_eq!(rows as usize, viewport_rows, "handshake rows mismatch");
         assert_eq!(cols as usize, viewport_cols, "handshake cols mismatch");
         assert_eq!(total as usize, total_rows, "handshake history mismatch");
+        assert_eq!(base_row, grid.row_offset(), "handshake base row mismatch");
     }
 
     #[test_timeout::timeout]

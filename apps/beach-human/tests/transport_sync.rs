@@ -444,6 +444,7 @@ where
                 viewport_rows: rows as u32,
                 cols: cols as u32,
                 history_rows: rows as u32,
+                base_row: server_grid_clone.row_offset(),
             },
         );
 

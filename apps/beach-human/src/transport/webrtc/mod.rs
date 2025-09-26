@@ -967,41 +967,55 @@ async fn connect_answerer(
     );
     post_result?;
 
+    let mut attempts: usize = 0;
     let transport = loop {
-        tracing::trace!(
-            target = "beach_human::transport::webrtc",
-            role = "answerer",
-            await = "transport_slot.lock",
-            state = "start"
-        );
+        attempts = attempts.saturating_add(1);
+        if attempts == 1 || attempts % 100 == 0 {
+            tracing::trace!(
+                target = "beach_human::transport::webrtc",
+                role = "answerer",
+                await = "transport_slot.lock",
+                state = "start",
+                attempts
+            );
+        }
         let mut transport_guard = transport_slot.lock().await;
-        tracing::trace!(
-            target = "beach_human::transport::webrtc",
-            role = "answerer",
-            await = "transport_slot.lock",
-            state = "end",
-            has_transport = transport_guard.is_some()
-        );
+        if attempts == 1 || attempts % 100 == 0 {
+            tracing::trace!(
+                target = "beach_human::transport::webrtc",
+                role = "answerer",
+                await = "transport_slot.lock",
+                state = "end",
+                has_transport = transport_guard.is_some(),
+                attempts
+            );
+        }
         if let Some(transport) = transport_guard.as_ref().cloned() {
             drop(transport_guard);
             break transport;
         }
         transport_guard.take();
         drop(transport_guard);
-        tracing::trace!(
-            target = "beach_human::transport::webrtc",
-            role = "answerer",
-            await = "sleep.retry",
-            state = "start",
-            poll_ms = 10_u64
-        );
+        if attempts == 1 || attempts % 100 == 0 {
+            tracing::trace!(
+                target = "beach_human::transport::webrtc",
+                role = "answerer",
+                await = "sleep.retry",
+                state = "start",
+                poll_ms = 10_u64,
+                attempts
+            );
+        }
         sleep(Duration::from_millis(10)).await;
-        tracing::trace!(
-            target = "beach_human::transport::webrtc",
-            role = "answerer",
-            await = "sleep.retry",
-            state = "end"
-        );
+        if attempts == 1 || attempts % 100 == 0 {
+            tracing::trace!(
+                target = "beach_human::transport::webrtc",
+                role = "answerer",
+                await = "sleep.retry",
+                state = "end",
+                attempts
+            );
+        }
     };
     tracing::trace!(target = "webrtc", ?client_id, "answerer transport ready");
 

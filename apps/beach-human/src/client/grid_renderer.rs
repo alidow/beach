@@ -117,6 +117,7 @@ pub struct GridRenderer {
     scroll_top: usize,
     viewport_height: usize,
     follow_tail: bool,
+    history_trimmed: bool,
     selection: Option<SelectionRange>,
     needs_redraw: bool,
     predictions: HashMap<(u64, usize), PredictedCell>,
@@ -133,6 +134,7 @@ impl GridRenderer {
             scroll_top: 0,
             viewport_height: 0,
             follow_tail: true,
+            history_trimmed: false,
             selection: None,
             needs_redraw: true,
             predictions: HashMap::new(),
@@ -176,6 +178,10 @@ impl GridRenderer {
         }
         self.base_row = base_row;
         self.mark_dirty();
+    }
+
+    pub fn set_history_origin(&mut self, base_row: u64) {
+        self.history_trimmed = base_row > 0;
     }
 
     fn ensure_capacity(&mut self, rows: usize, cols: usize) {
@@ -577,6 +583,9 @@ impl GridRenderer {
         if self.follow_tail {
             self.scroll_to_tail();
         }
+        if new_base > 0 {
+            self.history_trimmed = true;
+        }
         self.predictions.retain(|(row, _), _| *row >= self.base_row);
         if let Some(range) = &mut self.selection {
             let (anchor, head) = range.bounds();
@@ -962,7 +971,7 @@ impl GridRenderer {
                 entries.push((String::new(), true, absolute));
             }
         }
-        if self.follow_tail && (self.base_row > 0 || self.scroll_top > 0) {
+        if self.follow_tail && (self.base_row > 0 || self.scroll_top > 0 || self.history_trimmed) {
             let mut trimmed_absolute: Option<u64> = None;
             let mut trimmed = 0usize;
             while let Some((_, is_pending, abs)) = entries.last() {
@@ -987,6 +996,11 @@ impl GridRenderer {
                 );
             }
         }
+        let sample_rows: Vec<_> = entries
+            .iter()
+            .take(5)
+            .map(|(_, is_pending, abs)| format!("{}:{}", abs, if *is_pending { 'P' } else { 'L' }))
+            .collect();
         let mut lines = Vec::with_capacity(height);
         let blanks_needed = height.saturating_sub(entries.len());
         for _ in 0..blanks_needed {
@@ -1004,6 +1018,8 @@ impl GridRenderer {
                     viewport = self.viewport_height,
                     rows = self.rows.len(),
                     follow = self.follow_tail,
+                    blanks = blanks_needed,
+                    sample_rows = ?sample_rows,
                     last_line = %last.trim()
                 );
             }
@@ -1050,7 +1066,7 @@ impl GridRenderer {
                 entries.push((Line::from(" ".repeat(self.cols.max(1))), true, absolute));
             }
         }
-        if self.follow_tail && (self.base_row > 0 || self.scroll_top > 0) {
+        if self.follow_tail && (self.base_row > 0 || self.scroll_top > 0 || self.history_trimmed) {
             let mut trimmed = 0usize;
             while let Some((_, is_pending, _)) = entries.last() {
                 if *is_pending {
@@ -1072,6 +1088,11 @@ impl GridRenderer {
                 );
             }
         }
+        let sample_rows: Vec<_> = entries
+            .iter()
+            .take(5)
+            .map(|(_, is_pending, abs)| format!("{}:{}", abs, if *is_pending { 'P' } else { 'L' }))
+            .collect();
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(height);
         let blanks_needed = height.saturating_sub(entries.len());
         for _ in 0..blanks_needed {
@@ -1079,6 +1100,26 @@ impl GridRenderer {
         }
         lines.extend(entries.into_iter().map(|(line, _, _)| line));
         lines.truncate(height);
+        if tracing::enabled!(Level::TRACE) {
+            if let Some(last) = lines.last() {
+                let rendered = last
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                trace!(
+                    target = "client::tail",
+                    event = "render_body",
+                    base_row = self.base_row,
+                    scroll_top = self.scroll_top,
+                    viewport = self.viewport_height,
+                    rows = self.rows.len(),
+                    blanks = blanks_needed,
+                    sample_rows = ?sample_rows,
+                    last_line = %rendered.trim()
+                );
+            }
+        }
         TerminalBodyWidget { lines }
     }
 
@@ -1158,7 +1199,10 @@ impl GridRenderer {
                 break;
             }
             let rel = (absolute - self.base_row) as usize;
-            let loaded = matches!(self.rows.get(rel), Some(RowSlot::Loaded(_)));
+            let loaded = matches!(
+                self.rows.get(rel),
+                Some(RowSlot::Loaded(_)) | Some(RowSlot::Missing)
+            );
             if !loaded {
                 if gap_start.is_none() {
                     gap_start = Some(absolute);
@@ -1320,6 +1364,7 @@ mod tests {
         let mut renderer = GridRenderer::new(0, 10);
         renderer.on_resize(10, 8); // viewport_height reduced by status lines
         renderer.set_base_row(0);
+        renderer.set_history_origin(0);
         for row in 0..3u64 {
             let text = format!("Row {row}");
             renderer.apply_row_from_cells(row as usize, row as Seq, &decode_line(&text));
@@ -1336,6 +1381,7 @@ mod tests {
         let mut renderer = GridRenderer::new(0, 10);
         renderer.on_resize(10, 8);
         renderer.set_base_row(120);
+        renderer.set_history_origin(120);
         for idx in 0..3u64 {
             let abs = 120 + idx;
             let text = format!("Row {abs}");

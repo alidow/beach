@@ -92,6 +92,7 @@ pub enum HostFrame {
         viewport_rows: u32,
         cols: u32,
         history_rows: u32,
+        base_row: u64,
     },
     Snapshot {
         subscription: u64,

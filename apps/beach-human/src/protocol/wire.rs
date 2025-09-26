@@ -84,11 +84,13 @@ pub fn encode_host_frame_binary(frame: &HostFrame) -> Vec<u8> {
             viewport_rows,
             cols,
             history_rows,
+            base_row,
         } => {
             write_header(&mut buf, HOST_KIND_GRID);
             write_var_u32(&mut buf, *viewport_rows);
             write_var_u32(&mut buf, *cols);
             write_var_u32(&mut buf, *history_rows);
+            write_var_u64(&mut buf, *base_row);
         }
         HostFrame::Snapshot {
             subscription,
@@ -171,10 +173,12 @@ pub fn decode_host_frame_binary(bytes: &[u8]) -> Result<HostFrame, WireError> {
             let viewport_rows = cursor.read_var_u32()?;
             let cols = cursor.read_var_u32()?;
             let history_rows = cursor.read_var_u32()?;
+            let base_row = cursor.read_var_u64()?;
             Ok(HostFrame::Grid {
                 viewport_rows,
                 cols,
                 history_rows,
+                base_row,
             })
         }
         HOST_KIND_SNAPSHOT => {

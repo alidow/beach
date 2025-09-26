@@ -27,6 +27,7 @@ fn report_binary_vs_json_payload_sizes() {
             viewport_rows: 24,
             cols: 80,
             history_rows: 24,
+            base_row: 0,
         },
         HostFrame::Snapshot {
             subscription: 1,

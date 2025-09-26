@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::convert::TryFrom;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -305,6 +306,37 @@ impl TerminalGrid {
 
     pub fn row_offset(&self) -> u64 {
         self.inner.read().unwrap().base
+    }
+
+    pub fn set_row_offset(&self, base: u64) {
+        let mut inner = self.inner.write().unwrap();
+        let old_base = inner.base;
+        inner.base = base;
+        let mut absolute = base;
+        for entry in inner.rows.iter_mut() {
+            entry.absolute = absolute;
+            absolute = absolute.saturating_add(1);
+        }
+        inner.next_row_id = absolute;
+        if base > old_base {
+            let diff = base - old_base;
+            if let Ok(count) = usize::try_from(diff) {
+                self.guard_trim_events(Some(TrimEvent {
+                    start: old_base,
+                    count,
+                }));
+            } else {
+                self.guard_trim_events(Some(TrimEvent {
+                    start: old_base,
+                    count: usize::MAX,
+                }));
+            }
+        }
+        tracing::trace!(
+            target = "server::grid",
+            row_offset = base,
+            rows = inner.rows.len()
+        );
     }
 
     pub fn first_row_id(&self) -> Option<u64> {

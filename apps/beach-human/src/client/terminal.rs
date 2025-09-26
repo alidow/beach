@@ -384,6 +384,13 @@ impl TerminalClient {
             return Ok(());
         }
 
+        // Disable all backfill activity while following the live tail.
+        // Backfills will resume automatically once the user scrolls up
+        // (which flips follow_tail off via GridRenderer APIs).
+        if self.renderer.is_following_tail() {
+            return Ok(());
+        }
+
         if self.pending_backfills.is_empty() {
             if !self.renderer.is_following_tail() {
                 if let (Some(base), Some(highest)) = (self.known_base_row, self.highest_loaded_row)

@@ -16,6 +16,7 @@ use alacritty_terminal::{
     vte::ansi::{Color as AnsiColor, NamedColor, Processor},
 };
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::convert::TryFrom;
 use tracing::trace;
 
@@ -28,6 +29,38 @@ pub trait TerminalEmulator: Send {
         Vec::new()
     }
     fn resize(&mut self, rows: usize, cols: usize);
+}
+
+#[derive(Default)]
+struct GridSnapshot {
+    base_row: Option<u64>,
+    rows: Vec<Vec<PackedCell>>,
+}
+
+impl GridSnapshot {
+    fn clear(&mut self) {
+        self.base_row = None;
+        self.rows.clear();
+    }
+
+    fn replace(&mut self, base_row: u64, rows: Vec<Vec<PackedCell>>) {
+        self.base_row = Some(base_row);
+        self.rows = rows;
+    }
+
+    fn row(&self, absolute: u64) -> Option<&[PackedCell]> {
+        let base = self.base_row?;
+        if absolute < base {
+            return None;
+        }
+        let idx = (absolute - base) as usize;
+        self.rows.get(idx).map(|row| row.as_slice())
+    }
+}
+
+struct CapturedRow {
+    absolute: u64,
+    cells: Vec<PackedCell>,
 }
 
 pub struct SimpleTerminalEmulator {
@@ -222,9 +255,8 @@ pub struct AlacrittyEmulator {
     term: Term<EventProxy>,
     parser: Processor,
     seq: Seq,
-    need_full_redraw: bool,
     session_origin: Option<u64>,
-    last_seeded_tail: Option<usize>,
+    snapshot: GridSnapshot,
 }
 
 unsafe impl Send for AlacrittyEmulator {}
@@ -246,9 +278,8 @@ impl AlacrittyEmulator {
             term,
             parser,
             seq: 0,
-            need_full_redraw: true,
             session_origin: None,
-            last_seeded_tail: None,
+            snapshot: GridSnapshot::default(),
         }
     }
 
@@ -263,7 +294,6 @@ impl AlacrittyEmulator {
             Some(origin) if candidate <= origin => origin,
             _ => {
                 self.session_origin = Some(candidate);
-                self.last_seeded_tail = None;
                 candidate
             }
         }
@@ -275,50 +305,6 @@ impl AlacrittyEmulator {
         let abs = absolute_row as u64;
         let rel = abs.saturating_sub(origin);
         rel.min(usize::MAX as u64) as usize
-    }
-
-    fn tail_blank_candidate(
-        &self,
-        base_row: u64,
-        viewport_top: usize,
-        rows: usize,
-    ) -> Option<(usize, usize)> {
-        if rows == 0 {
-            return None;
-        }
-        let tail_index = rows.saturating_sub(1);
-        let tail_absolute = Self::absolute_row_id(base_row, viewport_top, tail_index)? as u64;
-        let next_absolute = tail_absolute.saturating_add(1);
-        let origin = self.session_origin.unwrap_or(0);
-        let relative = next_absolute.saturating_sub(origin);
-        let relative = relative.min(usize::MAX as u64) as usize;
-        let absolute = match usize::try_from(next_absolute) {
-            Ok(value) => value,
-            Err(_) => return None,
-        };
-        Some((relative, absolute))
-    }
-
-    fn seed_tail_blank_row(
-        &mut self,
-        candidate: Option<(usize, usize)>,
-        cell_updates: &mut Vec<CacheUpdate>,
-    ) {
-        let Some((next_relative, next_absolute)) = candidate else {
-            return;
-        };
-        if self.last_seeded_tail == Some(next_relative) {
-            return;
-        }
-        let seq = self.next_seq();
-        let blank = pack_cell(' ', StyleId::DEFAULT);
-        cell_updates.push(CacheUpdate::Cell(CellWrite::new(
-            next_absolute,
-            0,
-            seq,
-            blank,
-        )));
-        self.last_seeded_tail = Some(next_relative);
     }
 
     fn consume_trim_events(&self, grid: &TerminalGrid, out: &mut Vec<CacheUpdate>) {
@@ -345,194 +331,147 @@ impl AlacrittyEmulator {
         }
     }
 
-    fn render_full(&mut self, grid: &TerminalGrid) -> EmulatorResult {
-        let term_grid = self.term.grid();
-        let cols = term_grid.columns();
-        let rows = term_grid.screen_lines();
-        if cols == 0 || rows == 0 {
-            self.need_full_redraw = false;
-            return Vec::new();
+    fn capture_full_grid(&mut self, grid: &TerminalGrid) -> (Vec<CapturedRow>, Vec<CacheUpdate>) {
+        let (cols, total_lines, screen_lines, display_offset, top_line, bottom_line) = {
+            let term_grid = self.term.grid();
+            (
+                term_grid.columns(),
+                term_grid.total_lines(),
+                term_grid.screen_lines(),
+                term_grid.display_offset(),
+                term_grid.topmost_line().0,
+                term_grid.bottommost_line().0,
+            )
+        };
+        if cols == 0 || total_lines == 0 {
+            return (Vec::new(), Vec::new());
         }
-        let display_offset = term_grid.display_offset();
-        let total_lines = term_grid.total_lines();
-        let history_size = total_lines.saturating_sub(rows);
+
+        let history_size = total_lines.saturating_sub(screen_lines);
         let viewport_top = history_size.saturating_sub(display_offset);
-        let style_table = grid.style_table.clone();
-        let mut base_row = grid.row_offset();
+        let base_row = grid.row_offset();
         let origin = self.ensure_session_origin(base_row, viewport_top);
-        if origin != base_row {
-            grid.set_row_offset(origin);
-            base_row = origin;
-        }
 
-        let mut updates = self.render_full_internal(
-            rows,
-            cols,
-            base_row,
-            viewport_top,
-            display_offset,
-            style_table.as_ref(),
-        );
-        self.consume_trim_events(grid, &mut updates);
-        self.need_full_redraw = false;
-        self.term.reset_damage();
-        updates
-    }
-
-    fn render_full_internal(
-        &mut self,
-        rows: usize,
-        cols: usize,
-        base_row: u64,
-        viewport_top: usize,
-        display_offset: usize,
-        style_table: &StyleTable,
-    ) -> EmulatorResult {
+        let style_table = grid.style_table.clone();
         let mut style_updates = Vec::new();
-        let mut emitted_styles = std::collections::HashSet::new();
-        let mut cell_updates = Vec::with_capacity(rows * cols);
-        for visible_line in 0..rows {
-            let Some(absolute_row) = Self::absolute_row_id(base_row, viewport_top, visible_line)
-            else {
-                continue;
+        let mut emitted_styles = HashSet::new();
+        let mut captured_rows = Vec::with_capacity((bottom_line - top_line + 1) as usize);
+
+        for line_idx in top_line..=bottom_line {
+            let line = Line(line_idx);
+            let absolute = if line_idx >= 0 {
+                origin.saturating_add(line_idx as u64)
+            } else {
+                match origin.checked_sub((-line_idx) as u64) {
+                    Some(value) => value,
+                    None => continue,
+                }
             };
-            let line_index = visible_line as isize - display_offset as isize;
-            let line = Line(line_index as i32);
+
+            let mut row_cells = Vec::with_capacity(cols);
             for col in 0..cols {
                 let point = Point::new(line, Column(col));
-                let (packed, style_id, style, is_new) = self.pack_point(point, style_table);
+                let (packed, style_id, style, is_new) =
+                    self.pack_point(point, style_table.as_ref());
                 if is_new || emitted_styles.insert(style_id.0) {
                     let seq = self.next_seq();
                     style_updates.push(CacheUpdate::Style(StyleDefinition::new(
                         style_id, seq, style,
                     )));
                 }
-                let seq = self.next_seq();
-                cell_updates.push(CacheUpdate::Cell(CellWrite::new(
-                    absolute_row,
-                    col,
-                    seq,
-                    packed,
-                )));
+                row_cells.push(packed);
             }
-        }
-        let tail_candidate = self.tail_blank_candidate(base_row, viewport_top, rows);
-        self.seed_tail_blank_row(tail_candidate, &mut cell_updates);
-        style_updates.extend(cell_updates);
-        style_updates
-    }
 
-    #[inline]
-    fn absolute_row_id(base_row: u64, viewport_top: usize, visible_line: usize) -> Option<usize> {
-        let relative = viewport_top.checked_add(visible_line)? as u64;
-        let absolute = base_row.checked_add(relative)?;
-        usize::try_from(absolute).ok()
-    }
-
-    fn collect_updates(&mut self, grid: &TerminalGrid) -> EmulatorResult {
-        let term_grid = self.term.grid();
-        let cols = term_grid.columns();
-        let rows = term_grid.screen_lines();
-        if cols == 0 || rows == 0 {
-            self.term.reset_damage();
-            self.need_full_redraw = false;
-            return Vec::new();
-        }
-
-        let display_offset = term_grid.display_offset();
-        let total_lines = term_grid.total_lines();
-        let history_size = total_lines.saturating_sub(rows);
-        let viewport_top = history_size.saturating_sub(display_offset);
-        let mut base_row = grid.row_offset();
-        let forced_full = self.need_full_redraw;
-        let origin = self.ensure_session_origin(base_row, viewport_top);
-        if origin != base_row {
-            grid.set_row_offset(origin);
-            base_row = origin;
-        }
-        let mut cell_updates = Vec::new();
-        let mut style_updates = Vec::new();
-        let mut emitted_styles = std::collections::HashSet::new();
-        let mut damaged_lines: Vec<(usize, usize, usize)> = Vec::new();
-        let mut touched_cells = 0usize;
-
-        match self.term.damage() {
-            alacritty_terminal::term::TermDamage::Full => {
-                self.need_full_redraw = true;
-            }
-            alacritty_terminal::term::TermDamage::Partial(iter) if !forced_full => {
-                for bounds in iter {
-                    let visible_line = bounds.line.saturating_sub(display_offset);
-                    if visible_line >= rows {
-                        continue;
-                    }
-                    let left = bounds.left.min(cols.saturating_sub(1));
-                    let right = bounds.right.min(cols.saturating_sub(1));
-                    if left > right {
-                        continue;
-                    }
-                    touched_cells =
-                        touched_cells.saturating_add(right.saturating_sub(left).saturating_add(1));
-                    damaged_lines.push((visible_line, left, right));
-                }
-            }
-            _ => {}
+            captured_rows.push(CapturedRow {
+                absolute,
+                cells: row_cells,
+            });
         }
 
         self.term.reset_damage();
+        (captured_rows, style_updates)
+    }
 
-        if self.need_full_redraw || forced_full || touched_cells >= rows.saturating_mul(cols) / 2 {
-            let style_table = grid.style_table.clone();
-            let updates = self.render_full_internal(
-                rows,
-                cols,
-                base_row,
-                viewport_top,
-                display_offset,
-                style_table.as_ref(),
-            );
-            style_updates.extend(updates);
-            self.need_full_redraw = false;
-        } else if !damaged_lines.is_empty() {
-            let style_table = grid.style_table.clone();
-            for (visible_line, left, right) in damaged_lines {
-                let Some(absolute_row) =
-                    Self::absolute_row_id(base_row, viewport_top, visible_line)
-                else {
-                    continue;
-                };
-                let line_index = visible_line as isize - display_offset as isize;
-                let line = Line(line_index as i32);
-                for col in left..=right {
-                    let point = Point::new(line, Column(col));
-                    let (packed, style_id, style, is_new) =
-                        self.pack_point(point, style_table.as_ref());
-                    if is_new && emitted_styles.insert(style_id.0) {
-                        let seq = self.next_seq();
-                        style_updates.push(CacheUpdate::Style(StyleDefinition::new(
-                            style_id, seq, style,
-                        )));
-                    }
+    fn emit_deltas(&mut self, captured: Vec<CapturedRow>) -> EmulatorResult {
+        if captured.is_empty() {
+            self.snapshot.clear();
+            return Vec::new();
+        }
+
+        let mut updates = Vec::new();
+
+        for row in &captured {
+            let Some(prev_cells) = self.snapshot.row(row.absolute) else {
+                if let Ok(row_idx) = usize::try_from(row.absolute) {
                     let seq = self.next_seq();
-                    cell_updates.push(CacheUpdate::Cell(CellWrite::new(
-                        absolute_row,
-                        col,
+                    updates.push(CacheUpdate::Row(RowSnapshot::new(
+                        row_idx,
                         seq,
-                        packed,
+                        row.cells.clone(),
                     )));
+                }
+                continue;
+            };
+
+            if prev_cells.len() != row.cells.len() {
+                if let Ok(row_idx) = usize::try_from(row.absolute) {
+                    let seq = self.next_seq();
+                    updates.push(CacheUpdate::Row(RowSnapshot::new(
+                        row_idx,
+                        seq,
+                        row.cells.clone(),
+                    )));
+                }
+                continue;
+            }
+
+            let mut diff_cells = Vec::new();
+            for (col, (&prev, &curr)) in prev_cells.iter().zip(&row.cells).enumerate() {
+                if prev != curr {
+                    diff_cells.push((col, curr));
+                }
+            }
+
+            if diff_cells.is_empty() {
+                continue;
+            }
+
+            if diff_cells.len() > row.cells.len() / 2 {
+                if let Ok(row_idx) = usize::try_from(row.absolute) {
+                    let seq = self.next_seq();
+                    updates.push(CacheUpdate::Row(RowSnapshot::new(
+                        row_idx,
+                        seq,
+                        row.cells.clone(),
+                    )));
+                }
+            } else if let Ok(row_idx) = usize::try_from(row.absolute) {
+                for (col, cell) in diff_cells {
+                    let seq = self.next_seq();
+                    updates.push(CacheUpdate::Cell(CellWrite::new(row_idx, col, seq, cell)));
                 }
             }
         }
 
-        if !(self.need_full_redraw || forced_full || touched_cells >= rows.saturating_mul(cols) / 2)
-        {
-            let tail_candidate = self.tail_blank_candidate(base_row, viewport_top, rows);
-            self.seed_tail_blank_row(tail_candidate, &mut cell_updates);
-        }
+        let base_row = captured
+            .first()
+            .map(|row| row.absolute)
+            .unwrap_or(self.snapshot.base_row.unwrap_or(0));
+        let snapshot_rows = captured.into_iter().map(|row| row.cells).collect();
+        self.snapshot.replace(base_row, snapshot_rows);
 
-        style_updates.extend(cell_updates);
-        self.consume_trim_events(grid, &mut style_updates);
-        style_updates
+        updates
+    }
+
+    fn collect_full_diff(&mut self, grid: &TerminalGrid) -> EmulatorResult {
+        let (captured_rows, mut style_updates) = self.capture_full_grid(grid);
+        let mut updates = self.emit_deltas(captured_rows);
+        if !style_updates.is_empty() {
+            style_updates.extend(updates);
+            updates = style_updates;
+        }
+        self.consume_trim_events(grid, &mut updates);
+        updates
     }
 }
 
@@ -559,18 +498,16 @@ impl TerminalEmulator for AlacrittyEmulator {
                 self.parser.advance(&mut self.term, *byte);
             }
         }
-        self.collect_updates(grid)
+        self.collect_full_diff(grid)
     }
 
     fn flush(&mut self, grid: &TerminalGrid) -> EmulatorResult {
-        self.need_full_redraw = true;
-        self.render_full(grid)
+        self.collect_full_diff(grid)
     }
 
     fn resize(&mut self, rows: usize, cols: usize) {
         let dims = TermDimensions::new(cols.max(1), rows.max(1));
         self.term.resize(dims);
-        self.need_full_redraw = true;
     }
 }
 
@@ -632,6 +569,7 @@ fn style_from_heavy(cell: &HeavyCell) -> Style {
 mod tests {
     use super::*;
     use crate::cache::terminal::unpack_cell;
+    use crate::server::terminal::apply_update;
 
     #[test_timeout::timeout]
     fn ascii_output_produces_cell_updates() {
@@ -674,22 +612,46 @@ mod tests {
     }
 
     #[test_timeout::timeout]
-    fn newline_triggers_tail_blank_seed() {
-        let grid = TerminalGrid::new(4, 10);
+    fn alacritty_emits_scrollback_cells() {
+        let grid = TerminalGrid::new(24, 80);
         let mut emulator = AlacrittyEmulator::new(&grid);
 
-        let updates = emulator.handle_output(b"hello\n", &grid);
-        let mut saw_blank = false;
-        for update in updates {
-            if let CacheUpdate::Cell(cell) = update {
-                let (ch, _) = unpack_cell(cell.cell);
-                if cell.row == 1 && cell.col == 0 && ch == ' ' {
-                    saw_blank = true;
-                    break;
+        let burst = (1..=150)
+            .map(|i| format!("Line {i}: Test\n"))
+            .collect::<String>();
+
+        let updates = emulator.handle_output(burst.as_bytes(), &grid);
+        for update in &updates {
+            apply_update(&grid, update);
+        }
+
+        assert!(
+            grid_contains(&grid, "Line 1: Test"),
+            "missing earliest line"
+        );
+        assert!(
+            grid_contains(&grid, "Line 150: Test"),
+            "missing latest line"
+        );
+    }
+
+    fn grid_contains(grid: &TerminalGrid, needle: &str) -> bool {
+        let mut buffer = vec![0u64; grid.cols()];
+        let first = grid.first_row_id().unwrap_or(0);
+        let last = grid.last_row_id().unwrap_or(first);
+        for absolute in first..=last {
+            if let Some(index) = grid.index_of_row(absolute) {
+                if grid.snapshot_row_into(index, &mut buffer).is_ok() {
+                    let text: String = buffer
+                        .iter()
+                        .map(|cell| unpack_cell(PackedCell::from(*cell)).0)
+                        .collect();
+                    if text.trim_end().contains(needle) {
+                        return true;
+                    }
                 }
             }
         }
-
-        assert!(saw_blank, "expected blank cell for tail row");
+        false
     }
 }

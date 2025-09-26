@@ -302,9 +302,20 @@ mod tests {
         let mut timeout = Duration::from_secs(1);
         while collected.len() < 5 && timeout > Duration::from_millis(0) {
             if let Some(update) = updates.recv().await {
-                if let CacheUpdate::Cell(cell) = update {
-                    let (ch, _) = crate::cache::terminal::unpack_cell(cell.cell);
-                    collected.push(ch);
+                match update {
+                    CacheUpdate::Cell(cell) => {
+                        let (ch, _) = crate::cache::terminal::unpack_cell(cell.cell);
+                        collected.push(ch);
+                    }
+                    CacheUpdate::Row(row) => {
+                        let line: String = row
+                            .cells
+                            .iter()
+                            .map(|cell| unpack_cell(PackedCell::from(*cell)).0)
+                            .collect();
+                        collected.push_str(line.trim_end());
+                    }
+                    _ => {}
                 }
             } else {
                 break;

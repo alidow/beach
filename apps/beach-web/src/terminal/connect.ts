@@ -4,6 +4,7 @@ import {
 } from '../transport/terminalTransport';
 import { connectWebRtcTransport } from '../transport/webrtc';
 import { SignalingClient } from '../transport/signaling';
+import type { SignalingClientOptions } from '../transport/signaling';
 
 export interface BrowserTransportConnection {
   transport: TerminalTransport;
@@ -17,6 +18,7 @@ export interface ConnectBrowserTransportOptions {
   passcode?: string;
   iceServers?: RTCIceServer[];
   logger?: (message: string) => void;
+  createSocket?: SignalingClientOptions['createSocket'];
 }
 
 export async function connectBrowserTransport(
@@ -28,6 +30,7 @@ export async function connectBrowserTransport(
     url: websocketUrl,
     passphrase: options.passcode,
     supportedTransports: ['webrtc'],
+    createSocket: options.createSocket,
   });
   const { transport: webRtcTransport } = await connectWebRtcTransport({
     signaling,
@@ -37,7 +40,9 @@ export async function connectBrowserTransport(
     iceServers: options.iceServers,
     logger: options.logger,
   });
-  const transport = new DataChannelTerminalTransport(webRtcTransport);
+  const transport = new DataChannelTerminalTransport(webRtcTransport, {
+    logger: options.logger,
+  });
   return {
     transport,
     signaling,

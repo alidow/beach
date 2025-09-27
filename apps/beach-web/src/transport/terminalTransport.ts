@@ -13,19 +13,33 @@ export interface TerminalTransport extends EventTarget {
   close(): void;
 }
 
+interface DataChannelTerminalTransportOptions {
+  logger?: (message: string) => void;
+}
+
 export class DataChannelTerminalTransport extends EventTarget implements TerminalTransport {
   private readonly channel: WebRtcTransport;
+  private readonly logger?: (message: string) => void;
+  private framesSeen = 0;
 
-  constructor(channel: WebRtcTransport) {
+  constructor(channel: WebRtcTransport, options: DataChannelTerminalTransportOptions = {}) {
     super();
     this.channel = channel;
+    this.logger = options.logger;
     this.channel.addEventListener('message', (event) => {
       const { payload } = event.detail;
       if (payload.kind === 'binary') {
         try {
           const frame = decodeHostFrameBinary(payload.data);
+          this.framesSeen += 1;
+          if (this.framesSeen <= 5) {
+            this.log(`received host frame #${this.framesSeen} (${frame.type})`);
+          } else if (this.framesSeen % 50 === 0) {
+            this.log(`received host frame #${this.framesSeen} (${frame.type})`);
+          }
           this.dispatchEvent(new CustomEvent<HostFrame>('frame', { detail: frame }));
         } catch (error) {
+          this.log(`failed to decode host frame: ${error instanceof Error ? error.message : String(error)}`);
           const err = new Event('error');
           Object.assign(err, { error });
           this.dispatchEvent(err);
@@ -33,8 +47,10 @@ export class DataChannelTerminalTransport extends EventTarget implements Termina
       } else {
         const text = payload.text.trim();
         if (text === '__ready__' || text === '__offer_ready__') {
+          this.log(`received transport sentinel: ${text}`);
           return;
         }
+        this.log(`unexpected text payload on data channel: ${text}`);
         const err = new Event('error');
         Object.assign(err, { error: new Error(`unexpected text payload: ${text}`) });
         this.dispatchEvent(err);
@@ -52,6 +68,13 @@ export class DataChannelTerminalTransport extends EventTarget implements Termina
 
   close(): void {
     this.channel.close();
+  }
+
+  private log(message: string): void {
+    if (!this.logger) {
+      return;
+    }
+    this.logger(`[terminal transport] ${message}`);
   }
 }
 

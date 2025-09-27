@@ -87,16 +87,21 @@ export class WebRtcTransport extends EventTarget {
   }
 
   private attachChannelListeners(): void {
-    this.channel.addEventListener('open', (event) => {
-      this.dispatchEvent(event);
+    // Never re-dispatch the same event object that's currently being dispatched
+    // by the underlying RTCDataChannel — doing so can throw InvalidStateError.
+    this.channel.addEventListener('open', () => {
+      this.dispatchEvent(new Event('open'));
     });
 
-    this.channel.addEventListener('close', (event) => {
-      this.dispatchEvent(event);
+    this.channel.addEventListener('close', () => {
+      this.dispatchEvent(new Event('close'));
     });
 
     this.channel.addEventListener('error', (event) => {
-      this.dispatchEvent(event);
+      const cloned = new Event('error');
+      // Preserve error detail if present on the original event
+      Object.assign(cloned, { error: (event as any).error ?? event });
+      this.dispatchEvent(cloned);
     });
 
     this.channel.addEventListener('message', (event) => {
@@ -156,6 +161,8 @@ export interface ConnectedWebRtcTransport {
   remotePeerId: string;
 }
 
+const ANSWER_FLUSH_DELAY_MS = 400;
+
 export async function connectWebRtcTransport(
   options: ConnectWebRtcTransportOptions,
 ): Promise<ConnectedWebRtcTransport> {
@@ -175,19 +182,50 @@ export async function connectWebRtcTransport(
     log(logger, `transport negotiation proposal failed: ${String(error)}`);
   }
 
-  const pc = new RTCPeerConnection({ iceServers: options.iceServers });
-  const disposeSignalListener = attachSignalListener(signaling, remotePeerId, pc, logger);
+  const pc = new RTCPeerConnection({
+    iceServers:
+      options.iceServers && options.iceServers.length > 0
+        ? options.iceServers
+        : [{ urls: 'stun:stun.l.google.com:19302' }],
+  });
+  // Queue remote ICE candidates until the remote description is set.
+  let remoteDescriptionSet = false;
+  const pendingRemoteCandidates: RTCIceCandidateInit[] = [];
+  const onRemoteCandidate = (cand: RTCIceCandidateInit) => {
+    if (!remoteDescriptionSet) {
+      pendingRemoteCandidates.push(cand);
+      return;
+    }
+    pc.addIceCandidate(cand).catch((error) => log(logger, `ice add failed: ${error}`));
+  };
+  const disposeSignalListener = attachSignalListener(
+    signaling,
+    remotePeerId,
+    onRemoteCandidate,
+    logger,
+  );
   const disposeGeneralListener = attachGeneralListener(signaling, remotePeerId, logger);
 
   pc.onconnectionstatechange = () => {
     log(logger, `peer connection state: ${pc.connectionState}`);
   };
+  pc.onsignalingstatechange = () => {
+    log(logger, `signaling state: ${pc.signalingState}`);
+  };
+  pc.oniceconnectionstatechange = () => {
+    log(logger, `ice connection state: ${pc.iceConnectionState}`);
+  };
+  const pendingLocalCandidates: RTCIceCandidateInit[] = [];
+  const allLocalCandidates: RTCIceCandidateInit[] = [];
+  let candidateSendState: 'blocked' | 'delayed' | 'ready' = 'blocked';
+  let flushTimer: ReturnType<typeof setTimeout> | null = null;
+  let resendTimer: ReturnType<typeof setTimeout> | null = null;
+  let resendAttempts = 0;
+  const MAX_RESEND_ATTEMPTS = 3;
+  const RESEND_INTERVAL_MS = 1200;
 
-  pc.onicecandidate = (event) => {
-    if (!event.candidate) {
-      return;
-    }
-    const candidate = event.candidate.toJSON();
+  const dispatchCandidate = (candidate: RTCIceCandidateInit) => {
+    log(logger, `sending local candidate: ${JSON.stringify(candidate)}`);
     signaling.send({
       type: 'signal',
       to_peer: remotePeerId,
@@ -195,12 +233,78 @@ export async function connectWebRtcTransport(
         transport: 'webrtc',
         signal: {
           signal_type: 'ice_candidate',
-          candidate: candidate.candidate,
+          candidate: candidate.candidate ?? '',
           sdp_mid: candidate.sdpMid ?? undefined,
           sdp_mline_index: candidate.sdpMLineIndex ?? undefined,
         },
       },
     });
+  };
+
+  const flushPendingCandidates = () => {
+    if (pendingLocalCandidates.length === 0) {
+      return;
+    }
+    while (pendingLocalCandidates.length > 0) {
+      const candidate = pendingLocalCandidates.shift()!;
+      dispatchCandidate(candidate);
+    }
+    scheduleResend();
+  };
+
+  const scheduleFlush = (delayMs: number) => {
+    if (flushTimer !== null) {
+      return;
+    }
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      candidateSendState = 'ready';
+      flushPendingCandidates();
+    }, delayMs);
+  };
+
+  const scheduleResend = () => {
+    if (candidateSendState !== 'ready') {
+      return;
+    }
+    if (resendTimer !== null || resendAttempts >= MAX_RESEND_ATTEMPTS) {
+      return;
+    }
+    resendTimer = setTimeout(() => {
+      resendTimer = null;
+      resendAttempts += 1;
+      for (const candidate of allLocalCandidates) {
+        dispatchCandidate({ ...candidate });
+      }
+      if (resendAttempts < MAX_RESEND_ATTEMPTS) {
+        scheduleResend();
+      }
+    }, RESEND_INTERVAL_MS);
+  };
+
+  pc.onicegatheringstatechange = () => {
+    log(logger, `ice gathering state: ${pc.iceGatheringState}`);
+  };
+
+  pc.onicecandidate = (event) => {
+    if (!event.candidate) {
+      return;
+    }
+    const candidate = event.candidate.toJSON();
+    log(logger, `local candidate queued: ${JSON.stringify(candidate)}`);
+    const stored: RTCIceCandidateInit = {
+      candidate: candidate.candidate,
+      sdpMid: candidate.sdpMid ?? undefined,
+      sdpMLineIndex: candidate.sdpMLineIndex ?? undefined,
+      usernameFragment: candidate.usernameFragment ?? undefined,
+    };
+    pendingLocalCandidates.push(stored);
+    allLocalCandidates.push(stored);
+    if (candidateSendState === 'ready') {
+      flushPendingCandidates();
+    } else if (candidateSendState === 'delayed') {
+      scheduleFlush(ANSWER_FLUSH_DELAY_MS);
+    }
   };
 
   try {
@@ -214,6 +318,22 @@ export async function connectWebRtcTransport(
       pollIntervalMs: options.pollIntervalMs,
       remotePeerId,
       logger,
+      afterSetRemoteDescription: () => {
+        remoteDescriptionSet = true;
+        // Drain any queued remote candidates now that the offer is applied.
+        while (pendingRemoteCandidates.length > 0) {
+          const cand = pendingRemoteCandidates.shift()!;
+          pc.addIceCandidate(cand).catch((error) => log(logger, `ice add failed: ${error}`));
+        }
+      },
+      beforePostAnswer: () => {
+        candidateSendState = 'delayed';
+      },
+      afterPostAnswer: () => {
+        if (candidateSendState === 'delayed') {
+          scheduleFlush(ANSWER_FLUSH_DELAY_MS);
+        }
+      },
     });
   } finally {
     disposeSignalListener();
@@ -224,7 +344,7 @@ export async function connectWebRtcTransport(
 function attachSignalListener(
   signaling: SignalingClient,
   remotePeerId: string,
-  pc: RTCPeerConnection,
+  onRemoteCandidate: (cand: RTCIceCandidateInit) => void,
   logger?: (message: string) => void,
 ): () => void {
   const handler = (event: Event) => {
@@ -246,7 +366,7 @@ function attachSignalListener(
         sdpMLineIndex: signal.signal.sdp_mline_index ?? undefined,
       };
       log(logger, 'received remote ice candidate');
-      pc.addIceCandidate(candidate).catch((error) => log(logger, `ice add failed: ${error}`));
+      onRemoteCandidate(candidate);
     }
   };
 
@@ -339,22 +459,35 @@ async function connectAsAnswerer(options: {
   pollIntervalMs: number;
   remotePeerId: string;
   logger?: (message: string) => void;
+  afterSetRemoteDescription?: () => void;
+  beforePostAnswer?: () => void;
+  afterPostAnswer?: () => void;
 }): Promise<ConnectedWebRtcTransport> {
   const { pc, signalingUrl, pollIntervalMs, remotePeerId, logger } = options;
   log(logger, 'polling for SDP offer');
   const offer = await pollSdp(`${signalingUrl.replace(/\/$/, '')}/offer`, pollIntervalMs, logger);
   log(logger, 'SDP offer received');
   const channelPromise = waitForDataChannel(pc, remotePeerId, logger);
+  log(logger, 'waiting for data channel announcement');
 
   await pc.setRemoteDescription({ type: offer.type as RTCSdpType, sdp: offer.sdp });
+  try {
+    options.afterSetRemoteDescription?.();
+  } catch {}
 
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
+  try {
+    options.beforePostAnswer?.();
+  } catch {}
   await postSdp(`${signalingUrl.replace(/\/$/, '')}/answer`, {
     sdp: answer.sdp ?? '',
     type: answer.type,
   });
   log(logger, 'SDP answer posted');
+  try {
+    options.afterPostAnswer?.();
+  } catch {}
 
   return await channelPromise;
 }
@@ -414,6 +547,7 @@ async function pollSdp(
   while (Date.now() < deadline) {
     const payload = await fetchSdp(url);
     if (payload) {
+      log(logger, `polled SDP at ${url}`);
       return payload;
     }
     await delay(pollIntervalMs);

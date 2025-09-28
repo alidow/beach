@@ -340,10 +340,9 @@ export function buildLines(snapshot: TerminalGridSnapshot, limit: number): Rende
         styleId: cell.styleId ?? 0,
       }));
       let cursorCol: number | null = null;
-      if (snapshot.cursorRow === row.absolute && snapshot.cursorCol !== null && cells.length > 0) {
-        const maxIndex = Math.max(cells.length - 1, 0);
-        const clamped = Math.min(Math.max(snapshot.cursorCol, 0), maxIndex);
-        cursorCol = Number.isFinite(clamped) ? clamped : null;
+      if (snapshot.cursorRow === row.absolute && snapshot.cursorCol !== null) {
+        const raw = Math.floor(Math.max(snapshot.cursorCol, 0));
+        cursorCol = Number.isFinite(raw) ? raw : null;
       }
       lines.push({ absolute: row.absolute, kind: 'loaded', cells, cursorCol });
       continue;
@@ -364,11 +363,14 @@ function LineRow({ line, styles }: { line: RenderLine; styles: Map<number, Style
     return <div className={className}>{text}</div>;
   }
 
+  const cursorCol = line.cursorCol ?? null;
+  const baseStyleDef = styles.get(0) ?? { id: 0, fg: 0, bg: 0, attrs: 0 };
+
   return (
     <div>
       {line.cells.map((cell, index) => {
         const styleDef = styles.get(cell.styleId);
-        const isCursor = line.cursorCol !== null && line.cursorCol === index;
+        const isCursor = cursorCol !== null && cursorCol === index;
         const style = styleDef ? styleFromDefinition(styleDef, isCursor) : undefined;
         const char = cell.char === ' ' ? ' ' : cell.char;
         return (
@@ -377,6 +379,9 @@ function LineRow({ line, styles }: { line: RenderLine; styles: Map<number, Style
           </span>
         );
       })}
+      {cursorCol !== null && cursorCol >= line.cells.length ? (
+        <span key="cursor" style={styleFromDefinition(baseStyleDef, true)}> </span>
+      ) : null}
     </div>
   );
 }

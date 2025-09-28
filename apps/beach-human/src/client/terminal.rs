@@ -43,6 +43,7 @@ const TMUX_PREFIX_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[cfg(test)]
 mod clipboard {
+    #[allow(unused_imports)]
     use super::*;
     use std::cell::RefCell;
 
@@ -74,6 +75,7 @@ mod clipboard {
 
 #[cfg(not(test))]
 mod clipboard {
+    #[allow(unused_imports)]
     use super::*;
 
     pub fn set(contents: &str) -> Result<(), String> {
@@ -201,6 +203,8 @@ pub struct TerminalClient {
     forward_mouse_to_host: bool,
     tmux_prefix_started_at: Option<Instant>,
     subscription_id: Option<u64>,
+    handshake_history_rows: u64,
+    handshake_snapshot_lines: u32,
     next_backfill_request_id: u64,
     pending_backfills: Vec<BackfillRequestState>,
     last_backfill_request_at: Option<Instant>,
@@ -237,6 +241,8 @@ impl TerminalClient {
             forward_mouse_to_host: false,
             tmux_prefix_started_at: None,
             subscription_id: None,
+            handshake_history_rows: 0,
+            handshake_snapshot_lines: 0,
             next_backfill_request_id: 1,
             pending_backfills: Vec::new(),
             last_backfill_request_at: None,
@@ -376,7 +382,7 @@ impl TerminalClient {
             WireHostFrame::Hello {
                 subscription,
                 max_seq,
-                ..
+                config,
             } => {
                 self.subscription_id = Some(subscription);
                 self.last_seq = cmp::max(self.last_seq, max_seq);
@@ -389,6 +395,8 @@ impl TerminalClient {
                 self.last_tail_backfill_start = None;
                 self.last_gap_backfill_start = None;
                 self.empty_tail_ranges.clear();
+                self.handshake_snapshot_lines = config.initial_snapshot_lines;
+                self.handshake_history_rows = 0;
             }
             WireHostFrame::Grid {
                 viewport_rows,
@@ -410,6 +418,7 @@ impl TerminalClient {
                 self.cursor_col = 0;
                 self.renderer.clear_all_predictions();
                 self.pending_predictions.clear();
+                self.handshake_history_rows = history_rows as u64;
             }
             WireHostFrame::Snapshot {
                 updates, watermark, ..
@@ -524,6 +533,23 @@ impl TerminalClient {
         };
         self.prune_backfill_requests();
         if !self.has_loaded_rows {
+            return Ok(());
+        }
+
+        if self.renderer.is_following_tail()
+            && self.pending_backfills.is_empty()
+            && self.last_backfill_request_at.is_none()
+            && self.next_backfill_request_id == 1
+            && self.renderer.total_rows() > self.renderer.viewport_height() as u64
+            && self.handshake_history_rows > self.handshake_snapshot_lines as u64
+        {
+            if let Some((start, span)) = self.renderer.first_unloaded_range(BACKFILL_LOOKAHEAD_ROWS) {
+                let count = span.min(BACKFILL_MAX_ROWS_PER_REQUEST);
+                if count > 0 {
+                    self.send_backfill_request(subscription, start, count)?;
+                    self.last_backfill_request_at = Some(Instant::now());
+                }
+            }
             return Ok(());
         }
 
@@ -1996,7 +2022,11 @@ impl TerminalClient {
         if step == 0 {
             return;
         }
-        self.move_copy_cursor(pages.saturating_mul(step), 0);
+        let delta = pages.saturating_mul(step);
+        let moved = self.apply_scroll_delta(delta, false);
+        if moved == 0 {
+            self.move_copy_cursor(delta, 0);
+        }
     }
 
     fn move_copy_cursor_half_page(&mut self, delta: isize) {
@@ -2008,7 +2038,11 @@ impl TerminalClient {
             return;
         }
         let step = (height / 2).max(1);
-        self.move_copy_cursor(delta.saturating_mul(step), 0);
+        let lines = delta.saturating_mul(step);
+        let moved = self.apply_scroll_delta(lines, false);
+        if moved == 0 {
+            self.move_copy_cursor(lines, 0);
+        }
     }
 
     fn move_copy_cursor_word(&mut self, motion: WordMotion) {
@@ -3380,15 +3414,6 @@ fn mouse_button_code(button: MouseButton) -> Option<u16> {
         client
             .maybe_request_backfill()
             .expect("request backfill after snapshot");
-
-        dbg!(
-            client.renderer.is_following_tail(),
-            client.has_loaded_rows,
-            client.subscription_id,
-            client.pending_backfills.len(),
-            client.known_base_row,
-            client.highest_loaded_row
-        );
 
         let initial_requests = transport.take();
         assert_eq!(

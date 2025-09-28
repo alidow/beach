@@ -348,20 +348,18 @@ export class TerminalGridCache {
         return { kind: 'row_width', row: update.row };
       case 'rect': {
         const [rowStart, rowEnd] = update.rows;
-        const [colStart, colEnd] = update.cols;
-        if (rowEnd <= rowStart || colEnd <= colStart) {
+        if (rowEnd <= rowStart) {
           return null;
         }
         const targetRow = rowEnd - 1;
-        const targetCol = colEnd;
-        if (targetRow < 0 || targetCol < 0) {
+        if (targetRow < 0) {
           return null;
         }
-        return { kind: 'exact', row: targetRow, col: targetCol };
+        return { kind: 'row_width', row: targetRow };
       }
       case 'row_segment': {
         if (update.cells.length === 0) {
-          return null;
+          return { kind: 'row_width', row: update.row };
         }
         const col = update.startCol + update.cells.length;
         return { kind: 'exact', row: update.row, col };

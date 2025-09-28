@@ -15,7 +15,6 @@ export interface BeachTerminalProps {
   store?: TerminalGridStore;
   transport?: TerminalTransport;
   className?: string;
-  style?: React.CSSProperties;
   fontFamily?: string;
   fontSize?: number;
 }
@@ -29,7 +28,6 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     transport: providedTransport,
     store: providedStore,
     className,
-    style,
     fontFamily = "'SFMono-Regular', 'Menlo', 'Consolas', monospace",
     fontSize = 14,
   } = props;
@@ -52,17 +50,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   if (import.meta.env.DEV) {
     (window as any).beachLines = lines;
   }
-  const linesRef = useRef<RenderLine[]>(lines);
   const [minimumRows, setMinimumRows] = useState(24);
   const lineHeight = computeLineHeight(fontSize);
   const backfillController = useMemo(
     () => new BackfillController(store, (frame) => transportRef.current?.send(frame)),
     [store],
   );
-
-  useEffect(() => {
-    linesRef.current = lines;
-  }, [lines]);
 
   useEffect(() => {
     transportRef.current = providedTransport ?? null;
@@ -123,11 +116,13 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       if (!entry) {
         return;
       }
-      const viewportRows = Math.max(1, Math.floor(entry.contentRect.height / lineHeight));
+      const measured = Math.max(1, Math.floor(entry.contentRect.height / lineHeight));
+      const viewportRows = Math.max(minimumRows, measured);
       if (import.meta.env.DEV) {
         console.debug('[beach-web] resize', {
           height: entry.contentRect.height,
           lineHeight,
+          measuredRows: measured,
           viewportRows,
         });
       }
@@ -139,7 +134,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     });
     observer.observe(element);
     return () => observer.disconnect();
-  }, [lineHeight, store]);
+  }, [lineHeight, minimumRows, store]);
 
   useEffect(() => () => connectionRef.current?.close(), []);
 
@@ -160,64 +155,52 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     sendFrame(transport, { type: 'input', seq, data: payload });
   };
 
-  const handleScroll: React.UIEventHandler<HTMLDivElement> = (event) => {
-    const element = event.currentTarget;
-    const linesSnapshot = linesRef.current;
-    const firstAbsolute = linesSnapshot[0]?.absolute ?? snapshot.baseRow;
-    const approxRow = firstAbsolute + Math.floor(element.scrollTop / lineHeight);
-    const viewportRows = Math.max(1, Math.floor(element.clientHeight / lineHeight));
-    store.setViewport(approxRow, viewportRows);
-
-    const nearBottom =
-      element.scrollHeight - (element.scrollTop + element.clientHeight) < lineHeight * 2;
-    store.setFollowTail(nearBottom);
-    backfillController.maybeRequest(store.getSnapshot(), nearBottom);
-  };
+  const containerClasses = ['beach-terminal flex-1 overflow-auto whitespace-pre font-mono text-sm text-slate-100 bg-slate-950/95 border border-slate-800/60 rounded-xl shadow-inner px-4 py-3', className]
+    .filter(Boolean)
+    .join(' ');
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
+    <div className="flex flex-col gap-3">
       <div
         ref={containerRef}
-        className={className}
+        className={containerClasses}
+        tabIndex={0}
+        onKeyDown={handleKeyDown}
         style={{
-          ...style,
-          flex: 1,
-          minHeight: lineHeight * Math.max(1, minimumRows),
-          height: '100%',
-          overflow: 'auto',
           fontFamily,
           fontSize,
           lineHeight: `${lineHeight}px`,
-          color: '#f8fafc',
-          background: '#020617',
-          borderRadius: 8,
-          padding: '12px 16px',
-          whiteSpace: 'pre',
-          outline: 'none',
+          minHeight: lineHeight * Math.max(1, minimumRows),
         }}
-        tabIndex={0}
-        onKeyDown={handleKeyDown}
-        onScroll={handleScroll}
       >
         {lines.map((line) => (
-          <div key={line.absolute} style={{ opacity: line.kind === 'pending' ? 0.4 : 1 }}>
+          <div
+            key={line.absolute}
+            className={line.kind === 'pending' ? 'opacity-60' : undefined}
+          >
             {line.text}
           </div>
         ))}
       </div>
-      <footer style={{ marginTop: 8, fontSize: 12, opacity: 0.6, fontFamily }}>
-        {status === 'error' && error
-          ? `Error: ${error.message}`
-          : status === 'connected'
-            ? 'Connected'
-            : status === 'connecting'
-              ? 'Connecting…'
-              : status === 'closed'
-                ? 'Disconnected'
-                : 'Idle'}
-      </footer>
+      <footer className="text-xs text-slate-400">{renderStatus()}</footer>
     </div>
   );
+
+  function renderStatus(): string {
+    if (status === 'error' && error) {
+      return `Error: ${error.message}`;
+    }
+    if (status === 'connected') {
+      return 'Connected';
+    }
+    if (status === 'connecting') {
+      return 'Connecting…';
+    }
+    if (status === 'closed') {
+      return 'Disconnected';
+    }
+    return 'Idle';
+  }
 
   function bindTransport(transport: TerminalTransport): void {
     const frameHandler = (event: Event) => {

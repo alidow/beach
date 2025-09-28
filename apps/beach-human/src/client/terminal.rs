@@ -1674,21 +1674,30 @@ impl TerminalClient {
             self.enter_copy_mode();
         }
 
+        let before_top = self.renderer.viewport_top();
         self.renderer.scroll_lines(delta);
+        let after_top = self.renderer.viewport_top();
+        let actual_delta = if after_top >= before_top {
+            (after_top - before_top) as i64
+        } else {
+            -((before_top - after_top) as i64)
+        };
 
         if self.copy_mode.is_some() {
-            let (row, col) = {
-                let state = self.copy_mode.as_ref().unwrap();
-                (state.cursor.row, state.cursor.col)
-            };
-            let target_row = row as i64 + delta as i64;
-            let new_pos = self.renderer.clamp_position(target_row, col as isize);
-            self.set_copy_cursor_position(new_pos);
-        } else if delta > 0 && self.renderer.is_following_tail() {
+            if actual_delta != 0 {
+                let (row, col) = {
+                    let state = self.copy_mode.as_ref().unwrap();
+                    (state.cursor.row, state.cursor.col)
+                };
+                let target_row = row as i64 + actual_delta;
+                let new_pos = self.renderer.clamp_position(target_row, col as isize);
+                self.set_copy_cursor_position(new_pos);
+            }
+        } else if actual_delta > 0 && self.renderer.is_following_tail() {
             self.renderer.scroll_to_tail();
         }
 
-        if self.copy_mode.is_some() && delta > 0 && self.renderer.is_following_tail() {
+        if self.copy_mode.is_some() && actual_delta > 0 && self.renderer.is_following_tail() {
             self.exit_copy_mode();
         }
 
@@ -2782,6 +2791,40 @@ mod tests {
         client.process_copy_mode_key(&key(KeyCode::Char('d'), KeyModifiers::CONTROL));
         let cursor = client.copy_mode.as_ref().unwrap().cursor;
         assert_eq!(cursor.row, 6);
+    }
+
+    #[test]
+    fn mouse_scroll_selection_tracks_actual_viewport_delta() {
+        let mut client = new_client();
+        client.renderer.on_resize(80, 4);
+        client.renderer.ensure_size(6, 32);
+        for row in 0..6 {
+            let text = format!("line {row:02}");
+            client
+                .renderer
+                .apply_row_from_text(row, (row + 1) as u64, &text);
+        }
+        client.renderer.scroll_to_tail();
+
+        client.enter_copy_mode();
+        {
+            let state = client.copy_mode.as_mut().unwrap();
+            state.begin_selection(SelectionMode::Character);
+        }
+
+        client.move_copy_cursor(-1, 0);
+        let initial_row = client.copy_mode.as_ref().unwrap().cursor.row;
+        assert_eq!(initial_row, 4);
+
+        let before_top = client.renderer.viewport_top();
+        client.handle_mouse_scroll(-20);
+        let after_up = client.copy_mode.as_ref().unwrap().cursor.row;
+        assert_eq!(before_top, 4);
+        assert_eq!(after_up, 0, "scroll up should move cursor by actual delta");
+
+        client.handle_mouse_scroll(20);
+        let final_row = client.copy_mode.as_ref().unwrap().cursor.row;
+        assert_eq!(final_row, initial_row, "reverse scroll should restore cursor row");
     }
 
     #[test]

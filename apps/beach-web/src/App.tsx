@@ -8,130 +8,62 @@ export default function App(): JSX.Element {
   const [autoConnect, setAutoConnect] = useState(false);
 
   return (
-    <main style={styles.shell}>
-      <section style={styles.panel}>
-        <h1 style={styles.heading}>Beach Web</h1>
-        <p style={styles.text}>Experimental React/WebRTC terminal client.</p>
-        <div style={styles.formGrid}>
-          <label style={styles.label}>
+    <main className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-6">
+      <section className="w-full max-w-3xl rounded-2xl bg-slate-900 shadow-2xl shadow-slate-950/40 flex flex-col gap-6 p-10">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Beach Web</h1>
+          <p className="text-slate-300">Experimental React/WebRTC terminal client.</p>
+        </div>
+
+        <div className="grid gap-4">
+          <label className="flex flex-col gap-2 text-sm font-semibold uppercase tracking-[0.08em] text-slate-300">
             Session ID
             <input
-              style={styles.input}
               value={sessionId}
               onChange={(event) => setSessionId(event.target.value)}
               placeholder="00000000-0000-0000-0000-000000000000"
+              className="rounded-lg border border-slate-700/60 bg-slate-950/60 px-4 py-3 text-base text-slate-100 placeholder:text-slate-500 focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/40"
             />
           </label>
-          <label style={styles.label}>
+          <label className="flex flex-col gap-2 text-sm font-semibold uppercase tracking-[0.08em] text-slate-300">
             Base URL
             <input
-              style={styles.input}
               value={baseUrl}
               onChange={(event) => setBaseUrl(event.target.value)}
               placeholder="http://127.0.0.1:8080"
+              className="rounded-lg border border-slate-700/60 bg-slate-950/60 px-4 py-3 text-base text-slate-100 placeholder:text-slate-500 focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/40"
             />
           </label>
-          <label style={styles.label}>
+          <label className="flex flex-col gap-2 text-sm font-semibold uppercase tracking-[0.08em] text-slate-300">
             Passcode
             <input
-              style={styles.input}
               value={passcode}
               onChange={(event) => setPasscode(event.target.value)}
               placeholder="optional"
+              className="rounded-lg border border-slate-700/60 bg-slate-950/60 px-4 py-3 text-base text-slate-100 placeholder:text-slate-500 focus:border-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/40"
             />
           </label>
         </div>
-        <label style={styles.checkboxRow}>
+
+        <label className="flex items-center gap-3 text-sm font-semibold uppercase tracking-[0.08em] text-slate-300">
           <input
             type="checkbox"
             checked={autoConnect}
             onChange={(event) => setAutoConnect(event.target.checked)}
+            className="size-4 rounded border border-slate-600 bg-slate-950/80 text-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-500/40"
           />
           Auto connect
         </label>
-        <div style={styles.terminalShell}>
+
+        <div className="rounded-xl border border-slate-700/50 bg-slate-950/90 p-3">
           <BeachTerminal
             sessionId={sessionId || undefined}
             baseUrl={baseUrl || undefined}
             passcode={passcode || undefined}
             autoConnect={autoConnect}
-            style={{ flex: 1, minHeight: 0 }}
           />
         </div>
       </section>
     </main>
   );
 }
-
-const styles: Record<string, React.CSSProperties> = {
-  shell: {
-    minHeight: '100vh',
-    margin: 0,
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    background: '#0b1021',
-    color: '#f8fafc',
-    fontFamily: "'SF Pro Text', 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
-    padding: '3rem 1.5rem',
-  },
-  panel: {
-    width: 'min(720px, 95vw)',
-    minHeight: '70vh',
-    background: '#11162b',
-    borderRadius: 16,
-    padding: '2.5rem',
-    boxShadow: '0 18px 48px rgba(15, 23, 42, 0.45)',
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '1.5rem',
-  },
-  heading: {
-    fontSize: '1.75rem',
-    marginBottom: '0.5rem',
-  },
-  text: {
-    margin: 0,
-    opacity: 0.8,
-  },
-  formGrid: {
-    display: 'grid',
-    gap: '1rem',
-  },
-  label: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '0.5rem',
-    fontSize: '0.95rem',
-    letterSpacing: 0.05,
-    textTransform: 'uppercase',
-    opacity: 0.8,
-  },
-  checkboxRow: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '0.75rem',
-    letterSpacing: 0.05,
-    textTransform: 'uppercase',
-    opacity: 0.8,
-  },
-  input: {
-    padding: '0.75rem 1rem',
-    borderRadius: 10,
-    border: '1px solid rgba(148, 163, 184, 0.4)',
-    background: 'rgba(15, 23, 42, 0.4)',
-    color: '#f8fafc',
-    fontSize: '1rem',
-    outline: 'none',
-  },
-  terminalShell: {
-    flex: 1,
-    minHeight: 280,
-    background: '#020617',
-    borderRadius: 12,
-    border: '1px solid rgba(148, 163, 184, 0.25)',
-    padding: 8,
-    display: 'flex',
-    flexDirection: 'column',
-  },
-};

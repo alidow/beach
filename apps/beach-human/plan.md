@@ -79,9 +79,10 @@ This document tracks the remaining milestones for the new `beach-human` stack. E
 - **Validation**: add transcript-driven tests comparing tmux vs. beach snapshots after long outputs (e.g. 150-line loops).
 
 ### 8b. Copy/Scroll UX polish
+- ✅ Mouse wheel copy-mode scroll now clamps to the actual viewport delta (mirrors tmux’s `window_copy_scroll_*` logic) and ships a regression test to guard the behaviour.
 - Solidify tmux-style prefix handling (`Ctrl-B` window) and vi/emacs bindings in copy-mode, matching tmux’s expectations for start/stop selection, yank, and exit.
 - Ensure selection and cursor overlays match tmux visuals (preserve cell color, only tint background/underline as tmux does).
-- Guarantee scrollback navigation mirrors tmux: `PgUp/PgDn`, `Ctrl-B PgUp`, mouse wheel (if/when supported).
+- Guarantee scrollback navigation mirrors tmux for keyboard-driven flows (`PgUp/PgDn`, `Ctrl-B PgUp`); mouse wheel parity is covered above.
 
 ### 8c. Clipboard & Input Fidelity
 - Keep the system clipboard integration (done) and mirror tmux’s paste buffers; flesh out tests for `Ctrl-B ]`, multi-line paste, and Windows/macOS modifier quirks.

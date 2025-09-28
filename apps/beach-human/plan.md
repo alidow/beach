@@ -81,12 +81,12 @@ This document tracks the remaining milestones for the new `beach-human` stack. E
 ### 8b. Copy/Scroll UX polish
 - ✅ Mouse wheel copy-mode scroll now clamps to the actual viewport delta (mirrors tmux’s `window_copy_scroll_*` logic) and ships a regression test to guard the behaviour.
 - ✅ Copy-mode mouse-drag auto-scroll mirrors tmux’s edge paging so selections grow past the current viewport.
-- Solidify tmux-style prefix handling (`Ctrl-B` window) and vi/emacs bindings in copy-mode, matching tmux’s expectations for start/stop selection, yank, and exit.
+- ✅ `Ctrl-B [` and `Ctrl-B PgUp/PgDn` now mirror tmux’s prefix flow; remaining vi/emacs binding polish (start/stop selection, yank, exit prompts) is still in progress.
 - Ensure selection and cursor overlays match tmux visuals (preserve cell color, only tint background/underline as tmux does).
-- Guarantee scrollback navigation mirrors tmux for keyboard-driven flows (`PgUp/PgDn`, `Ctrl-B PgUp`); mouse wheel parity is covered above.
+- ✅ `PgUp` auto-enters copy mode and both `PgUp/PgDn` page via actual viewport deltas (prefix-bound variants piggyback on the same path).
 
 ### 8c. Clipboard & Input Fidelity
-- Keep the system clipboard integration (done) and mirror tmux’s paste buffers; flesh out tests for `Ctrl-B ]`, multi-line paste, and Windows/macOS modifier quirks.
+- ✅ `Ctrl-B ]` now pastes from the system clipboard (multi-line friendly) with regression coverage; remaining work covers Windows/macOS modifier quirks.
 - Map tmux’s default key tables (vi/emacs) so users can opt-in via config; document the bindings in `docs/tmux-parity.md`.
 
 ### 8d. Regression Tests & Docs

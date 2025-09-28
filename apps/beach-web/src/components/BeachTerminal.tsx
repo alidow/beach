@@ -1,4 +1,4 @@
-import type { CSSProperties } from 'react';
+import type { CSSProperties, UIEvent } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ClientFrame, HostFrame } from '../protocol/types';
 import { createTerminalStore, useTerminalSnapshot } from '../terminal/useTerminalState';
@@ -53,6 +53,13 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   }
   const [minimumRows, setMinimumRows] = useState(24);
   const lineHeight = computeLineHeight(fontSize);
+  const totalRows = snapshot.rows.length;
+  const firstAbsolute = lines.length > 0 ? lines[0]!.absolute : snapshot.baseRow;
+  const lastAbsolute = lines.length > 0 ? lines[lines.length - 1]!.absolute : firstAbsolute;
+  const topPaddingRows = Math.max(0, firstAbsolute - snapshot.baseRow);
+  const bottomPaddingRows = Math.max(0, snapshot.baseRow + totalRows - (lastAbsolute + 1));
+  const topPadding = topPaddingRows * lineHeight;
+  const bottomPadding = bottomPaddingRows * lineHeight;
   const backfillController = useMemo(
     () => new BackfillController(store, (frame) => transportRef.current?.send(frame)),
     [store],
@@ -139,6 +146,20 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
 
   useEffect(() => () => connectionRef.current?.close(), []);
 
+  useEffect(() => {
+    const element = containerRef.current;
+    if (!element || !snapshot.followTail) {
+      return;
+    }
+    const target = element.scrollHeight - element.clientHeight;
+    if (target < 0) {
+      return;
+    }
+    if (Math.abs(element.scrollTop - target) > 1) {
+      element.scrollTop = target;
+    }
+  }, [snapshot.followTail, snapshot.baseRow, snapshot.rows.length, lastAbsolute, lineHeight, topPadding, bottomPadding]);
+
   const handleKeyDown: React.KeyboardEventHandler<HTMLDivElement> = (event) => {
     const transport = transportRef.current;
     if (!transport) {
@@ -168,20 +189,45 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         className={containerClasses}
         tabIndex={0}
         onKeyDown={handleKeyDown}
+        onScroll={handleScroll}
         style={{
           fontFamily,
           fontSize,
           lineHeight: `${lineHeight}px`,
           minHeight: lineHeight * Math.max(1, minimumRows),
+          height: '100%',
+          maxHeight: '100%',
         }}
       >
+        <div style={{ height: topPadding }} aria-hidden="true" />
         {lines.map((line) => (
           <LineRow key={line.absolute} line={line} styles={snapshot.styles} />
         ))}
+        <div style={{ height: bottomPadding }} aria-hidden="true" />
       </div>
       <footer className="text-xs text-slate-400">{renderStatus()}</footer>
     </div>
   );
+
+  function handleScroll(event: UIEvent<HTMLDivElement>): void {
+    const element = event.currentTarget;
+    const approxRow = Math.max(
+      snapshot.baseRow,
+      snapshot.baseRow + Math.floor(element.scrollTop / lineHeight),
+    );
+    const measuredRows = Math.max(1, Math.floor(element.clientHeight / lineHeight));
+    const viewportRows = Math.max(minimumRows, measuredRows);
+    const maxTop = Math.max(snapshot.baseRow, snapshot.baseRow + totalRows - viewportRows);
+    const clampedTop = Math.min(approxRow, maxTop);
+
+    store.setViewport(clampedTop, viewportRows);
+
+    const nearBottom = element.scrollHeight - (element.scrollTop + element.clientHeight) < lineHeight * 2;
+    store.setFollowTail(nearBottom);
+    if (!nearBottom) {
+      backfillController.maybeRequest(store.getSnapshot(), false);
+    }
+  }
 
   function renderStatus(): string {
     if (status === 'error' && error) {
@@ -275,6 +321,7 @@ interface RenderLine {
   absolute: number;
   kind: 'loaded' | 'pending' | 'missing';
   cells?: RenderCell[];
+  cursorCol?: number | null;
 }
 
 export function buildLines(snapshot: TerminalGridSnapshot, limit: number): RenderLine[] {
@@ -292,7 +339,13 @@ export function buildLines(snapshot: TerminalGridSnapshot, limit: number): Rende
         char: cell.char ?? ' ',
         styleId: cell.styleId ?? 0,
       }));
-      lines.push({ absolute: row.absolute, kind: 'loaded', cells });
+      let cursorCol: number | null = null;
+      if (snapshot.cursorRow === row.absolute && snapshot.cursorCol !== null && cells.length > 0) {
+        const maxIndex = Math.max(cells.length - 1, 0);
+        const clamped = Math.min(Math.max(snapshot.cursorCol, 0), maxIndex);
+        cursorCol = Number.isFinite(clamped) ? clamped : null;
+      }
+      lines.push({ absolute: row.absolute, kind: 'loaded', cells, cursorCol });
       continue;
     }
     const fillChar = row.kind === 'pending' ? '·' : ' ';
@@ -315,7 +368,8 @@ function LineRow({ line, styles }: { line: RenderLine; styles: Map<number, Style
     <div>
       {line.cells.map((cell, index) => {
         const styleDef = styles.get(cell.styleId);
-        const style = styleDef ? styleFromDefinition(styleDef) : undefined;
+        const isCursor = line.cursorCol !== null && line.cursorCol === index;
+        const style = styleDef ? styleFromDefinition(styleDef, isCursor) : undefined;
         const char = cell.char === ' ' ? ' ' : cell.char;
         return (
           <span key={index} style={style}>
@@ -339,23 +393,101 @@ function sendResize(transport: TerminalTransport, cols: number, rows: number): v
   transport.send({ type: 'resize', cols, rows });
 }
 
-function styleFromDefinition(def: StyleDefinition): CSSProperties {
+const DEFAULT_FOREGROUND = '#e2e8f0';
+const DEFAULT_BACKGROUND = '#020617';
+
+function styleFromDefinition(def: StyleDefinition, highlightCursor = false): CSSProperties {
   const style: CSSProperties = {};
-  if (def.fg) {
-    style.color = formatColor(def.fg);
+  const attrs = (def.attrs ?? 0) | (highlightCursor ? 1 << 4 : 0);
+
+  let fg = decodeColor(def.fg);
+  let bg = decodeColor(def.bg);
+
+  if (attrs & (1 << 4)) {
+    const fallbackFg = fg ?? DEFAULT_FOREGROUND;
+    const fallbackBg = bg ?? DEFAULT_BACKGROUND;
+    fg = fallbackBg;
+    bg = fallbackFg;
   }
-  if (def.bg) {
-    style.backgroundColor = formatColor(def.bg);
+
+  if (fg) {
+    style.color = fg;
   }
-  if (def.attrs & 0b0000_0001) {
+  if (bg) {
+    style.backgroundColor = bg;
+  }
+
+  if (attrs & (1 << 0)) {
     style.fontWeight = 'bold';
   }
-  if (def.attrs & 0b0000_0010) {
-    style.textDecoration = style.textDecoration ? `${style.textDecoration} underline` : 'underline';
+  if (attrs & (1 << 1)) {
+    style.fontStyle = 'italic';
   }
+  if (attrs & (1 << 2)) {
+    style.textDecoration = appendTextDecoration(style.textDecoration, 'underline');
+  }
+  if (attrs & (1 << 3)) {
+    style.textDecoration = appendTextDecoration(style.textDecoration, 'line-through');
+  }
+  if (attrs & (1 << 5)) {
+    style.animation = 'beach-terminal-blink 1s steps(1, start) infinite';
+  }
+  if (attrs & (1 << 6)) {
+    style.opacity = style.opacity ? Number(style.opacity) * 0.6 : 0.6;
+  }
+  if (attrs & (1 << 7)) {
+    style.visibility = 'hidden';
+  }
+
   return style;
 }
 
-function formatColor(value: number): string {
-  return `#${value.toString(16).padStart(6, '0')}`;
+function appendTextDecoration(existing: string | undefined, value: string): string {
+  if (!existing) {
+    return value;
+  }
+  if (existing.includes(value)) {
+    return existing;
+  }
+  return `${existing} ${value}`.trim();
+}
+
+function decodeColor(packed: number): string | undefined {
+  const mode = (packed >>> 24) & 0xff;
+  if (mode === 0) {
+    return undefined;
+  }
+  if (mode === 1) {
+    return colorFromIndexed(packed & 0xff);
+  }
+  if (mode === 2) {
+    const r = (packed >>> 16) & 0xff;
+    const g = (packed >>> 8) & 0xff;
+    const b = packed & 0xff;
+    return `rgb(${r}, ${g}, ${b})`;
+  }
+  return undefined;
+}
+
+function colorFromIndexed(index: number): string {
+  const ansi16 = [
+    '#000000', '#800000', '#008000', '#808000', '#000080', '#800080', '#008080', '#c0c0c0',
+    '#808080', '#ff0000', '#00ff00', '#ffff00', '#0000ff', '#ff00ff', '#00ffff', '#ffffff',
+  ];
+  if (index < ansi16.length) {
+    return ansi16[index]!;
+  }
+  if (index >= 16 && index <= 231) {
+    const value = index - 16;
+    const r = Math.floor(value / 36);
+    const g = Math.floor((value % 36) / 6);
+    const b = value % 6;
+    const component = (n: number) => (n === 0 ? 0 : 55 + n * 40);
+    return `rgb(${component(r)}, ${component(g)}, ${component(b)})`;
+  }
+  if (index >= 232 && index <= 255) {
+    const level = 8 + (index - 232) * 10;
+    return `rgb(${level}, ${level}, ${level})`;
+  }
+  return DEFAULT_FOREGROUND;
 }

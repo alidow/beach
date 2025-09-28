@@ -48,6 +48,8 @@ export interface TerminalGridSnapshot {
   historyTrimmed: boolean;
   viewportTop: number;
   viewportHeight: number;
+  cursorRow: number | null;
+  cursorCol: number | null;
   visibleRows(limit?: number): RowSlot[];
 }
 
@@ -55,6 +57,10 @@ interface TerminalGridCacheOptions {
   initialCols?: number;
   maxHistory?: number;
 }
+
+type CursorHint =
+  | { kind: 'exact'; row: number; col: number }
+  | { kind: 'row_width'; row: number };
 
 export class TerminalGridCache {
   private readonly maxHistory: number;
@@ -67,6 +73,8 @@ export class TerminalGridCache {
   private historyTrimmed = false;
   private knownBaseRow: number | null = null;
   private styles = new Map<number, StyleDefinition>();
+  private cursorRow: number | null = null;
+  private cursorCol: number | null = null;
 
   constructor(options: TerminalGridCacheOptions = {}) {
     this.maxHistory = options.maxHistory ?? DEFAULT_HISTORY_LIMIT;
@@ -84,6 +92,8 @@ export class TerminalGridCache {
     this.historyTrimmed = false;
     this.knownBaseRow = null;
     this.styles = new Map([[0, { id: 0, fg: DEFAULT_COLOR, bg: DEFAULT_COLOR, attrs: 0 }]]);
+    this.cursorRow = null;
+    this.cursorCol = null;
   }
 
   setGridSize(totalRows: number, cols: number): boolean {
@@ -95,6 +105,9 @@ export class TerminalGridCache {
     const end = start + totalRows;
     if (this.ensureRowRange(start, end)) {
       mutated = true;
+    }
+    if (mutated) {
+      this.clampCursor();
     }
     return mutated;
   }
@@ -137,6 +150,10 @@ export class TerminalGridCache {
       this.baseRow = baseRow;
       this.historyTrimmed = this.historyTrimmed || baseRow > 0;
       mutated = true;
+      if (this.cursorRow !== null && this.cursorRow < this.baseRow) {
+        this.cursorRow = this.baseRow;
+        this.cursorCol = 0;
+      }
     } else {
       const newRows: RowSlot[] = [];
       for (let absolute = baseRow; absolute < this.baseRow; absolute += 1) {
@@ -148,6 +165,7 @@ export class TerminalGridCache {
     }
     this.trimToCapacity();
     this.reindexRows();
+    this.clampCursor();
     return mutated;
   }
 
@@ -164,8 +182,12 @@ export class TerminalGridCache {
     let mutated = false;
     let baseAdjusted = false;
     for (const update of updates) {
+      const hint = this.cursorHint(update);
       baseAdjusted = this.observeBounds(update, authoritative) || baseAdjusted;
-      mutated = this.applyUpdate(update) || mutated;
+      mutated = this.applyGridUpdate(update) || mutated;
+      if (hint) {
+        mutated = this.applyCursorHint(hint) || mutated;
+      }
     }
     return mutated || baseAdjusted;
   }
@@ -293,11 +315,13 @@ export class TerminalGridCache {
       historyTrimmed: this.historyTrimmed,
       viewportTop: this.viewportTop,
       viewportHeight: this.viewportHeight,
+      cursorRow: this.cursorRow,
+      cursorCol: this.cursorCol,
       visibleRows: (limit?: number) => this.visibleRows(limit),
     };
   }
 
-  private applyUpdate(update: Update): boolean {
+  private applyGridUpdate(update: Update): boolean {
     switch (update.type) {
       case 'cell':
         return this.applyCell(update.row, update.col, update.seq, update.cell);
@@ -314,6 +338,94 @@ export class TerminalGridCache {
       default:
         return false;
     }
+  }
+
+  private cursorHint(update: Update): CursorHint | null {
+    switch (update.type) {
+      case 'cell':
+        return { kind: 'exact', row: update.row, col: update.col + 1 };
+      case 'row':
+        return { kind: 'row_width', row: update.row };
+      case 'rect': {
+        const [rowStart, rowEnd] = update.rows;
+        const [colStart, colEnd] = update.cols;
+        if (rowEnd <= rowStart || colEnd <= colStart) {
+          return null;
+        }
+        const targetRow = rowEnd - 1;
+        const targetCol = colEnd;
+        if (targetRow < 0 || targetCol < 0) {
+          return null;
+        }
+        return { kind: 'exact', row: targetRow, col: targetCol };
+      }
+      case 'row_segment': {
+        if (update.cells.length === 0) {
+          return null;
+        }
+        const col = update.startCol + update.cells.length;
+        return { kind: 'exact', row: update.row, col };
+      }
+      default:
+        return null;
+    }
+  }
+
+  private applyCursorHint(hint: CursorHint): boolean {
+    const previousRow = this.cursorRow;
+    const previousCol = this.cursorCol;
+    switch (hint.kind) {
+      case 'exact': {
+        const row = Math.max(0, Math.floor(hint.row));
+        const col = Math.max(0, Math.floor(hint.col));
+        this.cursorRow = row;
+        this.cursorCol = col;
+        break;
+      }
+      case 'row_width': {
+        const row = Math.max(0, Math.floor(hint.row));
+        this.cursorRow = row;
+        this.cursorCol = this.rowDisplayWidth(row);
+        break;
+      }
+      default:
+        break;
+    }
+    this.clampCursor();
+    return this.cursorRow !== previousRow || this.cursorCol !== previousCol;
+  }
+
+  private rowDisplayWidth(absolute: number): number {
+    if (absolute < this.baseRow) {
+      return 0;
+    }
+    const index = absolute - this.baseRow;
+    if (index < 0 || index >= this.rows.length) {
+      return 0;
+    }
+    const slot = this.rows[index];
+    if (!slot || slot.kind !== 'loaded') {
+      return 0;
+    }
+    for (let col = slot.cells.length - 1; col >= 0; col -= 1) {
+      const cell = slot.cells[col]!;
+      if (cell.char !== ' ' || cell.styleId !== 0) {
+        return col + 1;
+      }
+    }
+    return 0;
+  }
+
+  private clampCursor(): void {
+    if (this.cursorRow === null || this.cursorCol === null) {
+      return;
+    }
+    if (this.cols <= 0) {
+      this.cursorCol = 0;
+      return;
+    }
+    const maxCol = Math.max(this.cols - 1, 0);
+    this.cursorCol = clamp(this.cursorCol, 0, maxCol);
   }
 
   private applyCell(row: number, col: number, seq: number, packed: number): boolean {
@@ -461,7 +573,13 @@ export class TerminalGridCache {
     if (this.knownBaseRow === null || this.knownBaseRow < end) {
       this.knownBaseRow = end;
     }
+    if (this.cursorRow !== null && this.cursorRow >= start && this.cursorRow < end) {
+      this.cursorRow = end;
+      this.cursorCol = 0;
+      mutated = true;
+    }
     this.reindexRows();
+    this.clampCursor();
     return mutated;
   }
 

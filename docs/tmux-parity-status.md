@@ -14,6 +14,9 @@
 - Copy mode state now tracks vi/emacs bindings, selection state, and last search; status line reflects mode and pending prompts.
 - Mouse wheel + drag gestures route through the command surface, so selecting with the pointer mirrors tmux copy-mode UX.
 - Dragging selections now auto-scrolls when the pointer hits the viewport edges, matching tmux’s paging cadence while growing the selection.
+- Plain `PageUp` now pulls the client into copy-mode and both `PageUp/PageDown` step the viewport using the real delta, matching tmux’s defaults.
+- `Ctrl-B [` and `Ctrl-B PgUp/PgDn` respect the tmux prefix workflow, reusing the same copy-mode entry/page mechanics with a 500 ms timeout guard.
+- `Ctrl-B ]` pastes from the system clipboard (multi-line safe) and has regression coverage to keep the transport framing honest.
 - Rectangle (`Ctrl+V`) and line (`V`) selection modes feed the renderer’s new selection pipeline, so copied text matches tmux’s block and line semantics without manual trimming.
 - Searches advance the viewport, with placeholder messaging when patterns are not found. Follow-up work will add history-aware wrapping and tests once the workspace manifest issues are resolved.
 

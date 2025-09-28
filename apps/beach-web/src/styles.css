@@ -22,3 +22,8 @@ button,
 textarea {
   font: inherit;
 }
+
+@keyframes beach-terminal-blink {
+  0%, 50% { opacity: 1; }
+  50.01%, 100% { opacity: 0; }
+}

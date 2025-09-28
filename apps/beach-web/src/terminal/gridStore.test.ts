@@ -17,6 +17,15 @@ describe('TerminalGridStore', () => {
     expect(text).toBe('AB');
   });
 
+  it('prefills pending rows when grid size is set', () => {
+    const store = new TerminalGridStore();
+    store.setGridSize(3, 80);
+
+    const snapshot = store.getSnapshot();
+    expect(snapshot.rows).toHaveLength(3);
+    expect(snapshot.rows.every((row) => row.kind === 'pending')).toBe(true);
+  });
+
   it('applies individual cell updates respecting sequence numbers', () => {
     const store = new TerminalGridStore();
     store.applyUpdates([{ type: 'row', row: 5, seq: 1, cells: [PACKED_A] }]);
@@ -89,6 +98,67 @@ describe('TerminalGridStore', () => {
     store.applyUpdates([{ type: 'row', row: 8, seq: 1, cells: packString('history') }], true);
 
     expect(store.getSnapshot().baseRow).toBe(8);
+  });
+
+  it('returns visible rows following the tail by default', () => {
+    const store = new TerminalGridStore();
+    store.setGridSize(5, 80);
+    store.applyUpdates(
+      [
+        { type: 'row', row: 0, seq: 1, cells: packString('zero') },
+        { type: 'row', row: 1, seq: 1, cells: packString('one') },
+        { type: 'row', row: 2, seq: 1, cells: packString('two') },
+        { type: 'row', row: 3, seq: 1, cells: packString('three') },
+        { type: 'row', row: 4, seq: 1, cells: packString('four') },
+      ],
+      true,
+    );
+    store.setViewport(0, 3);
+
+    const snapshot = store.getSnapshot();
+    const visible = snapshot.visibleRows(10);
+    expect(visible.map((row) => row.absolute)).toEqual([2, 3, 4]);
+  });
+
+  it('respects manual viewport when follow tail is disabled', () => {
+    const store = new TerminalGridStore();
+    store.setGridSize(5, 80);
+    store.applyUpdates(
+      [
+        { type: 'row', row: 0, seq: 1, cells: packString('zero') },
+        { type: 'row', row: 1, seq: 1, cells: packString('one') },
+        { type: 'row', row: 2, seq: 1, cells: packString('two') },
+      ],
+      true,
+    );
+    store.setViewport(0, 2);
+    store.setFollowTail(false);
+    store.setViewport(0, 2);
+    store.setViewport(1, 2);
+
+    const snapshot = store.getSnapshot();
+    const visible = snapshot.visibleRows(10);
+    expect(visible.map((row) => row.absolute)).toEqual([1, 2]);
+  });
+
+  it('reports the first gap within a range', () => {
+    const store = new TerminalGridStore();
+    store.setGridSize(5, 80);
+    store.applyUpdates([{ type: 'row', row: 0, seq: 1, cells: packString('row0') }], true);
+    store.markRowPending(1);
+    store.applyUpdates([{ type: 'row', row: 2, seq: 1, cells: packString('row2') }], true);
+
+    expect(store.firstGapBetween(0, 3)).toBe(1);
+    expect(store.firstGapBetween(0, 1)).toBeNull();
+  });
+
+  it('falls back to raw char codes when packed high bits are missing', () => {
+    const store = new TerminalGridStore();
+    store.setBaseRow(0);
+    store.setGridSize(1, 80);
+    store.applyUpdates([{ type: 'cell', row: 0, col: 0, seq: 1, cell: '('.codePointAt(0)! }], true);
+
+    expect(store.getRowText(0)).toBe('(');
   });
 });
 

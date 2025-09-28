@@ -1,88 +1,41 @@
 import type { Update } from '../protocol/types';
+import {
+  TerminalGridCache,
+  type CellState,
+  type LoadedRow,
+  type MissingRow,
+  type PendingRow,
+  type RowSlot,
+  type StyleDefinition,
+  type TerminalGridSnapshot,
+} from './cache';
 
-const HIGH_SHIFT = 32;
-const WORD = 2 ** HIGH_SHIFT;
-const LOW_MASK = 0xffff_ffff;
-
-export interface StyleDefinition {
-  id: number;
-  fg: number;
-  bg: number;
-  attrs: number;
-}
-
-export interface CellState {
-  char: string;
-  styleId: number;
-  seq: number;
-}
-
-export interface LoadedRow {
-  kind: 'loaded';
-  absolute: number;
-  latestSeq: number;
-  cells: CellState[];
-}
-
-export interface PendingRow {
-  kind: 'pending';
-  absolute: number;
-}
-
-export interface MissingRow {
-  kind: 'missing';
-  absolute: number;
-}
-
-export type RowSlot = LoadedRow | PendingRow | MissingRow;
-
-export interface TerminalGridSnapshot {
-  baseRow: number;
-  cols: number;
-  rows: RowSlot[];
-  styles: Map<number, StyleDefinition>;
-  followTail: boolean;
-  historyTrimmed: boolean;
-  viewportTop: number;
-  viewportHeight: number;
-}
+export type {
+  CellState,
+  LoadedRow,
+  MissingRow,
+  PendingRow,
+  RowSlot,
+  StyleDefinition,
+  TerminalGridSnapshot,
+} from './cache';
 
 /**
  * Headless grid store that mirrors the semantics of the Rust client (GridRenderer).
- * The store is intentionally imperative and exposes a subscribe/notify API so React
- * integrations can wire into `useSyncExternalStore` or any other state layer.
+ * The store uses an imperative cache internally and exposes a subscribe/notify API so React
+ * integrations can hook into `useSyncExternalStore` or any other state layer.
  */
 export class TerminalGridStore {
-  private baseRow = 0;
-  private cols = 0;
-  private followTail = true;
-  private historyTrimmed = false;
-  private viewportTop = 0;
-  private viewportHeight = 0;
-  private readonly rows = new Map<number, RowSlot>();
-  private readonly styles = new Map<number, StyleDefinition>();
+  private readonly cache: TerminalGridCache;
   private readonly listeners = new Set<() => void>();
   private snapshotCache: TerminalGridSnapshot | null = null;
-  private version = 0;
-  private knownBaseRow: number | null = null;
 
-  constructor(initialCols = 0) {
-    this.cols = initialCols;
-    this.styles.set(0, { id: 0, fg: DEFAULT_COLOR, bg: DEFAULT_COLOR, attrs: 0 });
+  constructor(initialCols = 0, maxHistory?: number) {
+    this.cache = new TerminalGridCache({ initialCols, maxHistory });
   }
 
   reset(): void {
-    this.baseRow = 0;
-    this.cols = 0;
-    this.followTail = true;
-    this.historyTrimmed = false;
-    this.viewportTop = 0;
-    this.viewportHeight = 0;
-    this.rows.clear();
-    this.styles.clear();
-    this.styles.set(0, { id: 0, fg: DEFAULT_COLOR, bg: DEFAULT_COLOR, attrs: 0 });
-    this.snapshotCache = null;
-    this.knownBaseRow = null;
+    this.cache.reset();
     this.invalidate();
     this.notify();
   }
@@ -96,347 +49,91 @@ export class TerminalGridStore {
     if (this.snapshotCache) {
       return this.snapshotCache;
     }
-    const snapshot: TerminalGridSnapshot = {
-      baseRow: this.baseRow,
-      cols: this.cols,
-      rows: Array.from(this.rows.values()).sort((a, b) => a.absolute - b.absolute),
-      styles: new Map(this.styles),
-      followTail: this.followTail,
-      historyTrimmed: this.historyTrimmed,
-      viewportTop: this.viewportTop,
-      viewportHeight: this.viewportHeight,
-    };
+    const snapshot = this.cache.snapshot();
     this.snapshotCache = snapshot;
     return snapshot;
   }
 
   setGridSize(totalRows: number, cols: number): void {
-    this.cols = Math.max(this.cols, cols);
-    for (let offset = 0; offset < totalRows; offset += 1) {
-      const absolute = this.baseRow + offset;
-      if (!this.rows.has(absolute)) {
-        this.rows.set(absolute, { kind: 'pending', absolute });
-      }
+    if (this.cache.setGridSize(totalRows, cols)) {
+      this.invalidate();
+      this.notify();
     }
-    this.invalidate();
-    this.notify();
   }
 
   setViewport(top: number, height: number): void {
-    if (top !== this.viewportTop || height !== this.viewportHeight) {
-      this.viewportTop = Math.max(0, top);
-      this.viewportHeight = Math.max(0, height);
+    if (this.cache.setViewport(top, height)) {
       this.invalidate();
       this.notify();
     }
   }
 
   setFollowTail(enabled: boolean): void {
-    if (this.followTail !== enabled) {
-      this.followTail = enabled;
+    if (this.cache.setFollowTail(enabled)) {
       this.invalidate();
       this.notify();
     }
   }
 
   setBaseRow(baseRow: number): void {
-    if (!this.updateBaseRow(baseRow)) {
-      return;
+    if (this.cache.setBaseRow(baseRow)) {
+      this.invalidate();
+      this.notify();
     }
-    this.invalidate();
-    this.notify();
   }
 
   setHistoryOrigin(baseRow: number): void {
-    this.historyTrimmed = baseRow > 0;
-    this.setBaseRow(baseRow);
+    if (this.cache.setHistoryOrigin(baseRow)) {
+      this.invalidate();
+      this.notify();
+    }
   }
 
   applyUpdates(updates: Update[], authoritative = false): void {
-    let mutated = false;
-    let baseAdjusted = false;
-    for (const update of updates) {
-      baseAdjusted = this.observeBounds(update, authoritative) || baseAdjusted;
-      mutated = this.applyUpdate(update) || mutated;
+    if (updates.length === 0) {
+      return;
     }
-    if (mutated || baseAdjusted) {
+    if (this.cache.applyUpdates(updates, authoritative)) {
       this.invalidate();
       this.notify();
     }
   }
 
   markRowPending(absolute: number): void {
-    const existing = this.rows.get(absolute);
-    if (existing?.kind === 'pending') {
-      return;
+    if (this.cache.markRowPending(absolute)) {
+      this.invalidate();
+      this.notify();
     }
-    this.rows.set(absolute, { kind: 'pending', absolute });
-    this.invalidate();
   }
 
   markPendingRange(start: number, end: number): void {
-    for (let row = start; row < end; row += 1) {
-      this.markRowPending(row);
+    if (this.cache.markPendingRange(start, end)) {
+      this.invalidate();
+      this.notify();
     }
-    this.notify();
   }
 
   markRowMissing(absolute: number): void {
-    const existing = this.rows.get(absolute);
-    if (existing?.kind === 'missing') {
-      return;
+    if (this.cache.markRowMissing(absolute)) {
+      this.invalidate();
+      this.notify();
     }
-    this.rows.set(absolute, { kind: 'missing', absolute });
-    this.invalidate();
+  }
+
+  firstGapBetween(start: number, end: number): number | null {
+    return this.cache.firstGapBetween(start, end);
   }
 
   getRowText(absolute: number): string | undefined {
-    const slot = this.rows.get(absolute);
-    if (!slot || slot.kind !== 'loaded') {
-      return undefined;
-    }
-    const chars = slot.cells.map((cell) => cell.char ?? ' ');
-    while (chars.length && chars[chars.length - 1] === ' ') {
-      chars.pop();
-    }
-    return chars.join('');
+    return this.cache.getRowText(absolute);
   }
 
   getRow(absolute: number): RowSlot | undefined {
-    return this.rows.get(absolute);
+    return this.cache.getRow(absolute);
   }
 
-  private applyUpdate(update: Update): boolean {
-    let mutated = false;
-    switch (update.type) {
-      case 'cell':
-        mutated = this.applyCell(update.row, update.col, update.seq, update.cell);
-        break;
-      case 'rect':
-        mutated = this.applyRect(update.rows, update.cols, update.seq, update.cell);
-        break;
-      case 'row':
-        mutated = this.applyRow(update.row, update.seq, update.cells);
-        break;
-      case 'row_segment':
-        mutated = this.applyRowSegment(update.row, update.startCol, update.seq, update.cells);
-        break;
-      case 'trim':
-        mutated = this.applyTrim(update.start, update.count);
-        break;
-      case 'style':
-        mutated = this.applyStyle(update.id, update.fg, update.bg, update.attrs);
-        break;
-      default:
-        break;
-    }
-    return mutated;
-  }
-
-  private applyCell(row: number, col: number, seq: number, packed: number): boolean {
-    const loaded = this.ensureLoadedRow(row);
-    let mutated = this.extendRow(loaded, col + 1);
-    const cell = loaded.cells[col]!;
-    if (seq >= cell.seq) {
-      const decoded = decodePackedCell(packed);
-      cell.char = decoded.char;
-      cell.styleId = decoded.styleId;
-      cell.seq = seq;
-      loaded.latestSeq = Math.max(loaded.latestSeq, seq);
-      mutated = true;
-    }
-    this.touchRow(row);
-    return mutated;
-  }
-
-  private applyRow(absoluteRow: number, seq: number, cells: number[]): boolean {
-    const loaded = this.ensureLoadedRow(absoluteRow);
-    const width = Math.max(cells.length, this.cols);
-    let mutated = this.extendRow(loaded, width);
-    for (let col = 0; col < width; col += 1) {
-      const packed = cells[col];
-      const cell = loaded.cells[col]!;
-      if (packed === undefined) {
-        if (seq >= cell.seq) {
-          cell.char = ' ';
-          cell.styleId = 0;
-          cell.seq = seq;
-          mutated = true;
-        }
-        continue;
-      }
-      if (seq >= cell.seq) {
-        const decoded = decodePackedCell(packed);
-        cell.char = decoded.char;
-        cell.styleId = decoded.styleId;
-        cell.seq = seq;
-        mutated = true;
-      }
-    }
-    loaded.latestSeq = Math.max(loaded.latestSeq, seq);
-    this.touchRow(absoluteRow);
-    return mutated;
-  }
-
-  private applyRowSegment(row: number, startCol: number, seq: number, cells: number[]): boolean {
-    const loaded = this.ensureLoadedRow(row);
-    const endCol = startCol + cells.length;
-    let mutated = this.extendRow(loaded, endCol);
-    for (let index = 0; index < cells.length; index += 1) {
-      const col = startCol + index;
-      const packed = cells[index]!;
-      const cell = loaded.cells[col]!;
-      if (seq >= cell.seq) {
-        const decoded = decodePackedCell(packed);
-        cell.char = decoded.char;
-        cell.styleId = decoded.styleId;
-        cell.seq = seq;
-        mutated = true;
-      }
-    }
-    if (startCol === 0 && endCol <= loaded.cells.length) {
-      for (let col = endCol; col < loaded.cells.length; col += 1) {
-        const cell = loaded.cells[col]!;
-        if (seq >= cell.seq && (cell.char !== ' ' || cell.styleId !== 0)) {
-          cell.char = ' ';
-          cell.styleId = 0;
-          cell.seq = seq;
-          mutated = true;
-        }
-      }
-    }
-    loaded.latestSeq = Math.max(loaded.latestSeq, seq);
-    this.touchRow(row);
-    return mutated;
-  }
-
-  private applyRect(rowRange: [number, number], colRange: [number, number], seq: number, packed: number): boolean {
-    let mutated = false;
-    for (let row = rowRange[0]; row < rowRange[1]; row += 1) {
-      const loaded = this.ensureLoadedRow(row);
-      mutated = this.extendRow(loaded, colRange[1]) || mutated;
-      for (let col = colRange[0]; col < colRange[1]; col += 1) {
-        const cell = loaded.cells[col]!;
-        if (seq >= cell.seq) {
-          const decoded = decodePackedCell(packed);
-          cell.char = decoded.char;
-          cell.styleId = decoded.styleId;
-          cell.seq = seq;
-          mutated = true;
-        }
-      }
-      loaded.latestSeq = Math.max(loaded.latestSeq, seq);
-      this.touchRow(row);
-    }
-    return mutated;
-  }
-
-  private applyTrim(start: number, count: number): boolean {
-    let mutated = false;
-    const end = start + count;
-    for (const key of Array.from(this.rows.keys())) {
-      if (key >= start && key < end) {
-        this.rows.delete(key);
-        mutated = true;
-      }
-    }
-    if (this.updateBaseRow(Math.max(this.baseRow, end))) {
-      mutated = true;
-    }
-    if (this.knownBaseRow === null || this.knownBaseRow < end) {
-      this.knownBaseRow = end;
-    }
-    return mutated;
-  }
-
-  private applyStyle(id: number, fg: number, bg: number, attrs: number): boolean {
-    this.styles.set(id, { id, fg, bg, attrs });
-    return true;
-  }
-
-  private ensureLoadedRow(absolute: number): LoadedRow {
-    const existing = this.rows.get(absolute);
-    if (existing && existing.kind === 'loaded') {
-      return existing;
-    }
-    const loaded: LoadedRow = {
-      kind: 'loaded',
-      absolute,
-      latestSeq: 0,
-      cells: createBlankRow(this.cols || DEFAULT_ROW_WIDTH),
-    };
-    this.rows.set(absolute, loaded);
-    return loaded;
-  }
-
-  private extendRow(row: LoadedRow, requiredCols: number): boolean {
-    if (row.cells.length >= requiredCols) {
-      return false;
-    }
-    for (let index = row.cells.length; index < requiredCols; index += 1) {
-      row.cells.push(createBlankCell());
-    }
-    this.cols = Math.max(this.cols, requiredCols);
-    return true;
-  }
-
-  private touchRow(absolute: number): void {
-    if (!this.followTail || this.viewportHeight === 0) {
-      return;
-    }
-    const bottomRow = this.viewportTop + this.viewportHeight - 1;
-    if (absolute > bottomRow) {
-      this.viewportTop = Math.max(0, absolute - this.viewportHeight + 1);
-      this.invalidate();
-    }
-  }
-
-  private updateBaseRow(baseRow: number): boolean {
-    if (baseRow === this.baseRow) {
-      return false;
-    }
-    const oldBase = this.baseRow;
-    if (baseRow > oldBase) {
-      for (const key of Array.from(this.rows.keys())) {
-        if (key < baseRow) {
-          this.rows.delete(key);
-        }
-      }
-    } else {
-      for (let absolute = baseRow; absolute < oldBase; absolute += 1) {
-        if (!this.rows.has(absolute)) {
-          this.rows.set(absolute, { kind: 'pending', absolute });
-        }
-      }
-    }
-    this.baseRow = baseRow;
-    if (baseRow > 0) {
-      this.historyTrimmed = true;
-    } else if (baseRow === 0 && this.rows.size === 0) {
-      this.historyTrimmed = false;
-    }
-    if (this.knownBaseRow !== null && this.knownBaseRow < baseRow) {
-      this.knownBaseRow = baseRow;
-    }
-    return true;
-  }
-
-  private observeBounds(update: Update, authoritative: boolean): boolean {
-    const minRow = extractUpdateRow(update);
-    if (minRow === null) {
-      return false;
-    }
-    if (authoritative) {
-      const base = this.knownBaseRow === null ? minRow : Math.min(this.knownBaseRow, minRow);
-      if (this.knownBaseRow !== base) {
-        this.knownBaseRow = base;
-      }
-      return this.updateBaseRow(base);
-    }
-    if (minRow < this.baseRow) {
-      return this.updateBaseRow(minRow);
-    }
-    return false;
+  visibleRows(limit?: number): RowSlot[] {
+    return this.cache.visibleRows(limit);
   }
 
   private notify(): void {
@@ -450,47 +147,5 @@ export class TerminalGridStore {
 
   private invalidate(): void {
     this.snapshotCache = null;
-    this.version += 1;
-  }
-}
-
-const DEFAULT_COLOR = 0x000000;
-const DEFAULT_ROW_WIDTH = 80;
-
-function createBlankCell(): CellState {
-  return { char: ' ', styleId: 0, seq: 0 };
-}
-
-function createBlankRow(width: number): CellState[] {
-  return Array.from({ length: Math.max(1, width) }, () => createBlankCell());
-}
-
-function decodePackedCell(packed: number): { char: string; styleId: number } {
-  const codePoint = Math.floor(packed / WORD);
-  const styleBits = packed - codePoint * WORD;
-  const char = safeFromCodePoint(codePoint);
-  return { char, styleId: styleBits & LOW_MASK };
-}
-
-function extractUpdateRow(update: Update): number | null {
-  switch (update.type) {
-    case 'cell':
-    case 'row':
-    case 'row_segment':
-      return update.row;
-    case 'rect':
-      return update.rows[0] ?? null;
-    case 'trim':
-    case 'style':
-    default:
-      return null;
-  }
-}
-
-function safeFromCodePoint(codePoint: number): string {
-  try {
-    return String.fromCodePoint(codePoint);
-  } catch {
-    return '\uFFFD';
   }
 }

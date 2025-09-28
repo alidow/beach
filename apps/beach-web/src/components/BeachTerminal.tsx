@@ -49,7 +49,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   );
   const [error, setError] = useState<Error | null>(null);
   const lines = useMemo(() => buildLines(snapshot, 600), [snapshot]);
+  if (import.meta.env.DEV) {
+    (window as any).beachLines = lines;
+  }
   const linesRef = useRef<RenderLine[]>(lines);
+  const [minimumRows, setMinimumRows] = useState(24);
+  const lineHeight = computeLineHeight(fontSize);
   const backfillController = useMemo(
     () => new BackfillController(store, (frame) => transportRef.current?.send(frame)),
     [store],
@@ -118,7 +123,6 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       if (!entry) {
         return;
       }
-      const lineHeight = computeLineHeight(fontSize);
       const viewportRows = Math.max(1, Math.floor(entry.contentRect.height / lineHeight));
       if (import.meta.env.DEV) {
         console.debug('[beach-web] resize', {
@@ -135,7 +139,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     });
     observer.observe(element);
     return () => observer.disconnect();
-  }, [fontSize, store]);
+  }, [lineHeight, store]);
 
   useEffect(() => () => connectionRef.current?.close(), []);
 
@@ -158,7 +162,6 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
 
   const handleScroll: React.UIEventHandler<HTMLDivElement> = (event) => {
     const element = event.currentTarget;
-    const lineHeight = computeLineHeight(fontSize);
     const linesSnapshot = linesRef.current;
     const firstAbsolute = linesSnapshot[0]?.absolute ?? snapshot.baseRow;
     const approxRow = firstAbsolute + Math.floor(element.scrollTop / lineHeight);
@@ -179,10 +182,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         style={{
           ...style,
           flex: 1,
+          minHeight: lineHeight * Math.max(1, minimumRows),
+          height: '100%',
           overflow: 'auto',
           fontFamily,
           fontSize,
-          lineHeight: `${computeLineHeight(fontSize)}px`,
+          lineHeight: `${lineHeight}px`,
           color: '#f8fafc',
           background: '#020617',
           borderRadius: 8,
@@ -239,6 +244,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         store.setBaseRow(frame.baseRow);
         store.setGridSize(frame.historyRows, frame.cols);
         store.setViewport(0, frame.viewportRows);
+        setMinimumRows(frame.viewportRows);
         break;
       case 'snapshot':
       case 'delta':
@@ -287,37 +293,15 @@ interface RenderLine {
 }
 
 export function buildLines(snapshot: TerminalGridSnapshot, limit: number): RenderLine[] {
-  const placeholderWidth = Math.max(1, snapshot.cols || 80);
-  const rowsByAbsolute = new Map(snapshot.rows.map((row) => [row.absolute, row]));
-  const highestLoaded = snapshot.rows.reduce<number | null>((acc, row) => {
-    if (row.kind === 'loaded') {
-      return acc === null || row.absolute > acc ? row.absolute : acc;
-    }
-    return acc;
-  }, null);
-
-  const availableRows = snapshot.rows.length;
-  const fallbackHeight = availableRows ? Math.min(limit, availableRows) : 1;
-  const viewportHeight = Math.max(1, Math.min(limit, snapshot.viewportHeight || fallbackHeight));
-
-  let scrollTop: number;
-  if (!snapshot.followTail) {
-    scrollTop = Math.max(0, snapshot.viewportTop - snapshot.baseRow);
-  } else if (highestLoaded !== null) {
-    const desiredTop = highestLoaded - viewportHeight + 1;
-    scrollTop = Math.max(0, desiredTop - snapshot.baseRow);
-  } else {
-    scrollTop = Math.max(0, snapshot.viewportTop - snapshot.baseRow);
+  const rows = snapshot.visibleRows(limit);
+  if (rows.length === 0) {
+    return [];
   }
 
+  const placeholderWidth = Math.max(1, snapshot.cols || 80);
   const lines: RenderLine[] = [];
-  for (let rowIdx = 0; rowIdx < viewportHeight && lines.length < limit; rowIdx += 1) {
-    const absolute = snapshot.baseRow + scrollTop + rowIdx;
-    const row = rowsByAbsolute.get(absolute);
-    if (!row) {
-      lines.push({ absolute, text: ' '.repeat(placeholderWidth), kind: 'missing' });
-      continue;
-    }
+
+  for (const row of rows) {
     if (row.kind === 'loaded') {
       const chars = row.cells.map((cell) => cell.char ?? ' ');
       while (chars.length && chars[chars.length - 1] === ' ') {
@@ -331,12 +315,6 @@ export function buildLines(snapshot: TerminalGridSnapshot, limit: number): Rende
       continue;
     }
     lines.push({ absolute: row.absolute, text: ' '.repeat(placeholderWidth), kind: 'missing' });
-  }
-
-  if (snapshot.followTail) {
-    while (lines.length > 0 && lines[lines.length - 1]?.kind !== 'loaded') {
-      lines.pop();
-    }
   }
 
   return lines;

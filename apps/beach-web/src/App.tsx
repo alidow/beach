@@ -55,6 +55,7 @@ export default function App(): JSX.Element {
             baseUrl={baseUrl || undefined}
             passcode={passcode || undefined}
             autoConnect={autoConnect}
+            style={{ flex: 1, minHeight: 0 }}
           />
         </div>
       </section>
@@ -130,5 +131,7 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 12,
     border: '1px solid rgba(148, 163, 184, 0.25)',
     padding: 8,
+    display: 'flex',
+    flexDirection: 'column',
   },
 };

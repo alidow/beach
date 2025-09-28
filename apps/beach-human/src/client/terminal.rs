@@ -1739,10 +1739,37 @@ impl TerminalClient {
             self.renderer.ensure_row_visible(position.row);
             self.force_render = true;
         }
+        self.maybe_auto_scroll_drag(mouse);
     }
 
     fn handle_mouse_primary_up(&mut self) {
         self.update_copy_mode_status();
+    }
+
+    fn maybe_auto_scroll_drag(&mut self, mouse: &MouseEvent) {
+        if self.copy_mode.is_none() {
+            return;
+        }
+
+        let viewport_height = self.renderer.viewport_height();
+        if viewport_height == 0 {
+            return;
+        }
+
+        let edge_row = mouse.row as usize;
+        if edge_row == 0 {
+            if self.renderer.viewport_top() > self.renderer.base_row() {
+                self.handle_mouse_scroll(-1);
+            }
+        } else if edge_row >= viewport_height.saturating_sub(1) {
+            let bottom_row = self
+                .renderer
+                .viewport_top()
+                .saturating_add(self.renderer.viewport_height().saturating_sub(1) as u64);
+            if bottom_row + 1 < self.renderer.total_rows() {
+                self.handle_mouse_scroll(1);
+            }
+        }
     }
 
     fn mouse_position_to_selection(&self, mouse: &MouseEvent) -> Option<SelectionPosition> {
@@ -2602,11 +2629,12 @@ fn mouse_button_code(button: MouseButton) -> Option<u16> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cache::terminal::PackedCell;
-    use crate::protocol::{Lane, LaneBudgetFrame, SyncConfigFrame};
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::cache::terminal::PackedCell;
+        use crate::protocol::{Lane, LaneBudgetFrame, SyncConfigFrame};
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind, KeyModifiers};
     use crate::transport::{
         Transport, TransportError, TransportId, TransportKind, TransportMessage, TransportPair,
     };
@@ -2825,6 +2853,59 @@ mod tests {
         client.handle_mouse_scroll(20);
         let final_row = client.copy_mode.as_ref().unwrap().cursor.row;
         assert_eq!(final_row, initial_row, "reverse scroll should restore cursor row");
+    }
+
+    #[test]
+    fn mouse_drag_edges_autoscroll_copy_mode() {
+        let mut client = new_client();
+        client.renderer.on_resize(80, 4);
+        client.renderer.ensure_size(12, 32);
+        for row in 0..12 {
+            let text = format!("line {row:02}");
+            client
+                .renderer
+                .apply_row_from_text(row, (row + 1) as u64, &text);
+        }
+        client.renderer.scroll_to_tail();
+
+        client.enter_copy_mode();
+        {
+            let state = client.copy_mode.as_mut().unwrap();
+            state.begin_selection(SelectionMode::Character);
+        }
+
+        let initial_cursor = client.copy_mode.as_ref().unwrap().cursor.row;
+        assert_eq!(
+            initial_cursor,
+            client.renderer.viewport_top() + client.renderer.viewport_height() as u64 - 1,
+        );
+
+        let drag_top = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        client.handle_mouse_primary_drag(&drag_top);
+        let after_up = client.copy_mode.as_ref().unwrap().cursor.row;
+        assert!(
+            after_up < initial_cursor,
+            "cursor should move upward when dragging at top edge",
+        );
+
+        let bottom_row = client.renderer.viewport_height().saturating_sub(1) as u16;
+        let drag_bottom = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 0,
+            row: bottom_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        client.handle_mouse_primary_drag(&drag_bottom);
+        let after_down = client.copy_mode.as_ref().unwrap().cursor.row;
+        assert!(
+            after_down >= after_up,
+            "cursor should move downward when dragging at bottom edge",
+        );
     }
 
     #[test]

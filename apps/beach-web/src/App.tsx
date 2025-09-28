@@ -55,12 +55,13 @@ export default function App(): JSX.Element {
           Auto connect
         </label>
 
-        <div className="rounded-xl border border-slate-700/50 bg-slate-950/90 p-3">
+        <div className="rounded-xl border border-slate-700/50 bg-slate-950/90 p-3 h-[60vh] min-h-[40vh] flex flex-col">
           <BeachTerminal
             sessionId={sessionId || undefined}
             baseUrl={baseUrl || undefined}
             passcode={passcode || undefined}
             autoConnect={autoConnect}
+            className="flex-1 min-h-0"
           />
         </div>
       </section>

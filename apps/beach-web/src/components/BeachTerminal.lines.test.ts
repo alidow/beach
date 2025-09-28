@@ -28,7 +28,7 @@ describe('buildLines', () => {
     const lines = buildLines(snapshot, 600);
 
     expect(lines.map((line) => line.absolute)).toEqual([101, 102]);
-    expect(lines.map((line) => line.text)).toEqual(['next-line', 'future']);
+    expect(lines.map((line) => textFromLine(line))).toEqual(['next-line', 'future']);
   });
 
   it('falls back to tail rows when viewport height is unknown', () => {
@@ -44,7 +44,7 @@ describe('buildLines', () => {
     const lines = buildLines(snapshot, 2);
 
     expect(lines.map((line) => line.absolute)).toEqual([1, 2]);
-    expect(lines.map((line) => line.text)).toEqual(['second', 'third']);
+    expect(lines.map((line) => textFromLine(line))).toEqual(['second', 'third']);
   });
 
   it('respects viewportTop when not following the tail', () => {
@@ -63,8 +63,12 @@ describe('buildLines', () => {
     const lines = buildLines(snapshot, 10);
 
     expect(lines.map((line) => line.absolute)).toEqual([1, 2]);
-    expect(lines.map((line) => line.text)).toEqual(['row1', 'row2']);
-  });
+    expect(lines.map((line) => textFromLine(line))).toEqual(['row1', 'row2']);
+});
+
+function textFromLine(line: ReturnType<typeof buildLines>[number]): string {
+  return line.cells?.map((cell) => cell.char).join('').trimEnd() ?? '';
+}
 });
 
 function packString(text: string): number[] {

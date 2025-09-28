@@ -80,6 +80,7 @@ This document tracks the remaining milestones for the new `beach-human` stack. E
 
 ### 8b. Copy/Scroll UX polish
 - ✅ Mouse wheel copy-mode scroll now clamps to the actual viewport delta (mirrors tmux’s `window_copy_scroll_*` logic) and ships a regression test to guard the behaviour.
+- ✅ Copy-mode mouse-drag auto-scroll mirrors tmux’s edge paging so selections grow past the current viewport.
 - Solidify tmux-style prefix handling (`Ctrl-B` window) and vi/emacs bindings in copy-mode, matching tmux’s expectations for start/stop selection, yank, and exit.
 - Ensure selection and cursor overlays match tmux visuals (preserve cell color, only tint background/underline as tmux does).
 - Guarantee scrollback navigation mirrors tmux for keyboard-driven flows (`PgUp/PgDn`, `Ctrl-B PgUp`); mouse wheel parity is covered above.

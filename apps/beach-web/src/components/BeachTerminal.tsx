@@ -1,3 +1,4 @@
+import type { CSSProperties } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ClientFrame, HostFrame } from '../protocol/types';
 import { createTerminalStore, useTerminalSnapshot } from '../terminal/useTerminalState';
@@ -155,12 +156,13 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     sendFrame(transport, { type: 'input', seq, data: payload });
   };
 
-  const containerClasses = ['beach-terminal flex-1 overflow-auto whitespace-pre font-mono text-sm text-slate-100 bg-slate-950/95 border border-slate-800/60 rounded-xl shadow-inner px-4 py-3', className]
+  const wrapperClasses = ['flex flex-col h-full min-h-0 gap-3', className]
     .filter(Boolean)
     .join(' ');
+  const containerClasses = 'beach-terminal flex-1 min-h-0 overflow-y-auto overflow-x-auto whitespace-pre font-mono text-sm text-slate-100 bg-slate-950/95 border border-slate-800/60 rounded-xl shadow-inner px-4 py-3';
 
   return (
-    <div className="flex flex-col gap-3">
+    <div className={wrapperClasses}>
       <div
         ref={containerRef}
         className={containerClasses}
@@ -174,12 +176,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         }}
       >
         {lines.map((line) => (
-          <div
-            key={line.absolute}
-            className={line.kind === 'pending' ? 'opacity-60' : undefined}
-          >
-            {line.text}
-          </div>
+          <LineRow key={line.absolute} line={line} styles={snapshot.styles} />
         ))}
       </div>
       <footer className="text-xs text-slate-400">{renderStatus()}</footer>
@@ -269,10 +266,15 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   }
 }
 
+interface RenderCell {
+  char: string;
+  styleId: number;
+}
+
 interface RenderLine {
   absolute: number;
-  text: string;
   kind: 'loaded' | 'pending' | 'missing';
+  cells?: RenderCell[];
 }
 
 export function buildLines(snapshot: TerminalGridSnapshot, limit: number): RenderLine[] {
@@ -286,21 +288,43 @@ export function buildLines(snapshot: TerminalGridSnapshot, limit: number): Rende
 
   for (const row of rows) {
     if (row.kind === 'loaded') {
-      const chars = row.cells.map((cell) => cell.char ?? ' ');
-      while (chars.length && chars[chars.length - 1] === ' ') {
-        chars.pop();
-      }
-      lines.push({ absolute: row.absolute, text: chars.join(''), kind: 'loaded' });
+      const cells = row.cells.map((cell) => ({
+        char: cell.char ?? ' ',
+        styleId: cell.styleId ?? 0,
+      }));
+      lines.push({ absolute: row.absolute, kind: 'loaded', cells });
       continue;
     }
-    if (row.kind === 'pending') {
-      lines.push({ absolute: row.absolute, text: '·'.repeat(placeholderWidth), kind: 'pending' });
-      continue;
-    }
-    lines.push({ absolute: row.absolute, text: ' '.repeat(placeholderWidth), kind: 'missing' });
+    const fillChar = row.kind === 'pending' ? '·' : ' ';
+    const width = row.kind === 'pending' ? placeholderWidth : placeholderWidth;
+    const cells = Array.from({ length: width }, () => ({ char: fillChar, styleId: 0 }));
+    lines.push({ absolute: row.absolute, kind: row.kind, cells });
   }
 
   return lines;
+}
+
+function LineRow({ line, styles }: { line: RenderLine; styles: Map<number, StyleDefinition> }): JSX.Element {
+  if (!line.cells || line.kind !== 'loaded') {
+    const text = line.cells?.map((cell) => cell.char).join('') ?? '';
+    const className = line.kind === 'pending' ? 'opacity-60' : undefined;
+    return <div className={className}>{text}</div>;
+  }
+
+  return (
+    <div>
+      {line.cells.map((cell, index) => {
+        const styleDef = styles.get(cell.styleId);
+        const style = styleDef ? styleFromDefinition(styleDef) : undefined;
+        const char = cell.char === ' ' ? ' ' : cell.char;
+        return (
+          <span key={index} style={style}>
+            {char}
+          </span>
+        );
+      })}
+    </div>
+  );
 }
 
 function computeLineHeight(fontSize: number): number {
@@ -313,4 +337,25 @@ function sendFrame(transport: TerminalTransport, frame: ClientFrame): void {
 
 function sendResize(transport: TerminalTransport, cols: number, rows: number): void {
   transport.send({ type: 'resize', cols, rows });
+}
+
+function styleFromDefinition(def: StyleDefinition): CSSProperties {
+  const style: CSSProperties = {};
+  if (def.fg) {
+    style.color = formatColor(def.fg);
+  }
+  if (def.bg) {
+    style.backgroundColor = formatColor(def.bg);
+  }
+  if (def.attrs & 0b0000_0001) {
+    style.fontWeight = 'bold';
+  }
+  if (def.attrs & 0b0000_0010) {
+    style.textDecoration = style.textDecoration ? `${style.textDecoration} underline` : 'underline';
+  }
+  return style;
+}
+
+function formatColor(value: number): string {
+  return `#${value.toString(16).padStart(6, '0')}`;
 }

@@ -64,10 +64,27 @@ export class TerminalGridStore {
   private readonly listeners = new Set<() => void>();
   private snapshotCache: TerminalGridSnapshot | null = null;
   private version = 0;
+  private knownBaseRow: number | null = null;
 
   constructor(initialCols = 0) {
     this.cols = initialCols;
     this.styles.set(0, { id: 0, fg: DEFAULT_COLOR, bg: DEFAULT_COLOR, attrs: 0 });
+  }
+
+  reset(): void {
+    this.baseRow = 0;
+    this.cols = 0;
+    this.followTail = true;
+    this.historyTrimmed = false;
+    this.viewportTop = 0;
+    this.viewportHeight = 0;
+    this.rows.clear();
+    this.styles.clear();
+    this.styles.set(0, { id: 0, fg: DEFAULT_COLOR, bg: DEFAULT_COLOR, attrs: 0 });
+    this.snapshotCache = null;
+    this.knownBaseRow = null;
+    this.invalidate();
+    this.notify();
   }
 
   subscribe(listener: () => void): () => void {
@@ -123,20 +140,8 @@ export class TerminalGridStore {
   }
 
   setBaseRow(baseRow: number): void {
-    if (baseRow === this.baseRow) {
+    if (!this.updateBaseRow(baseRow)) {
       return;
-    }
-    const oldBase = this.baseRow;
-    this.baseRow = baseRow;
-    if (baseRow > oldBase) {
-      for (const key of Array.from(this.rows.keys())) {
-        if (key < baseRow) {
-          this.rows.delete(key);
-        }
-      }
-    }
-    if (baseRow > 0) {
-      this.historyTrimmed = true;
     }
     this.invalidate();
     this.notify();
@@ -147,12 +152,14 @@ export class TerminalGridStore {
     this.setBaseRow(baseRow);
   }
 
-  applyUpdates(updates: Update[]): void {
+  applyUpdates(updates: Update[], authoritative = false): void {
     let mutated = false;
+    let baseAdjusted = false;
     for (const update of updates) {
+      baseAdjusted = this.observeBounds(update, authoritative) || baseAdjusted;
       mutated = this.applyUpdate(update) || mutated;
     }
-    if (mutated) {
+    if (mutated || baseAdjusted) {
       this.invalidate();
       this.notify();
     }
@@ -287,6 +294,17 @@ export class TerminalGridStore {
         mutated = true;
       }
     }
+    if (startCol === 0 && endCol <= loaded.cells.length) {
+      for (let col = endCol; col < loaded.cells.length; col += 1) {
+        const cell = loaded.cells[col]!;
+        if (seq >= cell.seq && (cell.char !== ' ' || cell.styleId !== 0)) {
+          cell.char = ' ';
+          cell.styleId = 0;
+          cell.seq = seq;
+          mutated = true;
+        }
+      }
+    }
     loaded.latestSeq = Math.max(loaded.latestSeq, seq);
     this.touchRow(row);
     return mutated;
@@ -322,9 +340,11 @@ export class TerminalGridStore {
         mutated = true;
       }
     }
-    if (this.baseRow < end) {
-      this.baseRow = end;
+    if (this.updateBaseRow(Math.max(this.baseRow, end))) {
       mutated = true;
+    }
+    if (this.knownBaseRow === null || this.knownBaseRow < end) {
+      this.knownBaseRow = end;
     }
     return mutated;
   }
@@ -371,6 +391,54 @@ export class TerminalGridStore {
     }
   }
 
+  private updateBaseRow(baseRow: number): boolean {
+    if (baseRow === this.baseRow) {
+      return false;
+    }
+    const oldBase = this.baseRow;
+    if (baseRow > oldBase) {
+      for (const key of Array.from(this.rows.keys())) {
+        if (key < baseRow) {
+          this.rows.delete(key);
+        }
+      }
+    } else {
+      for (let absolute = baseRow; absolute < oldBase; absolute += 1) {
+        if (!this.rows.has(absolute)) {
+          this.rows.set(absolute, { kind: 'pending', absolute });
+        }
+      }
+    }
+    this.baseRow = baseRow;
+    if (baseRow > 0) {
+      this.historyTrimmed = true;
+    } else if (baseRow === 0 && this.rows.size === 0) {
+      this.historyTrimmed = false;
+    }
+    if (this.knownBaseRow !== null && this.knownBaseRow < baseRow) {
+      this.knownBaseRow = baseRow;
+    }
+    return true;
+  }
+
+  private observeBounds(update: Update, authoritative: boolean): boolean {
+    const minRow = extractUpdateRow(update);
+    if (minRow === null) {
+      return false;
+    }
+    if (authoritative) {
+      const base = this.knownBaseRow === null ? minRow : Math.min(this.knownBaseRow, minRow);
+      if (this.knownBaseRow !== base) {
+        this.knownBaseRow = base;
+      }
+      return this.updateBaseRow(base);
+    }
+    if (minRow < this.baseRow) {
+      return this.updateBaseRow(minRow);
+    }
+    return false;
+  }
+
   private notify(): void {
     if (this.listeners.size === 0) {
       return;
@@ -402,6 +470,21 @@ function decodePackedCell(packed: number): { char: string; styleId: number } {
   const styleBits = packed - codePoint * WORD;
   const char = safeFromCodePoint(codePoint);
   return { char, styleId: styleBits & LOW_MASK };
+}
+
+function extractUpdateRow(update: Update): number | null {
+  switch (update.type) {
+    case 'cell':
+    case 'row':
+    case 'row_segment':
+      return update.row;
+    case 'rect':
+      return update.rows[0] ?? null;
+    case 'trim':
+    case 'style':
+    default:
+      return null;
+  }
 }
 
 function safeFromCodePoint(codePoint: number): string {

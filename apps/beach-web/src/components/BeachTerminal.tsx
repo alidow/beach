@@ -35,6 +35,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   } = props;
 
   const store = useMemo(() => providedStore ?? createTerminalStore(), [providedStore]);
+  if (import.meta.env.DEV) {
+    (window as any).beachStore = store;
+  }
   const snapshot = useTerminalSnapshot(store);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const transportRef = useRef<TerminalTransport | null>(providedTransport ?? null);
@@ -117,6 +120,13 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       }
       const lineHeight = computeLineHeight(fontSize);
       const viewportRows = Math.max(1, Math.floor(entry.contentRect.height / lineHeight));
+      if (import.meta.env.DEV) {
+        console.debug('[beach-web] resize', {
+          height: entry.contentRect.height,
+          lineHeight,
+          viewportRows,
+        });
+      }
       const current = store.getSnapshot();
       store.setViewport(current.viewportTop, viewportRows);
       if (subscriptionRef.current !== null && transportRef.current) {
@@ -221,7 +231,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     backfillController.handleFrame(frame);
     switch (frame.type) {
       case 'hello':
+        store.reset();
         subscriptionRef.current = frame.subscription;
+        inputSeqRef.current = 0;
         break;
       case 'grid':
         store.setBaseRow(frame.baseRow);
@@ -231,7 +243,21 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       case 'snapshot':
       case 'delta':
       case 'history_backfill': {
-        store.applyUpdates(frame.updates);
+        const authoritative = frame.type === 'snapshot' || frame.type === 'history_backfill';
+        if (import.meta.env.DEV) {
+          console.debug('[beach-web][updates]', frame.type, frame.updates);
+        }
+        store.applyUpdates(frame.updates, authoritative);
+        if (import.meta.env.DEV) {
+          const debugRows = store
+            .getSnapshot()
+            .rows.map((row) => ({
+              absolute: row.absolute,
+              kind: row.kind,
+              text: row.kind === 'loaded' ? store.getRowText(row.absolute) : null,
+            }));
+          console.debug('[beach-web][rows]', debugRows);
+        }
         if (!frame.hasMore && frame.type === 'snapshot') {
           store.setFollowTail(true);
         }
@@ -260,23 +286,60 @@ interface RenderLine {
   kind: 'loaded' | 'pending' | 'missing';
 }
 
-function buildLines(snapshot: TerminalGridSnapshot, limit: number): RenderLine[] {
-  const rows = snapshot.rows
-    .slice()
-    .sort((a, b) => a.absolute - b.absolute)
-    .slice(-limit);
+export function buildLines(snapshot: TerminalGridSnapshot, limit: number): RenderLine[] {
   const placeholderWidth = Math.max(1, snapshot.cols || 80);
-  return rows.map((row) => {
+  const rowsByAbsolute = new Map(snapshot.rows.map((row) => [row.absolute, row]));
+  const highestLoaded = snapshot.rows.reduce<number | null>((acc, row) => {
+    if (row.kind === 'loaded') {
+      return acc === null || row.absolute > acc ? row.absolute : acc;
+    }
+    return acc;
+  }, null);
+
+  const availableRows = snapshot.rows.length;
+  const fallbackHeight = availableRows ? Math.min(limit, availableRows) : 1;
+  const viewportHeight = Math.max(1, Math.min(limit, snapshot.viewportHeight || fallbackHeight));
+
+  let scrollTop: number;
+  if (!snapshot.followTail) {
+    scrollTop = Math.max(0, snapshot.viewportTop - snapshot.baseRow);
+  } else if (highestLoaded !== null) {
+    const desiredTop = highestLoaded - viewportHeight + 1;
+    scrollTop = Math.max(0, desiredTop - snapshot.baseRow);
+  } else {
+    scrollTop = Math.max(0, snapshot.viewportTop - snapshot.baseRow);
+  }
+
+  const lines: RenderLine[] = [];
+  for (let rowIdx = 0; rowIdx < viewportHeight && lines.length < limit; rowIdx += 1) {
+    const absolute = snapshot.baseRow + scrollTop + rowIdx;
+    const row = rowsByAbsolute.get(absolute);
+    if (!row) {
+      lines.push({ absolute, text: ' '.repeat(placeholderWidth), kind: 'missing' });
+      continue;
+    }
     if (row.kind === 'loaded') {
       const chars = row.cells.map((cell) => cell.char ?? ' ');
       while (chars.length && chars[chars.length - 1] === ' ') {
         chars.pop();
       }
-      return { absolute: row.absolute, text: chars.join(''), kind: 'loaded' as const };
+      lines.push({ absolute: row.absolute, text: chars.join(''), kind: 'loaded' });
+      continue;
     }
-    const placeholder = row.kind === 'pending' ? '·'.repeat(placeholderWidth) : '';
-    return { absolute: row.absolute, text: placeholder, kind: row.kind };
-  });
+    if (row.kind === 'pending') {
+      lines.push({ absolute: row.absolute, text: '·'.repeat(placeholderWidth), kind: 'pending' });
+      continue;
+    }
+    lines.push({ absolute: row.absolute, text: ' '.repeat(placeholderWidth), kind: 'missing' });
+  }
+
+  if (snapshot.followTail) {
+    while (lines.length > 0 && lines[lines.length - 1]?.kind !== 'loaded') {
+      lines.pop();
+    }
+  }
+
+  return lines;
 }
 
 function computeLineHeight(fontSize: number): number {

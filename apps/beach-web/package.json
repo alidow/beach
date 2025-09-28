@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "vitest",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "debug:webrtc": "tsx scripts/webrtc-debug.ts"
   },
   "dependencies": {
@@ -15,6 +16,7 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "^6.8.0",
     "@testing-library/react": "^14.1.2",
     "@types/node": "^20.11.30",
     "@types/react": "^18.3.3",

@@ -47,6 +47,49 @@ describe('TerminalGridStore', () => {
     const snapshot = store.getSnapshot();
     expect(snapshot.styles.get(2)).toEqual({ id: 2, fg: 0x112233, bg: 0x445566, attrs: 0b0000_0100 });
   });
+
+  it('clears trailing characters when a row segment rewrites from column zero', () => {
+    const store = new TerminalGridStore();
+    store.setGridSize(24, 80);
+
+    const prompt = '(base) % ';
+    const command = 'echo hi';
+
+    store.applyUpdates([
+      { type: 'row_segment', row: 0, startCol: 0, seq: 1, cells: packString(`${prompt}${command}`) },
+    ], true);
+
+    store.applyUpdates([
+      { type: 'row_segment', row: 0, startCol: 0, seq: 2, cells: packString(prompt) },
+    ], true);
+
+    expect(store.getRowText(0)).toBe('(base) %');
+  });
+
+  it('drops previous session state on reset', () => {
+    const store = new TerminalGridStore();
+    store.setGridSize(24, 80);
+    store.applyUpdates([{ type: 'row', row: 0, seq: 1, cells: packString('old session') }], true);
+    expect(store.getRowText(0)).toBe('old session');
+
+    store.reset();
+    store.setGridSize(24, 80);
+    store.applyUpdates([{ type: 'row', row: 0, seq: 2, cells: packString('new session') }], true);
+
+    const loadedRows = store.getSnapshot().rows.filter((row) => row.kind === 'loaded');
+    expect(loadedRows).toHaveLength(1);
+    expect(store.getRowText(0)).toBe('new session');
+  });
+
+  it('lowers the base row when authoritative updates reference earlier history', () => {
+    const store = new TerminalGridStore();
+    store.setBaseRow(10);
+    store.setGridSize(5, 80);
+
+    store.applyUpdates([{ type: 'row', row: 8, seq: 1, cells: packString('history') }], true);
+
+    expect(store.getSnapshot().baseRow).toBe(8);
+  });
 });
 
 function packCell(char: string, styleId: number): number {
@@ -55,4 +98,8 @@ function packCell(char: string, styleId: number): number {
     throw new Error('invalid char');
   }
   return codePoint * 2 ** 32 + styleId;
+}
+
+function packString(text: string, styleId = 0): number[] {
+  return Array.from(text).map((char) => packCell(char, styleId));
 }

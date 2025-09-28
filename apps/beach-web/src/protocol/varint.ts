@@ -7,7 +7,7 @@ export function writeVarUint(value: number, out: number[]): void {
   let current = value;
   while (current >= 0x80) {
     out.push((current & 0x7f) | 0x80);
-    current >>>= 7;
+    current = Math.floor(current / 0x80);
   }
   out.push(current);
 }
@@ -20,7 +20,7 @@ export function readVarUint(buffer: Uint8Array, offset: { value: number }): numb
       throw new RangeError('unexpected end of input while reading varint');
     }
     const byte = buffer[offset.value++];
-    result |= (byte & 0x7f) << shift;
+    result += (byte & 0x7f) * 2 ** shift;
     if ((byte & 0x80) === 0) {
       break;
     }

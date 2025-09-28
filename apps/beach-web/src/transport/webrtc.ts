@@ -126,7 +126,8 @@ function decodeDataChannelPayload(event: MessageEvent): TransportMessage {
     return decodeTransportMessage(data);
   }
   if (ArrayBuffer.isView(data)) {
-    return decodeTransportMessage(data.buffer);
+    const view = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    return decodeTransportMessage(view);
   }
   throw new Error('unsupported RTCDataChannel message payload');
 }

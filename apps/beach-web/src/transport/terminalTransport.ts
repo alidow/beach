@@ -57,8 +57,14 @@ export class DataChannelTerminalTransport extends EventTarget implements Termina
       }
     });
 
-    this.channel.addEventListener('close', (event) => this.dispatchEvent(event));
-    this.channel.addEventListener('error', (event) => this.dispatchEvent(event));
+    this.channel.addEventListener('close', () => {
+      this.dispatchEvent(new Event('close'));
+    });
+    this.channel.addEventListener('error', (event) => {
+      const cloned = new Event('error');
+      Object.assign(cloned, { error: (event as any).error ?? event });
+      this.dispatchEvent(cloned);
+    });
   }
 
   send(frame: ClientFrame): void {

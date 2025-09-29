@@ -2,28 +2,59 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  color-scheme: dark;
+@layer base {
+  :root {
+    color-scheme: dark;
+    --font-sans: 'Inter', 'SF Pro Text', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-mono: 'JetBrains Mono', 'SFMono-Regular', 'Menlo', 'Consolas', monospace;
+    --background: 222.2 84% 6%;
+    --foreground: 210 40% 96%;
+    --muted: 215 27% 17%;
+    --muted-foreground: 217 15% 65%;
+    --popover: 222.2 84% 8%;
+    --popover-foreground: 210 40% 96%;
+    --card: 222.2 72% 7.5%;
+    --card-foreground: 210 40% 96%;
+    --border: 219 32% 22%;
+    --border-glow: 199 85% 60%;
+    --input: 219 32% 22%;
+    --ring: 199 89% 48%;
+    --accent: 199 89% 48%;
+    --accent-foreground: 210 40% 96%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 210 40% 96%;
+    --success: 153 60% 45%;
+    --success-foreground: 159 77% 95%;
+    --radius: 0.9rem;
+    --terminal-frame: 219 46% 11%;
+    --terminal-bezel: 218 58% 12.5%;
+    --terminal-screen: 221 47% 6%;
+    --terminal-glow: 199 89% 36%;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    font-family: var(--font-sans);
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+    background-image: radial-gradient(circle at top, hsl(var(--terminal-glow)) 0%, transparent 55%),
+      linear-gradient(180deg, rgba(3, 8, 19, 0.85), rgba(2, 4, 8, 0.92));
+  }
+
+  input,
+  button,
+  textarea {
+    font: inherit;
+  }
+
+  .terminal-cursor {
+    animation: caret-blink 1.1s steps(2, start) infinite;
+  }
 }
 
-*,
-*::before,
-*::after {
-  box-sizing: border-box;
-}
-
-body {
-  margin: 0;
-  font-family: 'SF Pro Text', 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
-}
-
-input,
-button,
-textarea {
-  font: inherit;
-}
-
-@keyframes beach-terminal-blink {
-  0%, 50% { opacity: 1; }
-  50.01%, 100% { opacity: 0; }
+@layer utilities {
+  .glass-border {
+    box-shadow: inset 0 0 0 1px hsla(var(--border) / 0.4);
+  }
 }

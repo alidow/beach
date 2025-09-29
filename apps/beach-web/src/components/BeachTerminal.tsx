@@ -7,17 +7,22 @@ import type { TerminalGridSnapshot, TerminalGridStore } from '../terminal/gridSt
 import { encodeKeyEvent } from '../terminal/keymap';
 import type { TerminalTransport } from '../transport/terminalTransport';
 import { BackfillController } from '../terminal/backfillController';
+import { cn } from '../lib/utils';
+
+export type TerminalStatus = 'idle' | 'connecting' | 'connected' | 'error' | 'closed';
 
 export interface BeachTerminalProps {
   sessionId?: string;
   baseUrl?: string;
   passcode?: string;
   autoConnect?: boolean;
+  onStatusChange?: (status: TerminalStatus) => void;
   store?: TerminalGridStore;
   transport?: TerminalTransport;
   className?: string;
   fontFamily?: string;
   fontSize?: number;
+  showStatusBar?: boolean;
 }
 
 export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
@@ -26,11 +31,13 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     baseUrl,
     passcode,
     autoConnect = false,
+    onStatusChange,
     transport: providedTransport,
     store: providedStore,
     className,
     fontFamily = "'SFMono-Regular', 'Menlo', 'Consolas', monospace",
     fontSize = 14,
+    showStatusBar = true,
   } = props;
 
   const store = useMemo(() => providedStore ?? createTerminalStore(), [providedStore]);
@@ -43,10 +50,11 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const connectionRef = useRef<BrowserTransportConnection | null>(null);
   const subscriptionRef = useRef<number | null>(null);
   const inputSeqRef = useRef(0);
-  const [status, setStatus] = useState<'idle' | 'connecting' | 'connected' | 'error' | 'closed'>(
+  const [status, setStatus] = useState<TerminalStatus>(
     providedTransport ? 'connected' : 'idle',
   );
   const [error, setError] = useState<Error | null>(null);
+  useEffect(() => onStatusChange?.(status), [status, onStatusChange]);
   const lines = useMemo(() => buildLines(snapshot, 600), [snapshot]);
   if (import.meta.env.DEV) {
     (window as any).beachLines = lines;
@@ -178,10 +186,11 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     store.registerPrediction(seq, payload);
   };
 
-  const wrapperClasses = ['flex flex-col h-full min-h-0 gap-3', className]
-    .filter(Boolean)
-    .join(' ');
-  const containerClasses = 'beach-terminal flex-1 min-h-0 overflow-y-auto overflow-x-auto whitespace-pre font-mono text-sm text-slate-100 bg-slate-950/95 border border-slate-800/60 rounded-xl shadow-inner px-4 py-3';
+  const wrapperClasses = cn('flex flex-col h-full min-h-0 gap-4', className);
+  const containerClasses = cn(
+    'beach-terminal flex-1 min-h-0 overflow-y-auto overflow-x-auto whitespace-pre font-mono text-[13px] leading-6 text-[hsl(var(--foreground))]',
+    'rounded-2xl border border-[hsl(var(--border))]/70 bg-[hsl(var(--terminal-screen))]/95 px-6 py-5 shadow-inner shadow-slate-950/60',
+  );
 
   return (
     <div className={wrapperClasses}>
@@ -206,7 +215,11 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         ))}
         <div style={{ height: bottomPadding }} aria-hidden="true" />
       </div>
-      <footer className="text-xs text-slate-400">{renderStatus()}</footer>
+      {showStatusBar ? (
+        <footer className="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))]">
+          {renderStatus()}
+        </footer>
+      ) : null}
     </div>
   );
 

@@ -1,10 +1,11 @@
 #![recursion_limit = "1024"]
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{
-    Path, State,
+    Path, Query, State,
     ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
 };
 use axum::http::StatusCode;
@@ -147,8 +148,9 @@ struct AppState {
 
 #[derive(Default)]
 struct RestState {
-    offer: Option<Vec<u8>>,
-    answer: Option<Vec<u8>>,
+    offers: Vec<TestSdpPayload>,
+    answers: HashMap<String, TestSdpPayload>,
+    handshake_log: Vec<String>,
 }
 
 #[derive(Default)]
@@ -170,11 +172,24 @@ enum Role {
     Client,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct TestSdpPayload {
     sdp: String,
     #[serde(rename = "type")]
     typ: String,
+    handshake_id: String,
+    from_peer: String,
+    to_peer: String,
+}
+
+#[derive(Deserialize)]
+struct OfferQuery {
+    peer_id: String,
+}
+
+#[derive(Deserialize)]
+struct AnswerQuery {
+    handshake_id: String,
 }
 
 fn role_str(role: Role) -> &'static str {
@@ -250,28 +265,30 @@ async fn post_offer(
     }
     debug!("stub: received offer for session {session}");
     let mut guard = state.rest.lock().await;
-    guard.offer = Some(serde_json::to_vec(&payload).unwrap_or_default());
+    guard.handshake_log.push(payload.handshake_id.clone());
+    guard.offers.push(payload);
     StatusCode::NO_CONTENT
 }
 
 async fn get_offer(
     State(state): State<AppState>,
     Path(session): Path<String>,
+    Query(query): Query<OfferQuery>,
 ) -> Result<Json<TestSdpPayload>, StatusCode> {
     if session != SESSION_ID {
         return Err(StatusCode::NOT_FOUND);
     }
     debug!("stub: fetching offer for session {session}");
-    let guard = state.rest.lock().await;
-    guard
-        .offer
-        .as_ref()
-        .map(|bytes| {
-            serde_json::from_slice::<TestSdpPayload>(bytes)
-                .map(Json)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-        })
-        .unwrap_or(Err(StatusCode::NOT_FOUND))
+    let mut guard = state.rest.lock().await;
+    if let Some(index) = guard
+        .offers
+        .iter()
+        .position(|offer| offer.to_peer == query.peer_id)
+    {
+        Ok(Json(guard.offers.remove(index)))
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
 }
 
 async fn post_answer(
@@ -284,28 +301,24 @@ async fn post_answer(
     }
     debug!("stub: received answer for session {session}");
     let mut guard = state.rest.lock().await;
-    guard.answer = Some(serde_json::to_vec(&payload).unwrap_or_default());
+    guard.answers.insert(payload.handshake_id.clone(), payload);
     StatusCode::NO_CONTENT
 }
 
 async fn get_answer(
     State(state): State<AppState>,
     Path(session): Path<String>,
+    Query(query): Query<AnswerQuery>,
 ) -> Result<Json<TestSdpPayload>, StatusCode> {
     if session != SESSION_ID {
         return Err(StatusCode::NOT_FOUND);
     }
     debug!("stub: fetching answer for session {session}");
-    let guard = state.rest.lock().await;
-    guard
-        .answer
-        .as_ref()
-        .map(|bytes| {
-            serde_json::from_slice::<TestSdpPayload>(bytes)
-                .map(Json)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-        })
-        .unwrap_or(Err(StatusCode::NOT_FOUND))
+    let mut guard = state.rest.lock().await;
+    match guard.answers.remove(&query.handshake_id) {
+        Some(payload) => Ok(Json(payload)),
+        None => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 async fn ws_handler(
@@ -500,6 +513,7 @@ async fn webrtc_signaling_end_to_end() {
         Duration::from_millis(50),
         None,
     );
+    sleep(Duration::from_millis(50)).await;
     let answer_fut = connect_via_signaling(
         &base_url,
         WebRtcRole::Answerer,
@@ -554,4 +568,87 @@ async fn webrtc_signaling_end_to_end() {
     }
 
     shutdown_tx.send(()).ok();
+}
+
+#[test_timeout::tokio_timeout_test]
+async fn webrtc_multiple_handshakes_use_unique_ids() {
+    let _ = SubscriberBuilder::default()
+        .with_test_writer()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
+
+    const HANDSHAKES: usize = 3;
+    let mut handshake_ids = Vec::with_capacity(HANDSHAKES);
+
+    for _ in 0..HANDSHAKES {
+        let state = AppState::default();
+        let router = build_router(state.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bind");
+        let addr = listener.local_addr().expect("local addr");
+        let base_url = format!("http://{}/sessions/{}/webrtc", addr, SESSION_ID);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .ok();
+        });
+
+        let offer_fut = connect_via_signaling(
+            &base_url,
+            WebRtcRole::Offerer,
+            Duration::from_millis(50),
+            None,
+        );
+        sleep(Duration::from_millis(50)).await;
+        let answer_fut = connect_via_signaling(
+            &base_url,
+            WebRtcRole::Answerer,
+            Duration::from_millis(50),
+            None,
+        );
+
+        let (offer_res, answer_res) = tokio::join!(
+            timeout(Duration::from_secs(10), offer_fut),
+            timeout(Duration::from_secs(10), answer_fut),
+        );
+        let offer_transport = offer_res
+            .expect("offer signaling timeout")
+            .expect("offer transport");
+        let answer_transport = answer_res
+            .expect("answer signaling timeout")
+            .expect("answer transport");
+
+        offer_transport
+            .send_text("handshake-ping")
+            .expect("offer send ping");
+        let inbound = recv_data_message(&answer_transport, Duration::from_secs(5)).await;
+        match inbound.payload {
+            Payload::Text(text) => assert_eq!(text, "handshake-ping"),
+            Payload::Binary(_) => panic!("expected text payload"),
+        }
+
+        drop(offer_transport);
+        drop(answer_transport);
+
+        shutdown_tx.send(()).ok();
+        server.await.ok();
+
+        let rest = state.rest.lock().await;
+        let handshake_id = rest
+            .handshake_log
+            .last()
+            .cloned()
+            .expect("handshake id recorded");
+        handshake_ids.push(handshake_id);
+    }
+
+    let unique: HashSet<_> = handshake_ids.iter().collect();
+    assert_eq!(handshake_ids.len(), unique.len());
 }

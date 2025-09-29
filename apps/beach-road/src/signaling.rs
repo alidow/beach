@@ -50,14 +50,17 @@ pub enum TransportSignal {
 pub enum WebRTCSignal {
     Offer {
         sdp: String,
+        handshake_id: String,
     },
     Answer {
         sdp: String,
+        handshake_id: String,
     },
     IceCandidate {
         candidate: String,
         sdp_mid: Option<String>,
         sdp_mline_index: Option<u32>,
+        handshake_id: String,
     },
 }
 
@@ -150,6 +153,16 @@ pub enum ServerMessage {
     Error { message: String },
     /// Debug response with terminal state
     Debug { response: DebugResponse },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebRtcSdpPayload {
+    pub sdp: String,
+    #[serde(rename = "type")]
+    pub typ: String,
+    pub handshake_id: String,
+    pub from_peer: String,
+    pub to_peer: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

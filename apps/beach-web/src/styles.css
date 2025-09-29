@@ -53,6 +53,54 @@
   }
 }
 
+@layer components {
+  .beach-terminal {
+    text-rendering: optimizeLegibility;
+    font-feature-settings: 'liga' 0, 'calt' 0;
+    background-color: #1b1f2a;
+    color: #d5d9e0;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04), inset 0 24px 48px -28px rgba(7, 11, 20, 0.8);
+  }
+
+  .beach-terminal::-webkit-scrollbar {
+    width: 12px;
+    height: 12px;
+  }
+
+  .beach-terminal::-webkit-scrollbar-track {
+    background: rgba(14, 18, 28, 0.55);
+  }
+
+  .beach-terminal::-webkit-scrollbar-thumb {
+    background: rgba(69, 92, 128, 0.6);
+    border-radius: 9999px;
+    border: 2px solid rgba(18, 23, 34, 0.85);
+  }
+
+  .beach-terminal::-webkit-scrollbar-thumb:hover {
+    background: rgba(87, 115, 158, 0.72);
+  }
+
+  .beach-terminal ::selection {
+    background: rgba(58, 150, 221, 0.35);
+    color: #f8fafc;
+  }
+
+  .xterm-row {
+    min-height: 1.4rem;
+    letter-spacing: 0.01em;
+  }
+
+  .xterm-row span {
+    display: inline-block;
+    min-width: 0.62ch;
+  }
+
+  .xterm-row span[data-predicted='true'] {
+    text-decoration-style: dotted;
+  }
+}
+
 @layer utilities {
   .glass-border {
     box-shadow: inset 0 0 0 1px hsla(var(--border) / 0.4);

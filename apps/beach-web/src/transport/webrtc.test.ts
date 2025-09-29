@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { decodeTransportMessage } from './envelope';
-import { WebRtcTransport } from './webrtc';
+import { WebRtcTransport, appendParams } from './webrtc';
 
 describe('WebRtcTransport', () => {
   it('encodes outgoing text payloads with transport envelope', () => {
@@ -41,6 +41,31 @@ describe('WebRtcTransport', () => {
       expect(detail.payload.data).toEqual(Uint8Array.from([0xde, 0xad]));
     }
   });
+});
+
+describe('appendParams helper', () => {
+  it(
+    'adds query parameters without clobbering existing ones',
+    () => {
+      const base = 'http://127.0.0.1/offer?existing=value';
+      const result = appendParams(base, { peer_id: 'abc', handshake_id: '123' });
+      const url = new URL(result);
+      expect(url.searchParams.get('existing')).toBe('value');
+      expect(url.searchParams.get('peer_id')).toBe('abc');
+      expect(url.searchParams.get('handshake_id')).toBe('123');
+    },
+    60_000,
+  );
+
+  it(
+    'returns the original url when params are absent',
+    () => {
+      const base = 'http://127.0.0.1/answer';
+      const result = appendParams(base, undefined);
+      expect(result).toBe(base);
+    },
+    60_000,
+  );
 });
 
 class MockDataChannel extends EventTarget {

@@ -23,6 +23,8 @@ export interface BeachTerminalProps {
   fontFamily?: string;
   fontSize?: number;
   showStatusBar?: boolean;
+  isFullscreen?: boolean;
+  onToggleFullscreen?: (next: boolean) => void;
 }
 
 export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
@@ -38,6 +40,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     fontFamily = "'SFMono-Regular', 'Menlo', 'Consolas', monospace",
     fontSize = 14,
     showStatusBar = true,
+    isFullscreen = false,
+    onToggleFullscreen,
   } = props;
 
   const store = useMemo(() => providedStore ?? createTerminalStore(), [providedStore]);
@@ -54,8 +58,23 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     providedTransport ? 'connected' : 'idle',
   );
   const [error, setError] = useState<Error | null>(null);
-  useEffect(() => onStatusChange?.(status), [status, onStatusChange]);
+  const [showIdlePlaceholder, setShowIdlePlaceholder] = useState(true);
+  useEffect(() => {
+    onStatusChange?.(status);
+    if (status === 'connected') {
+      setShowIdlePlaceholder(false);
+    } else if (status === 'idle') {
+      setShowIdlePlaceholder(true);
+    }
+  }, [status, onStatusChange]);
   const lines = useMemo(() => buildLines(snapshot, 600), [snapshot]);
+  const sessionTitle = useMemo(() => {
+    if (sessionId && sessionId.trim().length > 0) {
+      const trimmed = sessionId.trim();
+      return trimmed.length > 24 ? `${trimmed.slice(0, 12)}…${trimmed.slice(-6)}` : trimmed;
+    }
+    return 'New Session';
+  }, [sessionId]);
   if (import.meta.env.DEV) {
     (window as any).beachLines = lines;
   }
@@ -186,14 +205,74 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     store.registerPrediction(seq, payload);
   };
 
-  const wrapperClasses = cn('flex flex-col h-full min-h-0 gap-4', className);
-  const containerClasses = cn(
-    'beach-terminal flex-1 min-h-0 overflow-y-auto overflow-x-auto whitespace-pre font-mono text-[13px] leading-6 text-[hsl(var(--foreground))]',
-    'rounded-2xl border border-[hsl(var(--border))]/70 bg-[hsl(var(--terminal-screen))]/95 px-6 py-5 shadow-inner shadow-slate-950/60',
+  const wrapperClasses = cn(
+    'relative flex h-full min-h-0 flex-col overflow-hidden',
+    'rounded-[22px] border border-[#0f131a] bg-[#090d14]/95 shadow-[0_45px_120px_-70px_rgba(10,26,55,0.85)]',
+    className,
   );
+  const containerClasses = cn(
+    'beach-terminal relative flex-1 min-h-0 overflow-y-auto overflow-x-auto whitespace-pre font-mono text-[13px] leading-[1.42] text-[#d5d9e0]',
+    'bg-[#1b1f2a] px-6 py-5 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04),inset_0_22px_45px_-25px_rgba(8,10,20,0.82)]',
+  );
+
+  const statusColor = useMemo(() => {
+    switch (status) {
+      case 'connected':
+        return '#22c55e';
+      case 'connecting':
+        return '#facc15';
+      case 'error':
+        return '#f87171';
+      case 'closed':
+        return '#94a3b8';
+      default:
+        return '#64748b';
+    }
+  }, [status]);
 
   return (
     <div className={wrapperClasses}>
+      <div className="pointer-events-none absolute inset-0">
+        <div className="absolute inset-x-0 top-0 h-28 bg-gradient-to-b from-white/12 via-white/0 to-transparent opacity-20" aria-hidden />
+        <div className="absolute inset-0 rounded-[22px] ring-1 ring-[#1f2736]/60" aria-hidden />
+      </div>
+      <header className="relative z-10 flex items-center justify-between gap-4 bg-[#111925]/95 px-6 py-3 text-[11px] font-medium uppercase tracking-[0.36em] text-[#9aa4bc]">
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => onToggleFullscreen?.(!isFullscreen)}
+            className={cn(
+              'inline-flex h-3.5 w-3.5 items-center justify-center rounded-full transition focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40',
+              isFullscreen
+                ? 'border border-[#111827] bg-[#212838] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.06)] hover:bg-[#1d2432] text-[#a5b4d6]'
+                : 'border border-[#1a8a39] bg-[#26c547] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.2)] hover:bg-[#2cd653] text-[#0f3d1d]'
+            )}
+            aria-label={isFullscreen ? 'Exit full screen' : 'Enter full screen'}
+            aria-pressed={isFullscreen}
+          >
+            <svg viewBox="0 0 12 12" className="h-2.5 w-2.5" fill="none" aria-hidden>
+              {isFullscreen ? (
+                <>
+                  <rect x="2.3" y="2.3" width="7.4" height="7.4" rx="1.7" stroke="currentColor" strokeWidth="1" />
+                  <path d="M4.5 7.6h3" stroke="currentColor" strokeWidth="1" strokeLinecap="round" />
+                </>
+              ) : (
+                <>
+                  <rect x="2.3" y="2.3" width="7.4" height="7.4" rx="1.9" fill="rgba(15,61,29,0.35)" stroke="#0f3d1d" strokeWidth="1" />
+                  <path d="M4.1 4.1l3.8 3.8" stroke="#0f3d1d" strokeWidth="1.1" strokeLinecap="round" />
+                </>
+              )}
+            </svg>
+          </button>
+          <span className="text-[10px] font-semibold uppercase tracking-[0.5em] text-[#c0cada]">{sessionTitle}</span>
+        </div>
+        <div className="flex items-center gap-2 text-[10px]">
+          <span className="inline-flex items-center gap-2 rounded-full border border-white/10 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.32em] text-[#c9d2e5]">
+            <span className="size-1.5 rounded-full" style={{ backgroundColor: statusColor }} aria-hidden />
+            {renderStatus()}
+          </span>
+        </div>
+      </header>
       <div
         ref={containerRef}
         className={containerClasses}
@@ -204,11 +283,16 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           fontFamily,
           fontSize,
           lineHeight: `${lineHeight}px`,
+          letterSpacing: '0.01em',
+          fontVariantLigatures: 'none',
           minHeight: lineHeight * Math.max(1, minimumRows),
           height: '100%',
           maxHeight: '100%',
         }}
       >
+        {showIdlePlaceholder ? (
+          <IdlePlaceholder onConnectNotice={() => setShowIdlePlaceholder(false)} status={status} />
+        ) : null}
         <div style={{ height: topPadding }} aria-hidden="true" />
         {lines.map((line) => (
           <LineRow key={line.absolute} line={line} styles={snapshot.styles} />
@@ -216,7 +300,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         <div style={{ height: bottomPadding }} aria-hidden="true" />
       </div>
       {showStatusBar ? (
-        <footer className="flex items-center gap-2 text-xs text-[hsl(var(--muted-foreground))]">
+        <footer className="flex items-center gap-2 px-6 pb-3 text-xs text-[hsl(var(--muted-foreground))]">
           {renderStatus()}
         </footer>
       ) : null}
@@ -391,7 +475,7 @@ export function buildLines(snapshot: TerminalGridSnapshot, limit: number): Rende
 function LineRow({ line, styles }: { line: RenderLine; styles: Map<number, StyleDefinition> }): JSX.Element {
   if (!line.cells || line.kind !== 'loaded') {
     const text = line.cells?.map((cell) => cell.char).join('') ?? '';
-    const className = line.kind === 'pending' ? 'opacity-60' : undefined;
+    const className = cn('xterm-row', line.kind === 'pending' ? 'opacity-60' : undefined);
     return <div className={className}>{text}</div>;
   }
 
@@ -399,7 +483,7 @@ function LineRow({ line, styles }: { line: RenderLine; styles: Map<number, Style
   const baseStyleDef = styles.get(0) ?? { id: 0, fg: 0, bg: 0, attrs: 0 };
 
   return (
-    <div>
+    <div className="xterm-row">
       {line.cells.map((cell, index) => {
         const styleDef = styles.get(cell.styleId);
         const isCursor = cursorCol !== null && cursorCol === index;
@@ -535,4 +619,18 @@ function colorFromIndexed(index: number): string {
     return `rgb(${level}, ${level}, ${level})`;
   }
   return DEFAULT_FOREGROUND;
+}
+
+function IdlePlaceholder({ onConnectNotice, status }: { onConnectNotice: () => void; status: TerminalStatus }): JSX.Element {
+  useEffect(() => {
+    if (status === 'connected') {
+      onConnectNotice();
+    }
+  }, [status, onConnectNotice]);
+  return (
+    <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 bg-gradient-to-br from-[#0a101b]/92 via-[#0d1421]/92 to-[#05070b]/94 text-[13px] font-mono text-[#8f9ab5]">
+      <div className="rounded-full border border-white/10 bg-[#141a28]/90 px-3 py-1 text-[11px] uppercase tracking-[0.4em] text-white/70">Terminal idle</div>
+      <p className="text-xs text-white/40">Awaiting connection</p>
+    </div>
+  );
 }

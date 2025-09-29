@@ -180,6 +180,7 @@ export async function connectWebRtcTransport(
   const { signaling, logger } = options;
   const join = await signaling.waitForMessage('join_success', 15_000);
   log(logger, `join_success payload: ${JSON.stringify(join)}`);
+  const assignedPeerId = join.peer_id;
   const remotePeerId = await resolveRemotePeerId(signaling, join, options.preferredPeerId);
   log(logger, `remote peer resolved: ${remotePeerId}`);
 
@@ -215,6 +216,7 @@ export async function connectWebRtcTransport(
   const disposeSignalListener = attachSignalListener(
     signaling,
     remotePeerId,
+    handshakeId,
     onRemoteCandidate,
     logger,
   );
@@ -247,6 +249,7 @@ export async function connectWebRtcTransport(
         transport: 'webrtc',
         signal: {
           signal_type: 'ice_candidate',
+          handshake_id: handshakeId,
           candidate: candidate.candidate ?? '',
           sdp_mid: candidate.sdpMid ?? undefined,
           sdp_mline_index: candidate.sdpMLineIndex ?? undefined,
@@ -361,6 +364,7 @@ export async function connectWebRtcTransport(
 function attachSignalListener(
   signaling: SignalingClient,
   remotePeerId: string,
+  handshakeId: string,
   onRemoteCandidate: (cand: RTCIceCandidateInit) => void,
   logger?: (message: string) => void,
 ): () => void {
@@ -374,6 +378,10 @@ function attachSignalListener(
     }
     const signal = parseWebRtcSignal(detail.signal);
     if (!signal) {
+      return;
+    }
+    if (signal.signal.handshake_id && signal.signal.handshake_id !== handshakeId) {
+      log(logger, `discarding signal for stale handshake ${signal.signal.handshake_id}`);
       return;
     }
     if (signal.signal.signal_type === 'ice_candidate') {
@@ -419,11 +427,15 @@ async function resolveRemotePeerId(
 }
 
 function parseWebRtcSignal(raw: unknown):
-  | { transport: 'webrtc'; signal: { signal_type: 'offer' | 'answer'; sdp: string } }
+  | {
+      transport: 'webrtc';
+      signal: { signal_type: 'offer' | 'answer'; sdp: string; handshake_id: string };
+    }
   | {
       transport: 'webrtc';
       signal: {
         signal_type: 'ice_candidate';
+        handshake_id: string;
         candidate: string;
         sdp_mid?: string;
         sdp_mline_index?: number;
@@ -443,11 +455,15 @@ function parseWebRtcSignal(raw: unknown):
   }
   const signalType = signal.signal_type;
   if (signalType === 'offer' || signalType === 'answer') {
+    if (typeof signal.handshake_id !== 'string') {
+      return undefined;
+    }
     return {
       transport: 'webrtc',
       signal: {
         signal_type: signalType,
         sdp: typeof signal.sdp === 'string' ? signal.sdp : '',
+        handshake_id: signal.handshake_id,
       },
     };
   }
@@ -455,10 +471,14 @@ function parseWebRtcSignal(raw: unknown):
     if (typeof signal.candidate !== 'string') {
       return undefined;
     }
+    if (typeof signal.handshake_id !== 'string') {
+      return undefined;
+    }
     return {
       transport: 'webrtc',
       signal: {
         signal_type: 'ice_candidate',
+        handshake_id: signal.handshake_id,
         candidate: signal.candidate,
         sdp_mid: typeof signal.sdp_mid === 'string' ? signal.sdp_mid : undefined,
         sdp_mline_index:
@@ -482,8 +502,17 @@ async function connectAsAnswerer(options: {
 }): Promise<ConnectedWebRtcTransport> {
   const { pc, signalingUrl, pollIntervalMs, remotePeerId, logger } = options;
   log(logger, 'polling for SDP offer');
-  const offer = await pollSdp(`${signalingUrl.replace(/\/$/, '')}/offer`, pollIntervalMs, logger);
+  const offer = await pollSdp(
+    `${signalingUrl.replace(/\/$/, '')}/offer`,
+    pollIntervalMs,
+    { peer_id: assignedPeerId },
+    logger,
+  );
   log(logger, 'SDP offer received');
+  const handshakeId = offer.handshake_id;
+  if (!handshakeId) {
+    throw new Error('offer missing handshake_id');
+  }
   const channelPromise = waitForDataChannel(pc, remotePeerId, logger);
   log(logger, 'waiting for data channel announcement');
 
@@ -500,6 +529,9 @@ async function connectAsAnswerer(options: {
   await postSdp(`${signalingUrl.replace(/\/$/, '')}/answer`, {
     sdp: answer.sdp ?? '',
     type: answer.type,
+    handshake_id: handshakeId,
+    from_peer: assignedPeerId,
+    to_peer: offer.from_peer,
   });
   log(logger, 'SDP answer posted');
   try {
@@ -557,11 +589,12 @@ async function waitForDataChannel(
 async function pollSdp(
   url: string,
   pollIntervalMs: number,
+  params: Record<string, string> | undefined,
   logger?: (message: string) => void,
 ): Promise<WebRtcSdpPayload> {
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
-    const payload = await fetchSdp(url);
+    const payload = await fetchSdp(url, params);
     if (payload) {
       log(logger, `polled SDP at ${url}`);
       return payload;
@@ -571,8 +604,12 @@ async function pollSdp(
   throw new Error('timed out waiting for SDP payload');
 }
 
-async function fetchSdp(url: string): Promise<WebRtcSdpPayload | null> {
-  const response = await fetch(url, { cache: 'no-cache' });
+async function fetchSdp(
+  url: string,
+  params?: Record<string, string>,
+): Promise<WebRtcSdpPayload | null> {
+  const target = appendParams(url, params);
+  const response = await fetch(target, { cache: 'no-cache' });
   if (response.status === 404) {
     return null;
   }
@@ -597,9 +634,27 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export function appendParams(
+  url: string,
+  params?: Record<string, string>,
+): string {
+  if (!params || Object.keys(params).length === 0) {
+    return url;
+  }
+  const base = typeof window === 'undefined' ? 'http://localhost/' : window.location.href;
+  const target = new URL(url, base);
+  for (const [key, value] of Object.entries(params)) {
+    target.searchParams.set(key, value);
+  }
+  return target.toString();
+}
+
 interface WebRtcSdpPayload {
   sdp: string;
   type: string;
+  handshake_id: string;
+  from_peer: string;
+  to_peer: string;
 }
 
 function log(logger: ((message: string) => void) | undefined, message: string): void {

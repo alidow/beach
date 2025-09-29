@@ -8,11 +8,12 @@ use crossbeam_channel::{
     TryRecvError as CrossbeamTryRecvError, unbounded as crossbeam_unbounded,
 };
 use once_cell::sync::Lazy;
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Handle, Runtime};
-use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc as tokio_mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, mpsc as tokio_mpsc, oneshot};
 use tokio::time::{sleep, timeout};
+use uuid::Uuid;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::setting_engine::SettingEngine;
@@ -415,11 +416,14 @@ pub enum WebRtcRole {
     Answerer,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct WebRtcSdpPayload {
     sdp: String,
     #[serde(rename = "type")]
     typ: String,
+    handshake_id: String,
+    from_peer: String,
+    to_peer: String,
 }
 
 pub async fn connect_via_signaling(
@@ -498,12 +502,15 @@ async fn connect_offerer_once(
     let pc = Arc::new(pc_result.map_err(to_setup_error)?);
 
     let pending_ice = Arc::new(AsyncMutex::new(Vec::new()));
+    let active_handshake = Arc::new(RwLock::new(None::<String>));
 
     let signaling_for_candidates = Arc::clone(signaling_client);
     let candidate_generation = Arc::clone(&generation_tracker);
+    let handshake_for_candidates = Arc::clone(&active_handshake);
     pc.on_ice_candidate(Box::new(move |candidate| {
         let signaling = Arc::clone(&signaling_for_candidates);
         let generation_guard = Arc::clone(&candidate_generation);
+        let handshake_guard = Arc::clone(&handshake_for_candidates);
         Box::pin(async move {
             if let Some(cand) = candidate {
                 let expected = generation_guard.load(Ordering::SeqCst);
@@ -517,13 +524,24 @@ async fn connect_offerer_once(
                     );
                     return;
                 }
+                let handshake_id = {
+                    let guard = handshake_guard.read().await;
+                    guard.clone()
+                };
+                let Some(handshake_id) = handshake_id else {
+                    tracing::debug!(
+                        target = "webrtc",
+                        "skipping local ICE candidate before handshake id assignment"
+                    );
+                    return;
+                };
                 tracing::debug!(
                     target = "webrtc",
                     role = "offerer",
                     candidate = %cand.to_string(),
                     "local ice candidate gathered"
                 );
-                if let Err(err) = signaling.send_ice_candidate(cand).await {
+                if let Err(err) = signaling.send_ice_candidate(cand, &handshake_id).await {
                     tracing::warn!(
                         target = "webrtc",
                         error = %err,
@@ -538,6 +556,7 @@ async fn connect_offerer_once(
     let signaling_for_incoming = Arc::clone(signaling_client);
     let pending_for_incoming = Arc::clone(&pending_ice);
     let incoming_generation = Arc::clone(&generation_tracker);
+    let handshake_for_incoming = Arc::clone(&active_handshake);
     let ice_task = spawn_on_global(async move {
         while let Some(signal) = signaling_for_incoming.recv_webrtc_signal().await {
             let expected = incoming_generation.load(Ordering::SeqCst);
@@ -555,8 +574,21 @@ async fn connect_offerer_once(
                 candidate,
                 sdp_mid,
                 sdp_mline_index,
+                handshake_id,
             } = signal
             {
+                let current_handshake = {
+                    let guard = handshake_for_incoming.read().await;
+                    guard.clone()
+                };
+                if current_handshake.as_deref() != Some(&handshake_id) {
+                    tracing::debug!(
+                        target = "webrtc",
+                        handshake_id,
+                        "ignoring remote ICE candidate for stale handshake"
+                    );
+                    continue;
+                }
                 let init = RTCIceCandidateInit {
                     candidate,
                     sdp_mid,
@@ -635,6 +667,23 @@ async fn connect_offerer_once(
         })
     }));
 
+    let (remote_peer, generation) = signaling_client
+        .wait_for_remote_peer_with_generation()
+        .await?;
+    generation_tracker.store(generation, Ordering::SeqCst);
+    tracing::info!(
+        target = "webrtc",
+        %remote_peer,
+        generation,
+        "offerer preparing handshake"
+    );
+    signaling_client.lock_remote_peer(&remote_peer).await;
+    let handshake_id = Uuid::new_v4().to_string();
+    {
+        let mut guard = active_handshake.write().await;
+        *guard = Some(handshake_id.clone());
+    }
+
     tracing::debug!(
         target = "beach_human::transport::webrtc",
         role = "offerer",
@@ -683,14 +732,24 @@ async fn connect_offerer_once(
     );
     let local_desc = maybe_local_desc
         .ok_or_else(|| TransportError::Setup("missing local description".into()))?;
-    let payload = payload_from_description(&local_desc);
+    let offerer_peer_id = signaling_client
+        .assigned_peer_id()
+        .await
+        .unwrap_or_else(|| signaling_client.peer_id().to_string());
+
+    let payload = payload_from_description(
+        &local_desc,
+        &handshake_id,
+        &offerer_peer_id,
+        &remote_peer,
+    );
     tracing::debug!(
         target = "beach_human::transport::webrtc",
         role = "offerer",
         await = "post_sdp.offer",
         state = "start"
     );
-    let post_result = post_sdp(client, signaling_base, "offer", &payload).await;
+    let post_result = post_sdp(client, signaling_base, "offer", &[], &payload).await;
     tracing::debug!(
         target = "beach_human::transport::webrtc",
         role = "offerer",
@@ -700,158 +759,161 @@ async fn connect_offerer_once(
     );
     post_result?;
 
-    let (remote_peer, generation) = signaling_client
-        .wait_for_remote_peer_with_generation()
-        .await?;
-    generation_tracker.store(generation, Ordering::SeqCst);
-    tracing::info!(
-        target = "webrtc",
-        %remote_peer,
-        generation,
-        "offerer preparing handshake"
-    );
-
-    wait_for_answer(
-        client,
-        signaling_base,
-        poll_interval,
-        Arc::clone(&pc),
-        Arc::clone(&pending_ice),
-        Arc::clone(signaling_client),
-        generation,
-    )
-    .await?;
-
-    if signaling_client.remote_generation() != generation {
-        tracing::info!(
-            target = "webrtc",
+    let result = 'handshake: loop {
+        if let Err(err) = wait_for_answer(
+            client,
+            signaling_base,
+            poll_interval,
+            Arc::clone(&pc),
+            Arc::clone(&pending_ice),
+            Arc::clone(signaling_client),
             generation,
-            "remote peer changed before data channel opened"
-        );
-        let _ = pc.close().await;
-        ice_task.abort();
-        return Err(TransportError::Setup(REMOTE_CHANGED_ERR.into()));
-    }
-
-    if tokio::time::timeout(Duration::from_secs(15), open_wait.notified())
+            &handshake_id,
+        )
         .await
-        .is_err()
-    {
-        tracing::warn!(
-            target = "webrtc",
-            generation,
-            "data channel open wait timed out"
-        );
-        let _ = pc.close().await;
-        ice_task.abort();
-        return Err(TransportError::Setup(
-            "offerer data channel did not open".into(),
-        ));
-    }
+        {
+            ice_task.abort();
+            break Err(err);
+        }
 
-    let local_id = next_transport_id();
-    let remote_id = next_transport_id();
-    tracing::debug!(
-        target = "webrtc",
-        ?local_id,
-        ?remote_id,
-        "offerer allocating transport ids"
-    );
-    let transport = Arc::new(WebRtcTransport::new(
-        TransportKind::WebRtc,
-        local_id,
-        remote_id,
-        pc.clone(),
-        dc,
-        None,
-        Some(dc_open_notify),
-        Some(Arc::clone(signaling_client)),
-    ));
-    tracing::debug!(
-        target = "webrtc",
-        ?local_id,
-        "offerer transport initialized"
-    );
-
-    let mut ready_seen = false;
-    for attempt in 0..READY_ACK_POLL_ATTEMPTS {
         if signaling_client.remote_generation() != generation {
             tracing::info!(
                 target = "webrtc",
                 generation,
-                "remote peer changed while waiting for readiness ack"
+                "remote peer changed before data channel opened"
             );
             let _ = pc.close().await;
             ice_task.abort();
-            return Err(TransportError::Setup(REMOTE_CHANGED_ERR.into()));
+            break Err(TransportError::Setup(REMOTE_CHANGED_ERR.into()));
         }
-        match transport.try_recv() {
-            Ok(Some(message)) => {
-                if message.payload.as_text() == Some("__ready__") {
-                    ready_seen = true;
-                    tracing::info!(
-                        target = "webrtc",
-                        attempts = attempt + 1,
-                        "offerer received readiness ack"
-                    );
-                    break;
-                } else {
+
+        if tokio::time::timeout(Duration::from_secs(15), open_wait.notified())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                target = "webrtc",
+                generation,
+                "data channel open wait timed out"
+            );
+            let _ = pc.close().await;
+            ice_task.abort();
+            break Err(TransportError::Setup(
+                "offerer data channel did not open".into(),
+            ));
+        }
+
+        let local_id = next_transport_id();
+        let remote_id = next_transport_id();
+        tracing::debug!(
+            target = "webrtc",
+            ?local_id,
+            ?remote_id,
+            "offerer allocating transport ids"
+        );
+        let transport = Arc::new(WebRtcTransport::new(
+            TransportKind::WebRtc,
+            local_id,
+            remote_id,
+            pc.clone(),
+            dc,
+            None,
+            Some(dc_open_notify),
+            Some(Arc::clone(signaling_client)),
+        ));
+        tracing::debug!(
+            target = "webrtc",
+            ?local_id,
+            "offerer transport initialized"
+        );
+
+        let mut ready_seen = false;
+        for attempt in 0..READY_ACK_POLL_ATTEMPTS {
+            if signaling_client.remote_generation() != generation {
+                tracing::info!(
+                    target = "webrtc",
+                    generation,
+                    "remote peer changed while waiting for readiness ack"
+                );
+                let _ = pc.close().await;
+                ice_task.abort();
+                break 'handshake Err(TransportError::Setup(REMOTE_CHANGED_ERR.into()));
+            }
+            match transport.try_recv() {
+                Ok(Some(message)) => {
+                    if message.payload.as_text() == Some("__ready__") {
+                        ready_seen = true;
+                        tracing::info!(
+                            target = "webrtc",
+                            attempts = attempt + 1,
+                            "offerer received readiness ack"
+                        );
+                        break;
+                    } else {
+                        tracing::warn!(
+                            target = "webrtc",
+                            payload = ?message.payload,
+                            "unexpected handshake message"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
                     tracing::warn!(
                         target = "webrtc",
-                        payload = ?message.payload,
-                        "unexpected handshake message"
+                        error = %err,
+                        "failed polling for readiness ack"
                     );
+                    break;
                 }
             }
-            Ok(None) => {}
-            Err(err) => {
-                tracing::warn!(
-                    target = "webrtc",
-                    error = %err,
-                    "failed polling for readiness ack"
-                );
-                break;
+            if attempt + 1 < READY_ACK_POLL_ATTEMPTS {
+                sleep(READY_ACK_POLL_INTERVAL).await;
             }
         }
-        if attempt + 1 < READY_ACK_POLL_ATTEMPTS {
-            sleep(READY_ACK_POLL_INTERVAL).await;
-        }
-    }
 
-    if !ready_seen {
-        tracing::warn!(
-            target = "webrtc",
-            "offerer did not receive readiness ack; aborting transport"
-        );
-        if let Err(err) = pc.close().await {
-            tracing::debug!(
+        if !ready_seen {
+            tracing::warn!(
+                target = "webrtc",
+                "offerer did not receive readiness ack; aborting transport"
+            );
+            if let Err(err) = pc.close().await {
+                tracing::debug!(
+                    target = "webrtc",
+                    error = %err,
+                    "offerer failed to close peer connection after readiness timeout"
+                );
+            }
+            ice_task.abort();
+            break Err(TransportError::Setup(
+                "offerer missing data channel readiness sentinel".into(),
+            ));
+        }
+
+        if let Err(err) = transport.send_text("__offer_ready__") {
+            tracing::warn!(
                 target = "webrtc",
                 error = %err,
-                "offerer failed to close peer connection after readiness timeout"
+                "offerer readiness signal failed"
             );
         }
+
         ice_task.abort();
-        return Err(TransportError::Setup(
-            "offerer missing data channel readiness sentinel".into(),
-        ));
-    }
-
-    if let Err(err) = transport.send_text("__offer_ready__") {
-        tracing::warn!(
+        tracing::info!(
             target = "webrtc",
-            error = %err,
-            "offerer readiness signal failed"
+            generation,
+            %remote_peer,
+            "offerer transport established"
         );
-    }
+        break Ok(transport as Arc<dyn Transport>);
+    };
 
-    ice_task.abort();
-    tracing::info!(
-        target = "webrtc",
-        generation,
-        %remote_peer,
-        "offerer transport established"
-    );
-    Ok(transport as Arc<dyn Transport>)
+    {
+        let mut guard = active_handshake.write().await;
+        *guard = None;
+    }
+    signaling_client.unlock_remote_peer(&remote_peer).await;
+    result
 }
 async fn connect_answerer(
     signaling_url: &str,
@@ -859,6 +921,12 @@ async fn connect_answerer(
     passphrase: Option<&str>,
 ) -> Result<Arc<dyn Transport>, TransportError> {
     let client = Client::new();
+    let signaling_client =
+        SignalingClient::connect(signaling_url, WebRtcRole::Answerer, passphrase).await?;
+    let assigned_peer_id = signaling_client
+        .assigned_peer_id()
+        .await
+        .expect("assigned peer id");
 
     let offer_payload = loop {
         tracing::debug!(
@@ -867,7 +935,8 @@ async fn connect_answerer(
             await = "fetch_sdp.offer",
             state = "start"
         );
-        let fetch_attempt = fetch_sdp(&client, signaling_url, "offer").await;
+        let peer_param = [("peer_id", assigned_peer_id.as_str())];
+        let fetch_attempt = fetch_sdp(&client, signaling_url, "offer", &peer_param).await;
         tracing::debug!(
             target = "beach_human::transport::webrtc",
             role = "answerer",
@@ -896,6 +965,8 @@ async fn connect_answerer(
         }
     };
     let offer_desc = session_description_from_payload(&offer_payload)?;
+    let handshake_id = Arc::new(offer_payload.handshake_id.clone());
+    let remote_offer_peer = offer_payload.from_peer.clone();
 
     let mut setting = SettingEngine::default();
     setting.set_ice_timeouts(
@@ -929,12 +1000,11 @@ async fn connect_answerer(
     );
     let pc = Arc::new(pc_result.map_err(to_setup_error)?);
 
-    let signaling_client =
-        SignalingClient::connect(signaling_url, WebRtcRole::Answerer, passphrase).await?;
-
     let signaling_for_candidates = Arc::clone(&signaling_client);
+    let handshake_for_candidates = Arc::clone(&handshake_id);
     pc.on_ice_candidate(Box::new(move |candidate| {
         let signaling = Arc::clone(&signaling_for_candidates);
+        let handshake_id = Arc::clone(&handshake_for_candidates);
         Box::pin(async move {
             if let Some(cand) = candidate {
                 tracing::debug!(
@@ -943,7 +1013,10 @@ async fn connect_answerer(
                     candidate = %cand.to_string(),
                     "local ice candidate gathered"
                 );
-                if let Err(err) = signaling.send_ice_candidate(cand).await {
+                if let Err(err) = signaling
+                    .send_ice_candidate(cand, handshake_id.as_str())
+                    .await
+                {
                     tracing::warn!(
                         target = "webrtc",
                         error = %err,
@@ -956,14 +1029,24 @@ async fn connect_answerer(
 
     let signaling_for_incoming = Arc::clone(&signaling_client);
     let pc_for_incoming = pc.clone();
+    let handshake_for_incoming = Arc::clone(&handshake_id);
     spawn_on_global(async move {
         while let Some(signal) = signaling_for_incoming.recv_webrtc_signal().await {
             if let WebRTCSignal::IceCandidate {
                 candidate,
                 sdp_mid,
                 sdp_mline_index,
+                handshake_id,
             } = signal
             {
+                if handshake_for_incoming.as_str() != handshake_id {
+                    tracing::debug!(
+                        target = "webrtc",
+                        handshake_id,
+                        "answerer ignoring remote ICE candidate for stale handshake"
+                    );
+                    continue;
+                }
                 let init = RTCIceCandidateInit {
                     candidate,
                     sdp_mid,
@@ -1091,6 +1174,12 @@ async fn connect_answerer(
         result = ?answer_result
     );
     let answer = answer_result.map_err(to_setup_error)?;
+    let answer_payload = payload_from_description(
+        &answer,
+        handshake_id.as_str(),
+        assigned_peer_id.as_str(),
+        &remote_offer_peer,
+    );
     tracing::debug!(
         target = "beach_human::transport::webrtc",
         role = "answerer",
@@ -1107,19 +1196,13 @@ async fn connect_answerer(
         state = "end"
     );
     wait_for_local_description(&pc).await?;
-
-    let local_desc = pc
-        .local_description()
-        .await
-        .ok_or_else(|| TransportError::Setup("missing local description".into()))?;
-    let payload = payload_from_description(&local_desc);
     tracing::debug!(
         target = "beach_human::transport::webrtc",
         role = "answerer",
         await = "post_sdp.answer",
         state = "start"
     );
-    let post_result = post_sdp(&client, signaling_url, "answer", &payload).await;
+    let post_result = post_sdp(&client, signaling_url, "answer", &[], &answer_payload).await;
     tracing::debug!(
         target = "beach_human::transport::webrtc",
         role = "answerer",
@@ -1244,8 +1327,21 @@ async fn connect_answerer(
     Ok(transport)
 }
 
-fn endpoint(base: &str, suffix: &str) -> String {
-    format!("{}/{}", base.trim_end_matches('/'), suffix)
+fn endpoint(base: &str, suffix: &str) -> Result<Url, TransportError> {
+    let full = format!("{}/{}", base.trim_end_matches('/'), suffix);
+    Url::parse(&full).map_err(|err| TransportError::Setup(err.to_string()))
+}
+
+fn endpoint_with_params(
+    base: &str,
+    suffix: &str,
+    params: &[(&str, &str)],
+) -> Result<Url, TransportError> {
+    let mut url = endpoint(base, suffix)?;
+    if !params.is_empty() {
+        url.query_pairs_mut().extend_pairs(params.iter().cloned());
+    }
+    Ok(url)
 }
 
 async fn wait_for_answer(
@@ -1256,6 +1352,7 @@ async fn wait_for_answer(
     pending_ice: Arc<AsyncMutex<Vec<RTCIceCandidateInit>>>,
     signaling_client: Arc<SignalingClient>,
     expected_generation: u64,
+    handshake_id: &str,
 ) -> Result<(), TransportError> {
     loop {
         if signaling_client.remote_generation() != expected_generation {
@@ -1267,7 +1364,13 @@ async fn wait_for_answer(
             await = "fetch_sdp.answer",
             state = "start"
         );
-        let fetch_attempt = fetch_sdp(client, signaling_base, "answer").await;
+        let fetch_attempt = fetch_sdp(
+            client,
+            signaling_base,
+            "answer",
+            &[("handshake_id", handshake_id)],
+        )
+        .await;
         tracing::debug!(
             target = "beach_human::transport::webrtc",
             role = "offerer",
@@ -1343,9 +1446,10 @@ async fn post_sdp(
     client: &Client,
     base: &str,
     suffix: &str,
+    params: &[(&str, &str)],
     payload: &WebRtcSdpPayload,
 ) -> Result<(), TransportError> {
-    let url = endpoint(base, suffix);
+    let url = endpoint_with_params(base, suffix, params)?;
     tracing::debug!(
         target = "beach_human::transport::webrtc",
         phase = "post_sdp",
@@ -1378,8 +1482,9 @@ async fn fetch_sdp(
     client: &Client,
     base: &str,
     suffix: &str,
+    params: &[(&str, &str)],
 ) -> Result<Option<WebRtcSdpPayload>, TransportError> {
-    let url = endpoint(base, suffix);
+    let url = endpoint_with_params(base, suffix, params)?;
     tracing::debug!(
         target = "beach_human::transport::webrtc",
         phase = "fetch_sdp",
@@ -1431,10 +1536,18 @@ async fn fetch_sdp(
     }
 }
 
-fn payload_from_description(desc: &RTCSessionDescription) -> WebRtcSdpPayload {
+fn payload_from_description(
+    desc: &RTCSessionDescription,
+    handshake_id: &str,
+    from_peer: &str,
+    to_peer: &str,
+) -> WebRtcSdpPayload {
     WebRtcSdpPayload {
         sdp: desc.sdp.clone(),
         typ: desc.sdp_type.to_string(),
+        handshake_id: handshake_id.to_string(),
+        from_peer: from_peer.to_string(),
+        to_peer: to_peer.to_string(),
     }
 }
 

@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
 };
@@ -12,6 +12,7 @@ use tracing::{debug, error, info};
 
 use crate::{
     session::{hash_passphrase, verify_passphrase},
+    signaling::WebRtcSdpPayload,
     storage::{SessionInfo, Storage},
 };
 
@@ -304,11 +305,14 @@ pub async fn join_session(
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct WebRtcSdpPayload {
-    pub sdp: String,
-    #[serde(rename = "type")]
-    pub typ: String,
+#[derive(Debug, Deserialize)]
+pub struct OfferQuery {
+    pub peer_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AnswerQuery {
+    pub handshake_id: String,
 }
 
 pub async fn post_webrtc_offer(
@@ -316,6 +320,13 @@ pub async fn post_webrtc_offer(
     Path(session_id): Path<String>,
     Json(payload): Json<WebRtcSdpPayload>,
 ) -> Result<StatusCode, StatusCode> {
+    if payload.handshake_id.trim().is_empty()
+        || payload.from_peer.trim().is_empty()
+        || payload.to_peer.trim().is_empty()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let mut storage = storage.lock().await;
     if !storage
         .session_exists(&session_id)
@@ -325,32 +336,34 @@ pub async fn post_webrtc_offer(
         return Ok(StatusCode::NOT_FOUND);
     }
 
-    let serialized =
-        serde_json::to_string(&payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     storage
-        .set_webrtc_offer(&session_id, &serialized)
+        .push_webrtc_offer(&session_id, &payload)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    // Any previous answer is no longer relevant once a new offer is posted.
-    let _ = storage.clear_webrtc_answer(&session_id).await;
+
+    debug!(
+        session = %session_id,
+        %payload.handshake_id,
+        %payload.from_peer,
+        %payload.to_peer,
+        "stored webrtc offer"
+    );
+
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn get_webrtc_offer(
     State(storage): State<SharedStorage>,
     Path(session_id): Path<String>,
+    Query(params): Query<OfferQuery>,
 ) -> Result<Json<WebRtcSdpPayload>, StatusCode> {
     let mut storage = storage.lock().await;
     match storage
-        .get_webrtc_offer(&session_id)
+        .pop_webrtc_offer_for_peer(&session_id, &params.peer_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
-        Some(value) => {
-            let payload: WebRtcSdpPayload =
-                serde_json::from_str(&value).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            Ok(Json(payload))
-        }
+        Some(payload) => Ok(Json(payload)),
         None => Err(StatusCode::NOT_FOUND),
     }
 }
@@ -360,6 +373,13 @@ pub async fn post_webrtc_answer(
     Path(session_id): Path<String>,
     Json(payload): Json<WebRtcSdpPayload>,
 ) -> Result<StatusCode, StatusCode> {
+    if payload.handshake_id.trim().is_empty()
+        || payload.from_peer.trim().is_empty()
+        || payload.to_peer.trim().is_empty()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let mut storage = storage.lock().await;
     if !storage
         .session_exists(&session_id)
@@ -369,32 +389,33 @@ pub async fn post_webrtc_answer(
         return Ok(StatusCode::NOT_FOUND);
     }
 
-    let serialized =
-        serde_json::to_string(&payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     storage
-        .set_webrtc_answer(&session_id, &serialized)
+        .store_webrtc_answer(&session_id, &payload)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    debug!(
+        session = %session_id,
+        %payload.handshake_id,
+        %payload.from_peer,
+        %payload.to_peer,
+        "stored webrtc answer"
+    );
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn get_webrtc_answer(
     State(storage): State<SharedStorage>,
     Path(session_id): Path<String>,
+    Query(params): Query<AnswerQuery>,
 ) -> Result<Json<WebRtcSdpPayload>, StatusCode> {
     let mut storage = storage.lock().await;
     match storage
-        .get_webrtc_answer(&session_id)
+        .take_webrtc_answer(&session_id, &params.handshake_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
-        Some(value) => {
-            let payload: WebRtcSdpPayload =
-                serde_json::from_str(&value).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            // Clear answer after it has been consumed.
-            let _ = storage.clear_webrtc_answer(&session_id).await;
-            Ok(Json(payload))
-        }
+        Some(payload) => Ok(Json(payload)),
         None => Err(StatusCode::NOT_FOUND),
     }
 }

@@ -9,6 +9,11 @@ _Last updated: 2025-09-29_
 - Introduce a lightweight, Mosh-style ordering model so the host can discard client keystrokes that were produced against an out-of-date terminal view.
 - Keep the implementation lean (no per-handshake Redis writes, predictable hot-path data structures) so we stay within the perf budget.
 
+## Current Status (2025-09-29)
+- The earlier regression fix restored `remote_generation`, but the host signaling client still tracks only **one** active remote peer. Any ICE candidate or ping from another connected client steals that slot mid-handshake.
+- When the browser joins after the Rust CLI, the host posts an offer, the browser answers, and the host immediately sees another CLI ping, decides the remote changed, posts a fresh offer, and discards the browser’s answer. Beach-web keeps polling `/webrtc/answer` and never sees a data channel.
+- We need the host to “lock” onto a peer while a handshake is in flight so that other clients cannot pre-empt the negotiation. This is a stepping stone toward the full handshake-ID multiplexing described below.
+
 ## High-Level Architecture
 1. **Per-handshake identifiers.** Every transport negotiation is scoped by a freshly generated `handshake_id` (UUID). Messages routed via beach-road must include this id so the host can manage multiple peer connections at once.
 2. **WebSocket-only signaling.** SDP offers/answers and ICE candidates flow exclusively over WebSocket frames. The REST `POST /webrtc/offer|answer` endpoints become legacy fallbacks (still registered for now but marked deprecated).

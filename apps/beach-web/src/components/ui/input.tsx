@@ -7,11 +7,11 @@ const Input = React.forwardRef<HTMLInputElement, React.InputHTMLAttributes<HTMLI
       <input
         type={type}
         className={cn(
-          'flex h-11 w-full rounded-lg border border-[hsl(var(--border))]/70 bg-[hsl(var(--terminal-bezel))]/70 px-4 text-sm text-[hsl(var(--foreground))] shadow-inner transition-colors placeholder:text-[hsl(var(--muted-foreground))]/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))]/60 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950 disabled:cursor-not-allowed disabled:opacity-50',
+          'flex h-11 w-full rounded-xl border border-[hsl(var(--border))]/70 bg-[hsl(var(--terminal-bezel))]/50 px-4 text-sm text-[hsl(var(--foreground))] shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] transition-colors placeholder:text-[hsl(var(--muted-foreground))]/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--ring))]/60 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950 disabled:cursor-not-allowed disabled:opacity-50',
           className,
         )}
         ref={ref}
-        spellCheck={type === 'password' ? false : undefined}
+        spellCheck={type === 'password' ? false : props.spellCheck}
         {...props}
       />
     );

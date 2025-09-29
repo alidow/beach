@@ -3,9 +3,7 @@ import * as LabelPrimitive from '@radix-ui/react-label';
 import { cva, type VariantProps } from 'class-variance-authority';
 import { cn } from '../../lib/utils';
 
-const labelVariants = cva(
-  'text-xs font-medium uppercase tracking-[0.22em] text-[hsl(var(--muted-foreground))] flex flex-col gap-2',
-);
+const labelVariants = cva('block text-xs font-semibold uppercase tracking-[0.35em] text-[hsl(var(--muted-foreground))]');
 
 const Label = React.forwardRef<
   React.ElementRef<typeof LabelPrimitive.Root>,

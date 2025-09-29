@@ -3,7 +3,10 @@ use crate::transport::TransportError;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -28,14 +31,17 @@ pub enum TransportType {
 pub enum WebRTCSignal {
     Offer {
         sdp: String,
+        handshake_id: String,
     },
     Answer {
         sdp: String,
+        handshake_id: String,
     },
     IceCandidate {
         candidate: String,
         sdp_mid: Option<String>,
         sdp_mline_index: Option<u32>,
+        handshake_id: String,
     },
 }
 
@@ -129,6 +135,9 @@ pub struct SignalingClient {
     signal_rx: AsyncMutex<mpsc::UnboundedReceiver<WebRTCSignal>>,
     remote_peer: RwLock<Option<String>>,
     remote_notify: Notify,
+    locked_peer: RwLock<Option<String>>,
+    remote_generation: AtomicU64,
+    assigned_peer_id: RwLock<Option<String>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -154,6 +163,9 @@ impl SignalingClient {
             signal_rx: AsyncMutex::new(signal_rx),
             remote_peer: RwLock::new(None),
             remote_notify: Notify::new(),
+            locked_peer: RwLock::new(None),
+            remote_generation: AtomicU64::new(0),
+            assigned_peer_id: RwLock::new(None),
             tasks: Mutex::new(Vec::new()),
         });
 
@@ -248,18 +260,62 @@ impl SignalingClient {
         }
     }
 
-    pub async fn wait_for_remote_peer(&self) -> Result<String, TransportError> {
+    pub fn remote_generation(&self) -> u64 {
+        self.remote_generation.load(Ordering::SeqCst)
+    }
+
+    pub async fn assigned_peer_id(&self) -> Option<String> {
+        self.assigned_peer_id.read().await.clone()
+    }
+
+    pub fn peer_id(&self) -> &str {
+        &self.peer_id
+    }
+
+    async fn is_self_peer(&self, peer_id: &str) -> bool {
+        if peer_id == self.peer_id {
+            return true;
+        }
+        let guard = self.assigned_peer_id.read().await;
+        guard.as_deref() == Some(peer_id)
+    }
+
+    pub async fn wait_for_remote_peer_with_generation(
+        &self,
+    ) -> Result<(String, u64), TransportError> {
         loop {
+            let generation = self.remote_generation.load(Ordering::SeqCst);
             if let Some(id) = self.remote_peer.read().await.clone() {
-                return Ok(id);
+                if generation == self.remote_generation.load(Ordering::SeqCst) {
+                    return Ok((id, generation));
+                }
             }
             self.remote_notify.notified().await;
+        }
+    }
+
+    #[allow(dead_code)]
+    pub async fn wait_for_remote_peer(&self) -> Result<String, TransportError> {
+        let (peer, _) = self.wait_for_remote_peer_with_generation().await?;
+        Ok(peer)
+    }
+
+    pub async fn lock_remote_peer(&self, peer_id: &str) {
+        let mut lock = self.locked_peer.write().await;
+        *lock = Some(peer_id.to_string());
+    }
+
+    pub async fn unlock_remote_peer(&self, peer_id: &str) {
+        let mut lock = self.locked_peer.write().await;
+        if lock.as_deref() == Some(peer_id) {
+            *lock = None;
         }
     }
 
     pub async fn send_ice_candidate(
         &self,
         candidate: RTCIceCandidate,
+        handshake_id: &str,
     ) -> Result<(), TransportError> {
         let json = candidate
             .to_json()
@@ -268,12 +324,13 @@ impl SignalingClient {
             candidate: json.candidate,
             sdp_mid: json.sdp_mid,
             sdp_mline_index: json.sdp_mline_index.map(|idx| idx as u32),
+            handshake_id: handshake_id.to_string(),
         };
         self.send_webrtc_signal(signal).await
     }
 
     pub async fn send_webrtc_signal(&self, signal: WebRTCSignal) -> Result<(), TransportError> {
-        let remote = self.wait_for_remote_peer().await?;
+        let (remote, _) = self.wait_for_remote_peer_with_generation().await?;
         let payload = signal
             .to_transport_signal()
             .to_value()
@@ -292,10 +349,63 @@ impl SignalingClient {
     }
 
     async fn set_remote_peer(&self, peer_id: String) {
+        {
+            let lock_guard = self.locked_peer.read().await;
+            if let Some(ref locked) = *lock_guard {
+                if locked != &peer_id {
+                    return;
+                }
+            }
+        }
         let mut guard = self.remote_peer.write().await;
         if guard.as_ref() != Some(&peer_id) {
-            *guard = Some(peer_id);
+            let previous = guard.clone();
+            *guard = Some(peer_id.clone());
+            let generation = self.remote_generation.fetch_add(1, Ordering::SeqCst) + 1;
             self.remote_notify.notify_waiters();
+            match previous {
+                Some(old) => tracing::info!(
+                    target = "webrtc",
+                    previous = %old,
+                    current = %peer_id,
+                    generation,
+                    "reassigned remote peer"
+                ),
+                None => tracing::info!(
+                    target = "webrtc",
+                    current = %peer_id,
+                    generation,
+                    "selected remote peer"
+                ),
+            }
+        }
+    }
+
+    async fn clear_remote_peer(&self, peer_id: &str) {
+        let unlock_ok = {
+            let lock_guard = self.locked_peer.read().await;
+            lock_guard.as_deref() == Some(peer_id)
+        };
+
+        let mut guard = self.remote_peer.write().await;
+        if guard.as_deref() == Some(peer_id) {
+            *guard = None;
+            let generation = self.remote_generation.fetch_add(1, Ordering::SeqCst) + 1;
+            self.remote_notify.notify_waiters();
+            tracing::info!(
+                target = "webrtc",
+                peer = %peer_id,
+                generation,
+                "cleared remote peer"
+            );
+        }
+        drop(guard);
+
+        if unlock_ok {
+            let mut lock = self.locked_peer.write().await;
+            if lock.as_deref() == Some(peer_id) {
+                *lock = None;
+            }
         }
     }
 }
@@ -317,23 +427,42 @@ async fn handle_server_message(
     join_notifier: &Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 ) {
     match message {
-        ServerMessage::JoinSuccess { peers, .. } => {
-            if let Some(target) = peers
-                .into_iter()
-                .find(|peer| peer.id != client.peer_id && peer.role == client.expected_remote_role)
-            {
-                client.set_remote_peer(target.id).await;
+        ServerMessage::JoinSuccess {
+            peer_id: assigned_id,
+            peers,
+            ..
+        } => {
+            *client.assigned_peer_id.write().await = Some(assigned_id.clone());
+            let remote_candidate = peers.into_iter().find_map(|peer| {
+                if peer.role != client.expected_remote_role {
+                    return None;
+                }
+                if peer.id == client.peer_id || peer.id == assigned_id {
+                    return None;
+                }
+                Some(peer.id)
+            });
+            if let Some(peer_id) = remote_candidate {
+                client.set_remote_peer(peer_id).await;
             }
             if let Some(tx) = join_notifier.lock().await.take() {
                 let _ = tx.send(());
             }
         }
         ServerMessage::PeerJoined { peer } => {
-            if peer.role == client.expected_remote_role {
+            if peer.role == client.expected_remote_role
+                && !client.is_self_peer(&peer.id).await
+            {
                 client.set_remote_peer(peer.id).await;
             }
         }
-        ServerMessage::Signal { signal, .. } => {
+        ServerMessage::PeerLeft { peer_id } => {
+            client.clear_remote_peer(&peer_id).await;
+        }
+        ServerMessage::Signal { from_peer, signal } => {
+            if !client.is_self_peer(&from_peer).await {
+                client.set_remote_peer(from_peer.clone()).await;
+            }
             if let Ok(TransportSignal::WebRTC { signal }) = TransportSignal::from_value(&signal) {
                 let _ = signal_tx.send(signal);
             }

@@ -49,12 +49,14 @@ export class WebRtcTransport extends EventTarget {
   private readonly channel: DataChannelLike;
   private sequence: number;
   private disposed = false;
+  private open: boolean;
 
   constructor(options: WebRtcTransportOptions) {
     super();
     this.channel = options.channel;
     this.channel.binaryType = 'arraybuffer';
     this.sequence = options.initialSequence ?? 0;
+    this.open = this.channel.readyState === 'open';
     this.attachChannelListeners();
   }
 
@@ -73,6 +75,7 @@ export class WebRtcTransport extends EventTarget {
       return;
     }
     this.disposed = true;
+    this.open = false;
     this.channel.close();
   }
 
@@ -86,14 +89,20 @@ export class WebRtcTransport extends EventTarget {
     return message.sequence;
   }
 
+  isOpen(): boolean {
+    return this.open && this.channel.readyState === 'open';
+  }
+
   private attachChannelListeners(): void {
     // Never re-dispatch the same event object that's currently being dispatched
     // by the underlying RTCDataChannel — doing so can throw InvalidStateError.
     this.channel.addEventListener('open', () => {
+      this.open = true;
       this.dispatchEvent(new Event('open'));
     });
 
     this.channel.addEventListener('close', () => {
+      this.open = false;
       this.dispatchEvent(new Event('close'));
     });
 
@@ -133,6 +142,7 @@ function decodeDataChannelPayload(event: MessageEvent): TransportMessage {
 }
 
 export interface WebRtcTransport {
+  isOpen(): boolean;
   addEventListener<K extends keyof WebRtcTransportEventMap>(
     type: K,
     listener: (event: WebRtcTransportEventMap[K]) => void,
@@ -197,7 +207,10 @@ export async function connectWebRtcTransport(
       pendingRemoteCandidates.push(cand);
       return;
     }
-    pc.addIceCandidate(cand).catch((error) => log(logger, `ice add failed: ${error}`));
+    pc
+      .addIceCandidate(cand)
+      .then(() => log(logger, `ice add ok: ${(cand.candidate ?? '').slice(0, 80)}`))
+      .catch((error) => log(logger, `ice add failed: ${error}`));
   };
   const disposeSignalListener = attachSignalListener(
     signaling,
@@ -324,7 +337,10 @@ export async function connectWebRtcTransport(
         // Drain any queued remote candidates now that the offer is applied.
         while (pendingRemoteCandidates.length > 0) {
           const cand = pendingRemoteCandidates.shift()!;
-          pc.addIceCandidate(cand).catch((error) => log(logger, `ice add failed: ${error}`));
+          pc
+      .addIceCandidate(cand)
+      .then(() => log(logger, `ice add ok: ${(cand.candidate ?? '').slice(0, 80)}`))
+      .catch((error) => log(logger, `ice add failed: ${error}`));
         }
       },
       beforePostAnswer: () => {
@@ -511,7 +527,6 @@ async function waitForDataChannel(
 
       const handleOpen = () => {
         cleanup();
-        transport.sendText('__ready__');
         log(logger, 'data channel open');
         resolve({
           transport,

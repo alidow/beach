@@ -38,6 +38,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep};
 use tracing::{Level, debug, error, info, trace, warn};
@@ -150,6 +151,13 @@ struct HostArgs {
         help = "Open a local preview client in this terminal"
     )]
     local_preview: bool,
+
+    #[arg(
+        long = "wait",
+        action = clap::ArgAction::SetTrue,
+        help = "Wait for a peer to connect before launching the host command"
+    )]
+    wait: bool,
 }
 
 #[derive(Args, Debug)]
@@ -199,19 +207,17 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let session_id = hosted.session_id().to_string();
     info!(session_id = %session_id, "session registered");
     print_host_banner(&hosted, &normalized_base, TransportKind::WebRtc);
-    info!(session_id = %session_id, "waiting for WebRTC transport");
-    let initial_transport = negotiate_transport(hosted.handle(), Some(hosted.join_code())).await?;
-    let selected_kind = initial_transport.kind();
-    info!(session_id = %session_id, transport = ?selected_kind, "transport negotiated");
-    let shared_transport = Arc::new(SharedTransport::new(initial_transport.clone()));
-    let supervisor = Arc::new(TransportSupervisor::new(
-        shared_transport.clone(),
-        hosted.handle().clone(),
-        Some(hosted.join_code().to_string()),
-    ));
-    let primary_transport: Arc<dyn Transport> = shared_transport.clone();
-    HeartbeatPublisher::new(primary_transport.clone(), Some(supervisor.clone()))
-        .spawn(Duration::from_secs(10), None);
+
+    let wait_for_peer = args.wait;
+    let session_handle = hosted.handle().clone();
+    let join_code = hosted.join_code().to_string();
+    let transports: Arc<Mutex<Vec<Arc<SharedTransport>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    if wait_for_peer {
+        info!(session_id = %session_id, "waiting for WebRTC transport");
+    } else {
+        info!(session_id = %session_id, "negotiating transport in background");
+    }
 
     let command = resolve_launch_command(&args)?;
     let command_display = display_cmd(&command);
@@ -242,18 +248,9 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
 
     info!(session_id = %session_id, "host ready");
 
-    let mut input_handles = Vec::new();
-    input_handles.push(spawn_input_listener(
-        primary_transport.clone(),
-        writer.clone(),
-        process_handle.clone(),
-        emulator_handle.clone(),
-        grid.clone(),
-        backfill_tx.clone(),
-    ));
-
+    let input_handles: Arc<Mutex<Vec<thread::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
     let mut forward_transports: Vec<(Arc<dyn Transport>, Option<Arc<TransportSupervisor>>)> =
-        vec![(primary_transport.clone(), Some(supervisor.clone()))];
+        Vec::new();
 
     let mut local_preview_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut local_server_transport: Option<Arc<dyn Transport>> = None;
@@ -263,14 +260,18 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         let local_client_transport: Arc<dyn Transport> = Arc::from(pair.client);
         let local_server: Arc<dyn Transport> = Arc::from(pair.server);
 
-        input_handles.push(spawn_input_listener(
-            local_server.clone(),
-            writer.clone(),
-            process_handle.clone(),
-            emulator_handle.clone(),
-            grid.clone(),
-            backfill_tx.clone(),
-        ));
+        {
+            let handle = spawn_input_listener(
+                local_server.clone(),
+                writer.clone(),
+                process_handle.clone(),
+                emulator_handle.clone(),
+                grid.clone(),
+                backfill_tx.clone(),
+                None,
+            );
+            input_handles.lock().unwrap().push(handle);
+        }
 
         local_preview_task = Some(tokio::task::spawn_blocking(move || {
             let client = TerminalClient::new(local_client_transport).with_predictive_input(true);
@@ -286,10 +287,40 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     }
 
     if interactive {
-        input_handles.push(spawn_local_stdin_forwarder(
-            writer.clone(),
-            local_echo.clone(),
-        ));
+        let handle = spawn_local_stdin_forwarder(writer.clone(), local_echo.clone());
+        input_handles.lock().unwrap().push(handle);
+    }
+
+    let (forwarder_cmd_tx, forwarder_cmd_rx) = mpsc::unbounded_channel();
+
+    let (first_ready_tx, first_ready_rx) = if wait_for_peer {
+        let (tx, rx) = oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    let accept_task = spawn_webrtc_acceptor(
+        session_id.clone(),
+        session_handle.clone(),
+        Some(join_code.clone()),
+        writer.clone(),
+        process_handle.clone(),
+        emulator_handle.clone(),
+        grid.clone(),
+        backfill_tx.clone(),
+        input_handles.clone(),
+        forwarder_cmd_tx.clone(),
+        transports.clone(),
+        first_ready_tx,
+    );
+
+    if wait_for_peer {
+        if let Some(rx) = first_ready_rx {
+            rx.await.map_err(|_| {
+                CliError::TransportNegotiation("webrtc transport was not ready".into())
+            })?;
+        }
     }
 
     let updates_task = spawn_update_forwarder(
@@ -299,6 +330,9 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         terminal_sync.clone(),
         sync_config.clone(),
         backfill_rx,
+        forwarder_cmd_rx,
+        Some(forwarder_cmd_tx.clone()),
+        transports.clone(),
     );
 
     runtime
@@ -310,7 +344,18 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     // redraws cleanly (mirrors the legacy apps/beach behaviour).
     drop(raw_guard);
 
-    let _ = send_host_frame(&primary_transport, HostFrame::Shutdown);
+    accept_task.abort();
+    let _ = accept_task.await;
+
+    let transports_snapshot: Vec<Arc<SharedTransport>> = {
+        let guard = transports.lock().unwrap();
+        guard.iter().cloned().collect()
+    };
+
+    for shared in transports_snapshot {
+        let transport: Arc<dyn Transport> = shared;
+        let _ = send_host_frame(&transport, HostFrame::Shutdown);
+    }
     if let Some(server) = &local_server_transport {
         let _ = send_host_frame(server, HostFrame::Shutdown);
     }
@@ -323,7 +368,8 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         let _ = handle.await;
     }
 
-    for handle in input_handles {
+    let mut guard = input_handles.lock().unwrap();
+    for handle in guard.drain(..) {
         handle.join().ok();
     }
 
@@ -647,11 +693,12 @@ impl HeartbeatPublisher {
                     timestamp_ms: now as u64,
                 };
 
-                if !send_host_frame(&self.transport, frame) {
+                if let Err(err) = send_host_frame(&self.transport, frame) {
                     debug!(
                         target = "transport_mod::heartbeat",
                         transport_id = self.transport.id().0,
                         transport = ?self.transport.kind(),
+                        error = %err,
                         "heartbeat send failed; scheduling reconnect"
                     );
                     if let Some(supervisor) = &self.supervisor {
@@ -663,6 +710,7 @@ impl HeartbeatPublisher {
                             target = "transport_mod::heartbeat",
                             transport_id = self.transport.id().0,
                             transport = ?self.transport.kind(),
+                            error = %err,
                             "heartbeat publisher stopping after failed send"
                         );
                         break;
@@ -884,7 +932,7 @@ fn host_frame_label(frame: &HostFrame) -> &'static str {
     }
 }
 
-fn send_host_frame(transport: &Arc<dyn Transport>, frame: HostFrame) -> bool {
+fn send_host_frame(transport: &Arc<dyn Transport>, frame: HostFrame) -> Result<(), TransportError> {
     let encode_start = Instant::now();
     let frame_label = host_frame_label(&frame);
     if tracing::enabled!(Level::TRACE) {
@@ -941,20 +989,17 @@ fn send_host_frame(transport: &Arc<dyn Transport>, frame: HostFrame) -> bool {
         HostFrame::Delta { .. } => telemetry::record_duration("sync_encode_delta", elapsed),
         _ => telemetry::record_duration("sync_encode_frame", elapsed),
     }
-    match transport.send_bytes(&bytes) {
-        Ok(_) => true,
-        Err(err) => {
-            debug!(
-                target = "sync::transport",
-                transport_id = transport.id().0,
-                transport = ?transport.kind(),
-                frame = frame_label,
-                error = %err,
-                "failed to send host frame"
-            );
-            false
-        }
-    }
+    transport.send_bytes(&bytes).map(|_| ()).map_err(|err| {
+        debug!(
+            target = "sync::transport",
+            transport_id = transport.id().0,
+            transport = ?transport.kind(),
+            frame = frame_label,
+            error = %err,
+            "failed to send host frame"
+        );
+        err
+    })
 }
 
 struct SharedTransport {
@@ -1141,6 +1186,7 @@ fn spawn_input_listener(
     emulator: Arc<Mutex<Box<dyn TerminalEmulator + Send>>>,
     grid: Arc<TerminalGrid>,
     backfill_tx: UnboundedSender<BackfillCommand>,
+    forwarder_tx: Option<UnboundedSender<ForwarderCommand>>,
 ) -> thread::JoinHandle<()> {
     let transport_id = transport.id().0;
     let transport_kind = transport.kind();
@@ -1152,6 +1198,8 @@ fn spawn_input_listener(
             transport = ?transport_kind,
             "input listener started"
         );
+        let mut channel_closed = false;
+        let mut fatal_error = false;
         loop {
             match transport.recv(Duration::from_millis(250)) {
                 Ok(message) => match message.payload {
@@ -1304,7 +1352,10 @@ fn spawn_input_listener(
                     }
                 },
                 Err(TransportError::Timeout) => continue,
-                Err(TransportError::ChannelClosed) => break,
+                Err(TransportError::ChannelClosed) => {
+                    channel_closed = true;
+                    break;
+                }
                 Err(err) => {
                     warn!(
                         target = "sync::incoming",
@@ -1313,6 +1364,7 @@ fn spawn_input_listener(
                         error = %err,
                         "input listener error"
                     );
+                    fatal_error = true;
                     break;
                 }
             }
@@ -1323,6 +1375,26 @@ fn spawn_input_listener(
             transport = ?transport_kind,
             "input listener stopped"
         );
+        if channel_closed || fatal_error {
+            if let Some(tx) = &forwarder_tx {
+                let id = transport.id();
+                if tx.send(ForwarderCommand::RemoveTransport { id }).is_err() {
+                    trace!(
+                        target = "sync::incoming",
+                        transport_id,
+                        transport = ?transport_kind,
+                        "forwarder dropped remove transport command"
+                    );
+                } else {
+                    debug!(
+                        target = "sync::incoming",
+                        transport_id,
+                        transport = ?transport_kind,
+                        "notified forwarder of transport removal"
+                    );
+                }
+            }
+        }
     })
 }
 
@@ -1543,6 +1615,91 @@ impl TerminalDeltaStream for TimelineDeltaStream {
     }
 }
 
+enum ForwarderCommand {
+    AddTransport {
+        transport: Arc<dyn Transport>,
+        supervisor: Option<Arc<TransportSupervisor>>,
+    },
+    RemoveTransport {
+        id: TransportId,
+    },
+}
+
+fn spawn_webrtc_acceptor(
+    session_id: String,
+    session_handle: SessionHandle,
+    join_code: Option<String>,
+    writer: PtyWriter,
+    process_handle: Arc<PtyProcess>,
+    emulator_handle: Arc<Mutex<Box<dyn TerminalEmulator + Send>>>,
+    grid: Arc<TerminalGrid>,
+    backfill_tx: UnboundedSender<BackfillCommand>,
+    input_handles: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+    forwarder_tx: UnboundedSender<ForwarderCommand>,
+    transports: Arc<Mutex<Vec<Arc<SharedTransport>>>>,
+    ready_tx: Option<oneshot::Sender<()>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ready_tx = ready_tx;
+        loop {
+            let passphrase = join_code.as_deref();
+            match negotiate_transport(&session_handle, passphrase).await {
+                Ok(transport) => {
+                    let selected_kind = transport.kind();
+                    info!(session_id = %session_id, transport = ?selected_kind, "transport negotiated");
+                    let shared_transport = Arc::new(SharedTransport::new(transport.clone()));
+                    {
+                        let mut guard = transports.lock().unwrap();
+                        guard.push(shared_transport.clone());
+                    }
+                    let supervisor = Arc::new(TransportSupervisor::new(
+                        shared_transport.clone(),
+                        session_handle.clone(),
+                        join_code.clone(),
+                    ));
+                    let primary_transport: Arc<dyn Transport> = shared_transport.clone();
+                    HeartbeatPublisher::new(primary_transport.clone(), Some(supervisor.clone()))
+                        .spawn(Duration::from_secs(10), None);
+                    let listener = spawn_input_listener(
+                        primary_transport.clone(),
+                        writer.clone(),
+                        process_handle.clone(),
+                        emulator_handle.clone(),
+                        grid.clone(),
+                        backfill_tx.clone(),
+                        Some(forwarder_tx.clone()),
+                    );
+                    input_handles.lock().unwrap().push(listener);
+                    if forwarder_tx
+                        .send(ForwarderCommand::AddTransport {
+                            transport: primary_transport.clone(),
+                            supervisor: Some(supervisor.clone()),
+                        })
+                        .is_err()
+                    {
+                        warn!(
+                            session_id = %session_id,
+                            "update forwarder closed; stopping transport acceptor"
+                        );
+                        break;
+                    }
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        session_id = %session_id,
+                        error = %err,
+                        "transport negotiation failed; retrying"
+                    );
+                    sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    })
+}
+
 fn spawn_update_forwarder(
     transports: Vec<(Arc<dyn Transport>, Option<Arc<TransportSupervisor>>)>,
     mut updates: UnboundedReceiver<CacheUpdate>,
@@ -1550,12 +1707,11 @@ fn spawn_update_forwarder(
     terminal_sync: Arc<TerminalSync>,
     sync_config: SyncConfig,
     mut backfill_rx: UnboundedReceiver<BackfillCommand>,
+    mut command_rx: UnboundedReceiver<ForwarderCommand>,
+    forwarder_tx: Option<UnboundedSender<ForwarderCommand>>,
+    shared_registry: Arc<Mutex<Vec<Arc<SharedTransport>>>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if transports.is_empty() {
-            return;
-        }
-
         struct Sink {
             transport: Arc<dyn Transport>,
             supervisor: Option<Arc<TransportSupervisor>>,
@@ -1571,6 +1727,77 @@ fn spawn_update_forwarder(
         }
 
         const HANDSHAKE_REFRESH: Duration = Duration::from_millis(200);
+
+        let forwarder_tx = forwarder_tx;
+
+        fn is_data_channel_not_open(err: &TransportError) -> bool {
+            matches!(err, TransportError::Setup(message) if message.contains("DataChannel is not opened"))
+        }
+
+        fn drop_transport(
+            sinks: &mut Vec<Sink>,
+            shared_registry: &Arc<Mutex<Vec<Arc<SharedTransport>>>>,
+            id: TransportId,
+        ) {
+            let before = sinks.len();
+            sinks.retain(|sink| sink.transport.id() != id);
+            if sinks.len() < before {
+                info!(
+                    target = "sync::forwarder",
+                    transport_id = id.0,
+                    removed = before - sinks.len(),
+                    "removed transport sink"
+                );
+            } else {
+                debug!(
+                    target = "sync::forwarder",
+                    transport_id = id.0,
+                    "remove command ignored: transport not found"
+                );
+            }
+            let mut registry = shared_registry.lock().unwrap();
+            let registry_before = registry.len();
+            registry.retain(|shared| shared.id() != id);
+            if registry.len() < registry_before {
+                trace!(
+                    target = "sync::forwarder",
+                    transport_id = id.0,
+                    removed = registry_before - registry.len(),
+                    "pruned shared transport registry"
+                );
+            }
+        }
+
+        fn request_transport_removal(
+            id: TransportId,
+            forwarder_tx: &Option<UnboundedSender<ForwarderCommand>>,
+            sinks: &mut Vec<Sink>,
+            shared_registry: &Arc<Mutex<Vec<Arc<SharedTransport>>>>,
+        ) {
+            let mut dispatched = false;
+            if let Some(tx) = forwarder_tx {
+                match tx.send(ForwarderCommand::RemoveTransport { id }) {
+                    Ok(()) => {
+                        dispatched = true;
+                        trace!(
+                            target = "sync::forwarder",
+                            transport_id = id.0,
+                            "enqueued transport removal command"
+                        );
+                    }
+                    Err(_) => {
+                        trace!(
+                            target = "sync::forwarder",
+                            transport_id = id.0,
+                            "failed to enqueue transport removal; removing locally"
+                        );
+                    }
+                }
+            }
+            if !dispatched {
+                drop_transport(sinks, shared_registry, id);
+            }
+        }
 
         let subscription = SubscriptionId(1);
         let grid = terminal_sync.grid().clone();
@@ -1592,21 +1819,56 @@ fn spawn_update_forwarder(
             })
             .collect();
 
+        let mut stale_transports: Vec<TransportId> = Vec::new();
+
         for sink in sinks.iter_mut() {
-            if let Some((sync, seq)) = initialize_transport_snapshot(
+            match initialize_transport_snapshot(
                 &sink.transport,
                 subscription,
                 &terminal_sync,
                 &sync_config,
                 &mut sink.cache,
             ) {
-                sink.synchronizer = sync;
-                sink.last_seq = seq;
-                sink.handshake_complete = true;
-            } else if let Some(supervisor) = &sink.supervisor {
-                supervisor.schedule_reconnect();
+                Ok((sync, seq)) => {
+                    sink.synchronizer = sync;
+                    sink.last_seq = seq;
+                    sink.handshake_complete = true;
+                }
+                Err(err) => {
+                    sink.handshake_complete = false;
+                    let transport_id = sink.transport.id();
+                    if is_data_channel_not_open(&err) {
+                        sink.active = false;
+                        sink.backfill_queue.clear();
+                        stale_transports.push(transport_id);
+                        warn!(
+                            target = "sync::handshake",
+                            transport_id = transport_id.0,
+                            transport = ?sink.transport.kind(),
+                            error = %err,
+                            "initial handshake failed: data channel not open"
+                        );
+                    } else {
+                        warn!(
+                            target = "sync::handshake",
+                            transport_id = transport_id.0,
+                            transport = ?sink.transport.kind(),
+                            error = %err,
+                            "initial handshake failed"
+                        );
+                    }
+                    if let Some(supervisor) = &sink.supervisor {
+                        supervisor.schedule_reconnect();
+                    }
+                }
             }
             sink.last_handshake = Instant::now();
+        }
+
+        if !stale_transports.is_empty() {
+            for id in stale_transports.drain(..) {
+                request_transport_removal(id, &forwarder_tx, &mut sinks, &shared_registry);
+            }
         }
 
         fn attempt_handshake(
@@ -1614,6 +1876,7 @@ fn spawn_update_forwarder(
             subscription: SubscriptionId,
             terminal_sync: &Arc<TerminalSync>,
             sync_config: &SyncConfig,
+            stale_transports: &mut Vec<TransportId>,
         ) {
             sink.handshake_attempts = sink.handshake_attempts.saturating_add(1);
             debug!(
@@ -1624,33 +1887,51 @@ fn spawn_update_forwarder(
                 "starting handshake replay"
             );
             sink.last_handshake = Instant::now();
-            if let Some((sync, seq)) = initialize_transport_snapshot(
+            match initialize_transport_snapshot(
                 &sink.transport,
                 subscription,
                 terminal_sync,
                 sync_config,
                 &mut sink.cache,
             ) {
-                sink.synchronizer = sync;
-                sink.last_seq = seq;
-                sink.handshake_complete = true;
-                debug!(
-                    target = "sync::handshake",
-                    transport_id = sink.transport.id().0,
-                    transport = ?sink.transport.kind(),
-                    watermark = seq,
-                    "handshake complete"
-                );
-            } else {
-                sink.handshake_complete = false;
-                debug!(
-                    target = "sync::handshake",
-                    transport_id = sink.transport.id().0,
-                    transport = ?sink.transport.kind(),
-                    "handshake attempt did not complete"
-                );
-                if let Some(supervisor) = &sink.supervisor {
-                    supervisor.schedule_reconnect();
+                Ok((sync, seq)) => {
+                    sink.synchronizer = sync;
+                    sink.last_seq = seq;
+                    sink.handshake_complete = true;
+                    debug!(
+                        target = "sync::handshake",
+                        transport_id = sink.transport.id().0,
+                        transport = ?sink.transport.kind(),
+                        watermark = seq,
+                        "handshake complete"
+                    );
+                }
+                Err(err) => {
+                    sink.handshake_complete = false;
+                    let transport_id = sink.transport.id();
+                    if is_data_channel_not_open(&err) {
+                        sink.active = false;
+                        sink.backfill_queue.clear();
+                        stale_transports.push(transport_id);
+                        warn!(
+                            target = "sync::handshake",
+                            transport_id = transport_id.0,
+                            transport = ?sink.transport.kind(),
+                            error = %err,
+                            "handshake attempt failed: data channel not open"
+                        );
+                    } else {
+                        debug!(
+                            target = "sync::handshake",
+                            transport_id = transport_id.0,
+                            transport = ?sink.transport.kind(),
+                            error = %err,
+                            "handshake attempt did not complete"
+                        );
+                    }
+                    if let Some(supervisor) = &sink.supervisor {
+                        supervisor.schedule_reconnect();
+                    }
                 }
             }
         }
@@ -1664,7 +1945,13 @@ fn spawn_update_forwarder(
                         if sink.last_handshake.elapsed() < HANDSHAKE_REFRESH {
                             continue;
                         }
-                        attempt_handshake(sink, subscription, &terminal_sync, &sync_config);
+                        attempt_handshake(
+                            sink,
+                            subscription,
+                            &terminal_sync,
+                            &sync_config,
+                            &mut stale_transports,
+                        );
                     }
                 }
                 maybe_update = updates.recv() => {
@@ -1694,7 +1981,7 @@ fn spawn_update_forwarder(
                                     telemetry::record_gauge("sync_delta_batch_updates", batch.updates.len() as u64);
                                     let converted_updates = sink.cache.apply_updates(&batch.updates, true);
                                     let _guard = PerfGuard::new("sync_send_delta");
-                                    let sent = send_host_frame(
+                                    match send_host_frame(
                                         &sink.transport,
                                         HostFrame::Delta {
                                             subscription: batch.subscription_id.0,
@@ -1702,23 +1989,41 @@ fn spawn_update_forwarder(
                                             has_more: batch.has_more,
                                             updates: converted_updates,
                                         },
-                                    );
-                                    if !sent {
-                                        sink.handshake_complete = false;
-                                        warn!(
-                                            target = "sync::handshake",
-                                            transport_id = sink.transport.id().0,
-                                            transport = ?sink.transport.kind(),
-                                            "delta send failed, marking handshake incomplete"
-                                        );
-                                        if let Some(supervisor) = &sink.supervisor {
-                                            supervisor.schedule_reconnect();
+                                    ) {
+                                        Ok(()) => {
+                                            sink.last_seq = batch.watermark.0;
+                                            sink.last_handshake = Instant::now();
+                                            batches_sent = batches_sent.saturating_add(1);
                                         }
-                                        break;
+                                        Err(err) => {
+                                            let transport_id = sink.transport.id();
+                                            sink.handshake_complete = false;
+                                            if is_data_channel_not_open(&err) {
+                                                sink.active = false;
+                                                sink.backfill_queue.clear();
+                                                stale_transports.push(transport_id);
+                                                warn!(
+                                                    target = "sync::handshake",
+                                                    transport_id = transport_id.0,
+                                                    transport = ?sink.transport.kind(),
+                                                    error = %err,
+                                                    "delta send failed: data channel not open"
+                                                );
+                                            } else {
+                                                warn!(
+                                                    target = "sync::handshake",
+                                                    transport_id = transport_id.0,
+                                                    transport = ?sink.transport.kind(),
+                                                    error = %err,
+                                                    "delta send failed, marking handshake incomplete"
+                                                );
+                                            }
+                                            if let Some(supervisor) = &sink.supervisor {
+                                                supervisor.schedule_reconnect();
+                                            }
+                                            break;
+                                        }
                                     }
-                                    sink.last_seq = batch.watermark.0;
-                                    sink.last_handshake = Instant::now();
-                                    batches_sent = batches_sent.saturating_add(1);
                                     trace!(
                                         target = "sync::timeline",
                                         transport_id = sink.transport.id().0,
@@ -1736,6 +2041,76 @@ fn spawn_update_forwarder(
                             }
                         }
                         None => break,
+                    }
+                }
+                maybe_forwarder = command_rx.recv() => {
+                    if let Some(command) = maybe_forwarder {
+                        match command {
+                            ForwarderCommand::AddTransport { transport, supervisor } => {
+                                let mut sink = Sink {
+                                    synchronizer: ServerSynchronizer::new(
+                                        terminal_sync.clone(),
+                                        sync_config.clone(),
+                                    ),
+                                    transport: transport.clone(),
+                                    supervisor,
+                                    last_seq: 0,
+                                    active: true,
+                                    handshake_complete: false,
+                                    last_handshake: Instant::now(),
+                                    handshake_attempts: 0,
+                                    cache: TransmitterCache::new(),
+                                    backfill_queue: VecDeque::new(),
+                                    last_backfill_sent: None,
+                                };
+
+                                match initialize_transport_snapshot(
+                                    &sink.transport,
+                                    subscription,
+                                    &terminal_sync,
+                                    &sync_config,
+                                    &mut sink.cache,
+                                ) {
+                                    Ok((sync, seq)) => {
+                                        sink.synchronizer = sync;
+                                        sink.last_seq = seq;
+                                        sink.handshake_complete = true;
+                                    }
+                                    Err(err) => {
+                                        sink.handshake_complete = false;
+                                        let transport_id = sink.transport.id();
+                                        if is_data_channel_not_open(&err) {
+                                            sink.active = false;
+                                            sink.backfill_queue.clear();
+                                            stale_transports.push(transport_id);
+                                            warn!(
+                                                target = "sync::handshake",
+                                                transport_id = transport_id.0,
+                                                transport = ?sink.transport.kind(),
+                                                error = %err,
+                                                "handshake failed for new transport: data channel not open"
+                                            );
+                                        } else {
+                                            warn!(
+                                                target = "sync::handshake",
+                                                transport_id = transport_id.0,
+                                                transport = ?sink.transport.kind(),
+                                                error = %err,
+                                                "handshake failed for new transport"
+                                            );
+                                        }
+                                        if let Some(supervisor) = &sink.supervisor {
+                                            supervisor.schedule_reconnect();
+                                        }
+                                    }
+                                }
+                                sink.last_handshake = Instant::now();
+                                sinks.push(sink);
+                            }
+                            ForwarderCommand::RemoveTransport { id } => {
+                                drop_transport(&mut sinks, &shared_registry, id);
+                            }
+                        }
                     }
                 }
                 maybe_command = backfill_rx.recv() => {
@@ -1822,7 +2197,7 @@ fn spawn_update_forwarder(
                     let more_pending = next_row < job.end_row;
                     let request_id = job.request_id;
                     let updates = sink.cache.apply_updates(&chunk.updates, false);
-                    let sent = send_host_frame(
+                    match send_host_frame(
                         &sink.transport,
                         HostFrame::HistoryBackfill {
                             subscription: job.subscription,
@@ -1832,31 +2207,60 @@ fn spawn_update_forwarder(
                             updates,
                             more: more_pending,
                         },
-                    );
-                    if !sent {
-                        sink.handshake_complete = false;
-                        sink.backfill_queue.push_front(job);
-                        if let Some(supervisor) = &sink.supervisor {
-                            supervisor.schedule_reconnect();
+                    ) {
+                        Ok(()) => {
+                            sink.last_backfill_sent = Some(Instant::now());
+                            job.next_row = next_row;
+                            if more_pending {
+                                sink.backfill_queue.push_back(job);
+                            }
+                            trace!(
+                                target = "sync::backfill",
+                                transport_id = sink.transport.id().0,
+                                request_id,
+                                start_row = chunk_start,
+                                count = chunk.attempted,
+                                delivered = chunk.delivered,
+                                more = more_pending,
+                                "sent backfill chunk"
+                            );
                         }
-                    } else {
-                        sink.last_backfill_sent = Some(Instant::now());
-                        job.next_row = next_row;
-                        if more_pending {
-                            sink.backfill_queue.push_back(job);
+                        Err(err) => {
+                            let transport_id = sink.transport.id();
+                            sink.handshake_complete = false;
+                            if is_data_channel_not_open(&err) {
+                                sink.active = false;
+                                sink.backfill_queue.clear();
+                                stale_transports.push(transport_id);
+                                warn!(
+                                    target = "sync::backfill",
+                                    transport_id = transport_id.0,
+                                    transport = ?sink.transport.kind(),
+                                    error = %err,
+                                    "backfill send failed: data channel not open"
+                                );
+                            } else {
+                                sink.backfill_queue.push_front(job);
+                                warn!(
+                                    target = "sync::backfill",
+                                    transport_id = transport_id.0,
+                                    transport = ?sink.transport.kind(),
+                                    error = %err,
+                                    "backfill send failed; scheduling reconnect"
+                                );
+                            }
+                            if let Some(supervisor) = &sink.supervisor {
+                                supervisor.schedule_reconnect();
+                            }
                         }
-                        trace!(
-                            target = "sync::backfill",
-                            transport_id = sink.transport.id().0,
-                            request_id,
-                            start_row = chunk_start,
-                            count = chunk.attempted,
-                            delivered = chunk.delivered,
-                            more = more_pending,
-                            "sent backfill chunk"
-                        );
                     }
                     break;
+                }
+            }
+
+            if !stale_transports.is_empty() {
+                for id in stale_transports.drain(..) {
+                    request_transport_removal(id, &forwarder_tx, &mut sinks, &shared_registry);
                 }
             }
         }
@@ -1869,7 +2273,7 @@ fn initialize_transport_snapshot(
     terminal_sync: &Arc<TerminalSync>,
     sync_config: &SyncConfig,
     cache: &mut TransmitterCache,
-) -> Option<(ServerSynchronizer<TerminalSync, CacheUpdate>, Seq)> {
+) -> Result<(ServerSynchronizer<TerminalSync, CacheUpdate>, Seq), TransportError> {
     let mut synchronizer = ServerSynchronizer::new(terminal_sync.clone(), sync_config.clone());
     let hello = synchronizer.hello(subscription);
     debug!(
@@ -1878,16 +2282,14 @@ fn initialize_transport_snapshot(
         transport = ?transport.kind(),
         "sending server hello"
     );
-    if !send_host_frame(
+    send_host_frame(
         transport,
         HostFrame::Hello {
             subscription: hello.subscription_id.0,
             max_seq: hello.max_seq.0,
             config: sync_config_to_wire(&hello.config),
         },
-    ) {
-        return None;
-    }
+    )?;
     let (viewport_rows, cols) = terminal_sync.grid().viewport_size();
     let history_rows = terminal_sync.grid().rows();
     cache.reset(cols);
@@ -1900,7 +2302,7 @@ fn initialize_transport_snapshot(
         history_rows,
         "sending grid descriptor"
     );
-    if !send_host_frame(
+    send_host_frame(
         transport,
         HostFrame::Grid {
             viewport_rows: viewport_rows as u32,
@@ -1908,20 +2310,24 @@ fn initialize_transport_snapshot(
             history_rows: history_rows as u32,
             base_row: terminal_sync.grid().row_offset(),
         },
-    ) {
-        return None;
-    }
-    if !transmit_initial_snapshots(transport, &mut synchronizer, cache, subscription) {
-        return None;
-    }
-    trace!(
+    )?;
+    transmit_initial_snapshots(transport, &mut synchronizer, cache, subscription)?;
+    debug!(
         target = "sync::handshake",
         transport_id = transport.id().0,
         transport = ?transport.kind(),
         watermark = hello.max_seq.0,
         "initial snapshots transmitted"
     );
-    Some((synchronizer, hello.max_seq.0))
+    debug!(
+        target = "sync::handshake",
+        transport_id = transport.id().0,
+        transport = ?transport.kind(),
+        lanes = 3usize,
+        watermark = hello.max_seq.0,
+        "initial snapshots complete"
+    );
+    Ok((synchronizer, hello.max_seq.0))
 }
 
 fn sync_config_to_wire(config: &SyncConfig) -> WireSyncConfig {
@@ -1947,7 +2353,7 @@ fn transmit_initial_snapshots(
     synchronizer: &mut ServerSynchronizer<TerminalSync, CacheUpdate>,
     cache: &mut TransmitterCache,
     subscription: SubscriptionId,
-) -> bool {
+) -> Result<(), TransportError> {
     let transport_id = transport.id().0;
     let transport_kind = transport.kind();
     for lane in [
@@ -1968,7 +2374,7 @@ fn transmit_initial_snapshots(
             );
             let lane_copy = lane;
             let updates = cache.apply_updates(&chunk.updates, false);
-            if !send_host_frame(
+            send_host_frame(
                 transport,
                 HostFrame::Snapshot {
                     subscription: chunk.subscription_id.0,
@@ -1977,41 +2383,42 @@ fn transmit_initial_snapshots(
                     has_more: chunk.has_more,
                     updates,
                 },
-            ) {
-                return false;
-            }
+            )?;
             if !chunk.has_more {
-                trace!(
+                debug!(
                     target = "sync::handshake",
                     transport_id,
                     transport = ?transport_kind,
                     lane = ?lane,
                     "lane snapshot complete"
                 );
-                if !send_host_frame(
+                send_host_frame(
                     transport,
                     HostFrame::SnapshotComplete {
                         subscription: subscription.0,
                         lane: map_lane(lane),
                     },
-                ) {
-                    return false;
-                }
+                )?;
             }
         }
         if !emitted_chunk {
-            if !send_host_frame(
+            debug!(
+                target = "sync::handshake",
+                transport_id,
+                transport = ?transport_kind,
+                lane = ?lane,
+                "lane snapshot empty; sending completion"
+            );
+            send_host_frame(
                 transport,
                 HostFrame::SnapshotComplete {
                     subscription: subscription.0,
                     lane: map_lane(lane),
                 },
-            ) {
-                return false;
-            }
+            )?;
         }
     }
-    true
+    Ok(())
 }
 
 fn display_cmd(cmd: &[String]) -> String {
@@ -2044,7 +2451,7 @@ mod tests {
     };
     use beach_human::sync::terminal::NullTerminalDeltaStream;
     use beach_human::transport::{Payload, TransportKind, TransportPair};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration as StdDuration, Instant};
     use tokio::time::{Instant as TokioInstant, sleep, timeout};
 
@@ -2371,6 +2778,7 @@ mod tests {
 
             let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
             let (_backfill_tx, backfill_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (_forwarder_tx, forwarder_rx) = tokio::sync::mpsc::unbounded_channel();
             let forwarder = spawn_update_forwarder(
                 vec![(Arc::clone(&server), None)],
                 update_rx,
@@ -2378,6 +2786,9 @@ mod tests {
                 terminal_sync.clone(),
                 sync_config.clone(),
                 backfill_rx,
+                forwarder_rx,
+                None,
+                Arc::new(Mutex::new(Vec::new())),
             );
 
             let mut client_view = ClientGrid::new(rows, cols);
@@ -2620,6 +3031,7 @@ mod tests {
 
         let (update_tx, update_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_backfill_tx, backfill_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_forwarder_tx, forwarder_rx) = tokio::sync::mpsc::unbounded_channel();
         let forwarder = spawn_update_forwarder(
             vec![(host_transport.clone(), None)],
             update_rx,
@@ -2627,6 +3039,9 @@ mod tests {
             terminal_sync.clone(),
             sync_config.clone(),
             backfill_rx,
+            forwarder_rx,
+            None,
+            Arc::new(Mutex::new(Vec::new())),
         );
 
         tokio::task::spawn_blocking(move || {
@@ -2739,12 +3154,8 @@ mod tests {
             },
         );
         let mut cache = TransmitterCache::new();
-        assert!(transmit_initial_snapshots(
-            &host_transport,
-            &mut synchronizer,
-            &mut cache,
-            subscription
-        ));
+        transmit_initial_snapshots(&host_transport, &mut synchronizer, &mut cache, subscription)
+            .expect("transmit snapshots");
 
         let mut saw_prompt = false;
         let mut view = ClientGrid::new(rows, cols);
@@ -2812,14 +3223,14 @@ mod tests {
 
         let subscription = SubscriptionId(99);
         let mut cache = TransmitterCache::new();
-        let handshake = initialize_transport_snapshot(
+        let _handshake = initialize_transport_snapshot(
             &host_transport,
             subscription,
             &terminal_sync,
             &sync_config,
             &mut cache,
-        );
-        assert!(handshake.is_some(), "handshake failed");
+        )
+        .expect("handshake");
 
         let mut advertised: Option<(u32, u32, u32, u64)> = None;
         for _ in 0..10 {

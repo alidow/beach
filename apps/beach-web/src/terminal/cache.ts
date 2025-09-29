@@ -20,6 +20,16 @@ export interface CellState {
   seq: number;
 }
 
+export interface PredictedCell {
+  char: string;
+  seq: number;
+}
+
+interface PredictedPosition {
+  row: number;
+  col: number;
+}
+
 export interface LoadedRow {
   kind: 'loaded';
   absolute: number;
@@ -51,6 +61,8 @@ export interface TerminalGridSnapshot {
   cursorRow: number | null;
   cursorCol: number | null;
   visibleRows(limit?: number): RowSlot[];
+  getPrediction(row: number, col: number): PredictedCell | null;
+  predictionsForRow(row: number): Array<{ col: number; cell: PredictedCell }>;
 }
 
 interface TerminalGridCacheOptions {
@@ -75,6 +87,8 @@ export class TerminalGridCache {
   private styles = new Map<number, StyleDefinition>();
   private cursorRow: number | null = null;
   private cursorCol: number | null = null;
+  private predictions = new Map<number, Map<number, PredictedCell>>();
+  private pendingPredictions = new Map<number, PredictedPosition[]>();
 
   constructor(options: TerminalGridCacheOptions = {}) {
     this.maxHistory = options.maxHistory ?? DEFAULT_HISTORY_LIMIT;
@@ -94,6 +108,8 @@ export class TerminalGridCache {
     this.styles = new Map([[0, { id: 0, fg: DEFAULT_COLOR, bg: DEFAULT_COLOR, attrs: 0 }]]);
     this.cursorRow = null;
     this.cursorCol = null;
+    this.predictions.clear();
+    this.pendingPredictions.clear();
   }
 
   setGridSize(totalRows: number, cols: number): boolean {
@@ -154,6 +170,7 @@ export class TerminalGridCache {
         this.cursorRow = this.baseRow;
         this.cursorCol = 0;
       }
+      mutated = this.prunePredictionsBelow(this.baseRow) || mutated;
     } else {
       const newRows: RowSlot[] = [];
       for (let absolute = baseRow; absolute < this.baseRow; absolute += 1) {
@@ -181,15 +198,20 @@ export class TerminalGridCache {
   applyUpdates(updates: Update[], authoritative = false): boolean {
     let mutated = false;
     let baseAdjusted = false;
+    let cursorChanged = false;
+    let cursorHintSeen = false;
     for (const update of updates) {
-      const hint = this.cursorHint(update);
+      const beforeWidth = this.debugRowWidthForUpdate(update);
       baseAdjusted = this.observeBounds(update, authoritative) || baseAdjusted;
       mutated = this.applyGridUpdate(update) || mutated;
+      const hint = this.cursorHint(update);
       if (hint) {
-        mutated = this.applyCursorHint(hint) || mutated;
+        cursorHintSeen = true;
+        cursorChanged = this.applyCursorHint(hint) || cursorChanged;
       }
+      this.logCursorDebug(update, hint, beforeWidth);
     }
-    return mutated || baseAdjusted;
+    return mutated || baseAdjusted || cursorChanged || cursorHintSeen;
   }
 
   markRowPending(absolute: number): boolean {
@@ -202,6 +224,7 @@ export class TerminalGridCache {
     if (existing && existing.kind === 'pending') {
       return false;
     }
+    this.clearPredictionsForRow(absolute);
     this.rows[index] = createPendingRow(absolute);
     return true;
   }
@@ -216,6 +239,7 @@ export class TerminalGridCache {
     if (existing && existing.kind === 'missing') {
       return false;
     }
+    this.clearPredictionsForRow(absolute);
     this.rows[index] = createMissingRow(absolute);
     return true;
   }
@@ -318,6 +342,8 @@ export class TerminalGridCache {
       cursorRow: this.cursorRow,
       cursorCol: this.cursorCol,
       visibleRows: (limit?: number) => this.visibleRows(limit),
+      getPrediction: (row: number, col: number) => this.getPrediction(row, col),
+      predictionsForRow: (row: number) => this.predictionsForRow(row),
     };
   }
 
@@ -344,8 +370,10 @@ export class TerminalGridCache {
     switch (update.type) {
       case 'cell':
         return { kind: 'exact', row: update.row, col: update.col + 1 };
-      case 'row':
-        return { kind: 'row_width', row: update.row };
+      case 'row': {
+        const col = this.inferRowCursorColumn(update.cells);
+        return { kind: 'exact', row: update.row, col };
+      }
       case 'rect': {
         const [rowStart, rowEnd] = update.rows;
         if (rowEnd <= rowStart) {
@@ -422,8 +450,47 @@ export class TerminalGridCache {
       this.cursorCol = 0;
       return;
     }
-    const maxCol = Math.max(this.cols - 1, 0);
+    const maxCol = Math.max(this.cols, 0);
     this.cursorCol = clamp(this.cursorCol, 0, maxCol);
+  }
+
+  private inferRowCursorColumn(cells: number[]): number {
+    if (!cells || cells.length === 0) {
+      return 0;
+    }
+    let lastDefined = -1;
+    for (let index = cells.length - 1; index >= 0; index -= 1) {
+      if (cells[index] !== undefined) {
+        lastDefined = index;
+        break;
+      }
+    }
+    return Math.max(0, lastDefined + 1);
+  }
+
+  private debugRowWidthForUpdate(update: Update): number | null {
+    const row = extractUpdateRow(update);
+    if (row === null) {
+      return null;
+    }
+    return this.rowDisplayWidth(row);
+  }
+
+  private logCursorDebug(update: Update, hint: CursorHint | null, beforeWidth: number | null): void {
+    if (!isCursorDebuggingEnabled()) {
+      return;
+    }
+    const summary = summarizeUpdate(update);
+    const row = hint ? hint.row : extractUpdateRow(update);
+    const afterWidth = row === null ? null : this.rowDisplayWidth(row);
+    console.log('[grid.cursor]', {
+      update: summary,
+      hint,
+      beforeWidth,
+      afterWidth,
+      cursorRow: this.cursorRow,
+      cursorCol: this.cursorCol,
+    });
   }
 
   private applyCell(row: number, col: number, seq: number, packed: number): boolean {
@@ -433,6 +500,7 @@ export class TerminalGridCache {
       mutated = true;
     }
     const cell = loaded.cells[col]!;
+    mutated = this.clearPredictionAt(row, col) || mutated;
     if (seq >= cell.seq) {
       const decoded = decodePackedCell(packed);
       cell.char = decoded.char;
@@ -456,6 +524,7 @@ export class TerminalGridCache {
     for (let col = 0; col < width; col += 1) {
       const packed = cells[col];
       const cell = loaded.cells[col]!;
+      mutated = this.clearPredictionAt(row, col) || mutated;
       if (packed === undefined) {
         if (seq >= cell.seq && (cell.char !== ' ' || cell.styleId !== 0)) {
           cell.char = ' ';
@@ -491,6 +560,7 @@ export class TerminalGridCache {
       const col = startCol + index;
       const packed = cells[index]!;
       const cell = loaded.cells[col]!;
+      mutated = this.clearPredictionAt(row, col) || mutated;
       if (seq >= cell.seq) {
         const decoded = decodePackedCell(packed);
         if (cell.char !== decoded.char || cell.styleId !== decoded.styleId || cell.seq !== seq) {
@@ -504,6 +574,7 @@ export class TerminalGridCache {
     if (startCol === 0) {
       for (let col = endCol; col < loaded.cells.length; col += 1) {
         const cell = loaded.cells[col]!;
+        mutated = this.clearPredictionAt(row, col) || mutated;
         if (seq >= cell.seq && (cell.char !== ' ' || cell.styleId !== 0)) {
           cell.char = ' ';
           cell.styleId = 0;
@@ -530,6 +601,7 @@ export class TerminalGridCache {
       mutated = extended || mutated;
       for (let col = colRange[0]; col < colRange[1]; col += 1) {
         const cell = loaded.cells[col]!;
+        mutated = this.clearPredictionAt(row, col) || mutated;
         if (seq >= cell.seq) {
           if (cell.char !== decoded.char || cell.styleId !== decoded.styleId || cell.seq !== seq) {
             cell.char = decoded.char;
@@ -578,6 +650,7 @@ export class TerminalGridCache {
     }
     this.reindexRows();
     this.clampCursor();
+    mutated = this.prunePredictionsBelow(this.baseRow) || mutated;
     return mutated;
   }
 
@@ -609,6 +682,85 @@ export class TerminalGridCache {
     return loaded;
   }
 
+  registerPrediction(seq: number, data: Uint8Array): boolean {
+    if (!Number.isFinite(seq) || seq <= 0) {
+      return false;
+    }
+    if (!data || data.length === 0 || data.length > 32) {
+      return false;
+    }
+
+    let mutated = false;
+    let cursorRow = this.cursorRow;
+    let cursorCol = this.cursorCol;
+
+    if (cursorRow === null || cursorCol === null) {
+      const fallbackRow = this.findHighestLoadedRow();
+      cursorRow = fallbackRow ?? this.baseRow;
+      cursorCol = this.rowDisplayWidth(cursorRow);
+    }
+
+    this.cursorRow = cursorRow ?? this.baseRow;
+    this.cursorCol = cursorCol ?? 0;
+
+    const positions: PredictedPosition[] = [];
+
+    for (const byte of data) {
+      if (byte === 0x0d) {
+        this.cursorCol = 0;
+        continue;
+      }
+      if (byte === 0x0a) {
+        this.cursorRow = (this.cursorRow ?? this.baseRow) + 1;
+        this.cursorCol = 0;
+        continue;
+      }
+      if (byte <= 0x1f || byte === 0x7f) {
+        continue;
+      }
+
+      const row = this.cursorRow ?? this.baseRow;
+      const col = this.cursorCol ?? 0;
+      const char = String.fromCharCode(byte);
+      mutated = this.setPrediction(row, col, seq, char) || mutated;
+      positions.push({ row, col });
+      this.advanceCursorForChar(char);
+    }
+
+    if (positions.length === 0) {
+      return mutated;
+    }
+
+    this.pendingPredictions.set(seq, positions);
+    if (this.pendingPredictions.size > 256) {
+      mutated = this.clearAllPredictions() || mutated;
+    }
+    return mutated || positions.length > 0;
+  }
+
+  clearPredictionSeq(seq: number): boolean {
+    const positions = this.pendingPredictions.get(seq);
+    if (!positions || positions.length === 0) {
+      this.pendingPredictions.delete(seq);
+      return false;
+    }
+    this.pendingPredictions.delete(seq);
+    let mutated = false;
+    for (const { row, col } of positions) {
+      mutated = this.clearPredictionAt(row, col) || mutated;
+    }
+    return mutated;
+  }
+
+  clearAllPredictions(): boolean {
+    if (this.predictions.size === 0 && this.pendingPredictions.size === 0) {
+      return false;
+    }
+    this.predictions.clear();
+    this.pendingPredictions.clear();
+    return true;
+  }
+
   private ensureCols(requiredCols: number): boolean {
     if (requiredCols <= this.cols) {
       return false;
@@ -631,6 +783,97 @@ export class TerminalGridCache {
       row.cells.push(createBlankCell());
     }
     return true;
+  }
+
+  private setPrediction(row: number, col: number, seq: number, char: string): boolean {
+    const loaded = this.ensureLoadedRow(row);
+    this.extendRow(loaded, col + 1);
+    let rowPredictions = this.predictions.get(row);
+    if (!rowPredictions) {
+      rowPredictions = new Map();
+      this.predictions.set(row, rowPredictions);
+    }
+    const existing = rowPredictions.get(col);
+    if (existing && existing.char === char && existing.seq === seq) {
+      return false;
+    }
+    rowPredictions.set(col, { char, seq });
+    return true;
+  }
+
+  private clearPredictionAt(row: number, col: number): boolean {
+    const rowPredictions = this.predictions.get(row);
+    if (!rowPredictions) {
+      return false;
+    }
+    const existing = rowPredictions.get(col);
+    if (!existing) {
+      return false;
+    }
+    rowPredictions.delete(col);
+    if (rowPredictions.size === 0) {
+      this.predictions.delete(row);
+    }
+    const positions = this.pendingPredictions.get(existing.seq);
+    if (positions) {
+      const filtered = positions.filter((pos) => !(pos.row === row && pos.col === col));
+      if (filtered.length === 0) {
+        this.pendingPredictions.delete(existing.seq);
+      } else if (filtered.length !== positions.length) {
+        this.pendingPredictions.set(existing.seq, filtered);
+      }
+    }
+    return true;
+  }
+
+  private clearPredictionsForRow(row: number): boolean {
+    const rowPredictions = this.predictions.get(row);
+    if (!rowPredictions || rowPredictions.size === 0) {
+      return false;
+    }
+    const cols = Array.from(rowPredictions.keys());
+    let mutated = false;
+    for (const col of cols) {
+      mutated = this.clearPredictionAt(row, col) || mutated;
+    }
+    return mutated;
+  }
+
+  private prunePredictionsBelow(row: number): boolean {
+    let mutated = false;
+    for (const predRow of Array.from(this.predictions.keys())) {
+      if (predRow < row) {
+        mutated = this.clearPredictionsForRow(predRow) || mutated;
+      }
+    }
+    return mutated;
+  }
+
+  private getPrediction(row: number, col: number): PredictedCell | null {
+    const rowPredictions = this.predictions.get(row);
+    if (!rowPredictions) {
+      return null;
+    }
+    return rowPredictions.get(col) ?? null;
+  }
+
+  private predictionsForRow(row: number): Array<{ col: number; cell: PredictedCell }> {
+    const rowPredictions = this.predictions.get(row);
+    if (!rowPredictions || rowPredictions.size === 0) {
+      return [];
+    }
+    return Array.from(rowPredictions.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([col, cell]) => ({ col, cell }));
+  }
+
+  private advanceCursorForChar(char: string): void {
+    if (char === '\n') {
+      this.cursorRow = (this.cursorRow ?? this.baseRow) + 1;
+      this.cursorCol = 0;
+    } else {
+      this.cursorCol = (this.cursorCol ?? 0) + 1;
+    }
   }
 
   private touchRow(absolute: number): boolean {
@@ -703,6 +946,9 @@ export class TerminalGridCache {
       this.baseRow += 1;
       this.historyTrimmed = true;
       mutated = true;
+    }
+    if (mutated) {
+      this.prunePredictionsBelow(this.baseRow);
     }
     return mutated;
   }
@@ -813,5 +1059,66 @@ function safeFromCodePoint(codePoint: number): string {
     return String.fromCodePoint(codePoint);
   } catch {
     return '\uFFFD';
+  }
+}
+
+function isCursorDebuggingEnabled(): boolean {
+  try {
+    const global = globalThis as { __BEACH_CURSOR_DEBUG__?: unknown };
+    return Boolean(global.__BEACH_CURSOR_DEBUG__);
+  } catch {
+    return false;
+  }
+}
+
+function summarizeUpdate(update: Update): Record<string, unknown> {
+  switch (update.type) {
+    case 'cell': {
+      const decoded = decodePackedCell(update.cell);
+      return {
+        type: update.type,
+        row: update.row,
+        col: update.col,
+        seq: update.seq,
+        char: decoded.char,
+      };
+    }
+    case 'rect':
+      return {
+        type: update.type,
+        rows: update.rows,
+        cols: update.cols,
+        seq: update.seq,
+      };
+    case 'row':
+      return {
+        type: update.type,
+        row: update.row,
+        seq: update.seq,
+        cells: update.cells.length,
+      };
+    case 'row_segment':
+      return {
+        type: update.type,
+        row: update.row,
+        startCol: update.startCol,
+        seq: update.seq,
+        cells: update.cells.length,
+      };
+    case 'trim':
+      return {
+        type: update.type,
+        start: update.start,
+        count: update.count,
+        seq: update.seq,
+      };
+    case 'style':
+      return {
+        type: update.type,
+        id: update.id,
+        seq: update.seq,
+      };
+    default:
+      return { type: (update as { type: string }).type };
   }
 }

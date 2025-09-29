@@ -160,6 +160,38 @@ describe('TerminalGridStore', () => {
 
     expect(store.getRowText(0)).toBe('(');
   });
+
+  it('records predictive characters and clears them on ack', () => {
+    const store = new TerminalGridStore();
+    store.setGridSize(1, 80);
+    store.applyUpdates([{ type: 'row', row: 0, seq: 1, cells: packString('> ') }], true);
+
+    store.registerPrediction(1, stringToBytes('ls'));
+    let snapshot = store.getSnapshot();
+    expect(snapshot.getPrediction(0, 2)?.char).toBe('l');
+    expect(snapshot.getPrediction(0, 3)?.char).toBe('s');
+
+    store.clearPrediction(1);
+    snapshot = store.getSnapshot();
+    expect(snapshot.getPrediction(0, 2)).toBeNull();
+    expect(snapshot.getPrediction(0, 3)).toBeNull();
+  });
+
+  it('drops stale predictions when authoritative updates overwrite cells', () => {
+    const store = new TerminalGridStore();
+    store.setGridSize(1, 80);
+    store.applyUpdates([{ type: 'row', row: 0, seq: 1, cells: packString('> ') }], true);
+
+    store.registerPrediction(1, stringToBytes('hi'));
+    expect(store.getSnapshot().getPrediction(0, 2)?.char).toBe('h');
+
+    store.applyUpdates([{ type: 'row_segment', row: 0, startCol: 2, seq: 2, cells: packString('hi') }], true);
+
+    const snapshot = store.getSnapshot();
+    expect(snapshot.getPrediction(0, 2)).toBeNull();
+    expect(snapshot.getPrediction(0, 3)).toBeNull();
+    expect(store.getRowText(0)).toBe('> hi');
+  });
 });
 
 function packCell(char: string, styleId: number): number {
@@ -172,4 +204,8 @@ function packCell(char: string, styleId: number): number {
 
 function packString(text: string, styleId = 0): number[] {
   return Array.from(text).map((char) => packCell(char, styleId));
+}
+
+function stringToBytes(text: string): Uint8Array {
+  return Uint8Array.from(Array.from(text).map((char) => char.codePointAt(0) ?? 0));
 }

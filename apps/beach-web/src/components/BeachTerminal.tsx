@@ -175,6 +175,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     event.preventDefault();
     const seq = ++inputSeqRef.current;
     sendFrame(transport, { type: 'input', seq, data: payload });
+    store.registerPrediction(seq, payload);
   };
 
   const wrapperClasses = ['flex flex-col h-full min-h-0 gap-3', className]
@@ -300,7 +301,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         break;
       }
       case 'snapshot_complete':
+        break;
       case 'input_ack':
+        store.clearPrediction(frame.seq);
+        break;
       case 'heartbeat':
         break;
       case 'shutdown':
@@ -315,6 +319,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
 interface RenderCell {
   char: string;
   styleId: number;
+  predicted?: boolean;
 }
 
 interface RenderLine {
@@ -339,6 +344,20 @@ export function buildLines(snapshot: TerminalGridSnapshot, limit: number): Rende
         char: cell.char ?? ' ',
         styleId: cell.styleId ?? 0,
       }));
+      const predictions = snapshot.predictionsForRow(row.absolute);
+      if (predictions.length > 0) {
+        for (const { col, cell: prediction } of predictions) {
+          while (cells.length <= col) {
+            cells.push({ char: ' ', styleId: 0 });
+          }
+          const existing = cells[col];
+          cells[col] = {
+            char: prediction.char ?? ' ',
+            styleId: existing?.styleId ?? 0,
+            predicted: true,
+          };
+        }
+      }
       let cursorCol: number | null = null;
       if (snapshot.cursorRow === row.absolute && snapshot.cursorCol !== null) {
         const raw = Math.floor(Math.max(snapshot.cursorCol, 0));
@@ -371,10 +390,18 @@ function LineRow({ line, styles }: { line: RenderLine; styles: Map<number, Style
       {line.cells.map((cell, index) => {
         const styleDef = styles.get(cell.styleId);
         const isCursor = cursorCol !== null && cursorCol === index;
-        const style = styleDef ? styleFromDefinition(styleDef, isCursor) : undefined;
+        let style = styleDef ? styleFromDefinition(styleDef, isCursor) : undefined;
+        const predicted = cell.predicted === true;
+        if (predicted) {
+          const merged: CSSProperties = { ...(style ?? {}) };
+          merged.textDecoration = appendTextDecoration(merged.textDecoration, 'underline');
+          const existingOpacity = merged.opacity !== undefined ? Number(merged.opacity) : undefined;
+          merged.opacity = existingOpacity !== undefined ? existingOpacity * 0.75 : 0.75;
+          style = merged;
+        }
         const char = cell.char === ' ' ? ' ' : cell.char;
         return (
-          <span key={index} style={style}>
+          <span key={index} style={style} data-predicted={predicted || undefined}>
             {char}
           </span>
         );

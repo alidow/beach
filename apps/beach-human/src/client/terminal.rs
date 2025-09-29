@@ -543,7 +543,8 @@ impl TerminalClient {
             && self.renderer.total_rows() > self.renderer.viewport_height() as u64
             && self.handshake_history_rows > self.handshake_snapshot_lines as u64
         {
-            if let Some((start, span)) = self.renderer.first_unloaded_range(BACKFILL_LOOKAHEAD_ROWS) {
+            if let Some((start, span)) = self.renderer.first_unloaded_range(BACKFILL_LOOKAHEAD_ROWS)
+            {
                 let count = span.min(BACKFILL_MAX_ROWS_PER_REQUEST);
                 if count > 0 {
                     self.send_backfill_request(subscription, start, count)?;
@@ -1690,7 +1691,7 @@ impl TerminalClient {
                     pattern: pattern_owned.clone(),
                 });
             }
-            self.set_copy_cursor_position(position);
+            self.set_copy_cursor_position(position, true);
             self.update_copy_mode_status();
             true
         } else {
@@ -1704,7 +1705,7 @@ impl TerminalClient {
         }
     }
 
-    fn set_copy_cursor_position(&mut self, position: SelectionPosition) {
+    fn set_copy_cursor_position(&mut self, position: SelectionPosition, ensure_visible: bool) {
         let (selection_active, anchor, mode) = match self.copy_mode.as_mut() {
             Some(state) => {
                 state.cursor = position;
@@ -1722,7 +1723,9 @@ impl TerminalClient {
             self.renderer.clear_selection();
         }
         self.renderer.set_follow_tail(false);
-        self.renderer.ensure_row_visible(position.row);
+        if ensure_visible {
+            self.renderer.ensure_row_visible(position.row);
+        }
         self.force_render = true;
     }
 
@@ -1905,7 +1908,7 @@ impl TerminalClient {
             };
             let target_row = row as i64 + actual_delta;
             let new_pos = self.renderer.clamp_position(target_row, col as isize);
-            self.set_copy_cursor_position(new_pos);
+            self.set_copy_cursor_position(new_pos, false);
         } else if actual_delta > 0 && reached_tail {
             self.renderer.scroll_to_tail();
         }
@@ -1925,8 +1928,7 @@ impl TerminalClient {
         match clipboard_get() {
             Ok(contents) => {
                 if contents.is_empty() {
-                    self.renderer
-                        .set_status_message(Some("clipboard empty"));
+                    self.renderer.set_status_message(Some("clipboard empty"));
                     self.force_render = true;
                     return;
                 }
@@ -2011,7 +2013,7 @@ impl TerminalClient {
         let target_row = row as i64 + delta_row as i64;
         let target_col = col as isize + delta_col;
         let new_pos = self.renderer.clamp_position(target_row, target_col);
-        self.set_copy_cursor_position(new_pos);
+        self.set_copy_cursor_position(new_pos, true);
     }
 
     fn move_copy_cursor_page(&mut self, pages: isize) {
@@ -2056,7 +2058,7 @@ impl TerminalClient {
             WordMotion::PrevStart => self.find_word_backward(start),
         };
         if let Some(position) = target {
-            self.set_copy_cursor_position(position);
+            self.set_copy_cursor_position(position, true);
         }
     }
 
@@ -2124,7 +2126,7 @@ impl TerminalClient {
         }
         let row = self.copy_mode.as_ref().unwrap().cursor.row;
         let new_pos = self.renderer.clamp_position(row as i64, 0);
-        self.set_copy_cursor_position(new_pos);
+        self.set_copy_cursor_position(new_pos, true);
     }
 
     fn move_copy_cursor_line_end(&mut self) {
@@ -2137,7 +2139,7 @@ impl TerminalClient {
         let new_pos = self
             .renderer
             .clamp_position(row as i64, target_col as isize);
-        self.set_copy_cursor_position(new_pos);
+        self.set_copy_cursor_position(new_pos, true);
     }
 
     fn jump_copy_cursor_to_top(&mut self) {
@@ -2146,7 +2148,7 @@ impl TerminalClient {
         }
         let top = self.renderer.base_row();
         let position = self.renderer.clamp_position(top as i64, 0);
-        self.set_copy_cursor_position(position);
+        self.set_copy_cursor_position(position, true);
     }
 
     fn jump_copy_cursor_to_bottom(&mut self) {
@@ -2155,7 +2157,7 @@ impl TerminalClient {
         }
         let last_row = self.renderer.total_rows().saturating_sub(1);
         let position = self.renderer.clamp_position(last_row as i64, 0);
-        self.set_copy_cursor_position(position);
+        self.set_copy_cursor_position(position, true);
     }
 
     fn copy_selection_to_clipboard(&mut self, exit_after: bool) {
@@ -2806,16 +2808,16 @@ fn mouse_button_code(button: MouseButton) -> Option<u16> {
     }
 }
 
-    #[cfg(test)]
-    mod tests {
-        #[allow(unused_imports)]
-        use super::*;
-        use crate::cache::terminal::PackedCell;
-        use crate::protocol::{Lane, LaneBudgetFrame, SyncConfigFrame};
-        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind, KeyModifiers};
+#[cfg(test)]
+mod tests {
+    #[allow(unused_imports)]
+    use super::*;
+    use crate::cache::terminal::PackedCell;
+    use crate::protocol::{Lane, LaneBudgetFrame, SyncConfigFrame};
     use crate::transport::{
         Transport, TransportError, TransportId, TransportKind, TransportMessage, TransportPair,
     };
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -3172,7 +3174,10 @@ fn mouse_button_code(button: MouseButton) -> Option<u16> {
 
         client.process_copy_mode_key(&key(KeyCode::PageDown, KeyModifiers::NONE));
 
-        assert!(client.copy_mode.is_none(), "PageDown at tail should exit copy mode");
+        assert!(
+            client.copy_mode.is_none(),
+            "PageDown at tail should exit copy mode"
+        );
         assert!(client.renderer.is_following_tail());
     }
 
@@ -3190,10 +3195,16 @@ fn mouse_button_code(button: MouseButton) -> Option<u16> {
 
         assert!(client.copy_mode.is_none());
         client.process_copy_mode_key(&key(KeyCode::Char('b'), KeyModifiers::CONTROL));
-        assert!(client.copy_mode.is_none(), "prefix should not enter copy mode yet");
+        assert!(
+            client.copy_mode.is_none(),
+            "prefix should not enter copy mode yet"
+        );
 
         client.process_copy_mode_key(&key(KeyCode::Char('['), KeyModifiers::NONE));
-        assert!(client.copy_mode.is_some(), "Ctrl-B [ should enter copy mode");
+        assert!(
+            client.copy_mode.is_some(),
+            "Ctrl-B [ should enter copy mode"
+        );
     }
 
     #[test]
@@ -3232,10 +3243,14 @@ fn mouse_button_code(button: MouseButton) -> Option<u16> {
         client.renderer.scroll_to_tail();
 
         client.process_copy_mode_key(&key(KeyCode::Char('b'), KeyModifiers::CONTROL));
-        client.tmux_prefix_started_at = Some(Instant::now() - TMUX_PREFIX_TIMEOUT - Duration::from_millis(1));
+        client.tmux_prefix_started_at =
+            Some(Instant::now() - TMUX_PREFIX_TIMEOUT - Duration::from_millis(1));
 
         client.process_copy_mode_key(&key(KeyCode::Char('['), KeyModifiers::NONE));
-        assert!(client.copy_mode.is_none(), "expired prefix should not enter copy mode");
+        assert!(
+            client.copy_mode.is_none(),
+            "expired prefix should not enter copy mode"
+        );
     }
 
     #[test]
@@ -3267,7 +3282,10 @@ fn mouse_button_code(button: MouseButton) -> Option<u16> {
         client.process_copy_mode_key(&key(KeyCode::Char('b'), KeyModifiers::CONTROL));
         client.process_copy_mode_key(&key(KeyCode::Char(']'), KeyModifiers::NONE));
 
-        assert!(transport.take().is_empty(), "no frames expected when clipboard empty");
+        assert!(
+            transport.take().is_empty(),
+            "no frames expected when clipboard empty"
+        );
     }
 
     #[test]

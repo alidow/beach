@@ -5,6 +5,7 @@ import {
   type LoadedRow,
   type MissingRow,
   type PendingRow,
+  type PredictedCell,
   type RowSlot,
   type StyleDefinition,
   type TerminalGridSnapshot,
@@ -15,6 +16,7 @@ export type {
   LoadedRow,
   MissingRow,
   PendingRow,
+  PredictedCell,
   RowSlot,
   StyleDefinition,
   TerminalGridSnapshot,
@@ -115,6 +117,27 @@ export class TerminalGridStore {
 
   markRowMissing(absolute: number): void {
     if (this.cache.markRowMissing(absolute)) {
+      this.invalidate();
+      this.notify();
+    }
+  }
+
+  registerPrediction(seq: number, data: Uint8Array): void {
+    if (this.cache.registerPrediction(seq, data)) {
+      this.invalidate();
+      this.notify();
+    }
+  }
+
+  clearPrediction(seq: number): void {
+    if (this.cache.clearPredictionSeq(seq)) {
+      this.invalidate();
+      this.notify();
+    }
+  }
+
+  clearAllPredictions(): void {
+    if (this.cache.clearAllPredictions()) {
       this.invalidate();
       this.notify();
     }

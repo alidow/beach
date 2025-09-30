@@ -948,6 +948,13 @@ async fn connect_answerer(
     let (expected_remote_peer, _) = signaling_client
         .wait_for_remote_peer_with_generation()
         .await?;
+    tracing::debug!(
+        target = "beach_human::transport::webrtc",
+        role = "answerer",
+        expected_remote = %expected_remote_peer,
+        "initialized expected remote peer"
+    );
+    signaling_client.lock_remote_peer(&expected_remote_peer).await;
     let assigned_peer_id = signaling_client
         .assigned_peer_id()
         .await
@@ -1248,6 +1255,7 @@ async fn connect_answerer(
         result = ?post_result
     );
     post_result?;
+    signaling_client.unlock_remote_peer(&expected_remote_peer).await;
 
     // Verbose connection state tracing for diagnosis
     {

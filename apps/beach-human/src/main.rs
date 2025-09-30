@@ -14,7 +14,7 @@ use beach_human::server::terminal::{
 };
 use beach_human::session::{
     HostSession, JoinedSession, SessionConfig, SessionError, SessionHandle, SessionManager,
-    TransportOffer,
+    SessionRole, TransportOffer,
 };
 use beach_human::sync::terminal::{TerminalDeltaStream, TerminalSync};
 use beach_human::sync::{LaneBudget, PriorityLane, ServerSynchronizer, SubscriptionId, SyncConfig};
@@ -428,8 +428,15 @@ async fn negotiate_transport(
     // Prefer WebRTC data channels for sync; fall back to WebSocket only if absolutely necessary.
     let offers: Vec<TransportOffer> = handle.offers().to_vec();
 
-    // Try WebRTC answerer roles first so non-host clients don't spin up an offerer supervisor.
-    for preferred_role in [WebRtcRole::Answerer, WebRtcRole::Offerer] {
+    const HOST_ROLE_CANDIDATES: [WebRtcRole; 2] = [WebRtcRole::Offerer, WebRtcRole::Answerer];
+    const PARTICIPANT_ROLE_CANDIDATES: [WebRtcRole; 1] = [WebRtcRole::Answerer];
+
+    let role_candidates: &[WebRtcRole] = match handle.role() {
+        SessionRole::Host => &HOST_ROLE_CANDIDATES,
+        SessionRole::Participant => &PARTICIPANT_ROLE_CANDIDATES,
+    };
+
+    for &preferred_role in role_candidates {
         for offer in &offers {
             let TransportOffer::WebRtc { offer } = offer else {
                 continue;
@@ -450,11 +457,10 @@ async fn negotiate_transport(
                 }
             };
 
-            let role_matches = matches!(
-                (preferred_role, role),
-                (WebRtcRole::Answerer, WebRtcRole::Answerer)
-                    | (WebRtcRole::Offerer, WebRtcRole::Offerer)
-            );
+            let role_matches = matches!(preferred_role, WebRtcRole::Offerer)
+                && matches!(role, WebRtcRole::Offerer)
+                || matches!(preferred_role, WebRtcRole::Answerer)
+                    && matches!(role, WebRtcRole::Answerer);
             if !role_matches {
                 continue;
             }

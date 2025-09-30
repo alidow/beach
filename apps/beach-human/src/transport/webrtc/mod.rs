@@ -451,14 +451,19 @@ struct OffererInner {
     poll_interval: Duration,
     accepted_tx: tokio_mpsc::UnboundedSender<OffererAcceptedTransport>,
     peer_tasks: AsyncMutex<HashMap<String, PeerNegotiatorHandle>>,
-    active_generations: AsyncMutex<HashMap<String, u64>>,
+    peer_states: AsyncMutex<HashMap<String, PeerLifecycleState>>,
     max_negotiators: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerLifecycleState {
+    Negotiating,
+    Established,
 }
 
 struct PeerNegotiatorHandle {
     cancel: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
-    generation: u64,
 }
 
 impl OffererSupervisor {
@@ -480,7 +485,7 @@ impl OffererSupervisor {
             poll_interval,
             accepted_tx,
             peer_tasks: AsyncMutex::new(HashMap::new()),
-            active_generations: AsyncMutex::new(HashMap::new()),
+            peer_states: AsyncMutex::new(HashMap::new()),
             max_negotiators: OFFERER_MAX_NEGOTIATORS,
         });
 
@@ -546,60 +551,40 @@ impl OffererInner {
             return;
         }
 
-        let generation = joined.generation;
-        let maybe_active_generation = {
-            let active = self.active_generations.lock().await;
-            active.get(&joined.peer.id).copied()
-        };
-
-        if let Some(active_generation) = maybe_active_generation {
-            if generation <= active_generation {
-                tracing::debug!(
-                    target = "webrtc",
-                    peer_id = %joined.peer.id,
-                    generation,
-                    active_generation,
-                    "ignoring peer join; generation already satisfied"
-                );
+        {
+            let mut states = self.peer_states.lock().await;
+            if let Some(state) = states.get(&joined.peer.id) {
+                match state {
+                    PeerLifecycleState::Negotiating => {
+                        tracing::debug!(
+                            target = "webrtc",
+                            peer_id = %joined.peer.id,
+                            "peer negotiator already active"
+                        );
+                    }
+                    PeerLifecycleState::Established => {
+                        tracing::debug!(
+                            target = "webrtc",
+                            peer_id = %joined.peer.id,
+                            "peer already has established transport"
+                        );
+                    }
+                }
                 return;
             }
-
-            {
-                let mut active = self.active_generations.lock().await;
-                active.remove(&joined.peer.id);
-            }
-            tracing::info!(
-                target = "webrtc",
-                peer_id = %joined.peer.id,
-                generation,
-                previous_generation = active_generation,
-                "remote peer advertised newer generation; restarting negotiation"
-            );
+            states.insert(joined.peer.id.clone(), PeerLifecycleState::Negotiating);
         }
 
         let mut tasks = self.peer_tasks.lock().await;
-        if let Some(existing) = tasks.get(&joined.peer.id) {
-            if existing.generation >= generation {
-                tracing::debug!(
-                    target = "webrtc",
-                    peer_id = %joined.peer.id,
-                    generation,
-                    active_generation = existing.generation,
-                    "peer negotiator already active"
-                );
-                return;
-            }
-
-            tracing::info!(
+        if tasks.contains_key(&joined.peer.id) {
+            tracing::debug!(
                 target = "webrtc",
                 peer_id = %joined.peer.id,
-                generation,
-                replaced_generation = existing.generation,
-                "cancelling stale peer negotiator for newer generation"
+                "peer negotiator already active"
             );
-            existing.cancel.store(true, Ordering::SeqCst);
-            existing.task.abort();
-            tasks.remove(&joined.peer.id);
+            let mut states = self.peer_states.lock().await;
+            states.remove(&joined.peer.id);
+            return;
         }
         if tasks.len() >= self.max_negotiators {
             tracing::warn!(
@@ -609,13 +594,14 @@ impl OffererInner {
                 max = self.max_negotiators,
                 "dropping peer join due to negotiator capacity"
             );
+            let mut states = self.peer_states.lock().await;
+            states.remove(&joined.peer.id);
             return;
         }
 
         tracing::info!(
             target = "webrtc",
             peer_id = %joined.peer.id,
-            generation,
             "registering peer negotiator"
         );
 
@@ -624,29 +610,18 @@ impl OffererInner {
         let inner_for_task = Arc::clone(self);
         let cancel_for_task = cancel.clone();
         let peer_id_for_task = peer_id.clone();
-        let generation_for_task = generation;
         let task = tokio::spawn(async move {
             let result =
                 negotiate_offerer_peer(inner_for_task.clone(), joined, cancel_for_task.clone())
                     .await;
             inner_for_task
-                .finalize_peer(
-                    &peer_id_for_task,
-                    generation_for_task,
-                    result,
-                    cancel_for_task,
-                )
+                .finalize_peer(&peer_id_for_task, result, cancel_for_task)
                 .await;
         });
 
-        tasks.insert(
-            peer_id,
-            PeerNegotiatorHandle {
-                cancel,
-                task,
-                generation,
-            },
-        );
+        tasks.insert(peer_id.clone(), PeerNegotiatorHandle { cancel, task });
+        drop(tasks);
+        // state already marked as Negotiating above; nothing else to do
     }
 
     async fn handle_peer_left(self: &Arc<Self>, peer_id: &str) {
@@ -656,14 +631,13 @@ impl OffererInner {
             handle.task.abort();
         }
 
-        let mut active = self.active_generations.lock().await;
-        active.remove(peer_id);
+        let mut states = self.peer_states.lock().await;
+        states.remove(peer_id);
     }
 
     async fn finalize_peer(
         self: Arc<Self>,
         peer_id: &str,
-        generation: u64,
         result: Result<Option<OffererAcceptedTransport>, TransportError>,
         cancel_flag: Arc<AtomicBool>,
     ) {
@@ -675,8 +649,12 @@ impl OffererInner {
         match result {
             Ok(Some(accepted)) => {
                 {
-                    let mut active = self.active_generations.lock().await;
-                    active.insert(peer_id.to_string(), generation);
+                    let mut states = self.peer_states.lock().await;
+                    if let Some(entry) = states.get_mut(peer_id) {
+                        *entry = PeerLifecycleState::Established;
+                    } else {
+                        states.insert(peer_id.to_string(), PeerLifecycleState::Established);
+                    }
                 }
                 if self.accepted_tx.send(accepted).is_err() {
                     tracing::debug!(
@@ -687,6 +665,10 @@ impl OffererInner {
                 }
             }
             Ok(None) => {
+                {
+                    let mut states = self.peer_states.lock().await;
+                    states.remove(peer_id);
+                }
                 tracing::debug!(
                     target = "webrtc",
                     peer_id = %peer_id,
@@ -695,6 +677,10 @@ impl OffererInner {
                 );
             }
             Err(err) => {
+                {
+                    let mut states = self.peer_states.lock().await;
+                    states.remove(peer_id);
+                }
                 tracing::warn!(
                     target = "webrtc",
                     peer_id = %peer_id,

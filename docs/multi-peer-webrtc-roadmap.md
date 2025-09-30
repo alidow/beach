@@ -88,6 +88,8 @@
 - The root cause is missing generation/peer tracking inside `OffererInner`: repeated `RemotePeerEvent::Joined` notifications for the same peer/generation aren’t coalesced, so we register another negotiator immediately after the first one starts.
 - Fix: track the highest generation that has an active transport (or an in-flight negotiator) per peer. Ignore duplicate joins for the same generation, and refuse to spawn a second negotiator while another is already running for that peer. Drop the generation entry only when Beach Road announces the peer has left.
 - Once the supervisor has a single negotiator per peer, the readiness sentinel stays queued for the original task, the host sends back `__offer_ready__`, and the browser data channel survives.
+  - Update (2025-10-02 PM): we continued to see duplicate negotiators even with generation tracking because Beach Road emits multiple `RemotePeerJoined` events before the first handshake finishes. The fix is to keep a per-peer lifecycle flag (`Negotiating` | `Established`) so every additional join is ignored until the current negotiator finishes or the peer actually leaves.
+  - Update (2025-10-02 late PM): participants were still tearing down the browser handshake because they opportunistically tried to act as offerers when they saw a `/webrtc/offer` slot. We now restrict `negotiate_transport` so only the host session role will spin up an `OffererSupervisor`; participants remain answerers and no longer publish competing offers.
 
 ## Revised Implementation Blueprint
 1. **Offerer Supervisor**

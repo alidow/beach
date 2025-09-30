@@ -22,7 +22,9 @@ use tracing::debug;
 use tracing_subscriber::{EnvFilter, fmt::SubscriberBuilder};
 
 use beach_human::protocol::{self, ClientFrame as WireClientFrame, HostFrame};
-use beach_human::transport::webrtc::{OffererSupervisor, WebRtcRole, connect_via_signaling, create_test_pair};
+use beach_human::transport::webrtc::{
+    OffererSupervisor, WebRtcRole, connect_via_signaling, create_test_pair,
+};
 use beach_human::transport::{Payload, Transport, TransportError, TransportKind, TransportMessage};
 
 const HANDSHAKE_SENTINELS: [&str; 2] = ["__ready__", "__offer_ready__"];
@@ -508,12 +510,8 @@ async fn webrtc_signaling_end_to_end() {
 
     let base_url = format!("http://{}/sessions/{}/webrtc", addr, SESSION_ID);
     let offer_fut = async {
-        let (supervisor, accepted) = OffererSupervisor::connect(
-            &base_url,
-            Duration::from_millis(50),
-            None,
-        )
-        .await?;
+        let (supervisor, accepted) =
+            OffererSupervisor::connect(&base_url, Duration::from_millis(50), None).await?;
         Ok::<(Arc<OffererSupervisor>, Arc<dyn Transport>), TransportError>((
             supervisor,
             accepted.transport,
@@ -608,12 +606,8 @@ async fn webrtc_multiple_handshakes_use_unique_ids() {
         });
 
         let offer_fut = async {
-            let (supervisor, accepted) = OffererSupervisor::connect(
-                &base_url,
-                Duration::from_millis(50),
-                None,
-            )
-            .await?;
+            let (supervisor, accepted) =
+                OffererSupervisor::connect(&base_url, Duration::from_millis(50), None).await?;
             Ok::<(Arc<OffererSupervisor>, Arc<dyn Transport>), TransportError>((
                 supervisor,
                 accepted.transport,

@@ -303,7 +303,9 @@ impl SignalingClient {
         self.assigned_peer_id.read().await.clone()
     }
 
-    pub async fn remote_events(&self) -> Result<mpsc::UnboundedReceiver<RemotePeerEvent>, TransportError> {
+    pub async fn remote_events(
+        &self,
+    ) -> Result<mpsc::UnboundedReceiver<RemotePeerEvent>, TransportError> {
         let mut guard = self.remote_events_rx.lock().await;
         guard
             .take()
@@ -405,12 +407,14 @@ impl SignalingClient {
     }
 
     async fn register_client_peer(&self, peer: PeerInfo) {
-        if self.expected_remote_role != PeerRole::Client {
-            self.set_remote_peer(peer.id).await;
+        if self.is_self_peer(&peer.id).await {
             return;
         }
 
-        if self.is_self_peer(&peer.id).await {
+        if self.expected_remote_role != PeerRole::Client {
+            if peer.role == self.expected_remote_role {
+                self.set_remote_peer(peer.id).await;
+            }
             return;
         }
 
@@ -418,10 +422,7 @@ impl SignalingClient {
         if channels.contains_key(&peer.id) {
             return;
         }
-        let generation = self
-            .peer_generation_counter
-            .fetch_add(1, Ordering::SeqCst)
-            + 1;
+        let generation = self.peer_generation_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let (tx, rx) = mpsc::unbounded_channel();
         let peer_id = peer.id.clone();
         channels.insert(
@@ -481,11 +482,7 @@ impl SignalingClient {
         self.clear_remote_peer(peer_id).await;
     }
 
-    async fn forward_signal_to_client(
-        &self,
-        peer_id: &str,
-        signal: WebRTCSignal,
-    ) -> bool {
+    async fn forward_signal_to_client(&self, peer_id: &str, signal: WebRTCSignal) -> bool {
         if self.expected_remote_role != PeerRole::Client {
             return false;
         }
@@ -611,7 +608,9 @@ async fn handle_server_message(
             client.unregister_client_peer(&peer_id).await;
         }
         ServerMessage::Signal { from_peer, signal } => {
-            if client.expected_remote_role != PeerRole::Client && !client.is_self_peer(&from_peer).await {
+            if client.expected_remote_role != PeerRole::Client
+                && !client.is_self_peer(&from_peer).await
+            {
                 client.set_remote_peer(from_peer.clone()).await;
             }
             if let Ok(TransportSignal::WebRTC { signal }) = TransportSignal::from_value(&signal) {

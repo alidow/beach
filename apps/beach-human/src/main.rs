@@ -434,7 +434,8 @@ async fn negotiate_transport(
             let TransportOffer::WebRtc { offer } = offer else {
                 continue;
             };
-            let offer_json = serde_json::to_string(&offer).unwrap_or_else(|_| "<invalid offer>".into());
+            let offer_json =
+                serde_json::to_string(&offer).unwrap_or_else(|_| "<invalid offer>".into());
             trace!(target = "session::webrtc", preferred = ?preferred_role, offer = %offer_json);
             let Some(signaling_url) = offer.get("signaling_url").and_then(Value::as_str) else {
                 errors.push("webrtc offer missing signaling_url".to_string());
@@ -451,7 +452,8 @@ async fn negotiate_transport(
 
             let role_matches = matches!(
                 (preferred_role, role),
-                (WebRtcRole::Answerer, WebRtcRole::Answerer) | (WebRtcRole::Offerer, WebRtcRole::Offerer)
+                (WebRtcRole::Answerer, WebRtcRole::Answerer)
+                    | (WebRtcRole::Offerer, WebRtcRole::Offerer)
             );
             if !role_matches {
                 continue;

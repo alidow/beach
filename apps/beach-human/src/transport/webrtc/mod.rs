@@ -451,12 +451,14 @@ struct OffererInner {
     poll_interval: Duration,
     accepted_tx: tokio_mpsc::UnboundedSender<OffererAcceptedTransport>,
     peer_tasks: AsyncMutex<HashMap<String, PeerNegotiatorHandle>>,
+    active_generations: AsyncMutex<HashMap<String, u64>>,
     max_negotiators: usize,
 }
 
 struct PeerNegotiatorHandle {
     cancel: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
+    generation: u64,
 }
 
 impl OffererSupervisor {
@@ -478,6 +480,7 @@ impl OffererSupervisor {
             poll_interval,
             accepted_tx,
             peer_tasks: AsyncMutex::new(HashMap::new()),
+            active_generations: AsyncMutex::new(HashMap::new()),
             max_negotiators: OFFERER_MAX_NEGOTIATORS,
         });
 
@@ -543,14 +546,60 @@ impl OffererInner {
             return;
         }
 
-        let mut tasks = self.peer_tasks.lock().await;
-        if tasks.contains_key(&joined.peer.id) {
-            tracing::debug!(
+        let generation = joined.generation;
+        let maybe_active_generation = {
+            let active = self.active_generations.lock().await;
+            active.get(&joined.peer.id).copied()
+        };
+
+        if let Some(active_generation) = maybe_active_generation {
+            if generation <= active_generation {
+                tracing::debug!(
+                    target = "webrtc",
+                    peer_id = %joined.peer.id,
+                    generation,
+                    active_generation,
+                    "ignoring peer join; generation already satisfied"
+                );
+                return;
+            }
+
+            {
+                let mut active = self.active_generations.lock().await;
+                active.remove(&joined.peer.id);
+            }
+            tracing::info!(
                 target = "webrtc",
                 peer_id = %joined.peer.id,
-                "peer negotiator already active"
+                generation,
+                previous_generation = active_generation,
+                "remote peer advertised newer generation; restarting negotiation"
             );
-            return;
+        }
+
+        let mut tasks = self.peer_tasks.lock().await;
+        if let Some(existing) = tasks.get(&joined.peer.id) {
+            if existing.generation >= generation {
+                tracing::debug!(
+                    target = "webrtc",
+                    peer_id = %joined.peer.id,
+                    generation,
+                    active_generation = existing.generation,
+                    "peer negotiator already active"
+                );
+                return;
+            }
+
+            tracing::info!(
+                target = "webrtc",
+                peer_id = %joined.peer.id,
+                generation,
+                replaced_generation = existing.generation,
+                "cancelling stale peer negotiator for newer generation"
+            );
+            existing.cancel.store(true, Ordering::SeqCst);
+            existing.task.abort();
+            tasks.remove(&joined.peer.id);
         }
         if tasks.len() >= self.max_negotiators {
             tracing::warn!(
@@ -566,6 +615,7 @@ impl OffererInner {
         tracing::info!(
             target = "webrtc",
             peer_id = %joined.peer.id,
+            generation,
             "registering peer negotiator"
         );
 
@@ -574,16 +624,29 @@ impl OffererInner {
         let inner_for_task = Arc::clone(self);
         let cancel_for_task = cancel.clone();
         let peer_id_for_task = peer_id.clone();
+        let generation_for_task = generation;
         let task = tokio::spawn(async move {
             let result =
                 negotiate_offerer_peer(inner_for_task.clone(), joined, cancel_for_task.clone())
                     .await;
             inner_for_task
-                .finalize_peer(&peer_id_for_task, result, cancel_for_task)
+                .finalize_peer(
+                    &peer_id_for_task,
+                    generation_for_task,
+                    result,
+                    cancel_for_task,
+                )
                 .await;
         });
 
-        tasks.insert(peer_id, PeerNegotiatorHandle { cancel, task });
+        tasks.insert(
+            peer_id,
+            PeerNegotiatorHandle {
+                cancel,
+                task,
+                generation,
+            },
+        );
     }
 
     async fn handle_peer_left(self: &Arc<Self>, peer_id: &str) {
@@ -592,11 +655,15 @@ impl OffererInner {
             handle.cancel.store(true, Ordering::SeqCst);
             handle.task.abort();
         }
+
+        let mut active = self.active_generations.lock().await;
+        active.remove(peer_id);
     }
 
     async fn finalize_peer(
         self: Arc<Self>,
         peer_id: &str,
+        generation: u64,
         result: Result<Option<OffererAcceptedTransport>, TransportError>,
         cancel_flag: Arc<AtomicBool>,
     ) {
@@ -607,6 +674,10 @@ impl OffererInner {
 
         match result {
             Ok(Some(accepted)) => {
+                {
+                    let mut active = self.active_generations.lock().await;
+                    active.insert(peer_id.to_string(), generation);
+                }
                 if self.accepted_tx.send(accepted).is_err() {
                     tracing::debug!(
                         target = "webrtc",
@@ -810,7 +881,9 @@ async fn negotiate_offerer_peer(
     .await?;
 
     let remote_desc = answer.to_session_description()?;
-    pc.set_remote_description(remote_desc).await.map_err(to_setup_error)?;
+    pc.set_remote_description(remote_desc)
+        .await
+        .map_err(to_setup_error)?;
 
     {
         let mut queued = pending_ice.lock().await;
@@ -932,8 +1005,7 @@ pub async fn connect_via_signaling(
                 OffererSupervisor::connect(signaling_url, poll_interval, passphrase).await?;
             Ok(accepted.transport)
         }
-        WebRtcRole::Answerer =>
-            connect_answerer(signaling_url, poll_interval, passphrase).await,
+        WebRtcRole::Answerer => connect_answerer(signaling_url, poll_interval, passphrase).await,
     }
 }
 
@@ -954,7 +1026,9 @@ async fn connect_answerer(
         expected_remote = %expected_remote_peer,
         "initialized expected remote peer"
     );
-    signaling_client.lock_remote_peer(&expected_remote_peer).await;
+    signaling_client
+        .lock_remote_peer(&expected_remote_peer)
+        .await;
     let assigned_peer_id = signaling_client
         .assigned_peer_id()
         .await
@@ -988,7 +1062,14 @@ async fn connect_answerer(
                     );
                     continue;
                 }
-                break payload
+                tracing::info!(
+                    target = "beach_human::transport::webrtc",
+                    role = "answerer",
+                    handshake_id = %payload.handshake_id,
+                    remote_peer = %payload.from_peer,
+                    "accepted offer"
+                );
+                break payload;
             }
             None => {
                 tracing::debug!(
@@ -1255,7 +1336,9 @@ async fn connect_answerer(
         result = ?post_result
     );
     post_result?;
-    signaling_client.unlock_remote_peer(&expected_remote_peer).await;
+    signaling_client
+        .unlock_remote_peer(&expected_remote_peer)
+        .await;
 
     // Verbose connection state tracing for diagnosis
     {
@@ -1388,7 +1471,6 @@ fn endpoint_with_params(
     }
     Ok(url)
 }
-
 
 async fn post_sdp(
     client: &Client,

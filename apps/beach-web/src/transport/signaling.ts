@@ -175,15 +175,15 @@ export class SignalingClient extends EventTarget {
     });
 
     this.socket.addEventListener('close', (event) => {
-      this.dispatchEvent(event);
+      this.dispatchEvent(new CustomEvent('close', { detail: event }));
     });
 
     this.socket.addEventListener('error', (event) => {
-      this.dispatchEvent(event);
+      this.dispatchEvent(new CustomEvent('error', { detail: event }));
     });
 
     this.socket.addEventListener('open', (event) => {
-      this.dispatchEvent(event);
+      this.dispatchEvent(new CustomEvent('open', { detail: event }));
     });
   }
 

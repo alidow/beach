@@ -83,6 +83,12 @@
 - The host runtime (`SharedTransport`, `TransportSupervisor`, per-sink broadcast loops) already supports many simultaneous transports. The missing piece is a handshake supervisor that can *safely* negotiate multiple viewers in parallel and hand each finished `WebRtcTransport` back to the runtime.
 - Without that supervisor, Beach Road still bears the load of repeated `/webrtc/offer` posts and answer polling retries, even though the peers would happily switch to data channels once established.
 
+### 2025-10-02 – Browser viewer drops after readiness sentinel
+- Reproducing the “Rust viewer first, browser second” flow shows the new `OffererSupervisor` still spawns *two* negotiator tasks for the same browser peer ID. The second task races the first, never sees the `__ready__` sentinel, and calls `pc.close()`, which tears down the viewer’s only data channel moments after it delivers its sentinel (`~/beach-debug/host.log:5139260`–`5139766`).
+- The root cause is missing generation/peer tracking inside `OffererInner`: repeated `RemotePeerEvent::Joined` notifications for the same peer/generation aren’t coalesced, so we register another negotiator immediately after the first one starts.
+- Fix: track the highest generation that has an active transport (or an in-flight negotiator) per peer. Ignore duplicate joins for the same generation, and refuse to spawn a second negotiator while another is already running for that peer. Drop the generation entry only when Beach Road announces the peer has left.
+- Once the supervisor has a single negotiator per peer, the readiness sentinel stays queued for the original task, the host sends back `__offer_ready__`, and the browser data channel survives.
+
 ## Revised Implementation Blueprint
 1. **Offerer Supervisor**
    - Build an `OffererSupervisor` that consumes `SignalingClient::remote_events()` and spawns a `PeerNegotiator` task per `RemotePeerJoined`.

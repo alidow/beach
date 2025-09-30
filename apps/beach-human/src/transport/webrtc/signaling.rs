@@ -450,9 +450,7 @@ async fn handle_server_message(
             }
         }
         ServerMessage::PeerJoined { peer } => {
-            if peer.role == client.expected_remote_role
-                && !client.is_self_peer(&peer.id).await
-            {
+            if peer.role == client.expected_remote_role && !client.is_self_peer(&peer.id).await {
                 client.set_remote_peer(peer.id).await;
             }
         }

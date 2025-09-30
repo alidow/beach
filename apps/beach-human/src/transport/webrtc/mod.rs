@@ -737,12 +737,8 @@ async fn connect_offerer_once(
         .await
         .unwrap_or_else(|| signaling_client.peer_id().to_string());
 
-    let payload = payload_from_description(
-        &local_desc,
-        &handshake_id,
-        &offerer_peer_id,
-        &remote_peer,
-    );
+    let payload =
+        payload_from_description(&local_desc, &handshake_id, &offerer_peer_id, &remote_peer);
     tracing::debug!(
         target = "beach_human::transport::webrtc",
         role = "offerer",

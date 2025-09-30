@@ -42,7 +42,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep};
 use tracing::{Level, debug, error, info, trace, warn};
-use transport_mod::webrtc::WebRtcRole;
+use transport_mod::webrtc::{OffererSupervisor, WebRtcRole};
 use url::Url;
 use uuid::Uuid;
 
@@ -390,7 +390,15 @@ async fn handle_join(base_url: &str, args: JoinArgs) -> Result<(), CliError> {
 
     let trimmed_pass = passcode.trim().to_string();
     let joined = manager.join(&session_id, trimmed_pass.as_str()).await?;
-    let transport = negotiate_transport(joined.handle(), Some(trimmed_pass.as_str())).await?;
+    let negotiated = negotiate_transport(joined.handle(), Some(trimmed_pass.as_str())).await?;
+    let transport = match negotiated {
+        NegotiatedTransport::Single(transport) => transport,
+        NegotiatedTransport::WebRtcOfferer { .. } => {
+            return Err(CliError::TransportNegotiation(
+                "unexpected offerer transport while joining session".into(),
+            ));
+        }
+    };
     let selected_kind = transport.kind();
     info!(session_id = %joined.session_id(), transport = ?selected_kind, "joined session");
     print_join_banner(&joined, selected_kind);
@@ -414,12 +422,20 @@ async fn handle_join(base_url: &str, args: JoinArgs) -> Result<(), CliError> {
 async fn negotiate_transport(
     handle: &SessionHandle,
     passphrase: Option<&str>,
-) -> Result<Arc<dyn Transport>, CliError> {
+) -> Result<NegotiatedTransport, CliError> {
     let mut errors = Vec::new();
 
     // Prefer WebRTC data channels for sync; fall back to WebSocket only if absolutely necessary.
-    for offer in handle.offers() {
-        if let TransportOffer::WebRtc { offer } = offer {
+    let offers: Vec<TransportOffer> = handle.offers().to_vec();
+
+    // Try WebRTC answerer roles first so non-host clients don't spin up an offerer supervisor.
+    for preferred_role in [WebRtcRole::Answerer, WebRtcRole::Offerer] {
+        for offer in &offers {
+            let TransportOffer::WebRtc { offer } = offer else {
+                continue;
+            };
+            let offer_json = serde_json::to_string(&offer).unwrap_or_else(|_| "<invalid offer>".into());
+            trace!(target = "session::webrtc", preferred = ?preferred_role, offer = %offer_json);
             let Some(signaling_url) = offer.get("signaling_url").and_then(Value::as_str) else {
                 errors.push("webrtc offer missing signaling_url".to_string());
                 continue;
@@ -432,39 +448,91 @@ async fn negotiate_transport(
                     continue;
                 }
             };
+
+            let role_matches = matches!(
+                (preferred_role, role),
+                (WebRtcRole::Answerer, WebRtcRole::Answerer) | (WebRtcRole::Offerer, WebRtcRole::Offerer)
+            );
+            if !role_matches {
+                continue;
+            }
             let poll_ms = offer
                 .get("poll_interval_ms")
                 .and_then(Value::as_u64)
                 .unwrap_or(250);
 
             debug!(transport = "webrtc", signaling_url = %signaling_url, ?role, "attempting webrtc transport");
-            match transport_mod::webrtc::connect_via_signaling(
-                signaling_url,
-                role,
-                Duration::from_millis(poll_ms),
-                passphrase,
-            )
-            .await
-            {
-                Ok(transport) => {
-                    info!(transport = "webrtc", signaling_url = %signaling_url, ?role, "transport established");
-                    return Ok(transport);
-                }
-                Err(err) => {
-                    warn!(transport = "webrtc", signaling_url = %signaling_url, ?role, error = %err, "webrtc negotiation failed");
-                    errors.push(format!("webrtc {}: {}", signaling_url, err));
-                }
+            match role {
+                WebRtcRole::Offerer => match OffererSupervisor::connect(
+                    signaling_url,
+                    Duration::from_millis(poll_ms),
+                    passphrase,
+                )
+                .await
+                {
+                    Ok((supervisor, accepted)) => {
+                        info!(
+                            transport = "webrtc",
+                            signaling_url = %signaling_url,
+                            peer_id = %accepted.peer_id,
+                            handshake_id = %accepted.handshake_id,
+                            "transport established"
+                        );
+                        return Ok(NegotiatedTransport::WebRtcOfferer {
+                            supervisor,
+                            transport: accepted.transport,
+                        });
+                    }
+                    Err(err) => {
+                        warn!(
+                            transport = "webrtc",
+                            signaling_url = %signaling_url,
+                            ?role,
+                            error = %err,
+                            "webrtc negotiation failed"
+                        );
+                        errors.push(format!("webrtc {}: {}", signaling_url, err));
+                    }
+                },
+                WebRtcRole::Answerer => match transport_mod::webrtc::connect_via_signaling(
+                    signaling_url,
+                    role,
+                    Duration::from_millis(poll_ms),
+                    passphrase,
+                )
+                .await
+                {
+                    Ok(transport) => {
+                        info!(
+                            transport = "webrtc",
+                            signaling_url = %signaling_url,
+                            ?role,
+                            "transport established"
+                        );
+                        return Ok(NegotiatedTransport::Single(transport));
+                    }
+                    Err(err) => {
+                        warn!(
+                            transport = "webrtc",
+                            signaling_url = %signaling_url,
+                            ?role,
+                            error = %err,
+                            "webrtc negotiation failed"
+                        );
+                        errors.push(format!("webrtc {}: {}", signaling_url, err));
+                    }
+                },
             }
         }
     }
 
-    for offer in handle.offers() {
+    for offer in offers {
         if let TransportOffer::WebSocket { url } = offer {
             debug!(transport = "websocket", url = %url, "attempting websocket transport");
-            match transport_mod::websocket::connect(url).await {
+            match transport_mod::websocket::connect(&url).await {
                 Ok(transport) => {
                     info!(transport = "websocket", url = %url, "transport established");
-                    return Ok(Arc::from(transport));
+                    return Ok(NegotiatedTransport::Single(Arc::from(transport)));
                 }
                 Err(err) => {
                     warn!(transport = "websocket", url = %url, error = %err, "websocket negotiation failed");
@@ -1078,6 +1146,14 @@ struct TransportSupervisor {
     reconnecting: Arc<AsyncMutex<bool>>,
 }
 
+enum NegotiatedTransport {
+    Single(Arc<dyn Transport>),
+    WebRtcOfferer {
+        supervisor: Arc<OffererSupervisor>,
+        transport: Arc<dyn Transport>,
+    },
+}
+
 impl TransportSupervisor {
     fn new(
         shared: Arc<SharedTransport>,
@@ -1106,7 +1182,7 @@ impl TransportSupervisor {
             let mut delay = Duration::from_millis(250);
             for attempt in 1..=MAX_ATTEMPTS {
                 match negotiate_transport(&this.session_handle, this.passphrase.as_deref()).await {
-                    Ok(new_transport) => {
+                    Ok(NegotiatedTransport::Single(new_transport)) => {
                         let kind = new_transport.kind();
                         let id = new_transport.id().0;
                         this.shared.swap(new_transport);
@@ -1116,6 +1192,19 @@ impl TransportSupervisor {
                             transport_id = id,
                             attempt,
                             "transport failover completed"
+                        );
+                        break;
+                    }
+                    Ok(NegotiatedTransport::WebRtcOfferer { transport, .. }) => {
+                        let kind = transport.kind();
+                        let id = transport.id().0;
+                        this.shared.swap(transport);
+                        info!(
+                            target = "transport_mod::failover",
+                            ?kind,
+                            transport_id = id,
+                            attempt,
+                            "transport failover completed (offerer)"
                         );
                         break;
                     }
@@ -1644,7 +1733,7 @@ fn spawn_webrtc_acceptor(
         loop {
             let passphrase = join_code.as_deref();
             match negotiate_transport(&session_handle, passphrase).await {
-                Ok(transport) => {
+                Ok(NegotiatedTransport::Single(transport)) => {
                     let selected_kind = transport.kind();
                     info!(session_id = %session_id, transport = ?selected_kind, "transport negotiated");
                     let shared_transport = Arc::new(SharedTransport::new(transport.clone()));
@@ -1687,6 +1776,62 @@ fn spawn_webrtc_acceptor(
                         let _ = tx.send(());
                     }
                 }
+                Ok(NegotiatedTransport::WebRtcOfferer {
+                    supervisor,
+                    transport,
+                }) => {
+                    info!(
+                        session_id = %session_id,
+                        transport = "webrtc-multi",
+                        "transport negotiated with offerer supervisor"
+                    );
+                    let shared_transport = Arc::new(SharedTransport::new(transport.clone()));
+                    {
+                        let mut guard = transports.lock().unwrap();
+                        guard.push(shared_transport.clone());
+                    }
+                    let primary_transport: Arc<dyn Transport> = shared_transport.clone();
+                    HeartbeatPublisher::new(primary_transport.clone(), None)
+                        .spawn(Duration::from_secs(10), None);
+                    let listener = spawn_input_listener(
+                        primary_transport.clone(),
+                        writer.clone(),
+                        process_handle.clone(),
+                        emulator_handle.clone(),
+                        grid.clone(),
+                        backfill_tx.clone(),
+                        Some(forwarder_tx.clone()),
+                    );
+                    input_handles.lock().unwrap().push(listener);
+                    if forwarder_tx
+                        .send(ForwarderCommand::AddTransport {
+                            transport: primary_transport.clone(),
+                            supervisor: None,
+                        })
+                        .is_err()
+                    {
+                        warn!(
+                            session_id = %session_id,
+                            "update forwarder closed; stopping transport acceptor"
+                        );
+                        break;
+                    }
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(());
+                    }
+
+                    spawn_viewer_accept_loop(
+                        supervisor,
+                        forwarder_tx.clone(),
+                        writer.clone(),
+                        process_handle.clone(),
+                        emulator_handle.clone(),
+                        grid.clone(),
+                        backfill_tx.clone(),
+                        Arc::clone(&input_handles),
+                        Arc::clone(&transports),
+                    );
+                }
                 Err(err) => {
                     warn!(
                         session_id = %session_id,
@@ -1698,6 +1843,65 @@ fn spawn_webrtc_acceptor(
             }
         }
     })
+}
+
+fn spawn_viewer_accept_loop(
+    supervisor: Arc<OffererSupervisor>,
+    forwarder_tx: UnboundedSender<ForwarderCommand>,
+    writer: PtyWriter,
+    process_handle: Arc<PtyProcess>,
+    emulator_handle: Arc<Mutex<Box<dyn TerminalEmulator + Send>>>,
+    grid: Arc<TerminalGrid>,
+    backfill_tx: UnboundedSender<BackfillCommand>,
+    input_handles: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+    transports: Arc<Mutex<Vec<Arc<SharedTransport>>>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match supervisor.next().await {
+                Ok(accepted) => {
+                    let shared_transport =
+                        Arc::new(SharedTransport::new(accepted.transport.clone()));
+                    {
+                        let mut guard = transports.lock().unwrap();
+                        guard.push(shared_transport.clone());
+                    }
+                    let arc_transport: Arc<dyn Transport> = shared_transport.clone();
+                    HeartbeatPublisher::new(arc_transport.clone(), None)
+                        .spawn(Duration::from_secs(10), None);
+
+                    let listener = spawn_input_listener(
+                        arc_transport.clone(),
+                        writer.clone(),
+                        process_handle.clone(),
+                        emulator_handle.clone(),
+                        grid.clone(),
+                        backfill_tx.clone(),
+                        Some(forwarder_tx.clone()),
+                    );
+                    input_handles.lock().unwrap().push(listener);
+
+                    if forwarder_tx
+                        .send(ForwarderCommand::AddTransport {
+                            transport: arc_transport,
+                            supervisor: None,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+
+                    info!(
+                        target = "webrtc",
+                        peer_id = %accepted.peer_id,
+                        handshake_id = %accepted.handshake_id,
+                        "viewer transport registered"
+                    );
+                }
+                Err(_) => break,
+            }
+        }
+    });
 }
 
 fn spawn_update_forwarder(

@@ -3,6 +3,7 @@ use crate::transport::TransportError;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -84,6 +85,25 @@ pub struct PeerInfo {
     pub preferred_transport: Option<TransportType>,
 }
 
+#[derive(Debug)]
+pub struct RemotePeerJoined {
+    pub peer: PeerInfo,
+    pub generation: u64,
+    pub signals: mpsc::UnboundedReceiver<WebRTCSignal>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemotePeerLeft {
+    pub peer_id: String,
+    pub generation: u64,
+}
+
+#[derive(Debug)]
+pub enum RemotePeerEvent {
+    Joined(RemotePeerJoined),
+    Left(RemotePeerLeft),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
@@ -138,7 +158,17 @@ pub struct SignalingClient {
     locked_peer: RwLock<Option<String>>,
     remote_generation: AtomicU64,
     assigned_peer_id: RwLock<Option<String>>,
+    peer_generation_counter: AtomicU64,
+    peer_channels: RwLock<HashMap<String, PeerChannelEntry>>,
+    remote_events_tx: mpsc::UnboundedSender<RemotePeerEvent>,
+    remote_events_rx: AsyncMutex<Option<mpsc::UnboundedReceiver<RemotePeerEvent>>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+#[derive(Clone)]
+struct PeerChannelEntry {
+    sender: mpsc::UnboundedSender<WebRTCSignal>,
+    generation: u64,
 }
 
 impl SignalingClient {
@@ -155,6 +185,7 @@ impl SignalingClient {
 
         let (send_tx, mut send_rx) = mpsc::unbounded_channel::<ClientMessage>();
         let (signal_tx, signal_rx) = mpsc::unbounded_channel::<WebRTCSignal>();
+        let (remote_events_tx, remote_events_rx) = mpsc::unbounded_channel::<RemotePeerEvent>();
 
         let client = Arc::new(SignalingClient {
             peer_id: Uuid::new_v4().to_string(),
@@ -166,6 +197,10 @@ impl SignalingClient {
             locked_peer: RwLock::new(None),
             remote_generation: AtomicU64::new(0),
             assigned_peer_id: RwLock::new(None),
+            peer_generation_counter: AtomicU64::new(0),
+            peer_channels: RwLock::new(HashMap::new()),
+            remote_events_tx,
+            remote_events_rx: AsyncMutex::new(Some(remote_events_rx)),
             tasks: Mutex::new(Vec::new()),
         });
 
@@ -268,6 +303,13 @@ impl SignalingClient {
         self.assigned_peer_id.read().await.clone()
     }
 
+    pub async fn remote_events(&self) -> Result<mpsc::UnboundedReceiver<RemotePeerEvent>, TransportError> {
+        let mut guard = self.remote_events_rx.lock().await;
+        guard
+            .take()
+            .ok_or_else(|| TransportError::Setup("remote event stream already taken".into()))
+    }
+
     pub fn peer_id(&self) -> &str {
         &self.peer_id
     }
@@ -317,6 +359,17 @@ impl SignalingClient {
         candidate: RTCIceCandidate,
         handshake_id: &str,
     ) -> Result<(), TransportError> {
+        let (remote, _) = self.wait_for_remote_peer_with_generation().await?;
+        self.send_ice_candidate_to_peer(candidate, handshake_id, &remote)
+            .await
+    }
+
+    pub async fn send_ice_candidate_to_peer(
+        &self,
+        candidate: RTCIceCandidate,
+        handshake_id: &str,
+        peer_id: &str,
+    ) -> Result<(), TransportError> {
         let json = candidate
             .to_json()
             .map_err(|err| TransportError::Setup(err.to_string()))?;
@@ -326,18 +379,21 @@ impl SignalingClient {
             sdp_mline_index: json.sdp_mline_index.map(|idx| idx as u32),
             handshake_id: handshake_id.to_string(),
         };
-        self.send_webrtc_signal(signal).await
+        self.send_signal_to_peer(peer_id, signal).await
     }
 
-    pub async fn send_webrtc_signal(&self, signal: WebRTCSignal) -> Result<(), TransportError> {
-        let (remote, _) = self.wait_for_remote_peer_with_generation().await?;
+    pub async fn send_signal_to_peer(
+        &self,
+        peer_id: &str,
+        signal: WebRTCSignal,
+    ) -> Result<(), TransportError> {
         let payload = signal
             .to_transport_signal()
             .to_value()
             .map_err(|err| TransportError::Setup(err.to_string()))?;
         self.send_tx
             .send(ClientMessage::Signal {
-                to_peer: remote,
+                to_peer: peer_id.to_string(),
                 signal: payload,
             })
             .map_err(|_| TransportError::ChannelClosed)
@@ -346,6 +402,111 @@ impl SignalingClient {
     pub async fn recv_webrtc_signal(&self) -> Option<WebRTCSignal> {
         let mut rx = self.signal_rx.lock().await;
         rx.recv().await
+    }
+
+    async fn register_client_peer(&self, peer: PeerInfo) {
+        if self.expected_remote_role != PeerRole::Client {
+            self.set_remote_peer(peer.id).await;
+            return;
+        }
+
+        if self.is_self_peer(&peer.id).await {
+            return;
+        }
+
+        let mut channels = self.peer_channels.write().await;
+        if channels.contains_key(&peer.id) {
+            return;
+        }
+        let generation = self
+            .peer_generation_counter
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let peer_id = peer.id.clone();
+        channels.insert(
+            peer_id.clone(),
+            PeerChannelEntry {
+                sender: tx,
+                generation,
+            },
+        );
+        drop(channels);
+
+        let join_event = RemotePeerEvent::Joined(RemotePeerJoined {
+            peer,
+            generation,
+            signals: rx,
+        });
+
+        if self.remote_events_tx.send(join_event).is_err() {
+            tracing::debug!(
+                target = "webrtc",
+                peer_id = %peer_id,
+                "remote events channel closed; dropping join event"
+            );
+            let mut channels = self.peer_channels.write().await;
+            channels.remove(&peer_id);
+        }
+    }
+
+    async fn unregister_client_peer(&self, peer_id: &str) {
+        if self.expected_remote_role != PeerRole::Client {
+            self.clear_remote_peer(peer_id).await;
+            return;
+        }
+
+        let removed = {
+            let mut channels = self.peer_channels.write().await;
+            channels.remove(peer_id)
+        };
+
+        if let Some(entry) = removed {
+            if self
+                .remote_events_tx
+                .send(RemotePeerEvent::Left(RemotePeerLeft {
+                    peer_id: peer_id.to_string(),
+                    generation: entry.generation,
+                }))
+                .is_err()
+            {
+                tracing::debug!(
+                    target = "webrtc",
+                    peer_id = %peer_id,
+                    "remote events channel closed; dropping leave event"
+                );
+            }
+        }
+
+        self.clear_remote_peer(peer_id).await;
+    }
+
+    async fn forward_signal_to_client(
+        &self,
+        peer_id: &str,
+        signal: WebRTCSignal,
+    ) -> bool {
+        if self.expected_remote_role != PeerRole::Client {
+            return false;
+        }
+
+        let entry = {
+            let channels = self.peer_channels.read().await;
+            channels.get(peer_id).cloned()
+        };
+        if let Some(entry) = entry {
+            if entry.sender.send(signal).is_err() {
+                tracing::debug!(
+                    target = "webrtc",
+                    peer_id = %peer_id,
+                    "peer signal channel closed; removing peer"
+                );
+                self.unregister_client_peer(peer_id).await;
+            }
+            true
+        } else {
+            false
+        }
     }
 
     async fn set_remote_peer(&self, peer_id: String) {
@@ -433,36 +594,39 @@ async fn handle_server_message(
             ..
         } => {
             *client.assigned_peer_id.write().await = Some(assigned_id.clone());
-            let remote_candidate = peers.into_iter().find_map(|peer| {
+            for peer in peers {
                 if peer.role != client.expected_remote_role {
-                    return None;
+                    continue;
                 }
-                if peer.id == client.peer_id || peer.id == assigned_id {
-                    return None;
-                }
-                Some(peer.id)
-            });
-            if let Some(peer_id) = remote_candidate {
-                client.set_remote_peer(peer_id).await;
+                client.register_client_peer(peer).await;
             }
             if let Some(tx) = join_notifier.lock().await.take() {
                 let _ = tx.send(());
             }
         }
         ServerMessage::PeerJoined { peer } => {
-            if peer.role == client.expected_remote_role && !client.is_self_peer(&peer.id).await {
-                client.set_remote_peer(peer.id).await;
-            }
+            client.register_client_peer(peer).await;
         }
         ServerMessage::PeerLeft { peer_id } => {
-            client.clear_remote_peer(&peer_id).await;
+            client.unregister_client_peer(&peer_id).await;
         }
         ServerMessage::Signal { from_peer, signal } => {
-            if !client.is_self_peer(&from_peer).await {
+            if client.expected_remote_role != PeerRole::Client && !client.is_self_peer(&from_peer).await {
                 client.set_remote_peer(from_peer.clone()).await;
             }
             if let Ok(TransportSignal::WebRTC { signal }) = TransportSignal::from_value(&signal) {
-                let _ = signal_tx.send(signal);
+                let routed = client
+                    .forward_signal_to_client(&from_peer, signal.clone())
+                    .await;
+                if !routed {
+                    let _ = signal_tx.send(signal);
+                } else if signal_tx.send(signal).is_err() {
+                    tracing::debug!(
+                        target = "webrtc",
+                        peer_id = %from_peer,
+                        "global signaling channel closed"
+                    );
+                }
             }
         }
         _ => {}

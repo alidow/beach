@@ -213,10 +213,11 @@ export async function connectWebRtcTransport(
       .then(() => log(logger, `ice add ok: ${(cand.candidate ?? '').slice(0, 80)}`))
       .catch((error) => log(logger, `ice add failed: ${error}`));
   };
+  let currentHandshakeId: string | null = null;
   const disposeSignalListener = attachSignalListener(
     signaling,
     remotePeerId,
-    handshakeId,
+    () => currentHandshakeId,
     onRemoteCandidate,
     logger,
   );
@@ -241,6 +242,10 @@ export async function connectWebRtcTransport(
   const RESEND_INTERVAL_MS = 1200;
 
   const dispatchCandidate = (candidate: RTCIceCandidateInit) => {
+    if (!currentHandshakeId) {
+      pendingLocalCandidates.unshift(candidate);
+      return;
+    }
     log(logger, `sending local candidate: ${JSON.stringify(candidate)}`);
     signaling.send({
       type: 'signal',
@@ -249,7 +254,7 @@ export async function connectWebRtcTransport(
         transport: 'webrtc',
         signal: {
           signal_type: 'ice_candidate',
-          handshake_id: handshakeId,
+          handshake_id: currentHandshakeId,
           candidate: candidate.candidate ?? '',
           sdp_mid: candidate.sdpMid ?? undefined,
           sdp_mline_index: candidate.sdpMLineIndex ?? undefined,
@@ -259,7 +264,7 @@ export async function connectWebRtcTransport(
   };
 
   const flushPendingCandidates = () => {
-    if (pendingLocalCandidates.length === 0) {
+    if (pendingLocalCandidates.length === 0 || !currentHandshakeId) {
       return;
     }
     while (pendingLocalCandidates.length > 0) {
@@ -317,7 +322,7 @@ export async function connectWebRtcTransport(
     };
     pendingLocalCandidates.push(stored);
     allLocalCandidates.push(stored);
-    if (candidateSendState === 'ready') {
+    if (candidateSendState === 'ready' && currentHandshakeId) {
       flushPendingCandidates();
     } else if (candidateSendState === 'delayed') {
       scheduleFlush(ANSWER_FLUSH_DELAY_MS);
@@ -335,6 +340,7 @@ export async function connectWebRtcTransport(
       pollIntervalMs: options.pollIntervalMs,
       remotePeerId,
       logger,
+      localPeerId: assignedPeerId,
       afterSetRemoteDescription: () => {
         remoteDescriptionSet = true;
         // Drain any queued remote candidates now that the offer is applied.
@@ -354,6 +360,12 @@ export async function connectWebRtcTransport(
           scheduleFlush(ANSWER_FLUSH_DELAY_MS);
         }
       },
+    }, (handshakeId) => {
+      currentHandshakeId = handshakeId;
+      log(logger, `handshake ready: ${handshakeId}`);
+      if (candidateSendState === 'ready') {
+        flushPendingCandidates();
+      }
     });
   } finally {
     disposeSignalListener();
@@ -364,7 +376,7 @@ export async function connectWebRtcTransport(
 function attachSignalListener(
   signaling: SignalingClient,
   remotePeerId: string,
-  handshakeId: string,
+  getHandshakeId: () => string | null,
   onRemoteCandidate: (cand: RTCIceCandidateInit) => void,
   logger?: (message: string) => void,
 ): () => void {
@@ -380,7 +392,12 @@ function attachSignalListener(
     if (!signal) {
       return;
     }
-    if (signal.signal.handshake_id && signal.signal.handshake_id !== handshakeId) {
+    const handshakeId = getHandshakeId();
+    if (
+      handshakeId &&
+      signal.signal.handshake_id &&
+      signal.signal.handshake_id !== handshakeId
+    ) {
       log(logger, `discarding signal for stale handshake ${signal.signal.handshake_id}`);
       return;
     }
@@ -499,13 +516,14 @@ async function connectAsAnswerer(options: {
   afterSetRemoteDescription?: () => void;
   beforePostAnswer?: () => void;
   afterPostAnswer?: () => void;
-}): Promise<ConnectedWebRtcTransport> {
-  const { pc, signalingUrl, pollIntervalMs, remotePeerId, logger } = options;
+  localPeerId: string;
+}, onHandshakeReady: (handshakeId: string) => void): Promise<ConnectedWebRtcTransport> {
+  const { pc, signalingUrl, pollIntervalMs, remotePeerId, logger, localPeerId } = options;
   log(logger, 'polling for SDP offer');
   const offer = await pollSdp(
     `${signalingUrl.replace(/\/$/, '')}/offer`,
     pollIntervalMs,
-    { peer_id: assignedPeerId },
+    { peer_id: localPeerId },
     logger,
   );
   log(logger, 'SDP offer received');
@@ -513,6 +531,7 @@ async function connectAsAnswerer(options: {
   if (!handshakeId) {
     throw new Error('offer missing handshake_id');
   }
+  onHandshakeReady(handshakeId);
   const channelPromise = waitForDataChannel(pc, remotePeerId, logger);
   log(logger, 'waiting for data channel announcement');
 
@@ -530,7 +549,7 @@ async function connectAsAnswerer(options: {
     sdp: answer.sdp ?? '',
     type: answer.type,
     handshake_id: handshakeId,
-    from_peer: assignedPeerId,
+    from_peer: localPeerId,
     to_peer: offer.from_peer,
   });
   log(logger, 'SDP answer posted');

@@ -22,8 +22,8 @@ use tracing::debug;
 use tracing_subscriber::{EnvFilter, fmt::SubscriberBuilder};
 
 use beach_human::protocol::{self, ClientFrame as WireClientFrame, HostFrame};
-use beach_human::transport::webrtc::{WebRtcRole, connect_via_signaling, create_test_pair};
-use beach_human::transport::{Payload, Transport, TransportKind, TransportMessage};
+use beach_human::transport::webrtc::{OffererSupervisor, WebRtcRole, connect_via_signaling, create_test_pair};
+use beach_human::transport::{Payload, Transport, TransportError, TransportKind, TransportMessage};
 
 const HANDSHAKE_SENTINELS: [&str; 2] = ["__ready__", "__offer_ready__"];
 
@@ -507,12 +507,18 @@ async fn webrtc_signaling_end_to_end() {
     });
 
     let base_url = format!("http://{}/sessions/{}/webrtc", addr, SESSION_ID);
-    let offer_fut = connect_via_signaling(
-        &base_url,
-        WebRtcRole::Offerer,
-        Duration::from_millis(50),
-        None,
-    );
+    let offer_fut = async {
+        let (supervisor, accepted) = OffererSupervisor::connect(
+            &base_url,
+            Duration::from_millis(50),
+            None,
+        )
+        .await?;
+        Ok::<(Arc<OffererSupervisor>, Arc<dyn Transport>), TransportError>((
+            supervisor,
+            accepted.transport,
+        ))
+    };
     sleep(Duration::from_millis(50)).await;
     let answer_fut = connect_via_signaling(
         &base_url,
@@ -525,9 +531,10 @@ async fn webrtc_signaling_end_to_end() {
         timeout(Duration::from_secs(10), offer_fut),
         timeout(Duration::from_secs(10), answer_fut),
     );
-    let offer_transport = offer_res
+    let (offer_supervisor, offer_transport) = offer_res
         .expect("offer signaling timeout")
         .expect("offer transport");
+    let _offer_supervisor = offer_supervisor;
     let answer_transport = answer_res
         .expect("answer signaling timeout")
         .expect("answer transport");
@@ -600,12 +607,18 @@ async fn webrtc_multiple_handshakes_use_unique_ids() {
                 .ok();
         });
 
-        let offer_fut = connect_via_signaling(
-            &base_url,
-            WebRtcRole::Offerer,
-            Duration::from_millis(50),
-            None,
-        );
+        let offer_fut = async {
+            let (supervisor, accepted) = OffererSupervisor::connect(
+                &base_url,
+                Duration::from_millis(50),
+                None,
+            )
+            .await?;
+            Ok::<(Arc<OffererSupervisor>, Arc<dyn Transport>), TransportError>((
+                supervisor,
+                accepted.transport,
+            ))
+        };
         sleep(Duration::from_millis(50)).await;
         let answer_fut = connect_via_signaling(
             &base_url,
@@ -618,9 +631,10 @@ async fn webrtc_multiple_handshakes_use_unique_ids() {
             timeout(Duration::from_secs(10), offer_fut),
             timeout(Duration::from_secs(10), answer_fut),
         );
-        let offer_transport = offer_res
+        let (offer_supervisor, offer_transport) = offer_res
             .expect("offer signaling timeout")
             .expect("offer transport");
+        let _offer_supervisor = offer_supervisor;
         let answer_transport = answer_res
             .expect("answer signaling timeout")
             .expect("answer transport");

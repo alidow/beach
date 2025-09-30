@@ -82,7 +82,7 @@ export default function App(): JSX.Element {
   const connectLabel = isConnecting ? 'Connecting…' : status === 'connected' ? 'Reconnect' : 'Connect';
 
   useEffect(() => {
-    if (status === 'connected' || status === 'error' || status === 'closed') {
+    if (status === 'error' || status === 'closed') {
       setConnectRequested(false);
     }
   }, [status]);

@@ -1839,6 +1839,7 @@ fn spawn_webrtc_acceptor(
                         Arc::clone(&input_handles),
                         Arc::clone(&transports),
                     );
+                    break;
                 }
                 Err(err) => {
                     warn!(

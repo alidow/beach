@@ -134,7 +134,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
 
     return () => {
       cancelled = true;
-      connectionRef.current?.close();
+      if (connectionRef.current) {
+        connectionRef.current.close();
+      }
       connectionRef.current = null;
       transportRef.current = null;
     };
@@ -170,8 +172,6 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     observer.observe(element);
     return () => observer.disconnect();
   }, [lineHeight, minimumRows, store]);
-
-  useEffect(() => () => connectionRef.current?.close(), []);
 
   useEffect(() => {
     const element = containerRef.current;

@@ -131,6 +131,7 @@ impl WebRtcTransport {
         router: Option<Arc<AsyncMutex<Router>>>,
         dc_ready: Option<Arc<Notify>>,
         signaling: Option<Arc<SignalingClient>>,
+        handshake_complete: Option<Arc<AtomicBool>>,
     ) -> Self {
         let (inbound_tx, inbound_rx) = crossbeam_unbounded();
         let handler_id = id;
@@ -167,6 +168,8 @@ impl WebRtcTransport {
                 }
             })
         }));
+        let pc_for_close = pc.clone();
+        let handshake_for_close = handshake_complete.clone();
         dc.on_error(Box::new(move |err| {
             let log_id = handler_id;
             Box::pin(async move {
@@ -175,8 +178,30 @@ impl WebRtcTransport {
         }));
         dc.on_close(Box::new(move || {
             let log_id = handler_id;
+            let pc_clone = pc_for_close.clone();
+            let handshake_for_close = handshake_for_close.clone();
             Box::pin(async move {
-                tracing::debug!(target = "webrtc", transport_id = ?log_id, "data channel closed");
+                let pc_state = pc_clone.connection_state();
+                let ice_state = pc_clone.ice_connection_state();
+                if let Some(flag) = handshake_for_close.as_ref() {
+                    if !flag.load(Ordering::SeqCst) {
+                        tracing::warn!(
+                            target = "webrtc",
+                            transport_id = ?log_id,
+                            pc_state = ?pc_state,
+                            ice_state = ?ice_state,
+                            "data channel closed before readiness handshake completed"
+                        );
+                        return;
+                    }
+                }
+                tracing::debug!(
+                    target = "webrtc",
+                    transport_id = ?log_id,
+                    pc_state = ?pc_state,
+                    ice_state = ?ice_state,
+                    "data channel closed"
+                );
             })
         }));
 
@@ -556,23 +581,39 @@ impl OffererInner {
             if let Some(state) = states.get(&joined.peer.id) {
                 match state {
                     PeerLifecycleState::Negotiating => {
+                        tracing::trace!(
+                            target = "webrtc",
+                            peer_id = %joined.peer.id,
+                            "peer negotiator already active; ignoring new join"
+                        );
                         tracing::debug!(
                             target = "webrtc",
                             peer_id = %joined.peer.id,
                             "peer negotiator already active"
                         );
+                        return;
                     }
                     PeerLifecycleState::Established => {
+                        tracing::trace!(
+                            target = "webrtc",
+                            peer_id = %joined.peer.id,
+                            "peer already has established transport; ignoring join"
+                        );
                         tracing::debug!(
                             target = "webrtc",
                             peer_id = %joined.peer.id,
                             "peer already has established transport"
                         );
+                        return;
                     }
                 }
-                return;
             }
             states.insert(joined.peer.id.clone(), PeerLifecycleState::Negotiating);
+            tracing::trace!(
+                target = "webrtc",
+                peer_id = %joined.peer.id,
+                "peer lifecycle transitioned to negotiating"
+            );
         }
 
         let mut tasks = self.peer_tasks.lock().await;
@@ -582,8 +623,6 @@ impl OffererInner {
                 peer_id = %joined.peer.id,
                 "peer negotiator already active"
             );
-            let mut states = self.peer_states.lock().await;
-            states.remove(&joined.peer.id);
             return;
         }
         if tasks.len() >= self.max_negotiators {
@@ -594,8 +633,6 @@ impl OffererInner {
                 max = self.max_negotiators,
                 "dropping peer join due to negotiator capacity"
             );
-            let mut states = self.peer_states.lock().await;
-            states.remove(&joined.peer.id);
             return;
         }
 
@@ -603,6 +640,12 @@ impl OffererInner {
             target = "webrtc",
             peer_id = %joined.peer.id,
             "registering peer negotiator"
+        );
+        tracing::debug!(
+            target = "webrtc",
+            peer_id = %joined.peer.id,
+            active_tasks = tasks.len(),
+            "spawning negotiator task for joined peer"
         );
 
         let cancel = Arc::new(AtomicBool::new(false));
@@ -619,16 +662,39 @@ impl OffererInner {
                 .await;
         });
 
-        tasks.insert(peer_id.clone(), PeerNegotiatorHandle { cancel, task });
+        let previous = tasks.insert(peer_id.clone(), PeerNegotiatorHandle { cancel, task });
+        tracing::trace!(
+            target = "webrtc",
+            peer_id = %peer_id,
+            active_tasks = tasks.len(),
+            replaced_existing = previous.is_some(),
+            "peer negotiator registered"
+        );
         drop(tasks);
-        // state already marked as Negotiating above; nothing else to do
+        // state already set to Negotiating above
     }
 
     async fn handle_peer_left(self: &Arc<Self>, peer_id: &str) {
+        tracing::info!(
+            target = "webrtc",
+            peer_id = %peer_id,
+            "handling peer left event"
+        );
         let mut tasks = self.peer_tasks.lock().await;
         if let Some(handle) = tasks.remove(peer_id) {
+            tracing::debug!(
+                target = "webrtc",
+                peer_id = %peer_id,
+                "setting cancel flag and aborting negotiator task for departed peer"
+            );
             handle.cancel.store(true, Ordering::SeqCst);
             handle.task.abort();
+        } else {
+            tracing::debug!(
+                target = "webrtc",
+                peer_id = %peer_id,
+                "no active negotiator task found for departed peer"
+            );
         }
 
         let mut states = self.peer_states.lock().await;
@@ -655,6 +721,12 @@ impl OffererInner {
                     } else {
                         states.insert(peer_id.to_string(), PeerLifecycleState::Established);
                     }
+                    tracing::trace!(
+                        target = "webrtc",
+                        peer_id = %peer_id,
+                        state = ?states.get(peer_id),
+                        "peer lifecycle updated to established"
+                    );
                 }
                 if self.accepted_tx.send(accepted).is_err() {
                     tracing::debug!(
@@ -668,25 +740,35 @@ impl OffererInner {
                 {
                     let mut states = self.peer_states.lock().await;
                     states.remove(peer_id);
+                    tracing::trace!(
+                        target = "webrtc",
+                        peer_id = %peer_id,
+                        "peer lifecycle entry removed after negotiator concluded without transport"
+                    );
                 }
                 tracing::debug!(
                     target = "webrtc",
                     peer_id = %peer_id,
                     cancelled = cancel_flag.load(Ordering::SeqCst),
-                    "peer negotiation finished without transport"
+                    "peer negotiation concluded without establishing transport"
                 );
             }
             Err(err) => {
                 {
                     let mut states = self.peer_states.lock().await;
                     states.remove(peer_id);
+                    tracing::trace!(
+                        target = "webrtc",
+                        peer_id = %peer_id,
+                        "peer lifecycle entry removed after negotiator error"
+                    );
                 }
                 tracing::warn!(
                     target = "webrtc",
                     peer_id = %peer_id,
                     cancelled = cancel_flag.load(Ordering::SeqCst),
                     error = %err,
-                    "peer negotiation error"
+                    "peer negotiation ended with error"
                 );
             }
         }
@@ -891,10 +973,20 @@ async fn negotiate_offerer_peer(
         return Ok(None);
     }
 
+    tracing::debug!(
+        target = "webrtc",
+        peer_id = %peer.id,
+        "waiting for datachannel to open (15s timeout)"
+    );
     if tokio::time::timeout(Duration::from_secs(15), dc_notify.notified())
         .await
         .is_err()
     {
+        tracing::warn!(
+            target = "webrtc",
+            peer_id = %peer.id,
+            "datachannel open timeout, closing peer connection"
+        );
         let _ = pc.close().await;
         ice_task.abort();
         return Err(TransportError::Setup(
@@ -904,6 +996,9 @@ async fn negotiate_offerer_peer(
 
     let local_id = next_transport_id();
     let remote_id = next_transport_id();
+    let handshake_complete = Arc::new(AtomicBool::new(false));
+    let dc_state_before = dc.ready_state();
+    let pc_state_before = pc.connection_state();
     let transport = Arc::new(WebRtcTransport::new(
         TransportKind::WebRtc,
         local_id,
@@ -913,12 +1008,54 @@ async fn negotiate_offerer_peer(
         None,
         Some(dc_notify.clone()),
         Some(Arc::clone(&inner.signaling_client)),
+        Some(Arc::clone(&handshake_complete)),
     ));
     let transport_dyn: Arc<dyn Transport> = transport.clone();
 
+    tracing::debug!(
+        target = "webrtc",
+        peer_id = %peer.id,
+        transport_id = ?local_id,
+        dc_state = ?dc_state_before,
+        pc_state = ?pc_state_before,
+        "starting readiness handshake"
+    );
+
+    // Give the data channel on_message callback a chance to fire and enqueue
+    // any messages that arrived immediately when the channel opened
+    tracing::trace!(
+        target = "webrtc",
+        peer_id = %peer.id,
+        "sleeping 10ms before polling for __ready__"
+    );
+    sleep(Duration::from_millis(10)).await;
+    let dc_state_after = transport._dc.ready_state();
+    let pc_state_after = pc.connection_state();
+    tracing::trace!(
+        target = "webrtc",
+        peer_id = %peer.id,
+        dc_state_after_sleep = ?dc_state_after,
+        pc_state_after_sleep = ?pc_state_after,
+        "sleep completed"
+    );
+
+    tracing::debug!(
+        target = "webrtc",
+        peer_id = %peer.id,
+        "beginning to poll for __ready__ sentinel"
+    );
+
     let mut ready_seen = false;
+    let mut readiness_attempts = 0usize;
     for attempt in 0..READY_ACK_POLL_ATTEMPTS {
+        readiness_attempts = attempt + 1;
         if cancel_flag.load(Ordering::SeqCst) {
+            tracing::warn!(
+                target = "webrtc",
+                peer_id = %peer.id,
+                attempt = attempt,
+                "readiness handshake cancelled via cancel_flag, closing peer connection"
+            );
             let _ = pc.close().await;
             ice_task.abort();
             return Ok(None);
@@ -927,7 +1064,20 @@ async fn negotiate_offerer_peer(
             Ok(Some(message)) => {
                 if message.payload.as_text() == Some("__ready__") {
                     ready_seen = true;
+                    tracing::info!(
+                        target = "webrtc",
+                        peer_id = %peer.id,
+                        attempt = attempt,
+                        "received __ready__ sentinel from answerer"
+                    );
                     break;
+                } else {
+                    tracing::debug!(
+                        target = "webrtc",
+                        peer_id = %peer.id,
+                        payload = ?message.payload,
+                        "received unexpected message during readiness handshake"
+                    );
                 }
             }
             Ok(None) => {}
@@ -946,13 +1096,42 @@ async fn negotiate_offerer_peer(
         }
     }
 
+    tracing::debug!(
+        target = "webrtc",
+        peer_id = %peer.id,
+        attempts = readiness_attempts,
+        ready_seen = ready_seen,
+        "readiness handshake polling finished"
+    );
+
     if !ready_seen {
+        tracing::warn!(
+            target = "webrtc",
+            peer_id = %peer.id,
+            transport_id = ?local_id,
+            "closing peer connection: did not receive __ready__ sentinel"
+        );
         let _ = pc.close().await;
         ice_task.abort();
         return Err(TransportError::Setup(
             "offerer missing data channel readiness sentinel".into(),
         ));
     }
+
+    tracing::debug!(
+        target = "webrtc",
+        peer_id = %peer.id,
+        "sending __offer_ready__ sentinel to answerer"
+    );
+
+    tracing::debug!(
+        target = "webrtc",
+        peer_id = %peer.id,
+        handshake_id = %handshake_id,
+        attempts = readiness_attempts,
+        "readiness handshake completed"
+    );
+    handshake_complete.store(true, Ordering::SeqCst);
 
     if let Err(err) = transport.send_text("__offer_ready__") {
         tracing::warn!(
@@ -1237,16 +1416,29 @@ async fn connect_answerer(
                     None,
                     Some(notify.clone()),
                     Some(signaling_for_transport),
+                    None,
                 );
                 let transport_arc = Arc::new(transport) as Arc<dyn Transport>;
                 slot_guard.replace(transport_arc.clone());
                 drop(slot_guard);
+
+                tracing::debug!(
+                    target = "webrtc",
+                    role = "answerer",
+                    "sending __ready__ sentinel to offerer"
+                );
 
                 if let Err(err) = transport_arc.send_text("__ready__") {
                     tracing::warn!(
                         target = "webrtc",
                         error = %err,
                         "answerer readiness ack failed"
+                    );
+                } else {
+                    tracing::info!(
+                        target = "webrtc",
+                        role = "answerer",
+                        "sent __ready__ sentinel successfully"
                     );
                 }
                 return;
@@ -1838,6 +2030,7 @@ async fn create_webrtc_pair() -> Result<TransportPair, TransportError> {
         router_keepalive.clone(),
         None,
         None,
+        None,
     );
 
     let server_transport = WebRtcTransport::new(
@@ -1847,6 +2040,7 @@ async fn create_webrtc_pair() -> Result<TransportPair, TransportError> {
         answer_pc.clone(),
         answer_dc.clone(),
         router_keepalive,
+        None,
         None,
         None,
     );

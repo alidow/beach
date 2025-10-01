@@ -128,6 +128,14 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     }
   }, [status, onStatusChange]);
   const lines = useMemo(() => buildLines(snapshot, 600), [snapshot]);
+  if (import.meta.env.DEV && typeof window !== 'undefined' && window.__BEACH_TRACE) {
+    const sample = lines.slice(-5).map((line) => ({
+      absolute: line.absolute,
+      kind: line.kind,
+      text: line.cells?.map((cell) => (cell.char === '\u00a0' ? ' ' : cell.char)).join('') ?? null,
+    }));
+    console.debug('[beach-trace][terminal] render sample', { count: lines.length, sample });
+  }
   const sessionTitle = useMemo(() => {
     if (sessionId && sessionId.trim().length > 0) {
       const trimmed = sessionId.trim();
@@ -239,8 +247,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       const windowRows = typeof window !== 'undefined'
         ? Math.max(1, Math.floor(window.innerHeight / lineHeight))
         : MAX_VIEWPORT_ROWS;
-      const viewportRows = Math.max(1, Math.min(measured, windowRows, MAX_VIEWPORT_ROWS));
+      const fallbackRows = Math.max(1, Math.min(windowRows, MAX_VIEWPORT_ROWS));
+      const viewportRows = fallbackRows;
       lastMeasuredViewportRows.current = viewportRows;
+      const maxHeightPx = viewportRows * lineHeight;
+      container.style.maxHeight = `${maxHeightPx}px`;
+      container.style.setProperty('--beach-terminal-max-height', `${maxHeightPx}px`);
       const current = store.getSnapshot();
       log('resize', {
         containerHeight: containerRect.height,
@@ -319,14 +331,38 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     if (!element || !snapshot.followTail) {
       return;
     }
-    const target = element.scrollHeight - element.clientHeight;
-    if (target < 0) {
-      return;
-    }
-    if (Math.abs(element.scrollTop - target) > 1) {
+    const applyScroll = () => {
+      const target = element.scrollHeight - element.clientHeight;
+      if (target < 0) {
+        return;
+      }
+      if (import.meta.env.DEV && typeof window !== 'undefined' && window.__BEACH_TRACE) {
+        console.debug('[beach-trace][terminal] autoscroll', {
+          before: element.scrollTop,
+          target,
+          scrollHeight: element.scrollHeight,
+          clientHeight: element.clientHeight,
+        });
+      }
       element.scrollTop = target;
+    };
+    if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+      let outer = -1;
+      let inner = -1;
+      outer = window.requestAnimationFrame(() => {
+        inner = window.requestAnimationFrame(applyScroll);
+      });
+      return () => {
+        if (outer !== -1) {
+          window.cancelAnimationFrame(outer);
+        }
+        if (inner !== -1) {
+          window.cancelAnimationFrame(inner);
+        }
+      };
     }
-  }, [snapshot.followTail, snapshot.baseRow, snapshot.rows.length, lastAbsolute, lineHeight, topPadding, bottomPadding]);
+    applyScroll();
+  }, [snapshot.followTail, snapshot.baseRow, snapshot.rows.length, lastAbsolute, lineHeight, topPadding, bottomPadding, lines.length]);
 
   const handleKeyDown: React.KeyboardEventHandler<HTMLDivElement> = (event) => {
     const transport = transportRef.current;
@@ -470,9 +506,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
 
     const nearBottom = element.scrollHeight - (element.scrollTop + element.clientHeight) < lineHeight * 2;
     store.setFollowTail(nearBottom);
-    if (!nearBottom) {
-      backfillController.maybeRequest(store.getSnapshot(), false);
-    }
+    backfillController.maybeRequest(store.getSnapshot(), nearBottom);
   }
 
   function renderStatus(): string {
@@ -567,14 +601,15 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           origin: frame.type,
           cursor: frame.cursor ?? null,
         });
+        if (frame.type === 'history_backfill') {
+          backfillController.finalizeHistoryBackfill(frame);
+        }
         summarizeSnapshot(store);
         if (!frame.hasMore && frame.type === 'snapshot') {
           store.setFollowTail(true);
         }
         const current = store.getSnapshot();
-        if (!current.followTail) {
-          backfillController.maybeRequest(current, current.followTail);
-        }
+        backfillController.maybeRequest(current, current.followTail);
         break;
       }
       case 'snapshot_complete':

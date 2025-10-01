@@ -10,7 +10,7 @@ use crate::transport::{Payload, Transport, TransportError};
 #[cfg(not(test))]
 use copypasta::{ClipboardContext, ClipboardProvider};
 use crossterm::{
-    cursor::MoveTo,
+    cursor::{MoveTo, Show},
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
         MouseButton, MouseEvent, MouseEventKind,
@@ -408,6 +408,7 @@ impl TerminalClient {
                 self.cursor_seq = 0;
                 self.cursor_visible = true;
                 self.renderer.clear_cursor();
+                self.sync_renderer_cursor();
                 self.pending_backfills.clear();
                 self.next_backfill_request_id = 1;
                 self.last_backfill_request_at = None;
@@ -1371,8 +1372,11 @@ impl TerminalClient {
                     self.cursor_col = col;
                 }
                 RowWidth(row) => {
-                    self.cursor_row = row;
-                    self.cursor_col = self.renderer.row_display_width(row as u64);
+                    let width = self.renderer.row_display_width(row as u64);
+                    if row > self.cursor_row || (row == self.cursor_row && width >= self.cursor_col) {
+                        self.cursor_row = row;
+                        self.cursor_col = width;
+                    }
                 }
             }
         }
@@ -1444,7 +1448,7 @@ impl TerminalClient {
         } else {
             let _guard = PerfGuard::new("client_render_simple");
             let mut stdout = io::stdout();
-            execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))
+            execute!(stdout, MoveTo(0, 0), Clear(ClearType::All), Show)
                 .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
             for line in self.renderer.visible_lines() {
                 writeln!(stdout, "{}", line).map_err(|err| {
@@ -1452,7 +1456,7 @@ impl TerminalClient {
                 })?;
             }
             if let Some((col, row)) = self.renderer.cursor_viewport_position() {
-                execute!(stdout, MoveTo(col, row)).map_err(|err| {
+                execute!(stdout, MoveTo(col, row), Show).map_err(|err| {
                     ClientError::Transport(TransportError::Setup(err.to_string()))
                 })?;
             }

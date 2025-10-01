@@ -401,7 +401,9 @@ export class TerminalGridCache {
     const highestLoaded = this.findHighestLoadedRow();
     let startAbsolute: number;
     if (this.followTail && highestLoaded !== null) {
-      startAbsolute = Math.max(this.baseRow, highestLoaded - height + 1);
+      const tailHeadroom = Math.max(0, height - 1);
+      const oldestTracked = highestLoaded - tailHeadroom;
+      startAbsolute = Math.max(this.baseRow, oldestTracked);
     } else if (this.followTail) {
       startAbsolute = this.baseRow;
     } else {

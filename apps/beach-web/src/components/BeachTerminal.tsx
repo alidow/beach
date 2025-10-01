@@ -1,5 +1,5 @@
 import type { CSSProperties, UIEvent } from 'react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { FEATURE_CURSOR_SYNC } from '../protocol/types';
 import type { ClientFrame, HostFrame } from '../protocol/types';
 import { createTerminalStore, useTerminalSnapshot } from '../terminal/useTerminalState';
@@ -147,17 +147,48 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     (window as any).beachLines = lines;
   }
   const lineHeight = computeLineHeight(fontSize);
+  const [measuredLineHeight, setMeasuredLineHeight] = useState<number>(lineHeight);
+  const effectiveLineHeight = measuredLineHeight > 0 ? measuredLineHeight : lineHeight;
   const totalRows = snapshot.rows.length;
   const firstAbsolute = lines.length > 0 ? lines[0]!.absolute : snapshot.baseRow;
   const lastAbsolute = lines.length > 0 ? lines[lines.length - 1]!.absolute : firstAbsolute;
   const topPaddingRows = Math.max(0, firstAbsolute - snapshot.baseRow);
   const bottomPaddingRows = Math.max(0, snapshot.baseRow + totalRows - (lastAbsolute + 1));
-  const topPadding = topPaddingRows * lineHeight;
-  const bottomPadding = bottomPaddingRows * lineHeight;
+  const topPadding = topPaddingRows * effectiveLineHeight;
+  const bottomPadding = bottomPaddingRows * effectiveLineHeight;
   const backfillController = useMemo(
     () => new BackfillController(store, (frame) => transportRef.current?.send(frame)),
     [store],
   );
+
+  useLayoutEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    const container = containerRef.current;
+    if (!container) {
+      return;
+    }
+    let raf = -1;
+    const measure = () => {
+      const row = container.querySelector<HTMLDivElement>('.xterm-row');
+      if (!row) {
+        return;
+      }
+      const rect = row.getBoundingClientRect();
+      const next = rect.height;
+      if (!Number.isFinite(next) || next <= 0) {
+        return;
+      }
+      setMeasuredLineHeight((prev) => (Math.abs(prev - next) > 0.1 ? next : prev));
+    };
+    raf = window.requestAnimationFrame(measure);
+    return () => {
+      if (raf !== -1) {
+        window.cancelAnimationFrame(raf);
+      }
+    };
+  }, [lines.length, fontFamily, fontSize]);
 
   useEffect(() => {
     transportRef.current = providedTransport ?? null;
@@ -240,17 +271,18 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       // This is the fixed available space, not affected by internal padding
       const containerRect = container.getBoundingClientRect();
       const viewportHeight = containerRect.height;
-      const measured = Math.max(1, Math.floor(viewportHeight / lineHeight));
+      const rowHeight = Math.max(1, effectiveLineHeight);
+      const measured = Math.max(1, Math.floor(viewportHeight / rowHeight));
       // Clamp to the physical window height so we never report more rows than
       // the screen can actually display. Using innerHeight keeps the loop from
       // chasing scrollHeight growth when content expands.
       const windowRows = typeof window !== 'undefined'
-        ? Math.max(1, Math.floor(window.innerHeight / lineHeight))
+        ? Math.max(1, Math.floor(window.innerHeight / rowHeight))
         : MAX_VIEWPORT_ROWS;
       const fallbackRows = Math.max(1, Math.min(windowRows, MAX_VIEWPORT_ROWS));
       const viewportRows = fallbackRows;
       lastMeasuredViewportRows.current = viewportRows;
-      const maxHeightPx = viewportRows * lineHeight;
+      const maxHeightPx = viewportRows * rowHeight;
       container.style.maxHeight = `${maxHeightPx}px`;
       container.style.setProperty('--beach-terminal-max-height', `${maxHeightPx}px`);
       const current = store.getSnapshot();
@@ -280,7 +312,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     // Observe the wrapper, not the scroll container
     observer.observe(wrapper);
     return () => observer.disconnect();
-  }, [lineHeight, store]);
+  }, [effectiveLineHeight, lineHeight, store]);
 
   useEffect(() => {
     const connection = activeConnection;
@@ -462,6 +494,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           lineHeight: `${lineHeight}px`,
           letterSpacing: '0.01em',
           fontVariantLigatures: 'none',
+          '--beach-terminal-line-height': `${lineHeight}px`,
         }}
       >
         {showIdlePlaceholder ? (
@@ -483,11 +516,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
 
   function handleScroll(event: UIEvent<HTMLDivElement>): void {
     const element = event.currentTarget;
+    const pixelsPerRow = Math.max(1, effectiveLineHeight);
     const approxRow = Math.max(
       snapshot.baseRow,
-      snapshot.baseRow + Math.floor(element.scrollTop / lineHeight),
+      snapshot.baseRow + Math.floor(element.scrollTop / pixelsPerRow),
     );
-    const measuredRows = Math.max(1, Math.floor(element.clientHeight / lineHeight));
+    const measuredRows = Math.max(1, Math.floor(element.clientHeight / pixelsPerRow));
     const viewportRows = Math.max(1, Math.min(measuredRows, MAX_VIEWPORT_ROWS));
     const maxTop = Math.max(snapshot.baseRow, snapshot.baseRow + totalRows - viewportRows);
     const clampedTop = Math.min(approxRow, maxTop);
@@ -504,9 +538,41 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       clampedTop,
     });
 
-    const nearBottom = element.scrollHeight - (element.scrollTop + element.clientHeight) < lineHeight * 2;
-    store.setFollowTail(nearBottom);
-    backfillController.maybeRequest(store.getSnapshot(), nearBottom);
+    const remainingPixels = Math.max(0, element.scrollHeight - (element.scrollTop + element.clientHeight));
+    const atBottom = shouldReenableFollowTail(remainingPixels);
+    const nearBottom = remainingPixels <= pixelsPerRow * 2;
+    const previousFollowTail = snapshot.followTail;
+    store.setFollowTail(atBottom);
+    const nextSnapshot = store.getSnapshot();
+    trace('scroll tail decision', {
+      previousFollowTail,
+      requestedFollowTail: atBottom,
+      appliedFollowTail: nextSnapshot.followTail,
+      nearBottom,
+      remainingPixels,
+      lineHeight,
+      measuredLineHeight: pixelsPerRow,
+      viewportRows,
+      measuredRows,
+      approxRow,
+      baseRow: snapshot.baseRow,
+      viewportTop: nextSnapshot.viewportTop,
+      viewportHeight: nextSnapshot.viewportHeight,
+      totalRows,
+      firstAbsolute,
+      lastAbsolute,
+    });
+    logScrollDiagnostics(
+      element,
+      remainingPixels,
+      viewportRows,
+      atBottom,
+      nextSnapshot,
+      lines,
+      firstAbsolute,
+      lastAbsolute,
+    );
+    backfillController.maybeRequest(nextSnapshot, nearBottom);
   }
 
   function renderStatus(): string {
@@ -633,6 +699,110 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         break;
     }
   }
+
+  function logScrollDiagnostics(
+    element: HTMLDivElement,
+    remainingPixels: number,
+    viewportRows: number,
+    requestedFollowTail: boolean,
+    snapshot: TerminalGridSnapshot,
+    renderLines: RenderLine[],
+    firstAbsolute: number,
+    lastAbsolute: number,
+  ): void {
+    if (!(typeof window !== 'undefined' && window.__BEACH_TRACE)) {
+      return;
+    }
+    const rowHeight = Math.max(1, effectiveLineHeight);
+    const rowElements = element.querySelectorAll<HTMLDivElement>('.xterm-row');
+    if (rowElements.length === 0) {
+      trace('scroll diagnostics', {
+        renderedRows: 0,
+        requestedFollowTail,
+        appliedFollowTail,
+        remainingPixels,
+        viewportRows,
+        scrollHeight: element.scrollHeight,
+        clientHeight: element.clientHeight,
+        scrollTop: element.scrollTop,
+        lineHeight: rowHeight,
+      });
+      return;
+    }
+
+    const firstRect = rowElements[0]!.getBoundingClientRect();
+    const middleIndex = Math.min(rowElements.length - 1, Math.floor(rowElements.length / 2));
+    const middleRect = rowElements[middleIndex]!.getBoundingClientRect();
+    const lastRect = rowElements[rowElements.length - 1]!.getBoundingClientRect();
+    const averageHeight = rowElements.length > 1
+      ? (lastRect.bottom - firstRect.top) / (rowElements.length - 1)
+      : firstRect.height;
+    const approximateRowsFromScrollHeight = element.scrollHeight / rowHeight;
+    const approximateRowsFromAverage = element.scrollHeight / averageHeight;
+
+    const summarizeLine = (line: RenderLine | undefined) => {
+      if (!line) {
+        return null;
+      }
+      const text = line.cells?.map((cell) => (cell.char === '\u00a0' ? ' ' : cell.char)).join('').trimEnd();
+      return {
+        absolute: line.absolute,
+        kind: line.kind,
+        text,
+        cursorCol: line.cursorCol ?? null,
+      };
+    };
+
+    const topLine = summarizeLine(renderLines[0]);
+    const middleLine = summarizeLine(renderLines[middleIndex]);
+    const bottomLine = summarizeLine(renderLines[renderLines.length - 1]);
+
+    trace('scroll diagnostics', {
+      renderedRows: rowElements.length,
+      requestedFollowTail,
+      appliedFollowTail: snapshot.followTail,
+      remainingPixels,
+      viewportRows,
+      scrollHeight: element.scrollHeight,
+      clientHeight: element.clientHeight,
+      scrollTop: element.scrollTop,
+      firstRowHeight: Number(firstRect.height.toFixed(3)),
+      middleRowHeight: Number(middleRect.height.toFixed(3)),
+      lastRowHeight: Number(lastRect.height.toFixed(3)),
+      averageRowHeight: Number(averageHeight.toFixed(3)),
+      approximateRowsFromScrollHeight: Number(approximateRowsFromScrollHeight.toFixed(3)),
+      approximateRowsFromAverage: Number(approximateRowsFromAverage.toFixed(3)),
+      lineHeight: rowHeight,
+      firstAbsolute,
+      lastAbsolute,
+      topLine,
+      middleLine,
+      bottomLine,
+      viewportTop: snapshot.viewportTop,
+      viewportHeight: snapshot.viewportHeight,
+      baseRow: snapshot.baseRow,
+    });
+
+    const summaryParts = [
+      `followTail=${snapshot.followTail}`,
+      `requested=${requestedFollowTail}`,
+      `remaining=${remainingPixels.toFixed(2)}`,
+      `viewportTop=${snapshot.viewportTop}`,
+      topLine ? `first=${topLine.absolute}:${truncate(topLine.text)}` : 'first=?',
+      bottomLine ? `last=${bottomLine.absolute}:${truncate(bottomLine.text)}` : 'last=?',
+    ];
+    console.debug('[beach-trace][terminal] scroll summary', summaryParts.join(' | '));
+  }
+}
+
+function truncate(text: string | undefined | null, max = 48): string {
+  if (!text) {
+    return '';
+  }
+  if (text.length <= max) {
+    return text;
+  }
+  return `${text.slice(0, max)}…`;
 }
 
 interface RenderCell {
@@ -764,6 +934,10 @@ function LineRow({ line, styles }: { line: RenderLine; styles: Map<number, Style
 
 function computeLineHeight(fontSize: number): number {
   return Math.round(fontSize * 1.4);
+}
+
+export function shouldReenableFollowTail(remainingPixels: number): boolean {
+  return remainingPixels <= 1;
 }
 
 function sendFrame(transport: TerminalTransport, frame: ClientFrame): void {

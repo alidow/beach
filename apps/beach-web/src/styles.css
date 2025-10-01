@@ -87,7 +87,8 @@
   }
 
   .xterm-row {
-    min-height: 1.4rem;
+    min-height: var(--beach-terminal-line-height, 1.4rem);
+    line-height: var(--beach-terminal-line-height, 1.4rem);
     letter-spacing: 0.01em;
   }
 

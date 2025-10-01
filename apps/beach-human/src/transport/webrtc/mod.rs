@@ -1144,8 +1144,6 @@ async fn negotiate_offerer_peer(
         );
     }
 
-    ice_task.abort();
-
     tracing::info!(
         target = "webrtc",
         peer_id = %peer.id,

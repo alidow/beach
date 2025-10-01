@@ -1,5 +1,5 @@
 import type { CSSProperties, UIEvent } from 'react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ClientFrame, HostFrame } from '../protocol/types';
 import { createTerminalStore, useTerminalSnapshot } from '../terminal/useTerminalState';
 import { connectBrowserTransport, type BrowserTransportConnection } from '../terminal/connect';
@@ -8,6 +8,7 @@ import { encodeKeyEvent } from '../terminal/keymap';
 import type { TerminalTransport } from '../transport/terminalTransport';
 import { BackfillController } from '../terminal/backfillController';
 import { cn } from '../lib/utils';
+import type { ServerMessage } from '../transport/signaling';
 
 export type TerminalStatus = 'idle' | 'connecting' | 'connected' | 'error' | 'closed';
 
@@ -64,6 +65,25 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   );
   const [error, setError] = useState<Error | null>(null);
   const [showIdlePlaceholder, setShowIdlePlaceholder] = useState(true);
+  const [activeConnection, setActiveConnection] = useState<BrowserTransportConnection | null>(null);
+  const [peerId, setPeerId] = useState<string | null>(null);
+  const [remotePeerId, setRemotePeerId] = useState<string | null>(null);
+  const peerIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    peerIdRef.current = peerId;
+  }, [peerId]);
+  const log = useCallback((message: string, detail?: Record<string, unknown>) => {
+    if (!import.meta.env.DEV) {
+      return;
+    }
+    const current = peerIdRef.current;
+    const prefix = current ? `[beach-web:${current.slice(0, 8)}]` : '[beach-web]';
+    if (detail) {
+      console.debug(`${prefix} ${message}`, detail);
+    } else {
+      console.debug(`${prefix} ${message}`);
+    }
+  }, []);
   useEffect(() => {
     onStatusChange?.(status);
     if (status === 'connected') {
@@ -113,11 +133,24 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     setStatus('connecting');
     (async () => {
       try {
+        const webrtcLogger = (message: string) => {
+          const noisyPrefixes = [
+            'sending local candidate',
+            'local candidate queued',
+            'received remote ice candidate',
+            'ice add ok',
+          ];
+          if (noisyPrefixes.some((prefix) => message.startsWith(prefix))) {
+            return;
+          }
+          log(message);
+        };
+
         const connection = await connectBrowserTransport({
           sessionId,
           baseUrl,
           passcode,
-          logger: (message) => console.log('[beach-web]', message),
+          logger: webrtcLogger,
         });
         if (cancelled) {
           connection.close();
@@ -125,6 +158,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         }
         connectionRef.current = connection;
         transportRef.current = connection.transport;
+        setActiveConnection(connection);
+        setPeerId(connection.signaling.peerId);
+        setRemotePeerId(connection.remotePeerId ?? null);
         bindTransport(connection.transport);
         setStatus('connected');
       } catch (err) {
@@ -143,6 +179,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       }
       connectionRef.current = null;
       transportRef.current = null;
+      setActiveConnection(null);
+      setPeerId(null);
+      setRemotePeerId(null);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoConnect, sessionId, baseUrl, passcode]);
@@ -168,20 +207,18 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       const viewportRows = Math.max(1, Math.min(measured, windowRows, MAX_VIEWPORT_ROWS));
       lastMeasuredViewportRows.current = viewportRows;
       const current = store.getSnapshot();
-      if (import.meta.env.DEV) {
-        console.debug('[beach-web] resize', {
-          containerHeight: containerRect.height,
-          viewportHeight,
-          lineHeight,
-          measuredRows: measured,
-          windowRows,
-          viewportRows,
-          lastSent: lastSentViewportRows.current,
-          baseRow: current.baseRow,
-          totalRows: current.rows.length,
-          followTail: current.followTail,
-        });
-      }
+      log('resize', {
+        containerHeight: containerRect.height,
+        viewportHeight,
+        lineHeight,
+        measuredRows: measured,
+        windowRows,
+        viewportRows,
+        lastSent: lastSentViewportRows.current,
+        baseRow: current.baseRow,
+        totalRows: current.rows.length,
+        followTail: current.followTail,
+      });
       store.setViewport(current.viewportTop, viewportRows);
       if (suppressNextResizeRef.current) {
         suppressNextResizeRef.current = false;
@@ -197,6 +234,50 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     observer.observe(wrapper);
     return () => observer.disconnect();
   }, [lineHeight, store]);
+
+  useEffect(() => {
+    const connection = activeConnection;
+    if (!connection) {
+      return;
+    }
+    const { signaling } = connection;
+
+    const handleMessage = (event: Event) => {
+      const detail = (event as CustomEvent<ServerMessage>).detail;
+      if (detail.type === 'peer_joined') {
+        log('signaling peer_joined', { peerId: detail.peer.id, role: detail.peer.role });
+      } else if (detail.type === 'peer_left') {
+        log('signaling peer_left', { peerId: detail.peer_id });
+      } else if (detail.type === 'error') {
+        log('signaling error', { message: detail.message });
+      }
+    };
+
+    const handleClose = (event: Event) => {
+      const detail = (event as CustomEvent<CloseEvent>).detail;
+      log('signaling closed', {
+        code: detail?.code,
+        reason: detail?.reason,
+      });
+    };
+
+    const handleError = (event: Event) => {
+      const err = (event as ErrorEvent).error ?? event;
+      log('signaling socket error', {
+        message: err instanceof Error ? err.message : String(err),
+      });
+    };
+
+    signaling.addEventListener('message', handleMessage as EventListener);
+    signaling.addEventListener('close', handleClose as EventListener);
+    signaling.addEventListener('error', handleError as EventListener);
+
+    return () => {
+      signaling.removeEventListener('message', handleMessage as EventListener);
+      signaling.removeEventListener('close', handleClose as EventListener);
+      signaling.removeEventListener('error', handleError as EventListener);
+    };
+  }, [activeConnection, log]);
 
   useEffect(() => {
     const element = containerRef.current;
@@ -341,18 +422,16 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     const clampedTop = Math.min(approxRow, maxTop);
 
     store.setViewport(clampedTop, viewportRows);
-    if (import.meta.env.DEV) {
-      console.debug('[beach-web] scroll', {
-        scrollTop: element.scrollTop,
-        clientHeight: element.clientHeight,
-        scrollHeight: element.scrollHeight,
-        measuredRows,
-        viewportRows,
-        baseRow: snapshot.baseRow,
-        totalRows,
-        clampedTop,
-      });
-    }
+    log('scroll', {
+      scrollTop: element.scrollTop,
+      clientHeight: element.clientHeight,
+      scrollHeight: element.scrollHeight,
+      measuredRows,
+      viewportRows,
+      baseRow: snapshot.baseRow,
+      totalRows,
+      clampedTop,
+    });
 
     const nearBottom = element.scrollHeight - (element.scrollTop + element.clientHeight) < lineHeight * 2;
     store.setFollowTail(nearBottom);
@@ -383,9 +462,20 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       handleHostFrame(frame);
     };
     transport.addEventListener('frame', frameHandler as EventListener);
-    transport.addEventListener('close', () => setStatus('closed'), { once: true });
+    transport.addEventListener(
+      'close',
+      () => {
+        const remote = remotePeerId ?? connectionRef.current?.remotePeerId ?? null;
+        log('transport closed', { remotePeerId: remote });
+        setStatus('closed');
+      },
+      { once: true },
+    );
     transport.addEventListener('error', (event) => {
-      setError((event as any).error ?? new Error('transport error'));
+      const err = (event as any).error ?? new Error('transport error');
+      const remote = remotePeerId ?? connectionRef.current?.remotePeerId ?? null;
+      log('transport error', { message: err.message, remotePeerId: remote });
+      setError(err);
       setStatus('error');
     });
   }
@@ -413,36 +503,22 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
             lastSentViewportRows.current = deviceViewport;
           }
           suppressNextResizeRef.current = true;
-          if (import.meta.env.DEV) {
-            console.debug('[beach-web] grid frame', {
-              baseRow: frame.baseRow,
-              historyRows: frame.historyRows,
-              cols: frame.cols,
-              serverViewport: frame.viewportRows ?? null,
-              deviceViewport,
-              viewportTop,
-            });
-          }
+          log('grid frame', {
+            baseRow: frame.baseRow,
+            historyRows: frame.historyRows,
+            cols: frame.cols,
+            serverViewport: frame.viewportRows ?? null,
+            deviceViewport,
+            viewportTop,
+          });
         }
         break;
       case 'snapshot':
       case 'delta':
       case 'history_backfill': {
         const authoritative = frame.type === 'snapshot' || frame.type === 'history_backfill';
-        if (import.meta.env.DEV) {
-          console.debug('[beach-web][updates]', frame.type, frame.updates);
-        }
+        log(`frame ${frame.type}`, { updates: frame.updates.length, authoritative });
         store.applyUpdates(frame.updates, authoritative, frame.type);
-        if (import.meta.env.DEV) {
-          const debugRows = store
-            .getSnapshot()
-            .rows.map((row) => ({
-              absolute: row.absolute,
-              kind: row.kind,
-              text: row.kind === 'loaded' ? store.getRowText(row.absolute) : null,
-            }));
-          console.debug('[beach-web][rows]', debugRows);
-        }
         if (!frame.hasMore && frame.type === 'snapshot') {
           store.setFollowTail(true);
         }
@@ -574,9 +650,6 @@ function sendFrame(transport: TerminalTransport, frame: ClientFrame): void {
 }
 
 function sendResize(transport: TerminalTransport, cols: number, rows: number): void {
-  if (import.meta.env.DEV) {
-    console.debug('[beach-web] sending resize', { cols, rows });
-  }
   transport.send({ type: 'resize', cols, rows });
 }
 

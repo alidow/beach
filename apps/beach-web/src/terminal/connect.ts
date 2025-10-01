@@ -9,6 +9,7 @@ import type { SignalingClientOptions } from '../transport/signaling';
 export interface BrowserTransportConnection {
   transport: TerminalTransport;
   signaling: SignalingClient;
+  remotePeerId?: string;
   close(): void;
 }
 
@@ -32,7 +33,10 @@ export async function connectBrowserTransport(
     supportedTransports: ['webrtc'],
     createSocket: options.createSocket,
   });
-  const { transport: webRtcTransport } = await connectWebRtcTransport({
+  const {
+    transport: webRtcTransport,
+    remotePeerId,
+  } = await connectWebRtcTransport({
     signaling,
     signalingUrl: join.signalingUrl,
     role: join.role,
@@ -46,6 +50,7 @@ export async function connectBrowserTransport(
   return {
     transport,
     signaling,
+    remotePeerId,
     close: () => {
       transport.close();
       signaling.close();

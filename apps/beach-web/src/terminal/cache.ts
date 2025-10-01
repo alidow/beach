@@ -693,17 +693,6 @@ export class TerminalGridCache {
       cells: createBlankRow(initialWidth),
     };
     this.rows[index] = loaded;
-    if (import.meta.env.DEV && this.debugContext) {
-      const summary = summarizeUpdate(this.debugContext.update);
-      console.debug('[beach-web][cache] created row', {
-        row: absolute,
-        baseRow: this.baseRow,
-        origin: this.debugContext.origin,
-        authoritative: this.debugContext.authoritative,
-        summary,
-        totalRows: this.rows.length,
-      });
-    }
     return loaded;
   }
 

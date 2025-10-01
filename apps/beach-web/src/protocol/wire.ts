@@ -305,7 +305,9 @@ export function encodeHostFrameBinary(frame: HostFrame): Uint8Array {
     }
     case 'grid': {
       writeHeader(HOST_KIND_GRID, out);
-      writeVarUint(ensureSafe(frame.viewportRows, 'viewportRows'), out);
+      if (typeof frame.viewportRows === 'number') {
+        writeVarUint(ensureSafe(frame.viewportRows, 'viewportRows'), out);
+      }
       writeVarUint(ensureSafe(frame.cols, 'cols'), out);
       writeVarUint(ensureSafe(frame.historyRows, 'historyRows'), out);
       writeVarUint(ensureSafe(frame.baseRow, 'baseRow'), out);
@@ -379,11 +381,25 @@ export function decodeHostFrameBinary(input: ArrayBuffer | Uint8Array): HostFram
       return { type: 'hello', subscription, maxSeq, config };
     }
     case HOST_KIND_GRID: {
-      const viewportRows = readVarUint(bytes, cursor);
+      const checkpoint = cursor.value;
       const cols = readVarUint(bytes, cursor);
       const historyRows = readVarUint(bytes, cursor);
       const baseRow = readVarUint(bytes, cursor);
-      return { type: 'grid', viewportRows, cols, historyRows, baseRow };
+      if (cursor.value === bytes.length) {
+        return { type: 'grid', cols, historyRows, baseRow };
+      }
+      cursor.value = checkpoint;
+      const viewportRows = readVarUint(bytes, cursor);
+      const legacyCols = readVarUint(bytes, cursor);
+      const legacyHistoryRows = readVarUint(bytes, cursor);
+      const legacyBaseRow = readVarUint(bytes, cursor);
+      return {
+        type: 'grid',
+        cols: legacyCols,
+        historyRows: legacyHistoryRows,
+        baseRow: legacyBaseRow,
+        viewportRows,
+      };
     }
     case HOST_KIND_SNAPSHOT: {
       const subscription = readVarUint(bytes, cursor);

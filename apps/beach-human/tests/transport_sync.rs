@@ -441,10 +441,10 @@ where
         send_host_frame(
             server_transport.as_ref(),
             HostFrame::Grid {
-                viewport_rows: rows as u32,
                 cols: cols as u32,
                 history_rows: rows as u32,
                 base_row: server_grid_clone.row_offset(),
+                viewport_rows: None,
             },
         );
 

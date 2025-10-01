@@ -89,10 +89,11 @@ pub enum HostFrame {
         config: SyncConfigFrame,
     },
     Grid {
-        viewport_rows: u32,
         cols: u32,
         history_rows: u32,
         base_row: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        viewport_rows: Option<u32>,
     },
     Snapshot {
         subscription: u64,

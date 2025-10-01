@@ -28,6 +28,7 @@ export interface BeachTerminalProps {
 }
 
 export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
+  const MAX_VIEWPORT_ROWS = 512;
   const {
     sessionId,
     baseUrl,
@@ -49,11 +50,15 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     (window as any).beachStore = store;
   }
   const snapshot = useTerminalSnapshot(store);
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const transportRef = useRef<TerminalTransport | null>(providedTransport ?? null);
   const connectionRef = useRef<BrowserTransportConnection | null>(null);
   const subscriptionRef = useRef<number | null>(null);
   const inputSeqRef = useRef(0);
+  const lastSentViewportRows = useRef<number>(0);
+  const lastMeasuredViewportRows = useRef<number>(24);
+  const suppressNextResizeRef = useRef<boolean>(false);
   const [status, setStatus] = useState<TerminalStatus>(
     providedTransport ? 'connected' : 'idle',
   );
@@ -78,7 +83,6 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   if (import.meta.env.DEV) {
     (window as any).beachLines = lines;
   }
-  const [minimumRows, setMinimumRows] = useState(24);
   const lineHeight = computeLineHeight(fontSize);
   const totalRows = snapshot.rows.length;
   const firstAbsolute = lines.length > 0 ? lines[0]!.absolute : snapshot.baseRow;
@@ -144,34 +148,55 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   }, [autoConnect, sessionId, baseUrl, passcode]);
 
   useEffect(() => {
-    if (!containerRef.current) {
+    if (!wrapperRef.current || !containerRef.current) {
       return;
     }
-    const element = containerRef.current;
-    const observer = new ResizeObserver((entries) => {
-      const entry = entries[entries.length - 1];
-      if (!entry) {
-        return;
-      }
-      const measured = Math.max(1, Math.floor(entry.contentRect.height / lineHeight));
-      const viewportRows = Math.max(minimumRows, measured);
+    const wrapper = wrapperRef.current;
+    const container = containerRef.current;
+    const observer = new ResizeObserver(() => {
+      // Measure the container's actual viewport size
+      // This is the fixed available space, not affected by internal padding
+      const containerRect = container.getBoundingClientRect();
+      const viewportHeight = containerRect.height;
+      const measured = Math.max(1, Math.floor(viewportHeight / lineHeight));
+      // Clamp to the physical window height so we never report more rows than
+      // the screen can actually display. Using innerHeight keeps the loop from
+      // chasing scrollHeight growth when content expands.
+      const windowRows = typeof window !== 'undefined'
+        ? Math.max(1, Math.floor(window.innerHeight / lineHeight))
+        : MAX_VIEWPORT_ROWS;
+      const viewportRows = Math.max(1, Math.min(measured, windowRows, MAX_VIEWPORT_ROWS));
+      lastMeasuredViewportRows.current = viewportRows;
+      const current = store.getSnapshot();
       if (import.meta.env.DEV) {
         console.debug('[beach-web] resize', {
-          height: entry.contentRect.height,
+          containerHeight: containerRect.height,
+          viewportHeight,
           lineHeight,
           measuredRows: measured,
+          windowRows,
           viewportRows,
+          lastSent: lastSentViewportRows.current,
+          baseRow: current.baseRow,
+          totalRows: current.rows.length,
+          followTail: current.followTail,
         });
       }
-      const current = store.getSnapshot();
       store.setViewport(current.viewportTop, viewportRows);
-      if (subscriptionRef.current !== null && transportRef.current) {
+      if (suppressNextResizeRef.current) {
+        suppressNextResizeRef.current = false;
+        return;
+      }
+      // Only send resize if the viewport size actually changed
+      if (subscriptionRef.current !== null && transportRef.current && viewportRows !== lastSentViewportRows.current) {
         sendResize(transportRef.current, current.cols, viewportRows);
+        lastSentViewportRows.current = viewportRows;
       }
     });
-    observer.observe(element);
+    // Observe the wrapper, not the scroll container
+    observer.observe(wrapper);
     return () => observer.disconnect();
-  }, [lineHeight, minimumRows, store]);
+  }, [lineHeight, store]);
 
   useEffect(() => {
     const element = containerRef.current;
@@ -231,7 +256,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   }, [status]);
 
   return (
-    <div className={wrapperClasses}>
+    <div ref={wrapperRef} className={wrapperClasses}>
       <div className="pointer-events-none absolute inset-0">
         <div className="absolute inset-x-0 top-0 h-28 bg-gradient-to-b from-white/12 via-white/0 to-transparent opacity-20" aria-hidden />
         <div className="absolute inset-0 rounded-[22px] ring-1 ring-[#1f2736]/60" aria-hidden />
@@ -285,9 +310,6 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           lineHeight: `${lineHeight}px`,
           letterSpacing: '0.01em',
           fontVariantLigatures: 'none',
-          minHeight: lineHeight * Math.max(1, minimumRows),
-          height: '100%',
-          maxHeight: '100%',
         }}
       >
         {showIdlePlaceholder ? (
@@ -314,11 +336,23 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       snapshot.baseRow + Math.floor(element.scrollTop / lineHeight),
     );
     const measuredRows = Math.max(1, Math.floor(element.clientHeight / lineHeight));
-    const viewportRows = Math.max(minimumRows, measuredRows);
+    const viewportRows = Math.max(1, Math.min(measuredRows, MAX_VIEWPORT_ROWS));
     const maxTop = Math.max(snapshot.baseRow, snapshot.baseRow + totalRows - viewportRows);
     const clampedTop = Math.min(approxRow, maxTop);
 
     store.setViewport(clampedTop, viewportRows);
+    if (import.meta.env.DEV) {
+      console.debug('[beach-web] scroll', {
+        scrollTop: element.scrollTop,
+        clientHeight: element.clientHeight,
+        scrollHeight: element.scrollHeight,
+        measuredRows,
+        viewportRows,
+        baseRow: snapshot.baseRow,
+        totalRows,
+        clampedTop,
+      });
+    }
 
     const nearBottom = element.scrollHeight - (element.scrollTop + element.clientHeight) < lineHeight * 2;
     store.setFollowTail(nearBottom);
@@ -367,8 +401,29 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       case 'grid':
         store.setBaseRow(frame.baseRow);
         store.setGridSize(frame.historyRows, frame.cols);
-        store.setViewport(0, frame.viewportRows);
-        setMinimumRows(frame.viewportRows);
+        {
+          const historyEnd = frame.baseRow + frame.historyRows;
+          const deviceViewport = Math.max(
+            1,
+            Math.min(lastMeasuredViewportRows.current, MAX_VIEWPORT_ROWS),
+          );
+          const viewportTop = Math.max(historyEnd - deviceViewport, frame.baseRow);
+          store.setViewport(viewportTop, deviceViewport);
+          if (lastSentViewportRows.current === 0) {
+            lastSentViewportRows.current = deviceViewport;
+          }
+          suppressNextResizeRef.current = true;
+          if (import.meta.env.DEV) {
+            console.debug('[beach-web] grid frame', {
+              baseRow: frame.baseRow,
+              historyRows: frame.historyRows,
+              cols: frame.cols,
+              serverViewport: frame.viewportRows ?? null,
+              deviceViewport,
+              viewportTop,
+            });
+          }
+        }
         break;
       case 'snapshot':
       case 'delta':
@@ -377,7 +432,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         if (import.meta.env.DEV) {
           console.debug('[beach-web][updates]', frame.type, frame.updates);
         }
-        store.applyUpdates(frame.updates, authoritative);
+        store.applyUpdates(frame.updates, authoritative, frame.type);
         if (import.meta.env.DEV) {
           const debugRows = store
             .getSnapshot()
@@ -519,6 +574,9 @@ function sendFrame(transport: TerminalTransport, frame: ClientFrame): void {
 }
 
 function sendResize(transport: TerminalTransport, cols: number, rows: number): void {
+  if (import.meta.env.DEV) {
+    console.debug('[beach-web] sending resize', { cols, rows });
+  }
   transport.send({ type: 'resize', cols, rows });
 }
 

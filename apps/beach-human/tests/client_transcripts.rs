@@ -50,10 +50,10 @@ async fn client_replays_basic_snapshot() {
     send_host_frame(
         &*server,
         HostFrame::Grid {
-            viewport_rows: 4,
             cols: 10,
             history_rows: 4,
             base_row: 0,
+            viewport_rows: Some(4),
         },
     );
     send_host_frame(
@@ -133,10 +133,10 @@ async fn client_applies_deltas() {
     send_host_frame(
         &*server,
         HostFrame::Grid {
-            viewport_rows: 2,
             cols: 5,
             history_rows: 2,
             base_row: 0,
+            viewport_rows: Some(2),
         },
     );
     send_host_frame(
@@ -213,10 +213,10 @@ async fn client_emits_input_events() {
     send_host_frame(
         &*server,
         HostFrame::Grid {
-            viewport_rows: 1,
             cols: 5,
             history_rows: 1,
             base_row: 0,
+            viewport_rows: Some(1),
         },
     );
 
@@ -273,10 +273,10 @@ async fn client_requests_backfill_and_hydrates_rows() {
     send_host_frame(
         &*server,
         HostFrame::Grid {
-            viewport_rows: 4,
             cols: 6,
             history_rows: 4,
             base_row: 0,
+            viewport_rows: Some(4),
         },
     );
     send_host_frame(
@@ -418,10 +418,10 @@ async fn client_requests_backfill_uses_session_rows() {
     send_host_frame(
         &*server,
         HostFrame::Grid {
-            viewport_rows: 400,
             cols: 80,
             history_rows: 400,
             base_row: 0,
+            viewport_rows: Some(400),
         },
     );
     send_host_frame(
@@ -533,10 +533,10 @@ async fn client_requests_history_after_delta_when_handshake_empty() {
     send_host_frame(
         &*server,
         HostFrame::Grid {
-            viewport_rows: 24,
             cols: 80,
             history_rows: 24,
             base_row: 0,
+            viewport_rows: Some(24),
         },
     );
     // Simulate an empty snapshot handshake.
@@ -652,10 +652,10 @@ async fn client_retries_history_when_initial_backfill_empty() {
     send_host_frame(
         &*server,
         HostFrame::Grid {
-            viewport_rows: 24,
             cols: 80,
             history_rows: 24,
             base_row: 0,
+            viewport_rows: Some(24),
         },
     );
     send_host_frame(
@@ -805,10 +805,10 @@ async fn client_targets_tail_history_after_large_delta() {
     send_host_frame(
         &*server,
         HostFrame::Grid {
-            viewport_rows: 400,
             cols: 80,
             history_rows: 400,
             base_row: 0,
+            viewport_rows: Some(400),
         },
     );
     // Provide a minimal snapshot so the renderer seeds a baseline but leaves most rows pending.
@@ -999,10 +999,10 @@ async fn client_marks_empty_backfill_as_missing() {
     send_host_frame(
         &*server,
         HostFrame::Grid {
-            viewport_rows: 200,
             cols: 80,
             history_rows: 200,
             base_row: 0,
+            viewport_rows: Some(200),
         },
     );
     send_host_frame(
@@ -1145,10 +1145,10 @@ async fn client_recovers_truncated_history_after_tail_burst() {
     send_host_frame(
         &*server,
         HostFrame::Grid {
-            viewport_rows: 400,
             cols: 80,
             history_rows: 400,
             base_row: 0,
+            viewport_rows: Some(400),
         },
     );
 
@@ -1394,10 +1394,10 @@ async fn client_resolves_missing_rows_after_empty_backfill() {
     send_host_frame(
         &*server,
         HostFrame::Grid {
-            viewport_rows: 6,
             cols: 8,
             history_rows: 6,
             base_row: 0,
+            viewport_rows: Some(6),
         },
     );
     send_host_frame(
@@ -1533,10 +1533,10 @@ async fn client_handles_binary_snapshot_and_delta() {
     send_host_frame(
         &*server,
         HostFrame::Grid {
-            viewport_rows: 4,
             cols: 10,
             history_rows: 4,
             base_row: 0,
+            viewport_rows: Some(4),
         },
     );
     send_host_frame(

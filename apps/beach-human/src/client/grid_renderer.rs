@@ -122,6 +122,14 @@ struct CachedStyle {
     style: Style,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GridUpdateDebugContext {
+    frame: &'static str,
+    update: &'static str,
+    row: Option<u64>,
+    seq: Option<Seq>,
+}
+
 #[derive(Clone)]
 struct RowState {
     cells: Vec<CellState>,
@@ -163,6 +171,7 @@ pub struct GridRenderer {
     predictions: HashMap<(u64, usize), PredictedCell>,
     status_message: Option<String>,
     styles: HashMap<u32, CachedStyle>,
+    debug_context: Option<GridUpdateDebugContext>,
 }
 
 impl GridRenderer {
@@ -180,6 +189,7 @@ impl GridRenderer {
             predictions: HashMap::new(),
             status_message: None,
             styles: HashMap::new(),
+            debug_context: None,
         };
         renderer.styles.insert(
             StyleId::DEFAULT.0,
@@ -311,8 +321,31 @@ impl GridRenderer {
         if rel >= self.rows.len() {
             return None;
         }
-        if !matches!(self.rows[rel], RowSlot::Loaded(_)) {
+        let created = !matches!(self.rows[rel], RowSlot::Loaded(_));
+        if created {
             self.rows[rel] = RowSlot::Loaded(RowState::new(self.cols));
+            if tracing::enabled!(Level::TRACE) {
+                let absolute_row = self.base_row + rel as u64;
+                if let Some(ctx) = &self.debug_context {
+                    trace!(
+                        target = "client::cache",
+                        frame = ctx.frame,
+                        update = ctx.update,
+                        row = ctx.row.unwrap_or(absolute_row),
+                        seq = ctx.seq,
+                        absolute_row,
+                        base_row = self.base_row,
+                        "created loaded row"
+                    );
+                } else {
+                    trace!(
+                        target = "client::cache",
+                        absolute_row,
+                        base_row = self.base_row,
+                        "created loaded row"
+                    );
+                }
+            }
         }
         match &mut self.rows[rel] {
             RowSlot::Loaded(state) => {
@@ -321,6 +354,25 @@ impl GridRenderer {
             }
             _ => None,
         }
+    }
+
+    pub fn set_debug_update_context(
+        &mut self,
+        frame: &'static str,
+        update: &'static str,
+        row: Option<u64>,
+        seq: Option<Seq>,
+    ) {
+        self.debug_context = Some(GridUpdateDebugContext {
+            frame,
+            update,
+            row,
+            seq,
+        });
+    }
+
+    pub fn clear_debug_update_context(&mut self) {
+        self.debug_context = None;
     }
 
     pub fn apply_cell(
@@ -994,10 +1046,16 @@ impl GridRenderer {
         }
     }
 
-    fn has_pending_rows(&self) -> bool {
+    pub fn has_pending_rows(&self) -> bool {
         self.rows
             .iter()
             .any(|slot| matches!(slot, RowSlot::Pending))
+    }
+
+    pub fn has_missing_rows(&self) -> bool {
+        self.rows
+            .iter()
+            .any(|slot| matches!(slot, RowSlot::Missing))
     }
 
     pub fn first_unloaded_range(&self, lookaround: usize) -> Option<(u64, u32)> {
@@ -1014,10 +1072,7 @@ impl GridRenderer {
         for offset in 0..=span {
             let absolute = start.saturating_add(offset as u64);
             if let Some(rel) = self.relative_row(absolute) {
-                let loaded = matches!(
-                    self.rows.get(rel),
-                    Some(RowSlot::Loaded(_)) | Some(RowSlot::Missing)
-                );
+                let loaded = matches!(self.rows.get(rel), Some(RowSlot::Loaded(_)));
                 if !loaded {
                     if pending_start.is_none() {
                         pending_start = Some(absolute);

@@ -75,10 +75,10 @@ export type HostFrame =
     }
   | {
       type: 'grid';
-      viewportRows: number;
       cols: number;
       historyRows: number;
       baseRow: number;
+      viewportRows?: number;
     }
   | {
       type: 'snapshot';

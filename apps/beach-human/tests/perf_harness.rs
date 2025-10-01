@@ -24,10 +24,10 @@ fn report_binary_vs_json_payload_sizes() {
             config: sync_config.clone(),
         },
         HostFrame::Grid {
-            viewport_rows: 24,
             cols: 80,
             history_rows: 24,
             base_row: 0,
+            viewport_rows: None,
         },
         HostFrame::Snapshot {
             subscription: 1,

@@ -80,10 +80,10 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
     send_host_frame(
         host_transport.as_ref(),
         HostFrame::Grid {
-            viewport_rows: rows as u32,
             cols: cols as u32,
             history_rows: rows as u32,
             base_row: grid.row_offset(),
+            viewport_rows: None,
         },
     );
 
@@ -136,10 +136,10 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
         match frame {
             HostFrame::Hello { .. } => {}
             HostFrame::Grid {
-                viewport_rows: _viewport,
                 cols,
                 history_rows,
                 base_row: _,
+                viewport_rows: _,
             } => {
                 client_view = Some(ClientGrid::new(history_rows as usize, cols as usize));
             }

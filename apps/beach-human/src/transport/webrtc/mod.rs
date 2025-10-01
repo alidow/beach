@@ -794,10 +794,12 @@ async fn negotiate_offerer_peer(
     );
     let api = build_api(setting)?;
     let mut config = RTCConfiguration::default();
-    config.ice_servers = vec![webrtc::ice_transport::ice_server::RTCIceServer {
-        urls: vec!["stun:stun.l.google.com:19302".to_string()],
-        ..Default::default()
-    }];
+    if std::env::var("BEACH_WEBRTC_DISABLE_STUN").is_err() {
+        config.ice_servers = vec![webrtc::ice_transport::ice_server::RTCIceServer {
+            urls: vec!["stun:stun.l.google.com:19302".to_string()],
+            ..Default::default()
+        }];
+    }
 
     let pc = Arc::new(
         api.new_peer_connection(config)
@@ -1269,10 +1271,12 @@ async fn connect_answerer(
     // Without this, host-only candidates can fail in common NAT setups where the
     // browser uses mDNS/srflx and the offerer has no reflexive candidates.
     let mut config = RTCConfiguration::default();
-    config.ice_servers = vec![webrtc::ice_transport::ice_server::RTCIceServer {
-        urls: vec!["stun:stun.l.google.com:19302".to_string()],
-        ..Default::default()
-    }];
+    if std::env::var("BEACH_WEBRTC_DISABLE_STUN").is_err() {
+        config.ice_servers = vec![webrtc::ice_transport::ice_server::RTCIceServer {
+            urls: vec!["stun:stun.l.google.com:19302".to_string()],
+            ..Default::default()
+        }];
+    }
 
     tracing::debug!(
         target = "beach_human::transport::webrtc",

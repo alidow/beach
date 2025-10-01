@@ -830,6 +830,10 @@ fn detect_terminal_size() -> (u16, u16) {
 
 const MAX_BACKFILL_ROWS_PER_REQUEST: u32 = 256;
 const SERVER_BACKFILL_CHUNK_ROWS: u32 = 64;
+const MAX_TRANSPORT_FRAME_BYTES: usize = 48 * 1024;
+const MAX_UPDATES_PER_FRAME: usize = 64;
+const MAX_PTY_COLS: u16 = 200;
+const MAX_PTY_ROWS: u16 = 200;
 const SERVER_BACKFILL_THROTTLE: Duration = Duration::from_millis(50);
 
 struct BackfillChunk {
@@ -1008,6 +1012,15 @@ fn host_frame_label(frame: &HostFrame) -> &'static str {
     }
 }
 
+fn client_frame_label(frame: &WireClientFrame) -> &'static str {
+    match frame {
+        WireClientFrame::Input { .. } => "input",
+        WireClientFrame::Resize { .. } => "resize",
+        WireClientFrame::RequestBackfill { .. } => "request_backfill",
+        WireClientFrame::Unknown => "unknown",
+    }
+}
+
 fn send_host_frame(transport: &Arc<dyn Transport>, frame: HostFrame) -> Result<(), TransportError> {
     let encode_start = Instant::now();
     let frame_label = host_frame_label(&frame);
@@ -1065,17 +1078,183 @@ fn send_host_frame(transport: &Arc<dyn Transport>, frame: HostFrame) -> Result<(
         HostFrame::Delta { .. } => telemetry::record_duration("sync_encode_delta", elapsed),
         _ => telemetry::record_duration("sync_encode_frame", elapsed),
     }
-    transport.send_bytes(&bytes).map(|_| ()).map_err(|err| {
-        debug!(
+    match transport.send_bytes(&bytes) {
+        Ok(sequence) => {
+            if tracing::enabled!(Level::TRACE) {
+                trace!(
+                    target = "sync::transport",
+                    transport_id = transport.id().0,
+                    transport = ?transport.kind(),
+                    frame = frame_label,
+                    payload_len = bytes.len(),
+                    sequence,
+                    "host frame sent"
+                );
+            }
+            Ok(())
+        }
+        Err(err) => {
+            debug!(
+                target = "sync::transport",
+                transport_id = transport.id().0,
+                transport = ?transport.kind(),
+                frame = frame_label,
+                error = %err,
+                "failed to send host frame"
+            );
+            Err(err)
+        }
+    }
+}
+
+fn send_snapshot_frames_chunked(
+    transport: &Arc<dyn Transport>,
+    subscription: SubscriptionId,
+    lane: PriorityLane,
+    watermark: Seq,
+    has_more: bool,
+    updates: Vec<WireUpdate>,
+) -> Result<(), TransportError> {
+    let wire_lane = map_lane(lane);
+    send_chunked_updates(
+        transport,
+        updates,
+        has_more,
+        |chunk_updates, chunk_has_more| HostFrame::Snapshot {
+            subscription: subscription.0,
+            lane: wire_lane,
+            watermark,
+            has_more: chunk_has_more,
+            updates: chunk_updates,
+        },
+    )
+}
+
+fn send_delta_frames_chunked(
+    transport: &Arc<dyn Transport>,
+    subscription: SubscriptionId,
+    watermark: Seq,
+    has_more: bool,
+    updates: Vec<WireUpdate>,
+) -> Result<(), TransportError> {
+    send_chunked_updates(
+        transport,
+        updates,
+        has_more,
+        |chunk_updates, chunk_has_more| HostFrame::Delta {
+            subscription: subscription.0,
+            watermark,
+            has_more: chunk_has_more,
+            updates: chunk_updates,
+        },
+    )
+}
+
+fn send_chunked_updates<F>(
+    transport: &Arc<dyn Transport>,
+    updates: Vec<WireUpdate>,
+    final_has_more: bool,
+    mut build_frame: F,
+) -> Result<(), TransportError>
+where
+    F: FnMut(Vec<WireUpdate>, bool) -> HostFrame,
+{
+    if updates.is_empty() {
+        let frame = build_frame(Vec::new(), final_has_more);
+        return send_host_frame(transport, frame);
+    }
+
+    let mut remaining: VecDeque<WireUpdate> = updates.into();
+    let mut chunk: Vec<WireUpdate> = Vec::new();
+
+    while let Some(update) = remaining.pop_front() {
+        chunk.push(update);
+        loop {
+            let more_updates_pending = !remaining.is_empty();
+            let chunk_has_more = more_updates_pending || final_has_more;
+            let frame = build_frame(chunk.clone(), chunk_has_more);
+            let encoded_len = protocol::encode_host_frame_binary(&frame).len();
+
+            if encoded_len > MAX_TRANSPORT_FRAME_BYTES && chunk.len() > 1 {
+                let overflow = chunk.pop().expect("chunk entry exists");
+                let chunk_frame = build_frame(chunk.clone(), true);
+                let chunk_len = protocol::encode_host_frame_binary(&chunk_frame).len();
+                trace!(
+                    target = "sync::transport",
+                    chunk_updates = chunk.len(),
+                    encoded_len = chunk_len,
+                    limit = MAX_TRANSPORT_FRAME_BYTES,
+                    "sending chunked host frame"
+                );
+                send_host_frame(transport, chunk_frame)?;
+                chunk.clear();
+                chunk.push(overflow);
+                continue;
+            }
+
+            if encoded_len > MAX_TRANSPORT_FRAME_BYTES {
+                trace!(
+                    target = "sync::transport",
+                    chunk_updates = chunk.len(),
+                    encoded_len,
+                    limit = MAX_TRANSPORT_FRAME_BYTES,
+                    "sending oversized single-update frame"
+                );
+                send_host_frame(transport, frame)?;
+                chunk.clear();
+                break;
+            }
+
+            if chunk.len() >= MAX_UPDATES_PER_FRAME {
+                trace!(
+                    target = "sync::transport",
+                    chunk_updates = chunk.len(),
+                    encoded_len,
+                    limit = MAX_TRANSPORT_FRAME_BYTES,
+                    "sending chunked host frame"
+                );
+                send_host_frame(transport, frame)?;
+                chunk.clear();
+                break;
+            }
+
+            if !more_updates_pending {
+                let final_frame = build_frame(chunk.clone(), final_has_more);
+                let final_len = protocol::encode_host_frame_binary(&final_frame).len();
+                trace!(
+                    target = "sync::transport",
+                    chunk_updates = chunk.len(),
+                    encoded_len = final_len,
+                    limit = MAX_TRANSPORT_FRAME_BYTES,
+                    "sending final chunked host frame"
+                );
+                send_host_frame(transport, final_frame)?;
+                chunk.clear();
+                break;
+            }
+
+            break;
+        }
+
+        if chunk.is_empty() {
+            continue;
+        }
+    }
+
+    if !chunk.is_empty() {
+        let final_frame = build_frame(chunk.clone(), final_has_more);
+        let encoded_len = protocol::encode_host_frame_binary(&final_frame).len();
+        trace!(
             target = "sync::transport",
-            transport_id = transport.id().0,
-            transport = ?transport.kind(),
-            frame = frame_label,
-            error = %err,
-            "failed to send host frame"
+            chunk_updates = chunk.len(),
+            encoded_len,
+            limit = MAX_TRANSPORT_FRAME_BYTES,
+            "sending trailing chunked host frame"
         );
-        err
-    })
+        send_host_frame(transport, final_frame)?;
+    }
+
+    Ok(())
 }
 
 struct SharedTransport {
@@ -1299,155 +1478,203 @@ fn spawn_input_listener(
         let mut fatal_error = false;
         loop {
             match transport.recv(Duration::from_millis(250)) {
-                Ok(message) => match message.payload {
-                    Payload::Binary(bytes) => match protocol::decode_client_frame_binary(&bytes) {
-                        Ok(WireClientFrame::Input { seq, data }) => {
-                            if seq <= last_seq {
+                Ok(message) => {
+                    let transport_sequence = message.sequence;
+                    match message.payload {
+                        Payload::Binary(bytes) => {
+                            match protocol::decode_client_frame_binary(&bytes) {
+                                Ok(frame) => {
+                                    if tracing::enabled!(Level::TRACE) {
+                                        trace!(
+                                            target = "sync::incoming",
+                                            transport_id,
+                                            transport = ?transport_kind,
+                                            transport_sequence,
+                                            frame = client_frame_label(&frame),
+                                            payload_len = bytes.len(),
+                                            "received client frame"
+                                        );
+                                    }
+                                    match frame {
+                                        WireClientFrame::Input { seq, data } => {
+                                            if seq <= last_seq {
+                                                trace!(
+                                                    target = "sync::incoming",
+                                                    transport_id,
+                                                    transport = ?transport_kind,
+                                                    seq,
+                                                    "dropping duplicate input sequence"
+                                                );
+                                                continue;
+                                            }
+                                            if let Err(err) = writer.write(&data) {
+                                                error!(
+                                                    target = "sync::incoming",
+                                                    transport_id,
+                                                    transport = ?transport_kind,
+                                                    seq,
+                                                    error = %err,
+                                                    "pty write failed"
+                                                );
+                                                break;
+                                            }
+                                            if tracing::enabled!(Level::TRACE) {
+                                                trace!(
+                                                    target = "sync::incoming",
+                                                    transport_id,
+                                                    transport = ?transport_kind,
+                                                    seq,
+                                                    bytes = data.len(),
+                                                    dump = %logctl::hexdump(&data),
+                                                    "client input bytes"
+                                                );
+                                            }
+                                            last_seq = seq;
+                                            let _ = send_host_frame(
+                                                &transport,
+                                                HostFrame::InputAck { seq },
+                                            );
+                                            debug!(
+                                                target = "sync::incoming",
+                                                transport_id,
+                                                transport = ?transport_kind,
+                                                seq,
+                                                "input applied and acked"
+                                            );
+                                        }
+                                        WireClientFrame::Resize { cols, rows } => {
+                                            let clamped_cols = cols.min(MAX_PTY_COLS);
+                                            let clamped_rows = rows.min(MAX_PTY_ROWS);
+                                            if cols != clamped_cols || rows != clamped_rows {
+                                                trace!(
+                                                    target = "sync::incoming",
+                                                    transport_id,
+                                                    transport = ?transport_kind,
+                                                    requested_cols = cols,
+                                                    requested_rows = rows,
+                                                    clamped_cols,
+                                                    clamped_rows,
+                                                    "clamped resize request"
+                                                );
+                                            }
+                                            if let Err(err) =
+                                                process.resize(clamped_cols, clamped_rows)
+                                            {
+                                                warn!(
+                                                    target = "sync::incoming",
+                                                    transport_id,
+                                                    transport = ?transport_kind,
+                                                    error = %err,
+                                                    cols = clamped_cols,
+                                                    rows = clamped_rows,
+                                                    "pty resize failed"
+                                                );
+                                            }
+                                            if let Ok(mut guard) = emulator.lock() {
+                                                guard.resize(
+                                                    clamped_rows as usize,
+                                                    clamped_cols as usize,
+                                                );
+                                            }
+                                            grid.set_viewport_size(
+                                                clamped_rows as usize,
+                                                clamped_cols as usize,
+                                            );
+                                            let history_rows = grid.rows();
+                                            let _ = send_host_frame(
+                                                &transport,
+                                                HostFrame::Grid {
+                                                    cols: clamped_cols as u32,
+                                                    history_rows: history_rows as u32,
+                                                    base_row: grid.row_offset(),
+                                                    viewport_rows: Some(clamped_rows as u32),
+                                                },
+                                            );
+                                            debug!(
+                                                target = "sync::incoming",
+                                                transport_id,
+                                                transport = ?transport_kind,
+                                                cols = clamped_cols,
+                                                rows = clamped_rows,
+                                                "processed resize request"
+                                            );
+                                        }
+                                        WireClientFrame::RequestBackfill {
+                                            subscription,
+                                            request_id,
+                                            start_row,
+                                            count,
+                                        } => {
+                                            let capped = count.min(MAX_BACKFILL_ROWS_PER_REQUEST);
+                                            if capped == 0 {
+                                                continue;
+                                            }
+                                            if let Err(err) = backfill_tx.send(BackfillCommand {
+                                                transport_id: transport.id(),
+                                                subscription,
+                                                request_id,
+                                                start_row,
+                                                count: capped,
+                                            }) {
+                                                warn!(
+                                                    target = "sync::incoming",
+                                                    transport_id,
+                                                    transport = ?transport_kind,
+                                                    request_id,
+                                                    error = %err,
+                                                    "failed to enqueue backfill request"
+                                                );
+                                            } else {
+                                                trace!(
+                                                    target = "sync::incoming",
+                                                    transport_id,
+                                                    transport = ?transport_kind,
+                                                    request_id,
+                                                    start_row,
+                                                    requested = count,
+                                                    enqueued = capped,
+                                                    "queued history backfill request"
+                                                );
+                                            }
+                                        }
+                                        WireClientFrame::Unknown => {}
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        target = "sync::incoming",
+                                        transport_id,
+                                        transport = ?transport_kind,
+                                        transport_sequence,
+                                        error = %err,
+                                        "failed to decode client frame"
+                                    );
+                                }
+                            }
+                        }
+                        Payload::Text(text) => {
+                            let trimmed = text.trim();
+                            if trimmed == "__ready__" || trimmed == "__offer_ready__" {
                                 trace!(
                                     target = "sync::incoming",
                                     transport_id,
                                     transport = ?transport_kind,
-                                    seq,
-                                    "dropping duplicate input sequence"
-                                );
-                                continue;
-                            }
-                            if let Err(err) = writer.write(&data) {
-                                error!(
-                                    target = "sync::incoming",
-                                    transport_id,
-                                    transport = ?transport_kind,
-                                    seq,
-                                    error = %err,
-                                    "pty write failed"
-                                );
-                                break;
-                            }
-                            if tracing::enabled!(Level::TRACE) {
-                                trace!(
-                                    target = "sync::incoming",
-                                    transport_id,
-                                    transport = ?transport_kind,
-                                    seq,
-                                    bytes = data.len(),
-                                    dump = %logctl::hexdump(&data),
-                                    "client input bytes"
-                                );
-                            }
-                            last_seq = seq;
-                            let _ = send_host_frame(&transport, HostFrame::InputAck { seq });
-                            debug!(
-                                target = "sync::incoming",
-                                transport_id,
-                                transport = ?transport_kind,
-                                seq,
-                                "input applied and acked"
-                            );
-                        }
-                        Ok(WireClientFrame::Resize { cols, rows }) => {
-                            if let Err(err) = process.resize(cols, rows) {
-                                warn!(
-                                    target = "sync::incoming",
-                                    transport_id,
-                                    transport = ?transport_kind,
-                                    error = %err,
-                                    cols,
-                                    rows,
-                                    "pty resize failed"
-                                );
-                            }
-                            if let Ok(mut guard) = emulator.lock() {
-                                guard.resize(rows as usize, cols as usize);
-                            }
-                            grid.set_viewport_size(rows as usize, cols as usize);
-                            let history_rows = grid.rows();
-                            let _ = send_host_frame(
-                                &transport,
-                                HostFrame::Grid {
-                                    viewport_rows: rows as u32,
-                                    cols: cols as u32,
-                                    history_rows: history_rows as u32,
-                                    base_row: grid.row_offset(),
-                                },
-                            );
-                            debug!(
-                                target = "sync::incoming",
-                                transport_id,
-                                transport = ?transport_kind,
-                                cols,
-                                rows,
-                                "processed resize request"
-                            );
-                        }
-                        Ok(WireClientFrame::RequestBackfill {
-                            subscription,
-                            request_id,
-                            start_row,
-                            count,
-                        }) => {
-                            let capped = count.min(MAX_BACKFILL_ROWS_PER_REQUEST);
-                            if capped == 0 {
-                                continue;
-                            }
-                            if let Err(err) = backfill_tx.send(BackfillCommand {
-                                transport_id: transport.id(),
-                                subscription,
-                                request_id,
-                                start_row,
-                                count: capped,
-                            }) {
-                                warn!(
-                                    target = "sync::incoming",
-                                    transport_id,
-                                    transport = ?transport_kind,
-                                    request_id,
-                                    error = %err,
-                                    "failed to enqueue backfill request"
+                                    transport_sequence,
+                                    "ignoring handshake sentinel"
                                 );
                             } else {
-                                trace!(
+                                debug!(
                                     target = "sync::incoming",
                                     transport_id,
                                     transport = ?transport_kind,
-                                    request_id,
-                                    start_row,
-                                    requested = count,
-                                    enqueued = capped,
-                                    "queued history backfill request"
+                                    transport_sequence,
+                                    payload = %trimmed,
+                                    "ignoring unexpected text payload"
                                 );
                             }
                         }
-                        Ok(WireClientFrame::Unknown) => {}
-                        Err(err) => {
-                            warn!(
-                                target = "sync::incoming",
-                                transport_id,
-                                transport = ?transport_kind,
-                                error = %err,
-                                "failed to decode client frame"
-                            );
-                        }
-                    },
-                    Payload::Text(text) => {
-                        let trimmed = text.trim();
-                        if trimmed == "__ready__" || trimmed == "__offer_ready__" {
-                            trace!(
-                                target = "sync::incoming",
-                                transport_id,
-                                transport = ?transport_kind,
-                                "ignoring handshake sentinel"
-                            );
-                        } else {
-                            debug!(
-                                target = "sync::incoming",
-                                transport_id,
-                                transport = ?transport_kind,
-                                payload = %trimmed,
-                                "ignoring unexpected text payload"
-                            );
-                        }
                     }
-                },
+                }
                 Err(TransportError::Timeout) => continue,
                 Err(TransportError::ChannelClosed) => {
                     channel_closed = true;
@@ -2194,14 +2421,12 @@ fn spawn_update_forwarder(
                                     telemetry::record_gauge("sync_delta_batch_updates", batch.updates.len() as u64);
                                     let converted_updates = sink.cache.apply_updates(&batch.updates, true);
                                     let _guard = PerfGuard::new("sync_send_delta");
-                                    match send_host_frame(
+                                    match send_delta_frames_chunked(
                                         &sink.transport,
-                                        HostFrame::Delta {
-                                            subscription: batch.subscription_id.0,
-                                            watermark: batch.watermark.0,
-                                            has_more: batch.has_more,
-                                            updates: converted_updates,
-                                        },
+                                        batch.subscription_id,
+                                        batch.watermark.0,
+                                        batch.has_more,
+                                        converted_updates,
                                     ) {
                                         Ok(()) => {
                                             sink.last_seq = batch.watermark.0;
@@ -2518,10 +2743,10 @@ fn initialize_transport_snapshot(
     send_host_frame(
         transport,
         HostFrame::Grid {
-            viewport_rows: viewport_rows as u32,
             cols: cols as u32,
             history_rows: history_rows as u32,
             base_row: terminal_sync.grid().row_offset(),
+            viewport_rows: None,
         },
     )?;
     transmit_initial_snapshots(transport, &mut synchronizer, cache, subscription)?;
@@ -2585,17 +2810,14 @@ fn transmit_initial_snapshots(
                 updates = chunk.updates.len(),
                 "sending snapshot chunk"
             );
-            let lane_copy = lane;
             let updates = cache.apply_updates(&chunk.updates, false);
-            send_host_frame(
+            send_snapshot_frames_chunked(
                 transport,
-                HostFrame::Snapshot {
-                    subscription: chunk.subscription_id.0,
-                    lane: map_lane(lane_copy),
-                    watermark: chunk.watermark.0,
-                    has_more: chunk.has_more,
-                    updates,
-                },
+                chunk.subscription_id,
+                lane,
+                chunk.watermark.0,
+                chunk.has_more,
+                updates,
             )?;
             if !chunk.has_more {
                 debug!(
@@ -3016,12 +3238,15 @@ mod tests {
 
             match recv_host_frame_async(&client, StdDuration::from_secs(5)).await {
                 WireHostFrame::Grid {
-                    viewport_rows: grid_rows,
                     cols: grid_cols,
                     history_rows,
                     base_row,
+                    viewport_rows,
                 } => {
-                    assert_eq!(grid_rows as usize, rows);
+                    assert!(
+                        viewport_rows.is_none(),
+                        "handshake should not advertise viewport rows"
+                    );
                     assert_eq!(grid_cols as usize, cols);
                     assert!(
                         history_rows as usize >= rows,
@@ -3360,10 +3585,10 @@ mod tests {
         send_host_frame(
             host_transport.as_ref(),
             HostFrame::Grid {
-                viewport_rows: rows as u32,
                 cols: cols as u32,
                 history_rows: rows as u32,
                 base_row: grid.row_offset(),
+                viewport_rows: None,
             },
         );
         let mut cache = TransmitterCache::new();
@@ -3406,7 +3631,7 @@ mod tests {
     }
 
     #[test_timeout::tokio_timeout_test]
-    async fn handshake_advertises_viewport_height_even_with_history() {
+    async fn handshake_suppresses_viewport_height_even_with_history() {
         let viewport_rows = 24;
         let viewport_cols = 80;
         let grid = Arc::new(TerminalGrid::new(viewport_rows, viewport_cols));
@@ -3445,7 +3670,7 @@ mod tests {
         )
         .expect("handshake");
 
-        let mut advertised: Option<(u32, u32, u32, u64)> = None;
+        let mut advertised: Option<(Option<u32>, u32, u32, u64)> = None;
         for _ in 0..10 {
             match recv_host_frame(client_transport.as_ref(), StdDuration::from_millis(200)) {
                 WireHostFrame::Grid {
@@ -3471,7 +3696,7 @@ mod tests {
         }
 
         let (rows, cols, total, base_row) = advertised.expect("grid frame missing from handshake");
-        assert_eq!(rows as usize, viewport_rows, "handshake rows mismatch");
+        assert!(rows.is_none(), "handshake should not include viewport rows");
         assert_eq!(cols as usize, viewport_cols, "handshake cols mismatch");
         assert_eq!(total as usize, total_rows, "handshake history mismatch");
         assert_eq!(base_row, grid.row_offset(), "handshake base row mismatch");

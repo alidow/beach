@@ -91,11 +91,11 @@ export class TerminalGridStore {
     }
   }
 
-  applyUpdates(updates: Update[], authoritative = false): void {
+  applyUpdates(updates: Update[], authoritative = false, origin?: string): void {
     if (updates.length === 0) {
       return;
     }
-    if (this.cache.applyUpdates(updates, authoritative)) {
+    if (this.cache.applyUpdates(updates, authoritative, origin)) {
       this.invalidate();
       this.notify();
     }

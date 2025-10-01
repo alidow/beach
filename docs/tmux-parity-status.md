@@ -92,7 +92,7 @@ Before we touch the implementation, we can lock the behaviour in a unit-style in
 
 This keeps the regression self-contained: no subprocess spawn, just mocked PTY dimensions and the existing transport pair. Once the fix is in place the test will fail if someone accidentally reverts to using `grid().len()` for the handshake rows.
 
-**Status (implemented Sep 24):** The host now tracks `viewport_size` on `TerminalGrid`, `initialize_transport_snapshot` emits the PTY height/width instead of the scrollback span, and `spawn_input_listener` updates the viewport on every resize. The new `handshake_advertises_viewport_height_even_with_history` test drives the mocked transport pair and fails if the handshake ever regresses to the old behaviour.
+**Status (implemented Sep 24):** The host now tracks `viewport_size` on `TerminalGrid`, `initialize_transport_snapshot` emits the PTY height/width instead of the scrollback span, and `spawn_input_listener` updates the viewport on every resize. The new `handshake_suppresses_viewport_height_even_with_history` test drives the mocked transport pair and fails if the handshake ever regresses to the old behaviour.
 
 Follow-up fix: `GridRenderer::scroll_to_tail` now walks back from the last *loaded* row before positioning the viewport, so empty tail backfills can no longer leave the UI parked on a wall of `·` placeholders. The new `follow_tail_prefers_loaded_rows_after_empty_tail_backfill` test captures the regression.
 

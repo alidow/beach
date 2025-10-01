@@ -171,6 +171,7 @@ struct EmptyTailRange {
     end: u64,
     recorded_at: Instant,
     highest_at: Option<u64>,
+    retry_attempted: bool,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -214,6 +215,7 @@ pub struct TerminalClient {
     last_tail_backfill_start: Option<u64>,
     last_gap_backfill_start: Option<u64>,
     empty_tail_ranges: Vec<EmptyTailRange>,
+    last_backfill_trimmed: bool,
 }
 
 impl TerminalClient {
@@ -252,6 +254,7 @@ impl TerminalClient {
             last_tail_backfill_start: None,
             last_gap_backfill_start: None,
             empty_tail_ranges: Vec::new(),
+            last_backfill_trimmed: false,
         }
     }
 
@@ -395,25 +398,36 @@ impl TerminalClient {
                 self.last_tail_backfill_start = None;
                 self.last_gap_backfill_start = None;
                 self.empty_tail_ranges.clear();
+                self.last_backfill_trimmed = false;
                 self.handshake_snapshot_lines = config.initial_snapshot_lines;
                 self.handshake_history_rows = 0;
             }
             WireHostFrame::Grid {
-                viewport_rows,
                 cols,
                 history_rows,
-                ..
+                base_row: _,
+                viewport_rows,
             } => {
+                let local_viewport = self.renderer.viewport_height().max(1);
+                let visible_rows = if local_viewport > 0 {
+                    local_viewport
+                } else {
+                    viewport_rows.map(|rows| rows.max(1) as usize).unwrap_or(1)
+                };
                 trace!(
                     target = "client::render",
-                    viewport_rows, cols, history_rows, "grid handshake"
+                    server_viewport = ?viewport_rows,
+                    local_viewport,
+                    visible_rows,
+                    cols,
+                    history_rows,
+                    "grid handshake"
                 );
-                let total_rows = history_rows.max(viewport_rows) as usize;
+                let total_rows = history_rows.max(visible_rows as u32) as usize;
                 let cols = cols as usize;
                 self.renderer.ensure_size(total_rows, cols);
                 self.renderer.mark_dirty();
                 self.force_render = true;
-                let visible_rows = viewport_rows as usize;
                 self.cursor_row = visible_rows.saturating_sub(1);
                 self.cursor_col = 0;
                 self.renderer.clear_all_predictions();
@@ -425,7 +439,15 @@ impl TerminalClient {
             } => {
                 for update in &updates {
                     self.observe_update_bounds(update, true);
+                    let (update_kind, row_hint, seq_hint) = Self::update_debug_metadata(update);
+                    self.renderer.set_debug_update_context(
+                        "snapshot",
+                        update_kind,
+                        row_hint,
+                        seq_hint,
+                    );
                     self.apply_wire_update(update);
+                    self.renderer.clear_debug_update_context();
                 }
                 self.last_seq = cmp::max(self.last_seq, watermark);
                 self.force_render = true;
@@ -435,7 +457,15 @@ impl TerminalClient {
             } => {
                 for update in &updates {
                     self.observe_update_bounds(update, false);
+                    let (update_kind, row_hint, seq_hint) = Self::update_debug_metadata(update);
+                    self.renderer.set_debug_update_context(
+                        "delta",
+                        update_kind,
+                        row_hint,
+                        seq_hint,
+                    );
                     self.apply_wire_update(update);
+                    self.renderer.clear_debug_update_context();
                 }
                 self.last_seq = cmp::max(self.last_seq, watermark);
                 self.force_render = true;
@@ -540,26 +570,31 @@ impl TerminalClient {
             && self.pending_backfills.is_empty()
             && self.last_backfill_request_at.is_none()
             && self.next_backfill_request_id == 1
-            && self.renderer.total_rows() > self.renderer.viewport_height() as u64
+            && (self.renderer.total_rows() > self.renderer.viewport_height() as u64
+                || self.renderer.has_pending_rows()
+                || self.renderer.has_missing_rows())
             && self.handshake_history_rows > self.handshake_snapshot_lines as u64
         {
             if let Some((start, span)) = self.renderer.first_unloaded_range(BACKFILL_LOOKAHEAD_ROWS)
             {
                 let count = span.min(BACKFILL_MAX_ROWS_PER_REQUEST);
                 if count > 0 {
-                    self.send_backfill_request(subscription, start, count)?;
-                    self.last_backfill_request_at = Some(Instant::now());
+                    let end = start.saturating_add(count as u64);
+                    let overlaps_trimmed = self.empty_tail_ranges.iter().any(|range| {
+                        range.retry_attempted
+                            && Self::ranges_overlap(start, end, range.start, range.end)
+                    });
+                    let should_defer = self.should_defer_empty_retry(start, end);
+                    if !overlaps_trimmed && !should_defer && !self.is_range_pending(start, end) {
+                        self.send_backfill_request(subscription, start, count)?;
+                        self.last_backfill_request_at = Some(Instant::now());
+                    }
                 }
             }
             return Ok(());
         }
 
-        // Disable all backfill activity while following the live tail.
-        // Backfills will resume automatically once the user scrolls up
-        // (which flips follow_tail off via GridRenderer APIs).
-        if self.renderer.is_following_tail() {
-            return Ok(());
-        }
+        // Disable all backfill activity while following the live tail unless we detect gaps.
 
         if self.pending_backfills.is_empty() {
             if !self.renderer.is_following_tail() {
@@ -734,19 +769,37 @@ impl TerminalClient {
                 }
             }
         }
-        let capped = span.min(BACKFILL_MAX_ROWS_PER_REQUEST);
-        if capped == 0 {
-            return Ok(());
-        }
         let tail_hint = self
             .highest_loaded_row
             .map(|row| row.saturating_sub(BACKFILL_LOOKAHEAD_ROWS as u64));
-        let mut request_start = match (self.known_base_row, tail_hint) {
-            (Some(base), Some(tail)) => start.max(base).max(tail),
-            (Some(base), None) => start.max(base),
-            (None, Some(tail)) => start.max(tail),
-            (None, None) => start,
-        };
+        let mut request_start = start;
+        let mut request_span = span;
+        let mut matched_unretried_range = false;
+        if let Some(range) = self.empty_tail_ranges.iter().find(|range| {
+            !range.retry_attempted
+                && Self::ranges_overlap(
+                    start,
+                    start.saturating_add(span as u64),
+                    range.start,
+                    range.end,
+                )
+        }) {
+            request_start = range.start;
+            request_span = range.end.saturating_sub(range.start) as u32;
+            matched_unretried_range = true;
+        }
+        if !matched_unretried_range {
+            request_start = match (self.known_base_row, tail_hint) {
+                (Some(base), Some(tail)) => request_start.max(base).max(tail),
+                (Some(base), None) => request_start.max(base),
+                (None, Some(tail)) => request_start.max(tail),
+                (None, None) => request_start,
+            };
+        }
+        let capped = request_span.min(BACKFILL_MAX_ROWS_PER_REQUEST);
+        if capped == 0 {
+            return Ok(());
+        }
         if let (Some(base), Some(highest)) = (self.known_base_row, self.highest_loaded_row) {
             if base < highest && request_start > base {
                 if let Some((gap_start, _)) = self.renderer.first_gap_between(base, request_start) {
@@ -766,6 +819,13 @@ impl TerminalClient {
             }
         }
         let request_end = request_start.saturating_add(capped as u64);
+        let overlaps_trimmed = self.empty_tail_ranges.iter().any(|range| {
+            range.retry_attempted
+                && Self::ranges_overlap(request_start, request_end, range.start, range.end)
+        });
+        if overlaps_trimmed {
+            return Ok(());
+        }
         if self.should_defer_empty_retry(request_start, request_end) {
             return Ok(());
         }
@@ -791,7 +851,7 @@ impl TerminalClient {
             .any(|req| Self::ranges_overlap(start, end, req.start, req.end))
     }
 
-    fn record_empty_tail_range(&mut self, start: u64, end: u64) {
+    fn record_empty_tail_range(&mut self, start: u64, end: u64, trimmed: bool) {
         if start >= end {
             return;
         }
@@ -806,12 +866,16 @@ impl TerminalClient {
             range.end = range.end.max(end);
             range.recorded_at = Instant::now();
             range.highest_at = highest;
+            if trimmed {
+                range.retry_attempted = true;
+            }
         } else {
             self.empty_tail_ranges.push(EmptyTailRange {
                 start,
                 end,
                 recorded_at: Instant::now(),
                 highest_at: highest,
+                retry_attempted: trimmed,
             });
         }
         let known_base = self.known_base_row.unwrap_or(start);
@@ -838,7 +902,20 @@ impl TerminalClient {
             .find(|range| Self::ranges_overlap(start, end, range.start, range.end))
         {
             let now = Instant::now();
+            if !range.retry_attempted {
+                range.retry_attempted = true;
+                range.recorded_at = now;
+                return false;
+            }
+            if range.highest_at != self.highest_loaded_row {
+                range.recorded_at = now;
+                return false;
+            }
             let elapsed = now.duration_since(range.recorded_at);
+            if elapsed >= BACKFILL_MIN_INTERVAL {
+                range.recorded_at = now;
+                return false;
+            }
             trace!(
                 target = "client::backfill",
                 start,
@@ -846,7 +923,6 @@ impl TerminalClient {
                 elapsed_ms = elapsed.as_millis() as u64,
                 "deferring retry for empty tail range"
             );
-            range.recorded_at = now;
             true
         } else {
             false
@@ -920,6 +996,7 @@ impl TerminalClient {
             }
         }
         let mut touched_rows: Vec<u64> = Vec::new();
+        let mut observed_trim = false;
         for update in &updates {
             match update {
                 WireUpdate::Cell { row, .. }
@@ -934,9 +1011,20 @@ impl TerminalClient {
                         touched_rows.push(r);
                     }
                 }
-                WireUpdate::Trim { .. } | WireUpdate::Style { .. } => {}
+                WireUpdate::Trim { .. } => {
+                    observed_trim = true;
+                }
+                WireUpdate::Style { .. } => {}
             }
+            let (update_kind, row_hint, seq_hint) = Self::update_debug_metadata(update);
+            self.renderer.set_debug_update_context(
+                "history_backfill",
+                update_kind,
+                row_hint,
+                seq_hint,
+            );
             self.apply_wire_update(update);
+            self.renderer.clear_debug_update_context();
         }
         touched_rows.sort_unstable();
         touched_rows.dedup();
@@ -960,11 +1048,14 @@ impl TerminalClient {
         if !more {
             let end = start_row.saturating_add(count as u64);
             self.finalize_backfill_range(start_row, end, &touched_rows);
+            let trimmed = observed_trim || self.last_backfill_trimmed;
             if updates.is_empty() {
-                self.record_empty_tail_range(start_row, end);
+                self.record_empty_tail_range(start_row, end, trimmed);
             } else {
                 self.clear_empty_tail_ranges(start_row, end);
+                self.last_backfill_trimmed = false;
             }
+            self.last_backfill_trimmed = trimmed;
             self.last_backfill_request_at = None;
             if self
                 .last_tail_backfill_start
@@ -1022,6 +1113,19 @@ impl TerminalClient {
 
     fn ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
         a_start < b_end && b_start < a_end
+    }
+
+    fn update_debug_metadata(update: &WireUpdate) -> (&'static str, Option<u64>, Option<Seq>) {
+        match update {
+            WireUpdate::Cell { row, seq, .. } => ("cell", Some(*row as u64), Some(*seq)),
+            WireUpdate::Row { row, seq, .. } => ("row", Some(*row as u64), Some(*seq)),
+            WireUpdate::RowSegment { row, seq, .. } => {
+                ("row_segment", Some(*row as u64), Some(*seq))
+            }
+            WireUpdate::Rect { rows, seq, .. } => ("rect", Some(rows[0] as u64), Some(*seq)),
+            WireUpdate::Trim { start, .. } => ("trim", Some(*start as u64), None),
+            WireUpdate::Style { seq, .. } => ("style", None, Some(*seq)),
+        }
     }
 
     fn apply_wire_update(&mut self, update: &WireUpdate) {
@@ -3405,7 +3509,7 @@ mod tests {
             .expect("hello");
         client
             .handle_host_frame(WireHostFrame::Grid {
-                viewport_rows: 24,
+                viewport_rows: Some(24),
                 cols: 80,
                 history_rows: 600,
                 base_row: 0,
@@ -3597,7 +3701,7 @@ mod tests {
         send_frame(
             &server,
             HostFrame::Grid {
-                viewport_rows: 24,
+                viewport_rows: Some(24),
                 cols: 80,
                 history_rows: 600,
                 base_row: 0,
@@ -3732,7 +3836,7 @@ mod tests {
             .expect("hello");
         client
             .handle_host_frame(WireHostFrame::Grid {
-                viewport_rows: 58,
+                viewport_rows: Some(58),
                 cols: 80,
                 history_rows: 600,
                 base_row: 0,
@@ -4130,7 +4234,7 @@ mod tests {
             .expect("hello");
         client
             .handle_host_frame(WireHostFrame::Grid {
-                viewport_rows: 24,
+                viewport_rows: Some(24),
                 cols: 80,
                 history_rows: 24,
                 base_row: 0,
@@ -4223,7 +4327,7 @@ mod tests {
             .expect("hello");
         client
             .handle_host_frame(WireHostFrame::Grid {
-                viewport_rows: 24,
+                viewport_rows: Some(24),
                 cols: 80,
                 history_rows: 154,
                 base_row: 0,

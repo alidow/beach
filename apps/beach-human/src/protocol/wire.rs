@@ -81,13 +81,15 @@ pub fn encode_host_frame_binary(frame: &HostFrame) -> Vec<u8> {
             encode_sync_config(&mut buf, config);
         }
         HostFrame::Grid {
-            viewport_rows,
             cols,
             history_rows,
             base_row,
+            viewport_rows,
         } => {
             write_header(&mut buf, HOST_KIND_GRID);
-            write_var_u32(&mut buf, *viewport_rows);
+            if let Some(rows) = viewport_rows {
+                write_var_u32(&mut buf, *rows);
+            }
             write_var_u32(&mut buf, *cols);
             write_var_u32(&mut buf, *history_rows);
             write_var_u64(&mut buf, *base_row);
@@ -170,16 +172,30 @@ pub fn decode_host_frame_binary(bytes: &[u8]) -> Result<HostFrame, WireError> {
             })
         }
         HOST_KIND_GRID => {
-            let viewport_rows = cursor.read_var_u32()?;
+            let checkpoint = cursor;
             let cols = cursor.read_var_u32()?;
             let history_rows = cursor.read_var_u32()?;
             let base_row = cursor.read_var_u64()?;
-            Ok(HostFrame::Grid {
-                viewport_rows,
-                cols,
-                history_rows,
-                base_row,
-            })
+            if cursor.remaining() == 0 {
+                Ok(HostFrame::Grid {
+                    cols,
+                    history_rows,
+                    base_row,
+                    viewport_rows: None,
+                })
+            } else {
+                let mut legacy = checkpoint;
+                let viewport_rows = legacy.read_var_u32()?;
+                let cols = legacy.read_var_u32()?;
+                let history_rows = legacy.read_var_u32()?;
+                let base_row = legacy.read_var_u64()?;
+                Ok(HostFrame::Grid {
+                    cols,
+                    history_rows,
+                    base_row,
+                    viewport_rows: Some(viewport_rows),
+                })
+            }
         }
         HOST_KIND_SNAPSHOT => {
             let subscription = cursor.read_var_u64()?;
@@ -579,6 +595,10 @@ impl<'a> Cursor<'a> {
         let slice = &self.bytes[self.pos..self.pos + len];
         self.pos += len;
         Ok(slice)
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
     }
 }
 

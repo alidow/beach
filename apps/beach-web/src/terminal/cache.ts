@@ -70,6 +70,12 @@ interface TerminalGridCacheOptions {
   maxHistory?: number;
 }
 
+interface DebugUpdateContext {
+  origin: string | null;
+  update: Update;
+  authoritative: boolean;
+}
+
 type CursorHint =
   | { kind: 'exact'; row: number; col: number }
   | { kind: 'row_width'; row: number };
@@ -89,6 +95,7 @@ export class TerminalGridCache {
   private cursorCol: number | null = null;
   private predictions = new Map<number, Map<number, PredictedCell>>();
   private pendingPredictions = new Map<number, PredictedPosition[]>();
+  private debugContext: DebugUpdateContext | null = null;
 
   constructor(options: TerminalGridCacheOptions = {}) {
     this.maxHistory = options.maxHistory ?? DEFAULT_HISTORY_LIMIT;
@@ -195,12 +202,18 @@ export class TerminalGridCache {
     return changed;
   }
 
-  applyUpdates(updates: Update[], authoritative = false): boolean {
+  applyUpdates(updates: Update[], authoritative = false, origin?: string): boolean {
     let mutated = false;
     let baseAdjusted = false;
     let cursorChanged = false;
     let cursorHintSeen = false;
+    const originLabel = origin ?? null;
     for (const update of updates) {
+      this.debugContext = {
+        origin: originLabel,
+        update,
+        authoritative,
+      };
       const beforeWidth = this.debugRowWidthForUpdate(update);
       baseAdjusted = this.observeBounds(update, authoritative) || baseAdjusted;
       mutated = this.applyGridUpdate(update) || mutated;
@@ -210,6 +223,7 @@ export class TerminalGridCache {
         cursorChanged = this.applyCursorHint(hint) || cursorChanged;
       }
       this.logCursorDebug(update, hint, beforeWidth);
+      this.debugContext = null;
     }
     return mutated || baseAdjusted || cursorChanged || cursorHintSeen;
   }
@@ -679,6 +693,17 @@ export class TerminalGridCache {
       cells: createBlankRow(initialWidth),
     };
     this.rows[index] = loaded;
+    if (import.meta.env.DEV && this.debugContext) {
+      const summary = summarizeUpdate(this.debugContext.update);
+      console.debug('[beach-web][cache] created row', {
+        row: absolute,
+        baseRow: this.baseRow,
+        origin: this.debugContext.origin,
+        authoritative: this.debugContext.authoritative,
+        summary,
+        totalRows: this.rows.length,
+      });
+    }
     return loaded;
   }
 

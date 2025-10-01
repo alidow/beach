@@ -25,13 +25,13 @@ use beach_human::transport::{
     Payload, Transport, TransportError, TransportId, TransportKind, TransportMessage,
 };
 use clap::{Args, Parser, Subcommand};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{self, Write as _};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -253,7 +253,7 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         Vec::new();
 
     let mut local_preview_task: Option<tokio::task::JoinHandle<()>> = None;
-    let mut local_server_transport: Option<Arc<dyn Transport>> = None;
+    let local_server_transport: Arc<Mutex<Option<Arc<dyn Transport>>>> = Arc::new(Mutex::new(None));
 
     if local_preview_enabled {
         let pair = transport_mod::TransportPair::new(TransportKind::Ipc);
@@ -282,14 +282,32 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         }));
 
         forward_transports.push((local_server.clone(), None));
-        local_server_transport = Some(local_server);
+        {
+            let mut guard = local_server_transport.lock().unwrap();
+            *guard = Some(local_server);
+        }
         debug!(session_id = %session_id, "local preview transport attached");
     }
 
-    if interactive {
+    let resize_monitor = if interactive {
         let handle = spawn_local_stdin_forwarder(writer.clone(), local_echo.clone());
         input_handles.lock().unwrap().push(handle);
-    }
+
+        let running = Arc::new(AtomicBool::new(true));
+        let resize_handle = spawn_local_resize_monitor(
+            running.clone(),
+            process_handle.clone(),
+            emulator_handle.clone(),
+            grid.clone(),
+            transports.clone(),
+            Arc::clone(&local_server_transport),
+        );
+        input_handles.lock().unwrap().push(resize_handle);
+
+        Some(running)
+    } else {
+        None
+    };
 
     let (forwarder_cmd_tx, forwarder_cmd_rx) = mpsc::unbounded_channel();
 
@@ -344,6 +362,10 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     // redraws cleanly (mirrors the legacy apps/beach behaviour).
     drop(raw_guard);
 
+    if let Some(flag) = &resize_monitor {
+        flag.store(false, Ordering::SeqCst);
+    }
+
     accept_task.abort();
     let _ = accept_task.await;
 
@@ -356,8 +378,9 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         let transport: Arc<dyn Transport> = shared;
         let _ = send_host_frame(&transport, HostFrame::Shutdown);
     }
-    if let Some(server) = &local_server_transport {
-        let _ = send_host_frame(server, HostFrame::Shutdown);
+    let local_server_snapshot = local_server_transport.lock().unwrap().clone();
+    if let Some(server) = local_server_snapshot {
+        let _ = send_host_frame(&server, HostFrame::Shutdown);
     }
 
     if let Err(err) = updates_task.await {
@@ -816,6 +839,12 @@ fn build_spawn_config(command: &[String]) -> Result<(SpawnConfig, Arc<TerminalGr
 }
 
 fn detect_terminal_size() -> (u16, u16) {
+    if let Ok((cols, rows)) = terminal_size() {
+        if cols > 0 && rows > 0 {
+            return (cols.max(20), rows.max(10));
+        }
+    }
+
     let cols = std::env::var("COLUMNS")
         .ok()
         .and_then(|v| v.parse::<u16>().ok())
@@ -1756,6 +1785,110 @@ fn spawn_local_stdin_forwarder(
         }
         local_echo.clear();
         trace!(target = "host::stdin", "stdin forwarder exited");
+    })
+}
+
+fn spawn_local_resize_monitor(
+    running: Arc<AtomicBool>,
+    process: Arc<PtyProcess>,
+    emulator: Arc<Mutex<Box<dyn TerminalEmulator + Send>>>,
+    grid: Arc<TerminalGrid>,
+    transports: Arc<Mutex<Vec<Arc<SharedTransport>>>>,
+    local_server_transport: Arc<Mutex<Option<Arc<dyn Transport>>>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut last_size: Option<(u16, u16)> = None;
+        while running.load(Ordering::Relaxed) {
+            let (cols_raw, rows_raw) = detect_terminal_size();
+            let cols = cols_raw.min(MAX_PTY_COLS);
+            let rows = rows_raw.min(MAX_PTY_ROWS);
+            let current = (cols, rows);
+
+            if Some(current) != last_size {
+                let mut applied = true;
+                if let Err(err) = process.resize(cols, rows) {
+                    warn!(
+                        target = "host::local_resize",
+                        cols,
+                        rows,
+                        error = %err,
+                        "failed to apply PTY resize"
+                    );
+                    applied = false;
+                }
+
+                if applied {
+                    if let Ok(mut emulator) = emulator.lock() {
+                        emulator.resize(rows as usize, cols as usize);
+                    }
+                    grid.set_viewport_size(rows as usize, cols as usize);
+
+                    let history_rows = grid.rows() as u32;
+                    let base_row = grid.row_offset();
+
+                    let transports_snapshot: Vec<Arc<SharedTransport>> = {
+                        let guard = transports.lock().unwrap();
+                        guard.iter().cloned().collect()
+                    };
+
+                    for shared in transports_snapshot {
+                        let transport_id = shared.id().0;
+                        let transport_kind = shared.kind();
+                        let transport: Arc<dyn Transport> = shared;
+                        if let Err(err) = send_host_frame(
+                            &transport,
+                            HostFrame::Grid {
+                                cols: cols as u32,
+                                history_rows,
+                                base_row,
+                                viewport_rows: Some(rows as u32),
+                            },
+                        ) {
+                            warn!(
+                                target = "host::local_resize",
+                                transport_id,
+                                transport = ?transport_kind,
+                                error = %err,
+                                "failed to broadcast viewport update"
+                            );
+                        }
+                    }
+
+                    if let Some(server) = local_server_transport.lock().unwrap().clone() {
+                        let transport_id = server.id().0;
+                        let transport_kind = server.kind();
+                        if let Err(err) = send_host_frame(
+                            &server,
+                            HostFrame::Grid {
+                                cols: cols as u32,
+                                history_rows,
+                                base_row,
+                                viewport_rows: Some(rows as u32),
+                            },
+                        ) {
+                            warn!(
+                                target = "host::local_resize",
+                                transport_id,
+                                transport = ?transport_kind,
+                                error = %err,
+                                "failed to broadcast viewport update"
+                            );
+                        }
+                    }
+
+                    trace!(
+                        target = "host::local_resize",
+                        cols, rows, history_rows, base_row, "applied local terminal resize"
+                    );
+
+                    last_size = Some(current);
+                }
+            }
+
+            std::thread::sleep(Duration::from_millis(200));
+        }
+
+        trace!(target = "host::local_resize", "resize monitor exiting");
     })
 }
 

@@ -149,6 +149,10 @@ impl RowState {
             self.cells.resize(cols, CellState::blank());
         }
     }
+
+    fn is_blank(&self) -> bool {
+        self.cells.iter().all(|cell| cell.ch == ' ')
+    }
 }
 
 #[derive(Clone)]
@@ -832,9 +836,18 @@ impl GridRenderer {
     }
 
     fn last_loaded_row_index(&self) -> Option<usize> {
-        self.rows
-            .iter()
-            .rposition(|slot| matches!(slot, RowSlot::Loaded(_)))
+        let mut last_loaded: Option<usize> = None;
+        for (idx, slot) in self.rows.iter().enumerate().rev() {
+            if let RowSlot::Loaded(state) = slot {
+                if !state.is_blank() {
+                    return Some(idx);
+                }
+                if last_loaded.is_none() {
+                    last_loaded = Some(idx);
+                }
+            }
+        }
+        last_loaded
     }
 
     pub fn viewport_top(&self) -> u64 {

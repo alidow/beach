@@ -1,5 +1,6 @@
 import {
   type ClientFrame,
+  type CursorFrame,
   type HostFrame,
   type LaneBudgetFrame,
   type SyncConfigFrame,
@@ -22,6 +23,7 @@ const HOST_KIND_DELTA = 5;
 const HOST_KIND_INPUT_ACK = 6;
 const HOST_KIND_SHUTDOWN = 7;
 const HOST_KIND_HISTORY_BACKFILL = 8;
+const HOST_KIND_CURSOR = 9;
 
 const CLIENT_KIND_INPUT = 0;
 const CLIENT_KIND_RESIZE = 1;
@@ -211,6 +213,14 @@ function writeUpdates(updates: Update[], out: number[]): void {
   }
 }
 
+function writeCursorFrame(cursor: CursorFrame, out: number[]): void {
+  writeVarUint(ensureSafe(cursor.row, 'cursor row'), out);
+  writeVarUint(ensureSafe(cursor.col, 'cursor col'), out);
+  writeVarUint(ensureSafe(cursor.seq, 'cursor seq'), out);
+  writeBool(cursor.visible, out);
+  writeBool(cursor.blink, out);
+}
+
 function readUpdates(bytes: Uint8Array, cursor: Cursor): Update[] {
   const count = readVarUint(bytes, cursor);
   const updates: Update[] = [];
@@ -287,6 +297,15 @@ function readUpdates(bytes: Uint8Array, cursor: Cursor): Update[] {
   return updates;
 }
 
+function readCursorFrame(bytes: Uint8Array, cursor: Cursor): CursorFrame {
+  const row = readVarUint(bytes, cursor);
+  const col = readVarUint(bytes, cursor);
+  const seq = readVarUint(bytes, cursor);
+  const visible = readBool(bytes, cursor);
+  const blink = readBool(bytes, cursor);
+  return { row, col, seq, visible, blink };
+}
+
 export function encodeHostFrameBinary(frame: HostFrame): Uint8Array {
   const out: number[] = [];
   switch (frame.type) {
@@ -301,6 +320,7 @@ export function encodeHostFrameBinary(frame: HostFrame): Uint8Array {
       writeVarUint(ensureSafe(frame.subscription, 'subscription'), out);
       writeVarUint(ensureSafe(frame.maxSeq, 'maxSeq'), out);
       writeSyncConfig(frame.config, out);
+      writeVarUint(ensureSafe(frame.features, 'features'), out);
       break;
     }
     case 'grid': {
@@ -320,6 +340,10 @@ export function encodeHostFrameBinary(frame: HostFrame): Uint8Array {
       writeVarUint(ensureSafe(frame.watermark, 'watermark'), out);
       writeBool(frame.hasMore, out);
       writeUpdates(frame.updates, out);
+      writeBool(Boolean(frame.cursor), out);
+      if (frame.cursor) {
+        writeCursorFrame(frame.cursor, out);
+      }
       break;
     }
     case 'snapshot_complete': {
@@ -334,6 +358,10 @@ export function encodeHostFrameBinary(frame: HostFrame): Uint8Array {
       writeVarUint(ensureSafe(frame.watermark, 'watermark'), out);
       writeBool(frame.hasMore, out);
       writeUpdates(frame.updates, out);
+      writeBool(Boolean(frame.cursor), out);
+      if (frame.cursor) {
+        writeCursorFrame(frame.cursor, out);
+      }
       break;
     }
     case 'history_backfill': {
@@ -344,11 +372,21 @@ export function encodeHostFrameBinary(frame: HostFrame): Uint8Array {
       writeVarUint(ensureSafe(frame.count, 'count'), out);
       writeBool(frame.more, out);
       writeUpdates(frame.updates, out);
+      writeBool(Boolean(frame.cursor), out);
+      if (frame.cursor) {
+        writeCursorFrame(frame.cursor, out);
+      }
       break;
     }
     case 'input_ack': {
       writeHeader(HOST_KIND_INPUT_ACK, out);
       writeVarUint(ensureSafe(frame.seq, 'seq'), out);
+      break;
+    }
+    case 'cursor': {
+      writeHeader(HOST_KIND_CURSOR, out);
+      writeVarUint(ensureSafe(frame.subscription, 'subscription'), out);
+      writeCursorFrame(frame.cursor, out);
       break;
     }
     case 'shutdown': {
@@ -378,7 +416,8 @@ export function decodeHostFrameBinary(input: ArrayBuffer | Uint8Array): HostFram
       const subscription = readVarUint(bytes, cursor);
       const maxSeq = readVarUint(bytes, cursor);
       const config = readSyncConfig(bytes, cursor);
-      return { type: 'hello', subscription, maxSeq, config };
+      const features = readVarUint(bytes, cursor);
+      return { type: 'hello', subscription, maxSeq, config, features };
     }
     case HOST_KIND_GRID: {
       const checkpoint = cursor.value;
@@ -407,7 +446,9 @@ export function decodeHostFrameBinary(input: ArrayBuffer | Uint8Array): HostFram
       const watermark = readVarUint(bytes, cursor);
       const hasMore = readBool(bytes, cursor);
       const updates = readUpdates(bytes, cursor);
-      return { type: 'snapshot', subscription, lane, watermark, hasMore, updates };
+      const hasCursor = readBool(bytes, cursor);
+      const cursorFrame = hasCursor ? readCursorFrame(bytes, cursor) : undefined;
+      return { type: 'snapshot', subscription, lane, watermark, hasMore, updates, cursor: cursorFrame };
     }
     case HOST_KIND_SNAPSHOT_COMPLETE: {
       const subscription = readVarUint(bytes, cursor);
@@ -419,7 +460,9 @@ export function decodeHostFrameBinary(input: ArrayBuffer | Uint8Array): HostFram
       const watermark = readVarUint(bytes, cursor);
       const hasMore = readBool(bytes, cursor);
       const updates = readUpdates(bytes, cursor);
-      return { type: 'delta', subscription, watermark, hasMore, updates };
+      const hasCursor = readBool(bytes, cursor);
+      const cursorFrame = hasCursor ? readCursorFrame(bytes, cursor) : undefined;
+      return { type: 'delta', subscription, watermark, hasMore, updates, cursor: cursorFrame };
     }
     case HOST_KIND_HISTORY_BACKFILL: {
       const subscription = readVarUint(bytes, cursor);
@@ -428,11 +471,27 @@ export function decodeHostFrameBinary(input: ArrayBuffer | Uint8Array): HostFram
       const count = readVarUint(bytes, cursor);
       const more = readBool(bytes, cursor);
       const updates = readUpdates(bytes, cursor);
-      return { type: 'history_backfill', subscription, requestId, startRow, count, updates, more };
+      const hasCursor = readBool(bytes, cursor);
+      const cursorFrame = hasCursor ? readCursorFrame(bytes, cursor) : undefined;
+      return {
+        type: 'history_backfill',
+        subscription,
+        requestId,
+        startRow,
+        count,
+        updates,
+        more,
+        cursor: cursorFrame,
+      };
     }
     case HOST_KIND_INPUT_ACK: {
       const seq = readVarUint(bytes, cursor);
       return { type: 'input_ack', seq };
+    }
+    case HOST_KIND_CURSOR: {
+      const subscription = readVarUint(bytes, cursor);
+      const cursorFrame = readCursorFrame(bytes, cursor);
+      return { type: 'cursor', subscription, cursor: cursorFrame };
     }
     case HOST_KIND_SHUTDOWN:
       return { type: 'shutdown' };

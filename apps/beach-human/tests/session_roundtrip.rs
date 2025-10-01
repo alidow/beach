@@ -7,7 +7,7 @@ use beach_human::cache::GridCache;
 use beach_human::cache::terminal::{self, Style, StyleId, TerminalGrid};
 use beach_human::model::terminal::diff::{CacheUpdate, RowSnapshot};
 use beach_human::protocol::{
-    self, ClientFrame as WireClientFrame, HostFrame, Lane as WireLane,
+    self, ClientFrame as WireClientFrame, CursorFrame, HostFrame, Lane as WireLane,
     LaneBudgetFrame as WireLaneBudget, SyncConfigFrame as WireSyncConfig, Update as WireUpdate,
 };
 use beach_human::sync::terminal::{TerminalDeltaStream, TerminalSync};
@@ -75,6 +75,7 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
             subscription: subscription.0,
             max_seq: hello.max_seq.0,
             config: sync_config_to_wire(&hello.config),
+            features: 0,
         },
     );
     send_host_frame(
@@ -95,7 +96,7 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
         let mut emitted_chunk = false;
         while let Some(chunk) = synchronizer.snapshot_chunk(subscription, lane) {
             emitted_chunk = true;
-            let updates = tx_cache.apply_updates(&chunk.updates, false);
+            let converted_batch = tx_cache.apply_updates(&chunk.updates, false);
             send_host_frame(
                 host_transport.as_ref(),
                 HostFrame::Snapshot {
@@ -103,7 +104,8 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
                     lane: map_lane(lane),
                     watermark: chunk.watermark.0,
                     has_more: chunk.has_more,
-                    updates,
+                    updates: converted_batch.updates,
+                    cursor: converted_batch.cursor,
                 },
             );
             if !chunk.has_more {
@@ -231,8 +233,8 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
             }
             break;
         }
-        let updates = tx_cache.apply_updates(&batch.updates, true);
-        if updates.is_empty() {
+        let converted_batch = tx_cache.apply_updates(&batch.updates, true);
+        if converted_batch.updates.is_empty() {
             last_seq = batch.watermark.0;
             if !batch.has_more {
                 break;
@@ -245,7 +247,8 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
                 subscription: batch.subscription_id.0,
                 watermark: batch.watermark.0,
                 has_more: batch.has_more,
-                updates,
+                updates: converted_batch.updates,
+                cursor: converted_batch.cursor,
             },
         );
         last_seq = batch.watermark.0;
@@ -272,6 +275,7 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
             | HostFrame::Snapshot { .. }
             | HostFrame::SnapshotComplete { .. }
             | HostFrame::HistoryBackfill { .. }
+            | HostFrame::Cursor { .. }
             | HostFrame::Shutdown => {}
         }
         if view.contains_row("host% echo world") && view.contains_row("world") {
@@ -332,6 +336,7 @@ struct TransmitterCache {
     cols: usize,
     rows: HashMap<usize, Vec<u64>>,
     styles: HashMap<u32, (u32, u32, u8)>,
+    cursor: Option<CursorFrame>,
 }
 
 impl TransmitterCache {
@@ -343,10 +348,16 @@ impl TransmitterCache {
         self.cols = cols;
         self.rows.clear();
         self.styles.clear();
+        self.cursor = None;
     }
 
-    fn apply_updates(&mut self, updates: &[CacheUpdate], dedupe: bool) -> Vec<WireUpdate> {
+    fn apply_updates(
+        &mut self,
+        updates: &[CacheUpdate],
+        dedupe: bool,
+    ) -> PreparedUpdateBatch {
         let mut out = Vec::with_capacity(updates.len());
+        let mut next_cursor: Option<CursorFrame> = None;
         for update in updates {
             match update {
                 CacheUpdate::Row(row) => {
@@ -426,9 +437,37 @@ impl TransmitterCache {
                         });
                     }
                 }
+                CacheUpdate::Cursor(cursor_state) => {
+                    next_cursor = Some(CursorFrame {
+                        row: usize_to_u32(cursor_state.row),
+                        col: usize_to_u32(cursor_state.col),
+                        seq: cursor_state.seq,
+                        visible: cursor_state.visible,
+                        blink: cursor_state.blink,
+                    });
+                }
             }
         }
-        out
+        let cursor = next_cursor.and_then(|candidate| {
+            let emit = match self.cursor.as_ref() {
+                Some(prev) => {
+                    candidate.seq > prev.seq
+                        || candidate.row != prev.row
+                        || candidate.col != prev.col
+                        || candidate.visible != prev.visible
+                        || candidate.blink != prev.blink
+                }
+                None => true,
+            };
+            if emit {
+                self.cursor = Some(candidate.clone());
+                Some(candidate)
+            } else {
+                None
+            }
+        });
+
+        PreparedUpdateBatch { updates: out, cursor }
     }
 
     fn ensure_row_capacity(&mut self, row: usize, min_cols: usize) -> &mut Vec<u64> {
@@ -457,6 +496,12 @@ impl TransmitterCache {
 
 fn usize_to_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+#[derive(Default)]
+struct PreparedUpdateBatch {
+    updates: Vec<WireUpdate>,
+    cursor: Option<CursorFrame>,
 }
 
 fn map_lane(lane: PriorityLane) -> WireLane {

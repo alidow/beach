@@ -1,4 +1,5 @@
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
+export const FEATURE_CURSOR_SYNC = 1 << 0;
 
 export enum Lane {
   Foreground = 0,
@@ -16,6 +17,14 @@ export interface SyncConfigFrame {
   deltaBudget: number;
   heartbeatMs: number;
   initialSnapshotLines: number;
+}
+
+export interface CursorFrame {
+  row: number;
+  col: number;
+  seq: number;
+  visible: boolean;
+  blink: boolean;
 }
 
 export type Update =
@@ -72,6 +81,7 @@ export type HostFrame =
       subscription: number;
       maxSeq: number;
       config: SyncConfigFrame;
+      features: number;
     }
   | {
       type: 'grid';
@@ -87,6 +97,7 @@ export type HostFrame =
       watermark: number;
       hasMore: boolean;
       updates: Update[];
+      cursor?: CursorFrame;
     }
   | {
       type: 'snapshot_complete';
@@ -99,6 +110,7 @@ export type HostFrame =
       watermark: number;
       hasMore: boolean;
       updates: Update[];
+      cursor?: CursorFrame;
     }
   | {
       type: 'history_backfill';
@@ -108,10 +120,16 @@ export type HostFrame =
       count: number;
       updates: Update[];
       more: boolean;
+      cursor?: CursorFrame;
     }
   | {
       type: 'input_ack';
       seq: number;
+    }
+  | {
+      type: 'cursor';
+      subscription: number;
+      cursor: CursorFrame;
     }
   | {
       type: 'shutdown';

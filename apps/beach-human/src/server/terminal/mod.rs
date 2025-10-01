@@ -267,6 +267,9 @@ fn apply_update(grid: &TerminalGrid, update: &CacheUpdate) {
         CacheUpdate::Style(style) => {
             let _ = grid.style_table.set(style.id, style.style);
         }
+        CacheUpdate::Cursor(_) => {
+            // Cursor updates do not mutate the grid cache directly.
+        }
     }
 }
 
@@ -279,7 +282,8 @@ mod tests {
     #[test_timeout::tokio_timeout_test]
     async fn runtime_captures_command_output() {
         let grid = Arc::new(TerminalGrid::new(4, 20));
-        let emulator: Box<dyn TerminalEmulator + Send> = Box::new(AlacrittyEmulator::new(&grid));
+        let emulator: Box<dyn TerminalEmulator + Send> =
+            Box::new(AlacrittyEmulator::new(&grid, false));
         let command = Command::new("/usr/bin/env").arg("printf").arg("hello");
         let config = SpawnConfig::new(command, 80, 24);
 

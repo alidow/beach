@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
+pub const FEATURE_CURSOR_SYNC: u32 = 1 << 0;
 
 pub mod wire;
 
@@ -35,6 +36,15 @@ pub struct SyncConfigFrame {
     pub delta_budget: u32,
     pub heartbeat_ms: u64,
     pub initial_snapshot_lines: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorFrame {
+    pub row: u32,
+    pub col: u32,
+    pub seq: u64,
+    pub visible: bool,
+    pub blink: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +97,7 @@ pub enum HostFrame {
         subscription: u64,
         max_seq: u64,
         config: SyncConfigFrame,
+        features: u32,
     },
     Grid {
         cols: u32,
@@ -101,6 +112,8 @@ pub enum HostFrame {
         watermark: u64,
         has_more: bool,
         updates: Vec<Update>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<CursorFrame>,
     },
     SnapshotComplete {
         subscription: u64,
@@ -111,6 +124,8 @@ pub enum HostFrame {
         watermark: u64,
         has_more: bool,
         updates: Vec<Update>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<CursorFrame>,
     },
     HistoryBackfill {
         subscription: u64,
@@ -119,11 +134,36 @@ pub enum HostFrame {
         count: u32,
         updates: Vec<Update>,
         more: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<CursorFrame>,
     },
     InputAck {
         seq: u64,
     },
+    Cursor {
+        subscription: u64,
+        cursor: CursorFrame,
+    },
     Shutdown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum ViewportCommand {
+    Clear = 0,
+}
+
+impl ViewportCommand {
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(ViewportCommand::Clear),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +182,9 @@ pub enum ClientFrame {
         request_id: u64,
         start_row: u64,
         count: u32,
+    },
+    ViewportCommand {
+        command: ViewportCommand,
     },
     #[serde(other)]
     Unknown,

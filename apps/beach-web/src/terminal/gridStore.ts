@@ -1,4 +1,4 @@
-import type { Update } from '../protocol/types';
+import type { CursorFrame, Update } from '../protocol/types';
 import {
   TerminalGridCache,
   type CellState,
@@ -6,9 +6,11 @@ import {
   type MissingRow,
   type PendingRow,
   type PredictedCell,
+  type PredictedCursorState,
   type RowSlot,
   type StyleDefinition,
   type TerminalGridSnapshot,
+  type ApplyUpdatesOptions,
 } from './cache';
 
 export type {
@@ -17,6 +19,7 @@ export type {
   MissingRow,
   PendingRow,
   PredictedCell,
+  PredictedCursorState,
   RowSlot,
   StyleDefinition,
   TerminalGridSnapshot,
@@ -91,14 +94,26 @@ export class TerminalGridStore {
     }
   }
 
-  applyUpdates(updates: Update[], authoritative = false, origin?: string): void {
-    if (updates.length === 0) {
+  applyUpdates(updates: Update[], options: ApplyUpdatesOptions = {}): void {
+    const hasCursor = Boolean(options.cursor);
+    if (updates.length === 0 && !hasCursor) {
       return;
     }
-    if (this.cache.applyUpdates(updates, authoritative, origin)) {
+    if (this.cache.applyUpdates(updates, options)) {
       this.invalidate();
       this.notify();
     }
+  }
+
+  setCursorSupport(enabled: boolean): void {
+    if (this.cache.enableCursorSupport(enabled)) {
+      this.invalidate();
+      this.notify();
+    }
+  }
+
+  applyCursorFrame(cursor: CursorFrame): void {
+    this.applyUpdates([], { cursor });
   }
 
   markRowPending(absolute: number): void {

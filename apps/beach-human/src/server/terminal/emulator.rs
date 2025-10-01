@@ -7,13 +7,14 @@ use crate::model::terminal::cell::{Cell as HeavyCell, CellAttributes, Color as H
 use crate::model::terminal::diff::{
     CacheUpdate, CellWrite, HistoryTrim, RowSnapshot, StyleDefinition,
 };
+use crate::model::terminal::CursorState;
 use alacritty_terminal::{
     Term,
     event::{Event, EventListener},
     grid::Dimensions,
     index::{Column, Line, Point},
     term::{Config, cell::Cell as AlacrittyCell, cell::Flags as CellFlags},
-    vte::ansi::{Color as AnsiColor, NamedColor, Processor},
+    vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Processor},
 };
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -257,12 +258,14 @@ pub struct AlacrittyEmulator {
     seq: Seq,
     session_origin: Option<u64>,
     snapshot: GridSnapshot,
+    cursor_frames_enabled: bool,
+    last_cursor: Option<CursorState>,
 }
 
 unsafe impl Send for AlacrittyEmulator {}
 
 impl AlacrittyEmulator {
-    pub fn new(grid: &TerminalGrid) -> Self {
+    pub fn new(grid: &TerminalGrid, cursor_frames_enabled: bool) -> Self {
         let (viewport_rows, viewport_cols) = grid.viewport_size();
         let dimensions = TermDimensions::new(viewport_cols.max(1), viewport_rows.max(1));
         let mut config = Config::default();
@@ -280,6 +283,8 @@ impl AlacrittyEmulator {
             seq: 0,
             session_origin: None,
             snapshot: GridSnapshot::default(),
+            cursor_frames_enabled,
+            last_cursor: None,
         }
     }
 
@@ -471,6 +476,7 @@ impl AlacrittyEmulator {
             updates = style_updates;
         }
         self.consume_trim_events(grid, &mut updates);
+        self.push_cursor_update(grid, &mut updates);
         updates
     }
 }
@@ -488,6 +494,80 @@ impl AlacrittyEmulator {
         let (style_id, is_new) = style_table.ensure_id_with_new(style);
         let packed = pack_cell(heavy.char, style_id);
         (packed, style_id, style, is_new)
+    }
+
+    fn push_cursor_update(&mut self, grid: &TerminalGrid, updates: &mut Vec<CacheUpdate>) {
+        if !self.cursor_frames_enabled {
+            return;
+        }
+
+        let Some((row, col, visible, blink)) = self.compute_cursor_components(grid) else {
+            return;
+        };
+
+        let target_seq = if updates.is_empty() {
+            self.seq.saturating_add(1)
+        } else {
+            self.seq
+        };
+
+        let cursor = CursorState::new(row, col, target_seq, visible, blink);
+
+        let should_emit = match self.last_cursor {
+            Some(prev) => {
+                cursor.seq > prev.seq
+                    || cursor.row != prev.row
+                    || cursor.col != prev.col
+                    || cursor.visible != prev.visible
+                    || cursor.blink != prev.blink
+            }
+            None => true,
+        };
+
+        if !should_emit {
+            return;
+        }
+
+        if updates.is_empty() {
+            self.seq = target_seq;
+        }
+
+        self.last_cursor = Some(cursor);
+        updates.push(CacheUpdate::Cursor(cursor));
+    }
+
+    fn compute_cursor_components(&mut self, grid: &TerminalGrid) -> Option<(usize, usize, bool, bool)> {
+        let origin = {
+            let term_grid = self.term.grid();
+            let total_lines = term_grid.total_lines();
+            let screen_lines = term_grid.screen_lines();
+            let display_offset = term_grid.display_offset();
+            let history_size = total_lines.saturating_sub(screen_lines);
+            let viewport_top = history_size.saturating_sub(display_offset);
+            let base_row = grid.row_offset();
+            self.ensure_session_origin(base_row, viewport_top)
+        };
+
+        let render_cursor = self.term.renderable_content().cursor;
+        let cursor_style = self.term.cursor_style();
+
+        let line = render_cursor.point.line.0;
+        let delta = if line >= 0 {
+            line as u64
+        } else {
+            line.wrapping_neg() as u64
+        };
+        let absolute_row = if line >= 0 {
+            origin.saturating_add(delta)
+        } else {
+            origin.saturating_sub(delta)
+        };
+        let row = usize::try_from(absolute_row).ok()?;
+        let col = usize::try_from(render_cursor.point.column.0).ok()?;
+        let visible = render_cursor.shape != CursorShape::Hidden;
+        let blink = cursor_style.blinking;
+
+        Some((row, col, visible, blink))
     }
 }
 
@@ -590,7 +670,7 @@ mod tests {
     #[test_timeout::timeout]
     fn session_origin_updates_when_viewport_shifts() {
         let grid = TerminalGrid::new(24, 80);
-        let mut emulator = AlacrittyEmulator::new(&grid);
+        let mut emulator = AlacrittyEmulator::new(&grid, false);
 
         // Initial call sees no scrollback.
         let origin0 = emulator.ensure_session_origin(0, 0);
@@ -614,7 +694,7 @@ mod tests {
     #[test_timeout::timeout]
     fn alacritty_emits_scrollback_cells() {
         let grid = TerminalGrid::new(24, 80);
-        let mut emulator = AlacrittyEmulator::new(&grid);
+        let mut emulator = AlacrittyEmulator::new(&grid, false);
 
         let burst = (1..=150)
             .map(|i| format!("Line {i}: Test\n"))

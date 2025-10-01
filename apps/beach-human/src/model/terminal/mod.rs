@@ -6,7 +6,7 @@ pub mod frame;
 pub mod line;
 pub mod style;
 
-pub use cursor::{CursorPosition, Viewport};
+pub use cursor::{CursorPosition, CursorState, Viewport};
 pub use diff::{CacheUpdate, CellWrite, RectFill};
 pub use frame::TerminalFrame;
 pub use line::TerminalLine;

@@ -20,7 +20,7 @@ describe('buildLines', () => {
         packRow(101, 'next-line'),
         packRow(102, 'future'),
       ],
-      true,
+      { authoritative: true },
     );
     store.setViewport(100, 2);
 
@@ -64,12 +64,26 @@ describe('buildLines', () => {
 
     expect(lines.map((line) => line.absolute)).toEqual([1, 2]);
     expect(lines.map((line) => textFromLine(line))).toEqual(['row1', 'row2']);
+  });
+
+  it('highlights predicted cursor position when available', () => {
+    const store = new TerminalGridStore();
+    store.setGridSize(1, 80);
+    store.applyUpdates([packRow(0, '> ')], { authoritative: true });
+    store.setCursorSupport(true);
+    store.applyCursorFrame({ row: 0, col: 2, seq: 1, visible: true, blink: true });
+
+    store.registerPrediction(2, stringToBytes('a'));
+
+    const [line] = buildLines(store.getSnapshot(), 10);
+    expect(line.cursorCol).toBe(2);
+    expect(line.predictedCursorCol).toBe(3);
+  });
 });
 
 function textFromLine(line: ReturnType<typeof buildLines>[number]): string {
   return line.cells?.map((cell) => cell.char).join('').trimEnd() ?? '';
 }
-});
 
 function packString(text: string): number[] {
   return Array.from(text).map((char) => packCell(char, PACKED_STYLE));
@@ -81,4 +95,8 @@ function packCell(char: string, styleId: number): number {
     throw new Error('invalid char');
   }
   return codePoint * 2 ** 32 + styleId;
+}
+
+function stringToBytes(text: string): Uint8Array {
+  return Uint8Array.from(Array.from(text).map((char) => char.codePointAt(0) ?? 0));
 }

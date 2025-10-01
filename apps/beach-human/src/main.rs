@@ -1,12 +1,14 @@
 #![recursion_limit = "1024"]
 
+use anyhow::Result as AnyResult;
 use beach_human::cache::Seq;
 use beach_human::cache::terminal::{PackedCell, StyleId, TerminalGrid, unpack_cell};
 use beach_human::client::terminal::{ClientError, TerminalClient};
 use beach_human::model::terminal::diff::{CacheUpdate, HistoryTrim, RowSnapshot, StyleDefinition};
 use beach_human::protocol::{
-    self, ClientFrame as WireClientFrame, HostFrame, Lane as WireLane,
-    LaneBudgetFrame as WireLaneBudget, SyncConfigFrame as WireSyncConfig, Update as WireUpdate,
+    self, CursorFrame, HostFrame, Lane as WireLane, LaneBudgetFrame as WireLaneBudget,
+    SyncConfigFrame as WireSyncConfig, Update as WireUpdate, ViewportCommand,
+    ClientFrame as WireClientFrame, FEATURE_CURSOR_SYNC,
 };
 use beach_human::server::terminal::{
     AlacrittyEmulator, Command as PtyCommand, LocalEcho, PtyProcess, PtyWriter, SpawnConfig,
@@ -45,6 +47,12 @@ use tracing::{Level, debug, error, info, trace, warn};
 use transport_mod::webrtc::{OffererSupervisor, WebRtcRole};
 use url::Url;
 use uuid::Uuid;
+
+fn cursor_sync_enabled() -> bool {
+    std::env::var("BEACH_CURSOR_SYNC")
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(true)
+}
 
 #[tokio::main]
 async fn main() {
@@ -198,6 +206,7 @@ enum CliError {
 
 async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let manager = SessionManager::new(SessionConfig::new(base_url)?)?;
+    let cursor_sync = cursor_sync_enabled();
     let normalized_base = manager.config().base_url().to_string();
     let local_preview_enabled = args.local_preview;
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
@@ -232,7 +241,7 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     ));
     let (backfill_tx, backfill_rx) = mpsc::unbounded_channel();
 
-    let emulator = Box::new(AlacrittyEmulator::new(&grid));
+    let emulator = Box::new(AlacrittyEmulator::new(&grid, cursor_sync));
     let local_echo = Arc::new(LocalEcho::new());
     let (runtime, updates) = TerminalRuntime::spawn(
         spawn_config,
@@ -351,6 +360,7 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         forwarder_cmd_rx,
         Some(forwarder_cmd_tx.clone()),
         transports.clone(),
+        cursor_sync,
     );
 
     runtime
@@ -1036,6 +1046,7 @@ fn host_frame_label(frame: &HostFrame) -> &'static str {
         HostFrame::SnapshotComplete { .. } => "snapshot_complete",
         HostFrame::Delta { .. } => "delta",
         HostFrame::HistoryBackfill { .. } => "history_backfill",
+        HostFrame::Cursor { .. } => "cursor",
         HostFrame::InputAck { .. } => "input_ack",
         HostFrame::Shutdown => "shutdown",
     }
@@ -1046,6 +1057,7 @@ fn client_frame_label(frame: &WireClientFrame) -> &'static str {
         WireClientFrame::Input { .. } => "input",
         WireClientFrame::Resize { .. } => "resize",
         WireClientFrame::RequestBackfill { .. } => "request_backfill",
+        WireClientFrame::ViewportCommand { .. } => "viewport_command",
         WireClientFrame::Unknown => "unknown",
     }
 }
@@ -1142,19 +1154,20 @@ fn send_snapshot_frames_chunked(
     lane: PriorityLane,
     watermark: Seq,
     has_more: bool,
-    updates: Vec<WireUpdate>,
+    batch: PreparedUpdateBatch,
 ) -> Result<(), TransportError> {
     let wire_lane = map_lane(lane);
     send_chunked_updates(
         transport,
-        updates,
+        batch,
         has_more,
-        |chunk_updates, chunk_has_more| HostFrame::Snapshot {
+        |chunk_updates, chunk_has_more, cursor| HostFrame::Snapshot {
             subscription: subscription.0,
             lane: wire_lane,
             watermark,
             has_more: chunk_has_more,
             updates: chunk_updates,
+            cursor,
         },
     )
 }
@@ -1164,49 +1177,53 @@ fn send_delta_frames_chunked(
     subscription: SubscriptionId,
     watermark: Seq,
     has_more: bool,
-    updates: Vec<WireUpdate>,
+    batch: PreparedUpdateBatch,
 ) -> Result<(), TransportError> {
     send_chunked_updates(
         transport,
-        updates,
+        batch,
         has_more,
-        |chunk_updates, chunk_has_more| HostFrame::Delta {
+        |chunk_updates, chunk_has_more, cursor| HostFrame::Delta {
             subscription: subscription.0,
             watermark,
             has_more: chunk_has_more,
             updates: chunk_updates,
+            cursor,
         },
     )
 }
 
 fn send_chunked_updates<F>(
     transport: &Arc<dyn Transport>,
-    updates: Vec<WireUpdate>,
+    batch: PreparedUpdateBatch,
     final_has_more: bool,
     mut build_frame: F,
 ) -> Result<(), TransportError>
 where
-    F: FnMut(Vec<WireUpdate>, bool) -> HostFrame,
+    F: FnMut(Vec<WireUpdate>, bool, Option<CursorFrame>) -> HostFrame,
 {
-    if updates.is_empty() {
-        let frame = build_frame(Vec::new(), final_has_more);
+    if batch.updates.is_empty() {
+        let frame = build_frame(Vec::new(), final_has_more, batch.cursor);
         return send_host_frame(transport, frame);
     }
 
-    let mut remaining: VecDeque<WireUpdate> = updates.into();
+    let mut remaining: VecDeque<WireUpdate> = batch.updates.into();
     let mut chunk: Vec<WireUpdate> = Vec::new();
+    let mut cursor_pending = batch.cursor;
 
     while let Some(update) = remaining.pop_front() {
         chunk.push(update);
         loop {
             let more_updates_pending = !remaining.is_empty();
             let chunk_has_more = more_updates_pending || final_has_more;
-            let frame = build_frame(chunk.clone(), chunk_has_more);
+            let cursor_frame = cursor_pending.clone();
+            let frame = build_frame(chunk.clone(), chunk_has_more, cursor_frame.clone());
             let encoded_len = protocol::encode_host_frame_binary(&frame).len();
 
             if encoded_len > MAX_TRANSPORT_FRAME_BYTES && chunk.len() > 1 {
                 let overflow = chunk.pop().expect("chunk entry exists");
-                let chunk_frame = build_frame(chunk.clone(), true);
+                let chunk_cursor = cursor_pending.clone();
+                let chunk_frame = build_frame(chunk.clone(), true, chunk_cursor.clone());
                 let chunk_len = protocol::encode_host_frame_binary(&chunk_frame).len();
                 trace!(
                     target = "sync::transport",
@@ -1216,6 +1233,9 @@ where
                     "sending chunked host frame"
                 );
                 send_host_frame(transport, chunk_frame)?;
+                if chunk_cursor.is_some() {
+                    cursor_pending = None;
+                }
                 chunk.clear();
                 chunk.push(overflow);
                 continue;
@@ -1230,6 +1250,9 @@ where
                     "sending oversized single-update frame"
                 );
                 send_host_frame(transport, frame)?;
+                if cursor_frame.is_some() {
+                    cursor_pending = None;
+                }
                 chunk.clear();
                 break;
             }
@@ -1243,12 +1266,16 @@ where
                     "sending chunked host frame"
                 );
                 send_host_frame(transport, frame)?;
+                if cursor_frame.is_some() {
+                    cursor_pending = None;
+                }
                 chunk.clear();
                 break;
             }
 
             if !more_updates_pending {
-                let final_frame = build_frame(chunk.clone(), final_has_more);
+                let final_cursor = cursor_pending.clone();
+                let final_frame = build_frame(chunk.clone(), final_has_more, final_cursor.clone());
                 let final_len = protocol::encode_host_frame_binary(&final_frame).len();
                 trace!(
                     target = "sync::transport",
@@ -1258,6 +1285,9 @@ where
                     "sending final chunked host frame"
                 );
                 send_host_frame(transport, final_frame)?;
+                if final_cursor.is_some() {
+                    cursor_pending = None;
+                }
                 chunk.clear();
                 break;
             }
@@ -1271,7 +1301,8 @@ where
     }
 
     if !chunk.is_empty() {
-        let final_frame = build_frame(chunk.clone(), final_has_more);
+        let final_cursor = cursor_pending.clone();
+        let final_frame = build_frame(chunk.clone(), final_has_more, final_cursor.clone());
         let encoded_len = protocol::encode_host_frame_binary(&final_frame).len();
         trace!(
             target = "sync::transport",
@@ -1281,8 +1312,30 @@ where
             "sending trailing chunked host frame"
         );
         send_host_frame(transport, final_frame)?;
+        if final_cursor.is_some() {
+        }
     }
 
+    Ok(())
+}
+
+fn handle_viewport_command(
+    command: ViewportCommand,
+    writer: &PtyWriter,
+    transport_id: u64,
+    transport_kind: &TransportKind,
+) -> AnyResult<()> {
+    match command {
+        ViewportCommand::Clear => {
+            writer.write(&[0x0c])?;
+            debug!(
+                target = "sync::incoming",
+                transport_id,
+                transport = ?transport_kind,
+                "viewport clear command applied"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1628,6 +1681,23 @@ fn spawn_input_listener(
                                                 "processed resize request"
                                             );
                                         }
+                                        WireClientFrame::ViewportCommand { command } => {
+                                            if let Err(err) = handle_viewport_command(
+                                                command,
+                                                &writer,
+                                                transport_id,
+                                                &transport_kind,
+                                            ) {
+                                                warn!(
+                                                    target = "sync::incoming",
+                                                    transport_id,
+                                                    transport = ?transport_kind,
+                                                    error = %err,
+                                                    command = ?command,
+                                                    "viewport command failed"
+                                                );
+                                            }
+                                        }
                                         WireClientFrame::RequestBackfill {
                                             subscription,
                                             request_id,
@@ -1922,6 +1992,7 @@ struct TransmitterCache {
     cols: usize,
     rows: HashMap<usize, Vec<u64>>,
     styles: HashMap<u32, (u32, u32, u8)>,
+    cursor: Option<CursorFrame>,
 }
 
 impl TransmitterCache {
@@ -1933,10 +2004,16 @@ impl TransmitterCache {
         self.cols = cols;
         self.rows.clear();
         self.styles.clear();
+        self.cursor = None;
     }
 
-    fn apply_updates(&mut self, updates: &[CacheUpdate], dedupe: bool) -> Vec<WireUpdate> {
+    fn apply_updates(
+        &mut self,
+        updates: &[CacheUpdate],
+        dedupe: bool,
+    ) -> PreparedUpdateBatch {
         let mut out = Vec::with_capacity(updates.len());
+        let mut next_cursor: Option<CursorFrame> = None;
         for update in updates {
             match update {
                 CacheUpdate::Row(row) => {
@@ -2023,9 +2100,41 @@ impl TransmitterCache {
                         });
                     }
                 }
+                CacheUpdate::Cursor(cursor_state) => {
+                    let candidate = CursorFrame {
+                        row: usize_to_u32(cursor_state.row),
+                        col: usize_to_u32(cursor_state.col),
+                        seq: cursor_state.seq,
+                        visible: cursor_state.visible,
+                        blink: cursor_state.blink,
+                    };
+                    match next_cursor {
+                        Some(ref existing) if existing.seq >= candidate.seq => {}
+                        _ => next_cursor = Some(candidate),
+                    }
+                }
             }
         }
-        out
+        let cursor = next_cursor.and_then(|candidate| {
+            let emit = match self.cursor.as_ref() {
+                Some(prev) => {
+                    candidate.seq > prev.seq
+                        || candidate.row != prev.row
+                        || candidate.col != prev.col
+                        || candidate.visible != prev.visible
+                        || candidate.blink != prev.blink
+                }
+                None => true,
+            };
+            if emit {
+                self.cursor = Some(candidate.clone());
+                Some(candidate)
+            } else {
+                None
+            }
+        });
+
+        PreparedUpdateBatch { updates: out, cursor }
     }
 
     fn ensure_row_capacity(&mut self, row: usize, min_cols: usize) -> &mut Vec<u64> {
@@ -2054,6 +2163,12 @@ impl TransmitterCache {
 
 fn usize_to_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+#[derive(Default)]
+struct PreparedUpdateBatch {
+    updates: Vec<WireUpdate>,
+    cursor: Option<CursorFrame>,
 }
 
 impl TerminalDeltaStream for TimelineDeltaStream {
@@ -2283,6 +2398,7 @@ fn spawn_update_forwarder(
     mut command_rx: UnboundedReceiver<ForwarderCommand>,
     forwarder_tx: Option<UnboundedSender<ForwarderCommand>>,
     shared_registry: Arc<Mutex<Vec<Arc<SharedTransport>>>>,
+    cursor_sync: bool,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         struct Sink {
@@ -2401,6 +2517,7 @@ fn spawn_update_forwarder(
                 &terminal_sync,
                 &sync_config,
                 &mut sink.cache,
+                cursor_sync,
             ) {
                 Ok((sync, seq)) => {
                     sink.synchronizer = sync;
@@ -2450,6 +2567,7 @@ fn spawn_update_forwarder(
             terminal_sync: &Arc<TerminalSync>,
             sync_config: &SyncConfig,
             stale_transports: &mut Vec<TransportId>,
+            cursor_sync: bool,
         ) {
             sink.handshake_attempts = sink.handshake_attempts.saturating_add(1);
             debug!(
@@ -2466,6 +2584,7 @@ fn spawn_update_forwarder(
                 terminal_sync,
                 sync_config,
                 &mut sink.cache,
+                cursor_sync,
             ) {
                 Ok((sync, seq)) => {
                     sink.synchronizer = sync;
@@ -2524,6 +2643,7 @@ fn spawn_update_forwarder(
                             &terminal_sync,
                             &sync_config,
                             &mut stale_transports,
+                            cursor_sync,
                         );
                     }
                 }
@@ -2552,14 +2672,14 @@ fn spawn_update_forwarder(
                                         break;
                                     }
                                     telemetry::record_gauge("sync_delta_batch_updates", batch.updates.len() as u64);
-                                    let converted_updates = sink.cache.apply_updates(&batch.updates, true);
+                                    let converted_batch = sink.cache.apply_updates(&batch.updates, true);
                                     let _guard = PerfGuard::new("sync_send_delta");
                                     match send_delta_frames_chunked(
                                         &sink.transport,
                                         batch.subscription_id,
                                         batch.watermark.0,
                                         batch.has_more,
-                                        converted_updates,
+                                        converted_batch,
                                     ) {
                                         Ok(()) => {
                                             sink.last_seq = batch.watermark.0;
@@ -2641,6 +2761,7 @@ fn spawn_update_forwarder(
                                     &terminal_sync,
                                     &sync_config,
                                     &mut sink.cache,
+                                    cursor_sync,
                                 ) {
                                     Ok((sync, seq)) => {
                                         sink.synchronizer = sync;
@@ -2767,7 +2888,7 @@ fn spawn_update_forwarder(
                     let next_row = chunk_start.saturating_add(chunk_advance);
                     let more_pending = next_row < job.end_row;
                     let request_id = job.request_id;
-                    let updates = sink.cache.apply_updates(&chunk.updates, false);
+                    let converted_batch = sink.cache.apply_updates(&chunk.updates, false);
                     match send_host_frame(
                         &sink.transport,
                         HostFrame::HistoryBackfill {
@@ -2775,8 +2896,9 @@ fn spawn_update_forwarder(
                             request_id: job.request_id,
                             start_row: chunk_start,
                             count: chunk.attempted,
-                            updates,
+                            updates: converted_batch.updates,
                             more: more_pending,
+                            cursor: converted_batch.cursor,
                         },
                     ) {
                         Ok(()) => {
@@ -2844,9 +2966,15 @@ fn initialize_transport_snapshot(
     terminal_sync: &Arc<TerminalSync>,
     sync_config: &SyncConfig,
     cache: &mut TransmitterCache,
+    cursor_sync: bool,
 ) -> Result<(ServerSynchronizer<TerminalSync, CacheUpdate>, Seq), TransportError> {
     let mut synchronizer = ServerSynchronizer::new(terminal_sync.clone(), sync_config.clone());
     let hello = synchronizer.hello(subscription);
+    let features = if cursor_sync {
+        FEATURE_CURSOR_SYNC
+    } else {
+        0
+    };
     debug!(
         target = "sync::handshake",
         transport_id = transport.id().0,
@@ -2859,6 +2987,7 @@ fn initialize_transport_snapshot(
             subscription: hello.subscription_id.0,
             max_seq: hello.max_seq.0,
             config: sync_config_to_wire(&hello.config),
+            features,
         },
     )?;
     let (viewport_rows, cols) = terminal_sync.grid().viewport_size();
@@ -2943,14 +3072,14 @@ fn transmit_initial_snapshots(
                 updates = chunk.updates.len(),
                 "sending snapshot chunk"
             );
-            let updates = cache.apply_updates(&chunk.updates, false);
+            let converted_batch = cache.apply_updates(&chunk.updates, false);
             send_snapshot_frames_chunked(
                 transport,
                 chunk.subscription_id,
                 lane,
                 chunk.watermark.0,
                 chunk.has_more,
-                updates,
+                converted_batch,
             )?;
             if !chunk.has_more {
                 debug!(
@@ -3254,16 +3383,22 @@ mod tests {
         let row_update =
             CacheUpdate::Row(RowSnapshot::new(0, 1, vec![pack_cell('h'), pack_cell('i')]));
         let first_emit = cache.apply_updates(&[row_update.clone()], false);
-        assert_eq!(first_emit.len(), 1, "initial row should emit");
+        assert_eq!(first_emit.updates.len(), 1, "initial row should emit");
 
         let second_emit = cache.apply_updates(&[row_update.clone()], true);
-        assert!(second_emit.is_empty(), "duplicate row should dedupe");
+        assert!(
+            second_emit.updates.is_empty(),
+            "duplicate row should dedupe"
+        );
 
         let cell_update = CacheUpdate::Cell(CellWrite::new(0, 1, 2, pack_cell('o')));
         let cell_emit = cache.apply_updates(&[cell_update.clone()], true);
-        assert_eq!(cell_emit.len(), 1, "cell change should emit once");
+        assert_eq!(cell_emit.updates.len(), 1, "cell change should emit once");
         let repeat_cell = cache.apply_updates(&[cell_update], true);
-        assert!(repeat_cell.is_empty(), "repeated cell should dedupe");
+        assert!(
+            repeat_cell.updates.is_empty(),
+            "repeated cell should dedupe"
+        );
 
         let style = StyleDefinition::new(
             StyleId(5),
@@ -3275,19 +3410,25 @@ mod tests {
             },
         );
         let style_emit = cache.apply_updates(&[CacheUpdate::Style(style.clone())], true);
-        assert_eq!(style_emit.len(), 1);
+        assert_eq!(style_emit.updates.len(), 1);
         let style_repeat = cache.apply_updates(&[CacheUpdate::Style(style)], true);
-        assert!(style_repeat.is_empty(), "duplicate style should dedupe");
+        assert!(
+            style_repeat.updates.is_empty(),
+            "duplicate style should dedupe"
+        );
 
         let trim = CacheUpdate::Trim(HistoryTrim::new(0, 1));
         let trim_emit = cache.apply_updates(&[trim.clone()], true);
-        assert_eq!(trim_emit.len(), 1, "trim should always emit");
+        assert_eq!(trim_emit.updates.len(), 1, "trim should always emit");
 
         let rect = CacheUpdate::Rect(RectFill::new(0..1, 0..2, 4, pack_cell('x')));
         let rect_emit = cache.apply_updates(&[rect.clone()], true);
-        assert_eq!(rect_emit.len(), 1, "rect change should emit");
+        assert_eq!(rect_emit.updates.len(), 1, "rect change should emit");
         let rect_repeat = cache.apply_updates(&[rect], true);
-        assert!(rect_repeat.is_empty(), "identical rect should dedupe");
+        assert!(
+            rect_repeat.updates.is_empty(),
+            "identical rect should dedupe"
+        );
     }
 
     #[test_timeout::timeout]
@@ -3357,6 +3498,7 @@ mod tests {
                 forwarder_rx,
                 None,
                 Arc::new(Mutex::new(Vec::new())),
+                false,
             );
 
             let mut client_view = ClientGrid::new(rows, cols);
@@ -3423,6 +3565,7 @@ mod tests {
                     WireHostFrame::Hello { .. }
                     | WireHostFrame::Grid { .. }
                     | WireHostFrame::InputAck { .. }
+                    | WireHostFrame::Cursor { .. }
                     | WireHostFrame::Shutdown => {}
                 }
             }
@@ -3475,6 +3618,7 @@ mod tests {
                     | WireHostFrame::Grid { .. }
                     | WireHostFrame::HistoryBackfill { .. }
                     | WireHostFrame::InputAck { .. }
+                    | WireHostFrame::Cursor { .. }
                     | WireHostFrame::Shutdown => {}
                 }
             }
@@ -3486,9 +3630,7 @@ mod tests {
                 &client,
                 WireClientFrame::Input {
                     seq: 1,
-                    data: b"echo world
-"
-                    .to_vec(),
+                    data: b"echo world\n".to_vec(),
                 },
             );
             events.lock().unwrap().push("client_sent_input".into());
@@ -3613,6 +3755,7 @@ mod tests {
             forwarder_rx,
             None,
             Arc::new(Mutex::new(Vec::new())),
+            false,
         );
 
         tokio::task::spawn_blocking(move || {
@@ -3650,6 +3793,7 @@ mod tests {
                             | WireHostFrame::HistoryBackfill { .. }
                             | WireHostFrame::Heartbeat { .. }
                             | WireHostFrame::InputAck { .. }
+                            | WireHostFrame::Cursor { .. }
                             | WireHostFrame::Shutdown => {}
                         }
                     }
@@ -3713,6 +3857,7 @@ mod tests {
                 subscription: hello.subscription_id.0,
                 max_seq: hello.max_seq.0,
                 config: sync_config_to_wire(&hello.config),
+                features: 0,
             },
         );
         send_host_frame(
@@ -3800,6 +3945,7 @@ mod tests {
             &terminal_sync,
             &sync_config,
             &mut cache,
+            cursor_sync_enabled(),
         )
         .expect("handshake");
 
@@ -3821,7 +3967,8 @@ mod tests {
                 | WireHostFrame::Delta { .. }
                 | WireHostFrame::HistoryBackfill { .. }
                 | WireHostFrame::Heartbeat { .. }
-                | WireHostFrame::InputAck { .. } => {
+                | WireHostFrame::InputAck { .. }
+                | WireHostFrame::Cursor { .. } => {
                     continue;
                 }
                 WireHostFrame::Shutdown => break,
@@ -3861,7 +4008,8 @@ mod tests {
 
         let mut cache = TransmitterCache::new();
         cache.reset(cols);
-        let wire_updates = cache.apply_updates(&chunk.updates, false);
+        let converted_batch = cache.apply_updates(&chunk.updates, false);
+        let wire_updates = converted_batch.updates;
 
         let mut seen_rows = Vec::new();
         for update in wire_updates {
@@ -3891,7 +4039,7 @@ mod tests {
         assert_eq!(chunk.delivered, 0);
         let mut cache = TransmitterCache::new();
         cache.reset(80);
-        let updates = cache.apply_updates(&chunk.updates, false);
-        assert!(updates.is_empty(), "expected no updates for default rows");
+        let batch = cache.apply_updates(&chunk.updates, false);
+        assert!(batch.updates.is_empty(), "expected no updates for default rows");
     }
 }

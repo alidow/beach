@@ -2,6 +2,7 @@ use std::ops::Range;
 
 use crate::cache::Seq;
 use crate::cache::terminal::{PackedCell, Style, StyleId};
+use crate::model::terminal::CursorState;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CellWrite {
@@ -118,6 +119,7 @@ pub enum CacheUpdate {
     Row(RowSnapshot),
     Trim(HistoryTrim),
     Style(StyleDefinition),
+    Cursor(CursorState),
 }
 
 impl CacheUpdate {
@@ -128,6 +130,7 @@ impl CacheUpdate {
             CacheUpdate::Row(row) => row.seq,
             CacheUpdate::Trim(trim) => trim.seq(),
             CacheUpdate::Style(style) => style.seq(),
+            CacheUpdate::Cursor(cursor) => cursor.seq,
         }
     }
 }

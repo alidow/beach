@@ -1,4 +1,4 @@
-import type { Update } from '../protocol/types';
+import type { CursorFrame, Update } from '../protocol/types';
 
 const HIGH_SHIFT = 32;
 const WORD = 2 ** HIGH_SHIFT;
@@ -28,6 +28,12 @@ export interface PredictedCell {
 interface PredictedPosition {
   row: number;
   col: number;
+}
+
+export interface PredictedCursorState {
+  row: number;
+  col: number;
+  seq: number;
 }
 
 export interface LoadedRow {
@@ -60,6 +66,11 @@ export interface TerminalGridSnapshot {
   viewportHeight: number;
   cursorRow: number | null;
   cursorCol: number | null;
+  cursorVisible: boolean;
+  cursorBlink: boolean;
+  cursorSeq: number | null;
+  cursorAuthoritative: boolean;
+  predictedCursor: PredictedCursorState | null;
   visibleRows(limit?: number): RowSlot[];
   getPrediction(row: number, col: number): PredictedCell | null;
   predictionsForRow(row: number): Array<{ col: number; cell: PredictedCell }>;
@@ -80,6 +91,12 @@ type CursorHint =
   | { kind: 'exact'; row: number; col: number }
   | { kind: 'row_width'; row: number };
 
+export interface ApplyUpdatesOptions {
+  authoritative?: boolean;
+  origin?: string;
+  cursor?: CursorFrame | null;
+}
+
 export class TerminalGridCache {
   private readonly maxHistory: number;
   private baseRow = 0;
@@ -93,6 +110,13 @@ export class TerminalGridCache {
   private styles = new Map<number, StyleDefinition>();
   private cursorRow: number | null = null;
   private cursorCol: number | null = null;
+  private cursorSeq: number | null = null;
+  private cursorVisible = true;
+  private cursorBlink = true;
+  private cursorFeatureEnabled = false;
+  private cursorAuthoritative = false;
+  private cursorAuthoritativePending = false;
+  private predictedCursor: PredictedCursorState | null = null;
   private predictions = new Map<number, Map<number, PredictedCell>>();
   private pendingPredictions = new Map<number, PredictedPosition[]>();
   private debugContext: DebugUpdateContext | null = null;
@@ -101,6 +125,13 @@ export class TerminalGridCache {
     this.maxHistory = options.maxHistory ?? DEFAULT_HISTORY_LIMIT;
     this.cols = Math.max(0, options.initialCols ?? 0);
     this.styles.set(0, { id: 0, fg: DEFAULT_COLOR, bg: DEFAULT_COLOR, attrs: 0 });
+    this.cursorSeq = null;
+    this.cursorVisible = true;
+    this.cursorBlink = true;
+    this.cursorFeatureEnabled = false;
+    this.cursorAuthoritative = false;
+    this.cursorAuthoritativePending = false;
+    this.predictedCursor = null;
   }
 
   reset(): void {
@@ -115,6 +146,13 @@ export class TerminalGridCache {
     this.styles = new Map([[0, { id: 0, fg: DEFAULT_COLOR, bg: DEFAULT_COLOR, attrs: 0 }]]);
     this.cursorRow = null;
     this.cursorCol = null;
+    this.cursorSeq = null;
+    this.cursorVisible = true;
+    this.cursorBlink = true;
+    this.cursorFeatureEnabled = false;
+    this.cursorAuthoritative = false;
+    this.cursorAuthoritativePending = false;
+    this.predictedCursor = null;
     this.predictions.clear();
     this.pendingPredictions.clear();
   }
@@ -177,6 +215,10 @@ export class TerminalGridCache {
         this.cursorRow = this.baseRow;
         this.cursorCol = 0;
       }
+      if (this.predictedCursor && this.predictedCursor.row < this.baseRow) {
+        this.predictedCursor = null;
+        mutated = true;
+      }
       mutated = this.prunePredictionsBelow(this.baseRow) || mutated;
     } else {
       const newRows: RowSlot[] = [];
@@ -202,29 +244,43 @@ export class TerminalGridCache {
     return changed;
   }
 
-  applyUpdates(updates: Update[], authoritative = false, origin?: string): boolean {
+  applyUpdates(updates: Update[], options: ApplyUpdatesOptions = {}): boolean {
+    const { authoritative = false, origin, cursor } = options;
+
+    if (cursor && this.cursorFeatureEnabled) {
+      this.cursorAuthoritativePending = true;
+    }
+
     let mutated = false;
     let baseAdjusted = false;
     let cursorChanged = false;
     let cursorHintSeen = false;
     const originLabel = origin ?? null;
-    for (const update of updates) {
-      this.debugContext = {
-        origin: originLabel,
-        update,
-        authoritative,
-      };
-      const beforeWidth = this.debugRowWidthForUpdate(update);
-      baseAdjusted = this.observeBounds(update, authoritative) || baseAdjusted;
-      mutated = this.applyGridUpdate(update) || mutated;
-      const hint = this.cursorHint(update);
-      if (hint) {
-        cursorHintSeen = true;
-        cursorChanged = this.applyCursorHint(hint) || cursorChanged;
+
+    if (updates.length > 0) {
+      for (const update of updates) {
+        this.debugContext = {
+          origin: originLabel,
+          update,
+          authoritative,
+        };
+        const beforeWidth = this.debugRowWidthForUpdate(update);
+        baseAdjusted = this.observeBounds(update, authoritative) || baseAdjusted;
+        mutated = this.applyGridUpdate(update) || mutated;
+        const hint = this.cursorAuthoritative || this.cursorAuthoritativePending ? null : this.cursorHint(update);
+        if (hint) {
+          cursorHintSeen = true;
+          cursorChanged = this.applyCursorHint(hint) || cursorChanged;
+        }
+        this.logCursorDebug(update, hint, beforeWidth);
+        this.debugContext = null;
       }
-      this.logCursorDebug(update, hint, beforeWidth);
-      this.debugContext = null;
     }
+
+    if (cursor && this.cursorFeatureEnabled) {
+      cursorChanged = this.applyCursorFrame(cursor) || cursorChanged;
+    }
+
     return mutated || baseAdjusted || cursorChanged || cursorHintSeen;
   }
 
@@ -355,6 +411,11 @@ export class TerminalGridCache {
       viewportHeight: this.viewportHeight,
       cursorRow: this.cursorRow,
       cursorCol: this.cursorCol,
+      cursorVisible: this.cursorVisible,
+      cursorBlink: this.cursorBlink,
+      cursorSeq: this.cursorSeq,
+      cursorAuthoritative: this.cursorAuthoritative,
+      predictedCursor: this.predictedCursor,
       visibleRows: (limit?: number) => this.visibleRows(limit),
       getPrediction: (row: number, col: number) => this.getPrediction(row, col),
       predictionsForRow: (row: number) => this.predictionsForRow(row),
@@ -435,6 +496,63 @@ export class TerminalGridCache {
     return this.cursorRow !== previousRow || this.cursorCol !== previousCol;
   }
 
+  enableCursorSupport(enabled: boolean): boolean {
+    if (this.cursorFeatureEnabled === enabled) {
+      return false;
+    }
+    this.cursorFeatureEnabled = enabled;
+    if (!enabled) {
+      this.cursorAuthoritative = false;
+      this.cursorAuthoritativePending = false;
+      this.cursorSeq = null;
+      this.cursorVisible = true;
+      this.cursorBlink = true;
+      this.predictedCursor = null;
+    }
+    return true;
+  }
+
+  private applyCursorFrame(frame: CursorFrame): boolean {
+    const row = Math.max(0, Math.floor(frame.row));
+    const col = Math.max(0, Math.floor(frame.col));
+    const prevRow = this.cursorRow;
+    const prevCol = this.cursorCol;
+    const prevSeq = this.cursorSeq;
+    const prevVisible = this.cursorVisible;
+    const prevBlink = this.cursorBlink;
+    const prevPredicted = this.predictedCursor;
+
+    this.ensureRowRange(row, row + 1);
+    this.cursorRow = row;
+    this.cursorCol = col;
+    this.cursorSeq = frame.seq;
+    this.cursorVisible = frame.visible;
+    this.cursorBlink = frame.blink;
+    this.cursorAuthoritative = true;
+    this.cursorAuthoritativePending = false;
+
+    if (this.cursorRow !== null && this.cursorRow < this.baseRow) {
+      this.cursorRow = this.baseRow;
+    }
+    this.clampCursor();
+
+    const viewportMoved = this.touchRow(this.cursorRow ?? row);
+
+    if (this.predictedCursor && this.predictedCursor.seq <= frame.seq) {
+      this.predictedCursor = null;
+    }
+
+    return (
+      viewportMoved ||
+      prevRow !== this.cursorRow ||
+      prevCol !== this.cursorCol ||
+      prevSeq !== this.cursorSeq ||
+      prevVisible !== this.cursorVisible ||
+      prevBlink !== this.cursorBlink ||
+      prevPredicted !== this.predictedCursor
+    );
+  }
+
   private rowDisplayWidth(absolute: number): number {
     if (absolute < this.baseRow) {
       return 0;
@@ -459,6 +577,9 @@ export class TerminalGridCache {
   private clampCursor(): void {
     if (this.cursorRow === null || this.cursorCol === null) {
       return;
+    }
+    if (this.cursorRow < this.baseRow) {
+      this.cursorRow = this.baseRow;
     }
     if (this.cols <= 0) {
       this.cursorCol = 0;
@@ -662,6 +783,10 @@ export class TerminalGridCache {
       this.cursorCol = 0;
       mutated = true;
     }
+    if (this.predictedCursor && this.predictedCursor.row >= start && this.predictedCursor.row < end) {
+      this.predictedCursor = null;
+      mutated = true;
+    }
     this.reindexRows();
     this.clampCursor();
     mutated = this.prunePredictionsBelow(this.baseRow) || mutated;
@@ -705,73 +830,125 @@ export class TerminalGridCache {
     }
 
     let mutated = false;
-    let cursorRow = this.cursorRow;
-    let cursorCol = this.cursorCol;
+    let cursorMoved = false;
 
-    if (cursorRow === null || cursorCol === null) {
-      const fallbackRow = this.findHighestLoadedRow();
-      cursorRow = fallbackRow ?? this.baseRow;
-      cursorCol = this.rowDisplayWidth(cursorRow);
+    let workingRow: number | null;
+    let workingCol: number | null;
+
+    if (this.cursorFeatureEnabled && this.cursorAuthoritative) {
+      workingRow = this.predictedCursor?.row ?? this.cursorRow;
+      workingCol = this.predictedCursor?.col ?? this.cursorCol;
+    } else {
+      workingRow = this.cursorRow;
+      workingCol = this.cursorCol;
     }
 
-    this.cursorRow = cursorRow ?? this.baseRow;
-    this.cursorCol = cursorCol ?? 0;
+    if (workingRow === null || workingCol === null) {
+      const fallbackRow = this.findHighestLoadedRow();
+      workingRow = fallbackRow ?? this.baseRow;
+      workingCol = this.rowDisplayWidth(workingRow);
+    }
+
+    if (workingRow === null || !Number.isFinite(workingRow)) {
+      workingRow = this.baseRow;
+    }
+    if (workingCol === null || !Number.isFinite(workingCol)) {
+      workingCol = 0;
+    }
+
+    let currentRow = workingRow;
+    let currentCol = workingCol;
 
     const positions: PredictedPosition[] = [];
 
     for (const byte of data) {
       if (byte === 0x0d) {
-        this.cursorCol = 0;
+        if (currentCol !== 0) {
+          cursorMoved = true;
+        }
+        currentCol = 0;
         continue;
       }
       if (byte === 0x0a) {
-        this.cursorRow = (this.cursorRow ?? this.baseRow) + 1;
-        this.cursorCol = 0;
+        currentRow += 1;
+        currentCol = 0;
+        cursorMoved = true;
         continue;
       }
       if (byte <= 0x1f || byte === 0x7f) {
         continue;
       }
 
-      const row = this.cursorRow ?? this.baseRow;
-      const col = this.cursorCol ?? 0;
+      const row = currentRow;
+      const col = currentCol;
       const char = String.fromCharCode(byte);
       mutated = this.setPrediction(row, col, seq, char) || mutated;
       positions.push({ row, col });
-      this.advanceCursorForChar(char);
+      const next = this.nextCursorPosition(row, col, char);
+      currentRow = next.row;
+      currentCol = next.col;
+      cursorMoved = true;
     }
 
-    if (positions.length === 0) {
-      return mutated;
+    this.pendingPredictions.delete(seq);
+    if (positions.length > 0) {
+      this.pendingPredictions.set(seq, positions);
+      if (this.pendingPredictions.size > 256) {
+        mutated = this.clearAllPredictions() || mutated;
+      }
     }
 
-    this.pendingPredictions.set(seq, positions);
-    if (this.pendingPredictions.size > 256) {
-      mutated = this.clearAllPredictions() || mutated;
+    if (this.cursorFeatureEnabled && this.cursorAuthoritative) {
+      currentRow = Math.max(this.baseRow, currentRow);
+      currentCol = Math.max(0, currentCol);
+      const newPredicted: PredictedCursorState = { row: currentRow, col: currentCol, seq };
+      const prev = this.predictedCursor;
+      const changed =
+        !prev || prev.row !== newPredicted.row || prev.col !== newPredicted.col || prev.seq !== newPredicted.seq;
+      this.predictedCursor = newPredicted;
+      mutated = mutated || changed || cursorMoved;
+    } else {
+      currentRow = Math.max(this.baseRow, currentRow);
+      currentCol = Math.max(0, currentCol);
+      this.cursorRow = currentRow;
+      this.cursorCol = currentCol;
+      this.clampCursor();
+      mutated = mutated || cursorMoved;
     }
-    return mutated || positions.length > 0;
+
+    return mutated || positions.length > 0 || cursorMoved;
   }
 
   clearPredictionSeq(seq: number): boolean {
     const positions = this.pendingPredictions.get(seq);
+    let cursorCleared = false;
+    if (this.predictedCursor && this.predictedCursor.seq === seq) {
+      this.predictedCursor = null;
+      cursorCleared = true;
+    }
     if (!positions || positions.length === 0) {
       this.pendingPredictions.delete(seq);
-      return false;
+      return cursorCleared;
     }
     this.pendingPredictions.delete(seq);
     let mutated = false;
     for (const { row, col } of positions) {
       mutated = this.clearPredictionAt(row, col) || mutated;
     }
-    return mutated;
+    return mutated || cursorCleared;
   }
 
   clearAllPredictions(): boolean {
-    if (this.predictions.size === 0 && this.pendingPredictions.size === 0) {
+    if (
+      this.predictions.size === 0 &&
+      this.pendingPredictions.size === 0 &&
+      this.predictedCursor === null
+    ) {
       return false;
     }
     this.predictions.clear();
     this.pendingPredictions.clear();
+    this.predictedCursor = null;
     return true;
   }
 
@@ -860,6 +1037,10 @@ export class TerminalGridCache {
         mutated = this.clearPredictionsForRow(predRow) || mutated;
       }
     }
+    if (this.predictedCursor && this.predictedCursor.row < row) {
+      this.predictedCursor = null;
+      mutated = true;
+    }
     return mutated;
   }
 
@@ -881,13 +1062,23 @@ export class TerminalGridCache {
       .map(([col, cell]) => ({ col, cell }));
   }
 
-  private advanceCursorForChar(char: string): void {
+  private nextCursorPosition(row: number, col: number, char: string): { row: number; col: number } {
     if (char === '\n') {
-      this.cursorRow = (this.cursorRow ?? this.baseRow) + 1;
-      this.cursorCol = 0;
-    } else {
-      this.cursorCol = (this.cursorCol ?? 0) + 1;
+      return { row: row + 1, col: 0 };
     }
+    if (char === '\r') {
+      return { row, col: 0 };
+    }
+    return { row, col: col + 1 };
+  }
+
+  private advanceCursorForChar(char: string): void {
+    const currentRow = this.cursorRow ?? this.baseRow;
+    const currentCol = this.cursorCol ?? 0;
+    const next = this.nextCursorPosition(currentRow, currentCol, char);
+    this.cursorRow = next.row;
+    this.cursorCol = next.col;
+    this.clampCursor();
   }
 
   private touchRow(absolute: number): boolean {

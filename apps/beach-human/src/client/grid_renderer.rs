@@ -550,6 +550,8 @@ impl GridRenderer {
             let absolute = absolute_row as u64;
             if let Some(rel) = self.touch_row(absolute) {
                 self.ensure_col(cols.end);
+                let mut cleared_cols: Vec<usize> = Vec::new();
+                let mut touched = false;
                 if let Some(state) = self.row_state_mut(rel) {
                     for col in cols.clone() {
                         let cell = &mut state.cells[col];
@@ -557,6 +559,8 @@ impl GridRenderer {
                             cell.ch = ch;
                             cell.seq = seq;
                             cell.style_id = style_id;
+                            cleared_cols.push(col);
+                            touched = true;
                             trace!(
                                 target = "client::render",
                                 row = absolute_row,
@@ -567,7 +571,12 @@ impl GridRenderer {
                         }
                     }
                     state.latest_seq = state.latest_seq.max(seq);
+                }
+                if touched {
                     self.mark_dirty();
+                }
+                for col in cleared_cols {
+                    self.clear_prediction_at(absolute_row, col);
                 }
             }
         }
@@ -597,6 +606,8 @@ impl GridRenderer {
             if *first_col == 0 {
                 let absolute = absolute_row as u64;
                 if let Some(rel) = self.relative_row(absolute) {
+                    let mut cleared_cols: Vec<usize> = Vec::new();
+                    let mut touched = false;
                     if let Some(RowSlot::Loaded(state)) = self.rows.get_mut(rel) {
                         let last_seq = cells.last().map(|(_, seq, _, _)| *seq).unwrap_or(0);
                         let end_col = cells
@@ -604,16 +615,23 @@ impl GridRenderer {
                             .map(|(col, _, _, _)| col.saturating_add(1))
                             .unwrap_or(0);
                         if end_col < state.cells.len() {
-                            for cell in state.cells.iter_mut().skip(end_col) {
+                            for (offset, cell) in state.cells.iter_mut().enumerate().skip(end_col) {
                                 if last_seq >= cell.seq {
                                     cell.ch = ' ';
                                     cell.seq = last_seq;
                                     cell.style_id = None;
+                                    cleared_cols.push(offset);
+                                    touched = true;
                                 }
                             }
                             state.latest_seq = state.latest_seq.max(last_seq);
-                            self.mark_dirty();
                         }
+                    }
+                    if touched {
+                        self.mark_dirty();
+                    }
+                    for col in cleared_cols {
+                        self.clear_prediction_at(absolute_row, col);
                     }
                 }
             }

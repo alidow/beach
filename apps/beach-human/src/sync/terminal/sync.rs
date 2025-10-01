@@ -302,6 +302,7 @@ impl SyncUpdate for CacheUpdate {
             CacheUpdate::Row(row) => row.width(),
             CacheUpdate::Trim(_) => 1,
             CacheUpdate::Style(_) => 1,
+            CacheUpdate::Cursor(_) => 1,
         }
     }
 }

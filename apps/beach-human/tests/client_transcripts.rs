@@ -45,6 +45,7 @@ async fn client_replays_basic_snapshot() {
                 heartbeat_ms: 250,
                 initial_snapshot_lines: 500,
             },
+            features: 0,
         },
     );
     send_host_frame(
@@ -75,6 +76,7 @@ async fn client_replays_basic_snapshot() {
                     cells: "world".chars().map(pack_char).collect(),
                 },
             ],
+            cursor: None,
         },
     );
     send_host_frame(
@@ -128,6 +130,7 @@ async fn client_applies_deltas() {
                 heartbeat_ms: 250,
                 initial_snapshot_lines: 500,
             },
+            features: 0,
         },
     );
     send_host_frame(
@@ -151,6 +154,7 @@ async fn client_applies_deltas() {
                 seq: 1,
                 cells: "hello".chars().map(pack_char).collect(),
             }],
+            cursor: None,
         },
     );
     send_host_frame(
@@ -172,6 +176,7 @@ async fn client_applies_deltas() {
                 seq: 2,
                 cell: pack_char('!'),
             }],
+            cursor: None,
         },
     );
     send_host_frame(&*server, HostFrame::Shutdown);
@@ -208,6 +213,7 @@ async fn client_emits_input_events() {
                 heartbeat_ms: 250,
                 initial_snapshot_lines: 500,
             },
+            features: 0,
         },
     );
     send_host_frame(
@@ -268,6 +274,7 @@ async fn client_requests_backfill_and_hydrates_rows() {
                 heartbeat_ms: 250,
                 initial_snapshot_lines: 2,
             },
+            features: 0,
         },
     );
     send_host_frame(
@@ -298,6 +305,7 @@ async fn client_requests_backfill_and_hydrates_rows() {
                     cells: "tail".chars().map(pack_char).collect(),
                 },
             ],
+            cursor: None,
         },
     );
     send_host_frame(
@@ -352,6 +360,7 @@ async fn client_requests_backfill_and_hydrates_rows() {
             count: chunk_rows,
             updates,
             more: false,
+            cursor: None,
         },
     );
 
@@ -413,6 +422,7 @@ async fn client_requests_backfill_uses_session_rows() {
                 heartbeat_ms: 250,
                 initial_snapshot_lines: 128,
             },
+            features: 0,
         },
     );
     send_host_frame(
@@ -443,6 +453,7 @@ async fn client_requests_backfill_uses_session_rows() {
                     cells: "tail".chars().map(pack_char).collect(),
                 },
             ],
+            cursor: None,
         },
     );
     send_host_frame(
@@ -490,6 +501,7 @@ async fn client_requests_backfill_uses_session_rows() {
                 cells: "prompt".chars().map(pack_char).collect(),
             }],
             more: false,
+            cursor: None,
         },
     );
 
@@ -528,6 +540,7 @@ async fn client_requests_history_after_delta_when_handshake_empty() {
                 heartbeat_ms: 250,
                 initial_snapshot_lines: 0,
             },
+            features: 0,
         },
     );
     send_host_frame(
@@ -579,6 +592,7 @@ async fn client_requests_history_after_delta_when_handshake_empty() {
             watermark: 50,
             has_more: false,
             updates,
+            cursor: None,
         },
     );
 
@@ -647,6 +661,7 @@ async fn client_retries_history_when_initial_backfill_empty() {
                 heartbeat_ms: 250,
                 initial_snapshot_lines: 0,
             },
+            features: 0,
         },
     );
     send_host_frame(
@@ -684,6 +699,7 @@ async fn client_retries_history_when_initial_backfill_empty() {
                 watermark: 10,
                 has_more: false,
                 updates: seed_updates,
+                cursor: None,
             },
         );
 
@@ -713,6 +729,7 @@ async fn client_retries_history_when_initial_backfill_empty() {
             count,
             updates: Vec::new(),
             more: false,
+            cursor: None,
         },
     );
 
@@ -733,6 +750,7 @@ async fn client_retries_history_when_initial_backfill_empty() {
             watermark: 150,
             has_more: false,
             updates,
+            cursor: None,
         },
     );
 
@@ -800,6 +818,7 @@ async fn client_targets_tail_history_after_large_delta() {
                 heartbeat_ms: 250,
                 initial_snapshot_lines: 32,
             },
+            features: 0,
         },
     );
     send_host_frame(
@@ -824,6 +843,7 @@ async fn client_targets_tail_history_after_large_delta() {
                 seq: 1,
                 cells: "seed".chars().map(pack_char).collect(),
             }],
+            cursor: None,
         },
     );
     send_host_frame(
@@ -894,6 +914,7 @@ async fn client_targets_tail_history_after_large_delta() {
                 count,
                 updates: bootstrap,
                 more: false,
+            cursor: None,
             },
         );
     }
@@ -916,6 +937,7 @@ async fn client_targets_tail_history_after_large_delta() {
             watermark: (2000 + high_base + 39) as u64,
             has_more: false,
             updates: delta_updates,
+            cursor: None,
         },
     );
 
@@ -994,6 +1016,7 @@ async fn client_marks_empty_backfill_as_missing() {
                 heartbeat_ms: 250,
                 initial_snapshot_lines: 32,
             },
+            features: 0,
         },
     );
     send_host_frame(
@@ -1017,6 +1040,7 @@ async fn client_marks_empty_backfill_as_missing() {
                 seq: 1,
                 cells: "seed".chars().map(pack_char).collect(),
             }],
+            cursor: None,
         },
     );
     send_host_frame(
@@ -1070,6 +1094,7 @@ async fn client_marks_empty_backfill_as_missing() {
             count: first_count,
             updates: Vec::new(),
             more: false,
+            cursor: None,
         },
     );
 
@@ -1140,6 +1165,7 @@ async fn client_recovers_truncated_history_after_tail_burst() {
                 heartbeat_ms: 250,
                 initial_snapshot_lines: 32,
             },
+            features: 0,
         },
     );
     send_host_frame(
@@ -1172,6 +1198,7 @@ async fn client_recovers_truncated_history_after_tail_burst() {
             watermark: base_row as u64 + 23,
             has_more: false,
             updates: snapshot_rows,
+            cursor: None,
         },
     );
     send_host_frame(
@@ -1240,6 +1267,7 @@ async fn client_recovers_truncated_history_after_tail_burst() {
             count: 64,
             updates: first_chunk_updates,
             more: true,
+            cursor: None,
         },
     );
     for chunk in [64u64, 128, 192] {
@@ -1252,6 +1280,7 @@ async fn client_recovers_truncated_history_after_tail_burst() {
                 count: 64,
                 updates: Vec::new(),
                 more: chunk != 192,
+            cursor: None,
             },
         );
     }
@@ -1274,6 +1303,7 @@ async fn client_recovers_truncated_history_after_tail_burst() {
             watermark: 20000 + base_row as u64 + 149,
             has_more: false,
             updates: delta_updates,
+            cursor: None,
         },
     );
 
@@ -1340,6 +1370,7 @@ async fn client_recovers_truncated_history_after_tail_burst() {
                 count,
                 updates,
                 more: false,
+            cursor: None,
             },
         );
     }
@@ -1389,6 +1420,7 @@ async fn client_resolves_missing_rows_after_empty_backfill() {
                 heartbeat_ms: 250,
                 initial_snapshot_lines: 2,
             },
+            features: 0,
         },
     );
     send_host_frame(
@@ -1419,6 +1451,7 @@ async fn client_resolves_missing_rows_after_empty_backfill() {
                     cells: "recent".chars().map(pack_char).collect(),
                 },
             ],
+            cursor: None,
         },
     );
     send_host_frame(
@@ -1462,6 +1495,7 @@ async fn client_resolves_missing_rows_after_empty_backfill() {
             count,
             updates: Vec::new(),
             more: false,
+            cursor: None,
         },
     );
 
@@ -1528,6 +1562,7 @@ async fn client_handles_binary_snapshot_and_delta() {
             subscription: 1,
             max_seq: 0,
             config: sync_config.clone(),
+            features: 0,
         },
     );
     send_host_frame(
@@ -1551,6 +1586,7 @@ async fn client_handles_binary_snapshot_and_delta() {
                 seq: 1,
                 cells: "hello".chars().map(pack_char).collect(),
             }],
+            cursor: None,
         },
     );
     send_host_frame(
@@ -1572,6 +1608,7 @@ async fn client_handles_binary_snapshot_and_delta() {
                 seq: 2,
                 cell: pack_char('!'),
             }],
+            cursor: None,
         },
     );
     send_host_frame(&*server, HostFrame::Shutdown);

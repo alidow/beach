@@ -1,5 +1,6 @@
 import type { CSSProperties, UIEvent } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { FEATURE_CURSOR_SYNC } from '../protocol/types';
 import type { ClientFrame, HostFrame } from '../protocol/types';
 import { createTerminalStore, useTerminalSnapshot } from '../terminal/useTerminalState';
 import { connectBrowserTransport, type BrowserTransportConnection } from '../terminal/connect';
@@ -487,6 +488,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         store.reset();
         subscriptionRef.current = frame.subscription;
         inputSeqRef.current = 0;
+        store.setCursorSupport(Boolean(frame.features & FEATURE_CURSOR_SYNC));
         break;
       case 'grid':
         store.setBaseRow(frame.baseRow);
@@ -518,7 +520,11 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       case 'history_backfill': {
         const authoritative = frame.type === 'snapshot' || frame.type === 'history_backfill';
         log(`frame ${frame.type}`, { updates: frame.updates.length, authoritative });
-        store.applyUpdates(frame.updates, authoritative, frame.type);
+        store.applyUpdates(frame.updates, {
+          authoritative,
+          origin: frame.type,
+          cursor: frame.cursor ?? null,
+        });
         if (!frame.hasMore && frame.type === 'snapshot') {
           store.setFollowTail(true);
         }
@@ -532,6 +538,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         break;
       case 'input_ack':
         store.clearPrediction(frame.seq);
+        break;
+      case 'cursor':
+        store.applyCursorFrame(frame.cursor);
         break;
       case 'heartbeat':
         break;
@@ -555,6 +564,7 @@ interface RenderLine {
   kind: 'loaded' | 'pending' | 'missing';
   cells?: RenderCell[];
   cursorCol?: number | null;
+  predictedCursorCol?: number | null;
 }
 
 export function buildLines(snapshot: TerminalGridSnapshot, limit: number): RenderLine[] {
@@ -587,11 +597,19 @@ export function buildLines(snapshot: TerminalGridSnapshot, limit: number): Rende
         }
       }
       let cursorCol: number | null = null;
-      if (snapshot.cursorRow === row.absolute && snapshot.cursorCol !== null) {
+      if (snapshot.cursorVisible && snapshot.cursorRow === row.absolute && snapshot.cursorCol !== null) {
         const raw = Math.floor(Math.max(snapshot.cursorCol, 0));
         cursorCol = Number.isFinite(raw) ? raw : null;
       }
-      lines.push({ absolute: row.absolute, kind: 'loaded', cells, cursorCol });
+      let predictedCursorCol: number | null = null;
+      if (
+        snapshot.predictedCursor &&
+        snapshot.predictedCursor.row === row.absolute &&
+        Number.isFinite(snapshot.predictedCursor.col)
+      ) {
+        predictedCursorCol = Math.max(0, Math.floor(snapshot.predictedCursor.col));
+      }
+      lines.push({ absolute: row.absolute, kind: 'loaded', cells, cursorCol, predictedCursorCol });
       continue;
     }
     const fillChar = row.kind === 'pending' ? '·' : ' ';
@@ -611,6 +629,7 @@ function LineRow({ line, styles }: { line: RenderLine; styles: Map<number, Style
   }
 
   const cursorCol = line.cursorCol ?? null;
+  const predictedCursorCol = line.predictedCursorCol ?? null;
   const baseStyleDef = styles.get(0) ?? { id: 0, fg: 0, bg: 0, attrs: 0 };
 
   return (
@@ -619,7 +638,8 @@ function LineRow({ line, styles }: { line: RenderLine; styles: Map<number, Style
         const styleDef = styles.get(cell.styleId);
         const isCursor = cursorCol !== null && cursorCol === index;
         let style = styleDef ? styleFromDefinition(styleDef, isCursor) : undefined;
-        const predicted = cell.predicted === true;
+        const isPredictedCursor = predictedCursorCol !== null && predictedCursorCol === index;
+        const predicted = cell.predicted === true || (isPredictedCursor && !isCursor);
         if (predicted) {
           const merged: CSSProperties = { ...(style ?? {}) };
           merged.textDecoration = appendTextDecoration(merged.textDecoration, 'underline');
@@ -629,13 +649,32 @@ function LineRow({ line, styles }: { line: RenderLine; styles: Map<number, Style
         }
         const char = cell.char === ' ' ? ' ' : cell.char;
         return (
-          <span key={index} style={style} data-predicted={predicted || undefined}>
+          <span
+            key={index}
+            style={style}
+            data-predicted={predicted || undefined}
+            data-predicted-cursor={isPredictedCursor || undefined}
+          >
             {char}
           </span>
         );
       })}
       {cursorCol !== null && cursorCol >= line.cells.length ? (
         <span key="cursor" style={styleFromDefinition(baseStyleDef, true)}> </span>
+      ) : null}
+      {predictedCursorCol !== null && predictedCursorCol >= line.cells.length ? (
+        <span
+          key="predicted-cursor"
+          style={{
+            ...styleFromDefinition(baseStyleDef, false),
+            textDecoration: appendTextDecoration(undefined, 'underline'),
+            opacity: 0.75,
+          }}
+          data-predicted
+          data-predicted-cursor
+        >
+           
+        </span>
       ) : null}
     </div>
   );

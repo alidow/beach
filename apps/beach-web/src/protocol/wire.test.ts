@@ -38,6 +38,7 @@ describe('wire codec', () => {
         heartbeatMs: 250,
         initialSnapshotLines: 64,
       },
+      features: 0b101,
     });
   });
 
@@ -62,6 +63,7 @@ describe('wire codec', () => {
         { type: 'trim', start: 2, count: 3, seq: 5 },
         { type: 'rect', rows: [7, 8], cols: [0, 10], seq: 6, cell: 0x4600_0001 },
       ],
+      cursor: { row: 5, col: 6, seq: 7, visible: true, blink: false },
     });
   });
 
@@ -74,6 +76,7 @@ describe('wire codec', () => {
       count: 25,
       updates: [],
       more: false,
+      cursor: { row: 101, col: 0, seq: 9, visible: false, blink: false },
     });
   });
 
@@ -84,6 +87,15 @@ describe('wire codec', () => {
       watermark: 100,
       hasMore: false,
       updates: [],
+      cursor: { row: 42, col: 1, seq: 200, visible: true, blink: true },
+    });
+  });
+
+  it('round-trips cursor-only frames', () => {
+    roundTripHost({
+      type: 'cursor',
+      subscription: 5,
+      cursor: { row: 10, col: 3, seq: 12, visible: false, blink: true },
     });
   });
 

@@ -1,5 +1,6 @@
 use super::{
-    ClientFrame, HostFrame, Lane, LaneBudgetFrame, PROTOCOL_VERSION, SyncConfigFrame, Update,
+    ClientFrame, CursorFrame, HostFrame, Lane, LaneBudgetFrame, PROTOCOL_VERSION,
+    SyncConfigFrame, Update, ViewportCommand,
 };
 
 const VERSION_BITS: u8 = 3;
@@ -15,6 +16,7 @@ const HOST_KIND_DELTA: u8 = 5;
 const HOST_KIND_INPUT_ACK: u8 = 6;
 const HOST_KIND_SHUTDOWN: u8 = 7;
 const HOST_KIND_HISTORY_BACKFILL: u8 = 8;
+const HOST_KIND_CURSOR: u8 = 9;
 
 const UPDATE_KIND_CELL: u8 = 0;
 const UPDATE_KIND_RECT: u8 = 1;
@@ -26,6 +28,7 @@ const UPDATE_KIND_STYLE: u8 = 5;
 const CLIENT_KIND_INPUT: u8 = 0;
 const CLIENT_KIND_RESIZE: u8 = 1;
 const CLIENT_KIND_REQUEST_BACKFILL: u8 = 2;
+const CLIENT_KIND_VIEWPORT_COMMAND: u8 = 3;
 const CLIENT_KIND_UNKNOWN: u8 = TYPE_MASK;
 
 const ENV_BINARY_PROTOCOL: &str = "BEACH_PROTO_BINARY";
@@ -74,11 +77,13 @@ pub fn encode_host_frame_binary(frame: &HostFrame) -> Vec<u8> {
             subscription,
             max_seq,
             config,
+            features,
         } => {
             write_header(&mut buf, HOST_KIND_HELLO);
             write_var_u64(&mut buf, *subscription);
             write_var_u64(&mut buf, *max_seq);
             encode_sync_config(&mut buf, config);
+            write_var_u32(&mut buf, *features);
         }
         HostFrame::Grid {
             cols,
@@ -100,6 +105,7 @@ pub fn encode_host_frame_binary(frame: &HostFrame) -> Vec<u8> {
             watermark,
             has_more,
             updates,
+            cursor,
         } => {
             write_header(&mut buf, HOST_KIND_SNAPSHOT);
             write_var_u64(&mut buf, *subscription);
@@ -107,6 +113,10 @@ pub fn encode_host_frame_binary(frame: &HostFrame) -> Vec<u8> {
             write_var_u64(&mut buf, *watermark);
             buf.push(*has_more as u8);
             encode_updates(&mut buf, updates);
+            buf.push(cursor.is_some() as u8);
+            if let Some(frame) = cursor {
+                encode_cursor(&mut buf, frame);
+            }
         }
         HostFrame::SnapshotComplete { subscription, lane } => {
             write_header(&mut buf, HOST_KIND_SNAPSHOT_COMPLETE);
@@ -118,12 +128,17 @@ pub fn encode_host_frame_binary(frame: &HostFrame) -> Vec<u8> {
             watermark,
             has_more,
             updates,
+            cursor,
         } => {
             write_header(&mut buf, HOST_KIND_DELTA);
             write_var_u64(&mut buf, *subscription);
             write_var_u64(&mut buf, *watermark);
             buf.push(*has_more as u8);
             encode_updates(&mut buf, updates);
+            buf.push(cursor.is_some() as u8);
+            if let Some(frame) = cursor {
+                encode_cursor(&mut buf, frame);
+            }
         }
         HostFrame::HistoryBackfill {
             subscription,
@@ -132,6 +147,7 @@ pub fn encode_host_frame_binary(frame: &HostFrame) -> Vec<u8> {
             count,
             updates,
             more,
+            cursor,
         } => {
             write_header(&mut buf, HOST_KIND_HISTORY_BACKFILL);
             write_var_u64(&mut buf, *subscription);
@@ -140,10 +156,19 @@ pub fn encode_host_frame_binary(frame: &HostFrame) -> Vec<u8> {
             write_var_u32(&mut buf, *count);
             buf.push(*more as u8);
             encode_updates(&mut buf, updates);
+            buf.push(cursor.is_some() as u8);
+            if let Some(frame) = cursor {
+                encode_cursor(&mut buf, frame);
+            }
         }
         HostFrame::InputAck { seq } => {
             write_header(&mut buf, HOST_KIND_INPUT_ACK);
             write_var_u64(&mut buf, *seq);
+        }
+        HostFrame::Cursor { subscription, cursor } => {
+            write_header(&mut buf, HOST_KIND_CURSOR);
+            write_var_u64(&mut buf, *subscription);
+            encode_cursor(&mut buf, cursor);
         }
         HostFrame::Shutdown => {
             write_header(&mut buf, HOST_KIND_SHUTDOWN);
@@ -165,10 +190,12 @@ pub fn decode_host_frame_binary(bytes: &[u8]) -> Result<HostFrame, WireError> {
             let subscription = cursor.read_var_u64()?;
             let max_seq = cursor.read_var_u64()?;
             let config = decode_sync_config(&mut cursor)?;
+            let features = cursor.read_var_u32()?;
             Ok(HostFrame::Hello {
                 subscription,
                 max_seq,
                 config,
+                features,
             })
         }
         HOST_KIND_GRID => {
@@ -203,12 +230,23 @@ pub fn decode_host_frame_binary(bytes: &[u8]) -> Result<HostFrame, WireError> {
             let watermark = cursor.read_var_u64()?;
             let has_more = cursor.read_bool()?;
             let updates = decode_updates(&mut cursor)?;
+            let cursor_frame = if cursor.remaining() > 0 {
+                let has_cursor = cursor.read_bool()?;
+                if has_cursor {
+                    Some(decode_cursor(&mut cursor)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             Ok(HostFrame::Snapshot {
                 subscription,
                 lane,
                 watermark,
                 has_more,
                 updates,
+                cursor: cursor_frame,
             })
         }
         HOST_KIND_SNAPSHOT_COMPLETE => {
@@ -221,11 +259,22 @@ pub fn decode_host_frame_binary(bytes: &[u8]) -> Result<HostFrame, WireError> {
             let watermark = cursor.read_var_u64()?;
             let has_more = cursor.read_bool()?;
             let updates = decode_updates(&mut cursor)?;
+            let cursor_frame = if cursor.remaining() > 0 {
+                let has_cursor = cursor.read_bool()?;
+                if has_cursor {
+                    Some(decode_cursor(&mut cursor)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             Ok(HostFrame::Delta {
                 subscription,
                 watermark,
                 has_more,
                 updates,
+                cursor: cursor_frame,
             })
         }
         HOST_KIND_HISTORY_BACKFILL => {
@@ -235,6 +284,16 @@ pub fn decode_host_frame_binary(bytes: &[u8]) -> Result<HostFrame, WireError> {
             let count = cursor.read_var_u32()?;
             let more = cursor.read_bool()?;
             let updates = decode_updates(&mut cursor)?;
+            let cursor_frame = if cursor.remaining() > 0 {
+                let has_cursor = cursor.read_bool()?;
+                if has_cursor {
+                    Some(decode_cursor(&mut cursor)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             Ok(HostFrame::HistoryBackfill {
                 subscription,
                 request_id,
@@ -242,11 +301,20 @@ pub fn decode_host_frame_binary(bytes: &[u8]) -> Result<HostFrame, WireError> {
                 count,
                 updates,
                 more,
+                cursor: cursor_frame,
             })
         }
         HOST_KIND_INPUT_ACK => {
             let seq = cursor.read_var_u64()?;
             Ok(HostFrame::InputAck { seq })
+        }
+        HOST_KIND_CURSOR => {
+            let subscription = cursor.read_var_u64()?;
+            let cursor_frame = decode_cursor(&mut cursor)?;
+            Ok(HostFrame::Cursor {
+                subscription,
+                cursor: cursor_frame,
+            })
         }
         HOST_KIND_SHUTDOWN => Ok(HostFrame::Shutdown),
         other => Err(WireError::UnknownFrameType(other)),
@@ -278,6 +346,10 @@ pub fn encode_client_frame_binary(frame: &ClientFrame) -> Vec<u8> {
             write_var_u64(&mut buf, *request_id);
             write_var_u64(&mut buf, *start_row);
             write_var_u32(&mut buf, *count);
+        }
+        ClientFrame::ViewportCommand { command } => {
+            write_header(&mut buf, CLIENT_KIND_VIEWPORT_COMMAND);
+            buf.push(command.as_u8());
         }
         ClientFrame::Unknown => {
             write_header(&mut buf, CLIENT_KIND_UNKNOWN);
@@ -312,6 +384,12 @@ pub fn decode_client_frame_binary(bytes: &[u8]) -> Result<ClientFrame, WireError
                 start_row,
                 count,
             })
+        }
+        CLIENT_KIND_VIEWPORT_COMMAND => {
+            let code = cursor.read_u8()?;
+            let command = ViewportCommand::from_u8(code)
+                .ok_or(WireError::InvalidData("unknown viewport command"))?;
+            Ok(ClientFrame::ViewportCommand { command })
         }
         CLIENT_KIND_UNKNOWN => Ok(ClientFrame::Unknown),
         other => Err(WireError::UnknownFrameType(other)),
@@ -394,6 +472,14 @@ fn encode_updates(buf: &mut Vec<u8>, updates: &[Update]) {
             }
         }
     }
+}
+
+fn encode_cursor(buf: &mut Vec<u8>, cursor: &CursorFrame) {
+    write_var_u32(buf, cursor.row);
+    write_var_u32(buf, cursor.col);
+    write_var_u64(buf, cursor.seq);
+    buf.push(cursor.visible as u8);
+    buf.push(cursor.blink as u8);
 }
 
 fn decode_updates(cursor: &mut Cursor<'_>) -> Result<Vec<Update>, WireError> {
@@ -479,6 +565,21 @@ fn decode_updates(cursor: &mut Cursor<'_>) -> Result<Vec<Update>, WireError> {
         updates.push(update);
     }
     Ok(updates)
+}
+
+fn decode_cursor(cursor: &mut Cursor<'_>) -> Result<CursorFrame, WireError> {
+    let row = cursor.read_var_u32()?;
+    let col = cursor.read_var_u32()?;
+    let seq = cursor.read_var_u64()?;
+    let visible = cursor.read_bool()?;
+    let blink = cursor.read_bool()?;
+    Ok(CursorFrame {
+        row,
+        col,
+        seq,
+        visible,
+        blink,
+    })
 }
 
 fn encode_sync_config(buf: &mut Vec<u8>, config: &SyncConfigFrame) {
@@ -646,6 +747,7 @@ mod tests {
                 heartbeat_ms: 250,
                 initial_snapshot_lines: 8,
             },
+            features: 0,
         };
         let encoded = encode_host_frame_binary(&frame);
         let decoded = decode_host_frame_binary(&encoded).expect("decode");
@@ -690,6 +792,62 @@ mod tests {
                     seq: 15,
                 },
             ],
+            cursor: Some(CursorFrame {
+                row: 6,
+                col: 6,
+                seq: 16,
+                visible: true,
+                blink: false,
+            }),
+        };
+        let encoded = encode_host_frame_binary(&frame);
+        let decoded = decode_host_frame_binary(&encoded).expect("decode");
+        assert_eq!(frame, decoded);
+    }
+
+    #[test_timeout::timeout]
+    fn encode_decode_history_backfill() {
+        let frame = HostFrame::HistoryBackfill {
+            subscription: 4,
+            request_id: 2,
+            start_row: 5,
+            count: 2,
+            updates: vec![
+                Update::Cell {
+                    row: 5,
+                    col: 0,
+                    seq: 1,
+                    cell: 0x0002,
+                },
+            ],
+            more: true,
+            cursor: Some(CursorFrame {
+                row: 5,
+                col: 1,
+                seq: 3,
+                visible: false,
+                blink: true,
+            }),
+        };
+        let encoded = encode_host_frame_binary(&frame);
+        let decoded = decode_host_frame_binary(&encoded).expect("decode");
+        assert_eq!(frame, decoded);
+    }
+
+    #[test_timeout::timeout]
+    fn encode_decode_delta_no_updates() {
+        let frame = HostFrame::Delta {
+            subscription: 3,
+            watermark: 10,
+            has_more: false,
+            updates: Vec::new(),
+            cursor: Some(CursorFrame {
+                row: 9,
+                col: 0,
+                seq: 11,
+                visible: true,
+                blink: true,
+            }),
         };
         let encoded = encode_host_frame_binary(&frame);
         let decoded = decode_host_frame_binary(&encoded).expect("decode");
@@ -703,6 +861,9 @@ mod tests {
             data: vec![1, 2, 3, 4],
         };
         let resize = ClientFrame::Resize { cols: 80, rows: 24 };
+        let viewport = ClientFrame::ViewportCommand {
+            command: ViewportCommand::Clear,
+        };
 
         let encoded_input = encode_client_frame_binary(&input);
         let decoded_input = decode_client_frame_binary(&encoded_input).expect("decode input");
@@ -711,6 +872,11 @@ mod tests {
         let encoded_resize = encode_client_frame_binary(&resize);
         let decoded_resize = decode_client_frame_binary(&encoded_resize).expect("decode resize");
         assert_eq!(resize, decoded_resize);
+
+        let encoded_viewport = encode_client_frame_binary(&viewport);
+        let decoded_viewport =
+            decode_client_frame_binary(&encoded_viewport).expect("decode viewport");
+        assert_eq!(viewport, decoded_viewport);
     }
 
     #[test_timeout::timeout]
@@ -721,5 +887,22 @@ mod tests {
         assert!(!parse_flag("false"));
         assert!(!parse_flag("0"));
         assert!(!parse_flag(""));
+    }
+
+    #[test_timeout::timeout]
+    fn encode_decode_cursor_frame() {
+        let frame = HostFrame::Cursor {
+            subscription: 2,
+            cursor: CursorFrame {
+                row: 7,
+                col: 3,
+                seq: 5,
+                visible: false,
+                blink: false,
+            },
+        };
+        let encoded = encode_host_frame_binary(&frame);
+        let decoded = decode_host_frame_binary(&encoded).expect("decode cursor");
+        assert_eq!(frame, decoded);
     }
 }

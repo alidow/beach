@@ -2,7 +2,8 @@ use crate::cache::Seq;
 use crate::cache::terminal::{PackedCell, StyleId, unpack_cell};
 use crate::client::grid_renderer::{GridRenderer, SelectionMode, SelectionPosition};
 use crate::protocol::{
-    self, ClientFrame as WireClientFrame, HostFrame as WireHostFrame, Update as WireUpdate,
+    self, ClientFrame as WireClientFrame, CursorFrame, HostFrame as WireHostFrame,
+    Update as WireUpdate, ViewportCommand, FEATURE_CURSOR_SYNC,
 };
 use crate::telemetry::{self, PerfGuard};
 use crate::transport::{Payload, Transport, TransportError};
@@ -195,6 +196,10 @@ pub struct TerminalClient {
     force_render: bool,
     cursor_row: usize,
     cursor_col: usize,
+    cursor_seq: Seq,
+    cursor_support: bool,
+    cursor_authoritative: bool,
+    cursor_authoritative_pending: bool,
     pending_predictions: HashMap<Seq, Vec<(usize, usize)>>,
     copy_mode: Option<CopyModeState>,
     last_render_at: Option<Instant>,
@@ -234,6 +239,10 @@ impl TerminalClient {
             force_render: true,
             cursor_row: 0,
             cursor_col: 0,
+            cursor_seq: 0,
+            cursor_support: false,
+            cursor_authoritative: false,
+            cursor_authoritative_pending: false,
             pending_predictions: HashMap::new(),
             copy_mode: None,
             last_render_at: None,
@@ -364,12 +373,13 @@ impl TerminalClient {
             let frame_type = match &frame {
                 WireHostFrame::Heartbeat { .. } => "heartbeat",
                 WireHostFrame::Hello { .. } => "hello",
-                WireHostFrame::Grid { .. } => "grid",
+                            WireHostFrame::Grid { .. } => "grid",
                 WireHostFrame::Snapshot { .. } => "snapshot",
                 WireHostFrame::SnapshotComplete { .. } => "snapshot_complete",
                 WireHostFrame::Delta { .. } => "delta",
                 WireHostFrame::HistoryBackfill { .. } => "history_backfill",
                 WireHostFrame::InputAck { .. } => "input_ack",
+                WireHostFrame::Cursor { .. } => "cursor",
                 WireHostFrame::Shutdown => "shutdown",
             };
             debug!(
@@ -386,9 +396,14 @@ impl TerminalClient {
                 subscription,
                 max_seq,
                 config,
+                features,
             } => {
                 self.subscription_id = Some(subscription);
                 self.last_seq = cmp::max(self.last_seq, max_seq);
+                self.cursor_support = (features & FEATURE_CURSOR_SYNC) != 0;
+                self.cursor_authoritative = false;
+                self.cursor_authoritative_pending = false;
+                self.cursor_seq = 0;
                 self.pending_backfills.clear();
                 self.next_backfill_request_id = 1;
                 self.last_backfill_request_at = None;
@@ -401,7 +416,7 @@ impl TerminalClient {
                 self.last_backfill_trimmed = false;
                 self.handshake_snapshot_lines = config.initial_snapshot_lines;
                 self.handshake_history_rows = 0;
-            }
+                        }
             WireHostFrame::Grid {
                 cols,
                 history_rows,
@@ -435,8 +450,14 @@ impl TerminalClient {
                 self.handshake_history_rows = history_rows as u64;
             }
             WireHostFrame::Snapshot {
-                updates, watermark, ..
+                updates,
+                watermark,
+                cursor,
+                ..
             } => {
+                if cursor.is_some() && self.cursor_support {
+                    self.cursor_authoritative_pending = true;
+                }
                 for update in &updates {
                     self.observe_update_bounds(update, true);
                     let (update_kind, row_hint, seq_hint) = Self::update_debug_metadata(update);
@@ -449,12 +470,21 @@ impl TerminalClient {
                     self.apply_wire_update(update);
                     self.renderer.clear_debug_update_context();
                 }
+                if let Some(cursor_frame) = cursor {
+                    self.apply_wire_cursor(&cursor_frame);
+                }
                 self.last_seq = cmp::max(self.last_seq, watermark);
                 self.force_render = true;
             }
             WireHostFrame::Delta {
-                updates, watermark, ..
+                updates,
+                watermark,
+                cursor,
+                ..
             } => {
+                if cursor.is_some() && self.cursor_support {
+                    self.cursor_authoritative_pending = true;
+                }
                 for update in &updates {
                     self.observe_update_bounds(update, false);
                     let (update_kind, row_hint, seq_hint) = Self::update_debug_metadata(update);
@@ -467,6 +497,9 @@ impl TerminalClient {
                     self.apply_wire_update(update);
                     self.renderer.clear_debug_update_context();
                 }
+                if let Some(cursor_frame) = cursor {
+                    self.apply_wire_cursor(&cursor_frame);
+                }
                 self.last_seq = cmp::max(self.last_seq, watermark);
                 self.force_render = true;
             }
@@ -477,7 +510,11 @@ impl TerminalClient {
                 count,
                 updates,
                 more,
+                cursor,
             } => {
+                if cursor.is_some() && self.cursor_support {
+                    self.cursor_authoritative_pending = true;
+                }
                 for update in &updates {
                     self.observe_update_bounds(update, true);
                 }
@@ -489,9 +526,15 @@ impl TerminalClient {
                     updates,
                     more,
                 )?;
+                if let Some(cursor_frame) = cursor {
+                    self.apply_wire_cursor(&cursor_frame);
+                }
             }
             WireHostFrame::InputAck { seq } => {
                 self.handle_input_ack(seq);
+            }
+            WireHostFrame::Cursor { cursor, .. } => {
+                self.apply_wire_cursor(&cursor);
             }
             WireHostFrame::SnapshotComplete { .. } => {}
             WireHostFrame::Shutdown => return Err(ClientError::Shutdown),
@@ -1131,28 +1174,35 @@ impl TerminalClient {
     fn apply_wire_update(&mut self, update: &WireUpdate) {
         use CursorHint::*;
 
-        let cursor_hint = match update {
-            WireUpdate::Cell { row, col, .. } => {
-                Some(Exact(*row as usize, (*col as usize).saturating_add(1)))
+        let cursor_hint = if self.cursor_authoritative || self.cursor_authoritative_pending {
+            None
+        } else {
+            match update {
+                WireUpdate::Cell { row, col, .. } => Some(Exact(
+                    *row as usize,
+                    (*col as usize).saturating_add(1),
+                )),
+                WireUpdate::Row { row, .. } => Some(RowWidth(*row as usize)),
+                WireUpdate::Rect { rows, cols, .. } => {
+                    let target_row = rows[1] as usize;
+                    let target_col = cols[1] as usize;
+                    Some(Exact(target_row.saturating_sub(1), target_col))
+                }
+                WireUpdate::RowSegment {
+                    row,
+                    start_col,
+                    cells,
+                    ..
+                } => cells
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, _)| {
+                        Exact(*row as usize, (*start_col as usize).saturating_add(idx + 1))
+                    })
+                    .last(),
+                WireUpdate::Trim { .. } => None,
+                WireUpdate::Style { .. } => None,
             }
-            WireUpdate::Row { row, .. } => Some(RowWidth(*row as usize)),
-            WireUpdate::Rect { rows, cols, .. } => {
-                let target_row = rows[1] as usize;
-                let target_col = cols[1] as usize;
-                Some(Exact(target_row.saturating_sub(1), target_col))
-            }
-            WireUpdate::RowSegment {
-                row,
-                start_col,
-                cells,
-                ..
-            } => cells
-                .iter()
-                .enumerate()
-                .map(|(idx, _)| Exact(*row as usize, (*start_col as usize).saturating_add(idx + 1)))
-                .last(),
-            WireUpdate::Trim { .. } => None,
-            WireUpdate::Style { .. } => None,
         };
 
         match update {
@@ -1309,6 +1359,19 @@ impl TerminalClient {
         }
     }
 
+    fn apply_wire_cursor(&mut self, frame: &CursorFrame) {
+        if !self.cursor_support {
+            return;
+        }
+
+        self.cursor_seq = frame.seq;
+        self.cursor_row = frame.row as usize;
+        self.cursor_col = frame.col as usize;
+        self.cursor_authoritative = true;
+        self.cursor_authoritative_pending = false;
+        self.force_render = true;
+    }
+
     fn maybe_render(&mut self) -> Result<(), ClientError> {
         if !self.render_enabled {
             return Ok(());
@@ -1391,6 +1454,9 @@ impl TerminalClient {
             while event::poll(Duration::from_millis(0)).unwrap_or(false) {
                 match event::read() {
                     Ok(Event::Key(key)) => {
+                        if self.handle_super_shortcuts(&key)? {
+                            continue;
+                        }
                         if self.handle_control_shortcuts(&key)? {
                             continue;
                         }
@@ -2312,6 +2378,24 @@ impl TerminalClient {
         Ok(false)
     }
 
+    fn handle_super_shortcuts(&mut self, key: &KeyEvent) -> Result<bool, ClientError> {
+        if !key.modifiers.contains(KeyModifiers::SUPER) {
+            return Ok(false);
+        }
+
+        match key.code {
+            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'k') => {
+                self.force_render = true;
+                self.renderer.mark_dirty();
+                self.request_viewport_clear()?;
+                return Ok(true);
+            }
+            _ => {}
+        }
+
+        Ok(false)
+    }
+
     fn handle_local_key(&mut self, key: &KeyEvent) -> bool {
         if !key.modifiers.intersects(KeyModifiers::ALT) {
             return false;
@@ -2378,6 +2462,31 @@ impl TerminalClient {
     }
 
     fn send_input(&mut self, bytes: &[u8]) -> Result<(), ClientError> {
+        self.send_input_internal(bytes, true)
+    }
+
+    fn request_viewport_clear(&mut self) -> Result<(), ClientError> {
+        self.send_viewport_command(ViewportCommand::Clear)?;
+        const CLEAR: &[u8] = b"\x0c"; // Ctrl+L fallback for older hosts
+        self.send_input_internal(CLEAR, false)
+    }
+
+    fn send_viewport_command(&mut self, command: ViewportCommand) -> Result<(), ClientError> {
+        let frame = WireClientFrame::ViewportCommand { command };
+        let encoded = protocol::encode_client_frame_binary(&frame);
+        telemetry::record_bytes("client_input_frames", encoded.len());
+        self.transport
+            .send_bytes(&encoded)
+            .map_err(ClientError::Transport)?;
+        trace!(target = "client::outgoing", command = ?command, "viewport command sent");
+        Ok(())
+    }
+
+    fn send_input_internal(
+        &mut self,
+        bytes: &[u8],
+        allow_predictions: bool,
+    ) -> Result<(), ClientError> {
         if bytes.is_empty() {
             return Ok(());
         }
@@ -2401,7 +2510,9 @@ impl TerminalClient {
                 "input sent"
             );
         }
-        self.register_prediction(self.input_seq, bytes);
+        if allow_predictions {
+            self.register_prediction(self.input_seq, bytes);
+        }
         Ok(())
     }
 
@@ -3505,6 +3616,7 @@ mod tests {
                 subscription: 1,
                 max_seq: 0,
                 config: sync_config.clone(),
+                features: 0,
             })
             .expect("hello");
         client
@@ -3524,6 +3636,7 @@ mod tests {
                 watermark: 24,
                 has_more: false,
                 updates: seeds,
+                cursor: None,
             })
             .expect("snapshot");
         client
@@ -3575,6 +3688,7 @@ mod tests {
                 count,
                 updates,
                 more: false,
+                cursor: None,
             })
             .expect("history backfill");
 
@@ -3591,6 +3705,7 @@ mod tests {
                 count,
                 updates: Vec::new(),
                 more: false,
+                cursor: None,
             })
             .expect("empty history backfill");
 
@@ -3694,6 +3809,7 @@ mod tests {
                 subscription: 1,
                 max_seq: 0,
                 config: sync_config.clone(),
+                features: 0,
             },
         );
         deliver_next(&client_transport, &mut client);
@@ -3718,6 +3834,7 @@ mod tests {
                 watermark: 24,
                 has_more: false,
                 updates: seeds,
+                cursor: None,
             },
         );
         deliver_next(&client_transport, &mut client);
@@ -3767,6 +3884,7 @@ mod tests {
                 count,
                 updates,
                 more: true,
+            cursor: None,
             },
         );
         deliver_next(&client_transport, &mut client);
@@ -3791,6 +3909,7 @@ mod tests {
                 count,
                 updates: Vec::new(),
                 more: false,
+            cursor: None,
             },
         );
         deliver_next(&client_transport, &mut client);
@@ -3832,6 +3951,7 @@ mod tests {
                 subscription: 1,
                 max_seq: 0,
                 config: sync_config.clone(),
+                features: 0,
             })
             .expect("hello");
         client
@@ -3851,6 +3971,7 @@ mod tests {
                 watermark: 58,
                 has_more: false,
                 updates: seeds,
+                cursor: None,
             })
             .expect("snapshot");
         client
@@ -3898,6 +4019,7 @@ mod tests {
                 count,
                 updates,
                 more: false,
+                cursor: None,
             })
             .expect("apply trimmed history");
         assert!(
@@ -3956,6 +4078,7 @@ mod tests {
                 count: tail_count,
                 updates: Vec::new(),
                 more: false,
+                cursor: None,
             })
             .expect("apply empty tail backfill");
 
@@ -3992,6 +4115,7 @@ mod tests {
                 watermark: 9500,
                 has_more: false,
                 updates: delta_updates,
+                cursor: None,
             })
             .expect("apply tail delta");
 
@@ -4073,6 +4197,7 @@ mod tests {
                 watermark: 150,
                 has_more: false,
                 updates: delta_updates,
+                cursor: None,
             })
             .expect("apply tail delta");
 
@@ -4139,6 +4264,7 @@ mod tests {
                     1,
                     "world                                  for",
                 )],
+                cursor: None,
             })
             .expect("seed row");
 
@@ -4149,6 +4275,7 @@ mod tests {
                 watermark: 2,
                 has_more: false,
                 updates: vec![pack_row_segment(5000, 0, 2, "world")],
+                cursor: None,
             })
             .expect("apply shorter row");
 
@@ -4187,6 +4314,7 @@ mod tests {
                 watermark: 20_000,
                 has_more: false,
                 updates,
+                cursor: None,
             })
             .expect("apply tail delta");
 
@@ -4230,6 +4358,7 @@ mod tests {
                 subscription: 1,
                 max_seq: 4,
                 config: sync_config.clone(),
+                features: 0,
             })
             .expect("hello");
         client
@@ -4249,6 +4378,7 @@ mod tests {
                 watermark: 4,
                 has_more: false,
                 updates: snapshot_updates,
+                cursor: None,
             })
             .expect("snapshot");
         client
@@ -4271,6 +4401,7 @@ mod tests {
                 watermark: 300,
                 has_more: false,
                 updates: tail_updates,
+                cursor: None,
             })
             .expect("delta burst");
 
@@ -4323,6 +4454,7 @@ mod tests {
                 subscription: 1,
                 max_seq: 4,
                 config: sync_config.clone(),
+                features: 0,
             })
             .expect("hello");
         client
@@ -4343,6 +4475,7 @@ mod tests {
                 watermark: 24,
                 has_more: false,
                 updates: snapshot_updates,
+                cursor: None,
             })
             .expect("snapshot");
         client
@@ -4362,6 +4495,7 @@ mod tests {
                 watermark: 300,
                 has_more: false,
                 updates: tail_updates,
+                cursor: None,
             })
             .expect("delta burst");
 

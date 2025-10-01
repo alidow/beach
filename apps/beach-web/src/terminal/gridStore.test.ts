@@ -66,11 +66,11 @@ describe('TerminalGridStore', () => {
 
     store.applyUpdates([
       { type: 'row_segment', row: 0, startCol: 0, seq: 1, cells: packString(`${prompt}${command}`) },
-    ], true);
+    ], { authoritative: true });
 
     store.applyUpdates([
       { type: 'row_segment', row: 0, startCol: 0, seq: 2, cells: packString(prompt) },
-    ], true);
+    ], { authoritative: true });
 
     expect(store.getRowText(0)).toBe('(base) %');
   });
@@ -78,12 +78,12 @@ describe('TerminalGridStore', () => {
   it('drops previous session state on reset', () => {
     const store = new TerminalGridStore();
     store.setGridSize(24, 80);
-    store.applyUpdates([{ type: 'row', row: 0, seq: 1, cells: packString('old session') }], true);
+    store.applyUpdates([{ type: 'row', row: 0, seq: 1, cells: packString('old session') }], { authoritative: true });
     expect(store.getRowText(0)).toBe('old session');
 
     store.reset();
     store.setGridSize(24, 80);
-    store.applyUpdates([{ type: 'row', row: 0, seq: 2, cells: packString('new session') }], true);
+    store.applyUpdates([{ type: 'row', row: 0, seq: 2, cells: packString('new session') }], { authoritative: true });
 
     const loadedRows = store.getSnapshot().rows.filter((row) => row.kind === 'loaded');
     expect(loadedRows).toHaveLength(1);
@@ -95,7 +95,7 @@ describe('TerminalGridStore', () => {
     store.setBaseRow(10);
     store.setGridSize(5, 80);
 
-    store.applyUpdates([{ type: 'row', row: 8, seq: 1, cells: packString('history') }], true);
+    store.applyUpdates([{ type: 'row', row: 8, seq: 1, cells: packString('history') }], { authoritative: true });
 
     expect(store.getSnapshot().baseRow).toBe(8);
   });
@@ -144,9 +144,9 @@ describe('TerminalGridStore', () => {
   it('reports the first gap within a range', () => {
     const store = new TerminalGridStore();
     store.setGridSize(5, 80);
-    store.applyUpdates([{ type: 'row', row: 0, seq: 1, cells: packString('row0') }], true);
+    store.applyUpdates([{ type: 'row', row: 0, seq: 1, cells: packString('row0') }], { authoritative: true });
     store.markRowPending(1);
-    store.applyUpdates([{ type: 'row', row: 2, seq: 1, cells: packString('row2') }], true);
+    store.applyUpdates([{ type: 'row', row: 2, seq: 1, cells: packString('row2') }], { authoritative: true });
 
     expect(store.firstGapBetween(0, 3)).toBe(1);
     expect(store.firstGapBetween(0, 1)).toBeNull();
@@ -156,7 +156,7 @@ describe('TerminalGridStore', () => {
     const store = new TerminalGridStore();
     store.setBaseRow(0);
     store.setGridSize(1, 80);
-    store.applyUpdates([{ type: 'cell', row: 0, col: 0, seq: 1, cell: '('.codePointAt(0)! }], true);
+    store.applyUpdates([{ type: 'cell', row: 0, col: 0, seq: 1, cell: '('.codePointAt(0)! }], { authoritative: true });
 
     expect(store.getRowText(0)).toBe('(');
   });
@@ -164,7 +164,7 @@ describe('TerminalGridStore', () => {
   it('records predictive characters and clears them on ack', () => {
     const store = new TerminalGridStore();
     store.setGridSize(1, 80);
-    store.applyUpdates([{ type: 'row', row: 0, seq: 1, cells: packString('> ') }], true);
+    store.applyUpdates([{ type: 'row', row: 0, seq: 1, cells: packString('> ') }], { authoritative: true });
 
     store.registerPrediction(1, stringToBytes('ls'));
     let snapshot = store.getSnapshot();
@@ -180,17 +180,50 @@ describe('TerminalGridStore', () => {
   it('drops stale predictions when authoritative updates overwrite cells', () => {
     const store = new TerminalGridStore();
     store.setGridSize(1, 80);
-    store.applyUpdates([{ type: 'row', row: 0, seq: 1, cells: packString('> ') }], true);
+    store.applyUpdates([{ type: 'row', row: 0, seq: 1, cells: packString('> ') }], { authoritative: true });
 
-    store.registerPrediction(1, stringToBytes('hi'));
-    expect(store.getSnapshot().getPrediction(0, 2)?.char).toBe('h');
+  store.registerPrediction(1, stringToBytes('hi'));
+  expect(store.getSnapshot().getPrediction(0, 2)?.char).toBe('h');
 
-    store.applyUpdates([{ type: 'row_segment', row: 0, startCol: 2, seq: 2, cells: packString('hi') }], true);
+  store.applyUpdates([{ type: 'row_segment', row: 0, startCol: 2, seq: 2, cells: packString('hi') }], { authoritative: true });
+
+  const snapshot = store.getSnapshot();
+  expect(snapshot.getPrediction(0, 2)).toBeNull();
+  expect(snapshot.getPrediction(0, 3)).toBeNull();
+  expect(store.getRowText(0)).toBe('> hi');
+});
+
+  it('propagates cursor frames to the snapshot when enabled', () => {
+    const store = new TerminalGridStore();
+    store.setGridSize(1, 80);
+    store.setCursorSupport(true);
+    store.applyUpdates([{ type: 'row', row: 0, seq: 1, cells: packString('> ') }], { authoritative: true });
+
+    store.applyCursorFrame({ row: 0, col: 2, seq: 2, visible: false, blink: true });
 
     const snapshot = store.getSnapshot();
-    expect(snapshot.getPrediction(0, 2)).toBeNull();
-    expect(snapshot.getPrediction(0, 3)).toBeNull();
-    expect(store.getRowText(0)).toBe('> hi');
+    expect(snapshot.cursorRow).toBe(0);
+    expect(snapshot.cursorCol).toBe(2);
+    expect(snapshot.cursorVisible).toBe(false);
+    expect(snapshot.cursorAuthoritative).toBe(true);
+    expect(snapshot.cursorSeq).toBe(2);
+  });
+
+  it('tracks predicted cursor while preserving authoritative cursor state', () => {
+    const store = new TerminalGridStore();
+    store.setGridSize(1, 80);
+    store.setCursorSupport(true);
+    store.applyUpdates([{ type: 'row', row: 0, seq: 1, cells: packString('> ') }], { authoritative: true });
+    store.applyCursorFrame({ row: 0, col: 2, seq: 2, visible: true, blink: false });
+
+    store.registerPrediction(3, stringToBytes('a'));
+    let snapshot = store.getSnapshot();
+    expect(snapshot.cursorCol).toBe(2);
+    expect(snapshot.predictedCursor?.col).toBe(3);
+
+    store.clearPrediction(3);
+    snapshot = store.getSnapshot();
+    expect(snapshot.predictedCursor).toBeNull();
   });
 });
 

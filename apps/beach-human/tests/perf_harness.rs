@@ -22,6 +22,7 @@ fn report_binary_vs_json_payload_sizes() {
             subscription: 1,
             max_seq: 0,
             config: sync_config.clone(),
+            features: 0,
         },
         HostFrame::Grid {
             cols: 80,
@@ -53,6 +54,7 @@ fn report_binary_vs_json_payload_sizes() {
                     cells: "Binary".chars().map(pack_char).collect(),
                 },
             ],
+            cursor: None,
         },
         HostFrame::SnapshotComplete {
             subscription: 1,
@@ -76,6 +78,7 @@ fn report_binary_vs_json_payload_sizes() {
                     attrs: 0b0000_0010,
                 },
             ],
+            cursor: None,
         },
         HostFrame::Shutdown,
     ];

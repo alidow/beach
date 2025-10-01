@@ -46,6 +46,13 @@ struct SelectionRange {
     mode: SelectionMode,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GridCursor {
+    absolute_row: u64,
+    col: usize,
+    visible: bool,
+}
+
 impl SelectionRange {
     fn new(anchor: SelectionPosition, head: SelectionPosition, mode: SelectionMode) -> Self {
         Self { anchor, head, mode }
@@ -176,6 +183,7 @@ pub struct GridRenderer {
     status_message: Option<String>,
     styles: HashMap<u32, CachedStyle>,
     debug_context: Option<GridUpdateDebugContext>,
+    cursor: Option<GridCursor>,
 }
 
 impl GridRenderer {
@@ -194,6 +202,7 @@ impl GridRenderer {
             status_message: None,
             styles: HashMap::new(),
             debug_context: None,
+            cursor: None,
         };
         renderer.styles.insert(
             StyleId::DEFAULT.0,
@@ -1125,6 +1134,56 @@ impl GridRenderer {
         self.needs_redraw = true;
     }
 
+    pub fn set_cursor(&mut self, absolute_row: u64, col: usize, visible: bool) {
+        self.cursor = Some(GridCursor {
+            absolute_row,
+            col,
+            visible,
+        });
+        self.mark_dirty();
+    }
+
+    pub fn clear_cursor(&mut self) {
+        if self.cursor.is_some() {
+            self.cursor = None;
+            self.mark_dirty();
+        }
+    }
+
+    fn cursor_viewport_offset(&self) -> Option<(usize, usize)> {
+        let cursor = self.cursor?;
+        if !cursor.visible {
+            return None;
+        }
+        let viewport_start = self.base_row + self.scroll_top as u64;
+        if cursor.absolute_row < viewport_start {
+            return None;
+        }
+        let row_offset = cursor.absolute_row - viewport_start;
+        if row_offset >= self.viewport_height as u64 {
+            return None;
+        }
+        let col = if self.cols == 0 {
+            0
+        } else {
+            cursor.col.min(self.cols.saturating_sub(1))
+        };
+        Some((col, row_offset as usize))
+    }
+
+    pub fn cursor_viewport_position(&self) -> Option<(u16, u16)> {
+        let (col, row) = self.cursor_viewport_offset()?;
+        Some((col as u16, row as u16))
+    }
+
+    pub fn cursor_widget_position(&self, area: Rect) -> Option<(u16, u16)> {
+        let (col, row) = self.cursor_viewport_offset()?;
+        if col as u16 >= area.width || row as u16 >= area.height {
+            return None;
+        }
+        Some((area.x + col as u16, area.y + row as u16))
+    }
+
     pub fn take_dirty(&mut self) -> bool {
         let was_dirty = self.needs_redraw;
         self.needs_redraw = false;
@@ -1156,6 +1215,9 @@ impl GridRenderer {
         if body_height > 0 {
             let body = self.render_body();
             frame.render_widget(body, chunks[0]);
+            if let Some((cursor_x, cursor_y)) = self.cursor_widget_position(chunks[0]) {
+                frame.set_cursor_position((cursor_x, cursor_y));
+            }
         }
 
         if chunks.len() >= 2 {
@@ -1276,6 +1338,16 @@ impl GridRenderer {
                     }
                     RowSlot::Loaded(_) => {
                         let mut spans = Vec::with_capacity(self.cols.max(1));
+                        let cursor_col_for_row = self
+                            .cursor
+                            .filter(|cursor| cursor.visible && cursor.absolute_row == absolute)
+                            .map(|cursor| {
+                                if self.cols == 0 {
+                                    0
+                                } else {
+                                    cursor.col.min(self.cols.saturating_sub(1))
+                                }
+                            });
                         for col in 0..self.cols.max(1) {
                             let (ch, style_id, predicted) = self.cell_for_render(absolute, col);
                             let selected = self
@@ -1283,7 +1355,16 @@ impl GridRenderer {
                                 .as_ref()
                                 .map(|sel| sel.contains(SelectionPosition { row: absolute, col }))
                                 .unwrap_or(false);
-                            spans.push(self.span_for_cell(ch, style_id, selected, predicted));
+                            let highlight_cursor = cursor_col_for_row
+                                .map(|cursor_col| cursor_col == col)
+                                .unwrap_or(false);
+                            spans.push(self.span_for_cell(
+                                ch,
+                                style_id,
+                                selected,
+                                predicted,
+                                highlight_cursor,
+                            ));
                         }
                         entries.push((Line::from(spans), false, absolute));
                     }
@@ -1355,6 +1436,7 @@ impl GridRenderer {
         style_id: Option<u32>,
         selected: bool,
         predicted: bool,
+        highlight_cursor: bool,
     ) -> Span<'static> {
         let mut style = style_id
             .and_then(|id| self.styles.get(&id).map(|cached| cached.style.clone()))
@@ -1369,6 +1451,9 @@ impl GridRenderer {
                 .fg(Color::Black)
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD);
+        }
+        if highlight_cursor {
+            style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
         }
         Span::styled(ch.to_string(), style)
     }

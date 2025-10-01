@@ -200,6 +200,7 @@ pub struct TerminalClient {
     cursor_support: bool,
     cursor_authoritative: bool,
     cursor_authoritative_pending: bool,
+    cursor_visible: bool,
     pending_predictions: HashMap<Seq, Vec<(usize, usize)>>,
     copy_mode: Option<CopyModeState>,
     last_render_at: Option<Instant>,
@@ -243,6 +244,7 @@ impl TerminalClient {
             cursor_support: false,
             cursor_authoritative: false,
             cursor_authoritative_pending: false,
+            cursor_visible: true,
             pending_predictions: HashMap::new(),
             copy_mode: None,
             last_render_at: None,
@@ -404,6 +406,8 @@ impl TerminalClient {
                 self.cursor_authoritative = false;
                 self.cursor_authoritative_pending = false;
                 self.cursor_seq = 0;
+                self.cursor_visible = true;
+                self.renderer.clear_cursor();
                 self.pending_backfills.clear();
                 self.next_backfill_request_id = 1;
                 self.last_backfill_request_at = None;
@@ -575,6 +579,22 @@ impl TerminalClient {
                 );
             }
         }
+    }
+
+    fn sync_renderer_cursor(&mut self) {
+        let visible = if self.cursor_support {
+            if self.cursor_authoritative {
+                self.cursor_visible
+            } else if self.cursor_authoritative_pending {
+                self.cursor_visible
+            } else {
+                true
+            }
+        } else {
+            true
+        };
+        self.renderer
+            .set_cursor(self.cursor_row as u64, self.cursor_col, visible);
     }
 
     fn note_loaded_row(&mut self, row: u64) {
@@ -1356,6 +1376,8 @@ impl TerminalClient {
                 }
             }
         }
+
+        self.sync_renderer_cursor();
     }
 
     fn apply_wire_cursor(&mut self, frame: &CursorFrame) {
@@ -1366,9 +1388,11 @@ impl TerminalClient {
         self.cursor_seq = frame.seq;
         self.cursor_row = frame.row as usize;
         self.cursor_col = frame.col as usize;
+        self.cursor_visible = frame.visible;
         self.cursor_authoritative = true;
         self.cursor_authoritative_pending = false;
         self.force_render = true;
+        self.sync_renderer_cursor();
     }
 
     fn maybe_render(&mut self) -> Result<(), ClientError> {
@@ -1424,6 +1448,11 @@ impl TerminalClient {
                 .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
             for line in self.renderer.visible_lines() {
                 writeln!(stdout, "{}", line).map_err(|err| {
+                    ClientError::Transport(TransportError::Setup(err.to_string()))
+                })?;
+            }
+            if let Some((col, row)) = self.renderer.cursor_viewport_position() {
+                execute!(stdout, MoveTo(col, row)).map_err(|err| {
                     ClientError::Transport(TransportError::Setup(err.to_string()))
                 })?;
             }
@@ -2568,6 +2597,7 @@ impl TerminalClient {
             self.pending_predictions.insert(seq, positions);
             self.force_render = true;
         }
+        self.sync_renderer_cursor();
     }
 
     fn advance_cursor_for_char(&mut self, ch: char) {
@@ -2577,6 +2607,7 @@ impl TerminalClient {
         } else {
             self.cursor_col = self.cursor_col.saturating_add(1);
         }
+        self.sync_renderer_cursor();
     }
 
     fn setup_tui(&mut self) -> Result<(), ClientError> {

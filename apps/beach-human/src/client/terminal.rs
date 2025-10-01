@@ -2,8 +2,8 @@ use crate::cache::Seq;
 use crate::cache::terminal::{PackedCell, StyleId, unpack_cell};
 use crate::client::grid_renderer::{GridRenderer, SelectionMode, SelectionPosition};
 use crate::protocol::{
-    self, ClientFrame as WireClientFrame, CursorFrame, HostFrame as WireHostFrame,
-    Update as WireUpdate, ViewportCommand, FEATURE_CURSOR_SYNC,
+    self, ClientFrame as WireClientFrame, CursorFrame, FEATURE_CURSOR_SYNC,
+    HostFrame as WireHostFrame, Update as WireUpdate, ViewportCommand,
 };
 use crate::telemetry::{self, PerfGuard};
 use crate::transport::{Payload, Transport, TransportError};
@@ -373,7 +373,7 @@ impl TerminalClient {
             let frame_type = match &frame {
                 WireHostFrame::Heartbeat { .. } => "heartbeat",
                 WireHostFrame::Hello { .. } => "hello",
-                            WireHostFrame::Grid { .. } => "grid",
+                WireHostFrame::Grid { .. } => "grid",
                 WireHostFrame::Snapshot { .. } => "snapshot",
                 WireHostFrame::SnapshotComplete { .. } => "snapshot_complete",
                 WireHostFrame::Delta { .. } => "delta",
@@ -416,7 +416,7 @@ impl TerminalClient {
                 self.last_backfill_trimmed = false;
                 self.handshake_snapshot_lines = config.initial_snapshot_lines;
                 self.handshake_history_rows = 0;
-                        }
+            }
             WireHostFrame::Grid {
                 cols,
                 history_rows,
@@ -1178,10 +1178,9 @@ impl TerminalClient {
             None
         } else {
             match update {
-                WireUpdate::Cell { row, col, .. } => Some(Exact(
-                    *row as usize,
-                    (*col as usize).saturating_add(1),
-                )),
+                WireUpdate::Cell { row, col, .. } => {
+                    Some(Exact(*row as usize, (*col as usize).saturating_add(1)))
+                }
                 WireUpdate::Row { row, .. } => Some(RowWidth(*row as usize)),
                 WireUpdate::Rect { rows, cols, .. } => {
                     let target_row = rows[1] as usize;
@@ -3884,7 +3883,7 @@ mod tests {
                 count,
                 updates,
                 more: true,
-            cursor: None,
+                cursor: None,
             },
         );
         deliver_next(&client_transport, &mut client);
@@ -3909,7 +3908,7 @@ mod tests {
                 count,
                 updates: Vec::new(),
                 more: false,
-            cursor: None,
+                cursor: None,
             },
         );
         deliver_next(&client_transport, &mut client);

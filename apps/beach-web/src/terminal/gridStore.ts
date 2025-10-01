@@ -13,6 +13,18 @@ import {
   type ApplyUpdatesOptions,
 } from './cache';
 
+declare global {
+  interface Window {
+    __BEACH_TRACE?: boolean;
+  }
+}
+
+function trace(...parts: unknown[]): void {
+  if (typeof window !== 'undefined' && window.__BEACH_TRACE) {
+    console.debug('[beach-trace][gridStore]', ...parts);
+  }
+}
+
 export type {
   CellState,
   LoadedRow,
@@ -97,15 +109,26 @@ export class TerminalGridStore {
   applyUpdates(updates: Update[], options: ApplyUpdatesOptions = {}): void {
     const hasCursor = Boolean(options.cursor);
     if (updates.length === 0 && !hasCursor) {
+      trace('applyUpdates skipped (no updates, no cursor)', options);
       return;
     }
+    trace('applyUpdates start', {
+      count: updates.length,
+      authoritative: options.authoritative,
+      origin: options.origin,
+      cursor: options.cursor ? { row: options.cursor.row, col: options.cursor.col, seq: options.cursor.seq } : null,
+    });
     if (this.cache.applyUpdates(updates, options)) {
+      trace('applyUpdates mutated');
       this.invalidate();
       this.notify();
+    } else {
+      trace('applyUpdates no-op');
     }
   }
 
   setCursorSupport(enabled: boolean): void {
+    trace('cursorSupport set', enabled);
     if (this.cache.enableCursorSupport(enabled)) {
       this.invalidate();
       this.notify();
@@ -113,6 +136,7 @@ export class TerminalGridStore {
   }
 
   applyCursorFrame(cursor: CursorFrame): void {
+    trace('applyCursorFrame', cursor);
     this.applyUpdates([], { cursor });
   }
 

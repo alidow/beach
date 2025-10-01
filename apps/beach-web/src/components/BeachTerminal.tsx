@@ -13,6 +13,40 @@ import type { ServerMessage } from '../transport/signaling';
 
 export type TerminalStatus = 'idle' | 'connecting' | 'connected' | 'error' | 'closed';
 
+declare global {
+  interface Window {
+    __BEACH_TRACE?: boolean;
+  }
+}
+
+function trace(...args: unknown[]): void {
+  if (typeof window !== 'undefined' && window.__BEACH_TRACE) {
+    console.debug('[beach-trace][terminal]', ...args);
+  }
+}
+
+function summarizeSnapshot(store: TerminalGridStore | undefined): void {
+  if (!store || !(typeof window !== 'undefined' && window.__BEACH_TRACE)) {
+    return;
+  }
+  const snapshot = store.getSnapshot();
+  const preview = snapshot.rows
+    .filter((row) => row.kind === 'loaded')
+    .slice(0, 5)
+    .map((row) => ({
+      absolute: row.absolute,
+      text: row.kind === 'loaded' ? row.cells.map((cell) => cell.char).join('').trimEnd() : '',
+      width: row.kind === 'loaded' ? row.cells.length : 0,
+    }));
+  trace('snapshot state', {
+    baseRow: snapshot.baseRow,
+    totalRows: snapshot.rows.length,
+    cursor: { row: snapshot.cursorRow, col: snapshot.cursorCol, seq: snapshot.cursorSeq },
+    predictedCursor: snapshot.predictedCursor,
+    preview,
+  });
+}
+
 export interface BeachTerminalProps {
   sessionId?: string;
   baseUrl?: string;
@@ -485,12 +519,15 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     backfillController.handleFrame(frame);
     switch (frame.type) {
       case 'hello':
+        trace('frame hello', frame);
         store.reset();
         subscriptionRef.current = frame.subscription;
         inputSeqRef.current = 0;
         store.setCursorSupport(Boolean(frame.features & FEATURE_CURSOR_SYNC));
+        summarizeSnapshot(store);
         break;
       case 'grid':
+        trace('frame grid', frame);
         store.setBaseRow(frame.baseRow);
         store.setGridSize(frame.historyRows, frame.cols);
         {
@@ -520,11 +557,17 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       case 'history_backfill': {
         const authoritative = frame.type === 'snapshot' || frame.type === 'history_backfill';
         log(`frame ${frame.type}`, { updates: frame.updates.length, authoritative });
+        trace('frame updates', {
+          type: frame.type,
+          updates: frame.updates.map((update) => update.type),
+          cursor: frame.cursor ?? null,
+        });
         store.applyUpdates(frame.updates, {
           authoritative,
           origin: frame.type,
           cursor: frame.cursor ?? null,
         });
+        summarizeSnapshot(store);
         if (!frame.hasMore && frame.type === 'snapshot') {
           store.setFollowTail(true);
         }
@@ -540,11 +583,15 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         store.clearPrediction(frame.seq);
         break;
       case 'cursor':
+        trace('frame cursor', frame.cursor);
         store.applyCursorFrame(frame.cursor);
+        summarizeSnapshot(store);
         break;
       case 'heartbeat':
+        trace('frame heartbeat', frame.seq);
         break;
       case 'shutdown':
+        trace('frame shutdown');
         setStatus('closed');
         break;
       default:

@@ -1,5 +1,17 @@
 import type { CursorFrame, Update } from '../protocol/types';
 
+declare global {
+  interface Window {
+    __BEACH_TRACE?: boolean;
+  }
+}
+
+function trace(...parts: unknown[]): void {
+  if (typeof window !== 'undefined' && window.__BEACH_TRACE) {
+    console.debug('[beach-trace][cache]', ...parts);
+  }
+}
+
 const HIGH_SHIFT = 32;
 const WORD = 2 ** HIGH_SHIFT;
 const LOW_MASK = 0xffff_ffff;
@@ -125,6 +137,7 @@ export class TerminalGridCache {
     this.maxHistory = options.maxHistory ?? DEFAULT_HISTORY_LIMIT;
     this.cols = Math.max(0, options.initialCols ?? 0);
     this.styles.set(0, { id: 0, fg: DEFAULT_COLOR, bg: DEFAULT_COLOR, attrs: 0 });
+    trace('init', { maxHistory: this.maxHistory, cols: this.cols });
     this.cursorSeq = null;
     this.cursorVisible = true;
     this.cursorBlink = true;
@@ -135,6 +148,7 @@ export class TerminalGridCache {
   }
 
   reset(): void {
+    trace('reset');
     this.baseRow = 0;
     this.cols = 0;
     this.rows = [];
@@ -256,6 +270,12 @@ export class TerminalGridCache {
     let cursorChanged = false;
     let cursorHintSeen = false;
     const originLabel = origin ?? null;
+    trace('applyUpdates start', {
+      count: updates.length,
+      authoritative,
+      origin: originLabel,
+      cursor,
+    });
 
     if (updates.length > 0) {
       for (const update of updates) {
@@ -265,6 +285,11 @@ export class TerminalGridCache {
           authoritative,
         };
         const beforeWidth = this.debugRowWidthForUpdate(update);
+        trace('applyUpdates update', {
+          type: update.type,
+          row: extractUpdateRow(update),
+          authoritative,
+        });
         baseAdjusted = this.observeBounds(update, authoritative) || baseAdjusted;
         mutated = this.applyGridUpdate(update) || mutated;
         const hint = this.cursorAuthoritative || this.cursorAuthoritativePending ? null : this.cursorHint(update);
@@ -281,7 +306,9 @@ export class TerminalGridCache {
       cursorChanged = this.applyCursorFrame(cursor) || cursorChanged;
     }
 
-    return mutated || baseAdjusted || cursorChanged || cursorHintSeen;
+    const changed = mutated || baseAdjusted || cursorChanged || cursorHintSeen;
+    trace('applyUpdates complete', { changed, mutated, baseAdjusted, cursorChanged, cursorHintSeen });
+    return changed;
   }
 
   markRowPending(absolute: number): boolean {
@@ -656,6 +683,7 @@ export class TerminalGridCache {
     if (this.ensureCols(width)) {
       mutated = true;
     }
+    const debugChars: string[] = [];
     for (let col = 0; col < width; col += 1) {
       const packed = cells[col];
       const cell = loaded.cells[col]!;
@@ -678,6 +706,17 @@ export class TerminalGridCache {
           mutated = true;
         }
       }
+      if (typeof window !== 'undefined' && window.__BEACH_TRACE && col < 16) {
+        debugChars[col] = cell.char ?? ' ';
+      }
+    }
+    if (typeof window !== 'undefined' && window.__BEACH_TRACE && row < this.baseRow + 5) {
+      trace('applyRow result', {
+        row,
+        seq,
+        width,
+        preview: debugChars.join(''),
+      });
     }
     loaded.latestSeq = Math.max(loaded.latestSeq, seq);
     const viewportMoved = this.touchRow(row);
@@ -1173,7 +1212,10 @@ export class TerminalGridCache {
     for (let index = this.rows.length - 1; index >= 0; index -= 1) {
       const slot = this.rows[index];
       if (slot && slot.kind === 'loaded') {
-        return slot.absolute;
+        const width = this.rowDisplayWidth(slot.absolute);
+        if (width > 0) {
+          return slot.absolute;
+        }
       }
     }
     return null;

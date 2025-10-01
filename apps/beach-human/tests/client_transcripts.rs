@@ -914,7 +914,7 @@ async fn client_targets_tail_history_after_large_delta() {
                 count,
                 updates: bootstrap,
                 more: false,
-            cursor: None,
+                cursor: None,
             },
         );
     }
@@ -1280,7 +1280,7 @@ async fn client_recovers_truncated_history_after_tail_burst() {
                 count: 64,
                 updates: Vec::new(),
                 more: chunk != 192,
-            cursor: None,
+                cursor: None,
             },
         );
     }
@@ -1370,7 +1370,7 @@ async fn client_recovers_truncated_history_after_tail_burst() {
                 count,
                 updates,
                 more: false,
-            cursor: None,
+                cursor: None,
             },
         );
     }

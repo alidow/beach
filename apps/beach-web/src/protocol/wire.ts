@@ -416,7 +416,7 @@ export function decodeHostFrameBinary(input: ArrayBuffer | Uint8Array): HostFram
       const subscription = readVarUint(bytes, cursor);
       const maxSeq = readVarUint(bytes, cursor);
       const config = readSyncConfig(bytes, cursor);
-      const features = readVarUint(bytes, cursor);
+      const features = cursor.value < bytes.length ? readVarUint(bytes, cursor) : 0;
       return { type: 'hello', subscription, maxSeq, config, features };
     }
     case HOST_KIND_GRID: {
@@ -446,8 +446,7 @@ export function decodeHostFrameBinary(input: ArrayBuffer | Uint8Array): HostFram
       const watermark = readVarUint(bytes, cursor);
       const hasMore = readBool(bytes, cursor);
       const updates = readUpdates(bytes, cursor);
-      const hasCursor = readBool(bytes, cursor);
-      const cursorFrame = hasCursor ? readCursorFrame(bytes, cursor) : undefined;
+      const cursorFrame = readOptionalCursor(bytes, cursor);
       return { type: 'snapshot', subscription, lane, watermark, hasMore, updates, cursor: cursorFrame };
     }
     case HOST_KIND_SNAPSHOT_COMPLETE: {
@@ -460,8 +459,7 @@ export function decodeHostFrameBinary(input: ArrayBuffer | Uint8Array): HostFram
       const watermark = readVarUint(bytes, cursor);
       const hasMore = readBool(bytes, cursor);
       const updates = readUpdates(bytes, cursor);
-      const hasCursor = readBool(bytes, cursor);
-      const cursorFrame = hasCursor ? readCursorFrame(bytes, cursor) : undefined;
+      const cursorFrame = readOptionalCursor(bytes, cursor);
       return { type: 'delta', subscription, watermark, hasMore, updates, cursor: cursorFrame };
     }
     case HOST_KIND_HISTORY_BACKFILL: {
@@ -471,8 +469,7 @@ export function decodeHostFrameBinary(input: ArrayBuffer | Uint8Array): HostFram
       const count = readVarUint(bytes, cursor);
       const more = readBool(bytes, cursor);
       const updates = readUpdates(bytes, cursor);
-      const hasCursor = readBool(bytes, cursor);
-      const cursorFrame = hasCursor ? readCursorFrame(bytes, cursor) : undefined;
+      const cursorFrame = readOptionalCursor(bytes, cursor);
       return {
         type: 'history_backfill',
         subscription,
@@ -498,6 +495,20 @@ export function decodeHostFrameBinary(input: ArrayBuffer | Uint8Array): HostFram
     default:
       throw new RangeError(`unknown host frame type: ${kind}`);
   }
+}
+
+function readOptionalCursor(bytes: Uint8Array, cursor: Cursor): CursorFrame | undefined {
+  if (cursor.value >= bytes.length) {
+    return undefined;
+  }
+  const hasCursor = readBool(bytes, cursor);
+  if (!hasCursor) {
+    return undefined;
+  }
+  if (cursor.value >= bytes.length) {
+    return undefined;
+  }
+  return readCursorFrame(bytes, cursor);
 }
 
 export function encodeClientFrameBinary(frame: ClientFrame): Uint8Array {

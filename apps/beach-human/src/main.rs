@@ -6,9 +6,9 @@ use beach_human::cache::terminal::{PackedCell, StyleId, TerminalGrid, unpack_cel
 use beach_human::client::terminal::{ClientError, TerminalClient};
 use beach_human::model::terminal::diff::{CacheUpdate, HistoryTrim, RowSnapshot, StyleDefinition};
 use beach_human::protocol::{
-    self, CursorFrame, HostFrame, Lane as WireLane, LaneBudgetFrame as WireLaneBudget,
-    SyncConfigFrame as WireSyncConfig, Update as WireUpdate, ViewportCommand,
-    ClientFrame as WireClientFrame, FEATURE_CURSOR_SYNC,
+    self, ClientFrame as WireClientFrame, CursorFrame, FEATURE_CURSOR_SYNC, HostFrame,
+    Lane as WireLane, LaneBudgetFrame as WireLaneBudget, SyncConfigFrame as WireSyncConfig,
+    Update as WireUpdate, ViewportCommand,
 };
 use beach_human::server::terminal::{
     AlacrittyEmulator, Command as PtyCommand, LocalEcho, PtyProcess, PtyWriter, SpawnConfig,
@@ -50,7 +50,12 @@ use uuid::Uuid;
 
 fn cursor_sync_enabled() -> bool {
     std::env::var("BEACH_CURSOR_SYNC")
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(true)
 }
 
@@ -1312,8 +1317,7 @@ where
             "sending trailing chunked host frame"
         );
         send_host_frame(transport, final_frame)?;
-        if final_cursor.is_some() {
-        }
+        if final_cursor.is_some() {}
     }
 
     Ok(())
@@ -1324,16 +1328,28 @@ fn handle_viewport_command(
     writer: &PtyWriter,
     transport_id: u64,
     transport_kind: &TransportKind,
+    grid: &Arc<TerminalGrid>,
+    forwarder_tx: &Option<UnboundedSender<ForwarderCommand>>,
 ) -> AnyResult<()> {
     match command {
         ViewportCommand::Clear => {
             writer.write(&[0x0c])?;
+            grid.clear_viewport();
             debug!(
                 target = "sync::incoming",
                 transport_id,
                 transport = ?transport_kind,
                 "viewport clear command applied"
             );
+            if let Some(tx) = forwarder_tx {
+                if tx.send(ForwarderCommand::ViewportRefresh).is_err() {
+                    trace!(
+                        target = "sync::incoming",
+                        transport_id = transport_id,
+                        "viewport refresh send failed (receiver closed)"
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -1687,6 +1703,8 @@ fn spawn_input_listener(
                                                 &writer,
                                                 transport_id,
                                                 &transport_kind,
+                                                &grid,
+                                                &forwarder_tx,
                                             ) {
                                                 warn!(
                                                     target = "sync::incoming",
@@ -2007,11 +2025,7 @@ impl TransmitterCache {
         self.cursor = None;
     }
 
-    fn apply_updates(
-        &mut self,
-        updates: &[CacheUpdate],
-        dedupe: bool,
-    ) -> PreparedUpdateBatch {
+    fn apply_updates(&mut self, updates: &[CacheUpdate], dedupe: bool) -> PreparedUpdateBatch {
         let mut out = Vec::with_capacity(updates.len());
         let mut next_cursor: Option<CursorFrame> = None;
         for update in updates {
@@ -2134,7 +2148,10 @@ impl TransmitterCache {
             }
         });
 
-        PreparedUpdateBatch { updates: out, cursor }
+        PreparedUpdateBatch {
+            updates: out,
+            cursor,
+        }
     }
 
     fn ensure_row_capacity(&mut self, row: usize, min_cols: usize) -> &mut Vec<u64> {
@@ -2195,6 +2212,7 @@ enum ForwarderCommand {
     RemoveTransport {
         id: TransportId,
     },
+    ViewportRefresh,
 }
 
 fn spawn_webrtc_acceptor(
@@ -2802,6 +2820,19 @@ fn spawn_update_forwarder(
                             ForwarderCommand::RemoveTransport { id } => {
                                 drop_transport(&mut sinks, &shared_registry, id);
                             }
+                            ForwarderCommand::ViewportRefresh => {
+                                let (_, cols) = grid.viewport_size();
+                                for sink in sinks.iter_mut() {
+                                    if !sink.active {
+                                        continue;
+                                    }
+                                    sink.synchronizer.reset();
+                                    sink.cache.reset(cols);
+                                    sink.handshake_complete = false;
+                                    sink.handshake_attempts = 0;
+                                    sink.last_handshake = Instant::now() - HANDSHAKE_REFRESH;
+                                }
+                            }
                         }
                     }
                 }
@@ -2970,11 +3001,7 @@ fn initialize_transport_snapshot(
 ) -> Result<(ServerSynchronizer<TerminalSync, CacheUpdate>, Seq), TransportError> {
     let mut synchronizer = ServerSynchronizer::new(terminal_sync.clone(), sync_config.clone());
     let hello = synchronizer.hello(subscription);
-    let features = if cursor_sync {
-        FEATURE_CURSOR_SYNC
-    } else {
-        0
-    };
+    let features = if cursor_sync { FEATURE_CURSOR_SYNC } else { 0 };
     debug!(
         target = "sync::handshake",
         transport_id = transport.id().0,
@@ -4040,6 +4067,9 @@ mod tests {
         let mut cache = TransmitterCache::new();
         cache.reset(80);
         let batch = cache.apply_updates(&chunk.updates, false);
-        assert!(batch.updates.is_empty(), "expected no updates for default rows");
+        assert!(
+            batch.updates.is_empty(),
+            "expected no updates for default rows"
+        );
     }
 }

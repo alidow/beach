@@ -42,6 +42,35 @@ describe('wire codec', () => {
     });
   });
 
+  it('decodes legacy hello frames without features', () => {
+    const encoded = encodeHostFrameBinary({
+      type: 'hello',
+      subscription: 2,
+      maxSeq: 128,
+      config: {
+        snapshotBudgets: [{ lane: Lane.Foreground, maxUpdates: 8 }],
+        deltaBudget: 32,
+        heartbeatMs: 500,
+        initialSnapshotLines: 16,
+      },
+      features: 0,
+    });
+    const legacy = encoded.slice(0, -1);
+    const decoded = decodeHostFrameBinary(legacy);
+    expect(decoded).toEqual({
+      type: 'hello',
+      subscription: 2,
+      maxSeq: 128,
+      config: {
+        snapshotBudgets: [{ lane: Lane.Foreground, maxUpdates: 8 }],
+        deltaBudget: 32,
+        heartbeatMs: 500,
+        initialSnapshotLines: 16,
+      },
+      features: 0,
+    });
+  });
+
   it('round-trips snapshot frames with updates', () => {
     roundTripHost({
       type: 'snapshot',

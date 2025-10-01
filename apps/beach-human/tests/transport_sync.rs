@@ -73,11 +73,7 @@ impl TransmitterCache {
         self.cursor = None;
     }
 
-    fn apply_updates(
-        &mut self,
-        updates: &[CacheUpdate],
-        dedupe: bool,
-    ) -> PreparedUpdateBatch {
+    fn apply_updates(&mut self, updates: &[CacheUpdate], dedupe: bool) -> PreparedUpdateBatch {
         let mut out = Vec::with_capacity(updates.len());
         let mut next_cursor: Option<CursorFrame> = None;
         for update in updates {
@@ -189,7 +185,10 @@ impl TransmitterCache {
             }
         });
 
-        PreparedUpdateBatch { updates: out, cursor }
+        PreparedUpdateBatch {
+            updates: out,
+            cursor,
+        }
     }
 
     fn ensure_row_capacity(&mut self, row: usize, min_cols: usize) -> &mut Vec<u64> {

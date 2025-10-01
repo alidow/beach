@@ -3,11 +3,11 @@ use crate::cache::terminal::{
     PackedCell, Style, StyleId, StyleTable, TerminalGrid, attrs_to_byte, pack_cell,
     pack_color_from_heavy,
 };
+use crate::model::terminal::CursorState;
 use crate::model::terminal::cell::{Cell as HeavyCell, CellAttributes, Color as HeavyColor};
 use crate::model::terminal::diff::{
     CacheUpdate, CellWrite, HistoryTrim, RowSnapshot, StyleDefinition,
 };
-use crate::model::terminal::CursorState;
 use alacritty_terminal::{
     Term,
     event::{Event, EventListener},
@@ -536,7 +536,10 @@ impl AlacrittyEmulator {
         updates.push(CacheUpdate::Cursor(cursor));
     }
 
-    fn compute_cursor_components(&mut self, grid: &TerminalGrid) -> Option<(usize, usize, bool, bool)> {
+    fn compute_cursor_components(
+        &mut self,
+        grid: &TerminalGrid,
+    ) -> Option<(usize, usize, bool, bool)> {
         let origin = {
             let term_grid = self.term.grid();
             let total_lines = term_grid.total_lines();

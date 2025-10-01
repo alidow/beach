@@ -285,6 +285,36 @@ impl TerminalGrid {
         self.viewport_cols.store(cols.max(1), Ordering::Relaxed);
     }
 
+    pub fn clear_viewport(&self) {
+        let mut inner = self.inner.write().unwrap();
+        let old_base = inner.base;
+        let trimmed_count = inner.rows.len();
+        let cols = inner.cols;
+        let viewport_rows = self.viewport_rows.load(Ordering::Relaxed).max(1);
+        inner.rows.clear();
+        for _ in 0..viewport_rows {
+            let absolute = inner.next_row_id;
+            inner.rows.push_back(RowEntry::new(
+                absolute,
+                cols,
+                self.default_cell,
+                self.default_seq,
+            ));
+            inner.next_row_id = inner.next_row_id.saturating_add(1);
+        }
+        inner.base = inner
+            .rows
+            .front()
+            .map(|entry| entry.absolute)
+            .unwrap_or(inner.next_row_id);
+        if trimmed_count > 0 {
+            self.trim_events.lock().unwrap().push(TrimEvent {
+                start: old_base,
+                count: trimmed_count,
+            });
+        }
+    }
+
     pub fn ensure_style_id(&self, style: Style) -> StyleId {
         self.style_table.ensure_id(style)
     }

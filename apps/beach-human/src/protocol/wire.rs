@@ -1,6 +1,6 @@
 use super::{
-    ClientFrame, CursorFrame, HostFrame, Lane, LaneBudgetFrame, PROTOCOL_VERSION,
-    SyncConfigFrame, Update, ViewportCommand,
+    ClientFrame, CursorFrame, HostFrame, Lane, LaneBudgetFrame, PROTOCOL_VERSION, SyncConfigFrame,
+    Update, ViewportCommand,
 };
 
 const VERSION_BITS: u8 = 3;
@@ -165,7 +165,10 @@ pub fn encode_host_frame_binary(frame: &HostFrame) -> Vec<u8> {
             write_header(&mut buf, HOST_KIND_INPUT_ACK);
             write_var_u64(&mut buf, *seq);
         }
-        HostFrame::Cursor { subscription, cursor } => {
+        HostFrame::Cursor {
+            subscription,
+            cursor,
+        } => {
             write_header(&mut buf, HOST_KIND_CURSOR);
             write_var_u64(&mut buf, *subscription);
             encode_cursor(&mut buf, cursor);
@@ -812,14 +815,12 @@ mod tests {
             request_id: 2,
             start_row: 5,
             count: 2,
-            updates: vec![
-                Update::Cell {
-                    row: 5,
-                    col: 0,
-                    seq: 1,
-                    cell: 0x0002,
-                },
-            ],
+            updates: vec![Update::Cell {
+                row: 5,
+                col: 0,
+                seq: 1,
+                cell: 0x0002,
+            }],
             more: true,
             cursor: Some(CursorFrame {
                 row: 5,

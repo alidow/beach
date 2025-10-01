@@ -308,6 +308,15 @@ where
     pub fn config(&self) -> &SyncConfig {
         &self.config
     }
+
+    pub fn reset(&mut self)
+    where
+        S::Cursor: Default,
+    {
+        self.cursor = Default::default();
+        self.lane_initialized = [false; 3];
+        self.lane_complete = [false; 3];
+    }
 }
 
 pub mod terminal;

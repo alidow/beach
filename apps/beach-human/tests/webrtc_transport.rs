@@ -532,6 +532,7 @@ async fn webrtc_signaling_end_to_end() {
         WebRtcRole::Answerer,
         Duration::from_millis(50),
         None,
+        None,
     );
 
     let (offer_res, answer_res) = tokio::join!(

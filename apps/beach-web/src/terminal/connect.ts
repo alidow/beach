@@ -20,6 +20,7 @@ export interface ConnectBrowserTransportOptions {
   iceServers?: RTCIceServer[];
   logger?: (message: string) => void;
   createSocket?: SignalingClientOptions['createSocket'];
+  clientLabel?: string;
 }
 
 export async function connectBrowserTransport(
@@ -32,6 +33,7 @@ export async function connectBrowserTransport(
     passphrase: options.passcode,
     supportedTransports: ['webrtc'],
     createSocket: options.createSocket,
+    label: options.clientLabel,
   });
   const {
     transport: webRtcTransport,

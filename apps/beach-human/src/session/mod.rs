@@ -126,11 +126,15 @@ impl SessionManager {
         &self,
         session_id: &str,
         join_code: &str,
+        label: Option<&str>,
     ) -> Result<JoinedSession, SessionError> {
         validate_join_code(join_code)?;
 
         let request = JoinSessionRequest {
             passphrase: join_code.to_string(),
+            label: label
+                .map(|value| value.trim().to_string())
+                .filter(|s| !s.is_empty()),
         };
 
         let response = self
@@ -415,6 +419,8 @@ struct RegisterSessionResponse {
 #[derive(Debug, Serialize)]
 struct JoinSessionRequest {
     passphrase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -656,7 +662,7 @@ mod tests {
 
         let hosted = manager.host().await.unwrap();
         let joiner = manager
-            .join(hosted.session_id(), hosted.join_code())
+            .join(hosted.session_id(), hosted.join_code(), None)
             .await
             .unwrap();
 
@@ -682,7 +688,7 @@ mod tests {
 
         let hosted = manager.host().await.unwrap();
         let err = manager
-            .join(hosted.session_id(), "000000")
+            .join(hosted.session_id(), "000000", None)
             .await
             .unwrap_err();
 

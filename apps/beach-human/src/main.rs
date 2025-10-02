@@ -26,25 +26,35 @@ use beach_human::transport as transport_mod;
 use beach_human::transport::{
     Payload, Transport, TransportError, TransportId, TransportKind, TransportMessage,
 };
-use clap::{Args, Parser, Subcommand};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use crossterm::cursor::{Hide, Show};
+use crossterm::event::{self, Event as CEvent, KeyCode, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode, size as terminal_size,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{self, Write as _};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::process::{ChildStderr, Command as TokioCommand};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep};
 use tracing::{Level, debug, error, info, trace, warn};
-use transport_mod::webrtc::{OffererSupervisor, WebRtcRole};
+use transport_mod::webrtc::{OffererAcceptedTransport, OffererSupervisor, WebRtcRole};
 use url::Url;
 use uuid::Uuid;
 
@@ -76,6 +86,7 @@ async fn run() -> Result<(), CliError> {
 
     match cli.command {
         Some(Command::Join(args)) => handle_join(&session_base, args).await,
+        Some(Command::Ssh(args)) => handle_ssh(&session_base, args).await,
         Some(Command::Host(args)) => handle_host(&session_base, args).await,
         None => handle_host(&session_base, HostArgs::default()).await,
     }
@@ -140,6 +151,8 @@ enum Command {
     Host(HostArgs),
     /// Join an existing session using a session id or share URL
     Join(JoinArgs),
+    /// Bootstrap a remote session over SSH and auto-attach the local client
+    Ssh(SshArgs),
 }
 
 #[derive(Args, Debug, Default)]
@@ -171,6 +184,28 @@ struct HostArgs {
         help = "Wait for a peer to connect before launching the host command"
     )]
     wait: bool,
+
+    #[arg(
+        long = "allow-all-clients",
+        action = clap::ArgAction::SetTrue,
+        help = "Automatically accept all clients without prompting"
+    )]
+    allow_all_clients: bool,
+
+    #[arg(
+        long = "bootstrap-output",
+        value_enum,
+        default_value_t = BootstrapOutput::Default,
+        help = "Control how bootstrap metadata is emitted (default banner or json envelope)"
+    )]
+    bootstrap_output: BootstrapOutput,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum BootstrapOutput {
+    #[default]
+    Default,
+    Json,
 }
 
 #[derive(Args, Debug)]
@@ -185,6 +220,102 @@ struct JoinArgs {
         help = "Six digit passcode (prompted interactively if omitted)"
     )]
     passcode: Option<String>,
+
+    #[arg(
+        long = "label",
+        value_name = "TEXT",
+        env = "BEACH_CLIENT_LABEL",
+        help = "Optional identifier displayed to the host"
+    )]
+    label: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct SshArgs {
+    #[arg(value_name = "TARGET", help = "SSH destination (user@host or host)")]
+    target: String,
+
+    #[arg(
+        long = "remote-path",
+        default_value = "beach",
+        value_name = "PATH",
+        help = "Remote beach binary name or absolute path"
+    )]
+    remote_path: String,
+
+    #[arg(
+        long = "ssh-binary",
+        default_value = "ssh",
+        value_name = "BIN",
+        help = "SSH executable to invoke"
+    )]
+    ssh_binary: String,
+
+    #[arg(
+        long = "ssh-flag",
+        value_name = "FLAG",
+        action = clap::ArgAction::Append,
+        help = "Additional flag to pass through to ssh (repeatable)"
+    )]
+    ssh_flag: Vec<String>,
+
+    #[arg(
+        long = "no-batch",
+        action = clap::ArgAction::SetTrue,
+        help = "Do not force BatchMode=yes when invoking ssh"
+    )]
+    no_batch: bool,
+
+    #[arg(
+        long = "copy-binary",
+        action = clap::ArgAction::SetTrue,
+        help = "Upload the local beach binary to the remote path via scp before launching"
+    )]
+    copy_binary: bool,
+
+    #[arg(
+        long = "copy-from",
+        value_name = "PATH",
+        help = "Override the local binary path to upload (defaults to current executable)"
+    )]
+    copy_from: Option<PathBuf>,
+
+    #[arg(
+        long = "scp-binary",
+        default_value = "scp",
+        value_name = "BIN",
+        help = "scp executable to invoke when --copy-binary is set"
+    )]
+    scp_binary: String,
+
+    #[arg(
+        long = "keep-ssh",
+        action = clap::ArgAction::SetTrue,
+        help = "Leave the SSH control channel open for log tailing instead of closing after bootstrap"
+    )]
+    keep_ssh: bool,
+
+    #[arg(
+        long = "request-tty",
+        action = clap::ArgAction::SetTrue,
+        help = "Request an interactive TTY from ssh instead of disabling it"
+    )]
+    request_tty: bool,
+
+    #[arg(
+        long = "handshake-timeout",
+        default_value_t = 30u64,
+        value_name = "SECONDS",
+        help = "Seconds to wait for the bootstrap handshake before failing"
+    )]
+    handshake_timeout: u64,
+
+    #[arg(
+        trailing_var_arg = true,
+        value_name = "COMMAND",
+        help = "Command to run remotely instead of the default shell"
+    )]
+    command: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -207,22 +338,66 @@ enum CliError {
     Runtime(String),
     #[error("logging initialization failed: {0}")]
     Logging(String),
+    #[error("bootstrap output failed: {0}")]
+    BootstrapOutput(String),
+    #[error("bootstrap handshake failed: {0}")]
+    BootstrapHandshake(String),
+    #[error("scp transfer failed: {0}")]
+    CopyBinary(String),
 }
 
 async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let manager = SessionManager::new(SessionConfig::new(base_url)?)?;
     let cursor_sync = cursor_sync_enabled();
     let normalized_base = manager.config().base_url().to_string();
-    let local_preview_enabled = args.local_preview;
-    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let bootstrap_output = args.bootstrap_output;
+    let bootstrap_mode = bootstrap_output == BootstrapOutput::Json;
+    configure_bootstrap_signal_handling(bootstrap_mode);
+    let local_preview_requested = args.local_preview;
+    let local_preview_enabled = local_preview_requested && !bootstrap_mode;
+    if local_preview_requested && !local_preview_enabled {
+        warn!("local preview disabled when bootstrap output is active");
+    }
+    let interactive = !bootstrap_mode && io::stdin().is_terminal() && io::stdout().is_terminal();
     let raw_guard = RawModeGuard::new(interactive);
+
+    let input_gate = if interactive {
+        Some(Arc::new(HostInputGate::new()))
+    } else {
+        None
+    };
+
+    let allow_all_clients = args.allow_all_clients || !interactive || bootstrap_mode;
+    if allow_all_clients {
+        debug!("client authorization prompt disabled (allow-all mode)");
+    }
+    let authorizer = Arc::new(if allow_all_clients {
+        JoinAuthorizer::allow_all()
+    } else {
+        let gate = input_gate
+            .as_ref()
+            .expect("interactive input gate must be present for prompts");
+        JoinAuthorizer::interactive(Arc::clone(gate))
+    });
 
     let hosted = manager.host().await?;
     let session_id = hosted.session_id().to_string();
     info!(session_id = %session_id, "session registered");
-    print_host_banner(&hosted, &normalized_base, TransportKind::WebRtc);
+    let wait_for_peer = if bootstrap_mode { true } else { args.wait };
+    let command = resolve_launch_command(&args)?;
+    let command_display = display_cmd(&command);
+    if bootstrap_mode {
+        emit_bootstrap_handshake(
+            &hosted,
+            &normalized_base,
+            TransportKind::WebRtc,
+            &command,
+            wait_for_peer,
+        )?;
+    } else {
+        print_host_banner(&hosted, &normalized_base, TransportKind::WebRtc);
+    }
 
-    let wait_for_peer = args.wait;
     let session_handle = hosted.handle().clone();
     let join_code = hosted.join_code().to_string();
     let transports: Arc<Mutex<Vec<Arc<SharedTransport>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -233,8 +408,6 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         info!(session_id = %session_id, "negotiating transport in background");
     }
 
-    let command = resolve_launch_command(&args)?;
-    let command_display = display_cmd(&command);
     let (spawn_config, grid) = build_spawn_config(&command)?;
     let sync_config = SyncConfig::default();
     let timeline = Arc::new(TimelineDeltaStream::new());
@@ -283,6 +456,7 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                 grid.clone(),
                 backfill_tx.clone(),
                 None,
+                None,
             );
             input_handles.lock().unwrap().push(handle);
         }
@@ -304,7 +478,11 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     }
 
     let resize_monitor = if interactive {
-        let handle = spawn_local_stdin_forwarder(writer.clone(), local_echo.clone());
+        let gate = input_gate
+            .as_ref()
+            .expect("interactive input gate must exist")
+            .clone();
+        let handle = spawn_local_stdin_forwarder(writer.clone(), local_echo.clone(), gate);
         input_handles.lock().unwrap().push(handle);
 
         let running = Arc::new(AtomicBool::new(true));
@@ -344,6 +522,7 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         input_handles.clone(),
         forwarder_cmd_tx.clone(),
         transports.clone(),
+        Arc::clone(&authorizer),
         first_ready_tx,
     );
 
@@ -411,9 +590,167 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         handle.join().ok();
     }
 
-    println!("\n✅ command '{}' completed", command_display);
+    if !bootstrap_mode {
+        println!("\n✅ command '{}' completed", command_display);
+    }
     info!(session_id = %session_id, "host command completed");
     Ok(())
+}
+
+async fn handle_ssh(base_url: &str, args: SshArgs) -> Result<(), CliError> {
+    copy_binary_to_remote(&args).await?;
+
+    let remote_args = remote_bootstrap_args(&args, base_url);
+    let remote_command = render_remote_command(&remote_args);
+
+    let mut command = TokioCommand::new(&args.ssh_binary);
+    if !args.no_batch {
+        command.arg("-o").arg("BatchMode=yes");
+    }
+    if args.request_tty {
+        command.arg("-tt");
+    } else {
+        command.arg("-T");
+    }
+    for flag in &args.ssh_flag {
+        command.arg(flag);
+    }
+    command.arg(&args.target);
+    command.arg(&remote_command);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    info!(
+        target = %args.target,
+        ssh_binary = %args.ssh_binary,
+        remote_command = %remote_command,
+        "launching ssh bootstrap"
+    );
+
+    let mut child = command.spawn()?;
+    let mut stderr_pipe = child.stderr.take();
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CliError::BootstrapHandshake("ssh stdout unavailable".into()))?;
+    let mut reader = BufReader::new(stdout);
+    let mut captured_stdout = Vec::new();
+    let timeout_secs = args.handshake_timeout.max(1);
+    let timeout = Duration::from_secs(timeout_secs);
+
+    let handshake = match read_bootstrap_handshake(&mut reader, &mut captured_stdout, timeout).await
+    {
+        Ok(handshake) => handshake,
+        Err(err) => {
+            let _ = child.start_kill();
+            let stderr_lines = if let Some(stderr) = stderr_pipe.take() {
+                collect_child_stream(stderr).await
+            } else {
+                Vec::new()
+            };
+            let _ = child.wait().await;
+            let mut context = err.to_string();
+            if !captured_stdout.is_empty() {
+                context = format!("{}; stdout: {}", context, captured_stdout.join(" | "));
+            }
+            if !stderr_lines.is_empty() {
+                context = format!("{}; stderr: {}", context, stderr_lines.join(" | "));
+            }
+            return Err(CliError::BootstrapHandshake(context));
+        }
+    };
+
+    if handshake.schema != BootstrapHandshake::SCHEMA_VERSION {
+        warn!(
+            schema = handshake.schema,
+            expected = BootstrapHandshake::SCHEMA_VERSION,
+            "bootstrap schema mismatch"
+        );
+    }
+    if let Some(warning) = &handshake.warning {
+        warn!(message = warning.as_str(), "remote bootstrap warning");
+    }
+
+    if !captured_stdout.is_empty() {
+        debug!(lines = ?captured_stdout, "ssh stdout before handshake");
+    }
+
+    let mut stdout_task = None;
+    let mut stderr_task = None;
+    let mut wait_task = None;
+
+    if args.keep_ssh {
+        stdout_task = Some(tokio::spawn(forward_child_lines(reader, "stdout")));
+        if let Some(stderr) = stderr_pipe.take() {
+            stderr_task = Some(tokio::spawn(forward_child_lines(
+                BufReader::new(stderr),
+                "stderr",
+            )));
+        }
+        wait_task = Some(tokio::spawn(async move {
+            match child.wait().await {
+                Ok(status) => {
+                    if status.success() {
+                        info!(status = %describe_exit_status(status), "ssh control channel closed");
+                    } else {
+                        warn!(status = %describe_exit_status(status), "ssh control channel closed with error");
+                    }
+                }
+                Err(err) => warn!(error = %err, "failed to await ssh control channel"),
+            }
+        }));
+    } else {
+        drop(reader);
+        let stderr_lines = if let Some(stderr) = stderr_pipe.take() {
+            collect_child_stream(stderr).await
+        } else {
+            Vec::new()
+        };
+        if let Err(err) = child.start_kill() {
+            warn!(error = %err, "failed to terminate ssh process after bootstrap");
+        }
+        match child.wait().await {
+            Ok(status) if !status.success() => {
+                warn!(status = %describe_exit_status(status), "ssh exited with non-zero status after bootstrap");
+            }
+            Err(err) => warn!(error = %err, "failed to await ssh process"),
+            _ => {}
+        }
+        if !stderr_lines.is_empty() {
+            debug!(lines = ?stderr_lines, "ssh stderr output");
+        }
+    }
+
+    if args.keep_ssh {
+        info!("leaving ssh control channel open; enable info logs to tail remote output");
+    }
+
+    println!(
+        "🔗 Starting beach session {} (remote {})",
+        handshake.session_id, args.target
+    );
+
+    let join_args = JoinArgs {
+        target: handshake.session_id.clone(),
+        passcode: Some(handshake.join_code.clone()),
+        label: None,
+    };
+
+    let join_result = handle_join(handshake.session_server.as_str(), join_args).await;
+
+    if let Some(task) = stdout_task {
+        let _ = task.await;
+    }
+    if let Some(task) = stderr_task {
+        let _ = task.await;
+    }
+    if let Some(task) = wait_task {
+        let _ = task.await;
+    }
+
+    join_result
 }
 
 async fn handle_join(base_url: &str, args: JoinArgs) -> Result<(), CliError> {
@@ -427,8 +764,15 @@ async fn handle_join(base_url: &str, args: JoinArgs) -> Result<(), CliError> {
     };
 
     let trimmed_pass = passcode.trim().to_string();
-    let joined = manager.join(&session_id, trimmed_pass.as_str()).await?;
-    let negotiated = negotiate_transport(joined.handle(), Some(trimmed_pass.as_str())).await?;
+    let joined = manager
+        .join(&session_id, trimmed_pass.as_str(), args.label.as_deref())
+        .await?;
+    let negotiated = negotiate_transport(
+        joined.handle(),
+        Some(trimmed_pass.as_str()),
+        args.label.as_deref(),
+    )
+    .await?;
     let transport = match negotiated {
         NegotiatedTransport::Single(transport) => transport,
         NegotiatedTransport::WebRtcOfferer { .. } => {
@@ -460,6 +804,7 @@ async fn handle_join(base_url: &str, args: JoinArgs) -> Result<(), CliError> {
 async fn negotiate_transport(
     handle: &SessionHandle,
     passphrase: Option<&str>,
+    client_label: Option<&str>,
 ) -> Result<NegotiatedTransport, CliError> {
     let mut errors = Vec::new();
 
@@ -517,16 +862,25 @@ async fn negotiate_transport(
                 .await
                 {
                     Ok((supervisor, accepted)) => {
+                        let OffererAcceptedTransport {
+                            peer_id,
+                            handshake_id,
+                            metadata,
+                            transport,
+                        } = accepted;
                         info!(
                             transport = "webrtc",
                             signaling_url = %signaling_url,
-                            peer_id = %accepted.peer_id,
-                            handshake_id = %accepted.handshake_id,
+                            peer_id = %peer_id,
+                            handshake_id = %handshake_id,
                             "transport established"
                         );
                         return Ok(NegotiatedTransport::WebRtcOfferer {
                             supervisor,
-                            transport: accepted.transport,
+                            transport,
+                            peer_id,
+                            handshake_id,
+                            metadata,
                         });
                     }
                     Err(err) => {
@@ -545,6 +899,7 @@ async fn negotiate_transport(
                     role,
                     Duration::from_millis(poll_ms),
                     passphrase,
+                    client_label,
                 )
                 .await
                 {
@@ -713,6 +1068,363 @@ fn prompt_passcode() -> Result<String, CliError> {
         Ok(trimmed.to_string())
     } else {
         Err(CliError::MissingPasscode)
+    }
+}
+
+fn emit_bootstrap_handshake(
+    session: &HostSession,
+    base: &str,
+    selected: TransportKind,
+    command: &[String],
+    wait_for_peer: bool,
+) -> Result<(), CliError> {
+    let handle = session.handle();
+    let handshake = BootstrapHandshake::from_context(
+        session.session_id(),
+        session.join_code(),
+        base,
+        handle.offers(),
+        selected,
+        command,
+        wait_for_peer,
+    );
+    let payload = serde_json::to_string(&handshake)
+        .map_err(|err| CliError::BootstrapOutput(err.to_string()))?;
+    println!("{}", payload);
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BootstrapHandshake {
+    schema: u32,
+    session_id: String,
+    join_code: String,
+    session_server: String,
+    active_transport: String,
+    transports: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    preferred_transport: Option<String>,
+    host_binary: String,
+    host_version: String,
+    timestamp: u64,
+    command: Vec<String>,
+    wait_for_peer: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    warning: Option<String>,
+}
+
+impl BootstrapHandshake {
+    const SCHEMA_VERSION: u32 = 1;
+
+    fn from_context(
+        session_id: &str,
+        join_code: &str,
+        base: &str,
+        offers: &[TransportOffer],
+        selected: TransportKind,
+        command: &[String],
+        wait_for_peer: bool,
+    ) -> Self {
+        let transports: Vec<String> = offers
+            .iter()
+            .map(|offer| offer.label().to_string())
+            .collect();
+        let preferred_transport = offers.first().map(|offer| offer.label().to_string());
+        let warning = if transports.is_empty() {
+            Some("session server returned no transport offers".to_string())
+        } else {
+            None
+        };
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_secs();
+        let host_binary = std::env::args()
+            .next()
+            .and_then(|arg0| {
+                std::path::Path::new(&arg0)
+                    .file_name()
+                    .and_then(|name| name.to_str().map(|s| s.to_string()))
+            })
+            .unwrap_or_else(|| "beach".to_string());
+
+        Self {
+            schema: Self::SCHEMA_VERSION,
+            session_id: session_id.to_string(),
+            join_code: join_code.to_string(),
+            session_server: base.to_string(),
+            active_transport: kind_label(selected).to_string(),
+            transports,
+            preferred_transport,
+            host_binary,
+            host_version: env!("CARGO_PKG_VERSION").to_string(),
+            timestamp,
+            command: command.to_vec(),
+            wait_for_peer,
+            warning,
+        }
+    }
+}
+
+fn remote_bootstrap_args(args: &SshArgs, session_server: &str) -> Vec<String> {
+    let mut command = Vec::new();
+    command.push(args.remote_path.clone());
+    command.push("host".to_string());
+    command.push("--bootstrap-output=json".to_string());
+    command.push("--session-server".to_string());
+    command.push(session_server.to_string());
+    command.push("--wait".to_string());
+    if !args.command.is_empty() {
+        command.push("--".to_string());
+        command.extend(args.command.clone());
+    }
+    command
+}
+
+fn scp_destination(target: &str, remote_path: &str) -> String {
+    if remote_path.contains(':') {
+        // user supplied user@host:/path explicitly; respect verbatim
+        remote_path.to_string()
+    } else {
+        format!("{}:{}", target, remote_path)
+    }
+}
+
+fn render_remote_command(remote_args: &[String]) -> String {
+    let quoted: Vec<String> = remote_args.iter().map(|arg| shell_quote(arg)).collect();
+    let body = quoted.join(" ");
+    format!("exec {}", body)
+}
+
+fn resolve_local_binary_path(args: &SshArgs) -> Result<PathBuf, CliError> {
+    let raw_path = if let Some(custom) = &args.copy_from {
+        custom.clone()
+    } else {
+        std::env::current_exe().map_err(|err| {
+            CliError::CopyBinary(format!("unable to determine current executable: {err}"))
+        })?
+    };
+
+    let resolved = if raw_path.is_relative() {
+        std::fs::canonicalize(&raw_path).unwrap_or(raw_path.clone())
+    } else {
+        raw_path.clone()
+    };
+
+    if !resolved.exists() {
+        return Err(CliError::CopyBinary(format!(
+            "local binary '{}' does not exist",
+            resolved.display()
+        )));
+    }
+
+    Ok(resolved)
+}
+
+async fn copy_binary_to_remote(args: &SshArgs) -> Result<(), CliError> {
+    if !args.copy_binary {
+        return Ok(());
+    }
+
+    let source_path = resolve_local_binary_path(args)?;
+    let destination = scp_destination(&args.target, &args.remote_path);
+
+    info!(
+        source = %source_path.display(),
+        destination = %destination,
+        scp_binary = %args.scp_binary,
+        "uploading beach binary to remote host"
+    );
+
+    let mut command = TokioCommand::new(&args.scp_binary);
+    if !args.no_batch {
+        command.arg("-o").arg("BatchMode=yes");
+    }
+    for flag in &args.ssh_flag {
+        command.arg(flag);
+    }
+    command.arg(&source_path);
+    command.arg(&destination);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    let output = command
+        .output()
+        .await
+        .map_err(|err| CliError::CopyBinary(format!("failed to spawn scp: {err}")))?;
+
+    if output.status.success() {
+        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        let stdout_trimmed = stdout_str.trim();
+        if !stdout_trimmed.is_empty() {
+            debug!(stdout = stdout_trimmed, "scp stdout");
+        }
+
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        let stderr_trimmed = stderr_str.trim();
+        if !stderr_trimmed.is_empty() {
+            debug!(stderr = stderr_trimmed, "scp stderr");
+        }
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(CliError::CopyBinary(format!(
+        "{} failed ({}): stdout='{}' stderr='{}'",
+        args.scp_binary,
+        describe_exit_status(output.status),
+        stdout.trim(),
+        stderr.trim()
+    )))
+}
+
+fn describe_exit_status(status: ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("exit code {code}");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return format!("signal {signal}");
+        }
+    }
+
+    "unknown status".to_string()
+}
+
+fn shell_quote(raw: &str) -> String {
+    if raw.is_empty() {
+        return "''".to_string();
+    }
+    let mut quoted = String::with_capacity(raw.len() + 2);
+    quoted.push('\'');
+    for ch in raw.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\"'\"'");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn configure_bootstrap_signal_handling(bootstrap_mode: bool) {
+    #[cfg(unix)]
+    {
+        if bootstrap_mode {
+            unsafe {
+                let result = libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                if result == libc::SIG_ERR {
+                    warn!("failed to ignore SIGHUP for bootstrap mode");
+                } else {
+                    debug!("ignoring SIGHUP so the host survives ssh disconnects");
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = bootstrap_mode;
+    }
+}
+
+async fn read_bootstrap_handshake<R>(
+    reader: &mut R,
+    captured: &mut Vec<String>,
+    timeout: Duration,
+) -> Result<BootstrapHandshake, CliError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let deadline = Instant::now() + timeout;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(CliError::BootstrapHandshake(format!(
+                "timed out after {}s waiting for bootstrap handshake",
+                timeout.as_secs()
+            )));
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let read = tokio::time::timeout(remaining, reader.read_line(&mut line))
+            .await
+            .map_err(|_| {
+                CliError::BootstrapHandshake(format!(
+                    "timed out after {}s waiting for bootstrap handshake",
+                    timeout.as_secs()
+                ))
+            })??;
+        if read == 0 {
+            return Err(CliError::BootstrapHandshake(
+                "ssh connection closed before bootstrap handshake".into(),
+            ));
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<BootstrapHandshake>(trimmed) {
+            Ok(handshake) => return Ok(handshake),
+            Err(parse_err) => {
+                if captured.len() < 32 {
+                    captured.push(trimmed.to_string());
+                }
+                debug!(line = trimmed, error = %parse_err, "ignoring non-handshake stdout");
+            }
+        }
+    }
+}
+
+async fn collect_child_stream(stream: ChildStderr) -> Vec<String> {
+    let mut reader = BufReader::new(stream);
+    let mut buf = String::new();
+    let mut lines = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let trimmed = buf.trim_end_matches(['\n', '\r']);
+                if !trimmed.is_empty() {
+                    lines.push(trimmed.to_string());
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "failed to read ssh stderr");
+                break;
+            }
+        }
+    }
+    lines
+}
+
+async fn forward_child_lines<R>(mut reader: BufReader<R>, stream: &'static str)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let trimmed = line.trim_end_matches(['\n', '\r']);
+                if !trimmed.is_empty() {
+                    info!(target: "beach::ssh", stream = stream, message = trimmed);
+                }
+            }
+            Err(err) => {
+                warn!(target: "beach::ssh", stream = stream, error = %err, "failed to read ssh output");
+                break;
+            }
+        }
     }
 }
 
@@ -1436,6 +2148,9 @@ enum NegotiatedTransport {
     WebRtcOfferer {
         supervisor: Arc<OffererSupervisor>,
         transport: Arc<dyn Transport>,
+        peer_id: String,
+        handshake_id: String,
+        metadata: HashMap<String, String>,
     },
 }
 
@@ -1466,7 +2181,9 @@ impl TransportSupervisor {
             const MAX_ATTEMPTS: usize = 5;
             let mut delay = Duration::from_millis(250);
             for attempt in 1..=MAX_ATTEMPTS {
-                match negotiate_transport(&this.session_handle, this.passphrase.as_deref()).await {
+                match negotiate_transport(&this.session_handle, this.passphrase.as_deref(), None)
+                    .await
+                {
                     Ok(NegotiatedTransport::Single(new_transport)) => {
                         let kind = new_transport.kind();
                         let id = new_transport.id().0;
@@ -1553,6 +2270,65 @@ impl Drop for RawModeGuard {
     }
 }
 
+const HOST_INPUT_BUFFER_LIMIT: usize = 8192;
+
+struct HostInputGate {
+    state: Mutex<GateState>,
+    condvar: Condvar,
+}
+
+struct GateState {
+    paused: bool,
+    buffer: Vec<u8>,
+}
+
+impl HostInputGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(GateState {
+                paused: false,
+                buffer: Vec::with_capacity(256),
+            }),
+            condvar: Condvar::new(),
+        }
+    }
+
+    fn pause(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.paused = true;
+    }
+
+    fn resume_and_discard(&self) -> usize {
+        let mut state = self.state.lock().unwrap();
+        let dropped = state.buffer.len();
+        state.buffer.clear();
+        state.paused = false;
+        self.condvar.notify_all();
+        dropped
+    }
+
+    fn intercept(&self, bytes: &[u8]) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !state.paused {
+            return false;
+        }
+        let available = HOST_INPUT_BUFFER_LIMIT.saturating_sub(state.buffer.len());
+        if available == 0 {
+            return true;
+        }
+        let to_copy = available.min(bytes.len());
+        state.buffer.extend_from_slice(&bytes[..to_copy]);
+        true
+    }
+
+    fn wait_until_resumed(&self) {
+        let mut state = self.state.lock().unwrap();
+        while state.paused {
+            state = self.condvar.wait(state).unwrap();
+        }
+    }
+}
+
 fn spawn_input_listener(
     transport: Arc<dyn Transport>,
     writer: PtyWriter,
@@ -1561,6 +2337,7 @@ fn spawn_input_listener(
     grid: Arc<TerminalGrid>,
     backfill_tx: UnboundedSender<BackfillCommand>,
     forwarder_tx: Option<UnboundedSender<ForwarderCommand>>,
+    gate: Option<Arc<HostInputGate>>,
 ) -> thread::JoinHandle<()> {
     let transport_id = transport.id().0;
     let transport_kind = transport.kind();
@@ -1575,6 +2352,9 @@ fn spawn_input_listener(
         let mut channel_closed = false;
         let mut fatal_error = false;
         loop {
+            if let Some(g) = &gate {
+                g.wait_until_resumed();
+            }
             match transport.recv(Duration::from_millis(250)) {
                 Ok(message) => {
                     let transport_sequence = message.sequence;
@@ -1595,6 +2375,9 @@ fn spawn_input_listener(
                                     }
                                     match frame {
                                         WireClientFrame::Input { seq, data } => {
+                                            if let Some(g) = &gate {
+                                                g.wait_until_resumed();
+                                            }
                                             if seq <= last_seq {
                                                 trace!(
                                                     target = "sync::incoming",
@@ -1842,15 +2625,20 @@ fn spawn_input_listener(
 fn spawn_local_stdin_forwarder(
     writer: PtyWriter,
     local_echo: Arc<LocalEcho>,
+    gate: Arc<HostInputGate>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut stdin = io::stdin();
         let mut buffer = [0u8; 1024];
         loop {
+            gate.wait_until_resumed();
             match stdin.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(n) => {
                     let bytes = &buffer[..n];
+                    if gate.intercept(bytes) {
+                        continue;
+                    }
                     if writer.write(bytes).is_err() {
                         break;
                     }
@@ -2215,6 +3003,327 @@ enum ForwarderCommand {
     ViewportRefresh,
 }
 
+#[derive(Clone, Debug)]
+struct JoinAuthorizationMetadata {
+    transport_kind: TransportKind,
+    peer_id: Option<String>,
+    handshake_id: Option<String>,
+    description: Option<String>,
+    label: Option<String>,
+    remote_addr: Option<String>,
+    metadata: HashMap<String, String>,
+}
+
+impl JoinAuthorizationMetadata {
+    fn from_parts(
+        transport_kind: TransportKind,
+        peer_id: Option<String>,
+        handshake_id: Option<String>,
+        description: Option<String>,
+        metadata: HashMap<String, String>,
+    ) -> Self {
+        let label = metadata.get("label").cloned();
+        let remote_addr = metadata.get("remote_addr").cloned();
+        Self {
+            transport_kind,
+            peer_id,
+            handshake_id,
+            description,
+            label,
+            remote_addr,
+            metadata,
+        }
+    }
+
+    fn synopsis(&self) -> String {
+        let mut parts = Vec::new();
+        parts.push(format!("transport: {:?}", self.transport_kind));
+        if let Some(peer) = &self.peer_id {
+            parts.push(format!("peer: {}", peer));
+        }
+        if let Some(handshake) = &self.handshake_id {
+            parts.push(format!("handshake: {}", handshake));
+        }
+        if let Some(desc) = &self.description {
+            parts.push(desc.clone());
+        }
+        if let Some(label) = &self.label {
+            parts.push(format!("label: {}", label));
+        }
+        if let Some(addr) = &self.remote_addr {
+            parts.push(format!("remote: {}", addr));
+        }
+        parts.join(", ")
+    }
+}
+
+struct JoinAuthorizer {
+    inner: JoinAuthorizerInner,
+}
+
+enum JoinAuthorizerInner {
+    AllowAll,
+    Interactive(InteractiveAuthorizer),
+}
+
+struct InteractiveAuthorizer {
+    gate: Arc<HostInputGate>,
+    prompt_lock: AsyncMutex<()>,
+}
+
+impl JoinAuthorizer {
+    fn allow_all() -> Self {
+        Self {
+            inner: JoinAuthorizerInner::AllowAll,
+        }
+    }
+
+    fn interactive(gate: Arc<HostInputGate>) -> Self {
+        Self {
+            inner: JoinAuthorizerInner::Interactive(InteractiveAuthorizer {
+                gate,
+                prompt_lock: AsyncMutex::new(()),
+            }),
+        }
+    }
+
+    fn should_emit_pending_hint(&self) -> bool {
+        matches!(self.inner, JoinAuthorizerInner::Interactive(_))
+    }
+
+    fn gate(&self) -> Option<Arc<HostInputGate>> {
+        match &self.inner {
+            JoinAuthorizerInner::Interactive(inner) => Some(Arc::clone(&inner.gate)),
+            _ => None,
+        }
+    }
+
+    async fn authorize(&self, metadata: JoinAuthorizationMetadata) -> bool {
+        match &self.inner {
+            JoinAuthorizerInner::AllowAll => true,
+            JoinAuthorizerInner::Interactive(inner) => inner.authorize(metadata).await,
+        }
+    }
+}
+
+impl InteractiveAuthorizer {
+    async fn authorize(&self, metadata: JoinAuthorizationMetadata) -> bool {
+        let _guard = self.prompt_lock.lock().await;
+        self.gate.pause();
+        sleep(Duration::from_millis(50)).await;
+        let mut decision = false;
+        let prompt_metadata = metadata.clone();
+        debug!(
+            target = "host::auth",
+            details = %prompt_metadata.synopsis(),
+            "prompting for client authorization"
+        );
+        let gate = Arc::clone(&self.gate);
+        let prompt_result =
+            tokio::task::spawn_blocking(move || run_authorization_prompt(&prompt_metadata)).await;
+
+        match prompt_result {
+            Ok(Ok(allow)) => {
+                decision = allow;
+                if allow {
+                    info!(
+                        target = "host::auth",
+                        details = %metadata.synopsis(),
+                        "client authorized"
+                    );
+                } else {
+                    info!(
+                        target = "host::auth",
+                        details = %metadata.synopsis(),
+                        "client denied"
+                    );
+                }
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    target = "host::auth",
+                    error = %err,
+                    details = %metadata.synopsis(),
+                    "authorization prompt failed; denying client"
+                );
+            }
+            Err(join_err) => {
+                warn!(
+                    target = "host::auth",
+                    error = %join_err,
+                    details = %metadata.synopsis(),
+                    "authorization prompt task panicked; denying client"
+                );
+            }
+        }
+
+        let dropped = gate.resume_and_discard();
+        if dropped > 0 {
+            debug!(
+                target = "host::auth",
+                dropped_bytes = dropped,
+                "discarded buffered stdin bytes after prompt"
+            );
+        }
+        decision
+    }
+}
+
+fn run_authorization_prompt(metadata: &JoinAuthorizationMetadata) -> io::Result<bool> {
+    let raw_was_enabled = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+    if !raw_was_enabled {
+        enable_raw_mode()?;
+    }
+
+    let mut stdout = io::stdout();
+    let mut cleanup = PromptCleanup::new(raw_was_enabled);
+    execute!(stdout, EnterAlternateScreen, Clear(ClearType::All), Hide)?;
+    cleanup.alt_screen_active = true;
+    write!(stdout, "\r==============================\r\n")?;
+    write!(stdout, "\r  Incoming beach client join\r\n")?;
+    write!(stdout, "\r==============================\r\n\r\n")?;
+    write!(stdout, "\rtransport : {:?}\r\n", metadata.transport_kind)?;
+    if let Some(desc) = &metadata.description {
+        write!(stdout, "\rcontext   : {}\r\n", desc)?;
+    }
+    if let Some(label) = &metadata.label {
+        write!(stdout, "\rlabel     : {}\r\n", label)?;
+    }
+    if let Some(peer) = &metadata.peer_id {
+        write!(stdout, "\rpeer id   : {}\r\n", peer)?;
+    }
+    if let Some(handshake) = &metadata.handshake_id {
+        write!(stdout, "\rhandshake : {}\r\n", handshake)?;
+    }
+    if let Some(remote) = &metadata.remote_addr {
+        write!(stdout, "\rremote    : {}\r\n", remote)?;
+    }
+    if !metadata.metadata.is_empty() {
+        let mut extra: Vec<_> = metadata
+            .metadata
+            .iter()
+            .filter(|(key, _)| key.as_str() != "label" && key.as_str() != "remote_addr")
+            .collect();
+        extra.sort_by(|a, b| a.0.cmp(b.0));
+        for (key, value) in extra {
+            write!(stdout, "\r{}: {}\r\n", key, value)?;
+        }
+    }
+    write!(stdout, "\r\n")?;
+    write!(
+        stdout,
+        "\rType 'yes' (enter) to allow, 'no' to deny. Press Ctrl+C to abort.\r\n\r\n"
+    )?;
+    stdout.flush()?;
+
+    let mut decision: Option<bool> = None;
+    let mut input = String::new();
+    write!(stdout, "\rresponse  : ")?;
+    stdout.flush()?;
+
+    while decision.is_none() {
+        if event::poll(Duration::from_millis(200))? {
+            match event::read()? {
+                CEvent::Key(key) => {
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(key.code, KeyCode::Char('c'))
+                    {
+                        writeln!(stdout)?;
+                        stdout.flush()?;
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "authorization aborted by user",
+                        ));
+                    }
+
+                    match key.code {
+                        KeyCode::Enter => {
+                            let trimmed = input.trim().to_ascii_lowercase();
+                            if trimmed.is_empty() {
+                                write!(stdout, "\r\n")?;
+                                write!(stdout, "\rPlease type 'yes' or 'no' and press enter.\r\n")?;
+                                write!(stdout, "\rresponse  : {}", input)?;
+                                stdout.flush()?;
+                                continue;
+                            }
+                            match trimmed.as_str() {
+                                "yes" | "y" => decision = Some(true),
+                                "no" | "n" => decision = Some(false),
+                                _ => {
+                                    write!(stdout, "\r\n")?;
+                                    write!(
+                                        stdout,
+                                        "\rUnrecognized response '{trimmed}'. Type 'yes' or 'no'.\r\n"
+                                    )?;
+                                    write!(stdout, "\rresponse  : {}", input)?;
+                                    stdout.flush()?;
+                                }
+                            }
+                        }
+                        KeyCode::Char(c)
+                            if !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                        {
+                            input.push(c);
+                            write!(stdout, "{c}")?;
+                            stdout.flush()?;
+                        }
+                        KeyCode::Backspace => {
+                            if input.pop().is_some() {
+                                write!(stdout, "\u{8} \u{8}")?;
+                                stdout.flush()?;
+                            }
+                        }
+                        KeyCode::Esc => {
+                            decision = Some(false);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    write!(stdout, "\r\n")?;
+    let allow = decision.unwrap_or(false);
+    writeln!(
+        stdout,
+        "Decision recorded: {}",
+        if allow { "allow" } else { "deny" }
+    )?;
+    stdout.flush()?;
+    Ok(allow)
+}
+
+struct PromptCleanup {
+    was_raw: bool,
+    alt_screen_active: bool,
+}
+
+impl PromptCleanup {
+    fn new(was_raw: bool) -> Self {
+        Self {
+            was_raw,
+            alt_screen_active: false,
+        }
+    }
+}
+
+impl Drop for PromptCleanup {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout();
+        if self.alt_screen_active {
+            let _ = execute!(stdout, LeaveAlternateScreen, Show);
+        }
+        let _ = stdout.flush();
+        if !self.was_raw {
+            let _ = disable_raw_mode();
+        }
+    }
+}
+
 fn spawn_webrtc_acceptor(
     session_id: String,
     session_handle: SessionHandle,
@@ -2227,16 +3336,43 @@ fn spawn_webrtc_acceptor(
     input_handles: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
     forwarder_tx: UnboundedSender<ForwarderCommand>,
     transports: Arc<Mutex<Vec<Arc<SharedTransport>>>>,
+    authorizer: Arc<JoinAuthorizer>,
     ready_tx: Option<oneshot::Sender<()>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ready_tx = ready_tx;
         loop {
             let passphrase = join_code.as_deref();
-            match negotiate_transport(&session_handle, passphrase).await {
+            match negotiate_transport(&session_handle, passphrase, None).await {
                 Ok(NegotiatedTransport::Single(transport)) => {
                     let selected_kind = transport.kind();
                     info!(session_id = %session_id, transport = ?selected_kind, "transport negotiated");
+                    let metadata = JoinAuthorizationMetadata::from_parts(
+                        selected_kind,
+                        None,
+                        None,
+                        Some("primary transport".to_string()),
+                        HashMap::new(),
+                    );
+                    let hint_pending = authorizer.should_emit_pending_hint();
+                    if hint_pending {
+                        let _ = transport.send_text("beach:status:approval_pending");
+                    }
+                    if !authorizer.authorize(metadata.clone()).await {
+                        if hint_pending {
+                            let _ = transport.send_text("beach:status:approval_denied");
+                        }
+                        info!(
+                            session_id = %session_id,
+                            transport = ?selected_kind,
+                            "client join denied"
+                        );
+                        continue;
+                    }
+                    if hint_pending {
+                        let _ = transport.send_text("beach:status:approval_granted");
+                    }
+
                     let shared_transport = Arc::new(SharedTransport::new(transport.clone()));
                     {
                         let mut guard = transports.lock().unwrap();
@@ -2258,6 +3394,7 @@ fn spawn_webrtc_acceptor(
                         grid.clone(),
                         backfill_tx.clone(),
                         Some(forwarder_tx.clone()),
+                        authorizer.gate(),
                     );
                     input_handles.lock().unwrap().push(listener);
                     if forwarder_tx
@@ -2280,12 +3417,40 @@ fn spawn_webrtc_acceptor(
                 Ok(NegotiatedTransport::WebRtcOfferer {
                     supervisor,
                     transport,
+                    peer_id,
+                    handshake_id,
+                    metadata: extra_metadata,
                 }) => {
                     info!(
                         session_id = %session_id,
                         transport = "webrtc-multi",
                         "transport negotiated with offerer supervisor"
                     );
+                    let metadata = JoinAuthorizationMetadata::from_parts(
+                        transport.kind(),
+                        Some(peer_id.clone()),
+                        Some(handshake_id.clone()),
+                        Some("offerer supervisor".to_string()),
+                        extra_metadata,
+                    );
+                    let hint_pending = authorizer.should_emit_pending_hint();
+                    if hint_pending {
+                        let _ = transport.send_text("beach:status:approval_pending");
+                    }
+                    if !authorizer.authorize(metadata.clone()).await {
+                        if hint_pending {
+                            let _ = transport.send_text("beach:status:approval_denied");
+                        }
+                        info!(
+                            session_id = %session_id,
+                            "offerer transport denied by host"
+                        );
+                        continue;
+                    }
+                    if hint_pending {
+                        let _ = transport.send_text("beach:status:approval_granted");
+                    }
+
                     let shared_transport = Arc::new(SharedTransport::new(transport.clone()));
                     {
                         let mut guard = transports.lock().unwrap();
@@ -2302,6 +3467,7 @@ fn spawn_webrtc_acceptor(
                         grid.clone(),
                         backfill_tx.clone(),
                         Some(forwarder_tx.clone()),
+                        authorizer.gate(),
                     );
                     input_handles.lock().unwrap().push(listener);
                     if forwarder_tx
@@ -2331,6 +3497,7 @@ fn spawn_webrtc_acceptor(
                         backfill_tx.clone(),
                         Arc::clone(&input_handles),
                         Arc::clone(&transports),
+                        Arc::clone(&authorizer),
                     );
                     break;
                 }
@@ -2357,35 +3524,70 @@ fn spawn_viewer_accept_loop(
     backfill_tx: UnboundedSender<BackfillCommand>,
     input_handles: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
     transports: Arc<Mutex<Vec<Arc<SharedTransport>>>>,
+    authorizer: Arc<JoinAuthorizer>,
 ) {
     tokio::spawn(async move {
         loop {
             match supervisor.next().await {
                 Ok(accepted) => {
-                    let shared_transport =
-                        Arc::new(SharedTransport::new(accepted.transport.clone()));
+                    let OffererAcceptedTransport {
+                        peer_id,
+                        handshake_id,
+                        metadata: extra_metadata,
+                        transport,
+                    } = accepted;
+                    let auth_metadata = JoinAuthorizationMetadata::from_parts(
+                        transport.kind(),
+                        Some(peer_id.clone()),
+                        Some(handshake_id.clone()),
+                        Some("viewer".to_string()),
+                        extra_metadata,
+                    );
+                    let transport: Arc<dyn Transport> = transport.clone();
+                    let hint_pending = authorizer.should_emit_pending_hint();
+                    if hint_pending {
+                        let _ = transport.send_text("beach:status:approval_pending");
+                    }
+                    if !authorizer.authorize(auth_metadata.clone()).await {
+                        if hint_pending {
+                            let _ = transport.send_text("beach:status:approval_denied");
+                        }
+                        info!(
+                            target = "webrtc",
+                            peer_id = %peer_id,
+                            handshake_id = %handshake_id,
+                            "viewer transport denied by host"
+                        );
+                        continue;
+                    }
+                    if hint_pending {
+                        let _ = transport.send_text("beach:status:approval_granted");
+                    }
+
+                    let shared_transport = Arc::new(SharedTransport::new(transport.clone()));
                     {
                         let mut guard = transports.lock().unwrap();
                         guard.push(shared_transport.clone());
                     }
-                    let arc_transport: Arc<dyn Transport> = shared_transport.clone();
-                    HeartbeatPublisher::new(arc_transport.clone(), None)
+                    let shared_arc: Arc<dyn Transport> = shared_transport.clone();
+                    HeartbeatPublisher::new(shared_arc.clone(), None)
                         .spawn(Duration::from_secs(10), None);
 
                     let listener = spawn_input_listener(
-                        arc_transport.clone(),
+                        shared_arc.clone(),
                         writer.clone(),
                         process_handle.clone(),
                         emulator_handle.clone(),
                         grid.clone(),
                         backfill_tx.clone(),
                         Some(forwarder_tx.clone()),
+                        authorizer.gate(),
                     );
                     input_handles.lock().unwrap().push(listener);
 
                     if forwarder_tx
                         .send(ForwarderCommand::AddTransport {
-                            transport: arc_transport,
+                            transport: shared_arc,
                             supervisor: None,
                         })
                         .is_err()
@@ -2395,8 +3597,8 @@ fn spawn_viewer_accept_loop(
 
                     info!(
                         target = "webrtc",
-                        peer_id = %accepted.peer_id,
-                        handshake_id = %accepted.handshake_id,
+                        peer_id = %peer_id,
+                        handshake_id = %handshake_id,
                         "viewer transport registered"
                     );
                 }
@@ -3173,11 +4375,112 @@ mod tests {
         self, ClientFrame as WireClientFrame, HostFrame as WireHostFrame, Lane as WireLane,
         Update as WireUpdate,
     };
+    use beach_human::session::TransportOffer;
     use beach_human::sync::terminal::NullTerminalDeltaStream;
     use beach_human::transport::{Payload, TransportKind, TransportPair};
+    use serde_json::json;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration as StdDuration, Instant};
+    use tokio::io::{AsyncWriteExt, duplex};
     use tokio::time::{Instant as TokioInstant, sleep, timeout};
+
+    #[test]
+    fn bootstrap_handshake_serializes_expected_fields() {
+        let offers = vec![
+            TransportOffer::WebRtc {
+                offer: json!({"type": "offer"}),
+            },
+            TransportOffer::WebSocket {
+                url: "wss://example.invalid/ws".to_string(),
+            },
+        ];
+        let command = vec!["/bin/zsh".to_string(), "-l".to_string()];
+        let handshake = BootstrapHandshake::from_context(
+            "session-123",
+            "012345",
+            "http://127.0.0.1:8080",
+            &offers,
+            TransportKind::WebRtc,
+            &command,
+            true,
+        );
+        assert_eq!(handshake.schema, BootstrapHandshake::SCHEMA_VERSION);
+        assert_eq!(handshake.session_id, "session-123");
+        assert_eq!(handshake.join_code, "012345");
+        assert_eq!(handshake.session_server, "http://127.0.0.1:8080");
+        assert_eq!(
+            handshake.transports,
+            vec!["webrtc".to_string(), "websocket".to_string()]
+        );
+        assert_eq!(handshake.preferred_transport.as_deref(), Some("webrtc"));
+        assert!(handshake.wait_for_peer);
+        let serialized = serde_json::to_string(&handshake).expect("serializes to json");
+        assert!(serialized.contains("\"session_id\":\"session-123\""));
+        assert!(serialized.contains("\"command\":[\"/bin/zsh\",\"-l\"]"));
+    }
+
+    #[tokio::test]
+    async fn read_bootstrap_handshake_skips_noise_lines() {
+        let payload = json!({
+            "schema": BootstrapHandshake::SCHEMA_VERSION,
+            "session_id": "abc123",
+            "join_code": "654321",
+            "session_server": "http://localhost:8080",
+            "active_transport": "WebRTC",
+            "transports": ["webrtc"],
+            "host_binary": "beach",
+            "host_version": "0.1.0",
+            "timestamp": 0,
+            "command": ["/bin/sh"],
+            "wait_for_peer": true
+        })
+        .to_string();
+        let script = format!("Last login: today\n{}\n", payload);
+
+        let (mut writer, reader) = duplex(256);
+        let mut reader = BufReader::new(reader);
+        tokio::spawn(async move {
+            writer
+                .write_all(script.as_bytes())
+                .await
+                .expect("write handshake");
+            writer.shutdown().await.expect("close writer");
+        });
+
+        let mut captured = Vec::new();
+        let handshake =
+            read_bootstrap_handshake(&mut reader, &mut captured, Duration::from_secs(2))
+                .await
+                .expect("handshake decoded");
+
+        assert_eq!(captured, vec!["Last login: today".to_string()]);
+        assert_eq!(handshake.session_id, "abc123");
+        assert_eq!(handshake.join_code, "654321");
+    }
+
+    #[test]
+    fn shell_quote_handles_spaces_and_quotes() {
+        assert_eq!(shell_quote("simple"), "'simple'");
+        assert_eq!(shell_quote("with space"), "'with space'");
+        assert_eq!(shell_quote("path'with"), "'path'\"'\"'with'");
+
+        let cmd = vec!["/opt/beach nightly".to_string(), "--flag".to_string()];
+        let rendered = render_remote_command(&cmd);
+        assert!(rendered.starts_with("exec '"));
+        assert!(rendered.contains("'/opt/beach nightly'"));
+    }
+
+    #[test]
+    fn scp_destination_defaults_to_target_prefix() {
+        let dest = scp_destination("user@example.com", "beach");
+        assert_eq!(dest, "user@example.com:beach");
+    }
+
+    #[test]
+    fn scp_destination_respects_explicit_remote() {
+        let dest = scp_destination("user@example.com", "root@other:/opt/beach");
+        assert_eq!(dest, "root@other:/opt/beach");
+    }
 
     fn emit_row_update(
         grid: &Arc<TerminalGrid>,

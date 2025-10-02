@@ -95,6 +95,14 @@ This document tracks the remaining milestones for the new `beach-human` stack. E
 
 ---
 
+## ✅ 10. SSH Bootstrap Pipeline
+
+- Host CLI now supports `--bootstrap-output=json`, emitting a single machine-readable handshake envelope (schema v1) with session/server metadata.
+- Host bootstrap mode disables local preview/TTY forwarding and ignores `SIGHUP` so remote shells survive after the SSH control channel drops.
+- New `beach ssh` subcommand spawns the remote host via SSH, parses the handshake, and auto-joins the session locally; flags cover `--ssh-flag`, `--remote-path`, `--no-batch`, `--request-tty`, and timeout tuning.
+- Optional `--copy-binary` helper (with `--copy-from` / `--scp-binary`) pushes the local build to the remote host before launch; `--keep-ssh` leaves the control channel open and streams logs at info level.
+- Added unit coverage for the handshake encoder/decoder, shell quoting, and command parsing plus documentation in `docs/bootstrap.md`.
+
 ## Client Runtime Testing Plan
 
 Design goals: deterministic, high-fidelity validation against reference terminal behaviour (tmux/Alacritty). The harness should let an agent script sessions, capture render output, and compare behaviour across clients.

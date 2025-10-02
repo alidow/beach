@@ -4,6 +4,8 @@ import { WebRtcTransport } from './webrtc';
 
 export type TerminalTransportEventMap = {
   frame: CustomEvent<HostFrame>;
+  status: CustomEvent<string>;
+  open: Event;
   error: Event;
   close: Event;
 };
@@ -51,11 +53,16 @@ export class DataChannelTerminalTransport extends EventTarget implements Termina
           this.log(`received transport sentinel: ${text}`);
           return;
         }
+        if (text.startsWith('beach:status:')) {
+          this.dispatchEvent(new CustomEvent<string>('status', { detail: text }));
+          return;
+        }
         this.log(`unexpected text payload on data channel: ${text}`);
-        const err = new Event('error');
-        Object.assign(err, { error: new Error(`unexpected text payload: ${text}`) });
-        this.dispatchEvent(err);
       }
+    });
+
+    this.channel.addEventListener('open', () => {
+      this.dispatchEvent(new Event('open'));
     });
 
     this.channel.addEventListener('close', () => {

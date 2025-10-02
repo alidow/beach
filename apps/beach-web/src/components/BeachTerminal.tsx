@@ -1,10 +1,10 @@
 import type { CSSProperties, UIEvent } from 'react';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { FEATURE_CURSOR_SYNC } from '../protocol/types';
-import type { ClientFrame, HostFrame } from '../protocol/types';
+import type { HostFrame } from '../protocol/types';
 import { createTerminalStore, useTerminalSnapshot } from '../terminal/useTerminalState';
 import { connectBrowserTransport, type BrowserTransportConnection } from '../terminal/connect';
-import type { TerminalGridSnapshot, TerminalGridStore } from '../terminal/gridStore';
+import type { CellState, TerminalGridSnapshot, TerminalGridStore } from '../terminal/gridStore';
 import { encodeKeyEvent } from '../terminal/keymap';
 import type { TerminalTransport } from '../transport/terminalTransport';
 import { BackfillController } from '../terminal/backfillController';
@@ -12,6 +12,24 @@ import { cn } from '../lib/utils';
 import type { ServerMessage } from '../transport/signaling';
 
 export type TerminalStatus = 'idle' | 'connecting' | 'connected' | 'error' | 'closed';
+
+type JoinOverlayState =
+  | 'idle'
+  | 'connecting'
+  | 'waiting'
+  | 'approved'
+  | 'denied'
+  | 'disconnected';
+
+const JOIN_WAIT_DEFAULT = 'Waiting for host approval...';
+const JOIN_WAIT_INITIAL = 'Connected - waiting for host approval...';
+const JOIN_WAIT_HINT_ONE = 'Still waiting... hang tight.';
+const JOIN_WAIT_HINT_TWO = 'Still waiting... ask the host to approve.';
+const JOIN_APPROVED_MESSAGE = 'Approved - syncing...';
+const JOIN_DENIED_MESSAGE = 'Join request was declined by host.';
+const JOIN_DISCONNECTED_MESSAGE = 'Disconnected before approval.';
+const JOIN_CONNECTING_MESSAGE = 'Connecting to host...';
+const JOIN_OVERLAY_HIDE_DELAY_MS = 1500;
 
 declare global {
   interface Window {
@@ -88,6 +106,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const snapshot = useTerminalSnapshot(store);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const headerRef = useRef<HTMLDivElement | null>(null);
   const transportRef = useRef<TerminalTransport | null>(providedTransport ?? null);
   const connectionRef = useRef<BrowserTransportConnection | null>(null);
   const subscriptionRef = useRef<number | null>(null);
@@ -100,13 +119,53 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   );
   const [error, setError] = useState<Error | null>(null);
   const [showIdlePlaceholder, setShowIdlePlaceholder] = useState(true);
+  const [headerHeight, setHeaderHeight] = useState<number>(0);
   const [activeConnection, setActiveConnection] = useState<BrowserTransportConnection | null>(null);
   const [peerId, setPeerId] = useState<string | null>(null);
   const [remotePeerId, setRemotePeerId] = useState<string | null>(null);
+  const [joinState, setJoinState] = useState<JoinOverlayState>('idle');
+  const joinStateRef = useRef<JoinOverlayState>('idle');
+  const [joinMessage, setJoinMessage] = useState<string | null>(null);
+  const joinTimersRef = useRef<{ short?: number; long?: number; hide?: number }>({});
   const peerIdRef = useRef<string | null>(null);
+  const handshakeReadyRef = useRef(false);
+  const queryLabel = useMemo(() => {
+    if (typeof window === 'undefined') {
+      return undefined;
+    }
+    const label = new URLSearchParams(window.location.search).get('label');
+    if (!label) {
+      return undefined;
+    }
+    const trimmed = label.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }, []);
+  const clearJoinTimers = useCallback(() => {
+    const timers = joinTimersRef.current;
+    if (timers.short !== undefined) {
+      window.clearTimeout(timers.short);
+      timers.short = undefined;
+    }
+    if (timers.long !== undefined) {
+      window.clearTimeout(timers.long);
+      timers.long = undefined;
+    }
+    if (timers.hide !== undefined) {
+      window.clearTimeout(timers.hide);
+      timers.hide = undefined;
+    }
+  }, []);
   useEffect(() => {
     peerIdRef.current = peerId;
   }, [peerId]);
+  useEffect(() => {
+    joinStateRef.current = joinState;
+  }, [joinState]);
+  useEffect(() => {
+    return () => {
+      clearJoinTimers();
+    };
+  }, [clearJoinTimers]);
   const log = useCallback((message: string, detail?: Record<string, unknown>) => {
     if (!import.meta.env.DEV) {
       return;
@@ -119,6 +178,120 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       console.debug(`${prefix} ${message}`);
     }
   }, []);
+
+  const enterWaitingState = useCallback(
+    (message?: string) => {
+      handshakeReadyRef.current = false;
+      const trimmed = message?.trim();
+      const effective = trimmed && trimmed.length > 0 ? trimmed : JOIN_WAIT_INITIAL;
+      setJoinState('waiting');
+      setJoinMessage(effective);
+      clearJoinTimers();
+      if (!trimmed || trimmed.length === 0) {
+        joinTimersRef.current.short = window.setTimeout(() => {
+          setJoinMessage((current) => {
+            if (!current) {
+              return current;
+            }
+            if (current === JOIN_WAIT_INITIAL || current === JOIN_WAIT_DEFAULT) {
+              return JOIN_WAIT_HINT_ONE;
+            }
+            return current;
+          });
+        }, 10_000);
+        joinTimersRef.current.long = window.setTimeout(() => {
+          setJoinMessage((current) => {
+            if (!current) {
+              return current;
+            }
+            if (
+              current === JOIN_WAIT_INITIAL ||
+              current === JOIN_WAIT_DEFAULT ||
+              current === JOIN_WAIT_HINT_ONE
+            ) {
+              return JOIN_WAIT_HINT_TWO;
+            }
+            return current;
+          });
+        }, 30_000);
+      }
+    },
+    [clearJoinTimers],
+  );
+
+  const enterApprovedState = useCallback(
+    (message?: string) => {
+      handshakeReadyRef.current = true;
+      const trimmed = message?.trim();
+      const effective = trimmed && trimmed.length > 0 ? trimmed : JOIN_APPROVED_MESSAGE;
+      setJoinState('approved');
+      setJoinMessage(effective);
+      clearJoinTimers();
+      joinTimersRef.current.hide = window.setTimeout(() => {
+        setJoinState('idle');
+        setJoinMessage(null);
+        joinTimersRef.current.hide = undefined;
+      }, JOIN_OVERLAY_HIDE_DELAY_MS);
+    },
+    [clearJoinTimers],
+  );
+
+  const enterDeniedState = useCallback(
+    (message?: string) => {
+      handshakeReadyRef.current = false;
+      const trimmed = message?.trim();
+      const effective = trimmed && trimmed.length > 0 ? trimmed : JOIN_DENIED_MESSAGE;
+      setJoinState('denied');
+      setJoinMessage(effective);
+      clearJoinTimers();
+      joinTimersRef.current.hide = window.setTimeout(() => {
+        setJoinState('idle');
+        setJoinMessage(null);
+        joinTimersRef.current.hide = undefined;
+      }, JOIN_OVERLAY_HIDE_DELAY_MS);
+    },
+    [clearJoinTimers],
+  );
+
+  const enterDisconnectedState = useCallback(() => {
+    handshakeReadyRef.current = false;
+    setJoinState('disconnected');
+    setJoinMessage(JOIN_DISCONNECTED_MESSAGE);
+    clearJoinTimers();
+    joinTimersRef.current.hide = window.setTimeout(() => {
+      setJoinState('idle');
+      setJoinMessage(null);
+      joinTimersRef.current.hide = undefined;
+    }, JOIN_OVERLAY_HIDE_DELAY_MS);
+  }, [clearJoinTimers]);
+
+  const handleStatusSignal = useCallback(
+    (signal: string) => {
+      if (!signal.startsWith('beach:status:')) {
+        return;
+      }
+      const payload = signal.slice('beach:status:'.length);
+      const [kind, ...rest] = payload.split(' ');
+      const detail = rest.join(' ').trim();
+      switch (kind) {
+        case 'approval_pending':
+          if (handshakeReadyRef.current) {
+            return;
+          }
+          enterWaitingState(detail.length > 0 ? detail : undefined);
+          break;
+        case 'approval_granted':
+          enterApprovedState(detail.length > 0 ? detail : undefined);
+          break;
+        case 'approval_denied':
+          enterDeniedState(detail.length > 0 ? detail : undefined);
+          break;
+        default:
+          break;
+      }
+    },
+    [enterApprovedState, enterDeniedState, enterWaitingState],
+  );
   useEffect(() => {
     onStatusChange?.(status);
     if (status === 'connected') {
@@ -165,6 +338,54 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     if (typeof window === 'undefined') {
       return;
     }
+    const header = headerRef.current;
+    if (!header) {
+      return;
+    }
+    let raf = -1;
+    const measure = () => {
+      const rect = header.getBoundingClientRect();
+      const next = rect.height;
+      if (!Number.isFinite(next) || next <= 0) {
+        return;
+      }
+      setHeaderHeight((prev) => (Math.abs(prev - next) > 0.5 ? next : prev));
+    };
+    measure();
+    if ('ResizeObserver' in window) {
+      const observer = new ResizeObserver(() => {
+        if (raf !== -1) {
+          window.cancelAnimationFrame(raf);
+        }
+        raf = window.requestAnimationFrame(measure);
+      });
+      observer.observe(header);
+      return () => {
+        observer.disconnect();
+        if (raf !== -1) {
+          window.cancelAnimationFrame(raf);
+        }
+      };
+    }
+    const handleResize = () => {
+      if (raf !== -1) {
+        window.cancelAnimationFrame(raf);
+      }
+      raf = window.requestAnimationFrame(measure);
+    };
+    window.addEventListener('resize', handleResize);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      if (raf !== -1) {
+        window.cancelAnimationFrame(raf);
+      }
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
     const container = containerRef.current;
     if (!container) {
       return;
@@ -195,6 +416,15 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     if (providedTransport) {
       bindTransport(providedTransport);
       setStatus('connected');
+      if (!handshakeReadyRef.current) {
+        enterWaitingState();
+      }
+    }
+    if (!providedTransport) {
+      handshakeReadyRef.current = false;
+      clearJoinTimers();
+      setJoinState('idle');
+      setJoinMessage(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [providedTransport]);
@@ -205,6 +435,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     }
     let cancelled = false;
     setStatus('connecting');
+    setJoinState('connecting');
+    setJoinMessage(JOIN_CONNECTING_MESSAGE);
+    handshakeReadyRef.current = false;
+    clearJoinTimers();
     (async () => {
       try {
         const webrtcLogger = (message: string) => {
@@ -225,6 +459,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           baseUrl,
           passcode,
           logger: webrtcLogger,
+          clientLabel: queryLabel,
         });
         if (cancelled) {
           connection.close();
@@ -256,9 +491,13 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       setActiveConnection(null);
       setPeerId(null);
       setRemotePeerId(null);
+      handshakeReadyRef.current = false;
+      clearJoinTimers();
+      setJoinState('idle');
+      setJoinMessage(null);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoConnect, sessionId, baseUrl, passcode]);
+  }, [autoConnect, sessionId, baseUrl, passcode, queryLabel]);
 
   useEffect(() => {
     if (!wrapperRef.current || !containerRef.current) {
@@ -280,9 +519,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         ? Math.max(1, Math.floor(window.innerHeight / rowHeight))
         : MAX_VIEWPORT_ROWS;
       const fallbackRows = Math.max(1, Math.min(windowRows, MAX_VIEWPORT_ROWS));
-      const viewportRows = fallbackRows;
+      const viewportRows = Math.max(1, Math.min(measured, fallbackRows));
       lastMeasuredViewportRows.current = viewportRows;
-      const maxHeightPx = viewportRows * rowHeight;
+      const maxHeightPx = fallbackRows * rowHeight;
       container.style.maxHeight = `${maxHeightPx}px`;
       container.style.setProperty('--beach-terminal-max-height', `${maxHeightPx}px`);
       const current = store.getSnapshot();
@@ -305,7 +544,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       }
       // Only send resize if the viewport size actually changed
       if (subscriptionRef.current !== null && transportRef.current && viewportRows !== lastSentViewportRows.current) {
-        sendResize(transportRef.current, current.cols, viewportRows);
+        transportRef.current.send({ type: 'resize', cols: current.cols, rows: viewportRows });
         lastSentViewportRows.current = viewportRows;
       }
     });
@@ -368,15 +607,29 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       if (target < 0) {
         return;
       }
+      const rowHeight = Math.max(1, effectiveLineHeight);
+      const viewportEstimate = Math.max(1, Math.floor(element.clientHeight / rowHeight));
+      let desired = target;
+      const lastContentAbsolute = findLastContentAbsolute(snapshot);
+      if (
+        lastContentAbsolute !== null &&
+        lastContentAbsolute >= snapshot.baseRow
+      ) {
+        const totalContentRows = lastContentAbsolute - snapshot.baseRow + 1;
+        if (totalContentRows <= viewportEstimate) {
+          desired = 0;
+        }
+      }
       if (import.meta.env.DEV && typeof window !== 'undefined' && window.__BEACH_TRACE) {
         console.debug('[beach-trace][terminal] autoscroll', {
           before: element.scrollTop,
           target,
+          desired,
           scrollHeight: element.scrollHeight,
           clientHeight: element.clientHeight,
         });
       }
-      element.scrollTop = target;
+      element.scrollTop = desired;
     };
     if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
       let outer = -1;
@@ -394,7 +647,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       };
     }
     applyScroll();
-  }, [snapshot.followTail, snapshot.baseRow, snapshot.rows.length, lastAbsolute, lineHeight, topPadding, bottomPadding, lines.length]);
+  }, [snapshot.followTail, snapshot.baseRow, snapshot.rows.length, lastAbsolute, lineHeight, topPadding, bottomPadding, lines.length, effectiveLineHeight]);
 
   const handleKeyDown: React.KeyboardEventHandler<HTMLDivElement> = (event) => {
     const transport = transportRef.current;
@@ -410,7 +663,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     }
     event.preventDefault();
     const seq = ++inputSeqRef.current;
-    sendFrame(transport, { type: 'input', seq, data: payload });
+    transport.send({ type: 'input', seq, data: payload });
     store.registerPrediction(seq, payload);
   };
 
@@ -445,32 +698,28 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         <div className="absolute inset-x-0 top-0 h-28 bg-gradient-to-b from-white/12 via-white/0 to-transparent opacity-20" aria-hidden />
         <div className="absolute inset-0 rounded-[22px] ring-1 ring-[#1f2736]/60" aria-hidden />
       </div>
-      <header className="relative z-10 flex items-center justify-between gap-4 bg-[#111925]/95 px-6 py-3 text-[11px] font-medium uppercase tracking-[0.36em] text-[#9aa4bc]">
+      <JoinStatusOverlay state={joinState} message={joinMessage} />
+      <header
+        ref={headerRef}
+        className="relative z-10 flex items-center justify-between gap-4 bg-[#111925]/95 px-6 py-3 text-[11px] font-medium uppercase tracking-[0.36em] text-[#9aa4bc]"
+      >
         <div className="flex items-center gap-3">
           <button
             type="button"
             onClick={() => onToggleFullscreen?.(!isFullscreen)}
             className={cn(
-              'inline-flex h-3.5 w-3.5 items-center justify-center rounded-full transition focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40',
-              isFullscreen
-                ? 'border border-[#111827] bg-[#212838] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.06)] hover:bg-[#1d2432] text-[#a5b4d6]'
-                : 'border border-[#1a8a39] bg-[#26c547] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.2)] hover:bg-[#2cd653] text-[#0f3d1d]'
+              'group inline-flex h-3 w-3 items-center justify-center transition focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40'
             )}
             aria-label={isFullscreen ? 'Exit full screen' : 'Enter full screen'}
             aria-pressed={isFullscreen}
           >
-            <svg viewBox="0 0 12 12" className="h-2.5 w-2.5" fill="none" aria-hidden>
-              {isFullscreen ? (
-                <>
-                  <rect x="2.3" y="2.3" width="7.4" height="7.4" rx="1.7" stroke="currentColor" strokeWidth="1" />
-                  <path d="M4.5 7.6h3" stroke="currentColor" strokeWidth="1" strokeLinecap="round" />
-                </>
-              ) : (
-                <>
-                  <rect x="2.3" y="2.3" width="7.4" height="7.4" rx="1.9" fill="rgba(15,61,29,0.35)" stroke="#0f3d1d" strokeWidth="1" />
-                  <path d="M4.1 4.1l3.8 3.8" stroke="#0f3d1d" strokeWidth="1.1" strokeLinecap="round" />
-                </>
-              )}
+            <svg viewBox="0 0 24 24" className="h-3 w-3" aria-hidden>
+              <circle cx="12" cy="12" r="10" fill="#34C759"/>
+              <g transform={isFullscreen ? 'rotate(45 12 12)' : 'rotate(-45 12 12)'}>
+                <rect x="6" y="10.5" width="12" height="3" rx="1.2" ry="1.2" fill="#0B7A34"/>
+                <polygon points="6,12 4.8,13.2 4.8,10.8" fill="#0B7A34"/>
+                <polygon points="18,12 19.2,13.2 19.2,10.8" fill="#0B7A34"/>
+              </g>
             </svg>
           </button>
           <span className="text-[10px] font-semibold uppercase tracking-[0.5em] text-[#c0cada]">{sessionTitle}</span>
@@ -498,7 +747,11 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         }}
       >
         {showIdlePlaceholder ? (
-          <IdlePlaceholder onConnectNotice={() => setShowIdlePlaceholder(false)} status={status} />
+          <IdlePlaceholder
+            topOffset={headerHeight}
+            onConnectNotice={() => setShowIdlePlaceholder(false)}
+            status={status}
+          />
         ) : null}
         <div style={{ height: topPadding }} aria-hidden="true" />
         {lines.map((line) => (
@@ -592,16 +845,32 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   }
 
   function bindTransport(transport: TerminalTransport): void {
+    subscriptionRef.current = null;
+    handshakeReadyRef.current = false;
     const frameHandler = (event: Event) => {
       const frame = (event as CustomEvent<HostFrame>).detail;
       handleHostFrame(frame);
     };
     transport.addEventListener('frame', frameHandler as EventListener);
+    transport.addEventListener('status', (event) => {
+      const detail = (event as CustomEvent<string>).detail;
+      handleStatusSignal(detail);
+    });
+    transport.addEventListener('open', () => {
+      if (!handshakeReadyRef.current) {
+        enterWaitingState();
+      }
+    });
     transport.addEventListener(
       'close',
       () => {
         const remote = remotePeerId ?? connectionRef.current?.remotePeerId ?? null;
         log('transport closed', { remotePeerId: remote });
+        handshakeReadyRef.current = false;
+        if (subscriptionRef.current === null && joinStateRef.current !== 'denied') {
+          enterDisconnectedState();
+        }
+        subscriptionRef.current = null;
         setStatus('closed');
       },
       { once: true },
@@ -613,6 +882,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       setError(err);
       setStatus('error');
     });
+
+    if (!handshakeReadyRef.current) {
+      enterWaitingState();
+    }
   }
 
   function handleHostFrame(frame: HostFrame): void {
@@ -625,6 +898,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         inputSeqRef.current = 0;
         store.setCursorSupport(Boolean(frame.features & FEATURE_CURSOR_SYNC));
         summarizeSnapshot(store);
+        handshakeReadyRef.current = true;
+        enterApprovedState(joinStateRef.current === 'approved' ? joinMessage ?? undefined : undefined);
         break;
       case 'grid':
         trace('frame grid', frame);
@@ -805,6 +1080,32 @@ function truncate(text: string | undefined | null, max = 48): string {
   return `${text.slice(0, max)}…`;
 }
 
+function findLastContentAbsolute(snapshot: TerminalGridSnapshot): number | null {
+  const rows = snapshot.rows;
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const slot = rows[index];
+    if (!slot) {
+      continue;
+    }
+    if (slot.kind !== 'loaded') {
+      return slot.absolute;
+    }
+    if (rowHasVisibleContent(slot.cells)) {
+      return slot.absolute;
+    }
+  }
+  return null;
+}
+
+function rowHasVisibleContent(cells: CellState[]): boolean {
+  for (const cell of cells) {
+    if (cell.char !== ' ' || cell.styleId !== 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 interface RenderCell {
   char: string;
   styleId: number;
@@ -873,6 +1174,45 @@ export function buildLines(snapshot: TerminalGridSnapshot, limit: number): Rende
   return lines;
 }
 
+function JoinStatusOverlay({ state, message }: { state: JoinOverlayState; message: string | null }): JSX.Element | null {
+  if (state === 'idle') {
+    return null;
+  }
+  const text = message ?? JOIN_WAIT_DEFAULT;
+  const showSpinner = state === 'connecting' || state === 'waiting';
+  const badgeText = state === 'approved' ? 'OK' : state === 'denied' ? 'NO' : 'OFF';
+
+  return (
+    <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-[#05070b]/80 backdrop-blur-sm">
+      <div className="pointer-events-auto flex w-[min(420px,90%)] flex-col items-center gap-3 rounded-lg border border-white/10 bg-[#111827]/95 px-6 py-5 text-center text-sm text-slate-200 shadow-2xl">
+        {showSpinner ? (
+          <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/40 border-t-transparent" />
+        ) : (
+          <div className="flex h-8 w-8 items-center justify-center rounded-full border border-white/30 text-xs font-semibold uppercase tracking-wide text-white/80">
+            {badgeText}
+          </div>
+        )}
+        <div className="font-mono text-[13px] text-slate-100">{text}</div>
+        {state === 'waiting' ? (
+          <p className="text-xs text-slate-400">Your typing stays local until the host approves.</p>
+        ) : null}
+        {state === 'connecting' ? (
+          <p className="text-xs text-slate-400">Negotiating WebRTC connection...</p>
+        ) : null}
+        {state === 'approved' ? (
+          <p className="text-xs text-emerald-300">Syncing terminal...</p>
+        ) : null}
+        {state === 'denied' ? (
+          <p className="text-xs text-rose-300">You can close this window.</p>
+        ) : null}
+        {state === 'disconnected' ? (
+          <p className="text-xs text-amber-300">Connection closed before approval.</p>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function LineRow({ line, styles }: { line: RenderLine; styles: Map<number, StyleDefinition> }): JSX.Element {
   if (!line.cells || line.kind !== 'loaded') {
     const text = line.cells?.map((cell) => cell.char).join('') ?? '';
@@ -938,14 +1278,6 @@ function computeLineHeight(fontSize: number): number {
 
 export function shouldReenableFollowTail(remainingPixels: number): boolean {
   return remainingPixels <= 1;
-}
-
-function sendFrame(transport: TerminalTransport, frame: ClientFrame): void {
-  transport.send(frame);
-}
-
-function sendResize(transport: TerminalTransport, cols: number, rows: number): void {
-  transport.send({ type: 'resize', cols, rows });
 }
 
 const DEFAULT_FOREGROUND = '#e2e8f0';
@@ -1047,14 +1379,22 @@ function colorFromIndexed(index: number): string {
   return DEFAULT_FOREGROUND;
 }
 
-function IdlePlaceholder({ onConnectNotice, status }: { onConnectNotice: () => void; status: TerminalStatus }): JSX.Element {
+function IdlePlaceholder({
+  onConnectNotice,
+  status,
+  topOffset,
+}: {
+  onConnectNotice: () => void;
+  status: TerminalStatus;
+  topOffset: number;
+}): JSX.Element {
   useEffect(() => {
     if (status === 'connected') {
       onConnectNotice();
     }
   }, [status, onConnectNotice]);
   return (
-    <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 bg-gradient-to-br from-[#0a101b]/92 via-[#0d1421]/92 to-[#05070b]/94 text-[13px] font-mono text-[#8f9ab5]">
+    <div className="pointer-events-none flex min-h-[300px] flex-col items-center justify-center gap-2 bg-gradient-to-br from-[#0a101b]/92 via-[#0d1421]/92 to-[#05070b]/94 px-6 py-10 text-center text-[13px] font-mono text-[#8f9ab5]">
       <div className="rounded-full border border-white/10 bg-[#141a28]/90 px-3 py-1 text-[11px] uppercase tracking-[0.4em] text-white/70">Terminal idle</div>
       <p className="text-xs text-white/40">Awaiting connection</p>
     </div>

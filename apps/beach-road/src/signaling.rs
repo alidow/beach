@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Supported P2P transport types
@@ -92,6 +93,8 @@ pub enum ClientMessage {
         supported_transports: Vec<TransportType>,
         /// Preferred transport order
         preferred_transport: Option<TransportType>,
+        #[serde(default)]
+        label: Option<String>,
     },
     /// Negotiate transport to use with a peer
     NegotiateTransport {
@@ -174,6 +177,8 @@ pub struct PeerInfo {
     pub supported_transports: Vec<TransportType>,
     /// Peer's preferred transport
     pub preferred_transport: Option<TransportType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

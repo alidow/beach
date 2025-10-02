@@ -30,6 +30,7 @@ use std::sync::{
     Arc,
     mpsc::{Receiver, TryRecvError},
 };
+use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{Level, debug, trace};
 
@@ -41,6 +42,28 @@ const BACKFILL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MOUSE_SCROLL_LINES: isize = 5;
 const COPY_MODE_KEYSET_ENV: &str = "BEACH_COPY_MODE_KEYS";
 const TMUX_PREFIX_TIMEOUT: Duration = Duration::from_millis(500);
+const AUTH_SPINNER_FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
+const AUTH_SPINNER_INTERVAL: Duration = Duration::from_millis(120);
+const AUTH_APPROVED_MESSAGE_DURATION: Duration = Duration::from_millis(1200);
+const AUTH_DENIED_EXIT_DELAY: Duration = Duration::from_millis(1200);
+const AUTH_FALLBACK_WAIT: Duration = Duration::from_millis(750);
+const AUTH_HINT_STAGE_ONE: Duration = Duration::from_secs(10);
+const AUTH_HINT_STAGE_TWO: Duration = Duration::from_secs(30);
+const AUTH_WAIT_MESSAGE: &str = "Waiting for host approval...";
+const AUTH_WAIT_MESSAGE_INIT: &str = "Connected - waiting for host approval...";
+const AUTH_WAIT_HINT_ONE: &str = "Still waiting... hang tight.";
+const AUTH_WAIT_HINT_TWO: &str = "Still waiting... ask the host to approve.";
+const AUTH_APPROVED_MESSAGE: &str = "Approved - syncing...";
+const AUTH_DENIED_MESSAGE: &str = "Join request was declined by host.";
+const AUTH_DISCONNECTED_MESSAGE: &str = "Disconnected before approval.";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthorizationState {
+    Connecting,
+    Waiting,
+    Approved,
+    Denied,
+}
 
 #[cfg(test)]
 mod clipboard {
@@ -222,6 +245,15 @@ pub struct TerminalClient {
     last_gap_backfill_start: Option<u64>,
     empty_tail_ranges: Vec<EmptyTailRange>,
     last_backfill_trimmed: bool,
+    authorization_state: AuthorizationState,
+    authorization_message: Option<String>,
+    authorization_wait_started: Option<Instant>,
+    authorization_last_tick: Instant,
+    authorization_spinner_index: usize,
+    authorization_approved_since: Option<Instant>,
+    authorization_shutdown_at: Option<Instant>,
+    authorization_hint_level: u8,
+    connect_started_at: Instant,
 }
 
 impl TerminalClient {
@@ -266,6 +298,15 @@ impl TerminalClient {
             last_gap_backfill_start: None,
             empty_tail_ranges: Vec::new(),
             last_backfill_trimmed: false,
+            authorization_state: AuthorizationState::Connecting,
+            authorization_message: None,
+            authorization_wait_started: None,
+            authorization_last_tick: Instant::now(),
+            authorization_spinner_index: 0,
+            authorization_approved_since: None,
+            authorization_shutdown_at: None,
+            authorization_hint_level: 0,
+            connect_started_at: Instant::now(),
         }
     }
 
@@ -301,10 +342,23 @@ impl TerminalClient {
             loop {
                 self.pump_input()?;
                 self.maybe_request_backfill()?;
+                self.tick_authorization();
                 let message = match self.transport.recv(Duration::from_millis(25)) {
                     Ok(message) => Some(message),
                     Err(TransportError::Timeout) => None,
-                    Err(TransportError::ChannelClosed) => return Ok(()),
+                    Err(TransportError::ChannelClosed) => {
+                        if self.subscription_id.is_none() {
+                            self.set_authorization_state(
+                                AuthorizationState::Denied,
+                                Some(AUTH_DISCONNECTED_MESSAGE.to_string()),
+                            );
+                            self.refresh_authorization_status();
+                            self.force_render = true;
+                            self.maybe_render()?;
+                            thread::sleep(AUTH_DENIED_EXIT_DELAY);
+                        }
+                        return Ok(());
+                    }
                     Err(err) => return Err(ClientError::Transport(err)),
                 };
 
@@ -345,6 +399,8 @@ impl TerminalClient {
                                     payload = trimmed,
                                     "ignoring handshake sentinel"
                                 );
+                            } else if self.handle_authorization_signal(trimmed) {
+                                trace!(target = "client::frame", payload = %trimmed, "processed authorization signal");
                             } else {
                                 debug!(
                                     target = "client::frame",
@@ -357,6 +413,13 @@ impl TerminalClient {
                 }
 
                 self.maybe_render()?;
+                if matches!(self.authorization_state, AuthorizationState::Denied) {
+                    if let Some(deadline) = self.authorization_shutdown_at {
+                        if Instant::now() >= deadline {
+                            return Ok(());
+                        }
+                    }
+                }
             }
         })();
 
@@ -421,6 +484,10 @@ impl TerminalClient {
                 self.last_backfill_trimmed = false;
                 self.handshake_snapshot_lines = config.initial_snapshot_lines;
                 self.handshake_history_rows = 0;
+                self.set_authorization_state(
+                    AuthorizationState::Approved,
+                    Some(AUTH_APPROVED_MESSAGE.to_string()),
+                );
             }
             WireHostFrame::Grid {
                 cols,
@@ -1373,7 +1440,8 @@ impl TerminalClient {
                 }
                 RowWidth(row) => {
                     let width = self.renderer.row_display_width(row as u64);
-                    if row > self.cursor_row || (row == self.cursor_row && width >= self.cursor_col) {
+                    if row > self.cursor_row || (row == self.cursor_row && width >= self.cursor_col)
+                    {
                         self.cursor_row = row;
                         self.cursor_col = width;
                     }
@@ -2522,6 +2590,13 @@ impl TerminalClient {
         if bytes.is_empty() {
             return Ok(());
         }
+        if self.subscription_id.is_none() {
+            trace!(
+                target = "client::outgoing",
+                "dropping input before handshake"
+            );
+            return Ok(());
+        }
         self.input_seq = self.input_seq.saturating_add(1);
         telemetry::record_bytes("client_input_bytes", bytes.len());
         let frame = WireClientFrame::Input {
@@ -2546,6 +2621,193 @@ impl TerminalClient {
             self.register_prediction(self.input_seq, bytes);
         }
         Ok(())
+    }
+
+    fn set_authorization_state(&mut self, state: AuthorizationState, message: Option<String>) {
+        if self.authorization_state == state && self.authorization_message == message {
+            return;
+        }
+        self.authorization_state = state;
+        self.authorization_hint_level = 0;
+        match self.authorization_state {
+            AuthorizationState::Waiting => {
+                self.authorization_message =
+                    Some(message.unwrap_or_else(|| AUTH_WAIT_MESSAGE.to_string()));
+                if self.authorization_wait_started.is_none() {
+                    self.authorization_wait_started = Some(Instant::now());
+                }
+                self.authorization_last_tick = Instant::now();
+                self.authorization_spinner_index = 0;
+                self.authorization_approved_since = None;
+                self.authorization_shutdown_at = None;
+            }
+            AuthorizationState::Approved => {
+                self.authorization_message =
+                    Some(message.unwrap_or_else(|| AUTH_APPROVED_MESSAGE.to_string()));
+                self.authorization_wait_started = None;
+                self.authorization_last_tick = Instant::now();
+                self.authorization_spinner_index = 0;
+                self.authorization_approved_since = Some(Instant::now());
+                self.authorization_shutdown_at = None;
+            }
+            AuthorizationState::Denied => {
+                self.authorization_message =
+                    Some(message.unwrap_or_else(|| AUTH_DENIED_MESSAGE.to_string()));
+                self.authorization_wait_started = None;
+                self.authorization_approved_since = None;
+                self.authorization_shutdown_at = Some(Instant::now() + AUTH_DENIED_EXIT_DELAY);
+            }
+            AuthorizationState::Connecting => {
+                self.authorization_message = message;
+                self.authorization_wait_started = None;
+                self.authorization_approved_since = None;
+                self.authorization_shutdown_at = None;
+                self.authorization_last_tick = Instant::now();
+                self.authorization_spinner_index = 0;
+            }
+        }
+        self.refresh_authorization_status();
+    }
+
+    fn refresh_authorization_status(&mut self) {
+        match self.authorization_state {
+            AuthorizationState::Waiting => {
+                let base = self
+                    .authorization_message
+                    .clone()
+                    .unwrap_or_else(|| AUTH_WAIT_MESSAGE.to_string());
+                let spinner = AUTH_SPINNER_FRAMES
+                    [self.authorization_spinner_index % AUTH_SPINNER_FRAMES.len()];
+                let text = format!("{base} {spinner}");
+                self.renderer.set_status_message(Some(text));
+                self.force_render = true;
+            }
+            AuthorizationState::Denied => {
+                if let Some(message) = &self.authorization_message {
+                    self.renderer.set_status_message(Some(message.clone()));
+                }
+                self.force_render = true;
+            }
+            AuthorizationState::Approved => {
+                if let Some(message) = &self.authorization_message {
+                    self.renderer.set_status_message(Some(message.clone()));
+                } else {
+                    self.renderer.set_status_message::<String>(None);
+                }
+                self.force_render = true;
+            }
+            AuthorizationState::Connecting => {
+                if self.authorization_message.is_some() {
+                    self.renderer.set_status_message::<String>(None);
+                }
+                self.force_render = true;
+            }
+        }
+    }
+
+    fn tick_authorization(&mut self) {
+        if matches!(self.authorization_state, AuthorizationState::Connecting)
+            && self.connect_started_at.elapsed() >= AUTH_FALLBACK_WAIT
+        {
+            self.set_authorization_state(
+                AuthorizationState::Waiting,
+                Some(AUTH_WAIT_MESSAGE_INIT.to_string()),
+            );
+        }
+
+        if matches!(self.authorization_state, AuthorizationState::Waiting)
+            && self.authorization_last_tick.elapsed() >= AUTH_SPINNER_INTERVAL
+        {
+            self.authorization_spinner_index =
+                (self.authorization_spinner_index + 1) % AUTH_SPINNER_FRAMES.len();
+            self.authorization_last_tick = Instant::now();
+            self.refresh_authorization_status();
+        }
+
+        if let AuthorizationState::Waiting = self.authorization_state {
+            if let Some(started) = self.authorization_wait_started {
+                let elapsed = started.elapsed();
+                let hint_level = if elapsed >= AUTH_HINT_STAGE_TWO {
+                    2
+                } else if elapsed >= AUTH_HINT_STAGE_ONE {
+                    1
+                } else {
+                    0
+                };
+                if hint_level != self.authorization_hint_level {
+                    self.authorization_hint_level = hint_level;
+                    let current = self
+                        .authorization_message
+                        .as_deref()
+                        .unwrap_or(AUTH_WAIT_MESSAGE);
+                    if current == AUTH_WAIT_MESSAGE || current == AUTH_WAIT_MESSAGE_INIT {
+                        let replacement = match hint_level {
+                            2 => AUTH_WAIT_HINT_TWO,
+                            1 => AUTH_WAIT_HINT_ONE,
+                            _ => AUTH_WAIT_MESSAGE,
+                        };
+                        self.authorization_message = Some(replacement.to_string());
+                        self.refresh_authorization_status();
+                    }
+                }
+            }
+        }
+
+        if let AuthorizationState::Approved = self.authorization_state {
+            if let Some(started) = self.authorization_approved_since {
+                if started.elapsed() >= AUTH_APPROVED_MESSAGE_DURATION
+                    && self.authorization_message.is_some()
+                {
+                    self.authorization_message = None;
+                    self.authorization_approved_since = None;
+                    self.refresh_authorization_status();
+                }
+            }
+        }
+    }
+
+    fn handle_authorization_signal(&mut self, signal: &str) -> bool {
+        let trimmed = signal.trim();
+        let Some(rest) = trimmed.strip_prefix("beach:status:") else {
+            return false;
+        };
+        let (kind, detail) = match rest.split_once(' ') {
+            Some((k, d)) => (k, d.trim()),
+            None => (rest, ""),
+        };
+        match kind {
+            "approval_pending" => {
+                if self.subscription_id.is_some() {
+                    return true;
+                }
+                let message = if detail.is_empty() {
+                    AUTH_WAIT_MESSAGE.to_string()
+                } else {
+                    detail.to_string()
+                };
+                self.set_authorization_state(AuthorizationState::Waiting, Some(message));
+                true
+            }
+            "approval_granted" => {
+                let message = if detail.is_empty() {
+                    AUTH_APPROVED_MESSAGE.to_string()
+                } else {
+                    detail.to_string()
+                };
+                self.set_authorization_state(AuthorizationState::Approved, Some(message));
+                true
+            }
+            "approval_denied" => {
+                let message = if detail.is_empty() {
+                    AUTH_DENIED_MESSAGE.to_string()
+                } else {
+                    detail.to_string()
+                };
+                self.set_authorization_state(AuthorizationState::Denied, Some(message));
+                true
+            }
+            _ => false,
+        }
     }
 
     fn send_resize(&mut self, cols: u16, rows: u16) -> Result<(), ClientError> {

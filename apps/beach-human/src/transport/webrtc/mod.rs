@@ -461,6 +461,7 @@ const OFFERER_MAX_NEGOTIATORS: usize = 128;
 pub struct OffererAcceptedTransport {
     pub peer_id: String,
     pub handshake_id: String,
+    pub metadata: HashMap<String, String>,
     pub transport: Arc<dyn Transport>,
 }
 
@@ -498,7 +499,7 @@ impl OffererSupervisor {
         passphrase: Option<&str>,
     ) -> Result<(Arc<Self>, OffererAcceptedTransport), TransportError> {
         let signaling_client =
-            SignalingClient::connect(signaling_url, WebRtcRole::Offerer, passphrase).await?;
+            SignalingClient::connect(signaling_url, WebRtcRole::Offerer, passphrase, None).await?;
         let client = Client::new();
         let signaling_base = signaling_url.trim_end_matches('/').to_string();
         let (accepted_tx, accepted_rx) = tokio_mpsc::unbounded_channel();
@@ -1154,6 +1155,7 @@ async fn negotiate_offerer_peer(
     Ok(Some(OffererAcceptedTransport {
         peer_id: peer.id,
         handshake_id,
+        metadata: peer.metadata.unwrap_or_default(),
         transport: transport_dyn,
     }))
 }
@@ -1163,6 +1165,7 @@ pub async fn connect_via_signaling(
     role: WebRtcRole,
     poll_interval: Duration,
     passphrase: Option<&str>,
+    label: Option<&str>,
 ) -> Result<Arc<dyn Transport>, TransportError> {
     match role {
         WebRtcRole::Offerer => {
@@ -1170,7 +1173,9 @@ pub async fn connect_via_signaling(
                 OffererSupervisor::connect(signaling_url, poll_interval, passphrase).await?;
             Ok(accepted.transport)
         }
-        WebRtcRole::Answerer => connect_answerer(signaling_url, poll_interval, passphrase).await,
+        WebRtcRole::Answerer => {
+            connect_answerer(signaling_url, poll_interval, passphrase, label).await
+        }
     }
 }
 
@@ -1178,10 +1183,16 @@ async fn connect_answerer(
     signaling_url: &str,
     poll_interval: Duration,
     passphrase: Option<&str>,
+    label: Option<&str>,
 ) -> Result<Arc<dyn Transport>, TransportError> {
     let client = Client::new();
-    let signaling_client =
-        SignalingClient::connect(signaling_url, WebRtcRole::Answerer, passphrase).await?;
+    let signaling_client = SignalingClient::connect(
+        signaling_url,
+        WebRtcRole::Answerer,
+        passphrase,
+        label.map(|s| s.to_string()),
+    )
+    .await?;
     let (expected_remote_peer, _) = signaling_client
         .wait_for_remote_peer_with_generation()
         .await?;

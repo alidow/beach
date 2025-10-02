@@ -10,6 +10,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
@@ -114,7 +115,8 @@ async fn main() {
     println!("🏖️  Beach Road listening on {}", addr);
 
     // Start the server
-    axum::serve(listener, app)
+    let service = app.into_make_service_with_connect_info::<SocketAddr>();
+    axum::serve(listener, service)
         .await
         .expect("Failed to start server");
 }

@@ -83,6 +83,8 @@ pub struct PeerInfo {
     pub joined_at: i64,
     pub supported_transports: Vec<TransportType>,
     pub preferred_transport: Option<TransportType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug)]
@@ -112,6 +114,8 @@ pub enum ClientMessage {
         passphrase: Option<String>,
         supported_transports: Vec<TransportType>,
         preferred_transport: Option<TransportType>,
+        #[serde(default)]
+        label: Option<String>,
     },
     Signal {
         to_peer: String,
@@ -176,6 +180,7 @@ impl SignalingClient {
         signaling_url: &str,
         role: WebRtcRole,
         passphrase: Option<&str>,
+        label: Option<String>,
     ) -> Result<Arc<Self>, TransportError> {
         let websocket_url = derive_websocket_url(signaling_url)?;
         let (ws_stream, _) = connect_async(websocket_url.as_str())
@@ -280,6 +285,7 @@ impl SignalingClient {
             passphrase: passphrase.map(|s| s.to_string()),
             supported_transports: vec![TransportType::WebRTC],
             preferred_transport: Some(TransportType::WebRTC),
+            label,
         };
         client
             .send_tx

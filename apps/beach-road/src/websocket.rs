@@ -2,12 +2,14 @@ use anyhow::Result;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        Path, State, WebSocketUpgrade,
+        ConnectInfo, Path, State, WebSocketUpgrade,
     },
     response::Response,
 };
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
@@ -27,6 +29,8 @@ struct PeerConnection {
     preferred_transport: Option<TransportType>,
     tx: mpsc::UnboundedSender<ServerMessage>,
     last_heartbeat: Arc<RwLock<std::time::Instant>>,
+    label: Option<String>,
+    remote_addr: Option<SocketAddr>,
 }
 
 /// Global state for managing WebSocket connections
@@ -137,6 +141,7 @@ impl SignalingState {
                         joined_at: chrono::Utc::now().timestamp(),
                         supported_transports: entry.supported_transports.clone(),
                         preferred_transport: entry.preferred_transport.clone(),
+                        metadata: build_metadata(entry.label.as_ref(), entry.remote_addr),
                     })
                     .collect()
             })
@@ -210,17 +215,44 @@ impl SignalingState {
     }
 }
 
+fn build_metadata(
+    label: Option<&String>,
+    remote_addr: Option<SocketAddr>,
+) -> Option<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    if let Some(label) = label {
+        let trimmed = label.trim();
+        if !trimmed.is_empty() {
+            map.insert("label".to_string(), trimmed.to_string());
+        }
+    }
+    if let Some(addr) = remote_addr {
+        map.insert("remote_addr".to_string(), addr.to_string());
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(map)
+    }
+}
+
 /// WebSocket upgrade handler
 pub async fn websocket_handler(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     ws: WebSocketUpgrade,
     Path(session_id): Path<String>,
     State(signaling): State<SignalingState>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, session_id, signaling))
+    ws.on_upgrade(move |socket| handle_socket(socket, session_id, signaling, remote_addr))
 }
 
 /// Handle a WebSocket connection
-async fn handle_socket(socket: WebSocket, session_id: String, state: SignalingState) {
+async fn handle_socket(
+    socket: WebSocket,
+    session_id: String,
+    state: SignalingState,
+    remote_addr: SocketAddr,
+) {
     let peer_id = generate_peer_id();
     let (mut sender, mut receiver) = socket.split();
 
@@ -278,9 +310,15 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: SignalingSt
                             "Successfully parsed ClientMessage from Text frame: {:?}",
                             client_msg
                         );
-                        if let Err(e) =
-                            handle_client_message(client_msg, &peer_id, &session_id, &state, &tx)
-                                .await
+                        if let Err(e) = handle_client_message(
+                            client_msg,
+                            &peer_id,
+                            &session_id,
+                            &state,
+                            &tx,
+                            Some(remote_addr),
+                        )
+                        .await
                         {
                             error!("Error handling message: {}", e);
                             let _ = tx.send(ServerMessage::Error {
@@ -313,6 +351,7 @@ async fn handle_socket(socket: WebSocket, session_id: String, state: SignalingSt
                                 &session_id,
                                 &state,
                                 &tx,
+                                Some(remote_addr),
                             )
                             .await
                             {
@@ -380,6 +419,7 @@ async fn handle_client_message(
     session_id: &str,
     state: &SignalingState,
     tx: &mpsc::UnboundedSender<ServerMessage>,
+    remote_addr: Option<SocketAddr>,
 ) -> Result<()> {
     match message {
         ClientMessage::Join {
@@ -387,6 +427,7 @@ async fn handle_client_message(
             passphrase: _,
             supported_transports,
             preferred_transport,
+            label,
         } => {
             info!(
                 "📥 RECEIVED Join message from peer {} (client_peer_id: {:?}) for session {}",
@@ -415,6 +456,8 @@ async fn handle_client_message(
                 preferred_transport: preferred_transport.clone(),
                 tx: tx.clone(),
                 last_heartbeat: Arc::new(RwLock::new(std::time::Instant::now())),
+                label: label.clone(),
+                remote_addr,
             };
             state.add_peer(session_id.to_string(), peer_conn);
             info!(
@@ -463,6 +506,7 @@ async fn handle_client_message(
                             joined_at: chrono::Utc::now().timestamp(),
                             supported_transports,
                             preferred_transport,
+                            metadata: build_metadata(label.as_ref(), remote_addr),
                         },
                     },
                 )

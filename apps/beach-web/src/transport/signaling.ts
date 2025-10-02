@@ -17,6 +17,7 @@ export type ClientMessage =
       passphrase?: string | null;
       supported_transports: TransportTypeJson[];
       preferred_transport?: TransportTypeJson;
+      label?: string | null;
     }
   | {
       type: 'negotiate_transport';
@@ -87,6 +88,7 @@ export interface PeerInfo {
   joined_at: number;
   supported_transports: TransportTypeJson[];
   preferred_transport?: TransportTypeJson;
+  metadata?: Record<string, string>;
 }
 
 type SignalingEventMap = {
@@ -105,6 +107,7 @@ export interface SignalingClientOptions {
   supportedTransports?: TransportTypeJson[];
   preferredTransport?: TransportTypeJson;
   createSocket?: WebSocketFactory;
+  label?: string;
 }
 
 const DEFAULT_SUPPORTED: TransportTypeJson[] = ['webrtc'];
@@ -129,6 +132,7 @@ export class SignalingClient extends EventTarget {
       supportedTransports = DEFAULT_SUPPORTED,
       preferredTransport,
       createSocket,
+      label,
     } = options;
 
     const factory: WebSocketFactory = createSocket ?? ((target) => new WebSocket(target));
@@ -145,6 +149,7 @@ export class SignalingClient extends EventTarget {
           passphrase: passphrase ?? null,
           supported_transports: supportedTransports,
           preferred_transport: preferredTransport,
+          label: label ?? null,
         });
         socket.removeEventListener('open', handleOpen);
         socket.removeEventListener('error', handleError);

@@ -180,6 +180,8 @@ pub struct GridRenderer {
     selection: Option<SelectionRange>,
     needs_redraw: bool,
     predictions: HashMap<(u64, usize), PredictedCell>,
+    predictions_visible: bool,
+    prediction_flagging: bool,
     status_message: Option<String>,
     styles: HashMap<u32, CachedStyle>,
     debug_context: Option<GridUpdateDebugContext>,
@@ -199,6 +201,8 @@ impl GridRenderer {
             selection: None,
             needs_redraw: true,
             predictions: HashMap::new(),
+            predictions_visible: false,
+            prediction_flagging: false,
             status_message: None,
             styles: HashMap::new(),
             debug_context: None,
@@ -732,6 +736,24 @@ impl GridRenderer {
         self.predictions
             .insert((row as u64, col), PredictedCell { ch, seq });
         self.mark_dirty();
+    }
+
+    pub fn set_predictions_visible(&mut self, visible: bool) {
+        if self.predictions_visible != visible {
+            self.predictions_visible = visible;
+            self.mark_dirty();
+        }
+    }
+
+    pub fn set_prediction_flagging(&mut self, underline: bool) {
+        if self.prediction_flagging != underline {
+            self.prediction_flagging = underline;
+            self.mark_dirty();
+        }
+    }
+
+    pub fn has_active_predictions(&self) -> bool {
+        !self.predictions.is_empty()
     }
 
     pub fn clear_prediction_seq(&mut self, seq: Seq) {
@@ -1441,10 +1463,8 @@ impl GridRenderer {
         let mut style = style_id
             .and_then(|id| self.styles.get(&id).map(|cached| cached.style.clone()))
             .unwrap_or_else(Style::default);
-        if predicted {
-            style = style
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::ITALIC | Modifier::DIM);
+        if predicted && self.prediction_flagging {
+            style = style.add_modifier(Modifier::UNDERLINED);
         }
         if selected {
             style = style
@@ -1459,9 +1479,12 @@ impl GridRenderer {
     }
 
     fn cell_for_render(&self, absolute_row: u64, col: usize) -> (char, Option<u32>, bool) {
-        if let Some(predicted) = self.predictions.get(&(absolute_row, col)) {
-            (predicted.ch, None, true)
-        } else if let Some(rel) = self.relative_row(absolute_row) {
+        if self.predictions_visible {
+            if let Some(predicted) = self.predictions.get(&(absolute_row, col)) {
+                return (predicted.ch, None, true);
+            }
+        }
+        if let Some(rel) = self.relative_row(absolute_row) {
             match &self.rows[rel] {
                 RowSlot::Loaded(state) => {
                     if col < state.cells.len() {

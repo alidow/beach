@@ -226,6 +226,7 @@ async fn client_emits_input_events() {
         },
     );
 
+    tokio::time::sleep(Duration::from_millis(10)).await;
     tx.send(b"a".to_vec()).expect("send input");
 
     let message = server

@@ -79,6 +79,19 @@ describe('buildLines', () => {
     expect(line.cursorCol).toBe(2);
     expect(line.predictedCursorCol).toBe(3);
   });
+
+  it('suppresses predicted cells when overlay is hidden', () => {
+    const store = new TerminalGridStore();
+    store.setGridSize(1, 80);
+    store.applyUpdates([packRow(0, '> ')], { authoritative: true });
+    store.registerPrediction(1, stringToBytes('a'));
+
+    const [lineVisible] = buildLines(store.getSnapshot(), 10, { visible: true, underline: false });
+    expect(lineVisible.cells?.some((cell) => cell.predicted)).toBe(true);
+
+    const [lineHidden] = buildLines(store.getSnapshot(), 10, { visible: false, underline: false });
+    expect(lineHidden.cells?.some((cell) => cell.predicted)).toBe(false);
+  });
 });
 
 function textFromLine(line: ReturnType<typeof buildLines>[number]): string {

@@ -98,7 +98,12 @@
   }
 
   .xterm-row span[data-predicted='true'] {
-    text-decoration-style: dotted;
+    text-decoration: none;
+  }
+
+  .xterm-row span[data-predicted='true'][data-predicted-underline='true'] {
+    text-decoration-line: underline;
+    text-decoration-style: solid;
   }
 }
 

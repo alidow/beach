@@ -57,6 +57,16 @@ const AUTH_APPROVED_MESSAGE: &str = "Approved - syncing...";
 const AUTH_DENIED_MESSAGE: &str = "Join request was declined by host.";
 const AUTH_DISCONNECTED_MESSAGE: &str = "Disconnected before approval.";
 
+const PREDICTION_SRTT_TRIGGER_LOW_MS: f64 = 20.0;
+const PREDICTION_SRTT_TRIGGER_HIGH_MS: f64 = 30.0;
+const PREDICTION_FLAG_TRIGGER_LOW_MS: f64 = 50.0;
+const PREDICTION_FLAG_TRIGGER_HIGH_MS: f64 = 80.0;
+const PREDICTION_GLITCH_THRESHOLD: Duration = Duration::from_millis(250);
+const PREDICTION_GLITCH_REPAIR_COUNT: u32 = 10;
+const PREDICTION_GLITCH_REPAIR_MIN_INTERVAL: Duration = Duration::from_millis(150);
+const PREDICTION_GLITCH_FLAG_THRESHOLD: Duration = Duration::from_millis(5000);
+const PREDICTION_SRTT_ALPHA: f64 = 0.125;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AuthorizationState {
     Connecting,
@@ -224,7 +234,12 @@ pub struct TerminalClient {
     cursor_authoritative: bool,
     cursor_authoritative_pending: bool,
     cursor_visible: bool,
-    pending_predictions: HashMap<Seq, Vec<(usize, usize)>>,
+    pending_predictions: HashMap<Seq, PendingPrediction>,
+    prediction_srtt_ms: Option<f64>,
+    prediction_srtt_trigger: bool,
+    prediction_flagging: bool,
+    prediction_glitch_trigger: u32,
+    prediction_last_quick_confirmation: Option<Instant>,
     copy_mode: Option<CopyModeState>,
     last_render_at: Option<Instant>,
     render_interval: Duration,
@@ -261,6 +276,8 @@ impl TerminalClient {
         let render_enabled = io::stdout().is_terminal();
         let mut renderer = GridRenderer::new(0, 0);
         renderer.on_resize(80, 24);
+        renderer.set_predictions_visible(false);
+        renderer.set_prediction_flagging(false);
         Self {
             transport,
             renderer,
@@ -278,6 +295,11 @@ impl TerminalClient {
             cursor_authoritative_pending: false,
             cursor_visible: true,
             pending_predictions: HashMap::new(),
+            prediction_srtt_ms: None,
+            prediction_srtt_trigger: false,
+            prediction_flagging: false,
+            prediction_glitch_trigger: 0,
+            prediction_last_quick_confirmation: None,
             copy_mode: None,
             last_render_at: None,
             render_interval: Duration::from_millis(16),
@@ -322,6 +344,7 @@ impl TerminalClient {
 
     pub fn with_predictive_input(mut self, enabled: bool) -> Self {
         self.predictive_input = enabled;
+        self.reset_prediction_state();
         self
     }
 
@@ -343,6 +366,7 @@ impl TerminalClient {
                 self.pump_input()?;
                 self.maybe_request_backfill()?;
                 self.tick_authorization();
+                self.update_prediction_overlay();
                 let message = match self.transport.recv(Duration::from_millis(25)) {
                     Ok(message) => Some(message),
                     Err(TransportError::Timeout) => None,
@@ -519,6 +543,7 @@ impl TerminalClient {
                 self.cursor_col = 0;
                 self.renderer.clear_all_predictions();
                 self.pending_predictions.clear();
+                self.reset_prediction_state();
                 self.handshake_history_rows = history_rows as u64;
             }
             WireHostFrame::Snapshot {
@@ -1399,11 +1424,15 @@ impl TerminalClient {
                         self.highest_loaded_row = None;
                     }
                 }
-                self.pending_predictions.values_mut().for_each(|positions| {
-                    positions.retain(|(row, _)| *row >= start + count);
+                self.pending_predictions.values_mut().for_each(|pending| {
+                    pending.positions.retain(|(row, _)| *row >= start + count);
                 });
                 self.pending_predictions
-                    .retain(|_, positions| !positions.is_empty());
+                    .retain(|_, pending| !pending.positions.is_empty());
+                if self.pending_predictions.is_empty() && self.renderer.has_active_predictions() {
+                    self.renderer.clear_all_predictions();
+                }
+                self.update_prediction_overlay();
                 if self.cursor_row >= start && self.cursor_row < start + count {
                     self.cursor_row = start + count;
                     self.cursor_col = 0;
@@ -2822,9 +2851,12 @@ impl TerminalClient {
     }
 
     fn handle_input_ack(&mut self, seq: Seq) {
+        if let Some(prediction) = self.pending_predictions.remove(&seq) {
+            self.record_prediction_ack(prediction.sent_at);
+        }
         self.renderer.clear_prediction_seq(seq);
-        self.pending_predictions.remove(&seq);
         self.force_render = true;
+        self.update_prediction_overlay();
     }
 
     fn register_prediction(&mut self, seq: Seq, bytes: &[u8]) {
@@ -2837,6 +2869,7 @@ impl TerminalClient {
         if self.pending_predictions.len() > 256 {
             self.pending_predictions.clear();
             self.renderer.clear_all_predictions();
+            self.reset_prediction_state();
         }
         let mut positions = Vec::new();
         for &byte in bytes {
@@ -2860,10 +2893,105 @@ impl TerminalClient {
             }
         }
         if !positions.is_empty() {
-            self.pending_predictions.insert(seq, positions);
+            self.pending_predictions.insert(
+                seq,
+                PendingPrediction {
+                    positions,
+                    sent_at: Instant::now(),
+                },
+            );
             self.force_render = true;
         }
         self.sync_renderer_cursor();
+        self.update_prediction_overlay();
+    }
+
+    fn update_prediction_overlay(&mut self) {
+        if !self.render_enabled || !self.predictive_input {
+            self.renderer.set_predictions_visible(false);
+            self.renderer.set_prediction_flagging(false);
+            return;
+        }
+
+        let now = Instant::now();
+        let mut glitch_trigger = self.prediction_glitch_trigger;
+        for pending in self.pending_predictions.values() {
+            let age = now.saturating_duration_since(pending.sent_at);
+            if age >= PREDICTION_GLITCH_FLAG_THRESHOLD {
+                glitch_trigger = PREDICTION_GLITCH_REPAIR_COUNT * 2;
+                break;
+            } else if age >= PREDICTION_GLITCH_THRESHOLD
+                && glitch_trigger < PREDICTION_GLITCH_REPAIR_COUNT
+            {
+                glitch_trigger = PREDICTION_GLITCH_REPAIR_COUNT;
+            }
+        }
+        self.prediction_glitch_trigger = glitch_trigger;
+
+        let srtt = self.prediction_srtt_ms.unwrap_or(0.0);
+
+        if srtt > PREDICTION_FLAG_TRIGGER_HIGH_MS
+            || self.prediction_glitch_trigger > PREDICTION_GLITCH_REPAIR_COUNT
+        {
+            self.prediction_flagging = true;
+        } else if self.prediction_flagging
+            && srtt <= PREDICTION_FLAG_TRIGGER_LOW_MS
+            && self.prediction_glitch_trigger <= PREDICTION_GLITCH_REPAIR_COUNT
+        {
+            self.prediction_flagging = false;
+        }
+
+        if srtt > PREDICTION_SRTT_TRIGGER_HIGH_MS || self.prediction_glitch_trigger > 0 {
+            self.prediction_srtt_trigger = true;
+        } else if self.prediction_srtt_trigger
+            && srtt <= PREDICTION_SRTT_TRIGGER_LOW_MS
+            && self.pending_predictions.is_empty()
+            && !self.renderer.has_active_predictions()
+        {
+            self.prediction_srtt_trigger = false;
+        }
+
+        let overlay_visible = self.predictive_input
+            && (self.prediction_srtt_trigger || self.prediction_glitch_trigger > 0);
+        let underline = self.prediction_flagging
+            || self.prediction_glitch_trigger > PREDICTION_GLITCH_REPAIR_COUNT;
+
+        self.renderer.set_predictions_visible(overlay_visible);
+        self.renderer.set_prediction_flagging(underline);
+    }
+
+    fn record_prediction_ack(&mut self, sent_at: Instant) {
+        let now = Instant::now();
+        let rtt = now.saturating_duration_since(sent_at);
+        let sample_ms = rtt.as_secs_f64() * 1000.0;
+        self.prediction_srtt_ms = Some(match self.prediction_srtt_ms {
+            Some(previous) => previous + (sample_ms - previous) * PREDICTION_SRTT_ALPHA,
+            None => sample_ms,
+        });
+
+        if self.prediction_glitch_trigger > 0 && rtt < PREDICTION_GLITCH_THRESHOLD {
+            let allow_decay = self
+                .prediction_last_quick_confirmation
+                .map_or(true, |last| {
+                    now.saturating_duration_since(last) >= PREDICTION_GLITCH_REPAIR_MIN_INTERVAL
+                });
+            if allow_decay {
+                self.prediction_glitch_trigger = self.prediction_glitch_trigger.saturating_sub(1);
+                self.prediction_last_quick_confirmation = Some(now);
+            }
+        }
+
+        self.update_prediction_overlay();
+    }
+
+    fn reset_prediction_state(&mut self) {
+        self.prediction_srtt_ms = None;
+        self.prediction_srtt_trigger = false;
+        self.prediction_flagging = false;
+        self.prediction_glitch_trigger = 0;
+        self.prediction_last_quick_confirmation = None;
+        self.renderer.set_predictions_visible(false);
+        self.renderer.set_prediction_flagging(false);
     }
 
     fn advance_cursor_for_char(&mut self, ch: char) {
@@ -2982,6 +3110,12 @@ impl CopyModeState {
             self.begin_selection(SelectionMode::Character);
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct PendingPrediction {
+    positions: Vec<(usize, usize)>,
+    sent_at: Instant,
 }
 
 enum CursorHint {
@@ -3770,6 +3904,7 @@ mod tests {
         let transport: Arc<RecordingTransport> = Arc::new(RecordingTransport::default());
         let mut client = TerminalClient::new(transport.clone()).with_render(false);
 
+        client.subscription_id = Some(1);
         client.process_copy_mode_key(&key(KeyCode::Char('b'), KeyModifiers::CONTROL));
         client.process_copy_mode_key(&key(KeyCode::Char(']'), KeyModifiers::NONE));
 
@@ -3790,6 +3925,7 @@ mod tests {
         let transport: Arc<RecordingTransport> = Arc::new(RecordingTransport::default());
         let mut client = TerminalClient::new(transport.clone()).with_render(false);
 
+        client.subscription_id = Some(1);
         client.process_copy_mode_key(&key(KeyCode::Char('b'), KeyModifiers::CONTROL));
         client.process_copy_mode_key(&key(KeyCode::Char(']'), KeyModifiers::NONE));
 

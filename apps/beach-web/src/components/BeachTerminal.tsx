@@ -65,6 +65,134 @@ function summarizeSnapshot(store: TerminalGridStore | undefined): void {
   });
 }
 
+export interface PredictionOverlayState {
+  visible: boolean;
+  underline: boolean;
+}
+
+const DEFAULT_PREDICTION_OVERLAY: PredictionOverlayState = { visible: true, underline: false };
+
+const PREDICTION_SRTT_TRIGGER_LOW_MS = 20;
+const PREDICTION_SRTT_TRIGGER_HIGH_MS = 30;
+const PREDICTION_FLAG_TRIGGER_LOW_MS = 50;
+const PREDICTION_FLAG_TRIGGER_HIGH_MS = 80;
+const PREDICTION_GLITCH_THRESHOLD_MS = 250;
+const PREDICTION_GLITCH_REPAIR_COUNT = 10;
+const PREDICTION_GLITCH_REPAIR_MIN_INTERVAL_MS = 150;
+const PREDICTION_GLITCH_FLAG_THRESHOLD_MS = 5000;
+const PREDICTION_SRTT_ALPHA = 0.125;
+
+function now(): number {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+function hasPredictiveByte(payload: Uint8Array): boolean {
+  for (const value of payload) {
+    if (value === 0x0a || value === 0x0d) {
+      continue;
+    }
+    if (value >= 0x20 && value !== 0x7f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+class PredictionUx {
+  private srttMs: number | null = null;
+  private srttTrigger = false;
+  private flagging = false;
+  private glitchTrigger = 0;
+  private lastQuickConfirmation = 0;
+  private pending = new Map<number, number>();
+  private overlay: PredictionOverlayState = { visible: false, underline: false };
+
+  recordSend(seq: number, timestampMs: number, predicted: boolean): PredictionOverlayState | null {
+    if (!predicted) {
+      return null;
+    }
+    this.pending.set(seq, timestampMs);
+    return this.updateOverlayState(timestampMs);
+  }
+
+  recordAck(seq: number, timestampMs: number): PredictionOverlayState | null {
+    const sentAt = this.pending.get(seq);
+    if (sentAt !== undefined) {
+      this.pending.delete(seq);
+      const sample = Math.max(0, timestampMs - sentAt);
+      this.srttMs = this.srttMs === null ? sample : this.srttMs + (sample - this.srttMs) * PREDICTION_SRTT_ALPHA;
+      if (this.glitchTrigger > 0 && sample < PREDICTION_GLITCH_THRESHOLD_MS) {
+        if (timestampMs - this.lastQuickConfirmation >= PREDICTION_GLITCH_REPAIR_MIN_INTERVAL_MS) {
+          this.glitchTrigger = Math.max(0, this.glitchTrigger - 1);
+          this.lastQuickConfirmation = timestampMs;
+        }
+      }
+    }
+    return this.updateOverlayState(timestampMs);
+  }
+
+  tick(timestampMs: number): PredictionOverlayState | null {
+    let glitch = this.glitchTrigger;
+    for (const sentAt of this.pending.values()) {
+      const age = timestampMs - sentAt;
+      if (age >= PREDICTION_GLITCH_FLAG_THRESHOLD_MS) {
+        glitch = Math.max(glitch, PREDICTION_GLITCH_REPAIR_COUNT * 2);
+        break;
+      }
+      if (age >= PREDICTION_GLITCH_THRESHOLD_MS) {
+        glitch = Math.max(glitch, PREDICTION_GLITCH_REPAIR_COUNT);
+      }
+    }
+    if (glitch !== this.glitchTrigger) {
+      this.glitchTrigger = glitch;
+    }
+    return this.updateOverlayState(timestampMs);
+  }
+
+  reset(timestampMs: number): PredictionOverlayState | null {
+    this.srttMs = null;
+    this.srttTrigger = false;
+    this.flagging = false;
+    this.glitchTrigger = 0;
+    this.lastQuickConfirmation = 0;
+    this.pending.clear();
+    return this.updateOverlayState(timestampMs);
+  }
+
+  private updateOverlayState(timestampMs: number): PredictionOverlayState | null {
+    const srtt = this.srttMs ?? 0;
+
+    if (srtt > PREDICTION_FLAG_TRIGGER_HIGH_MS || this.glitchTrigger > PREDICTION_GLITCH_REPAIR_COUNT) {
+      this.flagging = true;
+    } else if (
+      this.flagging &&
+      srtt <= PREDICTION_FLAG_TRIGGER_LOW_MS &&
+      this.glitchTrigger <= PREDICTION_GLITCH_REPAIR_COUNT
+    ) {
+      this.flagging = false;
+    }
+
+    if (srtt > PREDICTION_SRTT_TRIGGER_HIGH_MS || this.glitchTrigger > 0) {
+      this.srttTrigger = true;
+    } else if (this.srttTrigger && srtt <= PREDICTION_SRTT_TRIGGER_LOW_MS && this.pending.size === 0) {
+      this.srttTrigger = false;
+    }
+
+    const visible = this.srttTrigger || this.glitchTrigger > 0;
+    const underline = visible && (this.flagging || this.glitchTrigger > PREDICTION_GLITCH_REPAIR_COUNT);
+
+    if (visible === this.overlay.visible && underline === this.overlay.underline) {
+      return null;
+    }
+
+    this.overlay = { visible, underline };
+    return this.overlay;
+  }
+}
+
 export interface BeachTerminalProps {
   sessionId?: string;
   baseUrl?: string;
@@ -108,6 +236,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const headerRef = useRef<HTMLDivElement | null>(null);
   const transportRef = useRef<TerminalTransport | null>(providedTransport ?? null);
+  const predictionUxRef = useRef<PredictionUx>(new PredictionUx());
   const connectionRef = useRef<BrowserTransportConnection | null>(null);
   const subscriptionRef = useRef<number | null>(null);
   const inputSeqRef = useRef(0);
@@ -126,6 +255,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const [joinState, setJoinState] = useState<JoinOverlayState>('idle');
   const joinStateRef = useRef<JoinOverlayState>('idle');
   const [joinMessage, setJoinMessage] = useState<string | null>(null);
+  const [predictionOverlay, setPredictionOverlay] = useState<PredictionOverlayState>({
+    visible: false,
+    underline: false,
+  });
   const joinTimersRef = useRef<{ short?: number; long?: number; hide?: number }>({});
   const peerIdRef = useRef<string | null>(null);
   const handshakeReadyRef = useRef(false);
@@ -166,6 +299,25 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       clearJoinTimers();
     };
   }, [clearJoinTimers]);
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    let raf = 0;
+    const step = () => {
+      const update = predictionUxRef.current.tick(now());
+      if (update) {
+        setPredictionOverlay(update);
+      }
+      raf = window.requestAnimationFrame(step);
+    };
+    raf = window.requestAnimationFrame(step);
+    return () => {
+      if (raf) {
+        window.cancelAnimationFrame(raf);
+      }
+    };
+  }, []);
   const log = useCallback((message: string, detail?: Record<string, unknown>) => {
     if (!import.meta.env.DEV) {
       return;
@@ -300,7 +452,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       setShowIdlePlaceholder(true);
     }
   }, [status, onStatusChange]);
-  const lines = useMemo(() => buildLines(snapshot, 600), [snapshot]);
+  const lines = useMemo(
+    () => buildLines(snapshot, 600, predictionOverlay),
+    [snapshot, predictionOverlay],
+  );
   if (import.meta.env.DEV && typeof window !== 'undefined' && window.__BEACH_TRACE) {
     const sample = lines.slice(-5).map((line) => ({
       absolute: line.absolute,
@@ -666,8 +821,14 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     }
     event.preventDefault();
     const seq = ++inputSeqRef.current;
+    const predicts = hasPredictiveByte(payload);
+    const timestampMs = now();
     transport.send({ type: 'input', seq, data: payload });
     store.registerPrediction(seq, payload);
+    const overlayUpdate = predictionUxRef.current.recordSend(seq, timestampMs, predicts);
+    if (overlayUpdate) {
+      setPredictionOverlay(overlayUpdate);
+    }
   };
 
   // Store original position for smooth fullscreen animation
@@ -842,7 +1003,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         ) : null}
         <div style={{ height: topPadding }} aria-hidden="true" />
         {lines.map((line) => (
-          <LineRow key={line.absolute} line={line} styles={snapshot.styles} />
+          <LineRow key={line.absolute} line={line} styles={snapshot.styles} overlay={predictionOverlay} />
         ))}
         <div style={{ height: bottomPadding }} aria-hidden="true" />
       </div>
@@ -984,6 +1145,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         subscriptionRef.current = frame.subscription;
         inputSeqRef.current = 0;
         store.setCursorSupport(Boolean(frame.features & FEATURE_CURSOR_SYNC));
+        {
+          const overlayReset = predictionUxRef.current.reset(now());
+          if (overlayReset) {
+            setPredictionOverlay(overlayReset);
+          }
+        }
         summarizeSnapshot(store);
         handshakeReadyRef.current = true;
         enterApprovedState(joinStateRef.current === 'approved' ? joinMessage ?? undefined : undefined);
@@ -1012,6 +1179,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
             deviceViewport,
             viewportTop,
           });
+        }
+        {
+          const overlayReset = predictionUxRef.current.reset(now());
+          if (overlayReset) {
+            setPredictionOverlay(overlayReset);
+          }
         }
         break;
       case 'snapshot':
@@ -1044,6 +1217,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         break;
       case 'input_ack':
         store.clearPrediction(frame.seq);
+        {
+          const overlayUpdate = predictionUxRef.current.recordAck(frame.seq, now());
+          if (overlayUpdate) {
+            setPredictionOverlay(overlayUpdate);
+          }
+        }
         break;
       case 'cursor':
         trace('frame cursor', frame.cursor);
@@ -1208,7 +1387,11 @@ interface RenderLine {
   predictedCursorCol?: number | null;
 }
 
-export function buildLines(snapshot: TerminalGridSnapshot, limit: number): RenderLine[] {
+export function buildLines(
+  snapshot: TerminalGridSnapshot,
+  limit: number,
+  overlay: PredictionOverlayState = DEFAULT_PREDICTION_OVERLAY,
+): RenderLine[] {
   const rows = snapshot.visibleRows(limit);
   if (rows.length === 0) {
     return [];
@@ -1223,18 +1406,20 @@ export function buildLines(snapshot: TerminalGridSnapshot, limit: number): Rende
         char: cell.char ?? ' ',
         styleId: cell.styleId ?? 0,
       }));
-      const predictions = snapshot.predictionsForRow(row.absolute);
-      if (predictions.length > 0) {
-        for (const { col, cell: prediction } of predictions) {
-          while (cells.length <= col) {
-            cells.push({ char: ' ', styleId: 0 });
+      if (overlay.visible) {
+        const predictions = snapshot.predictionsForRow(row.absolute);
+        if (predictions.length > 0) {
+          for (const { col, cell: prediction } of predictions) {
+            while (cells.length <= col) {
+              cells.push({ char: ' ', styleId: 0 });
+            }
+            const existing = cells[col];
+            cells[col] = {
+              char: prediction.char ?? ' ',
+              styleId: existing?.styleId ?? 0,
+              predicted: true,
+            };
           }
-          const existing = cells[col];
-          cells[col] = {
-            char: prediction.char ?? ' ',
-            styleId: existing?.styleId ?? 0,
-            predicted: true,
-          };
         }
       }
       let cursorCol: number | null = null;
@@ -1244,6 +1429,7 @@ export function buildLines(snapshot: TerminalGridSnapshot, limit: number): Rende
       }
       let predictedCursorCol: number | null = null;
       if (
+        overlay.visible &&
         snapshot.predictedCursor &&
         snapshot.predictedCursor.row === row.absolute &&
         Number.isFinite(snapshot.predictedCursor.col)
@@ -1280,28 +1466,21 @@ function JoinStatusOverlay({ state, message }: { state: JoinOverlayState; messag
             {badgeText}
           </div>
         )}
-        <div className="font-mono text-[13px] text-slate-100">{text}</div>
-        {state === 'waiting' ? (
-          <p className="text-xs text-slate-400">Your typing stays local until the host approves.</p>
-        ) : null}
-        {state === 'connecting' ? (
-          <p className="text-xs text-slate-400">Negotiating WebRTC connection...</p>
-        ) : null}
-        {state === 'approved' ? (
-          <p className="text-xs text-emerald-300">Syncing terminal...</p>
-        ) : null}
-        {state === 'denied' ? (
-          <p className="text-xs text-rose-300">You can close this window.</p>
-        ) : null}
-        {state === 'disconnected' ? (
-          <p className="text-xs text-amber-300">Connection closed before approval.</p>
-        ) : null}
+        <p className="font-medium tracking-wide text-white/90">{text}</p>
       </div>
     </div>
   );
 }
 
-function LineRow({ line, styles }: { line: RenderLine; styles: Map<number, StyleDefinition> }): JSX.Element {
+function LineRow({
+  line,
+  styles,
+  overlay,
+}: {
+  line: RenderLine;
+  styles: Map<number, StyleDefinition>;
+  overlay: PredictionOverlayState;
+}): JSX.Element {
   if (!line.cells || line.kind !== 'loaded') {
     const text = line.cells?.map((cell) => cell.char).join('') ?? '';
     const className = cn('xterm-row', line.kind === 'pending' ? 'opacity-60' : undefined);
@@ -1309,7 +1488,9 @@ function LineRow({ line, styles }: { line: RenderLine; styles: Map<number, Style
   }
 
   const cursorCol = line.cursorCol ?? null;
-  const predictedCursorCol = line.predictedCursorCol ?? null;
+  const overlayVisible = overlay.visible;
+  const overlayUnderline = overlay.underline;
+  const predictedCursorCol = overlayVisible ? line.predictedCursorCol ?? null : null;
   const baseStyleDef = styles.get(0) ?? { id: 0, fg: 0, bg: 0, attrs: 0 };
 
   return (
@@ -1317,22 +1498,19 @@ function LineRow({ line, styles }: { line: RenderLine; styles: Map<number, Style
       {line.cells.map((cell, index) => {
         const styleDef = styles.get(cell.styleId);
         const isCursor = cursorCol !== null && cursorCol === index;
-        let style = styleDef ? styleFromDefinition(styleDef, isCursor) : undefined;
-        const isPredictedCursor = predictedCursorCol !== null && predictedCursorCol === index;
-        const predicted = cell.predicted === true || (isPredictedCursor && !isCursor);
-        if (predicted) {
-          const merged: CSSProperties = { ...(style ?? {}) };
-          merged.textDecoration = appendTextDecoration(merged.textDecoration, 'underline');
-          const existingOpacity = merged.opacity !== undefined ? Number(merged.opacity) : undefined;
-          merged.opacity = existingOpacity !== undefined ? existingOpacity * 0.75 : 0.75;
-          style = merged;
-        }
+        const style = styleDef ? styleFromDefinition(styleDef, isCursor) : undefined;
+        const predictedCell = overlayVisible && cell.predicted === true;
+        const isPredictedCursor =
+          overlayVisible && predictedCursorCol !== null && predictedCursorCol === index && !isCursor;
+        const predicted = predictedCell || isPredictedCursor;
+        const underline = predicted && overlayUnderline;
         const char = cell.char === ' ' ? ' ' : cell.char;
         return (
           <span
             key={index}
             style={style}
             data-predicted={predicted || undefined}
+            data-predicted-underline={underline || undefined}
             data-predicted-cursor={isPredictedCursor || undefined}
           >
             {char}
@@ -1342,15 +1520,12 @@ function LineRow({ line, styles }: { line: RenderLine; styles: Map<number, Style
       {cursorCol !== null && cursorCol >= line.cells.length ? (
         <span key="cursor" style={styleFromDefinition(baseStyleDef, true)}> </span>
       ) : null}
-      {predictedCursorCol !== null && predictedCursorCol >= line.cells.length ? (
+      {overlayVisible && predictedCursorCol !== null && predictedCursorCol >= line.cells.length ? (
         <span
           key="predicted-cursor"
-          style={{
-            ...styleFromDefinition(baseStyleDef, false),
-            textDecoration: appendTextDecoration(undefined, 'underline'),
-            opacity: 0.75,
-          }}
+          style={styleFromDefinition(baseStyleDef, false)}
           data-predicted
+          data-predicted-underline={overlayUnderline || undefined}
           data-predicted-cursor
         >
            

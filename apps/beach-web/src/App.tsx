@@ -149,7 +149,10 @@ export default function App(): JSX.Element {
   const handleToggleFullscreen = (next: boolean): void => {
     if (next) {
       panelWasCollapsedRef.current = panelCollapsed;
-      setPanelCollapsed(true);
+      // Only collapse if not already collapsed
+      if (!panelCollapsed) {
+        setPanelCollapsed(true);
+      }
       autoCollapsePendingRef.current = false;
     } else {
       setPanelCollapsed(panelWasCollapsedRef.current);

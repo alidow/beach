@@ -1,6 +1,6 @@
 [workspace]
 members = [
-  "apps/beach-human",
+  "apps/beach",
   "apps/beach-road",
   "crates/test-timeout",
 ]

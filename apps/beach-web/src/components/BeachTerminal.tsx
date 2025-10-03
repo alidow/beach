@@ -616,7 +616,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         lastContentAbsolute >= snapshot.baseRow
       ) {
         const totalContentRows = lastContentAbsolute - snapshot.baseRow + 1;
-        if (totalContentRows <= viewportEstimate) {
+        const hasScrollableOverflow = target > 1;
+        // Only snap to the top when there's no overflow to scroll through.
+        if (!hasScrollableOverflow && totalContentRows <= viewportEstimate) {
           desired = 0;
         }
       }

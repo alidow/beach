@@ -111,7 +111,7 @@ describe('TerminalGridStore', () => {
         { type: 'row', row: 3, seq: 1, cells: packString('three') },
         { type: 'row', row: 4, seq: 1, cells: packString('four') },
       ],
-      true,
+      { authoritative: true },
     );
     store.setViewport(0, 3);
 
@@ -129,7 +129,7 @@ describe('TerminalGridStore', () => {
         { type: 'row', row: 1, seq: 1, cells: packString('one') },
         { type: 'row', row: 2, seq: 1, cells: packString('two') },
       ],
-      true,
+      { authoritative: true },
     );
     store.setViewport(0, 2);
     store.setFollowTail(false);

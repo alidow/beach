@@ -4,7 +4,7 @@ import { FEATURE_CURSOR_SYNC } from '../protocol/types';
 import type { HostFrame } from '../protocol/types';
 import { createTerminalStore, useTerminalSnapshot } from '../terminal/useTerminalState';
 import { connectBrowserTransport, type BrowserTransportConnection } from '../terminal/connect';
-import type { CellState, TerminalGridSnapshot, TerminalGridStore } from '../terminal/gridStore';
+import type { CellState, StyleDefinition, TerminalGridSnapshot, TerminalGridStore } from '../terminal/gridStore';
 import { encodeKeyEvent } from '../terminal/keymap';
 import type { TerminalTransport } from '../transport/terminalTransport';
 import { BackfillController } from '../terminal/backfillController';
@@ -367,17 +367,18 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         }
       };
     }
+    const win: Window & typeof globalThis = window;
     const handleResize = () => {
       if (raf !== -1) {
-        window.cancelAnimationFrame(raf);
+        win.cancelAnimationFrame(raf);
       }
-      raf = window.requestAnimationFrame(measure);
+      raf = win.requestAnimationFrame(measure);
     };
-    window.addEventListener('resize', handleResize);
+    win.addEventListener('resize', handleResize);
     return () => {
-      window.removeEventListener('resize', handleResize);
+      win.removeEventListener('resize', handleResize);
       if (raf !== -1) {
-        window.cancelAnimationFrame(raf);
+        win.cancelAnimationFrame(raf);
       }
     };
   }, []);
@@ -749,6 +750,15 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     'bg-[#1b1f2a] px-6 py-5 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04),inset_0_22px_45px_-25px_rgba(8,10,20,0.82)]',
   );
 
+  const containerStyle: CSSProperties & { '--beach-terminal-line-height': string } = {
+    fontFamily,
+    fontSize,
+    lineHeight: `${lineHeight}px`,
+    letterSpacing: '0.01em',
+    fontVariantLigatures: 'none',
+    '--beach-terminal-line-height': `${lineHeight}px`,
+  };
+
   const statusColor = useMemo(() => {
     switch (status) {
       case 'connected':
@@ -821,14 +831,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         tabIndex={0}
         onKeyDown={handleKeyDown}
         onScroll={handleScroll}
-        style={{
-          fontFamily,
-          fontSize,
-          lineHeight: `${lineHeight}px`,
-          letterSpacing: '0.01em',
-          fontVariantLigatures: 'none',
-          '--beach-terminal-line-height': `${lineHeight}px`,
-        }}
+        style={containerStyle}
       >
         {showIdlePlaceholder ? (
           <IdlePlaceholder
@@ -1030,7 +1033,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           backfillController.finalizeHistoryBackfill(frame);
         }
         summarizeSnapshot(store);
-        if (!frame.hasMore && frame.type === 'snapshot') {
+        if (frame.type === 'snapshot' && !frame.hasMore) {
           store.setFollowTail(true);
         }
         const current = store.getSnapshot();
@@ -1072,6 +1075,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     if (!(typeof window !== 'undefined' && window.__BEACH_TRACE)) {
       return;
     }
+    const appliedFollowTail = snapshot.followTail;
     const rowHeight = Math.max(1, effectiveLineHeight);
     const rowElements = element.querySelectorAll<HTMLDivElement>('.xterm-row');
     if (rowElements.length === 0) {
@@ -1215,7 +1219,7 @@ export function buildLines(snapshot: TerminalGridSnapshot, limit: number): Rende
 
   for (const row of rows) {
     if (row.kind === 'loaded') {
-      const cells = row.cells.map((cell) => ({
+      const cells: RenderCell[] = row.cells.map((cell) => ({
         char: cell.char ?? ' ',
         styleId: cell.styleId ?? 0,
       }));
@@ -1413,14 +1417,15 @@ function styleFromDefinition(def: StyleDefinition, highlightCursor = false): CSS
   return style;
 }
 
-function appendTextDecoration(existing: string | undefined, value: string): string {
-  if (!existing) {
+function appendTextDecoration(existing: string | number | undefined, value: string): string {
+  if (existing === undefined) {
     return value;
   }
-  if (existing.includes(value)) {
-    return existing;
+  const current = String(existing);
+  if (current.includes(value)) {
+    return current;
   }
-  return `${existing} ${value}`.trim();
+  return `${current} ${value}`.trim();
 }
 
 function decodeColor(packed: number): string | undefined {

@@ -3,7 +3,7 @@ import type { SignalingClient, ServerMessage } from './signaling';
 
 export type WebRtcTransportPayload = TransportMessage['payload'];
 
-type DataChannelEventMap = {
+export type DataChannelEventMap = {
   message: MessageEvent;
   open: Event;
   close: Event;
@@ -14,7 +14,7 @@ export interface DataChannelLike extends EventTarget {
   readonly label: string;
   readyState: RTCDataChannelState;
   binaryType: 'arraybuffer' | 'blob';
-  send(data: ArrayBufferLike | string): void;
+  send(data: ArrayBufferLike | ArrayBufferView | string): void;
   close(): void;
   addEventListener<K extends keyof DataChannelEventMap>(
     type: K,

@@ -123,6 +123,22 @@ export class DataChannelTerminalTransport extends EventTarget implements Termina
     this.channel.close();
   }
 
+  addEventListener<K extends keyof TerminalTransportEventMap>(
+    type: K,
+    listener: (event: TerminalTransportEventMap[K]) => void,
+    options?: boolean | AddEventListenerOptions,
+  ): void {
+    super.addEventListener(type, listener as EventListener, options);
+  }
+
+  removeEventListener<K extends keyof TerminalTransportEventMap>(
+    type: K,
+    listener: (event: TerminalTransportEventMap[K]) => void,
+    options?: boolean | EventListenerOptions,
+  ): void {
+    super.removeEventListener(type, listener as EventListener, options);
+  }
+
   private log(message: string): void {
     if (!this.logger) {
       return;

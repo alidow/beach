@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { decodeTransportMessage } from './envelope';
 import { DataChannelTerminalTransport } from './terminalTransport';
-import { WebRtcTransport, type DataChannelLike } from './webrtc';
+import { WebRtcTransport, type DataChannelEventMap, type DataChannelLike } from './webrtc';
 
-type SentPayload = ArrayBufferLike | string;
+type SentPayload = ArrayBufferLike | ArrayBufferView | string;
 
 class FakeDataChannel extends EventTarget implements DataChannelLike {
   readonly label = 'fake';
@@ -16,14 +16,20 @@ class FakeDataChannel extends EventTarget implements DataChannelLike {
     this.readyState = state;
   }
 
-  addEventListener(...args: Parameters<DataChannelLike['addEventListener']>): void {
-    const [type, listener, options] = args;
-    super.addEventListener(type as string, listener as EventListener, options);
+  addEventListener<K extends keyof DataChannelEventMap>(
+    type: K,
+    listener: (event: DataChannelEventMap[K]) => void,
+    options?: boolean | AddEventListenerOptions,
+  ): void {
+    super.addEventListener(type, listener as EventListener, options);
   }
 
-  removeEventListener(...args: Parameters<DataChannelLike['removeEventListener']>): void {
-    const [type, listener, options] = args;
-    super.removeEventListener(type as string, listener as EventListener, options);
+  removeEventListener<K extends keyof DataChannelEventMap>(
+    type: K,
+    listener: (event: DataChannelEventMap[K]) => void,
+    options?: boolean | EventListenerOptions,
+  ): void {
+    super.removeEventListener(type, listener as EventListener, options);
   }
 
   send(data: SentPayload): void {

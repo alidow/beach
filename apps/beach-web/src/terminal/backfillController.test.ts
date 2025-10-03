@@ -60,8 +60,10 @@ describe('BackfillController', () => {
     expect(frames).toHaveLength(1);
     const request = frames[0];
     expect(request?.type).toBe('request_backfill');
-    expect(request?.startRow).toBeLessThan(20);
-    expect(request?.count).toBeGreaterThan(0);
+    if (request?.type === 'request_backfill') {
+      expect(request.startRow).toBeLessThan(20);
+      expect(request.count).toBeGreaterThan(0);
+    }
   });
 
   it('marks unresolved rows as missing after an empty history backfill', () => {

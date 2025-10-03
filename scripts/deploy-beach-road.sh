@@ -159,6 +159,8 @@ create_security_group() {
     --query 'GroupId' \
     --output text)
   aws_cli ec2 authorize-security-group-ingress --group-id "$sg_id" --protocol tcp --port 22 --cidr 0.0.0.0/0 >/dev/null 2>&1 || true
+  aws_cli ec2 authorize-security-group-ingress --group-id "$sg_id" --protocol tcp --port 80 --cidr 0.0.0.0/0 >/dev/null 2>&1 || true
+  aws_cli ec2 authorize-security-group-ingress --group-id "$sg_id" --protocol tcp --port 443 --cidr 0.0.0.0/0 >/dev/null 2>&1 || true
   aws_cli ec2 authorize-security-group-ingress --group-id "$sg_id" --protocol tcp --port 8080 --cidr 0.0.0.0/0 >/dev/null 2>&1 || true
   echo "$sg_id"
 }
@@ -218,7 +220,7 @@ create_instance() {
 #!/bin/bash
 set -euxo pipefail
 dnf update -y
-dnf install -y docker git
+dnf install -y docker git nginx certbot python3-certbot-nginx
 systemctl enable --now docker
 if ! docker ps --format '{{.Names}}' | grep -q '^beach-redis$'; then
   docker run -d --name beach-redis --restart unless-stopped -p 6379:6379 redis:7-alpine || true
@@ -371,7 +373,19 @@ else
   REMOTE_TMP_ENV=""
 fi
 
-read -r -d '' SERVICE_UNIT <<'SERVICE' || true
+ssh "${SSH_OPTS[@]}" "$REMOTE_USER@$HOST" bash -s "$REMOTE_TMP_BIN" "${REMOTE_TMP_ENV}" "$REMOTE_DIR" <<'EOSSH'
+set -euo pipefail
+TMP_BIN="$1"
+TMP_ENV="$2"
+REMOTE_DIR="$3"
+
+sudo id beach >/dev/null 2>&1 || sudo useradd --system --home /opt/beach-road --shell /usr/sbin/nologin beach
+sudo install -d -o beach -g beach -m 750 "${REMOTE_DIR}"
+sudo install -o beach -g beach -m 750 "${TMP_BIN}" "${REMOTE_DIR}/beach-road"
+if [[ -n "${TMP_ENV}" && -f "${TMP_ENV}" ]]; then
+  sudo install -o beach -g beach -m 640 "${TMP_ENV}" "${REMOTE_DIR}/beach-road.env"
+fi
+sudo tee /etc/systemd/system/beach-road.service >/dev/null <<'SERVICE'
 [Unit]
 Description=Beach Road Service
 After=network.target docker.service
@@ -388,22 +402,6 @@ WorkingDirectory=/opt/beach-road
 [Install]
 WantedBy=multi-user.target
 SERVICE
-
-ssh "${SSH_OPTS[@]}" "$REMOTE_USER@$HOST" bash -s "$REMOTE_TMP_BIN" "${REMOTE_TMP_ENV}" "$REMOTE_DIR" <<'EOSSH'
-set -euo pipefail
-TMP_BIN="$1"
-TMP_ENV="$2"
-REMOTE_DIR="$3"
-
-sudo id beach >/dev/null 2>&1 || sudo useradd --system --home /opt/beach-road --shell /usr/sbin/nologin beach
-sudo install -d -o beach -g beach -m 750 "${REMOTE_DIR}"
-sudo install -o beach -g beach -m 750 "${TMP_BIN}" "${REMOTE_DIR}/beach-road"
-if [[ -n "${TMP_ENV}" && -f "${TMP_ENV}" ]]; then
-  sudo install -o beach -g beach -m 640 "${TMP_ENV}" "${REMOTE_DIR}/beach-road.env"
-fi
-sudo tee /etc/systemd/system/beach-road.service >/dev/null <<'SERVICE'
-$SERVICE_UNIT
-SERVICE
 sudo systemctl daemon-reload
 sudo systemctl enable beach-road >/dev/null 2>&1 || true
 sudo systemctl restart beach-road
@@ -417,6 +415,29 @@ if command -v docker >/dev/null 2>&1; then
   if ! sudo docker ps --format '{{.Names}}' | grep -q '^beach-redis$'; then
     sudo docker run -d --name beach-redis --restart unless-stopped -p 6379:6379 redis:7-alpine >/dev/null
   fi
+fi
+
+# Setup nginx if not already configured
+if [ ! -f /etc/nginx/conf.d/beach-road.conf ]; then
+  sudo tee /etc/nginx/conf.d/beach-road.conf >/dev/null <<'NGINXCONF'
+server {
+    listen 80;
+    server_name api.beach.sh;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 86400;
+    }
+}
+NGINXCONF
+  sudo systemctl enable --now nginx >/dev/null 2>&1 || true
 fi
 
 sudo systemctl status --no-pager beach-road

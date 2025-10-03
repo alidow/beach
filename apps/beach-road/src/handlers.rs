@@ -167,7 +167,7 @@ pub async fn register_session(
     let passphrase_hash = hash_passphrase(&join_code_plain);
 
     let session_server_env = std::env::var("BEACH_SESSION_SERVER")
-        .unwrap_or_else(|_| "https://api.beach.sh:8080".to_string());
+        .unwrap_or_else(|_| "https://api.beach.sh".to_string());
     let base_http = normalize_base_url(&session_server_env);
 
     let mut session = SessionInfo::new(
@@ -258,7 +258,7 @@ pub async fn join_session(
 
             let base_http = session.server_address.clone().unwrap_or_else(|| {
                 let env = std::env::var("BEACH_SESSION_SERVER")
-                    .unwrap_or_else(|_| "https://api.beach.sh:8080".to_string());
+                    .unwrap_or_else(|_| "https://api.beach.sh".to_string());
                 normalize_base_url(&env)
             });
 

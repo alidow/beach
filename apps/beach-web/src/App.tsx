@@ -61,7 +61,7 @@ const statusStyles: Record<
 export default function App(): JSX.Element {
   const [sessionId, setSessionId] = useState('');
   const [sessionServer, setSessionServer] = useState(
-    () => import.meta.env.VITE_SESSION_SERVER_URL ?? 'https://api.beach.sh:8080'
+    () => import.meta.env.VITE_SESSION_SERVER_URL ?? 'https://api.beach.sh'
   );
   const [passcode, setPasscode] = useState('');
   const [status, setStatus] = useState<TerminalStatus>('idle');

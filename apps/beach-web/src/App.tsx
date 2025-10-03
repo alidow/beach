@@ -148,14 +148,15 @@ export default function App(): JSX.Element {
 
   const handleToggleFullscreen = (next: boolean): void => {
     if (next) {
+      // Save current state before collapsing
       panelWasCollapsedRef.current = panelCollapsed;
-      // Only collapse if not already collapsed
-      if (!panelCollapsed) {
-        setPanelCollapsed(true);
-      }
+      // Always collapse when going fullscreen
+      setPanelCollapsed(true);
       autoCollapsePendingRef.current = false;
     } else {
-      setPanelCollapsed(panelWasCollapsedRef.current);
+      // When exiting fullscreen, keep collapsed if it was open before (auto-collapse behavior)
+      // Only restore to open if it was already collapsed before fullscreen
+      setPanelCollapsed(true);
     }
     setTerminalFullscreen(next);
   };

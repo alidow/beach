@@ -19,7 +19,7 @@ impl Config {
             session_ttl_seconds: env::var("SESSION_TTL")
                 .ok()
                 .and_then(|t| t.parse().ok())
-                .unwrap_or(3600), // 1 hour default
+                .unwrap_or(2_592_000), // default 30 days
         }
     }
 }
@@ -29,7 +29,7 @@ impl Default for Config {
         Self {
             port: 8080,
             redis_url: "redis://localhost:6379".to_string(),
-            session_ttl_seconds: 3600,
+            session_ttl_seconds: 2_592_000,
         }
     }
 }

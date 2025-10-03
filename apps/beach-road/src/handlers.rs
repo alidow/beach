@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 use crate::{
     session::{hash_passphrase, verify_passphrase},
@@ -290,14 +290,17 @@ pub async fn join_session(
                 websocket_url: Some(websocket_url),
             }))
         }
-        Ok(None) => Ok(Json(JoinSessionResponse {
-            success: false,
-            message: Some("Session not found".to_string()),
-            webrtc_offer: None,
-            session_url: None,
-            transports: Vec::new(),
-            websocket_url: None,
-        })),
+        Ok(None) => {
+            debug!("Join attempt for missing session: {}", session_id);
+            Ok(Json(JoinSessionResponse {
+                success: false,
+                message: Some("Session not found".to_string()),
+                webrtc_offer: None,
+                session_url: None,
+                transports: Vec::new(),
+                websocket_url: None,
+            }))
+        }
         Err(e) => {
             error!("Failed to get session: {}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -341,6 +344,9 @@ pub async fn post_webrtc_offer(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Activity observed: refresh session TTL
+    let _ = storage.update_session_ttl(&session_id).await;
+
     debug!(
         session = %session_id,
         %payload.handshake_id,
@@ -363,7 +369,11 @@ pub async fn get_webrtc_offer(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
-        Some(payload) => Ok(Json(payload)),
+        Some(payload) => {
+            // Activity observed: refresh session TTL
+            let _ = storage.update_session_ttl(&session_id).await;
+            Ok(Json(payload))
+        }
         None => Err(StatusCode::NOT_FOUND),
     }
 }
@@ -401,6 +411,9 @@ pub async fn post_webrtc_answer(
         %payload.to_peer,
         "stored webrtc answer"
     );
+    // Activity observed: refresh session TTL
+    let _ = storage.update_session_ttl(&session_id).await;
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -415,7 +428,11 @@ pub async fn get_webrtc_answer(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
-        Some(payload) => Ok(Json(payload)),
+        Some(payload) => {
+            // Activity observed: refresh session TTL
+            let _ = storage.update_session_ttl(&session_id).await;
+            Ok(Json(payload))
+        }
         None => Err(StatusCode::NOT_FOUND),
     }
 }

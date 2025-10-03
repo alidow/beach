@@ -465,6 +465,12 @@ async fn handle_client_message(
                 peer_id, session_id, role
             );
 
+            // Refresh session TTL on join activity
+            {
+                let mut storage = state.storage.lock().await;
+                let _ = storage.update_session_ttl(session_id).await;
+            }
+
             // Get existing peers and available transports
             let peers = state.get_peers(session_id);
             let available_transports = state.get_available_transports(session_id);
@@ -569,6 +575,11 @@ async fn handle_client_message(
                 if let Some(peer) = peers.get(peer_id) {
                     *peer.last_heartbeat.write().await = std::time::Instant::now();
                 }
+            }
+            // Refresh session TTL on heartbeat
+            {
+                let mut storage = state.storage.lock().await;
+                let _ = storage.update_session_ttl(session_id).await;
             }
             tx.send(ServerMessage::Pong)?;
         }

@@ -667,9 +667,79 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     store.registerPrediction(seq, payload);
   };
 
+  // Store original position for smooth fullscreen animation
+  const [wrapperStyle, setWrapperStyle] = useState<CSSProperties>({});
+
+  useEffect(() => {
+    if (!wrapperRef.current) return;
+
+    if (isFullscreen) {
+      // Get position before going fullscreen
+      const rect = wrapperRef.current.getBoundingClientRect();
+
+      // Start at current position with fixed positioning
+      wrapperRef.current.style.position = 'fixed';
+      wrapperRef.current.style.top = `${rect.top}px`;
+      wrapperRef.current.style.left = `${rect.left}px`;
+      wrapperRef.current.style.width = `${rect.width}px`;
+      wrapperRef.current.style.height = `${rect.height}px`;
+      wrapperRef.current.style.transition = 'none';
+
+      // Force reflow
+      wrapperRef.current.offsetHeight;
+
+      // Enable transition and animate to fullscreen
+      wrapperRef.current.style.transition = 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)';
+
+      requestAnimationFrame(() => {
+        if (!wrapperRef.current) return;
+        wrapperRef.current.style.top = '0';
+        wrapperRef.current.style.left = '0';
+        wrapperRef.current.style.width = '100vw';
+        wrapperRef.current.style.height = '100vh';
+      });
+    } else {
+      // Collapsing from fullscreen
+      if (wrapperRef.current.style.position === 'fixed') {
+        // Create a temporary placeholder to measure where element should go
+        const placeholder = document.createElement('div');
+        placeholder.style.position = 'relative';
+        placeholder.style.visibility = 'hidden';
+        wrapperRef.current.parentElement?.insertBefore(placeholder, wrapperRef.current);
+
+        requestAnimationFrame(() => {
+          if (!wrapperRef.current) return;
+          const targetRect = placeholder.getBoundingClientRect();
+          placeholder.remove();
+
+          // Animate to target position
+          wrapperRef.current.style.transition = 'all 0.4s cubic-bezier(0.4, 0, 0.2, 1)';
+          wrapperRef.current.style.top = `${targetRect.top}px`;
+          wrapperRef.current.style.left = `${targetRect.left}px`;
+          wrapperRef.current.style.width = `${targetRect.width}px`;
+          wrapperRef.current.style.height = `${targetRect.height}px`;
+
+          // After animation, remove inline styles
+          const handler = () => {
+            if (!wrapperRef.current) return;
+            wrapperRef.current.style.position = '';
+            wrapperRef.current.style.top = '';
+            wrapperRef.current.style.left = '';
+            wrapperRef.current.style.width = '';
+            wrapperRef.current.style.height = '';
+            wrapperRef.current.style.transition = '';
+            wrapperRef.current.removeEventListener('transitionend', handler);
+          };
+          wrapperRef.current.addEventListener('transitionend', handler);
+        });
+      }
+    }
+  }, [isFullscreen]);
+
   const wrapperClasses = cn(
     'relative flex h-full min-h-0 flex-col overflow-hidden',
     'rounded-[22px] border border-[#0f131a] bg-[#090d14]/95 shadow-[0_45px_120px_-70px_rgba(10,26,55,0.85)]',
+    isFullscreen && 'z-50 rounded-none',
     className,
   );
   const containerClasses = cn(
@@ -708,18 +778,30 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
             type="button"
             onClick={() => onToggleFullscreen?.(!isFullscreen)}
             className={cn(
-              'group inline-flex h-3 w-3 items-center justify-center transition focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40'
+              'inline-flex h-3.5 w-3.5 items-center justify-center rounded-full transition focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40',
+              isFullscreen
+                ? 'border border-[#111827] bg-[#212838] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.06)] hover:bg-[#1d2432] text-[#a5b4d6]'
+                : 'border border-[#1a8a39] bg-[#26c547] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.2)] hover:bg-[#2cd653] text-[#0f3d1d]'
             )}
             aria-label={isFullscreen ? 'Exit full screen' : 'Enter full screen'}
             aria-pressed={isFullscreen}
           >
-            <svg viewBox="0 0 24 24" className="h-3 w-3" aria-hidden>
-              <circle cx="12" cy="12" r="10" fill="#34C759"/>
-              <g transform={isFullscreen ? 'rotate(45 12 12)' : 'rotate(-45 12 12)'}>
-                <rect x="6" y="10.5" width="12" height="3" rx="1.2" ry="1.2" fill="#0B7A34"/>
-                <polygon points="6,12 4.8,13.2 4.8,10.8" fill="#0B7A34"/>
-                <polygon points="18,12 19.2,13.2 19.2,10.8" fill="#0B7A34"/>
-              </g>
+            <svg viewBox="0 0 12 12" className="h-2.5 w-2.5" fill="none" aria-hidden>
+              {isFullscreen ? (
+                <>
+                  <rect x="2.3" y="2.3" width="7.4" height="7.4" rx="1.7" stroke="currentColor" strokeWidth="1" />
+                  <path d="M4.5 7.6h3" stroke="currentColor" strokeWidth="1" strokeLinecap="round" />
+                </>
+              ) : (
+                <>
+                  <rect x="2.3" y="2.3" width="7.4" height="7.4" rx="1.9" fill="rgba(15,61,29,0.35)" stroke="#0f3d1d" strokeWidth="1" />
+                  <g transform="rotate(45 6 6)" fill="#0f3d1d">
+                    <rect x="3.2" y="5.45" width="5.6" height="1.1" rx="0.4" />
+                    <polygon points="3.2,6 2.2,6.55 2.2,5.45" />
+                    <polygon points="8.8,6 9.8,6.55 9.8,5.45" />
+                  </g>
+                </>
+              )}
             </svg>
           </button>
           <span className="text-[10px] font-semibold uppercase tracking-[0.5em] text-[#c0cada]">{sessionTitle}</span>

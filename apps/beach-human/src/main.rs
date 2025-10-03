@@ -3178,6 +3178,9 @@ fn run_authorization_prompt(metadata: &JoinAuthorizationMetadata) -> io::Result<
     let mut stdout = io::stdout();
     let mut cleanup = PromptCleanup::new(raw_was_enabled);
     execute!(stdout, EnterAlternateScreen, Clear(ClearType::All), Hide)?;
+    while event::poll(Duration::from_millis(0))? {
+        let _ = event::read()?;
+    }
     cleanup.alt_screen_active = true;
     write!(stdout, "\r==============================\r\n")?;
     write!(stdout, "\r  Incoming beach client join\r\n")?;

@@ -789,7 +789,7 @@ async fn handle_join(base_url: &str, args: JoinArgs) -> Result<(), CliError> {
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     tokio::task::spawn_blocking(move || {
         let _raw_guard = RawModeGuard::new(interactive);
-        let client = TerminalClient::new(client_transport);
+        let client = TerminalClient::new(client_transport).with_predictive_input(interactive);
         match client.run() {
             Ok(()) | Err(ClientError::Shutdown) => {}
             Err(err) => eprintln!("⚠️  client error: {err}"),

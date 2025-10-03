@@ -104,7 +104,7 @@ struct Cli {
         long,
         global = true,
         env = "BEACH_SESSION_SERVER",
-        default_value = "http://127.0.0.1:8080",
+        default_value = "https://api.beach.sh:8080",
         help = "Base URL for the beach-road session broker"
     )]
     session_server: String,

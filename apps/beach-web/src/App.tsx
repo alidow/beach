@@ -60,7 +60,9 @@ const statusStyles: Record<
 
 export default function App(): JSX.Element {
   const [sessionId, setSessionId] = useState('');
-  const [sessionServer, setSessionServer] = useState('http://127.0.0.1:8080');
+  const [sessionServer, setSessionServer] = useState(
+    () => import.meta.env.VITE_SESSION_SERVER_URL ?? ''
+  );
   const [passcode, setPasscode] = useState('');
   const [status, setStatus] = useState<TerminalStatus>('idle');
   const [connectRequested, setConnectRequested] = useState(false);

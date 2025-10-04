@@ -1199,7 +1199,7 @@ fn render_remote_command(remote_args: &[String]) -> String {
     // Run beach in background, capture stdout to temp file, then cat the file
     // This allows the beach process to persist after SSH disconnects while still reading bootstrap JSON
     let temp_file = "/tmp/beach-bootstrap-$$.json";
-    format!("nohup {} >{} 2>&1 </dev/null & sleep 0.5 && cat {}", body, temp_file, temp_file)
+    format!("nohup {} >{} 2>&1 </dev/null & sleep 2 && cat {}", body, temp_file, temp_file)
 }
 
 fn resolve_local_binary_path(args: &SshArgs) -> Result<PathBuf, CliError> {

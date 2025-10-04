@@ -78,7 +78,11 @@ impl SignalingState {
                 for peer_entry in peers.iter() {
                     let peer_id = peer_entry.key().clone();
                     let peer = peer_entry.value();
-                    heartbeat_checks.push((session_id.clone(), peer_id.clone(), peer.last_heartbeat.clone()));
+                    heartbeat_checks.push((
+                        session_id.clone(),
+                        peer_id.clone(),
+                        peer.last_heartbeat.clone(),
+                    ));
                 }
             }
 
@@ -582,7 +586,9 @@ async fn handle_client_message(
         ClientMessage::Ping => {
             // Update heartbeat timestamp
             // Clone the Arc<RwLock> to avoid holding DashMap guards across await
-            let heartbeat_lock = state.sessions.get(session_id)
+            let heartbeat_lock = state
+                .sessions
+                .get(session_id)
                 .and_then(|peers| peers.get(peer_id).map(|peer| peer.last_heartbeat.clone()));
 
             if let Some(lock) = heartbeat_lock {

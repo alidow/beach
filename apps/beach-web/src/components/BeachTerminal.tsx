@@ -181,8 +181,11 @@ class PredictionUx {
       this.srttTrigger = false;
     }
 
-    const visible = this.srttTrigger || this.glitchTrigger > 0;
-    const underline = visible && (this.flagging || this.glitchTrigger > PREDICTION_GLITCH_REPAIR_COUNT);
+    const hasPending = this.pending.size > 0;
+
+    const visible = hasPending || this.srttTrigger || this.glitchTrigger > 0;
+    const underline =
+      visible && (this.flagging || this.glitchTrigger > PREDICTION_GLITCH_REPAIR_COUNT);
 
     if (visible === this.overlay.visible && underline === this.overlay.underline) {
       return null;

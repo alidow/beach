@@ -89,9 +89,7 @@ impl Storage {
     pub async fn update_session_ttl(&self, session_id: &str) -> Result<()> {
         let mut conn = self.redis.clone();
         let key = format!("session:{}", session_id);
-        conn
-            .expire::<_, ()>(&key, self.ttl_seconds as i64)
-            .await?;
+        conn.expire::<_, ()>(&key, self.ttl_seconds as i64).await?;
         Ok(())
     }
 
@@ -103,16 +101,13 @@ impl Storage {
         let mut conn = self.redis.clone();
         let payload_key = offer_payload_key(session_id, &payload.handshake_id);
         let serialized = serde_json::to_string(payload)?;
-        conn
-            .set_ex::<_, _, ()>(&payload_key, serialized, self.ttl_seconds)
+        conn.set_ex::<_, _, ()>(&payload_key, serialized, self.ttl_seconds)
             .await?;
 
         let queue_key = offer_queue_key(session_id, &payload.to_peer);
-        conn
-            .rpush::<_, _, ()>(&queue_key, payload.handshake_id.clone())
+        conn.rpush::<_, _, ()>(&queue_key, payload.handshake_id.clone())
             .await?;
-        conn
-            .expire::<_, ()>(&queue_key, self.ttl_seconds as i64)
+        conn.expire::<_, ()>(&queue_key, self.ttl_seconds as i64)
             .await?;
 
         Ok(())
@@ -156,9 +151,7 @@ impl Storage {
     ) -> Result<()> {
         let mut conn = self.redis.clone();
         let queue_key = offer_queue_key(session_id, peer_id);
-        conn
-            .lrem::<_, _, ()>(&queue_key, 0, handshake_id)
-            .await?;
+        conn.lrem::<_, _, ()>(&queue_key, 0, handshake_id).await?;
         Ok(())
     }
 
@@ -181,8 +174,7 @@ impl Storage {
         let mut conn = self.redis.clone();
         let key = answer_payload_key(session_id, &payload.handshake_id);
         let serialized = serde_json::to_string(payload)?;
-        conn
-            .set_ex::<_, _, ()>(&key, serialized, self.ttl_seconds)
+        conn.set_ex::<_, _, ()>(&key, serialized, self.ttl_seconds)
             .await?;
         Ok(())
     }

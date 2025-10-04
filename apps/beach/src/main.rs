@@ -630,11 +630,13 @@ async fn handle_ssh(base_url: &str, args: SshArgs) -> Result<(), CliError> {
         "launching ssh bootstrap"
     );
 
-    eprintln!("[DEBUG] SSH command: {} -o BatchMode=yes -T {} {} '{}'",
-              args.ssh_binary,
-              args.ssh_flag.join(" "),
-              args.target,
-              remote_command);
+    eprintln!(
+        "[DEBUG] SSH command: {} -o BatchMode=yes -T {} {} '{}'",
+        args.ssh_binary,
+        args.ssh_flag.join(" "),
+        args.target,
+        remote_command
+    );
 
     let mut child = command.spawn()?;
     let mut stderr_pipe = child.stderr.take();
@@ -1092,7 +1094,9 @@ fn emit_bootstrap_handshake(
     let payload = serde_json::to_string(&handshake)
         .map_err(|err| CliError::BootstrapOutput(err.to_string()))?;
     println!("{}", payload);
-    std::io::stdout().flush().map_err(|err| CliError::BootstrapOutput(err.to_string()))?;
+    std::io::stdout()
+        .flush()
+        .map_err(|err| CliError::BootstrapOutput(err.to_string()))?;
     Ok(())
 }
 
@@ -1199,7 +1203,10 @@ fn render_remote_command(remote_args: &[String]) -> String {
     // Run beach in background, capture stdout to temp file, then cat the file
     // This allows the beach process to persist after SSH disconnects while still reading bootstrap JSON
     let temp_file = "/tmp/beach-bootstrap-$$.json";
-    format!("nohup {} >{} 2>&1 </dev/null & sleep 2 && cat {}", body, temp_file, temp_file)
+    format!(
+        "nohup {} >{} 2>&1 </dev/null & sleep 2 && cat {}",
+        body, temp_file, temp_file
+    )
 }
 
 fn resolve_local_binary_path(args: &SshArgs) -> Result<PathBuf, CliError> {

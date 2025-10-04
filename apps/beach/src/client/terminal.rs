@@ -2951,10 +2951,16 @@ impl TerminalClient {
             self.prediction_srtt_trigger = false;
         }
 
+        let has_predictions =
+            !self.pending_predictions.is_empty() || self.renderer.has_active_predictions();
+
         let overlay_visible = self.predictive_input
-            && (self.prediction_srtt_trigger || self.prediction_glitch_trigger > 0);
-        let underline = self.prediction_flagging
-            || self.prediction_glitch_trigger > PREDICTION_GLITCH_REPAIR_COUNT;
+            && (has_predictions
+                || self.prediction_srtt_trigger
+                || self.prediction_glitch_trigger > 0);
+        let underline = overlay_visible
+            && (self.prediction_flagging
+                || self.prediction_glitch_trigger > PREDICTION_GLITCH_REPAIR_COUNT);
 
         self.renderer.set_predictions_visible(overlay_visible);
         self.renderer.set_prediction_flagging(underline);

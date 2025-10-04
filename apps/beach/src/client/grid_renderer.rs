@@ -756,6 +756,12 @@ impl GridRenderer {
         !self.predictions.is_empty()
     }
 
+    pub fn prediction_exists(&self, row: usize, col: usize, seq: Seq) -> bool {
+        self.predictions
+            .get(&(row as u64, col))
+            .map_or(false, |cell| cell.seq == seq)
+    }
+
     pub fn clear_prediction_seq(&mut self, seq: Seq) {
         let before = self.predictions.len();
         self.predictions.retain(|_, cell| cell.seq != seq);

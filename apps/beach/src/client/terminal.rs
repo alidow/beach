@@ -66,6 +66,7 @@ const PREDICTION_GLITCH_REPAIR_COUNT: u32 = 10;
 const PREDICTION_GLITCH_REPAIR_MIN_INTERVAL: Duration = Duration::from_millis(150);
 const PREDICTION_GLITCH_FLAG_THRESHOLD: Duration = Duration::from_millis(5000);
 const PREDICTION_SRTT_ALPHA: f64 = 0.125;
+const PREDICTION_ACK_GRACE: Duration = Duration::from_millis(90);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AuthorizationState {
@@ -2851,10 +2852,17 @@ impl TerminalClient {
     }
 
     fn handle_input_ack(&mut self, seq: Seq) {
-        if let Some(prediction) = self.pending_predictions.remove(&seq) {
-            self.record_prediction_ack(prediction.sent_at);
+        let now = Instant::now();
+        let mut sent_at: Option<Instant> = None;
+        if let Some(prediction) = self.pending_predictions.get_mut(&seq) {
+            prediction.acked_at = Some(now);
+            sent_at = Some(prediction.sent_at);
         }
-        self.renderer.clear_prediction_seq(seq);
+        if let Some(sent) = sent_at {
+            self.record_prediction_ack(sent);
+        } else {
+            self.renderer.clear_prediction_seq(seq);
+        }
         self.force_render = true;
         self.update_prediction_overlay();
     }
@@ -2898,6 +2906,7 @@ impl TerminalClient {
                 PendingPrediction {
                     positions,
                     sent_at: Instant::now(),
+                    acked_at: None,
                 },
             );
             self.force_render = true;
@@ -2906,14 +2915,50 @@ impl TerminalClient {
         self.update_prediction_overlay();
     }
 
+    fn prune_acked_predictions(&mut self, now: Instant) {
+        let mut expired: Vec<Seq> = Vec::new();
+        for (&seq, prediction) in self.pending_predictions.iter_mut() {
+            if let Some(acked_at) = prediction.acked_at {
+                prediction
+                    .positions
+                    .retain(|&(row, col)| self.renderer.prediction_exists(row, col, seq));
+                if prediction.positions.is_empty()
+                    || now.saturating_duration_since(acked_at) >= PREDICTION_ACK_GRACE
+                {
+                    expired.push(seq);
+                }
+            }
+        }
+
+        if expired.is_empty() {
+            return;
+        }
+
+        for seq in &expired {
+            self.renderer.clear_prediction_seq(*seq);
+        }
+
+        let mut removed = false;
+        for seq in expired {
+            if self.pending_predictions.remove(&seq).is_some() {
+                removed = true;
+            }
+        }
+
+        if removed {
+            self.force_render = true;
+        }
+    }
+
     fn update_prediction_overlay(&mut self) {
+        let now = Instant::now();
+        self.prune_acked_predictions(now);
+
         if !self.render_enabled || !self.predictive_input {
             self.renderer.set_predictions_visible(false);
             self.renderer.set_prediction_flagging(false);
             return;
         }
-
-        let now = Instant::now();
         let mut glitch_trigger = self.prediction_glitch_trigger;
         for pending in self.pending_predictions.values() {
             let age = now.saturating_duration_since(pending.sent_at);
@@ -3122,6 +3167,7 @@ impl CopyModeState {
 struct PendingPrediction {
     positions: Vec<(usize, usize)>,
     sent_at: Instant,
+    acked_at: Option<Instant>,
 }
 
 enum CursorHint {

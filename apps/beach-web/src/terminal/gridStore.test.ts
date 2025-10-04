@@ -4,6 +4,7 @@ import { TerminalGridStore } from './gridStore';
 
 const PACKED_A = packCell('A', 1);
 const PACKED_B = packCell('B', 1);
+const ACK_GRACE_MS = 90;
 
 describe('TerminalGridStore', () => {
   it('applies row updates and exposes row text', () => {
@@ -171,7 +172,12 @@ describe('TerminalGridStore', () => {
     expect(snapshot.getPrediction(0, 2)?.char).toBe('l');
     expect(snapshot.getPrediction(0, 3)?.char).toBe('s');
 
-    store.clearPrediction(1);
+    store.ackPrediction(1, 100);
+    snapshot = store.getSnapshot();
+    expect(snapshot.getPrediction(0, 2)?.char).toBe('l');
+    expect(snapshot.getPrediction(0, 3)?.char).toBe('s');
+
+    store.pruneAckedPredictions(100 + ACK_GRACE_MS, ACK_GRACE_MS);
     snapshot = store.getSnapshot();
     expect(snapshot.getPrediction(0, 2)).toBeNull();
     expect(snapshot.getPrediction(0, 3)).toBeNull();
@@ -221,7 +227,8 @@ describe('TerminalGridStore', () => {
     expect(snapshot.cursorCol).toBe(2);
     expect(snapshot.predictedCursor?.col).toBe(3);
 
-    store.clearPrediction(3);
+    store.ackPrediction(3, 200);
+    store.pruneAckedPredictions(200 + ACK_GRACE_MS, ACK_GRACE_MS);
     snapshot = store.getSnapshot();
     expect(snapshot.predictedCursor).toBeNull();
   });

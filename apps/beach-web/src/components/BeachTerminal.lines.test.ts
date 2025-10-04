@@ -3,6 +3,7 @@ import { TerminalGridStore } from '../terminal/gridStore';
 import { buildLines } from './BeachTerminal';
 
 const PACKED_STYLE = 0;
+const ACK_GRACE_MS = 90;
 
 function packRow(row: number, text: string, seq = 1) {
   return { type: 'row' as const, row, seq, cells: packString(text) };
@@ -80,17 +81,32 @@ describe('buildLines', () => {
     expect(line.predictedCursorCol).toBe(3);
   });
 
-  it('suppresses predicted cells when overlay is hidden', () => {
+  it('keeps predicted cells visible until cleared even if overlay is hidden', () => {
     const store = new TerminalGridStore();
     store.setGridSize(1, 80);
     store.applyUpdates([packRow(0, '> ')], { authoritative: true });
     store.registerPrediction(1, stringToBytes('a'));
 
-    const [lineVisible] = buildLines(store.getSnapshot(), 10, { visible: true, underline: false });
+    const snapshotWithPrediction = store.getSnapshot();
+    expect(snapshotWithPrediction.hasPredictions).toBe(true);
+
+    const [lineVisible] = buildLines(snapshotWithPrediction, 10, { visible: true, underline: false });
     expect(lineVisible.cells?.some((cell) => cell.predicted)).toBe(true);
 
-    const [lineHidden] = buildLines(store.getSnapshot(), 10, { visible: false, underline: false });
-    expect(lineHidden.cells?.some((cell) => cell.predicted)).toBe(false);
+    const hiddenOverlay = snapshotWithPrediction.hasPredictions
+      ? { visible: true, underline: false }
+      : { visible: false, underline: false };
+    const [lineHidden] = buildLines(snapshotWithPrediction, 10, hiddenOverlay);
+    expect(lineHidden.cells?.some((cell) => cell.predicted)).toBe(true);
+
+    store.ackPrediction(1, 100);
+    store.pruneAckedPredictions(100 + ACK_GRACE_MS, ACK_GRACE_MS);
+
+    const snapshotCleared = store.getSnapshot();
+    expect(snapshotCleared.hasPredictions).toBe(false);
+
+    const [lineCleared] = buildLines(snapshotCleared, 10, { visible: false, underline: false });
+    expect(lineCleared.cells?.some((cell) => cell.predicted)).toBe(false);
   });
 });
 

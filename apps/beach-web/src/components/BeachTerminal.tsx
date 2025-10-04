@@ -81,6 +81,7 @@ const PREDICTION_GLITCH_REPAIR_COUNT = 10;
 const PREDICTION_GLITCH_REPAIR_MIN_INTERVAL_MS = 150;
 const PREDICTION_GLITCH_FLAG_THRESHOLD_MS = 5000;
 const PREDICTION_SRTT_ALPHA = 0.125;
+const PREDICTION_ACK_GRACE_MS = 90;
 
 function now(): number {
   if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
@@ -262,6 +263,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     visible: false,
     underline: false,
   });
+  const effectiveOverlay = useMemo(() => {
+    if (predictionOverlay.visible || !snapshot.hasPredictions) {
+      return predictionOverlay;
+    }
+    return { ...predictionOverlay, visible: true };
+  }, [predictionOverlay, snapshot.hasPredictions]);
   const joinTimersRef = useRef<{ short?: number; long?: number; hide?: number }>({});
   const peerIdRef = useRef<string | null>(null);
   const handshakeReadyRef = useRef(false);
@@ -308,7 +315,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     }
     let raf = 0;
     const step = () => {
-      const update = predictionUxRef.current.tick(now());
+      const timestamp = now();
+      store.pruneAckedPredictions(timestamp, PREDICTION_ACK_GRACE_MS);
+      const update = predictionUxRef.current.tick(timestamp);
       if (update) {
         setPredictionOverlay(update);
       }
@@ -320,7 +329,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         window.cancelAnimationFrame(raf);
       }
     };
-  }, []);
+  }, [store]);
   const log = useCallback((message: string, detail?: Record<string, unknown>) => {
     if (!import.meta.env.DEV) {
       return;
@@ -455,10 +464,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       setShowIdlePlaceholder(true);
     }
   }, [status, onStatusChange]);
-  const lines = useMemo(
-    () => buildLines(snapshot, 600, predictionOverlay),
-    [snapshot, predictionOverlay],
-  );
+  const lines = useMemo(() => buildLines(snapshot, 600, effectiveOverlay), [snapshot, effectiveOverlay]);
   if (import.meta.env.DEV && typeof window !== 'undefined' && window.__BEACH_TRACE) {
     const sample = lines.slice(-5).map((line) => ({
       absolute: line.absolute,
@@ -1006,7 +1012,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         ) : null}
         <div style={{ height: topPadding }} aria-hidden="true" />
         {lines.map((line) => (
-          <LineRow key={line.absolute} line={line} styles={snapshot.styles} overlay={predictionOverlay} />
+          <LineRow key={line.absolute} line={line} styles={snapshot.styles} overlay={effectiveOverlay} />
         ))}
         <div style={{ height: bottomPadding }} aria-hidden="true" />
       </div>
@@ -1218,15 +1224,15 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       }
       case 'snapshot_complete':
         break;
-      case 'input_ack':
-        store.clearPrediction(frame.seq);
-        {
-          const overlayUpdate = predictionUxRef.current.recordAck(frame.seq, now());
-          if (overlayUpdate) {
-            setPredictionOverlay(overlayUpdate);
-          }
+      case 'input_ack': {
+        const timestamp = now();
+        store.ackPrediction(frame.seq, timestamp);
+        const overlayUpdate = predictionUxRef.current.recordAck(frame.seq, timestamp);
+        if (overlayUpdate) {
+          setPredictionOverlay(overlayUpdate);
         }
         break;
+      }
       case 'cursor':
         trace('frame cursor', frame.cursor);
         store.applyCursorFrame(frame.cursor);

@@ -42,6 +42,11 @@ interface PredictedPosition {
   col: number;
 }
 
+interface PendingPredictionEntry {
+  positions: PredictedPosition[];
+  ackedAt: number | null;
+}
+
 export interface PredictedCursorState {
   row: number;
   col: number;
@@ -83,6 +88,7 @@ export interface TerminalGridSnapshot {
   cursorSeq: number | null;
   cursorAuthoritative: boolean;
   predictedCursor: PredictedCursorState | null;
+  hasPredictions: boolean;
   visibleRows(limit?: number): RowSlot[];
   getPrediction(row: number, col: number): PredictedCell | null;
   predictionsForRow(row: number): Array<{ col: number; cell: PredictedCell }>;
@@ -130,7 +136,7 @@ export class TerminalGridCache {
   private cursorAuthoritativePending = false;
   private predictedCursor: PredictedCursorState | null = null;
   private predictions = new Map<number, Map<number, PredictedCell>>();
-  private pendingPredictions = new Map<number, PredictedPosition[]>();
+  private pendingPredictions = new Map<number, PendingPredictionEntry>();
   private debugContext: DebugUpdateContext | null = null;
 
   constructor(options: TerminalGridCacheOptions = {}) {
@@ -445,6 +451,7 @@ export class TerminalGridCache {
       cursorSeq: this.cursorSeq,
       cursorAuthoritative: this.cursorAuthoritative,
       predictedCursor: this.predictedCursor,
+      hasPredictions: this.predictions.size > 0 || this.predictedCursor !== null,
       visibleRows: (limit?: number) => this.visibleRows(limit),
       getPrediction: (row: number, col: number) => this.getPrediction(row, col),
       predictionsForRow: (row: number) => this.predictionsForRow(row),
@@ -933,7 +940,7 @@ export class TerminalGridCache {
 
     this.pendingPredictions.delete(seq);
     if (positions.length > 0) {
-      this.pendingPredictions.set(seq, positions);
+      this.pendingPredictions.set(seq, { positions, ackedAt: null });
       if (this.pendingPredictions.size > 256) {
         mutated = this.clearAllPredictions() || mutated;
       }
@@ -961,22 +968,53 @@ export class TerminalGridCache {
   }
 
   clearPredictionSeq(seq: number): boolean {
-    const positions = this.pendingPredictions.get(seq);
+    const entry = this.pendingPredictions.get(seq);
     let cursorCleared = false;
     if (this.predictedCursor && this.predictedCursor.seq === seq) {
       this.predictedCursor = null;
       cursorCleared = true;
     }
-    if (!positions || positions.length === 0) {
+    if (!entry || entry.positions.length === 0) {
       this.pendingPredictions.delete(seq);
       return cursorCleared;
     }
     this.pendingPredictions.delete(seq);
     let mutated = false;
-    for (const { row, col } of positions) {
+    for (const { row, col } of entry.positions) {
       mutated = this.clearPredictionAt(row, col) || mutated;
     }
     return mutated || cursorCleared;
+  }
+
+  ackPrediction(seq: number, timestampMs: number): boolean {
+    const entry = this.pendingPredictions.get(seq);
+    if (entry) {
+      if (entry.ackedAt === null || entry.ackedAt < timestampMs) {
+        entry.ackedAt = timestampMs;
+      }
+      return false;
+    }
+    return this.clearPredictionSeq(seq);
+  }
+
+  pruneAckedPredictions(nowMs: number, graceMs: number): boolean {
+    const expired: number[] = [];
+    for (const [seq, entry] of this.pendingPredictions) {
+      if (entry.ackedAt === null) {
+        continue;
+      }
+      if (entry.positions.length === 0 || nowMs - entry.ackedAt >= graceMs) {
+        expired.push(seq);
+      }
+    }
+    if (expired.length === 0) {
+      return false;
+    }
+    let mutated = false;
+    for (const seq of expired) {
+      mutated = this.clearPredictionSeq(seq) || mutated;
+    }
+    return mutated;
   }
 
   clearAllPredictions(): boolean {
@@ -1046,13 +1084,11 @@ export class TerminalGridCache {
     if (rowPredictions.size === 0) {
       this.predictions.delete(row);
     }
-    const positions = this.pendingPredictions.get(existing.seq);
-    if (positions) {
-      const filtered = positions.filter((pos) => !(pos.row === row && pos.col === col));
-      if (filtered.length === 0) {
+    const entry = this.pendingPredictions.get(existing.seq);
+    if (entry) {
+      entry.positions = entry.positions.filter((pos) => !(pos.row === row && pos.col === col));
+      if (entry.positions.length === 0) {
         this.pendingPredictions.delete(existing.seq);
-      } else if (filtered.length !== positions.length) {
-        this.pendingPredictions.set(existing.seq, filtered);
       }
     }
     return true;

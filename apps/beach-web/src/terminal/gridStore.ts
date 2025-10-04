@@ -175,6 +175,20 @@ export class TerminalGridStore {
     }
   }
 
+  ackPrediction(seq: number, timestampMs: number): void {
+    if (this.cache.ackPrediction(seq, timestampMs)) {
+      this.invalidate();
+      this.notify();
+    }
+  }
+
+  pruneAckedPredictions(nowMs: number, graceMs: number): void {
+    if (this.cache.pruneAckedPredictions(nowMs, graceMs)) {
+      this.invalidate();
+      this.notify();
+    }
+  }
+
   clearAllPredictions(): void {
     if (this.cache.clearAllPredictions()) {
       this.invalidate();

@@ -517,12 +517,16 @@ export class TerminalGridCache {
       case 'exact': {
         const row = Math.max(0, Math.floor(hint.row));
         let targetCol = Math.max(0, Math.floor(hint.col));
+        const committed = this.committedRowWidth(row);
+        targetCol = Math.min(targetCol, committed);
         this.cursorRow = row;
         if (this.rowHasPredictions(row)) {
           targetCol = Math.max(targetCol, this.predictedRowWidth(row));
           if (previousRow === row && previousCol !== null) {
             targetCol = Math.max(targetCol, previousCol);
           }
+        } else {
+          targetCol = Math.min(targetCol, committed);
         }
         this.cursorCol = targetCol;
         break;
@@ -538,7 +542,8 @@ export class TerminalGridCache {
           }
           this.cursorCol = target;
         } else {
-          this.cursorCol = width;
+          const committed = this.committedRowWidth(row);
+          this.cursorCol = Math.min(committed, width);
         }
         break;
       }
@@ -578,6 +583,8 @@ export class TerminalGridCache {
     this.ensureRowRange(row, row + 1);
     this.cursorRow = row;
     let targetCol = col;
+    const committed = this.committedRowWidth(row);
+    targetCol = Math.min(targetCol, committed);
     if (this.rowHasPredictions(row)) {
       targetCol = Math.max(targetCol, this.predictedRowWidth(row));
       if (prevRow === row && prevCol !== null) {
@@ -649,6 +656,10 @@ export class TerminalGridCache {
     return slot.logicalWidth;
   }
 
+  private committedRowWidth(absolute: number): number {
+    return Math.max(this.rowLogicalWidth(absolute), this.rowDisplayWidth(absolute));
+  }
+
   private predictedRowWidth(absolute: number): number {
     const rowPredictions = this.predictions.get(absolute);
     if (!rowPredictions || rowPredictions.size === 0) {
@@ -662,11 +673,7 @@ export class TerminalGridCache {
   }
 
   private rowEffectiveWidth(absolute: number): number {
-    return Math.max(
-      this.rowLogicalWidth(absolute),
-      this.rowDisplayWidth(absolute),
-      this.predictedRowWidth(absolute),
-    );
+    return Math.max(this.committedRowWidth(absolute), this.predictedRowWidth(absolute));
   }
 
   private predictionExists(row: number, col: number, seq: number): boolean {
@@ -1068,7 +1075,7 @@ export class TerminalGridCache {
           moved = true;
         } else if (currentRow > this.baseRow) {
           currentRow -= 1;
-          const width = this.rowEffectiveWidth(currentRow);
+          const width = this.committedRowWidth(currentRow);
           currentCol = Math.max(0, width - 1);
           moved = true;
         }

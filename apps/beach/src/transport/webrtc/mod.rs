@@ -40,9 +40,83 @@ use crate::transport::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_ACK_POLL_ATTEMPTS: usize = 200;
 const READY_ACK_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MCP_CHANNEL_LABEL: &str = "mcp-jsonrpc";
 mod signaling;
 
 use signaling::{PeerRole, RemotePeerEvent, RemotePeerJoined, SignalingClient, WebRTCSignal};
+
+#[derive(Clone, Default)]
+pub struct WebRtcChannels {
+    inner: Arc<WebRtcChannelsInner>,
+}
+
+#[derive(Default)]
+struct WebRtcChannelsInner {
+    channels: Mutex<HashMap<String, Arc<dyn Transport>>>,
+    waiters: Mutex<HashMap<String, Vec<oneshot::Sender<Arc<dyn Transport>>>>>,
+}
+
+impl WebRtcChannels {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn publish(&self, label: String, transport: Arc<dyn Transport>) {
+        {
+            let mut guard = self.inner.channels.lock().unwrap();
+            guard.insert(label.clone(), transport.clone());
+        }
+        let waiters = {
+            let mut guard = self.inner.waiters.lock().unwrap();
+            guard.remove(&label)
+        };
+        if let Some(waiters) = waiters {
+            for waiter in waiters {
+                let _ = waiter.send(transport.clone());
+            }
+        }
+    }
+
+    pub fn try_get(&self, label: &str) -> Option<Arc<dyn Transport>> {
+        let guard = self.inner.channels.lock().unwrap();
+        guard.get(label).cloned()
+    }
+
+    pub async fn wait_for(&self, label: &str) -> Result<Arc<dyn Transport>, TransportError> {
+        if let Some(existing) = self.try_get(label) {
+            return Ok(existing);
+        }
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut guard = self.inner.waiters.lock().unwrap();
+            guard.entry(label.to_string()).or_default().push(tx);
+        }
+        rx.await.map_err(|_| TransportError::ChannelClosed)
+    }
+}
+
+#[derive(Clone)]
+pub struct WebRtcConnection {
+    transport: Arc<dyn Transport>,
+    channels: WebRtcChannels,
+}
+
+impl WebRtcConnection {
+    pub fn new(transport: Arc<dyn Transport>, channels: WebRtcChannels) -> Self {
+        Self {
+            transport,
+            channels,
+        }
+    }
+
+    pub fn transport(&self) -> Arc<dyn Transport> {
+        self.transport.clone()
+    }
+
+    pub fn channels(&self) -> WebRtcChannels {
+        self.channels.clone()
+    }
+}
 
 pub fn build_pair() -> Result<TransportPair, TransportError> {
     RUNTIME.block_on(async { create_webrtc_pair().await })
@@ -462,7 +536,7 @@ pub struct OffererAcceptedTransport {
     pub peer_id: String,
     pub handshake_id: String,
     pub metadata: HashMap<String, String>,
-    pub transport: Arc<dyn Transport>,
+    pub connection: WebRtcConnection,
 }
 
 pub struct OffererSupervisor {
@@ -497,9 +571,16 @@ impl OffererSupervisor {
         signaling_url: &str,
         poll_interval: Duration,
         passphrase: Option<&str>,
+        request_mcp_channel: bool,
     ) -> Result<(Arc<Self>, OffererAcceptedTransport), TransportError> {
-        let signaling_client =
-            SignalingClient::connect(signaling_url, WebRtcRole::Offerer, passphrase, None).await?;
+        let signaling_client = SignalingClient::connect(
+            signaling_url,
+            WebRtcRole::Offerer,
+            passphrase,
+            None,
+            request_mcp_channel,
+        )
+        .await?;
         let client = Client::new();
         let signaling_base = signaling_url.trim_end_matches('/').to_string();
         let (accepted_tx, accepted_rx) = tokio_mpsc::unbounded_channel();
@@ -516,7 +597,7 @@ impl OffererSupervisor {
         });
 
         let remote_events = inner.signaling_client.remote_events().await?;
-        OffererInner::start_event_loop(inner.clone(), remote_events);
+        OffererInner::start_event_loop(inner.clone(), remote_events, request_mcp_channel);
 
         let supervisor = Arc::new(OffererSupervisor {
             inner,
@@ -545,12 +626,13 @@ impl OffererInner {
     fn start_event_loop(
         inner: Arc<Self>,
         mut remote_events: tokio_mpsc::UnboundedReceiver<RemotePeerEvent>,
+        request_mcp_channel: bool,
     ) {
         tokio::spawn(async move {
             while let Some(event) = remote_events.recv().await {
                 match event {
                     RemotePeerEvent::Joined(joined) => {
-                        inner.handle_peer_join(joined).await;
+                        inner.handle_peer_join(joined, request_mcp_channel).await;
                     }
                     RemotePeerEvent::Left(left) => {
                         inner.handle_peer_left(&left.peer_id).await;
@@ -566,7 +648,11 @@ impl OffererInner {
         });
     }
 
-    async fn handle_peer_join(self: &Arc<Self>, joined: RemotePeerJoined) {
+    async fn handle_peer_join(
+        self: &Arc<Self>,
+        joined: RemotePeerJoined,
+        request_mcp_channel: bool,
+    ) {
         if joined.peer.role != PeerRole::Client {
             tracing::debug!(
                 target = "webrtc",
@@ -654,10 +740,15 @@ impl OffererInner {
         let inner_for_task = Arc::clone(self);
         let cancel_for_task = cancel.clone();
         let peer_id_for_task = peer_id.clone();
+        let mcp_flag = request_mcp_channel;
         let task = tokio::spawn(async move {
-            let result =
-                negotiate_offerer_peer(inner_for_task.clone(), joined, cancel_for_task.clone())
-                    .await;
+            let result = negotiate_offerer_peer(
+                inner_for_task.clone(),
+                joined,
+                cancel_for_task.clone(),
+                mcp_flag,
+            )
+            .await;
             inner_for_task
                 .finalize_peer(&peer_id_for_task, result, cancel_for_task)
                 .await;
@@ -780,6 +871,7 @@ async fn negotiate_offerer_peer(
     inner: Arc<OffererInner>,
     joined: RemotePeerJoined,
     cancel_flag: Arc<AtomicBool>,
+    request_mcp_channel: bool,
 ) -> Result<Option<OffererAcceptedTransport>, TransportError> {
     if cancel_flag.load(Ordering::SeqCst) {
         return Ok(None);
@@ -807,6 +899,7 @@ async fn negotiate_offerer_peer(
             .await
             .map_err(to_setup_error)?,
     );
+    let channels = WebRtcChannels::new();
     let pending_ice = Arc::new(AsyncMutex::new(Vec::new()));
     let handshake_id = Uuid::new_v4().to_string();
     let handshake_id_arc = Arc::new(handshake_id.clone());
@@ -1014,6 +1107,7 @@ async fn negotiate_offerer_peer(
         Some(Arc::clone(&handshake_complete)),
     ));
     let transport_dyn: Arc<dyn Transport> = transport.clone();
+    channels.publish("beach-human".to_string(), transport_dyn.clone());
 
     tracing::debug!(
         target = "webrtc",
@@ -1152,11 +1246,41 @@ async fn negotiate_offerer_peer(
         "offerer transport established"
     );
 
+    if request_mcp_channel {
+        let mcp_init = RTCDataChannelInit {
+            ordered: Some(true),
+            ..Default::default()
+        };
+        let mcp_dc = pc
+            .create_data_channel(MCP_CHANNEL_LABEL, Some(mcp_init))
+            .await
+            .map_err(to_setup_error)?;
+        let mcp_transport = Arc::new(WebRtcTransport::new(
+            TransportKind::WebRtc,
+            next_transport_id(),
+            next_transport_id(),
+            pc.clone(),
+            mcp_dc,
+            None,
+            None,
+            Some(Arc::clone(&inner.signaling_client)),
+            Some(Arc::clone(&handshake_complete)),
+        ));
+        let mcp_transport_dyn: Arc<dyn Transport> = mcp_transport;
+        channels.publish(MCP_CHANNEL_LABEL.to_string(), mcp_transport_dyn);
+        tracing::info!(
+            target = "webrtc",
+            peer_id = %peer.id,
+            handshake_id = %handshake_id,
+            "offerer published mcp data channel"
+        );
+    }
+
     Ok(Some(OffererAcceptedTransport {
         peer_id: peer.id,
         handshake_id,
         metadata: peer.metadata.unwrap_or_default(),
-        transport: transport_dyn,
+        connection: WebRtcConnection::new(transport_dyn, channels),
     }))
 }
 
@@ -1166,12 +1290,18 @@ pub async fn connect_via_signaling(
     poll_interval: Duration,
     passphrase: Option<&str>,
     label: Option<&str>,
-) -> Result<Arc<dyn Transport>, TransportError> {
+    request_mcp_channel: bool,
+) -> Result<WebRtcConnection, TransportError> {
     match role {
         WebRtcRole::Offerer => {
-            let (_supervisor, accepted) =
-                OffererSupervisor::connect(signaling_url, poll_interval, passphrase).await?;
-            Ok(accepted.transport)
+            let (_supervisor, accepted) = OffererSupervisor::connect(
+                signaling_url,
+                poll_interval,
+                passphrase,
+                request_mcp_channel,
+            )
+            .await?;
+            Ok(accepted.connection)
         }
         WebRtcRole::Answerer => {
             connect_answerer(signaling_url, poll_interval, passphrase, label).await
@@ -1184,13 +1314,14 @@ async fn connect_answerer(
     poll_interval: Duration,
     passphrase: Option<&str>,
     label: Option<&str>,
-) -> Result<Arc<dyn Transport>, TransportError> {
+) -> Result<WebRtcConnection, TransportError> {
     let client = Client::new();
     let signaling_client = SignalingClient::connect(
         signaling_url,
         WebRtcRole::Answerer,
         passphrase,
         label.map(|s| s.to_string()),
+        false,
     )
     .await?;
     let (expected_remote_peer, _) = signaling_client
@@ -1302,6 +1433,7 @@ async fn connect_answerer(
         result = ?pc_result
     );
     let pc = Arc::new(pc_result.map_err(to_setup_error)?);
+    let channels = WebRtcChannels::new();
 
     let signaling_for_candidates = Arc::clone(&signaling_client);
     let handshake_for_candidates = Arc::clone(&handshake_id);
@@ -1382,11 +1514,13 @@ async fn connect_answerer(
         "answerer allocating transport ids"
     );
     let signaling_for_dc = Arc::clone(&signaling_client);
+    let channels_registry = channels.clone();
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let pc = pc_for_dc.clone();
         let notify = notify_clone.clone();
         let slot = slot_clone.clone();
         let signaling_for_transport = Arc::clone(&signaling_for_dc);
+        let channels = channels_registry.clone();
         Box::pin(async move {
             tracing::debug!(
                 target = "webrtc",
@@ -1419,19 +1553,21 @@ async fn connect_answerer(
                 state = "end",
                 is_populated = slot_guard.is_some()
             );
+            let label = dc.label().to_string();
+            let transport = WebRtcTransport::new(
+                TransportKind::WebRtc,
+                client_id,
+                peer_id,
+                pc.clone(),
+                dc,
+                None,
+                Some(notify.clone()),
+                Some(signaling_for_transport),
+                None,
+            );
+            let transport_arc = Arc::new(transport) as Arc<dyn Transport>;
+
             if slot_guard.is_none() {
-                let transport = WebRtcTransport::new(
-                    TransportKind::WebRtc,
-                    client_id,
-                    peer_id,
-                    pc.clone(),
-                    dc,
-                    None,
-                    Some(notify.clone()),
-                    Some(signaling_for_transport),
-                    None,
-                );
-                let transport_arc = Arc::new(transport) as Arc<dyn Transport>;
                 slot_guard.replace(transport_arc.clone());
                 drop(slot_guard);
 
@@ -1454,8 +1590,13 @@ async fn connect_answerer(
                         "sent __ready__ sentinel successfully"
                     );
                 }
+
+                channels.publish(label.clone(), transport_arc.clone());
                 return;
             }
+
+            drop(slot_guard);
+            channels.publish(label, transport_arc);
         })
     }));
 
@@ -1643,7 +1784,7 @@ async fn connect_answerer(
     );
     notify_result.map_err(|_| TransportError::Timeout)?;
 
-    Ok(transport)
+    Ok(WebRtcConnection::new(transport, channels))
 }
 
 fn endpoint(base: &str, suffix: &str) -> Result<Url, TransportError> {

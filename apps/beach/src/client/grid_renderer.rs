@@ -814,6 +814,11 @@ impl GridRenderer {
             .unwrap_or(0)
     }
 
+    pub fn committed_row_width(&self, absolute_row: u64) -> usize {
+        self.logical_row_width(absolute_row)
+            .max(self.row_display_width(absolute_row))
+    }
+
     pub fn predicted_row_width(&self, absolute_row: u64) -> usize {
         self.predictions
             .iter()
@@ -829,6 +834,51 @@ impl GridRenderer {
             .max(self.row_display_width(absolute_row));
         let predicted = self.predicted_row_width(absolute_row);
         committed.max(predicted)
+    }
+
+    pub fn shrink_row_to_column(&mut self, absolute_row: u64, col: usize) -> bool {
+        let mut changed = false;
+        if let Some(rel) = self.relative_row(absolute_row) {
+            if let Some(RowSlot::Loaded(state)) = self.rows.get_mut(rel) {
+                if state.logical_width > col {
+                    let mut new_width = state.logical_width;
+                    while new_width > col {
+                        if new_width == 0 {
+                            break;
+                        }
+                        let idx = new_width - 1;
+                        if idx >= state.cells.len() {
+                            new_width = new_width.saturating_sub(1);
+                            continue;
+                        }
+                        if state.cells[idx].ch != ' ' {
+                            break;
+                        }
+                        new_width = new_width.saturating_sub(1);
+                    }
+                    if new_width < state.logical_width {
+                        state.logical_width = new_width;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        let before = self.predictions.len();
+        self.predictions.retain(|(row, prediction_col), _| {
+            if *row == absolute_row && *prediction_col >= col {
+                changed = true;
+                false
+            } else {
+                true
+            }
+        });
+        if changed || self.predictions.len() != before {
+            self.mark_dirty();
+            true
+        } else {
+            false
+        }
     }
 
     pub fn clear_prediction_seq(&mut self, seq: Seq) {

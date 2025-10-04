@@ -51,6 +51,7 @@ const AUTH_HINT_STAGE_ONE: Duration = Duration::from_secs(10);
 const AUTH_HINT_STAGE_TWO: Duration = Duration::from_secs(30);
 const AUTH_WAIT_MESSAGE: &str = "Waiting for host approval...";
 const AUTH_WAIT_MESSAGE_INIT: &str = "Connected - waiting for host approval...";
+const AUTH_WAIT_MESSAGE_SYNCING: &str = "Connected - syncing remote session...";
 const AUTH_WAIT_HINT_ONE: &str = "Still waiting... hang tight.";
 const AUTH_WAIT_HINT_TWO: &str = "Still waiting... ask the host to approve.";
 const AUTH_APPROVED_MESSAGE: &str = "Approved - syncing...";
@@ -270,6 +271,7 @@ pub struct TerminalClient {
     authorization_shutdown_at: Option<Instant>,
     authorization_hint_level: u8,
     connect_started_at: Instant,
+    authorization_pending_hint: bool,
 }
 
 impl TerminalClient {
@@ -330,6 +332,7 @@ impl TerminalClient {
             authorization_shutdown_at: None,
             authorization_hint_level: 0,
             connect_started_at: Instant::now(),
+            authorization_pending_hint: false,
         }
     }
 
@@ -1460,12 +1463,17 @@ impl TerminalClient {
             match hint {
                 Exact(row, col) => {
                     let mut target_col = col;
+                    let committed = self.renderer.committed_row_width(row as u64);
+                    target_col = target_col.min(committed);
                     if self.row_has_predictions(row) {
                         let predicted_width = self.renderer.predicted_row_width(row as u64);
-                        target_col = target_col.max(predicted_width);
+                        target_col =
+                            target_col.max(predicted_width.min(committed.max(predicted_width)));
                         if row == previous_row {
                             target_col = target_col.max(previous_col);
                         }
+                    } else {
+                        target_col = target_col.min(committed);
                     }
                     self.cursor_row = row;
                     self.cursor_col = target_col;
@@ -1484,15 +1492,25 @@ impl TerminalClient {
         let previous_row = self.cursor_row;
         let previous_col = self.cursor_col;
         self.cursor_seq = frame.seq;
-        self.cursor_row = frame.row as usize;
+        let new_row = frame.row as usize;
         let mut target_col = frame.col as usize;
-        if self.row_has_predictions(self.cursor_row) {
-            let predicted_width = self.renderer.predicted_row_width(self.cursor_row as u64);
-            target_col = target_col.max(predicted_width);
-            if previous_row == self.cursor_row {
-                target_col = target_col.max(previous_col);
-            }
+        let total_cols = self.renderer.total_cols();
+        if total_cols > 0 {
+            target_col = target_col.min(total_cols);
         }
+
+        let predicted_width = self.renderer.predicted_row_width(new_row as u64);
+        let moving_left = new_row == previous_row && target_col < previous_col;
+        if predicted_width > target_col || moving_left {
+            self.discard_predictions_from_column(new_row, target_col);
+        }
+
+        let adjusted_predicted = self.renderer.predicted_row_width(new_row as u64);
+        if adjusted_predicted > target_col {
+            target_col = adjusted_predicted;
+        }
+
+        self.cursor_row = new_row;
         self.cursor_col = target_col;
         self.cursor_visible = frame.visible;
         self.cursor_authoritative = true;
@@ -2676,6 +2694,7 @@ impl TerminalClient {
                 self.authorization_shutdown_at = None;
             }
             AuthorizationState::Approved => {
+                self.authorization_pending_hint = false;
                 self.authorization_message =
                     Some(message.unwrap_or_else(|| AUTH_APPROVED_MESSAGE.to_string()));
                 self.authorization_wait_started = None;
@@ -2685,6 +2704,7 @@ impl TerminalClient {
                 self.authorization_shutdown_at = None;
             }
             AuthorizationState::Denied => {
+                self.authorization_pending_hint = false;
                 self.authorization_message =
                     Some(message.unwrap_or_else(|| AUTH_DENIED_MESSAGE.to_string()));
                 self.authorization_wait_started = None;
@@ -2692,6 +2712,7 @@ impl TerminalClient {
                 self.authorization_shutdown_at = Some(Instant::now() + AUTH_DENIED_EXIT_DELAY);
             }
             AuthorizationState::Connecting => {
+                self.authorization_pending_hint = false;
                 self.authorization_message = message;
                 self.authorization_wait_started = None;
                 self.authorization_approved_since = None;
@@ -2743,10 +2764,12 @@ impl TerminalClient {
         if matches!(self.authorization_state, AuthorizationState::Connecting)
             && self.connect_started_at.elapsed() >= AUTH_FALLBACK_WAIT
         {
-            self.set_authorization_state(
-                AuthorizationState::Waiting,
-                Some(AUTH_WAIT_MESSAGE_INIT.to_string()),
-            );
+            let fallback_message = if self.authorization_pending_hint {
+                AUTH_WAIT_MESSAGE_INIT.to_string()
+            } else {
+                AUTH_WAIT_MESSAGE_SYNCING.to_string()
+            };
+            self.set_authorization_state(AuthorizationState::Waiting, Some(fallback_message));
         }
 
         if matches!(self.authorization_state, AuthorizationState::Waiting)
@@ -2819,6 +2842,7 @@ impl TerminalClient {
                 } else {
                     detail.to_string()
                 };
+                self.authorization_pending_hint = true;
                 self.set_authorization_state(AuthorizationState::Waiting, Some(message));
                 true
             }
@@ -2828,6 +2852,7 @@ impl TerminalClient {
                 } else {
                     detail.to_string()
                 };
+                self.authorization_pending_hint = false;
                 self.set_authorization_state(AuthorizationState::Approved, Some(message));
                 true
             }
@@ -2837,6 +2862,7 @@ impl TerminalClient {
                 } else {
                     detail.to_string()
                 };
+                self.authorization_pending_hint = false;
                 self.set_authorization_state(AuthorizationState::Denied, Some(message));
                 true
             }
@@ -2924,7 +2950,7 @@ impl TerminalClient {
                         cursor_row = cursor_row.saturating_sub(1);
                         cursor_col = self
                             .renderer
-                            .effective_row_width(cursor_row as u64)
+                            .committed_row_width(cursor_row as u64)
                             .saturating_sub(1);
                         moved = true;
                     }
@@ -3026,6 +3052,28 @@ impl TerminalClient {
         self.pending_predictions
             .values()
             .any(|pending| pending.positions.iter().any(|pos| pos.row == row))
+    }
+
+    fn discard_predictions_from_column(&mut self, row: usize, col: usize) {
+        let trimmed_renderer = self.renderer.shrink_row_to_column(row as u64, col);
+        let mut trimmed_pending = false;
+        for prediction in self.pending_predictions.values_mut() {
+            let before = prediction.positions.len();
+            prediction
+                .positions
+                .retain(|pos| !(pos.row == row && pos.col >= col));
+            if prediction.positions.len() != before {
+                trimmed_pending = true;
+            }
+        }
+        if trimmed_pending {
+            self.pending_predictions
+                .retain(|_, pending| !pending.positions.is_empty());
+        }
+        if trimmed_renderer || trimmed_pending {
+            self.force_render = true;
+            self.update_prediction_overlay();
+        }
     }
 
     fn update_prediction_overlay(&mut self) {
@@ -3706,7 +3754,14 @@ mod tests {
         }
     }
 
-    fn pack_rect(row_start: u32, row_end: u32, col_start: u32, col_end: u32, seq: u64, ch: char) -> WireUpdate {
+    fn pack_rect(
+        row_start: u32,
+        row_end: u32,
+        col_start: u32,
+        col_end: u32,
+        seq: u64,
+        ch: char,
+    ) -> WireUpdate {
         WireUpdate::Rect {
             rows: [row_start, row_end],
             cols: [col_start, col_end],
@@ -3736,6 +3791,85 @@ mod tests {
         client.apply_wire_update(&pack_row_segment(0, 0, 2, prompt));
         assert_eq!(client.cursor_row, 0);
         assert_eq!(client.cursor_col, prompt.chars().count());
+    }
+
+    #[test]
+    fn handshake_snapshot_rect_preserves_initial_cursor_column() {
+        use crate::protocol::{
+            CursorFrame, FEATURE_CURSOR_SYNC, Lane, LaneBudgetFrame, SyncConfigFrame,
+        };
+
+        let mut client = new_client();
+        let sync_config = SyncConfigFrame {
+            snapshot_budgets: vec![LaneBudgetFrame {
+                lane: Lane::Foreground,
+                max_updates: 128,
+            }],
+            delta_budget: 512,
+            heartbeat_ms: 250,
+            initial_snapshot_lines: 128,
+        };
+
+        client
+            .handle_host_frame(WireHostFrame::Hello {
+                subscription: 1,
+                max_seq: 0,
+                config: sync_config,
+                features: FEATURE_CURSOR_SYNC,
+            })
+            .expect("hello");
+
+        client
+            .handle_host_frame(WireHostFrame::Grid {
+                cols: 80,
+                history_rows: 0,
+                base_row: 0,
+                viewport_rows: Some(24),
+            })
+            .expect("grid");
+
+        let bottom_row = client.cursor_row as u32;
+        assert_eq!(client.cursor_col, 0);
+
+        client
+            .handle_host_frame(WireHostFrame::Snapshot {
+                subscription: 1,
+                lane: Lane::Foreground,
+                watermark: 1,
+                has_more: false,
+                updates: vec![pack_rect(0, bottom_row + 1, 0, 80, 1, ' ')],
+                cursor: None,
+            })
+            .expect("snapshot");
+
+        assert_eq!(client.cursor_col, 0);
+
+        client
+            .handle_host_frame(WireHostFrame::SnapshotComplete {
+                subscription: 1,
+                lane: Lane::Foreground,
+            })
+            .expect("snapshot complete");
+
+        let prompt = "$ ";
+        let prompt_len = prompt.chars().count();
+        client
+            .handle_host_frame(WireHostFrame::Delta {
+                subscription: 1,
+                watermark: 2,
+                has_more: false,
+                updates: vec![pack_row_segment(bottom_row, 0, 2, prompt)],
+                cursor: Some(CursorFrame {
+                    row: bottom_row,
+                    col: prompt_len as u32,
+                    seq: 2,
+                    visible: true,
+                    blink: true,
+                }),
+            })
+            .expect("delta prompt");
+
+        assert_eq!(client.cursor_col, prompt_len);
     }
 
     #[test]

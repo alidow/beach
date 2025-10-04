@@ -4,7 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::io::IsTerminal;
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 use crate::signaling::{
     generate_peer_id, ClientMessage, DebugRequest, DebugResponse, PeerRole, ServerMessage,
@@ -97,6 +97,7 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
         supported_transports: vec![TransportType::Direct],
         preferred_transport: Some(TransportType::Direct),
         label: None,
+        mcp: false,
     };
 
     let join_text = serde_json::to_string(&join_msg)?;
@@ -201,7 +202,10 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
                 Message::Text(text) => {
                     let server_msg: ServerMessage = serde_json::from_str(&text)?;
                     match server_msg {
-                        ServerMessage::Signal { from_peer, signal } => {
+                        ServerMessage::Signal {
+                            from_peer: _,
+                            signal,
+                        } => {
                             // Check if this is a debug response wrapped in Custom transport (now as serde_json::Value)
                             if let Some(transport) =
                                 signal.get("transport").and_then(|v| v.as_str())

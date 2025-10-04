@@ -2,6 +2,7 @@
 
 pub mod cache;
 pub mod client;
+pub mod mcp;
 pub mod model;
 pub mod protocol;
 pub mod server;

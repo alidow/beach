@@ -116,6 +116,8 @@ pub enum ClientMessage {
         preferred_transport: Option<TransportType>,
         #[serde(default)]
         label: Option<String>,
+        #[serde(default)]
+        mcp: bool,
     },
     Signal {
         to_peer: String,
@@ -181,6 +183,7 @@ impl SignalingClient {
         role: WebRtcRole,
         passphrase: Option<&str>,
         label: Option<String>,
+        request_mcp_channel: bool,
     ) -> Result<Arc<Self>, TransportError> {
         let websocket_url = derive_websocket_url(signaling_url)?;
         let (ws_stream, _) = connect_async(websocket_url.as_str())
@@ -286,6 +289,7 @@ impl SignalingClient {
             supported_transports: vec![TransportType::WebRTC],
             preferred_transport: Some(TransportType::WebRTC),
             label,
+            mcp: request_mcp_channel,
         };
         client
             .send_tx

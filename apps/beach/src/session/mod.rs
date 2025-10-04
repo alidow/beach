@@ -127,6 +127,7 @@ impl SessionManager {
         session_id: &str,
         join_code: &str,
         label: Option<&str>,
+        request_mcp: bool,
     ) -> Result<JoinedSession, SessionError> {
         validate_join_code(join_code)?;
 
@@ -135,6 +136,7 @@ impl SessionManager {
             label: label
                 .map(|value| value.trim().to_string())
                 .filter(|s| !s.is_empty()),
+            mcp: if request_mcp { Some(true) } else { None },
         };
 
         let response = self
@@ -421,6 +423,8 @@ struct JoinSessionRequest {
     passphrase: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -662,7 +666,7 @@ mod tests {
 
         let hosted = manager.host().await.unwrap();
         let joiner = manager
-            .join(hosted.session_id(), hosted.join_code(), None)
+            .join(hosted.session_id(), hosted.join_code(), None, false)
             .await
             .unwrap();
 
@@ -688,7 +692,7 @@ mod tests {
 
         let hosted = manager.host().await.unwrap();
         let err = manager
-            .join(hosted.session_id(), "000000", None)
+            .join(hosted.session_id(), "000000", None, false)
             .await
             .unwrap_err();
 

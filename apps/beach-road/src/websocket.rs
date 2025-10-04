@@ -31,6 +31,7 @@ struct PeerConnection {
     last_heartbeat: Arc<RwLock<std::time::Instant>>,
     label: Option<String>,
     remote_addr: Option<SocketAddr>,
+    mcp_requested: bool,
 }
 
 /// Global state for managing WebSocket connections
@@ -155,7 +156,11 @@ impl SignalingState {
                         joined_at: chrono::Utc::now().timestamp(),
                         supported_transports: entry.supported_transports.clone(),
                         preferred_transport: entry.preferred_transport.clone(),
-                        metadata: build_metadata(entry.label.as_ref(), entry.remote_addr),
+                        metadata: build_metadata(
+                            entry.label.as_ref(),
+                            entry.remote_addr,
+                            entry.mcp_requested,
+                        ),
                     })
                     .collect()
             })
@@ -232,6 +237,7 @@ impl SignalingState {
 fn build_metadata(
     label: Option<&String>,
     remote_addr: Option<SocketAddr>,
+    mcp_requested: bool,
 ) -> Option<HashMap<String, String>> {
     let mut map = HashMap::new();
     if let Some(label) = label {
@@ -242,6 +248,9 @@ fn build_metadata(
     }
     if let Some(addr) = remote_addr {
         map.insert("remote_addr".to_string(), addr.to_string());
+    }
+    if mcp_requested {
+        map.insert("mcp".to_string(), "true".to_string());
     }
     if map.is_empty() {
         None
@@ -442,6 +451,7 @@ async fn handle_client_message(
             supported_transports,
             preferred_transport,
             label,
+            mcp,
         } => {
             info!(
                 "📥 RECEIVED Join message from peer {} (client_peer_id: {:?}) for session {}",
@@ -472,6 +482,7 @@ async fn handle_client_message(
                 last_heartbeat: Arc::new(RwLock::new(std::time::Instant::now())),
                 label: label.clone(),
                 remote_addr,
+                mcp_requested: mcp,
             };
             state.add_peer(session_id.to_string(), peer_conn);
             info!(
@@ -526,7 +537,7 @@ async fn handle_client_message(
                             joined_at: chrono::Utc::now().timestamp(),
                             supported_transports,
                             preferred_transport,
-                            metadata: build_metadata(label.as_ref(), remote_addr),
+                            metadata: build_metadata(label.as_ref(), remote_addr, mcp),
                         },
                     },
                 )

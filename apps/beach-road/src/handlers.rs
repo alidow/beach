@@ -76,6 +76,8 @@ pub struct RegisterSessionResponse {
 #[derive(Debug, Deserialize)]
 pub struct JoinSessionRequest {
     pub passphrase: Option<String>,
+    #[serde(default)]
+    pub mcp: bool,
 }
 
 #[derive(Debug, Serialize)]

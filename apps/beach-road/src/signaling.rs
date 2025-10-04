@@ -95,6 +95,8 @@ pub enum ClientMessage {
         preferred_transport: Option<TransportType>,
         #[serde(default)]
         label: Option<String>,
+        #[serde(default)]
+        mcp: bool,
     },
     /// Negotiate transport to use with a peer
     NegotiateTransport {

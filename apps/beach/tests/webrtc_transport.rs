@@ -520,10 +520,10 @@ async fn webrtc_signaling_end_to_end() {
     let base_url = format!("http://{}/sessions/{}/webrtc", addr, SESSION_ID);
     let offer_fut = async {
         let (supervisor, accepted) =
-            OffererSupervisor::connect(&base_url, Duration::from_millis(50), None).await?;
+            OffererSupervisor::connect(&base_url, Duration::from_millis(50), None, false).await?;
         Ok::<(Arc<OffererSupervisor>, Arc<dyn Transport>), TransportError>((
             supervisor,
-            accepted.transport,
+            accepted.connection.transport(),
         ))
     };
     sleep(Duration::from_millis(50)).await;
@@ -533,6 +533,7 @@ async fn webrtc_signaling_end_to_end() {
         Duration::from_millis(50),
         None,
         None,
+        false,
     );
 
     let (offer_res, answer_res) = tokio::join!(
@@ -545,7 +546,8 @@ async fn webrtc_signaling_end_to_end() {
     let _offer_supervisor = offer_supervisor;
     let answer_transport = answer_res
         .expect("answer signaling timeout")
-        .expect("answer transport");
+        .expect("answer transport")
+        .transport();
 
     let server_heartbeat = HostFrame::Heartbeat {
         seq: 1,

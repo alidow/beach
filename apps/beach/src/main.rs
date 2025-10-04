@@ -448,6 +448,12 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
             wait_for_peer,
             args.mcp,
         )?;
+        // In bootstrap mode without wait_for_peer, exit immediately after emitting JSON
+        // This prevents the shell from starting and writing its prompt to the redirected stdout
+        if !wait_for_peer {
+            info!(session_id = %session_id, "bootstrap handshake emitted, exiting (no-wait mode)");
+            return Ok(());
+        }
     } else {
         print_host_banner(&hosted, &normalized_base, TransportKind::WebRtc, args.mcp);
     }
@@ -4831,6 +4837,7 @@ mod tests {
             TransportKind::WebRtc,
             &command,
             true,
+            false,
         );
         assert_eq!(handshake.schema, BootstrapHandshake::SCHEMA_VERSION);
         assert_eq!(handshake.session_id, "session-123");

@@ -40,6 +40,7 @@ export interface PredictedCell {
 interface PredictedPosition {
   row: number;
   col: number;
+  char: string;
 }
 
 interface PendingPredictionEntry {
@@ -58,6 +59,7 @@ export interface LoadedRow {
   absolute: number;
   latestSeq: number;
   cells: CellState[];
+  logicalWidth: number;
 }
 
 export interface PendingRow {
@@ -632,7 +634,7 @@ export class TerminalGridCache {
     return 0;
   }
 
-  private rowCommittedWidth(absolute: number): number {
+  private rowLogicalWidth(absolute: number): number {
     if (absolute < this.baseRow) {
       return 0;
     }
@@ -644,13 +646,7 @@ export class TerminalGridCache {
     if (!slot || slot.kind !== 'loaded') {
       return 0;
     }
-    for (let col = slot.cells.length - 1; col >= 0; col -= 1) {
-      const cell = slot.cells[col]!;
-      if (cell.seq > 0) {
-        return col + 1;
-      }
-    }
-    return 0;
+    return slot.logicalWidth;
   }
 
   private predictedRowWidth(absolute: number): number {
@@ -666,7 +662,11 @@ export class TerminalGridCache {
   }
 
   private rowEffectiveWidth(absolute: number): number {
-    return Math.max(this.rowCommittedWidth(absolute), this.predictedRowWidth(absolute));
+    return Math.max(
+      this.rowLogicalWidth(absolute),
+      this.rowDisplayWidth(absolute),
+      this.predictedRowWidth(absolute),
+    );
   }
 
   private predictionExists(row: number, col: number, seq: number): boolean {
@@ -687,6 +687,17 @@ export class TerminalGridCache {
       }
     }
     return false;
+  }
+
+  private cellMatches(row: number, col: number, char: string): boolean {
+    const slot = this.getRow(row);
+    if (!slot || slot.kind !== 'loaded') {
+      return char === ' ';
+    }
+    if (col >= slot.cells.length) {
+      return char === ' ';
+    }
+    return slot.cells[col]?.char === char;
   }
 
   private rowHasPredictions(row: number): boolean {
@@ -769,6 +780,7 @@ export class TerminalGridCache {
       cell.styleId = decoded.styleId;
       cell.seq = seq;
       loaded.latestSeq = Math.max(loaded.latestSeq, seq);
+      loaded.logicalWidth = Math.max(loaded.logicalWidth, col + 1);
       this.touchRow(row);
       return true;
     }
@@ -784,6 +796,8 @@ export class TerminalGridCache {
       mutated = true;
     }
     const debugChars: string[] = [];
+    let logical = 0;
+    let allSpaces = true;
     for (let col = 0; col < width; col += 1) {
       const packed = cells[col];
       const cell = loaded.cells[col]!;
@@ -805,9 +819,15 @@ export class TerminalGridCache {
           cell.seq = seq;
           mutated = true;
         }
+        if (decoded.char !== ' ') {
+          allSpaces = false;
+        }
       }
       if (typeof window !== 'undefined' && window.__BEACH_TRACE && col < 16) {
         debugChars[col] = cell.char ?? ' ';
+      }
+      if (packed !== undefined) {
+        logical = col + 1;
       }
     }
     if (typeof window !== 'undefined' && window.__BEACH_TRACE && row < this.baseRow + 5) {
@@ -819,6 +839,7 @@ export class TerminalGridCache {
       });
     }
     loaded.latestSeq = Math.max(loaded.latestSeq, seq);
+    loaded.logicalWidth = allSpaces ? 0 : logical;
     const viewportMoved = this.touchRow(row);
     return mutated || viewportMoved;
   }
@@ -830,6 +851,8 @@ export class TerminalGridCache {
     if (this.ensureCols(endCol)) {
       mutated = true;
     }
+    let logical = 0;
+    let allSpaces = true;
     for (let index = 0; index < cells.length; index += 1) {
       const col = startCol + index;
       const packed = cells[index]!;
@@ -843,7 +866,11 @@ export class TerminalGridCache {
           cell.seq = seq;
           mutated = true;
         }
+        if (decoded.char !== ' ') {
+          allSpaces = false;
+        }
       }
+      logical = col + 1;
     }
     if (startCol === 0) {
       for (let col = endCol; col < loaded.cells.length; col += 1) {
@@ -855,6 +882,11 @@ export class TerminalGridCache {
           cell.seq = seq;
           mutated = true;
         }
+      }
+      loaded.logicalWidth = allSpaces ? 0 : logical;
+    } else {
+      if (!allSpaces) {
+        loaded.logicalWidth = Math.max(loaded.logicalWidth, logical);
       }
     }
     loaded.latestSeq = Math.max(loaded.latestSeq, seq);
@@ -886,6 +918,11 @@ export class TerminalGridCache {
         }
       }
       loaded.latestSeq = Math.max(loaded.latestSeq, seq);
+      if (decoded.char !== ' ') {
+        loaded.logicalWidth = Math.max(loaded.logicalWidth, width);
+      } else if (colRange[0] === 0 && width >= loaded.logicalWidth) {
+        loaded.logicalWidth = colRange[0];
+      }
       const viewportMoved = this.touchRow(row);
       mutated = mutated || viewportMoved;
     }
@@ -955,6 +992,7 @@ export class TerminalGridCache {
       absolute,
       latestSeq: 0,
       cells: createBlankRow(initialWidth),
+      logicalWidth: 0,
     };
     this.rows[index] = loaded;
     return loaded;
@@ -1000,9 +1038,12 @@ export class TerminalGridCache {
 
     const positions: PredictedPosition[] = [];
 
-    const recordPosition = (row: number, col: number) => {
-      if (!positions.some((pos) => pos.row === row && pos.col === col)) {
-        positions.push({ row, col });
+    const recordPosition = (row: number, col: number, char: string) => {
+      const existing = positions.find((pos) => pos.row === row && pos.col === col);
+      if (existing) {
+        existing.char = char;
+      } else {
+        positions.push({ row, col, char });
       }
     };
 
@@ -1035,7 +1076,7 @@ export class TerminalGridCache {
           const row = currentRow;
           const col = currentCol;
           mutated = this.setPrediction(row, col, seq, ' ') || mutated;
-          recordPosition(row, col);
+          recordPosition(row, col, ' ');
           cursorMoved = true;
         }
         continue;
@@ -1048,7 +1089,7 @@ export class TerminalGridCache {
       const col = currentCol;
       const char = String.fromCharCode(byte);
       mutated = this.setPrediction(row, col, seq, char) || mutated;
-      recordPosition(row, col);
+      recordPosition(row, col, char);
       const next = this.nextCursorPosition(row, col, char);
       currentRow = next.row;
       currentCol = next.col;
@@ -1109,6 +1150,17 @@ export class TerminalGridCache {
       if (entry.ackedAt === null || entry.ackedAt < timestampMs) {
         entry.ackedAt = timestampMs;
       }
+      const committed = entry.positions.every((pos) => {
+        return !this.predictionExists(pos.row, pos.col, seq) || this.cellMatches(pos.row, pos.col, pos.char);
+      });
+      if (committed) {
+        this.pendingPredictions.delete(seq);
+        let mutated = false;
+        for (const { row, col } of entry.positions) {
+          mutated = this.clearPredictionAt(row, col) || mutated;
+        }
+        return mutated;
+      }
       return false;
     }
     return this.clearPredictionSeq(seq);
@@ -1121,7 +1173,7 @@ export class TerminalGridCache {
       if (entry.ackedAt === null) {
         continue;
       }
-      if (!this.seqHasPredictions(seq) && nowMs - entry.ackedAt >= graceMs) {
+      if (nowMs - entry.ackedAt >= graceMs) {
         expired.push(seq);
       }
     }
@@ -1130,7 +1182,18 @@ export class TerminalGridCache {
     }
     let mutated = false;
     for (const seq of expired) {
-      mutated = this.clearPredictionSeq(seq) || mutated;
+      const entry = this.pendingPredictions.get(seq);
+      if (entry) {
+        const committed = entry.positions.every((pos) => {
+          return !this.predictionExists(pos.row, pos.col, seq) || this.cellMatches(pos.row, pos.col, pos.char);
+        });
+        if (committed) {
+          this.pendingPredictions.delete(seq);
+          for (const { row, col } of entry.positions) {
+            mutated = this.clearPredictionAt(row, col) || mutated;
+          }
+        }
+      }
     }
     return mutated;
   }
@@ -1402,6 +1465,7 @@ function cloneRowSlot(slot: RowSlot): RowSlot {
         absolute: slot.absolute,
         latestSeq: slot.latestSeq,
         cells: slot.cells.map((cell) => ({ ...cell })),
+        logicalWidth: slot.logicalWidth,
       };
     case 'pending':
       return { kind: 'pending', absolute: slot.absolute };

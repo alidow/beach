@@ -1288,35 +1288,7 @@ impl TerminalClient {
     fn apply_wire_update(&mut self, update: &WireUpdate) {
         use CursorHint::*;
 
-        let cursor_hint = if self.cursor_authoritative || self.cursor_authoritative_pending {
-            None
-        } else {
-            match update {
-                WireUpdate::Cell { row, col, .. } => {
-                    Some(Exact(*row as usize, (*col as usize).saturating_add(1)))
-                }
-                WireUpdate::Row { row, .. } => Some(RowWidth(*row as usize)),
-                WireUpdate::Rect { rows, cols, .. } => {
-                    let target_row = rows[1] as usize;
-                    let target_col = cols[1] as usize;
-                    Some(Exact(target_row.saturating_sub(1), target_col))
-                }
-                WireUpdate::RowSegment {
-                    row,
-                    start_col,
-                    cells,
-                    ..
-                } => cells
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, _)| {
-                        Exact(*row as usize, (*start_col as usize).saturating_add(idx + 1))
-                    })
-                    .last(),
-                WireUpdate::Trim { .. } => None,
-                WireUpdate::Style { .. } => None,
-            }
-        };
+        let mut cursor_hint: Option<CursorHint> = None;
 
         match update {
             WireUpdate::Cell {
@@ -1337,6 +1309,11 @@ impl TerminalClient {
                     .apply_cell(*row as usize, *col as usize, *seq, ch, style);
                 self.note_loaded_row(*row as u64);
                 self.clear_empty_tail_ranges(*row as u64, (*row as u64).saturating_add(1));
+                if !self.cursor_authoritative && !self.cursor_authoritative_pending {
+                    let width = self.renderer.effective_row_width(*row as u64);
+                    let target = width.max((*col as usize).saturating_add(1));
+                    cursor_hint = Some(Exact(*row as usize, target));
+                }
             }
             WireUpdate::Row { row, seq, cells } => {
                 trace!(
@@ -1352,6 +1329,10 @@ impl TerminalClient {
                     .apply_row_from_cells(*row as usize, *seq, &decoded);
                 self.note_loaded_row(*row as u64);
                 self.clear_empty_tail_ranges(*row as u64, (*row as u64).saturating_add(1));
+                if !self.cursor_authoritative && !self.cursor_authoritative_pending {
+                    let width = self.renderer.effective_row_width(*row as u64);
+                    cursor_hint = Some(Exact(*row as usize, width));
+                }
             }
             WireUpdate::Rect {
                 rows,
@@ -1375,6 +1356,13 @@ impl TerminalClient {
                     self.note_loaded_row(r as u64);
                 }
                 self.clear_empty_tail_ranges(rows[0] as u64, rows[1] as u64);
+                if !self.cursor_authoritative && !self.cursor_authoritative_pending {
+                    if let Some(&target_row) = rows.last() {
+                        let row_idx = target_row.saturating_sub(1) as usize;
+                        let width = self.renderer.effective_row_width(row_idx as u64);
+                        cursor_hint = Some(Exact(row_idx, width));
+                    }
+                }
             }
             WireUpdate::RowSegment {
                 row,
@@ -1400,6 +1388,10 @@ impl TerminalClient {
                     self.renderer.apply_segment(*row as usize, &segment);
                     self.note_loaded_row(*row as u64);
                     self.clear_empty_tail_ranges(*row as u64, (*row as u64).saturating_add(1));
+                    if !self.cursor_authoritative && !self.cursor_authoritative_pending {
+                        let width = self.renderer.effective_row_width(*row as u64);
+                        cursor_hint = Some(Exact(*row as usize, width));
+                    }
                 }
             }
             WireUpdate::Trim { start, count, .. } => {
@@ -1426,7 +1418,7 @@ impl TerminalClient {
                     }
                 }
                 self.pending_predictions.values_mut().for_each(|pending| {
-                    pending.positions.retain(|(row, _)| *row >= start + count);
+                    pending.positions.retain(|pos| pos.row >= start + count);
                 });
                 self.pending_predictions
                     .retain(|_, pending| !pending.positions.is_empty());
@@ -1477,19 +1469,6 @@ impl TerminalClient {
                     }
                     self.cursor_row = row;
                     self.cursor_col = target_col;
-                }
-                RowWidth(row) => {
-                    let width = self.renderer.effective_row_width(row as u64);
-                    self.cursor_row = row;
-                    if self.row_has_predictions(row) {
-                        let mut target = width;
-                        if row == previous_row {
-                            target = target.max(previous_col);
-                        }
-                        self.cursor_col = target;
-                    } else {
-                        self.cursor_col = width;
-                    }
                 }
             }
         }
@@ -2883,10 +2862,13 @@ impl TerminalClient {
             prediction.acked_at = Some(now);
             sent_at = Some(prediction.sent_at);
         }
-        if let Some(sent) = sent_at {
-            self.record_prediction_ack(sent);
+        if self.pending_predictions.contains_key(&seq) {
+            self.try_clear_prediction(seq, now);
         } else {
             self.renderer.clear_prediction_seq(seq);
+        }
+        if let Some(sent) = sent_at {
+            self.record_prediction_ack(sent);
         }
         self.force_render = true;
         self.update_prediction_overlay();
@@ -2907,11 +2889,16 @@ impl TerminalClient {
         let mut cursor_row = self.cursor_row;
         let mut cursor_col = self.cursor_col;
         let mut cursor_changed = false;
-        let mut positions: Vec<(usize, usize)> = Vec::new();
+        let mut positions: Vec<PredictedPosition> = Vec::new();
 
-        let mut push_position = |row: usize, col: usize| {
-            if !positions.iter().any(|&(r, c)| r == row && c == col) {
-                positions.push((row, col));
+        let mut push_position = |row: usize, col: usize, ch: char| {
+            if let Some(existing) = positions
+                .iter_mut()
+                .find(|pos| pos.row == row && pos.col == col)
+            {
+                existing.ch = ch;
+            } else {
+                positions.push(PredictedPosition { row, col, ch });
             }
         };
 
@@ -2945,7 +2932,7 @@ impl TerminalClient {
                         let row = cursor_row;
                         let col = cursor_col;
                         self.renderer.add_prediction(row, col, seq, ' ');
-                        push_position(row, col);
+                        push_position(row, col, ' ');
                         cursor_changed = true;
                     }
                 }
@@ -2955,7 +2942,7 @@ impl TerminalClient {
                     let row = cursor_row;
                     let col = cursor_col;
                     self.renderer.add_prediction(row, col, seq, ch);
-                    push_position(row, col);
+                    push_position(row, col, ch);
                     cursor_col = cursor_col.saturating_add(1);
                     cursor_changed = true;
                 }
@@ -2990,12 +2977,10 @@ impl TerminalClient {
         for (&seq, prediction) in self.pending_predictions.iter_mut() {
             prediction
                 .positions
-                .retain(|&(row, col)| self.renderer.prediction_exists(row, col, seq));
+                .retain(|pos| self.renderer.prediction_exists(pos.row, pos.col, seq));
 
             if let Some(acked_at) = prediction.acked_at {
-                if !self.renderer.seq_has_predictions(seq)
-                    && now.saturating_duration_since(acked_at) >= PREDICTION_ACK_GRACE
-                {
+                if now.saturating_duration_since(acked_at) >= PREDICTION_ACK_GRACE {
                     expired.push(seq);
                 }
             }
@@ -3005,19 +2990,32 @@ impl TerminalClient {
             return;
         }
 
-        for seq in &expired {
-            self.renderer.clear_prediction_seq(*seq);
-        }
-
-        let mut removed = false;
         for seq in expired {
-            if self.pending_predictions.remove(&seq).is_some() {
-                removed = true;
-            }
+            self.try_clear_prediction(seq, now);
         }
+    }
 
-        if removed {
-            self.force_render = true;
+    fn try_clear_prediction(&mut self, seq: Seq, now: Instant) -> bool {
+        if let Some(prediction) = self.pending_predictions.remove(&seq) {
+            let overlay_gone = prediction
+                .positions
+                .iter()
+                .all(|pos| !self.renderer.prediction_exists(pos.row, pos.col, seq));
+            let committed = prediction
+                .positions
+                .iter()
+                .all(|pos| self.renderer.cell_matches(pos.row, pos.col, pos.ch));
+            if overlay_gone || committed {
+                self.renderer.clear_prediction_seq(seq);
+                self.force_render = true;
+                self.prediction_last_quick_confirmation = Some(now);
+                true
+            } else {
+                self.pending_predictions.insert(seq, prediction);
+                false
+            }
+        } else {
+            false
         }
     }
 
@@ -3027,7 +3025,7 @@ impl TerminalClient {
         }
         self.pending_predictions
             .values()
-            .any(|pending| pending.positions.iter().any(|&(r, _)| r == row))
+            .any(|pending| pending.positions.iter().any(|pos| pos.row == row))
     }
 
     fn update_prediction_overlay(&mut self) {
@@ -3234,15 +3232,20 @@ impl CopyModeState {
 }
 
 #[derive(Clone, Debug)]
+struct PredictedPosition {
+    row: usize,
+    col: usize,
+    ch: char,
+}
+
 struct PendingPrediction {
-    positions: Vec<(usize, usize)>,
+    positions: Vec<PredictedPosition>,
     sent_at: Instant,
     acked_at: Option<Instant>,
 }
 
 enum CursorHint {
     Exact(usize, usize),
-    RowWidth(usize),
 }
 
 fn encode_key_event(key: KeyEvent) -> Option<Vec<u8>> {
@@ -3703,12 +3706,66 @@ mod tests {
         }
     }
 
+    fn pack_rect(row_start: u32, row_end: u32, col_start: u32, col_end: u32, seq: u64, ch: char) -> WireUpdate {
+        WireUpdate::Rect {
+            rows: [row_start, row_end],
+            cols: [col_start, col_end],
+            seq,
+            cell: pack_char(ch),
+        }
+    }
+
     fn new_client() -> TerminalClient {
         TerminalClient::new(Arc::new(NullTransport::default())).with_render(false)
     }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn rect_of_spaces_does_not_push_cursor() {
+        let mut client = new_client();
+        client.renderer.ensure_size(1, 80);
+
+        client.apply_wire_update(&pack_rect(0, 1, 0, 80, 1, ' '));
+        assert_eq!(client.cursor_row, 0);
+        assert_eq!(client.cursor_col, 0);
+
+        let prompt = "[user@host ~]$ ";
+        client.apply_wire_update(&pack_row_segment(0, 0, 2, prompt));
+        assert_eq!(client.cursor_row, 0);
+        assert_eq!(client.cursor_col, prompt.chars().count());
+    }
+
+    #[test]
+    fn predictive_space_ack_clears_overlay() {
+        let mut client = new_client();
+        client.render_enabled = true;
+        client.predictive_input = true;
+        client.renderer.ensure_size(1, 4);
+
+        client.register_prediction(1, b" ");
+        assert!(client.renderer.has_active_predictions());
+        assert!(!client.pending_predictions.is_empty());
+
+        client.handle_input_ack(1);
+        assert!(!client.renderer.has_active_predictions());
+        assert!(client.pending_predictions.is_empty());
+    }
+
+    #[test]
+    fn ctrl_u_clears_line_and_resets_cursor() {
+        let mut client = new_client();
+        let prompt = "$ ";
+        client.apply_wire_update(&pack_row_segment(0, 0, 1, prompt));
+        let typed = "$ hello";
+        client.apply_wire_update(&pack_row_segment(0, 0, 2, typed));
+        assert_eq!(client.cursor_col, typed.chars().count());
+
+        let blanks = " ".repeat(typed.chars().count());
+        client.apply_wire_update(&pack_row_segment(0, 0, 3, &blanks));
+        assert_eq!(client.cursor_col, 0);
     }
 
     #[test]

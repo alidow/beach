@@ -25,6 +25,27 @@ describe('TerminalGridCache cursor hints', () => {
     expect(snapshot.cursorCol).toBe(2);
   });
 
+  it('keeps cursor at zero after a rect of spaces', () => {
+    const cache = new TerminalGridCache({ initialCols: 80 });
+    cache.setGridSize(1, 80);
+
+    cache.applyUpdates([
+      { type: 'rect', rows: [0, 1], cols: [0, 80], seq: 1, cell: packCell(' ', DEFAULT_STYLE) },
+    ]);
+
+    let snapshot = cache.snapshot();
+    expect(snapshot.cursorRow).toBe(0);
+    expect(snapshot.cursorCol).toBe(0);
+
+    const prompt = '[user@host ~]$ ';
+    cache.applyUpdates([
+      { type: 'row_segment', row: 0, startCol: 0, seq: 2, cells: packString(prompt) },
+    ]);
+
+    snapshot = cache.snapshot();
+    expect(snapshot.cursorCol).toBe(prompt.length);
+  });
+
   it('treats cursor hints as mutations even when the grid cells stay unchanged', () => {
     const cache = new TerminalGridCache({ initialCols: 80 });
     cache.setGridSize(1, 80);
@@ -107,6 +128,40 @@ describe('TerminalGridCache cursor hints', () => {
     cache.clearPredictionSeq(3);
     snapshot = cache.snapshot();
     expect(snapshot.predictedCursor).toBeNull();
+  });
+
+  it('clears predicted spaces when acked without output', () => {
+    const cache = new TerminalGridCache({ initialCols: 16 });
+    cache.setGridSize(1, 16);
+    cache.registerPrediction(1, stringToBytes(' '));
+    let snapshot = cache.snapshot();
+    expect(snapshot.hasPredictions).toBe(true);
+
+    cache.ackPrediction(1, 100);
+    snapshot = cache.snapshot();
+    expect(snapshot.hasPredictions).toBe(false);
+  });
+
+  it('resets cursor when a row segment of spaces clears the line', () => {
+    const cache = new TerminalGridCache({ initialCols: 80 });
+    cache.setGridSize(1, 80);
+    const prompt = '$ ';
+    cache.applyUpdates([
+      { type: 'row_segment', row: 0, startCol: 0, seq: 1, cells: packString(prompt) },
+    ]);
+    const typed = '$ hello';
+    cache.applyUpdates([
+      { type: 'row_segment', row: 0, startCol: 0, seq: 2, cells: packString(typed) },
+    ]);
+    let snapshot = cache.snapshot();
+    expect(snapshot.cursorCol).toBe(typed.length);
+
+    const blanks = ' '.repeat(typed.length);
+    cache.applyUpdates([
+      { type: 'row_segment', row: 0, startCol: 0, seq: 3, cells: packString(blanks) },
+    ]);
+    snapshot = cache.snapshot();
+    expect(snapshot.cursorCol).toBe(0);
   });
 });
 

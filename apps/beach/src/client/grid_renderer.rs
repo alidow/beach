@@ -141,6 +141,7 @@ struct GridUpdateDebugContext {
 struct RowState {
     cells: Vec<CellState>,
     latest_seq: Seq,
+    logical_width: usize,
 }
 
 impl RowState {
@@ -148,6 +149,7 @@ impl RowState {
         Self {
             cells: vec![CellState::blank(); cols.max(1)],
             latest_seq: 0,
+            logical_width: 0,
         }
     }
 
@@ -412,6 +414,7 @@ impl GridRenderer {
                     cell.seq = seq;
                     cell.style_id = style_id;
                     state.latest_seq = state.latest_seq.max(seq);
+                    state.logical_width = state.logical_width.max(col.saturating_add(1));
                     self.mark_dirty();
                     trace!(
                         target = "client::render",
@@ -449,6 +452,8 @@ impl GridRenderer {
                 if seq < state.latest_seq {
                     return;
                 }
+                let mut logical = 0usize;
+                let mut all_spaces = true;
                 for (col, ch) in text.chars().enumerate() {
                     let cell = &mut state.cells[col];
                     if seq >= cell.seq {
@@ -462,6 +467,10 @@ impl GridRenderer {
                             absolute_row, col, seq, "apply_row_from_text"
                         );
                     }
+                    if ch != ' ' {
+                        all_spaces = false;
+                    }
+                    logical = col + 1;
                 }
                 for col in width..total_cols {
                     let cell = &mut state.cells[col];
@@ -474,6 +483,7 @@ impl GridRenderer {
                     }
                 }
                 state.latest_seq = state.latest_seq.max(seq);
+                state.logical_width = if all_spaces { 0 } else { logical };
             }
 
             for col in columns_to_clear {
@@ -511,6 +521,8 @@ impl GridRenderer {
                 if seq < state.latest_seq {
                     return;
                 }
+                let mut logical = 0usize;
+                let mut all_spaces = true;
                 for (col, (ch, style_id)) in cells.iter().enumerate() {
                     let cell = &mut state.cells[col];
                     if seq >= cell.seq {
@@ -527,6 +539,10 @@ impl GridRenderer {
                             "apply_row_from_cells"
                         );
                     }
+                    if *ch != ' ' {
+                        all_spaces = false;
+                    }
+                    logical = col + 1;
                 }
                 for col in cells.len()..total_cols {
                     let cell = &mut state.cells[col];
@@ -539,6 +555,7 @@ impl GridRenderer {
                     }
                 }
                 state.latest_seq = state.latest_seq.max(seq);
+                state.logical_width = if all_spaces { 0 } else { logical };
             }
 
             for col in columns_to_clear {
@@ -566,6 +583,11 @@ impl GridRenderer {
                 let mut cleared_cols: Vec<usize> = Vec::new();
                 let mut touched = false;
                 if let Some(state) = self.row_state_mut(rel) {
+                    if ch != ' ' {
+                        state.logical_width = state.logical_width.max(cols.end);
+                    } else if cols.start == 0 && cols.end >= state.logical_width {
+                        state.logical_width = cols.start;
+                    }
                     for col in cols.clone() {
                         let cell = &mut state.cells[col];
                         if seq >= cell.seq {
@@ -627,6 +649,11 @@ impl GridRenderer {
                             .last()
                             .map(|(col, _, _, _)| col.saturating_add(1))
                             .unwrap_or(0);
+                        if cells.iter().any(|(_, _, ch, _)| *ch != ' ') {
+                            state.logical_width = end_col;
+                        } else {
+                            state.logical_width = 0;
+                        }
                         if end_col < state.cells.len() {
                             for (offset, cell) in state.cells.iter_mut().enumerate().skip(end_col) {
                                 if last_seq >= cell.seq {
@@ -766,21 +793,25 @@ impl GridRenderer {
         self.predictions.values().any(|cell| cell.seq == seq)
     }
 
-    pub fn committed_row_width(&self, absolute_row: u64) -> usize {
-        let Some(rel) = self.relative_row(absolute_row) else {
-            return 0;
-        };
-        match self.rows.get(rel) {
-            Some(RowSlot::Loaded(state)) => state
-                .cells
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(_, cell)| cell.seq > 0)
-                .map(|(idx, _)| idx + 1)
-                .unwrap_or(0),
-            _ => 0,
+    pub fn cell_matches(&self, row: usize, col: usize, ch: char) -> bool {
+        let absolute = row as u64;
+        if let Some(rel) = self.relative_row(absolute) {
+            if let Some(RowSlot::Loaded(state)) = self.rows.get(rel) {
+                if col < state.cells.len() {
+                    return state.cells[col].ch == ch;
+                }
+            }
         }
+        ch == ' '
+    }
+
+    fn logical_row_width(&self, absolute_row: u64) -> usize {
+        self.relative_row(absolute_row)
+            .and_then(|rel| match self.rows.get(rel) {
+                Some(RowSlot::Loaded(state)) => Some(state.logical_width),
+                _ => None,
+            })
+            .unwrap_or(0)
     }
 
     pub fn predicted_row_width(&self, absolute_row: u64) -> usize {
@@ -793,7 +824,9 @@ impl GridRenderer {
     }
 
     pub fn effective_row_width(&self, absolute_row: u64) -> usize {
-        let committed = self.committed_row_width(absolute_row);
+        let committed = self
+            .logical_row_width(absolute_row)
+            .max(self.row_display_width(absolute_row));
         let predicted = self.predicted_row_width(absolute_row);
         committed.max(predicted)
     }

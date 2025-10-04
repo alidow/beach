@@ -12,7 +12,6 @@ use axum::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
@@ -72,7 +71,7 @@ async fn main() {
         }
     };
 
-    let shared_storage: SharedStorage = Arc::new(Mutex::new(storage));
+    let shared_storage: SharedStorage = Arc::new(storage);
 
     // Initialize WebSocket signaling state
     let signaling_state = SignalingState::new(shared_storage.clone());

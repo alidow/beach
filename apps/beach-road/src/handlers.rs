@@ -7,7 +7,6 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::{debug, error};
 
 use crate::{
@@ -16,7 +15,7 @@ use crate::{
     storage::{SessionInfo, Storage},
 };
 
-pub type SharedStorage = Arc<Mutex<Storage>>;
+pub type SharedStorage = Arc<Storage>;
 
 #[derive(Debug, Serialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
@@ -138,7 +137,7 @@ pub async fn register_session(
 ) -> Result<Json<RegisterSessionResponse>, StatusCode> {
     debug!("Registering session: {}", payload.session_id);
 
-    let mut storage = storage.lock().await;
+    let storage = (*storage).clone();
 
     // Check if session already exists
     match storage.session_exists(&payload.session_id).await {
@@ -222,7 +221,7 @@ pub async fn join_session(
 ) -> Result<Json<JoinSessionResponse>, StatusCode> {
     debug!("Client attempting to join session: {}", session_id);
 
-    let mut storage = storage.lock().await;
+    let storage = (*storage).clone();
 
     match storage.get_session(&session_id).await {
         Ok(Some(session)) => {
@@ -330,7 +329,7 @@ pub async fn post_webrtc_offer(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let mut storage = storage.lock().await;
+    let storage = (*storage).clone();
     if !storage
         .session_exists(&session_id)
         .await
@@ -363,7 +362,7 @@ pub async fn get_webrtc_offer(
     Path(session_id): Path<String>,
     Query(params): Query<OfferQuery>,
 ) -> Result<Json<WebRtcSdpPayload>, StatusCode> {
-    let mut storage = storage.lock().await;
+    let storage = (*storage).clone();
     match storage
         .pop_webrtc_offer_for_peer(&session_id, &params.peer_id)
         .await
@@ -390,7 +389,7 @@ pub async fn post_webrtc_answer(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let mut storage = storage.lock().await;
+    let storage = (*storage).clone();
     if !storage
         .session_exists(&session_id)
         .await
@@ -422,7 +421,7 @@ pub async fn get_webrtc_answer(
     Path(session_id): Path<String>,
     Query(params): Query<AnswerQuery>,
 ) -> Result<Json<WebRtcSdpPayload>, StatusCode> {
-    let mut storage = storage.lock().await;
+    let storage = (*storage).clone();
     match storage
         .take_webrtc_answer(&session_id, &params.handshake_id)
         .await
@@ -442,7 +441,7 @@ pub async fn get_session_status(
     State(storage): State<SharedStorage>,
     Path(session_id): Path<String>,
 ) -> Result<Json<SessionStatusResponse>, StatusCode> {
-    let mut storage = storage.lock().await;
+    let storage = (*storage).clone();
 
     match storage.get_session(&session_id).await {
         Ok(Some(session)) => Ok(Json(SessionStatusResponse {

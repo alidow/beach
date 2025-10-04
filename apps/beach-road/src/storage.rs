@@ -46,21 +46,22 @@ impl Storage {
         Ok(Self { redis, ttl_seconds })
     }
 
-    pub async fn register_session(&mut self, session: SessionInfo) -> Result<()> {
+    pub async fn register_session(&self, session: SessionInfo) -> Result<()> {
+        let mut conn = self.redis.clone();
         let key = format!("session:{}", session.session_id);
         let value = serde_json::to_string(&session)?;
 
         // Set with TTL
-        self.redis
-            .set_ex::<_, _, ()>(&key, value, self.ttl_seconds)
+        conn.set_ex::<_, _, ()>(&key, value, self.ttl_seconds)
             .await?;
 
         Ok(())
     }
 
-    pub async fn get_session(&mut self, session_id: &str) -> Result<Option<SessionInfo>> {
+    pub async fn get_session(&self, session_id: &str) -> Result<Option<SessionInfo>> {
+        let mut conn = self.redis.clone();
         let key = format!("session:{}", session_id);
-        let value: Option<String> = self.redis.get(&key).await?;
+        let value: Option<String> = conn.get(&key).await?;
 
         match value {
             Some(json) => {
@@ -71,42 +72,46 @@ impl Storage {
         }
     }
 
-    pub async fn session_exists(&mut self, session_id: &str) -> Result<bool> {
+    pub async fn session_exists(&self, session_id: &str) -> Result<bool> {
+        let mut conn = self.redis.clone();
         let key = format!("session:{}", session_id);
-        let exists: bool = self.redis.exists(&key).await?;
+        let exists: bool = conn.exists(&key).await?;
         Ok(exists)
     }
 
-    pub async fn delete_session(&mut self, session_id: &str) -> Result<()> {
+    pub async fn delete_session(&self, session_id: &str) -> Result<()> {
+        let mut conn = self.redis.clone();
         let key = format!("session:{}", session_id);
-        self.redis.del::<_, ()>(&key).await?;
+        conn.del::<_, ()>(&key).await?;
         Ok(())
     }
 
-    pub async fn update_session_ttl(&mut self, session_id: &str) -> Result<()> {
+    pub async fn update_session_ttl(&self, session_id: &str) -> Result<()> {
+        let mut conn = self.redis.clone();
         let key = format!("session:{}", session_id);
-        self.redis
+        conn
             .expire::<_, ()>(&key, self.ttl_seconds as i64)
             .await?;
         Ok(())
     }
 
     pub async fn push_webrtc_offer(
-        &mut self,
+        &self,
         session_id: &str,
         payload: &WebRtcSdpPayload,
     ) -> Result<()> {
+        let mut conn = self.redis.clone();
         let payload_key = offer_payload_key(session_id, &payload.handshake_id);
         let serialized = serde_json::to_string(payload)?;
-        self.redis
+        conn
             .set_ex::<_, _, ()>(&payload_key, serialized, self.ttl_seconds)
             .await?;
 
         let queue_key = offer_queue_key(session_id, &payload.to_peer);
-        self.redis
+        conn
             .rpush::<_, _, ()>(&queue_key, payload.handshake_id.clone())
             .await?;
-        self.redis
+        conn
             .expire::<_, ()>(&queue_key, self.ttl_seconds as i64)
             .await?;
 
@@ -114,25 +119,26 @@ impl Storage {
     }
 
     pub async fn pop_webrtc_offer_for_peer(
-        &mut self,
+        &self,
         session_id: &str,
         peer_id: &str,
     ) -> Result<Option<WebRtcSdpPayload>> {
+        let mut conn = self.redis.clone();
         let queue_key = offer_queue_key(session_id, peer_id);
 
         loop {
-            let handshake_id: Option<String> = self.redis.lpop(&queue_key, None).await?;
+            let handshake_id: Option<String> = conn.lpop(&queue_key, None).await?;
             let Some(handshake_id) = handshake_id else {
                 return Ok(None);
             };
 
             let payload_key = offer_payload_key(session_id, &handshake_id);
-            let serialized: Option<String> = self.redis.get(&payload_key).await?;
+            let serialized: Option<String> = conn.get(&payload_key).await?;
             match serialized {
                 Some(json) => {
                     let payload: WebRtcSdpPayload = serde_json::from_str(&json)?;
                     if payload.to_peer != peer_id {
-                        self.redis.del::<_, ()>(&payload_key).await?;
+                        conn.del::<_, ()>(&payload_key).await?;
                         continue;
                     }
                     return Ok(Some(payload));
@@ -143,51 +149,55 @@ impl Storage {
     }
 
     pub async fn remove_offer_from_queue(
-        &mut self,
+        &self,
         session_id: &str,
         peer_id: &str,
         handshake_id: &str,
     ) -> Result<()> {
+        let mut conn = self.redis.clone();
         let queue_key = offer_queue_key(session_id, peer_id);
-        self.redis
+        conn
             .lrem::<_, _, ()>(&queue_key, 0, handshake_id)
             .await?;
         Ok(())
     }
 
     pub async fn clear_webrtc_offer_payload(
-        &mut self,
+        &self,
         session_id: &str,
         handshake_id: &str,
     ) -> Result<()> {
+        let mut conn = self.redis.clone();
         let key = offer_payload_key(session_id, handshake_id);
-        self.redis.del::<_, ()>(&key).await?;
+        conn.del::<_, ()>(&key).await?;
         Ok(())
     }
 
     pub async fn store_webrtc_answer(
-        &mut self,
+        &self,
         session_id: &str,
         payload: &WebRtcSdpPayload,
     ) -> Result<()> {
+        let mut conn = self.redis.clone();
         let key = answer_payload_key(session_id, &payload.handshake_id);
         let serialized = serde_json::to_string(payload)?;
-        self.redis
+        conn
             .set_ex::<_, _, ()>(&key, serialized, self.ttl_seconds)
             .await?;
         Ok(())
     }
 
     pub async fn take_webrtc_answer(
-        &mut self,
+        &self,
         session_id: &str,
         handshake_id: &str,
     ) -> Result<Option<WebRtcSdpPayload>> {
+        let mut conn = self.redis.clone();
         let key = answer_payload_key(session_id, handshake_id);
-        let serialized: Option<String> = self.redis.get(&key).await?;
+        let serialized: Option<String> = conn.get(&key).await?;
         match serialized {
             Some(json) => {
-                self.redis.del::<_, ()>(&key).await?;
+                conn.del::<_, ()>(&key).await?;
                 let payload = serde_json::from_str(&json)?;
                 Ok(Some(payload))
             }

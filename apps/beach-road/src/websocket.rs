@@ -69,6 +69,8 @@ impl SignalingState {
             let mut stale_peers = Vec::new();
 
             // Find stale connections
+            // Collect peer heartbeat locks first to avoid holding DashMap guards across await
+            let mut heartbeat_checks = Vec::new();
             for session_entry in self.sessions.iter() {
                 let session_id = session_entry.key().clone();
                 let peers = session_entry.value();
@@ -76,11 +78,15 @@ impl SignalingState {
                 for peer_entry in peers.iter() {
                     let peer_id = peer_entry.key().clone();
                     let peer = peer_entry.value();
+                    heartbeat_checks.push((session_id.clone(), peer_id.clone(), peer.last_heartbeat.clone()));
+                }
+            }
 
-                    let last_heartbeat = *peer.last_heartbeat.read().await;
-                    if last_heartbeat.elapsed() > timeout {
-                        stale_peers.push((session_id.clone(), peer_id.clone()));
-                    }
+            // Now check heartbeats without holding DashMap guards
+            for (session_id, peer_id, heartbeat_lock) in heartbeat_checks {
+                let last_heartbeat = *heartbeat_lock.read().await;
+                if last_heartbeat.elapsed() > timeout {
+                    stale_peers.push((session_id, peer_id));
                 }
             }
 
@@ -119,12 +125,16 @@ impl SignalingState {
 
     /// Remove a peer from a session
     fn remove_peer(&self, session_id: &str, peer_id: &str) {
+        let mut remove_session = false;
+
         if let Some(peers) = self.sessions.get(session_id) {
             peers.remove(peer_id);
-            // Clean up empty sessions
-            if peers.is_empty() {
-                self.sessions.remove(session_id);
-            }
+            // Avoid holding the DashMap guard when deciding to remove the session entry.
+            remove_session = peers.is_empty();
+        }
+
+        if remove_session {
+            self.sessions.remove(session_id);
         }
     }
 
@@ -467,7 +477,7 @@ async fn handle_client_message(
 
             // Refresh session TTL on join activity
             {
-                let mut storage = state.storage.lock().await;
+                let storage = (*state.storage).clone();
                 let _ = storage.update_session_ttl(session_id).await;
             }
 
@@ -571,14 +581,17 @@ async fn handle_client_message(
 
         ClientMessage::Ping => {
             // Update heartbeat timestamp
-            if let Some(peers) = state.sessions.get(session_id) {
-                if let Some(peer) = peers.get(peer_id) {
-                    *peer.last_heartbeat.write().await = std::time::Instant::now();
-                }
+            // Clone the Arc<RwLock> to avoid holding DashMap guards across await
+            let heartbeat_lock = state.sessions.get(session_id)
+                .and_then(|peers| peers.get(peer_id).map(|peer| peer.last_heartbeat.clone()));
+
+            if let Some(lock) = heartbeat_lock {
+                *lock.write().await = std::time::Instant::now();
             }
+
             // Refresh session TTL on heartbeat
             {
-                let mut storage = state.storage.lock().await;
+                let storage = (*state.storage).clone();
                 let _ = storage.update_session_ttl(session_id).await;
             }
             tx.send(ServerMessage::Pong)?;

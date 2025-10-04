@@ -383,7 +383,9 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let hosted = manager.host().await?;
     let session_id = hosted.session_id().to_string();
     info!(session_id = %session_id, "session registered");
-    let wait_for_peer = if bootstrap_mode { true } else { args.wait };
+    // In bootstrap mode, respect the --wait flag to control whether we wait for peer
+    // (this allows SSH bootstrap to output JSON immediately without waiting)
+    let wait_for_peer = args.wait;
     let command = resolve_launch_command(&args)?;
     let command_display = display_cmd(&command);
     if bootstrap_mode {
@@ -628,6 +630,12 @@ async fn handle_ssh(base_url: &str, args: SshArgs) -> Result<(), CliError> {
         "launching ssh bootstrap"
     );
 
+    eprintln!("[DEBUG] SSH command: {} -o BatchMode=yes -T {} {} '{}'",
+              args.ssh_binary,
+              args.ssh_flag.join(" "),
+              args.target,
+              remote_command);
+
     let mut child = command.spawn()?;
     let mut stderr_pipe = child.stderr.take();
 
@@ -703,11 +711,7 @@ async fn handle_ssh(base_url: &str, args: SshArgs) -> Result<(), CliError> {
         }));
     } else {
         drop(reader);
-        let stderr_lines = if let Some(stderr) = stderr_pipe.take() {
-            collect_child_stream(stderr).await
-        } else {
-            Vec::new()
-        };
+        drop(stderr_pipe); // Drop stderr to avoid blocking on it
         if let Err(err) = child.start_kill() {
             warn!(error = %err, "failed to terminate ssh process after bootstrap");
         }
@@ -717,9 +721,6 @@ async fn handle_ssh(base_url: &str, args: SshArgs) -> Result<(), CliError> {
             }
             Err(err) => warn!(error = %err, "failed to await ssh process"),
             _ => {}
-        }
-        if !stderr_lines.is_empty() {
-            debug!(lines = ?stderr_lines, "ssh stderr output");
         }
     }
 
@@ -1091,6 +1092,7 @@ fn emit_bootstrap_handshake(
     let payload = serde_json::to_string(&handshake)
         .map_err(|err| CliError::BootstrapOutput(err.to_string()))?;
     println!("{}", payload);
+    std::io::stdout().flush().map_err(|err| CliError::BootstrapOutput(err.to_string()))?;
     Ok(())
 }
 
@@ -1173,7 +1175,8 @@ fn remote_bootstrap_args(args: &SshArgs, session_server: &str) -> Vec<String> {
     command.push("--bootstrap-output=json".to_string());
     command.push("--session-server".to_string());
     command.push(session_server.to_string());
-    command.push("--wait".to_string());
+    // Don't use --wait here; let beach start the command immediately
+    // The local client will connect after reading the bootstrap JSON
     if !args.command.is_empty() {
         command.push("--".to_string());
         command.extend(args.command.clone());
@@ -1193,7 +1196,10 @@ fn scp_destination(target: &str, remote_path: &str) -> String {
 fn render_remote_command(remote_args: &[String]) -> String {
     let quoted: Vec<String> = remote_args.iter().map(|arg| shell_quote(arg)).collect();
     let body = quoted.join(" ");
-    format!("exec {}", body)
+    // Run beach in background, capture stdout to temp file, then cat the file
+    // This allows the beach process to persist after SSH disconnects while still reading bootstrap JSON
+    let temp_file = "/tmp/beach-bootstrap-$$.json";
+    format!("nohup {} >{} 2>&1 </dev/null & sleep 0.5 && cat {}", body, temp_file, temp_file)
 }
 
 fn resolve_local_binary_path(args: &SshArgs) -> Result<PathBuf, CliError> {

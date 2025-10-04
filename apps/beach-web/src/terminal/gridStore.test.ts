@@ -179,6 +179,15 @@ describe('TerminalGridStore', () => {
 
     store.pruneAckedPredictions(100 + ACK_GRACE_MS, ACK_GRACE_MS);
     snapshot = store.getSnapshot();
+    expect(snapshot.getPrediction(0, 2)?.char).toBe('l');
+    expect(snapshot.getPrediction(0, 3)?.char).toBe('s');
+
+    store.applyUpdates(
+      [{ type: 'row_segment', row: 0, startCol: 2, seq: 2, cells: packString('  ') }],
+      { authoritative: true },
+    );
+    store.pruneAckedPredictions(120 + ACK_GRACE_MS, ACK_GRACE_MS);
+    snapshot = store.getSnapshot();
     expect(snapshot.getPrediction(0, 2)).toBeNull();
     expect(snapshot.getPrediction(0, 3)).toBeNull();
   });
@@ -229,6 +238,11 @@ describe('TerminalGridStore', () => {
 
     store.ackPrediction(3, 200);
     store.pruneAckedPredictions(200 + ACK_GRACE_MS, ACK_GRACE_MS);
+    snapshot = store.getSnapshot();
+    expect(snapshot.predictedCursor?.col).toBe(3);
+
+    store.applyCursorFrame({ row: 0, col: 2, seq: 4, visible: true, blink: false });
+    store.pruneAckedPredictions(240 + ACK_GRACE_MS, ACK_GRACE_MS);
     snapshot = store.getSnapshot();
     expect(snapshot.predictedCursor).toBeNull();
   });

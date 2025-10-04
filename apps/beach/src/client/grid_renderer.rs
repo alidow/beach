@@ -762,6 +762,42 @@ impl GridRenderer {
             .map_or(false, |cell| cell.seq == seq)
     }
 
+    pub fn seq_has_predictions(&self, seq: Seq) -> bool {
+        self.predictions.values().any(|cell| cell.seq == seq)
+    }
+
+    pub fn committed_row_width(&self, absolute_row: u64) -> usize {
+        let Some(rel) = self.relative_row(absolute_row) else {
+            return 0;
+        };
+        match self.rows.get(rel) {
+            Some(RowSlot::Loaded(state)) => state
+                .cells
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, cell)| cell.seq > 0)
+                .map(|(idx, _)| idx + 1)
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    pub fn predicted_row_width(&self, absolute_row: u64) -> usize {
+        self.predictions
+            .iter()
+            .filter(|((row, _), _)| *row == absolute_row)
+            .map(|((_, col), _)| col.saturating_add(1))
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn effective_row_width(&self, absolute_row: u64) -> usize {
+        let committed = self.committed_row_width(absolute_row);
+        let predicted = self.predicted_row_width(absolute_row);
+        committed.max(predicted)
+    }
+
     pub fn clear_prediction_seq(&mut self, seq: Seq) {
         let before = self.predictions.len();
         self.predictions.retain(|_, cell| cell.seq != seq);

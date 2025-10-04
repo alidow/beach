@@ -1463,16 +1463,31 @@ impl TerminalClient {
         }
 
         if let Some(hint) = cursor_hint {
+            let previous_row = self.cursor_row;
+            let previous_col = self.cursor_col;
             match hint {
                 Exact(row, col) => {
+                    let mut target_col = col;
+                    if self.row_has_predictions(row) {
+                        let predicted_width = self.renderer.predicted_row_width(row as u64);
+                        target_col = target_col.max(predicted_width);
+                        if row == previous_row {
+                            target_col = target_col.max(previous_col);
+                        }
+                    }
                     self.cursor_row = row;
-                    self.cursor_col = col;
+                    self.cursor_col = target_col;
                 }
                 RowWidth(row) => {
-                    let width = self.renderer.row_display_width(row as u64);
-                    if row > self.cursor_row || (row == self.cursor_row && width >= self.cursor_col)
-                    {
-                        self.cursor_row = row;
+                    let width = self.renderer.effective_row_width(row as u64);
+                    self.cursor_row = row;
+                    if self.row_has_predictions(row) {
+                        let mut target = width;
+                        if row == previous_row {
+                            target = target.max(previous_col);
+                        }
+                        self.cursor_col = target;
+                    } else {
                         self.cursor_col = width;
                     }
                 }
@@ -1487,9 +1502,19 @@ impl TerminalClient {
             return;
         }
 
+        let previous_row = self.cursor_row;
+        let previous_col = self.cursor_col;
         self.cursor_seq = frame.seq;
         self.cursor_row = frame.row as usize;
-        self.cursor_col = frame.col as usize;
+        let mut target_col = frame.col as usize;
+        if self.row_has_predictions(self.cursor_row) {
+            let predicted_width = self.renderer.predicted_row_width(self.cursor_row as u64);
+            target_col = target_col.max(predicted_width);
+            if previous_row == self.cursor_row {
+                target_col = target_col.max(previous_col);
+            }
+        }
+        self.cursor_col = target_col;
         self.cursor_visible = frame.visible;
         self.cursor_authoritative = true;
         self.cursor_authoritative_pending = false;
@@ -2879,27 +2904,70 @@ impl TerminalClient {
             self.renderer.clear_all_predictions();
             self.reset_prediction_state();
         }
-        let mut positions = Vec::new();
+        let mut cursor_row = self.cursor_row;
+        let mut cursor_col = self.cursor_col;
+        let mut cursor_changed = false;
+        let mut positions: Vec<(usize, usize)> = Vec::new();
+
+        let mut push_position = |row: usize, col: usize| {
+            if !positions.iter().any(|&(r, c)| r == row && c == col) {
+                positions.push((row, col));
+            }
+        };
+
         for &byte in bytes {
             match byte {
                 b'\r' => {
-                    self.cursor_col = 0;
+                    if cursor_col != 0 {
+                        cursor_col = 0;
+                        cursor_changed = true;
+                    }
                 }
                 b'\n' => {
-                    self.cursor_row = self.cursor_row.saturating_add(1);
-                    self.cursor_col = 0;
+                    cursor_row = cursor_row.saturating_add(1);
+                    cursor_col = 0;
+                    cursor_changed = true;
                 }
-                0x00..=0x1f | 0x7f => {}
+                0x08 | 0x7f => {
+                    let mut moved = false;
+                    if cursor_col > 0 {
+                        cursor_col = cursor_col.saturating_sub(1);
+                        moved = true;
+                    } else if cursor_row > 0 {
+                        cursor_row = cursor_row.saturating_sub(1);
+                        cursor_col = self
+                            .renderer
+                            .effective_row_width(cursor_row as u64)
+                            .saturating_sub(1);
+                        moved = true;
+                    }
+                    if moved {
+                        let row = cursor_row;
+                        let col = cursor_col;
+                        self.renderer.add_prediction(row, col, seq, ' ');
+                        push_position(row, col);
+                        cursor_changed = true;
+                    }
+                }
+                0x00..=0x1f => {}
                 value => {
                     let ch = value as char;
-                    let row = self.cursor_row;
-                    let col = self.cursor_col;
+                    let row = cursor_row;
+                    let col = cursor_col;
                     self.renderer.add_prediction(row, col, seq, ch);
-                    positions.push((row, col));
-                    self.advance_cursor_for_char(ch);
+                    push_position(row, col);
+                    cursor_col = cursor_col.saturating_add(1);
+                    cursor_changed = true;
                 }
             }
         }
+
+        if cursor_changed {
+            self.cursor_row = cursor_row;
+            self.cursor_col = cursor_col;
+            self.sync_renderer_cursor();
+        }
+
         if !positions.is_empty() {
             self.pending_predictions.insert(
                 seq,
@@ -2910,20 +2978,23 @@ impl TerminalClient {
                 },
             );
             self.force_render = true;
+        } else if cursor_changed {
+            self.force_render = true;
         }
-        self.sync_renderer_cursor();
+
         self.update_prediction_overlay();
     }
 
     fn prune_acked_predictions(&mut self, now: Instant) {
         let mut expired: Vec<Seq> = Vec::new();
         for (&seq, prediction) in self.pending_predictions.iter_mut() {
+            prediction
+                .positions
+                .retain(|&(row, col)| self.renderer.prediction_exists(row, col, seq));
+
             if let Some(acked_at) = prediction.acked_at {
-                prediction
-                    .positions
-                    .retain(|&(row, col)| self.renderer.prediction_exists(row, col, seq));
-                if prediction.positions.is_empty()
-                    || now.saturating_duration_since(acked_at) >= PREDICTION_ACK_GRACE
+                if !self.renderer.seq_has_predictions(seq)
+                    && now.saturating_duration_since(acked_at) >= PREDICTION_ACK_GRACE
                 {
                     expired.push(seq);
                 }
@@ -2948,6 +3019,15 @@ impl TerminalClient {
         if removed {
             self.force_render = true;
         }
+    }
+
+    fn row_has_predictions(&self, row: usize) -> bool {
+        if self.renderer.predicted_row_width(row as u64) > 0 {
+            return true;
+        }
+        self.pending_predictions
+            .values()
+            .any(|pending| pending.positions.iter().any(|&(r, _)| r == row))
     }
 
     fn update_prediction_overlay(&mut self) {
@@ -3043,16 +3123,6 @@ impl TerminalClient {
         self.prediction_last_quick_confirmation = None;
         self.renderer.set_predictions_visible(false);
         self.renderer.set_prediction_flagging(false);
-    }
-
-    fn advance_cursor_for_char(&mut self, ch: char) {
-        if ch == '\n' {
-            self.cursor_row = self.cursor_row.saturating_add(1);
-            self.cursor_col = 0;
-        } else {
-            self.cursor_col = self.cursor_col.saturating_add(1);
-        }
-        self.sync_renderer_cursor();
     }
 
     fn setup_tui(&mut self) -> Result<(), ClientError> {

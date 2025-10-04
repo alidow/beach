@@ -102,6 +102,18 @@ describe('buildLines', () => {
     store.ackPrediction(1, 100);
     store.pruneAckedPredictions(100 + ACK_GRACE_MS, ACK_GRACE_MS);
 
+    const snapshotAfterAck = store.getSnapshot();
+    expect(snapshotAfterAck.hasPredictions).toBe(true);
+
+    const overlayAfterAck = snapshotAfterAck.hasPredictions
+      ? { visible: true, underline: false }
+      : { visible: false, underline: false };
+    const [lineAfterAck] = buildLines(snapshotAfterAck, 10, overlayAfterAck);
+    expect(lineAfterAck.cells?.some((cell) => cell.predicted)).toBe(true);
+
+    store.applyUpdates([packRow(0, '> ', 2)], { authoritative: true });
+    store.pruneAckedPredictions(140 + ACK_GRACE_MS, ACK_GRACE_MS);
+
     const snapshotCleared = store.getSnapshot();
     expect(snapshotCleared.hasPredictions).toBe(false);
 

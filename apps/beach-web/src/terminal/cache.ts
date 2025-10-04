@@ -514,15 +514,30 @@ export class TerminalGridCache {
     switch (hint.kind) {
       case 'exact': {
         const row = Math.max(0, Math.floor(hint.row));
-        const col = Math.max(0, Math.floor(hint.col));
+        let targetCol = Math.max(0, Math.floor(hint.col));
         this.cursorRow = row;
-        this.cursorCol = col;
+        if (this.rowHasPredictions(row)) {
+          targetCol = Math.max(targetCol, this.predictedRowWidth(row));
+          if (previousRow === row && previousCol !== null) {
+            targetCol = Math.max(targetCol, previousCol);
+          }
+        }
+        this.cursorCol = targetCol;
         break;
       }
       case 'row_width': {
         const row = Math.max(0, Math.floor(hint.row));
         this.cursorRow = row;
-        this.cursorCol = this.rowDisplayWidth(row);
+        const width = this.rowEffectiveWidth(row);
+        if (this.rowHasPredictions(row)) {
+          let target = width;
+          if (previousRow === row && previousCol !== null) {
+            target = Math.max(target, previousCol);
+          }
+          this.cursorCol = target;
+        } else {
+          this.cursorCol = width;
+        }
         break;
       }
       default:
@@ -560,7 +575,14 @@ export class TerminalGridCache {
 
     this.ensureRowRange(row, row + 1);
     this.cursorRow = row;
-    this.cursorCol = col;
+    let targetCol = col;
+    if (this.rowHasPredictions(row)) {
+      targetCol = Math.max(targetCol, this.predictedRowWidth(row));
+      if (prevRow === row && prevCol !== null) {
+        targetCol = Math.max(targetCol, prevCol);
+      }
+    }
+    this.cursorCol = targetCol;
     this.cursorSeq = frame.seq;
     this.cursorVisible = frame.visible;
     this.cursorBlink = frame.blink;
@@ -608,6 +630,75 @@ export class TerminalGridCache {
       }
     }
     return 0;
+  }
+
+  private rowCommittedWidth(absolute: number): number {
+    if (absolute < this.baseRow) {
+      return 0;
+    }
+    const index = absolute - this.baseRow;
+    if (index < 0 || index >= this.rows.length) {
+      return 0;
+    }
+    const slot = this.rows[index];
+    if (!slot || slot.kind !== 'loaded') {
+      return 0;
+    }
+    for (let col = slot.cells.length - 1; col >= 0; col -= 1) {
+      const cell = slot.cells[col]!;
+      if (cell.seq > 0) {
+        return col + 1;
+      }
+    }
+    return 0;
+  }
+
+  private predictedRowWidth(absolute: number): number {
+    const rowPredictions = this.predictions.get(absolute);
+    if (!rowPredictions || rowPredictions.size === 0) {
+      return 0;
+    }
+    let maxCol = 0;
+    for (const col of rowPredictions.keys()) {
+      maxCol = Math.max(maxCol, col + 1);
+    }
+    return maxCol;
+  }
+
+  private rowEffectiveWidth(absolute: number): number {
+    return Math.max(this.rowCommittedWidth(absolute), this.predictedRowWidth(absolute));
+  }
+
+  private predictionExists(row: number, col: number, seq: number): boolean {
+    const rowPredictions = this.predictions.get(row);
+    if (!rowPredictions) {
+      return false;
+    }
+    const cell = rowPredictions.get(col);
+    return !!cell && cell.seq === seq;
+  }
+
+  private seqHasPredictions(seq: number): boolean {
+    for (const rowPredictions of this.predictions.values()) {
+      for (const cell of rowPredictions.values()) {
+        if (cell.seq === seq) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private rowHasPredictions(row: number): boolean {
+    if (this.predictedRowWidth(row) > 0) {
+      return true;
+    }
+    for (const entry of this.pendingPredictions.values()) {
+      if (entry.positions.some((pos) => pos.row === row)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private clampCursor(): void {
@@ -909,6 +1000,12 @@ export class TerminalGridCache {
 
     const positions: PredictedPosition[] = [];
 
+    const recordPosition = (row: number, col: number) => {
+      if (!positions.some((pos) => pos.row === row && pos.col === col)) {
+        positions.push({ row, col });
+      }
+    };
+
     for (const byte of data) {
       if (byte === 0x0d) {
         if (currentCol !== 0) {
@@ -923,7 +1020,27 @@ export class TerminalGridCache {
         cursorMoved = true;
         continue;
       }
-      if (byte <= 0x1f || byte === 0x7f) {
+      if (byte === 0x08 || byte === 0x7f) {
+        let moved = false;
+        if (currentCol > 0) {
+          currentCol -= 1;
+          moved = true;
+        } else if (currentRow > this.baseRow) {
+          currentRow -= 1;
+          const width = this.rowEffectiveWidth(currentRow);
+          currentCol = Math.max(0, width - 1);
+          moved = true;
+        }
+        if (moved) {
+          const row = currentRow;
+          const col = currentCol;
+          mutated = this.setPrediction(row, col, seq, ' ') || mutated;
+          recordPosition(row, col);
+          cursorMoved = true;
+        }
+        continue;
+      }
+      if (byte <= 0x1f) {
         continue;
       }
 
@@ -931,7 +1048,7 @@ export class TerminalGridCache {
       const col = currentCol;
       const char = String.fromCharCode(byte);
       mutated = this.setPrediction(row, col, seq, char) || mutated;
-      positions.push({ row, col });
+      recordPosition(row, col);
       const next = this.nextCursorPosition(row, col, char);
       currentRow = next.row;
       currentCol = next.col;
@@ -1000,10 +1117,11 @@ export class TerminalGridCache {
   pruneAckedPredictions(nowMs: number, graceMs: number): boolean {
     const expired: number[] = [];
     for (const [seq, entry] of this.pendingPredictions) {
+      entry.positions = entry.positions.filter((pos) => this.predictionExists(pos.row, pos.col, seq));
       if (entry.ackedAt === null) {
         continue;
       }
-      if (entry.positions.length === 0 || nowMs - entry.ackedAt >= graceMs) {
+      if (!this.seqHasPredictions(seq) && nowMs - entry.ackedAt >= graceMs) {
         expired.push(seq);
       }
     }

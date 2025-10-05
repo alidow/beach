@@ -448,11 +448,8 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
             wait_for_peer,
             args.mcp,
         )?;
-        // In bootstrap mode without wait_for_peer, redirect stdout to /dev/null
-        // to prevent any subsequent output (like shell prompts) from corrupting the JSON file
-        if !wait_for_peer {
-            redirect_stdout_to_devnull();
-        }
+        // Flush stdout to ensure JSON is written before the shell starts
+        std::io::stdout().flush().ok();
     } else {
         print_host_banner(&hosted, &normalized_base, TransportKind::WebRtc, args.mcp);
     }
@@ -1540,26 +1537,6 @@ fn configure_bootstrap_signal_handling(bootstrap_mode: bool) {
     #[cfg(not(unix))]
     {
         let _ = bootstrap_mode;
-    }
-}
-
-fn redirect_stdout_to_devnull() {
-    #[cfg(unix)]
-    {
-        unsafe {
-            let devnull = libc::open(b"/dev/null\0".as_ptr() as *const i8, libc::O_WRONLY);
-            if devnull >= 0 {
-                libc::dup2(devnull, libc::STDOUT_FILENO);
-                libc::close(devnull);
-                debug!("redirected stdout to /dev/null after bootstrap handshake");
-            } else {
-                warn!("failed to open /dev/null for stdout redirection");
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        warn!("stdout redirection not implemented for non-Unix platforms");
     }
 }
 

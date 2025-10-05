@@ -485,7 +485,7 @@ async fn client_requests_backfill_uses_session_rows() {
     };
 
     assert!(
-        start_row >= BASE_ROW && start_row < TAIL_ROW,
+        (BASE_ROW..TAIL_ROW).contains(&start_row),
         "backfill start_row should target session gap: {start_row} (expected between {BASE_ROW} and {TAIL_ROW})"
     );
 
@@ -902,7 +902,7 @@ async fn client_targets_tail_history_after_large_delta() {
             let text = format!("init-{row:03}");
             bootstrap.push(Update::Row {
                 row: row as u32,
-                seq: (500 + row) as u64,
+                seq: 500 + row,
                 cells: text.chars().map(pack_char).collect(),
             });
         }

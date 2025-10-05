@@ -5,7 +5,7 @@ mod pty;
 pub use emulator::{AlacrittyEmulator, EmulatorResult, SimpleTerminalEmulator, TerminalEmulator};
 pub use pty::{Command, PtyProcess, PtyReader, PtyWriter, SpawnConfig, resize_pty};
 
-use crate::cache::terminal::{PackedCell, TerminalGrid, unpack_cell};
+use crate::cache::terminal::{TerminalGrid, unpack_cell};
 use crate::model::terminal::diff::CacheUpdate;
 use crate::telemetry::{self, PerfGuard};
 use anyhow::Result;
@@ -218,7 +218,7 @@ fn log_update_sample(update: &CacheUpdate) {
             }
         }
         CacheUpdate::Cell(cell) => {
-            let (ch, _) = unpack_cell(cell.cell.into());
+            let (ch, _) = unpack_cell(cell.cell);
             if ch != ' ' {
                 trace!(target = "server::grid", row = cell.row, col = cell.col, seq = cell.seq, ch = %ch);
             }
@@ -244,11 +244,7 @@ fn apply_update(grid: &TerminalGrid, update: &CacheUpdate) {
         }
         CacheUpdate::Row(row) => {
             if tracing::enabled!(Level::TRACE) {
-                let text: String = row
-                    .cells
-                    .iter()
-                    .map(|cell| unpack_cell(PackedCell::from(*cell)).0)
-                    .collect();
+                let text: String = row.cells.iter().map(|cell| unpack_cell(*cell).0).collect();
                 if text.contains("Line ") {
                     trace!(
                         target = "server::grid",
@@ -373,7 +369,7 @@ mod tests {
             }
             let text: String = buffer
                 .iter()
-                .map(|cell| unpack_cell(PackedCell::from(*cell)).0)
+                .map(|cell| unpack_cell(PackedCell::from_raw(*cell)).0)
                 .collect();
             let trimmed = text.trim_end();
             if trimmed.starts_with("Line ") {

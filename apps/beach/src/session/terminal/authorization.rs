@@ -50,19 +50,19 @@ impl JoinAuthorizationMetadata {
         let mut parts = Vec::new();
         parts.push(format!("transport: {:?}", self.transport_kind));
         if let Some(peer) = &self.peer_id {
-            parts.push(format!("peer: {}", peer));
+            parts.push(format!("peer: {peer}"));
         }
         if let Some(handshake) = &self.handshake_id {
-            parts.push(format!("handshake: {}", handshake));
+            parts.push(format!("handshake: {handshake}"));
         }
         if let Some(desc) = &self.description {
             parts.push(desc.clone());
         }
         if let Some(label) = &self.label {
-            parts.push(format!("label: {}", label));
+            parts.push(format!("label: {label}"));
         }
         if let Some(addr) = &self.remote_addr {
-            parts.push(format!("remote: {}", addr));
+            parts.push(format!("remote: {addr}"));
         }
         if let Some(mcp_flag) = self.metadata.get("mcp") {
             if mcp_flag == "true" {

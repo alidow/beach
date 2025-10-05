@@ -55,6 +55,8 @@ use tokio::time::{interval, sleep, timeout};
 use tracing::{Level, debug, error, info, trace, warn};
 use transport_mod::webrtc::{OffererAcceptedTransport, OffererSupervisor};
 
+type ForwardTransport = (Arc<dyn Transport>, Option<Arc<TransportSupervisor>>);
+
 pub(crate) const MCP_CHANNEL_LABEL: &str = "mcp-jsonrpc";
 pub(crate) const MCP_CHANNEL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -170,13 +172,13 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                     .unwrap_or_else(|| mcp_default_socket_path(&session_id)),
             )
         };
-        let mut config = McpConfig::default();
-        config.socket = resolved_socket.clone();
-        config.use_stdio = args.mcp_stdio;
-        config.allow_write = args.mcp_allow_write;
-        config.read_only = !args.mcp_allow_write;
-        config.session_filter = Some(vec![session_id.clone()]);
-        let server = McpServer::new(config);
+        let server = McpServer::new(McpConfig {
+            socket: resolved_socket.clone(),
+            use_stdio: args.mcp_stdio,
+            read_only: !args.mcp_allow_write,
+            allow_write: args.mcp_allow_write,
+            session_filter: Some(vec![session_id.clone()]),
+        });
         let handle = server.handle();
         mcp_handle = Some(handle.clone());
         mcp_task = Some(tokio::spawn(async move {
@@ -199,8 +201,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     info!(session_id = %session_id, "host ready");
 
     let input_handles: Arc<Mutex<Vec<thread::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
-    let mut forward_transports: Vec<(Arc<dyn Transport>, Option<Arc<TransportSupervisor>>)> =
-        Vec::new();
+    let mut forward_transports: Vec<ForwardTransport> = Vec::new();
 
     let mut local_preview_task: Option<tokio::task::JoinHandle<()>> = None;
     let local_server_transport: Arc<Mutex<Option<Arc<dyn Transport>>>> = Arc::new(Mutex::new(None));
@@ -350,9 +351,11 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         let _ = handle.await;
     }
 
-    let mut guard = input_handles.lock().unwrap();
-    for handle in guard.drain(..) {
-        handle.join().ok();
+    {
+        let mut guard = input_handles.lock().unwrap();
+        for handle in guard.drain(..) {
+            handle.join().ok();
+        }
     }
 
     let bridge_handles: Vec<JoinHandle<()>> = {
@@ -370,7 +373,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     }
 
     if !bootstrap_mode {
-        println!("\n✅ command '{}' completed", command_display);
+        println!("\n✅ command '{command_display}' completed");
     }
     info!(session_id = %session_id, "host command completed");
     Ok(())
@@ -661,7 +664,7 @@ fn collect_backfill_chunk(grid: &TerminalGrid, start_row: u64, max_rows: u32) ->
         if tracing::enabled!(Level::TRACE) && offset < 4 {
             let preview: String = buffer
                 .iter()
-                .map(|cell| unpack_cell(PackedCell::from(*cell)).0)
+                .map(|cell| unpack_cell(PackedCell::from_raw(*cell)).0)
                 .collect();
             trace!(
                 target = "sync::backfill",
@@ -672,11 +675,11 @@ fn collect_backfill_chunk(grid: &TerminalGrid, start_row: u64, max_rows: u32) ->
 
         let mut max_seq = 0;
         let mut packed_cells: Vec<PackedCell> = Vec::with_capacity(cols);
-        for col in 0..cols {
+        for (col, raw_cell) in buffer.iter().enumerate().take(cols) {
             if let Some(snapshot) = grid.get_cell_relaxed(index, col) {
                 max_seq = max_seq.max(snapshot.seq);
             }
-            let packed = PackedCell::from(buffer[col]);
+            let packed = PackedCell::from_raw(*raw_cell);
             let (_, style_id) = unpack_cell(packed);
             style_ids.insert(style_id);
             packed_cells.push(packed);
@@ -1211,6 +1214,7 @@ fn map_lane(lane: PriorityLane) -> WireLane {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_input_listener(
     transport: Arc<dyn Transport>,
     writer: PtyWriter,
@@ -1774,7 +1778,7 @@ impl TransmitterCache {
                 CacheUpdate::Style(style) => {
                     let current = (style.style.fg, style.style.bg, style.style.attrs);
                     let prev = self.styles.insert(style.id.0, current);
-                    if !dedupe || prev.map_or(true, |value| value != current) {
+                    if !dedupe || prev != Some(current) {
                         out.push(WireUpdate::Style {
                             id: style.id.0,
                             seq: style.seq,
@@ -1885,6 +1889,7 @@ enum ForwarderCommand {
     ViewportRefresh,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_webrtc_acceptor(
     session_id: String,
     session_handle: SessionHandle,
@@ -2194,6 +2199,7 @@ fn spawn_webrtc_acceptor(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_viewer_accept_loop(
     supervisor: Arc<OffererSupervisor>,
     forwarder_tx: UnboundedSender<ForwarderCommand>,
@@ -2209,150 +2215,142 @@ fn spawn_viewer_accept_loop(
     mcp_bridges: Arc<Mutex<Vec<JoinHandle<()>>>>,
 ) {
     tokio::spawn(async move {
-        loop {
-            match supervisor.next().await {
-                Ok(accepted) => {
-                    let OffererAcceptedTransport {
-                        peer_id,
-                        handshake_id,
-                        metadata: extra_metadata,
-                        connection,
-                    } = accepted;
-                    let transport = connection.transport();
-                    let channels = connection.channels();
-                    let transport_arc: Arc<dyn Transport> = transport.clone();
-                    let auth_metadata = JoinAuthorizationMetadata::from_parts(
-                        transport_arc.kind(),
-                        Some(peer_id.clone()),
-                        Some(handshake_id.clone()),
-                        Some("viewer".to_string()),
-                        extra_metadata,
-                    );
-                    let hint_pending = authorizer.should_emit_pending_hint();
-                    let auto_grant = authorizer.should_emit_auto_granted();
-                    if hint_pending {
-                        let _ = transport_arc.send_text("beach:status:approval_pending");
-                    }
-                    if !authorizer.authorize(auth_metadata.clone()).await {
-                        if hint_pending {
-                            let _ = transport_arc.send_text("beach:status:approval_denied");
-                        }
-                        info!(
-                            target = "webrtc",
-                            peer_id = %peer_id,
-                            handshake_id = %handshake_id,
-                            "viewer transport denied by host"
-                        );
-                        continue;
-                    }
-                    if hint_pending || auto_grant {
-                        let _ = transport_arc.send_text("beach:status:approval_granted");
-                    }
-
-                    let shared_transport = Arc::new(SharedTransport::new(transport_arc.clone()));
-                    {
-                        let mut guard = transports.lock().unwrap();
-                        guard.push(shared_transport.clone());
-                    }
-                    let shared_arc: Arc<dyn Transport> = shared_transport.clone();
-
-                    if let Some(handle) = mcp_handle.clone() {
-                        let bridges = Arc::clone(&mcp_bridges);
-                        let parent_transport_id = shared_arc.id();
-                        let parent_peer_id = shared_arc.peer();
-                        let peer_for_bridge = peer_id.clone();
-                        let handshake_for_bridge = handshake_id.clone();
-                        let channels_clone = channels.clone();
-                        let bridge_task = tokio::spawn(async move {
-                            match timeout(
-                                MCP_CHANNEL_TIMEOUT,
-                                channels_clone.wait_for(MCP_CHANNEL_LABEL),
-                            )
-                            .await
-                            {
-                                Ok(Ok(mcp_transport)) => {
-                                    debug!(
-                                        target = "mcp::bridge",
-                                        peer_id = %peer_for_bridge,
-                                        handshake_id = %handshake_for_bridge,
-                                        parent_transport_id = parent_transport_id.0,
-                                        parent_peer_id = parent_peer_id.0,
-                                        mcp_transport_id = mcp_transport.id().0,
-                                        "viewer attached mcp bridge"
-                                    );
-                                    let bridge_handle = spawn_webrtc_bridge(
-                                        handle,
-                                        mcp_transport,
-                                        MCP_CHANNEL_LABEL,
-                                    );
-                                    let _ = bridge_handle.await;
-                                }
-                                Ok(Err(err)) => {
-                                    warn!(
-                                        target = "mcp::bridge",
-                                        peer_id = %peer_for_bridge,
-                                        handshake_id = %handshake_for_bridge,
-                                        parent_transport_id = parent_transport_id.0,
-                                        parent_peer_id = parent_peer_id.0,
-                                        error = %err,
-                                        "viewer mcp channel failed"
-                                    );
-                                }
-                                Err(_) => {
-                                    debug!(
-                                        target = "mcp::bridge",
-                                        peer_id = %peer_for_bridge,
-                                        handshake_id = %handshake_for_bridge,
-                                        parent_transport_id = parent_transport_id.0,
-                                        parent_peer_id = parent_peer_id.0,
-                                        timeout_secs = MCP_CHANNEL_TIMEOUT.as_secs(),
-                                        "viewer did not create mcp channel"
-                                    );
-                                }
-                            }
-                        });
-                        bridges.lock().unwrap().push(bridge_task);
-                    }
-                    HeartbeatPublisher::new(shared_arc.clone(), None)
-                        .spawn(Duration::from_secs(10), None);
-
-                    let listener = spawn_input_listener(
-                        shared_arc.clone(),
-                        writer.clone(),
-                        process_handle.clone(),
-                        emulator_handle.clone(),
-                        grid.clone(),
-                        backfill_tx.clone(),
-                        Some(forwarder_tx.clone()),
-                        authorizer.gate(),
-                    );
-                    input_handles.lock().unwrap().push(listener);
-
-                    if forwarder_tx
-                        .send(ForwarderCommand::AddTransport {
-                            transport: shared_arc,
-                            supervisor: None,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-
-                    info!(
-                        target = "webrtc",
-                        peer_id = %peer_id,
-                        handshake_id = %handshake_id,
-                        "viewer transport registered"
-                    );
-                }
-                Err(_) => break,
+        while let Ok(accepted) = supervisor.next().await {
+            let OffererAcceptedTransport {
+                peer_id,
+                handshake_id,
+                metadata: extra_metadata,
+                connection,
+            } = accepted;
+            let transport = connection.transport();
+            let channels = connection.channels();
+            let transport_arc: Arc<dyn Transport> = transport.clone();
+            let auth_metadata = JoinAuthorizationMetadata::from_parts(
+                transport_arc.kind(),
+                Some(peer_id.clone()),
+                Some(handshake_id.clone()),
+                Some("viewer".to_string()),
+                extra_metadata,
+            );
+            let hint_pending = authorizer.should_emit_pending_hint();
+            let auto_grant = authorizer.should_emit_auto_granted();
+            if hint_pending {
+                let _ = transport_arc.send_text("beach:status:approval_pending");
             }
+            if !authorizer.authorize(auth_metadata.clone()).await {
+                if hint_pending {
+                    let _ = transport_arc.send_text("beach:status:approval_denied");
+                }
+                info!(
+                    target = "webrtc",
+                    peer_id = %peer_id,
+                    handshake_id = %handshake_id,
+                    "viewer transport denied by host"
+                );
+                continue;
+            }
+            if hint_pending || auto_grant {
+                let _ = transport_arc.send_text("beach:status:approval_granted");
+            }
+
+            let shared_transport = Arc::new(SharedTransport::new(transport_arc.clone()));
+            {
+                let mut guard = transports.lock().unwrap();
+                guard.push(shared_transport.clone());
+            }
+            let shared_arc: Arc<dyn Transport> = shared_transport.clone();
+
+            if let Some(handle) = mcp_handle.clone() {
+                let bridges = Arc::clone(&mcp_bridges);
+                let parent_transport_id = shared_arc.id();
+                let parent_peer_id = shared_arc.peer();
+                let peer_for_bridge = peer_id.clone();
+                let handshake_for_bridge = handshake_id.clone();
+                let channels_clone = channels.clone();
+                let bridge_task = tokio::spawn(async move {
+                    match timeout(
+                        MCP_CHANNEL_TIMEOUT,
+                        channels_clone.wait_for(MCP_CHANNEL_LABEL),
+                    )
+                    .await
+                    {
+                        Ok(Ok(mcp_transport)) => {
+                            debug!(
+                                target = "mcp::bridge",
+                                peer_id = %peer_for_bridge,
+                                handshake_id = %handshake_for_bridge,
+                                parent_transport_id = parent_transport_id.0,
+                                parent_peer_id = parent_peer_id.0,
+                                mcp_transport_id = mcp_transport.id().0,
+                                "viewer attached mcp bridge"
+                            );
+                            let bridge_handle =
+                                spawn_webrtc_bridge(handle, mcp_transport, MCP_CHANNEL_LABEL);
+                            let _ = bridge_handle.await;
+                        }
+                        Ok(Err(err)) => {
+                            warn!(
+                                target = "mcp::bridge",
+                                peer_id = %peer_for_bridge,
+                                handshake_id = %handshake_for_bridge,
+                                parent_transport_id = parent_transport_id.0,
+                                parent_peer_id = parent_peer_id.0,
+                                error = %err,
+                                "viewer mcp channel failed"
+                            );
+                        }
+                        Err(_) => {
+                            debug!(
+                                target = "mcp::bridge",
+                                peer_id = %peer_for_bridge,
+                                handshake_id = %handshake_for_bridge,
+                                parent_transport_id = parent_transport_id.0,
+                                parent_peer_id = parent_peer_id.0,
+                                timeout_secs = MCP_CHANNEL_TIMEOUT.as_secs(),
+                                "viewer did not create mcp channel"
+                            );
+                        }
+                    }
+                });
+                bridges.lock().unwrap().push(bridge_task);
+            }
+            HeartbeatPublisher::new(shared_arc.clone(), None).spawn(Duration::from_secs(10), None);
+
+            let listener = spawn_input_listener(
+                shared_arc.clone(),
+                writer.clone(),
+                process_handle.clone(),
+                emulator_handle.clone(),
+                grid.clone(),
+                backfill_tx.clone(),
+                Some(forwarder_tx.clone()),
+                authorizer.gate(),
+            );
+            input_handles.lock().unwrap().push(listener);
+
+            if forwarder_tx
+                .send(ForwarderCommand::AddTransport {
+                    transport: shared_arc,
+                    supervisor: None,
+                })
+                .is_err()
+            {
+                break;
+            }
+
+            info!(
+                target = "webrtc",
+                peer_id = %peer_id,
+                handshake_id = %handshake_id,
+                "viewer transport registered"
+            );
         }
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_update_forwarder(
-    transports: Vec<(Arc<dyn Transport>, Option<Arc<TransportSupervisor>>)>,
+    transports: Vec<ForwardTransport>,
     mut updates: UnboundedReceiver<CacheUpdate>,
     timeline: Arc<TimelineDeltaStream>,
     terminal_sync: Arc<TerminalSync>,
@@ -2782,40 +2780,37 @@ fn spawn_update_forwarder(
                     }
                 }
                 maybe_command = backfill_rx.recv() => {
-                    match maybe_command {
-                        Some(command) => {
-                            let end_row = command.start_row.saturating_add(command.count as u64);
-                            if end_row <= command.start_row {
-                                continue;
-                            }
-                            if let Some(sink) = sinks
-                                .iter_mut()
-                                .find(|s| s.transport.id() == command.transport_id)
-                            {
-                                sink.backfill_queue.push_back(BackfillJob {
-                                    subscription: command.subscription,
-                                    request_id: command.request_id,
-                                    next_row: command.start_row,
-                                    end_row,
-                                });
-                                trace!(
-                                    target = "sync::backfill",
-                                    transport_id = sink.transport.id().0,
-                                    request_id = command.request_id,
-                                    start_row = command.start_row,
-                                    count = command.count,
-                                    queued = sink.backfill_queue.len(),
-                                    "enqueued backfill request"
-                                );
-                            } else {
-                                debug!(
-                                    target = "sync::backfill",
-                                    transport = command.transport_id.0,
-                                    "backfill request dropped: transport not found"
-                                );
-                            }
+                    if let Some(command) = maybe_command {
+                        let end_row = command.start_row.saturating_add(command.count as u64);
+                        if end_row <= command.start_row {
+                            continue;
                         }
-                        None => {}
+                        if let Some(sink) = sinks
+                            .iter_mut()
+                            .find(|s| s.transport.id() == command.transport_id)
+                        {
+                            sink.backfill_queue.push_back(BackfillJob {
+                                subscription: command.subscription,
+                                request_id: command.request_id,
+                                next_row: command.start_row,
+                                end_row,
+                            });
+                            trace!(
+                                target = "sync::backfill",
+                                transport_id = sink.transport.id().0,
+                                request_id = command.request_id,
+                                start_row = command.start_row,
+                                count = command.count,
+                                queued = sink.backfill_queue.len(),
+                                "enqueued backfill request"
+                            );
+                        } else {
+                            debug!(
+                                target = "sync::backfill",
+                                transport = command.transport_id.0,
+                                "backfill request dropped: transport not found"
+                            );
+                        }
                     }
                 }
             }
@@ -3099,7 +3094,7 @@ fn display_cmd(cmd: &[String]) -> String {
         }
         rendered.push(' ');
         if item.chars().any(char::is_whitespace) {
-            write!(&mut rendered, "\"{}\"", item).ok();
+            write!(&mut rendered, "\"{item}\"").ok();
         } else {
             rendered.push_str(item);
         }

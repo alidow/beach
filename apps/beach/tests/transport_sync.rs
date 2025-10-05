@@ -145,7 +145,7 @@ impl TransmitterCache {
                 CacheUpdate::Style(style) => {
                     let current = (style.style.fg, style.style.bg, style.style.attrs);
                     let prev = self.styles.insert(style.id.0, current);
-                    if !dedupe || prev.map_or(true, |value| value != current) {
+                    if !dedupe || prev != Some(current) {
                         out.push(WireUpdate::Style {
                             id: style.id.0,
                             seq: style.seq,

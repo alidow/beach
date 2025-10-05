@@ -268,9 +268,11 @@ impl AlacrittyEmulator {
     pub fn new(grid: &TerminalGrid, cursor_frames_enabled: bool) -> Self {
         let (viewport_rows, viewport_cols) = grid.viewport_size();
         let dimensions = TermDimensions::new(viewport_cols.max(1), viewport_rows.max(1));
-        let mut config = Config::default();
-        config.scrolling_history = grid.history_limit();
-        let mut term = Term::new(config, &dimensions, EventProxy::default());
+        let config = Config {
+            scrolling_history: grid.history_limit(),
+            ..Config::default()
+        };
+        let mut term = Term::new(config, &dimensions, EventProxy);
         let mut parser = Processor::new();
         // Enable standard LF behavior so shells that rely on ESC[20h behave normally.
         for byte in b"\x1b[20h" {
@@ -566,7 +568,7 @@ impl AlacrittyEmulator {
             origin.saturating_sub(delta)
         };
         let row = usize::try_from(absolute_row).ok()?;
-        let col = usize::try_from(render_cursor.point.column.0).ok()?;
+        let col = render_cursor.point.column.0;
         let visible = render_cursor.shape != CursorShape::Hidden;
         let blink = cursor_style.blinking;
 

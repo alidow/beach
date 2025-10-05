@@ -38,13 +38,11 @@ use crate::transport::terminal::negotiation::{
     HeartbeatPublisher, NegotiatedSingle, NegotiatedTransport, SharedTransport,
     TransportSupervisor, negotiate_transport,
 };
-use crate::transport::{
-    Payload, Transport, TransportError, TransportId, TransportKind, TransportMessage,
-};
+use crate::transport::{Payload, Transport, TransportError, TransportId, TransportKind};
 use anyhow::Result as AnyResult;
 use crossterm::terminal::size as terminal_size;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt::{self, Write as _};
+use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

@@ -183,7 +183,6 @@ pub async fn negotiate_transport(
     }
 }
 
-#[derive(Clone)]
 pub(crate) struct SharedTransport {
     inner: RwLock<Arc<dyn Transport>>,
 }

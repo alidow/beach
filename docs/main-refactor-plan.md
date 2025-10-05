@@ -22,7 +22,7 @@
 | 4 | ✅ Done | Host extraction | Host runtime now lives in `server::terminal::host::run`, `terminal::app` delegates, negotiation helpers are shared, and all targeted tests (including the full suite) plus `cargo clippy -p beach-human --all-targets -- -D warnings` pass. | `cargo check -p beach-human`, `cargo test -p beach-human bootstrap_handshake_serializes_expected_fields`, `cargo test -p beach-human read_bootstrap_handshake_skips_noise_lines`, `cargo test -p beach-human webrtc_mock_session_flow`, `cargo test -p beach-human`, `cargo clippy -p beach-human --all-targets -- -D warnings` |
 | 5 | ✅ Done | Join extraction | Join workflow + MCP proxy bootstrap now live in `client::terminal::join`; negotiation helpers remain shared | `cargo test -p beach-human` and `cargo run -p beach-human -- join --help` |
 | 6 | ✅ Done | SSH extraction | SSH bootstrap now lives in `transport::ssh::run`, terminal app delegates, helpers are consolidated | `cargo test -p beach-human read_bootstrap_handshake_skips_noise_lines` and `cargo run -p beach-human -- ssh --help` |
-| 7 | ⏳ Todo | Transport negotiation | Create `transport::terminal::negotiation` housing negotiation + failover + heartbeat publisher | `cargo test -p beach-human heartbeat_publisher_emits_messages` and `cargo test -p beach-human handshake_refresh_stops_after_completion` |
+| 7 | ✅ Done | Transport negotiation | Negotiation, failover, and heartbeat publisher now live under `transport::terminal::negotiation` with callers updated | `cargo test -p beach-human heartbeat_publisher_emits_messages` and `cargo test -p beach-human handshake_refresh_stops_after_completion` |
 | 8 | ⏳ Todo | Sync pipeline move | Shift timeline/backfill/update-forwarder + send helpers into `sync::terminal::server_pipeline` | `cargo test -p beach-human webrtc_mock_session_flow`, `cargo test -p beach-human history_backfill_contains_line_text`, `cargo test -p beach-human history_backfill_skips_default_rows` |
 | 9 | ⏳ Todo | Runtime utilities & clean-up | Rehome spawn config helpers, viewport utilities, frame encoders; prune leftovers & update docs | `cargo fmt`, `cargo clippy -p beach-human --all-targets -- -D warnings`, `cargo test -p beach-human` |
 
@@ -89,3 +89,17 @@ Following these phases keeps the work reviewable and verifiable, while steadily 
 
 4. **Regression Checks**
    - ✅ Done: `cargo test -p beach-human read_bootstrap_handshake_skips_noise_lines` and `cargo run -p beach-human -- ssh --help` pass after the move.
+
+## Phase 7 – Transport Negotiation Checklist
+
+1. **Module Creation**
+   - ✅ Done: added `transport::terminal::negotiation` exposing `negotiate_transport`, `Negotiated*` types, and consolidation helpers for transport selection.
+
+2. **Failover Primitives**
+   - ✅ Done: `SharedTransport` and `TransportSupervisor` relocated under the new module, with host runtime updated to reference them.
+
+3. **Heartbeat Publisher**
+   - ✅ Done: moved the heartbeat loop alongside negotiation, simplifying `terminal::host` by delegating publishing logic.
+
+4. **Callers Updated & Tests**
+   - ✅ Done: `client::terminal::join` and `server::terminal::host` now import from the transport module; `cargo test -p beach-human heartbeat_publisher_emits_messages` and `cargo test -p beach-human handshake_refresh_stops_after_completion` both pass.

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL_VERSION: u8 = 2;
 pub const FEATURE_CURSOR_SYNC: u32 = 1 << 0;
 
+pub mod terminal;
 pub mod wire;
 
 pub use wire::{

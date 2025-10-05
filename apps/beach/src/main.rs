@@ -16,6 +16,7 @@ use beach_human::mcp::{
     server::{McpServer, McpServerHandle},
 };
 use beach_human::model::terminal::diff::{CacheUpdate, HistoryTrim, RowSnapshot, StyleDefinition};
+use beach_human::protocol::terminal::bootstrap::{self, BootstrapHandshake};
 use beach_human::protocol::{
     self, ClientFrame as WireClientFrame, CursorFrame, FEATURE_CURSOR_SYNC, HostFrame,
     Lane as WireLane, LaneBudgetFrame as WireLaneBudget, SyncConfigFrame as WireSyncConfig,
@@ -26,8 +27,8 @@ use beach_human::server::terminal::{
     TerminalEmulator, TerminalRuntime,
 };
 use beach_human::session::{
-    HostSession, JoinedSession, SessionConfig, SessionError, SessionHandle, SessionManager,
-    SessionRole, TransportOffer,
+    HostSession, JoinedSession, SessionConfig, SessionHandle, SessionManager, SessionRole,
+    TransportOffer,
 };
 use beach_human::sync::terminal::{TerminalDeltaStream, TerminalSync};
 use beach_human::sync::{LaneBudget, PriorityLane, ServerSynchronizer, SubscriptionId, SyncConfig};
@@ -35,6 +36,7 @@ use beach_human::telemetry::logging as logctl;
 use beach_human::telemetry::{self, PerfGuard};
 use beach_human::terminal::cli::{self, BootstrapOutput, Command, HostArgs, JoinArgs, SshArgs};
 use beach_human::terminal::config::cursor_sync_enabled;
+use beach_human::terminal::error::CliError;
 use beach_human::transport as transport_mod;
 use beach_human::transport::{
     Payload, Transport, TransportError, TransportId, TransportKind, TransportMessage,
@@ -46,19 +48,16 @@ use crossterm::terminal::{
     Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
     enable_raw_mode, size as terminal_size,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{self, Write as _};
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::PathBuf;
-use std::process::{ExitStatus, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use thiserror::Error;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{ChildStderr, Command as TokioCommand};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -96,34 +95,6 @@ async fn run() -> Result<(), CliError> {
         Some(Command::Host(args)) => handle_host(&session_base, args).await,
         None => handle_host(&session_base, HostArgs::default()).await,
     }
-}
-
-#[derive(Debug, Error)]
-enum CliError {
-    #[error("{0}")]
-    Session(#[from] SessionError),
-    #[error("io error: {0}")]
-    Io(#[from] io::Error),
-    #[error("unable to determine session id from '{target}'")]
-    InvalidSessionTarget { target: String },
-    #[error("no executable command available; set $SHELL or pass '-- command'")]
-    MissingCommand,
-    #[error("session requires a six digit passcode")]
-    MissingPasscode,
-    #[error("transport negotiation failed: {0}")]
-    TransportNegotiation(String),
-    #[error("session did not provide a supported transport offer")]
-    NoUsableTransport,
-    #[error("terminal runtime error: {0}")]
-    Runtime(String),
-    #[error("logging initialization failed: {0}")]
-    Logging(String),
-    #[error("bootstrap output failed: {0}")]
-    BootstrapOutput(String),
-    #[error("bootstrap handshake failed: {0}")]
-    BootstrapHandshake(String),
-    #[error("scp transfer failed: {0}")]
-    CopyBinary(String),
 }
 
 async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
@@ -169,7 +140,7 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let command = resolve_launch_command(&args)?;
     let command_display = display_cmd(&command);
     if bootstrap_mode {
-        emit_bootstrap_handshake(
+        bootstrap::emit_bootstrap_handshake(
             &hosted,
             &normalized_base,
             TransportKind::WebRtc,
@@ -445,10 +416,10 @@ async fn handle_host(base_url: &str, args: HostArgs) -> Result<(), CliError> {
 }
 
 async fn handle_ssh(base_url: &str, args: SshArgs) -> Result<(), CliError> {
-    copy_binary_to_remote(&args).await?;
+    bootstrap::copy_binary_to_remote(&args).await?;
 
-    let remote_args = remote_bootstrap_args(&args, base_url);
-    let remote_command = render_remote_command(&remote_args);
+    let remote_args = bootstrap::remote_bootstrap_args(&args, base_url);
+    let remote_command = bootstrap::render_remote_command(&remote_args);
 
     let mut command = TokioCommand::new(&args.ssh_binary);
     if !args.no_batch {
@@ -495,27 +466,28 @@ async fn handle_ssh(base_url: &str, args: SshArgs) -> Result<(), CliError> {
     let timeout_secs = args.handshake_timeout.max(1);
     let timeout = Duration::from_secs(timeout_secs);
 
-    let handshake = match read_bootstrap_handshake(&mut reader, &mut captured_stdout, timeout).await
-    {
-        Ok(handshake) => handshake,
-        Err(err) => {
-            let _ = child.start_kill();
-            let stderr_lines = if let Some(stderr) = stderr_pipe.take() {
-                collect_child_stream(stderr).await
-            } else {
-                Vec::new()
-            };
-            let _ = child.wait().await;
-            let mut context = err.to_string();
-            if !captured_stdout.is_empty() {
-                context = format!("{}; stdout: {}", context, captured_stdout.join(" | "));
+    let handshake =
+        match bootstrap::read_bootstrap_handshake(&mut reader, &mut captured_stdout, timeout).await
+        {
+            Ok(handshake) => handshake,
+            Err(err) => {
+                let _ = child.start_kill();
+                let stderr_lines = if let Some(stderr) = stderr_pipe.take() {
+                    collect_child_stream(stderr).await
+                } else {
+                    Vec::new()
+                };
+                let _ = child.wait().await;
+                let mut context = err.to_string();
+                if !captured_stdout.is_empty() {
+                    context = format!("{}; stdout: {}", context, captured_stdout.join(" | "));
+                }
+                if !stderr_lines.is_empty() {
+                    context = format!("{}; stderr: {}", context, stderr_lines.join(" | "));
+                }
+                return Err(CliError::BootstrapHandshake(context));
             }
-            if !stderr_lines.is_empty() {
-                context = format!("{}; stderr: {}", context, stderr_lines.join(" | "));
-            }
-            return Err(CliError::BootstrapHandshake(context));
-        }
-    };
+        };
 
     if handshake.schema != BootstrapHandshake::SCHEMA_VERSION {
         warn!(
@@ -548,9 +520,15 @@ async fn handle_ssh(base_url: &str, args: SshArgs) -> Result<(), CliError> {
             match child.wait().await {
                 Ok(status) => {
                     if status.success() {
-                        info!(status = %describe_exit_status(status), "ssh control channel closed");
+                        info!(
+                            status = %bootstrap::describe_exit_status(status),
+                            "ssh control channel closed"
+                        );
                     } else {
-                        warn!(status = %describe_exit_status(status), "ssh control channel closed with error");
+                        warn!(
+                            status = %bootstrap::describe_exit_status(status),
+                            "ssh control channel closed with error"
+                        );
                     }
                 }
                 Err(err) => warn!(error = %err, "failed to await ssh control channel"),
@@ -564,7 +542,10 @@ async fn handle_ssh(base_url: &str, args: SshArgs) -> Result<(), CliError> {
         }
         match child.wait().await {
             Ok(status) if !status.success() => {
-                warn!(status = %describe_exit_status(status), "ssh exited with non-zero status after bootstrap");
+                warn!(
+                    status = %bootstrap::describe_exit_status(status),
+                    "ssh exited with non-zero status after bootstrap"
+                );
             }
             Err(err) => warn!(error = %err, "failed to await ssh process"),
             _ => {}
@@ -992,263 +973,6 @@ fn prompt_passcode() -> Result<String, CliError> {
     }
 }
 
-fn emit_bootstrap_handshake(
-    session: &HostSession,
-    base: &str,
-    selected: TransportKind,
-    command: &[String],
-    wait_for_peer: bool,
-    mcp_enabled: bool,
-) -> Result<(), CliError> {
-    let handle = session.handle();
-    let handshake = BootstrapHandshake::from_context(
-        session.session_id(),
-        session.join_code(),
-        base,
-        handle.offers(),
-        selected,
-        command,
-        wait_for_peer,
-        mcp_enabled,
-    );
-    let payload = serde_json::to_string(&handshake)
-        .map_err(|err| CliError::BootstrapOutput(err.to_string()))?;
-    println!("{}", payload);
-    std::io::stdout()
-        .flush()
-        .map_err(|err| CliError::BootstrapOutput(err.to_string()))?;
-    Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct BootstrapHandshake {
-    schema: u32,
-    session_id: String,
-    join_code: String,
-    session_server: String,
-    active_transport: String,
-    transports: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    preferred_transport: Option<String>,
-    host_binary: String,
-    host_version: String,
-    timestamp: u64,
-    command: Vec<String>,
-    wait_for_peer: bool,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    warning: Option<String>,
-    mcp_enabled: bool,
-}
-
-impl BootstrapHandshake {
-    const SCHEMA_VERSION: u32 = 2;
-
-    fn from_context(
-        session_id: &str,
-        join_code: &str,
-        base: &str,
-        offers: &[TransportOffer],
-        selected: TransportKind,
-        command: &[String],
-        wait_for_peer: bool,
-        mcp_enabled: bool,
-    ) -> Self {
-        let transports: Vec<String> = offers
-            .iter()
-            .map(|offer| offer.label().to_string())
-            .collect();
-        let preferred_transport = offers.first().map(|offer| offer.label().to_string());
-        let warning = if transports.is_empty() {
-            Some("session server returned no transport offers".to_string())
-        } else {
-            None
-        };
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_else(|_| Duration::from_secs(0))
-            .as_secs();
-        let host_binary = std::env::args()
-            .next()
-            .and_then(|arg0| {
-                std::path::Path::new(&arg0)
-                    .file_name()
-                    .and_then(|name| name.to_str().map(|s| s.to_string()))
-            })
-            .unwrap_or_else(|| "beach".to_string());
-
-        Self {
-            schema: Self::SCHEMA_VERSION,
-            session_id: session_id.to_string(),
-            join_code: join_code.to_string(),
-            session_server: base.to_string(),
-            active_transport: kind_label(selected).to_string(),
-            transports,
-            preferred_transport,
-            host_binary,
-            host_version: env!("CARGO_PKG_VERSION").to_string(),
-            timestamp,
-            command: command.to_vec(),
-            wait_for_peer,
-            warning,
-            mcp_enabled,
-        }
-    }
-}
-
-fn remote_bootstrap_args(args: &SshArgs, session_server: &str) -> Vec<String> {
-    let mut command = Vec::new();
-    command.push(args.remote_path.clone());
-    command.push("host".to_string());
-    command.push("--bootstrap-output=json".to_string());
-    command.push("--session-server".to_string());
-    command.push(session_server.to_string());
-    // Don't use --wait here; let beach start the command immediately
-    // The local client will connect after reading the bootstrap JSON
-    if !args.command.is_empty() {
-        command.push("--".to_string());
-        command.extend(args.command.clone());
-    }
-    command
-}
-
-fn scp_destination(target: &str, remote_path: &str) -> String {
-    if remote_path.contains(':') {
-        // user supplied user@host:/path explicitly; respect verbatim
-        remote_path.to_string()
-    } else {
-        format!("{}:{}", target, remote_path)
-    }
-}
-
-fn render_remote_command(remote_args: &[String]) -> String {
-    let quoted: Vec<String> = remote_args.iter().map(|arg| shell_quote(arg)).collect();
-    let body = quoted.join(" ");
-    // Run beach in background, capture stdout to temp file, then cat the file
-    // This allows the beach process to persist after SSH disconnects while still reading bootstrap JSON
-    let temp_file = "/tmp/beach-bootstrap-$$.json";
-    format!(
-        "nohup {} >{} 2>&1 </dev/null & sleep 2 && cat {}",
-        body, temp_file, temp_file
-    )
-}
-
-fn resolve_local_binary_path(args: &SshArgs) -> Result<PathBuf, CliError> {
-    let raw_path = if let Some(custom) = &args.copy_from {
-        custom.clone()
-    } else {
-        std::env::current_exe().map_err(|err| {
-            CliError::CopyBinary(format!("unable to determine current executable: {err}"))
-        })?
-    };
-
-    let resolved = if raw_path.is_relative() {
-        std::fs::canonicalize(&raw_path).unwrap_or(raw_path.clone())
-    } else {
-        raw_path.clone()
-    };
-
-    if !resolved.exists() {
-        return Err(CliError::CopyBinary(format!(
-            "local binary '{}' does not exist",
-            resolved.display()
-        )));
-    }
-
-    Ok(resolved)
-}
-
-async fn copy_binary_to_remote(args: &SshArgs) -> Result<(), CliError> {
-    if !args.copy_binary {
-        return Ok(());
-    }
-
-    let source_path = resolve_local_binary_path(args)?;
-    let destination = scp_destination(&args.target, &args.remote_path);
-
-    info!(
-        source = %source_path.display(),
-        destination = %destination,
-        scp_binary = %args.scp_binary,
-        "uploading beach binary to remote host"
-    );
-
-    let mut command = TokioCommand::new(&args.scp_binary);
-    if !args.no_batch {
-        command.arg("-o").arg("BatchMode=yes");
-    }
-    for flag in &args.ssh_flag {
-        command.arg(flag);
-    }
-    command.arg(&source_path);
-    command.arg(&destination);
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-
-    let output = command
-        .output()
-        .await
-        .map_err(|err| CliError::CopyBinary(format!("failed to spawn scp: {err}")))?;
-
-    if output.status.success() {
-        let stdout_str = String::from_utf8_lossy(&output.stdout);
-        let stdout_trimmed = stdout_str.trim();
-        if !stdout_trimmed.is_empty() {
-            debug!(stdout = stdout_trimmed, "scp stdout");
-        }
-
-        let stderr_str = String::from_utf8_lossy(&output.stderr);
-        let stderr_trimmed = stderr_str.trim();
-        if !stderr_trimmed.is_empty() {
-            debug!(stderr = stderr_trimmed, "scp stderr");
-        }
-        return Ok(());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(CliError::CopyBinary(format!(
-        "{} failed ({}): stdout='{}' stderr='{}'",
-        args.scp_binary,
-        describe_exit_status(output.status),
-        stdout.trim(),
-        stderr.trim()
-    )))
-}
-
-fn describe_exit_status(status: ExitStatus) -> String {
-    if let Some(code) = status.code() {
-        return format!("exit code {code}");
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return format!("signal {signal}");
-        }
-    }
-
-    "unknown status".to_string()
-}
-
-fn shell_quote(raw: &str) -> String {
-    if raw.is_empty() {
-        return "''".to_string();
-    }
-    let mut quoted = String::with_capacity(raw.len() + 2);
-    quoted.push('\'');
-    for ch in raw.chars() {
-        if ch == '\'' {
-            quoted.push_str("'\"'\"'");
-        } else {
-            quoted.push(ch);
-        }
-    }
-    quoted.push('\'');
-    quoted
-}
-
 fn configure_bootstrap_signal_handling(bootstrap_mode: bool) {
     #[cfg(unix)]
     {
@@ -1266,55 +990,6 @@ fn configure_bootstrap_signal_handling(bootstrap_mode: bool) {
     #[cfg(not(unix))]
     {
         let _ = bootstrap_mode;
-    }
-}
-
-async fn read_bootstrap_handshake<R>(
-    reader: &mut R,
-    captured: &mut Vec<String>,
-    timeout: Duration,
-) -> Result<BootstrapHandshake, CliError>
-where
-    R: AsyncBufRead + Unpin,
-{
-    let deadline = Instant::now() + timeout;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(CliError::BootstrapHandshake(format!(
-                "timed out after {}s waiting for bootstrap handshake",
-                timeout.as_secs()
-            )));
-        }
-        let remaining = deadline.saturating_duration_since(now);
-        let read = tokio::time::timeout(remaining, reader.read_line(&mut line))
-            .await
-            .map_err(|_| {
-                CliError::BootstrapHandshake(format!(
-                    "timed out after {}s waiting for bootstrap handshake",
-                    timeout.as_secs()
-                ))
-            })??;
-        if read == 0 {
-            return Err(CliError::BootstrapHandshake(
-                "ssh connection closed before bootstrap handshake".into(),
-            ));
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<BootstrapHandshake>(trimmed) {
-            Ok(handshake) => return Ok(handshake),
-            Err(parse_err) => {
-                if captured.len() < 32 {
-                    captured.push(trimmed.to_string());
-                }
-                debug!(line = trimmed, error = %parse_err, "ignoring non-handshake stdout");
-            }
-        }
     }
 }
 
@@ -1430,11 +1105,7 @@ fn offer_label(offer: &TransportOffer) -> &'static str {
 }
 
 fn kind_label(kind: TransportKind) -> &'static str {
-    match kind {
-        TransportKind::WebRtc => "WebRTC",
-        TransportKind::WebSocket => "WebSocket",
-        TransportKind::Ipc => "IPC",
-    }
+    bootstrap::transport_kind_label(kind)
 }
 
 #[derive(Clone)]
@@ -4592,7 +4263,8 @@ mod tests {
             "host_version": "0.1.0",
             "timestamp": 0,
             "command": ["/bin/sh"],
-            "wait_for_peer": true
+            "wait_for_peer": true,
+            "mcp_enabled": false
         })
         .to_string();
         let script = format!("Last login: today\n{}\n", payload);
@@ -4609,7 +4281,7 @@ mod tests {
 
         let mut captured = Vec::new();
         let handshake =
-            read_bootstrap_handshake(&mut reader, &mut captured, Duration::from_secs(2))
+            bootstrap::read_bootstrap_handshake(&mut reader, &mut captured, Duration::from_secs(2))
                 .await
                 .expect("handshake decoded");
 
@@ -4620,25 +4292,25 @@ mod tests {
 
     #[test]
     fn shell_quote_handles_spaces_and_quotes() {
-        assert_eq!(shell_quote("simple"), "'simple'");
-        assert_eq!(shell_quote("with space"), "'with space'");
-        assert_eq!(shell_quote("path'with"), "'path'\"'\"'with'");
+        assert_eq!(bootstrap::shell_quote("simple"), "'simple'");
+        assert_eq!(bootstrap::shell_quote("with space"), "'with space'");
+        assert_eq!(bootstrap::shell_quote("path'with"), "'path'\"'\"'with'");
 
         let cmd = vec!["/opt/beach nightly".to_string(), "--flag".to_string()];
-        let rendered = render_remote_command(&cmd);
+        let rendered = bootstrap::render_remote_command(&cmd);
         assert!(rendered.starts_with("exec '"));
         assert!(rendered.contains("'/opt/beach nightly'"));
     }
 
     #[test]
     fn scp_destination_defaults_to_target_prefix() {
-        let dest = scp_destination("user@example.com", "beach");
+        let dest = bootstrap::scp_destination("user@example.com", "beach");
         assert_eq!(dest, "user@example.com:beach");
     }
 
     #[test]
     fn scp_destination_respects_explicit_remote() {
-        let dest = scp_destination("user@example.com", "root@other:/opt/beach");
+        let dest = bootstrap::scp_destination("user@example.com", "root@other:/opt/beach");
         assert_eq!(dest, "root@other:/opt/beach");
     }
 

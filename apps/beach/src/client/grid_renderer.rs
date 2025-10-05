@@ -800,8 +800,12 @@ impl GridRenderer {
                 if col < state.cells.len() {
                     return state.cells[col].ch == ch;
                 }
+                // Cell doesn't exist yet - only match if we're checking for a space
+                // AND the column is beyond the logical width (truly empty)
+                return ch == ' ' && col >= state.logical_width;
             }
         }
+        // Row doesn't exist - only match spaces
         ch == ' '
     }
 

@@ -1,3 +1,5 @@
+pub mod join;
+
 use crate::cache::Seq;
 use crate::cache::terminal::{PackedCell, StyleId, unpack_cell};
 use crate::client::grid_renderer::{GridRenderer, SelectionMode, SelectionPosition};

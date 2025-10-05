@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 pub mod ipc;
+pub mod ssh;
+pub mod terminal;
 pub mod webrtc;
 pub mod websocket;
 

@@ -20,8 +20,8 @@
 | 2 | ✅ Done | Isolate bootstrap protocol | Move bootstrap handshake structs + helpers into `protocol/terminal/bootstrap.rs`; update callers | `cargo test -p beach-human bootstrap_handshake_serializes_expected_fields` and `cargo test -p beach-human read_bootstrap_handshake_skips_noise_lines` |
 | 3 | ✅ Done | Introduce dispatcher | Add `terminal::app::run` coordinating `host/join/ssh`; slim `main.rs` to logging + delegation | `cargo check -p beach-human` and `cargo run -p beach-human -- --help` |
 | 4 | ✅ Done | Host extraction | Host runtime now lives in `server::terminal::host::run`, `terminal::app` delegates, negotiation helpers are shared, and all targeted tests (including the full suite) plus `cargo clippy -p beach-human --all-targets -- -D warnings` pass. | `cargo check -p beach-human`, `cargo test -p beach-human bootstrap_handshake_serializes_expected_fields`, `cargo test -p beach-human read_bootstrap_handshake_skips_noise_lines`, `cargo test -p beach-human webrtc_mock_session_flow`, `cargo test -p beach-human`, `cargo clippy -p beach-human --all-targets -- -D warnings` |
-| 5 | ⏳ Todo | Join extraction | Move join workflow + MCP proxy bootstrap into `client::terminal::join`; keep negotiation shared | `cargo test -p beach-human` and `cargo run -p beach-human -- join --help` |
-| 6 | ⏳ Todo | SSH extraction | Relocate SSH bootstrap into `transport::ssh`; consolidate bootstrap helpers | `cargo test -p beach-human read_bootstrap_handshake_skips_noise_lines` and `cargo run -p beach-human -- ssh --help` |
+| 5 | ✅ Done | Join extraction | Join workflow + MCP proxy bootstrap now live in `client::terminal::join`; negotiation helpers remain shared | `cargo test -p beach-human` and `cargo run -p beach-human -- join --help` |
+| 6 | ✅ Done | SSH extraction | SSH bootstrap now lives in `transport::ssh::run`, terminal app delegates, helpers are consolidated | `cargo test -p beach-human read_bootstrap_handshake_skips_noise_lines` and `cargo run -p beach-human -- ssh --help` |
 | 7 | ⏳ Todo | Transport negotiation | Create `transport::terminal::negotiation` housing negotiation + failover + heartbeat publisher | `cargo test -p beach-human heartbeat_publisher_emits_messages` and `cargo test -p beach-human handshake_refresh_stops_after_completion` |
 | 8 | ⏳ Todo | Sync pipeline move | Shift timeline/backfill/update-forwarder + send helpers into `sync::terminal::server_pipeline` | `cargo test -p beach-human webrtc_mock_session_flow`, `cargo test -p beach-human history_backfill_contains_line_text`, `cargo test -p beach-human history_backfill_skips_default_rows` |
 | 9 | ⏳ Todo | Runtime utilities & clean-up | Rehome spawn config helpers, viewport utilities, frame encoders; prune leftovers & update docs | `cargo fmt`, `cargo clippy -p beach-human --all-targets -- -D warnings`, `cargo test -p beach-human` |
@@ -61,3 +61,31 @@ Following these phases keeps the work reviewable and verifiable, while steadily 
 
 5. **Cleanup Pass**
    - ✅ Done: docs updated, lint backlog cleared, `cargo fmt`, `cargo test -p beach-human`, and `cargo clippy -p beach-human --all-targets -- -D warnings` are all green.
+
+## Phase 5 – Join Extraction Checklist
+
+1. **Module Scaffold**
+   - ✅ Done: created `client::terminal::join` module and re-routed terminal CLI to call into it.
+
+2. **Logic Lift-and-Shift**
+   - ✅ Done: `client::terminal::join::run` now owns session discovery, transport negotiation, MCP proxy spawn, and client bootstrap without behavioural changes.
+
+3. **App Slimming & Re-exports**
+   - ✅ Done: `summarize_offers`, `kind_label`, passcode prompts, and `interpret_session_target` live under `client::terminal::join`; `terminal::app` is reduced to CLI dispatch plus SSH bootstrap.
+
+4. **Tests & Follow-ups**
+   - ✅ Done: `cargo test -p beach-human`, `cargo run -p beach-human -- join --help`, `cargo clippy -p beach-human --all-targets -- -D warnings`, and `cargo fmt` executed successfully.
+
+## Phase 6 – SSH Extraction Checklist
+
+1. **Module Lift**
+   - ✅ Done: added `transport::ssh::run` housing the SSH bootstrap workflow, including remote command orchestration and handshake capture.
+
+2. **App Delegation**
+   - ✅ Done: `terminal::app::run` now defers the SSH command to the new transport module, leaving the CLI surface minimal.
+
+3. **Helper Consolidation**
+   - ✅ Done: stdout/stderr forwarding and bootstrap cleanup helpers moved alongside the SSH module with no remaining duplicates in `terminal::app`.
+
+4. **Regression Checks**
+   - ✅ Done: `cargo test -p beach-human read_bootstrap_handshake_skips_noise_lines` and `cargo run -p beach-human -- ssh --help` pass after the move.

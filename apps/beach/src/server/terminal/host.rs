@@ -1,5 +1,6 @@
 use crate::cache::Seq;
 use crate::cache::terminal::{PackedCell, StyleId, TerminalGrid, unpack_cell};
+use crate::client::terminal::join::{kind_label, summarize_offers};
 use crate::client::terminal::{ClientError, TerminalClient};
 use crate::mcp::{
     McpConfig,
@@ -29,12 +30,14 @@ use crate::sync::terminal::{TerminalDeltaStream, TerminalSync};
 use crate::sync::{LaneBudget, PriorityLane, ServerSynchronizer, SubscriptionId, SyncConfig};
 use crate::telemetry::logging as logctl;
 use crate::telemetry::{self, PerfGuard};
-use crate::terminal::app::{kind_label, summarize_offers};
 use crate::terminal::cli::{BootstrapOutput, HostArgs};
 use crate::terminal::config::cursor_sync_enabled;
 use crate::terminal::error::CliError;
-use crate::terminal::negotiation::{NegotiatedSingle, NegotiatedTransport, negotiate_transport};
 use crate::transport as transport_mod;
+use crate::transport::terminal::negotiation::{
+    HeartbeatPublisher, NegotiatedSingle, NegotiatedTransport, SharedTransport,
+    TransportSupervisor, negotiate_transport,
+};
 use crate::transport::{
     Payload, Transport, TransportError, TransportId, TransportKind, TransportMessage,
 };
@@ -44,10 +47,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{self, Write as _};
 use std::io::{self, IsTerminal, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::Mutex as AsyncMutex;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -456,70 +458,6 @@ fn print_host_banner(
     }
     println!();
     println!("🌊 Launching host process... type 'exit' to end the session.\n");
-}
-
-#[derive(Clone)]
-struct HeartbeatPublisher {
-    transport: Arc<dyn Transport>,
-    supervisor: Option<Arc<TransportSupervisor>>,
-}
-
-impl HeartbeatPublisher {
-    fn new(transport: Arc<dyn Transport>, supervisor: Option<Arc<TransportSupervisor>>) -> Self {
-        Self {
-            transport,
-            supervisor,
-        }
-    }
-
-    fn spawn(self, interval: Duration, limit: Option<usize>) {
-        tokio::spawn(async move {
-            let mut count: usize = 0;
-            loop {
-                if let Some(max) = limit {
-                    if count >= max {
-                        break;
-                    }
-                }
-
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis();
-                let frame = HostFrame::Heartbeat {
-                    seq: count as u64,
-                    timestamp_ms: now as u64,
-                };
-
-                if let Err(err) = send_host_frame(&self.transport, frame) {
-                    debug!(
-                        target = "transport_mod::heartbeat",
-                        transport_id = self.transport.id().0,
-                        transport = ?self.transport.kind(),
-                        error = %err,
-                        "heartbeat send failed; scheduling reconnect"
-                    );
-                    if let Some(supervisor) = &self.supervisor {
-                        supervisor.schedule_reconnect();
-                        sleep(interval).await;
-                        continue;
-                    } else {
-                        warn!(
-                            target = "transport_mod::heartbeat",
-                            transport_id = self.transport.id().0,
-                            transport = ?self.transport.kind(),
-                            error = %err,
-                            "heartbeat publisher stopping after failed send"
-                        );
-                        break;
-                    }
-                }
-
-                count += 1;
-                sleep(interval).await;
-            }
-        });
-    }
 }
 
 fn build_spawn_config(command: &[String]) -> Result<(SpawnConfig, Arc<TerminalGrid>), CliError> {
@@ -1037,173 +975,6 @@ fn handle_viewport_command(
         }
     }
     Ok(())
-}
-
-struct SharedTransport {
-    inner: RwLock<Arc<dyn Transport>>,
-}
-
-impl SharedTransport {
-    fn new(initial: Arc<dyn Transport>) -> Self {
-        Self {
-            inner: RwLock::new(initial),
-        }
-    }
-
-    fn swap(&self, next: Arc<dyn Transport>) {
-        let mut guard = self.inner.write().expect("shared transport poisoned");
-        *guard = next;
-    }
-
-    fn current(&self) -> Arc<dyn Transport> {
-        self.inner
-            .read()
-            .expect("shared transport poisoned")
-            .clone()
-    }
-}
-
-impl fmt::Debug for SharedTransport {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let current = self.current();
-        f.debug_struct("SharedTransport")
-            .field("transport_id", &current.id())
-            .field("transport_kind", &current.kind())
-            .finish()
-    }
-}
-
-impl Transport for SharedTransport {
-    fn kind(&self) -> TransportKind {
-        self.current().kind()
-    }
-
-    fn id(&self) -> TransportId {
-        self.current().id()
-    }
-
-    fn peer(&self) -> TransportId {
-        self.current().peer()
-    }
-
-    fn send(&self, message: TransportMessage) -> Result<(), TransportError> {
-        self.current().send(message)
-    }
-
-    fn send_text(&self, text: &str) -> Result<u64, TransportError> {
-        self.current().send_text(text)
-    }
-
-    fn send_bytes(&self, bytes: &[u8]) -> Result<u64, TransportError> {
-        self.current().send_bytes(bytes)
-    }
-
-    fn recv(&self, timeout: Duration) -> Result<TransportMessage, TransportError> {
-        self.current().recv(timeout)
-    }
-
-    fn try_recv(&self) -> Result<Option<TransportMessage>, TransportError> {
-        self.current().try_recv()
-    }
-}
-
-#[derive(Clone)]
-struct TransportSupervisor {
-    shared: Arc<SharedTransport>,
-    session_handle: SessionHandle,
-    passphrase: Option<String>,
-    reconnecting: Arc<AsyncMutex<bool>>,
-}
-
-impl TransportSupervisor {
-    fn new(
-        shared: Arc<SharedTransport>,
-        session_handle: SessionHandle,
-        passphrase: Option<String>,
-    ) -> Self {
-        Self {
-            shared,
-            session_handle,
-            passphrase,
-            reconnecting: Arc::new(AsyncMutex::new(false)),
-        }
-    }
-
-    fn schedule_reconnect(&self) {
-        let this = self.clone();
-        tokio::spawn(async move {
-            let mut guard = this.reconnecting.lock().await;
-            if *guard {
-                return;
-            }
-            *guard = true;
-            drop(guard);
-
-            const MAX_ATTEMPTS: usize = 5;
-            let mut delay = Duration::from_millis(250);
-            for attempt in 1..=MAX_ATTEMPTS {
-                match negotiate_transport(
-                    &this.session_handle,
-                    this.passphrase.as_deref(),
-                    None,
-                    false,
-                )
-                .await
-                {
-                    Ok(NegotiatedTransport::Single(NegotiatedSingle {
-                        transport: new_transport,
-                        ..
-                    })) => {
-                        let kind = new_transport.kind();
-                        let id = new_transport.id().0;
-                        this.shared.swap(new_transport);
-                        info!(
-                            target = "transport_mod::failover",
-                            ?kind,
-                            transport_id = id,
-                            attempt,
-                            "transport failover completed"
-                        );
-                        break;
-                    }
-                    Ok(NegotiatedTransport::WebRtcOfferer { connection, .. }) => {
-                        let transport = connection.transport();
-                        let kind = transport.kind();
-                        let id = transport.id().0;
-                        this.shared.swap(transport);
-                        info!(
-                            target = "transport_mod::failover",
-                            ?kind,
-                            transport_id = id,
-                            attempt,
-                            "transport failover completed (offerer)"
-                        );
-                        break;
-                    }
-                    Err(err) => {
-                        warn!(
-                            target = "transport_mod::failover",
-                            attempt,
-                            error = %err,
-                            "transport failover attempt failed"
-                        );
-                        if attempt == MAX_ATTEMPTS {
-                            error!(
-                                target = "transport_mod::failover",
-                                "exhausted transport failover attempts"
-                            );
-                            break;
-                        }
-                        sleep(delay).await;
-                        delay = (delay * 2).min(Duration::from_secs(5));
-                    }
-                }
-            }
-
-            let mut guard = this.reconnecting.lock().await;
-            *guard = false;
-        });
-    }
 }
 
 fn map_lane(lane: PriorityLane) -> WireLane {
@@ -3106,6 +2877,7 @@ fn display_cmd(cmd: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::cache::terminal::{self, PackedCell, Style, StyleId};
+    use crate::client::terminal::join::interpret_session_target;
     use crate::model::terminal::diff::{
         CellWrite, HistoryTrim, RectFill, RowSnapshot, StyleDefinition,
     };
@@ -3116,7 +2888,6 @@ mod tests {
     };
     use crate::session::TransportOffer;
     use crate::sync::terminal::NullTerminalDeltaStream;
-    use crate::terminal::app::interpret_session_target;
     use crate::transport::{Payload, TransportKind, TransportPair};
     use serde_json::json;
     use std::sync::{Arc, Mutex};

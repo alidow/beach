@@ -69,7 +69,7 @@ const PREDICTION_GLITCH_FLAG_THRESHOLD: Duration = Duration::from_millis(5000);
 const PREDICTION_SRTT_ALPHA: f64 = 0.125;
 const PREDICTION_ACK_GRACE: Duration = Duration::from_millis(90);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthorizationState {
     Connecting,
     Waiting,
@@ -478,6 +478,7 @@ impl TerminalClient {
             debug!(
                 target = "client::frame",
                 frame = frame_type,
+                authorization_state = ?self.authorization_state,
                 "processing binary frame"
             );
         }
@@ -512,6 +513,11 @@ impl TerminalClient {
                 self.last_backfill_trimmed = false;
                 self.handshake_snapshot_lines = config.initial_snapshot_lines;
                 self.handshake_history_rows = 0;
+                debug!(
+                    subscription = subscription,
+                    initial_snapshot_lines = config.initial_snapshot_lines,
+                    "received Hello frame, setting Approved state"
+                );
                 self.set_authorization_state(
                     AuthorizationState::Approved,
                     Some(AUTH_APPROVED_MESSAGE.to_string()),
@@ -637,7 +643,13 @@ impl TerminalClient {
             WireHostFrame::Cursor { cursor, .. } => {
                 self.apply_wire_cursor(&cursor);
             }
-            WireHostFrame::SnapshotComplete { .. } => {}
+            WireHostFrame::SnapshotComplete { .. } => {
+                debug!(
+                    authorization_state = ?self.authorization_state,
+                    has_loaded_rows = self.has_loaded_rows,
+                    "received SnapshotComplete"
+                );
+            }
             WireHostFrame::Shutdown => return Err(ClientError::Shutdown),
         }
         Ok(())
@@ -2769,6 +2781,11 @@ impl TerminalClient {
             } else {
                 AUTH_WAIT_MESSAGE_SYNCING.to_string()
             };
+            debug!(
+                pending_hint = self.authorization_pending_hint,
+                elapsed = ?self.connect_started_at.elapsed(),
+                "transitioning to Waiting state"
+            );
             self.set_authorization_state(AuthorizationState::Waiting, Some(fallback_message));
         }
 

@@ -3215,8 +3215,9 @@ mod tests {
 
         let cmd = vec!["/opt/beach nightly".to_string(), "--flag".to_string()];
         let rendered = bootstrap::render_remote_command(&cmd);
-        assert!(rendered.starts_with("exec '"));
+        assert!(rendered.starts_with("nohup '"));
         assert!(rendered.contains("'/opt/beach nightly'"));
+        assert!(rendered.contains("'--flag'"));
     }
 
     #[test]

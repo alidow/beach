@@ -382,7 +382,7 @@ impl SessionBackend for ReqwestSessionBackend {
         request: &JoinSessionRequest,
     ) -> Result<JoinSessionResponse, SessionError> {
         let endpoint = base_url
-            .join(&format!("sessions/{}/join", session_id))
+            .join(&format!("sessions/{session_id}/join"))
             .map_err(|err| {
                 SessionError::InvalidConfig(format!(
                     "invalid join endpoint for session {session_id}: {err}"
@@ -609,7 +609,7 @@ mod tests {
                 Some(expected) if *expected == request.passphrase => Ok(JoinSessionResponse {
                     success: true,
                     message: None,
-                    session_url: Some(format!("http://mock/{}", session_id)),
+                    session_url: Some(format!("http://mock/{session_id}")),
                     transports: vec![
                         AdvertisedTransport {
                             kind: AdvertisedTransportKind::WebRtc,

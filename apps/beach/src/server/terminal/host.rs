@@ -3184,7 +3184,7 @@ mod tests {
             "mcp_enabled": false
         })
         .to_string();
-        let script = format!("Last login: today\n{}\n", payload);
+        let script = format!("Last login: today\n{payload}\n");
 
         let (mut writer, reader) = duplex(256);
         let mut reader = BufReader::new(reader);
@@ -3427,7 +3427,7 @@ mod tests {
                         .iter()
                         .take(prefix_len)
                         .copied()
-                        .eq(needle_chars.into_iter());
+                        .eq(needle_chars.iter().copied());
                     let suffix_blank = row.iter().skip(prefix_len).all(|&ch| ch == ' ');
                     prefix_matches && suffix_blank
                 } else {
@@ -3514,7 +3514,7 @@ mod tests {
     #[test_timeout::timeout]
     fn parse_url_with_join_suffix() {
         let id = Uuid::new_v4();
-        let url = format!("https://example.com/api/sessions/{}/join", id);
+        let url = format!("https://example.com/api/sessions/{id}/join");
         let (parsed, base) = interpret_session_target(&url).unwrap();
         assert_eq!(parsed, id.to_string());
         assert_eq!(base.unwrap(), "https://example.com/api/");
@@ -3839,7 +3839,7 @@ mod tests {
         );
 
         tokio::task::spawn_blocking(move || {
-            let mut view = ClientGrid::new(rows as usize, cols as usize);
+            let mut view = ClientGrid::new(rows, cols);
             let mut saw_prompt = false;
             let mut foreground_complete = false;
             let mut recent_complete = false;
@@ -4107,8 +4107,7 @@ mod tests {
 
         assert!(
             seen_rows.iter().any(|(_, text)| text == "Line 113: Test"),
-            "expected row text in backfill, got {:?}",
-            seen_rows
+            "expected row text in backfill, got {seen_rows:?}"
         );
     }
 

@@ -60,7 +60,7 @@ pub async fn negotiate_transport(
                 Some("offerer") => WebRtcRole::Offerer,
                 Some("answerer") | None => WebRtcRole::Answerer,
                 Some(other) => {
-                    errors.push(format!("unsupported webrtc role {}", other));
+                    errors.push(format!("unsupported webrtc role {other}"));
                     continue;
                 }
             };
@@ -112,7 +112,7 @@ pub async fn negotiate_transport(
                             error = %err,
                             "webrtc negotiation failed"
                         );
-                        errors.push(format!("webrtc {}: {}", signaling_url, err));
+                        errors.push(format!("webrtc {signaling_url}: {err}"));
                     }
                 },
                 WebRtcRole::Answerer => match transport_mod::webrtc::connect_via_signaling(
@@ -145,7 +145,7 @@ pub async fn negotiate_transport(
                             error = %err,
                             "webrtc negotiation failed"
                         );
-                        errors.push(format!("webrtc {}: {}", signaling_url, err));
+                        errors.push(format!("webrtc {signaling_url}: {err}"));
                     }
                 },
             }
@@ -166,7 +166,7 @@ pub async fn negotiate_transport(
                 }
                 Err(err) => {
                     warn!(transport = "websocket", url = %url, error = %err, "websocket negotiation failed");
-                    errors.push(format!("websocket {}: {}", url, err));
+                    errors.push(format!("websocket {url}: {err}"));
                 }
             }
         }

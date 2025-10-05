@@ -325,27 +325,27 @@ impl McpService {
             "resources/list" => {
                 let result = self.resources_list();
                 Some(JsonRpcResponse::Result(JsonRpcResult::new(
-                    id.unwrap_or_else(|| serde_json::Value::Null),
+                    id.unwrap_or(serde_json::Value::Null),
                     result,
                 )))
             }
             "resources/read" => match self.resources_read(&params).await {
                 Ok(value) => Some(JsonRpcResponse::Result(JsonRpcResult::new(
-                    id.unwrap_or_else(|| serde_json::Value::Null),
+                    id.unwrap_or(serde_json::Value::Null),
                     value,
                 ))),
                 Err(err) => Some(err.into_response(id)),
             },
             "resources/subscribe" => match self.resources_subscribe(state, &params).await {
                 Ok(value) => Some(JsonRpcResponse::Result(JsonRpcResult::new(
-                    id.unwrap_or_else(|| serde_json::Value::Null),
+                    id.unwrap_or(serde_json::Value::Null),
                     value,
                 ))),
                 Err(err) => Some(err.into_response(id)),
             },
             "resources/unsubscribe" => match self.resources_unsubscribe(state, &params).await {
                 Ok(value) => Some(JsonRpcResponse::Result(JsonRpcResult::new(
-                    id.unwrap_or_else(|| serde_json::Value::Null),
+                    id.unwrap_or(serde_json::Value::Null),
                     value,
                 ))),
                 Err(err) => Some(err.into_response(id)),
@@ -353,13 +353,13 @@ impl McpService {
             "tools/list" => {
                 let result = self.tools_list();
                 Some(JsonRpcResponse::Result(JsonRpcResult::new(
-                    id.unwrap_or_else(|| serde_json::Value::Null),
+                    id.unwrap_or(serde_json::Value::Null),
                     result,
                 )))
             }
             "tools/call" => match self.tools_call(&params).await {
                 Ok(value) => Some(JsonRpcResponse::Result(JsonRpcResult::new(
-                    id.unwrap_or_else(|| serde_json::Value::Null),
+                    id.unwrap_or(serde_json::Value::Null),
                     value,
                 ))),
                 Err(err) => Some(err.into_response(id)),

@@ -51,6 +51,7 @@ pub struct WebRtcChannels {
 }
 
 #[derive(Default)]
+#[allow(clippy::type_complexity)]
 struct WebRtcChannelsInner {
     channels: Mutex<HashMap<String, Arc<dyn Transport>>>,
     waiters: Mutex<HashMap<String, Vec<oneshot::Sender<Arc<dyn Transport>>>>>,
@@ -196,6 +197,7 @@ struct WebRtcTransport {
 }
 
 impl WebRtcTransport {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         kind: TransportKind,
         id: TransportId,
@@ -1909,12 +1911,10 @@ async fn fetch_sdp(
         }
         StatusCode::NOT_FOUND => Ok(None),
         status if status.is_server_error() => Err(TransportError::Setup(format!(
-            "signaling server returned {}",
-            status
+            "signaling server returned {status}"
         ))),
         status => Err(TransportError::Setup(format!(
-            "unexpected signaling status {}",
-            status
+            "unexpected signaling status {status}"
         ))),
     }
 }

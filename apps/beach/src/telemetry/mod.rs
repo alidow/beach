@@ -126,9 +126,10 @@ pub mod logging {
     use tracing_appender::non_blocking::WorkerGuard;
     use tracing_subscriber::EnvFilter;
 
-    #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq, PartialOrd, Ord)]
+    #[derive(Clone, Copy, Debug, Default, ValueEnum, PartialEq, Eq, PartialOrd, Ord)]
     pub enum LogLevel {
         Error,
+        #[default]
         Warn,
         Info,
         Debug,
@@ -144,12 +145,6 @@ pub mod logging {
                 LogLevel::Debug => LevelFilter::DEBUG,
                 LogLevel::Trace => LevelFilter::TRACE,
             }
-        }
-    }
-
-    impl Default for LogLevel {
-        fn default() -> Self {
-            LogLevel::Warn
         }
     }
 

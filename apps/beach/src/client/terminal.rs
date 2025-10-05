@@ -84,7 +84,7 @@ mod clipboard {
     use std::cell::RefCell;
 
     thread_local! {
-        static TEST_CLIPBOARD: RefCell<Option<String>> = RefCell::new(None);
+        static TEST_CLIPBOARD: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
     pub fn set(contents: &str) -> Result<(), String> {
@@ -916,22 +916,19 @@ impl TerminalClient {
                 }
             }
         }
-        if self.renderer.is_following_tail() && self.pending_backfills.is_empty() {
-            if let (Some(base), Some(highest)) = (self.known_base_row, self.highest_loaded_row) {
-                if base == 0
-                    && start > highest
-                    && self.next_backfill_request_id == 1
-                    && self.renderer.total_rows() <= BACKFILL_LOOKAHEAD_ROWS as u64
-                {
-                    if self
-                        .renderer
-                        .first_gap_between(base, highest.saturating_add(1))
-                        .is_none()
-                    {
-                        return Ok(());
-                    }
-                }
-            }
+        if self.renderer.is_following_tail()
+            && self.pending_backfills.is_empty()
+            && let (Some(base), Some(highest)) = (self.known_base_row, self.highest_loaded_row)
+            && base == 0
+            && start > highest
+            && self.next_backfill_request_id == 1
+            && self.renderer.total_rows() <= BACKFILL_LOOKAHEAD_ROWS as u64
+            && self
+                .renderer
+                .first_gap_between(base, highest.saturating_add(1))
+                .is_none()
+        {
+            return Ok(());
         }
         let tail_hint = self
             .highest_loaded_row
@@ -1576,7 +1573,7 @@ impl TerminalClient {
             execute!(stdout, MoveTo(0, 0), Clear(ClearType::All), Show)
                 .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
             for line in self.renderer.visible_lines() {
-                writeln!(stdout, "{}", line).map_err(|err| {
+                writeln!(stdout, "{line}").map_err(|err| {
                     ClientError::Transport(TransportError::Setup(err.to_string()))
                 })?;
             }
@@ -1688,20 +1685,17 @@ impl TerminalClient {
             return false;
         }
 
-        match key.code {
-            KeyCode::PageUp => {
-                self.enter_copy_mode();
-                if self.copy_mode.is_some() {
-                    self.execute_copy_mode_command(CopyModeCommand::Page { delta: -1 });
-                }
-                return true;
+        if matches!(key.code, KeyCode::PageUp) {
+            self.enter_copy_mode();
+            if self.copy_mode.is_some() {
+                self.execute_copy_mode_command(CopyModeCommand::Page { delta: -1 });
             }
-            _ => {}
+            return true;
         }
 
         if key.modifiers.contains(KeyModifiers::ALT) {
             if let KeyCode::Char(c) = key.code {
-                if c.to_ascii_lowercase() == '[' {
+                if c.eq_ignore_ascii_case(&'[') {
                     self.enter_copy_mode();
                     return true;
                 }
@@ -1714,7 +1708,7 @@ impl TerminalClient {
     fn handle_tmux_prefix(&mut self, key: &KeyEvent) -> bool {
         self.expire_tmux_prefix();
 
-        let is_ctrl_b = matches!(key.code, KeyCode::Char(c) if c.to_ascii_lowercase() == 'b')
+        let is_ctrl_b = matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'b'))
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && !key
                 .modifiers
@@ -1725,7 +1719,7 @@ impl TerminalClient {
             return true;
         }
 
-        if let Some(_) = self.tmux_prefix_started_at.take() {
+        if self.tmux_prefix_started_at.take().is_some() {
             match key.code {
                 KeyCode::Char('[') => {
                     self.enter_copy_mode();
@@ -1792,8 +1786,7 @@ impl TerminalClient {
                     let found = self.perform_copy_mode_search(direction, &pattern);
                     if !found {
                         self.renderer.set_status_message(Some(format!(
-                            "copy-mode: \"{}\" not found",
-                            pattern
+                            r#"copy-mode: "{pattern}" not found"#
                         )));
                     }
                     self.update_copy_mode_status();
@@ -1828,7 +1821,7 @@ impl TerminalClient {
                     CopyModeSearchDirection::Forward => '/',
                     CopyModeSearchDirection::Backward => '?',
                 };
-                let text = format!("{}{}", prefix, buffer);
+                let text = format!("{prefix}{buffer}");
                 self.renderer.set_status_message(Some(text));
             }
         }
@@ -1933,7 +1926,7 @@ impl TerminalClient {
 
         if !self.perform_copy_mode_search(direction, &pattern) {
             self.renderer
-                .set_status_message(Some(format!("copy-mode: \"{}\" not found", pattern)));
+                .set_status_message(Some(format!(r#"copy-mode: "{pattern}" not found"#)));
             self.force_render = true;
         }
     }
@@ -3316,7 +3309,7 @@ fn encode_key_event(key: KeyEvent) -> Option<Vec<u8>> {
             }
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 let lower = c.to_ascii_lowercase();
-                if ('a'..='z').contains(&lower) {
+                if lower.is_ascii_lowercase() {
                     bytes.push((lower as u8 - b'a') + 1);
                 } else {
                     return None;
@@ -3347,11 +3340,10 @@ fn encode_key_event(key: KeyEvent) -> Option<Vec<u8>> {
 fn is_copy_shortcut(key: &KeyEvent) -> bool {
     match key.code {
         KeyCode::Char(c) => {
-            let lower = c.to_ascii_lowercase();
-            (key.modifiers.contains(KeyModifiers::SUPER) && lower == 'c')
+            (key.modifiers.contains(KeyModifiers::SUPER) && c.eq_ignore_ascii_case(&'c'))
                 || (key.modifiers.contains(KeyModifiers::CONTROL)
                     && key.modifiers.contains(KeyModifiers::SHIFT)
-                    && lower == 'c')
+                    && c.eq_ignore_ascii_case(&'c'))
         }
         KeyCode::Insert => key.modifiers.contains(KeyModifiers::CONTROL),
         _ => false,
@@ -3378,7 +3370,7 @@ fn copy_mode_command_for_key(
 
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         if let KeyCode::Char(c) = key.code {
-            if c.to_ascii_lowercase() == 'g' {
+            if c.eq_ignore_ascii_case(&'g') {
                 return Some(CopyModeCommand::Cancel);
             }
         }
@@ -3625,7 +3617,7 @@ fn encode_mouse_event(mouse: &MouseEvent) -> Option<Vec<u8>> {
 
     let column = mouse.column.saturating_add(1);
     let row = mouse.row.saturating_add(1);
-    let sequence = format!("\u{1b}[<{};{};{}{}", code, column, row, suffix);
+    let sequence = format!("\u{1b}[<{code};{column};{row}{suffix}");
     Some(sequence.into_bytes())
 }
 
@@ -3739,7 +3731,7 @@ mod tests {
     }
 
     fn pack_text_row(absolute_row: u32, label: u32) -> WireUpdate {
-        let text = format!("Line {}: Test", label);
+        let text = format!("Line {label}: Test");
         let cells = text.chars().map(pack_char).collect();
         WireUpdate::Row {
             row: absolute_row,
@@ -3782,7 +3774,7 @@ mod tests {
     }
 
     fn new_client() -> TerminalClient {
-        TerminalClient::new(Arc::new(NullTransport::default())).with_render(false)
+        TerminalClient::new(Arc::new(NullTransport)).with_render(false)
     }
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {

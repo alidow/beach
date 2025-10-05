@@ -333,7 +333,7 @@ fn encode_char_key(ch: char, modifiers: &[KeyModifier]) -> Option<Vec<u8>> {
         bytes.push(0x1b);
     }
     if ctrl {
-        if ('a'..='z').contains(&lower) {
+        if lower.is_ascii_lowercase() {
             bytes.push((lower as u8 - b'a') + 1);
         } else {
             return None;

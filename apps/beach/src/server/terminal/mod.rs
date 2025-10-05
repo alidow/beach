@@ -313,11 +313,8 @@ mod tests {
                         collected.push(ch);
                     }
                     CacheUpdate::Row(row) => {
-                        let line: String = row
-                            .cells
-                            .iter()
-                            .map(|cell| unpack_cell(PackedCell::from(*cell)).0)
-                            .collect();
+                        let line: String =
+                            row.cells.iter().map(|cell| unpack_cell(*cell).0).collect();
                         collected.push_str(line.trim_end());
                     }
                     _ => {}

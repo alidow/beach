@@ -52,21 +52,21 @@ impl TerminalResource {
     pub fn descriptors(session_id: &str) -> Vec<ResourceDescriptor> {
         vec![
             ResourceDescriptor {
-                uri: format!("beach://session/{}/terminal/grid", session_id),
+                uri: format!("beach://session/{session_id}/terminal/grid"),
                 name: "Terminal Grid".to_string(),
                 description: Some("Current terminal viewport snapshot".to_string()),
                 resource_type: "terminal.grid".to_string(),
                 read_only: false,
             },
             ResourceDescriptor {
-                uri: format!("beach://session/{}/terminal/history", session_id),
+                uri: format!("beach://session/{session_id}/terminal/history"),
                 name: "Terminal History".to_string(),
                 description: Some("Scrollback history snapshot".to_string()),
                 resource_type: "terminal.history".to_string(),
                 read_only: false,
             },
             ResourceDescriptor {
-                uri: format!("beach://session/{}/terminal/cursor", session_id),
+                uri: format!("beach://session/{session_id}/terminal/cursor"),
                 name: "Cursor".to_string(),
                 description: Some("Latest cursor state".to_string()),
                 resource_type: "terminal.cursor".to_string(),
@@ -316,51 +316,51 @@ fn render_row(buffer: &[u64]) -> (String, Vec<Value>) {
 fn updates_to_json(updates: &[CacheUpdate]) -> Vec<Value> {
     updates
         .iter()
-        .filter_map(|update| match update {
-            CacheUpdate::Cell(cell) => Some(json!({
+        .map(|update| match update {
+            CacheUpdate::Cell(cell) => json!({
                 "type": "cell",
                 "row": cell.row,
                 "col": cell.col,
                 "seq": cell.seq,
                 "cell": u64::from(cell.cell),
-            })),
-            CacheUpdate::Rect(rect) => Some(json!({
+            }),
+            CacheUpdate::Rect(rect) => json!({
                 "type": "rect",
                 "rows": {"start": rect.rows.start, "end": rect.rows.end},
                 "cols": {"start": rect.cols.start, "end": rect.cols.end},
                 "seq": rect.seq,
                 "cell": u64::from(rect.cell),
-            })),
+            }),
             CacheUpdate::Row(row) => {
                 let cells: Vec<u64> = row.cells.iter().map(|cell| (*cell).into()).collect();
-                Some(json!({
+                json!({
                     "type": "row",
                     "row": row.row,
                     "seq": row.seq,
                     "cells": cells,
-                }))
+                })
             }
-            CacheUpdate::Trim(trim) => Some(json!({
+            CacheUpdate::Trim(trim) => json!({
                 "type": "trim",
                 "start": trim.start,
                 "count": trim.count,
-            })),
-            CacheUpdate::Style(style) => Some(json!({
+            }),
+            CacheUpdate::Style(style) => json!({
                 "type": "style",
                 "id": style.id.0,
                 "seq": style.seq,
                 "fg": style.style.fg,
                 "bg": style.style.bg,
                 "attrs": style.style.attrs,
-            })),
-            CacheUpdate::Cursor(cursor) => Some(json!({
+            }),
+            CacheUpdate::Cursor(cursor) => json!({
                 "type": "cursor",
                 "row": cursor.row,
                 "col": cursor.col,
                 "seq": cursor.seq,
                 "visible": cursor.visible,
                 "blink": cursor.blink,
-            })),
+            }),
         })
         .collect()
 }

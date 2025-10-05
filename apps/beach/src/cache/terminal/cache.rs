@@ -569,7 +569,7 @@ mod tests {
         let grid = TerminalGrid::new(2, 3);
         let style_table = grid.style_table.as_ref();
 
-        let rows = vec![
+        let rows = [
             vec![
                 Cell {
                     char: 'H',

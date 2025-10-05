@@ -328,7 +328,7 @@ pub(crate) fn session_id_from_url(url: &Url) -> Option<String> {
     let mut segments: Vec<_> = url
         .path_segments()
         .map(|segments| segments.filter(|s| !s.is_empty()).collect())
-        .unwrap_or_else(Vec::new);
+        .unwrap_or_default();
     if segments.is_empty() {
         return None;
     }

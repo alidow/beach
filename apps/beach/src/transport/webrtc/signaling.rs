@@ -64,7 +64,7 @@ impl TransportSignal {
 }
 
 impl WebRTCSignal {
-    pub fn to_transport_signal(self) -> TransportSignal {
+    pub fn into_transport_signal(self) -> TransportSignal {
         TransportSignal::WebRTC { signal: self }
     }
 }
@@ -400,7 +400,7 @@ impl SignalingClient {
         signal: WebRTCSignal,
     ) -> Result<(), TransportError> {
         let payload = signal
-            .to_transport_signal()
+            .into_transport_signal()
             .to_value()
             .map_err(|err| TransportError::Setup(err.to_string()))?;
         self.send_tx

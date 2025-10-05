@@ -121,7 +121,7 @@ async fn run_bridge(handle: McpServerHandle, transport: Arc<dyn Transport>) -> R
                         tokio::task::spawn_blocking(move || transport.send_text(&send_line))
                             .await
                             .map_err(|err| TransportError::Setup(err.to_string()))
-                            .and_then(|res| res.map_err(|err| err));
+                            .and_then(|res| res);
                     if send_result.is_err() {
                         break;
                     }

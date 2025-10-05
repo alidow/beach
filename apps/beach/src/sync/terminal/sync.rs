@@ -258,9 +258,7 @@ impl DeltaSource<CacheUpdate> for TerminalSync {
             }
             if total > 0 {
                 updates.push(CacheUpdate::Trim(HistoryTrim::new(start, total)));
-                if remaining > 0 {
-                    remaining -= 1;
-                }
+                remaining = remaining.saturating_sub(1);
             }
         }
 
@@ -392,14 +390,16 @@ mod tests {
         ];
         let delta_stream = Arc::new(MockDeltaStream::new(delta_updates));
 
-        let mut config = SyncConfig::default();
-        config.snapshot_budgets = vec![
-            LaneBudget::new(PriorityLane::Foreground, 5),
-            LaneBudget::new(PriorityLane::Recent, 8),
-            LaneBudget::new(PriorityLane::History, 12),
-        ];
-        config.delta_budget = 2;
-        config.initial_snapshot_lines = 5;
+        let config = SyncConfig {
+            snapshot_budgets: vec![
+                LaneBudget::new(PriorityLane::Foreground, 5),
+                LaneBudget::new(PriorityLane::Recent, 8),
+                LaneBudget::new(PriorityLane::History, 12),
+            ],
+            delta_budget: 2,
+            initial_snapshot_lines: 5,
+            ..Default::default()
+        };
 
         let terminal_sync = Arc::new(TerminalSync::new(
             grid.clone(),

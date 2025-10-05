@@ -54,7 +54,7 @@ fn payload_bytes(message: &TransportMessage) -> Vec<u8> {
     }
 }
 
-async fn recv_with_timeout(transport: &Box<dyn Transport>, timeout: Duration) -> TransportMessage {
+async fn recv_with_timeout(transport: &dyn Transport, timeout: Duration) -> TransportMessage {
     let deadline = Instant::now() + timeout;
     loop {
         match transport.try_recv() {
@@ -116,18 +116,18 @@ async fn webrtc_bidirectional_transport_delivers_messages() {
     client
         .send_text("hello from client")
         .expect("send client text");
-    let server_msg = recv_with_timeout(&server, Duration::from_secs(5)).await;
+    let server_msg = recv_with_timeout(server.as_ref(), Duration::from_secs(5)).await;
     assert_eq!(payload_text(&server_msg), Some("hello from client"));
 
     server
         .send_text("hello from server")
         .expect("send server text");
-    let client_msg = recv_with_timeout(&client, Duration::from_secs(5)).await;
+    let client_msg = recv_with_timeout(client.as_ref(), Duration::from_secs(5)).await;
     assert_eq!(payload_text(&client_msg), Some("hello from server"));
 
     let bytes = vec![1u8, 2, 3, 4, 5];
     server.send_bytes(&bytes).expect("send server binary");
-    let binary_msg = recv_with_timeout(&client, Duration::from_secs(5)).await;
+    let binary_msg = recv_with_timeout(client.as_ref(), Duration::from_secs(5)).await;
     assert_eq!(payload_bytes(&binary_msg), bytes);
     match binary_msg.payload {
         Payload::Binary(_) => {}
@@ -141,7 +141,7 @@ async fn webrtc_bidirectional_transport_delivers_messages() {
     }
     for idx in 0..10 {
         let expected = format!("msg-{idx}");
-        let received = recv_with_timeout(&server, Duration::from_secs(5)).await;
+        let received = recv_with_timeout(server.as_ref(), Duration::from_secs(5)).await;
         assert_eq!(payload_text(&received), Some(expected.as_str()));
     }
 }
@@ -240,10 +240,10 @@ impl WsSession {
     }
 
     fn remove_peer(&mut self, peer_id: &str) {
-        if self.server.as_ref().map_or(false, |p| p.peer_id == peer_id) {
+        if self.server.as_ref().is_some_and(|p| p.peer_id == peer_id) {
             self.server = None;
         }
-        if self.client.as_ref().map_or(false, |p| p.peer_id == peer_id) {
+        if self.client.as_ref().is_some_and(|p| p.peer_id == peer_id) {
             self.client = None;
         }
     }
@@ -517,7 +517,7 @@ async fn webrtc_signaling_end_to_end() {
             .ok();
     });
 
-    let base_url = format!("http://{}/sessions/{}/webrtc", addr, SESSION_ID);
+    let base_url = format!("http://{addr}/sessions/{SESSION_ID}/webrtc");
     let offer_fut = async {
         let (supervisor, accepted) =
             OffererSupervisor::connect(&base_url, Duration::from_millis(50), None, false).await?;

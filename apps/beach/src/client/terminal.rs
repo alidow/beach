@@ -692,9 +692,7 @@ impl TerminalClient {
 
     fn sync_renderer_cursor(&mut self) {
         let visible = if self.cursor_support {
-            if self.cursor_authoritative {
-                self.cursor_visible
-            } else if self.cursor_authoritative_pending {
+            if self.cursor_authoritative || self.cursor_authoritative_pending {
                 self.cursor_visible
             } else {
                 true
@@ -786,9 +784,7 @@ impl TerminalClient {
                             );
                             if gap_span > 0
                                 && distance > BACKFILL_LOOKAHEAD_ROWS as u64
-                                && self
-                                    .last_gap_backfill_start
-                                    .map_or(true, |prev| prev != gap_start)
+                                && self.last_gap_backfill_start != Some(gap_start)
                                 && !self.is_range_pending(
                                     gap_start,
                                     gap_start.saturating_add(BACKFILL_MAX_ROWS_PER_REQUEST as u64),
@@ -799,7 +795,7 @@ impl TerminalClient {
                                         return Ok(());
                                     }
                                 }
-                                let count = gap_span.min(BACKFILL_MAX_ROWS_PER_REQUEST).max(1);
+                                let count = gap_span.clamp(1, BACKFILL_MAX_ROWS_PER_REQUEST);
                                 self.send_backfill_request(subscription, gap_start, count)?;
                                 self.last_backfill_request_at = Some(Instant::now());
                                 self.last_gap_backfill_start = Some(gap_start);
@@ -822,9 +818,7 @@ impl TerminalClient {
                             if let Some(base) = self.known_base_row {
                                 tail_start = tail_start.max(base);
                             }
-                            if self
-                                .last_tail_backfill_start
-                                .map_or(true, |prev| prev != tail_start)
+                            if self.last_tail_backfill_start != Some(tail_start)
                                 && !self.is_range_pending(
                                     tail_start,
                                     tail_start.saturating_add(BACKFILL_MAX_ROWS_PER_REQUEST as u64),
@@ -848,9 +842,7 @@ impl TerminalClient {
                         }
                     } else {
                         let tail_start = highest.saturating_sub(BACKFILL_LOOKAHEAD_ROWS as u64);
-                        if self
-                            .last_tail_backfill_start
-                            .map_or(true, |prev| prev != tail_start)
+                        if self.last_tail_backfill_start != Some(tail_start)
                             && !self.is_range_pending(
                                 tail_start,
                                 tail_start.saturating_add(BACKFILL_MAX_ROWS_PER_REQUEST as u64),
@@ -1420,10 +1412,11 @@ impl TerminalClient {
                 let count = *count as usize;
                 let trimmed_origin = (start as u64).saturating_add(count as u64);
                 self.renderer.apply_trim(start, count);
-                if self
-                    .known_base_row
-                    .map_or(true, |base| base < trimmed_origin)
-                {
+                let update_base = match self.known_base_row {
+                    Some(base) => base < trimmed_origin,
+                    None => true,
+                };
+                if update_base {
                     self.known_base_row = Some(trimmed_origin);
                 }
                 if let Some(highest) = self.highest_loaded_row {
@@ -3164,11 +3157,12 @@ impl TerminalClient {
         });
 
         if self.prediction_glitch_trigger > 0 && rtt < PREDICTION_GLITCH_THRESHOLD {
-            let allow_decay = self
-                .prediction_last_quick_confirmation
-                .map_or(true, |last| {
+            let allow_decay = match self.prediction_last_quick_confirmation {
+                Some(last) => {
                     now.saturating_duration_since(last) >= PREDICTION_GLITCH_REPAIR_MIN_INTERVAL
-                });
+                }
+                None => true,
+            };
             if allow_decay {
                 self.prediction_glitch_trigger = self.prediction_glitch_trigger.saturating_sub(1);
                 self.prediction_last_quick_confirmation = Some(now);

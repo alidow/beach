@@ -79,11 +79,14 @@ impl AtomicGrid {
         self.rows[row] = match current {
             RowState::Active(r) => {
                 let mut payloads = Vec::with_capacity(r.cols());
+                payloads.extend(
+                    r.payloads
+                        .iter()
+                        .take(r.cols())
+                        .map(|cell| cell.load(Acquire)),
+                );
                 let mut seqs = Vec::with_capacity(r.cols());
-                for i in 0..r.cols() {
-                    payloads.push(r.payloads[i].load(Acquire));
-                    seqs.push(r.seqs[i].load(Acquire));
-                }
+                seqs.extend(r.seqs.iter().take(r.cols()).map(|cell| cell.load(Acquire)));
                 RowState::Frozen { payloads, seqs }
             }
             RowState::Frozen { payloads, seqs } => RowState::Frozen { payloads, seqs },
@@ -107,10 +110,11 @@ impl AtomicGrid {
             RowState::Frozen { payloads, seqs } => {
                 let cols = payloads.len();
                 let active = ActiveRow::new(cols, 0, seq);
-                for i in 0..cols {
-                    active.payloads[i].store(payloads[i], Release);
-                    let stored_seq = seqs.get(i).copied().unwrap_or(seq);
-                    active.seqs[i].store(stored_seq, Release);
+                for (slot, value) in active.payloads.iter().zip(&payloads) {
+                    slot.store(*value, Release);
+                }
+                for (slot, value) in active.seqs.iter().zip(&seqs) {
+                    slot.store(*value, Release);
                 }
                 RowState::Active(active)
             }
@@ -178,13 +182,15 @@ impl GridCache for AtomicGrid {
                     if col1 > r.cols() {
                         return Err(WriteError::CoordOutOfBounds);
                     }
-                    for col in col0..col1 {
-                        let cur_seq = r.seqs[col].load(Acquire);
+                    for (payload_cell, seq_cell) in
+                        r.payloads[col0..col1].iter().zip(&r.seqs[col0..col1])
+                    {
+                        let cur_seq = seq_cell.load(Acquire);
                         if new_seq <= cur_seq {
                             skipped += 1;
                         } else {
-                            r.payloads[col].store(payload, Release);
-                            r.seqs[col].store(new_seq, Release);
+                            payload_cell.store(payload, Release);
+                            seq_cell.store(new_seq, Release);
                             written += 1;
                         }
                     }
@@ -204,8 +210,8 @@ impl GridCache for AtomicGrid {
                 if out.len() != r.cols() {
                     return Err(WriteError::CoordOutOfBounds);
                 }
-                for i in 0..r.cols() {
-                    out[i] = r.payloads[i].load(Acquire);
+                for (slot, value) in out.iter_mut().zip(r.payloads.iter()) {
+                    *slot = value.load(Acquire);
                 }
                 Ok(())
             }

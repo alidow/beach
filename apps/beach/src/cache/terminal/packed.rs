@@ -126,6 +126,10 @@ impl StyleTable {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.read().unwrap().vec.is_empty()
+    }
+
     /// Returns an existing ID for `style` or inserts it.
     pub fn ensure_id(&self, style: Style) -> StyleId {
         self.ensure_id_with_new(style).0
@@ -166,6 +170,12 @@ impl StyleTable {
 
     pub fn len(&self) -> usize {
         self.inner.read().unwrap().vec.len()
+    }
+}
+
+impl Default for StyleTable {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

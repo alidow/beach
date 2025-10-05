@@ -970,8 +970,7 @@ async fn client_targets_tail_history_after_large_delta() {
 
     assert!(
         followup_requests.len() <= 1,
-        "expected at most one tail request; observed {:?}",
-        followup_requests
+        "expected at most one tail request; observed {followup_requests:?}"
     );
     if let Some((_, start_row, _)) = followup_requests.first() {
         assert!(
@@ -1123,9 +1122,7 @@ async fn client_marks_empty_backfill_as_missing() {
 
     assert!(
         duplicate_request.is_some(),
-        "client failed to retry empty backfill for start={} count={}",
-        first_start_row,
-        first_count
+        "client failed to retry empty backfill for start={first_start_row} count={first_count}"
     );
 
     send_host_frame(&*server, HostFrame::Shutdown);
@@ -1340,15 +1337,13 @@ async fn client_recovers_truncated_history_after_tail_burst() {
         followup_requests
             .iter()
             .any(|(_, start, _)| *start == base_row as u64 + 24),
-        "client never issued follow-up backfill for rows starting at base+24; observed {:?}",
-        followup_requests
+        "client never issued follow-up backfill for rows starting at base+24; observed {followup_requests:?}"
     );
     assert!(
         followup_requests
             .iter()
             .any(|(_, start, _)| *start <= base_row as u64 + 37),
-        "client never issued broader backfill after burst; observed {:?}",
-        followup_requests
+        "client never issued broader backfill after burst; observed {followup_requests:?}"
     );
 
     for (request_id, start_row, count) in followup_requests {

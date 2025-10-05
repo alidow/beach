@@ -786,7 +786,7 @@ impl GridRenderer {
     pub fn prediction_exists(&self, row: usize, col: usize, seq: Seq) -> bool {
         self.predictions
             .get(&(row as u64, col))
-            .map_or(false, |cell| cell.seq == seq)
+            .is_some_and(|cell| cell.seq == seq)
     }
 
     pub fn seq_has_predictions(&self, seq: Seq) -> bool {
@@ -1586,8 +1586,8 @@ impl GridRenderer {
         highlight_cursor: bool,
     ) -> Span<'static> {
         let mut style = style_id
-            .and_then(|id| self.styles.get(&id).map(|cached| cached.style.clone()))
-            .unwrap_or_else(Style::default);
+            .and_then(|id| self.styles.get(&id).map(|cached| cached.style))
+            .unwrap_or_default();
         if predicted && self.prediction_flagging {
             style = style.add_modifier(Modifier::UNDERLINED);
         }
@@ -1788,7 +1788,7 @@ impl Widget for TerminalBodyWidget {
         let rendered = lines.len().min(max_rows);
         for row in rendered..max_rows {
             let blank = blank_line.get_or_insert_with(|| {
-                let repeated: String = std::iter::repeat(' ').take(area.width as usize).collect();
+                let repeated = " ".repeat(area.width as usize);
                 Line::from(repeated)
             });
             buf.set_line(area.x, area.y + row as u16, blank, area.width);

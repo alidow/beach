@@ -1,6 +1,7 @@
 mod emulator;
 pub mod host;
 mod pty;
+pub mod runtime;
 
 pub use emulator::{AlacrittyEmulator, EmulatorResult, SimpleTerminalEmulator, TerminalEmulator};
 pub use pty::{Command, PtyProcess, PtyReader, PtyWriter, SpawnConfig, resize_pty};

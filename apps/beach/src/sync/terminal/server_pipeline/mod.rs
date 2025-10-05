@@ -1,4 +1,9 @@
-// Extracted sync pipeline utilities
+//! Terminal host-side sync pipeline building blocks.
+//!
+//! This module centralises the data-plane helpers that the terminal host runtime
+//! (and its tests) share: timeline/backfill bookkeeping, frame chunking, and the
+//! async forwarder loop that keeps transports hydrated. Host-specific wiring
+//! such as accept loops or viewport handlers stays in `server::terminal::host`.
 
 use crate::cache::Seq;
 use crate::cache::terminal::{PackedCell, StyleId, TerminalGrid, unpack_cell};
@@ -741,6 +746,8 @@ pub(crate) fn spawn_update_forwarder(
     shared_registry: Arc<Mutex<Vec<Arc<SharedTransport>>>>,
     cursor_sync: bool,
 ) -> JoinHandle<()> {
+    // TODO(codex): phase 9 should reevaluate the shared forwarder surface once
+    // viewport utilities and spawn config helpers move alongside it.
     tokio::spawn(async move {
         struct Sink {
             transport: Arc<dyn Transport>,

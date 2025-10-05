@@ -23,8 +23,8 @@
 | 5 | ✅ Done | Join extraction | Join workflow + MCP proxy bootstrap now live in `client::terminal::join`; negotiation helpers remain shared | `cargo test -p beach-human` and `cargo run -p beach-human -- join --help` |
 | 6 | ✅ Done | SSH extraction | SSH bootstrap now lives in `transport::ssh::run`, terminal app delegates, helpers are consolidated | `cargo test -p beach-human read_bootstrap_handshake_skips_noise_lines` and `cargo run -p beach-human -- ssh --help` |
 | 7 | ✅ Done | Transport negotiation | Negotiation, failover, and heartbeat publisher now live under `transport::terminal::negotiation` with callers updated | `cargo test -p beach-human heartbeat_publisher_emits_messages` and `cargo test -p beach-human handshake_refresh_stops_after_completion` |
-| 8 | 🔄 In progress | Sync pipeline move | Shift timeline/backfill/update-forwarder + send helpers into `sync::terminal::server_pipeline` | `cargo test -p beach-human webrtc_mock_session_flow`, `cargo test -p beach-human history_backfill_contains_line_text`, `cargo test -p beach-human history_backfill_skips_default_rows` |
-| 9 | ⏳ Todo | Runtime utilities & clean-up | Rehome spawn config helpers, viewport utilities, frame encoders; prune leftovers & update docs | `cargo fmt`, `cargo clippy -p beach-human --all-targets -- -D warnings`, `cargo test -p beach-human` |
+| 8 | ✅ Done | Sync pipeline move | Shift timeline/backfill/update-forwarder + send helpers into `sync::terminal::server_pipeline` | `cargo test -p beach-human webrtc_mock_session_flow`, `cargo test -p beach-human history_backfill_contains_line_text`, `cargo test -p beach-human history_backfill_skips_default_rows` |
+| 9 | ✅ Done | Runtime utilities & clean-up | Rehome spawn config helpers, viewport utilities, frame encoders; prune leftovers & update docs | `cargo fmt`, `cargo clippy -p beach-human --all-targets -- -D warnings`, `cargo test -p beach-human` |
 
 ## Notes & Risk Mitigation
 - Compile after each move to catch missing imports/visibility (`cargo check -p beach-human`).
@@ -119,4 +119,18 @@ Following these phases keeps the work reviewable and verifiable, while steadily 
    - ✅ Done: `cargo test -p beach-human webrtc_mock_session_flow`, `cargo test -p beach-human history_backfill_contains_line_text`, and `cargo test -p beach-human history_backfill_skips_default_rows` all pass with the new module layout.
 
 5. **Follow-ups**
-   - ⏳ Pending: add inline docs/ownership notes to the new module, double-check constant single-sourcing, and log any remaining host↔pipeline coupling for Phase 9 cleanup.
+   - ✅ Done: documented module scope inline, confirmed constants are sourced from the shared module, and left a TODO in the forwarder to revisit host↔pipeline coupling during Phase 9 cleanup.
+
+## Phase 9 – Runtime Utilities & Clean-up Checklist
+
+1. **Utility Module Scaffold**
+   - ✅ Done: added `server::terminal::runtime` to house spawn-config helpers, viewport command handling, and PTY clamps for reuse.
+
+2. **Host Slimming**
+   - ✅ Done: `server::terminal::host` now imports the runtime helpers instead of defining them inline, keeping the file focused on orchestration.
+
+3. **Regression Checks**
+   - ✅ Done: `cargo check -p beach-human` and `cargo test -p beach-human webrtc_mock_session_flow` run clean after the extraction.
+
+4. **Follow-ups**
+   - ✅ Done: resize broadcasting and frame send helpers now live in shared runtime modules, and the full verification pass (`cargo fmt`, `cargo check -p beach-human`, `cargo clippy -p beach-human --all-targets -- -D warnings`, and targeted `cargo test -p beach-human …`) is clean.

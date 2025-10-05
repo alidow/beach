@@ -31,7 +31,7 @@ pub fn emit_bootstrap_handshake(
     );
     let payload = serde_json::to_string(&handshake)
         .map_err(|err| CliError::BootstrapOutput(err.to_string()))?;
-    println!("{}", payload);
+    println!("{payload}");
     std::io::stdout()
         .flush()
         .map_err(|err| CliError::BootstrapOutput(err.to_string()))?;
@@ -61,6 +61,7 @@ pub struct BootstrapHandshake {
 impl BootstrapHandshake {
     pub const SCHEMA_VERSION: u32 = 2;
 
+    #[allow(clippy::too_many_arguments)]
     pub fn from_context(
         session_id: &str,
         join_code: &str,
@@ -114,12 +115,12 @@ impl BootstrapHandshake {
 }
 
 pub fn remote_bootstrap_args(args: &SshArgs, session_server: &str) -> Vec<String> {
-    let mut command = Vec::new();
-    command.push(args.remote_path.clone());
-    command.push("host".to_string());
-    command.push("--bootstrap-output=json".to_string());
-    command.push("--session-server".to_string());
-    command.push(session_server.to_string());
+    let mut command = vec![
+        args.remote_path.clone(),
+        "host".to_string(),
+        "--bootstrap-output=json".to_string(),
+    ];
+    command.extend(["--session-server".to_string(), session_server.to_string()]);
     if !args.command.is_empty() {
         command.push("--".to_string());
         command.extend(args.command.clone());
@@ -131,7 +132,7 @@ pub fn scp_destination(target: &str, remote_path: &str) -> String {
     if remote_path.contains(':') {
         remote_path.to_string()
     } else {
-        format!("{}:{}", target, remote_path)
+        format!("{target}:{remote_path}")
     }
 }
 
@@ -139,10 +140,7 @@ pub fn render_remote_command(remote_args: &[String]) -> String {
     let quoted: Vec<String> = remote_args.iter().map(|arg| shell_quote(arg)).collect();
     let body = quoted.join(" ");
     let temp_file = "/tmp/beach-bootstrap-$$.json";
-    format!(
-        "nohup {} >{} 2>&1 </dev/null & sleep 2 && cat {}",
-        body, temp_file, temp_file
-    )
+    format!("nohup {body} >{temp_file} 2>&1 </dev/null & sleep 2 && cat {temp_file}")
 }
 
 pub fn resolve_local_binary_path(args: &SshArgs) -> Result<PathBuf, CliError> {
@@ -161,9 +159,9 @@ pub fn resolve_local_binary_path(args: &SshArgs) -> Result<PathBuf, CliError> {
     };
 
     if !resolved.exists() {
+        let resolved_display = resolved.display();
         return Err(CliError::CopyBinary(format!(
-            "local binary '{}' does not exist",
-            resolved.display()
+            "local binary '{resolved_display}' does not exist"
         )));
     }
 

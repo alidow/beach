@@ -4231,7 +4231,7 @@ mod tests {
             WireClientFrame::Input { data, .. } => {
                 assert_eq!(data, b"line1\nline2".to_vec());
             }
-            other => panic!("unexpected frame {:?}", other),
+            other => panic!("unexpected frame {other:?}"),
         }
     }
 
@@ -4420,11 +4420,11 @@ mod tests {
             seq: 426,
         });
         for offset in 0..22u32 {
-            let absolute = 426 + offset as u32;
+            let absolute = 426u32 + offset;
             updates.push(pack_row(
                 absolute,
-                5000 + offset as u64,
-                &format!("Line {}: Test", absolute),
+                5000 + u64::from(offset),
+                &format!("Line {absolute}: Test"),
             ));
         }
 
@@ -4619,7 +4619,7 @@ mod tests {
             updates.push(pack_row(
                 absolute,
                 5000 + offset as u64,
-                &format!("Line {}: Test", absolute),
+                &format!("Line {absolute}: Test"),
             ));
         }
 
@@ -4756,7 +4756,7 @@ mod tests {
             updates.push(pack_row(
                 absolute,
                 5000 + offset as u64,
-                &format!("Line {}: Test", absolute),
+                &format!("Line {absolute}: Test"),
             ));
         }
         client
@@ -4801,12 +4801,12 @@ mod tests {
             (id, start_row, count)
         } else {
             let fallback_id = request_id + 1;
-            let fallback_start = 447;
+            let fallback_start = 447u64;
             let fallback_count = 16;
             seed_request(
                 &mut client,
-                fallback_id as u64,
-                fallback_start as u64,
+                fallback_id,
+                fallback_start,
                 fallback_count,
                 false,
             );
@@ -4816,7 +4816,7 @@ mod tests {
             tail_start >= 400,
             "tail request should target trimmed region"
         );
-        let trimmed_end = tail_start as u64 + tail_count as u64;
+        let trimmed_end = tail_start + u64::from(tail_count);
 
         client
             .handle_host_frame(WireHostFrame::HistoryBackfill {
@@ -4843,7 +4843,7 @@ mod tests {
                 panic!("expected RequestBackfill frame");
             };
             assert!(
-                start_row as u64 >= trimmed_end,
+                start_row >= trimmed_end,
                 "unexpected backfill retry after empty reply"
             );
         }
@@ -4851,10 +4851,11 @@ mod tests {
         let mut delta_updates = Vec::new();
         for idx in 0..150u32 {
             let absolute = 422 + idx;
+            let label = idx + 1;
             delta_updates.push(pack_row(
                 absolute,
                 8000 + idx as u64,
-                &format!("Line {}: Test", idx + 1),
+                &format!("Line {label}: Test"),
             ));
         }
         client
@@ -4909,7 +4910,7 @@ mod tests {
 
     #[test_timeout::timeout]
     fn history_backfill_loads_rows_across_sparse_chunks() {
-        let transport: Arc<dyn Transport> = Arc::new(NullTransport::default());
+        let transport: Arc<dyn Transport> = Arc::new(NullTransport);
         let mut client = TerminalClient::new(transport).with_render(false);
 
         let base: u32 = 12000;
@@ -4982,11 +4983,12 @@ mod tests {
         for row in 0..150u64 {
             let text = client
                 .test_row_text(base as u64 + row)
-                .unwrap_or_else(|| "".to_string())
+                .unwrap_or_default()
                 .trim_end()
                 .to_string();
+            let row_label = row + 1;
             assert!(
-                text.contains(&format!("Line {}", row + 1)),
+                text.contains(&format!("Line {row_label}")),
                 "row {row} missing expected text, got '{text}'"
             );
         }
@@ -4994,7 +4996,7 @@ mod tests {
 
     #[test_timeout::timeout]
     fn row_segment_overwrites_shrinks_row() {
-        let transport: Arc<dyn Transport> = Arc::new(NullTransport::default());
+        let transport: Arc<dyn Transport> = Arc::new(NullTransport);
         let mut client = TerminalClient::new(transport).with_render(false);
 
         client.subscription_id = Some(1);
@@ -5038,7 +5040,7 @@ mod tests {
 
     #[test_timeout::timeout]
     fn follow_tail_prefers_loaded_rows_after_empty_tail_backfill() {
-        let transport: Arc<dyn Transport> = Arc::new(NullTransport::default());
+        let transport: Arc<dyn Transport> = Arc::new(NullTransport);
         let mut client = TerminalClient::new(transport).with_render(false);
 
         client.subscription_id = Some(1);
@@ -5159,7 +5161,8 @@ mod tests {
         assert_no_backfill_requests(&transport.take());
 
         for offset in 0..150u64 {
-            let expected = format!("Line {}", offset + 1);
+            let expected_label = offset + 1;
+            let expected = format!("Line {expected_label}");
             let row_text = client
                 .test_row_text(offset)
                 .unwrap_or_default()
@@ -5279,20 +5282,20 @@ mod tests {
         client.renderer.set_follow_tail(false);
 
         for row in 0..24u64 {
-            client.renderer.apply_row_from_text(
-                row as usize,
-                row,
-                &format!("Line {}: Test", row as usize + 1),
-            );
+            let label = row as usize + 1;
+            client
+                .renderer
+                .apply_row_from_text(row as usize, row, &format!("Line {label}: Test"));
         }
         for row in 24..112u64 {
             client.renderer.mark_row_missing(row);
         }
         for row in 112..150u64 {
+            let label = row as usize + 1;
             client.renderer.apply_row_from_text(
                 row as usize,
                 1000 + row,
-                &format!("Line {}: Test", row as usize + 1),
+                &format!("Line {label}: Test"),
             );
         }
         client.highest_loaded_row = Some(149);

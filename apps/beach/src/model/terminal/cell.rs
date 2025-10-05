@@ -23,7 +23,7 @@ pub enum Color {
     Rgb(u8, u8, u8), // 24-bit true color
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CellAttributes {
     pub bold: bool,
     pub italic: bool,
@@ -50,21 +50,6 @@ impl Cell {
     /// Check if cell is blank (space or null character)
     pub fn is_blank(&self) -> bool {
         self.char == ' ' || self.char == '\0'
-    }
-}
-
-impl Default for CellAttributes {
-    fn default() -> Self {
-        CellAttributes {
-            bold: false,
-            italic: false,
-            underline: false,
-            strikethrough: false,
-            reverse: false,
-            blink: false,
-            dim: false,
-            hidden: false,
-        }
     }
 }
 
@@ -117,12 +102,12 @@ impl Cell {
         cursor += char_len;
 
         // Read colors
-        let (fg_color, fg_size) = Color::from_bytes(&bytes[cursor..])
-            .map_err(|e| TerminalStateError::SerializationError(e))?;
+        let (fg_color, fg_size) =
+            Color::from_bytes(&bytes[cursor..]).map_err(TerminalStateError::SerializationError)?;
         cursor += fg_size;
 
-        let (bg_color, bg_size) = Color::from_bytes(&bytes[cursor..])
-            .map_err(|e| TerminalStateError::SerializationError(e))?;
+        let (bg_color, bg_size) =
+            Color::from_bytes(&bytes[cursor..]).map_err(TerminalStateError::SerializationError)?;
         cursor += bg_size;
 
         // Read attributes

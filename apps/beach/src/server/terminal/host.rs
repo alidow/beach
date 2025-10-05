@@ -4070,7 +4070,8 @@ mod tests {
         let style_id = grid.ensure_style_id(Style::default());
 
         for row in 0..150usize {
-            let text = format!("Line {}: Test", row + 1);
+            let label = row + 1;
+            let text = format!("Line {label}: Test");
             let seq = (row as Seq) + 1;
             for (col, ch) in text.chars().enumerate() {
                 let packed = TerminalGrid::pack_char_with_style(ch, style_id);

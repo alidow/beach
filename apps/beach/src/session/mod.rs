@@ -25,7 +25,7 @@ impl SessionConfig {
             ));
         }
         if !base.starts_with("http://") && !base.starts_with("https://") {
-            base = format!("http://{}", base);
+            base = format!("http://{base}");
         }
         let parsed = Url::parse(&base).map_err(|err| {
             SessionError::InvalidConfig(format!("invalid session server url: {err}"))
@@ -95,8 +95,7 @@ impl SessionManager {
         if let Some(server_session_id) = returned_id {
             if server_session_id != session_id {
                 return Err(SessionError::InvalidResponse(format!(
-                    "session id mismatch: expected {}, got {}",
-                    session_id, server_session_id
+                    "session id mismatch: expected {session_id}, got {server_session_id}"
                 )));
             }
         }
@@ -186,7 +185,7 @@ impl SessionManager {
     fn default_session_url(&self, session_id: &str) -> Result<Url, SessionError> {
         self.config
             .base_url()
-            .join(&format!("sessions/{}", session_id))
+            .join(&format!("sessions/{session_id}"))
             .map_err(|err| {
                 SessionError::InvalidConfig(format!(
                     "unable to construct session url for {session_id}: {err}"
@@ -573,7 +572,10 @@ mod tests {
                     success: false,
                     message: Some("session already exists".into()),
                     session_id: Some(request.session_id.clone()),
-                    session_url: Some(format!("http://mock/{}", request.session_id)),
+                    session_url: Some({
+                        let session_id = &request.session_id;
+                        format!("http://mock/{session_id}")
+                    }),
                     join_code: None,
                     transports: Vec::new(),
                     websocket_url: None,
@@ -587,7 +589,10 @@ mod tests {
                 success: true,
                 message: None,
                 session_id: Some(request.session_id.clone()),
-                session_url: Some(format!("http://mock/{}", request.session_id)),
+                session_url: Some({
+                    let session_id = &request.session_id;
+                    format!("http://mock/{session_id}")
+                }),
                 join_code: Some(code),
                 transports: vec![AdvertisedTransport {
                     kind: AdvertisedTransportKind::WebSocket,

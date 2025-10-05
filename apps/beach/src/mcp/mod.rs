@@ -40,5 +40,5 @@ pub use server::{McpServer, McpServerHandle};
 pub fn default_socket_path(session_id: &str) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let dir = Path::new(&home).join(".beach").join("mcp");
-    dir.join(format!("{}.sock", session_id))
+    dir.join(format!("{session_id}.sock"))
 }

@@ -87,3 +87,9 @@ impl HostInputGate {
         }
     }
 }
+
+impl Default for HostInputGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}

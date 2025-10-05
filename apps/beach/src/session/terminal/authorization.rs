@@ -207,19 +207,19 @@ fn run_authorization_prompt(metadata: &JoinAuthorizationMetadata) -> io::Result<
     write!(stdout, "\r==============================\r\n\r\n")?;
     write!(stdout, "\rtransport : {:?}\r\n", metadata.transport_kind)?;
     if let Some(desc) = &metadata.description {
-        write!(stdout, "\rcontext   : {}\r\n", desc)?;
+        write!(stdout, "\rcontext   : {desc}\r\n")?;
     }
     if let Some(label) = &metadata.label {
-        write!(stdout, "\rlabel     : {}\r\n", label)?;
+        write!(stdout, "\rlabel     : {label}\r\n")?;
     }
     if let Some(peer) = &metadata.peer_id {
-        write!(stdout, "\rpeer id   : {}\r\n", peer)?;
+        write!(stdout, "\rpeer id   : {peer}\r\n")?;
     }
     if let Some(handshake) = &metadata.handshake_id {
-        write!(stdout, "\rhandshake : {}\r\n", handshake)?;
+        write!(stdout, "\rhandshake : {handshake}\r\n")?;
     }
     if let Some(remote) = &metadata.remote_addr {
-        write!(stdout, "\rremote    : {}\r\n", remote)?;
+        write!(stdout, "\rremote    : {remote}\r\n")?;
     }
     if !metadata.metadata.is_empty() {
         let mut extra: Vec<_> = metadata
@@ -229,7 +229,7 @@ fn run_authorization_prompt(metadata: &JoinAuthorizationMetadata) -> io::Result<
             .collect();
         extra.sort_by(|a, b| a.0.cmp(b.0));
         for (key, value) in extra {
-            write!(stdout, "\r{}: {}\r\n", key, value)?;
+            write!(stdout, "\r{key}: {value}\r\n")?;
         }
     }
     write!(stdout, "\r\n")?;
@@ -246,65 +246,62 @@ fn run_authorization_prompt(metadata: &JoinAuthorizationMetadata) -> io::Result<
 
     while decision.is_none() {
         if event::poll(Duration::from_millis(200))? {
-            match event::read()? {
-                CEvent::Key(key) => {
-                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(key.code, KeyCode::Char('c'))
-                    {
-                        writeln!(stdout)?;
-                        stdout.flush()?;
-                        return Err(io::Error::new(
-                            io::ErrorKind::Interrupted,
-                            "authorization aborted by user",
-                        ));
-                    }
+            if let CEvent::Key(key) = event::read()? {
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(key.code, KeyCode::Char('c'))
+                {
+                    writeln!(stdout)?;
+                    stdout.flush()?;
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "authorization aborted by user",
+                    ));
+                }
 
-                    match key.code {
-                        KeyCode::Enter => {
-                            let trimmed = input.trim().to_ascii_lowercase();
-                            if trimmed.is_empty() {
+                match key.code {
+                    KeyCode::Enter => {
+                        let trimmed = input.trim().to_ascii_lowercase();
+                        if trimmed.is_empty() {
+                            write!(stdout, "\r\n")?;
+                            write!(stdout, "\rPlease type 'yes' or 'no' and press enter.\r\n")?;
+                            write!(stdout, "\rresponse  : {input}")?;
+                            stdout.flush()?;
+                            continue;
+                        }
+                        match trimmed.as_str() {
+                            "yes" | "y" => decision = Some(true),
+                            "no" | "n" => decision = Some(false),
+                            _ => {
                                 write!(stdout, "\r\n")?;
-                                write!(stdout, "\rPlease type 'yes' or 'no' and press enter.\r\n")?;
-                                write!(stdout, "\rresponse  : {}", input)?;
+                                write!(
+                                    stdout,
+                                    "\rUnrecognized response '{trimmed}'. Type 'yes' or 'no'.\r\n"
+                                )?;
+                                write!(stdout, "\rresponse  : {input}")?;
                                 stdout.flush()?;
-                                continue;
-                            }
-                            match trimmed.as_str() {
-                                "yes" | "y" => decision = Some(true),
-                                "no" | "n" => decision = Some(false),
-                                _ => {
-                                    write!(stdout, "\r\n")?;
-                                    write!(
-                                        stdout,
-                                        "\rUnrecognized response '{trimmed}'. Type 'yes' or 'no'.\r\n"
-                                    )?;
-                                    write!(stdout, "\rresponse  : {}", input)?;
-                                    stdout.flush()?;
-                                }
                             }
                         }
-                        KeyCode::Char(c)
-                            if !key
-                                .modifiers
-                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-                        {
-                            input.push(c);
-                            write!(stdout, "{c}")?;
+                    }
+                    KeyCode::Char(c)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        input.push(c);
+                        write!(stdout, "{c}")?;
+                        stdout.flush()?;
+                    }
+                    KeyCode::Backspace => {
+                        if input.pop().is_some() {
+                            write!(stdout, "\u{8} \u{8}")?;
                             stdout.flush()?;
                         }
-                        KeyCode::Backspace => {
-                            if input.pop().is_some() {
-                                write!(stdout, "\u{8} \u{8}")?;
-                                stdout.flush()?;
-                            }
-                        }
-                        KeyCode::Esc => {
-                            decision = Some(false);
-                        }
-                        _ => {}
                     }
+                    KeyCode::Esc => {
+                        decision = Some(false);
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }

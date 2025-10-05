@@ -9,4 +9,5 @@ pub mod server;
 pub mod session;
 pub mod sync;
 pub mod telemetry;
+pub mod terminal;
 pub mod transport;

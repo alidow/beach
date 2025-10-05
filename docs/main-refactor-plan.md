@@ -19,7 +19,7 @@
 | 1 | ✅ Done | Extract CLI & config helpers | Create `terminal::{cli,config}` modules, relocate Clap structs + logging glue, expose `parse()` helper; update `main.rs` to consume them | `cargo check -p beach-human` and `cargo run -p beach-human -- --help` |
 | 2 | ✅ Done | Isolate bootstrap protocol | Move bootstrap handshake structs + helpers into `protocol/terminal/bootstrap.rs`; update callers | `cargo test -p beach-human bootstrap_handshake_serializes_expected_fields` and `cargo test -p beach-human read_bootstrap_handshake_skips_noise_lines` |
 | 3 | ✅ Done | Introduce dispatcher | Add `terminal::app::run` coordinating `host/join/ssh`; slim `main.rs` to logging + delegation | `cargo check -p beach-human` and `cargo run -p beach-human -- --help` |
-| 4 | 🔄 In progress | Host extraction | Move host runtime + session UX (`JoinAuthorizer`, raw-mode guard, input gate) into `server::terminal::host` and `session::terminal::{authorization, tty}`; expose `host::run` for reuse | `cargo test -p beach-human webrtc_mock_session_flow` and `cargo test -p beach-human handshake_refresh_stops_after_completion` |
+| 4 | 🔄 In progress | Host extraction | **Steps 1–4 complete:** host runtime now lives in `server::terminal::host::run`, `terminal::app` delegates, negotiation helpers are shared, and targeted host tests (`bootstrap_handshake_serializes_expected_fields`, `read_bootstrap_handshake_skips_noise_lines`, `webrtc_mock_session_flow`) are green. **Next:** finish the cleanup pass (docs/clippy/full test) before closing the phase. | `cargo check -p beach-human`, `cargo test -p beach-human bootstrap_handshake_serializes_expected_fields`, `cargo test -p beach-human read_bootstrap_handshake_skips_noise_lines`, `cargo test -p beach-human webrtc_mock_session_flow` |
 | 5 | ⏳ Todo | Join extraction | Move join workflow + MCP proxy bootstrap into `client::terminal::join`; keep negotiation shared | `cargo test -p beach-human` and `cargo run -p beach-human -- join --help` |
 | 6 | ⏳ Todo | SSH extraction | Relocate SSH bootstrap into `transport::ssh`; consolidate bootstrap helpers | `cargo test -p beach-human read_bootstrap_handshake_skips_noise_lines` and `cargo run -p beach-human -- ssh --help` |
 | 7 | ⏳ Todo | Transport negotiation | Create `transport::terminal::negotiation` housing negotiation + failover + heartbeat publisher | `cargo test -p beach-human heartbeat_publisher_emits_messages` and `cargo test -p beach-human handshake_refresh_stops_after_completion` |
@@ -44,27 +44,20 @@ Following these phases keeps the work reviewable and verifiable, while steadily 
 ## Phase 4 – Host Extraction Checklist
 
 1. **Session Utilities**
-   - Add `session/terminal/{tty.rs, authorization.rs}` with the raw-mode guard, input gate, and join-authorization prompt.
-   - Re-export the new modules from `session/mod.rs` and update call sites to use them.
-   - Tests: `cargo check -p beach-human`.
+   - ✅ Done (via this session): `session/terminal/{tty.rs, authorization.rs}` now hold the raw-mode guard, host-input gate, and join authorization prompt. `session/mod.rs` re-exports the namespace, and `terminal::app` consumes the new helpers.
+   - Tests: `cargo check -p beach-human` (passing).
 
 2. **Host Runtime Module**
-   - Create `server/terminal/host.rs` exposing `pub async fn run(base_url, HostArgs)`.
-   - Move `handle_host` and supporting helpers (preview setup, acceptor, update forwarder, shared transport types, resize/input handlers, queue structs) from `terminal::app` into the new module.
-   - Keep telemetry/trace hooks unchanged while relocating imports.
+   - ✅ Done: `server/terminal/host.rs` now exposes `pub async fn run(base_url, HostArgs)` and owns the former host workflow (preview setup, acceptor, update forwarder, shared transport types, resize/input handlers, queue structs).
    - Tests: `cargo check -p beach-human`.
 
 3. **Wire-Up**
-   - Update `server/terminal/mod.rs` to export `host`.
-   - Change `terminal::app::run` to delegate host requests to `server::terminal::host::run` and drop the duplicated logic/imports.
-   - Ensure `main.rs` still compiles with the slimmer `app` module.
-   - Tests: `cargo check -p beach-human`, `cargo run -p beach-human -- --help`.
+   - ✅ Done: `server/terminal/mod.rs` exports `host`, and `terminal::app::run` delegates host commands with the heavy imports removed.
+   - Tests: `cargo check -p beach-human`.
 
 4. **Regression Tests**
-   - Run targeted host flows: `cargo test -p beach-human bootstrap_handshake_serializes_expected_fields`, `cargo test -p beach-human read_bootstrap_handshake_skips_noise_lines`, and `cargo test -p beach-human webrtc_mock_session_flow`.
-   - Smoke test SSH bootstrap: `cargo run -p beach-human -- ssh --help` (optional but recommended).
+   - ✅ Done: `cargo test -p beach-human bootstrap_handshake_serializes_expected_fields`, `cargo test -p beach-human read_bootstrap_handshake_skips_noise_lines`, and `cargo test -p beach-human webrtc_mock_session_flow`.
+   - Smoke test SSH bootstrap (`cargo run -p beach-human -- ssh --help`) remains optional.
 
 5. **Cleanup Pass**
-   - Remove dead imports from `terminal::app.rs` and friends.
-   - Ensure module-level docs/comments point at the new locations.
-   - Final check: `cargo fmt`, `cargo clippy -p beach-human --all-targets -- -D warnings`, `cargo test -p beach-human`.
+   - 🔄 Partial: dead imports pruned and `cargo fmt` applied. Still need to update docs/comments if any stragglers appear and run `cargo clippy -p beach-human --all-targets -- -D warnings` plus a full `cargo test -p beach-human` before closing the phase.

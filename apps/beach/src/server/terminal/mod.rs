@@ -1,4 +1,5 @@
 mod emulator;
+pub mod host;
 mod pty;
 
 pub use emulator::{AlacrittyEmulator, EmulatorResult, SimpleTerminalEmulator, TerminalEmulator};

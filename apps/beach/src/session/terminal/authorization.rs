@@ -139,7 +139,8 @@ impl InteractiveAuthorizer {
             "prompting for client authorization"
         );
         let gate = Arc::clone(&self.gate);
-        let prompt_result = tokio::task::spawn_blocking(move || run_authorization_prompt(&prompt_metadata)).await;
+        let prompt_result =
+            tokio::task::spawn_blocking(move || run_authorization_prompt(&prompt_metadata)).await;
 
         match prompt_result {
             Ok(Ok(allow)) => {

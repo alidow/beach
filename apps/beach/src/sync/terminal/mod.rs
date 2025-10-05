@@ -1,3 +1,4 @@
+pub mod server_pipeline;
 pub mod sync;
 
 pub use sync::{

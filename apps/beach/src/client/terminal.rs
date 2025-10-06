@@ -1,8 +1,10 @@
+pub mod debug;
 pub mod join;
 
 use crate::cache::Seq;
 use crate::cache::terminal::{PackedCell, StyleId, unpack_cell};
 use crate::client::grid_renderer::{GridRenderer, SelectionMode, SelectionPosition};
+use crate::debug::server::DiagnosticServer;
 use crate::protocol::{
     self, ClientFrame as WireClientFrame, CursorFrame, FEATURE_CURSOR_SYNC,
     HostFrame as WireHostFrame, Update as WireUpdate, ViewportCommand,
@@ -274,6 +276,8 @@ pub struct TerminalClient {
     authorization_hint_level: u8,
     connect_started_at: Instant,
     authorization_pending_hint: bool,
+    diagnostic_server: Option<DiagnosticServer>,
+    initial_scroll_done: bool,
 }
 
 impl TerminalClient {
@@ -283,6 +287,9 @@ impl TerminalClient {
         renderer.on_resize(80, 24);
         renderer.set_predictions_visible(false);
         renderer.set_prediction_flagging(false);
+        // Disable follow_tail initially until we receive first cursor frame
+        // This prevents viewport from scrolling to tail during initial handshake
+        renderer.set_follow_tail(false);
         Self {
             transport,
             renderer,
@@ -335,6 +342,8 @@ impl TerminalClient {
             authorization_hint_level: 0,
             connect_started_at: Instant::now(),
             authorization_pending_hint: false,
+            diagnostic_server: None,
+            initial_scroll_done: false,
         }
     }
 
@@ -354,6 +363,11 @@ impl TerminalClient {
         self
     }
 
+    pub fn with_diagnostic_server(mut self, server: DiagnosticServer) -> Self {
+        self.diagnostic_server = Some(server);
+        self
+    }
+
     #[cfg(test)]
     pub fn renderer_base_row(&self) -> u64 {
         self.renderer.base_row()
@@ -363,12 +377,68 @@ impl TerminalClient {
     pub fn known_base_row(&self) -> Option<u64> {
         self.known_base_row
     }
+
+    fn handle_diagnostic_requests(&self) {
+        if let Some(server) = &self.diagnostic_server {
+            let _ = server.try_handle_request(|request| {
+                use crate::debug::{CacheState, CursorState, DiagnosticRequest, DiagnosticResponse, RendererState, TerminalDimensions};
+
+                match request {
+                    DiagnosticRequest::GetCursorState => {
+                        DiagnosticResponse::CursorState(CursorState {
+                            row: self.cursor_row,
+                            col: self.cursor_col,
+                            seq: self.cursor_seq,
+                            visible: self.cursor_visible,
+                            authoritative: self.cursor_authoritative,
+                            cursor_support: self.cursor_support,
+                        })
+                    }
+                    DiagnosticRequest::GetTerminalDimensions => {
+                        let grid_rows = self.renderer.total_rows() as usize;
+                        let grid_cols = self.renderer.total_cols();
+                        let viewport_rows = self.renderer.viewport_height();
+                        let viewport_cols = grid_cols; // viewport width matches grid width
+                        DiagnosticResponse::TerminalDimensions(TerminalDimensions {
+                            rows: grid_rows,
+                            cols: grid_cols,
+                            viewport_rows,
+                            viewport_cols,
+                        })
+                    }
+                    DiagnosticRequest::GetCacheState => {
+                        DiagnosticResponse::CacheState(CacheState {
+                            grid_rows: self.renderer.total_rows() as usize,
+                            grid_cols: self.renderer.total_cols(),
+                            row_offset: self.renderer.base_row(),
+                            first_row_id: None,
+                            last_row_id: None,
+                        })
+                    }
+                    DiagnosticRequest::GetRendererState => {
+                        let (cursor_row, cursor_col, cursor_visible) = self.renderer.get_cursor()
+                            .unwrap_or((0, 0, false));
+                        DiagnosticResponse::RendererState(RendererState {
+                            cursor_row,
+                            cursor_col,
+                            cursor_visible,
+                            base_row: self.renderer.base_row(),
+                            viewport_top: self.renderer.viewport_top(),
+                            cursor_viewport_position: self.renderer.cursor_viewport_position(),
+                        })
+                    }
+                }
+            });
+        }
+    }
+
     pub fn run(mut self) -> Result<(), ClientError> {
         self.setup_tui()?;
         debug!(target = "client::loop", "client loop started");
 
         let run_result = (|| -> Result<(), ClientError> {
             loop {
+                self.handle_diagnostic_requests();
                 self.pump_input()?;
                 self.maybe_request_backfill()?;
                 self.tick_authorization();
@@ -651,6 +721,12 @@ impl TerminalClient {
                     has_loaded_rows = self.has_loaded_rows,
                     "received SnapshotComplete"
                 );
+                // If we haven't received a cursor frame yet, scroll to top
+                // to ensure cursor at row 0 is visible
+                if self.cursor_seq == 0 && !self.initial_scroll_done {
+                    self.renderer.scroll_to_top();
+                    self.initial_scroll_done = true;
+                }
             }
             WireHostFrame::Shutdown => return Err(ClientError::Shutdown),
         }
@@ -693,10 +769,25 @@ impl TerminalClient {
     }
 
     fn sync_renderer_cursor(&mut self) {
+        // If we haven't received any cursor frames yet, reset internal state to origin
+        if self.cursor_seq == 0 {
+            if self.cursor_row != 0 || self.cursor_col != 0 {
+                self.cursor_row = 0;
+                self.cursor_col = 0;
+            }
+        } else {
+            // Once we've received the first cursor frame, enable follow_tail
+            // to resume normal terminal behavior
+            if !self.renderer.is_following_tail() {
+                self.renderer.set_follow_tail(true);
+            }
+        }
+
         let visible = if self.cursor_support {
             if self.cursor_authoritative || self.cursor_authoritative_pending {
                 self.cursor_visible
             } else {
+                // Show cursor even without authoritative position
                 true
             }
         } else {
@@ -2981,8 +3072,12 @@ impl TerminalClient {
         }
 
         if cursor_changed {
-            self.cursor_row = cursor_row;
-            self.cursor_col = cursor_col;
+            // Only update cursor from predictions if we have an authoritative position
+            // or if we've received at least one cursor frame
+            if self.cursor_seq > 0 || self.cursor_authoritative {
+                self.cursor_row = cursor_row;
+                self.cursor_col = cursor_col;
+            }
             self.sync_renderer_cursor();
         }
 

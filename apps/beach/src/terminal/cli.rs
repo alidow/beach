@@ -64,6 +64,8 @@ pub enum Command {
     Join(JoinArgs),
     /// Bootstrap a remote session over SSH and auto-attach the local client
     Ssh(SshArgs),
+    /// Query diagnostic state from a running session
+    Debug(DebugArgs),
 }
 
 #[derive(Args, Debug, Default)]
@@ -262,6 +264,20 @@ pub struct SshArgs {
         help = "Command to run remotely instead of the default shell"
     )]
     pub command: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct DebugArgs {
+    #[arg(value_name = "SESSION_ID", help = "Session ID to inspect")]
+    pub session_id: String,
+
+    #[arg(
+        long,
+        short = 'q',
+        value_name = "QUERY",
+        help = "What to query: cursor, dimensions, cache"
+    )]
+    pub query: Option<String>,
 }
 
 pub fn parse() -> Cli {

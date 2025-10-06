@@ -28,4 +28,6 @@ pub enum CliError {
     BootstrapHandshake(String),
     #[error("scp transfer failed: {0}")]
     CopyBinary(String),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }

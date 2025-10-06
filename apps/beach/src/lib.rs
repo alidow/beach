@@ -2,6 +2,7 @@
 
 pub mod cache;
 pub mod client;
+pub mod debug;
 pub mod mcp;
 pub mod model;
 pub mod protocol;

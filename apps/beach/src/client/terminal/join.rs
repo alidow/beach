@@ -111,9 +111,26 @@ pub async fn run(base_url: &str, args: JoinArgs) -> Result<(), CliError> {
 
     let client_transport = transport.clone();
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let session_id_for_debug = session_id.clone();
+
     tokio::task::spawn_blocking(move || {
+        use crate::debug::server::DiagnosticServer;
+        use crate::debug::ipc::start_diagnostic_listener;
+
         let _raw_guard = RawModeGuard::new(interactive);
-        let client = TerminalClient::new(client_transport).with_predictive_input(interactive);
+
+        // Start diagnostic server
+        let (diagnostic_server, (request_tx, response_rx)) = DiagnosticServer::new();
+        let _listener_handle = start_diagnostic_listener(
+            session_id_for_debug.clone(),
+            request_tx,
+            response_rx,
+        );
+
+        let client = TerminalClient::new(client_transport)
+            .with_predictive_input(interactive)
+            .with_diagnostic_server(diagnostic_server);
+
         match client.run() {
             Ok(()) | Err(ClientError::Shutdown) => {}
             Err(err) => eprintln!("⚠️  client error: {err}"),

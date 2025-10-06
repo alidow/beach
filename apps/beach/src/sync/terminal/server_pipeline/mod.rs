@@ -1410,6 +1410,7 @@ pub(crate) fn transmit_initial_snapshots(
 ) -> Result<(), TransportError> {
     let transport_id = transport.id().0;
     let transport_kind = transport.kind();
+    let mut first_foreground_chunk = true;
     for lane in [
         PriorityLane::Foreground,
         PriorityLane::Recent,
@@ -1426,7 +1427,21 @@ pub(crate) fn transmit_initial_snapshots(
                 updates = chunk.updates.len(),
                 "sending snapshot chunk"
             );
-            let converted_batch = cache.apply_updates(&chunk.updates, false);
+            let mut converted_batch = cache.apply_updates(&chunk.updates, false);
+
+            // Inject an initial cursor frame (0,0) in the first foreground chunk if none exists
+            // This ensures clients always receive a cursor position with the initial snapshot
+            if first_foreground_chunk && lane == PriorityLane::Foreground && converted_batch.cursor.is_none() {
+                converted_batch.cursor = Some(CursorFrame {
+                    row: 0,
+                    col: 0,
+                    seq: 1,
+                    visible: true,
+                    blink: true,
+                });
+                first_foreground_chunk = false;
+            }
+
             send_snapshot_frames_chunked(
                 transport,
                 chunk.subscription_id,

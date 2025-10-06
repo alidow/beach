@@ -159,6 +159,7 @@ pub async fn run(base_url: &str, args: SshArgs) -> Result<(), CliError> {
         passcode: Some(handshake.join_code.clone()),
         label: None,
         mcp: false,
+        inject_latency: None,
     };
 
     let join_result = join::run(handshake.session_server.as_str(), join_args).await;

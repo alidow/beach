@@ -176,6 +176,13 @@ pub struct JoinArgs {
         help = "Expose the host's MCP server locally via WebRTC"
     )]
     pub mcp: bool,
+
+    #[arg(
+        long = "inject-latency",
+        value_name = "MS",
+        help = "Inject artificial latency (ms) to server responses for testing"
+    )]
+    pub inject_latency: Option<u64>,
 }
 
 #[derive(Args, Debug)]
@@ -278,6 +285,14 @@ pub struct DebugArgs {
         help = "What to query: cursor, dimensions, cache"
     )]
     pub query: Option<String>,
+
+    #[arg(
+        long,
+        short = 's',
+        value_name = "TEXT",
+        help = "Send input text to the session"
+    )]
+    pub send: Option<String>,
 }
 
 pub fn parse() -> Cli {

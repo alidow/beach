@@ -9,6 +9,7 @@ pub enum DiagnosticRequest {
     GetTerminalDimensions,
     GetCacheState,
     GetRendererState,
+    SendInput(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,5 +55,6 @@ pub enum DiagnosticResponse {
     TerminalDimensions(TerminalDimensions),
     CacheState(CacheState),
     RendererState(RendererState),
+    InputSent { bytes: usize },
     Error(String),
 }

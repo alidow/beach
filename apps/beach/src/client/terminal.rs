@@ -37,7 +37,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
-use tracing::{Level, debug, trace};
+use tracing::{Level, debug, trace, warn};
 
 const BACKFILL_LOOKAHEAD_ROWS: usize = 120;
 const BACKFILL_MAX_ROWS_PER_REQUEST: u32 = 256;
@@ -75,6 +75,8 @@ const PREDICTION_SRTT_ALPHA: f64 = 0.125;
 const PREDICTION_ACK_GRACE: Duration = Duration::from_millis(90);
 
 const PREDICTION_TRACE_MAX_HITS: usize = 64;
+const PREDICTION_SEQ_SAMPLE_LIMIT: usize = 4;
+const PREDICTION_POSITION_SAMPLE_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthorizationState {
@@ -243,7 +245,10 @@ pub struct TerminalClient {
     cursor_authoritative: bool,
     cursor_authoritative_pending: bool,
     cursor_visible: bool,
+    server_cursor_row: usize,
+    server_cursor_col: usize,
     pending_predictions: HashMap<Seq, PendingPrediction>,
+    dropped_predictions: HashMap<Seq, DroppedPrediction>,
     prediction_srtt_ms: Option<f64>,
     prediction_srtt_trigger: bool,
     prediction_flagging: bool,
@@ -283,6 +288,7 @@ pub struct TerminalClient {
     authorization_pending_hint: bool,
     diagnostic_server: Option<DiagnosticServer>,
     initial_scroll_done: bool,
+    injected_latency_ms: Option<u64>,
 }
 
 impl TerminalClient {
@@ -315,7 +321,10 @@ impl TerminalClient {
             cursor_authoritative: false,
             cursor_authoritative_pending: false,
             cursor_visible: true,
+            server_cursor_row: 0,
+            server_cursor_col: 0,
             pending_predictions: HashMap::new(),
+            dropped_predictions: HashMap::new(),
             prediction_srtt_ms: None,
             prediction_srtt_trigger: false,
             prediction_flagging: false,
@@ -355,6 +364,7 @@ impl TerminalClient {
             authorization_pending_hint: false,
             diagnostic_server: None,
             initial_scroll_done: false,
+            injected_latency_ms: None,
         }
     }
 
@@ -374,6 +384,11 @@ impl TerminalClient {
         self
     }
 
+    pub fn with_injected_latency_ms(mut self, ms: u64) -> Self {
+        self.injected_latency_ms = Some(ms);
+        self
+    }
+
     pub fn with_diagnostic_server(mut self, server: DiagnosticServer) -> Self {
         self.diagnostic_server = Some(server);
         self
@@ -389,60 +404,82 @@ impl TerminalClient {
         self.known_base_row
     }
 
-    fn handle_diagnostic_requests(&self) {
-        if let Some(server) = &self.diagnostic_server {
-            let _ = server.try_handle_request(|request| {
-                use crate::debug::{
-                    CacheState, CursorState, DiagnosticRequest, DiagnosticResponse, RendererState,
-                    TerminalDimensions,
-                };
+    fn handle_diagnostic_requests(&mut self) {
+        use crate::debug::{
+            CacheState, CursorState, DiagnosticRequest, DiagnosticResponse, RendererState,
+            TerminalDimensions,
+        };
 
-                match request {
-                    DiagnosticRequest::GetCursorState => {
-                        DiagnosticResponse::CursorState(CursorState {
-                            row: self.cursor_row,
-                            col: self.cursor_col,
-                            seq: self.cursor_seq,
-                            visible: self.cursor_visible,
-                            authoritative: self.cursor_authoritative,
-                            cursor_support: self.cursor_support,
-                        })
-                    }
-                    DiagnosticRequest::GetTerminalDimensions => {
-                        let grid_rows = self.renderer.total_rows() as usize;
-                        let grid_cols = self.renderer.total_cols();
-                        let viewport_rows = self.renderer.viewport_height();
-                        let viewport_cols = grid_cols; // viewport width matches grid width
-                        DiagnosticResponse::TerminalDimensions(TerminalDimensions {
-                            rows: grid_rows,
-                            cols: grid_cols,
-                            viewport_rows,
-                            viewport_cols,
-                        })
-                    }
-                    DiagnosticRequest::GetCacheState => {
-                        DiagnosticResponse::CacheState(CacheState {
-                            grid_rows: self.renderer.total_rows() as usize,
-                            grid_cols: self.renderer.total_cols(),
-                            row_offset: self.renderer.base_row(),
-                            first_row_id: None,
-                            last_row_id: None,
-                        })
-                    }
-                    DiagnosticRequest::GetRendererState => {
-                        let (cursor_row, cursor_col, cursor_visible) =
-                            self.renderer.get_cursor().unwrap_or((0, 0, false));
-                        DiagnosticResponse::RendererState(RendererState {
-                            cursor_row,
-                            cursor_col,
-                            cursor_visible,
-                            base_row: self.renderer.base_row(),
-                            viewport_top: self.renderer.viewport_top(),
-                            cursor_viewport_position: self.renderer.cursor_viewport_position(),
-                        })
+        let (requests, response_tx) = if let Some(server) = &self.diagnostic_server {
+            // Collect all pending requests first
+            let receiver = match server.request_rx.lock() {
+                Ok(r) => r,
+                Err(_) => return,
+            };
+
+            let mut requests = Vec::new();
+            while let Ok(request) = receiver.try_recv() {
+                requests.push(request);
+            }
+            drop(receiver);
+
+            (requests, server.response_tx.clone())
+        } else {
+            return;
+        };
+
+        // Process requests with mutable self
+        for request in requests {
+            let response = match request {
+                DiagnosticRequest::GetCursorState => DiagnosticResponse::CursorState(CursorState {
+                    row: self.cursor_row,
+                    col: self.cursor_col,
+                    seq: self.cursor_seq,
+                    visible: self.cursor_visible,
+                    authoritative: self.cursor_authoritative,
+                    cursor_support: self.cursor_support,
+                }),
+                DiagnosticRequest::GetTerminalDimensions => {
+                    let grid_rows = self.renderer.total_rows() as usize;
+                    let grid_cols = self.renderer.total_cols();
+                    let viewport_rows = self.renderer.viewport_height();
+                    let viewport_cols = grid_cols;
+                    DiagnosticResponse::TerminalDimensions(TerminalDimensions {
+                        rows: grid_rows,
+                        cols: grid_cols,
+                        viewport_rows,
+                        viewport_cols,
+                    })
+                }
+                DiagnosticRequest::GetCacheState => DiagnosticResponse::CacheState(CacheState {
+                    grid_rows: self.renderer.total_rows() as usize,
+                    grid_cols: self.renderer.total_cols(),
+                    row_offset: self.renderer.base_row(),
+                    first_row_id: None,
+                    last_row_id: None,
+                }),
+                DiagnosticRequest::GetRendererState => {
+                    let (cursor_row, cursor_col, cursor_visible) =
+                        self.renderer.get_cursor().unwrap_or((0, 0, false));
+                    DiagnosticResponse::RendererState(RendererState {
+                        cursor_row,
+                        cursor_col,
+                        cursor_visible,
+                        base_row: self.renderer.base_row(),
+                        viewport_top: self.renderer.viewport_top(),
+                        cursor_viewport_position: self.renderer.cursor_viewport_position(),
+                    })
+                }
+                DiagnosticRequest::SendInput(text) => {
+                    let bytes = text.as_bytes();
+                    match self.send_input(bytes) {
+                        Ok(()) => DiagnosticResponse::InputSent { bytes: bytes.len() },
+                        Err(e) => DiagnosticResponse::Error(format!("Failed to send input: {}", e)),
                     }
                 }
-            });
+            };
+
+            let _ = response_tx.send(response);
         }
     }
 
@@ -479,6 +516,10 @@ impl TerminalClient {
                 if let Some(message) = message {
                     match message.payload {
                         Payload::Binary(bytes) => {
+                            // Inject artificial latency for testing predictive echo
+                            if let Some(latency_ms) = self.injected_latency_ms {
+                                thread::sleep(Duration::from_millis(latency_ms));
+                            }
                             telemetry::record_bytes("client_frame_bytes", bytes.len());
                             let decode_start = Instant::now();
                             let frame = protocol::decode_host_frame_binary(&bytes)?;
@@ -639,6 +680,7 @@ impl TerminalClient {
                 self.cursor_col = 0;
                 self.renderer.clear_all_predictions();
                 self.pending_predictions.clear();
+                self.dropped_predictions.clear();
                 self.reset_prediction_state();
                 self.handshake_history_rows = history_rows as u64;
             }
@@ -821,9 +863,23 @@ impl TerminalClient {
     fn sync_renderer_cursor(&mut self) {
         // If we haven't received any cursor frames yet, reset internal state to origin
         if self.cursor_seq == 0 {
-            if self.cursor_row != 0 || self.cursor_col != 0 {
-                self.cursor_row = 0;
-                self.cursor_col = 0;
+            if !self.has_loaded_rows {
+                if self.cursor_row != 0 || self.cursor_col != 0 {
+                    self.cursor_row = 0;
+                    self.cursor_col = 0;
+                }
+            } else {
+                let viewport_rows = self.renderer.viewport_height().max(1);
+                if self.cursor_row >= viewport_rows {
+                    self.cursor_row = viewport_rows.saturating_sub(1);
+                }
+                let effective_width = self
+                    .renderer
+                    .effective_row_width(self.cursor_row as u64)
+                    .max(self.renderer.total_cols());
+                if self.cursor_col > effective_width {
+                    self.cursor_col = effective_width;
+                }
             }
         } else {
             // Once we've received the first cursor frame, enable follow_tail
@@ -950,7 +1006,9 @@ impl TerminalClient {
             }
 
             if !self.renderer.is_following_tail() {
-                if let Some(highest) = self.highest_loaded_row {
+                if self.cursor_seq == 0 {
+                    // Defer tail backfill until we have an authoritative cursor position
+                } else if let Some(highest) = self.highest_loaded_row {
                     if let Some(base) = self.known_base_row {
                         if highest.saturating_sub(base) <= BACKFILL_LOOKAHEAD_ROWS as u64 {
                             // Not far enough from base to justify tail backfill
@@ -1046,6 +1104,12 @@ impl TerminalClient {
             return Ok(());
         };
         if span == 0 {
+            return Ok(());
+        }
+        if self.cursor_seq == 0
+            && !self.renderer.has_pending_rows()
+            && !self.renderer.has_missing_rows()
+        {
             return Ok(());
         }
         if self.renderer.is_following_tail() && self.pending_backfills.is_empty() {
@@ -1240,6 +1304,12 @@ impl TerminalClient {
         count: u32,
     ) -> Result<(), ClientError> {
         if count == 0 {
+            return Ok(());
+        }
+        if self.cursor_seq == 0
+            && !self.renderer.has_pending_rows()
+            && !self.renderer.has_missing_rows()
+        {
             return Ok(());
         }
         let request_id = self.next_backfill_request_id;
@@ -1454,6 +1524,7 @@ impl TerminalClient {
         use CursorHint::*;
 
         let mut cursor_hint: Option<CursorHint> = None;
+        let mut predictions_changed = false;
 
         match update {
             WireUpdate::Cell {
@@ -1470,8 +1541,14 @@ impl TerminalClient {
                     seq = *seq
                 );
                 let (ch, style) = decode_wire_cell(*cell);
+                let target_row = *row as usize;
+                let target_col = *col as usize;
                 self.renderer
-                    .apply_cell(*row as usize, *col as usize, *seq, ch, style);
+                    .apply_cell(target_row, target_col, *seq, ch, style);
+                predictions_changed |= self
+                    .drop_predictions_matching(PredictionDropReason::ServerOverlap, |pos| {
+                        pos.row == target_row && pos.col == target_col
+                    });
                 self.note_loaded_row(*row as u64);
                 self.clear_empty_tail_ranges(*row as u64, (*row as u64).saturating_add(1));
                 if !self.cursor_authoritative && !self.cursor_authoritative_pending {
@@ -1490,8 +1567,13 @@ impl TerminalClient {
                 );
                 let decoded: Vec<(char, Option<u32>)> =
                     cells.iter().map(|cell| decode_wire_cell(*cell)).collect();
+                let target_row = *row as usize;
                 self.renderer
-                    .apply_row_from_cells(*row as usize, *seq, &decoded);
+                    .apply_row_from_cells(target_row, *seq, &decoded);
+                predictions_changed |= self
+                    .drop_predictions_matching(PredictionDropReason::ServerOverlap, |pos| {
+                        pos.row == target_row
+                    });
                 self.note_loaded_row(*row as u64);
                 self.clear_empty_tail_ranges(*row as u64, (*row as u64).saturating_add(1));
                 if !self.cursor_authoritative && !self.cursor_authoritative_pending {
@@ -1512,11 +1594,22 @@ impl TerminalClient {
                     cols = ?cols,
                     seq = *seq
                 );
-                let row_range = rows[0] as usize..rows[1] as usize;
-                let col_range = cols[0] as usize..cols[1] as usize;
+                let row_start = rows[0] as usize;
+                let row_end = rows[1] as usize;
+                let col_start = cols[0] as usize;
+                let col_end = cols[1] as usize;
+                let row_range = row_start..row_end;
+                let col_range = col_start..col_end;
                 let (ch, style) = decode_wire_cell(*cell);
                 self.renderer
                     .apply_rect(row_range, col_range, *seq, ch, style);
+                predictions_changed |=
+                    self.drop_predictions_matching(PredictionDropReason::ServerOverlap, |pos| {
+                        pos.row >= row_start
+                            && pos.row < row_end
+                            && pos.col >= col_start
+                            && pos.col < col_end
+                    });
                 for r in rows[0]..rows[1] {
                     self.note_loaded_row(r as u64);
                 }
@@ -1544,13 +1637,20 @@ impl TerminalClient {
                         len = cells.len(),
                         seq = *seq
                     );
+                    let target_row = *row as usize;
+                    let start = *start_col as usize;
+                    let end = start.saturating_add(cells.len());
                     let mut segment = Vec::with_capacity(cells.len());
                     for (idx, cell) in cells.iter().enumerate() {
                         let (ch, style) = decode_wire_cell(*cell);
                         let col = *start_col as usize + idx;
                         segment.push((col, *seq, ch, style));
                     }
-                    self.renderer.apply_segment(*row as usize, &segment);
+                    self.renderer.apply_segment(target_row, &segment);
+                    predictions_changed |= self
+                        .drop_predictions_matching(PredictionDropReason::ServerOverlap, |pos| {
+                            pos.row == target_row && pos.col >= start && pos.col < end
+                        });
                     self.note_loaded_row(*row as u64);
                     self.clear_empty_tail_ranges(*row as u64, (*row as u64).saturating_add(1));
                     if !self.cursor_authoritative && !self.cursor_authoritative_pending {
@@ -1570,6 +1670,10 @@ impl TerminalClient {
                 let count = *count as usize;
                 let trimmed_origin = (start as u64).saturating_add(count as u64);
                 self.renderer.apply_trim(start, count);
+                if !self.pending_predictions.is_empty() {
+                    self.drop_all_predictions_with_reason(PredictionDropReason::Trimmed);
+                    predictions_changed = true;
+                }
                 let update_base = match self.known_base_row {
                     Some(base) => base < trimmed_origin,
                     None => true,
@@ -1583,19 +1687,12 @@ impl TerminalClient {
                         self.highest_loaded_row = None;
                     }
                 }
-                self.pending_predictions.values_mut().for_each(|pending| {
-                    pending.positions.retain(|pos| pos.row >= start + count);
-                });
-                self.pending_predictions
-                    .retain(|_, pending| !pending.positions.is_empty());
-                if self.pending_predictions.is_empty() && self.renderer.has_active_predictions() {
-                    self.renderer.clear_all_predictions();
-                }
-                self.update_prediction_overlay();
                 if self.cursor_row >= start && self.cursor_row < start + count {
                     self.cursor_row = start + count;
                     self.cursor_col = 0;
                 }
+                self.server_cursor_row = self.cursor_row;
+                self.server_cursor_col = self.cursor_col;
                 self.force_render = true;
             }
             WireUpdate::Style {
@@ -1620,31 +1717,42 @@ impl TerminalClient {
             self.has_loaded_rows = true;
         }
 
+        if predictions_changed {
+            self.update_prediction_overlay();
+        }
+
         if let Some(hint) = cursor_hint {
             let previous_row = self.cursor_row;
             let previous_col = self.cursor_col;
             match hint {
                 Exact(row, col) => {
                     let mut target_col = col;
-                    let committed = self.renderer.committed_row_width(row as u64);
-                    target_col = target_col.min(committed);
                     if self.row_has_predictions(row) {
                         let predicted_width = self.renderer.predicted_row_width(row as u64);
-                        target_col =
-                            target_col.max(predicted_width.min(committed.max(predicted_width)));
+                        let committed = self.renderer.committed_row_width(row as u64);
+                        let predicted_cap = predicted_width.min(committed.max(predicted_width));
+                        target_col = target_col.max(predicted_cap);
                         if row == previous_row {
                             target_col = target_col.max(previous_col);
                         }
-                    } else {
-                        target_col = target_col.min(committed);
+                    }
+                    let total_cols = self.renderer.total_cols();
+                    if total_cols > 0 {
+                        target_col = target_col.min(total_cols);
                     }
                     self.cursor_row = row;
                     self.cursor_col = target_col;
+                    self.server_cursor_row = row;
+                    self.server_cursor_col = target_col;
                 }
             }
         }
 
-        self.sync_renderer_cursor();
+        if self.predictive_input {
+            self.refresh_prediction_cursor();
+        } else {
+            self.sync_renderer_cursor();
+        }
     }
 
     fn apply_wire_cursor(&mut self, frame: &CursorFrame) {
@@ -1664,21 +1772,41 @@ impl TerminalClient {
 
         let predicted_width = self.renderer.predicted_row_width(new_row as u64);
         let moving_left = new_row == previous_row && target_col < previous_col;
-        if predicted_width > target_col || moving_left {
-            self.discard_predictions_from_column(new_row, target_col);
+        if moving_left {
+            if self.cursor_seq == 0 && previous_col > target_col {
+                let delta = previous_col - target_col;
+                self.rebase_predictions_for_row(new_row, delta);
+            } else {
+                self.discard_predictions_from_column(
+                    new_row,
+                    target_col,
+                    PredictionTrimContext::CursorMoveLeft,
+                );
+            }
+        } else if predicted_width > target_col {
+            self.discard_predictions_from_column(
+                new_row,
+                target_col,
+                PredictionTrimContext::CursorClamp,
+            );
         }
 
-        let adjusted_predicted = self.renderer.predicted_row_width(new_row as u64);
-        if adjusted_predicted > target_col {
-            target_col = adjusted_predicted;
-        }
-
+        // FIX: Always trust server cursor position, never adjust to match predictions.
+        // Previously, we adjusted target_col forward to match predicted_row_width,
+        // which caused cursor drift. Instead, trust the server's authoritative position.
+        // Predictions that extend past server cursor are already discarded above (lines 1787-1793).
         self.cursor_row = new_row;
         self.cursor_col = target_col;
+        self.server_cursor_row = new_row;
+        self.server_cursor_col = target_col;
         self.cursor_visible = frame.visible;
         self.cursor_authoritative = true;
         self.cursor_authoritative_pending = false;
         self.force_render = true;
+
+        // IMPORTANT: Don't call refresh_prediction_cursor() here, as it would override
+        // the authoritative server cursor position with predicted cursor position.
+        // Always use server cursor for rendering when we have an authoritative update.
         self.sync_renderer_cursor();
     }
 
@@ -3199,26 +3327,42 @@ impl TerminalClient {
     fn handle_input_ack(&mut self, seq: Seq) {
         let now = Instant::now();
         let pending_before = self.pending_predictions.len();
+        let dropped_before = self.dropped_predictions.len();
         let mut positions_snapshot: Vec<PredictedPosition> = Vec::new();
         let mut sent_at: Option<Instant> = None;
         let mut had_prediction = false;
+        let mut renderer_only = false;
+        let mut renderer_had_seq = false;
+        let mut drop_reason: Option<PredictionDropReason> = None;
+        let mut drop_dwell_ms: Option<f64> = None;
+        let mut dropped_before_ack = false;
+        let cleared;
+
         if let Some(prediction) = self.pending_predictions.get_mut(&seq) {
             had_prediction = true;
             prediction.acked_at = Some(now);
             sent_at = Some(prediction.sent_at);
             positions_snapshot = prediction.positions.clone();
-        }
-        let mut renderer_only = false;
-        let mut renderer_had_seq = false;
-        let cleared = if self.pending_predictions.contains_key(&seq) {
-            self.try_clear_prediction(seq, now, "ack")
+            cleared = self.try_clear_prediction(seq, now, "ack");
+        } else if let Some(drop) = self.dropped_predictions.remove(&seq) {
+            had_prediction = true;
+            sent_at = Some(drop.sent_at);
+            positions_snapshot = drop.positions.clone();
+            drop_reason = Some(drop.reason);
+            dropped_before_ack = true;
+            drop_dwell_ms =
+                Some(now.saturating_duration_since(drop.dropped_at).as_secs_f64() * 1000.0);
+            cleared = true;
+            self.renderer.clear_prediction_seq(seq);
         } else {
             renderer_only = true;
             renderer_had_seq = self.renderer.seq_has_predictions(seq);
             self.renderer.clear_prediction_seq(seq);
-            renderer_had_seq
-        };
+            cleared = renderer_had_seq;
+        }
+
         let pending_after = self.pending_predictions.len();
+        let dropped_after = self.dropped_predictions.len();
         let ack_delay =
             sent_at.map(|sent| now.saturating_duration_since(sent).as_secs_f64() * 1000.0);
         let positions_json: Vec<Value> = positions_snapshot
@@ -3230,12 +3374,21 @@ impl TerminalClient {
             payload.insert("seq".into(), json!(seq));
             payload.insert("pending_before".into(), json!(pending_before));
             payload.insert("pending_after".into(), json!(pending_after));
+            payload.insert("dropped_before".into(), json!(dropped_before));
+            payload.insert("dropped_after".into(), json!(dropped_after));
             payload.insert("had_prediction".into(), json!(had_prediction));
             payload.insert("cleared".into(), json!(cleared));
             if renderer_only {
                 payload.insert("renderer_only".into(), json!(true));
                 payload.insert("renderer_had_seq".into(), json!(renderer_had_seq));
             }
+            if let Some(reason) = drop_reason {
+                payload.insert("drop_reason".into(), json!(reason.as_str()));
+            }
+            if let Some(drop_ms) = drop_dwell_ms {
+                payload.insert("drop_dwell_ms".into(), json!(drop_ms));
+            }
+            payload.insert("dropped_before_ack".into(), json!(dropped_before_ack));
             if let Some(delay) = ack_delay {
                 payload.insert("ack_delay_ms".into(), json!(delay));
             }
@@ -3244,11 +3397,36 @@ impl TerminalClient {
             }
         });
 
+        if !had_prediction && drop_reason.is_none() {
+            let mut outstanding: Vec<Seq> = self.pending_predictions.keys().copied().collect();
+            outstanding.extend(self.dropped_predictions.keys().copied());
+            outstanding.sort_unstable();
+            if let (Some(min), Some(max)) = (outstanding.first(), outstanding.last()) {
+                warn!(
+                    target = "client::predictive",
+                    seq,
+                    outstanding_min = *min,
+                    outstanding_max = *max,
+                    "received ack for unknown prediction sequence"
+                );
+            } else {
+                warn!(
+                    target = "client::predictive",
+                    seq, "received ack for unknown prediction sequence"
+                );
+            }
+        }
+
         if let Some(sent) = sent_at {
             self.record_prediction_ack(sent);
         }
         self.force_render = true;
         self.update_prediction_overlay();
+        if self.predictive_input {
+            self.refresh_prediction_cursor();
+        } else {
+            self.sync_renderer_cursor();
+        }
     }
 
     fn register_prediction(&mut self, seq: Seq, bytes: &[u8]) {
@@ -3284,11 +3462,21 @@ impl TerminalClient {
         if self.pending_predictions.len() > 256 {
             let cleared = self.pending_predictions.len();
             self.pending_predictions.clear();
+            self.dropped_predictions.clear();
             self.renderer.clear_all_predictions();
             self.reset_prediction_state();
             self.log_predictive_event(timestamp, "prediction_buffer_reset", |payload| {
                 payload.insert("cleared".into(), json!(cleared));
             });
+        }
+        if self.cursor_authoritative_pending && !self.pending_predictions.is_empty() {
+            let pending = self.pending_predictions.len();
+            self.log_predictive_event(timestamp, "prediction_cursor_flush", |payload| {
+                payload.insert("seq".into(), json!(seq));
+                payload.insert("pending".into(), json!(pending));
+            });
+            self.drop_all_predictions_with_reason(PredictionDropReason::Reset);
+            self.update_prediction_overlay();
         }
         let mut cursor_row = self.cursor_row;
         let mut cursor_col = self.cursor_col;
@@ -3361,31 +3549,32 @@ impl TerminalClient {
         let computed_cursor_row = cursor_row;
         let computed_cursor_col = cursor_col;
         let positions_snapshot = positions.clone();
+        let store_prediction = cursor_changed || !positions_snapshot.is_empty();
 
-        if cursor_changed {
-            if self.cursor_seq > 0 || self.cursor_authoritative {
-                self.cursor_row = cursor_row;
-                self.cursor_col = cursor_col;
-            }
-            self.sync_renderer_cursor();
-        }
-
-        let cursor_effective = json!({
-            "row": self.cursor_row,
-            "col": self.cursor_col,
-            "seq": self.cursor_seq,
-        });
-
-        if !positions.is_empty() {
+        if store_prediction {
             self.pending_predictions.insert(
                 seq,
                 PendingPrediction {
                     positions,
                     sent_at: timestamp,
                     acked_at: None,
+                    cursor_row: computed_cursor_row,
+                    cursor_col: computed_cursor_col,
                 },
             );
             self.force_render = true;
+        }
+
+        if self.predictive_input {
+            self.update_cursor_from_predictions();
+        }
+        let cursor_effective = json!({
+            "row": self.cursor_row,
+            "col": self.cursor_col,
+            "seq": self.cursor_seq,
+        });
+
+        if !positions_snapshot.is_empty() {
             let positions_json: Vec<Value> = positions_snapshot
                 .iter()
                 .map(|pos| json!({"row": pos.row, "col": pos.col, "ch": pos.ch}))
@@ -3406,9 +3595,17 @@ impl TerminalClient {
                 );
                 payload.insert("cursor_before".into(), cursor_before.clone());
                 payload.insert("cursor_effective".into(), cursor_effective.clone());
+                payload.insert("internal_cursor_mutated".into(), json!(store_prediction));
+                payload.insert(
+                    "internal_cursor_after".into(),
+                    json!({
+                        "row": self.cursor_row,
+                        "col": self.cursor_col,
+                        "seq": self.cursor_seq
+                    }),
+                );
             });
         } else if cursor_changed {
-            self.force_render = true;
             self.log_predictive_event(timestamp, "prediction_cursor_only", |payload| {
                 payload.insert("seq".into(), json!(seq));
                 payload.insert("byte_count".into(), json!(bytes.len()));
@@ -3431,9 +3628,20 @@ impl TerminalClient {
             });
         }
 
+        if store_prediction {
+            if self.predictive_input {
+                if self.predictive_input {
+            self.refresh_prediction_cursor();
+        } else {
+            self.sync_renderer_cursor();
+        }
+            } else {
+                self.sync_renderer_cursor();
+            }
+        }
+
         self.update_prediction_overlay();
     }
-
     fn prune_acked_predictions(&mut self, now: Instant) {
         let mut expired: Vec<Seq> = Vec::new();
         for (&seq, prediction) in self.pending_predictions.iter_mut() {
@@ -3463,15 +3671,53 @@ impl TerminalClient {
             let overlay_gone = positions_snapshot
                 .iter()
                 .all(|pos| !self.renderer.prediction_exists(pos.row, pos.col, seq));
-            let committed = positions_snapshot
-                .iter()
-                .all(|pos| self.renderer.cell_matches(pos.row, pos.col, pos.ch));
-            if overlay_gone || committed {
+
+            // Detailed cell matching trace
+            let mut cell_match_details: Vec<Value> = Vec::new();
+            let mut all_match = true;
+            for pos in &positions_snapshot {
+                let actual_matches = self.renderer.cell_matches(pos.row, pos.col, pos.ch);
+                if !actual_matches {
+                    all_match = false;
+                }
+                if cell_match_details.len() < 10 {
+                    cell_match_details.push(json!({
+                        "row": pos.row,
+                        "col": pos.col,
+                        "predicted_ch": pos.ch,
+                        "matches": actual_matches
+                    }));
+                }
+            }
+            let committed = all_match;
+
+            // Check if prediction has been acknowledged and grace period has expired
+            let ack_expired = if let Some(acked_at) = prediction.acked_at {
+                now.saturating_duration_since(acked_at) >= PREDICTION_ACK_GRACE
+            } else {
+                false
+            };
+
+            // NOTE: Aggressive mismatch handling disabled - was causing cursor to jump backwards.
+            // Instead, let individual predictions clear naturally via ack_expired below.
+            // Mosh doesn't do nuclear resets - it validates predictions individually.
+
+            // Clear prediction if:
+            // 1. overlay_gone: Renderer no longer shows this prediction
+            // 2. committed: All predicted characters match actual terminal content
+            // 3. ack_expired: Server acknowledged and grace period passed (cursor position now authoritative)
+            if overlay_gone || committed || ack_expired {
                 self.renderer.clear_prediction_seq(seq);
                 self.force_render = true;
                 self.prediction_last_quick_confirmation = Some(now);
                 let reason = if overlay_gone {
-                    "overlay_absent"
+                    if prediction.acked_at.is_some() {
+                        "dropped_before_ack"
+                    } else {
+                        "overlay_absent"
+                    }
+                } else if ack_expired {
+                    "ack_expired"
                 } else {
                     "committed"
                 };
@@ -3485,7 +3731,11 @@ impl TerminalClient {
                     payload.insert("reason".into(), json!(reason));
                     payload.insert("positions".into(), Value::Array(positions_json.clone()));
                     payload.insert("acked".into(), json!(prediction.acked_at.is_some()));
+                    payload.insert("cell_matches".into(), Value::Array(cell_match_details.clone()));
+                    payload.insert("overlay_gone".into(), json!(overlay_gone));
                 });
+                // After clearing predictions, always sync cursor from server, not predictions
+                self.sync_renderer_cursor();
                 true
             } else {
                 let age_ms = now
@@ -3504,6 +3754,8 @@ impl TerminalClient {
                     payload.insert("acked".into(), json!(acked));
                     payload.insert("age_ms".into(), json!(age_ms));
                     payload.insert("positions".into(), Value::Array(positions_json.clone()));
+                    payload.insert("cell_matches".into(), Value::Array(cell_match_details.clone()));
+                    payload.insert("overlay_gone".into(), json!(overlay_gone));
                 });
                 false
             }
@@ -3516,6 +3768,263 @@ impl TerminalClient {
         }
     }
 
+    fn drop_predictions_matching<F>(
+        &mut self,
+        reason: PredictionDropReason,
+        mut predicate: F,
+    ) -> bool
+    where
+        F: FnMut(&PredictedPosition) -> bool,
+    {
+        let mut to_drop: Vec<Seq> = Vec::new();
+        for (&seq, pending) in &self.pending_predictions {
+            if pending.positions.iter().any(|pos| predicate(pos)) {
+                to_drop.push(seq);
+            }
+        }
+        self.drop_prediction_sequences(&to_drop, reason)
+    }
+
+    fn drop_prediction_sequences(
+        &mut self,
+        sequences: &[Seq],
+        reason: PredictionDropReason,
+    ) -> bool {
+        if sequences.is_empty() {
+            return false;
+        }
+        let now = Instant::now();
+        let mut dropped_any = false;
+        for &seq in sequences {
+            if let Some(prediction) = self.pending_predictions.remove(&seq) {
+                self.emit_prediction_drop(seq, &prediction, reason, now);
+                dropped_any = true;
+            }
+        }
+        if dropped_any {
+            self.force_render = true;
+            if self.predictive_input {
+            self.refresh_prediction_cursor();
+        } else {
+            self.sync_renderer_cursor();
+        }
+        }
+        dropped_any
+    }
+
+    fn drop_all_predictions_with_reason(&mut self, reason: PredictionDropReason) {
+        if self.pending_predictions.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let pending = std::mem::take(&mut self.pending_predictions);
+        for (seq, prediction) in pending {
+            self.emit_prediction_drop(seq, &prediction, reason, now);
+        }
+        self.force_render = true;
+        if self.predictive_input {
+            self.refresh_prediction_cursor();
+        } else {
+            self.sync_renderer_cursor();
+        }
+    }
+
+    fn rebase_predictions_for_row(&mut self, row: usize, delta: usize) {
+        if delta == 0 {
+            return;
+        }
+        let absolute_row = row as u64;
+        let committed_before = self.renderer.committed_row_width(absolute_row);
+        let predicted_before = self.renderer.predicted_row_width(absolute_row);
+        let effective_before = self.renderer.effective_row_width(absolute_row);
+        let renderer_active_before = self.renderer.has_active_predictions();
+        let pending_before = self.pending_predictions.len();
+
+        let shifted = self.renderer.shift_predictions_left(row, delta);
+        let mut adjusted = false;
+        let mut rebased_sequences: Vec<Value> = Vec::new();
+        let mut rebased_sequences_truncated = false;
+        for (&seq, prediction) in self.pending_predictions.iter_mut() {
+            let mut changes: Vec<Value> = Vec::new();
+            let mut changes_truncated = false;
+            let mut count = 0;
+            for pos in prediction.positions.iter_mut() {
+                if pos.row == row {
+                    let from = pos.col;
+                    let to = pos.col.saturating_sub(delta);
+                    if to != from {
+                        pos.col = to;
+                        count += 1;
+                        if changes.len() < PREDICTION_POSITION_SAMPLE_LIMIT {
+                            changes.push(json!({ "from": from, "to": to, "ch": pos.ch }));
+                        } else {
+                            changes_truncated = true;
+                        }
+                    }
+                }
+            }
+            if count > 0 {
+                adjusted = true;
+                if prediction.cursor_row == row {
+                    prediction.cursor_col = prediction.cursor_col.saturating_sub(delta);
+                }
+                if rebased_sequences.len() < PREDICTION_SEQ_SAMPLE_LIMIT {
+                    let mut entry = Map::new();
+                    entry.insert("seq".into(), json!(seq));
+                    entry.insert("count".into(), json!(count));
+                    if !changes.is_empty() {
+                        entry.insert("changes".into(), Value::Array(changes));
+                        if changes_truncated {
+                            entry.insert("changes_truncated".into(), json!(true));
+                        }
+                    }
+                    rebased_sequences.push(Value::Object(entry));
+                } else {
+                    rebased_sequences_truncated = true;
+                }
+            } else if prediction.cursor_row == row && delta > 0 {
+                prediction.cursor_col = prediction.cursor_col.saturating_sub(delta);
+            }
+        }
+
+        if shifted || adjusted {
+            let committed_after = self.renderer.committed_row_width(absolute_row);
+            let predicted_after = self.renderer.predicted_row_width(absolute_row);
+            let effective_after = self.renderer.effective_row_width(absolute_row);
+            let renderer_active_after = self.renderer.has_active_predictions();
+            let pending_after = self.pending_predictions.len();
+            if self.predictive_input {
+                self.update_cursor_from_predictions();
+            }
+            let cursor_row = self.cursor_row;
+            let cursor_col = self.cursor_col;
+
+            self.log_predictive_event(Instant::now(), "prediction_rebase", |payload| {
+                payload.insert("row".into(), json!(row));
+                payload.insert("delta".into(), json!(delta));
+                payload.insert("shifted_renderer".into(), json!(shifted));
+                payload.insert("adjusted_pending".into(), json!(adjusted));
+                payload.insert("committed_before".into(), json!(committed_before));
+                payload.insert("committed_after".into(), json!(committed_after));
+                payload.insert("predicted_before".into(), json!(predicted_before));
+                payload.insert("predicted_after".into(), json!(predicted_after));
+                payload.insert("effective_before".into(), json!(effective_before));
+                payload.insert("effective_after".into(), json!(effective_after));
+                payload.insert(
+                    "renderer_active_before".into(),
+                    json!(renderer_active_before),
+                );
+                payload.insert("renderer_active_after".into(), json!(renderer_active_after));
+                payload.insert("pending_before".into(), json!(pending_before));
+                payload.insert("pending_after".into(), json!(pending_after));
+                if !rebased_sequences.is_empty() {
+                    payload.insert(
+                        "pending_rebased_sequences".into(),
+                        Value::Array(rebased_sequences.clone()),
+                    );
+                    if rebased_sequences_truncated {
+                        payload.insert("pending_rebased_sequences_truncated".into(), json!(true));
+                    }
+                }
+                payload.insert("cursor_row".into(), json!(cursor_row));
+                payload.insert("cursor_col".into(), json!(cursor_col));
+            });
+
+            self.force_render = true;
+            self.update_prediction_overlay();
+            if self.predictive_input {
+            self.refresh_prediction_cursor();
+        } else {
+            self.sync_renderer_cursor();
+        }
+        }
+    }
+
+    fn emit_prediction_drop(
+        &mut self,
+        seq: Seq,
+        prediction: &PendingPrediction,
+        reason: PredictionDropReason,
+        timestamp: Instant,
+    ) {
+        self.renderer.clear_prediction_seq(seq);
+        let positions_json: Vec<Value> = prediction
+            .positions
+            .iter()
+            .map(|pos| json!({ "row": pos.row, "col": pos.col, "ch": pos.ch }))
+            .collect();
+        let age_ms = timestamp
+            .saturating_duration_since(prediction.sent_at)
+            .as_secs_f64()
+            * 1000.0;
+        self.log_predictive_event(timestamp, "prediction_dropped", |payload| {
+            payload.insert("seq".into(), json!(seq));
+            payload.insert("reason".into(), json!(reason.as_str()));
+            payload.insert("age_ms".into(), json!(age_ms));
+            payload.insert("cursor_row".into(), json!(prediction.cursor_row));
+            payload.insert("cursor_col".into(), json!(prediction.cursor_col));
+            if !positions_json.is_empty() {
+                payload.insert("positions".into(), Value::Array(positions_json.clone()));
+            }
+            payload.insert(
+                "pending_after".into(),
+                json!(self.pending_predictions.len()),
+            );
+        });
+        self.dropped_predictions.insert(
+            seq,
+            DroppedPrediction {
+                positions: prediction.positions.clone(),
+                sent_at: prediction.sent_at,
+                dropped_at: timestamp,
+                reason,
+            },
+        );
+    }
+
+    fn latest_prediction_cursor(&self) -> Option<(Seq, usize, usize)> {
+        let mut best_seq: Option<Seq> = None;
+        let mut best_row: usize = 0;
+        let mut best_col: usize = 0;
+        for (&seq, prediction) in &self.pending_predictions {
+            let row = prediction.cursor_row;
+            let col = prediction.cursor_col;
+            let better = match best_seq {
+                None => true,
+                Some(existing) => {
+                    seq > existing || (seq == existing && (row, col) > (best_row, best_col))
+                }
+            };
+            if better {
+                best_seq = Some(seq);
+                best_row = row;
+                best_col = col;
+            }
+        }
+        best_seq.map(|seq| (seq, best_row, best_col))
+    }
+
+    fn update_cursor_from_predictions(&mut self) {
+        // Update cursor to predicted position for display (like Mosh).
+        // This makes typing feel responsive. When server sends cursor update,
+        // we trust server and may discard predictions (see apply_wire_cursor).
+        if let Some((_, row, col)) = self.latest_prediction_cursor() {
+            self.cursor_row = row;
+            self.cursor_col = col;
+        } else {
+            // No predictions, restore to server position
+            self.cursor_row = self.server_cursor_row;
+            self.cursor_col = self.server_cursor_col;
+        }
+    }
+
+    fn refresh_prediction_cursor(&mut self) {
+        if self.predictive_input {
+            self.update_cursor_from_predictions();
+        }
+        self.sync_renderer_cursor();
+    }
+
     fn row_has_predictions(&self, row: usize) -> bool {
         if self.renderer.predicted_row_width(row as u64) > 0 {
             return true;
@@ -3525,31 +4034,125 @@ impl TerminalClient {
             .any(|pending| pending.positions.iter().any(|pos| pos.row == row))
     }
 
-    fn discard_predictions_from_column(&mut self, row: usize, col: usize) {
-        let trimmed_renderer = self.renderer.shrink_row_to_column(row as u64, col);
-        let mut trimmed_pending = false;
-        for prediction in self.pending_predictions.values_mut() {
-            let before = prediction.positions.len();
-            prediction
-                .positions
-                .retain(|pos| !(pos.row == row && pos.col >= col));
-            if prediction.positions.len() != before {
-                trimmed_pending = true;
+    fn discard_predictions_from_column(
+        &mut self,
+        row: usize,
+        col: usize,
+        context: PredictionTrimContext,
+    ) {
+        let absolute_row = row as u64;
+        let committed_before = self.renderer.committed_row_width(absolute_row);
+        let predicted_before = self.renderer.predicted_row_width(absolute_row);
+        let effective_before = self.renderer.effective_row_width(absolute_row);
+        let renderer_active_before = self.renderer.has_active_predictions();
+        let pending_before = self.pending_predictions.len();
+
+        let mut trimmed_sequences: Vec<Value> = Vec::new();
+        let mut trimmed_sequences_truncated = false;
+        for (&seq, prediction) in &self.pending_predictions {
+            let mut positions: Vec<Value> = Vec::new();
+            let mut positions_truncated = false;
+            let mut trimmed_count = 0;
+            for pos in &prediction.positions {
+                if pos.row == row && pos.col >= col {
+                    trimmed_count += 1;
+                    if positions.len() < PREDICTION_POSITION_SAMPLE_LIMIT {
+                        positions.push(json!({ "col": pos.col, "ch": pos.ch }));
+                    } else {
+                        positions_truncated = true;
+                    }
+                }
+            }
+            if trimmed_count > 0 {
+                if trimmed_sequences.len() < PREDICTION_SEQ_SAMPLE_LIMIT {
+                    let mut entry = Map::new();
+                    entry.insert("seq".into(), json!(seq));
+                    entry.insert("count".into(), json!(trimmed_count));
+                    if !positions.is_empty() {
+                        entry.insert("positions".into(), Value::Array(positions));
+                        if positions_truncated {
+                            entry.insert("positions_truncated".into(), json!(true));
+                        }
+                    }
+                    trimmed_sequences.push(Value::Object(entry));
+                } else {
+                    trimmed_sequences_truncated = true;
+                }
             }
         }
-        if trimmed_pending {
-            self.pending_predictions
-                .retain(|_, pending| !pending.positions.is_empty());
+
+        let trimmed_renderer = self.renderer.shrink_row_to_column(absolute_row, col);
+        let trimmed_pending = self
+            .drop_predictions_matching(PredictionDropReason::RendererTrim, |pos| {
+                pos.row == row && pos.col >= col
+            });
+
+        let committed_after = self.renderer.committed_row_width(absolute_row);
+        let predicted_after = self.renderer.predicted_row_width(absolute_row);
+        let effective_after = self.renderer.effective_row_width(absolute_row);
+        let renderer_active_after = self.renderer.has_active_predictions();
+        let pending_after = self.pending_predictions.len();
+        let cursor_row = self.cursor_row;
+        let cursor_col = self.cursor_col;
+        let cursor_authoritative = self.cursor_authoritative;
+        let cursor_pending = self.cursor_authoritative_pending;
+
+        if trimmed_renderer || trimmed_pending || predicted_before > col {
+            self.log_predictive_event(Instant::now(), "prediction_trim", |payload| {
+                payload.insert("row".into(), json!(row));
+                payload.insert("col".into(), json!(col));
+                payload.insert("context".into(), json!(context.as_str()));
+                payload.insert("trimmed_renderer".into(), json!(trimmed_renderer));
+                payload.insert("trimmed_pending".into(), json!(trimmed_pending));
+                payload.insert("committed_before".into(), json!(committed_before));
+                payload.insert("committed_after".into(), json!(committed_after));
+                payload.insert("predicted_before".into(), json!(predicted_before));
+                payload.insert("predicted_after".into(), json!(predicted_after));
+                payload.insert("effective_before".into(), json!(effective_before));
+                payload.insert("effective_after".into(), json!(effective_after));
+                payload.insert("pending_before".into(), json!(pending_before));
+                payload.insert("pending_after".into(), json!(pending_after));
+                payload.insert(
+                    "renderer_active_before".into(),
+                    json!(renderer_active_before),
+                );
+                payload.insert("renderer_active_after".into(), json!(renderer_active_after));
+                if !trimmed_sequences.is_empty() {
+                    payload.insert(
+                        "pending_trim_sequences".into(),
+                        Value::Array(trimmed_sequences.clone()),
+                    );
+                    if trimmed_sequences_truncated {
+                        payload.insert("pending_trim_sequences_truncated".into(), json!(true));
+                    }
+                }
+                payload.insert("cursor_row".into(), json!(cursor_row));
+                payload.insert("cursor_col".into(), json!(cursor_col));
+                payload.insert("cursor_authoritative".into(), json!(cursor_authoritative));
+                payload.insert("cursor_pending".into(), json!(cursor_pending));
+            });
+        }
+
+        if trimmed_renderer {
+            self.force_render = true;
         }
         if trimmed_renderer || trimmed_pending {
-            self.force_render = true;
             self.update_prediction_overlay();
+            if self.predictive_input {
+            self.refresh_prediction_cursor();
+        } else {
+            self.sync_renderer_cursor();
+        }
         }
     }
 
     fn update_prediction_overlay(&mut self) {
         let now = Instant::now();
         self.prune_acked_predictions(now);
+
+        if !self.renderer.has_active_predictions() && !self.pending_predictions.is_empty() {
+            self.drop_all_predictions_with_reason(PredictionDropReason::OverlayPruned);
+        }
 
         if !self.render_enabled || !self.predictive_input {
             self.renderer.set_predictions_visible(false);
@@ -3671,6 +4274,11 @@ impl TerminalClient {
         });
 
         self.update_prediction_overlay();
+        if self.predictive_input {
+            self.refresh_prediction_cursor();
+        } else {
+            self.sync_renderer_cursor();
+        }
     }
 
     fn reset_prediction_state(&mut self) {
@@ -3683,6 +4291,12 @@ impl TerminalClient {
         self.prediction_overlay_logged_underline = false;
         self.renderer.set_predictions_visible(false);
         self.renderer.set_prediction_flagging(false);
+        self.dropped_predictions.clear();
+        if self.predictive_input {
+            self.refresh_prediction_cursor();
+        } else {
+            self.sync_renderer_cursor();
+        }
     }
 
     fn setup_tui(&mut self) -> Result<(), ClientError> {
@@ -3804,6 +4418,53 @@ struct PendingPrediction {
     positions: Vec<PredictedPosition>,
     sent_at: Instant,
     acked_at: Option<Instant>,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PredictionTrimContext {
+    CursorMoveLeft,
+    CursorClamp,
+}
+
+impl PredictionTrimContext {
+    fn as_str(self) -> &'static str {
+        match self {
+            PredictionTrimContext::CursorMoveLeft => "cursor_move_left",
+            PredictionTrimContext::CursorClamp => "cursor_clamp",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PredictionDropReason {
+    ServerOverlap,
+    OverlayPruned,
+    RendererTrim,
+    Reset,
+    Trimmed,
+    ServerMismatch,
+}
+
+impl PredictionDropReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            PredictionDropReason::ServerOverlap => "server_overlap",
+            PredictionDropReason::OverlayPruned => "overlay_pruned",
+            PredictionDropReason::RendererTrim => "renderer_trim",
+            PredictionDropReason::Reset => "reset",
+            PredictionDropReason::Trimmed => "trimmed",
+            PredictionDropReason::ServerMismatch => "server_mismatch",
+        }
+    }
+}
+
+struct DroppedPrediction {
+    positions: Vec<PredictedPosition>,
+    sent_at: Instant,
+    dropped_at: Instant,
+    reason: PredictionDropReason,
 }
 
 enum CursorHint {
@@ -4399,6 +5060,53 @@ mod tests {
         client.handle_input_ack(1);
         assert!(!client.renderer.has_active_predictions());
         assert!(client.pending_predictions.is_empty());
+    }
+
+    #[test]
+    fn predictive_server_overlap_moves_prediction_to_drop_queue() {
+        let mut client = new_client();
+        client.render_enabled = true;
+        client.predictive_input = true;
+        client.renderer.ensure_size(2, 8);
+
+        client.register_prediction(1, b"a");
+        assert!(client.pending_predictions.contains_key(&1));
+
+        client.apply_wire_update(&pack_row_segment(0, 0, 10, "a"));
+        assert!(client.pending_predictions.is_empty());
+
+        let dropped = client
+            .dropped_predictions
+            .get(&1)
+            .expect("dropped prediction recorded");
+        assert_eq!(dropped.reason, PredictionDropReason::ServerOverlap);
+        assert_eq!(dropped.positions.len(), 1);
+
+        client.handle_input_ack(1);
+        assert!(client.dropped_predictions.is_empty());
+    }
+
+    #[test]
+    fn predictive_cursor_flushes_predictions_when_authoritative_pending() {
+        let mut client = new_client();
+        client.render_enabled = true;
+        client.predictive_input = true;
+        client.renderer.ensure_size(1, 4);
+
+        client.register_prediction(1, b"a");
+        assert!(client.pending_predictions.contains_key(&1));
+
+        client.cursor_authoritative_pending = true;
+        client.register_prediction(2, b"b");
+
+        assert!(!client.pending_predictions.contains_key(&1));
+        assert!(client.pending_predictions.contains_key(&2));
+        let dropped = client
+            .dropped_predictions
+            .get(&1)
+            .expect("cursor flush recorded drop");
+        assert_eq!(dropped.reason, PredictionDropReason::Reset);
+        assert_eq!(dropped.positions.len(), 1);
     }
 
     #[test]
@@ -5665,10 +6373,18 @@ mod tests {
             })
             .expect("delta burst");
 
+        dbg!(client.cursor_seq);
+        dbg!(client.renderer.is_following_tail());
+        dbg!(client.renderer.has_pending_rows());
+        dbg!(client.renderer.first_unloaded_range(BACKFILL_LOOKAHEAD_ROWS));
+        dbg!(client.known_base_row);
+        dbg!(client.highest_loaded_row);
         client
             .maybe_request_backfill()
             .expect("maybe request after burst");
-        assert_no_backfill_requests(&transport.take());
+        let frames = transport.take();
+        dbg!(&frames.iter().map(|f| protocol::decode_client_frame_binary(f)).collect::<Vec<_>>());
+        assert_no_backfill_requests(&frames);
 
         for offset in 0..150u64 {
             let expected_label = offset + 1;
@@ -5760,6 +6476,15 @@ mod tests {
             })
             .expect("delta burst");
 
+        println!("missing_rows={} pending_rows={} first_unloaded={:?} follow_tail={} total_rows={} viewport={}",
+            client.renderer.has_missing_rows(),
+            client.renderer.has_pending_rows(),
+            client.renderer.first_unloaded_range(BACKFILL_LOOKAHEAD_ROWS),
+            client.renderer.is_following_tail(),
+            client.renderer.total_rows(),
+            client.renderer.viewport_height());
+        println!("known_base_row={:?} highest_loaded_row={:?} last_tail_backfill_start={:?} last_gap_backfill_start={:?}",
+            client.known_base_row, client.highest_loaded_row, client.last_tail_backfill_start, client.last_gap_backfill_start);
         client
             .maybe_request_backfill()
             .expect("no backfill while following tail");

@@ -22,6 +22,7 @@ pub async fn run(base_url: &str, args: JoinArgs) -> Result<(), CliError> {
         passcode,
         label,
         mcp,
+        inject_latency,
     } = args;
 
     let (session_id, inferred_base) = interpret_session_target(&target)?;
@@ -124,9 +125,13 @@ pub async fn run(base_url: &str, args: JoinArgs) -> Result<(), CliError> {
         let _listener_handle =
             start_diagnostic_listener(session_id_for_debug.clone(), request_tx, response_rx);
 
-        let client = TerminalClient::new(client_transport)
+        let mut client = TerminalClient::new(client_transport)
             .with_predictive_input(interactive)
             .with_diagnostic_server(diagnostic_server);
+
+        if let Some(latency_ms) = inject_latency {
+            client = client.with_injected_latency_ms(latency_ms);
+        }
 
         match client.run() {
             Ok(()) | Err(ClientError::Shutdown) => {}

@@ -889,6 +889,33 @@ impl GridRenderer {
         }
     }
 
+    pub fn shift_predictions_left(&mut self, row: usize, delta: usize) -> bool {
+        if delta == 0 {
+            return false;
+        }
+        let row_key = row as u64;
+        let mut moved: Vec<((u64, usize), PredictedCell)> = Vec::new();
+        let mut to_remove: Vec<(u64, usize)> = Vec::new();
+        for (&(pred_row, col), cell) in self.predictions.iter() {
+            if pred_row == row_key {
+                let new_col = col.saturating_sub(delta);
+                to_remove.push((pred_row, col));
+                moved.push(((pred_row, new_col), *cell));
+            }
+        }
+        if to_remove.is_empty() {
+            return false;
+        }
+        for key in to_remove {
+            self.predictions.remove(&key);
+        }
+        for (key, cell) in moved {
+            self.predictions.insert(key, cell);
+        }
+        self.mark_dirty();
+        true
+    }
+
     pub fn clear_all_predictions(&mut self) {
         if !self.predictions.is_empty() {
             self.predictions.clear();

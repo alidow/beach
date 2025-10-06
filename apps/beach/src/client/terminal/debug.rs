@@ -6,6 +6,15 @@ use crate::terminal::error::CliError;
 pub fn run(args: DebugArgs) -> Result<(), CliError> {
     let session_id = &args.session_id;
 
+    // Handle send input if provided
+    if let Some(text) = args.send {
+        let request = DiagnosticRequest::SendInput(text);
+        let response = send_diagnostic_request(session_id, request)
+            .map_err(|err| CliError::Runtime(err.to_string()))?;
+        print_response(&response);
+        return Ok(());
+    }
+
     let requests = if let Some(query) = args.query {
         match query.to_lowercase().as_str() {
             "cursor" => vec![
@@ -101,6 +110,9 @@ fn print_response(response: &DiagnosticResponse) {
                 println!("  Last row:    {}", last);
             }
             println!();
+        }
+        DiagnosticResponse::InputSent { bytes } => {
+            println!("Input sent: {} bytes", bytes);
         }
         DiagnosticResponse::Error(err) => {
             eprintln!("Error: {}", err);

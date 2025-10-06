@@ -1298,7 +1298,9 @@ impl GridRenderer {
     }
 
     pub fn get_cursor(&self) -> Option<(u64, usize, bool)> {
-        self.cursor.as_ref().map(|c| (c.absolute_row, c.col, c.visible))
+        self.cursor
+            .as_ref()
+            .map(|c| (c.absolute_row, c.col, c.visible))
     }
 
     fn cursor_viewport_offset(&self) -> Option<(usize, usize)> {

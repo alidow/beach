@@ -114,18 +114,15 @@ pub async fn run(base_url: &str, args: JoinArgs) -> Result<(), CliError> {
     let session_id_for_debug = session_id.clone();
 
     tokio::task::spawn_blocking(move || {
-        use crate::debug::server::DiagnosticServer;
         use crate::debug::ipc::start_diagnostic_listener;
+        use crate::debug::server::DiagnosticServer;
 
         let _raw_guard = RawModeGuard::new(interactive);
 
         // Start diagnostic server
         let (diagnostic_server, (request_tx, response_rx)) = DiagnosticServer::new();
-        let _listener_handle = start_diagnostic_listener(
-            session_id_for_debug.clone(),
-            request_tx,
-            response_rx,
-        );
+        let _listener_handle =
+            start_diagnostic_listener(session_id_for_debug.clone(), request_tx, response_rx);
 
         let client = TerminalClient::new(client_transport)
             .with_predictive_input(interactive)

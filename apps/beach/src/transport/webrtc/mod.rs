@@ -1780,7 +1780,9 @@ async fn connect_answerer(
                 attempts,
                 "timeout waiting for data channel to be announced"
             );
-            return Err(TransportError::Setup("timeout waiting for data channel".into()));
+            return Err(TransportError::Setup(
+                "timeout waiting for data channel".into(),
+            ));
         }
         transport_guard.take();
         drop(transport_guard);

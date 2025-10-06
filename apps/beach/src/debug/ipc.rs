@@ -43,7 +43,9 @@ pub fn start_diagnostic_listener(
                     let response_rx = response_rx.clone();
 
                     std::thread::spawn(move || {
-                        if let Err(e) = handle_diagnostic_connection(&mut stream, request_tx, response_rx) {
+                        if let Err(e) =
+                            handle_diagnostic_connection(&mut stream, request_tx, response_rx)
+                        {
                             tracing::warn!(target = "debug::ipc", error = %e, "diagnostic connection error");
                         }
                     });
@@ -86,7 +88,9 @@ fn handle_diagnostic_connection(
 
     // Wait for response
     let response = {
-        let rx = response_rx.lock().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let rx = response_rx
+            .lock()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         rx.recv()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?
     };

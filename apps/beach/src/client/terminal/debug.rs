@@ -8,7 +8,10 @@ pub fn run(args: DebugArgs) -> Result<(), CliError> {
 
     let requests = if let Some(query) = args.query {
         match query.to_lowercase().as_str() {
-            "cursor" => vec![DiagnosticRequest::GetCursorState, DiagnosticRequest::GetRendererState],
+            "cursor" => vec![
+                DiagnosticRequest::GetCursorState,
+                DiagnosticRequest::GetRendererState,
+            ],
             "dimensions" => vec![DiagnosticRequest::GetTerminalDimensions],
             "cache" => vec![DiagnosticRequest::GetCacheState],
             "renderer" => vec![DiagnosticRequest::GetRendererState],
@@ -22,7 +25,7 @@ pub fn run(args: DebugArgs) -> Result<(), CliError> {
                 return Err(CliError::InvalidArgument(format!(
                     "Unknown query type: {}. Valid options: cursor, dimensions, cache, renderer, all",
                     query
-                )))
+                )));
             }
         }
     } else {
@@ -52,14 +55,19 @@ fn print_response(response: &DiagnosticResponse) {
             println!("  Sequence:      {}", state.seq);
             println!("  Visible:       {}", state.visible);
             println!("  Authoritative: {}", state.authoritative);
-            println!("  Cursor support: {} (server {}sending cursor frames)",
-                     state.cursor_support,
-                     if state.cursor_support { "IS " } else { "NOT " });
+            println!(
+                "  Cursor support: {} (server {}sending cursor frames)",
+                state.cursor_support,
+                if state.cursor_support { "IS " } else { "NOT " }
+            );
             println!();
         }
         DiagnosticResponse::RendererState(state) => {
             println!("=== Renderer State (What's Actually Rendered) ===");
-            println!("  Cursor:        row={}, col={}", state.cursor_row, state.cursor_col);
+            println!(
+                "  Cursor:        row={}, col={}",
+                state.cursor_row, state.cursor_col
+            );
             println!("  Cursor visible: {}", state.cursor_visible);
             println!("  Base row:      {}", state.base_row);
             println!("  Viewport top:  {}", state.viewport_top);

@@ -295,6 +295,10 @@ impl TerminalClient {
         // Disable follow_tail initially until we receive first cursor frame
         // This prevents viewport from scrolling to tail during initial handshake
         renderer.set_follow_tail(false);
+        trace!(
+            target = "client::predictive",
+            "predictive logging initialized"
+        );
         Self {
             transport,
             renderer,
@@ -3045,9 +3049,6 @@ impl TerminalClient {
     where
         F: FnMut(&mut Map<String, Value>),
     {
-        if !tracing::enabled!(target: "client::predictive", tracing::Level::TRACE) {
-            return;
-        }
         let elapsed = timestamp.saturating_duration_since(self.connect_started_at);
         let mut payload = Map::new();
         payload.insert("source".into(), json!("rust_cli"));
@@ -3060,7 +3061,7 @@ impl TerminalClient {
         );
         build(&mut payload);
         let value = Value::Object(payload);
-        trace!(target = "client::predictive", payload = %value);
+        debug!(target = "client::predictive", payload = %value);
     }
 
     fn push_prediction_hit(

@@ -1431,7 +1431,10 @@ pub(crate) fn transmit_initial_snapshots(
 
             // Inject an initial cursor frame (0,0) in the first foreground chunk if none exists
             // This ensures clients always receive a cursor position with the initial snapshot
-            if first_foreground_chunk && lane == PriorityLane::Foreground && converted_batch.cursor.is_none() {
+            if first_foreground_chunk
+                && lane == PriorityLane::Foreground
+                && converted_batch.cursor.is_none()
+            {
                 converted_batch.cursor = Some(CursorFrame {
                     row: 0,
                     col: 0,

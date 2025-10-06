@@ -26,6 +26,7 @@ use crossterm::{
     },
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
+use serde_json::{Map, Value, json};
 use std::cmp;
 use std::collections::HashMap;
 use std::env;
@@ -72,6 +73,8 @@ const PREDICTION_GLITCH_REPAIR_MIN_INTERVAL: Duration = Duration::from_millis(15
 const PREDICTION_GLITCH_FLAG_THRESHOLD: Duration = Duration::from_millis(5000);
 const PREDICTION_SRTT_ALPHA: f64 = 0.125;
 const PREDICTION_ACK_GRACE: Duration = Duration::from_millis(90);
+
+const PREDICTION_TRACE_MAX_HITS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthorizationState {
@@ -246,6 +249,8 @@ pub struct TerminalClient {
     prediction_flagging: bool,
     prediction_glitch_trigger: u32,
     prediction_last_quick_confirmation: Option<Instant>,
+    prediction_overlay_logged_visible: bool,
+    prediction_overlay_logged_underline: bool,
     copy_mode: Option<CopyModeState>,
     last_render_at: Option<Instant>,
     render_interval: Duration,
@@ -312,6 +317,8 @@ impl TerminalClient {
             prediction_flagging: false,
             prediction_glitch_trigger: 0,
             prediction_last_quick_confirmation: None,
+            prediction_overlay_logged_visible: false,
+            prediction_overlay_logged_underline: false,
             copy_mode: None,
             last_render_at: None,
             render_interval: Duration::from_millis(16),
@@ -381,7 +388,10 @@ impl TerminalClient {
     fn handle_diagnostic_requests(&self) {
         if let Some(server) = &self.diagnostic_server {
             let _ = server.try_handle_request(|request| {
-                use crate::debug::{CacheState, CursorState, DiagnosticRequest, DiagnosticResponse, RendererState, TerminalDimensions};
+                use crate::debug::{
+                    CacheState, CursorState, DiagnosticRequest, DiagnosticResponse, RendererState,
+                    TerminalDimensions,
+                };
 
                 match request {
                     DiagnosticRequest::GetCursorState => {
@@ -416,8 +426,8 @@ impl TerminalClient {
                         })
                     }
                     DiagnosticRequest::GetRendererState => {
-                        let (cursor_row, cursor_col, cursor_visible) = self.renderer.get_cursor()
-                            .unwrap_or((0, 0, false));
+                        let (cursor_row, cursor_col, cursor_visible) =
+                            self.renderer.get_cursor().unwrap_or((0, 0, false));
                         DiagnosticResponse::RendererState(RendererState {
                             cursor_row,
                             cursor_col,
@@ -640,6 +650,24 @@ impl TerminalClient {
                 for update in &updates {
                     self.observe_update_bounds(update, true);
                     let (update_kind, row_hint, seq_hint) = Self::update_debug_metadata(update);
+                    let (hits, truncated) = self.prediction_hits_for_update(update);
+                    if !hits.is_empty() {
+                        let now = Instant::now();
+                        self.log_predictive_event(now, "prediction_update_overlap", |payload| {
+                            payload.insert("frame".into(), json!("snapshot"));
+                            payload.insert("update_kind".into(), json!(update_kind));
+                            if let Some(row) = row_hint {
+                                payload.insert("row_hint".into(), json!(row));
+                            }
+                            if let Some(seq_value) = seq_hint {
+                                payload.insert("seq_hint".into(), json!(seq_value));
+                            }
+                            if truncated {
+                                payload.insert("truncated".into(), json!(true));
+                            }
+                            payload.insert("hits".into(), Value::Array(hits.clone()));
+                        });
+                    }
                     self.renderer.set_debug_update_context(
                         "snapshot",
                         update_kind,
@@ -667,6 +695,24 @@ impl TerminalClient {
                 for update in &updates {
                     self.observe_update_bounds(update, false);
                     let (update_kind, row_hint, seq_hint) = Self::update_debug_metadata(update);
+                    let (hits, truncated) = self.prediction_hits_for_update(update);
+                    if !hits.is_empty() {
+                        let now = Instant::now();
+                        self.log_predictive_event(now, "prediction_update_overlap", |payload| {
+                            payload.insert("frame".into(), json!("delta"));
+                            payload.insert("update_kind".into(), json!(update_kind));
+                            if let Some(row) = row_hint {
+                                payload.insert("row_hint".into(), json!(row));
+                            }
+                            if let Some(seq_value) = seq_hint {
+                                payload.insert("seq_hint".into(), json!(seq_value));
+                            }
+                            if truncated {
+                                payload.insert("truncated".into(), json!(true));
+                            }
+                            payload.insert("hits".into(), Value::Array(hits.clone()));
+                        });
+                    }
                     self.renderer.set_debug_update_context(
                         "delta",
                         update_kind,
@@ -1271,6 +1317,24 @@ impl TerminalClient {
                 WireUpdate::Style { .. } => {}
             }
             let (update_kind, row_hint, seq_hint) = Self::update_debug_metadata(update);
+            let (hits, truncated) = self.prediction_hits_for_update(update);
+            if !hits.is_empty() {
+                let now = Instant::now();
+                self.log_predictive_event(now, "prediction_update_overlap", |payload| {
+                    payload.insert("frame".into(), json!("history_backfill"));
+                    payload.insert("update_kind".into(), json!(update_kind));
+                    if let Some(row) = row_hint {
+                        payload.insert("row_hint".into(), json!(row));
+                    }
+                    if let Some(seq_value) = seq_hint {
+                        payload.insert("seq_hint".into(), json!(seq_value));
+                    }
+                    if truncated {
+                        payload.insert("truncated".into(), json!(true));
+                    }
+                    payload.insert("hits".into(), Value::Array(hits.clone()));
+                });
+            }
             self.renderer.set_debug_update_context(
                 "history_backfill",
                 update_kind,
@@ -2977,18 +3041,208 @@ impl TerminalClient {
         Ok(())
     }
 
+    fn log_predictive_event<F>(&self, timestamp: Instant, event: &str, mut build: F)
+    where
+        F: FnMut(&mut Map<String, Value>),
+    {
+        if !tracing::enabled!(target: "client::predictive", tracing::Level::TRACE) {
+            return;
+        }
+        let elapsed = timestamp.saturating_duration_since(self.connect_started_at);
+        let mut payload = Map::new();
+        payload.insert("source".into(), json!("rust_cli"));
+        payload.insert("event".into(), json!(event));
+        payload.insert("elapsed_ms".into(), json!(elapsed.as_secs_f64() * 1000.0));
+        payload.insert("pending".into(), json!(self.pending_predictions.len()));
+        payload.insert(
+            "renderer_predictions".into(),
+            json!(self.renderer.has_active_predictions()),
+        );
+        build(&mut payload);
+        let value = Value::Object(payload);
+        trace!(target = "client::predictive", payload = %value);
+    }
+
+    fn push_prediction_hit(
+        &self,
+        row: usize,
+        col: usize,
+        server_ch: Option<char>,
+        hits: &mut Vec<Value>,
+        truncated: &mut bool,
+    ) {
+        if *truncated {
+            return;
+        }
+        for (&seq, pending) in &self.pending_predictions {
+            for pos in &pending.positions {
+                if pos.row == row && pos.col == col {
+                    hits.push(json!({
+                        "seq": seq,
+                        "row": row,
+                        "col": col,
+                        "predicted": pos.ch,
+                        "server": server_ch,
+                        "match": server_ch.map(|ch| ch == pos.ch).unwrap_or(false),
+                    }));
+                    if hits.len() >= PREDICTION_TRACE_MAX_HITS {
+                        *truncated = true;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn prediction_hits_for_update(&self, update: &WireUpdate) -> (Vec<Value>, bool) {
+        let mut hits: Vec<Value> = Vec::new();
+        let mut truncated = false;
+        match update {
+            WireUpdate::Cell { row, col, cell, .. } => {
+                let (ch, _) = decode_wire_cell(*cell);
+                self.push_prediction_hit(
+                    *row as usize,
+                    *col as usize,
+                    Some(ch),
+                    &mut hits,
+                    &mut truncated,
+                );
+            }
+            WireUpdate::Row { row, cells, .. } => {
+                for (idx, cell) in cells.iter().enumerate() {
+                    let (ch, _) = decode_wire_cell(*cell);
+                    self.push_prediction_hit(
+                        *row as usize,
+                        idx,
+                        Some(ch),
+                        &mut hits,
+                        &mut truncated,
+                    );
+                    if truncated {
+                        break;
+                    }
+                }
+            }
+            WireUpdate::RowSegment {
+                row,
+                start_col,
+                cells,
+                ..
+            } => {
+                for (offset, cell) in cells.iter().enumerate() {
+                    let (ch, _) = decode_wire_cell(*cell);
+                    let col = (*start_col as usize).saturating_add(offset);
+                    self.push_prediction_hit(
+                        *row as usize,
+                        col,
+                        Some(ch),
+                        &mut hits,
+                        &mut truncated,
+                    );
+                    if truncated {
+                        break;
+                    }
+                }
+            }
+            WireUpdate::Rect {
+                rows, cols, cell, ..
+            } => {
+                let (ch, _) = decode_wire_cell(*cell);
+                let row_start = rows[0] as usize;
+                let row_end = rows[1] as usize;
+                let col_start = cols[0] as usize;
+                let col_end = cols[1] as usize;
+                for row in row_start..row_end {
+                    for col in col_start..col_end {
+                        self.push_prediction_hit(row, col, Some(ch), &mut hits, &mut truncated);
+                        if truncated {
+                            break;
+                        }
+                    }
+                    if truncated {
+                        break;
+                    }
+                }
+            }
+            WireUpdate::Trim { start, count, .. } => {
+                let start = *start as usize;
+                let end = start.saturating_add(*count as usize);
+                for (&seq, pending) in &self.pending_predictions {
+                    for pos in &pending.positions {
+                        if pos.row >= start && pos.row < end {
+                            hits.push(json!({
+                                "seq": seq,
+                                "row": pos.row,
+                                "col": pos.col,
+                                "predicted": pos.ch,
+                                "server": Value::Null,
+                                "match": false,
+                                "trimmed": true,
+                            }));
+                            if hits.len() >= PREDICTION_TRACE_MAX_HITS {
+                                truncated = true;
+                                break;
+                            }
+                        }
+                    }
+                    if truncated {
+                        break;
+                    }
+                }
+            }
+            WireUpdate::Style { .. } => {}
+        }
+        (hits, truncated)
+    }
+
     fn handle_input_ack(&mut self, seq: Seq) {
         let now = Instant::now();
+        let pending_before = self.pending_predictions.len();
+        let mut positions_snapshot: Vec<PredictedPosition> = Vec::new();
         let mut sent_at: Option<Instant> = None;
+        let mut had_prediction = false;
         if let Some(prediction) = self.pending_predictions.get_mut(&seq) {
+            had_prediction = true;
             prediction.acked_at = Some(now);
             sent_at = Some(prediction.sent_at);
+            positions_snapshot = prediction.positions.clone();
         }
-        if self.pending_predictions.contains_key(&seq) {
-            self.try_clear_prediction(seq, now);
+        let mut renderer_only = false;
+        let mut renderer_had_seq = false;
+        let cleared = if self.pending_predictions.contains_key(&seq) {
+            self.try_clear_prediction(seq, now, "ack")
         } else {
+            renderer_only = true;
+            renderer_had_seq = self.renderer.seq_has_predictions(seq);
             self.renderer.clear_prediction_seq(seq);
-        }
+            renderer_had_seq
+        };
+        let pending_after = self.pending_predictions.len();
+        let ack_delay =
+            sent_at.map(|sent| now.saturating_duration_since(sent).as_secs_f64() * 1000.0);
+        let positions_json: Vec<Value> = positions_snapshot
+            .iter()
+            .map(|pos| json!({ "row": pos.row, "col": pos.col, "ch": pos.ch }))
+            .collect();
+
+        self.log_predictive_event(now, "prediction_ack", |payload| {
+            payload.insert("seq".into(), json!(seq));
+            payload.insert("pending_before".into(), json!(pending_before));
+            payload.insert("pending_after".into(), json!(pending_after));
+            payload.insert("had_prediction".into(), json!(had_prediction));
+            payload.insert("cleared".into(), json!(cleared));
+            if renderer_only {
+                payload.insert("renderer_only".into(), json!(true));
+                payload.insert("renderer_had_seq".into(), json!(renderer_had_seq));
+            }
+            if let Some(delay) = ack_delay {
+                payload.insert("ack_delay_ms".into(), json!(delay));
+            }
+            if !positions_json.is_empty() {
+                payload.insert("positions".into(), Value::Array(positions_json.clone()));
+            }
+        });
+
         if let Some(sent) = sent_at {
             self.record_prediction_ack(sent);
         }
@@ -2997,21 +3251,53 @@ impl TerminalClient {
     }
 
     fn register_prediction(&mut self, seq: Seq, bytes: &[u8]) {
+        let timestamp = Instant::now();
         if !self.render_enabled || !self.predictive_input {
+            let reason = if !self.render_enabled {
+                "render_disabled"
+            } else {
+                "predictive_disabled"
+            };
+            self.log_predictive_event(timestamp, "prediction_skipped", |payload| {
+                payload.insert("seq".into(), json!(seq));
+                payload.insert("byte_count".into(), json!(bytes.len()));
+                payload.insert("reason".into(), json!(reason));
+            });
+            return;
+        }
+        if bytes.is_empty() {
+            self.log_predictive_event(timestamp, "prediction_skipped", |payload| {
+                payload.insert("seq".into(), json!(seq));
+                payload.insert("reason".into(), json!("empty_payload"));
+            });
             return;
         }
         if bytes.len() > 32 {
+            self.log_predictive_event(timestamp, "prediction_skipped", |payload| {
+                payload.insert("seq".into(), json!(seq));
+                payload.insert("byte_count".into(), json!(bytes.len()));
+                payload.insert("reason".into(), json!("payload_too_large"));
+            });
             return;
         }
         if self.pending_predictions.len() > 256 {
+            let cleared = self.pending_predictions.len();
             self.pending_predictions.clear();
             self.renderer.clear_all_predictions();
             self.reset_prediction_state();
+            self.log_predictive_event(timestamp, "prediction_buffer_reset", |payload| {
+                payload.insert("cleared".into(), json!(cleared));
+            });
         }
         let mut cursor_row = self.cursor_row;
         let mut cursor_col = self.cursor_col;
         let mut cursor_changed = false;
         let mut positions: Vec<PredictedPosition> = Vec::new();
+        let cursor_before = json!({
+            "row": self.cursor_row,
+            "col": self.cursor_col,
+            "seq": self.cursor_seq,
+        });
 
         let mut push_position = |row: usize, col: usize, ch: char| {
             if let Some(existing) = positions
@@ -3071,9 +3357,11 @@ impl TerminalClient {
             }
         }
 
+        let computed_cursor_row = cursor_row;
+        let computed_cursor_col = cursor_col;
+        let positions_snapshot = positions.clone();
+
         if cursor_changed {
-            // Only update cursor from predictions if we have an authoritative position
-            // or if we've received at least one cursor frame
             if self.cursor_seq > 0 || self.cursor_authoritative {
                 self.cursor_row = cursor_row;
                 self.cursor_col = cursor_col;
@@ -3081,18 +3369,65 @@ impl TerminalClient {
             self.sync_renderer_cursor();
         }
 
+        let cursor_effective = json!({
+            "row": self.cursor_row,
+            "col": self.cursor_col,
+            "seq": self.cursor_seq,
+        });
+
         if !positions.is_empty() {
             self.pending_predictions.insert(
                 seq,
                 PendingPrediction {
                     positions,
-                    sent_at: Instant::now(),
+                    sent_at: timestamp,
                     acked_at: None,
                 },
             );
             self.force_render = true;
+            let positions_json: Vec<Value> = positions_snapshot
+                .iter()
+                .map(|pos| json!({"row": pos.row, "col": pos.col, "ch": pos.ch}))
+                .collect();
+            let preview: String = positions_snapshot.iter().map(|pos| pos.ch).collect();
+            self.log_predictive_event(timestamp, "prediction_registered", |payload| {
+                payload.insert("seq".into(), json!(seq));
+                payload.insert("byte_count".into(), json!(bytes.len()));
+                payload.insert(
+                    "payload_hex".into(),
+                    json!(crate::telemetry::logging::hexdump(bytes)),
+                );
+                payload.insert("positions".into(), Value::Array(positions_json.clone()));
+                payload.insert("preview".into(), json!(preview));
+                payload.insert(
+                    "cursor_computed".into(),
+                    json!({ "row": computed_cursor_row, "col": computed_cursor_col }),
+                );
+                payload.insert("cursor_before".into(), cursor_before.clone());
+                payload.insert("cursor_effective".into(), cursor_effective.clone());
+            });
         } else if cursor_changed {
             self.force_render = true;
+            self.log_predictive_event(timestamp, "prediction_cursor_only", |payload| {
+                payload.insert("seq".into(), json!(seq));
+                payload.insert("byte_count".into(), json!(bytes.len()));
+                payload.insert(
+                    "payload_hex".into(),
+                    json!(crate::telemetry::logging::hexdump(bytes)),
+                );
+                payload.insert("cursor_before".into(), cursor_before.clone());
+                payload.insert(
+                    "cursor_computed".into(),
+                    json!({ "row": computed_cursor_row, "col": computed_cursor_col }),
+                );
+                payload.insert("cursor_effective".into(), cursor_effective.clone());
+            });
+        } else {
+            self.log_predictive_event(timestamp, "prediction_skipped", |payload| {
+                payload.insert("seq".into(), json!(seq));
+                payload.insert("byte_count".into(), json!(bytes.len()));
+                payload.insert("reason".into(), json!("no_positions"));
+            });
         }
 
         self.update_prediction_overlay();
@@ -3117,30 +3452,65 @@ impl TerminalClient {
         }
 
         for seq in expired {
-            self.try_clear_prediction(seq, now);
+            self.try_clear_prediction(seq, now, "prune");
         }
     }
 
-    fn try_clear_prediction(&mut self, seq: Seq, now: Instant) -> bool {
+    fn try_clear_prediction(&mut self, seq: Seq, now: Instant, context: &'static str) -> bool {
         if let Some(prediction) = self.pending_predictions.remove(&seq) {
-            let overlay_gone = prediction
-                .positions
+            let positions_snapshot = prediction.positions.clone();
+            let overlay_gone = positions_snapshot
                 .iter()
                 .all(|pos| !self.renderer.prediction_exists(pos.row, pos.col, seq));
-            let committed = prediction
-                .positions
+            let committed = positions_snapshot
                 .iter()
                 .all(|pos| self.renderer.cell_matches(pos.row, pos.col, pos.ch));
             if overlay_gone || committed {
                 self.renderer.clear_prediction_seq(seq);
                 self.force_render = true;
                 self.prediction_last_quick_confirmation = Some(now);
+                let reason = if overlay_gone {
+                    "overlay_absent"
+                } else {
+                    "committed"
+                };
+                let positions_json: Vec<Value> = positions_snapshot
+                    .iter()
+                    .map(|pos| json!({ "row": pos.row, "col": pos.col, "ch": pos.ch }))
+                    .collect();
+                self.log_predictive_event(now, "prediction_cleared", |payload| {
+                    payload.insert("seq".into(), json!(seq));
+                    payload.insert("context".into(), json!(context));
+                    payload.insert("reason".into(), json!(reason));
+                    payload.insert("positions".into(), Value::Array(positions_json.clone()));
+                    payload.insert("acked".into(), json!(prediction.acked_at.is_some()));
+                });
                 true
             } else {
+                let age_ms = now
+                    .saturating_duration_since(prediction.sent_at)
+                    .as_secs_f64()
+                    * 1000.0;
+                let positions_json: Vec<Value> = positions_snapshot
+                    .iter()
+                    .map(|pos| json!({ "row": pos.row, "col": pos.col, "ch": pos.ch }))
+                    .collect();
+                let acked = prediction.acked_at.is_some();
                 self.pending_predictions.insert(seq, prediction);
+                self.log_predictive_event(now, "prediction_clear_deferred", |payload| {
+                    payload.insert("seq".into(), json!(seq));
+                    payload.insert("context".into(), json!(context));
+                    payload.insert("acked".into(), json!(acked));
+                    payload.insert("age_ms".into(), json!(age_ms));
+                    payload.insert("positions".into(), Value::Array(positions_json.clone()));
+                });
                 false
             }
         } else {
+            self.log_predictive_event(now, "prediction_missing", |payload| {
+                payload.insert("seq".into(), json!(seq));
+                payload.insert("context".into(), json!(context));
+            });
             false
         }
     }
@@ -3183,6 +3553,20 @@ impl TerminalClient {
         if !self.render_enabled || !self.predictive_input {
             self.renderer.set_predictions_visible(false);
             self.renderer.set_prediction_flagging(false);
+            if self.prediction_overlay_logged_visible || self.prediction_overlay_logged_underline {
+                self.prediction_overlay_logged_visible = false;
+                self.prediction_overlay_logged_underline = false;
+                self.log_predictive_event(now, "overlay_state", |payload| {
+                    payload.insert("visible".into(), json!(false));
+                    payload.insert("underline".into(), json!(false));
+                    payload.insert("srtt_ms".into(), json!(self.prediction_srtt_ms));
+                    payload.insert(
+                        "glitch_trigger".into(),
+                        json!(self.prediction_glitch_trigger),
+                    );
+                    payload.insert("srtt_trigger".into(), json!(self.prediction_srtt_trigger));
+                });
+            }
             return;
         }
         let mut glitch_trigger = self.prediction_glitch_trigger;
@@ -3235,6 +3619,23 @@ impl TerminalClient {
 
         self.renderer.set_predictions_visible(overlay_visible);
         self.renderer.set_prediction_flagging(underline);
+        if self.prediction_overlay_logged_visible != overlay_visible
+            || self.prediction_overlay_logged_underline != underline
+        {
+            self.prediction_overlay_logged_visible = overlay_visible;
+            self.prediction_overlay_logged_underline = underline;
+            self.log_predictive_event(now, "overlay_state", |payload| {
+                payload.insert("visible".into(), json!(overlay_visible));
+                payload.insert("underline".into(), json!(underline));
+                payload.insert("srtt_ms".into(), json!(self.prediction_srtt_ms));
+                payload.insert(
+                    "glitch_trigger".into(),
+                    json!(self.prediction_glitch_trigger),
+                );
+                payload.insert("srtt_trigger".into(), json!(self.prediction_srtt_trigger));
+                payload.insert("has_predictions".into(), json!(has_predictions));
+            });
+        }
     }
 
     fn record_prediction_ack(&mut self, sent_at: Instant) {
@@ -3259,6 +3660,15 @@ impl TerminalClient {
             }
         }
 
+        self.log_predictive_event(now, "prediction_ack_sample", |payload| {
+            payload.insert("sample_ms".into(), json!(sample_ms));
+            payload.insert("srtt_ms".into(), json!(self.prediction_srtt_ms));
+            payload.insert(
+                "glitch_trigger".into(),
+                json!(self.prediction_glitch_trigger),
+            );
+        });
+
         self.update_prediction_overlay();
     }
 
@@ -3268,6 +3678,8 @@ impl TerminalClient {
         self.prediction_flagging = false;
         self.prediction_glitch_trigger = 0;
         self.prediction_last_quick_confirmation = None;
+        self.prediction_overlay_logged_visible = false;
+        self.prediction_overlay_logged_underline = false;
         self.renderer.set_predictions_visible(false);
         self.renderer.set_prediction_flagging(false);
     }

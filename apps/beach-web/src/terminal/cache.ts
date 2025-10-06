@@ -12,6 +12,25 @@ function trace(...parts: unknown[]): void {
   }
 }
 
+const PREDICTION_TRACE_MAX_HITS = 64;
+
+function predictiveTraceEnabled(): boolean {
+  return typeof window !== 'undefined' && Boolean(window.__BEACH_TRACE);
+}
+
+function traceNow(): number {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
+    return performance.now();
+  }
+  return Date.now();
+}
+
+function predictionHexdump(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((value) => value.toString(16).padStart(2, '0'))
+    .join('');
+}
+
 const HIGH_SHIFT = 32;
 const WORD = 2 ** HIGH_SHIFT;
 const LOW_MASK = 0xffff_ffff;
@@ -138,6 +157,7 @@ export class TerminalGridCache {
   private cursorAuthoritativePending = false;
   private predictedCursor: PredictedCursorState | null = null;
   private predictions = new Map<number, Map<number, PredictedCell>>();
+  private readonly traceStartMs = traceNow();
   private pendingPredictions = new Map<number, PendingPredictionEntry>();
   private debugContext: DebugUpdateContext | null = null;
 
@@ -153,6 +173,132 @@ export class TerminalGridCache {
     this.cursorAuthoritative = false;
     this.cursorAuthoritativePending = false;
     this.predictedCursor = null;
+  }
+
+  private predictiveLog(event: string, fields: Record<string, unknown> = {}): void {
+    if (!predictiveTraceEnabled()) {
+      return;
+    }
+    const nowMs = traceNow();
+    const payload = {
+      source: 'web_client',
+      event,
+      elapsed_ms: nowMs - this.traceStartMs,
+      pending: this.pendingPredictions.size,
+      renderer_predictions: this.predictions.size,
+      ...fields,
+    };
+    try {
+      console.debug('[beach-trace][predictive]', JSON.stringify(payload));
+    } catch {
+      console.debug('[beach-trace][predictive]', payload);
+    }
+  }
+
+  private predictionHitsForUpdate(update: Update): { hits: Array<Record<string, unknown>>; truncated: boolean } {
+    const hits: Array<Record<string, unknown>> = [];
+    let truncated = false;
+    const pushHit = (row: number, col: number, serverChar: string | null) => {
+      if (truncated) {
+        return;
+      }
+      for (const [seq, entry] of this.pendingPredictions) {
+        for (const pos of entry.positions) {
+          if (pos.row === row && pos.col === col) {
+            hits.push({
+              seq,
+              row,
+              col,
+              predicted: pos.char,
+              server: serverChar,
+              match: serverChar !== null ? pos.char === serverChar : false,
+            });
+            if (hits.length >= PREDICTION_TRACE_MAX_HITS) {
+              truncated = true;
+              return;
+            }
+          }
+        }
+      }
+    };
+    switch (update.type) {
+      case 'cell': {
+        const { char } = decodePackedCell(update.cell);
+        pushHit(update.row, update.col, char);
+        break;
+      }
+      case 'row': {
+        for (let idx = 0; idx < update.cells.length; idx += 1) {
+          const packed = update.cells[idx];
+          const char = packed === undefined ? ' ' : decodePackedCell(packed).char;
+          pushHit(update.row, idx, char);
+          if (truncated) {
+            break;
+          }
+        }
+        break;
+      }
+      case 'row_segment': {
+        for (let offset = 0; offset < update.cells.length; offset += 1) {
+          const packed = update.cells[offset];
+          const char = packed === undefined ? ' ' : decodePackedCell(packed).char;
+          const col = update.startCol + offset;
+          pushHit(update.row, col, char);
+          if (truncated) {
+            break;
+          }
+        }
+        break;
+      }
+      case 'rect': {
+        const [rowStart, rowEnd] = update.rows;
+        const [colStart, colEnd] = update.cols;
+        const { char } = decodePackedCell(update.cell);
+        for (let row = rowStart; row < rowEnd; row += 1) {
+          for (let col = colStart; col < colEnd; col += 1) {
+            pushHit(row, col, char);
+            if (truncated) {
+              break;
+            }
+          }
+          if (truncated) {
+            break;
+          }
+        }
+        break;
+      }
+      case 'trim': {
+        const start = update.start;
+        const end = update.start + update.count;
+        for (const [seq, entry] of this.pendingPredictions) {
+          for (const pos of entry.positions) {
+            if (pos.row >= start && pos.row < end) {
+              hits.push({
+                seq,
+                row: pos.row,
+                col: pos.col,
+                predicted: pos.char,
+                server: null,
+                match: false,
+                trimmed: true,
+              });
+              if (hits.length >= PREDICTION_TRACE_MAX_HITS) {
+                truncated = true;
+                break;
+              }
+            }
+          }
+          if (truncated) {
+            break;
+          }
+        }
+        break;
+      }
+      default: {
+        break;
+      }
+    }
+    return { hits, truncated };
   }
 
   reset(): void {
@@ -298,6 +444,18 @@ export class TerminalGridCache {
           row: extractUpdateRow(update),
           authoritative,
         });
+        const { hits, truncated } = this.predictionHitsForUpdate(update);
+        if (hits.length > 0) {
+          const seqHint = (update as any).seq ?? null;
+          this.predictiveLog('prediction_update_overlap', {
+            frame: originLabel ?? 'unknown',
+            update_kind: update.type,
+            row_hint: extractUpdateRow(update),
+            seq_hint: seqHint,
+            hits,
+            truncated,
+          });
+        }
         baseAdjusted = this.observeBounds(update, authoritative) || baseAdjusted;
         mutated = this.applyGridUpdate(update) || mutated;
         const hint = this.cursorAuthoritative || this.cursorAuthoritativePending ? null : this.cursorHint(update);
@@ -1006,10 +1164,23 @@ export class TerminalGridCache {
   }
 
   registerPrediction(seq: number, data: Uint8Array): boolean {
+    const tracing = predictiveTraceEnabled();
+    const timestamp = tracing ? traceNow() : 0;
+    const cursorBefore = tracing
+      ? { row: this.cursorRow, col: this.cursorCol, seq: this.cursorSeq }
+      : null;
     if (!Number.isFinite(seq) || seq <= 0) {
+      if (tracing) {
+        this.predictiveLog('prediction_skipped', { seq, reason: 'invalid_seq' });
+      }
       return false;
     }
     if (!data || data.length === 0 || data.length > 32) {
+      if (tracing) {
+        const byteCount = data ? data.length : 0;
+        const reason = byteCount === 0 ? 'empty_payload' : byteCount > 32 ? 'payload_too_large' : 'invalid_payload';
+        this.predictiveLog('prediction_skipped', { seq, byte_count: byteCount, reason });
+      }
       return false;
     }
 
@@ -1103,11 +1274,23 @@ export class TerminalGridCache {
       cursorMoved = true;
     }
 
+    const computedRow = currentRow;
+    const computedCol = currentCol;
+    const positionsLog = tracing
+      ? positions.map((pos) => ({ row: pos.row, col: pos.col, char: pos.char }))
+      : null;
+    const preview = tracing ? positions.map((pos) => pos.char).join('') : '';
+
     this.pendingPredictions.delete(seq);
     if (positions.length > 0) {
       this.pendingPredictions.set(seq, { positions, ackedAt: null });
       if (this.pendingPredictions.size > 256) {
+        const cleared = this.pendingPredictions.size;
+        const rendererCleared = this.predictions.size;
         mutated = this.clearAllPredictions() || mutated;
+        if (tracing) {
+          this.predictiveLog('prediction_buffer_reset', { seq, cleared, renderer_cleared: rendererCleared });
+        }
       }
     }
 
@@ -1127,6 +1310,38 @@ export class TerminalGridCache {
       this.cursorCol = currentCol;
       this.clampCursor();
       mutated = mutated || cursorMoved;
+    }
+
+    if (tracing) {
+      const cursorEffective = {
+        row: this.cursorRow,
+        col: this.cursorCol,
+        seq: this.cursorSeq,
+        predictedCursor: this.predictedCursor,
+      };
+      if (positionsLog && positionsLog.length > 0) {
+        this.predictiveLog('prediction_registered', {
+          seq,
+          byte_count: data.length,
+          payload_hex: predictionHexdump(data),
+          positions: positionsLog,
+          preview,
+          cursor_before: cursorBefore,
+          cursor_computed: { row: computedRow, col: computedCol },
+          cursor_effective: cursorEffective,
+        });
+      } else if (cursorMoved) {
+        this.predictiveLog('prediction_cursor_only', {
+          seq,
+          byte_count: data.length,
+          payload_hex: predictionHexdump(data),
+          cursor_before: cursorBefore,
+          cursor_computed: { row: computedRow, col: computedCol },
+          cursor_effective: cursorEffective,
+        });
+      } else {
+        this.predictiveLog('prediction_skipped', { seq, byte_count: data.length, reason: 'no_positions' });
+      }
     }
 
     return mutated || positions.length > 0 || cursorMoved;
@@ -1152,28 +1367,88 @@ export class TerminalGridCache {
   }
 
   ackPrediction(seq: number, timestampMs: number): boolean {
+    const tracing = predictiveTraceEnabled();
+    const pendingBefore = this.pendingPredictions.size;
     const entry = this.pendingPredictions.get(seq);
     if (entry) {
       if (entry.ackedAt === null || entry.ackedAt < timestampMs) {
         entry.ackedAt = timestampMs;
       }
+      const positionsLog = entry.positions.map((pos) => ({ row: pos.row, col: pos.col, char: pos.char }));
       const committed = entry.positions.every((pos) => {
         return !this.predictionExists(pos.row, pos.col, seq) || this.cellMatches(pos.row, pos.col, pos.char);
       });
       if (committed) {
         this.pendingPredictions.delete(seq);
         let mutated = false;
-        for (const { row, col } of entry.positions) {
+        for (const { row, col } of positionsLog) {
           mutated = this.clearPredictionAt(row, col) || mutated;
+        }
+        if (tracing) {
+          this.predictiveLog('prediction_cleared', {
+            seq,
+            context: 'ack',
+            reason: 'committed',
+            positions: positionsLog,
+          });
+          this.predictiveLog('prediction_ack', {
+            seq,
+            pending_before: pendingBefore,
+            pending_after: this.pendingPredictions.size,
+            cleared: true,
+            renderer_only: false,
+            positions: positionsLog,
+          });
         }
         return mutated;
       }
+      if (tracing) {
+        this.predictiveLog('prediction_ack', {
+          seq,
+          pending_before: pendingBefore,
+          pending_after: this.pendingPredictions.size,
+          cleared: false,
+          renderer_only: false,
+          positions: positionsLog,
+        });
+      }
       return false;
     }
-    return this.clearPredictionSeq(seq);
+    let rendererCleared = false;
+    for (const rowPredictions of this.predictions.values()) {
+      for (const cell of rowPredictions.values()) {
+        if (cell.seq === seq) {
+          rendererCleared = true;
+          break;
+        }
+      }
+      if (rendererCleared) {
+        break;
+      }
+    }
+    this.clearPredictionSeq(seq);
+    if (tracing) {
+      this.predictiveLog('prediction_ack', {
+        seq,
+        pending_before: pendingBefore,
+        pending_after: this.pendingPredictions.size,
+        cleared: rendererCleared,
+        renderer_only: true,
+      });
+      if (rendererCleared) {
+        this.predictiveLog('prediction_cleared', {
+          seq,
+          context: 'ack',
+          reason: 'renderer_only',
+          positions: [],
+        });
+      }
+    }
+    return rendererCleared;
   }
 
   pruneAckedPredictions(nowMs: number, graceMs: number): boolean {
+    const tracing = predictiveTraceEnabled();
     const expired: number[] = [];
     for (const [seq, entry] of this.pendingPredictions) {
       entry.positions = entry.positions.filter((pos) => this.predictionExists(pos.row, pos.col, seq));
@@ -1191,13 +1466,22 @@ export class TerminalGridCache {
     for (const seq of expired) {
       const entry = this.pendingPredictions.get(seq);
       if (entry) {
+        const positionsLog = entry.positions.map((pos) => ({ row: pos.row, col: pos.col, char: pos.char }));
         const committed = entry.positions.every((pos) => {
           return !this.predictionExists(pos.row, pos.col, seq) || this.cellMatches(pos.row, pos.col, pos.char);
         });
         if (committed) {
           this.pendingPredictions.delete(seq);
-          for (const { row, col } of entry.positions) {
+          for (const { row, col } of positionsLog) {
             mutated = this.clearPredictionAt(row, col) || mutated;
+          }
+          if (tracing) {
+            this.predictiveLog('prediction_cleared', {
+              seq,
+              context: 'prune',
+              reason: 'committed',
+              positions: positionsLog,
+            });
           }
         }
       }

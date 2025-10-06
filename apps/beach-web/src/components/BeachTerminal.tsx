@@ -43,6 +43,26 @@ function trace(...args: unknown[]): void {
   }
 }
 
+const PREDICTIVE_TRACE_START_MS = now();
+
+function predictiveLog(event: string, fields: Record<string, unknown> = {}): void {
+  if (!(typeof window !== 'undefined' && window.__BEACH_TRACE)) {
+    return;
+  }
+  const timestamp = now();
+  const payload = {
+    source: 'web_client',
+    event,
+    elapsed_ms: timestamp - PREDICTIVE_TRACE_START_MS,
+    ...fields,
+  };
+  try {
+    console.debug('[beach-trace][predictive]', JSON.stringify(payload));
+  } catch {
+    console.debug('[beach-trace][predictive]', payload);
+  }
+}
+
 function summarizeSnapshot(store: TerminalGridStore | undefined): void {
   if (!store || !(typeof window !== 'undefined' && window.__BEACH_TRACE)) {
     return;
@@ -111,19 +131,33 @@ class PredictionUx {
   private pending = new Map<number, number>();
   private overlay: PredictionOverlayState = { visible: false, underline: false };
 
+  private log(event: string, fields: Record<string, unknown> = {}): void {
+    predictiveLog(event, {
+      component: 'PredictionUx',
+      pending: this.pending.size,
+      srtt_ms: this.srttMs,
+      glitch_trigger: this.glitchTrigger,
+      ...fields,
+    });
+  }
+
   recordSend(seq: number, timestampMs: number, predicted: boolean): PredictionOverlayState | null {
     if (!predicted) {
+      this.log('prediction_send', { seq, predicted: false, timestamp_ms: timestampMs });
       return null;
     }
     this.pending.set(seq, timestampMs);
+    this.log('prediction_send', { seq, predicted: true, timestamp_ms: timestampMs });
     return this.updateOverlayState(timestampMs);
   }
 
   recordAck(seq: number, timestampMs: number): PredictionOverlayState | null {
     const sentAt = this.pending.get(seq);
+    let delayMs: number | null = null;
     if (sentAt !== undefined) {
       this.pending.delete(seq);
       const sample = Math.max(0, timestampMs - sentAt);
+      delayMs = sample;
       this.srttMs = this.srttMs === null ? sample : this.srttMs + (sample - this.srttMs) * PREDICTION_SRTT_ALPHA;
       if (this.glitchTrigger > 0 && sample < PREDICTION_GLITCH_THRESHOLD_MS) {
         if (timestampMs - this.lastQuickConfirmation >= PREDICTION_GLITCH_REPAIR_MIN_INTERVAL_MS) {
@@ -132,7 +166,9 @@ class PredictionUx {
         }
       }
     }
-    return this.updateOverlayState(timestampMs);
+    const overlay = this.updateOverlayState(timestampMs);
+    this.log('prediction_ack', { seq, ack_delay_ms: delayMs, cleared: sentAt !== undefined });
+    return overlay;
   }
 
   tick(timestampMs: number): PredictionOverlayState | null {
@@ -160,7 +196,9 @@ class PredictionUx {
     this.glitchTrigger = 0;
     this.lastQuickConfirmation = 0;
     this.pending.clear();
-    return this.updateOverlayState(timestampMs);
+    const overlay = this.updateOverlayState(timestampMs);
+    this.log('prediction_state_reset');
+    return overlay;
   }
 
   private updateOverlayState(timestampMs: number): PredictionOverlayState | null {
@@ -193,6 +231,7 @@ class PredictionUx {
     }
 
     this.overlay = { visible, underline };
+    this.log('overlay_state', { visible, underline, srtt_trigger: this.srttTrigger });
     return this.overlay;
   }
 }
@@ -1206,6 +1245,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           updates: frame.updates.map((update) => update.type),
           cursor: frame.cursor ?? null,
         });
+        predictiveLog('server_frame', { frame: frame.type, updates: frame.updates.length, authoritative });
         store.applyUpdates(frame.updates, {
           authoritative,
           origin: frame.type,
@@ -1226,6 +1266,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         break;
       case 'input_ack': {
         const timestamp = now();
+        predictiveLog('server_frame', { frame: 'input_ack', seq: frame.seq });
         store.ackPrediction(frame.seq, timestamp);
         const overlayUpdate = predictionUxRef.current.recordAck(frame.seq, timestamp);
         if (overlayUpdate) {

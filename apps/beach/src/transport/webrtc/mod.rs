@@ -1467,6 +1467,9 @@ async fn connect_answerer(
     let signaling_for_incoming = Arc::clone(&signaling_client);
     let pc_for_incoming = pc.clone();
     let handshake_for_incoming = Arc::clone(&handshake_id);
+    let pending_for_incoming: Arc<AsyncMutex<Vec<RTCIceCandidateInit>>> =
+        Arc::new(AsyncMutex::new(Vec::new()));
+    let pending_for_incoming_clone = Arc::clone(&pending_for_incoming);
     spawn_on_global(async move {
         while let Some(signal) = signaling_for_incoming.recv_webrtc_signal().await {
             if let WebRTCSignal::IceCandidate {
@@ -1490,12 +1493,25 @@ async fn connect_answerer(
                     sdp_mline_index: sdp_mline_index.map(|idx| idx as u16),
                     username_fragment: None,
                 };
-                if let Err(err) = pc_for_incoming.add_ice_candidate(init).await {
+                let has_remote = pc_for_incoming.remote_description().await.is_some();
+                if !has_remote {
+                    let mut queue = pending_for_incoming.lock().await;
+                    queue.push(init);
+                    tracing::debug!(
+                        target = "webrtc",
+                        role = "answerer",
+                        "queued remote ice candidate (remote description not set yet)"
+                    );
+                    continue;
+                }
+                if let Err(err) = pc_for_incoming.add_ice_candidate(init.clone()).await {
                     tracing::warn!(
                         target = "webrtc",
                         error = %err,
                         "answerer failed to add remote ice candidate"
                     );
+                    let mut queue = pending_for_incoming.lock().await;
+                    queue.push(init);
                 }
             }
         }
@@ -1618,6 +1634,31 @@ async fn connect_answerer(
         state = "end"
     );
 
+    // Process queued ICE candidates now that remote description is set
+    let pending_candidates = {
+        let mut queue = pending_for_incoming_clone.lock().await;
+        let candidates = queue.drain(..).collect::<Vec<_>>();
+        candidates
+    };
+    if !pending_candidates.is_empty() {
+        tracing::debug!(
+            target = "webrtc",
+            role = "answerer",
+            count = pending_candidates.len(),
+            "processing queued remote ice candidates"
+        );
+        for init in pending_candidates {
+            if let Err(err) = pc.add_ice_candidate(init).await {
+                tracing::warn!(
+                    target = "webrtc",
+                    role = "answerer",
+                    error = %err,
+                    "failed to add queued remote ice candidate"
+                );
+            }
+        }
+    }
+
     tracing::debug!(
         target = "beach_human::transport::webrtc",
         role = "answerer",
@@ -1704,6 +1745,7 @@ async fn connect_answerer(
     }
 
     let mut attempts: usize = 0;
+    let max_attempts = 1000; // 10 seconds timeout (1000 * 10ms)
     let transport = loop {
         attempts = attempts.saturating_add(1);
         if attempts == 1 || attempts % 100 == 0 {
@@ -1729,6 +1771,16 @@ async fn connect_answerer(
         if let Some(transport) = transport_guard.as_ref().cloned() {
             drop(transport_guard);
             break transport;
+        }
+        if attempts >= max_attempts {
+            drop(transport_guard);
+            tracing::warn!(
+                target = "beach_human::transport::webrtc",
+                role = "answerer",
+                attempts,
+                "timeout waiting for data channel to be announced"
+            );
+            return Err(TransportError::Setup("timeout waiting for data channel".into()));
         }
         transport_guard.take();
         drop(transport_guard);
@@ -1770,21 +1822,36 @@ async fn connect_answerer(
         result = ?wait_result
     );
     wait_result?;
-    tracing::debug!(
-        target = "beach_human::transport::webrtc",
-        role = "answerer",
-        await = "dc_open_notify.timeout",
-        state = "start"
-    );
-    let notify_result = timeout(CONNECT_TIMEOUT, dc_open_notify.notified()).await;
-    tracing::debug!(
-        target = "beach_human::transport::webrtc",
-        role = "answerer",
-        await = "dc_open_notify.timeout",
-        state = "end",
-        result = ?notify_result
-    );
-    notify_result.map_err(|_| TransportError::Timeout)?;
+
+    // Check if transport is already populated (data channel already opened)
+    let already_ready = {
+        let guard = transport_slot.lock().await;
+        guard.is_some()
+    };
+
+    if !already_ready {
+        tracing::debug!(
+            target = "beach_human::transport::webrtc",
+            role = "answerer",
+            await = "dc_open_notify.timeout",
+            state = "start"
+        );
+        let notify_result = timeout(CONNECT_TIMEOUT, dc_open_notify.notified()).await;
+        tracing::debug!(
+            target = "beach_human::transport::webrtc",
+            role = "answerer",
+            await = "dc_open_notify.timeout",
+            state = "end",
+            result = ?notify_result
+        );
+        notify_result.map_err(|_| TransportError::Timeout)?;
+    } else {
+        tracing::debug!(
+            target = "beach_human::transport::webrtc",
+            role = "answerer",
+            "data channel already open, skipping notify wait"
+        );
+    }
 
     Ok(WebRtcConnection::new(transport, channels))
 }

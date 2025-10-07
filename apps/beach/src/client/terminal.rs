@@ -3478,6 +3478,9 @@ impl TerminalClient {
             self.drop_all_predictions_with_reason(PredictionDropReason::Reset);
             self.update_prediction_overlay();
         }
+        // Start from display cursor position (which includes max predicted cursor tracking)
+        // This ensures we build on the furthest position we've predicted, even if some
+        // earlier predictions have cleared but later ones haven't.
         let mut cursor_row = self.cursor_row;
         let mut cursor_col = self.cursor_col;
         let mut cursor_changed = false;
@@ -3660,8 +3663,16 @@ impl TerminalClient {
             return;
         }
 
+        // Sort by sequence number to clear in order
+        expired.sort();
+
+        // Only clear predictions in sequence order - don't clear seq N if seq N-1 is still pending
         for seq in expired {
-            self.try_clear_prediction(seq, now, "prune");
+            // Check if there are any pending predictions with lower sequence numbers
+            let has_earlier_pending = self.pending_predictions.keys().any(|&s| s < seq);
+            if !has_earlier_pending {
+                self.try_clear_prediction(seq, now, "prune");
+            }
         }
     }
 
@@ -3803,11 +3814,9 @@ impl TerminalClient {
         }
         if dropped_any {
             self.force_render = true;
-            if self.predictive_input {
-            self.refresh_prediction_cursor();
-        } else {
+            // Don't update cursor from predictions when dropping - keep cursor at current position
+            // to avoid backwards jumping as predictions clear one-by-one
             self.sync_renderer_cursor();
-        }
         }
         dropped_any
     }
@@ -3822,11 +3831,8 @@ impl TerminalClient {
             self.emit_prediction_drop(seq, &prediction, reason, now);
         }
         self.force_render = true;
-        if self.predictive_input {
-            self.refresh_prediction_cursor();
-        } else {
-            self.sync_renderer_cursor();
-        }
+        // Don't update cursor from predictions when dropping - keep cursor at current position
+        self.sync_renderer_cursor();
     }
 
     fn rebase_predictions_for_row(&mut self, row: usize, delta: usize) {

@@ -1806,7 +1806,10 @@ impl GridRenderer {
     }
 
     fn render_instructions(&self) -> Paragraph<'_> {
-        let text = "CTRL+Q quit";
+        let text = self
+            .status_highlight
+            .clone()
+            .unwrap_or_else(|| "CTRL+Q quit".to_string());
         Paragraph::new(text).block(Block::default())
     }
 }

@@ -227,61 +227,6 @@ impl KeyBinding {
     fn matches(&self, key: &KeyEvent) -> bool {
         key.kind == KeyEventKind::Press && key.code == self.code && key.modifiers == self.modifiers
     }
-
-    fn display(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        if self.modifiers.contains(KeyModifiers::CONTROL) {
-            parts.push("Ctrl".to_string());
-        }
-        if self.modifiers.contains(KeyModifiers::ALT) {
-            let label = if cfg!(target_os = "macos") {
-                "Option"
-            } else {
-                "Alt"
-            };
-            parts.push(label.to_string());
-        }
-        if self.modifiers.contains(KeyModifiers::SHIFT) {
-            parts.push("Shift".to_string());
-        }
-        if self.modifiers.contains(KeyModifiers::SUPER) {
-            let label = if cfg!(target_os = "macos") {
-                "Cmd"
-            } else {
-                "Super"
-            };
-            parts.push(label.to_string());
-        }
-        parts.push(format_key_code(self.code));
-        parts.join("+")
-    }
-}
-
-fn format_key_code(code: KeyCode) -> String {
-    match code {
-        KeyCode::Esc => "Esc".to_string(),
-        KeyCode::Enter => "Enter".to_string(),
-        KeyCode::Backspace => "Backspace".to_string(),
-        KeyCode::Tab => "Tab".to_string(),
-        KeyCode::Left => "Left".to_string(),
-        KeyCode::Right => "Right".to_string(),
-        KeyCode::Up => "Up".to_string(),
-        KeyCode::Down => "Down".to_string(),
-        KeyCode::PageUp => "PageUp".to_string(),
-        KeyCode::PageDown => "PageDown".to_string(),
-        KeyCode::Home => "Home".to_string(),
-        KeyCode::End => "End".to_string(),
-        KeyCode::Insert => "Insert".to_string(),
-        KeyCode::Delete => "Delete".to_string(),
-        KeyCode::Char(ch) => {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_uppercase().to_string()
-            } else {
-                ch.to_string()
-            }
-        }
-        _ => format!("{:?}", code),
-    }
 }
 
 fn default_scroll_toggle_bindings() -> Vec<KeyBinding> {
@@ -403,7 +348,7 @@ pub struct TerminalClient {
     prediction_overlay_logged_underline: bool,
     copy_mode: Option<CopyModeState>,
     scroll_toggle: Vec<KeyBinding>,
-    scroll_toggle_display: String,
+    tail_flash_until: Option<Instant>,
     last_plain_esc: Option<Instant>,
     last_render_at: Option<Instant>,
     render_interval: Duration,
@@ -470,15 +415,6 @@ impl TerminalClient {
                 }
             })
             .unwrap_or_else(default_scroll_toggle_bindings);
-        let mut toggle_hints: Vec<String> = vec!["ESC ESC".to_string()];
-        for binding in &scroll_toggle {
-            let upper = binding.display().to_uppercase();
-            if upper != "ESC" && upper != "ESC ESC" && !toggle_hints.contains(&upper) {
-                toggle_hints.push(upper);
-            }
-        }
-        let scroll_toggle_display = toggle_hints.join(" / ");
-
         let mut client = Self {
             transport,
             renderer,
@@ -509,7 +445,7 @@ impl TerminalClient {
             prediction_overlay_logged_underline: false,
             copy_mode: None,
             scroll_toggle,
-            scroll_toggle_display,
+            tail_flash_until: None,
             last_plain_esc: None,
             last_render_at: None,
             render_interval: Duration::from_millis(16),
@@ -678,6 +614,7 @@ impl TerminalClient {
                 self.pump_input()?;
                 self.maybe_request_backfill()?;
                 self.tick_authorization();
+                self.maybe_update_tail_flash();
                 self.update_prediction_overlay();
                 let message = match self.transport.recv(Duration::from_millis(25)) {
                     Ok(message) => Some(message),
@@ -2580,8 +2517,8 @@ impl TerminalClient {
             self.update_copy_mode_prompt();
             return;
         }
-        let mut main = String::from("scrollback");
-        let mut highlight = format!("{} to tail • ESC exit", self.scroll_toggle_display);
+        let main = String::from("scrollback");
+        let mut highlight = String::from("ESC exit");
         if state.selection_active {
             highlight.push_str(" • CTRL+C copy");
         }
@@ -2672,7 +2609,17 @@ impl TerminalClient {
     }
 
     fn apply_tail_status(&mut self) {
-        let highlight = format!("{} to scrollback • CTRL+Q quit", self.scroll_toggle_display);
+        let now = Instant::now();
+        if let Some(until) = self.tail_flash_until {
+            if now >= until {
+                self.tail_flash_until = None;
+            }
+        }
+        let highlight = if self.tail_flash_until.is_some() {
+            "TAIL • ESC ESC to scrollback • CTRL+Q quit".to_string()
+        } else {
+            "ESC ESC to scrollback • CTRL+Q quit".to_string()
+        };
         self.renderer
             .set_status_with_highlight(Some(self.tail_status_text()), Some(highlight));
         self.force_render = true;
@@ -2683,10 +2630,7 @@ impl TerminalClient {
             self.update_copy_mode_status();
         } else {
             let text = self.scrollback_base_status();
-            let highlight = format!(
-                "{} to tail • ESC exit • CTRL+Q quit",
-                self.scroll_toggle_display
-            );
+            let highlight = "ESC exit • CTRL+Q quit".to_string();
             self.renderer
                 .set_status_with_highlight(Some(text), Some(highlight));
             self.force_render = true;
@@ -2700,7 +2644,14 @@ impl TerminalClient {
             }
             return;
         }
+        let previous = self.view_mode;
         self.view_mode = mode;
+        if matches!(mode, ViewMode::Tail) && !matches!(previous, ViewMode::Tail) {
+            self.tail_flash_until = Some(Instant::now() + Duration::from_secs(3));
+        }
+        if matches!(mode, ViewMode::Scrollback) {
+            self.tail_flash_until = None;
+        }
         match mode {
             ViewMode::Tail => self.apply_tail_status(),
             ViewMode::Scrollback => self.apply_scrollback_status(),
@@ -2761,6 +2712,18 @@ impl TerminalClient {
         };
         self.renderer
             .set_connection_status(text.trim().to_string(), style);
+    }
+
+    fn maybe_update_tail_flash(&mut self) {
+        if !matches!(self.view_mode, ViewMode::Tail) {
+            return;
+        }
+        if let Some(until) = self.tail_flash_until {
+            if Instant::now() >= until {
+                self.tail_flash_until = None;
+                self.apply_tail_status();
+            }
+        }
     }
 
     fn sync_view_mode_with_follow(&mut self) {

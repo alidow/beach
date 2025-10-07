@@ -1,0 +1,356 @@
+import { type CSSProperties, type ComponentType, type ReactNode, useEffect, useMemo, useState } from 'react';
+import {
+  ChevronDown,
+  CircleDot,
+  Loader2,
+  Plug,
+  Server,
+  ShieldAlert,
+} from 'lucide-react';
+import { BeachTerminal, type TerminalStatus } from './components/BeachTerminal';
+import { Button } from './components/ui/button';
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from './components/ui/collapsible';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from './components/ui/dialog';
+import { Input } from './components/ui/input';
+import { Label } from './components/ui/label';
+import { useConnectionController } from './hooks/useConnectionController';
+import { cn } from './lib/utils';
+
+// Host surfaces can override --beach-shell-height to fit custom containers.
+const SHELL_STYLE: CSSProperties = {
+  minHeight: 'var(--beach-shell-height, 100dvh)',
+  height: 'var(--beach-shell-height, 100dvh)',
+};
+
+const STATUS_META: Record<
+  TerminalStatus,
+  {
+    label: string;
+    tone: string;
+    ring: string;
+    accent: string;
+    helper: string;
+    icon: ComponentType<{ className?: string }>;
+  }
+> = {
+  idle: {
+    label: 'Idle',
+    tone: 'bg-slate-800/80 text-slate-200',
+    ring: 'ring-1 ring-slate-700/60',
+    accent: 'text-slate-400',
+    helper: 'Ready for a new session.',
+    icon: CircleDot,
+  },
+  connecting: {
+    label: 'Connecting',
+    tone: 'bg-amber-500/10 text-amber-200',
+    ring: 'ring-1 ring-amber-400/40',
+    accent: 'text-amber-300',
+    helper: 'Negotiating with the host…',
+    icon: Loader2,
+  },
+  connected: {
+    label: 'Connected',
+    tone: 'bg-emerald-500/10 text-emerald-200',
+    ring: 'ring-1 ring-emerald-400/40',
+    accent: 'text-emerald-300',
+    helper: 'Streaming terminal output in real-time.',
+    icon: Plug,
+  },
+  error: {
+    label: 'Error',
+    tone: 'bg-rose-500/10 text-rose-200',
+    ring: 'ring-1 ring-rose-400/40',
+    accent: 'text-rose-300',
+    helper: 'Check your credentials and try again.',
+    icon: ShieldAlert,
+  },
+  closed: {
+    label: 'Disconnected',
+    tone: 'bg-slate-800/70 text-slate-300',
+    ring: 'ring-1 ring-slate-700/60',
+    accent: 'text-slate-400',
+    helper: 'Session closed by host.',
+    icon: CircleDot,
+  },
+};
+
+export default function AppV2(): JSX.Element {
+  const {
+    sessionId,
+    setSessionId,
+    sessionServer,
+    setSessionServer,
+    passcode,
+    setPasscode,
+    status,
+    connectRequested,
+    requestConnect,
+    cancelConnect,
+    trimmedSessionId,
+    trimmedServer,
+    isConnecting,
+    connectDisabled,
+    connectLabel,
+    onStatusChange,
+  } = useConnectionController();
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [infoExpanded, setInfoExpanded] = useState(false);
+
+  const statusMeta = STATUS_META[status] ?? STATUS_META.idle;
+  const showModal = status !== 'connected';
+  const serverLabel = useMemo(() => shortenServerLabel(trimmedServer), [trimmedServer]);
+  const sessionPreview = useMemo(() => shortenSessionId(trimmedSessionId), [trimmedSessionId]);
+
+  useEffect(() => {
+    if (status !== 'connected') {
+      setInfoExpanded(false);
+    }
+  }, [status]);
+
+  const handleSubmit = (): void => {
+    if (connectDisabled) {
+      return;
+    }
+    requestConnect();
+  };
+
+  const handleDisconnect = (): void => {
+    cancelConnect();
+  };
+
+  return (
+    <main
+      className="relative flex w-full flex-col overflow-hidden bg-[#020617] text-slate-100"
+      style={SHELL_STYLE}
+    >
+      <div
+        className="pointer-events-none absolute inset-0 -z-10 bg-[radial-gradient(circle_at_top,_rgba(15,23,42,0.75),_rgba(2,6,23,0.95))]"
+        aria-hidden
+      />
+      <div
+        className="pointer-events-none absolute inset-0 -z-10 bg-[url('data:image/svg+xml,%3Csvg width=\'60\' height=\'60\' viewBox=\'0 0 60 60\' fill=\'none\' xmlns=\'http://www.w3.org/2000/svg\'%3E%3Cpath d=\'M0 59.5H60?v-1H0v1Z\' stroke=\'%2307172A\' stroke-opacity=\'0.4\' stroke-width=\'0.5\'/%3E%3Cpath d=\'M59.5 0v60h1V0h-1Z\' stroke=\'%2307172A\' stroke-opacity=\'0.4\' stroke-width=\'0.5\'/%3E%3C/svg%3E')] opacity-50"
+        aria-hidden
+      />
+
+      <div className="flex flex-1 min-h-0 flex-col">
+        <div className="relative flex flex-1 min-h-0">
+          <BeachTerminal
+            sessionId={trimmedSessionId || undefined}
+            baseUrl={trimmedServer || undefined}
+            passcode={passcode || undefined}
+            autoConnect={connectRequested}
+            onStatusChange={onStatusChange}
+            className="flex-1"
+            showStatusBar={false}
+            showTopBar={false}
+          />
+        </div>
+      </div>
+
+      <Collapsible
+        open={infoExpanded}
+        onOpenChange={(open) => {
+          if (status !== 'connected') {
+            setInfoExpanded(false);
+            return;
+          }
+          setInfoExpanded(open);
+        }}
+      >
+        <header className="pointer-events-none absolute left-0 right-0 top-0 flex justify-center px-4 pt-6">
+          <div className="pointer-events-auto w-full max-w-3xl">
+            <div className="flex items-center justify-between gap-3 rounded-full border border-white/5 bg-slate-950/70 px-5 py-2.5 backdrop-blur">
+              <div className="flex flex-1 flex-col gap-1 text-left sm:flex-row sm:items-center sm:gap-3">
+                <span className="text-[11px] font-semibold uppercase tracking-[0.32em] text-slate-500">
+                  {serverLabel ? 'Connected via' : 'Session'}
+                </span>
+                <span className="text-sm text-slate-200">
+                  {status === 'connected' && serverLabel ? serverLabel : sessionPreview ?? 'Awaiting session'}
+                </span>
+              </div>
+              <span
+                className={cn(
+                  'inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold',
+                  statusMeta.tone,
+                  statusMeta.ring,
+                  status === 'connecting' && 'pl-2',
+                )}
+              >
+                <statusMeta.icon className={cn('size-3.5', status === 'connecting' ? 'animate-spin' : '')} />
+                {statusMeta.label}
+              </span>
+              <CollapsibleTrigger asChild disabled={status !== 'connected'}>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className={cn('h-8 gap-1 px-3 text-xs text-slate-300 transition', status === 'connected' ? 'hover:bg-white/5 hover:text-slate-100' : 'opacity-50')}
+                >
+                  {infoExpanded ? 'Hide' : 'Details'}
+                  <ChevronDown
+                    className={cn('size-3.5 transition-transform duration-200', infoExpanded ? 'rotate-180' : 'rotate-0')}
+                  />
+                </Button>
+              </CollapsibleTrigger>
+            </div>
+            <CollapsibleContent>
+              <div className="mt-3 max-h-[min(70vh,24rem)] overflow-y-auto rounded-3xl border border-white/5 bg-slate-950/85 p-6 shadow-2xl backdrop-blur">
+                <div className="flex flex-col gap-6">
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <InfoItem label="Session ID" value={trimmedSessionId || '—'} icon={CircleDot} />
+                    <InfoItem label="Session Server" value={trimmedServer || 'https://api.beach.sh'} icon={Server} />
+                  </div>
+                  <p className="text-sm text-slate-400">{statusMeta.helper}</p>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <Button variant="outline" size="sm" onClick={handleDisconnect}>
+                      Disconnect
+                    </Button>
+                    <span className="text-xs text-slate-500">
+                      Need help? Double-check your session ID or contact the host.
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </CollapsibleContent>
+          </div>
+        </header>
+      </Collapsible>
+
+      <Dialog open={showModal} onOpenChange={() => {}}>
+        <DialogContent className="w-[min(94vw,420px)] max-h-[min(92svh,520px)] overflow-y-auto p-7 sm:w-[440px] sm:p-8">
+          <DialogHeader className="space-y-3">
+            <DialogTitle>Connect to Beach</DialogTitle>
+            <DialogDescription>
+              Enter the session credentials from your host to begin streaming the terminal. Everything happens live
+              in this window.
+            </DialogDescription>
+          </DialogHeader>
+          <form
+            className="space-y-5"
+            onSubmit={(event) => {
+              event.preventDefault();
+              handleSubmit();
+            }}
+          >
+            <Field label="Session ID" htmlFor="session-id-v2">
+              <Input
+                id="session-id-v2"
+                value={sessionId}
+                onChange={(event) => setSessionId(event.target.value)}
+                placeholder="00000000-0000-0000-0000-000000000000"
+                autoCapitalize="none"
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </Field>
+            <Field label="Passcode" htmlFor="passcode-v2" hint="Optional, only if provided by the host.">
+              <Input
+                id="passcode-v2"
+                value={passcode}
+                onChange={(event) => setPasscode(event.target.value)}
+                type="password"
+                placeholder="••••••"
+              />
+            </Field>
+            {showAdvanced ? (
+              <Field label="Session Server" htmlFor="session-server-v2" hint="Beach session host URL.">
+                <Input
+                  id="session-server-v2"
+                  value={sessionServer}
+                  onChange={(event) => setSessionServer(event.target.value)}
+                  autoCapitalize="none"
+                  autoComplete="off"
+                  inputMode="url"
+                />
+              </Field>
+            ) : null}
+            <div className="flex items-center justify-between">
+              <button
+                type="button"
+                className="text-xs font-medium text-slate-400 underline-offset-4 hover:text-slate-200 hover:underline"
+                onClick={() => setShowAdvanced((prev) => !prev)}
+              >
+                {showAdvanced ? 'Hide advanced' : 'Advanced settings'}
+              </button>
+              <Button type="submit" disabled={connectDisabled} className="min-w-[120px] gap-2">
+                {isConnecting ? <Loader2 className="size-4 animate-spin" /> : null}
+                {connectLabel}
+              </Button>
+            </div>
+          </form>
+          {status === 'error' ? (
+            <p className="mt-3 flex items-center gap-2 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
+              <ShieldAlert className="size-4" />
+              Connection failed. Double-check the session details and try again.
+            </p>
+          ) : null}
+        </DialogContent>
+      </Dialog>
+    </main>
+  );
+}
+
+interface InfoItemProps {
+  label: string;
+  value: string;
+  icon?: ComponentType<{ className?: string }>;
+}
+
+function InfoItem({ label, value, icon: Icon = CircleDot }: InfoItemProps): JSX.Element {
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.28em] text-slate-500">
+        <Icon className="size-3.5 text-slate-600" aria-hidden />
+        {label}
+      </div>
+      <p className="truncate text-sm text-slate-200">{value}</p>
+    </div>
+  );
+}
+
+interface FieldProps {
+  label: string;
+  htmlFor: string;
+  children: ReactNode;
+  hint?: string;
+}
+
+function Field({ label, htmlFor, children, hint }: FieldProps): JSX.Element {
+  return (
+    <div className="space-y-2">
+      <Label htmlFor={htmlFor} className="text-[11px] font-semibold uppercase tracking-[0.32em] text-slate-400">
+        {label}
+      </Label>
+      {children}
+      {hint ? <p className="text-xs text-slate-500">{hint}</p> : null}
+    </div>
+  );
+}
+
+function shortenSessionId(value: string): string | null {
+  if (!value) {
+    return null;
+  }
+  if (value.length <= 20) {
+    return value;
+  }
+  return `${value.slice(0, 8)}…${value.slice(-4)}`;
+}
+
+function shortenServerLabel(value: string): string | null {
+  if (!value) {
+    return null;
+  }
+  try {
+    const url = new URL(value);
+    return url.host;
+  } catch {
+    return value;
+  }
+}

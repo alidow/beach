@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{ChildStderr, Command as TokioCommand};
 use tracing::{debug, info, warn};
+use url::Url;
 
 pub async fn run(base_url: &str, args: SshArgs) -> Result<(), CliError> {
     bootstrap::copy_binary_to_remote(&args).await?;
@@ -149,10 +150,14 @@ pub async fn run(base_url: &str, args: SshArgs) -> Result<(), CliError> {
         info!("leaving ssh control channel open; enable info logs to tail remote output");
     }
 
+    let join_url = build_join_url(&handshake.session_server, &handshake.session_id);
+
     println!(
         "🔗 Starting beach session {} (remote {})",
         handshake.session_id, args.target
     );
+    println!("  passcode  : {}", handshake.join_code);
+    println!("  join url  : {}", join_url);
 
     let join_args = JoinArgs {
         target: handshake.session_id.clone(),
@@ -198,6 +203,16 @@ async fn collect_child_stream(stream: ChildStderr) -> Vec<String> {
         }
     }
     lines
+}
+
+fn build_join_url(base: &str, session_id: &str) -> String {
+    Url::parse(base)
+        .and_then(|parsed| parsed.join(&format!("sessions/{session_id}/join")))
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| {
+            let trimmed = base.trim_end_matches('/');
+            format!("{trimmed}/sessions/{session_id}/join")
+        })
 }
 
 async fn forward_child_lines<R>(mut reader: BufReader<R>, stream: &'static str)

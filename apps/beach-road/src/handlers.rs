@@ -3,7 +3,7 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
-use rand::Rng;
+use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -101,7 +101,10 @@ pub struct SessionStatusResponse {
 
 fn generate_join_code() -> String {
     let mut rng = rand::thread_rng();
-    format!("{:06}", rng.gen_range(0..=999_999))
+    rng.sample_iter(&Alphanumeric)
+        .map(|c| char::from(c).to_ascii_uppercase())
+        .take(6)
+        .collect()
 }
 
 fn normalize_base_url(raw: &str) -> String {

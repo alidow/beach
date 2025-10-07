@@ -321,7 +321,7 @@ pub enum SessionError {
     AuthenticationFailed(String),
     #[error("invalid response: {0}")]
     InvalidResponse(String),
-    #[error("join code must be six numeric digits")]
+    #[error("join code must be a six character alphanumeric string")]
     InvalidJoinCode,
 }
 
@@ -524,7 +524,7 @@ fn parse_transports(
 }
 
 fn validate_join_code(code: &str) -> Result<(), SessionError> {
-    if code.len() == 6 && code.chars().all(|c| c.is_ascii_digit()) {
+    if code.len() == 6 && code.chars().all(|c| c.is_ascii_alphanumeric()) {
         Ok(())
     } else {
         Err(SessionError::InvalidJoinCode)
@@ -648,6 +648,19 @@ mod tests {
                 }),
             }
         }
+    }
+
+    #[test]
+    fn validate_join_code_accepts_alphanumeric() {
+        assert!(validate_join_code("A1B2C3").is_ok());
+        assert!(validate_join_code("123456").is_ok());
+    }
+
+    #[test]
+    fn validate_join_code_rejects_invalid_codes() {
+        assert!(validate_join_code("ABC12!").is_err());
+        assert!(validate_join_code("ABCDE").is_err());
+        assert!(validate_join_code("ABCDEFG").is_err());
     }
 
     #[test_timeout::tokio_timeout_test]

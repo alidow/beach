@@ -252,6 +252,7 @@ export interface BeachTerminalProps {
   showStatusBar?: boolean;
   isFullscreen?: boolean;
   onToggleFullscreen?: (next: boolean) => void;
+  showTopBar?: boolean;
 }
 
 export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
@@ -270,6 +271,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     showStatusBar = true,
     isFullscreen = false,
     onToggleFullscreen,
+    showTopBar = true,
   } = props;
 
   const store = useMemo(() => providedStore ?? createTerminalStore(), [providedStore]);
@@ -544,6 +546,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   );
 
   useLayoutEffect(() => {
+    if (!showTopBar) {
+      setHeaderHeight(0);
+      return;
+    }
     if (typeof window === 'undefined') {
       return;
     }
@@ -590,7 +596,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         win.cancelAnimationFrame(raf);
       }
     };
-  }, []);
+  }, [showTopBar]);
 
   useLayoutEffect(() => {
     if (typeof window === 'undefined') {
@@ -1012,50 +1018,52 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         <div className="absolute inset-0 rounded-[22px] ring-1 ring-[#1f2736]/60" aria-hidden />
       </div>
       <JoinStatusOverlay state={joinState} message={joinMessage} />
-      <header
-        ref={headerRef}
-        className="relative z-10 flex items-center justify-between gap-4 bg-[#111925]/95 px-6 py-3 text-[11px] font-medium uppercase tracking-[0.36em] text-[#9aa4bc]"
-      >
-        <div className="flex items-center gap-3">
-          <button
-            type="button"
-            onClick={() => onToggleFullscreen?.(!isFullscreen)}
-            className={cn(
-              'inline-flex h-3.5 w-3.5 items-center justify-center rounded-full transition focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40',
-              isFullscreen
-                ? 'border border-[#111827] bg-[#212838] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.06)] hover:bg-[#1d2432] text-[#a5b4d6]'
-                : 'border border-[#1a8a39] bg-[#26c547] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.2)] hover:bg-[#2cd653] text-[#0f3d1d]'
-            )}
-            aria-label={isFullscreen ? 'Exit full screen' : 'Enter full screen'}
-            aria-pressed={isFullscreen}
-          >
-            <svg viewBox="0 0 12 12" className="h-2.5 w-2.5" fill="none" aria-hidden>
-              {isFullscreen ? (
-                <>
-                  <rect x="2.3" y="2.3" width="7.4" height="7.4" rx="1.7" stroke="currentColor" strokeWidth="1" />
-                  <path d="M4.5 7.6h3" stroke="currentColor" strokeWidth="1" strokeLinecap="round" />
-                </>
-              ) : (
-                <>
-                  <rect x="2.3" y="2.3" width="7.4" height="7.4" rx="1.9" fill="rgba(15,61,29,0.35)" stroke="#0f3d1d" strokeWidth="1" />
-                  <g transform="rotate(45 6 6)" fill="#0f3d1d">
-                    <rect x="3.2" y="5.45" width="5.6" height="1.1" rx="0.4" />
-                    <polygon points="3.2,6 2.2,6.55 2.2,5.45" />
-                    <polygon points="8.8,6 9.8,6.55 9.8,5.45" />
-                  </g>
-                </>
+      {showTopBar ? (
+        <header
+          ref={headerRef}
+          className="relative z-10 flex items-center justify-between gap-4 bg-[#111925]/95 px-6 py-3 text-[11px] font-medium uppercase tracking-[0.36em] text-[#9aa4bc]"
+        >
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={() => onToggleFullscreen?.(!isFullscreen)}
+              className={cn(
+                'inline-flex h-3.5 w-3.5 items-center justify-center rounded-full transition focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40',
+                isFullscreen
+                  ? 'border border-[#111827] bg-[#212838] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.06)] hover:bg-[#1d2432] text-[#a5b4d6]'
+                  : 'border border-[#1a8a39] bg-[#26c547] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.2)] hover:bg-[#2cd653] text-[#0f3d1d]'
               )}
-            </svg>
-          </button>
-          <span className="text-[10px] font-semibold uppercase tracking-[0.5em] text-[#c0cada]">{sessionTitle}</span>
-        </div>
-        <div className="flex items-center gap-2 text-[10px]">
-          <span className="inline-flex items-center gap-2 rounded-full border border-white/10 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.32em] text-[#c9d2e5]">
-            <span className="size-1.5 rounded-full" style={{ backgroundColor: statusColor }} aria-hidden />
-            {renderStatus()}
-          </span>
-        </div>
-      </header>
+              aria-label={isFullscreen ? 'Exit full screen' : 'Enter full screen'}
+              aria-pressed={isFullscreen}
+            >
+              <svg viewBox="0 0 12 12" className="h-2.5 w-2.5" fill="none" aria-hidden>
+                {isFullscreen ? (
+                  <>
+                    <rect x="2.3" y="2.3" width="7.4" height="7.4" rx="1.7" stroke="currentColor" strokeWidth="1" />
+                    <path d="M4.5 7.6h3" stroke="currentColor" strokeWidth="1" strokeLinecap="round" />
+                  </>
+                ) : (
+                  <>
+                    <rect x="2.3" y="2.3" width="7.4" height="7.4" rx="1.9" fill="rgba(15,61,29,0.35)" stroke="#0f3d1d" strokeWidth="1" />
+                    <g transform="rotate(45 6 6)" fill="#0f3d1d">
+                      <rect x="3.2" y="5.45" width="5.6" height="1.1" rx="0.4" />
+                      <polygon points="3.2,6 2.2,6.55 2.2,5.45" />
+                      <polygon points="8.8,6 9.8,6.55 9.8,5.45" />
+                    </g>
+                  </>
+                )}
+              </svg>
+            </button>
+            <span className="text-[10px] font-semibold uppercase tracking-[0.5em] text-[#c0cada]">{sessionTitle}</span>
+          </div>
+          <div className="flex items-center gap-2 text-[10px]">
+            <span className="inline-flex items-center gap-2 rounded-full border border-white/10 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.32em] text-[#c9d2e5]">
+              <span className="size-1.5 rounded-full" style={{ backgroundColor: statusColor }} aria-hidden />
+              {renderStatus()}
+            </span>
+          </div>
+        </header>
+      ) : null}
       <div
         ref={containerRef}
         className={containerClasses}

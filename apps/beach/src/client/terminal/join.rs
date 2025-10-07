@@ -34,7 +34,7 @@ pub async fn run(base_url: &str, args: JoinArgs) -> Result<(), CliError> {
         None => prompt_passcode()?,
     };
 
-    let trimmed_pass = passcode.trim().to_string();
+    let trimmed_pass = passcode.trim().to_ascii_uppercase();
     let joined = manager
         .join(&session_id, trimmed_pass.as_str(), label.as_deref(), mcp)
         .await?;
@@ -231,8 +231,8 @@ fn prompt_passcode() -> Result<String, CliError> {
     let mut buf = String::new();
     io::stdin().read_line(&mut buf)?;
     let trimmed = buf.trim();
-    if trimmed.len() == 6 && trimmed.chars().all(|c| c.is_ascii_digit()) {
-        Ok(trimmed.to_string())
+    if trimmed.len() == 6 && trimmed.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Ok(trimmed.to_ascii_uppercase())
     } else {
         Err(CliError::MissingPasscode)
     }

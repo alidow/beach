@@ -165,7 +165,7 @@ pub struct JoinArgs {
         long,
         short = 'p',
         value_name = "CODE",
-        help = "Six digit passcode (prompted interactively if omitted)"
+        help = "Six character alphanumeric passcode (prompted interactively if omitted)"
     )]
     pub passcode: Option<String>,
 

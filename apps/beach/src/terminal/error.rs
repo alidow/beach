@@ -12,7 +12,7 @@ pub enum CliError {
     InvalidSessionTarget { target: String },
     #[error("no executable command available; set $SHELL or pass '-- command'")]
     MissingCommand,
-    #[error("session requires a six digit passcode")]
+    #[error("session requires a six character alphanumeric passcode")]
     MissingPasscode,
     #[error("transport negotiation failed: {0}")]
     TransportNegotiation(String),

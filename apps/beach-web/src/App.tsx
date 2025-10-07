@@ -15,6 +15,7 @@ import { Button } from './components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './components/ui/card';
 import { Input } from './components/ui/input';
 import { Label } from './components/ui/label';
+import { useConnectionController } from './hooks/useConnectionController';
 import { cn } from './lib/utils';
 
 const statusStyles: Record<
@@ -59,35 +60,34 @@ const statusStyles: Record<
 };
 
 export default function App(): JSX.Element {
-  const [sessionId, setSessionId] = useState('');
-  const [sessionServer, setSessionServer] = useState(
-    () => import.meta.env.VITE_SESSION_SERVER_URL ?? 'https://api.beach.sh'
-  );
-  const [passcode, setPasscode] = useState('');
-  const [status, setStatus] = useState<TerminalStatus>('idle');
-  const [connectRequested, setConnectRequested] = useState(false);
+  const {
+    sessionId,
+    setSessionId,
+    sessionServer,
+    setSessionServer,
+    passcode,
+    setPasscode,
+    status,
+    connectRequested,
+    requestConnect,
+    trimmedSessionId,
+    trimmedServer,
+    isConnecting,
+    connectDisabled,
+    connectLabel,
+    onStatusChange,
+  } = useConnectionController();
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [panelCollapsed, setPanelCollapsed] = useState(false);
   const [terminalFullscreen, setTerminalFullscreen] = useState(false);
 
   const collapseTimerRef = useRef<number | null>(null);
   const autoCollapsePendingRef = useRef(false);
-  const previousStatusRef = useRef<TerminalStatus>("idle");
+  const previousStatusRef = useRef<TerminalStatus>('idle');
   const panelWasCollapsedRef = useRef(false);
 
   const statusInfo = useMemo(() => statusStyles[status] ?? statusStyles.idle, [status]);
   const StatusIcon = statusInfo.icon;
-  const trimmedSessionId = sessionId.trim();
-  const trimmedServer = sessionServer.trim();
-  const isConnecting = status === 'connecting';
-  const connectDisabled = !trimmedSessionId || !trimmedServer || isConnecting;
-  const connectLabel = isConnecting ? 'Connecting…' : status === 'connected' ? 'Reconnect' : 'Connect';
-
-  useEffect(() => {
-    if (status === 'error' || status === 'closed') {
-      setConnectRequested(false);
-    }
-  }, [status]);
 
   useEffect(() => {
     if (terminalFullscreen) {
@@ -145,7 +145,7 @@ export default function App(): JSX.Element {
       setPanelCollapsed(false);
     }
     autoCollapsePendingRef.current = true;
-    setConnectRequested(true);
+    requestConnect();
   };
 
   const handleToggleFullscreen = (next: boolean): void => {
@@ -332,7 +332,7 @@ export default function App(): JSX.Element {
                   autoConnect={connectRequested}
                   className="h-full"
                   showStatusBar={false}
-                  onStatusChange={setStatus}
+                  onStatusChange={onStatusChange}
                   isFullscreen={terminalFullscreen}
                   onToggleFullscreen={handleToggleFullscreen}
                 />

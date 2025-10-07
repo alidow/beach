@@ -70,7 +70,6 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         warn!("local preview disabled when bootstrap output is active");
     }
     let interactive = !bootstrap_mode && io::stdin().is_terminal() && io::stdout().is_terminal();
-    let raw_guard = RawModeGuard::new(interactive);
 
     let input_gate = if interactive {
         Some(Arc::new(HostInputGate::new()))
@@ -131,6 +130,8 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     } else {
         print_host_banner(&hosted, &normalized_base, TransportKind::WebRtc, args.mcp);
     }
+
+    let raw_guard = RawModeGuard::new(interactive);
 
     let session_handle = hosted.handle().clone();
     let join_code = hosted.join_code().to_string();

@@ -23,6 +23,7 @@ import {
 import { Input } from './components/ui/input';
 import { Label } from './components/ui/label';
 import { useConnectionController } from './hooks/useConnectionController';
+import { useDocumentTitle } from './hooks/useDocumentTitle';
 import { cn } from './lib/utils';
 
 // Host surfaces can override --beach-shell-height to fit custom containers.
@@ -103,6 +104,7 @@ export default function AppV2(): JSX.Element {
     connectLabel,
     onStatusChange,
   } = useConnectionController();
+  useDocumentTitle({ sessionId: trimmedSessionId });
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [infoExpanded, setInfoExpanded] = useState(false);
   const [infoDock, setInfoDock] = useState<'top' | 'bottom'>('bottom');
@@ -110,7 +112,6 @@ export default function AppV2(): JSX.Element {
 
   const statusMeta = STATUS_META[status] ?? STATUS_META.idle;
   const showModal = status !== 'connected';
-  const serverLabel = useMemo(() => shortenServerLabel(trimmedServer), [trimmedServer]);
   const sessionPreview = useMemo(() => shortenSessionId(trimmedSessionId), [trimmedSessionId]);
 
   useEffect(() => {
@@ -201,14 +202,6 @@ export default function AppV2(): JSX.Element {
             <div className="pointer-events-auto w-full max-w-3xl">
               <div className="flex flex-col rounded-3xl border border-white/5 bg-slate-950/70 backdrop-blur">
                 <header className="flex flex-col gap-3 px-5 py-3 sm:flex-row sm:items-center sm:justify-between">
-                  <div className="flex flex-1 flex-col gap-1 text-left sm:flex-row sm:items-center sm:gap-3">
-                    <span className="text-[11px] font-semibold uppercase tracking-[0.32em] text-slate-500">
-                      {serverLabel ? 'Connected via' : 'Session'}
-                    </span>
-                    <span className="text-sm text-slate-200">
-                      {status === 'connected' && serverLabel ? serverLabel : sessionPreview ?? 'Awaiting session'}
-                    </span>
-                  </div>
                   <div className="flex items-center gap-2">
                     <span
                       className={cn(
@@ -423,16 +416,4 @@ function shortenSessionId(value: string): string | null {
     return value;
   }
   return `${value.slice(0, 8)}…${value.slice(-4)}`;
-}
-
-function shortenServerLabel(value: string): string | null {
-  if (!value) {
-    return null;
-  }
-  try {
-    const url = new URL(value);
-    return url.host;
-  } catch {
-    return value;
-  }
 }

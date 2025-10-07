@@ -1,7 +1,10 @@
 import { type CSSProperties, type ComponentType, type ReactNode, useEffect, useMemo, useState } from 'react';
 import {
+  ArrowUpDown,
   ChevronDown,
   CircleDot,
+  Eye,
+  EyeOff,
   Loader2,
   Plug,
   Server,
@@ -102,6 +105,8 @@ export default function AppV2(): JSX.Element {
   } = useConnectionController();
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [infoExpanded, setInfoExpanded] = useState(false);
+  const [infoDock, setInfoDock] = useState<'top' | 'bottom'>('bottom');
+  const [infoVisible, setInfoVisible] = useState(true);
 
   const statusMeta = STATUS_META[status] ?? STATUS_META.idle;
   const showModal = status !== 'connected';
@@ -114,6 +119,12 @@ export default function AppV2(): JSX.Element {
     }
   }, [status]);
 
+  useEffect(() => {
+    if (!infoVisible) {
+      setInfoExpanded(false);
+    }
+  }, [infoVisible]);
+
   const handleSubmit = (): void => {
     if (connectDisabled) {
       return;
@@ -124,6 +135,27 @@ export default function AppV2(): JSX.Element {
   const handleDisconnect = (): void => {
     cancelConnect();
   };
+
+  const toggleDockPosition = (): void => {
+    setInfoDock((previous) => (previous === 'top' ? 'bottom' : 'top'));
+  };
+
+  const handleHideInfo = (): void => {
+    setInfoExpanded(false);
+    setInfoVisible(false);
+  };
+
+  const handleShowInfo = (): void => {
+    setInfoVisible(true);
+  };
+
+  const dockWrapperClass = cn(
+    'pointer-events-none absolute left-0 right-0 flex justify-center px-4',
+    infoDock === 'top' ? 'top-0 pt-6' : 'bottom-0 pb-6',
+  );
+  const dockRevealOffset = infoDock === 'top' ? '-translate-y-1.5' : 'translate-y-1.5';
+
+  const dockToggleLabel = infoDock === 'top' ? 'Move connection info to bottom' : 'Move connection info to top';
 
   return (
     <main
@@ -154,73 +186,123 @@ export default function AppV2(): JSX.Element {
         </div>
       </div>
 
-      <Collapsible
-        open={infoExpanded}
-        onOpenChange={(open) => {
-          if (status !== 'connected') {
-            setInfoExpanded(false);
-            return;
-          }
-          setInfoExpanded(open);
-        }}
-      >
-        <header className="pointer-events-none absolute left-0 right-0 top-0 flex justify-center px-4 pt-6">
-          <div className="pointer-events-auto w-full max-w-3xl">
-            <div className="flex items-center justify-between gap-3 rounded-full border border-white/5 bg-slate-950/70 px-5 py-2.5 backdrop-blur">
-              <div className="flex flex-1 flex-col gap-1 text-left sm:flex-row sm:items-center sm:gap-3">
-                <span className="text-[11px] font-semibold uppercase tracking-[0.32em] text-slate-500">
-                  {serverLabel ? 'Connected via' : 'Session'}
-                </span>
-                <span className="text-sm text-slate-200">
-                  {status === 'connected' && serverLabel ? serverLabel : sessionPreview ?? 'Awaiting session'}
-                </span>
-              </div>
-              <span
-                className={cn(
-                  'inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold',
-                  statusMeta.tone,
-                  statusMeta.ring,
-                  status === 'connecting' && 'pl-2',
-                )}
-              >
-                <statusMeta.icon className={cn('size-3.5', status === 'connecting' ? 'animate-spin' : '')} />
-                {statusMeta.label}
-              </span>
-              <CollapsibleTrigger asChild disabled={status !== 'connected'}>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className={cn('h-8 gap-1 px-3 text-xs text-slate-300 transition', status === 'connected' ? 'hover:bg-white/5 hover:text-slate-100' : 'opacity-50')}
-                >
-                  {infoExpanded ? 'Hide' : 'Details'}
-                  <ChevronDown
-                    className={cn('size-3.5 transition-transform duration-200', infoExpanded ? 'rotate-180' : 'rotate-0')}
-                  />
-                </Button>
-              </CollapsibleTrigger>
-            </div>
-            <CollapsibleContent>
-              <div className="mt-3 max-h-[min(70vh,24rem)] overflow-y-auto rounded-3xl border border-white/5 bg-slate-950/85 p-6 shadow-2xl backdrop-blur">
-                <div className="flex flex-col gap-6">
-                  <div className="grid gap-4 sm:grid-cols-2">
-                    <InfoItem label="Session ID" value={trimmedSessionId || '—'} icon={CircleDot} />
-                    <InfoItem label="Session Server" value={trimmedServer || 'https://api.beach.sh'} icon={Server} />
-                  </div>
-                  <p className="text-sm text-slate-400">{statusMeta.helper}</p>
-                  <div className="flex flex-wrap items-center gap-3">
-                    <Button variant="outline" size="sm" onClick={handleDisconnect}>
-                      Disconnect
-                    </Button>
-                    <span className="text-xs text-slate-500">
-                      Need help? Double-check your session ID or contact the host.
+      {infoVisible ? (
+        <div className={dockWrapperClass}>
+          <Collapsible
+            open={infoExpanded}
+            onOpenChange={(open) => {
+              if (status !== 'connected') {
+                setInfoExpanded(false);
+                return;
+              }
+              setInfoExpanded(open);
+            }}
+          >
+            <div className="pointer-events-auto w-full max-w-3xl">
+              <div className="flex flex-col rounded-3xl border border-white/5 bg-slate-950/70 backdrop-blur">
+                <header className="flex flex-col gap-3 px-5 py-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex flex-1 flex-col gap-1 text-left sm:flex-row sm:items-center sm:gap-3">
+                    <span className="text-[11px] font-semibold uppercase tracking-[0.32em] text-slate-500">
+                      {serverLabel ? 'Connected via' : 'Session'}
+                    </span>
+                    <span className="text-sm text-slate-200">
+                      {status === 'connected' && serverLabel ? serverLabel : sessionPreview ?? 'Awaiting session'}
                     </span>
                   </div>
-                </div>
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={cn(
+                        'inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold',
+                        statusMeta.tone,
+                        statusMeta.ring,
+                        status === 'connecting' && 'pl-2',
+                      )}
+                    >
+                      <statusMeta.icon className={cn('size-3.5', status === 'connecting' ? 'animate-spin' : '')} />
+                      {statusMeta.label}
+                    </span>
+                    <CollapsibleTrigger asChild disabled={status !== 'connected'}>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className={cn(
+                          'h-8 gap-1 px-3 text-xs text-slate-300 transition',
+                          status === 'connected' ? 'hover:bg-white/5 hover:text-slate-100' : 'opacity-50',
+                        )}
+                      >
+                        {infoExpanded ? 'Hide' : 'Details'}
+                        <ChevronDown
+                          className={cn('size-3.5 transition-transform duration-200', infoExpanded ? 'rotate-180' : 'rotate-0')}
+                        />
+                      </Button>
+                    </CollapsibleTrigger>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      onClick={toggleDockPosition}
+                      aria-label={dockToggleLabel}
+                      className="h-8 w-8 text-slate-300 transition hover:bg-white/5 hover:text-slate-100"
+                    >
+                      <ArrowUpDown className={cn('size-4', infoDock === 'bottom' ? 'rotate-180' : '')} />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      onClick={handleHideInfo}
+                      aria-label="Hide connection info"
+                      className="h-8 w-8 text-slate-300 transition hover:bg-white/5 hover:text-slate-100"
+                    >
+                      <EyeOff className="size-4" />
+                    </Button>
+                  </div>
+                </header>
+                <CollapsibleContent className="border-t border-white/8 px-5 pb-5 pt-4">
+                  <div className="max-h-[min(70vh,24rem)] overflow-y-auto pr-1">
+                    <div className="flex flex-col gap-6">
+                      <div className="grid gap-4 sm:grid-cols-2">
+                        <InfoItem label="Session ID" value={trimmedSessionId || '—'} icon={CircleDot} />
+                        <InfoItem label="Session Server" value={trimmedServer || 'https://api.beach.sh'} icon={Server} />
+                      </div>
+                      <p className="text-sm text-slate-400">{statusMeta.helper}</p>
+                      <div className="flex flex-wrap items-center gap-3">
+                        <Button variant="outline" size="sm" onClick={handleDisconnect}>
+                          Disconnect
+                        </Button>
+                        <span className="text-xs text-slate-500">
+                          Need help? Double-check your session ID or contact the host.
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </CollapsibleContent>
               </div>
-            </CollapsibleContent>
+            </div>
+          </Collapsible>
+        </div>
+      ) : null}
+      {!infoVisible ? (
+        <div className={dockWrapperClass}>
+          <div
+            className={cn(
+              'pointer-events-auto rounded-full bg-slate-950/80 shadow-lg backdrop-blur transition-transform duration-200',
+              dockRevealOffset,
+            )}
+          >
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={handleShowInfo}
+              aria-label="Show connection info"
+              className="h-11 w-11 rounded-full border-white/10 bg-transparent text-slate-200 hover:bg-white/10 focus-visible:ring-white/30 select-none"
+            >
+              <Eye className="size-4" />
+              <span className="sr-only">Show connection info</span>
+            </Button>
           </div>
-        </header>
-      </Collapsible>
+        </div>
+      ) : null}
 
       <Dialog open={showModal} onOpenChange={() => {}}>
         <DialogContent className="w-[min(94vw,420px)] max-h-[min(92svh,520px)] overflow-y-auto p-7 sm:w-[440px] sm:p-8">

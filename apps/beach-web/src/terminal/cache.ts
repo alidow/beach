@@ -65,6 +65,8 @@ interface PredictedPosition {
 interface PendingPredictionEntry {
   positions: PredictedPosition[];
   ackedAt: number | null;
+  cursorRow: number;
+  cursorCol: number;
 }
 
 export interface PredictedCursorState {
@@ -156,6 +158,7 @@ export class TerminalGridCache {
   private cursorAuthoritative = false;
   private cursorAuthoritativePending = false;
   private predictedCursor: PredictedCursorState | null = null;
+  private firstCursorReceived = false;
   private predictions = new Map<number, Map<number, PredictedCell>>();
   private readonly traceStartMs = traceNow();
   private pendingPredictions = new Map<number, PendingPredictionEntry>();
@@ -167,7 +170,7 @@ export class TerminalGridCache {
     this.styles.set(0, { id: 0, fg: DEFAULT_COLOR, bg: DEFAULT_COLOR, attrs: 0 });
     trace('init', { maxHistory: this.maxHistory, cols: this.cols });
     this.cursorSeq = null;
-    this.cursorVisible = true;
+    this.cursorVisible = false;
     this.cursorBlink = true;
     this.cursorFeatureEnabled = false;
     this.cursorAuthoritative = false;
@@ -315,7 +318,7 @@ export class TerminalGridCache {
     this.cursorRow = null;
     this.cursorCol = null;
     this.cursorSeq = null;
-    this.cursorVisible = true;
+    this.cursorVisible = false;
     this.cursorBlink = true;
     this.cursorFeatureEnabled = false;
     this.cursorAuthoritative = false;
@@ -751,7 +754,16 @@ export class TerminalGridCache {
     }
     this.cursorCol = targetCol;
     this.cursorSeq = frame.seq;
-    this.cursorVisible = frame.visible;
+
+    // Suppress initial cursor at (0, 0) to avoid flash in upper-left corner
+    if (!this.firstCursorReceived && row === 0 && col === 0) {
+      this.cursorVisible = false;
+      this.firstCursorReceived = true;
+    } else {
+      this.cursorVisible = frame.visible;
+      this.firstCursorReceived = true;
+    }
+
     this.cursorBlink = frame.blink;
     this.cursorAuthoritative = true;
     this.cursorAuthoritativePending = false;
@@ -888,8 +900,49 @@ export class TerminalGridCache {
       this.cursorCol = 0;
       return;
     }
-    const maxCol = Math.max(this.cols, 0);
+    // Clamp cursor to valid column range [0, cols-1] to match Rust client behavior
+    // Cursor positions are 0-indexed, so for an 80-column grid, valid range is 0-79
+    const maxCol = Math.max(0, this.cols - 1);
     this.cursorCol = clamp(this.cursorCol, 0, maxCol);
+  }
+
+  /**
+   * Find the latest prediction's cursor position (like Mosh).
+   * Returns [seq, row, col] for the prediction with the highest sequence number.
+   */
+  private latestPredictionCursor(): { seq: number; row: number; col: number } | null {
+    let bestSeq: number | null = null;
+    let bestRow = 0;
+    let bestCol = 0;
+
+    for (const [seq, prediction] of this.pendingPredictions.entries()) {
+      const row = prediction.cursorRow;
+      const col = prediction.cursorCol;
+      const better = bestSeq === null || seq > bestSeq || (seq === bestSeq && (row > bestRow || (row === bestRow && col > bestCol)));
+      if (better) {
+        bestSeq = seq;
+        bestRow = row;
+        bestCol = col;
+      }
+    }
+
+    return bestSeq !== null ? { seq: bestSeq, row: bestRow, col: bestCol } : null;
+  }
+
+  /**
+   * Update display cursor to predicted position (like Mosh).
+   * This makes typing feel responsive. When server sends cursor update,
+   * we trust server and may discard predictions.
+   */
+  private updateCursorFromPredictions(): void {
+    const latest = this.latestPredictionCursor();
+    if (latest) {
+      this.cursorRow = latest.row;
+      this.cursorCol = latest.col;
+    }
+    // Note: We don't restore to server cursor here like Rust client does,
+    // because web client doesn't track separate server_cursor_row/col.
+    // The cursor will be updated when server sends cursor frames.
   }
 
   private inferRowCursorColumn(cells: number[]): number {
@@ -1187,32 +1240,24 @@ export class TerminalGridCache {
     let mutated = false;
     let cursorMoved = false;
 
-    let workingRow: number | null;
-    let workingCol: number | null;
+    // Start from latest prediction's cursor position, or current cursor if no predictions
+    // This ensures each prediction builds on the previous one's end position (like Mosh)
+    const latestPrediction = this.latestPredictionCursor();
+    let currentRow: number;
+    let currentCol: number;
 
-    if (this.cursorFeatureEnabled && this.cursorAuthoritative) {
-      workingRow = this.predictedCursor?.row ?? this.cursorRow;
-      workingCol = this.predictedCursor?.col ?? this.cursorCol;
+    if (latestPrediction) {
+      currentRow = latestPrediction.row;
+      currentCol = latestPrediction.col;
+    } else if (this.cursorRow !== null && this.cursorCol !== null) {
+      currentRow = this.cursorRow;
+      currentCol = this.cursorCol;
     } else {
-      workingRow = this.cursorRow;
-      workingCol = this.cursorCol;
-    }
-
-    if (workingRow === null || workingCol === null) {
+      // Fallback if cursor is not initialized
       const fallbackRow = this.findHighestLoadedRow();
-      workingRow = fallbackRow ?? this.baseRow;
-      workingCol = this.rowDisplayWidth(workingRow);
+      currentRow = fallbackRow ?? this.baseRow;
+      currentCol = this.rowDisplayWidth(currentRow);
     }
-
-    if (workingRow === null || !Number.isFinite(workingRow)) {
-      workingRow = this.baseRow;
-    }
-    if (workingCol === null || !Number.isFinite(workingCol)) {
-      workingCol = 0;
-    }
-
-    let currentRow = workingRow;
-    let currentCol = workingCol;
 
     const positions: PredictedPosition[] = [];
 
@@ -1283,7 +1328,7 @@ export class TerminalGridCache {
 
     this.pendingPredictions.delete(seq);
     if (positions.length > 0) {
-      this.pendingPredictions.set(seq, { positions, ackedAt: null });
+      this.pendingPredictions.set(seq, { positions, ackedAt: null, cursorRow: computedRow, cursorCol: computedCol });
       if (this.pendingPredictions.size > 256) {
         const cleared = this.pendingPredictions.size;
         const rendererCleared = this.predictions.size;
@@ -1294,6 +1339,7 @@ export class TerminalGridCache {
       }
     }
 
+    // Update predicted cursor state if cursor sync is enabled
     if (this.cursorFeatureEnabled && this.cursorAuthoritative) {
       currentRow = Math.max(this.baseRow, currentRow);
       currentCol = Math.max(0, currentCol);
@@ -1303,14 +1349,12 @@ export class TerminalGridCache {
         !prev || prev.row !== newPredicted.row || prev.col !== newPredicted.col || prev.seq !== newPredicted.seq;
       this.predictedCursor = newPredicted;
       mutated = mutated || changed || cursorMoved;
-    } else {
-      currentRow = Math.max(this.baseRow, currentRow);
-      currentCol = Math.max(0, currentCol);
-      this.cursorRow = currentRow;
-      this.cursorCol = currentCol;
-      this.clampCursor();
-      mutated = mutated || cursorMoved;
     }
+
+    // Update display cursor to latest prediction (like Mosh)
+    // This makes typing feel responsive by showing cursor at predicted position
+    this.updateCursorFromPredictions();
+    this.clampCursor();
 
     if (tracing) {
       const cursorEffective = {

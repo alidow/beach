@@ -79,7 +79,9 @@ function summarizeSnapshot(store: TerminalGridStore | undefined): void {
   trace('snapshot state', {
     baseRow: snapshot.baseRow,
     totalRows: snapshot.rows.length,
-    cursor: { row: snapshot.cursorRow, col: snapshot.cursorCol, seq: snapshot.cursorSeq },
+    cursor: snapshot.cursorRow !== null && snapshot.cursorCol !== null
+      ? `row=${snapshot.cursorRow} col=${snapshot.cursorCol} seq=${snapshot.cursorSeq} visible=${snapshot.cursorVisible}`
+      : `null (visible=${snapshot.cursorVisible})`,
     predictedCursor: snapshot.predictedCursor,
     preview,
   });

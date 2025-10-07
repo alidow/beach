@@ -37,7 +37,7 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
-use tracing::{Level, debug, trace, warn};
+use tracing::{Level, debug, trace};
 
 const BACKFILL_LOOKAHEAD_ROWS: usize = 120;
 const BACKFILL_MAX_ROWS_PER_REQUEST: u32 = 256;
@@ -2460,14 +2460,22 @@ impl TerminalClient {
                 self.mouse_capture_enabled = enabled;
             }
             Err(err) => {
-                warn!(
+                let err_text = err.to_string();
+                let action = if enabled { "enable" } else { "disable" };
+                debug!(
                     target = "client::mouse",
-                    "failed to {} mouse capture: {}",
-                    if enabled { "enable" } else { "disable" },
-                    err
+                    action,
+                    error = %err_text,
+                    "failed to toggle mouse capture"
                 );
+                self.show_error_status(format!("mouse capture: unable to {action} ({err_text})"));
             }
         }
+    }
+
+    fn show_error_status<S: Into<String>>(&mut self, message: S) {
+        self.renderer.set_status_error_message(Some(message.into()));
+        self.force_render = true;
     }
 
     fn handle_mouse_primary_down(&mut self, mouse: &MouseEvent) {
@@ -2817,28 +2825,50 @@ impl TerminalClient {
             .map(|state| state.selection_active)
             .unwrap_or(false);
         if !selection_active {
-            self.renderer
-                .set_status_message(Some("copy-mode: no active selection"));
-            self.force_render = true;
             if exit_after {
                 self.exit_copy_mode();
             }
+            self.show_error_status("copy-mode: no active selection");
             return;
         }
 
-        if let Some(text) = self.renderer.selection_text() {
-            if let Err(err) = clipboard_set(&text) {
-                eprintln!("⚠️  failed to copy selection: {err}");
+        let Some(text) = self.renderer.selection_text() else {
+            if exit_after {
+                self.exit_copy_mode();
+            }
+            self.show_error_status("copy-mode: selection unavailable");
+            return;
+        };
+
+        match clipboard_set(&text) {
+            Ok(()) => {
+                let line_count = text.lines().count();
+                let message = if line_count > 1 {
+                    format!("copied {line_count} lines to clipboard")
+                } else {
+                    let char_count = text.chars().count();
+                    if char_count == 1 {
+                        "copied 1 character to clipboard".to_string()
+                    } else {
+                        format!("copied {char_count} characters to clipboard")
+                    }
+                };
+
+                if exit_after {
+                    self.exit_copy_mode();
+                    self.renderer.set_status_message(Some(message));
+                } else {
+                    self.update_copy_mode_status();
+                }
+                self.force_render = true;
+            }
+            Err(err) => {
+                if exit_after {
+                    self.exit_copy_mode();
+                }
+                self.show_error_status(format!("copy failed: {}", err));
             }
         }
-
-        if exit_after {
-            self.exit_copy_mode();
-        } else {
-            self.update_copy_mode_status();
-        }
-
-        self.force_render = true;
     }
 
     fn handle_control_shortcuts(&mut self, key: &KeyEvent) -> Result<bool, ClientError> {
@@ -2850,7 +2880,7 @@ impl TerminalClient {
                 return Err(ClientError::Shutdown);
             }
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'c') && self.copy_mode.is_some() => {
-                self.exit_copy_mode();
+                self.copy_selection_to_clipboard(true);
                 return Ok(true);
             }
             _ => {}
@@ -3442,20 +3472,24 @@ impl TerminalClient {
             let mut outstanding: Vec<Seq> = self.pending_predictions.keys().copied().collect();
             outstanding.extend(self.dropped_predictions.keys().copied());
             outstanding.sort_unstable();
-            if let (Some(min), Some(max)) = (outstanding.first(), outstanding.last()) {
-                warn!(
+            let message = if let (Some(min), Some(max)) = (outstanding.first(), outstanding.last())
+            {
+                debug!(
                     target = "client::predictive",
                     seq,
                     outstanding_min = *min,
                     outstanding_max = *max,
-                    "received ack for unknown prediction sequence"
+                    "received ack for sequence not tracked locally"
                 );
+                format!("prediction ack {seq}: not tracking seq (pending {min}-{max})")
             } else {
-                warn!(
+                debug!(
                     target = "client::predictive",
-                    seq, "received ack for unknown prediction sequence"
+                    seq, "received ack for sequence not tracked locally"
                 );
-            }
+                format!("prediction ack {seq}: not tracking seq")
+            };
+            self.show_error_status(message);
         }
 
         if let Some(sent) = sent_at {
@@ -3612,6 +3646,16 @@ impl TerminalClient {
                 },
             );
             self.force_render = true;
+        } else {
+            self.dropped_predictions.insert(
+                seq,
+                DroppedPrediction {
+                    positions,
+                    sent_at: timestamp,
+                    dropped_at: timestamp,
+                    reason: PredictionDropReason::Skipped,
+                },
+            );
         }
 
         self.refresh_prediction_cursor();
@@ -4492,6 +4536,7 @@ enum PredictionDropReason {
     Reset,
     Trimmed,
     ServerMismatch,
+    Skipped,
 }
 
 impl PredictionDropReason {
@@ -4503,6 +4548,7 @@ impl PredictionDropReason {
             PredictionDropReason::Reset => "reset",
             PredictionDropReason::Trimmed => "trimmed",
             PredictionDropReason::ServerMismatch => "server_mismatch",
+            PredictionDropReason::Skipped => "skipped",
         }
     }
 }
@@ -5157,6 +5203,33 @@ mod tests {
     }
 
     #[test]
+    fn predictive_skips_control_bytes_without_warning() {
+        let mut client = new_client();
+        client.render_enabled = true;
+        client.predictive_input = true;
+        client.renderer.ensure_size(1, 8);
+
+        client.register_prediction(42, &[0x15]);
+
+        assert!(client.pending_predictions.is_empty());
+        let drop = client
+            .dropped_predictions
+            .get(&42)
+            .expect("control byte should record dropped prediction");
+        assert_eq!(drop.reason, PredictionDropReason::Skipped);
+        assert!(drop.positions.is_empty());
+
+        client.handle_input_ack(42);
+        assert!(!client.dropped_predictions.contains_key(&42));
+        let (status, is_error) = client.renderer.status_for_test();
+        assert!(
+            !is_error,
+            "status should not show error for skipped prediction"
+        );
+        assert_eq!(status, None);
+    }
+
+    #[test]
     fn ctrl_u_clears_line_and_resets_cursor() {
         let mut client = new_client();
         let prompt = "$ ";
@@ -5576,6 +5649,76 @@ mod tests {
         assert!(client.copy_mode.is_some());
         client.process_copy_mode_key(&key(KeyCode::Char('c'), KeyModifiers::SUPER));
         assert!(client.copy_mode.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_copies_selection_to_clipboard() {
+        clipboard::clear();
+        let mut client = new_client();
+        client.render_enabled = true;
+        client.renderer.ensure_size(1, 16);
+        client.renderer.apply_row_from_text(0, 1, "hello world");
+        client.copy_mode = Some(CopyModeState::new(
+            SelectionPosition { row: 0, col: 0 },
+            CopyModeKeySet::Vi,
+        ));
+        client.renderer.set_follow_tail(false);
+        client.update_copy_mode_status();
+
+        if let Some(state) = client.copy_mode.as_mut() {
+            state.selection_active = true;
+            state.selection_mode = SelectionMode::Character;
+            state.anchor = SelectionPosition { row: 0, col: 0 };
+            state.cursor = SelectionPosition { row: 0, col: 4 };
+        }
+        client.renderer.set_selection(
+            SelectionPosition { row: 0, col: 0 },
+            SelectionPosition { row: 0, col: 4 },
+            SelectionMode::Character,
+        );
+
+        client
+            .handle_control_shortcuts(&key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .expect("ctrl+c shortcut should succeed");
+
+        assert!(client.copy_mode.is_none());
+        let copied = clipboard::get().expect("clipboard populated");
+        assert_eq!(copied, "hello");
+        let (status, is_error) = client.renderer.status_for_test();
+        assert_eq!(status.as_deref(), Some("copied 5 characters to clipboard"));
+        assert!(!is_error);
+    }
+
+    #[test]
+    fn super_c_copies_selection_to_clipboard() {
+        clipboard::clear();
+        let mut client = new_client();
+        client.render_enabled = true;
+        client.renderer.ensure_size(1, 16);
+        client.renderer.apply_row_from_text(0, 1, "goodbye");
+        client.copy_mode = Some(CopyModeState::new(
+            SelectionPosition { row: 0, col: 0 },
+            CopyModeKeySet::Vi,
+        ));
+        client.renderer.set_follow_tail(false);
+        client.update_copy_mode_status();
+
+        if let Some(state) = client.copy_mode.as_mut() {
+            state.selection_active = true;
+            state.selection_mode = SelectionMode::Character;
+            state.anchor = SelectionPosition { row: 0, col: 0 };
+            state.cursor = SelectionPosition { row: 0, col: 6 };
+        }
+        client.renderer.set_selection(
+            SelectionPosition { row: 0, col: 0 },
+            SelectionPosition { row: 0, col: 6 },
+            SelectionMode::Character,
+        );
+
+        assert!(client.process_copy_mode_key(&key(KeyCode::Char('c'), KeyModifiers::SUPER)));
+        assert!(client.copy_mode.is_none());
+        let copied = clipboard::get().expect("clipboard populated");
+        assert_eq!(copied, "goodbye");
     }
 
     #[test]

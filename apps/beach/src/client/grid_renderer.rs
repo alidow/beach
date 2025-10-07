@@ -185,6 +185,7 @@ pub struct GridRenderer {
     predictions_visible: bool,
     prediction_flagging: bool,
     status_message: Option<String>,
+    status_is_error: bool,
     styles: HashMap<u32, CachedStyle>,
     debug_context: Option<GridUpdateDebugContext>,
     cursor: Option<GridCursor>,
@@ -206,6 +207,7 @@ impl GridRenderer {
             predictions_visible: false,
             prediction_flagging: false,
             status_message: None,
+            status_is_error: false,
             styles: HashMap::new(),
             debug_context: None,
             cursor: None,
@@ -1242,8 +1244,22 @@ impl GridRenderer {
     }
 
     pub fn set_status_message<S: Into<String>>(&mut self, message: Option<S>) {
-        self.status_message = message.map(Into::into);
+        self.set_status_internal(message.map(Into::into), false);
+    }
+
+    pub fn set_status_error_message<S: Into<String>>(&mut self, message: Option<S>) {
+        self.set_status_internal(message.map(Into::into), true);
+    }
+
+    fn set_status_internal(&mut self, message: Option<String>, error: bool) {
+        self.status_message = message;
+        self.status_is_error = error && self.status_message.is_some();
         self.mark_dirty();
+    }
+
+    #[cfg(test)]
+    pub fn status_for_test(&self) -> (Option<String>, bool) {
+        (self.status_message.clone(), self.status_is_error)
     }
 
     pub fn on_resize(&mut self, _cols: u16, rows: u16) {
@@ -1733,14 +1749,21 @@ impl GridRenderer {
         } else {
             ""
         };
-        let text = format!(
-            "rows {total_rows} • showing {displayed} • scroll {} • mode {} • {}{}",
+        let mut spans = vec![Span::raw(format!(
+            "rows {total_rows} • showing {displayed} • scroll {} • mode {} • ",
             self.viewport_top(),
-            follow,
-            status,
-            loading
-        );
-        Paragraph::new(text).block(Block::default())
+            follow
+        ))];
+        let status_span = if self.status_is_error {
+            Span::styled(status.to_string(), Style::default().fg(Color::Red))
+        } else {
+            Span::raw(status.to_string())
+        };
+        spans.push(status_span);
+        if !loading.is_empty() {
+            spans.push(Span::raw(loading));
+        }
+        Paragraph::new(Line::from(spans)).block(Block::default())
     }
 
     fn render_instructions(&self) -> Paragraph<'_> {

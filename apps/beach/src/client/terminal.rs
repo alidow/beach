@@ -262,6 +262,7 @@ pub struct TerminalClient {
     pending_render: bool,
     predictive_input: bool,
     forward_mouse_to_host: bool,
+    mouse_capture_enabled: bool,
     tmux_prefix_started_at: Option<Instant>,
     subscription_id: Option<u64>,
     handshake_history_rows: u64,
@@ -338,6 +339,7 @@ impl TerminalClient {
             pending_render: false,
             predictive_input: false,
             forward_mouse_to_host: false,
+            mouse_capture_enabled: false,
             tmux_prefix_started_at: None,
             subscription_id: None,
             handshake_history_rows: 0,
@@ -2441,6 +2443,33 @@ impl TerminalClient {
         self.apply_scroll_delta(delta, true);
     }
 
+    fn set_mouse_capture(&mut self, enabled: bool) {
+        if !self.render_enabled || self.mouse_capture_enabled == enabled {
+            return;
+        }
+
+        let mut stdout = io::stdout();
+        let result = if enabled {
+            execute!(stdout, EnableMouseCapture)
+        } else {
+            execute!(stdout, DisableMouseCapture)
+        };
+
+        match result {
+            Ok(()) => {
+                self.mouse_capture_enabled = enabled;
+            }
+            Err(err) => {
+                warn!(
+                    target = "client::mouse",
+                    "failed to {} mouse capture: {}",
+                    if enabled { "enable" } else { "disable" },
+                    err
+                );
+            }
+        }
+    }
+
     fn handle_mouse_primary_down(&mut self, mouse: &MouseEvent) {
         if let Some(position) = self.mouse_position_to_selection(mouse) {
             if let Some(state) = self.copy_mode.as_mut() {
@@ -2605,6 +2634,7 @@ impl TerminalClient {
         let start_pos = self.renderer.clamp_position(start_row as i64, 0);
         let mode = default_copy_mode_keyset();
         self.copy_mode = Some(CopyModeState::new(start_pos, mode));
+        self.set_mouse_capture(true);
         self.renderer.set_follow_tail(false);
         self.renderer.clear_selection();
         self.update_copy_mode_status();
@@ -2613,6 +2643,7 @@ impl TerminalClient {
 
     fn exit_copy_mode(&mut self) {
         if self.copy_mode.take().is_some() {
+            self.set_mouse_capture(false);
             self.renderer.clear_selection();
             self.renderer.set_status_message::<String>(None);
             self.renderer.set_follow_tail(true);
@@ -4322,8 +4353,9 @@ impl TerminalClient {
         enable_raw_mode()
             .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+        execute!(stdout, EnterAlternateScreen)
             .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
+        self.mouse_capture_enabled = false;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)
             .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
@@ -4352,6 +4384,7 @@ impl TerminalClient {
         let mut stdout = io::stdout();
         execute!(stdout, DisableMouseCapture, LeaveAlternateScreen)
             .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
+        self.mouse_capture_enabled = false;
         Ok(())
     }
 

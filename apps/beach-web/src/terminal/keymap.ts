@@ -1,16 +1,27 @@
+function trace(...args: unknown[]): void {
+  if (typeof window !== 'undefined' && (window as any).__BEACH_TRACE) {
+    console.debug('[beach-trace][keymap]', ...args);
+  }
+}
+
 export function encodeKeyEvent(event: KeyboardEvent): Uint8Array | null {
   if (event.metaKey) {
+    trace('encodeKeyEvent: metaKey pressed, ignoring', { key: event.key });
     return null;
   }
 
   switch (event.key) {
     case 'Enter':
+      trace('encodeKeyEvent: Enter key', { result: '0x0a' });
       return new Uint8Array([0x0a]);
     case 'Tab':
+      trace('encodeKeyEvent: Tab key', { result: '0x09' });
       return new Uint8Array([0x09]);
     case 'Backspace':
+      trace('encodeKeyEvent: Backspace key', { result: '0x7f' });
       return new Uint8Array([0x7f]);
     case 'Escape':
+      trace('encodeKeyEvent: Escape key', { result: '0x1b' });
       return new Uint8Array([0x1b]);
     case 'ArrowUp':
       return esc('[A');
@@ -43,21 +54,30 @@ export function encodeKeyEvent(event: KeyboardEvent): Uint8Array | null {
     if (event.ctrlKey) {
       if (lower >= 'a' && lower <= 'z') {
         bytes.push(lower.charCodeAt(0) - 96);
+        trace('encodeKeyEvent: Ctrl+letter', { key: event.key, char, lower, bytes });
       } else if (char === ' ' || char === '@') {
         bytes.push(0);
+        trace('encodeKeyEvent: Ctrl+space/@', { key: event.key, char, bytes });
       } else {
+        trace('encodeKeyEvent: unhandled Ctrl+key', { key: event.key, char });
         return null;
       }
     } else {
       const encoder = new TextEncoder();
       bytes.push(...encoder.encode(char));
+      trace('encodeKeyEvent: regular character', { key: event.key, char, bytes });
     }
     if (event.altKey) {
       bytes.unshift(0x1b);
+      trace('encodeKeyEvent: Alt modifier applied', { bytes });
     }
-    return new Uint8Array(bytes);
+    const result = new Uint8Array(bytes);
+    const debugStr = Array.from(result).map(b => `0x${b.toString(16).padStart(2, '0')}`).join(' ');
+    trace('encodeKeyEvent: final result', { key: event.key, result: debugStr });
+    return result;
   }
 
+  trace('encodeKeyEvent: no encoding for key', { key: event.key, keyLength: event.key.length });
   return null;
 }
 

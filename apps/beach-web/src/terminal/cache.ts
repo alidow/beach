@@ -1378,7 +1378,22 @@ export class TerminalGridCache {
       const committed = entry.positions.every((pos) => {
         return !this.predictionExists(pos.row, pos.col, seq) || this.cellMatches(pos.row, pos.col, pos.char);
       });
-      if (committed) {
+
+      // Check if any position has authoritative content that differs from prediction
+      const hasConflict = entry.positions.some((pos) => {
+        const row = this.getRow(pos.row);
+        if (!row || row.kind !== 'loaded') {
+          return false;
+        }
+        if (pos.col >= row.cells.length) {
+          return false;
+        }
+        const cell = row.cells[pos.col];
+        // If we have a loaded cell with a sequence number, and it doesn't match prediction, clear it
+        return cell && cell.seq > 0 && cell.char !== pos.char;
+      });
+
+      if (committed || hasConflict) {
         this.pendingPredictions.delete(seq);
         let mutated = false;
         for (const { row, col } of positionsLog) {
@@ -1388,7 +1403,7 @@ export class TerminalGridCache {
           this.predictiveLog('prediction_cleared', {
             seq,
             context: 'ack',
-            reason: 'committed',
+            reason: committed ? 'committed' : 'conflict',
             positions: positionsLog,
           });
           this.predictiveLog('prediction_ack', {
@@ -1470,7 +1485,21 @@ export class TerminalGridCache {
         const committed = entry.positions.every((pos) => {
           return !this.predictionExists(pos.row, pos.col, seq) || this.cellMatches(pos.row, pos.col, pos.char);
         });
-        if (committed) {
+
+        // Check if any position has authoritative content that differs from prediction
+        const hasConflict = entry.positions.some((pos) => {
+          const row = this.getRow(pos.row);
+          if (!row || row.kind !== 'loaded') {
+            return false;
+          }
+          if (pos.col >= row.cells.length) {
+            return false;
+          }
+          const cell = row.cells[pos.col];
+          return cell && cell.seq > 0 && cell.char !== pos.char;
+        });
+
+        if (committed || hasConflict) {
           this.pendingPredictions.delete(seq);
           for (const { row, col } of positionsLog) {
             mutated = this.clearPredictionAt(row, col) || mutated;
@@ -1479,7 +1508,7 @@ export class TerminalGridCache {
             this.predictiveLog('prediction_cleared', {
               seq,
               context: 'prune',
-              reason: 'committed',
+              reason: committed ? 'committed' : 'conflict',
               positions: positionsLog,
             });
           }

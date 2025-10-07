@@ -858,19 +858,32 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const handleKeyDown: React.KeyboardEventHandler<HTMLDivElement> = (event) => {
     const transport = transportRef.current;
     if (!transport) {
+      trace('handleKeyDown: no transport');
       return;
     }
     const payload = encodeKeyEvent(event.nativeEvent);
     if (!payload || payload.length === 0) {
+      trace('handleKeyDown: no payload', { key: event.key, code: event.code });
       return;
     }
     if (subscriptionRef.current === null) {
+      trace('handleKeyDown: no subscription');
       return;
     }
     event.preventDefault();
     const seq = ++inputSeqRef.current;
     const predicts = hasPredictiveByte(payload);
     const timestampMs = now();
+    const payloadDebug = Array.from(payload).map(b => `0x${b.toString(16).padStart(2, '0')}`).join(' ');
+    trace('handleKeyDown: sending input', {
+      seq,
+      key: event.key,
+      code: event.code,
+      payload: payloadDebug,
+      payloadLength: payload.length,
+      predicts,
+      subscription: subscriptionRef.current,
+    });
     transport.send({ type: 'input', seq, data: payload });
     store.registerPrediction(seq, payload);
     const overlayUpdate = predictionUxRef.current.recordSend(seq, timestampMs, predicts);
@@ -1464,8 +1477,21 @@ export function buildLines(
               cells.push({ char: ' ', styleId: 0 });
             }
             const existing = cells[col];
+            const predictionChar = prediction.char ?? ' ';
+            // Only overlay prediction if the cell is empty/whitespace
+            // If server has sent authoritative content, don't replace it with prediction
+            if (existing && existing.char !== ' ' && existing.char !== predictionChar) {
+              // Server has authoritative content that differs from prediction - skip this prediction
+              trace('buildLines: skipping prediction due to authoritative content', {
+                row: row.absolute,
+                col,
+                existing: existing.char,
+                prediction: predictionChar,
+              });
+              continue;
+            }
             cells[col] = {
-              char: prediction.char ?? ' ',
+              char: predictionChar,
               styleId: existing?.styleId ?? 0,
               predicted: true,
             };

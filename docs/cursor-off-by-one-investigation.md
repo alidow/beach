@@ -1,6 +1,6 @@
 # Cursor Off-By-One Investigation
 
-**Status:** OPEN - Cursor appears one space to the left of correct position after Enter
+**Status:** OPEN — multiple cursor regressions (missing initial cursor, incorrect scroll position, off-by-one after Enter)
 **Date:** October 7, 2025
 **Log File:** `/Users/arellidow/development/beach/temp/beach-web.log`
 
@@ -42,6 +42,18 @@ From `temp/beach-web.log`:
 
 The server position (col=38) appears to be **one column before** the actual input position.
 
+## Latest Findings (October 8, 2025)
+
+1. **Cursor hidden on connect:** Suppressing the first `(0, 0)` cursor frame means we never draw a caret until another authoritative update arrives. The server sticks at `(0, 0)` until the first keypress, so the web client looks cursorless on startup.
+2. **Viewport jumps to historic rows:** `followTail` scrolls to the tail of the 160-row snapshot we receive, even when only the most recent 2 rows contain non-empty content. Result: the initial render is scrolled hundreds of rows past the prompt.
+3. **Off-by-one still present:** After Enter, the server continues to report `col=38`. The web client now trusts the server frame (no longer clamps to committed width), so the cursor still lands one cell to the left. This points back to the server/emulator generating the wrong column rather than the web clamp.
+
+### Next Checks
+- Revisit the initial cursor suppression so we show a caret on connect (maybe only skip rendering the flash but keep visibility when no alternative frame arrives).
+- Investigate why the initial snapshot includes 160 rows; confirm whether the emulator is reusing history even for a fresh session or if we need to clamp the viewport before first paint.
+- Instrument the Rust emulator (`AlacrittyEmulator::compute_cursor_components`) to log the raw column it emits right after a prompt write, and compare against the prompt string length.
+
+
 ## What We've Fixed
 
 ### 1. Initial Cursor Flash at (0, 0) ✅
@@ -68,6 +80,8 @@ if (!this.firstCursorReceived && row === 0 && col === 0) {
 }
 ```
 
+⚠️ **Regression:** Because the server does not send another cursor frame until the user types, suppressing the first `(0, 0)` update leaves the UI without any caret right after connect. We need to refine this logic (e.g., delay suppression or synthesize a visible cursor once the prompt row arrives).
+
 ### 2. Predictive Cursor Advancement Implementation ✅
 
 **Problem:** Cursor wasn't advancing immediately when typing - had to wait for server confirmation.
@@ -89,7 +103,7 @@ if (!this.firstCursorReceived && row === 0 && col === 0) {
 
 **Behavior:** Cursor now advances immediately when typing, before server confirms. Predictions chain correctly - each builds on previous prediction's cursor position.
 
-## Open Issue: Off-By-One After Enter
+## Open Issue: Off-By-One After Enter (Server-side Suspect)
 
 ### Hypothesis 1: Server Position Accuracy
 
@@ -99,17 +113,9 @@ The server is sending `col=38` but the actual cursor should be at `col=39`. Need
 2. Is the prompt structure causing column mismatch?
 3. Are we receiving the correct cursor frame sequence?
 
-### Hypothesis 2: Cursor Clamping Issue
+### Hypothesis 2: Client Clamping Regressions
 
-In `applyCursorFrame()` (cache.ts:734-765), we clamp cursor to committed content:
-
-```typescript
-let targetCol = col;
-const committed = this.committedRowWidth(row);
-targetCol = Math.min(targetCol, committed);
-```
-
-**Question:** Is the committed row width one less than it should be? Could the prompt's final space character not be committed yet?
+We removed the committed-width clamp in `applyCursorFrame()` (`apps/beach-web/src/terminal/cache.ts:744-756`) so the cursor now mirrors whatever column the server reports, up to the terminal width. That puts the spotlight back on the server data: if the prompt row really ends with a space, the emulator should be sending `col=39`, not `38`.
 
 ### Hypothesis 3: Prediction Conflict
 
@@ -134,10 +140,9 @@ From logs line 1082, `predictedCursor: null` suggests predictions are cleared wh
    - Check if intermediate cursor positions are being skipped
    - Verify cursor sequence numbers are monotonic
 
-4. **Test Cursor Clamping**
-   - Temporarily disable cursor clamping to `committedRowWidth`
-   - Check if cursor appears at correct position
-   - This will help isolate whether issue is server-side or clamping logic
+4. **Instrument server cursor reporting**
+   - Add temporary logging to `AlacrittyEmulator::compute_cursor_components()` to dump `(row, col)` alongside the prompt text length
+   - Compare against what the web client renders to confirm the off-by-one originates on the server
 
 ## Log Analysis Commands
 

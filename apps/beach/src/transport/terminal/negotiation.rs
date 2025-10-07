@@ -394,7 +394,7 @@ impl HeartbeatPublisher {
                         sleep(interval).await;
                         continue;
                     } else {
-                        warn!(
+                        debug!(
                             target = "transport_mod::heartbeat",
                             transport_id = self.transport.id().0,
                             transport = ?self.transport.kind(),

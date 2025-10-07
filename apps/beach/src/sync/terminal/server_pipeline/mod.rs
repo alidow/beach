@@ -879,7 +879,7 @@ pub(crate) fn spawn_update_forwarder(
                         sink.active = false;
                         sink.backfill_queue.clear();
                         stale_transports.push(transport_id);
-                        warn!(
+                        debug!(
                             target = "sync::handshake",
                             transport_id = transport_id.0,
                             transport = ?sink.transport.kind(),
@@ -953,7 +953,7 @@ pub(crate) fn spawn_update_forwarder(
                         sink.active = false;
                         sink.backfill_queue.clear();
                         stale_transports.push(transport_id);
-                        warn!(
+                        debug!(
                             target = "sync::handshake",
                             transport_id = transport_id.0,
                             transport = ?sink.transport.kind(),
@@ -1041,7 +1041,7 @@ pub(crate) fn spawn_update_forwarder(
                                                 sink.active = false;
                                                 sink.backfill_queue.clear();
                                                 stale_transports.push(transport_id);
-                                                warn!(
+                                                debug!(
                                                     target = "sync::handshake",
                                                     transport_id = transport_id.0,
                                                     transport = ?sink.transport.kind(),
@@ -1123,7 +1123,7 @@ pub(crate) fn spawn_update_forwarder(
                                             sink.active = false;
                                             sink.backfill_queue.clear();
                                             stale_transports.push(transport_id);
-                                            warn!(
+                                            debug!(
                                                 target = "sync::handshake",
                                                 transport_id = transport_id.0,
                                                 transport = ?sink.transport.kind(),
@@ -1283,7 +1283,7 @@ pub(crate) fn spawn_update_forwarder(
                                 sink.active = false;
                                 sink.backfill_queue.clear();
                                 stale_transports.push(transport_id);
-                                warn!(
+                                debug!(
                                     target = "sync::backfill",
                                     transport_id = transport_id.0,
                                     transport = ?sink.transport.kind(),

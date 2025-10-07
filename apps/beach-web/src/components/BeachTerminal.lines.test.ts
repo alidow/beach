@@ -77,7 +77,7 @@ describe('buildLines', () => {
     store.registerPrediction(2, stringToBytes('a'));
 
     const [line] = buildLines(store.getSnapshot(), 10);
-    expect(line.cursorCol).toBe(2);
+    expect(line.cursorCol).toBe(3);
     expect(line.predictedCursorCol).toBe(3);
   });
 

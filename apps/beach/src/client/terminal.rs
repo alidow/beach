@@ -16,8 +16,8 @@ use copypasta::{ClipboardContext, ClipboardProvider};
 use crossterm::{
     cursor::{MoveTo, Show},
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{
@@ -46,6 +46,7 @@ const BACKFILL_MIN_INTERVAL: Duration = Duration::from_millis(250);
 const BACKFILL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MOUSE_SCROLL_LINES: isize = 5;
 const COPY_MODE_KEYSET_ENV: &str = "BEACH_COPY_MODE_KEYS";
+const SCROLL_TOGGLE_KEY_ENV: &str = "BEACH_SCROLL_TOGGLE_KEY";
 const TMUX_PREFIX_TIMEOUT: Duration = Duration::from_millis(500);
 const AUTH_SPINNER_FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
 const AUTH_SPINNER_INTERVAL: Duration = Duration::from_millis(120);
@@ -201,6 +202,145 @@ enum CopyModeCommand {
     RepeatLastSearch(CopyModeSearchDirection),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewMode {
+    Tail,
+    Scrollback,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyBinding {
+    code: KeyCode,
+    modifiers: KeyModifiers,
+}
+
+impl KeyBinding {
+    const fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
+        Self { code, modifiers }
+    }
+
+    fn matches(&self, key: &KeyEvent) -> bool {
+        key.kind == KeyEventKind::Press && key.code == self.code && key.modifiers == self.modifiers
+    }
+
+    fn display(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.modifiers.contains(KeyModifiers::CONTROL) {
+            parts.push("Ctrl".to_string());
+        }
+        if self.modifiers.contains(KeyModifiers::ALT) {
+            let label = if cfg!(target_os = "macos") {
+                "Option"
+            } else {
+                "Alt"
+            };
+            parts.push(label.to_string());
+        }
+        if self.modifiers.contains(KeyModifiers::SHIFT) {
+            parts.push("Shift".to_string());
+        }
+        if self.modifiers.contains(KeyModifiers::SUPER) {
+            let label = if cfg!(target_os = "macos") {
+                "Cmd"
+            } else {
+                "Super"
+            };
+            parts.push(label.to_string());
+        }
+        parts.push(format_key_code(self.code));
+        parts.join("+")
+    }
+}
+
+fn format_key_code(code: KeyCode) -> String {
+    match code {
+        KeyCode::Esc => "Esc".to_string(),
+        KeyCode::Enter => "Enter".to_string(),
+        KeyCode::Backspace => "Backspace".to_string(),
+        KeyCode::Tab => "Tab".to_string(),
+        KeyCode::Left => "Left".to_string(),
+        KeyCode::Right => "Right".to_string(),
+        KeyCode::Up => "Up".to_string(),
+        KeyCode::Down => "Down".to_string(),
+        KeyCode::PageUp => "PageUp".to_string(),
+        KeyCode::PageDown => "PageDown".to_string(),
+        KeyCode::Home => "Home".to_string(),
+        KeyCode::End => "End".to_string(),
+        KeyCode::Insert => "Insert".to_string(),
+        KeyCode::Delete => "Delete".to_string(),
+        KeyCode::Char(ch) => {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase().to_string()
+            } else {
+                ch.to_string()
+            }
+        }
+        _ => format!("{:?}", code),
+    }
+}
+
+fn default_scroll_toggle_binding() -> KeyBinding {
+    KeyBinding::new(KeyCode::Esc, KeyModifiers::CONTROL)
+}
+
+fn parse_scroll_toggle_binding(value: &str) -> Option<KeyBinding> {
+    let mut modifiers = KeyModifiers::NONE;
+    let mut key_token: Option<String> = None;
+    for part in value.split('+') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        match lower.as_str() {
+            "ctrl" | "control" => modifiers |= KeyModifiers::CONTROL,
+            "alt" | "option" | "opt" => modifiers |= KeyModifiers::ALT,
+            "shift" => modifiers |= KeyModifiers::SHIFT,
+            "super" => modifiers |= KeyModifiers::SUPER,
+            "cmd" | "command" => modifiers |= KeyModifiers::SUPER,
+            token => {
+                if key_token.is_some() {
+                    return None;
+                }
+                key_token = Some(token.to_string());
+            }
+        }
+    }
+
+    let token = key_token?;
+    let code = match token.as_str() {
+        "esc" | "escape" => KeyCode::Esc,
+        "enter" | "return" => KeyCode::Enter,
+        "tab" => KeyCode::Tab,
+        "backspace" => KeyCode::Backspace,
+        "pageup" => KeyCode::PageUp,
+        "pagedown" => KeyCode::PageDown,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "space" => KeyCode::Char(' '),
+        "delete" => KeyCode::Delete,
+        "insert" => KeyCode::Insert,
+        other => {
+            let mut chars = other.chars();
+            let ch = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            KeyCode::Char(ch)
+        }
+    };
+
+    Some(KeyBinding::new(code, modifiers))
+}
+
+fn copy_shortcut_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Ctrl+C copy (Cmd+C native)"
+    } else {
+        "Ctrl+C copy"
+    }
+}
+
 #[derive(Clone, Debug)]
 struct BackfillRequestState {
     id: u64,
@@ -234,6 +374,7 @@ pub struct TerminalClient {
     renderer: GridRenderer,
     render_enabled: bool,
     tui: Option<Terminal<CrosstermBackend<io::Stdout>>>,
+    view_mode: ViewMode,
     last_seq: Seq,
     input_rx: Option<Receiver<Vec<u8>>>,
     input_seq: Seq,
@@ -257,6 +398,8 @@ pub struct TerminalClient {
     prediction_overlay_logged_visible: bool,
     prediction_overlay_logged_underline: bool,
     copy_mode: Option<CopyModeState>,
+    scroll_toggle: KeyBinding,
+    scroll_toggle_hint: String,
     last_render_at: Option<Instant>,
     render_interval: Duration,
     pending_render: bool,
@@ -306,11 +449,28 @@ impl TerminalClient {
             target = "client::predictive",
             "predictive logging initialized"
         );
+
+        let scroll_toggle = env::var(SCROLL_TOGGLE_KEY_ENV)
+            .ok()
+            .and_then(|value| {
+                let parsed = parse_scroll_toggle_binding(&value);
+                if parsed.is_none() {
+                    debug!(
+                        target = "client::config",
+                        value, "invalid scroll toggle binding, using default"
+                    );
+                }
+                parsed
+            })
+            .unwrap_or_else(default_scroll_toggle_binding);
+        let scroll_toggle_hint = scroll_toggle.display();
+
         Self {
             transport,
             renderer,
             render_enabled,
             tui: None,
+            view_mode: ViewMode::Tail,
             last_seq: 0,
             input_rx: None,
             input_seq: 0,
@@ -334,6 +494,8 @@ impl TerminalClient {
             prediction_overlay_logged_visible: false,
             prediction_overlay_logged_underline: false,
             copy_mode: None,
+            scroll_toggle,
+            scroll_toggle_hint,
             last_render_at: None,
             render_interval: Duration::from_millis(16),
             pending_render: false,
@@ -888,6 +1050,7 @@ impl TerminalClient {
             // to resume normal terminal behavior
             if !self.renderer.is_following_tail() {
                 self.renderer.set_follow_tail(true);
+                self.sync_view_mode_with_follow();
             }
         }
 
@@ -1909,6 +2072,9 @@ impl TerminalClient {
             while event::poll(Duration::from_millis(0)).unwrap_or(false) {
                 match event::read() {
                     Ok(Event::Key(key)) => {
+                        if self.handle_scroll_toggle(&key)? {
+                            continue;
+                        }
                         if self.handle_super_shortcuts(&key)? {
                             continue;
                         }
@@ -2371,39 +2537,31 @@ impl TerminalClient {
             self.update_copy_mode_prompt();
             return;
         }
-        let mode_label = match state.mode {
-            CopyModeKeySet::Vi => "vi",
-            CopyModeKeySet::Emacs => "emacs",
-        };
         let focus = if state.selection_active {
             match state.selection_mode {
-                SelectionMode::Character => "select (char)",
-                SelectionMode::Line => "select (line)",
-                SelectionMode::Block => "select (block)",
+                SelectionMode::Character => "select char",
+                SelectionMode::Line => "select line",
+                SelectionMode::Block => "select block",
             }
         } else {
             "cursor"
         };
-        let last_search = state
-            .last_search
-            .as_ref()
-            .map(|search| {
-                let prefix = match search.direction {
-                    CopyModeSearchDirection::Forward => '/',
-                    CopyModeSearchDirection::Backward => '?',
-                };
-                format!(" • last {prefix}{}", search.pattern)
-            })
-            .unwrap_or_default();
         let selection_hint = if state.selection_active {
             "Space unmark"
         } else {
             "Space mark"
         };
-        let text = format!(
-            "copy-mode ({mode_label}) • {focus} • {selection_hint} • V line • Ctrl+V block • Cmd/Ctrl+Shift+C copy • n/N repeat • Esc/q exit{last_search}"
+        let mut text = format!(
+            "scrollback [{focus}] • {} tail • {} • {}",
+            self.scroll_toggle_hint,
+            selection_hint,
+            copy_shortcut_hint()
         );
+        if matches!(state.selection_mode, SelectionMode::Character) {
+            text.push_str(" • V line • Ctrl+V block");
+        }
         self.renderer.set_status_message(Some(text));
+        self.force_render = true;
     }
 
     fn handle_mouse_event(&mut self, mouse: &MouseEvent) -> Result<bool, ClientError> {
@@ -2476,6 +2634,99 @@ impl TerminalClient {
     fn show_error_status<S: Into<String>>(&mut self, message: S) {
         self.renderer.set_status_error_message(Some(message.into()));
         self.force_render = true;
+    }
+
+    fn tail_status_text(&self) -> String {
+        format!("tail • {} scrollback", self.scroll_toggle_hint)
+    }
+
+    fn scrollback_base_status(&self) -> String {
+        format!(
+            "scrollback • {} tail • {}",
+            self.scroll_toggle_hint,
+            copy_shortcut_hint()
+        )
+    }
+
+    fn apply_tail_status(&mut self) {
+        self.renderer
+            .set_status_message(Some(self.tail_status_text()));
+        self.force_render = true;
+    }
+
+    fn apply_scrollback_status(&mut self) {
+        if self.copy_mode.is_some() {
+            self.update_copy_mode_status();
+        } else {
+            let text = self.scrollback_base_status();
+            self.renderer.set_status_message(Some(text));
+            self.force_render = true;
+        }
+    }
+
+    fn set_view_mode(&mut self, mode: ViewMode) {
+        if self.view_mode == mode {
+            if matches!(mode, ViewMode::Scrollback) && self.copy_mode.is_some() {
+                self.update_copy_mode_status();
+            }
+            return;
+        }
+        self.view_mode = mode;
+        match mode {
+            ViewMode::Tail => self.apply_tail_status(),
+            ViewMode::Scrollback => self.apply_scrollback_status(),
+        }
+    }
+
+    fn sync_view_mode_with_follow(&mut self) {
+        if self.copy_mode.is_some() {
+            if !matches!(self.view_mode, ViewMode::Scrollback) {
+                self.set_view_mode(ViewMode::Scrollback);
+            }
+            return;
+        }
+
+        if self.renderer.is_following_tail() {
+            if !matches!(self.view_mode, ViewMode::Tail) {
+                self.set_view_mode(ViewMode::Tail);
+            }
+        } else if !matches!(self.view_mode, ViewMode::Scrollback) {
+            self.set_view_mode(ViewMode::Scrollback);
+        }
+    }
+
+    fn handle_scroll_toggle(&mut self, key: &KeyEvent) -> Result<bool, ClientError> {
+        if !self.scroll_toggle.matches(key) {
+            return Ok(false);
+        }
+
+        if self.copy_mode.is_some() {
+            self.exit_copy_mode();
+            self.renderer.scroll_to_tail();
+            self.renderer.set_follow_tail(true);
+            self.set_view_mode(ViewMode::Tail);
+            self.force_render = true;
+            return Ok(true);
+        }
+
+        if matches!(self.view_mode, ViewMode::Scrollback) || !self.renderer.is_following_tail() {
+            self.renderer.scroll_to_tail();
+            self.renderer.set_follow_tail(true);
+            self.set_view_mode(ViewMode::Tail);
+            self.force_render = true;
+            return Ok(true);
+        }
+
+        self.renderer.set_follow_tail(false);
+        self.enter_copy_mode();
+        if self.copy_mode.is_none() {
+            self.renderer.set_follow_tail(true);
+            self.set_view_mode(ViewMode::Tail);
+            self.show_error_status("scrollback unavailable");
+        } else {
+            self.set_view_mode(ViewMode::Scrollback);
+        }
+        Ok(true)
     }
 
     fn handle_mouse_primary_down(&mut self, mouse: &MouseEvent) {
@@ -2577,6 +2828,8 @@ impl TerminalClient {
             self.force_render = true;
         }
 
+        self.sync_view_mode_with_follow();
+
         actual_delta
     }
 
@@ -2645,7 +2898,7 @@ impl TerminalClient {
         self.set_mouse_capture(true);
         self.renderer.set_follow_tail(false);
         self.renderer.clear_selection();
-        self.update_copy_mode_status();
+        self.set_view_mode(ViewMode::Scrollback);
         self.force_render = true;
     }
 
@@ -2653,10 +2906,10 @@ impl TerminalClient {
         if self.copy_mode.take().is_some() {
             self.set_mouse_capture(false);
             self.renderer.clear_selection();
-            self.renderer.set_status_message::<String>(None);
             self.renderer.set_follow_tail(true);
             self.renderer.mark_dirty();
             self.force_render = true;
+            self.set_view_mode(ViewMode::Tail);
         }
     }
 
@@ -2918,32 +3171,38 @@ impl TerminalClient {
             KeyCode::Up => {
                 self.renderer.set_follow_tail(false);
                 self.renderer.scroll_lines(-1);
+                self.sync_view_mode_with_follow();
                 self.force_render = true;
                 true
             }
             KeyCode::Down => {
                 self.renderer.scroll_lines(1);
+                self.sync_view_mode_with_follow();
                 self.force_render = true;
                 true
             }
             KeyCode::PageUp => {
                 self.renderer.set_follow_tail(false);
                 self.renderer.scroll_pages(-1);
+                self.sync_view_mode_with_follow();
                 self.force_render = true;
                 true
             }
             KeyCode::PageDown => {
                 self.renderer.scroll_pages(1);
+                self.sync_view_mode_with_follow();
                 self.force_render = true;
                 true
             }
             KeyCode::End => {
                 self.renderer.scroll_to_tail();
+                self.sync_view_mode_with_follow();
                 self.force_render = true;
                 true
             }
             KeyCode::Home => {
                 self.renderer.scroll_to_top();
+                self.sync_view_mode_with_follow();
                 self.force_render = true;
                 true
             }
@@ -5719,6 +5978,30 @@ mod tests {
         assert!(client.copy_mode.is_none());
         let copied = clipboard::get().expect("clipboard populated");
         assert_eq!(copied, "goodbye");
+    }
+
+    #[test]
+    fn ctrl_esc_toggle_enters_and_exits_scrollback() {
+        let mut client = new_client();
+        client.render_enabled = true;
+        client.renderer.ensure_size(2, 12);
+        client.renderer.apply_row_from_text(0, 1, "hello");
+        client.renderer.apply_row_from_text(1, 2, "world");
+        client.renderer.set_follow_tail(true);
+
+        let toggle = key(KeyCode::Esc, KeyModifiers::CONTROL);
+        assert!(client.handle_scroll_toggle(&toggle).unwrap());
+        assert!(client.copy_mode.is_some());
+        assert!(matches!(client.view_mode, ViewMode::Scrollback));
+        let (status, is_error) = client.renderer.status_for_test();
+        assert!(!is_error);
+        let status = status.expect("scrollback status present");
+        assert!(status.starts_with("scrollback"));
+
+        assert!(client.handle_scroll_toggle(&toggle).unwrap());
+        assert!(client.copy_mode.is_none());
+        assert!(matches!(client.view_mode, ViewMode::Tail));
+        assert!(client.renderer.is_following_tail());
     }
 
     #[test]

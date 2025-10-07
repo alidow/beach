@@ -744,8 +744,9 @@ export class TerminalGridCache {
     this.ensureRowRange(row, row + 1);
     this.cursorRow = row;
     let targetCol = col;
-    const committed = this.committedRowWidth(row);
-    targetCol = Math.min(targetCol, committed);
+    if (this.cols > 0) {
+      targetCol = Math.min(targetCol, this.cols);
+    }
     if (this.rowHasPredictions(row)) {
       targetCol = Math.max(targetCol, this.predictedRowWidth(row));
       if (prevRow === row && prevCol !== null) {
@@ -900,9 +901,9 @@ export class TerminalGridCache {
       this.cursorCol = 0;
       return;
     }
-    // Clamp cursor to valid column range [0, cols-1] to match Rust client behavior
-    // Cursor positions are 0-indexed, so for an 80-column grid, valid range is 0-79
-    const maxCol = Math.max(0, this.cols - 1);
+    // Clamp cursor to valid column range [0, cols] to match Rust client behavior
+    // Cursor positions are 0-indexed, so an 80-column grid allows positions 0-80 inclusive
+    const maxCol = Math.max(0, this.cols);
     this.cursorCol = clamp(this.cursorCol, 0, maxCol);
   }
 

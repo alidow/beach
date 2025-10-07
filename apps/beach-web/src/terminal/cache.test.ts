@@ -100,6 +100,30 @@ describe('TerminalGridCache cursor hints', () => {
     expect(snapshot.cursorSeq).toBe(2);
   });
 
+  it('keeps cursor column when server reports position beyond committed width', () => {
+    const cache = new TerminalGridCache({ initialCols: 80 });
+    cache.setGridSize(2, 80);
+    const prompt = 'prompt%';
+    cache.applyUpdates([
+      {
+        type: 'row',
+        row: 1,
+        seq: 1,
+        cells: packString(prompt),
+      },
+    ], { authoritative: true });
+
+    cache.enableCursorSupport(true);
+    const desiredCol = prompt.length + 1;
+    cache.applyUpdates([], {
+      cursor: { row: 1, col: desiredCol, seq: 2, visible: true, blink: true },
+    });
+
+    const snapshot = cache.snapshot();
+    expect(snapshot.cursorRow).toBe(1);
+    expect(snapshot.cursorCol).toBe(desiredCol);
+  });
+
   it('tracks predicted cursor while preserving authoritative cursor', () => {
     const cache = new TerminalGridCache({ initialCols: 80 });
     cache.setGridSize(1, 80);
@@ -121,7 +145,7 @@ describe('TerminalGridCache cursor hints', () => {
 
     let snapshot = cache.snapshot();
     expect(snapshot.cursorRow).toBe(0);
-    expect(snapshot.cursorCol).toBe(2);
+    expect(snapshot.cursorCol).toBe(3);
     expect(snapshot.predictedCursor?.row).toBe(0);
     expect(snapshot.predictedCursor?.col).toBe(3);
 

@@ -233,7 +233,7 @@ describe('TerminalGridStore', () => {
 
     store.registerPrediction(3, stringToBytes('a'));
     let snapshot = store.getSnapshot();
-    expect(snapshot.cursorCol).toBe(2);
+    expect(snapshot.cursorCol).toBe(3);
     expect(snapshot.predictedCursor?.col).toBe(3);
 
     store.ackPrediction(3, 200);

@@ -501,6 +501,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     onStatusChange?.(status);
     if (status === 'connected') {
       setShowIdlePlaceholder(false);
+      // Auto-focus terminal when connected
+      if (containerRef.current) {
+        containerRef.current.focus();
+      }
     } else if (status === 'idle') {
       setShowIdlePlaceholder(true);
     }
@@ -972,6 +976,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const containerClasses = cn(
     'beach-terminal relative flex-1 min-h-0 overflow-y-auto overflow-x-auto whitespace-pre font-mono text-[13px] leading-[1.42] text-[#d5d9e0]',
     'bg-[#1b1f2a] px-6 py-5 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04),inset_0_22px_45px_-25px_rgba(8,10,20,0.82)]',
+    'outline-none focus:outline-none',
   );
 
   const containerStyle: CSSProperties & { '--beach-terminal-line-height': string } = {

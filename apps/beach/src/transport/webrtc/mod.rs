@@ -388,12 +388,22 @@ impl WebRtcTransport {
                         );
                     }
                     Ok(Err(err)) => {
-                        tracing::warn!(
-                            target = "webrtc",
-                            transport_id = ?transport_id,
-                            error = %err,
-                            "webrtc send error"
-                        );
+                        let err_display = err.to_string();
+                        if err_display.contains("DataChannel is not opened") {
+                            tracing::debug!(
+                                target = "webrtc",
+                                transport_id = ?transport_id,
+                                error = %err_display,
+                                "dropping outbound frame: data channel not open"
+                            );
+                        } else {
+                            tracing::warn!(
+                                target = "webrtc",
+                                transport_id = ?transport_id,
+                                error = %err_display,
+                                "webrtc send error"
+                            );
+                        }
                         break;
                     }
                     Err(_) => {

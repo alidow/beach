@@ -4849,7 +4849,18 @@ fn encode_key_event(key: KeyEvent) -> Option<Vec<u8>> {
             }
             Some(bytes)
         }
-        KeyCode::Enter => Some(vec![b'\n']),
+        KeyCode::Enter => {
+            let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            let has_other_mods = key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+
+            if has_shift && !has_other_mods {
+                Some(vec![b'\n'])
+            } else {
+                Some(vec![b'\r'])
+            }
+        }
         KeyCode::Tab => Some(vec![b'\t']),
         KeyCode::Backspace => Some(vec![0x7f]),
         KeyCode::Esc => Some(vec![0x1b]),

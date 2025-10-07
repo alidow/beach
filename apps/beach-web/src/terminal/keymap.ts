@@ -11,9 +11,15 @@ export function encodeKeyEvent(event: KeyboardEvent): Uint8Array | null {
   }
 
   switch (event.key) {
-    case 'Enter':
-      trace('encodeKeyEvent: Enter key', { result: '0x0a' });
-      return new Uint8Array([0x0a]);
+    case 'Enter': {
+      const hasShiftOnly = event.shiftKey && !event.ctrlKey && !event.altKey;
+      if (hasShiftOnly) {
+        trace('encodeKeyEvent: Shift+Enter', { result: '0x0a' });
+        return new Uint8Array([0x0a]);
+      }
+      trace('encodeKeyEvent: Enter key', { result: '0x0d' });
+      return new Uint8Array([0x0d]);
+    }
     case 'Tab':
       trace('encodeKeyEvent: Tab key', { result: '0x09' });
       return new Uint8Array([0x09]);

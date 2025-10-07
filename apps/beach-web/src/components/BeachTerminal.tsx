@@ -94,6 +94,8 @@ export interface PredictionOverlayState {
 
 const DEFAULT_PREDICTION_OVERLAY: PredictionOverlayState = { visible: true, underline: false };
 
+const PREDICTION_HANDSHAKE_OFFSET_THRESHOLD = 16;
+
 const PREDICTION_SRTT_TRIGGER_LOW_MS = 20;
 const PREDICTION_SRTT_TRIGGER_HIGH_MS = 30;
 const PREDICTION_FLAG_TRIGGER_LOW_MS = 50;
@@ -1459,6 +1461,19 @@ interface RenderCell {
   predicted?: boolean;
 }
 
+function computeVisibleWidth(cells: RenderCell[]): number {
+  for (let index = cells.length - 1; index >= 0; index -= 1) {
+    const cell = cells[index];
+    if (!cell) {
+      continue;
+    }
+    if (cell.char !== ' ' || cell.styleId !== 0) {
+      return index + 1;
+    }
+  }
+  return 0;
+}
+
 interface RenderLine {
   absolute: number;
   kind: 'loaded' | 'pending' | 'missing';
@@ -1486,14 +1501,38 @@ export function buildLines(
         char: cell.char ?? ' ',
         styleId: cell.styleId ?? 0,
       }));
+      const visibleWidth = computeVisibleWidth(cells);
+      const handshakeActive =
+        overlay.visible &&
+        snapshot.cursorSeq === null &&
+        snapshot.cursorVisible === false &&
+        snapshot.cursorRow === row.absolute;
+      let handshakeProjectionCol: number | null = null;
       if (overlay.visible) {
         const predictions = snapshot.predictionsForRow(row.absolute);
         if (predictions.length > 0) {
           for (const { col, cell: prediction } of predictions) {
-            while (cells.length <= col) {
+            let targetCol = col;
+            if (handshakeActive) {
+              const offsetFromContent = col - visibleWidth;
+              if (visibleWidth >= 0 && offsetFromContent >= PREDICTION_HANDSHAKE_OFFSET_THRESHOLD) {
+                if (handshakeProjectionCol === null) {
+                  handshakeProjectionCol = Math.max(visibleWidth, 0);
+                }
+                targetCol = handshakeProjectionCol;
+                handshakeProjectionCol += 1;
+                trace('buildLines: remapped handshake prediction', {
+                  row: row.absolute,
+                  originalCol: col,
+                  remappedCol: targetCol,
+                  visibleWidth,
+                });
+              }
+            }
+            while (cells.length <= targetCol) {
               cells.push({ char: ' ', styleId: 0 });
             }
-            const existing = cells[col];
+            const existing = cells[targetCol];
             const predictionChar = prediction.char ?? ' ';
             // Only overlay prediction if the cell is empty/whitespace
             // If server has sent authoritative content, don't replace it with prediction
@@ -1501,20 +1540,20 @@ export function buildLines(
               // Server has authoritative content that differs from prediction - skip this prediction
               trace('buildLines: skipping prediction due to authoritative content', {
                 row: row.absolute,
-                col,
+                col: targetCol,
                 existing: existing.char,
                 prediction: predictionChar,
               });
               continue;
             }
-            cells[col] = {
+            cells[targetCol] = {
               char: predictionChar,
               styleId: existing?.styleId ?? 0,
               predicted: true,
             };
             trace('buildLines: applied prediction', {
               row: row.absolute,
-              col,
+              col: targetCol,
               char: predictionChar,
               overlayVisible: overlay.visible,
               viewportTop: snapshot.viewportTop,

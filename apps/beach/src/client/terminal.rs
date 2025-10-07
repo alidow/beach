@@ -345,14 +345,6 @@ fn parse_scroll_toggle_bindings(value: &str) -> Vec<KeyBinding> {
         .collect()
 }
 
-fn copy_shortcut_hint() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "CTRL+C copy (Cmd+C native)"
-    } else {
-        "CTRL+C copy"
-    }
-}
-
 #[derive(Clone, Debug)]
 struct BackfillRequestState {
     id: u64,
@@ -2588,24 +2580,7 @@ impl TerminalClient {
             self.update_copy_mode_prompt();
             return;
         }
-        let focus = if state.selection_active {
-            match state.selection_mode {
-                SelectionMode::Character => "select char",
-                SelectionMode::Line => "select line",
-                SelectionMode::Block => "select block",
-            }
-        } else {
-            "cursor"
-        };
-        let selection_hint = if state.selection_active {
-            "Space unmark"
-        } else {
-            "Space mark"
-        };
-        let mut main = format!("scrollback [{focus}] • {selection_hint}");
-        if matches!(state.selection_mode, SelectionMode::Character) {
-            main.push_str(" • V line • Ctrl+V block");
-        }
+        let mut main = String::from("scrollback");
         let mut highlight = format!("{} to tail • ESC exit", self.scroll_toggle_display);
         if state.selection_active {
             highlight.push_str(" • CTRL+C copy");
@@ -2697,7 +2672,7 @@ impl TerminalClient {
     }
 
     fn apply_tail_status(&mut self) {
-        let highlight = format!("{} to scrollback", self.scroll_toggle_display);
+        let highlight = format!("{} to scrollback • CTRL+Q quit", self.scroll_toggle_display);
         self.renderer
             .set_status_with_highlight(Some(self.tail_status_text()), Some(highlight));
         self.force_render = true;
@@ -2709,9 +2684,8 @@ impl TerminalClient {
         } else {
             let text = self.scrollback_base_status();
             let highlight = format!(
-                "{} to tail • ESC exit • {}",
-                self.scroll_toggle_display,
-                copy_shortcut_hint()
+                "{} to tail • ESC exit • CTRL+Q quit",
+                self.scroll_toggle_display
             );
             self.renderer
                 .set_status_with_highlight(Some(text), Some(highlight));
@@ -2949,20 +2923,29 @@ impl TerminalClient {
             -((before_top - after_top) as i64)
         };
 
-        if self.copy_mode.is_some() && actual_delta != 0 {
-            let (row, col) = {
-                let state = self.copy_mode.as_ref().unwrap();
-                (state.cursor.row, state.cursor.col)
-            };
-            let target_row = row as i64 + actual_delta;
-            let new_pos = self.renderer.clamp_position(target_row, col as isize);
-            self.set_copy_cursor_position(new_pos, false);
+        if self.copy_mode.is_some() {
+            if actual_delta != 0 {
+                let (row, col) = {
+                    let state = self.copy_mode.as_ref().unwrap();
+                    (state.cursor.row, state.cursor.col)
+                };
+                let target_row = row as i64 + actual_delta;
+                let new_pos = self.renderer.clamp_position(target_row, col as isize);
+                self.set_copy_cursor_position(new_pos, false);
+            }
+            if actual_delta > 0 && reached_tail {
+                let selection_active = self
+                    .copy_mode
+                    .as_ref()
+                    .map(|state| state.selection_active)
+                    .unwrap_or(false);
+                self.renderer.scroll_to_tail();
+                if !selection_active {
+                    self.exit_copy_mode();
+                }
+            }
         } else if actual_delta > 0 && reached_tail {
             self.renderer.scroll_to_tail();
-        }
-
-        if self.copy_mode.is_some() && actual_delta > 0 && reached_tail {
-            self.exit_copy_mode();
         }
 
         if actual_delta != 0 {

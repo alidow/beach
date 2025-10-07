@@ -1776,31 +1776,19 @@ impl GridRenderer {
     fn render_status_line(&self) -> Paragraph<'_> {
         let total_rows = self.total_rows();
         let displayed = self.viewport_height.min(self.rows.len());
+        let status_line = format!(
+            "rows {total_rows} • showing {displayed} • scroll {}",
+            self.viewport_top()
+        );
         let mut spans: Vec<Span> = Vec::new();
         if let Some(indicator) = &self.connection_status {
             spans.push(Span::styled(indicator.text.clone(), indicator.style));
             spans.push(Span::raw("  "));
         }
-
-        let mut base = format!(
-            "rows {total_rows} • showing {displayed} • scroll {}",
-            self.viewport_top()
-        );
-        if self.has_pending_rows() {
-            base.push_str(" • loading history");
-        }
-        spans.push(Span::raw(base));
+        spans.push(Span::raw(status_line));
 
         if let Some(message) = &self.status_message {
-            let text = format!(" • {}", message);
-            if self.status_is_error {
-                spans.push(Span::styled(
-                    text,
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ));
-            } else {
-                spans.push(Span::raw(text));
-            }
+            spans.push(Span::raw(format!(" • {}", message)));
         }
 
         if !self.status_is_error {
@@ -1818,7 +1806,7 @@ impl GridRenderer {
     }
 
     fn render_instructions(&self) -> Paragraph<'_> {
-        let text = "ESC ESC toggle • ESC exit scrollback • CTRL+C copy selection";
+        let text = "CTRL+Q quit";
         Paragraph::new(text).block(Block::default())
     }
 }

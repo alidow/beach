@@ -78,17 +78,35 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         None
     };
 
-    let allow_all_clients = args.allow_all_clients || !interactive || bootstrap_mode;
-    if allow_all_clients {
-        debug!("client authorization prompt disabled (allow-all mode)");
+    if args.legacy_allow_all_clients {
+        debug!(
+            "deprecated --allow-all-clients flag supplied; approval already disabled by default"
+        );
     }
-    let authorizer = Arc::new(if allow_all_clients {
-        JoinAuthorizer::allow_all()
+
+    let approval_requested = args.require_client_approval && !args.legacy_allow_all_clients;
+    if approval_requested && bootstrap_mode {
+        warn!(
+            "client approval prompts unavailable when bootstrap output is active; auto-accepting clients"
+        );
+    } else if approval_requested && !interactive {
+        warn!("client approval prompts require an interactive TTY; auto-accepting clients");
+    }
+
+    let require_client_approval = approval_requested && interactive && !bootstrap_mode;
+    if require_client_approval {
+        debug!("client authorization prompt enabled (manual approval mode)");
     } else {
+        debug!("client authorization prompt disabled (auto-accept mode)");
+    }
+
+    let authorizer = Arc::new(if require_client_approval {
         let gate = input_gate
             .as_ref()
             .expect("interactive input gate must be present for prompts");
         JoinAuthorizer::interactive(Arc::clone(gate))
+    } else {
+        JoinAuthorizer::allow_all()
     });
 
     let hosted = manager.host().await?;

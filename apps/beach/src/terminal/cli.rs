@@ -99,11 +99,18 @@ pub struct HostArgs {
     pub wait: bool,
 
     #[arg(
+        long = "require-client-approval",
+        action = clap::ArgAction::SetTrue,
+        help = "Prompt before accepting new clients (defaults to auto-accept)"
+    )]
+    pub require_client_approval: bool,
+
+    #[arg(
         long = "allow-all-clients",
         action = clap::ArgAction::SetTrue,
-        help = "Automatically accept all clients without prompting"
+        hide = true
     )]
-    pub allow_all_clients: bool,
+    pub legacy_allow_all_clients: bool,
 
     #[arg(
         long = "bootstrap-output",

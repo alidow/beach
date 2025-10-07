@@ -1,6 +1,6 @@
 # Client Join Authorization Prompt — Implementation Plan
 
-This document proposes and details a host-side authorization prompt for new client connections to the `beach-human` server runtime. By default, new clients require explicit approval from the host via a full-screen prompt in the host terminal. The feature can be disabled via a CLI flag (`--allow-all-clients`).
+This document proposes and details a host-side authorization prompt for new client connections to the `beach-human` server runtime. When originally shipped, new clients required explicit approval from the host via a full-screen prompt in the host terminal. The feature could be disabled via a CLI flag (`--allow-all-clients`). As of flipping the default, sessions now auto-accept clients unless the host opts in with `--require-client-approval`.
 
 ## Background & Current State
 
@@ -24,8 +24,8 @@ Observations:
 Current behavior accepts viewers as soon as negotiation completes. This can surprise hosts or leak terminal state if a share code is reused unintentionally. We want a simple, safe approval step that’s on by default but unobtrusive for power users (opt-out flag).
 
 ## Goals
-- Default-deny new remote clients until the host explicitly authorizes them in the host terminal.
-- Provide `--allow-all-clients` to disable prompting for frictionless workflows and automation.
+- (Original launch goal) Default-deny new remote clients until the host explicitly authorizes them in the host terminal.
+- Provide `--require-client-approval` to enable prompting for manual approval workflows.
 - Ensure no keystrokes typed by the host before or during prompt display count as approval.
 - Work in single-host, multi-viewer scenarios (queue if multiple joins arrive).
 - Avoid sending any server frames (hello/snapshots/deltas) prior to approval.
@@ -44,11 +44,11 @@ Current behavior accepts viewers as soon as negotiation completes. This can surp
 
 ## UX & CLI
 
-Flag: `--allow-all-clients`
+Flag: `--require-client-approval`
 - Type: boolean
 - Scope: `HostArgs`
-- Default: false (prompt enabled)
-- Behavior: when true, all clients are auto-accepted (existing behavior), bypassing the prompt.
+- Default: false (auto-accept)
+- Behavior: when true, the host is prompted to approve each new client before sync begins.
 
 Prompt behavior (interactive TTY only):
 - On a new client request, switch to a full-screen prompt in the alternate screen buffer.
@@ -85,7 +85,7 @@ Data flow:
 ## Detailed Implementation Plan
 
 1) CLI additions
-- Modify `HostArgs` (apps/beach-human/src/main.rs:153) to include `#[arg(long = "allow-all-clients", action = clap::ArgAction::SetTrue, help = "Disable interactive approval; automatically accept all clients")] pub allow_all_clients: bool`.
+- Modify `HostArgs` (apps/beach-human/src/main.rs:153) to include `#[arg(long = "require-client-approval", action = clap::ArgAction::SetTrue, help = "Prompt before accepting new clients")] pub require_client_approval: bool`.
 - In `handle_host`, compute `interactive` as it is today (`apps/beach-human/src/main.rs:340`). Determine authorizer mode:
   - If `args.allow_all_clients` or not `interactive` or in bootstrap JSON mode → `AllowAll`.
   - Else → `Interactive`.
@@ -146,7 +146,7 @@ Data flow:
   - Run host with prompt enabled; attempt to join; verify TUI, accept/deny flow, and that local typing during the switch doesn’t leak into consent.
 
 9) Rollout Plan
-- Land behind the new default (prompt on). Provide `--allow-all-clients` for opt-out.
+- Land behind the new default (prompt on). Provide `--require-client-approval` for opt-in.
 - Add an env var override for CI: `BEACH_ALLOW_ALL_CLIENTS=1` to simplify automated flows.
 - Document behavior in the host banner and `--help`.
 
@@ -168,4 +168,4 @@ Data flow:
 - A non-fullscreen minimal prompt option and/or sound/visual notification with deferred queue.
 - Structured denial notice sent to the client over a control channel.
 
-This plan constrains the change to the server process, provides a safe default, and minimizes the risk of accidental authorization while keeping the existing fast-path available through `--allow-all-clients`.
+This plan constrains the change to the server process, provides a safe default, and minimizes the risk of accidental authorization while keeping the existing fast-path available through `--require-client-approval`.

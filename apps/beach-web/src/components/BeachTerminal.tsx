@@ -1512,6 +1512,15 @@ export function buildLines(
               styleId: existing?.styleId ?? 0,
               predicted: true,
             };
+            trace('buildLines: applied prediction', {
+              row: row.absolute,
+              col,
+              char: predictionChar,
+              overlayVisible: overlay.visible,
+              viewportTop: snapshot.viewportTop,
+              cursorRow: snapshot.cursorRow,
+              cursorCol: snapshot.cursorCol,
+            });
           }
         }
       }

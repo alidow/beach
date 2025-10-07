@@ -1,7 +1,7 @@
 use crate::cache::Seq;
 use crate::cache::terminal::{
     PackedCell, Style, StyleId, StyleTable, TerminalGrid, attrs_to_byte, pack_cell,
-    pack_color_from_heavy,
+    pack_color_from_heavy, unpack_cell,
 };
 use crate::model::terminal::CursorState;
 use crate::model::terminal::cell::{Cell as HeavyCell, CellAttributes, Color as HeavyColor};
@@ -19,7 +19,7 @@ use alacritty_terminal::{
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::convert::TryFrom;
-use tracing::trace;
+use tracing::{Level, trace};
 
 pub type EmulatorResult = Vec<CacheUpdate>;
 
@@ -571,6 +571,49 @@ impl AlacrittyEmulator {
         let col = render_cursor.point.column.0;
         let visible = render_cursor.shape != CursorShape::Hidden;
         let blink = cursor_style.blinking;
+
+        if tracing::enabled!(Level::TRACE) {
+            if let Some(index) = grid.index_of_row(absolute_row) {
+                let cols = grid.cols().max(1);
+                let mut packed = vec![0u64; cols];
+                if grid.snapshot_row_into(index, &mut packed).is_ok() {
+                    let mut committed_width = 0usize;
+                    let mut preview = String::new();
+                    for (idx, raw) in packed.iter().enumerate() {
+                        let (ch, _) = unpack_cell(PackedCell::from(*raw));
+                        if ch != ' ' {
+                            committed_width = idx + 1;
+                        }
+                        if preview.len() < 32 {
+                            preview.push(ch);
+                        }
+                    }
+                    let preview_trimmed = preview.trim_end_matches(' ').to_string();
+                    trace!(
+                        target = "server::cursor",
+                        cursor_row = row,
+                        cursor_col = col,
+                        committed_width,
+                        preview = %preview_trimmed,
+                        marker = "cursor_components"
+                    );
+                } else {
+                    trace!(
+                        target = "server::cursor",
+                        cursor_row = row,
+                        cursor_col = col,
+                        marker = "cursor_row_snapshot_failed"
+                    );
+                }
+            } else {
+                trace!(
+                    target = "server::cursor",
+                    cursor_row = row,
+                    cursor_col = col,
+                    marker = "cursor_row_unloaded"
+                );
+            }
+        }
 
         Some((row, col, visible, blink))
     }

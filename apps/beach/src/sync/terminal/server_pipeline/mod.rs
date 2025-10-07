@@ -771,6 +771,10 @@ pub(crate) fn spawn_update_forwarder(
             matches!(err, TransportError::Setup(message) if message.contains("DataChannel is not opened"))
         }
 
+        fn is_transport_channel_closed(err: &TransportError) -> bool {
+            matches!(err, TransportError::ChannelClosed)
+        }
+
         fn drop_transport(
             sinks: &mut Vec<Sink>,
             shared_registry: &Arc<Mutex<Vec<Arc<SharedTransport>>>>,
@@ -886,6 +890,14 @@ pub(crate) fn spawn_update_forwarder(
                             error = %err,
                             "initial handshake failed: data channel not open"
                         );
+                    } else if is_transport_channel_closed(&err) {
+                        debug!(
+                            target = "sync::handshake",
+                            transport_id = transport_id.0,
+                            transport = ?sink.transport.kind(),
+                            error = %err,
+                            "initial handshake failed: transport channel closed"
+                        );
                     } else {
                         warn!(
                             target = "sync::handshake",
@@ -959,6 +971,14 @@ pub(crate) fn spawn_update_forwarder(
                             transport = ?sink.transport.kind(),
                             error = %err,
                             "handshake attempt failed: data channel not open"
+                        );
+                    } else if is_transport_channel_closed(&err) {
+                        debug!(
+                            target = "sync::handshake",
+                            transport_id = transport_id.0,
+                            transport = ?sink.transport.kind(),
+                            error = %err,
+                            "handshake attempt failed: transport channel closed"
                         );
                     } else {
                         debug!(
@@ -1048,6 +1068,14 @@ pub(crate) fn spawn_update_forwarder(
                                                     error = %err,
                                                     "delta send failed: data channel not open"
                                                 );
+                                            } else if is_transport_channel_closed(&err) {
+                                                debug!(
+                                                    target = "sync::handshake",
+                                                    transport_id = transport_id.0,
+                                                    transport = ?sink.transport.kind(),
+                                                    error = %err,
+                                                    "delta send failed: transport channel closed"
+                                                );
                                             } else {
                                                 warn!(
                                                     target = "sync::handshake",
@@ -1129,6 +1157,14 @@ pub(crate) fn spawn_update_forwarder(
                                                 transport = ?sink.transport.kind(),
                                                 error = %err,
                                                 "handshake failed for new transport: data channel not open"
+                                            );
+                                        } else if is_transport_channel_closed(&err) {
+                                            debug!(
+                                                target = "sync::handshake",
+                                                transport_id = transport_id.0,
+                                                transport = ?sink.transport.kind(),
+                                                error = %err,
+                                                "handshake failed for new transport: transport channel closed"
                                             );
                                         } else {
                                             warn!(
@@ -1289,6 +1325,16 @@ pub(crate) fn spawn_update_forwarder(
                                     transport = ?sink.transport.kind(),
                                     error = %err,
                                     "backfill send failed: data channel not open"
+                                );
+                            } else if is_transport_channel_closed(&err) {
+                                sink.backfill_queue.clear();
+                                stale_transports.push(transport_id);
+                                debug!(
+                                    target = "sync::backfill",
+                                    transport_id = transport_id.0,
+                                    transport = ?sink.transport.kind(),
+                                    error = %err,
+                                    "backfill send failed: transport channel closed"
                                 );
                             } else {
                                 sink.backfill_queue.push_front(job);

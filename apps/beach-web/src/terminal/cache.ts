@@ -159,6 +159,7 @@ export class TerminalGridCache {
   private cursorAuthoritativePending = false;
   private predictedCursor: PredictedCursorState | null = null;
   private firstCursorReceived = false;
+  private pendingInitialCursor: { visible: boolean; blink: boolean } | null = null;
   private predictions = new Map<number, Map<number, PredictedCell>>();
   private readonly traceStartMs = traceNow();
   private pendingPredictions = new Map<number, PendingPredictionEntry>();
@@ -324,6 +325,7 @@ export class TerminalGridCache {
     this.cursorAuthoritative = false;
     this.cursorAuthoritativePending = false;
     this.predictedCursor = null;
+    this.pendingInitialCursor = null;
     this.predictions.clear();
     this.pendingPredictions.clear();
   }
@@ -727,6 +729,7 @@ export class TerminalGridCache {
       this.cursorVisible = true;
       this.cursorBlink = true;
       this.predictedCursor = null;
+      this.pendingInitialCursor = null;
     }
     return true;
   }
@@ -759,9 +762,11 @@ export class TerminalGridCache {
     // Suppress initial cursor at (0, 0) to avoid flash in upper-left corner
     if (!this.firstCursorReceived && row === 0 && col === 0) {
       this.cursorVisible = false;
+      this.pendingInitialCursor = { visible: frame.visible, blink: frame.blink };
       this.firstCursorReceived = true;
     } else {
       this.cursorVisible = frame.visible;
+      this.pendingInitialCursor = null;
       this.firstCursorReceived = true;
     }
 
@@ -773,6 +778,7 @@ export class TerminalGridCache {
       this.cursorRow = this.baseRow;
     }
     this.clampCursor();
+    this.maybeRevealPendingCursor();
 
     const viewportMoved = this.touchRow(this.cursorRow ?? row);
 
@@ -890,6 +896,27 @@ export class TerminalGridCache {
     return false;
   }
 
+  private maybeRevealPendingCursor(): void {
+    if (!this.pendingInitialCursor) {
+      return;
+    }
+    if (this.cursorRow === null || this.cursorCol === null) {
+      return;
+    }
+    if (this.cursorRow === 0 && this.cursorCol === 0) {
+      return;
+    }
+    const row = this.cursorRow;
+    const committed = this.committedRowWidth(row);
+    const predicted = this.predictedRowWidth(row);
+    if (committed <= 0 && predicted <= 0) {
+      return;
+    }
+    this.cursorVisible = this.pendingInitialCursor.visible;
+    this.cursorBlink = this.pendingInitialCursor.blink;
+    this.pendingInitialCursor = null;
+  }
+
   private clampCursor(): void {
     if (this.cursorRow === null || this.cursorCol === null) {
       return;
@@ -1001,9 +1028,11 @@ export class TerminalGridCache {
       loaded.latestSeq = Math.max(loaded.latestSeq, seq);
       loaded.logicalWidth = Math.max(loaded.logicalWidth, col + 1);
       this.touchRow(row);
+      this.maybeRevealPendingCursor();
       return true;
     }
     const viewportMoved = this.touchRow(row);
+    this.maybeRevealPendingCursor();
     return mutated || viewportMoved;
   }
 
@@ -1060,6 +1089,7 @@ export class TerminalGridCache {
     loaded.latestSeq = Math.max(loaded.latestSeq, seq);
     loaded.logicalWidth = allSpaces ? 0 : logical;
     const viewportMoved = this.touchRow(row);
+    this.maybeRevealPendingCursor();
     return mutated || viewportMoved;
   }
 
@@ -1110,6 +1140,7 @@ export class TerminalGridCache {
     }
     loaded.latestSeq = Math.max(loaded.latestSeq, seq);
     const viewportMoved = this.touchRow(row);
+    this.maybeRevealPendingCursor();
     return mutated || viewportMoved;
   }
 
@@ -1143,6 +1174,7 @@ export class TerminalGridCache {
         loaded.logicalWidth = colRange[0];
       }
       const viewportMoved = this.touchRow(row);
+      this.maybeRevealPendingCursor();
       mutated = mutated || viewportMoved;
     }
     return mutated;
@@ -1424,21 +1456,7 @@ export class TerminalGridCache {
         return !this.predictionExists(pos.row, pos.col, seq) || this.cellMatches(pos.row, pos.col, pos.char);
       });
 
-      // Check if any position has authoritative content that differs from prediction
-      const hasConflict = entry.positions.some((pos) => {
-        const row = this.getRow(pos.row);
-        if (!row || row.kind !== 'loaded') {
-          return false;
-        }
-        if (pos.col >= row.cells.length) {
-          return false;
-        }
-        const cell = row.cells[pos.col];
-        // If we have a loaded cell with a sequence number, and it doesn't match prediction, clear it
-        return cell && cell.seq > 0 && cell.char !== pos.char;
-      });
-
-      if (committed || hasConflict) {
+      if (committed) {
         this.pendingPredictions.delete(seq);
         let mutated = false;
         for (const { row, col } of positionsLog) {
@@ -1448,7 +1466,7 @@ export class TerminalGridCache {
           this.predictiveLog('prediction_cleared', {
             seq,
             context: 'ack',
-            reason: committed ? 'committed' : 'conflict',
+            reason: 'committed',
             positions: positionsLog,
           });
           this.predictiveLog('prediction_ack', {

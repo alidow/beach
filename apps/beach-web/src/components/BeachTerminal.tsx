@@ -818,19 +818,19 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         return;
       }
       const rowHeight = Math.max(1, effectiveLineHeight);
-      const viewportEstimate = Math.max(1, Math.floor(element.clientHeight / rowHeight));
+      const viewportRows = Math.max(1, Math.floor(element.clientHeight / rowHeight));
       let desired = target;
       const lastContentAbsolute = findLastContentAbsolute(snapshot);
-      if (
-        lastContentAbsolute !== null &&
-        lastContentAbsolute >= snapshot.baseRow
-      ) {
+      if (lastContentAbsolute !== null && lastContentAbsolute >= snapshot.baseRow) {
         const totalContentRows = lastContentAbsolute - snapshot.baseRow + 1;
-        const hasScrollableOverflow = target > 1;
-        // Only snap to the top when there's no overflow to scroll through.
-        if (!hasScrollableOverflow && totalContentRows <= viewportEstimate) {
-          desired = 0;
-        }
+        const contentBottom = topPadding + totalContentRows * rowHeight;
+        const desiredByContent = Math.max(0, contentBottom - element.clientHeight);
+        const scrollableRows = Math.max(0, totalContentRows - viewportRows);
+        const contentRowsOffset = topPadding + scrollableRows * rowHeight;
+        const boundedDesired = Math.min(desiredByContent, contentRowsOffset);
+        desired = Math.min(target, Math.max(0, boundedDesired));
+      } else {
+        desired = 0;
       }
       if (import.meta.env.DEV && typeof window !== 'undefined' && window.__BEACH_TRACE) {
         console.debug('[beach-trace][terminal] autoscroll', {
@@ -839,6 +839,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           desired,
           scrollHeight: element.scrollHeight,
           clientHeight: element.clientHeight,
+          viewportRows,
+          totalContentRows: lastContentAbsolute !== null ? lastContentAbsolute - snapshot.baseRow + 1 : 0,
         });
       }
       element.scrollTop = desired;

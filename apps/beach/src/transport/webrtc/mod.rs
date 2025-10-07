@@ -261,7 +261,7 @@ impl WebRtcTransport {
                 let ice_state = pc_clone.ice_connection_state();
                 if let Some(flag) = handshake_for_close.as_ref() {
                     if !flag.load(Ordering::SeqCst) {
-                        tracing::warn!(
+                        tracing::debug!(
                             target = "webrtc",
                             transport_id = ?log_id,
                             pc_state = ?pc_state,

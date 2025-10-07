@@ -22,10 +22,14 @@ use crossterm::{
     execute,
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode,
+        enable_raw_mode, size as crossterm_size,
     },
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    style::{Color, Modifier, Style},
+};
 use serde_json::{Map, Value, json};
 use std::cmp;
 use std::collections::HashMap;
@@ -47,6 +51,7 @@ const BACKFILL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MOUSE_SCROLL_LINES: isize = 5;
 const COPY_MODE_KEYSET_ENV: &str = "BEACH_COPY_MODE_KEYS";
 const SCROLL_TOGGLE_KEY_ENV: &str = "BEACH_SCROLL_TOGGLE_KEY";
+const SCROLL_TOGGLE_DOUBLE_ESC: Duration = Duration::from_millis(400);
 const TMUX_PREFIX_TIMEOUT: Duration = Duration::from_millis(500);
 const AUTH_SPINNER_FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
 const AUTH_SPINNER_INTERVAL: Duration = Duration::from_millis(120);
@@ -279,8 +284,8 @@ fn format_key_code(code: KeyCode) -> String {
     }
 }
 
-fn default_scroll_toggle_binding() -> KeyBinding {
-    KeyBinding::new(KeyCode::Esc, KeyModifiers::CONTROL)
+fn default_scroll_toggle_bindings() -> Vec<KeyBinding> {
+    Vec::new()
 }
 
 fn parse_scroll_toggle_binding(value: &str) -> Option<KeyBinding> {
@@ -333,11 +338,18 @@ fn parse_scroll_toggle_binding(value: &str) -> Option<KeyBinding> {
     Some(KeyBinding::new(code, modifiers))
 }
 
+fn parse_scroll_toggle_bindings(value: &str) -> Vec<KeyBinding> {
+    value
+        .split(',')
+        .filter_map(|part| parse_scroll_toggle_binding(part.trim()))
+        .collect()
+}
+
 fn copy_shortcut_hint() -> &'static str {
     if cfg!(target_os = "macos") {
-        "Ctrl+C copy (Cmd+C native)"
+        "CTRL+C copy (Cmd+C native)"
     } else {
-        "Ctrl+C copy"
+        "CTRL+C copy"
     }
 }
 
@@ -398,8 +410,9 @@ pub struct TerminalClient {
     prediction_overlay_logged_visible: bool,
     prediction_overlay_logged_underline: bool,
     copy_mode: Option<CopyModeState>,
-    scroll_toggle: KeyBinding,
-    scroll_toggle_hint: String,
+    scroll_toggle: Vec<KeyBinding>,
+    scroll_toggle_display: String,
+    last_plain_esc: Option<Instant>,
     last_render_at: Option<Instant>,
     render_interval: Duration,
     pending_render: bool,
@@ -452,20 +465,29 @@ impl TerminalClient {
 
         let scroll_toggle = env::var(SCROLL_TOGGLE_KEY_ENV)
             .ok()
-            .and_then(|value| {
-                let parsed = parse_scroll_toggle_binding(&value);
-                if parsed.is_none() {
+            .map(|value| {
+                let parsed = parse_scroll_toggle_bindings(&value);
+                if parsed.is_empty() {
                     debug!(
                         target = "client::config",
                         value, "invalid scroll toggle binding, using default"
                     );
+                    default_scroll_toggle_bindings()
+                } else {
+                    parsed
                 }
-                parsed
             })
-            .unwrap_or_else(default_scroll_toggle_binding);
-        let scroll_toggle_hint = scroll_toggle.display();
+            .unwrap_or_else(default_scroll_toggle_bindings);
+        let mut toggle_hints: Vec<String> = vec!["ESC ESC".to_string()];
+        for binding in &scroll_toggle {
+            let upper = binding.display().to_uppercase();
+            if upper != "ESC" && upper != "ESC ESC" && !toggle_hints.contains(&upper) {
+                toggle_hints.push(upper);
+            }
+        }
+        let scroll_toggle_display = toggle_hints.join(" / ");
 
-        Self {
+        let mut client = Self {
             transport,
             renderer,
             render_enabled,
@@ -495,7 +517,8 @@ impl TerminalClient {
             prediction_overlay_logged_underline: false,
             copy_mode: None,
             scroll_toggle,
-            scroll_toggle_hint,
+            scroll_toggle_display,
+            last_plain_esc: None,
             last_render_at: None,
             render_interval: Duration::from_millis(16),
             pending_render: false,
@@ -529,7 +552,12 @@ impl TerminalClient {
             diagnostic_server: None,
             initial_scroll_done: false,
             injected_latency_ms: None,
-        }
+        };
+
+        client.apply_tail_status();
+        client.update_connection_indicator();
+
+        client
     }
 
     pub fn with_render(mut self, enabled: bool) -> Self {
@@ -649,6 +677,7 @@ impl TerminalClient {
 
     pub fn run(mut self) -> Result<(), ClientError> {
         self.setup_tui()?;
+        self.send_initial_resize()?;
         debug!(target = "client::loop", "client loop started");
 
         let run_result = (|| -> Result<(), ClientError> {
@@ -749,6 +778,28 @@ impl TerminalClient {
             (Err(err), _) => Err(err),
             (Ok(()), Err(err)) => Err(err),
             (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    fn send_initial_resize(&mut self) -> Result<(), ClientError> {
+        let (cols, rows) = self.detect_terminal_size();
+        self.send_resize(cols, rows)
+    }
+
+    fn detect_terminal_size(&self) -> (u16, u16) {
+        if let Some(tui) = self.tui.as_ref() {
+            if let Ok(size) = tui.size() {
+                let cols = size.width.max(1);
+                let rows = size.height.max(1);
+                if cols > 0 && rows > 0 {
+                    return (cols, rows);
+                }
+            }
+        }
+
+        match crossterm_size() {
+            Ok((cols, rows)) => (cols.max(1), rows.max(1)),
+            Err(_) => (80, 24),
         }
     }
 
@@ -2551,16 +2602,17 @@ impl TerminalClient {
         } else {
             "Space mark"
         };
-        let mut text = format!(
-            "scrollback [{focus}] • {} tail • {} • {}",
-            self.scroll_toggle_hint,
-            selection_hint,
-            copy_shortcut_hint()
-        );
+        let mut main = format!("scrollback [{focus}] • {selection_hint}");
         if matches!(state.selection_mode, SelectionMode::Character) {
-            text.push_str(" • V line • Ctrl+V block");
+            main.push_str(" • V line • Ctrl+V block");
         }
-        self.renderer.set_status_message(Some(text));
+        let mut highlight = format!("{} to tail • ESC exit", self.scroll_toggle_display);
+        if state.selection_active {
+            highlight.push_str(" • CTRL+C copy");
+        }
+        highlight.push_str(" • CTRL+Q quit");
+        self.renderer
+            .set_status_with_highlight(Some(main), Some(highlight));
         self.force_render = true;
     }
 
@@ -2637,20 +2689,17 @@ impl TerminalClient {
     }
 
     fn tail_status_text(&self) -> String {
-        format!("tail • {} scrollback", self.scroll_toggle_hint)
+        "tail".to_string()
     }
 
     fn scrollback_base_status(&self) -> String {
-        format!(
-            "scrollback • {} tail • {}",
-            self.scroll_toggle_hint,
-            copy_shortcut_hint()
-        )
+        "scrollback".to_string()
     }
 
     fn apply_tail_status(&mut self) {
+        let highlight = format!("{} to scrollback", self.scroll_toggle_display);
         self.renderer
-            .set_status_message(Some(self.tail_status_text()));
+            .set_status_with_highlight(Some(self.tail_status_text()), Some(highlight));
         self.force_render = true;
     }
 
@@ -2659,7 +2708,13 @@ impl TerminalClient {
             self.update_copy_mode_status();
         } else {
             let text = self.scrollback_base_status();
-            self.renderer.set_status_message(Some(text));
+            let highlight = format!(
+                "{} to tail • ESC exit • {}",
+                self.scroll_toggle_display,
+                copy_shortcut_hint()
+            );
+            self.renderer
+                .set_status_with_highlight(Some(text), Some(highlight));
             self.force_render = true;
         }
     }
@@ -2676,6 +2731,62 @@ impl TerminalClient {
             ViewMode::Tail => self.apply_tail_status(),
             ViewMode::Scrollback => self.apply_scrollback_status(),
         }
+    }
+
+    fn refresh_view_mode_status(&mut self) {
+        match self.view_mode {
+            ViewMode::Tail => self.apply_tail_status(),
+            ViewMode::Scrollback => self.apply_scrollback_status(),
+        }
+    }
+
+    fn update_connection_indicator(&mut self) {
+        let spinner =
+            AUTH_SPINNER_FRAMES[self.authorization_spinner_index % AUTH_SPINNER_FRAMES.len()];
+        let (text, style) = match self.authorization_state {
+            AuthorizationState::Connecting => (
+                format!("🔌 connecting {spinner}"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            AuthorizationState::Waiting => {
+                let message = self
+                    .authorization_message
+                    .clone()
+                    .unwrap_or_else(|| AUTH_WAIT_MESSAGE.to_string());
+                (
+                    format!("🕑 {message} {spinner}"),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            }
+            AuthorizationState::Approved => {
+                let message = self
+                    .authorization_message
+                    .clone()
+                    .unwrap_or_else(|| "connected".to_string());
+                (
+                    format!("✅ {message}"),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )
+            }
+            AuthorizationState::Denied => {
+                let message = self
+                    .authorization_message
+                    .clone()
+                    .unwrap_or_else(|| AUTH_DENIED_MESSAGE.to_string());
+                (
+                    format!("⛔ {message}"),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )
+            }
+        };
+        self.renderer
+            .set_connection_status(text.trim().to_string(), style);
     }
 
     fn sync_view_mode_with_follow(&mut self) {
@@ -2696,9 +2807,39 @@ impl TerminalClient {
     }
 
     fn handle_scroll_toggle(&mut self, key: &KeyEvent) -> Result<bool, ClientError> {
-        if !self.scroll_toggle.matches(key) {
+        if key.kind != KeyEventKind::Press {
             return Ok(false);
         }
+
+        let mut triggered = false;
+
+        if self
+            .scroll_toggle
+            .iter()
+            .any(|binding| binding.matches(key))
+        {
+            triggered = true;
+        } else if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+            let now = Instant::now();
+            if let Some(last) = self.last_plain_esc {
+                if now.saturating_duration_since(last) <= SCROLL_TOGGLE_DOUBLE_ESC {
+                    triggered = true;
+                    self.last_plain_esc = None;
+                } else {
+                    self.last_plain_esc = Some(now);
+                }
+            } else {
+                self.last_plain_esc = Some(now);
+            }
+        } else {
+            self.last_plain_esc = None;
+        }
+
+        if !triggered {
+            return Ok(false);
+        }
+
+        self.last_plain_esc = None;
 
         if self.copy_mode.is_some() {
             self.exit_copy_mode();
@@ -3160,74 +3301,8 @@ impl TerminalClient {
     }
 
     fn handle_local_key(&mut self, key: &KeyEvent) -> bool {
-        if !key.modifiers.intersects(KeyModifiers::ALT) {
-            return false;
-        }
-        let lower = match key.code {
-            KeyCode::Char(c) => c.to_ascii_lowercase(),
-            _ => '\0',
-        };
-        match key.code {
-            KeyCode::Up => {
-                self.renderer.set_follow_tail(false);
-                self.renderer.scroll_lines(-1);
-                self.sync_view_mode_with_follow();
-                self.force_render = true;
-                true
-            }
-            KeyCode::Down => {
-                self.renderer.scroll_lines(1);
-                self.sync_view_mode_with_follow();
-                self.force_render = true;
-                true
-            }
-            KeyCode::PageUp => {
-                self.renderer.set_follow_tail(false);
-                self.renderer.scroll_pages(-1);
-                self.sync_view_mode_with_follow();
-                self.force_render = true;
-                true
-            }
-            KeyCode::PageDown => {
-                self.renderer.scroll_pages(1);
-                self.sync_view_mode_with_follow();
-                self.force_render = true;
-                true
-            }
-            KeyCode::End => {
-                self.renderer.scroll_to_tail();
-                self.sync_view_mode_with_follow();
-                self.force_render = true;
-                true
-            }
-            KeyCode::Home => {
-                self.renderer.scroll_to_top();
-                self.sync_view_mode_with_follow();
-                self.force_render = true;
-                true
-            }
-            KeyCode::Char(_) if lower == 'f' => {
-                self.renderer.toggle_follow_tail();
-                self.force_render = true;
-                true
-            }
-            KeyCode::Char(_) if lower == 'c' => {
-                if let Some(state) = self.copy_mode.as_mut() {
-                    state.clear_selection();
-                    self.update_copy_mode_selection();
-                    self.update_copy_mode_status();
-                } else {
-                    self.renderer.clear_selection();
-                }
-                self.force_render = true;
-                true
-            }
-            KeyCode::Char(_) if lower == 'y' => {
-                self.copy_selection_to_clipboard(true);
-                true
-            }
-            _ => false,
-        }
+        let _ = key;
+        false
     }
 
     fn send_input(&mut self, bytes: &[u8]) -> Result<(), ClientError> {
@@ -3342,37 +3417,15 @@ impl TerminalClient {
     }
 
     fn refresh_authorization_status(&mut self) {
+        self.update_connection_indicator();
         match self.authorization_state {
-            AuthorizationState::Waiting => {
-                let base = self
-                    .authorization_message
-                    .clone()
-                    .unwrap_or_else(|| AUTH_WAIT_MESSAGE.to_string());
-                let spinner = AUTH_SPINNER_FRAMES
-                    [self.authorization_spinner_index % AUTH_SPINNER_FRAMES.len()];
-                let text = format!("{base} {spinner}");
-                self.renderer.set_status_message(Some(text));
-                self.force_render = true;
-            }
             AuthorizationState::Denied => {
                 if let Some(message) = &self.authorization_message {
-                    self.renderer.set_status_message(Some(message.clone()));
+                    self.show_error_status(message.clone());
                 }
-                self.force_render = true;
             }
-            AuthorizationState::Approved => {
-                if let Some(message) = &self.authorization_message {
-                    self.renderer.set_status_message(Some(message.clone()));
-                } else {
-                    self.renderer.set_status_message::<String>(None);
-                }
-                self.force_render = true;
-            }
-            AuthorizationState::Connecting => {
-                if self.authorization_message.is_some() {
-                    self.renderer.set_status_message::<String>(None);
-                }
-                self.force_render = true;
+            _ => {
+                self.refresh_view_mode_status();
             }
         }
     }
@@ -4665,6 +4718,14 @@ impl TerminalClient {
         terminal.hide_cursor().ok();
         if let Ok(area) = terminal.size() {
             self.renderer.on_resize(area.width, area.height);
+            // Ensure the host immediately learns our viewport dimensions so shells don't
+            // default to 1-column layouts before the first SIGWINCH.
+            if let Err(err) = self.send_resize(area.width, area.height) {
+                debug!(
+                    target = "client::outgoing",
+                    "failed to send initial resize: {}", err
+                );
+            }
         }
         self.renderer.mark_dirty();
         self.force_render = true;
@@ -6002,6 +6063,24 @@ mod tests {
         assert!(client.copy_mode.is_none());
         assert!(matches!(client.view_mode, ViewMode::Tail));
         assert!(client.renderer.is_following_tail());
+    }
+
+    #[test]
+    fn double_esc_toggle_enters_scrollback() {
+        let mut client = new_client();
+        client.render_enabled = true;
+        client.renderer.ensure_size(2, 12);
+        client.renderer.apply_row_from_text(0, 1, "alpha");
+        client.renderer.apply_row_from_text(1, 2, "beta");
+        client.renderer.set_follow_tail(true);
+
+        let esc = key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!client.handle_scroll_toggle(&esc).unwrap());
+        assert!(client.copy_mode.is_none());
+
+        assert!(client.handle_scroll_toggle(&esc).unwrap());
+        assert!(client.copy_mode.is_some());
+        assert!(matches!(client.view_mode, ViewMode::Scrollback));
     }
 
     #[test]

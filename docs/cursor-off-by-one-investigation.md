@@ -44,14 +44,15 @@ The server position (col=38) appears to be **one column before** the actual inpu
 
 ## Latest Findings (October 8, 2025)
 
-1. **Cursor hidden on connect:** Suppressing the first `(0, 0)` cursor frame means we never draw a caret until another authoritative update arrives. The server sticks at `(0, 0)` until the first keypress, so the web client looks cursorless on startup.
-2. **Viewport jumps to historic rows:** `followTail` scrolls to the tail of the 160-row snapshot we receive, even when only the most recent 2 rows contain non-empty content. Result: the initial render is scrolled hundreds of rows past the prompt.
-3. **Off-by-one still present:** After Enter, the server continues to report `col=38`. The web client now trusts the server frame (no longer clamps to committed width), so the cursor still lands one cell to the left. This points back to the server/emulator generating the wrong column rather than the web clamp.
+1. **Cursor hidden on connect:** The `(0, 0)` cursor suppression now holds the frame until the prompt row has real content, then re-enables visibility so the caret appears without the original top-left flash.
+2. **Viewport jumps to historic rows:** Follow-tail now clamps to the actual content height; initial renders stay near the prompt even when the snapshot includes hundreds of blank history rows.
+3. **Off-by-one still present:** After Enter, the server continues to report `col=38`. The web client trusts the server frame, so the cursor still lands one cell to the left. This points back to the server/emulator generating the wrong column rather than the web clamp.
+4. **Server cursor tracing:** `server::cursor` trace logs now include the reported column, committed width, and a short row preview so we can diff the prompt against the authoritative column.
 
 ### Next Checks
-- Revisit the initial cursor suppression so we show a caret on connect (maybe only skip rendering the flash but keep visibility when no alternative frame arrives).
-- Investigate why the initial snapshot includes 160 rows; confirm whether the emulator is reusing history even for a fresh session or if we need to clamp the viewport before first paint.
-- Instrument the Rust emulator (`AlacrittyEmulator::compute_cursor_components`) to log the raw column it emits right after a prompt write, and compare against the prompt string length.
+- Verify the deferred cursor reveal keeps the caret visible immediately after connect without reintroducing the top-left flash.
+- Capture a session with `RUST_LOG=server::cursor=trace` and diff the logged `committed_width`/`preview` against what the web client renders right after Enter.
+- If the server continues to report `col=38`, inspect the emulator's prompt write path to see where the trailing space is lost.
 
 
 ## What We've Fixed

@@ -185,7 +185,9 @@ pub struct GridRenderer {
     predictions_visible: bool,
     prediction_flagging: bool,
     status_message: Option<String>,
+    status_highlight: Option<String>,
     status_is_error: bool,
+    connection_status: Option<StatusIndicator>,
     styles: HashMap<u32, CachedStyle>,
     debug_context: Option<GridUpdateDebugContext>,
     cursor: Option<GridCursor>,
@@ -207,7 +209,9 @@ impl GridRenderer {
             predictions_visible: false,
             prediction_flagging: false,
             status_message: None,
+            status_highlight: None,
             status_is_error: false,
+            connection_status: None,
             styles: HashMap::new(),
             debug_context: None,
             cursor: None,
@@ -1244,15 +1248,33 @@ impl GridRenderer {
     }
 
     pub fn set_status_message<S: Into<String>>(&mut self, message: Option<S>) {
-        self.set_status_internal(message.map(Into::into), false);
+        self.set_status_internal(message.map(Into::into), None, false);
     }
 
     pub fn set_status_error_message<S: Into<String>>(&mut self, message: Option<S>) {
-        self.set_status_internal(message.map(Into::into), true);
+        self.set_status_internal(message.map(Into::into), None, true);
     }
 
-    fn set_status_internal(&mut self, message: Option<String>, error: bool) {
+    pub fn set_status_with_highlight<S1, S2>(&mut self, message: Option<S1>, highlight: Option<S2>)
+    where
+        S1: Into<String>,
+        S2: Into<String>,
+    {
+        self.set_status_internal(message.map(Into::into), highlight.map(Into::into), false);
+    }
+
+    fn set_status_internal(
+        &mut self,
+        message: Option<String>,
+        highlight: Option<String>,
+        error: bool,
+    ) {
         self.status_message = message;
+        if error {
+            self.status_highlight = None;
+        } else {
+            self.status_highlight = highlight;
+        }
         self.status_is_error = error && self.status_message.is_some();
         self.mark_dirty();
     }
@@ -1260,6 +1282,21 @@ impl GridRenderer {
     #[cfg(test)]
     pub fn status_for_test(&self) -> (Option<String>, bool) {
         (self.status_message.clone(), self.status_is_error)
+    }
+
+    pub fn set_connection_status<S: Into<String>>(&mut self, text: S, style: Style) {
+        self.connection_status = Some(StatusIndicator {
+            text: text.into(),
+            style,
+        });
+        self.mark_dirty();
+    }
+
+    pub fn clear_connection_status(&mut self) {
+        if self.connection_status.is_some() {
+            self.connection_status = None;
+            self.mark_dirty();
+        }
     }
 
     pub fn on_resize(&mut self, _cols: u16, rows: u16) {
@@ -1739,37 +1776,56 @@ impl GridRenderer {
     fn render_status_line(&self) -> Paragraph<'_> {
         let total_rows = self.total_rows();
         let displayed = self.viewport_height.min(self.rows.len());
-        let follow = if self.follow_tail { "tail" } else { "manual" };
-        let status = self
-            .status_message
-            .as_deref()
-            .unwrap_or("alt+[ copy • alt+f follow • alt+End tail");
-        let loading = if self.has_pending_rows() {
-            " • loading history"
-        } else {
-            ""
-        };
-        let mut spans = vec![Span::raw(format!(
-            "rows {total_rows} • showing {displayed} • scroll {} • mode {} • ",
-            self.viewport_top(),
-            follow
-        ))];
-        let status_span = if self.status_is_error {
-            Span::styled(status.to_string(), Style::default().fg(Color::Red))
-        } else {
-            Span::raw(status.to_string())
-        };
-        spans.push(status_span);
-        if !loading.is_empty() {
-            spans.push(Span::raw(loading));
+        let mut spans: Vec<Span> = Vec::new();
+        if let Some(indicator) = &self.connection_status {
+            spans.push(Span::styled(indicator.text.clone(), indicator.style));
+            spans.push(Span::raw("  "));
         }
+
+        let mut base = format!(
+            "rows {total_rows} • showing {displayed} • scroll {}",
+            self.viewport_top()
+        );
+        if self.has_pending_rows() {
+            base.push_str(" • loading history");
+        }
+        spans.push(Span::raw(base));
+
+        if let Some(message) = &self.status_message {
+            let text = format!(" • {}", message);
+            if self.status_is_error {
+                spans.push(Span::styled(
+                    text,
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::raw(text));
+            }
+        }
+
+        if !self.status_is_error {
+            if let Some(highlight) = &self.status_highlight {
+                spans.push(Span::styled(
+                    format!(" • {}", highlight),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
+
         Paragraph::new(Line::from(spans)).block(Block::default())
     }
 
     fn render_instructions(&self) -> Paragraph<'_> {
-        let text = "alt+↑/↓ line • alt+PgUp/PgDn page • alt+End tail • alt+f follow";
+        let text = "ESC ESC toggle • ESC exit scrollback • CTRL+C copy selection";
         Paragraph::new(text).block(Block::default())
     }
+}
+
+struct StatusIndicator {
+    text: String,
+    style: Style,
 }
 
 fn decode_packed_style(fg: u32, bg: u32, attrs: u8) -> Style {

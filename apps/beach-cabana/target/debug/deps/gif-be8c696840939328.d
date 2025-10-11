@@ -1,0 +1,11 @@
+/Users/arellidow/development/beach/apps/beach-cabana/target/debug/deps/gif-be8c696840939328.d: /Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/lib.rs /Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/traits.rs /Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/common.rs /Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/reader/mod.rs /Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/reader/decoder.rs /Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/encoder.rs /Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/../README.md
+
+/Users/arellidow/development/beach/apps/beach-cabana/target/debug/deps/libgif-be8c696840939328.rmeta: /Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/lib.rs /Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/traits.rs /Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/common.rs /Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/reader/mod.rs /Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/reader/decoder.rs /Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/encoder.rs /Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/../README.md
+
+/Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/lib.rs:
+/Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/traits.rs:
+/Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/common.rs:
+/Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/reader/mod.rs:
+/Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/reader/decoder.rs:
+/Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/encoder.rs:
+/Users/arellidow/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/gif-0.12.0/src/../README.md:

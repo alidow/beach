@@ -1,8 +1,10 @@
 use anyhow::Result;
+use beach_rescue_core::{GuardrailCounters, GuardrailSnapshot};
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+use time::OffsetDateTime;
 
 use crate::signaling::WebRtcSdpPayload;
 
@@ -196,6 +198,62 @@ impl Storage {
             None => Ok(None),
         }
     }
+
+    pub async fn track_fallback_activation(
+        &self,
+        cohort_id: &str,
+        total_sessions_hint: Option<u64>,
+    ) -> Result<GuardrailSnapshot> {
+        let mut conn = self.redis.clone();
+        let now = OffsetDateTime::now_utc();
+        let bucket = guardrail_bucket(now);
+
+        let fallback_key = guardrail_fallback_key(cohort_id, &bucket);
+        let total_key = guardrail_total_key(cohort_id, &bucket);
+        let ttl_seconds = 90 * 60; // 90 minutes to cover an hour bucket plus buffer
+
+        let fallback_sessions: u64 = {
+            let count: u64 = conn.incr(&fallback_key, 1).await?;
+            if count == 1 {
+                let _: () = conn.expire(&fallback_key, ttl_seconds).await?;
+            }
+            count
+        };
+
+        let stored_total = if let Some(total_hint) = total_sessions_hint {
+            let _: () = conn.set(&total_key, total_hint).await?;
+            let _: () = conn.expire(&total_key, ttl_seconds).await?;
+            total_hint
+        } else {
+            let existing: Option<u64> = conn.get(&total_key).await?;
+            existing.unwrap_or(fallback_sessions)
+        };
+
+        let counters = GuardrailCounters {
+            total_sessions: stored_total.max(fallback_sessions),
+            fallback_sessions,
+        };
+
+        Ok(GuardrailSnapshot::new(now, counters))
+    }
+}
+
+fn guardrail_bucket(now: OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}-{:02}",
+        now.year(),
+        now.month() as u8,
+        now.day(),
+        now.hour()
+    )
+}
+
+fn guardrail_fallback_key(cohort_id: &str, bucket: &str) -> String {
+    format!("fallback:cohort:{}:{}:fallback", cohort_id, bucket)
+}
+
+fn guardrail_total_key(cohort_id: &str, bucket: &str) -> String {
+    format!("fallback:cohort:{}:{}:total", cohort_id, bucket)
 }
 
 fn offer_payload_key(session_id: &str, handshake_id: &str) -> String {

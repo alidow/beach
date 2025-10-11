@@ -2,6 +2,12 @@
 members = [
   "apps/beach",
   "apps/beach-road",
+  "apps/beach-rescue/core",
+  "apps/beach-rescue/server",
+  "apps/beach-rescue/client",
   "crates/test-timeout",
+]
+exclude = [
+  "apps/beach-cabana",
 ]
 resolver = "2"

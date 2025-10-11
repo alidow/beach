@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
+use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use crossbeam_channel::{
     Receiver as CrossbeamReceiver, RecvTimeoutError as CrossbeamRecvTimeoutError,
     TryRecvError as CrossbeamTryRecvError, unbounded as crossbeam_unbounded,
@@ -41,9 +43,23 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_ACK_POLL_ATTEMPTS: usize = 200;
 const READY_ACK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MCP_CHANNEL_LABEL: &str = "mcp-jsonrpc";
+mod secure_handshake;
+mod secure_signaling;
 mod signaling;
 
+use secure_handshake::{
+    HANDSHAKE_CHANNEL_LABEL, HandshakeParams, HandshakeResult, HandshakeRole,
+    build_prologue_context, handshake_channel_init, run_handshake, secure_transport_enabled,
+};
+use secure_signaling::{MessageLabel, SealedEnvelope, open_message, seal_message, should_encrypt};
 use signaling::{PeerRole, RemotePeerEvent, RemotePeerJoined, SignalingClient, WebRTCSignal};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct IceCandidateBlob {
+    candidate: String,
+    sdp_mid: Option<String>,
+    sdp_mline_index: Option<u32>,
+}
 
 #[derive(Clone, Default)]
 pub struct WebRtcChannels {
@@ -96,17 +112,148 @@ impl WebRtcChannels {
     }
 }
 
+const TRANSPORT_ENCRYPTION_VERSION: u8 = 1;
+const TRANSPORT_ENCRYPTION_AAD: &[u8] = b"beach:secure-transport:v1";
+
+struct EncryptionState {
+    send_cipher: ChaCha20Poly1305,
+    recv_cipher: ChaCha20Poly1305,
+    send_counter: AtomicU64,
+    recv_counter: AtomicU64,
+}
+
+struct EncryptionManager {
+    state: Mutex<Option<EncryptionState>>,
+    enabled: AtomicBool,
+}
+
+impl EncryptionManager {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(None),
+            enabled: AtomicBool::new(false),
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::SeqCst)
+    }
+
+    fn enable(&self, keys: &HandshakeResult) -> Result<(), TransportError> {
+        let mut guard = self.state.lock().unwrap();
+        if guard.is_some() {
+            return Ok(());
+        }
+        let send_cipher = ChaCha20Poly1305::new_from_slice(&keys.send_key).map_err(|err| {
+            TransportError::Setup(format!("secure transport send key invalid: {err}"))
+        })?;
+        let recv_cipher = ChaCha20Poly1305::new_from_slice(&keys.recv_key).map_err(|err| {
+            TransportError::Setup(format!("secure transport recv key invalid: {err}"))
+        })?;
+        guard.replace(EncryptionState {
+            send_cipher,
+            recv_cipher,
+            send_counter: AtomicU64::new(0),
+            recv_counter: AtomicU64::new(0),
+        });
+        self.enabled.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, TransportError> {
+        let guard = self.state.lock().unwrap();
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| TransportError::Setup("secure transport not negotiated".into()))?;
+        let counter = state.send_counter.fetch_add(1, Ordering::SeqCst);
+        let nonce_bytes = nonce_from_counter(counter);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = state
+            .send_cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext,
+                    aad: TRANSPORT_ENCRYPTION_AAD,
+                },
+            )
+            .map_err(|err| {
+                TransportError::Setup(format!("secure transport encrypt failed: {err}"))
+            })?;
+        let mut frame = Vec::with_capacity(1 + 8 + ciphertext.len());
+        frame.push(TRANSPORT_ENCRYPTION_VERSION);
+        frame.extend_from_slice(&counter.to_be_bytes());
+        frame.extend_from_slice(&ciphertext);
+        Ok(frame)
+    }
+
+    fn decrypt(&self, frame: &[u8]) -> Result<Vec<u8>, TransportError> {
+        let guard = self.state.lock().unwrap();
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| TransportError::Setup("secure transport not negotiated".into()))?;
+        if frame.len() < 9 {
+            return Err(TransportError::Setup(
+                "secure transport frame too short".into(),
+            ));
+        }
+        let version = frame[0];
+        if version != TRANSPORT_ENCRYPTION_VERSION {
+            return Err(TransportError::Setup(
+                "secure transport version mismatch".into(),
+            ));
+        }
+        let mut counter_bytes = [0u8; 8];
+        counter_bytes.copy_from_slice(&frame[1..9]);
+        let counter = u64::from_be_bytes(counter_bytes);
+        let expected = state.recv_counter.load(Ordering::SeqCst);
+        if counter != expected {
+            return Err(TransportError::Setup(
+                "secure transport counter mismatch".into(),
+            ));
+        }
+        let nonce_bytes = nonce_from_counter(counter);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let plaintext = state
+            .recv_cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: &frame[9..],
+                    aad: TRANSPORT_ENCRYPTION_AAD,
+                },
+            )
+            .map_err(|err| {
+                TransportError::Setup(format!("secure transport decrypt failed: {err}"))
+            })?;
+        state.recv_counter.fetch_add(1, Ordering::SeqCst);
+        Ok(plaintext)
+    }
+}
+
+fn nonce_from_counter(counter: u64) -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    nonce[4..].copy_from_slice(&counter.to_be_bytes());
+    nonce
+}
+
 #[derive(Clone)]
 pub struct WebRtcConnection {
     transport: Arc<dyn Transport>,
     channels: WebRtcChannels,
+    secure: Option<Arc<HandshakeResult>>,
 }
 
 impl WebRtcConnection {
-    pub fn new(transport: Arc<dyn Transport>, channels: WebRtcChannels) -> Self {
+    pub fn new(
+        transport: Arc<dyn Transport>,
+        channels: WebRtcChannels,
+        secure: Option<Arc<HandshakeResult>>,
+    ) -> Self {
         Self {
             transport,
             channels,
+            secure,
         }
     }
 
@@ -116,6 +263,10 @@ impl WebRtcConnection {
 
     pub fn channels(&self) -> WebRtcChannels {
         self.channels.clone()
+    }
+
+    pub fn secure(&self) -> Option<Arc<HandshakeResult>> {
+        self.secure.clone()
     }
 }
 
@@ -194,6 +345,7 @@ struct WebRtcTransport {
     _dc: Arc<RTCDataChannel>,
     _router: Option<Arc<AsyncMutex<Router>>>,
     _signaling: Option<Arc<SignalingClient>>,
+    encryption: Arc<EncryptionManager>,
 }
 
 impl WebRtcTransport {
@@ -213,16 +365,35 @@ impl WebRtcTransport {
         let handler_id = id;
         let tx_clone = inbound_tx.clone();
         tracing::debug!(target = "webrtc", transport_id = ?handler_id, "registering data channel handler");
+        let encryption = Arc::new(EncryptionManager::new());
+        let encryption_clone_for_handler = Arc::clone(&encryption);
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
             let sender = tx_clone.clone();
             let log_id = handler_id;
+            let encryption = Arc::clone(&encryption_clone_for_handler);
             Box::pin(async move {
                 let bytes = msg.data.to_vec();
-                if let Some(message) = decode_message(&bytes) {
+                let payload = if encryption.is_enabled() {
+                    match encryption.decrypt(&bytes) {
+                        Ok(plaintext) => plaintext,
+                        Err(err) => {
+                            tracing::warn!(
+                                target = "webrtc",
+                                transport_id = ?log_id,
+                                error = %err,
+                                "failed to decrypt inbound frame"
+                            );
+                            return;
+                        }
+                    }
+                } else {
+                    bytes
+                };
+                if let Some(message) = decode_message(&payload) {
                     tracing::debug!(
                         target = "webrtc",
                         transport_id = ?log_id,
-                        frame_len = bytes.len(),
+                        frame_len = payload.len(),
                         sequence = message.sequence,
                         "received frame"
                     );
@@ -238,7 +409,7 @@ impl WebRtcTransport {
                     tracing::warn!(
                         target = "webrtc",
                         transport_id = ?log_id,
-                        frame_len = bytes.len(),
+                        frame_len = payload.len(),
                         "failed to decode message"
                     );
                 }
@@ -430,7 +601,12 @@ impl WebRtcTransport {
             _dc: dc,
             _router: router,
             _signaling: signaling,
+            encryption,
         }
+    }
+
+    fn enable_encryption(&self, result: &HandshakeResult) -> Result<(), TransportError> {
+        self.encryption.enable(result)
     }
 }
 
@@ -446,7 +622,10 @@ impl Transport for WebRtcTransport {
     }
 
     fn send(&self, message: TransportMessage) -> Result<(), TransportError> {
-        let bytes = encode_message(&message);
+        let mut bytes = encode_message(&message);
+        if self.encryption.is_enabled() {
+            bytes = self.encryption.encrypt(&bytes)?;
+        }
         tracing::info!(
             target = "webrtc",
             transport_id = ?self.id,
@@ -534,11 +713,16 @@ struct WebRtcSdpPayload {
     handshake_id: String,
     from_peer: String,
     to_peer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sealed: Option<SealedEnvelope>,
 }
 
 impl WebRtcSdpPayload {
-    fn to_session_description(&self) -> Result<RTCSessionDescription, TransportError> {
-        session_description_from_payload(self)
+    fn to_session_description(
+        &self,
+        passphrase: Option<&str>,
+    ) -> Result<RTCSessionDescription, TransportError> {
+        session_description_from_payload(self, passphrase)
     }
 }
 
@@ -561,6 +745,7 @@ struct OffererInner {
     signaling_client: Arc<SignalingClient>,
     signaling_base: String,
     poll_interval: Duration,
+    passphrase: Option<String>,
     accepted_tx: tokio_mpsc::UnboundedSender<OffererAcceptedTransport>,
     peer_tasks: AsyncMutex<HashMap<String, PeerNegotiatorHandle>>,
     peer_states: AsyncMutex<HashMap<String, PeerLifecycleState>>,
@@ -602,6 +787,7 @@ impl OffererSupervisor {
             signaling_client,
             signaling_base,
             poll_interval,
+            passphrase: passphrase.map(|p| p.to_string()),
             accepted_tx,
             peer_tasks: AsyncMutex::new(HashMap::new()),
             peer_states: AsyncMutex::new(HashMap::new()),
@@ -946,12 +1132,14 @@ async fn negotiate_offerer_peer(
         })
     }));
 
+    let signaling_for_incoming = Arc::clone(&inner.signaling_client);
     let pc_for_incoming = Arc::clone(&pc);
     let pending_for_incoming = Arc::clone(&pending_ice);
     let handshake_for_incoming = handshake_id_arc.clone();
     let cancel_for_incoming = Arc::clone(&cancel_flag);
     let mut signal_stream = signals;
     let peer_id_for_incoming = peer_id.clone();
+    let passphrase_for_signals = inner.passphrase.clone();
     let ice_task = spawn_on_global(async move {
         while let Some(signal) = signal_stream.recv().await {
             if cancel_for_incoming.load(Ordering::SeqCst) {
@@ -962,6 +1150,7 @@ async fn negotiate_offerer_peer(
                 sdp_mid,
                 sdp_mline_index,
                 handshake_id,
+                sealed,
             } = signal
             {
                 if handshake_id != handshake_for_incoming.as_str() {
@@ -973,10 +1162,35 @@ async fn negotiate_offerer_peer(
                     );
                     continue;
                 }
-                let init = RTCIceCandidateInit {
+                let local_peer_id = signaling_for_incoming
+                    .assigned_peer_id()
+                    .await
+                    .unwrap_or_else(|| signaling_for_incoming.peer_id().to_string());
+                let resolved = match resolve_ice_candidate(
                     candidate,
                     sdp_mid,
-                    sdp_mline_index: sdp_mline_index.map(|idx| idx as u16),
+                    sdp_mline_index,
+                    sealed,
+                    passphrase_for_signals.as_deref(),
+                    handshake_for_incoming.as_str(),
+                    &peer_id_for_incoming,
+                    local_peer_id.as_str(),
+                ) {
+                    Ok(resolved) => resolved,
+                    Err(err) => {
+                        tracing::warn!(
+                            target = "webrtc",
+                            peer_id = %peer_id_for_incoming,
+                            error = %err,
+                            "failed to decode remote ice candidate"
+                        );
+                        continue;
+                    }
+                };
+                let init = RTCIceCandidateInit {
+                    candidate: resolved.candidate,
+                    sdp_mid: resolved.sdp_mid,
+                    sdp_mline_index: resolved.sdp_mline_index.map(|idx| idx as u16),
                     username_fragment: None,
                 };
                 let has_remote = pc_for_incoming.remote_description().await.is_some();
@@ -1017,6 +1231,22 @@ async fn negotiate_offerer_peer(
         })
     }));
 
+    let secure_transport_active = secure_transport_enabled()
+        && inner
+            .passphrase
+            .as_ref()
+            .map(|p| !p.trim().is_empty())
+            .unwrap_or(false);
+    let handshake_dc = if secure_transport_active {
+        Some(
+            pc.create_data_channel(HANDSHAKE_CHANNEL_LABEL, Some(handshake_channel_init()))
+                .await
+                .map_err(to_setup_error)?,
+        )
+    } else {
+        None
+    };
+
     if cancel_flag.load(Ordering::SeqCst) {
         let _ = pc.close().await;
         ice_task.abort();
@@ -1038,7 +1268,13 @@ async fn negotiate_offerer_peer(
         .await
         .unwrap_or_else(|| inner.signaling_client.peer_id().to_string());
 
-    let payload = payload_from_description(&local_desc, &handshake_id, &offerer_peer_id, &peer.id);
+    let payload = payload_from_description(
+        &local_desc,
+        &handshake_id,
+        &offerer_peer_id,
+        &peer.id,
+        inner.passphrase.as_deref(),
+    )?;
 
     if cancel_flag.load(Ordering::SeqCst) {
         let _ = pc.close().await;
@@ -1056,7 +1292,7 @@ async fn negotiate_offerer_peer(
     )
     .await?;
 
-    let remote_desc = answer.to_session_description()?;
+    let remote_desc = answer.to_session_description(inner.passphrase.as_deref())?;
     pc.set_remote_description(remote_desc)
         .await
         .map_err(to_setup_error)?;
@@ -1288,11 +1524,36 @@ async fn negotiate_offerer_peer(
         );
     }
 
+    let mut peer_metadata = peer.metadata.clone().unwrap_or_default();
+    let secure_context = if let (true, Some(passphrase), Some(handshake_channel)) = (
+        secure_transport_active,
+        inner.passphrase.as_ref(),
+        handshake_dc.clone(),
+    ) {
+        let prologue_context = build_prologue_context(&handshake_id, &offerer_peer_id, &peer_id);
+        let params = HandshakeParams {
+            passphrase: passphrase.clone(),
+            handshake_id: handshake_id.clone(),
+            local_peer_id: offerer_peer_id.clone(),
+            remote_peer_id: peer_id.clone(),
+            prologue_context,
+        };
+        let result = run_handshake(HandshakeRole::Initiator, handshake_channel, params).await?;
+        transport.enable_encryption(&result)?;
+        let result_arc = Arc::new(result);
+        peer_metadata
+            .entry("secure_verification".to_string())
+            .or_insert(result_arc.verification_code.clone());
+        Some(result_arc)
+    } else {
+        None
+    };
+
     Ok(Some(OffererAcceptedTransport {
-        peer_id: peer.id,
+        peer_id: peer_id,
         handshake_id,
-        metadata: peer.metadata.unwrap_or_default(),
-        connection: WebRtcConnection::new(transport_dyn, channels),
+        metadata: peer_metadata,
+        connection: WebRtcConnection::new(transport_dyn, channels, secure_context),
     }))
 }
 
@@ -1327,6 +1588,20 @@ async fn connect_answerer(
     passphrase: Option<&str>,
     label: Option<&str>,
 ) -> Result<WebRtcConnection, TransportError> {
+    let passphrase_owned = passphrase.map(|s| s.to_string());
+    let secure_transport_active = secure_transport_enabled()
+        && passphrase_owned
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+    let (secure_tx, secure_rx) =
+        oneshot::channel::<Result<Option<Arc<HandshakeResult>>, TransportError>>();
+    let secure_sender = Arc::new(AsyncMutex::new(Some(secure_tx)));
+    if !secure_transport_active {
+        if let Some(sender) = secure_sender.lock().await.take() {
+            let _ = sender.send(Ok(None));
+        }
+    }
     let client = Client::new();
     let signaling_client = SignalingClient::connect(
         signaling_url,
@@ -1408,7 +1683,7 @@ async fn connect_answerer(
             }
         }
     };
-    let offer_desc = session_description_from_payload(&offer_payload)?;
+    let offer_desc = session_description_from_payload(&offer_payload, passphrase_owned.as_deref())?;
     let handshake_id = Arc::new(offer_payload.handshake_id.clone());
     let remote_offer_peer = offer_payload.from_peer.clone();
 
@@ -1480,6 +1755,9 @@ async fn connect_answerer(
     let pending_for_incoming: Arc<AsyncMutex<Vec<RTCIceCandidateInit>>> =
         Arc::new(AsyncMutex::new(Vec::new()));
     let pending_for_incoming_clone = Arc::clone(&pending_for_incoming);
+    let remote_offer_peer_for_signals = remote_offer_peer.clone();
+    let assigned_peer_id_for_signals = assigned_peer_id.clone();
+    let passphrase_for_signals = passphrase_owned.clone();
     spawn_on_global(async move {
         while let Some(signal) = signaling_for_incoming.recv_webrtc_signal().await {
             if let WebRTCSignal::IceCandidate {
@@ -1487,6 +1765,7 @@ async fn connect_answerer(
                 sdp_mid,
                 sdp_mline_index,
                 handshake_id,
+                sealed,
             } = signal
             {
                 if handshake_for_incoming.as_str() != handshake_id {
@@ -1497,10 +1776,31 @@ async fn connect_answerer(
                     );
                     continue;
                 }
-                let init = RTCIceCandidateInit {
+                let resolved = match resolve_ice_candidate(
                     candidate,
                     sdp_mid,
-                    sdp_mline_index: sdp_mline_index.map(|idx| idx as u16),
+                    sdp_mline_index,
+                    sealed,
+                    passphrase_for_signals.as_deref(),
+                    handshake_for_incoming.as_str(),
+                    &remote_offer_peer_for_signals,
+                    assigned_peer_id_for_signals.as_str(),
+                ) {
+                    Ok(resolved) => resolved,
+                    Err(err) => {
+                        tracing::warn!(
+                            target = "webrtc",
+                            handshake_id,
+                            error = %err,
+                            "failed to decode remote ice candidate"
+                        );
+                        continue;
+                    }
+                };
+                let init = RTCIceCandidateInit {
+                    candidate: resolved.candidate,
+                    sdp_mid: resolved.sdp_mid,
+                    sdp_mline_index: resolved.sdp_mline_index.map(|idx| idx as u16),
                     username_fragment: None,
                 };
                 let has_remote = pc_for_incoming.remote_description().await.is_some();
@@ -1528,7 +1828,7 @@ async fn connect_answerer(
     });
 
     let dc_open_notify = Arc::new(Notify::new());
-    let transport_slot: Arc<AsyncMutex<Option<Arc<dyn Transport>>>> =
+    let transport_slot: Arc<AsyncMutex<Option<Arc<WebRtcTransport>>>> =
         Arc::new(AsyncMutex::new(None));
     let pc_for_dc = pc.clone();
     let notify_clone = dc_open_notify.clone();
@@ -1543,19 +1843,72 @@ async fn connect_answerer(
     );
     let signaling_for_dc = Arc::clone(&signaling_client);
     let channels_registry = channels.clone();
+    let secure_sender_holder = Arc::clone(&secure_sender);
+    let passphrase_for_secure = passphrase_owned.clone();
+    let assigned_peer_for_secure = assigned_peer_id.clone();
+    let remote_peer_for_secure = remote_offer_peer.clone();
+    let handshake_for_secure = Arc::clone(&handshake_id);
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let pc = pc_for_dc.clone();
         let notify = notify_clone.clone();
         let slot = slot_clone.clone();
         let signaling_for_transport = Arc::clone(&signaling_for_dc);
         let channels = channels_registry.clone();
+        let secure_sender = Arc::clone(&secure_sender_holder);
+        let passphrase_value = passphrase_for_secure.clone();
+        let assigned_peer_value = assigned_peer_for_secure.clone();
+        let remote_peer_value = remote_peer_for_secure.clone();
+        let handshake_value = Arc::clone(&handshake_for_secure);
         Box::pin(async move {
+            let label = dc.label().to_string();
             tracing::debug!(
                 target = "webrtc",
                 role = "answerer",
-                label = dc.label(),
+                label = %label,
                 "incoming data channel announced"
             );
+
+            if label == HANDSHAKE_CHANNEL_LABEL {
+                if !secure_transport_active {
+                    if let Some(sender) = secure_sender.lock().await.take() {
+                        let _ = sender.send(Ok(None));
+                    }
+                    return;
+                }
+                let Some(passphrase) = passphrase_value.clone() else {
+                    if let Some(sender) = secure_sender.lock().await.take() {
+                        let _ = sender.send(Ok(None));
+                    }
+                    return;
+                };
+                let dc_for_handshake = Arc::clone(&dc);
+                let sender_holder = Arc::clone(&secure_sender);
+                let local_peer = assigned_peer_value.clone();
+                let remote_peer = remote_peer_value.clone();
+                let handshake_id_value = (*handshake_value).clone();
+                spawn_on_global(async move {
+                    let prologue_context = build_prologue_context(
+                        &handshake_id_value,
+                        local_peer.as_str(),
+                        remote_peer.as_str(),
+                    );
+                    let params = HandshakeParams {
+                        passphrase,
+                        handshake_id: handshake_id_value.clone(),
+                        local_peer_id: local_peer.clone(),
+                        remote_peer_id: remote_peer.clone(),
+                        prologue_context,
+                    };
+                    let outcome = run_handshake(HandshakeRole::Responder, dc_for_handshake, params)
+                        .await
+                        .map(|res| Some(Arc::new(res)));
+                    if let Some(sender) = sender_holder.lock().await.take() {
+                        let _ = sender.send(outcome);
+                    }
+                });
+                return;
+            }
+
             let notify_for_open = notify.clone();
             dc.on_open(Box::new(move || {
                 let notify = notify_for_open.clone();
@@ -1581,8 +1934,7 @@ async fn connect_answerer(
                 state = "end",
                 is_populated = slot_guard.is_some()
             );
-            let label = dc.label().to_string();
-            let transport = WebRtcTransport::new(
+            let transport = Arc::new(WebRtcTransport::new(
                 TransportKind::WebRtc,
                 client_id,
                 peer_id,
@@ -1592,11 +1944,11 @@ async fn connect_answerer(
                 Some(notify.clone()),
                 Some(signaling_for_transport),
                 None,
-            );
-            let transport_arc = Arc::new(transport) as Arc<dyn Transport>;
+            ));
+            let transport_dyn: Arc<dyn Transport> = transport.clone();
 
             if slot_guard.is_none() {
-                slot_guard.replace(transport_arc.clone());
+                slot_guard.replace(transport.clone());
                 drop(slot_guard);
 
                 tracing::debug!(
@@ -1605,7 +1957,7 @@ async fn connect_answerer(
                     "sending __ready__ sentinel to offerer"
                 );
 
-                if let Err(err) = transport_arc.send_text("__ready__") {
+                if let Err(err) = transport_dyn.send_text("__ready__") {
                     tracing::warn!(
                         target = "webrtc",
                         error = %err,
@@ -1619,12 +1971,12 @@ async fn connect_answerer(
                     );
                 }
 
-                channels.publish(label.clone(), transport_arc.clone());
+                channels.publish(label.clone(), transport_dyn.clone());
                 return;
             }
 
             drop(slot_guard);
-            channels.publish(label, transport_arc);
+            channels.publish(label, transport_dyn);
         })
     }));
 
@@ -1689,7 +2041,8 @@ async fn connect_answerer(
         handshake_id.as_str(),
         assigned_peer_id.as_str(),
         &remote_offer_peer,
-    );
+        passphrase_owned.as_deref(),
+    )?;
     tracing::debug!(
         target = "beach_human::transport::webrtc",
         role = "answerer",
@@ -1865,7 +2218,28 @@ async fn connect_answerer(
         );
     }
 
-    Ok(WebRtcConnection::new(transport, channels))
+    let secure_context = match timeout(Duration::from_secs(10), secure_rx).await {
+        Ok(Ok(result)) => result?,
+        Ok(Err(_)) => None,
+        Err(_) => {
+            if secure_transport_active {
+                return Err(TransportError::Setup("secure handshake timed out".into()));
+            } else {
+                None
+            }
+        }
+    };
+
+    if let Some(ref result) = secure_context {
+        transport.enable_encryption(result.as_ref())?;
+    }
+    let transport_dyn: Arc<dyn Transport> = transport.clone();
+
+    Ok(WebRtcConnection::new(
+        transport_dyn,
+        channels,
+        secure_context,
+    ))
 }
 
 fn endpoint(base: &str, suffix: &str) -> Result<Url, TransportError> {
@@ -2003,26 +2377,84 @@ fn payload_from_description(
     handshake_id: &str,
     from_peer: &str,
     to_peer: &str,
-) -> WebRtcSdpPayload {
-    WebRtcSdpPayload {
+    passphrase: Option<&str>,
+) -> Result<WebRtcSdpPayload, TransportError> {
+    let typ = desc.sdp_type.to_string();
+    let mut payload = WebRtcSdpPayload {
         sdp: desc.sdp.clone(),
-        typ: desc.sdp_type.to_string(),
+        typ: typ.clone(),
         handshake_id: handshake_id.to_string(),
         from_peer: from_peer.to_string(),
         to_peer: to_peer.to_string(),
+        sealed: None,
+    };
+    if let Some(passphrase_value) = passphrase {
+        if should_encrypt(Some(passphrase_value)) {
+            let label = match desc.sdp_type {
+                RTCSdpType::Offer => MessageLabel::Offer,
+                RTCSdpType::Answer => MessageLabel::Answer,
+                other => {
+                    return Err(TransportError::Setup(format!(
+                        "unsupported sdp type {other} for secure signaling"
+                    )));
+                }
+            };
+            let associated = [from_peer, to_peer, typ.as_str()];
+            let sealed = seal_message(
+                passphrase_value,
+                handshake_id,
+                label,
+                &associated,
+                desc.sdp.as_bytes(),
+            )?;
+            payload.sdp.clear();
+            payload.sealed = Some(sealed);
+        }
     }
+    Ok(payload)
 }
 
 fn session_description_from_payload(
     payload: &WebRtcSdpPayload,
+    passphrase: Option<&str>,
 ) -> Result<RTCSessionDescription, TransportError> {
     let sdp_type = RTCSdpType::from(payload.typ.as_str());
+    let sdp_plain = if let Some(sealed) = &payload.sealed {
+        let passphrase_value = passphrase.ok_or_else(|| {
+            TransportError::Setup("missing passphrase for sealed signaling payload".into())
+        })?;
+        let label = match sdp_type {
+            RTCSdpType::Offer => MessageLabel::Offer,
+            RTCSdpType::Answer => MessageLabel::Answer,
+            other => {
+                return Err(TransportError::Setup(format!(
+                    "unsupported sdp type {other} for sealed payload"
+                )));
+            }
+        };
+        let associated = [
+            payload.from_peer.as_str(),
+            payload.to_peer.as_str(),
+            payload.typ.as_str(),
+        ];
+        let plaintext = open_message(
+            passphrase_value,
+            &payload.handshake_id,
+            label,
+            &associated,
+            sealed,
+        )?;
+        String::from_utf8(plaintext)
+            .map_err(|err| TransportError::Setup(format!("invalid utf8 in decrypted sdp: {err}")))?
+    } else {
+        payload.sdp.clone()
+    };
     let description = match sdp_type {
-        RTCSdpType::Offer => RTCSessionDescription::offer(payload.sdp.clone())
+        RTCSdpType::Offer => RTCSessionDescription::offer(sdp_plain.clone())
             .map_err(|err| TransportError::Setup(err.to_string()))?,
-        RTCSdpType::Answer => RTCSessionDescription::answer(payload.sdp.clone())
+        RTCSdpType::Answer => RTCSessionDescription::answer(sdp_plain.clone())
             .map_err(|err| TransportError::Setup(err.to_string()))?,
-        RTCSdpType::Pranswer => RTCSessionDescription::pranswer(payload.sdp.clone())
+        RTCSdpType::Pranswer => RTCSessionDescription::pranswer(sdp_plain.clone())
             .map_err(|err| TransportError::Setup(err.to_string()))?,
         RTCSdpType::Rollback | RTCSdpType::Unspecified => {
             return Err(TransportError::Setup(format!(
@@ -2036,6 +2468,41 @@ fn session_description_from_payload(
 
 fn http_error(err: reqwest::Error) -> TransportError {
     TransportError::Setup(err.to_string())
+}
+
+fn resolve_ice_candidate(
+    candidate: String,
+    sdp_mid: Option<String>,
+    sdp_mline_index: Option<u32>,
+    sealed: Option<SealedEnvelope>,
+    passphrase: Option<&str>,
+    handshake_id: &str,
+    from_peer: &str,
+    to_peer: &str,
+) -> Result<IceCandidateBlob, TransportError> {
+    if let Some(sealed_env) = sealed {
+        let passphrase_value = passphrase.ok_or_else(|| {
+            TransportError::Setup("missing passphrase for sealed ice candidate".into())
+        })?;
+        let associated = [from_peer, to_peer, handshake_id];
+        let plaintext = open_message(
+            passphrase_value,
+            handshake_id,
+            MessageLabel::Ice,
+            &associated,
+            &sealed_env,
+        )?;
+        let decoded: IceCandidateBlob = serde_json::from_slice(&plaintext).map_err(|err| {
+            TransportError::Setup(format!("decode sealed ice candidate failed: {err}"))
+        })?;
+        Ok(decoded)
+    } else {
+        Ok(IceCandidateBlob {
+            candidate,
+            sdp_mid,
+            sdp_mline_index,
+        })
+    }
 }
 
 async fn create_webrtc_pair() -> Result<TransportPair, TransportError> {

@@ -3,11 +3,19 @@ use axum::{
     http::StatusCode,
     response::Json,
 };
+use base64::engine::general_purpose::STANDARD_NO_PAD;
+use base64::Engine;
+use beach_rescue_core::{
+    guardrail::SoftGuardrailState, is_telemetry_enabled, CohortId, FallbackTokenClaims,
+    TelemetryPreference,
+};
 use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
+use time::Duration;
 use tracing::{debug, error};
+use uuid::Uuid;
 
 use crate::{
     session::{hash_passphrase, verify_passphrase},
@@ -16,6 +24,14 @@ use crate::{
 };
 
 pub type SharedStorage = Arc<Storage>;
+
+#[derive(Clone)]
+pub struct FallbackContext {
+    pub storage: SharedStorage,
+    pub guardrail_threshold: f64,
+    pub token_ttl_seconds: u64,
+    pub require_oidc: bool,
+}
 
 #[derive(Debug, Serialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
@@ -99,6 +115,27 @@ pub struct SessionStatusResponse {
     pub created_at: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct FallbackTokenRequest {
+    pub session_id: String,
+    pub cohort_id: Option<String>,
+    #[serde(default)]
+    pub telemetry_opt_in: bool,
+    #[serde(default)]
+    pub total_sessions_hint: Option<u64>,
+    #[serde(default)]
+    pub entitlement_proof: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FallbackTokenResponse {
+    pub token: String,
+    pub expires_at: time::OffsetDateTime,
+    pub guardrail_ratio: f64,
+    pub guardrail_soft_breach: bool,
+    pub telemetry_enabled: bool,
+}
+
 fn generate_join_code() -> String {
     let mut rng = rand::thread_rng();
     rng.sample_iter(&Alphanumeric)
@@ -133,6 +170,60 @@ fn signaling_url(base_http: &str, session_id: &str) -> String {
         base_http.trim_end_matches('/'),
         session_id
     )
+}
+
+/// POST /fallback/token - Issue a fallback token for WebSocket rescue path.
+pub async fn issue_fallback_token(
+    State(ctx): State<FallbackContext>,
+    Json(payload): Json<FallbackTokenRequest>,
+) -> Result<Json<FallbackTokenResponse>, StatusCode> {
+    if ctx.require_oidc && payload.entitlement_proof.is_none() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let session_id = Uuid::parse_str(&payload.session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let cohort_id = payload.cohort_id.as_deref().unwrap_or("public").to_string();
+
+    let snapshot = ctx
+        .storage
+        .track_fallback_activation(&cohort_id, payload.total_sessions_hint)
+        .await
+        .map_err(|err| {
+            error!("redis guardrail error: {err:?}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let guardrail_soft_breach = matches!(
+        snapshot.soft_state(ctx.guardrail_threshold),
+        SoftGuardrailState::Breaching
+    );
+    let telemetry_pref = if payload.telemetry_opt_in {
+        TelemetryPreference::Enabled
+    } else {
+        TelemetryPreference::Disabled
+    };
+
+    let ttl = Duration::seconds(ctx.token_ttl_seconds as i64);
+    let claims = FallbackTokenClaims::new(
+        session_id,
+        CohortId::from(cohort_id.clone()),
+        ttl,
+        telemetry_pref,
+    );
+
+    let serialized = serde_json::to_vec(&claims).map_err(|err| {
+        error!("failed to serialize fallback token claims: {err:?}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let token = STANDARD_NO_PAD.encode(serialized);
+
+    Ok(Json(FallbackTokenResponse {
+        token,
+        expires_at: claims.expires_at,
+        guardrail_ratio: snapshot.counters.fallback_ratio(),
+        guardrail_soft_breach,
+        telemetry_enabled: is_telemetry_enabled(telemetry_pref),
+    }))
 }
 
 /// POST /sessions - Register a new session

@@ -21,8 +21,9 @@ use crate::{
     cli::{Cli, Commands},
     config::Config,
     handlers::{
-        get_session_status, get_webrtc_answer, get_webrtc_offer, health_check, join_session,
-        post_webrtc_answer, post_webrtc_offer, register_session, SharedStorage,
+        get_session_status, get_webrtc_answer, get_webrtc_offer, health_check,
+        issue_fallback_token, join_session, post_webrtc_answer, post_webrtc_offer,
+        register_session, FallbackContext, SharedStorage,
     },
     storage::Storage,
     websocket::{websocket_handler, SignalingState},
@@ -61,6 +62,12 @@ async fn main() {
     info!("Starting Beach Road session server on port {}", config.port);
     info!("Redis URL: {}", config.redis_url);
     info!("Session TTL: {} seconds", config.session_ttl_seconds);
+    info!(
+        "Fallback guardrail threshold: {:.3}% (token ttl {} seconds, oidc required: {})",
+        config.fallback_guardrail_threshold * 100.0,
+        config.fallback_token_ttl_seconds,
+        config.fallback_require_oidc
+    );
 
     // Initialize Redis storage
     let storage = match Storage::new(&config.redis_url, config.session_ttl_seconds).await {
@@ -75,6 +82,13 @@ async fn main() {
 
     // Initialize WebSocket signaling state
     let signaling_state = SignalingState::new(shared_storage.clone());
+
+    let fallback_state = FallbackContext {
+        storage: shared_storage.clone(),
+        guardrail_threshold: config.fallback_guardrail_threshold,
+        token_ttl_seconds: config.fallback_token_ttl_seconds,
+        require_oidc: config.fallback_require_oidc,
+    };
 
     // Build the Axum router - split into two parts with different states
     let http_routes = Router::new()
@@ -92,12 +106,17 @@ async fn main() {
         )
         .with_state(shared_storage);
 
+    let fallback_routes = Router::new()
+        .route("/fallback/token", post(issue_fallback_token))
+        .with_state(fallback_state);
+
     let ws_routes = Router::new()
         .route("/ws/:session_id", get(websocket_handler))
         .with_state(signaling_state);
 
     let app = Router::new()
         .merge(http_routes)
+        .merge(fallback_routes)
         .merge(ws_routes)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());

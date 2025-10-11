@@ -1,3 +1,5 @@
+use super::IceCandidateBlob;
+use super::secure_signaling::{MessageLabel, SealedEnvelope, seal_message, should_encrypt};
 use super::spawn_on_global;
 use crate::transport::TransportError;
 use futures_util::{SinkExt, StreamExt};
@@ -43,6 +45,8 @@ pub enum WebRTCSignal {
         sdp_mid: Option<String>,
         sdp_mline_index: Option<u32>,
         handshake_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sealed: Option<SealedEnvelope>,
     },
 }
 
@@ -169,6 +173,7 @@ pub struct SignalingClient {
     remote_events_tx: mpsc::UnboundedSender<RemotePeerEvent>,
     remote_events_rx: AsyncMutex<Option<mpsc::UnboundedReceiver<RemotePeerEvent>>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    passphrase: Option<String>,
 }
 
 #[derive(Clone)]
@@ -194,6 +199,7 @@ impl SignalingClient {
         let (send_tx, mut send_rx) = mpsc::unbounded_channel::<ClientMessage>();
         let (signal_tx, signal_rx) = mpsc::unbounded_channel::<WebRTCSignal>();
         let (remote_events_tx, remote_events_rx) = mpsc::unbounded_channel::<RemotePeerEvent>();
+        let passphrase_owned = passphrase.map(|s| s.to_string());
 
         let client = Arc::new(SignalingClient {
             peer_id: Uuid::new_v4().to_string(),
@@ -210,6 +216,7 @@ impl SignalingClient {
             remote_events_tx,
             remote_events_rx: AsyncMutex::new(Some(remote_events_rx)),
             tasks: Mutex::new(Vec::new()),
+            passphrase: passphrase_owned.clone(),
         });
 
         let (join_tx, join_rx) = tokio::sync::oneshot::channel::<()>();
@@ -285,7 +292,7 @@ impl SignalingClient {
 
         let join_message = ClientMessage::Join {
             peer_id: client.peer_id.clone(),
-            passphrase: passphrase.map(|s| s.to_string()),
+            passphrase: passphrase_owned,
             supported_transports: vec![TransportType::WebRTC],
             preferred_transport: Some(TransportType::WebRTC),
             label,
@@ -385,11 +392,45 @@ impl SignalingClient {
         let json = candidate
             .to_json()
             .map_err(|err| TransportError::Setup(err.to_string()))?;
-        let signal = WebRTCSignal::IceCandidate {
+        let blob = IceCandidateBlob {
             candidate: json.candidate,
-            sdp_mid: json.sdp_mid,
+            sdp_mid: json.sdp_mid.clone(),
             sdp_mline_index: json.sdp_mline_index.map(|idx| idx as u32),
+        };
+        let mut candidate_text = blob.candidate.clone();
+        let mut sdp_mid = blob.sdp_mid.clone();
+        let mut sdp_mline_index = blob.sdp_mline_index;
+        let mut sealed = None;
+
+        if let Some(passphrase) = self.passphrase.as_deref() {
+            if should_encrypt(Some(passphrase)) {
+                let local_peer_id = self
+                    .assigned_peer_id()
+                    .await
+                    .unwrap_or_else(|| self.peer_id.clone());
+                let plaintext = serde_json::to_vec(&blob).map_err(|err| {
+                    TransportError::Setup(format!("serialize ice candidate failed: {err}"))
+                })?;
+                let associated = [local_peer_id.as_str(), peer_id, handshake_id];
+                sealed = Some(seal_message(
+                    passphrase,
+                    handshake_id,
+                    MessageLabel::Ice,
+                    &associated,
+                    &plaintext,
+                )?);
+                candidate_text.clear();
+                sdp_mid = None;
+                sdp_mline_index = None;
+            }
+        }
+
+        let signal = WebRTCSignal::IceCandidate {
+            candidate: candidate_text,
+            sdp_mid,
+            sdp_mline_index,
             handshake_id: handshake_id.to_string(),
+            sealed,
         };
         self.send_signal_to_peer(peer_id, signal).await
     }

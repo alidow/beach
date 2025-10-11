@@ -9,6 +9,7 @@ tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "sync"] }
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+base64 = "0.22"
 sha2 = "0.10"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 anyhow = "1.0"
@@ -23,6 +24,8 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 tokio-tungstenite = "0.26"
 rand = "0.8"
+time = { version = "0.3", features = ["serde"] }
+beach-rescue-core = { path = "../beach-rescue/core" }
 
 [dev-dependencies]
 test-timeout = { path = "../../crates/test-timeout" }

@@ -4,6 +4,13 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Supported P2P transport types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SealedEnvelope {
+    pub version: u32,
+    pub nonce: String,
+    pub ciphertext: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportType {
@@ -62,6 +69,8 @@ pub enum WebRTCSignal {
         sdp_mid: Option<String>,
         sdp_mline_index: Option<u32>,
         handshake_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sealed: Option<SealedEnvelope>,
     },
 }
 
@@ -168,6 +177,8 @@ pub struct WebRtcSdpPayload {
     pub handshake_id: String,
     pub from_peer: String,
     pub to_peer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed: Option<SealedEnvelope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

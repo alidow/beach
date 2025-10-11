@@ -1,0 +1,34 @@
+[package]
+name = "beach-cabana"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+cabana_sck = []
+
+[dependencies]
+anyhow = "1"
+argon2 = "0.5"
+base64 = "0.21"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+hkdf = "0.12"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+tiny_http = "0.12"
+image = { version = "0.24", default-features = false, features = ["png"] }
+gif = "0.12"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-graphics = "0.24"
+core-foundation-sys = "0.8"
+foreign-types = "0.5"

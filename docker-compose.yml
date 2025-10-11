@@ -9,9 +9,28 @@ services:
       - redis-data:/data
     networks:
       - beach-network
+  beach-rescue:
+    image: rust:1.80
+    container_name: beach-rescue
+    working_dir: /app
+    command: ["cargo", "run", "-p", "beach-rescue-server"]
+    environment:
+      BEACH_RESCUE_REDIS_URL: redis://beach-redis:6379
+      BEACH_RESCUE_DISABLE_OIDC: "1"
+      RUST_LOG: info
+    volumes:
+      - .:/app
+      - cargo-target:/app/target
+      - cargo-registry:/usr/local/cargo/registry
+    depends_on:
+      - redis
+    networks:
+      - beach-network
 
 volumes:
   redis-data:
+  cargo-target:
+  cargo-registry:
 
 networks:
   beach-network:

@@ -384,15 +384,15 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     };
   }, [store]);
   const log = useCallback((message: string, detail?: Record<string, unknown>) => {
-    if (!import.meta.env.DEV) {
+    if (typeof window === 'undefined' || !window.__BEACH_TRACE) {
       return;
     }
     const current = peerIdRef.current;
     const prefix = current ? `[beach-web:${current.slice(0, 8)}]` : '[beach-web]';
     if (detail) {
-      console.debug(`${prefix} ${message}`, detail);
+      console.info(`${prefix} ${message}`, detail);
     } else {
-      console.debug(`${prefix} ${message}`);
+      console.info(`${prefix} ${message}`);
     }
   }, []);
 

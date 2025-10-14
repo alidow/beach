@@ -38,8 +38,14 @@ declare global {
   }
 }
 
+let versionLogged = false;
+
 function trace(...args: unknown[]): void {
   if (typeof window !== 'undefined' && window.__BEACH_TRACE) {
+    if (!versionLogged) {
+      versionLogged = true;
+      console.info('[beach-web] version', __APP_VERSION__);
+    }
     console.debug('[beach-trace][terminal]', ...args);
   }
 }

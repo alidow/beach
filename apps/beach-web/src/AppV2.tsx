@@ -365,6 +365,9 @@ export default function AppV2(): JSX.Element {
               Connection failed. Double-check the session details and try again.
             </p>
           ) : null}
+          <p className="mt-8 text-center text-[10px] font-semibold uppercase tracking-[0.32em] text-slate-500">
+            beach-web {__APP_VERSION__}
+          </p>
         </DialogContent>
       </Dialog>
     </main>

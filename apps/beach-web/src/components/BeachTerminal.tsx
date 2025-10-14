@@ -698,6 +698,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         if (cancelled) {
           return;
         }
+        console.error('[beach-web] transport connect failed', err);
         setError(err instanceof Error ? err : new Error(String(err)));
         setStatus('error');
       }

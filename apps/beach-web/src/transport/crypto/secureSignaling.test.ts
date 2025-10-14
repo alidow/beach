@@ -13,7 +13,7 @@ import { openWithKey, sealWithKey } from './secureSignaling';
 describe('secure signaling', () => {
   it('round-trips payloads using ChaCha20-Poly1305', async () => {
     const passphrase = 'OttersPlayAtDawn';
-    const handshakeId = 'hs-1234';
+    const handshakeId = 'handshake-1234';
     const key = await derivePreSharedKey(passphrase, handshakeId);
 
     const envelope = await sealWithKey({

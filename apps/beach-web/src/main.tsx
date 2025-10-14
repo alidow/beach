@@ -1,8 +1,6 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-import App from './App';
 import AppV2 from './AppV2';
-import { isTerminalFirstShell } from './lib/featureFlags';
 import './styles.css';
 
 const rootElement = document.getElementById('root');
@@ -15,8 +13,6 @@ if (typeof window !== 'undefined' && (window as any).__BEACH_TRACE) {
   console.info('[beach-web] version', __APP_VERSION__);
 }
 
-const RootComponent = isTerminalFirstShell() ? AppV2 : App;
-
 ReactDOM.createRoot(rootElement).render(
-  <RootComponent />,
+  <AppV2 />,
 );

@@ -13,5 +13,7 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
     },
+    include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
+    exclude: ['tests/**/*', 'playwright.config.ts'],
   },
 });

@@ -1300,7 +1300,7 @@ impl GridRenderer {
     }
 
     pub fn on_resize(&mut self, _cols: u16, rows: u16) {
-        let usable = rows.saturating_sub(2) as usize;
+        let usable = rows.saturating_sub(1) as usize;
         if usable != self.viewport_height {
             self.viewport_height = usable;
             if self.follow_tail {
@@ -1425,7 +1425,7 @@ impl GridRenderer {
 
     pub fn render_frame(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
-        let status_lines = if area.height >= 3 { 2 } else { 1 };
+        let status_lines = 1usize;
         let body_height = area.height.saturating_sub(status_lines as u16);
         self.viewport_height = body_height.max(1) as usize;
         if self.follow_tail {
@@ -1456,11 +1456,6 @@ impl GridRenderer {
         if chunks.len() >= 2 {
             let status = self.render_status_line();
             frame.render_widget(status, chunks[1]);
-        }
-
-        if status_lines > 1 && chunks.len() >= 3 {
-            let instructions = self.render_instructions();
-            frame.render_widget(instructions, chunks[2]);
         }
 
         self.needs_redraw = false;
@@ -1791,26 +1786,22 @@ impl GridRenderer {
             spans.push(Span::raw(format!(" • {}", message)));
         }
 
-        if !self.status_is_error {
-            if let Some(highlight) = &self.status_highlight {
-                spans.push(Span::styled(
-                    format!(" • {}", highlight),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
+        let highlight = if self.status_is_error {
+            None
+        } else {
+            self.status_highlight.clone()
+        };
+        match highlight {
+            Some(text) => spans.push(Span::styled(
+                format!(" • {}", text),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            None => spans.push(Span::raw(" • CTRL+Q quit")),
         }
 
         Paragraph::new(Line::from(spans)).block(Block::default())
-    }
-
-    fn render_instructions(&self) -> Paragraph<'_> {
-        let text = self
-            .status_highlight
-            .clone()
-            .unwrap_or_else(|| "CTRL+Q quit".to_string());
-        Paragraph::new(text).block(Block::default())
     }
 }
 
@@ -1935,7 +1926,7 @@ mod tests {
     #[test_timeout::timeout]
     fn tail_short_buffer_stays_top_aligned() {
         let mut renderer = GridRenderer::new(0, 10);
-        renderer.on_resize(10, 8); // viewport_height reduced by status lines
+        renderer.on_resize(10, 8); // viewport_height reduced by status line
         renderer.set_base_row(0);
         renderer.set_history_origin(0);
         for row in 0..3u64 {

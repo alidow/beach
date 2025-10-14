@@ -140,9 +140,56 @@
 - OPAQUE/PAKE background: CFRG RFC 9380.
 
 ## Immediate Next Steps (handoff summary)
-1. **Browser Noise handshake (Phase 4/A3):** choose a Noise JS/WASM implementation, wire it into `transport/crypto/noiseHandshake.ts`, and surface verification strings/telemetry in the UI.
-2. **Browser transport AEAD (Phase 4/A4):** reuse the ChaCha20-Poly1305 framing on the web data channel once handshake keys are available.
-3. **Feature negotiation & telemetry (Phase 4/B):** advertise secure capability, add metric hooks, and gate rollout behind flags before removing plaintext fallbacks.
+1. **Browser Argon2 parity (Phase 4/A1):** replace the PBKDF2 placeholder in `derivePreSharedKey` with the same Argon2id settings used by the Rust clients and host.
+2. **Browser Noise handshake (Phase 4/A3):** choose a Noise JS/WASM implementation, wire it into `transport/crypto/noiseHandshake.ts`, and surface verification strings/telemetry in the UI.
+3. **Browser transport AEAD (Phase 4/A4):** reuse the ChaCha20-Poly1305 framing on the web data channel once handshake keys are available.
+4. **Feature negotiation & telemetry (Phase 4/B):** advertise secure capability, add metric hooks, and gate rollout behind flags before removing plaintext fallbacks.
+
+## Phase 4/A1 – Browser Argon2 Parity Execution Plan
+
+### Summary
+Bring `apps/beach-web` in line with the Rust toolchain by deriving sealed-signaling keys with Argon2id (64 MiB, 3 passes, parallelism = 1, 32-byte output). This removes the PBKDF2 stopgap and ensures browser clients can decrypt the CLI’s sealed SDP/ICE payloads.
+
+### Deliverables
+- WASM-backed Argon2id helper that exposes `derivePreSharedKey(passphrase, handshakeId) -> Promise<Uint8Array>`.
+- Updated `sharedKey.ts` to call the helper, including lazy initialisation and structured error reporting.
+- Unit and integration tests asserting byte-for-byte parity with the Rust implementation.
+- Documentation and rollout notes covering bundle impact, loading strategy, and ops toggles.
+
+### Work Breakdown
+1. **Library selection & integration**
+   - Adopt `argon2-browser` (preferred) or build a custom WASM module if evaluation fails. Validate that the bundled WASM supports Argon2id with configurable memory, iterations, and output length.
+   - Add the dependency to `apps/beach-web` and configure Vite to emit the WASM artifact alongside the JS chunk (ensure `vite.config.ts` includes `wasm` in asset handling).
+   - Provide a thin loader (`transport/crypto/argon2.ts`) that initialises the WASM once, caches the promise, and surfaces a typed API.
+
+2. **Derivation helper implementation**
+   - Replace `derivePreSharedKey` in `sharedKey.ts` to call the loader with parameters matching the Rust defaults (`memoryCost: 65536`, `timeCost: 3`, `parallelism: 1`, `hashLen: 32`, `type: Argon2id`).
+   - Maintain the existing async contract and return a `Uint8Array` without base64 conversion.
+   - Emit `console.error('[beach-web] argon2 derive failed', err)` before rethrow so the UI surfaces actionable errors during rollout.
+
+3. **Parity verification**
+   - Add Jest/Vitest unit tests that compare the browser-derived output against known vectors exported from the Rust side (`derive_pre_shared_key`), covering different passphrase lengths and salts.
+   - Introduce an integration test (Playwright or Vitest environment) that runs the sealed signaling flow against the Rust CLI to confirm offers unwrap successfully.
+
+4. **Telemetry & fallback handling**
+   - Count Argon2 failures separately in telemetry (`secure-signaling.argon2_failure`) and surface a UI hint that suggests retrying without secure mode only if the user explicitly overrides it.
+   - Keep the plaintext escape hatch (`VITE_ALLOW_PLAINTEXT=I_KNOW_THIS_IS_UNSAFE`) documented but make sealed signaling the default path once Argon2 is stable.
+
+5. **Bundle & performance auditing**
+   - Measure initial load and derive latency on target devices (M-series Mac, mid-tier Windows laptop, Chromebook). Record numbers in this file and set acceptance thresholds (≤150 ms derivation on desktop, ≤400 ms on Chromebook).
+   - Investigate lazy-loading the WASM module only when a passphrase is present to avoid penalising open sessions without a shared secret.
+
+6. **Rollout plan**
+   - Behind a feature flag (`VITE_ENABLE_SECURE_SIGNALING=1` during dogfood) to allow quick rollback.
+   - After staged rollout, deprecate PBKDF2 fallback code paths and update CLI/web compatibility matrix.
+
+### Open Questions
+- **WASM initialisation:** Should we prefetch the WASM binary on login, or rely on dynamic import the first time a sealed session is joined?
+- **Worker isolation:** Do we need to run Argon2 in a Web Worker to avoid blocking the UI thread on low-end devices?
+- **Shared module reuse:** If we add more crypto to the browser bundle (Noise, secure transport), can we consolidate into a single WASM package?
+
+### Decision Log
+- Pending: confirm `argon2-browser` meets bundle-size and WASM-streaming constraints; otherwise fall back to a custom WASM build using the existing Rust Argon2 crate compiled via `wasm-pack`.
 
 ## Phase 4/A3 – Browser Noise Handshake Execution Plan
 - Select a Noise library that supports XXpsk2 with PSK injection and small bundle size; evaluate `@chainsafe/libp2p-noise` versus `noise-c.wasm` and record the decision.

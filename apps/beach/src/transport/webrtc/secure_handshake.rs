@@ -94,9 +94,7 @@ pub async fn run_handshake(
     let builder = NoiseBuilder::new(noise_params)
         .psk(2, &psk)
         .prologue(&prologue);
-    let keypair = builder
-        .generate_keypair()
-        .map_err(map_noise_error)?;
+    let keypair = builder.generate_keypair().map_err(map_noise_error)?;
     let builder = builder.local_private_key(&keypair.private);
     let mut state = match role {
         HandshakeRole::Initiator => builder.build_initiator().map_err(map_noise_error)?,

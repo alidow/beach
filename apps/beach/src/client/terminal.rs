@@ -1366,8 +1366,8 @@ impl TerminalClient {
         }
         let request_end = request_start.saturating_add(capped as u64);
         let overlaps_trimmed = self.empty_tail_ranges.iter().any(|range| {
-            range.retry_attempted
-                && Self::ranges_overlap(request_start, request_end, range.start, range.end)
+            let overlap = Self::ranges_overlap(request_start, request_end, range.start, range.end);
+            range.retry_attempted && overlap
         });
         if overlaps_trimmed {
             return Ok(());
@@ -1377,6 +1377,11 @@ impl TerminalClient {
         }
         if self.is_range_pending(request_start, request_end) {
             return Ok(());
+        }
+        if let Some(base) = self.known_base_row {
+            if request_start < base {
+                return Ok(());
+            }
         }
         self.send_backfill_request(subscription, request_start, capped)?;
         self.last_backfill_request_at = Some(Instant::now());
@@ -1402,19 +1407,18 @@ impl TerminalClient {
         let clamped_start = start.max(trimmed_floor);
         let mut clamped_end = end.max(clamped_start);
         if let Some(highest) = self.highest_loaded_row {
-            let tail_ceiling =
-                highest.saturating_add(BACKFILL_LOOKAHEAD_ROWS as u64).saturating_add(1);
+            let tail_ceiling = highest
+                .saturating_add(BACKFILL_LOOKAHEAD_ROWS as u64)
+                .saturating_add(1);
             clamped_end = clamped_end.max(tail_ceiling);
         }
         if clamped_start >= clamped_end {
             return;
         }
         let highest = self.highest_loaded_row;
-        if let Some(pos) = self
-            .empty_tail_ranges
-            .iter()
-            .position(|range| Self::ranges_overlap(clamped_start, clamped_end, range.start, range.end))
-        {
+        if let Some(pos) = self.empty_tail_ranges.iter().position(|range| {
+            Self::ranges_overlap(clamped_start, clamped_end, range.start, range.end)
+        }) {
             let range = &mut self.empty_tail_ranges[pos];
             range.start = range.start.min(clamped_start);
             range.end = range.end.max(clamped_end);
@@ -2915,7 +2919,9 @@ impl TerminalClient {
         {
             if actual_delta != 0 && !selection_active {
                 let target_row = cursor_row as i64 + actual_delta;
-                let new_pos = self.renderer.clamp_position(target_row, cursor_col as isize);
+                let new_pos = self
+                    .renderer
+                    .clamp_position(target_row, cursor_col as isize);
                 self.set_copy_cursor_position(new_pos, false);
             }
             if actual_delta > 0 && reached_tail {
@@ -5630,7 +5636,10 @@ mod tests {
             client.renderer.total_rows(),
             "tail view should start where visible rows cover the end of the buffer"
         );
-        assert_eq!(after_top, 0, "viewport should still move while selection active");
+        assert_eq!(
+            after_top, 0,
+            "viewport should still move while selection active"
+        );
         assert_eq!(
             after_cursor, initial_row,
             "selection cursor should remain anchored while scrolling"

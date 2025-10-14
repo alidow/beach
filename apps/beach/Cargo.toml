@@ -40,6 +40,7 @@ snow = "0.9"
 beach-rescue-client = { path = "../beach-rescue/client" }
 beach-rescue-core = { path = "../beach-rescue/core" }
 time = { version = "0.3", features = ["serde"] }
+hex = "0.4"
 
 [dev-dependencies]
 hyper = { version = "0.14", features = ["server"] }

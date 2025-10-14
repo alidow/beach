@@ -1,4 +1,5 @@
 import { decodeTransportMessage, encodeTransportMessage, type TransportMessage } from './envelope';
+import { toHex } from './crypto/sharedKey';
 import {
   secureSignalingEnabled,
   sealWithKey,
@@ -716,6 +717,7 @@ async function connectAsAnswerer(options: {
       throw new Error('expected sealed offer payload');
     }
     const key = await secure.ensureKey(handshakeId);
+    log(logger, `derived Argon2 key for handshake ${handshakeId}: ${toHex(key)}`);
     cachedSecureKey = key;
     const plaintext = await openSdpWithKey({
       key,

@@ -51,7 +51,9 @@ use secure_handshake::{
     HANDSHAKE_CHANNEL_LABEL, HandshakeParams, HandshakeResult, HandshakeRole,
     build_prologue_context, handshake_channel_init, run_handshake, secure_transport_enabled,
 };
-use secure_signaling::{MessageLabel, SealedEnvelope, open_message, seal_message, should_encrypt};
+use secure_signaling::{
+    MessageLabel, SealedEnvelope, derive_pre_shared_key, open_message, seal_message, should_encrypt,
+};
 use signaling::{PeerRole, RemotePeerEvent, RemotePeerJoined, SignalingClient, WebRTCSignal};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2512,6 +2514,16 @@ fn payload_from_description(
     };
     if let Some(passphrase_value) = passphrase {
         if should_encrypt(Some(passphrase_value)) {
+            if let Ok(psk) = derive_pre_shared_key(passphrase_value, handshake_id) {
+                tracing::debug!(
+                    target = "webrtc",
+                    handshake_id = %handshake_id,
+                    from_peer,
+                    to_peer,
+                    key = %hex::encode(psk),
+                    "offerer derived pre-shared key"
+                );
+            }
             let label = match desc.sdp_type {
                 RTCSdpType::Offer => MessageLabel::Offer,
                 RTCSdpType::Answer => MessageLabel::Answer,

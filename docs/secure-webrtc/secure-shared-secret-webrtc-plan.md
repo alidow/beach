@@ -22,8 +22,8 @@
 - `secure-webrtc/beach-webrtc-handshake.md`: troubleshooting log for signaling/data-channel flows.
 
 ## Status Overview
-- [x] **Phase 1 – Sealed Signaling (2025-02-15):** CLI offer/answer/ICE sealing behind `BEACH_SECURE_SIGNALING`; beach-road updated to store ciphertext envelopes.
-- [x] **Phase 2 – Noise Key Confirmation (2025-02-15):** Post-connect Noise XXpsk2 handshake over a dedicated data channel derives send/recv keys and a verification string when `BEACH_SECURE_TRANSPORT=1`.
+- [x] **Phase 1 – Sealed Signaling (2025-02-15):** CLI offer/answer/ICE sealing landed (originally hidden behind `BEACH_SECURE_SIGNALING` during rollout; now enabled by default).
+- [x] **Phase 2 – Noise Key Confirmation (2025-02-15):** Post-connect Noise XXpsk2 handshake over a dedicated data channel derives send/recv keys and a verification string (initially behind `BEACH_SECURE_TRANSPORT`; now always on).
 - [x] **Phase 3 – Encrypted Transport Wrapper (2025-02-15):** CLI transports now wrap every frame with ChaCha20-Poly1305 using handshake-derived keys and per-direction nonces; replayed or tampered frames are rejected.
 - [ ] **Phase 4 – Web Client Parity & Rollout:** Ship sealed signaling + transport encryption in beach-web, remove plaintext fallback after adoption (pending).
 
@@ -82,19 +82,19 @@
 - Fuzz test the ciphertext parser to guard against panic on malformed data.
 
 ### 7. Rollout plan
-- Ship behind `BEACH_SECURE_SIGNALING=1` and `BEACH_SECURE_TRANSPORT=1` flags.
+- Ship with secure signaling + transport enabled by default (legacy flags removed; use the explicit `BEACH_INSECURE_SIGNALING=I_KNOW_THIS_IS_UNSAFE` / `BEACH_INSECURE_TRANSPORT=I_KNOW_THIS_IS_UNSAFE` / `VITE_ALLOW_PLAINTEXT=I_KNOW_THIS_IS_UNSAFE` escape hatches only for debugging).
 - Enable in nightly builds; collect telemetry on fallback usage and handshake failures.
 - Remove plaintext fallback once clients >90% adoption and publish migration notes.
 
 ## Phase 1 Implementation Notes (2025-02-15)
-- `beach-human` now seals WebRTC offers, answers, and ICE candidates when `BEACH_SECURE_SIGNALING=1` and a session passphrase is present. (The data channel handshake stayed plaintext until Phase 2 landed.)
+- `beach-human` now seals WebRTC offers, answers, and ICE candidates whenever a session passphrase is present (the original `BEACH_SECURE_SIGNALING` rollout flag has been retired). The data channel handshake stayed plaintext until Phase 2 landed.
 - `beach-road` stores the new ciphertext envelopes transparently; plaintext fields are retained for backward compatibility but are blanked when sealing is active.
 - Secure signaling is off by default to avoid breaking older clients (including the web UI). Operators should enable the flag only when both peers run a build with this feature.
 - Transport-layer encryption remains pending (Phase 3); web parity follows in Phase 4.
 - **Next checkpoints:** (a) wrap terminal traffic with the derived keys (completed in Phase 3); (b) port sealed signaling + handshake to beach-web so the feature flags can be enabled for mixed-client sessions.
 
 ## Phase 2 Implementation Notes (2025-02-15)
-- `beach-human` spins up a dedicated `beach-secure-handshake` data channel when `BEACH_SECURE_TRANSPORT=1` and a passphrase is present. Both roles run a Noise `XXpsk2` exchange seeded by the Argon2id-derived key and handshake metadata.
+- `beach-human` spins up a dedicated `beach-secure-handshake` data channel whenever a passphrase is present. Both roles run a Noise `XXpsk2` exchange seeded by the Argon2id-derived key and handshake metadata (the legacy `BEACH_SECURE_TRANSPORT` flag is no longer required).
 - The handshake yields symmetric send/receive keys (stored on the `WebRtcConnection`) plus a 6-digit verification string exposed via connection metadata (`secure_verification`) for hosts; values aren't yet used to wrap traffic.
 - Failures (or timeouts) abort the WebRTC negotiation so sessions don't silently fall back to plaintext once secure transport is requested.
 - The handshake currently skips DTLS exporter binding pending support in `webrtc-rs`; the session/peer IDs are mixed into the Noise prologue as an interim safeguard.

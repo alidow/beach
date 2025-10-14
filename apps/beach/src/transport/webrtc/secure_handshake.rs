@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use bytes::Bytes;
 use hkdf::Hkdf;
@@ -17,8 +16,7 @@ use crate::transport::TransportError;
 use super::secure_signaling::derive_pre_shared_key;
 
 pub const HANDSHAKE_CHANNEL_LABEL: &str = "beach-secure-handshake";
-
-static SECURE_TRANSPORT_ENABLED: OnceLock<bool> = OnceLock::new();
+const INSECURE_OVERRIDE_TOKEN: &str = "I_KNOW_THIS_IS_UNSAFE";
 
 #[derive(Clone, Copy, Debug)]
 pub enum HandshakeRole {
@@ -43,16 +41,7 @@ pub struct HandshakeParams {
 }
 
 pub fn secure_transport_enabled() -> bool {
-    *SECURE_TRANSPORT_ENABLED.get_or_init(|| {
-        let env = std::env::var("BEACH_SECURE_TRANSPORT").unwrap_or_default();
-        if env.is_empty() {
-            return false;
-        }
-        !matches!(
-            env.to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        )
-    })
+    !insecure_transport_override()
 }
 
 pub fn handshake_channel_init() -> RTCDataChannelInit {
@@ -273,4 +262,13 @@ async fn wait_for_channel_open(channel: &RTCDataChannel) -> Result<(), Transport
 
 fn map_noise_error(err: snow::Error) -> TransportError {
     TransportError::Setup(format!("secure handshake noise error: {err}"))
+}
+
+fn insecure_transport_override() -> bool {
+    matches!(
+        std::env::var("BEACH_INSECURE_TRANSPORT")
+            .ok()
+            .map(|value| value.trim().eq(INSECURE_OVERRIDE_TOKEN)),
+        Some(true)
+    )
 }

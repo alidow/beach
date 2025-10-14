@@ -18,14 +18,11 @@ const LABEL_BYTES: Record<SignalingLabel, Uint8Array> = {
   answer: encoder.encode('answer'),
   ice: encoder.encode('ice'),
 };
+const INSECURE_OVERRIDE_TOKEN = 'I_KNOW_THIS_IS_UNSAFE';
 
 export function secureSignalingEnabled(): boolean {
-  const flag = import.meta.env?.VITE_SECURE_SIGNALING ?? '';
-  if (!flag) {
-    return false;
-  }
-  const normalised = flag.trim().toLowerCase();
-  return !['0', 'false', 'off', 'no'].includes(normalised);
+  const override = import.meta.env?.VITE_ALLOW_PLAINTEXT ?? '';
+  return override.trim() !== INSECURE_OVERRIDE_TOKEN;
 }
 
 export async function sealSignalingMessage(options: {

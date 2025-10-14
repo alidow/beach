@@ -3,7 +3,7 @@
 
 interface ImportMetaEnv {
   readonly VITE_SESSION_SERVER_URL?: string;
-  readonly VITE_SECURE_SIGNALING?: string;
+  readonly VITE_ALLOW_PLAINTEXT?: string;
 }
 
 interface ImportMeta {

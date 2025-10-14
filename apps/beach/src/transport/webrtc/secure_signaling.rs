@@ -1,5 +1,3 @@
-use std::sync::OnceLock;
-
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -16,8 +14,7 @@ const HKDF_INFO_AEAD: &[u8] = b"beach:secure-signaling:aead:v1";
 const LABEL_OFFER: &[u8] = b"offer";
 const LABEL_ANSWER: &[u8] = b"answer";
 const LABEL_ICE: &[u8] = b"ice";
-
-static SECURE_SIGNALING_ENABLED: OnceLock<bool> = OnceLock::new();
+const INSECURE_OVERRIDE_TOKEN: &str = "I_KNOW_THIS_IS_UNSAFE";
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SealedEnvelope {
@@ -34,16 +31,7 @@ pub enum MessageLabel {
 }
 
 pub fn secure_signaling_enabled() -> bool {
-    *SECURE_SIGNALING_ENABLED.get_or_init(|| {
-        let val = std::env::var("BEACH_SECURE_SIGNALING").unwrap_or_default();
-        if val.is_empty() {
-            return false;
-        }
-        !matches!(
-            val.to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        )
-    })
+    !insecure_signaling_override()
 }
 
 pub fn should_encrypt(passphrase: Option<&str>) -> bool {
@@ -170,4 +158,13 @@ fn build_aad(handshake_id: &str, label: &MessageLabel, associated: &[&str]) -> V
         aad.extend_from_slice(component.as_bytes());
     }
     aad
+}
+
+fn insecure_signaling_override() -> bool {
+    matches!(
+        std::env::var("BEACH_INSECURE_SIGNALING")
+            .ok()
+            .map(|value| value.trim().eq(INSECURE_OVERRIDE_TOKEN)),
+        Some(true)
+    )
 }

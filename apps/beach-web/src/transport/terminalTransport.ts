@@ -1,6 +1,6 @@
 import { decodeHostFrameBinary, encodeClientFrameBinary } from '../protocol/wire';
 import type { ClientFrame, HostFrame } from '../protocol/types';
-import { WebRtcTransport } from './webrtc';
+import { WebRtcTransport, type SecureTransportSummary } from './webrtc';
 
 export type TerminalTransportEventMap = {
   frame: CustomEvent<HostFrame>;
@@ -8,6 +8,7 @@ export type TerminalTransportEventMap = {
   open: Event;
   error: Event;
   close: Event;
+  secure: CustomEvent<SecureTransportSummary>;
 };
 
 export interface TerminalTransport extends EventTarget {
@@ -17,6 +18,7 @@ export interface TerminalTransport extends EventTarget {
 
 interface DataChannelTerminalTransportOptions {
   logger?: (message: string) => void;
+  secureContext?: SecureTransportSummary;
 }
 
 export class DataChannelTerminalTransport extends EventTarget implements TerminalTransport {
@@ -73,6 +75,15 @@ export class DataChannelTerminalTransport extends EventTarget implements Termina
       Object.assign(cloned, { error: (event as any).error ?? event });
       this.dispatchEvent(cloned);
     });
+    this.channel.addEventListener('secure', (event) => {
+      const detail = (event as CustomEvent<SecureTransportSummary>).detail;
+      this.dispatchEvent(new CustomEvent<SecureTransportSummary>('secure', { detail }));
+    });
+    if (options.secureContext) {
+      queueMicrotask(() => {
+        this.dispatchEvent(new CustomEvent<SecureTransportSummary>('secure', { detail: options.secureContext! }));
+      });
+    }
 
     this.announceReadiness();
   }

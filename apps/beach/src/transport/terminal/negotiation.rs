@@ -3,15 +3,24 @@ use crate::session::{SessionHandle, SessionRole, TransportOffer};
 use crate::terminal::error::CliError;
 use crate::transport as transport_mod;
 use crate::transport::{Transport, TransportError, TransportId, TransportKind, TransportMessage};
+use beach_rescue_client::{ClientHello, ServerHello};
+use beach_rescue_core::TelemetryPreference;
+use futures_util::{SinkExt, StreamExt};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use time::OffsetDateTime;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::sleep;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, trace, warn};
 use transport_mod::webrtc::{OffererSupervisor, WebRtcChannels, WebRtcConnection, WebRtcRole};
+use url::Url;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct NegotiatedSingle {
@@ -156,10 +165,10 @@ pub async fn negotiate_transport(
         }
     }
 
-    for offer in offers {
+    for offer in &offers {
         if let TransportOffer::WebSocket { url } = offer {
             debug!(transport = "websocket", url = %url, "attempting websocket transport");
-            match transport_mod::websocket::connect(&url).await {
+            match transport_mod::websocket::connect(url).await {
                 Ok(transport) => {
                     let transport = Arc::from(transport);
                     info!(transport = "websocket", url = %url, "transport established");
@@ -176,11 +185,158 @@ pub async fn negotiate_transport(
         }
     }
 
+    for offer in &offers {
+        if let TransportOffer::WebSocketFallback { url } = offer {
+            debug!(transport = "websocket_fallback", url = %url, "attempting ws fallback transport");
+            match connect_fallback_websocket(handle, url).await {
+                Ok(transport) => {
+                    info!(transport = "websocket_fallback", url = %url, "transport established");
+                    return Ok(NegotiatedTransport::Single(NegotiatedSingle {
+                        transport,
+                        webrtc_channels: None,
+                    }));
+                }
+                Err(err) => {
+                    warn!(transport = "websocket_fallback", url = %url, error = %err, "websocket fallback negotiation failed");
+                    errors.push(format!("websocket_fallback {url}: {err}"));
+                }
+            }
+        }
+    }
+
     if errors.is_empty() {
         Err(CliError::NoUsableTransport)
     } else {
         Err(CliError::TransportNegotiation(errors.join("; ")))
     }
+}
+
+async fn connect_fallback_websocket(
+    handle: &SessionHandle,
+    websocket_url: &str,
+) -> Result<Arc<dyn Transport>, String> {
+    #[derive(Serialize)]
+    struct FallbackTokenRequest {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cohort_id: Option<String>,
+        #[serde(default)]
+        telemetry_opt_in: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        total_sessions_hint: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        entitlement_proof: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct FallbackTokenResponse {
+        token: String,
+        #[allow(dead_code)]
+        expires_at: OffsetDateTime,
+        guardrail_ratio: f64,
+        guardrail_soft_breach: bool,
+        telemetry_enabled: bool,
+    }
+
+    let token_url = handle
+        .session_url()
+        .join("../fallback/token")
+        .map_err(|err| format!("invalid fallback token url: {err}"))?;
+
+    let session_uuid =
+        Uuid::parse_str(handle.session_id()).map_err(|err| format!("invalid session id: {err}"))?;
+
+    let client = Client::new();
+    let request = FallbackTokenRequest {
+        session_id: handle.session_id().to_string(),
+        cohort_id: None,
+        telemetry_opt_in: false,
+        total_sessions_hint: None,
+        entitlement_proof: None,
+    };
+
+    let response = client
+        .post(token_url.clone())
+        .json(&request)
+        .send()
+        .await
+        .map_err(|err| format!("token request failed: {err}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "token request failed ({status})",
+            status = response.status()
+        ));
+    }
+
+    let token_response: FallbackTokenResponse = response
+        .json()
+        .await
+        .map_err(|err| format!("failed to decode token response: {err}"))?;
+
+    if token_response.guardrail_soft_breach {
+        warn!(
+            transport = "websocket_fallback",
+            ratio = %token_response.guardrail_ratio,
+            "fallback guardrail soft breach"
+        );
+    }
+
+    let mut ws_url = Url::parse(websocket_url)
+        .map_err(|err| format!("invalid websocket url '{websocket_url}': {err}"))?;
+    ws_url
+        .query_pairs_mut()
+        .append_pair("token", &token_response.token);
+
+    let (mut stream, _response) = connect_async(ws_url.as_str())
+        .await
+        .map_err(|err| format!("websocket connect failed: {err}"))?;
+
+    let telemetry_pref = if token_response.telemetry_enabled {
+        TelemetryPreference::Enabled
+    } else {
+        TelemetryPreference::Disabled
+    };
+
+    let client_hello = ClientHello::new(session_uuid).with_telemetry(telemetry_pref);
+    let payload = serde_json::to_string(&client_hello)
+        .map_err(|err| format!("failed to encode client hello: {err}"))?;
+
+    stream
+        .send(Message::Text(payload))
+        .await
+        .map_err(|err| format!("failed to send client hello: {err}"))?;
+
+    let server_msg = stream
+        .next()
+        .await
+        .ok_or_else(|| "server closed during handshake".to_string())
+        .and_then(|msg| msg.map_err(|err| format!("error receiving server hello: {err}")))?;
+
+    match server_msg {
+        Message::Text(text) => {
+            serde_json::from_str::<ServerHello>(&text)
+                .map_err(|err| format!("failed to parse server hello: {err}"))?;
+        }
+        Message::Binary(bytes) => {
+            serde_json::from_slice::<ServerHello>(&bytes)
+                .map_err(|err| format!("failed to parse server hello: {err}"))?;
+        }
+        Message::Close(frame) => {
+            let reason = frame.map(|f| f.reason.to_string());
+            return Err(format!("server closed during handshake: {:?}", reason));
+        }
+        other => {
+            return Err(format!("unexpected server hello frame: {other:?}"));
+        }
+    }
+
+    let id = transport_mod::next_transport_id();
+    let peer = TransportId(0);
+    let transport =
+        transport_mod::websocket::wrap_stream(TransportKind::WebSocket, id, peer, stream);
+
+    Ok(Arc::from(transport))
 }
 
 pub(crate) struct SharedTransport {

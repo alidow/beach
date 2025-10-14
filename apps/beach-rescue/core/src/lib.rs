@@ -8,7 +8,7 @@ pub mod guardrail;
 pub mod token;
 
 pub use guardrail::{GuardrailCounters, GuardrailSnapshot, SoftGuardrailState};
-pub use token::{FallbackTokenClaims, TelemetryPreference, TokenFeatureBits};
+pub use token::{FallbackTokenClaims, TelemetryPreference, TokenFeatureBits, TokenValidationError};
 
 /// Identifier representing a cohort or entitlement group.
 ///

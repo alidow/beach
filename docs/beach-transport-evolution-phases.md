@@ -24,7 +24,7 @@ Notes
 
 ### Implementation Prompt
 ```
-Read @docs/dual-channel-implementation-plan.md focusing on the "Phase 1: Transport Layer Evolution" section, specifically 1.2 Remove Passphrase from Signaling.
+Read @docs/secure-webrtc/dual-channel-implementation-plan.md focusing on the "Phase 1: Transport Layer Evolution" section, specifically 1.2 Remove Passphrase from Signaling.
 
 1. Update apps/beach/src/session/mod.rs to store passphrase locally only
 2. Modify signaling messages to exclude passphrase
@@ -76,7 +76,7 @@ Create the foundation for supporting multiple channels with different reliabilit
 
 ### Implementation Prompt
 ```
-Read @docs/dual-channel-implementation-plan.md section "1.1 Channel Abstraction".
+Read @docs/secure-webrtc/dual-channel-implementation-plan.md section "1.1 Channel Abstraction".
 
 1. Create apps/beach/src/transport/channel.rs with:
    - ChannelReliability enum (Reliable, Unreliable)
@@ -184,13 +184,13 @@ Scope clarification
 
 ### Implementation Prompt
 ```
-Read @docs/dual-channel-implementation-plan.md section "1.3 WebRTC Dual-Channel Support".
+Read @docs/secure-webrtc/dual-channel-implementation-plan.md section "1.3 WebRTC Dual-Channel Support".
 
 1. Update `apps/beach/src/transport/webrtc/mod.rs`:
    - Create two data channels: `beach/ctrl/1` (reliable, ordered) and `beach/term/1` (unreliable, unordered)
    - Route control messages to reliable channel; route terminal output to unreliable channel
    - Handle `on_data_channel` on the receiving side and map incoming channels by label to `ChannelPurpose`
-2. Add remote signaling adapter (see `docs/dual-channel-webrtc-implementation.md`) to exchange SDP/ICE via beach-road
+2. Add remote signaling adapter (see `docs/secure-webrtc/dual-channel-webrtc-implementation.md`) to exchange SDP/ICE via beach-road
 3. Update message routing in subscription/client handlers to prefer WebRTC when available; keep WebSocket as fallback
 4. Ensure proper channel lifecycle management
 ```
@@ -241,7 +241,7 @@ Note: This can be implemented in parallel with Phase 2a to validate UX with the 
 
 ### Implementation Prompt
 ```
-Read @docs/dual-channel-implementation-plan.md "CRITICAL: Developer Experience & Modes" section on Public Beach Mode.
+Read @docs/secure-webrtc/dual-channel-implementation-plan.md "CRITICAL: Developer Experience & Modes" section on Public Beach Mode.
 
 1. Update apps/beach/src/main.rs:
    - Generate short codes when no passphrase provided
@@ -404,7 +404,7 @@ Enable recovery from packet loss on the unreliable output channel.
 
 ### Implementation Prompt
 ```
-Read @docs/dual-channel-implementation-plan.md section "2.3 Server Output Processing".
+Read @docs/secure-webrtc/dual-channel-implementation-plan.md section "2.3 Server Output Processing".
 
 1. Add frame versioning to apps/beach/src/server/terminal_state/frame.rs:
    - Add sequence numbers to output frames
@@ -461,7 +461,7 @@ Add enterprise authentication and authorization using Clerk.
 
 ### Implementation Prompt
 ```
-Read @docs/dual-channel-implementation-plan.md "CRITICAL: Developer Experience & Modes" section on Private Beach Mode.
+Read @docs/secure-webrtc/dual-channel-implementation-plan.md "CRITICAL: Developer Experience & Modes" section on Private Beach Mode.
 
 1. Add login command to apps/beach/src/cli/login.rs:
    - Implement browser/device code flow

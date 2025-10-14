@@ -208,7 +208,7 @@ tail -f /tmp/server.log /tmp/client.log
 ## Related Documentation
 
 - `docs/webrtc-dual-channel-status-and-plan.md` - Overall WebRTC implementation plan
-- `docs/dual-channel-webrtc-spec.md` - Dual-channel architecture specification  
+- `docs/secure-webrtc/dual-channel-webrtc-spec.md` - Dual-channel architecture specification  
 - `CLAUDE.md` - Critical debugging guidelines (no stdout/stderr output)
 
 ## Summary

@@ -267,6 +267,7 @@ fn offer_label(offer: &TransportOffer) -> &'static str {
     match offer {
         TransportOffer::WebRtc { .. } => "WebRTC",
         TransportOffer::WebSocket { .. } => "WebSocket",
+        TransportOffer::WebSocketFallback { .. } => "WebSocket (Fallback)",
         TransportOffer::Ipc => "IPC",
     }
 }

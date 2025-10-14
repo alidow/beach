@@ -28,7 +28,7 @@ Architecture Overview
 - **Closed-source beach-cabana module:** Implements capture adapters (`macOS::ScreenCaptureKit`, `Windows::GraphicsCapture`, `Linux::PipeWire`), window enumeration, hardware encoder integration, zero-trust signaling, and UI flows while living in a private workspace member (`apps/beach-cabana`). This module starts life standalone, without requiring modifications to existing Beach binaries.
 - **Picker UI:** React/SwiftUI/Tauri-based selection modal for the desktop app; TUI picker for CLI via `crossterm`/`ratatui`. Both feed a normalized `CaptureTarget` back into the host module.
 - **Web Viewer (open-source):** Beach-web adds a video element fed by WebRTC; retains terminal viewer for existing sessions. Long-term it can choose layout based on session type.
-- **Zero-trust security:** Cabana adopts the sealed-signaling + Noise transport design from `docs/secure-shared-secret-webrtc-plan.md` so a compromised `beach-road` cannot read window content. Unique links and passcodes continue to derive per-session secrets that wrap both signaling and media frames.
+- **Zero-trust security:** Cabana adopts the sealed-signaling + Noise transport design from `docs/secure-webrtc/secure-shared-secret-webrtc-plan.md` so a compromised `beach-road` cannot read window content. Unique links and passcodes continue to derive per-session secrets that wrap both signaling and media frames.
 - **Feature Gating:** Workspace layout ensures open-source release omits GUI host crate; binaries link conditionally based on build features. Integration with Beach (terminal host) happens only after Cabana’s standalone milestone.
 
 Phased Delivery
@@ -48,7 +48,7 @@ Phased Delivery
 - Notes: Hardware VideoToolbox/Media Foundation integrations remain follow-ups (Phase 2.1) once the ScreenCaptureKit bridge lands; the encoder trait is ready to accept those adapters.
 
 **Phase 3 — Zero-Trust Signaling & Media Pipeline**
-- Deliverables: Implement sealed signaling (Phase 1 spec in `docs/secure-shared-secret-webrtc-plan.md`) inside Cabana; run Noise `XXpsk2` handshake over data channel; wrap outgoing media frames (video + control) in AEAD using keys derived from the unique link + passcode.
+- Deliverables: Implement sealed signaling (Phase 1 spec in `docs/secure-webrtc/secure-shared-secret-webrtc-plan.md`) inside Cabana; run Noise `XXpsk2` handshake over data channel; wrap outgoing media frames (video + control) in AEAD using keys derived from the unique link + passcode.
 - Success: Cabana peers exchange unique link/passcode, establish WebRTC video channel via `beach-road` while keeping signaling opaque; tampering at the relay fails verification.
 
 **Phase 4 — Selection UX (Desktop App & CLI)**

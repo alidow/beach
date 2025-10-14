@@ -374,7 +374,7 @@ Update and add tests in `apps/beach/src/tests/`.
 
 7) Docs
 - [ ] Update `docs/SCROLLBACK_HISTORY_SPEC.md` to reference this unified model.
-- [ ] Note channel routing expectations in `docs/dual-channel-webrtc-spec.md`.
+- [ ] Note channel routing expectations in `docs/secure-webrtc/dual-channel-webrtc-spec.md`.
 
 ---
 
@@ -420,4 +420,3 @@ Update and add tests in `apps/beach/src/tests/`.
 4) Remove legacy ViewMode toggles once both ends are migrated; keep deserialization for safety for one release.
 
 This plan yields a simpler client (no modes), a single subscription model, and localized server complexity (prioritization, ordering). It aligns with our dual-channel transport and existing terminal history primitives.
-

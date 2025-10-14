@@ -66,7 +66,22 @@ pub async fn run_handshake(
     channel: Arc<RTCDataChannel>,
     params: HandshakeParams,
 ) -> Result<HandshakeResult, TransportError> {
+    tracing::info!(
+        target = "webrtc",
+        ?role,
+        handshake_id = %params.handshake_id,
+        local_peer = %params.local_peer_id,
+        remote_peer = %params.remote_peer_id,
+        channel_state = ?channel.ready_state(),
+        "starting secure handshake, waiting for channel open"
+    );
     wait_for_channel_open(&channel).await?;
+    tracing::info!(
+        target = "webrtc",
+        ?role,
+        handshake_id = %params.handshake_id,
+        "handshake channel is now open, proceeding with noise protocol"
+    );
 
     let (incoming_tx, mut incoming_rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
     channel.on_message(Box::new(move |msg: DataChannelMessage| {
@@ -90,6 +105,10 @@ pub async fn run_handshake(
     let builder = NoiseBuilder::new(noise_params)
         .psk(2, &psk)
         .prologue(&prologue);
+    let keypair = builder
+        .generate_keypair()
+        .map_err(map_noise_error)?;
+    let builder = builder.local_private_key(&keypair.private);
     let mut state = match role {
         HandshakeRole::Initiator => builder.build_initiator().map_err(map_noise_error)?,
         HandshakeRole::Responder => builder.build_responder().map_err(map_noise_error)?,
@@ -212,7 +231,17 @@ fn derive_session_material(
 }
 
 async fn wait_for_channel_open(channel: &RTCDataChannel) -> Result<(), TransportError> {
-    if channel.ready_state() == RTCDataChannelState::Open {
+    let initial_state = channel.ready_state();
+    tracing::debug!(
+        target = "webrtc",
+        ?initial_state,
+        "wait_for_channel_open called"
+    );
+    if initial_state == RTCDataChannelState::Open {
+        tracing::debug!(
+            target = "webrtc",
+            "channel already open, returning immediately"
+        );
         return Ok(());
     }
     let notify = Arc::new(Notify::new());
@@ -220,11 +249,25 @@ async fn wait_for_channel_open(channel: &RTCDataChannel) -> Result<(), Transport
     channel.on_open(Box::new(move || {
         let notify = Arc::clone(&notify_clone);
         Box::pin(async move {
+            tracing::debug!(
+                target = "webrtc",
+                "handshake channel on_open callback fired"
+            );
             notify.notify_waiters();
             notify.notify_one();
         })
     }));
+    tracing::debug!(
+        target = "webrtc",
+        "registered on_open handler, awaiting notification"
+    );
     notify.notified().await;
+    let final_state = channel.ready_state();
+    tracing::debug!(
+        target = "webrtc",
+        ?final_state,
+        "channel open notification received"
+    );
     Ok(())
 }
 

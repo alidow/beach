@@ -10,6 +10,7 @@ import type { TerminalTransport } from '../transport/terminalTransport';
 import { BackfillController } from '../terminal/backfillController';
 import { cn } from '../lib/utils';
 import type { ServerMessage } from '../transport/signaling';
+import type { SecureTransportSummary } from '../transport/webrtc';
 
 export type TerminalStatus = 'idle' | 'connecting' | 'connected' | 'error' | 'closed';
 
@@ -296,6 +297,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     providedTransport ? 'connected' : 'idle',
   );
   const [error, setError] = useState<Error | null>(null);
+  const [secureSummary, setSecureSummary] = useState<SecureTransportSummary | null>(null);
   const [showIdlePlaceholder, setShowIdlePlaceholder] = useState(true);
   const [headerHeight, setHeaderHeight] = useState<number>(0);
   const [activeConnection, setActiveConnection] = useState<BrowserTransportConnection | null>(null);
@@ -631,6 +633,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
 
   useEffect(() => {
     transportRef.current = providedTransport ?? null;
+    setSecureSummary(null);
     if (providedTransport) {
       bindTransport(providedTransport);
       setStatus('connected');
@@ -686,6 +689,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         connectionRef.current = connection;
         transportRef.current = connection.transport;
         setActiveConnection(connection);
+        setSecureSummary(connection.secure ?? null);
         setPeerId(connection.signaling.peerId);
         setRemotePeerId(connection.remotePeerId ?? null);
         bindTransport(connection.transport);
@@ -707,6 +711,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       connectionRef.current = null;
       transportRef.current = null;
       setActiveConnection(null);
+      setSecureSummary(null);
       setPeerId(null);
       setRemotePeerId(null);
       handshakeReadyRef.current = false;
@@ -1059,6 +1064,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
             <span className="text-[10px] font-semibold uppercase tracking-[0.5em] text-[#c0cada]">{sessionTitle}</span>
           </div>
           <div className="flex items-center gap-2 text-[10px]">
+            {renderSecureBadge()}
             <span className="inline-flex items-center gap-2 rounded-full border border-white/10 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.32em] text-[#c9d2e5]">
               <span className="size-1.5 rounded-full" style={{ backgroundColor: statusColor }} aria-hidden />
               {renderStatus()}
@@ -1172,6 +1178,29 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     return 'Idle';
   }
 
+  function renderSecureBadge(): JSX.Element | null {
+    if (!secureSummary) {
+      return null;
+    }
+    if (secureSummary.mode === 'secure') {
+      return (
+        <span className="inline-flex items-center gap-2 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.32em] text-emerald-200">
+          Secure
+          {secureSummary.verificationCode ? (
+            <span className="font-mono text-[11px] tracking-[0.2em] text-emerald-100/90">
+              {secureSummary.verificationCode}
+            </span>
+          ) : null}
+        </span>
+      );
+    }
+    return (
+      <span className="inline-flex items-center gap-2 rounded-full border border-amber-500/30 bg-amber-500/10 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.32em] text-amber-200">
+        Plaintext
+      </span>
+    );
+  }
+
   function bindTransport(transport: TerminalTransport): void {
     subscriptionRef.current = null;
     handshakeReadyRef.current = false;
@@ -1183,6 +1212,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     transport.addEventListener('status', (event) => {
       const detail = (event as CustomEvent<string>).detail;
       handleStatusSignal(detail);
+    });
+    transport.addEventListener('secure', (event) => {
+      const detail = (event as CustomEvent<SecureTransportSummary>).detail;
+      setSecureSummary(detail);
     });
     transport.addEventListener('open', () => {
       if (!handshakeReadyRef.current) {
@@ -1199,6 +1232,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           enterDisconnectedState();
         }
         subscriptionRef.current = null;
+        setSecureSummary(null);
         setStatus('closed');
       },
       { once: true },

@@ -450,3 +450,38 @@ fi
 if [[ -n $SECURITY_GROUP_ID ]]; then
   echo "Security Group: $SECURITY_GROUP_ID"
 fi
+
+# Update Route53 DNS if deploying to us-east-2
+if [[ "$AWS_REGION" == "us-east-2" && -n "$HOST" ]]; then
+  echo "Updating Route53 api.beach.sh to point to $HOST..."
+  HOSTED_ZONE_ID=$(aws_cli route53 list-hosted-zones --query 'HostedZones[?Name==`beach.sh.`].Id' --output text 2>/dev/null || echo "")
+  if [[ -n "$HOSTED_ZONE_ID" ]]; then
+    CHANGE_BATCH=$(cat <<EOF
+{
+  "Changes": [
+    {
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "api.beach.sh",
+        "Type": "A",
+        "TTL": 300,
+        "ResourceRecords": [
+          {
+            "Value": "$HOST"
+          }
+        ]
+      }
+    }
+  ]
+}
+EOF
+)
+    if aws_cli route53 change-resource-record-sets --hosted-zone-id "$HOSTED_ZONE_ID" --change-batch "$CHANGE_BATCH" >/dev/null 2>&1; then
+      echo "Route53 updated: api.beach.sh -> $HOST"
+    else
+      echo "Warning: Failed to update Route53. You may need to update DNS manually."
+    fi
+  else
+    echo "Warning: Could not find beach.sh hosted zone. Skipping DNS update."
+  fi
+fi

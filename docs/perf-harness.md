@@ -29,6 +29,6 @@ savings hold steady.
    `pty_chunk_process`.
 4. Repeat without `BEACH_PROTO_BINARY` set to compare byte/latency deltas.
 
-For full comparisons vs. SSH+tmux, the existing `docs/dual-channel-implementation-plan.md`
+For full comparisons vs. SSH+tmux, the existing `docs/secure-webrtc/dual-channel-implementation-plan.md`
 benchmark checklist still applies—use this new harness to verify protocol-level
 savings before capturing end-to-end timings.

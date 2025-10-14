@@ -269,6 +269,14 @@ impl SessionHandle {
         &self.offers
     }
 
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn session_url(&self) -> &Url {
+        &self.session_url
+    }
+
     pub fn preferred_offer(&self) -> Option<&TransportOffer> {
         self.offers.first()
     }
@@ -294,6 +302,7 @@ pub enum SessionRole {
 pub enum TransportOffer {
     WebRtc { offer: Value },
     WebSocket { url: String },
+    WebSocketFallback { url: String },
     Ipc,
 }
 
@@ -302,6 +311,7 @@ impl TransportOffer {
         match self {
             TransportOffer::WebRtc { .. } => "webrtc",
             TransportOffer::WebSocket { .. } => "websocket",
+            TransportOffer::WebSocketFallback { .. } => "websocket_fallback",
             TransportOffer::Ipc => "ipc",
         }
     }
@@ -502,14 +512,17 @@ fn parse_transports(
         }
     }
 
-    let has_websocket = offers
-        .iter()
-        .any(|offer| matches!(offer, TransportOffer::WebSocket { .. }));
+    let has_websocket = offers.iter().any(|offer| {
+        matches!(
+            offer,
+            TransportOffer::WebSocket { .. } | TransportOffer::WebSocketFallback { .. }
+        )
+    });
     if !has_websocket {
         if let Some(url) = fallback_websocket {
             let trimmed = url.trim();
             if !trimmed.is_empty() {
-                offers.push(TransportOffer::WebSocket {
+                offers.push(TransportOffer::WebSocketFallback {
                     url: trimmed.to_string(),
                 });
             }
@@ -696,12 +709,10 @@ mod tests {
                 .iter()
                 .any(|offer| matches!(offer, TransportOffer::WebRtc { .. }))
         );
-        assert!(
-            joiner
-                .offers()
-                .iter()
-                .any(|offer| matches!(offer, TransportOffer::WebSocket { .. }))
-        );
+        assert!(joiner.offers().iter().any(|offer| matches!(
+            offer,
+            TransportOffer::WebSocket { .. } | TransportOffer::WebSocketFallback { .. }
+        )));
     }
 
     #[test_timeout::tokio_timeout_test]

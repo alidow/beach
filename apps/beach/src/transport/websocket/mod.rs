@@ -38,6 +38,18 @@ pub async fn connect(url: &str) -> Result<Box<dyn Transport>, TransportError> {
     )))
 }
 
+pub fn wrap_stream<S>(
+    kind: TransportKind,
+    id: TransportId,
+    peer: TransportId,
+    stream: WebSocketStream<S>,
+) -> Box<dyn Transport>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    Box::new(WebSocketTransport::new(kind, id, peer, stream))
+}
+
 struct WebSocketTransport {
     kind: TransportKind,
     id: TransportId,

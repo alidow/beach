@@ -9,6 +9,40 @@ pub trait VideoEncoder {
     fn finish(self) -> Result<()>;
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::{Frame, PixelFormat};
+    use std::fs;
+    use std::time::SystemTime;
+
+    #[test]
+    fn gif_encoder_writes_file() {
+        let path = std::env::temp_dir().join(format!(
+            "cabana-test-{}.gif",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+
+        let mut encoder = GifVideoEncoder::new(&path, 2, 2, 5).expect("encoder");
+        let frame = Frame {
+            timestamp: SystemTime::now(),
+            width: 2,
+            height: 2,
+            pixel_format: PixelFormat::Rgba8888,
+            data: vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255],
+        };
+        encoder.write_frame(&frame).expect("write");
+        encoder.finish().expect("finish");
+
+        let metadata = fs::metadata(&path).expect("metadata");
+        assert!(metadata.len() > 0);
+        let _ = fs::remove_file(path);
+    }
+}
+
 pub struct GifVideoEncoder {
     encoder: Encoder<File>,
     delay_hundredths: u16,

@@ -5,11 +5,13 @@ import {
 import { connectWebRtcTransport } from '../transport/webrtc';
 import { SignalingClient } from '../transport/signaling';
 import type { SignalingClientOptions } from '../transport/signaling';
+import type { SecureTransportSummary } from '../transport/webrtc';
 
 export interface BrowserTransportConnection {
   transport: TerminalTransport;
   signaling: SignalingClient;
   remotePeerId?: string;
+  secure?: SecureTransportSummary;
   close(): void;
 }
 
@@ -38,6 +40,7 @@ export async function connectBrowserTransport(
   const {
     transport: webRtcTransport,
     remotePeerId,
+    secure,
   } = await connectWebRtcTransport({
     signaling,
     signalingUrl: join.signalingUrl,
@@ -45,14 +48,19 @@ export async function connectBrowserTransport(
     pollIntervalMs: join.pollIntervalMs,
     iceServers: options.iceServers,
     logger: options.logger,
+    passphrase: options.passcode,
+    telemetryBaseUrl: options.baseUrl,
+    sessionId: options.sessionId,
   });
   const transport = new DataChannelTerminalTransport(webRtcTransport, {
     logger: options.logger,
+    secureContext: secure,
   });
   return {
     transport,
     signaling,
     remotePeerId,
+    secure,
     close: () => {
       transport.close();
       signaling.close();

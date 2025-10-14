@@ -1237,15 +1237,42 @@ async fn negotiate_offerer_peer(
             .as_ref()
             .map(|p| !p.trim().is_empty())
             .unwrap_or(false);
+    tracing::info!(
+        target = "webrtc",
+        role = "offerer",
+        secure_transport_active,
+        has_passphrase = inner.passphrase.is_some(),
+        env_enabled = secure_transport_enabled(),
+        "offerer: checking if secure transport should be enabled"
+    );
     let handshake_dc = if secure_transport_active {
+        tracing::info!(
+            target = "webrtc",
+            role = "offerer",
+            label = HANDSHAKE_CHANNEL_LABEL,
+            "offerer: creating handshake data channel"
+        );
         Some(
             pc.create_data_channel(HANDSHAKE_CHANNEL_LABEL, Some(handshake_channel_init()))
                 .await
                 .map_err(to_setup_error)?,
         )
     } else {
+        tracing::info!(
+            target = "webrtc",
+            role = "offerer",
+            "offerer: NOT creating handshake channel (secure transport disabled)"
+        );
         None
     };
+    if let Some(ref dc) = handshake_dc {
+        tracing::info!(
+            target = "webrtc",
+            role = "offerer",
+            channel_state = ?dc.ready_state(),
+            "offerer: handshake channel created"
+        );
+    }
 
     if cancel_flag.load(Ordering::SeqCst) {
         let _ = pc.close().await;
@@ -1525,11 +1552,29 @@ async fn negotiate_offerer_peer(
     }
 
     let mut peer_metadata = peer.metadata.clone().unwrap_or_default();
+    tracing::info!(
+        target = "webrtc",
+        role = "offerer",
+        peer_id = %peer.id,
+        secure_transport_active,
+        has_passphrase = inner.passphrase.is_some(),
+        has_handshake_channel = handshake_dc.is_some(),
+        "offerer: evaluating whether to run secure handshake"
+    );
     let secure_context = if let (true, Some(passphrase), Some(handshake_channel)) = (
         secure_transport_active,
         inner.passphrase.as_ref(),
         handshake_dc.clone(),
     ) {
+        tracing::info!(
+            target = "webrtc",
+            role = "offerer",
+            handshake_id = %handshake_id,
+            offerer_peer = %offerer_peer_id,
+            remote_peer = %peer_id,
+            channel_state = ?handshake_channel.ready_state(),
+            "offerer: about to run handshake as Initiator"
+        );
         let prologue_context = build_prologue_context(&handshake_id, &offerer_peer_id, &peer_id);
         let params = HandshakeParams {
             passphrase: passphrase.clone(),
@@ -1538,7 +1583,20 @@ async fn negotiate_offerer_peer(
             remote_peer_id: peer_id.clone(),
             prologue_context,
         };
+        tracing::debug!(
+            target = "webrtc",
+            role = "offerer",
+            handshake_id = %handshake_id,
+            "offerer: calling run_handshake as Initiator"
+        );
         let result = run_handshake(HandshakeRole::Initiator, handshake_channel, params).await?;
+        tracing::info!(
+            target = "webrtc",
+            role = "offerer",
+            handshake_id = %handshake_id,
+            verification = %result.verification_code,
+            "offerer: handshake completed successfully as Initiator"
+        );
         transport.enable_encryption(&result)?;
         let result_arc = Arc::new(result);
         peer_metadata
@@ -1546,6 +1604,15 @@ async fn negotiate_offerer_peer(
             .or_insert(result_arc.verification_code.clone());
         Some(result_arc)
     } else {
+        tracing::info!(
+            target = "webrtc",
+            role = "offerer",
+            peer_id = %peer.id,
+            secure_transport_active,
+            has_passphrase = inner.passphrase.is_some(),
+            has_handshake_channel = handshake_dc.is_some(),
+            "offerer: skipping secure handshake (conditions not met)"
+        );
         None
     };
 
@@ -1882,11 +1949,28 @@ async fn connect_answerer(
                     return;
                 };
                 let dc_for_handshake = Arc::clone(&dc);
+                let channel_state = dc_for_handshake.ready_state();
                 let sender_holder = Arc::clone(&secure_sender);
                 let local_peer = assigned_peer_value.clone();
                 let remote_peer = remote_peer_value.clone();
                 let handshake_id_value = (*handshake_value).clone();
+                tracing::info!(
+                    target = "webrtc",
+                    label = HANDSHAKE_CHANNEL_LABEL,
+                    ?channel_state,
+                    handshake_id = %handshake_id_value,
+                    local_peer = %local_peer,
+                    remote_peer = %remote_peer,
+                    "spawning handshake task for answerer"
+                );
                 spawn_on_global(async move {
+                    tracing::info!(
+                        target = "webrtc",
+                        handshake_id = %handshake_id_value,
+                        local_peer = %local_peer,
+                        remote_peer = %remote_peer,
+                        "handshake task started on answerer (inside spawned task)"
+                    );
                     let prologue_context = build_prologue_context(
                         &handshake_id_value,
                         local_peer.as_str(),
@@ -1899,9 +1983,20 @@ async fn connect_answerer(
                         remote_peer_id: remote_peer.clone(),
                         prologue_context,
                     };
+                    tracing::debug!(
+                        target = "webrtc",
+                        handshake_id = %handshake_id_value,
+                        "calling run_handshake as Responder"
+                    );
                     let outcome = run_handshake(HandshakeRole::Responder, dc_for_handshake, params)
                         .await
                         .map(|res| Some(Arc::new(res)));
+                    tracing::info!(
+                        target = "webrtc",
+                        handshake_id = %handshake_id_value,
+                        outcome = ?outcome.as_ref().map(|_| "success").unwrap_or("error"),
+                        "handshake task completed, sending result"
+                    );
                     if let Some(sender) = sender_holder.lock().await.take() {
                         let _ = sender.send(outcome);
                     }
@@ -1951,24 +2046,26 @@ async fn connect_answerer(
                 slot_guard.replace(transport.clone());
                 drop(slot_guard);
 
-                tracing::debug!(
-                    target = "webrtc",
-                    role = "answerer",
-                    "sending __ready__ sentinel to offerer"
-                );
-
-                if let Err(err) = transport_dyn.send_text("__ready__") {
-                    tracing::warn!(
-                        target = "webrtc",
-                        error = %err,
-                        "answerer readiness ack failed"
-                    );
-                } else {
-                    tracing::info!(
+                if !secure_transport_active {
+                    tracing::debug!(
                         target = "webrtc",
                         role = "answerer",
-                        "sent __ready__ sentinel successfully"
+                        "sending __ready__ sentinel to offerer"
                     );
+
+                    if let Err(err) = transport_dyn.send_text("__ready__") {
+                        tracing::warn!(
+                            target = "webrtc",
+                            error = %err,
+                            "answerer readiness ack failed"
+                        );
+                    } else {
+                        tracing::info!(
+                            target = "webrtc",
+                            role = "answerer",
+                            "sent __ready__ sentinel successfully"
+                        );
+                    }
                 }
 
                 channels.publish(label.clone(), transport_dyn.clone());
@@ -2232,6 +2329,18 @@ async fn connect_answerer(
 
     if let Some(ref result) = secure_context {
         transport.enable_encryption(result.as_ref())?;
+        tracing::debug!(
+            target = "webrtc",
+            role = "answerer",
+            "sending encrypted __ready__ sentinel to offerer"
+        );
+        if let Err(err) = transport.send_text("__ready__") {
+            tracing::warn!(
+                target = "webrtc",
+                error = %err,
+                "answerer encrypted readiness ack failed"
+            );
+        }
     }
     let transport_dyn: Arc<dyn Transport> = transport.clone();
 

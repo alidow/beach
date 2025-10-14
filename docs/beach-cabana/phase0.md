@@ -72,7 +72,7 @@ Artifacts from each spike should be committed under `research/beach-cabana/` (pr
 
 ## Zero-Trust Alignment (Secure Signaling & Transport)
 
-- Cabana adopts the workflow defined in `docs/secure-shared-secret-webrtc-plan.md`.
+- Cabana adopts the workflow defined in `docs/secure-webrtc/secure-shared-secret-webrtc-plan.md`.
 - Each unique share link + passcode feeds an Argon2id stretch to produce a pre-shared key; Cabana must treat the passcode as mandatory and never send it to `beach-road`.
 - Signaling blobs (offer/answer/ICE) are sealed client-side using AES-256-GCM or ChaCha20-Poly1305 with keys derived via HKDF from the stretched secret and handshake id.
 - After data channel establishment, Cabana peers run a Noise `XXpsk2` handshake, binding to DTLS exporter/SDP fingerprints, and derive per-direction AEAD keys for video/control frames.

@@ -1,44 +1,47 @@
 import { decodeTransportMessage, encodeTransportMessage, type TransportMessage } from './envelope';
+import {
+  secureSignalingEnabled,
+  sealWithKey,
+  openWithKey,
+  type SealedEnvelope,
+  type SignalingLabel,
+} from './crypto/secureSignaling';
+import { derivePreSharedKey } from './crypto/sharedKey';
+import {
+  runBrowserHandshake,
+  buildPrologueContext,
+  type BrowserHandshakeResult,
+  type BrowserHandshakeRole,
+} from './crypto/noiseHandshake';
+import {
+  SecureDataChannel,
+  type DataChannelLike,
+} from './crypto/secureDataChannel';
 import type { SignalingClient, ServerMessage } from './signaling';
+import { reportSecureTransportEvent } from '../lib/telemetry';
+
+export interface SecureTransportSummary {
+  mode: 'secure' | 'plaintext';
+  verificationCode?: string;
+  handshakeId?: string;
+  remotePeerId?: string;
+}
 
 export type WebRtcTransportPayload = TransportMessage['payload'];
-
-export type DataChannelEventMap = {
-  message: MessageEvent;
-  open: Event;
-  close: Event;
-  error: Event;
-};
-
-export interface DataChannelLike extends EventTarget {
-  readonly label: string;
-  readyState: RTCDataChannelState;
-  binaryType: 'arraybuffer' | 'blob';
-  send(data: ArrayBufferLike | ArrayBufferView | string): void;
-  close(): void;
-  addEventListener<K extends keyof DataChannelEventMap>(
-    type: K,
-    listener: (event: DataChannelEventMap[K]) => void,
-    options?: boolean | AddEventListenerOptions,
-  ): void;
-  removeEventListener<K extends keyof DataChannelEventMap>(
-    type: K,
-    listener: (event: DataChannelEventMap[K]) => void,
-    options?: boolean | EventListenerOptions,
-  ): void;
-}
 
 export type WebRtcTransportEventMap = {
   message: CustomEvent<TransportMessage>;
   open: Event;
   close: Event;
   error: Event;
+  secure: CustomEvent<SecureTransportSummary>;
 };
 
 export interface WebRtcTransportOptions {
   channel: DataChannelLike;
   /** Optional initial outbound sequence value. Useful for deterministic tests. */
   initialSequence?: number;
+  secureSummary?: SecureTransportSummary;
 }
 
 /**
@@ -50,6 +53,7 @@ export class WebRtcTransport extends EventTarget {
   private sequence: number;
   private disposed = false;
   private open: boolean;
+  private readonly secureSummary: SecureTransportSummary;
 
   constructor(options: WebRtcTransportOptions) {
     super();
@@ -57,7 +61,11 @@ export class WebRtcTransport extends EventTarget {
     this.channel.binaryType = 'arraybuffer';
     this.sequence = options.initialSequence ?? 0;
     this.open = this.channel.readyState === 'open';
+    this.secureSummary = options.secureSummary ?? { mode: 'plaintext' };
     this.attachChannelListeners();
+    queueMicrotask(() => {
+      this.dispatchEvent(new CustomEvent<SecureTransportSummary>('secure', { detail: this.secureSummary }));
+    });
   }
 
   /** Send a UTF-8 text payload across the data channel. Returns the assigned sequence. */
@@ -91,6 +99,10 @@ export class WebRtcTransport extends EventTarget {
 
   isOpen(): boolean {
     return this.open && this.channel.readyState === 'open';
+  }
+
+  getSecureSummary(): SecureTransportSummary {
+    return this.secureSummary;
   }
 
   private attachChannelListeners(): void {
@@ -163,6 +175,9 @@ export interface ConnectWebRtcTransportOptions {
   iceServers?: RTCIceServer[];
   preferredPeerId?: string;
   logger?: (message: string) => void;
+  passphrase?: string;
+  telemetryBaseUrl?: string;
+  sessionId?: string;
 }
 
 export interface ConnectedWebRtcTransport {
@@ -170,14 +185,40 @@ export interface ConnectedWebRtcTransport {
   peerConnection: RTCPeerConnection;
   dataChannel: RTCDataChannel;
   remotePeerId: string;
+  secure?: SecureTransportSummary;
 }
 
 const ANSWER_FLUSH_DELAY_MS = 400;
+const HANDSHAKE_CHANNEL_LABEL = 'beach-secure-handshake';
+
+interface HandshakeOptions {
+  role: BrowserHandshakeRole;
+  handshakeId: string;
+  localPeerId: string;
+  remotePeerId: string;
+  prologueContext: Uint8Array;
+  keyPromise: Promise<Uint8Array>;
+  telemetryBaseUrl?: string;
+  sessionId?: string;
+}
 
 export async function connectWebRtcTransport(
   options: ConnectWebRtcTransportOptions,
 ): Promise<ConnectedWebRtcTransport> {
   const { signaling, logger } = options;
+  const passphrase = options.passphrase?.trim();
+  const secureSignalingActive = Boolean(secureSignalingEnabled() && passphrase && passphrase.length > 0);
+  let sealingKeyPromise: Promise<Uint8Array> | null = null;
+  const ensureSealingKey = (handshakeId: string): Promise<Uint8Array> => {
+    if (!sealingKeyPromise) {
+      if (!passphrase) {
+        throw new Error('secure signaling requires passphrase');
+      }
+      sealingKeyPromise = derivePreSharedKey(passphrase, handshakeId);
+    }
+    return sealingKeyPromise;
+  };
+  const getSealingKey = () => sealingKeyPromise;
   const join = await signaling.waitForMessage('join_success', 15_000);
   log(logger, `join_success payload: ${JSON.stringify(join)}`);
   const assignedPeerId = join.peer_id;
@@ -219,6 +260,7 @@ export async function connectWebRtcTransport(
     remotePeerId,
     () => currentHandshakeId,
     onRemoteCandidate,
+    secureState,
     logger,
   );
   const disposeGeneralListener = attachGeneralListener(signaling, remotePeerId, logger);
@@ -241,16 +283,21 @@ export async function connectWebRtcTransport(
   const MAX_RESEND_ATTEMPTS = 3;
   const RESEND_INTERVAL_MS = 1200;
 
-  const dispatchCandidate = (candidate: RTCIceCandidateInit) => {
+  const secureState = {
+    enabled: secureSignalingActive,
+    localPeerId: assignedPeerId,
+    ensureKey: ensureSealingKey,
+    getKey: getSealingKey,
+  } as const;
+
+  const dispatchCandidate = async (candidate: RTCIceCandidateInit) => {
     if (!currentHandshakeId) {
       pendingLocalCandidates.unshift(candidate);
       return;
     }
-    log(logger, `sending local candidate: ${JSON.stringify(candidate)}`);
-    signaling.send({
-      type: 'signal',
-      to_peer: remotePeerId,
-      signal: {
+    try {
+      log(logger, `sending local candidate: ${JSON.stringify(candidate)}`);
+      const signalPayload: any = {
         transport: 'webrtc',
         signal: {
           signal_type: 'ice_candidate',
@@ -259,17 +306,44 @@ export async function connectWebRtcTransport(
           sdp_mid: candidate.sdpMid ?? undefined,
           sdp_mline_index: candidate.sdpMLineIndex ?? undefined,
         },
-      },
-    });
+      };
+
+      if (secureState.enabled) {
+        const key = await secureState.ensureKey(currentHandshakeId);
+        const envelope = await sealIceCandidate({
+          key,
+          handshakeId: currentHandshakeId,
+          localPeerId: secureState.localPeerId,
+          remotePeerId,
+          candidate,
+        });
+        signalPayload.signal.candidate = '';
+        delete signalPayload.signal.sdp_mid;
+        delete signalPayload.signal.sdp_mline_index;
+        signalPayload.signal.sealed = envelope;
+      }
+
+      signaling.send({
+        type: 'signal',
+        to_peer: remotePeerId,
+        signal: signalPayload,
+      });
+    } catch (error) {
+      log(logger, `failed to send ICE candidate: ${String(error)}`);
+    }
   };
 
-  const flushPendingCandidates = () => {
+  const flushPendingCandidates = async () => {
     if (pendingLocalCandidates.length === 0 || !currentHandshakeId) {
       return;
     }
     while (pendingLocalCandidates.length > 0) {
       const candidate = pendingLocalCandidates.shift()!;
-      dispatchCandidate(candidate);
+      try {
+        await dispatchCandidate(candidate);
+      } catch (error) {
+        log(logger, `failed to flush candidate: ${String(error)}`);
+      }
     }
     scheduleResend();
   };
@@ -281,7 +355,7 @@ export async function connectWebRtcTransport(
     flushTimer = setTimeout(() => {
       flushTimer = null;
       candidateSendState = 'ready';
-      flushPendingCandidates();
+      void flushPendingCandidates();
     }, delayMs);
   };
 
@@ -295,12 +369,18 @@ export async function connectWebRtcTransport(
     resendTimer = setTimeout(() => {
       resendTimer = null;
       resendAttempts += 1;
-      for (const candidate of allLocalCandidates) {
-        dispatchCandidate({ ...candidate });
-      }
-      if (resendAttempts < MAX_RESEND_ATTEMPTS) {
-        scheduleResend();
-      }
+      void (async () => {
+        for (const candidate of allLocalCandidates) {
+          try {
+            await dispatchCandidate({ ...candidate });
+          } catch (error) {
+            log(logger, `failed to resend candidate: ${String(error)}`);
+          }
+        }
+        if (resendAttempts < MAX_RESEND_ATTEMPTS) {
+          scheduleResend();
+        }
+      })();
     }, RESEND_INTERVAL_MS);
   };
 
@@ -323,7 +403,7 @@ export async function connectWebRtcTransport(
     pendingLocalCandidates.push(stored);
     allLocalCandidates.push(stored);
     if (candidateSendState === 'ready' && currentHandshakeId) {
-      flushPendingCandidates();
+      void flushPendingCandidates();
     } else if (candidateSendState === 'delayed') {
       scheduleFlush(ANSWER_FLUSH_DELAY_MS);
     }
@@ -341,6 +421,14 @@ export async function connectWebRtcTransport(
       remotePeerId,
       logger,
       localPeerId: assignedPeerId,
+      secure: {
+        enabled: secureState.enabled,
+        passphrase,
+        ensureKey: ensureSealingKey,
+        getKey: getSealingKey,
+        localPeerId: assignedPeerId,
+        remotePeerId,
+      },
       afterSetRemoteDescription: () => {
         remoteDescriptionSet = true;
         // Drain any queued remote candidates now that the offer is applied.
@@ -364,7 +452,7 @@ export async function connectWebRtcTransport(
       currentHandshakeId = handshakeId;
       log(logger, `handshake ready: ${handshakeId}`);
       if (candidateSendState === 'ready') {
-        flushPendingCandidates();
+        void flushPendingCandidates();
       }
     });
   } finally {
@@ -378,6 +466,11 @@ function attachSignalListener(
   remotePeerId: string,
   getHandshakeId: () => string | null,
   onRemoteCandidate: (cand: RTCIceCandidateInit) => void,
+  secure: {
+    enabled: boolean;
+    getKey: () => Promise<Uint8Array> | null;
+    localPeerId: string;
+  },
   logger?: (message: string) => void,
 ): () => void {
   const handler = (event: Event) => {
@@ -402,13 +495,50 @@ function attachSignalListener(
       return;
     }
     if (signal.signal.signal_type === 'ice_candidate') {
-      const candidate: RTCIceCandidateInit = {
-        candidate: signal.signal.candidate,
-        sdpMid: signal.signal.sdp_mid ?? undefined,
-        sdpMLineIndex: signal.signal.sdp_mline_index ?? undefined,
-      };
-      log(logger, 'received remote ice candidate');
-      onRemoteCandidate(candidate);
+      void (async () => {
+        const handshakeId = getHandshakeId();
+        if (!handshakeId) {
+          log(logger, 'ignoring remote candidate: handshake not established');
+          return;
+        }
+
+        let candidateInit: RTCIceCandidateInit;
+        if (secure.enabled) {
+          const keyPromise = secure.getKey();
+          if (!keyPromise) {
+            log(logger, 'ignoring remote candidate: secure key not ready');
+            return;
+          }
+          const sealed = signal.signal.sealed;
+          if (!sealed) {
+            log(logger, 'ignoring remote candidate: sealed payload missing');
+            return;
+          }
+          try {
+            const key = await keyPromise;
+            const decoded = await openIceCandidate({
+              key,
+              handshakeId,
+              localPeerId: secure.localPeerId,
+              remotePeerId,
+              envelope: sealed,
+            });
+            candidateInit = decoded;
+          } catch (error) {
+            log(logger, `failed to decrypt remote candidate: ${String(error)}`);
+            return;
+          }
+        } else {
+          candidateInit = {
+            candidate: signal.signal.candidate,
+            sdpMid: signal.signal.sdp_mid ?? undefined,
+            sdpMLineIndex: signal.signal.sdp_mline_index ?? undefined,
+          };
+        }
+
+        log(logger, 'received remote ice candidate');
+        onRemoteCandidate(candidateInit);
+      })();
     }
   };
 
@@ -446,7 +576,12 @@ async function resolveRemotePeerId(
 function parseWebRtcSignal(raw: unknown):
   | {
       transport: 'webrtc';
-      signal: { signal_type: 'offer' | 'answer'; sdp: string; handshake_id: string };
+      signal: {
+        signal_type: 'offer' | 'answer';
+        sdp: string;
+        handshake_id: string;
+        sealed?: SealedEnvelope;
+      };
     }
   | {
       transport: 'webrtc';
@@ -456,6 +591,7 @@ function parseWebRtcSignal(raw: unknown):
         candidate: string;
         sdp_mid?: string;
         sdp_mline_index?: number;
+        sealed?: SealedEnvelope;
       };
     }
   | undefined {
@@ -481,6 +617,7 @@ function parseWebRtcSignal(raw: unknown):
         signal_type: signalType,
         sdp: typeof signal.sdp === 'string' ? signal.sdp : '',
         handshake_id: signal.handshake_id,
+        sealed: parseSealed(signal.sealed),
       },
     };
   }
@@ -500,8 +637,26 @@ function parseWebRtcSignal(raw: unknown):
         sdp_mid: typeof signal.sdp_mid === 'string' ? signal.sdp_mid : undefined,
         sdp_mline_index:
           typeof signal.sdp_mline_index === 'number' ? signal.sdp_mline_index : undefined,
+        sealed: parseSealed(signal.sealed),
       },
     };
+  }
+  return undefined;
+}
+
+function parseSealed(value: unknown): SealedEnvelope | undefined {
+  if (!value || typeof value !== 'object') {
+    return undefined;
+  }
+  const version = (value as any).version;
+  const nonce = (value as any).nonce;
+  const ciphertext = (value as any).ciphertext;
+  if (
+    typeof version === 'number' &&
+    typeof nonce === 'string' &&
+    typeof ciphertext === 'string'
+  ) {
+    return { version, nonce, ciphertext };
   }
   return undefined;
 }
@@ -517,8 +672,17 @@ async function connectAsAnswerer(options: {
   beforePostAnswer?: () => void;
   afterPostAnswer?: () => void;
   localPeerId: string;
+  secure: {
+    enabled: boolean;
+    passphrase?: string;
+    ensureKey: (handshakeId: string) => Promise<Uint8Array>;
+    getKey: () => Promise<Uint8Array> | null;
+    localPeerId: string;
+    remotePeerId: string;
+  };
 }, onHandshakeReady: (handshakeId: string) => void): Promise<ConnectedWebRtcTransport> {
-  const { pc, signalingUrl, pollIntervalMs, remotePeerId, logger, localPeerId } = options;
+  const { pc, signalingUrl, pollIntervalMs, remotePeerId, logger, localPeerId, secure } = options;
+  let cachedSecureKey: Uint8Array | null = null;
   log(logger, 'polling for SDP offer');
   const offer = await pollSdp(
     `${signalingUrl.replace(/\/$/, '')}/offer`,
@@ -531,8 +695,53 @@ async function connectAsAnswerer(options: {
   if (!handshakeId) {
     throw new Error('offer missing handshake_id');
   }
+  if (secure.enabled) {
+    if (!secure.passphrase) {
+      throw new Error('secure signaling requires passphrase');
+    }
+    if (!offer.sealed) {
+      throw new Error('expected sealed offer payload');
+    }
+    const key = await secure.ensureKey(handshakeId);
+    cachedSecureKey = key;
+    const plaintext = await openSdpWithKey({
+      key,
+      handshakeId,
+      label: 'offer',
+      payload: offer,
+    });
+    offer.sdp = plaintext;
+  }
   onHandshakeReady(handshakeId);
-  const channelPromise = waitForDataChannel(pc, remotePeerId, logger);
+  const prologueContext = buildPrologueContext(
+    handshakeId,
+    secure.localPeerId,
+    secure.remotePeerId,
+  );
+  const handshakeKeyPromise =
+    secure.enabled && cachedSecureKey
+      ? Promise.resolve(cachedSecureKey)
+      : secure.enabled
+        ? secure.ensureKey(handshakeId)
+        : undefined;
+  const channelPromise = waitForDataChannel(pc, {
+    remotePeerId,
+    logger,
+    handshake: secure.enabled
+      ? {
+          role: 'responder',
+          handshakeId,
+          localPeerId: secure.localPeerId,
+          remotePeerId: secure.remotePeerId,
+          prologueContext,
+          keyPromise: handshakeKeyPromise!,
+          telemetryBaseUrl: options.telemetryBaseUrl,
+          sessionId: options.sessionId,
+        }
+      : undefined,
+    telemetryBaseUrl: options.telemetryBaseUrl,
+    sessionId: options.sessionId,
+  });
   log(logger, 'waiting for data channel announcement');
 
   await pc.setRemoteDescription({ type: offer.type as RTCSdpType, sdp: offer.sdp });
@@ -545,13 +754,30 @@ async function connectAsAnswerer(options: {
   try {
     options.beforePostAnswer?.();
   } catch {}
-  await postSdp(`${signalingUrl.replace(/\/$/, '')}/answer`, {
+  const answerPayload: WebRtcSdpPayload = {
     sdp: answer.sdp ?? '',
     type: answer.type,
     handshake_id: handshakeId,
     from_peer: localPeerId,
     to_peer: offer.from_peer,
-  });
+  };
+
+  if (secure.enabled) {
+    const key =
+      cachedSecureKey ??
+      (await secure.ensureKey(handshakeId));
+    cachedSecureKey = key;
+    const sealed = await sealSdpWithKey({
+      key,
+      handshakeId,
+      label: 'answer',
+      payload: answerPayload,
+    });
+    answerPayload.sdp = '';
+    answerPayload.sealed = sealed;
+  }
+
+  await postSdp(`${signalingUrl.replace(/\/$/, '')}/answer`, answerPayload);
   log(logger, 'SDP answer posted');
   try {
     options.afterPostAnswer?.();
@@ -562,46 +788,164 @@ async function connectAsAnswerer(options: {
 
 async function waitForDataChannel(
   pc: RTCPeerConnection,
-  remotePeerId: string,
-  logger?: (message: string) => void,
+  options: {
+    remotePeerId: string;
+    logger?: (message: string) => void;
+    handshake?: HandshakeOptions;
+    telemetryBaseUrl?: string;
+    sessionId?: string;
+  },
 ): Promise<ConnectedWebRtcTransport> {
   return await new Promise<ConnectedWebRtcTransport>((resolve, reject) => {
+    let cleaned = false;
+    const cleanupCallbacks: Array<() => void> = [];
+    const cleanup = () => {
+      if (cleaned) {
+        return;
+      }
+      cleaned = true;
+      clearTimeout(timeout);
+      pc.removeEventListener('datachannel', handleDataChannel);
+      while (cleanupCallbacks.length > 0) {
+        const fn = cleanupCallbacks.pop()!;
+        try {
+          fn();
+        } catch {}
+      }
+    };
+
     const timeout = setTimeout(() => {
+      cleanup();
       reject(new Error('timed out waiting for data channel'));
     }, 20_000);
 
-    pc.ondatachannel = (event) => {
+    let resolveHandshake: ((value: BrowserHandshakeResult) => void) | null = null;
+    let rejectHandshake: ((reason?: unknown) => void) | null = null;
+    const handshakePromise: Promise<BrowserHandshakeResult | null> = options.handshake
+      ? new Promise<BrowserHandshakeResult>((res, rej) => {
+          resolveHandshake = res;
+          rejectHandshake = rej;
+        })
+      : Promise.resolve(null);
+
+    const handleDataChannel = (event: RTCDataChannelEvent) => {
       const channel = event.channel;
-      log(logger, `data channel announced: ${channel.label}`);
-      channel.binaryType = 'arraybuffer';
-      const transport = new WebRtcTransport({ channel });
+      log(options.logger, `data channel announced: ${channel.label}`);
 
-      const handleOpen = () => {
-        cleanup();
-        log(logger, 'data channel open');
-        resolve({
-          transport,
-          peerConnection: pc,
-          dataChannel: channel,
-          remotePeerId,
-        });
+      if (channel.label === HANDSHAKE_CHANNEL_LABEL) {
+        if (!options.handshake) {
+          log(options.logger, 'unexpected handshake channel; closing');
+          try {
+            channel.close();
+          } catch {}
+          return;
+        }
+        const cfg = options.handshake;
+        const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        runBrowserHandshake(channel, {
+          role: cfg.role,
+          handshakeId: cfg.handshakeId,
+          localPeerId: cfg.localPeerId,
+          remotePeerId: cfg.remotePeerId,
+          prologueContext: cfg.prologueContext,
+          preSharedKeyPromise: cfg.keyPromise,
+        })
+          .then((result) => {
+            log(
+              options.logger,
+              `secure handshake complete; verification ${result.verificationCode}`,
+            );
+            const finishedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+            void reportSecureTransportEvent(cfg.telemetryBaseUrl ?? options.telemetryBaseUrl, {
+              sessionId: cfg.sessionId ?? options.sessionId,
+              handshakeId: cfg.handshakeId,
+              role: cfg.role === 'initiator' ? 'offerer' : 'answerer',
+              outcome: 'success',
+              verificationCode: result.verificationCode,
+              latencyMs: Math.max(0, finishedAt - startedAt),
+            });
+            resolveHandshake?.(result);
+            try {
+              channel.close();
+            } catch {}
+          })
+          .catch((error) => {
+            void reportSecureTransportEvent(cfg.telemetryBaseUrl ?? options.telemetryBaseUrl, {
+              sessionId: cfg.sessionId ?? options.sessionId,
+              handshakeId: cfg.handshakeId,
+              role: cfg.role === 'initiator' ? 'offerer' : 'answerer',
+              outcome: 'failure',
+              reason: error instanceof Error ? error.message : String(error),
+            });
+            rejectHandshake?.(error);
+            cleanup();
+            reject(error instanceof Error ? error : new Error(String(error)));
+          });
+        return;
+      }
+
+      const prepare = async () => {
+        try {
+          const handshakeResult = await handshakePromise;
+          const secureSummary: SecureTransportSummary =
+            handshakeResult && options.handshake
+              ? {
+                  mode: 'secure',
+                  verificationCode: handshakeResult.verificationCode,
+                  handshakeId: options.handshake.handshakeId,
+                  remotePeerId: options.handshake.remotePeerId,
+                }
+              : { mode: 'plaintext' };
+          const wrappedChannel: DataChannelLike =
+            handshakeResult !== null
+              ? new SecureDataChannel(channel, {
+                  sendKey: handshakeResult.sendKey,
+                  recvKey: handshakeResult.recvKey,
+                })
+              : channel;
+
+          const transport = new WebRtcTransport({
+            channel: wrappedChannel,
+            secureSummary,
+          });
+
+          const handleOpen = () => {
+            cleanup();
+            log(options.logger, 'data channel open');
+            resolve({
+              transport,
+              peerConnection: pc,
+              dataChannel: channel,
+              remotePeerId: options.remotePeerId,
+              secure: secureSummary,
+            });
+          };
+
+          const handleError = (event: Event) => {
+            cleanup();
+            reject((event as any).error ?? new Error('data channel error'));
+          };
+
+          cleanupCallbacks.push(() => {
+            wrappedChannel.removeEventListener('open', handleOpen);
+            wrappedChannel.removeEventListener('error', handleError);
+          });
+
+          wrappedChannel.addEventListener('open', handleOpen, { once: true });
+          wrappedChannel.addEventListener('error', handleError, { once: true });
+          wrappedChannel.addEventListener('close', () =>
+            log(options.logger, 'data channel closed'),
+          );
+        } catch (error) {
+          cleanup();
+          reject(error instanceof Error ? error : new Error(String(error)));
+        }
       };
 
-      const handleError = (event: Event) => {
-        cleanup();
-        reject((event as any).error ?? new Error('data channel error'));
-      };
-
-      const cleanup = () => {
-        clearTimeout(timeout);
-        channel.removeEventListener('open', handleOpen);
-        channel.removeEventListener('error', handleError);
-      };
-
-      channel.addEventListener('open', handleOpen, { once: true });
-      channel.addEventListener('error', handleError, { once: true });
-      channel.addEventListener('close', () => log(logger, 'data channel closed'));
+      void prepare();
     };
+
+    pc.addEventListener('datachannel', handleDataChannel);
   });
 }
 
@@ -649,6 +993,92 @@ async function postSdp(url: string, payload: WebRtcSdpPayload): Promise<void> {
   }
 }
 
+async function sealSdpWithKey(options: {
+  key: Uint8Array;
+  handshakeId: string;
+  label: 'offer' | 'answer';
+  payload: WebRtcSdpPayload;
+}): Promise<SealedEnvelope> {
+  const { key, handshakeId, label, payload } = options;
+  return await sealWithKey({
+    psk: key,
+    handshakeId,
+    label,
+    associatedData: [payload.from_peer, payload.to_peer, payload.type],
+    plaintext: payload.sdp,
+  });
+}
+
+async function openSdpWithKey(options: {
+  key: Uint8Array;
+  handshakeId: string;
+  label: 'offer' | 'answer';
+  payload: WebRtcSdpPayload;
+}): Promise<string> {
+  const { key, handshakeId, label, payload } = options;
+  if (!payload.sealed) {
+    throw new Error('sealed envelope missing');
+  }
+  return await openWithKey({
+    psk: key,
+    handshakeId,
+    label,
+    associatedData: [payload.from_peer, payload.to_peer, payload.type],
+    envelope: payload.sealed,
+  });
+}
+
+async function sealIceCandidate(options: {
+  key: Uint8Array;
+  handshakeId: string;
+  localPeerId: string;
+  remotePeerId: string;
+  candidate: RTCIceCandidateInit;
+}): Promise<SealedEnvelope> {
+  const { key, handshakeId, localPeerId, remotePeerId, candidate } = options;
+  const plaintext = JSON.stringify({
+    candidate: candidate.candidate ?? '',
+    sdp_mid: candidate.sdpMid ?? null,
+    sdp_mline_index: candidate.sdpMLineIndex ?? null,
+  });
+  return await sealWithKey({
+    psk: key,
+    handshakeId,
+    label: 'ice',
+    associatedData: [localPeerId, remotePeerId, handshakeId],
+    plaintext,
+  });
+}
+
+async function openIceCandidate(options: {
+  key: Uint8Array;
+  handshakeId: string;
+  localPeerId: string;
+  remotePeerId: string;
+  envelope: SealedEnvelope;
+}): Promise<RTCIceCandidateInit> {
+  const { key, handshakeId, localPeerId, remotePeerId, envelope } = options;
+  const plaintext = await openWithKey({
+    psk: key,
+    handshakeId,
+    label: 'ice',
+    associatedData: [remotePeerId, localPeerId, handshakeId],
+    envelope,
+  });
+  let parsed: any;
+  try {
+    parsed = JSON.parse(plaintext);
+  } catch (error) {
+    throw new Error(`failed to parse sealed ICE candidate: ${String(error)}`);
+  }
+  return {
+    candidate: typeof parsed.candidate === 'string' ? parsed.candidate : '',
+    sdpMid: typeof parsed.sdp_mid === 'string' ? parsed.sdp_mid : undefined,
+    sdpMLineIndex:
+      typeof parsed.sdp_mline_index === 'number' ? parsed.sdp_mline_index : undefined,
+  };
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -674,6 +1104,7 @@ interface WebRtcSdpPayload {
   handshake_id: string;
   from_peer: string;
   to_peer: string;
+  sealed?: SealedEnvelope;
 }
 
 function log(logger: ((message: string) => void) | undefined, message: string): void {

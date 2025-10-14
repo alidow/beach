@@ -2,6 +2,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 pub mod macos;
 
 #[derive(Debug, Clone, Serialize)]

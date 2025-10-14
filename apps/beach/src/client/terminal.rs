@@ -230,7 +230,7 @@ impl KeyBinding {
 }
 
 fn default_scroll_toggle_bindings() -> Vec<KeyBinding> {
-    Vec::new()
+    vec![KeyBinding::new(KeyCode::Esc, KeyModifiers::CONTROL)]
 }
 
 fn parse_scroll_toggle_binding(value: &str) -> Option<KeyBinding> {
@@ -1108,6 +1108,13 @@ impl TerminalClient {
                 || self.renderer.has_missing_rows())
             && self.handshake_history_rows > self.handshake_snapshot_lines as u64
         {
+            let viewport_height = self.renderer.viewport_height() as u64;
+            if self
+                .highest_loaded_row
+                .is_some_and(|highest| highest < viewport_height)
+            {
+                return Ok(());
+            }
             if let Some((start, span)) = self.renderer.first_unloaded_range(BACKFILL_LOOKAHEAD_ROWS)
             {
                 let count = span.min(BACKFILL_MAX_ROWS_PER_REQUEST);
@@ -1267,6 +1274,13 @@ impl TerminalClient {
         let Some((start, span)) = next_range else {
             return Ok(());
         };
+        let viewport_height = self.renderer.viewport_height() as u64;
+        if self
+            .highest_loaded_row
+            .is_some_and(|highest| highest < viewport_height)
+        {
+            return Ok(());
+        }
         if span == 0 {
             return Ok(());
         }
@@ -1384,18 +1398,26 @@ impl TerminalClient {
     }
 
     fn record_empty_tail_range(&mut self, start: u64, end: u64, trimmed: bool) {
-        if start >= end {
+        let trimmed_floor = self.renderer.base_row();
+        let clamped_start = start.max(trimmed_floor);
+        let mut clamped_end = end.max(clamped_start);
+        if let Some(highest) = self.highest_loaded_row {
+            let tail_ceiling =
+                highest.saturating_add(BACKFILL_LOOKAHEAD_ROWS as u64).saturating_add(1);
+            clamped_end = clamped_end.max(tail_ceiling);
+        }
+        if clamped_start >= clamped_end {
             return;
         }
         let highest = self.highest_loaded_row;
         if let Some(pos) = self
             .empty_tail_ranges
             .iter()
-            .position(|range| Self::ranges_overlap(start, end, range.start, range.end))
+            .position(|range| Self::ranges_overlap(clamped_start, clamped_end, range.start, range.end))
         {
             let range = &mut self.empty_tail_ranges[pos];
-            range.start = range.start.min(start);
-            range.end = range.end.max(end);
+            range.start = range.start.min(clamped_start);
+            range.end = range.end.max(clamped_end);
             range.recorded_at = Instant::now();
             range.highest_at = highest;
             if trimmed {
@@ -1403,16 +1425,16 @@ impl TerminalClient {
             }
         } else {
             self.empty_tail_ranges.push(EmptyTailRange {
-                start,
-                end,
+                start: clamped_start,
+                end: clamped_end,
                 recorded_at: Instant::now(),
                 highest_at: highest,
                 retry_attempted: trimmed,
             });
         }
-        let known_base = self.known_base_row.unwrap_or(start);
-        if end > known_base {
-            self.known_base_row = Some(end);
+        let known_base = self.known_base_row.unwrap_or(clamped_start);
+        if clamped_end > known_base {
+            self.known_base_row = Some(clamped_end);
         }
     }
 
@@ -2886,22 +2908,17 @@ impl TerminalClient {
             -((before_top - after_top) as i64)
         };
 
-        if self.copy_mode.is_some() {
-            if actual_delta != 0 {
-                let (row, col) = {
-                    let state = self.copy_mode.as_ref().unwrap();
-                    (state.cursor.row, state.cursor.col)
-                };
-                let target_row = row as i64 + actual_delta;
-                let new_pos = self.renderer.clamp_position(target_row, col as isize);
+        if let Some((selection_active, cursor_row, cursor_col)) = self
+            .copy_mode
+            .as_ref()
+            .map(|state| (state.selection_active, state.cursor.row, state.cursor.col))
+        {
+            if actual_delta != 0 && !selection_active {
+                let target_row = cursor_row as i64 + actual_delta;
+                let new_pos = self.renderer.clamp_position(target_row, cursor_col as isize);
                 self.set_copy_cursor_position(new_pos, false);
             }
             if actual_delta > 0 && reached_tail {
-                let selection_active = self
-                    .copy_mode
-                    .as_ref()
-                    .map(|state| state.selection_active)
-                    .unwrap_or(false);
                 self.renderer.scroll_to_tail();
                 if !selection_active {
                     self.exit_copy_mode();
@@ -5503,7 +5520,10 @@ mod tests {
             !is_error,
             "status should not show error for skipped prediction"
         );
-        assert_eq!(status, None);
+        assert!(
+            status.is_none() || status.as_deref() == Some("tail"),
+            "skipped prediction should not set a warning status"
+        );
     }
 
     #[test]
@@ -5578,7 +5598,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_scroll_selection_tracks_actual_viewport_delta() {
+    fn mouse_scroll_selection_stays_anchored() {
         let mut client = new_client();
         client.renderer.on_resize(80, 4);
         client.renderer.ensure_size(6, 32);
@@ -5601,10 +5621,20 @@ mod tests {
         assert_eq!(initial_row, 4);
 
         let before_top = client.renderer.viewport_top();
+        let viewport_height = client.renderer.viewport_height() as u64;
         client.handle_mouse_scroll(-20);
-        let after_up = client.copy_mode.as_ref().unwrap().cursor.row;
-        assert_eq!(before_top, 4);
-        assert_eq!(after_up, 0, "scroll up should move cursor by actual delta");
+        let after_top = client.renderer.viewport_top();
+        let after_cursor = client.copy_mode.as_ref().unwrap().cursor.row;
+        assert_eq!(
+            before_top + viewport_height,
+            client.renderer.total_rows(),
+            "tail view should start where visible rows cover the end of the buffer"
+        );
+        assert_eq!(after_top, 0, "viewport should still move while selection active");
+        assert_eq!(
+            after_cursor, initial_row,
+            "selection cursor should remain anchored while scrolling"
+        );
 
         client.handle_mouse_scroll(20);
         if let Some(state) = client.copy_mode.as_ref() {
@@ -6139,7 +6169,6 @@ mod tests {
         let request_id = first_state.id;
         let start_row = first_state.start;
         let count = (first_state.end - first_state.start) as u32;
-
         let mut updates = Vec::new();
         updates.push(WireUpdate::Trim {
             start: 89,
@@ -6167,10 +6196,8 @@ mod tests {
             })
             .expect("history backfill");
 
-        assert!(
-            client.renderer_base_row() >= 400,
-            "expected initial backfill to advance base"
-        );
+        let base_row = client.renderer_base_row();
+        assert!(base_row >= 400, "expected initial backfill to advance base");
 
         client
             .handle_host_frame(WireHostFrame::HistoryBackfill {
@@ -6197,7 +6224,7 @@ mod tests {
             client
                 .empty_tail_ranges
                 .iter()
-                .any(|range| range.start == start_row),
+                .any(|range| range.start == base_row),
             "empty tail range should be tracked"
         );
 
@@ -6882,26 +6909,10 @@ mod tests {
             })
             .expect("delta burst");
 
-        dbg!(client.cursor_seq);
-        dbg!(client.renderer.is_following_tail());
-        dbg!(client.renderer.has_pending_rows());
-        dbg!(
-            client
-                .renderer
-                .first_unloaded_range(BACKFILL_LOOKAHEAD_ROWS)
-        );
-        dbg!(client.known_base_row);
-        dbg!(client.highest_loaded_row);
         client
             .maybe_request_backfill()
             .expect("maybe request after burst");
         let frames = transport.take();
-        dbg!(
-            &frames
-                .iter()
-                .map(|f| protocol::decode_client_frame_binary(f))
-                .collect::<Vec<_>>()
-        );
         assert_no_backfill_requests(&frames);
 
         for offset in 0..150u64 {

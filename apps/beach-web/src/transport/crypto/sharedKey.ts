@@ -1,15 +1,11 @@
+import { deriveArgon2id } from './argon2';
+
 /**
  * Shared-secret derivation helpers for sealed signaling and post-handshake crypto.
- *
- * NOTE: We will swap the PBKDF2 placeholder for Argon2id once the WASM dependency
- * is added to the bundle. The interim implementation keeps the API stable so the
- * rest of the pipeline can be wired up safely.
  */
 
-const DERIVED_KEY_LENGTH_BITS = 32 * 8;
-
 /**
- * Stretch a human passphrase using PBKDF2(SHA-256) while we integrate Argon2id.
+ * Stretch a human passphrase using Argon2id (aligned with the Rust toolchain).
  * Salt is expected to be the handshake identifier so both peers converge on the
  * same 32-byte secret.
  */
@@ -17,30 +13,12 @@ export async function derivePreSharedKey(
   passphrase: string,
   salt: string,
 ): Promise<Uint8Array> {
-  const encoder = new TextEncoder();
-  const passphraseBytes = encoder.encode(passphrase);
-  const saltBytes = encoder.encode(salt);
-
-  const keyMaterial = await crypto.subtle.importKey(
-    'raw',
-    toArrayBuffer(passphraseBytes),
-    { name: 'PBKDF2' },
-    false,
-    ['deriveBits'],
-  );
-
-  const derivedBits = await crypto.subtle.deriveBits(
-    {
-      name: 'PBKDF2',
-      hash: 'SHA-256',
-      iterations: 64_000,
-      salt: toArrayBuffer(saltBytes),
-    },
-    keyMaterial,
-    DERIVED_KEY_LENGTH_BITS,
-  );
-
-  return new Uint8Array(derivedBits);
+  try {
+    return await deriveArgon2id({ passphrase, salt });
+  } catch (error) {
+    console.error('[beach-web] argon2 derive failed', error);
+    throw error instanceof Error ? error : new Error(String(error));
+  }
 }
 
 /**

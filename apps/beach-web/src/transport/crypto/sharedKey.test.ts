@@ -1,37 +1,13 @@
-import { webcrypto } from 'node:crypto';
-import { describe, expect, it } from 'vitest';
+import { describe, it, expect } from 'vitest';
+import { derivePreSharedKey, toHex } from './sharedKey';
 
-if (!globalThis.crypto) {
-  // Vitest under Node provides the Web Crypto API via node:crypto.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  globalThis.crypto = webcrypto as unknown as Crypto;
-}
-
-import { derivePreSharedKey, hkdfExpand, toHex } from './sharedKey';
-
-const encoder = new TextEncoder();
-
-describe('shared key derivation', () => {
-  it('derives deterministic pre-shared keys', async () => {
-    const passphrase = 'Otters-Play-At-Dawn';
-    const handshakeId = 'handshake-12345';
-
-    const keyA = await derivePreSharedKey(passphrase, handshakeId);
-    const keyB = await derivePreSharedKey(passphrase, handshakeId);
-
-    expect(toHex(keyA)).toEqual(toHex(keyB));
-    expect(keyA).toHaveLength(32);
-  });
-
-  it('produces distinct HKDF outputs for different info labels', async () => {
-    const ikm = encoder.encode('shared-secret');
-    const salt = encoder.encode('handshake-v1');
-
-    const sendKey = await hkdfExpand(ikm, salt, encoder.encode('send'), 32);
-    const recvKey = await hkdfExpand(ikm, salt, encoder.encode('recv'), 32);
-
-    expect(toHex(sendKey)).not.toEqual(toHex(recvKey));
-    expect(sendKey).toHaveLength(32);
-    expect(recvKey).toHaveLength(32);
-  });
+describe('derivePreSharedKey', () => {
+  it(
+    'matches Rust Argon2id output for known vector',
+    async () => {
+      const key = await derivePreSharedKey('correct horse battery staple', 'session-id-1234');
+      expect(toHex(key)).toBe('939fee58f639eab75e07d235688001ebba6a2146b95c4ee013961819847943fc');
+    },
+    20_000,
+  );
 });

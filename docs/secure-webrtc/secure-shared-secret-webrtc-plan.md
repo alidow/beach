@@ -140,7 +140,7 @@
 - OPAQUE/PAKE background: CFRG RFC 9380.
 
 ## Immediate Next Steps (handoff summary)
-1. **Browser Argon2 parity (Phase 4/A1):** replace the PBKDF2 placeholder in `derivePreSharedKey` with the same Argon2id settings used by the Rust clients and host.
+1. **(Done – 2025-10-14)** Browser Argon2 parity (Phase 4/A1): replace the PBKDF2 placeholder in `derivePreSharedKey` with the same Argon2id settings used by the Rust clients and host.
 2. **Browser Noise handshake (Phase 4/A3):** choose a Noise JS/WASM implementation, wire it into `transport/crypto/noiseHandshake.ts`, and surface verification strings/telemetry in the UI.
 3. **Browser transport AEAD (Phase 4/A4):** reuse the ChaCha20-Poly1305 framing on the web data channel once handshake keys are available.
 4. **Feature negotiation & telemetry (Phase 4/B):** advertise secure capability, add metric hooks, and gate rollout behind flags before removing plaintext fallbacks.
@@ -158,7 +158,7 @@ Bring `apps/beach-web` in line with the Rust toolchain by deriving sealed-signal
 
 ### Work Breakdown
 1. **Library selection & integration**
-   - Adopt `argon2-browser` (preferred) or build a custom WASM module if evaluation fails. Validate that the bundled WASM supports Argon2id with configurable memory, iterations, and output length.
+   - Integrate `@noble/hashes/argon2id` for the initial parity pass, keeping the abstraction thin so we can swap in a dedicated WASM backend if later profiling justifies the trade.
    - Add the dependency to `apps/beach-web` and configure Vite to emit the WASM artifact alongside the JS chunk (ensure `vite.config.ts` includes `wasm` in asset handling).
    - Provide a thin loader (`transport/crypto/argon2.ts`) that initialises the WASM once, caches the promise, and surfaces a typed API.
 
@@ -189,7 +189,13 @@ Bring `apps/beach-web` in line with the Rust toolchain by deriving sealed-signal
 - **Shared module reuse:** If we add more crypto to the browser bundle (Noise, secure transport), can we consolidate into a single WASM package?
 
 ### Decision Log
-- Pending: confirm `argon2-browser` meets bundle-size and WASM-streaming constraints; otherwise fall back to a custom WASM build using the existing Rust Argon2 crate compiled via `wasm-pack`.
+- Adopted `@noble/hashes` for the initial rollout to avoid WASM loading quirks; revisit a dedicated WASM implementation only if browser perf measurements show the pure-JS path is too slow.
+
+## Phase 4/A1 Progress Notes (2025-10-14)
+- Replaced the PBKDF2 stopgap with `@noble/hashes/argon2idAsync`, wiring it through `derivePreSharedKey` so the web client now derives the same 32-byte PSK (t=3, m=64 MiB, p=1) as the Rust toolchain.
+- Added a lazy loader (`apps/beach-web/src/transport/crypto/argon2.ts`) and parity test (`sharedKey.test.ts`) that asserts the browser output matches Rust vectors (`939fee58…943fc` for the reference input).
+- Observed derivation latency of ~2.2 s under Vitest’s Node backend; need follow-up browser profiling to ensure UI stays responsive (consider yielding via `argon2idAsync`’s `asyncTick` if required).
+- Cleared the previous `argon2-browser` TODO in the decision log; noble’s pure JS implementation keeps the bundle dependency-free while we evaluate whether a dedicated WASM build is still necessary.
 
 ## Phase 4/A3 – Browser Noise Handshake Execution Plan
 - Select a Noise library that supports XXpsk2 with PSK injection and small bundle size; evaluate `@chainsafe/libp2p-noise` versus `noise-c.wasm` and record the decision.

@@ -220,7 +220,7 @@ fn derive_session_material(
 
     let (send_key, recv_key) = match role {
         HandshakeRole::Initiator => (send_material, recv_material),
-        HandshakeRole::Responder => (recv_material, send_material),
+        HandshakeRole::Responder => (send_material, recv_material),
     };
 
     Ok(HandshakeResult {

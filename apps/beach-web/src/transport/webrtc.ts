@@ -225,6 +225,13 @@ export async function connectWebRtcTransport(
   const remotePeerId = await resolveRemotePeerId(signaling, join, options.preferredPeerId);
   log(logger, `remote peer resolved: ${remotePeerId}`);
 
+  const secureState = {
+    enabled: secureSignalingActive,
+    localPeerId: assignedPeerId,
+    ensureKey: ensureSealingKey,
+    getKey: getSealingKey,
+  } as const;
+
   try {
     signaling.send({
       type: 'negotiate_transport',
@@ -282,13 +289,6 @@ export async function connectWebRtcTransport(
   let resendAttempts = 0;
   const MAX_RESEND_ATTEMPTS = 3;
   const RESEND_INTERVAL_MS = 1200;
-
-  const secureState = {
-    enabled: secureSignalingActive,
-    localPeerId: assignedPeerId,
-    ensureKey: ensureSealingKey,
-    getKey: getSealingKey,
-  } as const;
 
   const dispatchCandidate = async (candidate: RTCIceCandidateInit) => {
     if (!currentHandshakeId) {
@@ -495,6 +495,7 @@ function attachSignalListener(
       return;
     }
     if (signal.signal.signal_type === 'ice_candidate') {
+      const candidateSignal = signal.signal;
       void (async () => {
         const handshakeId = getHandshakeId();
         if (!handshakeId) {
@@ -509,7 +510,7 @@ function attachSignalListener(
             log(logger, 'ignoring remote candidate: secure key not ready');
             return;
           }
-          const sealed = signal.signal.sealed;
+          const sealed = candidateSignal.sealed;
           if (!sealed) {
             log(logger, 'ignoring remote candidate: sealed payload missing');
             return;
@@ -530,9 +531,9 @@ function attachSignalListener(
           }
         } else {
           candidateInit = {
-            candidate: signal.signal.candidate,
-            sdpMid: signal.signal.sdp_mid ?? undefined,
-            sdpMLineIndex: signal.signal.sdp_mline_index ?? undefined,
+            candidate: candidateSignal.candidate,
+            sdpMid: candidateSignal.sdp_mid ?? undefined,
+            sdpMLineIndex: candidateSignal.sdp_mline_index ?? undefined,
           };
         }
 
@@ -672,6 +673,8 @@ async function connectAsAnswerer(options: {
   beforePostAnswer?: () => void;
   afterPostAnswer?: () => void;
   localPeerId: string;
+  telemetryBaseUrl?: string;
+  sessionId?: string;
   secure: {
     enabled: boolean;
     passphrase?: string;
@@ -681,7 +684,17 @@ async function connectAsAnswerer(options: {
     remotePeerId: string;
   };
 }, onHandshakeReady: (handshakeId: string) => void): Promise<ConnectedWebRtcTransport> {
-  const { pc, signalingUrl, pollIntervalMs, remotePeerId, logger, localPeerId, secure } = options;
+  const {
+    pc,
+    signalingUrl,
+    pollIntervalMs,
+    remotePeerId,
+    logger,
+    localPeerId,
+    secure,
+    telemetryBaseUrl,
+    sessionId,
+  } = options;
   let cachedSecureKey: Uint8Array | null = null;
   log(logger, 'polling for SDP offer');
   const offer = await pollSdp(
@@ -735,12 +748,12 @@ async function connectAsAnswerer(options: {
           remotePeerId: secure.remotePeerId,
           prologueContext,
           keyPromise: handshakeKeyPromise!,
-          telemetryBaseUrl: options.telemetryBaseUrl,
-          sessionId: options.sessionId,
+          telemetryBaseUrl,
+          sessionId,
         }
       : undefined,
-    telemetryBaseUrl: options.telemetryBaseUrl,
-    sessionId: options.sessionId,
+    telemetryBaseUrl,
+    sessionId,
   });
   log(logger, 'waiting for data channel announcement');
 

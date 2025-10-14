@@ -3,6 +3,40 @@ import noiseWasmUrl from 'noise-c.wasm/src/noise-c.wasm?url';
 
 import { derivePreSharedKey, hkdfExpand } from './sharedKey';
 
+interface NoiseConstants {
+  NOISE_ROLE_INITIATOR: number;
+  NOISE_ROLE_RESPONDER: number;
+  NOISE_ACTION_NONE: number;
+  NOISE_ACTION_WRITE_MESSAGE: number;
+  NOISE_ACTION_READ_MESSAGE: number;
+  NOISE_ACTION_FAILED: number;
+  NOISE_ACTION_SPLIT: number;
+}
+
+interface NoiseCipherState {
+  free(): void;
+}
+
+interface NoiseHandshakeState {
+  Initialize(
+    prologue: Uint8Array | null,
+    s: Uint8Array | null,
+    rs: Uint8Array | null,
+    psk: Uint8Array | null,
+  ): void;
+  GetAction(): number;
+  WriteMessage(payload: Uint8Array | null): Uint8Array;
+  ReadMessage(message: Uint8Array, payloadNeeded?: boolean, fallbackSupported?: boolean): Uint8Array | null;
+  Split(): [NoiseCipherState, NoiseCipherState];
+  GetHandshakeHash(): Uint8Array;
+  free(): void;
+}
+
+interface NoiseModule {
+  constants: NoiseConstants;
+  HandshakeState: new (protocolName: string, role: number) => NoiseHandshakeState;
+}
+
 const PROTOCOL_NAME = 'Noise_XXpsk2_25519_ChaChaPoly_BLAKE2s';
 const PROLOGUE_PREFIX = 'beach:secure-handshake:v1';
 const FIELD_SEPARATOR = 0x1f;
@@ -11,8 +45,7 @@ const TRANSPORT_VERIFY_PREFIX = 'beach:secure-transport:verify:';
 
 const encoder = new TextEncoder();
 
-type NoiseModule = Awaited<ReturnType<typeof loadNoise>>;
-type NoiseHandshake = InstanceType<NoiseModule['HandshakeState']>;
+type NoiseHandshake = NoiseHandshakeState;
 
 export type BrowserHandshakeRole = 'initiator' | 'responder';
 
@@ -142,7 +175,7 @@ async function driveHandshake(
     switch (action) {
       case noise.constants.NOISE_ACTION_WRITE_MESSAGE: {
         const message = handshake.WriteMessage(null);
-        channel.send(message);
+        channel.send(toArrayBuffer(message));
         break;
       }
       case noise.constants.NOISE_ACTION_READ_MESSAGE: {
@@ -197,8 +230,8 @@ async function deriveTransportMaterial(
     };
   }
   return {
-    sendKey: recvMaterial,
-    recvKey: sendMaterial,
+    sendKey: sendMaterial,
+    recvKey: recvMaterial,
     verificationCode,
   };
 }
@@ -345,6 +378,19 @@ function normaliseData(data: unknown): Uint8Array {
 }
 
 let noiseModulePromise: Promise<NoiseModule> | null = null;
+
+function toArrayBuffer(view: Uint8Array): ArrayBuffer {
+  const { buffer, byteOffset, byteLength } = view;
+  if (buffer instanceof ArrayBuffer) {
+    if (byteOffset === 0 && byteLength === buffer.byteLength) {
+      return buffer;
+    }
+    return buffer.slice(byteOffset, byteOffset + byteLength);
+  }
+  const copy = new Uint8Array(byteLength);
+  copy.set(view);
+  return copy.buffer;
+}
 
 async function loadNoise(): Promise<NoiseModule> {
   if (!noiseModulePromise) {

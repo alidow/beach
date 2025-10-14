@@ -1384,6 +1384,69 @@ async fn negotiate_offerer_peer(
     let transport_dyn: Arc<dyn Transport> = transport.clone();
     channels.publish("beach-human".to_string(), transport_dyn.clone());
 
+    // Run secure handshake BEFORE waiting for __ready__ sentinel
+    // The answerer will send __ready__ only after completing the handshake,
+    // so the offerer must initiate the handshake first
+    tracing::info!(
+        target = "webrtc",
+        role = "offerer",
+        peer_id = %peer.id,
+        secure_transport_active,
+        has_passphrase = inner.passphrase.is_some(),
+        has_handshake_channel = handshake_dc.is_some(),
+        "offerer: evaluating whether to run secure handshake"
+    );
+    let secure_context = if let (true, Some(passphrase), Some(handshake_channel)) = (
+        secure_transport_active,
+        inner.passphrase.as_ref(),
+        handshake_dc.clone(),
+    ) {
+        tracing::info!(
+            target = "webrtc",
+            role = "offerer",
+            handshake_id = %handshake_id,
+            offerer_peer = %offerer_peer_id,
+            remote_peer = %peer_id,
+            channel_state = ?handshake_channel.ready_state(),
+            "offerer: about to run handshake as Initiator"
+        );
+        let prologue_context = build_prologue_context(&handshake_id, &offerer_peer_id, &peer_id);
+        let params = HandshakeParams {
+            passphrase: passphrase.clone(),
+            handshake_id: handshake_id.clone(),
+            local_peer_id: offerer_peer_id.clone(),
+            remote_peer_id: peer_id.clone(),
+            prologue_context,
+        };
+        tracing::debug!(
+            target = "webrtc",
+            role = "offerer",
+            handshake_id = %handshake_id,
+            "offerer: calling run_handshake as Initiator"
+        );
+        let result = run_handshake(HandshakeRole::Initiator, handshake_channel, params).await?;
+        tracing::info!(
+            target = "webrtc",
+            role = "offerer",
+            handshake_id = %handshake_id,
+            verification = %result.verification_code,
+            "offerer: handshake completed successfully as Initiator"
+        );
+        transport.enable_encryption(&result)?;
+        Some(Arc::new(result))
+    } else {
+        tracing::info!(
+            target = "webrtc",
+            role = "offerer",
+            peer_id = %peer.id,
+            secure_transport_active,
+            has_passphrase = inner.passphrase.is_some(),
+            has_handshake_channel = handshake_dc.is_some(),
+            "offerer: skipping secure handshake (conditions not met)"
+        );
+        None
+    };
+
     tracing::debug!(
         target = "webrtc",
         peer_id = %peer.id,
@@ -1434,6 +1497,14 @@ async fn negotiate_offerer_peer(
         }
         match transport.try_recv() {
             Ok(Some(message)) => {
+                tracing::debug!(
+                    target = "webrtc",
+                    peer_id = %peer.id,
+                    attempt = attempt,
+                    payload = ?message.payload,
+                    payload_text = ?message.payload.as_text(),
+                    "offerer received message during readiness handshake"
+                );
                 if message.payload.as_text() == Some("__ready__") {
                     ready_seen = true;
                     tracing::info!(
@@ -1552,69 +1623,11 @@ async fn negotiate_offerer_peer(
     }
 
     let mut peer_metadata = peer.metadata.clone().unwrap_or_default();
-    tracing::info!(
-        target = "webrtc",
-        role = "offerer",
-        peer_id = %peer.id,
-        secure_transport_active,
-        has_passphrase = inner.passphrase.is_some(),
-        has_handshake_channel = handshake_dc.is_some(),
-        "offerer: evaluating whether to run secure handshake"
-    );
-    let secure_context = if let (true, Some(passphrase), Some(handshake_channel)) = (
-        secure_transport_active,
-        inner.passphrase.as_ref(),
-        handshake_dc.clone(),
-    ) {
-        tracing::info!(
-            target = "webrtc",
-            role = "offerer",
-            handshake_id = %handshake_id,
-            offerer_peer = %offerer_peer_id,
-            remote_peer = %peer_id,
-            channel_state = ?handshake_channel.ready_state(),
-            "offerer: about to run handshake as Initiator"
-        );
-        let prologue_context = build_prologue_context(&handshake_id, &offerer_peer_id, &peer_id);
-        let params = HandshakeParams {
-            passphrase: passphrase.clone(),
-            handshake_id: handshake_id.clone(),
-            local_peer_id: offerer_peer_id.clone(),
-            remote_peer_id: peer_id.clone(),
-            prologue_context,
-        };
-        tracing::debug!(
-            target = "webrtc",
-            role = "offerer",
-            handshake_id = %handshake_id,
-            "offerer: calling run_handshake as Initiator"
-        );
-        let result = run_handshake(HandshakeRole::Initiator, handshake_channel, params).await?;
-        tracing::info!(
-            target = "webrtc",
-            role = "offerer",
-            handshake_id = %handshake_id,
-            verification = %result.verification_code,
-            "offerer: handshake completed successfully as Initiator"
-        );
-        transport.enable_encryption(&result)?;
-        let result_arc = Arc::new(result);
+    if let Some(ref result) = secure_context {
         peer_metadata
             .entry("secure_verification".to_string())
-            .or_insert(result_arc.verification_code.clone());
-        Some(result_arc)
-    } else {
-        tracing::info!(
-            target = "webrtc",
-            role = "offerer",
-            peer_id = %peer.id,
-            secure_transport_active,
-            has_passphrase = inner.passphrase.is_some(),
-            has_handshake_channel = handshake_dc.is_some(),
-            "offerer: skipping secure handshake (conditions not met)"
-        );
-        None
-    };
+            .or_insert(result.verification_code.clone());
+    }
 
     Ok(Some(OffererAcceptedTransport {
         peer_id: peer_id,

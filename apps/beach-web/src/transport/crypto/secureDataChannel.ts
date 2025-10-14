@@ -123,7 +123,8 @@ export class SecureDataChannel extends EventTarget implements DataChannelLike {
     const nonce = buildNonce(counter);
     const ciphertext = chacha20poly1305Encrypt(this.sendKey, nonce, TRANSPORT_AAD, plaintext);
     const frame = buildFrame(counter, ciphertext);
-    this.channel.send(frame);
+    const payload = toArrayBuffer(frame);
+    this.channel.send(payload);
   }
 
   close(): void {
@@ -207,6 +208,19 @@ function buildNonce(counter: bigint): Uint8Array {
 function readCounter(bytes: Uint8Array): bigint {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   return view.getBigUint64(0, false);
+}
+
+function toArrayBuffer(view: Uint8Array): ArrayBuffer {
+  const { buffer, byteOffset, byteLength } = view;
+  if (buffer instanceof ArrayBuffer) {
+    if (byteOffset === 0 && byteLength === buffer.byteLength) {
+      return buffer;
+    }
+    return buffer.slice(byteOffset, byteOffset + byteLength);
+  }
+  const copy = new Uint8Array(byteLength);
+  copy.set(view);
+  return copy.buffer;
 }
 
 function normaliseData(data: unknown): Uint8Array {

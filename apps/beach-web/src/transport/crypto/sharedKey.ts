@@ -23,7 +23,7 @@ export async function derivePreSharedKey(
 
   const keyMaterial = await crypto.subtle.importKey(
     'raw',
-    passphraseBytes,
+    toArrayBuffer(passphraseBytes),
     { name: 'PBKDF2' },
     false,
     ['deriveBits'],
@@ -34,7 +34,7 @@ export async function derivePreSharedKey(
       name: 'PBKDF2',
       hash: 'SHA-256',
       iterations: 64_000,
-      salt: saltBytes,
+      salt: toArrayBuffer(saltBytes),
     },
     keyMaterial,
     DERIVED_KEY_LENGTH_BITS,
@@ -54,7 +54,7 @@ export async function hkdfExpand(
 ): Promise<Uint8Array> {
   const keyMaterial = await crypto.subtle.importKey(
     'raw',
-    ikm,
+    toArrayBuffer(ikm),
     'HKDF',
     false,
     ['deriveBits'],
@@ -64,8 +64,8 @@ export async function hkdfExpand(
     {
       name: 'HKDF',
       hash: 'SHA-256',
-      salt,
-      info,
+      salt: toArrayBuffer(salt),
+      info: toArrayBuffer(info),
     },
     keyMaterial,
     length * 8,
@@ -76,4 +76,17 @@ export async function hkdfExpand(
 
 export function toHex(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function toArrayBuffer(view: Uint8Array): ArrayBuffer {
+  const { buffer, byteOffset, byteLength } = view;
+  if (buffer instanceof ArrayBuffer) {
+    if (byteOffset === 0 && byteLength === buffer.byteLength) {
+      return buffer;
+    }
+    return buffer.slice(byteOffset, byteOffset + byteLength);
+  }
+  const copy = new Uint8Array(byteLength);
+  copy.set(view);
+  return copy.buffer;
 }

@@ -21,6 +21,8 @@ pub enum NoiseDriverError {
     UnexpectedPlaintext,
     #[error("received non-media frame post-handshake")]
     UnexpectedFrame,
+    #[error("noise worker join failed: {0}")]
+    Join(String),
 }
 
 #[allow(dead_code)]
@@ -35,6 +37,7 @@ pub struct NoiseDriver<C: CabanaChannel> {
     channel: C,
 }
 
+#[allow(dead_code)]
 impl<C: CabanaChannel> NoiseDriver<C> {
     pub fn new(channel: C, config: HandshakeConfig) -> Result<Self, NoiseDriverError> {
         let controller = NoiseController::new(config)?;
@@ -89,6 +92,177 @@ impl<C: CabanaChannel> NoiseDriver<C> {
             None => Err(NoiseDriverError::UnexpectedFrame),
         }
     }
+}
+
+#[cfg(feature = "webrtc")]
+use std::sync::{Arc, Mutex};
+
+#[cfg(feature = "webrtc")]
+use bytes::Bytes;
+
+#[cfg(feature = "webrtc")]
+use tokio::{
+    runtime::Handle,
+    sync::{mpsc, oneshot},
+    task,
+    time,
+};
+
+#[cfg(feature = "webrtc")]
+use webrtc::data_channel::{
+    data_channel_message::DataChannelMessage,
+    data_channel_state::RTCDataChannelState,
+    RTCDataChannel,
+};
+
+#[cfg(feature = "webrtc")]
+#[allow(dead_code)]
+struct DataChannelAdapter {
+    channel: Arc<RTCDataChannel>,
+    handle: Handle,
+    receiver: mpsc::UnboundedReceiver<Option<Vec<u8>>>,
+}
+
+#[cfg(feature = "webrtc")]
+#[allow(dead_code)]
+impl DataChannelAdapter {
+    fn new(channel: Arc<RTCDataChannel>, handle: Handle) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let message_tx = tx.clone();
+        channel.on_message(Box::new(move |msg: DataChannelMessage| {
+            let sender = message_tx.clone();
+            Box::pin(async move {
+                if sender.send(Some(msg.data.to_vec())).is_err() {
+                    tracing::debug!("cabana noise message dropped: receiver gone");
+                }
+            })
+        }));
+
+        let close_tx = tx.clone();
+        channel.on_close(Box::new(move || {
+            let _ = close_tx.send(None);
+            Box::pin(async {})
+        }));
+
+        Self {
+            channel,
+            handle,
+            receiver: rx,
+        }
+    }
+}
+
+#[cfg(feature = "webrtc")]
+impl CabanaChannel for DataChannelAdapter {
+    fn send(&mut self, payload: &[u8]) -> Result<(), NoiseDriverError> {
+        let channel = self.channel.clone();
+        let data = Bytes::from(payload.to_vec());
+        self.handle.block_on(async move {
+            channel
+                .send(&data)
+                .await
+                .map(|_| ())
+                .map_err(|err| NoiseDriverError::ChannelSend(err.to_string()))
+        })
+    }
+
+    fn recv(&mut self, timeout: Duration) -> Result<Vec<u8>, NoiseDriverError> {
+        self.handle.block_on(async {
+            match time::timeout(timeout, self.receiver.recv()).await {
+                Ok(Some(Some(payload))) => Ok(payload),
+                Ok(Some(None)) => Err(NoiseDriverError::ChannelClosed),
+                Ok(None) => Err(NoiseDriverError::ChannelClosed),
+                Err(_) => Err(NoiseDriverError::Timeout),
+            }
+        })
+    }
+}
+
+#[cfg(feature = "webrtc")]
+#[allow(dead_code)]
+pub struct DataChannelSecureTransport {
+    driver: Arc<Mutex<NoiseDriver<DataChannelAdapter>>>,
+    verification_code: Option<String>,
+}
+
+#[cfg(feature = "webrtc")]
+#[allow(dead_code)]
+impl DataChannelSecureTransport {
+    pub fn verification_code(&self) -> Option<&str> {
+        self.verification_code.as_deref()
+    }
+
+    pub async fn send_media(&self, payload: &[u8]) -> Result<(), NoiseDriverError> {
+        let driver = self.driver.clone();
+        let data = payload.to_vec();
+        task::spawn_blocking(move || {
+            let mut guard = driver.lock().unwrap();
+            guard.send_media(&data)
+        })
+        .await
+        .map_err(|err| NoiseDriverError::Join(err.to_string()))?
+    }
+
+    pub async fn recv_media(&self, timeout: Duration) -> Result<Vec<u8>, NoiseDriverError> {
+        let driver = self.driver.clone();
+        task::spawn_blocking(move || {
+            let mut guard = driver.lock().unwrap();
+            guard.recv_media(timeout)
+        })
+        .await
+        .map_err(|err| NoiseDriverError::Join(err.to_string()))?
+    }
+}
+
+#[cfg(feature = "webrtc")]
+#[allow(dead_code)]
+async fn wait_for_channel_open(
+    channel: &Arc<RTCDataChannel>,
+    timeout: Duration,
+) -> Result<Duration, NoiseDriverError> {
+    if channel.ready_state() == RTCDataChannelState::Open {
+        return Ok(timeout);
+    }
+
+    let (tx, rx) = oneshot::channel();
+    channel.on_open(Box::new(move || {
+        let _ = tx.send(());
+        Box::pin(async {})
+    }));
+
+    let start = Instant::now();
+    time::timeout(timeout, rx)
+        .await
+        .map_err(|_| NoiseDriverError::Timeout)?
+        .map_err(|_| NoiseDriverError::ChannelClosed)?;
+    let elapsed = start.elapsed();
+    Ok(timeout.saturating_sub(elapsed))
+}
+
+#[cfg(feature = "webrtc")]
+#[allow(dead_code)]
+pub async fn negotiate_data_channel(
+    channel: Arc<RTCDataChannel>,
+    config: HandshakeConfig<'_>,
+    timeout: Duration,
+) -> Result<DataChannelSecureTransport, NoiseDriverError> {
+    let remaining = wait_for_channel_open(&channel, timeout).await?;
+    let adapter = DataChannelAdapter::new(channel, Handle::current());
+    let mut driver = NoiseDriver::new(adapter, config)?;
+
+    let driver = task::spawn_blocking(move || -> Result<NoiseDriver<DataChannelAdapter>, NoiseDriverError> {
+        driver.run_handshake(remaining)?;
+        Ok(driver)
+    })
+    .await
+    .map_err(|err| NoiseDriverError::Join(err.to_string()))??;
+
+    let verification_code = driver.verification_code().map(|code| code.to_string());
+    let driver = Arc::new(Mutex::new(driver));
+    Ok(DataChannelSecureTransport {
+        driver,
+        verification_code,
+    })
 }
 
 #[cfg(test)]

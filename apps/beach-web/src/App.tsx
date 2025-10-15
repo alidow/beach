@@ -110,7 +110,7 @@ interface LayoutMetrics {
   };
 }
 
-export default function AppV2(): JSX.Element {
+export default function App(): JSX.Element {
   const {
     sessionId,
     setSessionId,

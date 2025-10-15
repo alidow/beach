@@ -11,6 +11,8 @@ interface NoiseConstants {
   NOISE_ACTION_READ_MESSAGE: number;
   NOISE_ACTION_FAILED: number;
   NOISE_ACTION_SPLIT: number;
+  NOISE_DH_CURVE25519: number;
+  NOISE_DH_CURVE448: number;
 }
 
 interface NoiseCipherState {
@@ -35,6 +37,7 @@ interface NoiseHandshakeState {
 interface NoiseModule {
   constants: NoiseConstants;
   HandshakeState: new (protocolName: string, role: number) => NoiseHandshakeState;
+  CreateKeyPair(curveId: number): [Uint8Array, Uint8Array];
 }
 
 const PROTOCOL_NAME = 'Noise_XX_25519_ChaChaPoly_BLAKE2s';
@@ -216,7 +219,23 @@ function createHandshake(
     role,
     roleConstant,
   });
-  const [privateKey] = noise.CreateKeyPair(noise.constants.NOISE_DH_CURVE25519);
+  const keypair = noise.CreateKeyPair(noise.constants.NOISE_DH_CURVE25519);
+  console.debug('[beach-web][noise] CreateKeyPair result', {
+    keypair,
+    isArray: Array.isArray(keypair),
+    length: keypair?.length,
+    privateKeyType: typeof keypair?.[0],
+    privateKeyLength: keypair?.[0]?.length,
+    publicKeyType: typeof keypair?.[1],
+    publicKeyLength: keypair?.[1]?.length,
+  });
+  const [privateKey] = keypair;
+  console.debug('[beach-web][noise] About to Initialize', {
+    privateKeyType: typeof privateKey,
+    privateKeyLength: privateKey?.length,
+    privateKeyIsNull: privateKey === null,
+    privateKeyIsUndefined: privateKey === undefined,
+  });
   try {
     handshake.Initialize(prologue, privateKey, null, null);
   } finally {

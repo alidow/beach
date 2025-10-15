@@ -395,11 +395,15 @@ export default function AppV2(): JSX.Element {
   };
 
   const baseToolbarPosition = toolbarPosition ?? { top: DOCK_MARGIN, left: DOCK_MARGIN };
+  const measuredToolbarWidth = toolbarSizeRef.current?.width;
   const toolbarWrapperStyle: CSSProperties = {
     top: baseToolbarPosition.top,
     left: baseToolbarPosition.left,
-    width: 'min(calc(100% - 32px), 48rem)',
     visibility: toolbarPosition ? 'visible' : 'hidden',
+    width:
+      typeof measuredToolbarWidth === 'number' && Number.isFinite(measuredToolbarWidth)
+        ? `${measuredToolbarWidth}px`
+        : undefined,
   };
   const toolbarWrapperClass = cn(
     'pointer-events-none absolute',
@@ -441,7 +445,7 @@ export default function AppV2(): JSX.Element {
 
       {infoVisible ? (
         <div className={toolbarWrapperClass} style={toolbarWrapperStyle}>
-          <div ref={toolbarRef} className="pointer-events-auto w-full max-w-3xl">
+          <div ref={toolbarRef} className="pointer-events-auto max-w-3xl min-w-[18rem]">
             <Collapsible
               open={infoExpanded}
               onOpenChange={(open) => {

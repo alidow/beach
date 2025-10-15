@@ -188,6 +188,7 @@ pub struct NoiseSession {
 }
 
 impl NoiseSession {
+    #[allow(dead_code)]
     pub fn verification_code(&self) -> &str {
         &self.keys.verification_code
     }

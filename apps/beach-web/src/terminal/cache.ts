@@ -1811,14 +1811,28 @@ export class TerminalGridCache {
   }
 
   private findHighestLoadedRow(): number | null {
+    const cursorRow = this.cursorRow;
     for (let index = this.rows.length - 1; index >= 0; index -= 1) {
       const slot = this.rows[index];
-      if (slot && slot.kind === 'loaded') {
-        const width = this.rowDisplayWidth(slot.absolute);
-        if (width > 0) {
-          return slot.absolute;
-        }
+      if (!slot) {
+        continue;
       }
+      if (cursorRow !== null && slot.absolute === cursorRow) {
+        return cursorRow;
+      }
+      if (slot.kind !== 'loaded') {
+        continue;
+      }
+      const width = this.rowDisplayWidth(slot.absolute);
+      if (width > 0) {
+        return slot.absolute;
+      }
+      if (this.predictionsForRow(slot.absolute).length > 0) {
+        return slot.absolute;
+      }
+    }
+    if (cursorRow !== null && cursorRow >= this.baseRow) {
+      return cursorRow;
     }
     return null;
   }

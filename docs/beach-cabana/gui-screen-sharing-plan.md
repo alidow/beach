@@ -50,7 +50,7 @@ Phased Delivery
 **Phase 3 — Zero-Trust Signaling & Media Pipeline**
 - Deliverables: Implement sealed signaling (Phase 1 spec in `docs/secure-webrtc/secure-shared-secret-webrtc-plan.md`) inside Cabana; run Noise `XXpsk2` handshake over data channel; wrap outgoing media frames (video + control) in AEAD using keys derived from the unique link + passcode.
 - Success: Cabana peers exchange unique link/passcode, establish WebRTC video channel via `beach-road` while keeping signaling opaque; tampering at the relay fails verification.
-- Progress: Added `noise` module with reusable `NoiseController`, media frame encoder/decoder, and replay-aware encrypt/decrypt helpers (`apps/beach-cabana/src/noise.rs`). `noise-diag` CLI now runs an end-to-end XXpsk2 exchange and validates encrypted payload flow. Temporary smoketest script lives at `temp/cabana-noise-smoketest.sh` to guard against regressions outside the Rust test suite.
+- Progress: Added `noise` module with reusable `NoiseController`, media frame encoder/decoder, and replay-aware encrypt/decrypt helpers (`apps/beach-cabana/src/noise.rs`). `noise-diag` CLI now runs an end-to-end XXpsk2 exchange and validates encrypted payload flow. Temporary smoketest script lives at `temp/cabana-noise-smoketest.sh`, and `apps/beach-cabana/src/webrtc.rs` introduces a channel-agnostic `NoiseDriver` so the upcoming WebRTC bridge can wrap data channels without rewriting the handshake loop.
 
 **Phase 4 — Selection UX (Desktop App & CLI)**
 - Deliverables: Zoom-style picker modal in Cabana desktop app prototype; CLI TUI menu with arrow/enter flow plus `--window-id` flag; permission prompts surfaced with guidance; verification string surfaced post-handshake so users confirm zero-trust link.

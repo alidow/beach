@@ -4,6 +4,7 @@ use thiserror::Error;
 
 use crate::noise::{HandshakeConfig, NoiseController, NoiseError};
 
+#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub enum NoiseDriverError {
     #[error("noise handshake error: {0}")]
@@ -22,11 +23,13 @@ pub enum NoiseDriverError {
     UnexpectedFrame,
 }
 
+#[allow(dead_code)]
 pub trait CabanaChannel: Send {
     fn send(&mut self, payload: &[u8]) -> Result<(), NoiseDriverError>;
     fn recv(&mut self, timeout: Duration) -> Result<Vec<u8>, NoiseDriverError>;
 }
 
+#[allow(dead_code)]
 pub struct NoiseDriver<C: CabanaChannel> {
     controller: NoiseController,
     channel: C,

@@ -1,6 +1,6 @@
 import type { CursorFrame, Update } from '../protocol/types';
 import { TerminalGridCache } from './cache';
-import type { ApplyUpdatesOptions, TerminalGridSnapshot } from './cache';
+import type { ApplyUpdatesOptions, RowSlot, TerminalGridSnapshot } from './cache';
 
 declare global {
   interface Window {

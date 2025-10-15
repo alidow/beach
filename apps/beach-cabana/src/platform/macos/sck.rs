@@ -9,7 +9,8 @@ use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 use dispatch2::{Queue, QueueAttribute};
 use image::{ImageBuffer, Rgba};
 use objc2::{
-    declare_class, msg_send_id, mutability,
+    class,
+    declare_class, msg_send, msg_send_id, mutability,
     rc::Id,
     runtime::ProtocolObject,
     ClassType, DeclaredClass,
@@ -22,13 +23,32 @@ use screen_capture_kit::{
         SCStreamOutputType,
     },
 };
-use tracing::{debug, info, warn};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Once;
+use tracing::{debug, info, warn};
+
+#[link(name = "AppKit", kind = "framework")]
+unsafe extern "C" {
+    fn NSApplicationLoad() -> bool;
+}
+
+fn ensure_appkit_initialized() {
+    static APPKIT_INIT: Once = Once::new();
+    APPKIT_INIT.call_once(|| unsafe {
+        if !NSApplicationLoad() {
+            warn!("NSApplicationLoad returned false; screen capture may fail");
+        } else {
+            info!("AppKit initialized via NSApplicationLoad");
+        }
+        let app: Id<NSObject> = msg_send_id![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![&app, finishLaunching];
+    });
+}
 
 #[derive(Debug)]
 enum StreamEvent {
@@ -105,6 +125,7 @@ pub struct SckStream {
 
 impl SckStream {
     pub fn new(target: &str) -> Result<Self, WindowApiError> {
+        ensure_appkit_initialized();
         info!(target, "initializing ScreenCaptureKit stream");
         let content = fetch_shareable_content()?;
         debug!(

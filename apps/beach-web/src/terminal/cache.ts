@@ -955,7 +955,7 @@ export class TerminalGridCache {
     if (row < this.baseRow) {
       return;
     }
-    const floor = this.committedRowWidth(row);
+    const floor = this.authoritativeRowFloor(row);
     if (floor > 0) {
       this.rowCursorFloors.set(row, floor);
     } else {
@@ -973,6 +973,20 @@ export class TerminalGridCache {
         this.rowCursorFloors.delete(key);
       }
     }
+  }
+
+  private authoritativeRowFloor(row: number): number {
+    const slot = this.getRow(row);
+    if (!slot || slot.kind !== 'loaded') {
+      return 0;
+    }
+    for (let col = slot.cells.length - 1; col >= 0; col -= 1) {
+      const cell = slot.cells[col]!;
+      if (cell.seq > 0) {
+        return col + 1;
+      }
+    }
+    return 0;
   }
 
   private minimumServerColumn(row: number): number {

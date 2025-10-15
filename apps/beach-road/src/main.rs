@@ -68,6 +68,10 @@ async fn main() {
         config.fallback_token_ttl_seconds,
         config.fallback_require_oidc
     );
+    info!(
+        "Fallback token minting paused: {}",
+        if config.fallback_paused { "yes" } else { "no" }
+    );
 
     // Initialize Redis storage
     let storage = match Storage::new(&config.redis_url, config.session_ttl_seconds).await {
@@ -88,6 +92,7 @@ async fn main() {
         guardrail_threshold: config.fallback_guardrail_threshold,
         token_ttl_seconds: config.fallback_token_ttl_seconds,
         require_oidc: config.fallback_require_oidc,
+        paused: config.fallback_paused,
     };
 
     // Build the Axum router - split into two parts with different states

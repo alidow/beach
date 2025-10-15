@@ -160,7 +160,7 @@ export default function AppV2(): JSX.Element {
 
   return (
     <main
-      className="relative flex w-full flex-col overflow-hidden bg-[#020617] text-slate-100"
+      className="relative flex w-full flex-col overflow-hidden bg-[hsl(var(--terminal-screen))] text-slate-100"
       style={SHELL_STYLE}
     >
       <div

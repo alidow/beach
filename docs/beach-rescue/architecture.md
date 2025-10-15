@@ -119,7 +119,7 @@ sequenceDiagram
   - Provide manual override (`fallback_ws_paused`) for SREs to stop token issuance during runaway incidents; default state keeps fallback available for users behind restrictive firewalls.
   - Distinguish paid vs unpaid cohorts in metrics (aggregate only) so we can see if entitlements correlate with fallback volume; unpaid users have the flag unset and are excluded from WSS paths.
 - **Kill switch**
-  - Emergency feature flag in control-plane API to disable token issuance; clients degrade to WebRTC retries only.
+  - Emergency feature flag in control-plane API to disable token issuance; clients degrade to WebRTC retries only. `beach-road` now exposes an environment toggle (`FALLBACK_WS_PAUSED`) that forces `/fallback/token` to return a structured 403, giving operators an immediate shutoff while longer-term flag plumbing lands.
   - SRE runbook for manual draining (mark all sessions `draining`, send CLOSE frames, scale deployment to zero).
 - **Alerting**
   - Prometheus alerts on high activation rate (soft breach), connection churn > 20%/5min, CPU > 70%, and handshake failure spikes; alerts page the transport on-call rotation.

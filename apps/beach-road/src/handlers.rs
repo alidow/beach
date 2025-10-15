@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::Json,
+    response::{IntoResponse, Json, Response},
 };
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use time::Duration;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -31,6 +31,7 @@ pub struct FallbackContext {
     pub guardrail_threshold: f64,
     pub token_ttl_seconds: u64,
     pub require_oidc: bool,
+    pub paused: bool,
 }
 
 #[derive(Debug, Serialize, Clone, Copy)]
@@ -115,6 +116,52 @@ pub struct SessionStatusResponse {
     pub created_at: Option<u64>,
 }
 
+#[derive(Debug, Serialize)]
+struct FallbackTokenErrorBody {
+    success: bool,
+    reason: &'static str,
+}
+
+pub struct FallbackTokenErrorResponse {
+    status: StatusCode,
+    body: Option<FallbackTokenErrorBody>,
+}
+
+impl FallbackTokenErrorResponse {
+    fn paused() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            body: Some(FallbackTokenErrorBody {
+                success: false,
+                reason: "fallback_paused",
+            }),
+        }
+    }
+
+    fn with_reason(status: StatusCode, reason: &'static str) -> Self {
+        Self {
+            status,
+            body: Some(FallbackTokenErrorBody {
+                success: false,
+                reason,
+            }),
+        }
+    }
+
+    fn status(status: StatusCode) -> Self {
+        Self { status, body: None }
+    }
+}
+
+impl IntoResponse for FallbackTokenErrorResponse {
+    fn into_response(self) -> Response {
+        match self.body {
+            Some(body) => (self.status, Json(body)).into_response(),
+            None => self.status.into_response(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct FallbackTokenRequest {
     pub session_id: String,
@@ -176,12 +223,22 @@ fn signaling_url(base_http: &str, session_id: &str) -> String {
 pub async fn issue_fallback_token(
     State(ctx): State<FallbackContext>,
     Json(payload): Json<FallbackTokenRequest>,
-) -> Result<Json<FallbackTokenResponse>, StatusCode> {
-    if ctx.require_oidc && payload.entitlement_proof.is_none() {
-        return Err(StatusCode::UNAUTHORIZED);
+) -> Result<Json<FallbackTokenResponse>, FallbackTokenErrorResponse> {
+    if ctx.paused {
+        warn!("fallback token minting paused; rejecting request");
+        return Err(FallbackTokenErrorResponse::paused());
     }
 
-    let session_id = Uuid::parse_str(&payload.session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if ctx.require_oidc && payload.entitlement_proof.is_none() {
+        return Err(FallbackTokenErrorResponse::with_reason(
+            StatusCode::UNAUTHORIZED,
+            "entitlement_required",
+        ));
+    }
+
+    let session_id = Uuid::parse_str(&payload.session_id).map_err(|_| {
+        FallbackTokenErrorResponse::with_reason(StatusCode::BAD_REQUEST, "invalid_session_id")
+    })?;
     let cohort_id = payload.cohort_id.as_deref().unwrap_or("public").to_string();
 
     let snapshot = ctx
@@ -190,7 +247,7 @@ pub async fn issue_fallback_token(
         .await
         .map_err(|err| {
             error!("redis guardrail error: {err:?}");
-            StatusCode::INTERNAL_SERVER_ERROR
+            FallbackTokenErrorResponse::status(StatusCode::INTERNAL_SERVER_ERROR)
         })?;
 
     let guardrail_soft_breach = matches!(
@@ -213,7 +270,7 @@ pub async fn issue_fallback_token(
 
     let serialized = serde_json::to_vec(&claims).map_err(|err| {
         error!("failed to serialize fallback token claims: {err:?}");
-        StatusCode::INTERNAL_SERVER_ERROR
+        FallbackTokenErrorResponse::status(StatusCode::INTERNAL_SERVER_ERROR)
     })?;
     let token = STANDARD_NO_PAD.encode(serialized);
 

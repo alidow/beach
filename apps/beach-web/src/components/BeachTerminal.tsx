@@ -863,7 +863,20 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           totalContentRows: lastContentAbsolute !== null ? lastContentAbsolute - snapshot.baseRow + 1 : 0,
         });
       }
-      element.scrollTop = desired;
+      const currentTop = element.scrollTop;
+      const upwardsDelta = currentTop - desired;
+      const maxAutoRewind = rowHeight * 1.5;
+      // Only adjust upward if we're nudging by about a row; avoid yanking the user to the top.
+      if (desired >= currentTop || upwardsDelta <= maxAutoRewind) {
+        element.scrollTop = desired;
+      } else if (import.meta.env.DEV && typeof window !== 'undefined' && window.__BEACH_TRACE) {
+        console.debug('[beach-trace][terminal] autoscroll skipped rewind', {
+          before: currentTop,
+          desired,
+          upwardsDelta,
+          maxAutoRewind,
+        });
+      }
     };
     if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
       let outer = -1;
@@ -997,7 +1010,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   );
   const containerClasses = cn(
     'beach-terminal relative flex-1 min-h-0 overflow-y-auto overflow-x-auto whitespace-pre font-mono text-[13px] leading-[1.42] text-[#d5d9e0]',
-    'bg-[#1b1f2a] px-6 py-5 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04),inset_0_22px_45px_-25px_rgba(8,10,20,0.82)]',
+    'bg-[hsl(var(--terminal-screen))] px-6 py-5 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04),inset_0_22px_45px_-25px_rgba(8,10,20,0.82)]',
     'outline-none focus:outline-none',
   );
 
@@ -1726,7 +1739,7 @@ export function shouldReenableFollowTail(remainingPixels: number): boolean {
 }
 
 const DEFAULT_FOREGROUND = '#e2e8f0';
-const DEFAULT_BACKGROUND = '#020617';
+const DEFAULT_BACKGROUND = 'hsl(var(--terminal-screen))';
 
 function styleFromDefinition(def: StyleDefinition, highlightCursor = false): CSSProperties {
   const style: CSSProperties = {};

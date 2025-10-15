@@ -8,6 +8,7 @@ pub struct Config {
     pub fallback_guardrail_threshold: f64,
     pub fallback_token_ttl_seconds: u64,
     pub fallback_require_oidc: bool,
+    pub fallback_paused: bool,
 }
 
 impl Config {
@@ -21,6 +22,9 @@ impl Config {
             .and_then(|val| val.parse().ok())
             .unwrap_or(300);
         let fallback_require_oidc = env::var("FALLBACK_REQUIRE_OIDC")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let fallback_paused = env::var("FALLBACK_WS_PAUSED")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
@@ -38,6 +42,7 @@ impl Config {
             fallback_guardrail_threshold,
             fallback_token_ttl_seconds,
             fallback_require_oidc,
+            fallback_paused,
         }
     }
 }
@@ -51,6 +56,7 @@ impl Default for Config {
             fallback_guardrail_threshold: 0.005,
             fallback_token_ttl_seconds: 300,
             fallback_require_oidc: false,
+            fallback_paused: false,
         }
     }
 }

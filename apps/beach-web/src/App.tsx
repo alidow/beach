@@ -182,7 +182,7 @@ export default function App(): JSX.Element {
               </span>
               <p className="text-sm text-slate-300">{statusMeta.helper}</p>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2 gap-y-2">
               {status === 'connected' ? (
                 <Button variant="outline" size="sm" onClick={handleDisconnect} className="gap-1.5">
                   <X className="size-3.5" />

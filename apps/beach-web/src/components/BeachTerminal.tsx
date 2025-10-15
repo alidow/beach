@@ -546,8 +546,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const totalRows = snapshot.rows.length;
   const firstAbsolute = lines.length > 0 ? lines[0]!.absolute : snapshot.baseRow;
   const lastAbsolute = lines.length > 0 ? lines[lines.length - 1]!.absolute : firstAbsolute;
+  const lastContentAbsolute = findLastContentAbsolute(snapshot);
   const topPaddingRows = Math.max(0, firstAbsolute - snapshot.baseRow);
-  const bottomPaddingRows = Math.max(0, snapshot.baseRow + totalRows - (lastAbsolute + 1));
+  const minimumViewportRows = snapshot.viewportHeight > 0 ? snapshot.viewportHeight : Math.max(lines.length, 1);
+  const contentRows = lastContentAbsolute !== null ? Math.max(0, lastContentAbsolute - snapshot.baseRow + 1) : 0;
+  const effectiveTotalRows = Math.max(minimumViewportRows, contentRows);
+  const bottomPaddingRows = Math.max(0, snapshot.baseRow + effectiveTotalRows - (lastAbsolute + 1));
   const topPadding = topPaddingRows * effectiveLineHeight;
   const bottomPadding = bottomPaddingRows * effectiveLineHeight;
   const backfillController = useMemo(
@@ -1485,17 +1489,25 @@ function truncate(text: string | undefined | null, max = 48): string {
 
 function findLastContentAbsolute(snapshot: TerminalGridSnapshot): number | null {
   const rows = snapshot.rows;
+  const cursorRow = snapshot.cursorRow ?? null;
   for (let index = rows.length - 1; index >= 0; index -= 1) {
     const slot = rows[index];
-    if (!slot) {
+    if (!slot || slot.kind !== 'loaded') {
       continue;
-    }
-    if (slot.kind !== 'loaded') {
-      return slot.absolute;
     }
     if (rowHasVisibleContent(slot.cells)) {
       return slot.absolute;
     }
+    if (cursorRow !== null && slot.absolute === cursorRow) {
+      return slot.absolute;
+    }
+    const predictions = snapshot.predictionsForRow(slot.absolute);
+    if (predictions.length > 0) {
+      return slot.absolute;
+    }
+  }
+  if (cursorRow !== null && cursorRow >= snapshot.baseRow) {
+    return cursorRow;
   }
   return null;
 }

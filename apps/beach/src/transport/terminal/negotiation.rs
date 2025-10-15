@@ -10,6 +10,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::env;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -247,12 +248,15 @@ async fn connect_fallback_websocket(
         Uuid::parse_str(handle.session_id()).map_err(|err| format!("invalid session id: {err}"))?;
 
     let client = Client::new();
+    let cohort_override = fallback_cohort_override();
+    let entitlement = fallback_entitlement_proof();
+    let telemetry_opt_in = fallback_telemetry_opt_in();
     let request = FallbackTokenRequest {
         session_id: handle.session_id().to_string(),
-        cohort_id: None,
-        telemetry_opt_in: false,
+        cohort_id: cohort_override,
+        telemetry_opt_in,
         total_sessions_hint: None,
-        entitlement_proof: None,
+        entitlement_proof: entitlement,
     };
 
     let response = client
@@ -261,18 +265,38 @@ async fn connect_fallback_websocket(
         .send()
         .await
         .map_err(|err| format!("token request failed: {err}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|err| format!("failed to read token response body: {err}"))?;
 
-    if !response.status().is_success() {
+    if !status.is_success() {
+        if let Ok(error) = serde_json::from_str::<FallbackTokenErrorBody>(&body) {
+            if let Some(reason) = error.reason {
+                return Err(match reason {
+                    "fallback_paused" => {
+                        "websocket fallback disabled by operator (kill switch engaged)".to_string()
+                    }
+                    "entitlement_required" => {
+                        "websocket fallback requires private beaches entitlement; access denied"
+                            .to_string()
+                    }
+                    "invalid_session_id" => "server rejected session identifier".to_string(),
+                    other => {
+                        format!("token request failed ({status}): server reported reason '{other}'")
+                    }
+                });
+            }
+        }
         return Err(format!(
-            "token request failed ({status})",
-            status = response.status()
+            "token request failed ({status}): {body}",
+            status = status
         ));
     }
 
-    let token_response: FallbackTokenResponse = response
-        .json()
-        .await
-        .map_err(|err| format!("failed to decode token response: {err}"))?;
+    let token_response: FallbackTokenResponse = serde_json::from_str(&body)
+        .map_err(|err| format!("failed to decode token response: {err} ({body})"))?;
 
     if token_response.guardrail_soft_breach {
         warn!(
@@ -337,6 +361,40 @@ async fn connect_fallback_websocket(
         transport_mod::websocket::wrap_stream(TransportKind::WebSocket, id, peer, stream);
 
     Ok(Arc::from(transport))
+}
+
+#[derive(Debug, Deserialize)]
+struct FallbackTokenErrorBody {
+    success: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+fn fallback_cohort_override() -> Option<String> {
+    env::var("BEACH_FALLBACK_COHORT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn fallback_entitlement_proof() -> Option<String> {
+    env::var("BEACH_ENTITLEMENT_PROOF")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn fallback_telemetry_opt_in() -> bool {
+    env::var("BEACH_FALLBACK_TELEMETRY_OPT_IN")
+        .map(|value| matches_ignore_ascii_true(&value))
+        .unwrap_or(false)
+}
+
+fn matches_ignore_ascii_true(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 pub(crate) struct SharedTransport {

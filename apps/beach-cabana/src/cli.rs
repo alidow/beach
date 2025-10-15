@@ -112,4 +112,19 @@ pub enum Commands {
         #[arg(long)]
         envelope: String,
     },
+    /// Diagnostic: run a local Noise XXpsk2 handshake and inspect derived media keys.
+    NoiseDiag {
+        #[arg(long)]
+        session_id: String,
+        #[arg(long)]
+        passcode: String,
+        #[arg(long)]
+        handshake_id: Option<String>,
+        #[arg(long, default_value = "host")]
+        host_id: String,
+        #[arg(long, default_value = "viewer")]
+        viewer_id: String,
+        #[arg(long, default_value = "cabana-cli")]
+        prologue: String,
+    },
 }

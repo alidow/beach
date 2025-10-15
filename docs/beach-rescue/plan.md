@@ -23,6 +23,7 @@ Author: Codex (implementation planning)
 - **Deployment posture:** production deployment stays paused until the relay is exercised end-to-end in the dev environment; manifests remain staging-only.
 - **What remains:** finalize activation gating (entitlement flags + kill switch endpoints), stand up load/perf harness + dashboards, and move into Phase 3 integration work once dev/staging validation passes.
 - **Control-plane kill switch:** beach-road now honours `FALLBACK_WS_PAUSED`; when enabled the `/fallback/token` endpoint refuses requests with a structured 403 so operators can halt fallback minting instantly.
+- **CLI cohort plumbing:** terminal fallback requests now honour optional env overrides (`BEACH_FALLBACK_COHORT`, `BEACH_ENTITLEMENT_PROOF`, `BEACH_FALLBACK_TELEMETRY_OPT_IN`) so Clerk-backed entitlements can slipstream in without further protocol changes; paused responses surface a friendly error to users.
 ## Naming Options
 - **beach-rescue** (selected): Signals emergency-only fallback, aligns with “Plan B” intent.
 - **beach-buoy** (previous codename): Matches rescue/fallback metaphor, short and descriptive.
@@ -117,7 +118,7 @@ Author: Codex (implementation planning)
 
 ## Next Steps After Approval
 1. Harden operability: document the new Prometheus metrics + Redis keys, wire dashboards/alerts, and extend `/debug` endpoints so on-call can inspect sessions safely.
-2. Gate the fallback transport behind control-plane entitlements/feature flags (production default off) and integrate Clerk-based proofs; kill switch toggle (`FALLBACK_WS_PAUSED`) is in place, entitlement plumbing remains.
+2. Gate the fallback transport behind control-plane entitlements/feature flags (production default off) and integrate Clerk-based proofs; CLI already forwards cohort/proof hints and the kill switch toggle (`FALLBACK_WS_PAUSED`) is in place pending server-side verification hooks.
 3. Exercise the load/chaos harness against the new session registry (target 5K active / 10K idle) and archive reports ahead of Phase 3 rollout planning.
 
 ## Open Source Coordination

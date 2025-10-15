@@ -119,7 +119,7 @@ sequenceDiagram
   - Provide manual override (`fallback_ws_paused`) for SREs to stop token issuance during runaway incidents; default state keeps fallback available for users behind restrictive firewalls.
   - Distinguish paid vs unpaid cohorts in metrics (aggregate only) so we can see if entitlements correlate with fallback volume; unpaid users have the flag unset and are excluded from WSS paths.
 - **Kill switch**
-  - Emergency feature flag in control-plane API to disable token issuance; clients degrade to WebRTC retries only. `beach-road` now exposes an environment toggle (`FALLBACK_WS_PAUSED`) that forces `/fallback/token` to return a structured 403, giving operators an immediate shutoff while longer-term flag plumbing lands.
+  - Emergency feature flag in control-plane API to disable token issuance; clients degrade to WebRTC retries only. `beach-road` now exposes an environment toggle (`FALLBACK_WS_PAUSED`) that forces `/fallback/token` to return a structured 403, giving operators an immediate shutoff while longer-term flag plumbing lands. `/health` responds with `fallback_paused` so observers can confirm the switch state.
   - SRE runbook for manual draining (mark all sessions `draining`, send CLOSE frames, scale deployment to zero).
 - **Alerting**
   - Prometheus alerts on high activation rate (soft breach), connection churn > 20%/5min, CPU > 70%, and handshake failure spikes; alerts page the transport on-call rotation.
@@ -131,6 +131,7 @@ sequenceDiagram
 ## Control Plane & Token API Decisions
 - **Endpoint:** `POST /v1/fallback/token` (authenticated via mTLS service account) returning `{ token, expires_at, cohort, guardrail_hint }`.
 - **Inputs:** `session_id`, `cohort_id`, `client_version`, `entitlement_proof` (optional JWT from future Clerk/OIDC integration), `telemetry_opt_in`.
+  - CLI already forwards optional overrides via environment variables (`BEACH_FALLBACK_COHORT`, `BEACH_ENTITLEMENT_PROOF`, `BEACH_FALLBACK_TELEMETRY_OPT_IN`) to smooth future Clerk rollout.
 - **Validation Flow:** verify entitlement when proof provided (paid “private beaches” users); in dev or when entitlement disabled, skip OIDC checks. Ensure `fallback_ws_enabled` true. Guardrail counters stored in Redis (shared with beach-road) using hourly buckets.
 - **Token Format:** Ed25519-signed CBOR payload containing `session_id`, `issued_at`, `expires_at` (<= 5 min), `cohort_id`, `feature_bits`.
   - **Implementation note (Phase 1):** Tokens are currently returned as Base64-encoded JSON claims; Ed25519 signing will be introduced alongside production hardening.

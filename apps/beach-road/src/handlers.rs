@@ -12,6 +12,7 @@ use beach_rescue_core::{
 use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::env;
 use std::sync::Arc;
 use time::Duration;
 use tracing::{debug, error, warn};
@@ -162,6 +163,12 @@ impl IntoResponse for FallbackTokenErrorResponse {
     }
 }
 
+#[derive(Debug, Serialize)]
+pub struct HealthStatus {
+    status: &'static str,
+    fallback_paused: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct FallbackTokenRequest {
     pub session_id: String,
@@ -184,8 +191,8 @@ pub struct FallbackTokenResponse {
 }
 
 fn generate_join_code() -> String {
-    let mut rng = rand::thread_rng();
-    rng.sample_iter(&Alphanumeric)
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
         .map(|c| char::from(c).to_ascii_uppercase())
         .take(6)
         .collect()
@@ -613,6 +620,22 @@ pub async fn get_session_status(
 }
 
 /// GET /health - Health check endpoint
-pub async fn health_check() -> &'static str {
-    "OK"
+pub async fn health_check() -> Json<HealthStatus> {
+    Json(HealthStatus {
+        status: "ok",
+        fallback_paused: fallback_paused_env(),
+    })
+}
+
+fn fallback_paused_env() -> bool {
+    env::var("FALLBACK_WS_PAUSED")
+        .map(|value| matches_truthy(&value))
+        .unwrap_or(false)
+}
+
+fn matches_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }

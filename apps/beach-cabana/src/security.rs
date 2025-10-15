@@ -13,6 +13,7 @@ use thiserror::Error;
 
 const ENVELOPE_VERSION: u8 = 1;
 const SIGNALING_LABEL: &[u8] = b"beach-cabana/signaling";
+const NOISE_PSK_LABEL: &[u8] = b"beach-cabana/noise-psk";
 
 #[derive(Debug, Error)]
 pub enum SecurityError {
@@ -104,6 +105,13 @@ impl SessionMaterial {
         handshake_id: &HandshakeId,
     ) -> Result<[u8; 32], SecurityError> {
         self.derive_signaling_key(handshake_id)
+    }
+
+    pub fn derive_noise_psk(
+        &self,
+        handshake_id: &HandshakeId,
+    ) -> Result<[u8; 32], SecurityError> {
+        derive_key(&self.stretched_key, handshake_id.as_bytes(), NOISE_PSK_LABEL)
     }
 
     fn derive_signaling_key(&self, handshake_id: &HandshakeId) -> Result<[u8; 32], SecurityError> {
@@ -238,4 +246,24 @@ pub fn open_signaling_payload(
     cipher
         .decrypt(Nonce::from_slice(&nonce), Payload { msg: &ciphertext, aad: &[] })
         .map_err(SecurityError::Decrypt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_noise_psk_is_deterministic_per_inputs() {
+        let material = SessionMaterial::derive("session-abc", "passcode123").expect("material");
+        let handshake_a =
+            HandshakeId::from_base64("AAAAAAAAAAAAAAAAAAAAAA==").expect("handshake parse");
+        let psk_a = material.derive_noise_psk(&handshake_a).expect("psk");
+        let psk_b = material.derive_noise_psk(&handshake_a).expect("psk");
+        assert_eq!(psk_a, psk_b);
+
+        let handshake_b =
+            HandshakeId::from_base64("/////////////////////w==").expect("handshake parse");
+        let psk_c = material.derive_noise_psk(&handshake_b).expect("psk");
+        assert_ne!(psk_a, psk_c);
+    }
 }

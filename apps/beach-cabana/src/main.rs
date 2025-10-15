@@ -3,6 +3,7 @@ mod cli;
 mod encoder;
 mod fixture;
 mod platform;
+mod noise;
 mod security;
 
 use anyhow::{anyhow, Context, Result};
@@ -380,6 +381,95 @@ fn run(cli: cli::Cli) -> Result<()> {
             storage_dir,
         } => {
             fixture::server::serve(listen, storage_dir)?;
+        }
+        cli::Commands::NoiseDiag {
+            session_id,
+            passcode,
+            handshake_id,
+            host_id,
+            viewer_id,
+            prologue,
+        } => {
+            let material = security::SessionMaterial::derive(&session_id, &passcode)?;
+            let handshake = match handshake_id {
+                Some(value) => security::HandshakeId::from_base64(&value)?,
+                None => security::HandshakeId::random(),
+            };
+            let context_bytes = prologue.into_bytes();
+
+            let mut host_handshake = noise::NoiseHandshake::new(noise::HandshakeConfig {
+                material: &material,
+                handshake_id: &handshake,
+                role: noise::HandshakeRole::Initiator,
+                local_id: &host_id,
+                remote_id: &viewer_id,
+                prologue_context: &context_bytes,
+            })?;
+            let mut viewer_handshake = noise::NoiseHandshake::new(noise::HandshakeConfig {
+                material: &material,
+                handshake_id: &handshake,
+                role: noise::HandshakeRole::Responder,
+                local_id: &viewer_id,
+                remote_id: &host_id,
+                prologue_context: &context_bytes,
+            })?;
+
+            // Exchange the three Noise XXpsk2 handshake messages locally.
+            let msg1 = host_handshake.write_message(&[])?;
+            viewer_handshake.read_message(&msg1)?;
+            let msg2 = viewer_handshake.write_message(&[])?;
+            host_handshake.read_message(&msg2)?;
+            let msg3 = host_handshake.write_message(&[])?;
+            viewer_handshake.read_message(&msg3)?;
+
+            if !(host_handshake.is_finished() && viewer_handshake.is_finished()) {
+                return Err(anyhow!("noise handshake did not complete"));
+            }
+
+            let host_session = host_handshake.finalize()?;
+            let viewer_session = viewer_handshake.finalize()?;
+
+            println!("Noise handshake diagnostic");
+            println!("  Session ID     : {}", session_id);
+            println!("  Handshake ID   : {}", handshake.to_base64());
+            println!("  Verification   : {}", host_session.verification_code());
+            println!("  Host send key  : {}", hex::encode(host_session.keys.send_key));
+            println!("  Host recv key  : {}", hex::encode(host_session.keys.recv_key));
+            println!(
+                "  Viewer send key: {}",
+                hex::encode(viewer_session.keys.send_key)
+            );
+            println!(
+                "  Viewer recv key: {}",
+                hex::encode(viewer_session.keys.recv_key)
+            );
+            println!(
+                "  Handshake hash : {}",
+                hex::encode(&host_session.handshake_hash)
+            );
+            if host_session.handshake_hash != viewer_session.handshake_hash {
+                println!("  Warning: handshake hash mismatch between peers!");
+            }
+
+            let mut encryptor =
+                host_session.keys.encryptor(&host_session.handshake_hash);
+            let mut decryptor =
+                viewer_session.keys.decryptor(&viewer_session.handshake_hash);
+
+            let demo_frame = encryptor.seal(b"cabana-demo-frame")?;
+            let demo_plaintext = decryptor.open(&demo_frame)?;
+            println!(
+                "  Demo nonce     : {}",
+                hex::encode(demo_frame.nonce)
+            );
+            println!(
+                "  Demo ciphertext: {}",
+                hex::encode(&demo_frame.ciphertext)
+            );
+            println!(
+                "  Demo plaintext : {}",
+                String::from_utf8_lossy(&demo_plaintext)
+            );
         }
     }
 

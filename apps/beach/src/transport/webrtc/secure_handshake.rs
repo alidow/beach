@@ -88,11 +88,11 @@ pub async fn run_handshake(
     prologue.push(0x1f);
     prologue.extend_from_slice(params.prologue_context.as_slice());
 
-    let noise_params: NoiseParams = "Noise_XXpsk2_25519_ChaChaPoly_BLAKE2s"
+    let noise_params: NoiseParams = "Noise_XXpsk0_25519_ChaChaPoly_BLAKE2s"
         .parse()
         .map_err(|err| TransportError::Setup(format!("invalid noise params: {err}")))?;
     let builder = NoiseBuilder::new(noise_params)
-        .psk(2, &psk)
+        .psk(0, &psk)
         .prologue(&prologue);
     let keypair = builder.generate_keypair().map_err(map_noise_error)?;
     let builder = builder.local_private_key(&keypair.private);

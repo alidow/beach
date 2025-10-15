@@ -37,7 +37,7 @@ interface NoiseModule {
   HandshakeState: new (protocolName: string, role: number) => NoiseHandshakeState;
 }
 
-const PROTOCOL_NAME = 'Noise_XXpsk2_25519_ChaChaPoly_BLAKE2s';
+const PROTOCOL_NAME = 'Noise_XXpsk0_25519_ChaChaPoly_BLAKE2s';
 const PROLOGUE_PREFIX = 'beach:secure-handshake:v1';
 const FIELD_SEPARATOR = 0x1f;
 const TRANSPORT_DIRECTION_PREFIX = 'beach:secure-transport:direction:';

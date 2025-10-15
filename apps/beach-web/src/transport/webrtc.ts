@@ -1,5 +1,5 @@
 import { decodeTransportMessage, encodeTransportMessage, type TransportMessage } from './envelope';
-import { derivePreSharedKey, toHex } from './crypto/sharedKey';
+import { deriveHandshakeKey, derivePreSharedKey, toHex } from './crypto/sharedKey';
 import {
   secureSignalingEnabled,
   sealWithKey,
@@ -211,34 +211,69 @@ export async function connectWebRtcTransport(
   const trace = options.trace ?? null;
   trace?.mark('webrtc:connect_start', { role: options.role });
   const passphrase = options.passphrase?.trim();
-  const secureSignalingActive = Boolean(secureSignalingEnabled() && passphrase && passphrase.length > 0);
-  let sealingKeyPromise: Promise<Uint8Array> | null = null;
+  const secureSignalingActive = Boolean(
+    secureSignalingEnabled() && passphrase && passphrase.length > 0,
+  );
+  let sessionKeyPromise: Promise<Uint8Array> | null = null;
+  const handshakeKeyPromises = new Map<string, Promise<Uint8Array>>();
+  let currentHandshakeId: string | null = null;
   const ensureSealingKey = (handshakeId: string): Promise<Uint8Array> => {
-    if (!sealingKeyPromise) {
-      if (!passphrase) {
-        throw new Error('secure signaling requires passphrase');
-      }
-      trace?.mark('webrtc:derive_psk_start', { handshakeId });
-      sealingKeyPromise = derivePreSharedKey(passphrase, handshakeId)
-        .then((value) => {
-          trace?.mark('webrtc:derive_psk_complete', { handshakeId });
-          return value;
-        })
-        .catch((error) => {
-          trace?.mark('webrtc:derive_psk_error', { handshakeId, message: String(error) });
-          sealingKeyPromise = null;
-          throw error;
-        });
+    const existing = handshakeKeyPromises.get(handshakeId);
+    if (existing) {
+      return existing;
     }
-    return sealingKeyPromise;
+    if (!secureSignalingActive) {
+      throw new Error('secure signaling disabled');
+    }
+    if (!passphrase) {
+      throw new Error('secure signaling requires passphrase');
+    }
+    if (!sessionKeyPromise) {
+      throw new Error('session key not ready');
+    }
+    trace?.mark('webrtc:derive_handshake_key_start', { handshakeId });
+    const promise = sessionKeyPromise
+      .then((sessionKey) => deriveHandshakeKey(sessionKey, handshakeId))
+      .then((value) => {
+        trace?.mark('webrtc:derive_handshake_key_complete', { handshakeId });
+        return value;
+      })
+      .catch((error) => {
+        trace?.mark('webrtc:derive_handshake_key_error', {
+          handshakeId,
+          message: String(error),
+        });
+        handshakeKeyPromises.delete(handshakeId);
+        throw error;
+      });
+    handshakeKeyPromises.set(handshakeId, promise);
+    return promise;
   };
-  const getSealingKey = () => sealingKeyPromise;
+  const getSealingKey = () =>
+    currentHandshakeId ? handshakeKeyPromises.get(currentHandshakeId) ?? null : null;
   const join = await signaling.waitForMessage('join_success', 15_000);
   trace?.mark('signaling:join_success', {
     assignedPeerId: join.peer_id,
     peers: join.peers.length,
   });
   log(logger, `join_success payload: ${JSON.stringify(join)}`);
+  const sessionId = options.sessionId ?? join.session_id;
+  if (secureSignalingActive) {
+    trace?.mark('webrtc:derive_session_key_start', { sessionId });
+    sessionKeyPromise = derivePreSharedKey(passphrase!, sessionId)
+      .then((value) => {
+        trace?.mark('webrtc:derive_session_key_complete', { sessionId });
+        return value;
+      })
+      .catch((error) => {
+        trace?.mark('webrtc:derive_session_key_error', {
+          sessionId,
+          message: String(error),
+        });
+        sessionKeyPromise = null;
+        throw error;
+      });
+  }
   const assignedPeerId = join.peer_id;
   const remotePeerId = await resolveRemotePeerId(signaling, join, options.preferredPeerId);
   trace?.mark('webrtc:remote_peer_resolved', { remotePeerId });
@@ -280,7 +315,6 @@ export async function connectWebRtcTransport(
       .then(() => log(logger, `ice add ok: ${(cand.candidate ?? '').slice(0, 80)}`))
       .catch((error) => log(logger, `ice add failed: ${error}`));
   };
-  let currentHandshakeId: string | null = null;
   const disposeSignalListener = attachSignalListener(
     signaling,
     remotePeerId,
@@ -448,7 +482,7 @@ export async function connectWebRtcTransport(
         localPeerId: assignedPeerId,
         remotePeerId,
       },
-      sessionId: options.sessionId,
+      sessionId,
       trace,
       afterSetRemoteDescription: () => {
         remoteDescriptionSet = true;
@@ -473,6 +507,9 @@ export async function connectWebRtcTransport(
       currentHandshakeId = handshakeId;
       log(logger, `handshake ready: ${handshakeId}`);
       trace?.mark('webrtc:handshake_ready', { handshakeId });
+      if (secureState.enabled) {
+        void ensureSealingKey(handshakeId);
+      }
       if (candidateSendState === 'ready') {
         void flushPendingCandidates();
       }

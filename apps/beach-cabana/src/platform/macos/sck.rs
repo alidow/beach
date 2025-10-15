@@ -1,6 +1,8 @@
 use crate::capture::{Frame, PixelFormat};
 use crate::platform::WindowApiError;
-use core_foundation::base::TCFType;
+use core_foundation::base::{CFType, TCFType};
+use core_foundation::number::CFNumber;
+use core_foundation::string::CFString;
 use core_media::sample_buffer::{CMSampleBuffer, CMSampleBufferRef};
 use core_media::time::CMTime;
 use core_video::pixel_buffer::{CVPixelBuffer, kCVPixelFormatType_32BGRA};
@@ -9,7 +11,7 @@ use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 use dispatch2::{Queue, QueueAttribute};
 use image::{ImageBuffer, Rgba};
 use objc2::{
-    class,
+    class, sel,
     declare_class, msg_send, msg_send_id, mutability,
     rc::Id,
     runtime::ProtocolObject,
@@ -28,7 +30,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::sync::Once;
 use tracing::{debug, info, warn};
 
@@ -37,24 +39,63 @@ unsafe extern "C" {
     fn NSApplicationLoad() -> bool;
 }
 
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGSInitialize();
+}
+
+#[repr(C)]
+#[derive(Debug, Default)]
+struct ProcessSerialNumber {
+    high: u32,
+    low: u32,
+}
+
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn GetCurrentProcess(psn: *mut ProcessSerialNumber) -> i32;
+    fn TransformProcessType(psn: *mut ProcessSerialNumber, transform_state: i32) -> i32;
+}
+
+const PROCESS_TRANSFORM_TO_FOREGROUND_APPLICATION: i32 = 1;
+
 fn ensure_appkit_initialized() {
     static APPKIT_INIT: Once = Once::new();
     APPKIT_INIT.call_once(|| unsafe {
+        info!("invoking CGSInitialize()");
+        CGSInitialize();
+        info!("CGSInitialize completed");
+        let mut psn = ProcessSerialNumber::default();
+        let status = GetCurrentProcess(&mut psn);
+        info!(status, psn_high = psn.high, psn_low = psn.low, "GetCurrentProcess");
+        let transform_status =
+            TransformProcessType(&mut psn, PROCESS_TRANSFORM_TO_FOREGROUND_APPLICATION);
+        info!(transform_status, "TransformProcessType to foreground");
+        info!("invoking NSApplicationLoad()");
         if !NSApplicationLoad() {
             warn!("NSApplicationLoad returned false; screen capture may fail");
         } else {
-            info!("AppKit initialized via NSApplicationLoad");
+            info!("NSApplicationLoad returned true");
         }
         let app: Id<NSObject> = msg_send_id![class!(NSApplication), sharedApplication];
+        info!("obtained NSApplication.sharedApplication()");
         let _: () = msg_send![&app, finishLaunching];
+        info!("sent finishLaunching to NSApplication");
     });
 }
 
 #[derive(Debug)]
 enum StreamEvent {
     Frame(Frame),
+    Blank { status: Option<i64> },
     Error(String),
     Stopped,
+}
+
+#[derive(Debug)]
+enum ProcessResult {
+    Frame(Frame),
+    Blank { status: Option<i64> },
 }
 
 struct StreamDelegateIvars {
@@ -88,8 +129,18 @@ declare_class!(
                 return;
             }
             let sender = self.ivars().sender.clone();
-            if let Err(message) = process_sample_buffer(sender.clone(), sample_buffer) {
-                let _ = sender.send(StreamEvent::Error(message));
+            info!("ScreenCaptureKit output callback received");
+            match process_sample_buffer(sample_buffer) {
+                Ok(ProcessResult::Frame(frame)) => {
+                    let _ = sender.send(StreamEvent::Frame(frame));
+                }
+                Ok(ProcessResult::Blank { status }) => {
+                    info!(status, "ScreenCaptureKit sample reported blank frame");
+                    let _ = sender.send(StreamEvent::Blank { status });
+                }
+                Err(message) => {
+                    let _ = sender.send(StreamEvent::Error(message));
+                }
             }
         }
     }
@@ -200,21 +251,39 @@ impl SckStream {
     }
 
     pub fn next_frame(&self, timeout: Duration) -> Result<Frame, WindowApiError> {
-        match self.receiver.recv_timeout(timeout) {
-            Ok(StreamEvent::Frame(frame)) => Ok(frame),
-            Ok(StreamEvent::Error(message)) => Err(WindowApiError::CaptureFailed(message)),
-            Ok(StreamEvent::Stopped) => Err(WindowApiError::CaptureFailed(
-                "ScreenCaptureKit stream stopped".into(),
-            )),
-            Err(RecvTimeoutError::Timeout) => {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
                 warn!("ScreenCaptureKit frame receive timed out");
-                Err(WindowApiError::CaptureFailed(
+                return Err(WindowApiError::CaptureFailed(
                     "ScreenCaptureKit frame timeout".into(),
-                ))
+                ));
             }
-            Err(RecvTimeoutError::Disconnected) => Err(WindowApiError::CaptureFailed(
-                "ScreenCaptureKit stream disconnected".into(),
-            )),
+
+            let remaining = deadline.saturating_duration_since(now);
+            match self.receiver.recv_timeout(remaining) {
+                Ok(StreamEvent::Frame(frame)) => return Ok(frame),
+                Ok(StreamEvent::Blank { status }) => {
+                    debug!(status, "ScreenCaptureKit reported blank frame; awaiting next sample");
+                }
+                Ok(StreamEvent::Error(message)) => {
+                    warn!(%message, "ScreenCaptureKit sample error");
+                }
+                Ok(StreamEvent::Stopped) => {
+                    return Err(WindowApiError::CaptureFailed(
+                        "ScreenCaptureKit stream stopped".into(),
+                    ))
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // Continue loop to re-evaluate deadline.
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(WindowApiError::CaptureFailed(
+                        "ScreenCaptureKit stream disconnected".into(),
+                    ))
+                }
+            }
         }
     }
 }
@@ -350,27 +419,40 @@ fn make_configuration(size: CGSize) -> Id<SCStreamConfiguration> {
     configuration.set_height(height);
     configuration.set_pixel_format(kCVPixelFormatType_32BGRA);
     configuration.set_queue_depth(4);
-    configuration.set_show_cursor(true);
+    unsafe {
+        let responds: bool = msg_send![&*configuration, respondsToSelector: sel!(setShowCursor:)];
+        if responds {
+            let _: () = msg_send![&*configuration, setShowCursor: true];
+        } else {
+            debug!("SCStreamConfiguration#setShowCursor: unavailable; skipping cursor capture toggle");
+        }
+    }
     configuration.set_scales_to_fit(true);
     configuration.set_minimum_frame_interval(CMTime::make(1, 60));
     configuration
 }
 
-fn process_sample_buffer(
-    sender: Sender<StreamEvent>,
-    sample_buffer: CMSampleBufferRef,
-) -> Result<(), String> {
+fn process_sample_buffer(sample_buffer: CMSampleBufferRef) -> Result<ProcessResult, String> {
     let sample = unsafe { CMSampleBuffer::wrap_under_get_rule(sample_buffer) };
+    let status = sample_frame_status(&sample);
     let Some(image_buffer) = sample.get_image_buffer() else {
-        return Err("sample buffer missing image buffer".into());
+        return Ok(ProcessResult::Blank { status });
     };
     let Some(pixel_buffer) = image_buffer.downcast::<CVPixelBuffer>() else {
         return Err("unsupported pixel buffer type".into());
     };
     let frame = convert_pixel_buffer(&pixel_buffer)?;
-    sender
-        .send(StreamEvent::Frame(frame))
-        .map_err(|err| err.to_string())
+    Ok(ProcessResult::Frame(frame))
+}
+
+fn sample_frame_status(sample: &CMSampleBuffer) -> Option<i64> {
+    let attachments = sample.get_sample_attachments_array(false)?;
+    let dict = attachments.get(0)?;
+    let status_key = CFString::from_static_string("SCStreamFrameInfoStatus");
+    let value = dict.find(&status_key)?;
+    let cf_type: &CFType = &value;
+    let number = cf_type.downcast::<CFNumber>()?;
+    number.to_i64()
 }
 
 fn convert_pixel_buffer(pixel_buffer: &CVPixelBuffer) -> Result<Frame, String> {

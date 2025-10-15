@@ -115,8 +115,17 @@ impl BootstrapHandshake {
 }
 
 pub fn remote_bootstrap_args(args: &SshArgs, session_server: &str) -> Vec<String> {
+    // If remote_path is relative (doesn't start with / or ~), prefix with ./
+    // so the shell can find it in the current directory
+    let executable_path = if args.remote_path.starts_with('/') || args.remote_path.starts_with('~')
+    {
+        args.remote_path.clone()
+    } else {
+        format!("./{}", args.remote_path)
+    };
+
     let mut command = vec![
-        args.remote_path.clone(),
+        executable_path,
         "host".to_string(),
         "--bootstrap-output=json".to_string(),
     ];
@@ -168,12 +177,200 @@ pub fn resolve_local_binary_path(args: &SshArgs) -> Result<PathBuf, CliError> {
     Ok(resolved)
 }
 
+/// Detect the architecture of the remote machine
+async fn detect_remote_architecture(args: &SshArgs) -> Result<String, CliError> {
+    let mut command = TokioCommand::new(&args.ssh_binary);
+    if !args.no_batch {
+        command.arg("-o").arg("BatchMode=yes");
+    }
+    command.arg("-T");
+    for flag in &args.ssh_flag {
+        command.arg(flag);
+    }
+    command.arg(&args.target);
+    command.arg("uname -m");
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+
+    let output = command.output().await.map_err(|err| {
+        CliError::CopyBinary(format!("failed to detect remote architecture: {err}"))
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CliError::CopyBinary(format!(
+            "failed to detect remote architecture ({}): {}",
+            describe_exit_status(output.status),
+            stderr.trim()
+        )));
+    }
+
+    let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    info!(architecture = %arch, "detected remote architecture");
+    Ok(arch)
+}
+
+/// Check if beach binary exists on remote and get its version
+async fn check_remote_beach_version(args: &SshArgs) -> Result<Option<String>, CliError> {
+    let remote_binary = if args.remote_path.starts_with('/') || args.remote_path.starts_with('~') {
+        args.remote_path.clone()
+    } else {
+        format!("./{}", args.remote_path)
+    };
+
+    let mut command = TokioCommand::new(&args.ssh_binary);
+    if !args.no_batch {
+        command.arg("-o").arg("BatchMode=yes");
+    }
+    command.arg("-T");
+    for flag in &args.ssh_flag {
+        command.arg(flag);
+    }
+    command.arg(&args.target);
+    command.arg(format!(
+        "{} --version 2>/dev/null || echo NOTFOUND",
+        shell_quote(&remote_binary)
+    ));
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+
+    let output = command.output().await.map_err(|err| {
+        CliError::CopyBinary(format!("failed to check remote beach version: {err}"))
+    })?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.contains("NOTFOUND") || stdout.is_empty() {
+        info!("no beach binary found on remote");
+        Ok(None)
+    } else {
+        info!(version = %stdout, "found beach binary on remote");
+        Ok(Some(stdout))
+    }
+}
+
+/// Map remote architecture to Rust target triple
+fn architecture_to_target(arch: &str) -> Result<&'static str, CliError> {
+    match arch {
+        "x86_64" => Ok("x86_64-unknown-linux-musl"),
+        "aarch64" | "arm64" => Ok("aarch64-unknown-linux-musl"),
+        "armv7l" => Ok("armv7-unknown-linux-musleabihf"),
+        _ => Err(CliError::CopyBinary(format!(
+            "unsupported remote architecture: {}. Supported: x86_64, aarch64/arm64, armv7l",
+            arch
+        ))),
+    }
+}
+
+/// Build beach binary for the specified target
+async fn build_for_target(target: &str) -> Result<PathBuf, CliError> {
+    info!(target = %target, "building beach binary for target");
+
+    let mut command = TokioCommand::new("cargo");
+    command.arg("build");
+    command.arg("--release");
+    command.arg("--target");
+    command.arg(target);
+    command.arg("-p");
+    command.arg("beach-human");
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+
+    let output = command
+        .output()
+        .await
+        .map_err(|err| CliError::CopyBinary(format!("failed to spawn cargo build: {err}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let error_msg = if stderr.contains("target may not be installed")
+            || stderr.contains("can't find crate")
+        {
+            format!(
+                "cargo build failed - target '{}' may not be installed.\n\
+                 Run: rustup target add {}\n\
+                 Error: {}",
+                target,
+                target,
+                stderr.trim()
+            )
+        } else {
+            format!(
+                "cargo build failed ({}): {}",
+                describe_exit_status(output.status),
+                stderr.trim()
+            )
+        };
+        return Err(CliError::CopyBinary(error_msg));
+    }
+
+    // Construct the path to the built binary
+    let workspace_root = std::env::current_dir()
+        .map_err(|err| CliError::CopyBinary(format!("failed to get current directory: {err}")))?;
+    let binary_path = workspace_root
+        .join("target")
+        .join(target)
+        .join("release")
+        .join("beach-human");
+
+    if !binary_path.exists() {
+        return Err(CliError::CopyBinary(format!(
+            "built binary not found at: {}",
+            binary_path.display()
+        )));
+    }
+
+    info!(path = %binary_path.display(), "successfully built beach binary");
+    Ok(binary_path)
+}
+
 pub async fn copy_binary_to_remote(args: &SshArgs) -> Result<(), CliError> {
     if !args.copy_binary {
         return Ok(());
     }
 
-    let source_path = resolve_local_binary_path(args)?;
+    // Check if remote already has the correct version
+    let local_version = env!("CARGO_PKG_VERSION");
+    if let Ok(Some(remote_version)) = check_remote_beach_version(args).await {
+        if remote_version.contains(local_version) {
+            info!(
+                local_version = %local_version,
+                remote_version = %remote_version,
+                "remote beach binary is up to date, skipping copy"
+            );
+            return Ok(());
+        } else {
+            info!(
+                local_version = %local_version,
+                remote_version = %remote_version,
+                "remote beach version mismatch, will copy new binary"
+            );
+        }
+    }
+
+    // Detect remote architecture and build for it
+    let source_path = if args.copy_from.is_some() {
+        // User provided explicit path, use it as-is
+        resolve_local_binary_path(args)?
+    } else {
+        // Auto-detect architecture and build
+        let remote_arch = detect_remote_architecture(args).await?;
+        let target = architecture_to_target(&remote_arch)?;
+
+        info!(
+            remote_arch = %remote_arch,
+            target = %target,
+            "auto-building for remote architecture"
+        );
+
+        build_for_target(target).await?
+    };
     let destination = scp_destination(&args.target, &args.remote_path);
 
     info!(
@@ -201,30 +398,68 @@ pub async fn copy_binary_to_remote(args: &SshArgs) -> Result<(), CliError> {
         .await
         .map_err(|err| CliError::CopyBinary(format!("failed to spawn scp: {err}")))?;
 
-    if output.status.success() {
-        let stdout_str = String::from_utf8_lossy(&output.stdout);
-        let stdout_trimmed = stdout_str.trim();
-        if !stdout_trimmed.is_empty() {
-            debug!(stdout = stdout_trimmed, "scp stdout");
-        }
-
-        let stderr_str = String::from_utf8_lossy(&output.stderr);
-        let stderr_trimmed = stderr_str.trim();
-        if !stderr_trimmed.is_empty() {
-            debug!(stderr = stderr_trimmed, "scp stderr");
-        }
-        return Ok(());
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CliError::CopyBinary(format!(
+            "{} failed ({}): stdout='{}' stderr='{}'",
+            args.scp_binary,
+            describe_exit_status(output.status),
+            stdout.trim(),
+            stderr.trim()
+        )));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(CliError::CopyBinary(format!(
-        "{} failed ({}): stdout='{}' stderr='{}'",
-        args.scp_binary,
-        describe_exit_status(output.status),
-        stdout.trim(),
-        stderr.trim()
-    )))
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let stdout_trimmed = stdout_str.trim();
+    if !stdout_trimmed.is_empty() {
+        debug!(stdout = stdout_trimmed, "scp stdout");
+    }
+
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    let stderr_trimmed = stderr_str.trim();
+    if !stderr_trimmed.is_empty() {
+        debug!(stderr = stderr_trimmed, "scp stderr");
+    }
+
+    // Make the remote binary executable
+    info!(
+        target = %args.target,
+        remote_path = %args.remote_path,
+        "making remote binary executable"
+    );
+
+    let mut chmod_command = TokioCommand::new(&args.ssh_binary);
+    if !args.no_batch {
+        chmod_command.arg("-o").arg("BatchMode=yes");
+    }
+    chmod_command.arg("-T");
+    for flag in &args.ssh_flag {
+        chmod_command.arg(flag);
+    }
+    chmod_command.arg(&args.target);
+    chmod_command.arg(format!("chmod +x {}", shell_quote(&args.remote_path)));
+    chmod_command.stdin(std::process::Stdio::null());
+    chmod_command.stdout(std::process::Stdio::piped());
+    chmod_command.stderr(std::process::Stdio::piped());
+
+    let chmod_output = chmod_command
+        .output()
+        .await
+        .map_err(|err| CliError::CopyBinary(format!("failed to spawn ssh for chmod: {err}")))?;
+
+    if !chmod_output.status.success() {
+        let stdout = String::from_utf8_lossy(&chmod_output.stdout);
+        let stderr = String::from_utf8_lossy(&chmod_output.stderr);
+        return Err(CliError::CopyBinary(format!(
+            "chmod +x failed ({}): stdout='{}' stderr='{}'",
+            describe_exit_status(chmod_output.status),
+            stdout.trim(),
+            stderr.trim()
+        )));
+    }
+
+    Ok(())
 }
 
 pub fn shell_quote(raw: &str) -> String {

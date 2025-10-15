@@ -52,8 +52,8 @@ use secure_handshake::{
     build_prologue_context, handshake_channel_init, run_handshake, secure_transport_enabled,
 };
 use secure_signaling::{
-    MessageLabel, SealedEnvelope, derive_pre_shared_key, open_message, open_message_with_psk,
-    seal_message, seal_message_with_psk, should_encrypt,
+    MessageLabel, SealedEnvelope, derive_handshake_key_from_session, derive_pre_shared_key,
+    open_message, open_message_with_psk, seal_message, seal_message_with_psk, should_encrypt,
 };
 use signaling::{PeerRole, RemotePeerEvent, RemotePeerJoined, SignalingClient, WebRTCSignal};
 
@@ -748,8 +748,10 @@ struct OffererInner {
     client: Client,
     signaling_client: Arc<SignalingClient>,
     signaling_base: String,
+    session_id: String,
     poll_interval: Duration,
     passphrase: Option<String>,
+    session_key: Arc<OnceCell<Arc<[u8; 32]>>>,
     accepted_tx: tokio_mpsc::UnboundedSender<OffererAcceptedTransport>,
     peer_tasks: AsyncMutex<HashMap<String, PeerNegotiatorHandle>>,
     peer_states: AsyncMutex<HashMap<String, PeerLifecycleState>>,
@@ -784,19 +786,28 @@ impl OffererSupervisor {
         .await?;
         let client = Client::new();
         let signaling_base = signaling_url.trim_end_matches('/').to_string();
+        let session_id = extract_session_id(signaling_url)?;
         let (accepted_tx, accepted_rx) = tokio_mpsc::unbounded_channel();
 
         let inner = Arc::new(OffererInner {
             client,
             signaling_client,
             signaling_base,
+            session_id: session_id.clone(),
             poll_interval,
             passphrase: passphrase.map(|p| p.to_string()),
+            session_key: Arc::new(OnceCell::new()),
             accepted_tx,
             peer_tasks: AsyncMutex::new(HashMap::new()),
             peer_states: AsyncMutex::new(HashMap::new()),
             max_negotiators: OFFERER_MAX_NEGOTIATORS,
         });
+
+        prime_session_key(
+            &inner.session_key,
+            inner.passphrase.as_deref(),
+            &inner.session_id,
+        );
 
         let remote_events = inner.signaling_client.remote_events().await?;
         OffererInner::start_event_loop(inner.clone(), remote_events, request_mcp_channel);
@@ -1108,7 +1119,9 @@ async fn negotiate_offerer_peer(
     let pre_shared_key_cell = Arc::new(OnceCell::<Arc<[u8; 32]>>::new());
     prime_pre_shared_key(
         &pre_shared_key_cell,
+        &inner.session_key,
         inner.passphrase.as_deref(),
+        inner.session_id.as_str(),
         &handshake_id,
     );
     let peer_id = peer.id.clone();
@@ -1312,7 +1325,9 @@ async fn negotiate_offerer_peer(
 
     let shared_key = await_pre_shared_key(
         &pre_shared_key_cell,
+        &inner.session_key,
         inner.passphrase.as_deref(),
+        inner.session_id.as_str(),
         &handshake_id,
     )
     .await?;
@@ -1694,6 +1709,13 @@ async fn connect_answerer(
     label: Option<&str>,
 ) -> Result<WebRtcConnection, TransportError> {
     let passphrase_owned = passphrase.map(|s| s.to_string());
+    let session_id = extract_session_id(signaling_url)?;
+    let session_key_cell = Arc::new(OnceCell::<Arc<[u8; 32]>>::new());
+    prime_session_key(
+        &session_key_cell,
+        passphrase_owned.as_deref(),
+        session_id.as_str(),
+    );
     let secure_transport_active = secure_transport_enabled()
         && passphrase_owned
             .as_ref()
@@ -1791,12 +1813,16 @@ async fn connect_answerer(
     let pre_shared_key_cell = Arc::new(OnceCell::<Arc<[u8; 32]>>::new());
     prime_pre_shared_key(
         &pre_shared_key_cell,
+        &session_key_cell,
         passphrase_owned.as_deref(),
+        session_id.as_str(),
         &offer_payload.handshake_id,
     );
     let shared_key = await_pre_shared_key(
         &pre_shared_key_cell,
+        &session_key_cell,
         passphrase_owned.as_deref(),
+        session_id.as_str(),
         &offer_payload.handshake_id,
     )
     .await?;
@@ -2538,51 +2564,154 @@ async fn fetch_sdp(
     }
 }
 
-fn prime_pre_shared_key(
+fn extract_session_id(signaling_url: &str) -> Result<String, TransportError> {
+    let url = Url::parse(signaling_url).map_err(|err| {
+        TransportError::Setup(format!("invalid signaling url {signaling_url}: {err}"))
+    })?;
+    let segments = url
+        .path_segments()
+        .ok_or_else(|| TransportError::Setup("signaling url missing path segments".into()))?
+        .collect::<Vec<_>>();
+    if segments.len() < 2 || segments[0] != "sessions" {
+        return Err(TransportError::Setup(format!(
+            "unexpected signaling url path: {}",
+            url.path()
+        )));
+    }
+    Ok(segments[1].to_string())
+}
+
+fn prime_session_key(
     cell: &Arc<OnceCell<Arc<[u8; 32]>>>,
     passphrase: Option<&str>,
+    session_id: &str,
+) {
+    let Some(passphrase_value) = passphrase else {
+        return;
+    };
+    if !should_encrypt(Some(passphrase_value)) || cell.get().is_some() {
+        return;
+    }
+    let cell_clone = Arc::clone(cell);
+    let passphrase_owned = passphrase_value.to_string();
+    let session_id_owned = session_id.to_string();
+    spawn_on_global(async move {
+        if cell_clone.get().is_some() {
+            return;
+        }
+        if let Err(err) = ensure_session_key(
+            &cell_clone,
+            Some(passphrase_owned.as_str()),
+            session_id_owned.as_str(),
+        )
+        .await
+        {
+            tracing::error!(
+                target = "webrtc",
+                session_id = %session_id_owned,
+                error = %err,
+                "background session key derivation failed"
+            );
+        }
+    });
+}
+
+async fn ensure_session_key(
+    cell: &Arc<OnceCell<Arc<[u8; 32]>>>,
+    passphrase: Option<&str>,
+    session_id: &str,
+) -> Result<Option<Arc<[u8; 32]>>, TransportError> {
+    let Some(passphrase_value) = passphrase else {
+        return Ok(None);
+    };
+    if !should_encrypt(Some(passphrase_value)) {
+        return Ok(None);
+    }
+    if let Some(existing) = cell.get() {
+        return Ok(Some(existing.clone()));
+    }
+    let passphrase_owned = passphrase_value.to_string();
+    let session_id_owned = session_id.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        derive_pre_shared_key(passphrase_owned.as_str(), session_id_owned.as_str())
+    })
+    .await
+    .map_err(|err| TransportError::Setup(format!("session key derivation task failed: {err}")))??;
+    let arc_key = Arc::new(result);
+    match cell.set(arc_key.clone()) {
+        Ok(()) => {
+            tracing::debug!(
+                target = "webrtc",
+                session_id = %session_id,
+                "session key cached"
+            );
+            Ok(Some(arc_key))
+        }
+        Err(SetError::AlreadyInitializedError(_)) => Ok(cell.get().cloned().or(Some(arc_key))),
+        Err(SetError::InitializingError(value)) => Ok(Some(value)),
+    }
+}
+
+fn prime_pre_shared_key(
+    handshake_cell: &Arc<OnceCell<Arc<[u8; 32]>>>,
+    session_key_cell: &Arc<OnceCell<Arc<[u8; 32]>>>,
+    passphrase: Option<&str>,
+    session_id: &str,
     handshake_id: &str,
 ) {
     let Some(passphrase_value) = passphrase else {
         return;
     };
-    if !should_encrypt(Some(passphrase_value)) {
+    if !should_encrypt(Some(passphrase_value)) || handshake_cell.get().is_some() {
         return;
     }
+    prime_session_key(session_key_cell, Some(passphrase_value), session_id);
+    let handshake_cell_clone = Arc::clone(handshake_cell);
+    let session_key_cell_clone = Arc::clone(session_key_cell);
     let passphrase_owned = passphrase_value.to_string();
+    let session_id_owned = session_id.to_string();
     let handshake_owned = handshake_id.to_string();
-    let cell_clone = Arc::clone(cell);
     spawn_on_global(async move {
-        let handshake_for_log = handshake_owned.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            derive_pre_shared_key(passphrase_owned.as_str(), handshake_owned.as_str())
-        })
-        .await;
-        match result {
-            Ok(Ok(psk)) => {
-                let arc_key = Arc::new(psk);
-                if cell_clone.set(arc_key.clone()).is_ok() {
-                    tracing::debug!(
+        if handshake_cell_clone.get().is_some() {
+            return;
+        }
+        match ensure_session_key(
+            &session_key_cell_clone,
+            Some(passphrase_owned.as_str()),
+            session_id_owned.as_str(),
+        )
+        .await
+        {
+            Ok(Some(session_key)) => match derive_handshake_key_from_session(
+                session_key.as_ref(),
+                handshake_owned.as_str(),
+            ) {
+                Ok(derived) => {
+                    let arc_key = Arc::new(derived);
+                    if handshake_cell_clone.set(arc_key.clone()).is_ok() {
+                        tracing::debug!(
+                            target = "webrtc",
+                            handshake_id = %handshake_owned,
+                            "background handshake key derivation complete"
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(
                         target = "webrtc",
-                        handshake_id = %handshake_for_log,
-                        "background pre-shared key derivation complete"
+                        handshake_id = %handshake_owned,
+                        error = %err,
+                        "handshake key derivation failed"
                     );
                 }
-            }
-            Ok(Err(err)) => {
+            },
+            Ok(None) => {}
+            Err(err) => {
                 tracing::error!(
                     target = "webrtc",
-                    handshake_id = %handshake_for_log,
+                    handshake_id = %handshake_owned,
                     error = %err,
-                    "background pre-shared key derivation failed"
-                );
-            }
-            Err(join_err) => {
-                tracing::error!(
-                    target = "webrtc",
-                    handshake_id = %handshake_for_log,
-                    error = %join_err,
-                    "pre-shared key derivation task panicked"
+                    "background session key derivation for handshake failed"
                 );
             }
         }
@@ -2590,11 +2719,13 @@ fn prime_pre_shared_key(
 }
 
 async fn await_pre_shared_key(
-    cell: &Arc<OnceCell<Arc<[u8; 32]>>>,
+    handshake_cell: &Arc<OnceCell<Arc<[u8; 32]>>>,
+    session_key_cell: &Arc<OnceCell<Arc<[u8; 32]>>>,
     passphrase: Option<&str>,
+    session_id: &str,
     handshake_id: &str,
 ) -> Result<Option<Arc<[u8; 32]>>, TransportError> {
-    if let Some(existing) = cell.get() {
+    if let Some(existing) = handshake_cell.get() {
         return Ok(Some(existing.clone()));
     }
     let Some(passphrase_value) = passphrase else {
@@ -2603,26 +2734,24 @@ async fn await_pre_shared_key(
     if !should_encrypt(Some(passphrase_value)) {
         return Ok(None);
     }
-    let passphrase_owned = passphrase_value.to_string();
-    let handshake_owned = handshake_id.to_string();
-    let cell_clone = Arc::clone(cell);
-    let result = tokio::task::spawn_blocking(move || {
-        derive_pre_shared_key(passphrase_owned.as_str(), handshake_owned.as_str())
-    })
-    .await
-    .map_err(|err| TransportError::Setup(format!("psk derivation task failed: {err}")))??;
-    let arc_key = Arc::new(result);
-    match cell_clone.set(arc_key.clone()) {
+    let session_key =
+        ensure_session_key(session_key_cell, Some(passphrase_value), session_id).await?;
+    let Some(session_key) = session_key else {
+        return Ok(None);
+    };
+    let derived = derive_handshake_key_from_session(session_key.as_ref(), handshake_id)?;
+    let arc_key = Arc::new(derived);
+    match handshake_cell.set(arc_key.clone()) {
         Ok(()) => {
             tracing::debug!(
                 target = "webrtc",
                 handshake_id = %handshake_id,
-                "pre-shared key cached"
+                "handshake key cached"
             );
             Ok(Some(arc_key))
         }
         Err(SetError::AlreadyInitializedError(_)) => {
-            Ok(cell_clone.get().cloned().or(Some(arc_key)))
+            Ok(handshake_cell.get().cloned().or(Some(arc_key)))
         }
         Err(SetError::InitializingError(value)) => Ok(Some(value)),
     }

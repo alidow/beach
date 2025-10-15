@@ -1,5 +1,8 @@
 import { deriveArgon2id } from './argon2';
 
+const encoder = new TextEncoder();
+const HANDSHAKE_INFO_BYTES = encoder.encode('beach:secure-signaling:handshake');
+
 /**
  * Shared-secret derivation helpers for sealed signaling and post-handshake crypto.
  */
@@ -50,6 +53,14 @@ export async function hkdfExpand(
   );
 
   return new Uint8Array(derivedBits);
+}
+
+export async function deriveHandshakeKey(
+  sessionKey: Uint8Array,
+  handshakeId: string,
+): Promise<Uint8Array> {
+  const salt = encoder.encode(handshakeId);
+  return hkdfExpand(sessionKey, salt, HANDSHAKE_INFO_BYTES, 32);
 }
 
 export function toHex(bytes: Uint8Array): string {

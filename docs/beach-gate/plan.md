@@ -45,8 +45,8 @@ Authentication uses `Authorization: Bearer <token>` where applicable.
 
 ## Token Format
 - Alg: ES256 (P-256) with private key stored as PEM on disk (`BEACH_GATE_SIGNING_KEY_PATH`).
-- Payload fields: `sub`, `iss="beach-gate"`, `exp`, `iat`, `entitlements` array, `profile`, `tier`, `nonce`.
-- Refresh tokens are opaque, one-way hashed (Argon2id) if persisted; initial version keeps them ephemeral in memory.
+- Payload fields: `sub`, `iss="beach-gate"`, `exp`, `iat`, `entitlements` array, `profile`, `tier`, optional `email`.
+- Refresh tokens are opaque, SHA-256 hashed in-memory; persistent storage approach TBD.
 
 ## Credential Storage (CLI)
 - Config path: `~/.beach/credentials` (TOML or ini-style with named profiles).
@@ -55,15 +55,15 @@ Authentication uses `Authorization: Bearer <token>` where applicable.
 - Command UX: `beach login`, `beach logout`, `beach status`, `beach switch-profile`.
 
 ## Implementation Plan & Status
-- [ ] Scaffold Beach Gate service (TypeScript project, Fastify server, env config).
-- [ ] Implement Clerk device flow helpers (start/finish endpoints, env-driven).
-- [ ] Create JWT signer & refresh token manager (ephemeral store + ES256 keys).
-- [ ] Add entitlement lookup stub + middleware enforcing feature flags.
-- [ ] Provide verification and entitlements endpoints with tests.
-- [ ] Document CLI integration points + future private beach entitlement requirements.
+- [x] Scaffold Beach Gate service (TypeScript project, Fastify server, env config).
+- [x] Implement Clerk device flow helpers (start/finish endpoints, env-driven).
+- [x] Create JWT signer & refresh token manager (ephemeral store + ES256 keys).
+- [x] Add entitlement lookup stub + middleware enforcing feature flags.
+- [x] Provide verification and entitlements endpoints (baseline manual testing).
+- [x] Add automated tests for auth flows and entitlement enforcement.
+- [x] Document CLI integration points + future private beach entitlement requirements.
 
 ## Open Questions
 - How will billing webhooks populate entitlements? (Future task: integrate billing service.)
 - Should refresh tokens persist across restarts or use external store (Redis/Postgres)?
 - Required scopes/claims from Clerk for subscription tiers—pending Clerk configuration.
-

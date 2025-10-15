@@ -714,6 +714,8 @@ async function connectAsAnswerer(options: {
   if (!handshakeId) {
     throw new Error('offer missing handshake_id');
   }
+  const associatedData = [offer.from_peer, offer.to_peer, offer.type];
+  log(logger, `offer associated data ${JSON.stringify(associatedData)}`);
   if (secure.enabled) {
     if (!secure.passphrase) {
       throw new Error('secure signaling requires passphrase');
@@ -724,13 +726,18 @@ async function connectAsAnswerer(options: {
     const key = await secure.ensureKey(handshakeId);
     log(logger, `derived Argon2 key for handshake ${handshakeId}: ${toHex(key)}`);
     cachedSecureKey = key;
-    const plaintext = await openSdpWithKey({
-      key,
-      handshakeId,
-      label: 'offer',
-      payload: offer,
-    });
-    offer.sdp = plaintext;
+    try {
+      const plaintext = await openSdpWithKey({
+        key,
+        handshakeId,
+        label: 'offer',
+        payload: offer,
+      });
+      offer.sdp = plaintext;
+    } catch (error) {
+      log(logger, `offer decrypt failed for handshake ${handshakeId}: ${String(error)}`);
+      throw error;
+    }
   }
   onHandshakeReady(handshakeId);
   const prologueContext = buildPrologueContext(

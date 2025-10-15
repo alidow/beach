@@ -2534,6 +2534,14 @@ fn payload_from_description(
                 }
             };
             let associated = [from_peer, to_peer, typ.as_str()];
+            tracing::debug!(
+                target = "webrtc",
+                handshake_id = %handshake_id,
+                from_peer,
+                to_peer,
+                typ = typ.as_str(),
+                "offer sealing associated data"
+            );
             let sealed = seal_message(
                 passphrase_value,
                 handshake_id,
@@ -2546,6 +2554,7 @@ fn payload_from_description(
                 handshake_id = %handshake_id,
                 nonce = sealed.nonce,
                 ciphertext_len = sealed.ciphertext.len(),
+                plaintext_len = desc.sdp.len(),
                 "offer sealed envelope created"
             );
             payload.sdp.clear();

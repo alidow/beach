@@ -12,19 +12,18 @@
 
 ## Plan
 1. **Shared Key Cell**
-   - ✅ Added a session-scoped `OnceCell<Arc<[u8; 32]>>` so we only stretch the passphrase once per session.
-   - ✅ Handshake-specific keys now fan out from this cached base via HKDF, eliminating duplicate Argon2 work.
+   - 🚧 Session-level caching is wired through the host, but currently disabled to preserve compatibility with existing clients.
+   - 🚧 Once client rollout is ready, re-enable HKDF fan-out so we can stop re-running Argon2 per handshake.
 
 2. **Async Derivation Helper**
    - ✅ Session-level stretches now run inside `spawn_blocking`, keeping the async runtime responsive.
    - ✅ Failures propagate as `TransportError::Setup`, preserving existing error handling.
 
 3. **Payload Sealing Updates**
-   - ✅ `payload_from_description`/`session_description_from_payload` accept precomputed keys and reuse them across offer/answer paths.
-   - ✅ ICE candidate sealing/decryption now taps the cached handshake key as well.
+   - 🚧 Host/client still rely on per-handshake Argon2 until HKDF rollout lands; structure is in place for the follow-up.
 
 4. **Answer Path Reuse**
-   - ✅ Answer-side signaling and ICE decryption reuse the cached session key, skipping redundant Argon2 work.
+   - 🚧 Pending HKDF rollout; current implementation falls back to legacy flow for compatibility.
 
 5. **Diagnostics**
    - ✅ Added trace markers (`via: 'session_base'`) to confirm when cached material is used.

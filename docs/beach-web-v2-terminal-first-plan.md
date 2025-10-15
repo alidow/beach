@@ -15,13 +15,13 @@
 - **Theming**: maintain the existing Tailwind design tokens (`--background`, `--foreground`, etc.) while biasing to dark mode defaults.
 
 ## Phase 1 – Architecture & Routing Scaffold
-- [ ] Introduce a lightweight route switch in `main.tsx` (or a new router entry) that renders the current `App` for legacy routes and a new `AppV2` when `window.location.pathname.startsWith('/v2')`.
-- [ ] Create a feature flag utility so future A/B toggles (env var, query param) can point to the new shell without altering the old path.
-- [ ] Ensure build tooling (Vite dev server, preview) automatically serves `/v2` without extra configuration by relying on client-side routing.
+- [x] Introduce a lightweight route switch in `main.tsx` so the root `App` chooses between the refreshed shell and the legacy UI (`AppLegacy`) when feature flags or `/v2` paths are present.
+- [x] Create a feature flag utility so future A/B toggles (env var, query param) can point to the new shell without altering the old path.
+- [x] Ensure build tooling (Vite dev server, preview) automatically serves `/v2` without extra configuration by relying on client-side routing.
 
 ## Phase 2 – Layout Shell & Evergreen Terminal Canvas
-- [ ] Stand up `AppV2` with a full-viewport container (`min-h-screen`) hosting the terminal frame; keep background gradients subtle/flat.
-- [ ] Extract terminal orchestration logic (session state, connect handler) into shared hooks to avoid drift between `App` and `AppV2`.
+- [ ] Stand up the new `App` shell with a full-viewport container (`min-h-screen`) hosting the terminal frame; keep background gradients subtle/flat.
+- [ ] Extract terminal orchestration logic (session state, connect handler) into shared hooks to avoid drift between `App` and `AppLegacy`.
   - Introduce something like `useConnectionController` that manages `sessionId`, `passcode`, `server`, status, and connect/disconnect actions.
 - [ ] Render `BeachTerminal` stretched to fill the viewport, ensuring it works even while the connection modal is open (read-only until connect).
 - [ ] Add optional quiet status overlay (e.g., muted watermark) for idle state so the empty terminal doesn’t feel broken.

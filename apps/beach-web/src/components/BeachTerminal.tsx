@@ -3,7 +3,11 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { FEATURE_CURSOR_SYNC } from '../protocol/types';
 import type { HostFrame } from '../protocol/types';
 import { createTerminalStore, useTerminalSnapshot } from '../terminal/useTerminalState';
-import { connectBrowserTransport, type BrowserTransportConnection } from '../terminal/connect';
+import {
+  connectBrowserTransport,
+  type BrowserTransportConnection,
+  type FallbackOverrides,
+} from '../terminal/connect';
 import type { CellState, StyleDefinition, TerminalGridSnapshot, TerminalGridStore } from '../terminal/gridStore';
 import { encodeKeyEvent } from '../terminal/keymap';
 import type { TerminalTransport } from '../transport/terminalTransport';
@@ -262,6 +266,7 @@ export interface BeachTerminalProps {
   isFullscreen?: boolean;
   onToggleFullscreen?: (next: boolean) => void;
   showTopBar?: boolean;
+  fallbackOverrides?: FallbackOverrides;
 }
 
 export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
@@ -274,6 +279,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     onStatusChange,
     transport: providedTransport,
     store: providedStore,
+    fallbackOverrides,
     className,
     fontFamily = "'SFMono-Regular', 'Menlo', 'Consolas', monospace",
     fontSize = 14,
@@ -691,6 +697,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           passcode,
           logger: webrtcLogger,
           clientLabel: queryLabel,
+          fallbackOverrides,
         });
         if (cancelled) {
           connection.close();

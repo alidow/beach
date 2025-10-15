@@ -7,11 +7,18 @@ import { SignalingClient } from '../transport/signaling';
 import type { SignalingClientOptions } from '../transport/signaling';
 import type { SecureTransportSummary } from '../transport/webrtc';
 
+export interface FallbackOverrides {
+  cohort?: string;
+  entitlementProof?: string;
+  telemetryOptIn?: boolean;
+}
+
 export interface BrowserTransportConnection {
   transport: TerminalTransport;
   signaling: SignalingClient;
   remotePeerId?: string;
   secure?: SecureTransportSummary;
+  fallbackOverrides?: FallbackOverrides;
   close(): void;
 }
 
@@ -23,6 +30,7 @@ export interface ConnectBrowserTransportOptions {
   logger?: (message: string) => void;
   createSocket?: SignalingClientOptions['createSocket'];
   clientLabel?: string;
+  fallbackOverrides?: FallbackOverrides;
 }
 
 export async function connectBrowserTransport(
@@ -56,11 +64,20 @@ export async function connectBrowserTransport(
     logger: options.logger,
     secureContext: secure,
   });
+  if (options.fallbackOverrides && options.logger) {
+    const { cohort, entitlementProof, telemetryOptIn } = options.fallbackOverrides;
+    options.logger(
+      `[fallback overrides] cohort=${cohort ?? '—'} proof=${entitlementProof ? 'present' : 'none'} telemetry=${
+        telemetryOptIn ? 'on' : 'off'
+      }`,
+    );
+  }
   return {
     transport,
     signaling,
     remotePeerId,
     secure,
+    fallbackOverrides: options.fallbackOverrides,
     close: () => {
       transport.close();
       signaling.close();

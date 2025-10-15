@@ -1,27 +1,65 @@
-export type UiShellVariant = 'legacy' | 'terminal-first';
+export type AppVariant = 'legacy' | 'v2';
 
-const V2_PATH_PREFIX = '/v2';
-const SEARCH_PARAM_KEYS = ['ui', 'shell'];
-const V2_PARAM_VALUES = new Set(['v2', 'terminal-first', 'terminal']);
+const V2_MATCHERS = new Set(['v2', 'new', 'next', 'terminal']);
+const LEGACY_MATCHERS = new Set(['legacy', 'v1', 'classic']);
 
-export function resolveUiShellVariant(): UiShellVariant {
-  if (typeof window === 'undefined') {
-    return 'legacy';
+function normalise(value: string | null | undefined): string | null {
+  if (value == null) {
+    return null;
   }
-  const { pathname, search } = window.location;
-  if (pathname.startsWith(V2_PATH_PREFIX)) {
-    return 'terminal-first';
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
   }
-  const params = new URLSearchParams(search);
-  for (const key of SEARCH_PARAM_KEYS) {
-    const value = params.get(key);
-    if (value && V2_PARAM_VALUES.has(value.toLowerCase())) {
-      return 'terminal-first';
-    }
-  }
-  return 'legacy';
+  return trimmed.toLowerCase();
 }
 
-export function isTerminalFirstShell(): boolean {
-  return resolveUiShellVariant() === 'terminal-first';
+function parseVariant(value: string | null | undefined): AppVariant | null {
+  const normalised = normalise(value);
+  if (!normalised) {
+    return null;
+  }
+  if (V2_MATCHERS.has(normalised)) {
+    return 'v2';
+  }
+  if (LEGACY_MATCHERS.has(normalised)) {
+    return 'legacy';
+  }
+  return null;
+}
+
+function queryVariant(): AppVariant | null {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  try {
+    const params = new URLSearchParams(window.location.search);
+    return parseVariant(params.get('ui') ?? params.get('variant'));
+  } catch (err) {
+    return null;
+  }
+}
+
+function envVariant(): AppVariant | null {
+  const envValue = (import.meta.env as Record<string, string | undefined>).VITE_BEACH_WEB_UI;
+  return parseVariant(envValue);
+}
+
+function pathVariant(): AppVariant | null {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  const pathname = window.location.pathname.toLowerCase();
+  if (pathname.startsWith('/v2')) {
+    return 'v2';
+  }
+  return null;
+}
+
+export function resolveAppVariant(): AppVariant {
+  return queryVariant() ?? envVariant() ?? pathVariant() ?? 'legacy';
+}
+
+export function shouldUseAppV2(): boolean {
+  return resolveAppVariant() === 'v2';
 }

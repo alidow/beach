@@ -435,13 +435,21 @@ fn make_configuration(size: CGSize) -> Id<SCStreamConfiguration> {
 fn process_sample_buffer(sample_buffer: CMSampleBufferRef) -> Result<ProcessResult, String> {
     let sample = unsafe { CMSampleBuffer::wrap_under_get_rule(sample_buffer) };
     let status = sample_frame_status(&sample);
+    let attachment_count = sample
+        .get_sample_attachments_array(false)
+        .as_ref()
+        .map(|arr| arr.len())
+        .unwrap_or(0);
+    let total_size = sample.get_total_sample_size();
     let Some(image_buffer) = sample.get_image_buffer() else {
+        info!(status = status.unwrap_or(-1), attachment_count, total_size, "blank sample missing image buffer");
         return Ok(ProcessResult::Blank { status });
     };
     let Some(pixel_buffer) = image_buffer.downcast::<CVPixelBuffer>() else {
         return Err("unsupported pixel buffer type".into());
     };
     let frame = convert_pixel_buffer(&pixel_buffer)?;
+    info!(status, attachment_count, total_size, "produced ScreenCaptureKit frame");
     Ok(ProcessResult::Frame(frame))
 }
 

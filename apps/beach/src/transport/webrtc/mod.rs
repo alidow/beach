@@ -1163,9 +1163,13 @@ async fn negotiate_offerer_peer(
     let mut signal_stream = signals;
     let peer_id_for_incoming = peer_id.clone();
     let passphrase_for_signals = inner.passphrase.clone();
+    let session_key_for_signals = Arc::clone(&inner.session_key);
+    let session_id_for_signals = inner.session_id.clone();
     let pre_shared_key_for_signals = Arc::clone(&pre_shared_key_cell);
     let ice_task = spawn_on_global({
         let pre_shared_key_for_signals = Arc::clone(&pre_shared_key_for_signals);
+        let session_key_for_signals = Arc::clone(&session_key_for_signals);
+        let session_id_for_signals = session_id_for_signals.clone();
         async move {
             while let Some(signal) = signal_stream.recv().await {
                 if cancel_for_incoming.load(Ordering::SeqCst) {
@@ -1192,13 +1196,33 @@ async fn negotiate_offerer_peer(
                         .assigned_peer_id()
                         .await
                         .unwrap_or_else(|| signaling_for_incoming.peer_id().to_string());
+                    let derived_key = match await_pre_shared_key(
+                        &pre_shared_key_for_signals,
+                        &session_key_for_signals,
+                        passphrase_for_signals.as_deref(),
+                        session_id_for_signals.as_str(),
+                        handshake_for_incoming.as_str(),
+                    )
+                    .await
+                    {
+                        Ok(key) => key,
+                        Err(err) => {
+                            tracing::warn!(
+                                target = "webrtc",
+                                peer_id = %peer_id_for_incoming,
+                                error = %err,
+                                "failed to derive handshake key for remote ice candidate"
+                            );
+                            continue;
+                        }
+                    };
                     let resolved = match resolve_ice_candidate(
                         candidate,
                         sdp_mid,
                         sdp_mline_index,
                         sealed,
                         passphrase_for_signals.as_deref(),
-                        pre_shared_key_for_signals.get().map(|key| key.as_ref()),
+                        derived_key.as_ref().map(|key| key.as_ref()),
                         handshake_for_incoming.as_str(),
                         &peer_id_for_incoming,
                         local_peer_id.as_str(),
@@ -1906,6 +1930,8 @@ async fn connect_answerer(
     let assigned_peer_id_for_signals = assigned_peer_id.clone();
     let passphrase_for_signals = passphrase_owned.clone();
     let pre_shared_key_for_signals = Arc::clone(&pre_shared_key_cell);
+    let session_key_for_signals = Arc::clone(&session_key_cell);
+    let session_id_for_signals = session_id.clone();
     spawn_on_global(async move {
         while let Some(signal) = signaling_for_incoming.recv_webrtc_signal().await {
             if let WebRTCSignal::IceCandidate {
@@ -1924,13 +1950,33 @@ async fn connect_answerer(
                     );
                     continue;
                 }
+                let derived_key = match await_pre_shared_key(
+                    &pre_shared_key_for_signals,
+                    &session_key_for_signals,
+                    passphrase_for_signals.as_deref(),
+                    session_id_for_signals.as_str(),
+                    handshake_for_incoming.as_str(),
+                )
+                .await
+                {
+                    Ok(key) => key,
+                    Err(err) => {
+                        tracing::warn!(
+                            target = "webrtc",
+                            handshake_id,
+                            error = %err,
+                            "answerer failed to derive handshake key for remote ice candidate"
+                        );
+                        continue;
+                    }
+                };
                 let resolved = match resolve_ice_candidate(
                     candidate,
                     sdp_mid,
                     sdp_mline_index,
                     sealed,
                     passphrase_for_signals.as_deref(),
-                    pre_shared_key_for_signals.get().map(|key| key.as_ref()),
+                    derived_key.as_ref().map(|key| key.as_ref()),
                     handshake_for_incoming.as_str(),
                     &remote_offer_peer_for_signals,
                     assigned_peer_id_for_signals.as_str(),

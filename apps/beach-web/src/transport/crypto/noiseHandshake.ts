@@ -159,6 +159,11 @@ function createHandshake(
     role === 'initiator'
       ? noise.constants.NOISE_ROLE_INITIATOR
       : noise.constants.NOISE_ROLE_RESPONDER;
+  console.log('[DEBUG] noise module:', noise);
+  console.log('[DEBUG] noise.HandshakeState:', noise.HandshakeState);
+  console.log('[DEBUG] noise.constants:', noise.constants);
+  console.log('[DEBUG] PROTOCOL_NAME:', PROTOCOL_NAME);
+  console.log('[DEBUG] roleConstant:', roleConstant);
   const handshake = new noise.HandshakeState(PROTOCOL_NAME, roleConstant);
   handshake.Initialize(prologue, null, null, psk);
   return handshake;

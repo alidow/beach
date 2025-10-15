@@ -15,14 +15,13 @@
 - **Theming**: maintain the existing Tailwind design tokens (`--background`, `--foreground`, etc.) while biasing to dark mode defaults.
 
 ## Phase 1 – Architecture & Routing Scaffold
-- [x] Introduce a lightweight route switch in `main.tsx` so the root `App` chooses between the refreshed shell and the legacy UI (`AppLegacy`) when feature flags or `/v2` paths are present.
-- [x] Create a feature flag utility so future A/B toggles (env var, query param) can point to the new shell without altering the old path.
-- [x] Ensure build tooling (Vite dev server, preview) automatically serves `/v2` without extra configuration by relying on client-side routing.
+- [x] Retired the legacy shell; `App.tsx` now hosts the terminal-first experience by default (feature flag hook remains available for future experiments).
+- [x] Create a feature flag utility so future A/B toggles (env var, query param) can point to alternates without altering the main code path.
+- [x] Ensure build tooling (Vite dev server, preview) automatically serves the terminal-first shell on every route via client-side routing.
 
 ## Phase 2 – Layout Shell & Evergreen Terminal Canvas
 - [x] Stand up the new `App` shell with a full-viewport container (`min-h-screen`) hosting the terminal frame; keep background gradients subtle/flat.
-- [ ] Extract terminal orchestration logic (session state, connect handler) into shared hooks to avoid drift between `App` and `AppLegacy`.
-  - Introduce something like `useConnectionController` that manages `sessionId`, `passcode`, `server`, status, and connect/disconnect actions.
+- [x] Centralise session orchestration (`useConnectionController`) so the shell and any embedding surfaces share a single source of truth for session id, passcode, server, status, and connect/disconnect actions.
 - [x] Render `BeachTerminal` stretched to fill the viewport, ensuring it works even while the connection modal is open (read-only until connect).
 - [x] Add optional quiet status overlay (e.g., muted watermark) for idle state so the empty terminal doesn’t feel broken.
 
@@ -36,7 +35,7 @@
 ## Phase 4 – Connection Info Strip & Drawer
 - [x] Introduce a persistent top bar showing host name/IP and connection state chip (latency badge still TODO).
 - [x] Add a toggle button (`Info` / chevron) that expands a drawer (custom mobile sheet + desktop inline details) anchored to the top; drawer houses disconnect button, detailed metadata, advanced diagnostics.
-- [ ] When connecting, animate the strip into a loading state; on errors, surface alert styling and retry inline.
+- [x] When connecting, animate the strip into a loading state; on errors, surface alert styling and retry inline (next: wire latency badge).
 - [ ] Support both pointer and keyboard interactions (Enter/Space toggles drawer, Esc closes).
 - [ ] Include subtle transitions (opacity/slide) with reduced-motion fallbacks via `motion-safe` classes.
 

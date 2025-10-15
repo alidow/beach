@@ -62,6 +62,8 @@ interface PredictedPosition {
   char: string;
 }
 
+type UpdateWithSeq = Update & { seq?: number | null };
+
 interface PendingPredictionEntry {
   positions: PredictedPosition[];
   ackedAt: number | null;
@@ -457,7 +459,7 @@ export class TerminalGridCache {
         });
         const { hits, truncated } = this.predictionHitsForUpdate(update);
         if (hits.length > 0) {
-          const seqHint = (update as any).seq ?? null;
+          const seqHint = 'seq' in update ? (update as UpdateWithSeq).seq ?? null : null;
           this.predictiveLog('prediction_update_overlap', {
             frame: originLabel ?? 'unknown',
             update_kind: update.type,
@@ -1325,7 +1327,6 @@ export class TerminalGridCache {
 
   registerPrediction(seq: number, data: Uint8Array): boolean {
     const tracing = predictiveTraceEnabled();
-    const timestamp = tracing ? traceNow() : 0;
     const cursorBefore = tracing
       ? { row: this.cursorRow, col: this.cursorCol, seq: this.cursorSeq }
       : null;

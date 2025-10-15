@@ -164,7 +164,7 @@ class PredictionUx {
     }
     this.pending.set(seq, timestampMs);
     this.log('prediction_send', { seq, predicted: true, timestamp_ms: timestampMs });
-    return this.updateOverlayState(timestampMs);
+    return this.updateOverlayState();
   }
 
   recordAck(seq: number, timestampMs: number): PredictionOverlayState | null {
@@ -182,7 +182,7 @@ class PredictionUx {
         }
       }
     }
-    const overlay = this.updateOverlayState(timestampMs);
+    const overlay = this.updateOverlayState();
     this.log('prediction_ack', { seq, ack_delay_ms: delayMs, cleared: sentAt !== undefined });
     return overlay;
   }
@@ -202,7 +202,7 @@ class PredictionUx {
     if (glitch !== this.glitchTrigger) {
       this.glitchTrigger = glitch;
     }
-    return this.updateOverlayState(timestampMs);
+    return this.updateOverlayState();
   }
 
   reset(timestampMs: number): PredictionOverlayState | null {
@@ -212,12 +212,12 @@ class PredictionUx {
     this.glitchTrigger = 0;
     this.lastQuickConfirmation = 0;
     this.pending.clear();
-    const overlay = this.updateOverlayState(timestampMs);
+    const overlay = this.updateOverlayState();
     this.log('prediction_state_reset');
     return overlay;
   }
 
-  private updateOverlayState(timestampMs: number): PredictionOverlayState | null {
+  private updateOverlayState(): PredictionOverlayState | null {
     const srtt = this.srttMs ?? 0;
 
     if (srtt > PREDICTION_FLAG_TRIGGER_HIGH_MS || this.glitchTrigger > PREDICTION_GLITCH_REPAIR_COUNT) {
@@ -313,7 +313,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const [error, setError] = useState<Error | null>(null);
   const [secureSummary, setSecureSummary] = useState<SecureTransportSummary | null>(null);
   const [showIdlePlaceholder, setShowIdlePlaceholder] = useState(true);
-  const [headerHeight, setHeaderHeight] = useState<number>(0);
+  const [, setHeaderHeight] = useState<number>(0);
   const [activeConnection, setActiveConnection] = useState<BrowserTransportConnection | null>(null);
   const [peerId, setPeerId] = useState<string | null>(null);
   const [remotePeerId, setRemotePeerId] = useState<string | null>(null);
@@ -984,9 +984,6 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     }
   };
 
-  // Store original position for smooth fullscreen animation
-  const [wrapperStyle, setWrapperStyle] = useState<CSSProperties>({});
-
   useEffect(() => {
     if (!wrapperRef.current) return;
 
@@ -1153,7 +1150,6 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       >
         {showIdlePlaceholder ? (
           <IdlePlaceholder
-            topOffset={headerHeight}
             onConnectNotice={() => setShowIdlePlaceholder(false)}
             status={status}
           />
@@ -1775,7 +1771,7 @@ function LineRow({
           overlayVisible && predictedCursorCol !== null && predictedCursorCol === index && !isCursor;
         const predicted = predictedCell || isPredictedCursor;
         const underline = predicted && overlayUnderline;
-        const char = cell.char === ' ' ? ' ' : cell.char;
+        const char = cell.char === ' ' ? NBSP : cell.char;
         return (
           <span
             key={index}
@@ -1789,7 +1785,7 @@ function LineRow({
         );
       })}
       {cursorCol !== null && cursorCol >= line.cells.length ? (
-        <span key="cursor" style={styleFromDefinition(baseStyleDef, true)}> </span>
+        <span key="cursor" style={styleFromDefinition(baseStyleDef, true)}>{NBSP}</span>
       ) : null}
       {overlayVisible && predictedCursorCol !== null && predictedCursorCol >= line.cells.length ? (
         <span
@@ -1799,7 +1795,7 @@ function LineRow({
           data-predicted-underline={overlayUnderline || undefined}
           data-predicted-cursor
         >
-           
+          {NBSP}
         </span>
       ) : null}
     </div>
@@ -1816,6 +1812,7 @@ export function shouldReenableFollowTail(remainingPixels: number): boolean {
 
 const DEFAULT_FOREGROUND = '#e2e8f0';
 const DEFAULT_BACKGROUND = 'hsl(var(--terminal-screen))';
+const NBSP = '\u00A0';
 
 function styleFromDefinition(def: StyleDefinition, highlightCursor = false): CSSProperties {
   const style: CSSProperties = {};
@@ -1917,11 +1914,9 @@ function colorFromIndexed(index: number): string {
 function IdlePlaceholder({
   onConnectNotice,
   status,
-  topOffset,
 }: {
   onConnectNotice: () => void;
   status: TerminalStatus;
-  topOffset: number;
 }): JSX.Element {
   useEffect(() => {
     if (status === 'connected') {

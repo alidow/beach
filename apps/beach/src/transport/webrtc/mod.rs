@@ -14,7 +14,7 @@ use once_cell::sync::Lazy;
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Handle, Runtime};
-use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc as tokio_mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OnceCell, SetError, mpsc as tokio_mpsc, oneshot};
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -52,7 +52,8 @@ use secure_handshake::{
     build_prologue_context, handshake_channel_init, run_handshake, secure_transport_enabled,
 };
 use secure_signaling::{
-    MessageLabel, SealedEnvelope, derive_pre_shared_key, open_message, seal_message, should_encrypt,
+    MessageLabel, SealedEnvelope, derive_pre_shared_key, open_message, open_message_with_psk,
+    seal_message, seal_message_with_psk, should_encrypt,
 };
 use signaling::{PeerRole, RemotePeerEvent, RemotePeerJoined, SignalingClient, WebRTCSignal};
 
@@ -723,8 +724,9 @@ impl WebRtcSdpPayload {
     fn to_session_description(
         &self,
         passphrase: Option<&str>,
+        pre_shared_key: Option<&[u8; 32]>,
     ) -> Result<RTCSessionDescription, TransportError> {
-        session_description_from_payload(self, passphrase)
+        session_description_from_payload(self, passphrase, pre_shared_key)
     }
 }
 
@@ -1103,6 +1105,12 @@ async fn negotiate_offerer_peer(
     let pending_ice = Arc::new(AsyncMutex::new(Vec::new()));
     let handshake_id = Uuid::new_v4().to_string();
     let handshake_id_arc = Arc::new(handshake_id.clone());
+    let pre_shared_key_cell = Arc::new(OnceCell::<Arc<[u8; 32]>>::new());
+    prime_pre_shared_key(
+        &pre_shared_key_cell,
+        inner.passphrase.as_deref(),
+        &handshake_id,
+    );
     let peer_id = peer.id.clone();
     let peer_id_for_candidates = peer_id.clone();
 
@@ -1142,74 +1150,79 @@ async fn negotiate_offerer_peer(
     let mut signal_stream = signals;
     let peer_id_for_incoming = peer_id.clone();
     let passphrase_for_signals = inner.passphrase.clone();
-    let ice_task = spawn_on_global(async move {
-        while let Some(signal) = signal_stream.recv().await {
-            if cancel_for_incoming.load(Ordering::SeqCst) {
-                break;
-            }
-            if let WebRTCSignal::IceCandidate {
-                candidate,
-                sdp_mid,
-                sdp_mline_index,
-                handshake_id,
-                sealed,
-            } = signal
-            {
-                if handshake_id != handshake_for_incoming.as_str() {
-                    tracing::debug!(
-                        target = "webrtc",
-                        peer_id = %peer_id_for_incoming,
-                        handshake_id = %handshake_id,
-                        "ignoring remote ice candidate for stale handshake"
-                    );
-                    continue;
+    let pre_shared_key_for_signals = Arc::clone(&pre_shared_key_cell);
+    let ice_task = spawn_on_global({
+        let pre_shared_key_for_signals = Arc::clone(&pre_shared_key_for_signals);
+        async move {
+            while let Some(signal) = signal_stream.recv().await {
+                if cancel_for_incoming.load(Ordering::SeqCst) {
+                    break;
                 }
-                let local_peer_id = signaling_for_incoming
-                    .assigned_peer_id()
-                    .await
-                    .unwrap_or_else(|| signaling_for_incoming.peer_id().to_string());
-                let resolved = match resolve_ice_candidate(
+                if let WebRTCSignal::IceCandidate {
                     candidate,
                     sdp_mid,
                     sdp_mline_index,
+                    handshake_id,
                     sealed,
-                    passphrase_for_signals.as_deref(),
-                    handshake_for_incoming.as_str(),
-                    &peer_id_for_incoming,
-                    local_peer_id.as_str(),
-                ) {
-                    Ok(resolved) => resolved,
-                    Err(err) => {
+                } = signal
+                {
+                    if handshake_id != handshake_for_incoming.as_str() {
+                        tracing::debug!(
+                            target = "webrtc",
+                            peer_id = %peer_id_for_incoming,
+                            handshake_id = %handshake_id,
+                            "ignoring remote ice candidate for stale handshake"
+                        );
+                        continue;
+                    }
+                    let local_peer_id = signaling_for_incoming
+                        .assigned_peer_id()
+                        .await
+                        .unwrap_or_else(|| signaling_for_incoming.peer_id().to_string());
+                    let resolved = match resolve_ice_candidate(
+                        candidate,
+                        sdp_mid,
+                        sdp_mline_index,
+                        sealed,
+                        passphrase_for_signals.as_deref(),
+                        pre_shared_key_for_signals.get().map(|key| key.as_ref()),
+                        handshake_for_incoming.as_str(),
+                        &peer_id_for_incoming,
+                        local_peer_id.as_str(),
+                    ) {
+                        Ok(resolved) => resolved,
+                        Err(err) => {
+                            tracing::warn!(
+                                target = "webrtc",
+                                peer_id = %peer_id_for_incoming,
+                                error = %err,
+                                "failed to decode remote ice candidate"
+                            );
+                            continue;
+                        }
+                    };
+                    let init = RTCIceCandidateInit {
+                        candidate: resolved.candidate,
+                        sdp_mid: resolved.sdp_mid,
+                        sdp_mline_index: resolved.sdp_mline_index.map(|idx| idx as u16),
+                        username_fragment: None,
+                    };
+                    let has_remote = pc_for_incoming.remote_description().await.is_some();
+                    if !has_remote {
+                        let mut queue = pending_for_incoming.lock().await;
+                        queue.push(init);
+                        continue;
+                    }
+                    if let Err(err) = pc_for_incoming.add_ice_candidate(init.clone()).await {
                         tracing::warn!(
                             target = "webrtc",
                             peer_id = %peer_id_for_incoming,
                             error = %err,
-                            "failed to decode remote ice candidate"
+                            "failed to add remote ice candidate"
                         );
-                        continue;
+                        let mut queue = pending_for_incoming.lock().await;
+                        queue.push(init);
                     }
-                };
-                let init = RTCIceCandidateInit {
-                    candidate: resolved.candidate,
-                    sdp_mid: resolved.sdp_mid,
-                    sdp_mline_index: resolved.sdp_mline_index.map(|idx| idx as u16),
-                    username_fragment: None,
-                };
-                let has_remote = pc_for_incoming.remote_description().await.is_some();
-                if !has_remote {
-                    let mut queue = pending_for_incoming.lock().await;
-                    queue.push(init);
-                    continue;
-                }
-                if let Err(err) = pc_for_incoming.add_ice_candidate(init.clone()).await {
-                    tracing::warn!(
-                        target = "webrtc",
-                        peer_id = %peer_id_for_incoming,
-                        error = %err,
-                        "failed to add remote ice candidate"
-                    );
-                    let mut queue = pending_for_incoming.lock().await;
-                    queue.push(init);
                 }
             }
         }
@@ -1297,12 +1310,19 @@ async fn negotiate_offerer_peer(
         .await
         .unwrap_or_else(|| inner.signaling_client.peer_id().to_string());
 
+    let shared_key = await_pre_shared_key(
+        &pre_shared_key_cell,
+        inner.passphrase.as_deref(),
+        &handshake_id,
+    )
+    .await?;
     let payload = payload_from_description(
         &local_desc,
         &handshake_id,
         &offerer_peer_id,
         &peer.id,
         inner.passphrase.as_deref(),
+        shared_key.as_ref().map(|key| key.as_ref()),
     )?;
 
     if cancel_flag.load(Ordering::SeqCst) {
@@ -1321,7 +1341,10 @@ async fn negotiate_offerer_peer(
     )
     .await?;
 
-    let remote_desc = answer.to_session_description(inner.passphrase.as_deref())?;
+    let remote_desc = answer.to_session_description(
+        inner.passphrase.as_deref(),
+        shared_key.as_ref().map(|key| key.as_ref()),
+    )?;
     pc.set_remote_description(remote_desc)
         .await
         .map_err(to_setup_error)?;
@@ -1765,7 +1788,23 @@ async fn connect_answerer(
             }
         }
     };
-    let offer_desc = session_description_from_payload(&offer_payload, passphrase_owned.as_deref())?;
+    let pre_shared_key_cell = Arc::new(OnceCell::<Arc<[u8; 32]>>::new());
+    prime_pre_shared_key(
+        &pre_shared_key_cell,
+        passphrase_owned.as_deref(),
+        &offer_payload.handshake_id,
+    );
+    let shared_key = await_pre_shared_key(
+        &pre_shared_key_cell,
+        passphrase_owned.as_deref(),
+        &offer_payload.handshake_id,
+    )
+    .await?;
+    let offer_desc = session_description_from_payload(
+        &offer_payload,
+        passphrase_owned.as_deref(),
+        shared_key.as_ref().map(|key| key.as_ref()),
+    )?;
     let handshake_id = Arc::new(offer_payload.handshake_id.clone());
     let remote_offer_peer = offer_payload.from_peer.clone();
 
@@ -1840,6 +1879,7 @@ async fn connect_answerer(
     let remote_offer_peer_for_signals = remote_offer_peer.clone();
     let assigned_peer_id_for_signals = assigned_peer_id.clone();
     let passphrase_for_signals = passphrase_owned.clone();
+    let pre_shared_key_for_signals = Arc::clone(&pre_shared_key_cell);
     spawn_on_global(async move {
         while let Some(signal) = signaling_for_incoming.recv_webrtc_signal().await {
             if let WebRTCSignal::IceCandidate {
@@ -1864,6 +1904,7 @@ async fn connect_answerer(
                     sdp_mline_index,
                     sealed,
                     passphrase_for_signals.as_deref(),
+                    pre_shared_key_for_signals.get().map(|key| key.as_ref()),
                     handshake_for_incoming.as_str(),
                     &remote_offer_peer_for_signals,
                     assigned_peer_id_for_signals.as_str(),
@@ -2154,6 +2195,7 @@ async fn connect_answerer(
         assigned_peer_id.as_str(),
         &remote_offer_peer,
         passphrase_owned.as_deref(),
+        shared_key.as_ref().map(|key| key.as_ref()),
     )?;
     tracing::debug!(
         target = "beach_human::transport::webrtc",
@@ -2496,12 +2538,106 @@ async fn fetch_sdp(
     }
 }
 
+fn prime_pre_shared_key(
+    cell: &Arc<OnceCell<Arc<[u8; 32]>>>,
+    passphrase: Option<&str>,
+    handshake_id: &str,
+) {
+    let Some(passphrase_value) = passphrase else {
+        return;
+    };
+    if !should_encrypt(Some(passphrase_value)) {
+        return;
+    }
+    if cell.get().is_some() {
+        return;
+    }
+    let passphrase_owned = passphrase_value.to_string();
+    let handshake_owned = handshake_id.to_string();
+    let cell_clone = Arc::clone(cell);
+    spawn_on_global(async move {
+        let handshake_for_log = handshake_owned.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            derive_pre_shared_key(passphrase_owned.as_str(), handshake_owned.as_str())
+        })
+        .await;
+        match result {
+            Ok(Ok(psk)) => {
+                let arc_key = Arc::new(psk);
+                if cell_clone.set(arc_key.clone()).is_ok() {
+                    tracing::debug!(
+                        target = "webrtc",
+                        handshake_id = %handshake_for_log,
+                        "background pre-shared key derivation complete"
+                    );
+                }
+            }
+            Ok(Err(err)) => {
+                tracing::error!(
+                    target = "webrtc",
+                    handshake_id = %handshake_for_log,
+                    error = %err,
+                    "background pre-shared key derivation failed"
+                );
+            }
+            Err(join_err) => {
+                tracing::error!(
+                    target = "webrtc",
+                    handshake_id = %handshake_for_log,
+                    error = %join_err,
+                    "pre-shared key derivation task panicked"
+                );
+            }
+        }
+    });
+}
+
+async fn await_pre_shared_key(
+    cell: &Arc<OnceCell<Arc<[u8; 32]>>>,
+    passphrase: Option<&str>,
+    handshake_id: &str,
+) -> Result<Option<Arc<[u8; 32]>>, TransportError> {
+    let Some(passphrase_value) = passphrase else {
+        return Ok(None);
+    };
+    if !should_encrypt(Some(passphrase_value)) {
+        return Ok(None);
+    }
+    if let Some(existing) = cell.get() {
+        return Ok(Some(existing.clone()));
+    }
+    let passphrase_owned = passphrase_value.to_string();
+    let handshake_owned = handshake_id.to_string();
+    let cell_clone = Arc::clone(cell);
+    let result = tokio::task::spawn_blocking(move || {
+        derive_pre_shared_key(passphrase_owned.as_str(), handshake_owned.as_str())
+    })
+    .await
+    .map_err(|err| TransportError::Setup(format!("psk derivation task failed: {err}")))??;
+    let arc_key = Arc::new(result);
+    match cell_clone.set(arc_key.clone()) {
+        Ok(()) => {
+            tracing::debug!(
+                target = "webrtc",
+                handshake_id = %handshake_id,
+                "pre-shared key cached"
+            );
+            Ok(Some(arc_key))
+        }
+        Err(SetError::AlreadyInitializedError(_)) => {
+            Ok(cell_clone.get().cloned().or(Some(arc_key)))
+        }
+        Err(SetError::InitializingError(value)) => Ok(Some(value)),
+    }
+}
+
 fn payload_from_description(
     desc: &RTCSessionDescription,
     handshake_id: &str,
     from_peer: &str,
     to_peer: &str,
     passphrase: Option<&str>,
+    pre_shared_key: Option<&[u8; 32]>,
 ) -> Result<WebRtcSdpPayload, TransportError> {
     let typ = desc.sdp_type.to_string();
     let mut payload = WebRtcSdpPayload {
@@ -2514,16 +2650,6 @@ fn payload_from_description(
     };
     if let Some(passphrase_value) = passphrase {
         if should_encrypt(Some(passphrase_value)) {
-            if let Ok(psk) = derive_pre_shared_key(passphrase_value, handshake_id) {
-                tracing::debug!(
-                    target = "webrtc",
-                    handshake_id = %handshake_id,
-                    from_peer,
-                    to_peer,
-                    key = %hex::encode(psk),
-                    "offerer derived pre-shared key"
-                );
-            }
             let label = match desc.sdp_type {
                 RTCSdpType::Offer => MessageLabel::Offer,
                 RTCSdpType::Answer => MessageLabel::Answer,
@@ -2542,13 +2668,17 @@ fn payload_from_description(
                 typ = typ.as_str(),
                 "offer sealing associated data"
             );
-            let sealed = seal_message(
-                passphrase_value,
-                handshake_id,
-                label,
-                &associated,
-                desc.sdp.as_bytes(),
-            )?;
+            let sealed = if let Some(psk) = pre_shared_key {
+                seal_message_with_psk(psk, handshake_id, label, &associated, desc.sdp.as_bytes())?
+            } else {
+                seal_message(
+                    passphrase_value,
+                    handshake_id,
+                    label,
+                    &associated,
+                    desc.sdp.as_bytes(),
+                )?
+            };
             tracing::debug!(
                 target = "webrtc",
                 handshake_id = %handshake_id,
@@ -2567,6 +2697,7 @@ fn payload_from_description(
 fn session_description_from_payload(
     payload: &WebRtcSdpPayload,
     passphrase: Option<&str>,
+    pre_shared_key: Option<&[u8; 32]>,
 ) -> Result<RTCSessionDescription, TransportError> {
     let sdp_type = RTCSdpType::from(payload.typ.as_str());
     let sdp_plain = if let Some(sealed) = &payload.sealed {
@@ -2587,13 +2718,17 @@ fn session_description_from_payload(
             payload.to_peer.as_str(),
             payload.typ.as_str(),
         ];
-        let plaintext = open_message(
-            passphrase_value,
-            &payload.handshake_id,
-            label,
-            &associated,
-            sealed,
-        )?;
+        let plaintext = if let Some(psk) = pre_shared_key {
+            open_message_with_psk(psk, &payload.handshake_id, label, &associated, sealed)?
+        } else {
+            open_message(
+                passphrase_value,
+                &payload.handshake_id,
+                label,
+                &associated,
+                sealed,
+            )?
+        };
         String::from_utf8(plaintext)
             .map_err(|err| TransportError::Setup(format!("invalid utf8 in decrypted sdp: {err}")))?
     } else {
@@ -2626,6 +2761,7 @@ fn resolve_ice_candidate(
     sdp_mline_index: Option<u32>,
     sealed: Option<SealedEnvelope>,
     passphrase: Option<&str>,
+    pre_shared_key: Option<&[u8; 32]>,
     handshake_id: &str,
     from_peer: &str,
     to_peer: &str,
@@ -2635,13 +2771,23 @@ fn resolve_ice_candidate(
             TransportError::Setup("missing passphrase for sealed ice candidate".into())
         })?;
         let associated = [from_peer, to_peer, handshake_id];
-        let plaintext = open_message(
-            passphrase_value,
-            handshake_id,
-            MessageLabel::Ice,
-            &associated,
-            &sealed_env,
-        )?;
+        let plaintext = if let Some(psk) = pre_shared_key {
+            open_message_with_psk(
+                psk,
+                handshake_id,
+                MessageLabel::Ice,
+                &associated,
+                &sealed_env,
+            )?
+        } else {
+            open_message(
+                passphrase_value,
+                handshake_id,
+                MessageLabel::Ice,
+                &associated,
+                &sealed_env,
+            )?
+        };
         let decoded: IceCandidateBlob = serde_json::from_slice(&plaintext).map_err(|err| {
             TransportError::Setup(format!("decode sealed ice candidate failed: {err}"))
         })?;

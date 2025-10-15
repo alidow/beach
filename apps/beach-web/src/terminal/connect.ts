@@ -156,7 +156,7 @@ async function fetchJoinMetadata(options: ConnectBrowserTransportOptions): Promi
     });
     throw new Error(payload.message ?? 'join rejected');
   }
-  const offerMetadata =
+  const offerMetadata: OfferMetadata | undefined =
     payload.webrtc_offer ??
     payload.transports?.find((transport) => transport.kind === 'webrtc')?.metadata;
   if (!offerMetadata) {
@@ -195,10 +195,19 @@ function normaliseBase(input: string): URL {
   return url;
 }
 
+interface OfferMetadata {
+  signaling_url?: string;
+  signalingUrl?: string;
+  role?: 'offerer' | 'answerer';
+  poll_interval_ms?: number;
+  pollIntervalMs?: number;
+  [key: string]: unknown;
+}
+
 interface JoinSessionResponse {
   success: boolean;
   message?: string;
-  webrtc_offer?: any;
-  transports?: Array<{ kind: string; metadata?: any }>;
+  webrtc_offer?: OfferMetadata;
+  transports?: Array<{ kind: string; metadata?: OfferMetadata }>;
   websocket_url?: string;
 }

@@ -38,14 +38,14 @@ pub fn should_encrypt(passphrase: Option<&str>) -> bool {
     secure_signaling_enabled() && passphrase.map(|p| !p.trim().is_empty()).unwrap_or(false)
 }
 
-pub fn seal_message(
-    passphrase: &str,
+pub fn seal_message_with_psk(
+    pre_shared_key: &[u8; 32],
     handshake_id: &str,
     label: MessageLabel,
     associated: &[&str],
     plaintext: &[u8],
 ) -> Result<SealedEnvelope, TransportError> {
-    let msg_key = derive_message_key(passphrase, handshake_id, &label)?;
+    let msg_key = derive_message_key_from_psk(pre_shared_key, handshake_id, &label)?;
     let mut nonce_bytes = [0u8; 12];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -69,8 +69,30 @@ pub fn seal_message(
     })
 }
 
+pub fn seal_message(
+    passphrase: &str,
+    handshake_id: &str,
+    label: MessageLabel,
+    associated: &[&str],
+    plaintext: &[u8],
+) -> Result<SealedEnvelope, TransportError> {
+    let stretched = derive_pre_shared_key(passphrase, handshake_id)?;
+    seal_message_with_psk(&stretched, handshake_id, label, associated, plaintext)
+}
+
 pub fn open_message(
     passphrase: &str,
+    handshake_id: &str,
+    label: MessageLabel,
+    associated: &[&str],
+    envelope: &SealedEnvelope,
+) -> Result<Vec<u8>, TransportError> {
+    let stretched = derive_pre_shared_key(passphrase, handshake_id)?;
+    open_message_with_psk(&stretched, handshake_id, label, associated, envelope)
+}
+
+pub fn open_message_with_psk(
+    pre_shared_key: &[u8; 32],
     handshake_id: &str,
     label: MessageLabel,
     associated: &[&str],
@@ -82,7 +104,7 @@ pub fn open_message(
             envelope.version
         )));
     }
-    let msg_key = derive_message_key(passphrase, handshake_id, &label)?;
+    let msg_key = derive_message_key_from_psk(pre_shared_key, handshake_id, &label)?;
     let nonce_bytes = BASE64_STANDARD
         .decode(envelope.nonce.as_bytes())
         .map_err(|err| TransportError::Setup(format!("invalid nonce encoding: {err}")))?;
@@ -108,14 +130,13 @@ pub fn open_message(
     Ok(plaintext)
 }
 
-fn derive_message_key(
-    passphrase: &str,
+fn derive_message_key_from_psk(
+    stretched: &[u8; 32],
     handshake_id: &str,
     label: &MessageLabel,
 ) -> Result<[u8; 32], TransportError> {
-    let stretched = stretch_passphrase(passphrase, handshake_id)?;
     let salt = handshake_id.as_bytes();
-    let hkdf = Hkdf::<Sha256>::new(Some(salt), &stretched);
+    let hkdf = Hkdf::<Sha256>::new(Some(salt), stretched);
     let hkdf_label = match label {
         MessageLabel::Offer => LABEL_OFFER,
         MessageLabel::Answer => LABEL_ANSWER,

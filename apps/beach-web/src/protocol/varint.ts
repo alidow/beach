@@ -15,24 +15,21 @@ export function writeVarUint(value: number, out: number[]): void {
 export function readVarUint(buffer: Uint8Array, offset: { value: number }): number {
   let result = 0;
   let shift = 0;
-  while (true) {
-    if (offset.value >= buffer.length) {
-      throw new RangeError('unexpected end of input while reading varint');
-    }
+  while (offset.value < buffer.length) {
     const byte = buffer[offset.value++];
     result += (byte & 0x7f) * 2 ** shift;
     if ((byte & 0x80) === 0) {
-      break;
+      if (result > MAX_SAFE_U53) {
+        throw new RangeError('varint exceeds Number.MAX_SAFE_INTEGER');
+      }
+      return result;
     }
     shift += 7;
     if (shift > 53) {
       throw new RangeError('varint overflow');
     }
   }
-  if (result > MAX_SAFE_U53) {
-    throw new RangeError('varint exceeds Number.MAX_SAFE_INTEGER');
-  }
-  return result;
+  throw new RangeError('unexpected end of input while reading varint');
 }
 
 export function readBytes(buffer: Uint8Array, length: number, offset: { value: number }): Uint8Array {

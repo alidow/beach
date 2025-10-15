@@ -28,6 +28,27 @@ export interface ConnectionTraceSnapshot {
 
 const activeTraces = new Set<ConnectionTrace>();
 
+type TraceHost = typeof globalThis & {
+  [TRACE_ACTIVE_KEY]?: Set<ConnectionTrace>;
+  [TRACE_CURRENT_KEY]?: ConnectionTrace | null;
+  [TRACE_HISTORY_KEY]?: ConnectionTraceSnapshot[];
+  [TRACE_LAST_KEY]?: ConnectionTraceSnapshot | null;
+  __BEACH_TRACE?: boolean;
+  BEACH_TRACE?: boolean;
+};
+
+declare global {
+  interface Window {
+    __BEACH_TRACE?: boolean;
+    BEACH_TRACE?: boolean;
+  }
+
+  interface GlobalThis {
+    __BEACH_TRACE?: boolean;
+    BEACH_TRACE?: boolean;
+  }
+}
+
 export class ConnectionTrace {
   private readonly enabled: boolean;
   private readonly startedAt: number;
@@ -111,20 +132,20 @@ export function createConnectionTrace(context: ConnectionTraceContext = {}): Con
 
 function registerActiveTrace(trace: ConnectionTrace): void {
   activeTraces.add(trace);
-  if (typeof globalThis === 'undefined') {
+  const host = getTraceHost();
+  if (!host) {
     return;
   }
-  const host = globalThis as any;
   host[TRACE_ACTIVE_KEY] = activeTraces;
   host[TRACE_CURRENT_KEY] = trace;
 }
 
 function unregisterActiveTrace(trace: ConnectionTrace): void {
   activeTraces.delete(trace);
-  if (typeof globalThis === 'undefined') {
+  const host = getTraceHost();
+  if (!host) {
     return;
   }
-  const host = globalThis as any;
   if (host[TRACE_CURRENT_KEY] === trace) {
     const next = Array.from(activeTraces).pop() ?? null;
     host[TRACE_CURRENT_KEY] = next;
@@ -132,10 +153,10 @@ function unregisterActiveTrace(trace: ConnectionTrace): void {
 }
 
 function recordSnapshot(snapshot: ConnectionTraceSnapshot): void {
-  if (typeof globalThis === 'undefined') {
+  const host = getTraceHost();
+  if (!host) {
     return;
   }
-  const host = globalThis as any;
   const history: ConnectionTraceSnapshot[] = Array.isArray(host[TRACE_HISTORY_KEY])
     ? host[TRACE_HISTORY_KEY]
     : (host[TRACE_HISTORY_KEY] = []);
@@ -147,14 +168,22 @@ function recordSnapshot(snapshot: ConnectionTraceSnapshot): void {
 }
 
 function isTraceEnabled(): boolean {
-  if (typeof globalThis === 'undefined') {
+  const host = getTraceHost();
+  if (!host) {
     return false;
   }
   const globalFlag =
-    (globalThis as any).__BEACH_TRACE ??
-    (globalThis as any).BEACH_TRACE ??
-    (typeof window !== 'undefined' ? (window as any).__BEACH_TRACE ?? (window as any).BEACH_TRACE : undefined);
+    host.__BEACH_TRACE ??
+    host.BEACH_TRACE ??
+    (typeof window !== 'undefined' ? window.__BEACH_TRACE ?? window.BEACH_TRACE : undefined);
   return Boolean(globalFlag);
+}
+
+function getTraceHost(): TraceHost | null {
+  if (typeof globalThis === 'undefined') {
+    return null;
+  }
+  return globalThis as TraceHost;
 }
 
 function now(): number {

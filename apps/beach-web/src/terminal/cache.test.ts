@@ -189,8 +189,9 @@ describe('TerminalGridCache cursor hints', () => {
     cache.registerPrediction(3, Uint8Array.from([0x7f]));
 
     let snapshot = cache.snapshot();
-    expect(snapshot.hasPredictions).toBe(true);
-    expect(snapshot.predictedCursor?.col).toBe(prompt.length - 1);
+    expect(snapshot.hasPredictions).toBe(false);
+    expect(snapshot.predictedCursor).toBeNull();
+    expect(snapshot.cursorCol).toBe(prompt.length);
 
     cache.applyUpdates([], {
       cursor: { row: 0, col: prompt.length, seq: 4, visible: true, blink: true },
@@ -200,6 +201,66 @@ describe('TerminalGridCache cursor hints', () => {
     expect(snapshot.hasPredictions).toBe(false);
     expect(snapshot.cursorCol).toBe(prompt.length);
     expect(snapshot.predictedCursor).toBeNull();
+  });
+
+  it('blocks predictive backspace before the server cursor minimum', () => {
+    const cache = new TerminalGridCache({ initialCols: 80 });
+    cache.setGridSize(1, 80);
+    const prompt = 'user@host %';
+    cache.applyUpdates(
+      [
+        {
+          type: 'row',
+          row: 0,
+          seq: 1,
+          cells: packString(prompt),
+        },
+      ],
+      { authoritative: true },
+    );
+    cache.enableCursorSupport(true);
+    cache.applyUpdates([], {
+      cursor: { row: 0, col: prompt.length, seq: 2, visible: true, blink: true },
+    });
+
+    const changed = cache.registerPrediction(3, Uint8Array.from([0x7f]));
+    expect(changed).toBe(false);
+
+    const snapshot = cache.snapshot();
+    expect(snapshot.hasPredictions).toBe(false);
+    expect(snapshot.predictedCursor).toBeNull();
+    expect(snapshot.cursorCol).toBe(prompt.length);
+  });
+
+  it('allows predictive backspace when deleting freshly typed input', () => {
+    const cache = new TerminalGridCache({ initialCols: 80 });
+    cache.setGridSize(1, 80);
+    const prompt = '$ ';
+    cache.applyUpdates(
+      [
+        {
+          type: 'row',
+          row: 0,
+          seq: 1,
+          cells: packString(prompt),
+        },
+      ],
+      { authoritative: true },
+    );
+    cache.enableCursorSupport(true);
+    cache.applyUpdates([], {
+      cursor: { row: 0, col: prompt.length, seq: 2, visible: true, blink: true },
+    });
+
+    cache.registerPrediction(3, stringToBytes('a'));
+    let snapshot = cache.snapshot();
+    expect(snapshot.hasPredictions).toBe(true);
+    expect(snapshot.predictedCursor?.col).toBe(prompt.length + 1);
+
+    cache.registerPrediction(4, Uint8Array.from([0x7f]));
+    snapshot = cache.snapshot();
+    expect(snapshot.hasPredictions).toBe(true);
+    expect(snapshot.predictedCursor?.col).toBe(prompt.length);
   });
 
   it('resets cursor when a row segment of spaces clears the line', () => {

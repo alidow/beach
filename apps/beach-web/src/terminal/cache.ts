@@ -159,6 +159,7 @@ export class TerminalGridCache {
   private cursorAuthoritativePending = false;
   private serverCursorRow: number | null = null;
   private serverCursorCol: number | null = null;
+  private serverCursorMinCol: number | null = null;
   private predictedCursor: PredictedCursorState | null = null;
   private firstCursorReceived = false;
   private pendingInitialCursor: { visible: boolean; blink: boolean } | null = null;
@@ -328,6 +329,7 @@ export class TerminalGridCache {
     this.cursorAuthoritativePending = false;
     this.serverCursorRow = null;
     this.serverCursorCol = null;
+    this.serverCursorMinCol = null;
     this.predictedCursor = null;
     this.pendingInitialCursor = null;
     this.predictions.clear();
@@ -734,6 +736,7 @@ export class TerminalGridCache {
       this.cursorBlink = true;
       this.serverCursorRow = null;
       this.serverCursorCol = null;
+      this.serverCursorMinCol = null;
       this.predictedCursor = null;
       this.pendingInitialCursor = null;
     }
@@ -749,7 +752,6 @@ export class TerminalGridCache {
     const prevVisible = this.cursorVisible;
     const prevBlink = this.cursorBlink;
     const prevPredicted = this.predictedCursor;
-
     const prevServerRow = this.serverCursorRow;
     const prevServerCol = this.serverCursorCol;
 
@@ -762,12 +764,12 @@ export class TerminalGridCache {
 
     const shouldTrimPredictions =
       this.rowHasPredictions(row) && prevRow === row && prevCol !== null && targetCol > prevCol;
-    if (shouldTrimPredictions && prevCol !== null) {
-      const trimmed = this.discardPredictionsFromColumn(row, prevCol, 'cursor_clamp');
+    if (shouldTrimPredictions) {
+      const trimmed = this.discardPredictionsFromColumn(row, targetCol, 'cursor_clamp');
       if (trimmed) {
         this.predictiveLog('prediction_trim_cursor', {
           row,
-          col: prevCol,
+          col: targetCol,
           target: targetCol,
           prevCursor: prevCol,
           prevServer: { row: prevServerRow, col: prevServerCol },
@@ -784,6 +786,14 @@ export class TerminalGridCache {
     }
     this.cursorCol = targetCol;
     this.cursorSeq = frame.seq;
+
+    if (this.serverCursorRow !== row) {
+      this.serverCursorMinCol = targetCol;
+    } else if (this.serverCursorMinCol === null) {
+      this.serverCursorMinCol = targetCol;
+    } else {
+      this.serverCursorMinCol = Math.min(this.serverCursorMinCol, targetCol);
+    }
     this.serverCursorRow = row;
     this.serverCursorCol = targetCol;
 
@@ -888,6 +898,14 @@ export class TerminalGridCache {
     }
     const cell = rowPredictions.get(col);
     return !!cell && cell.seq === seq;
+  }
+
+  private hasPredictionAt(row: number, col: number): boolean {
+    const rowPredictions = this.predictions.get(row);
+    if (!rowPredictions) {
+      return false;
+    }
+    return rowPredictions.has(col);
   }
 
   private seqHasPredictions(seq: number): boolean {
@@ -1376,13 +1394,32 @@ export class TerminalGridCache {
       if (byte === 0x08 || byte === 0x7f) {
         let moved = false;
         if (currentCol > 0) {
-          currentCol -= 1;
-          moved = true;
+          const nextCol = currentCol - 1;
+          const minCol =
+            this.serverCursorRow === currentRow && this.serverCursorMinCol !== null
+              ? this.serverCursorMinCol
+              : 0;
+          const hasPredictedCell = this.hasPredictionAt(currentRow, nextCol);
+          if (nextCol >= minCol || hasPredictedCell) {
+            currentCol = nextCol;
+            moved = true;
+          }
         } else if (currentRow > this.baseRow) {
-          currentRow -= 1;
-          const width = this.committedRowWidth(currentRow);
-          currentCol = Math.max(0, width - 1);
-          moved = true;
+          const nextRow = currentRow - 1;
+          const width = Math.max(this.committedRowWidth(nextRow), this.predictedRowWidth(nextRow));
+          if (width > 0) {
+            const nextCol = width - 1;
+            const minCol =
+              this.serverCursorRow === nextRow && this.serverCursorMinCol !== null
+                ? this.serverCursorMinCol
+                : 0;
+            const hasPredictedCell = this.hasPredictionAt(nextRow, nextCol);
+            if (nextCol >= minCol || hasPredictedCell) {
+              currentRow = nextRow;
+              currentCol = Math.max(nextCol, minCol);
+              moved = true;
+            }
+          }
         }
         if (moved) {
           const row = currentRow;
@@ -1429,7 +1466,7 @@ export class TerminalGridCache {
     }
 
     // Update predicted cursor state if cursor sync is enabled
-    if (this.cursorFeatureEnabled && this.cursorAuthoritative) {
+    if (this.cursorFeatureEnabled && this.cursorAuthoritative && (positions.length > 0 || cursorMoved)) {
       currentRow = Math.max(this.baseRow, currentRow);
       currentCol = Math.max(0, currentCol);
       const newPredicted: PredictedCursorState = { row: currentRow, col: currentCol, seq };

@@ -882,6 +882,7 @@ async function waitForDataChannel(
 
     const timeout = setTimeout(() => {
       cleanup();
+      trace?.mark('webrtc:data_channel_timeout');
       reject(new Error('timed out waiting for data channel'));
     }, 20_000);
 
@@ -1017,7 +1018,11 @@ async function waitForDataChannel(
 
           const handleError = (event: Event) => {
             cleanup();
-            reject((event as any).error ?? new Error('data channel error'));
+            const errorInstance = (event as any).error ?? new Error('data channel error');
+            trace?.mark('webrtc:data_channel_error', {
+              message: errorInstance instanceof Error ? errorInstance.message : String(errorInstance),
+            });
+            reject(errorInstance);
           };
 
           cleanupCallbacks.push(() => {
@@ -1028,7 +1033,10 @@ async function waitForDataChannel(
           wrappedChannel.addEventListener('open', handleOpen, { once: true });
           wrappedChannel.addEventListener('error', handleError, { once: true });
           wrappedChannel.addEventListener('close', () =>
-            log(options.logger, 'data channel closed'),
+            {
+              log(options.logger, 'data channel closed');
+              trace?.mark('webrtc:data_channel_close', { label: channel.label });
+            },
           );
         } catch (error) {
           cleanup();

@@ -27,15 +27,15 @@
 - [x] Add optional quiet status overlay (e.g., muted watermark) for idle state so the empty terminal doesn’t feel broken.
 
 ## Phase 3 – Connection Modal & Flow
-- [ ] Build a centered modal using shadcn `Dialog` primitives; dim background but keep terminal visible.
-- [ ] Port the connection fields (session ID, passcode, advanced server input) into the modal with mobile-friendly spacing and larger tap targets.
-- [ ] Implement validation/disabled states, inline status messaging, and a progress indicator for the connecting state.
-- [ ] Dismiss the modal when `status === 'connected'`; in error/closed states, reopen or present retry CTA inline.
-- [ ] Ensure focus management: autofocus session field on open, trap focus inside modal while visible, restore focus when it closes.
+- [x] Build a centered modal using shadcn `Dialog` primitives; dim background but keep terminal visible.
+- [x] Port the connection fields (session ID, passcode, advanced server input) into the modal with mobile-friendly spacing and larger tap targets.
+- [x] Implement validation/disabled states, inline status messaging, and a progress indicator for the connecting state.
+- [x] Dismiss the modal when `status === 'connected'`; in error/closed states, reopen or present retry CTA inline.
+- [ ] Ensure focus management: autofocus session field on open, trap focus inside modal while visible, restore focus when it closes (follow-up for accessibility review).
 
 ## Phase 4 – Connection Info Strip & Drawer
 - [x] Introduce a persistent top bar showing host name/IP and connection state chip (latency badge still TODO).
-- [x] Add a toggle button (`Info` / chevron) that expands a drawer (shadcn `Sheet` or custom) anchored to the top; drawer houses disconnect button, detailed metadata, advanced diagnostics.
+- [x] Add a toggle button (`Info` / chevron) that expands a drawer (custom mobile sheet + desktop inline details) anchored to the top; drawer houses disconnect button, detailed metadata, advanced diagnostics.
 - [ ] When connecting, animate the strip into a loading state; on errors, surface alert styling and retry inline.
 - [ ] Support both pointer and keyboard interactions (Enter/Space toggles drawer, Esc closes).
 - [ ] Include subtle transitions (opacity/slide) with reduced-motion fallbacks via `motion-safe` classes.

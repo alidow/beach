@@ -1393,6 +1393,20 @@ export class TerminalGridCache {
       }
       if (byte === 0x08 || byte === 0x7f) {
         let moved = false;
+        const attemptRow = currentRow;
+        const attemptCol = currentCol;
+        const nextColCandidate = currentCol > 0 ? currentCol - 1 : null;
+        const minColSameRow = this.minimumServerColumn(currentRow);
+        this.predictiveLog('backspace_attempt', {
+          seq,
+          attemptRow,
+          attemptCol,
+          nextColCandidate,
+          minColSameRow,
+          serverCursorRow: this.serverCursorRow,
+          serverCursorCol: this.serverCursorCol,
+          serverCursorMinCol: this.serverCursorMinCol,
+        });
         if (currentCol > 0) {
           const nextCol = currentCol - 1;
           const minCol = this.minimumServerColumn(currentRow);
@@ -1419,6 +1433,17 @@ export class TerminalGridCache {
           mutated = this.setPrediction(row, col, seq, ' ') || mutated;
           recordPosition(row, col, ' ');
           cursorMoved = true;
+        } else {
+          this.predictiveLog('backspace_blocked', {
+            seq,
+            attemptRow,
+            attemptCol,
+            nextColCandidate,
+            minColSameRow,
+            serverCursorRow: this.serverCursorRow,
+            serverCursorCol: this.serverCursorCol,
+            serverCursorMinCol: this.serverCursorMinCol,
+          });
         }
         continue;
       }

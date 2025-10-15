@@ -216,7 +216,12 @@ function createHandshake(
     role,
     roleConstant,
   });
-  handshake.Initialize(prologue, null, null, null);
+  const [privateKey] = noise.CreateKeyPair(noise.constants.NOISE_DH_CURVE25519);
+  try {
+    handshake.Initialize(prologue, privateKey, null, null);
+  } finally {
+    privateKey.fill(0);
+  }
   return handshake;
 }
 

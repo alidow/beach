@@ -7,6 +7,8 @@ declare module 'noise-c.wasm' {
     NOISE_ACTION_READ_MESSAGE: number;
     NOISE_ACTION_FAILED: number;
     NOISE_ACTION_SPLIT: number;
+    NOISE_DH_CURVE25519: number;
+    NOISE_DH_CURVE448: number;
   }
 
   interface NoiseCipherState {
@@ -31,6 +33,7 @@ declare module 'noise-c.wasm' {
   interface NoiseModule {
     constants: NoiseConstants;
     HandshakeState: new (protocolName: string, role: number) => NoiseHandshakeState;
+    CreateKeyPair(curveId: number): [Uint8Array, Uint8Array];
   }
 
   interface NoiseInitOptions {

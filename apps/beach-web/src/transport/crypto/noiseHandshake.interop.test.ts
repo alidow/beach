@@ -5,7 +5,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { deriveNoiseTransportSecrets } from './noiseHandshake';
-import { derivePreSharedKey } from './sharedKey';
+import { deriveHandshakeKey, derivePreSharedKey } from './sharedKey';
 
 if (!globalThis.crypto) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -24,6 +24,11 @@ type RustHandshakeOutput = {
   challenge_context: string;
 };
 
+type RustHandshakeKeyOutput = {
+  session_key: string;
+  handshake_key: string;
+};
+
 function runRustHandshake(payload: Record<string, unknown>): RustHandshakeOutput {
   const output = execFileSync(
     'cargo',
@@ -35,6 +40,19 @@ function runRustHandshake(payload: Record<string, unknown>): RustHandshakeOutput
     },
   );
   return JSON.parse(output) as RustHandshakeOutput;
+}
+
+function runRustHandshakeKey(payload: Record<string, unknown>): RustHandshakeKeyOutput {
+  const output = execFileSync(
+    'cargo',
+    ['run', '--quiet', '--manifest-path', rustInteropManifest, '--bin', 'handshake_key'],
+    {
+      cwd: repoRoot,
+      input: JSON.stringify(payload),
+      encoding: 'utf8',
+    },
+  );
+  return JSON.parse(output) as RustHandshakeKeyOutput;
 }
 
 const bytesToBase64 = (value: Uint8Array): string => Buffer.from(value).toString('base64');
@@ -102,5 +120,25 @@ describe('noise handshake derivation interop', () => {
     expect(rust.challenge_key).toEqual(bytesToBase64(secrets.challengeKey));
     expect(rust.challenge_context).toEqual(new TextDecoder().decode(secrets.challengeContext));
     expect(rust.verification_code).toEqual(secrets.verificationCode);
+  });
+});
+
+describe('secure signaling key derivation interop', () => {
+  const passphrase = 'InteropOtters!';
+  const sessionId = 'session-interop-001';
+  const handshakeId = 'handshake-interop-abc';
+
+  it('matches Rust session and handshake keys', async () => {
+    const sessionKey = await derivePreSharedKey(passphrase, sessionId);
+    const handshakeKey = await deriveHandshakeKey(sessionKey, handshakeId);
+
+    const rust = runRustHandshakeKey({
+      passphrase,
+      session_id: sessionId,
+      handshake_id: handshakeId,
+    });
+
+    expect(rust.session_key).toEqual(bytesToBase64(sessionKey));
+    expect(rust.handshake_key).toEqual(bytesToBase64(handshakeKey));
   });
 });

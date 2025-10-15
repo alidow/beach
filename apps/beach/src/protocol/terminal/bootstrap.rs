@@ -194,13 +194,13 @@ async fn detect_remote_architecture(args: &SshArgs) -> Result<String, CliError> 
     command.stderr(std::process::Stdio::piped());
 
     let output = command.output().await.map_err(|err| {
-        CliError::CopyBinary(format!("failed to detect remote architecture: {err}"))
+        CliError::RemoteArchDetection(format!("failed to run ssh command: {err}"))
     })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(CliError::CopyBinary(format!(
-            "failed to detect remote architecture ({}): {}",
+        return Err(CliError::RemoteArchDetection(format!(
+            "ssh command failed ({}): {}",
             describe_exit_status(output.status),
             stderr.trim()
         )));
@@ -260,7 +260,7 @@ fn architecture_to_target(arch: &str) -> Result<&'static str, CliError> {
         "x86_64" => Ok("x86_64-unknown-linux-musl"),
         "aarch64" | "arm64" => Ok("aarch64-unknown-linux-musl"),
         "armv7l" => Ok("armv7-unknown-linux-musleabihf"),
-        _ => Err(CliError::CopyBinary(format!(
+        _ => Err(CliError::CrossCompile(format!(
             "unsupported remote architecture: {}. Supported: x86_64, aarch64/arm64, armv7l",
             arch
         ))),
@@ -285,7 +285,7 @@ async fn build_for_target(target: &str) -> Result<PathBuf, CliError> {
     let output = command
         .output()
         .await
-        .map_err(|err| CliError::CopyBinary(format!("failed to spawn cargo build: {err}")))?;
+        .map_err(|err| CliError::CrossCompile(format!("failed to spawn cargo build: {err}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -307,12 +307,12 @@ async fn build_for_target(target: &str) -> Result<PathBuf, CliError> {
                 stderr.trim()
             )
         };
-        return Err(CliError::CopyBinary(error_msg));
+        return Err(CliError::CrossCompile(error_msg));
     }
 
     // Construct the path to the built binary
     let workspace_root = std::env::current_dir()
-        .map_err(|err| CliError::CopyBinary(format!("failed to get current directory: {err}")))?;
+        .map_err(|err| CliError::CrossCompile(format!("failed to get current directory: {err}")))?;
     let binary_path = workspace_root
         .join("target")
         .join(target)
@@ -320,7 +320,7 @@ async fn build_for_target(target: &str) -> Result<PathBuf, CliError> {
         .join("beach-human");
 
     if !binary_path.exists() {
-        return Err(CliError::CopyBinary(format!(
+        return Err(CliError::CrossCompile(format!(
             "built binary not found at: {}",
             binary_path.display()
         )));

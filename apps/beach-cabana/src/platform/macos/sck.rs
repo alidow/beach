@@ -17,7 +17,7 @@ use objc2::{
     runtime::ProtocolObject,
     ClassType, DeclaredClass,
 };
-use objc2_foundation::{CGRect, CGSize, NSArray, NSError, NSObject, NSObjectProtocol};
+use objc2_foundation::{CGPoint, CGRect, CGSize, NSArray, NSError, NSObject, NSObjectProtocol};
 use screen_capture_kit::{
     shareable_content::{SCDisplay, SCShareableContent, SCWindow},
     stream::{

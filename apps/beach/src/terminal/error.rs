@@ -26,8 +26,12 @@ pub enum CliError {
     BootstrapOutput(String),
     #[error("bootstrap handshake failed: {0}")]
     BootstrapHandshake(String),
-    #[error("scp transfer failed: {0}")]
+    #[error("binary copy failed: {0}")]
     CopyBinary(String),
+    #[error("remote architecture detection failed: {0}")]
+    RemoteArchDetection(String),
+    #[error("cross-compilation failed: {0}")]
+    CrossCompile(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 }

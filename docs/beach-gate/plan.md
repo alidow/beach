@@ -63,7 +63,13 @@ Authentication uses `Authorization: Bearer <token>` where applicable.
 - [x] Add automated tests for auth flows and entitlement enforcement.
 - [x] Document CLI integration points + future private beach entitlement requirements.
 
+## Current Status
+- Device authorization, token issuance, refresh rotation, and entitlement verification are all implemented behind Fastify endpoints.
+- Service bootstraps without Clerk credentials by using mock mode for local development.
+- Vitest suite covers end-to-end happy paths, token rotation, entitlement protection, and invalid token rejection (`npm test` from `apps/beach-gate`).
+- Local test run pending `npm install` (10s timeout encountered; rerun when convenient to verify).
+
 ## Open Questions
-- How will billing webhooks populate entitlements? (Future task: integrate billing service.)
-- Should refresh tokens persist across restarts or use external store (Redis/Postgres)?
-- Required scopes/claims from Clerk for subscription tiers—pending Clerk configuration.
+- **Billing sync path** – Today entitlements come from config overrides only. Need decision on how billing updates will be delivered (e.g., Clerk webhook → billing service → Beach Gate API vs. direct database read) to plan storage and reconciliation.
+- **Refresh token durability** – Refresh tokens live in memory and are invalidated on restart or across replicas. Confirm whether to accept that limitation for MVP or store tokens in Redis/Postgres for multi-node resilience.
+- **Clerk claims/scopes** – Current device flow only retrieves basic profile info. Clarify if Clerk can supply subscription tier/entitlement claims directly, or if Beach Gate should treat Clerk purely for identity and rely entirely on the billing feed.

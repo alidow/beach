@@ -22,13 +22,14 @@ use crate::{
     config::Config,
     handlers::{
         get_session_status, get_webrtc_answer, get_webrtc_offer, health_check,
-        issue_fallback_token, join_session, post_webrtc_answer, post_webrtc_offer,
+        issue_fallback_token, join_session, metrics_handler, post_webrtc_answer, post_webrtc_offer,
         register_session, FallbackContext, SharedStorage,
     },
     storage::Storage,
     websocket::{websocket_handler, SignalingState},
 };
 use clap::Parser;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 #[tokio::main]
 async fn main() {
@@ -72,6 +73,8 @@ async fn main() {
         "Fallback token minting paused: {}",
         if config.fallback_paused { "yes" } else { "no" }
     );
+
+    let prometheus_handle = install_metrics_recorder();
 
     // Initialize Redis storage
     let storage = match Storage::new(&config.redis_url, config.session_ttl_seconds).await {
@@ -119,10 +122,15 @@ async fn main() {
         .route("/ws/:session_id", get(websocket_handler))
         .with_state(signaling_state);
 
+    let metrics_routes = Router::new()
+        .route("/metrics", get(metrics_handler))
+        .with_state(prometheus_handle.clone());
+
     let app = Router::new()
         .merge(http_routes)
         .merge(fallback_routes)
         .merge(ws_routes)
+        .merge(metrics_routes)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
 
@@ -142,4 +150,10 @@ async fn main() {
     axum::serve(listener, service)
         .await
         .expect("Failed to start server");
+}
+
+fn install_metrics_recorder() -> PrometheusHandle {
+    PrometheusBuilder::new()
+        .install_recorder()
+        .expect("failed to install Prometheus recorder")
 }

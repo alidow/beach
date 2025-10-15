@@ -4,6 +4,7 @@ mod encoder;
 mod fixture;
 mod platform;
 mod noise;
+mod webrtc;
 mod security;
 
 use anyhow::{anyhow, Context, Result};
@@ -397,7 +398,7 @@ fn run(cli: cli::Cli) -> Result<()> {
             };
             let context_bytes = prologue.into_bytes();
 
-            let mut host_handshake = noise::NoiseHandshake::new(noise::HandshakeConfig {
+            let mut host_ctrl = noise::NoiseController::new(noise::HandshakeConfig {
                 material: &material,
                 handshake_id: &handshake,
                 role: noise::HandshakeRole::Initiator,
@@ -405,7 +406,7 @@ fn run(cli: cli::Cli) -> Result<()> {
                 remote_id: &viewer_id,
                 prologue_context: &context_bytes,
             })?;
-            let mut viewer_handshake = noise::NoiseHandshake::new(noise::HandshakeConfig {
+            let mut viewer_ctrl = noise::NoiseController::new(noise::HandshakeConfig {
                 material: &material,
                 handshake_id: &handshake,
                 role: noise::HandshakeRole::Responder,
@@ -414,61 +415,94 @@ fn run(cli: cli::Cli) -> Result<()> {
                 prologue_context: &context_bytes,
             })?;
 
-            // Exchange the three Noise XXpsk2 handshake messages locally.
-            let msg1 = host_handshake.write_message(&[])?;
-            viewer_handshake.read_message(&msg1)?;
-            let msg2 = viewer_handshake.write_message(&[])?;
-            host_handshake.read_message(&msg2)?;
-            let msg3 = host_handshake.write_message(&[])?;
-            viewer_handshake.read_message(&msg3)?;
+            let mut iterations = 0;
+            while !host_ctrl.handshake_complete() || !viewer_ctrl.handshake_complete() {
+                iterations += 1;
+                if iterations > 6 {
+                    return Err(anyhow!("noise handshake did not converge within expected rounds"));
+                }
+                if let Some(msg) = host_ctrl.take_outgoing() {
+                    viewer_ctrl.process_incoming(&msg)?;
+                }
+                if let Some(msg) = viewer_ctrl.take_outgoing() {
+                    host_ctrl.process_incoming(&msg)?;
+                }
+            }
 
-            if !(host_handshake.is_finished() && viewer_handshake.is_finished()) {
+            if !(host_ctrl.handshake_complete() && viewer_ctrl.handshake_complete()) {
                 return Err(anyhow!("noise handshake did not complete"));
             }
 
-            let host_session = host_handshake.finalize()?;
-            let viewer_session = viewer_handshake.finalize()?;
+            let host_keys = host_ctrl
+                .transport_keys()
+                .expect("host transport keys")
+                .clone();
+            let viewer_keys = viewer_ctrl
+                .transport_keys()
+                .expect("viewer transport keys")
+                .clone();
+            let host_hash = host_ctrl
+                .handshake_hash()
+                .ok_or_else(|| anyhow!("host missing handshake hash"))?;
+            let viewer_hash = viewer_ctrl
+                .handshake_hash()
+                .ok_or_else(|| anyhow!("viewer missing handshake hash"))?;
 
             println!("Noise handshake diagnostic");
             println!("  Session ID     : {}", session_id);
             println!("  Handshake ID   : {}", handshake.to_base64());
-            println!("  Verification   : {}", host_session.verification_code());
-            println!("  Host send key  : {}", hex::encode(host_session.keys.send_key));
-            println!("  Host recv key  : {}", hex::encode(host_session.keys.recv_key));
+            println!(
+                "  Verification   : {}",
+                host_ctrl.verification_code().unwrap_or("unknown")
+            );
+            println!("  Host send key  : {}", hex::encode(host_keys.send_key));
+            println!("  Host recv key  : {}", hex::encode(host_keys.recv_key));
             println!(
                 "  Viewer send key: {}",
-                hex::encode(viewer_session.keys.send_key)
+                hex::encode(viewer_keys.send_key)
             );
             println!(
                 "  Viewer recv key: {}",
-                hex::encode(viewer_session.keys.recv_key)
+                hex::encode(viewer_keys.recv_key)
             );
             println!(
                 "  Handshake hash : {}",
-                hex::encode(&host_session.handshake_hash)
+                hex::encode(host_hash)
             );
-            if host_session.handshake_hash != viewer_session.handshake_hash {
+            if host_hash != viewer_hash {
                 println!("  Warning: handshake hash mismatch between peers!");
             }
 
-            let mut encryptor =
-                host_session.keys.encryptor(&host_session.handshake_hash);
-            let mut decryptor =
-                viewer_session.keys.decryptor(&viewer_session.handshake_hash);
-
-            let demo_frame = encryptor.seal(b"cabana-demo-frame")?;
-            let demo_plaintext = decryptor.open(&demo_frame)?;
+            let demo_frame_bytes = host_ctrl.seal_media(b"cabana-demo-frame")?;
+            let demo_frame = noise::MediaFrame::decode(&demo_frame_bytes)?;
+            let demo_plaintext = viewer_ctrl
+                .process_incoming(&demo_frame_bytes)?
+                .ok_or_else(|| anyhow!("expected demo plaintext"))?;
             println!(
                 "  Demo nonce     : {}",
                 hex::encode(demo_frame.nonce)
             );
             println!(
                 "  Demo ciphertext: {}",
-                hex::encode(&demo_frame.ciphertext)
+                hex::encode(demo_frame.ciphertext)
             );
             println!(
                 "  Demo plaintext : {}",
                 String::from_utf8_lossy(&demo_plaintext)
+            );
+
+            let reply_frame_bytes = viewer_ctrl.seal_media(b"cabana-reply-frame")?;
+            let reply_frame = noise::MediaFrame::decode(&reply_frame_bytes)?;
+            let reply_plaintext = host_ctrl
+                .process_incoming(&reply_frame_bytes)?
+                .ok_or_else(|| anyhow!("expected reply plaintext"))?;
+            println!(
+                "  Reply nonce    : {}",
+                hex::encode(reply_frame.nonce)
+            );
+            println!(
+                "  Reply plaintext: {}",
+                String::from_utf8_lossy(&reply_plaintext)
             );
         }
     }

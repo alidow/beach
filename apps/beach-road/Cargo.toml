@@ -26,6 +26,8 @@ tokio-tungstenite = "0.26"
 rand = "0.8"
 time = { version = "0.3", features = ["serde"] }
 beach-rescue-core = { path = "../beach-rescue/core" }
+metrics = "0.21"
+metrics-exporter-prometheus = "0.13"
 
 [dev-dependencies]
 test-timeout = { path = "../../crates/test-timeout" }

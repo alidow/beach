@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{IntoResponse, Json, Response},
 };
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -17,6 +17,9 @@ use std::sync::Arc;
 use time::Duration;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
+
+use metrics::counter;
+use metrics_exporter_prometheus::PrometheusHandle;
 
 use crate::{
     session::{hash_passphrase, verify_passphrase},
@@ -233,10 +236,12 @@ pub async fn issue_fallback_token(
 ) -> Result<Json<FallbackTokenResponse>, FallbackTokenErrorResponse> {
     if ctx.paused {
         warn!("fallback token minting paused; rejecting request");
+        record_token_metric("paused", "n/a");
         return Err(FallbackTokenErrorResponse::paused());
     }
 
     if ctx.require_oidc && payload.entitlement_proof.is_none() {
+        record_token_metric("entitlement_denied", "n/a");
         return Err(FallbackTokenErrorResponse::with_reason(
             StatusCode::UNAUTHORIZED,
             "entitlement_required",
@@ -244,6 +249,7 @@ pub async fn issue_fallback_token(
     }
 
     let session_id = Uuid::parse_str(&payload.session_id).map_err(|_| {
+        record_token_metric("invalid_session", "n/a");
         FallbackTokenErrorResponse::with_reason(StatusCode::BAD_REQUEST, "invalid_session_id")
     })?;
     let cohort_id = payload.cohort_id.as_deref().unwrap_or("public").to_string();
@@ -254,6 +260,7 @@ pub async fn issue_fallback_token(
         .await
         .map_err(|err| {
             error!("redis guardrail error: {err:?}");
+            record_token_metric("error", "redis");
             FallbackTokenErrorResponse::status(StatusCode::INTERNAL_SERVER_ERROR)
         })?;
 
@@ -277,9 +284,17 @@ pub async fn issue_fallback_token(
 
     let serialized = serde_json::to_vec(&claims).map_err(|err| {
         error!("failed to serialize fallback token claims: {err:?}");
+        record_token_metric("error", "serialize");
         FallbackTokenErrorResponse::status(StatusCode::INTERNAL_SERVER_ERROR)
     })?;
     let token = STANDARD_NO_PAD.encode(serialized);
+
+    let guardrail_label = if guardrail_soft_breach {
+        "soft_breach"
+    } else {
+        "within_budget"
+    };
+    record_token_metric("issued", guardrail_label);
 
     Ok(Json(FallbackTokenResponse {
         token,
@@ -627,6 +642,14 @@ pub async fn health_check() -> Json<HealthStatus> {
     })
 }
 
+/// GET /metrics - Prometheus metrics scrape endpoint
+pub async fn metrics_handler(State(handle): State<PrometheusHandle>) -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        handle.render(),
+    )
+}
+
 fn fallback_paused_env() -> bool {
     env::var("FALLBACK_WS_PAUSED")
         .map(|value| matches_truthy(&value))
@@ -638,4 +661,13 @@ fn matches_truthy(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+fn record_token_metric(outcome: &'static str, guardrail: &'static str) {
+    counter!(
+        "beach_fallback_token_requests_total",
+        1,
+        "outcome" => outcome,
+        "guardrail" => guardrail
+    );
 }

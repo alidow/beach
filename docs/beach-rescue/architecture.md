@@ -124,6 +124,7 @@ sequenceDiagram
 - **Alerting**
   - Prometheus alerts on high activation rate (soft breach), connection churn > 20%/5min, CPU > 70%, and handshake failure spikes; alerts page the transport on-call rotation.
   - Structured logs shipped to Loki; `transport.fallback.activated` / `guardrail_soft_breach` events feed PagerDuty + Slack. Metrics emitted as privacy-preserving aggregates (counts per cohort, no user identifiers) with opt-out respected (clients can disable telemetry, which suppresses non-essential metrics).
+  - Control-plane exposes `/metrics` with `beach_fallback_token_requests_total{outcome,guardrail}`, enabling dashboards to spot kill-switch triggers and entitlement denials.
 - **Rollout gates**
   - Must pass soak test (48h) in staging with synthetic clients before first prod cohort.
   - Require sign-off from security (key handling review) and transport leads (perf budgets).

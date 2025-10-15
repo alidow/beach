@@ -4,6 +4,7 @@
 //! the eventual WebRTC integration can focus on wiring messages over the data
 //! channel rather than re-deriving cryptographic details from scratch.
 
+use std::collections::VecDeque;
 use std::fmt;
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -67,6 +68,8 @@ pub enum NoiseError {
     Replay(u64),
     #[error("unsupported media frame version: {0}")]
     UnsupportedFrame(u8),
+    #[error("invalid media frame: {0}")]
+    InvalidFrame(String),
 }
 
 /// Wraps a Noise handshake state along with metadata required to derive transport keys.
@@ -194,6 +197,38 @@ pub struct MediaFrame {
     pub version: u8,
     pub nonce: [u8; 12],
     pub ciphertext: Vec<u8>,
+}
+
+impl MediaFrame {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + 12 + 4 + self.ciphertext.len());
+        buf.push(self.version);
+        buf.extend_from_slice(&self.nonce);
+        buf.extend_from_slice(&(self.ciphertext.len() as u32).to_be_bytes());
+        buf.extend_from_slice(&self.ciphertext);
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, NoiseError> {
+        if bytes.len() < 17 {
+            return Err(NoiseError::InvalidFrame("frame too short".into()));
+        }
+        let version = bytes[0];
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&bytes[1..13]);
+        let mut len_bytes = [0u8; 4];
+        len_bytes.copy_from_slice(&bytes[13..17]);
+        let ciphertext_len = u32::from_be_bytes(len_bytes) as usize;
+        if bytes.len() != 17 + ciphertext_len {
+            return Err(NoiseError::InvalidFrame("ciphertext length mismatch".into()));
+        }
+        let ciphertext = bytes[17..].to_vec();
+        Ok(Self {
+            version,
+            nonce,
+            ciphertext,
+        })
+    }
 }
 
 pub struct MediaEncryptor {
@@ -337,6 +372,111 @@ fn counter_to_nonce(counter: u64) -> [u8; 12] {
     nonce
 }
 
+pub struct NoiseController {
+    handshake: Option<NoiseHandshake>,
+    pending_outgoing: VecDeque<Vec<u8>>,
+    encryptor: Option<MediaEncryptor>,
+    decryptor: Option<MediaDecryptor>,
+    transport_keys: Option<TransportKeys>,
+    handshake_hash: Option<Vec<u8>>,
+    verification_code: Option<String>,
+}
+
+impl NoiseController {
+    pub fn new(config: HandshakeConfig<'_>) -> Result<Self, NoiseError> {
+        let role = config.role;
+        let mut handshake = NoiseHandshake::new(config)?;
+        let mut pending_outgoing = VecDeque::new();
+        if matches!(role, HandshakeRole::Initiator) {
+            let message = handshake.write_message(&[])?;
+            pending_outgoing.push_back(message);
+        }
+        Ok(Self {
+            handshake: Some(handshake),
+            pending_outgoing,
+            encryptor: None,
+            decryptor: None,
+            transport_keys: None,
+            handshake_hash: None,
+            verification_code: None,
+        })
+    }
+
+    fn finish_handshake(&mut self, handshake: NoiseHandshake) -> Result<(), NoiseError> {
+        let session = handshake.finalize()?;
+        let NoiseSession {
+            handshake_hash,
+            keys,
+        } = session;
+        let encryptor = keys.encryptor(&handshake_hash);
+        let decryptor = keys.decryptor(&handshake_hash);
+        self.verification_code = Some(keys.verification_code.clone());
+        self.handshake_hash = Some(handshake_hash.clone());
+        self.encryptor = Some(encryptor);
+        self.decryptor = Some(decryptor);
+        self.transport_keys = Some(keys);
+        Ok(())
+    }
+
+    pub fn take_outgoing(&mut self) -> Option<Vec<u8>> {
+        self.pending_outgoing.pop_front()
+    }
+
+    pub fn process_incoming(&mut self, message: &[u8]) -> Result<Option<Vec<u8>>, NoiseError> {
+        if self.handshake.is_some() {
+            let finalize = {
+                let handshake = self.handshake.as_mut().expect("handshake present");
+                handshake.read_message(message)?;
+                let mut finished = handshake.is_finished();
+                if !finished {
+                    let outbound = handshake.write_message(&[])?;
+                    finished = handshake.is_finished();
+                    self.pending_outgoing.push_back(outbound);
+                }
+                finished
+            };
+            if finalize {
+                let handshake = self.handshake.take().expect("handshake present");
+                self.finish_handshake(handshake)?;
+            }
+            Ok(None)
+        } else {
+            let frame = MediaFrame::decode(message)?;
+            let decryptor = self
+                .decryptor
+                .as_mut()
+                .ok_or_else(|| NoiseError::Incomplete)?;
+            let plaintext = decryptor.open(&frame)?;
+            Ok(Some(plaintext))
+        }
+    }
+
+    pub fn handshake_complete(&self) -> bool {
+        self.encryptor.is_some() && self.decryptor.is_some()
+    }
+
+    pub fn verification_code(&self) -> Option<&str> {
+        self.verification_code.as_deref()
+    }
+
+    pub fn handshake_hash(&self) -> Option<&[u8]> {
+        self.handshake_hash.as_deref()
+    }
+
+    pub fn transport_keys(&self) -> Option<&TransportKeys> {
+        self.transport_keys.as_ref()
+    }
+
+    pub fn seal_media(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, NoiseError> {
+        let encryptor = self
+            .encryptor
+            .as_mut()
+            .ok_or_else(|| NoiseError::Incomplete)?;
+        let frame = encryptor.seal(plaintext)?;
+        Ok(frame.encode())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,5 +561,62 @@ mod tests {
         // Replaying the first frame should now fail due to the counter monotonic check.
         let err = decryptor.open(&frame1).expect_err("replay");
         assert!(matches!(err, NoiseError::Replay(_)));
+    }
+
+    #[test]
+    fn controller_negotiates_and_transports_media() {
+        let material = material();
+        let handshake_id = handshake_id();
+        let context = b"controller-demo".to_vec();
+
+        let mut host = NoiseController::new(HandshakeConfig {
+            material: &material,
+            handshake_id: &handshake_id,
+            role: HandshakeRole::Initiator,
+            local_id: "host",
+            remote_id: "viewer",
+            prologue_context: &context,
+        })
+        .expect("host controller");
+        let mut viewer = NoiseController::new(HandshakeConfig {
+            material: &material,
+            handshake_id: &handshake_id,
+            role: HandshakeRole::Responder,
+            local_id: "viewer",
+            remote_id: "host",
+            prologue_context: &context,
+        })
+        .expect("viewer controller");
+
+        let msg1 = host.take_outgoing().expect("message 1");
+        assert!(viewer.process_incoming(&msg1).expect("process1").is_none());
+        let msg2 = viewer.take_outgoing().expect("message 2");
+        assert!(host.process_incoming(&msg2).expect("process2").is_none());
+        let msg3 = host.take_outgoing().expect("message 3");
+        assert!(viewer.process_incoming(&msg3).expect("process3").is_none());
+
+        assert!(host.handshake_complete());
+        assert!(viewer.handshake_complete());
+        assert_eq!(host.verification_code(), viewer.verification_code());
+        assert_eq!(
+            host.handshake_hash()
+                .map(hex::encode),
+            viewer.handshake_hash().map(hex::encode)
+        );
+
+        let payload = b"encrypted-frame";
+        let outbound = host.seal_media(payload).expect("seal");
+        let decoded = viewer
+            .process_incoming(&outbound)
+            .expect("decrypt")
+            .expect("plaintext");
+        assert_eq!(decoded, payload);
+
+        let reply = viewer.seal_media(b"reply-frame").expect("seal reply");
+        let reply_plain = host
+            .process_incoming(&reply)
+            .expect("decrypt reply")
+            .expect("plaintext");
+        assert_eq!(reply_plain, b"reply-frame");
     }
 }

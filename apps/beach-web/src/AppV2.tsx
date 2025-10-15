@@ -1,4 +1,13 @@
-import { type CSSProperties, type ComponentType, type ReactNode, useEffect, useMemo, useState } from 'react';
+import {
+  type CSSProperties,
+  type ComponentType,
+  type ReactNode,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   ArrowUpDown,
   ChevronDown,
@@ -85,6 +94,22 @@ const STATUS_META: Record<
   },
 };
 
+const BOUNDARY_PADDING = 16;
+const DOCK_MARGIN = 24;
+
+interface Position {
+  top: number;
+  left: number;
+}
+
+interface LayoutMetrics {
+  shellRect: DOMRect;
+  panelSize: {
+    width: number;
+    height: number;
+  };
+}
+
 export default function AppV2(): JSX.Element {
   const {
     sessionId,
@@ -107,8 +132,75 @@ export default function AppV2(): JSX.Element {
   useDocumentTitle({ sessionId: trimmedSessionId });
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [infoExpanded, setInfoExpanded] = useState(false);
-  const [infoDock, setInfoDock] = useState<'top' | 'bottom'>('bottom');
   const [infoVisible, setInfoVisible] = useState(true);
+  const [infoDock, setInfoDock] = useState<'top' | 'bottom' | 'floating'>('bottom');
+  const [dockPreference, setDockPreference] = useState<'top' | 'bottom'>('bottom');
+  const [toolbarPosition, setToolbarPosition] = useState<{ top: number; left: number } | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const shellRef = useRef<HTMLElement | null>(null);
+  const toolbarRef = useRef<HTMLDivElement | null>(null);
+  const toolbarSizeRef = useRef<{ width: number; height: number } | null>(null);
+  const dragStateRef = useRef<{ pointerId: number; offsetX: number; offsetY: number } | null>(null);
+  const getLayoutMetrics = (): LayoutMetrics | null => {
+    const shellElement = shellRef.current;
+    if (!shellElement) {
+      return null;
+    }
+    const shellRect = shellElement.getBoundingClientRect();
+    const toolbarElement = toolbarRef.current;
+    let panelSize = toolbarSizeRef.current;
+
+    if (toolbarElement) {
+      const rect = toolbarElement.getBoundingClientRect();
+      panelSize = { width: rect.width, height: rect.height };
+      toolbarSizeRef.current = panelSize;
+    }
+
+    if (!panelSize) {
+      const fallbackWidth = Math.max(
+        200,
+        Math.min(shellRect.width - BOUNDARY_PADDING * 2, 768),
+      );
+      panelSize = {
+        width: Number.isFinite(fallbackWidth) ? fallbackWidth : shellRect.width,
+        height: 0,
+      };
+    }
+
+    return { shellRect, panelSize };
+  };
+
+  const clampPosition = (desired: Position, metrics?: LayoutMetrics): Position => {
+    const layout = metrics ?? getLayoutMetrics();
+    if (!layout) {
+      return desired;
+    }
+    const { shellRect, panelSize } = layout;
+    const maxLeft = shellRect.width - panelSize.width - BOUNDARY_PADDING;
+    const maxTop = shellRect.height - panelSize.height - BOUNDARY_PADDING;
+    const maxLeftWithPadding = maxLeft < BOUNDARY_PADDING ? BOUNDARY_PADDING : maxLeft;
+    const maxTopWithPadding = maxTop < BOUNDARY_PADDING ? BOUNDARY_PADDING : maxTop;
+
+    const clampedLeft = Math.min(Math.max(desired.left, BOUNDARY_PADDING), maxLeftWithPadding);
+    const clampedTop = Math.min(Math.max(desired.top, BOUNDARY_PADDING), maxTopWithPadding);
+
+    return {
+      left: Number.isFinite(clampedLeft) ? clampedLeft : BOUNDARY_PADDING,
+      top: Number.isFinite(clampedTop) ? clampedTop : BOUNDARY_PADDING,
+    };
+  };
+
+  const computeDockedPosition = (dock: 'top' | 'bottom', metrics?: LayoutMetrics): Position => {
+    const layout = metrics ?? getLayoutMetrics();
+    if (!layout) {
+      return { top: DOCK_MARGIN, left: DOCK_MARGIN };
+    }
+    const { shellRect, panelSize } = layout;
+    const baseTop =
+      dock === 'top' ? DOCK_MARGIN : shellRect.height - panelSize.height - DOCK_MARGIN;
+    const baseLeft = (shellRect.width - panelSize.width) / 2;
+    return clampPosition({ top: baseTop, left: baseLeft }, layout);
+  };
 
   const statusMeta = STATUS_META[status] ?? STATUS_META.idle;
   const showModal = status !== 'connected';
@@ -126,6 +218,72 @@ export default function AppV2(): JSX.Element {
     }
   }, [infoVisible]);
 
+  useLayoutEffect(() => {
+    if (!infoVisible && !toolbarPosition) {
+      return;
+    }
+    const metrics = getLayoutMetrics();
+    if (!metrics) {
+      return;
+    }
+
+    if (infoDock === 'floating') {
+      setToolbarPosition((previous) => {
+        if (!previous) {
+          return clampPosition(computeDockedPosition(dockPreference, metrics), metrics);
+        }
+        const clamped = clampPosition(previous, metrics);
+        if (previous.left === clamped.left && previous.top === clamped.top) {
+          return previous;
+        }
+        return clamped;
+      });
+      return;
+    }
+
+    const targetPosition = computeDockedPosition(infoDock, metrics);
+    setToolbarPosition((previous) => {
+      if (!previous) {
+        return targetPosition;
+      }
+      if (previous.left === targetPosition.left && previous.top === targetPosition.top) {
+        return previous;
+      }
+      return targetPosition;
+    });
+  }, [dockPreference, infoDock, infoExpanded, infoVisible, toolbarPosition]);
+
+  useEffect(() => {
+    const handleResize = (): void => {
+      setToolbarPosition((previous) => {
+        if (!previous) {
+          return previous;
+        }
+        const metrics = getLayoutMetrics();
+        if (!metrics) {
+          return previous;
+        }
+
+        if (infoDock === 'floating') {
+          const clamped = clampPosition(previous, metrics);
+          if (clamped.left === previous.left && clamped.top === previous.top) {
+            return previous;
+          }
+          return clamped;
+        }
+
+        const targetPosition = computeDockedPosition(infoDock, metrics);
+        if (previous.left === targetPosition.left && previous.top === targetPosition.top) {
+          return previous;
+        }
+        return targetPosition;
+      });
+    };
+
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [infoDock]);
+
   const handleSubmit = (): void => {
     if (connectDisabled) {
       return;
@@ -138,7 +296,9 @@ export default function AppV2(): JSX.Element {
   };
 
   const toggleDockPosition = (): void => {
-    setInfoDock((previous) => (previous === 'top' ? 'bottom' : 'top'));
+    const nextPreference = dockPreference === 'top' ? 'bottom' : 'top';
+    setDockPreference(nextPreference);
+    setInfoDock(nextPreference);
   };
 
   const handleHideInfo = (): void => {
@@ -150,16 +310,108 @@ export default function AppV2(): JSX.Element {
     setInfoVisible(true);
   };
 
-  const dockWrapperClass = cn(
-    'pointer-events-none absolute left-0 right-0 flex justify-center px-4',
-    infoDock === 'top' ? 'top-0 pt-6' : 'bottom-0 pb-6',
-  );
-  const dockRevealOffset = infoDock === 'top' ? '-translate-y-1.5' : 'translate-y-1.5';
+  const handlePointerDown = (event: React.PointerEvent<HTMLElement>): void => {
+    if (event.button !== 0) {
+      return;
+    }
+    if (event.target instanceof Element) {
+      const interactiveTarget = event.target.closest(
+        'button, a, input, textarea, select, label, [data-no-drag="true"]',
+      );
+      if (interactiveTarget) {
+        return;
+      }
+    }
 
-  const dockToggleLabel = infoDock === 'top' ? 'Move connection info to bottom' : 'Move connection info to top';
+    const metrics = getLayoutMetrics();
+    const toolbarElement = toolbarRef.current;
+    if (!metrics || !toolbarElement) {
+      return;
+    }
+
+    event.preventDefault();
+    const rect = toolbarElement.getBoundingClientRect();
+    dragStateRef.current = {
+      pointerId: event.pointerId,
+      offsetX: event.clientX - rect.left,
+      offsetY: event.clientY - rect.top,
+    };
+    setToolbarPosition({
+      left: rect.left - metrics.shellRect.left,
+      top: rect.top - metrics.shellRect.top,
+    });
+    setInfoDock('floating');
+    setIsDragging(true);
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const handlePointerMove = (event: React.PointerEvent<HTMLElement>): void => {
+    const dragState = dragStateRef.current;
+    if (!dragState || dragState.pointerId !== event.pointerId) {
+      return;
+    }
+    const metrics = getLayoutMetrics();
+    if (!metrics) {
+      return;
+    }
+    const nextPosition = {
+      left: event.clientX - metrics.shellRect.left - dragState.offsetX,
+      top: event.clientY - metrics.shellRect.top - dragState.offsetY,
+    };
+    setToolbarPosition((previous) => {
+      const clamped = clampPosition(nextPosition, metrics);
+      if (previous && previous.left === clamped.left && previous.top === clamped.top) {
+        return previous;
+      }
+      return clamped;
+    });
+  };
+
+  const handlePointerUp = (event: React.PointerEvent<HTMLElement>): void => {
+    if (!dragStateRef.current || dragStateRef.current.pointerId !== event.pointerId) {
+      return;
+    }
+    dragStateRef.current = null;
+    setIsDragging(false);
+
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    setToolbarPosition((previous) => {
+      if (!previous) {
+        return previous;
+      }
+      const metrics = getLayoutMetrics();
+      if (!metrics) {
+        return previous;
+      }
+      const clamped = clampPosition(previous, metrics);
+      if (previous.left === clamped.left && previous.top === clamped.top) {
+        return previous;
+      }
+      return clamped;
+    });
+  };
+
+  const baseToolbarPosition = toolbarPosition ?? { top: DOCK_MARGIN, left: DOCK_MARGIN };
+  const toolbarWrapperStyle: CSSProperties = {
+    top: baseToolbarPosition.top,
+    left: baseToolbarPosition.left,
+    width: 'min(calc(100% - 32px), 48rem)',
+    visibility: toolbarPosition ? 'visible' : 'hidden',
+  };
+  const toolbarWrapperClass = cn(
+    'pointer-events-none absolute',
+    isDragging ? 'transition-none' : 'transition-[top,left] duration-150 ease-out',
+  );
+  const dockToggleLabel = dockPreference === 'top' ? 'Move connection info to bottom' : 'Move connection info to top';
+  const dockRevealOffset =
+    infoDock === 'floating' ? '' : dockPreference === 'top' ? '-translate-y-1.5' : 'translate-y-1.5';
 
   return (
     <main
+      ref={shellRef}
       className="relative flex w-full flex-col overflow-hidden bg-[hsl(var(--terminal-screen))] text-slate-100"
       style={SHELL_STYLE}
     >
@@ -188,20 +440,30 @@ export default function AppV2(): JSX.Element {
       </div>
 
       {infoVisible ? (
-        <div className={dockWrapperClass}>
-          <Collapsible
-            open={infoExpanded}
-            onOpenChange={(open) => {
-              if (status !== 'connected') {
-                setInfoExpanded(false);
-                return;
-              }
-              setInfoExpanded(open);
-            }}
-          >
-            <div className="pointer-events-auto w-full max-w-3xl">
+        <div className={toolbarWrapperClass} style={toolbarWrapperStyle}>
+          <div ref={toolbarRef} className="pointer-events-auto w-full max-w-3xl">
+            <Collapsible
+              open={infoExpanded}
+              onOpenChange={(open) => {
+                if (status !== 'connected') {
+                  setInfoExpanded(false);
+                  return;
+                }
+                setInfoExpanded(open);
+              }}
+            >
               <div className="flex flex-col rounded-3xl border border-white/5 bg-slate-950/70 backdrop-blur">
-                <header className="flex flex-col gap-3 px-5 py-3 sm:flex-row sm:items-center sm:justify-between">
+                <header
+                  className="flex flex-col gap-3 px-5 py-3 sm:flex-row sm:items-center sm:justify-between cursor-move"
+                  onPointerDown={handlePointerDown}
+                  onPointerMove={handlePointerMove}
+                  onPointerUp={handlePointerUp}
+                  onPointerCancel={handlePointerUp}
+                  style={{
+                    touchAction: 'none',
+                    userSelect: isDragging ? 'none' : undefined,
+                  }}
+                >
                   <div className="flex items-center gap-2">
                     <span
                       className={cn(
@@ -219,7 +481,7 @@ export default function AppV2(): JSX.Element {
                         variant="ghost"
                         size="sm"
                         className={cn(
-                          'h-8 gap-1 px-3 text-xs text-slate-300 transition',
+                          'h-8 gap-1 px-3 text-xs text-slate-300 transition cursor-pointer',
                           status === 'connected' ? 'hover:bg-white/5 hover:text-slate-100' : 'opacity-50',
                         )}
                       >
@@ -235,9 +497,9 @@ export default function AppV2(): JSX.Element {
                       size="icon"
                       onClick={toggleDockPosition}
                       aria-label={dockToggleLabel}
-                      className="h-8 w-8 text-slate-300 transition hover:bg-white/5 hover:text-slate-100"
+                      className="h-8 w-8 cursor-pointer text-slate-300 transition hover:bg-white/5 hover:text-slate-100"
                     >
-                      <ArrowUpDown className={cn('size-4', infoDock === 'bottom' ? 'rotate-180' : '')} />
+                      <ArrowUpDown className={cn('size-4', dockPreference === 'bottom' ? 'rotate-180' : '')} />
                     </Button>
                     <Button
                       type="button"
@@ -245,7 +507,7 @@ export default function AppV2(): JSX.Element {
                       size="icon"
                       onClick={handleHideInfo}
                       aria-label="Hide connection info"
-                      className="h-8 w-8 text-slate-300 transition hover:bg-white/5 hover:text-slate-100"
+                      className="h-8 w-8 cursor-pointer text-slate-300 transition hover:bg-white/5 hover:text-slate-100"
                     >
                       <EyeOff className="size-4" />
                     </Button>
@@ -271,28 +533,30 @@ export default function AppV2(): JSX.Element {
                   </div>
                 </CollapsibleContent>
               </div>
-            </div>
-          </Collapsible>
+            </Collapsible>
+          </div>
         </div>
       ) : null}
       {!infoVisible ? (
-        <div className={dockWrapperClass}>
-          <div
-            className={cn(
-              'pointer-events-auto rounded-full bg-slate-950/80 shadow-lg backdrop-blur transition-transform duration-200',
-              dockRevealOffset,
-            )}
-          >
-            <Button
-              variant="outline"
-              size="icon"
-              onClick={handleShowInfo}
-              aria-label="Show connection info"
-              className="h-11 w-11 rounded-full border-white/10 bg-transparent text-slate-200 hover:bg-white/10 focus-visible:ring-white/30 select-none"
+        <div className={toolbarWrapperClass} style={toolbarWrapperStyle}>
+          <div className="pointer-events-none flex justify-center">
+            <div
+              className={cn(
+                'pointer-events-auto rounded-full bg-slate-950/80 shadow-lg backdrop-blur transition-transform duration-200',
+                dockRevealOffset,
+              )}
             >
-              <Eye className="size-4" />
-              <span className="sr-only">Show connection info</span>
-            </Button>
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={handleShowInfo}
+                aria-label="Show connection info"
+                className="h-11 w-11 rounded-full border-white/10 bg-transparent text-slate-200 hover:bg-white/10 focus-visible:ring-white/30 select-none cursor-pointer"
+              >
+                <Eye className="size-4" />
+                <span className="sr-only">Show connection info</span>
+              </Button>
+            </div>
           </div>
         </div>
       ) : null}

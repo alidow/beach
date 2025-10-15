@@ -6,6 +6,7 @@ import { connectWebRtcTransport } from '../transport/webrtc';
 import { SignalingClient } from '../transport/signaling';
 import type { SignalingClientOptions } from '../transport/signaling';
 import type { SecureTransportSummary } from '../transport/webrtc';
+import { deriveHandshakeKeyFromSession, derivePreSharedKey } from '../transport/crypto/sharedKey';
 import type { ConnectionTrace } from '../lib/connectionTrace';
 
 export interface FallbackOverrides {
@@ -33,6 +34,7 @@ export interface ConnectBrowserTransportOptions {
   clientLabel?: string;
   fallbackOverrides?: FallbackOverrides;
   trace?: ConnectionTrace | null;
+  sessionKeyPromise?: Promise<Uint8Array>;
 }
 
 export async function connectBrowserTransport(
@@ -40,6 +42,10 @@ export async function connectBrowserTransport(
 ): Promise<BrowserTransportConnection> {
   const trace = options.trace ?? null;
   trace?.mark('connect_browser_transport:start', { hasPasscode: Boolean(options.passcode) });
+
+  const sessionKeyPromise = options.sessionKeyPromise ?? (options.passcode
+    ? derivePreSharedKey(options.passcode.trim(), options.sessionId.trim())
+    : undefined);
 
   const join = await fetchJoinMetadata(options);
   trace?.mark('join_metadata:received', {
@@ -68,10 +74,11 @@ export async function connectBrowserTransport(
       iceServers: options.iceServers,
       logger: options.logger,
       passphrase: options.passcode,
-      telemetryBaseUrl: options.baseUrl,
-      sessionId: options.sessionId,
-      trace,
-    });
+    telemetryBaseUrl: options.baseUrl,
+    sessionId: options.sessionId,
+    trace,
+    sessionKeyPromise,
+  });
   } catch (error) {
     trace?.mark('webrtc:connect_error', {
       message: error instanceof Error ? error.message : String(error),

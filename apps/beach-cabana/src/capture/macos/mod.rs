@@ -2,6 +2,9 @@ use crate::capture::{BoxedProducer, Frame, FrameProducer, PixelFormat};
 use crate::platform::WindowApiError;
 use std::time::{Duration, SystemTime};
 
+#[cfg(feature = "cabana_sck")]
+use crate::platform::macos::sck;
+
 /// Temporary CoreGraphics-based frame producer until ScreenCaptureKit lands.
 pub struct CoreGraphicsProducer {
     target: String,
@@ -60,11 +63,52 @@ impl FrameProducer for CoreGraphicsProducer {
     fn stop(&mut self) {}
 }
 
-/// Placeholder for the real ScreenCaptureKit producer. Will be wired up once
-/// the Swift/Obj-C bridge is implemented.
+#[cfg(feature = "cabana_sck")]
+pub struct ScreenCaptureKitProducer {
+    target: String,
+    stream: Option<sck::SckStream>,
+}
+
+#[cfg(feature = "cabana_sck")]
+impl ScreenCaptureKitProducer {
+    pub fn new(target: impl Into<String>) -> Result<Self, WindowApiError> {
+        Ok(Self {
+            target: target.into(),
+            stream: None,
+        })
+    }
+}
+
+#[cfg(feature = "cabana_sck")]
+impl FrameProducer for ScreenCaptureKitProducer {
+    fn start(&mut self) -> anyhow::Result<()> {
+        if self.stream.is_none() {
+            let stream = sck::SckStream::new(&self.target)?;
+            self.stream = Some(stream);
+        }
+        Ok(())
+    }
+
+    fn next_frame(&mut self) -> anyhow::Result<Frame> {
+        let stream = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("ScreenCaptureKit stream not started"))?;
+        stream
+            .next_frame(Duration::from_secs(2))
+            .map_err(anyhow::Error::from)
+    }
+
+    fn stop(&mut self) {
+        self.stream = None;
+    }
+}
+
+#[cfg(not(feature = "cabana_sck"))]
 #[allow(dead_code)]
 pub struct ScreenCaptureKitProducer;
 
+#[cfg(not(feature = "cabana_sck"))]
 #[allow(dead_code)]
 impl ScreenCaptureKitProducer {
     pub fn new(_target: impl Into<String>) -> Result<Self, WindowApiError> {
@@ -74,6 +118,7 @@ impl ScreenCaptureKitProducer {
     }
 }
 
+#[cfg(not(feature = "cabana_sck"))]
 impl FrameProducer for ScreenCaptureKitProducer {
     fn start(&mut self) -> anyhow::Result<()> {
         Err(anyhow::anyhow!(

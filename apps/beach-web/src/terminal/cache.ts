@@ -902,14 +902,6 @@ export class TerminalGridCache {
     return !!cell && cell.seq === seq;
   }
 
-  private hasPredictionAt(row: number, col: number): boolean {
-    const rowPredictions = this.predictions.get(row);
-    if (!rowPredictions) {
-      return false;
-    }
-    return rowPredictions.has(col);
-  }
-
   private seqHasPredictions(seq: number): boolean {
     for (const rowPredictions of this.predictions.values()) {
       for (const cell of rowPredictions.values()) {
@@ -942,6 +934,13 @@ export class TerminalGridCache {
       }
     }
     return false;
+  }
+
+  private minimumServerColumn(row: number): number {
+    if (this.serverCursorRow === row && this.serverCursorMinCol !== null) {
+      return this.serverCursorMinCol;
+    }
+    return 0;
   }
 
   private discardPredictionsFromColumn(row: number, col: number, reason: string): boolean {
@@ -1396,12 +1395,8 @@ export class TerminalGridCache {
         let moved = false;
         if (currentCol > 0) {
           const nextCol = currentCol - 1;
-          const minCol =
-            this.serverCursorRow === currentRow && this.serverCursorMinCol !== null
-              ? this.serverCursorMinCol
-              : 0;
-          const hasPredictedCell = this.hasPredictionAt(currentRow, nextCol);
-          if (nextCol >= minCol || hasPredictedCell) {
+          const minCol = this.minimumServerColumn(currentRow);
+          if (nextCol >= minCol) {
             currentCol = nextCol;
             moved = true;
           }
@@ -1410,12 +1405,8 @@ export class TerminalGridCache {
           const width = Math.max(this.committedRowWidth(nextRow), this.predictedRowWidth(nextRow));
           if (width > 0) {
             const nextCol = width - 1;
-            const minCol =
-              this.serverCursorRow === nextRow && this.serverCursorMinCol !== null
-                ? this.serverCursorMinCol
-                : 0;
-            const hasPredictedCell = this.hasPredictionAt(nextRow, nextCol);
-            if (nextCol >= minCol || hasPredictedCell) {
+            const minCol = this.minimumServerColumn(nextRow);
+            if (nextCol >= minCol) {
               currentRow = nextRow;
               currentCol = Math.max(nextCol, minCol);
               moved = true;

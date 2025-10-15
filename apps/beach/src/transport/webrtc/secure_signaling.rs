@@ -14,6 +14,7 @@ const HKDF_INFO_AEAD: &[u8] = b"beach:secure-signaling:aead:v1";
 const LABEL_OFFER: &[u8] = b"offer";
 const LABEL_ANSWER: &[u8] = b"answer";
 const LABEL_ICE: &[u8] = b"ice";
+const HANDSHAKE_HKDF_INFO: &[u8] = b"beach:secure-signaling:handshake";
 const INSECURE_OVERRIDE_TOKEN: &str = "I_KNOW_THIS_IS_UNSAFE";
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -147,6 +148,18 @@ fn derive_message_key_from_psk(
         .map_err(|err| {
             TransportError::Setup(format!("secure signaling hkdf expand failed: {err}"))
         })?;
+    Ok(key_bytes)
+}
+
+pub fn derive_handshake_key_from_session(
+    session_key: &[u8; 32],
+    handshake_id: &str,
+) -> Result<[u8; 32], TransportError> {
+    let salt = handshake_id.as_bytes();
+    let hkdf = Hkdf::<Sha256>::new(Some(salt), session_key);
+    let mut key_bytes = [0u8; 32];
+    hkdf.expand(HANDSHAKE_HKDF_INFO, &mut key_bytes)
+        .map_err(|err| TransportError::Setup(format!("handshake hkdf expand failed: {err}")))?;
     Ok(key_bytes)
 }
 

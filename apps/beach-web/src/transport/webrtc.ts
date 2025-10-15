@@ -1,5 +1,5 @@
 import { decodeTransportMessage, encodeTransportMessage, type TransportMessage } from './envelope';
-import { toHex } from './crypto/sharedKey';
+import { deriveHandshakeKeyFromSession, derivePreSharedKey, toHex } from './crypto/sharedKey';
 import {
   secureSignalingEnabled,
   sealWithKey,
@@ -7,7 +7,6 @@ import {
   type SealedEnvelope,
   type SignalingLabel,
 } from './crypto/secureSignaling';
-import { derivePreSharedKey } from './crypto/sharedKey';
 import {
   runBrowserHandshake,
   buildPrologueContext,
@@ -181,6 +180,7 @@ export interface ConnectWebRtcTransportOptions {
   telemetryBaseUrl?: string;
   sessionId?: string;
   trace?: ConnectionTrace | null;
+  sessionKeyPromise?: Promise<Uint8Array>;
 }
 
 export interface ConnectedWebRtcTransport {
@@ -213,26 +213,51 @@ export async function connectWebRtcTransport(
   trace?.mark('webrtc:connect_start', { role: options.role });
   const passphrase = options.passphrase?.trim();
   const secureSignalingActive = Boolean(secureSignalingEnabled() && passphrase && passphrase.length > 0);
-  let sealingKeyPromise: Promise<Uint8Array> | null = null;
+  const sessionKeyPromise =
+    options.sessionKeyPromise ??
+    (secureSignalingActive && passphrase && options.sessionId
+      ? derivePreSharedKey(passphrase, options.sessionId)
+      : null);
+  const handshakeKeys = new Map<string, Promise<Uint8Array>>();
   const ensureSealingKey = (handshakeId: string): Promise<Uint8Array> => {
-    if (!sealingKeyPromise) {
+    const cached = handshakeKeys.get(handshakeId);
+    if (cached) {
+      return cached;
+    }
+    const promise = (async () => {
+      if (sessionKeyPromise) {
+        try {
+          trace?.mark('webrtc:derive_psk_start', { handshakeId, via: 'session_base' });
+          const base = await sessionKeyPromise;
+          const derived = await deriveHandshakeKeyFromSession(base, handshakeId);
+          trace?.mark('webrtc:derive_psk_complete', { handshakeId, via: 'session_base' });
+          return derived;
+        } catch (error) {
+          trace?.mark('webrtc:derive_psk_error', {
+            handshakeId,
+            message: String(error),
+            via: 'session_base',
+          });
+          throw error;
+        }
+      }
       if (!passphrase) {
         throw new Error('secure signaling requires passphrase');
       }
       trace?.mark('webrtc:derive_psk_start', { handshakeId });
-      sealingKeyPromise = derivePreSharedKey(passphrase, handshakeId)
-        .then((value) => {
-          trace?.mark('webrtc:derive_psk_complete', { handshakeId });
-          return value;
-        })
-        .catch((error) => {
-          trace?.mark('webrtc:derive_psk_error', { handshakeId, message: String(error) });
-          throw error;
-        });
-    }
-    return sealingKeyPromise;
+      try {
+        const derived = await derivePreSharedKey(passphrase, handshakeId);
+        trace?.mark('webrtc:derive_psk_complete', { handshakeId });
+        return derived;
+      } catch (error) {
+        trace?.mark('webrtc:derive_psk_error', { handshakeId, message: String(error) });
+        throw error instanceof Error ? error : new Error(String(error));
+      }
+    })();
+    handshakeKeys.set(handshakeId, promise);
+    return promise;
   };
-  const getSealingKey = () => sealingKeyPromise;
+  const getSealingKey = (handshakeId: string) => handshakeKeys.get(handshakeId) ?? null;
   const join = await signaling.waitForMessage('join_success', 15_000);
   trace?.mark('signaling:join_success', {
     assignedPeerId: join.peer_id,
@@ -448,6 +473,8 @@ export async function connectWebRtcTransport(
         localPeerId: assignedPeerId,
         remotePeerId,
       },
+      sessionId: options.sessionId,
+      trace,
       afterSetRemoteDescription: () => {
         remoteDescriptionSet = true;
         // Drain any queued remote candidates now that the offer is applied.
@@ -467,7 +494,6 @@ export async function connectWebRtcTransport(
           scheduleFlush(ANSWER_FLUSH_DELAY_MS);
         }
       },
-      trace,
     }, (handshakeId) => {
       currentHandshakeId = handshakeId;
       log(logger, `handshake ready: ${handshakeId}`);
@@ -495,7 +521,7 @@ function attachSignalListener(
   onRemoteCandidate: (cand: RTCIceCandidateInit) => void,
   secure: {
     enabled: boolean;
-    getKey: () => Promise<Uint8Array> | null;
+    getKey: (handshakeId: string) => Promise<Uint8Array> | null;
     localPeerId: string;
   },
   logger?: (message: string) => void,
@@ -532,7 +558,7 @@ function attachSignalListener(
 
         let candidateInit: RTCIceCandidateInit;
         if (secure.enabled) {
-          const keyPromise = secure.getKey();
+          const keyPromise = secure.getKey(handshakeId);
           if (!keyPromise) {
             log(logger, 'ignoring remote candidate: secure key not ready');
             return;
@@ -707,7 +733,7 @@ async function connectAsAnswerer(options: {
     enabled: boolean;
     passphrase?: string;
     ensureKey: (handshakeId: string) => Promise<Uint8Array>;
-    getKey: () => Promise<Uint8Array> | null;
+    getKey: (handshakeId: string) => Promise<Uint8Array> | null;
     localPeerId: string;
     remotePeerId: string;
   };
@@ -757,7 +783,7 @@ async function connectAsAnswerer(options: {
       throw new Error('expected sealed offer payload');
     }
     const key = await secure.ensureKey(handshakeId);
-    log(logger, `derived Argon2 key for handshake ${handshakeId}: ${toHex(key)}`);
+    log(logger, `derived handshake key for ${handshakeId}: ${toHex(key)}`);
     cachedSecureKey = key;
     try {
       const plaintext = await openSdpWithKey({

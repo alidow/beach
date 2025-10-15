@@ -24,7 +24,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "cabana_sck")]
-mod sck;
+pub mod sck;
 #[cfg(not(feature = "cabana_sck"))]
 mod sck {
     pub fn stream_window(

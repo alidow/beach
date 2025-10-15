@@ -97,6 +97,7 @@ const STATUS_META: Record<
 
 const BOUNDARY_PADDING = 16;
 const DOCK_MARGIN = 24;
+const MIN_TOOLBAR_WIDTH = 320;
 
 interface Position {
   top: number;
@@ -160,15 +161,18 @@ export default function App(): JSX.Element {
 
     if (toolbarElement) {
       const rect = toolbarElement.getBoundingClientRect();
-      panelSize = { width: rect.width, height: rect.height };
+      const width = Math.max(rect.width, toolbarElement.scrollWidth);
+      const height = Math.max(rect.height, toolbarElement.scrollHeight);
+      panelSize = { width, height };
       toolbarSizeRef.current = panelSize;
     }
 
     if (!panelSize) {
-      const fallbackWidth = Math.max(200, Math.min(shellRect.width - BOUNDARY_PADDING * 2, 768));
+      const fallbackWidth = Math.max(320, Math.min(shellRect.width - BOUNDARY_PADDING * 2, 768));
+      const fallbackHeight = Math.max(120, shellRect.height * 0.25);
       panelSize = {
         width: Number.isFinite(fallbackWidth) ? fallbackWidth : shellRect.width,
-        height: 0,
+        height: Number.isFinite(fallbackHeight) ? fallbackHeight : shellRect.height / 3,
       };
     }
 
@@ -409,15 +413,21 @@ export default function App(): JSX.Element {
     layoutMetricsRef.current != null
       ? Math.max(Math.floor(layoutMetricsRef.current.shellRect.width - BOUNDARY_PADDING * 2), 0)
       : null;
-  const resolvedWidthPx =
-    measuredWidthPx !== null && availableWidth !== null
-      ? Math.min(measuredWidthPx, availableWidth)
-      : measuredWidthPx ?? availableWidth ?? null;
+  let resolvedWidthPx: number | null = null;
+  if (availableWidth !== null) {
+    const effectiveMin = Math.min(MIN_TOOLBAR_WIDTH, availableWidth);
+    const candidate = measuredWidthPx ?? effectiveMin;
+    resolvedWidthPx = Math.max(candidate, effectiveMin);
+    resolvedWidthPx = Math.min(resolvedWidthPx, availableWidth);
+  } else if (measuredWidthPx !== null) {
+    resolvedWidthPx = Math.max(measuredWidthPx, MIN_TOOLBAR_WIDTH);
+  }
   const toolbarWrapperStyle: CSSProperties = {
     top: baseToolbarPosition.top,
     left: baseToolbarPosition.left,
     visibility: toolbarPosition ? 'visible' : 'hidden',
     width: resolvedWidthPx !== null && resolvedWidthPx > 0 ? `${resolvedWidthPx}px` : undefined,
+    minWidth: resolvedWidthPx !== null && resolvedWidthPx > 0 ? `${resolvedWidthPx}px` : undefined,
   };
   const toolbarWrapperClass = cn(
     'pointer-events-none absolute',
@@ -483,7 +493,7 @@ export default function App(): JSX.Element {
                     userSelect: isDragging ? 'none' : undefined,
                   }}
                 >
-                  <div className="flex flex-wrap items-center gap-2 gap-y-2">
+                  <div className="flex items-center gap-2">
                     <span
                       className={cn(
                         'inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold',

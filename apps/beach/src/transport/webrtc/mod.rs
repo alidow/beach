@@ -52,8 +52,8 @@ use secure_handshake::{
     build_prologue_context, handshake_channel_init, run_handshake, secure_transport_enabled,
 };
 use secure_signaling::{
-    MessageLabel, SealedEnvelope, derive_pre_shared_key, open_message, open_message_with_psk,
-    seal_message, seal_message_with_psk, should_encrypt,
+    MessageLabel, SealedEnvelope, derive_handshake_key_from_session, derive_pre_shared_key,
+    open_message, open_message_with_psk, seal_message, seal_message_with_psk, should_encrypt,
 };
 use signaling::{PeerRole, RemotePeerEvent, RemotePeerJoined, SignalingClient, WebRTCSignal};
 
@@ -750,6 +750,8 @@ struct OffererInner {
     signaling_base: String,
     poll_interval: Duration,
     passphrase: Option<String>,
+    session_id: Option<String>,
+    session_base_key: OnceCell<Arc<[u8; 32]>>,
     accepted_tx: tokio_mpsc::UnboundedSender<OffererAcceptedTransport>,
     peer_tasks: AsyncMutex<HashMap<String, PeerNegotiatorHandle>>,
     peer_states: AsyncMutex<HashMap<String, PeerLifecycleState>>,
@@ -784,6 +786,7 @@ impl OffererSupervisor {
         .await?;
         let client = Client::new();
         let signaling_base = signaling_url.trim_end_matches('/').to_string();
+        let session_id = extract_session_id(&signaling_base);
         let (accepted_tx, accepted_rx) = tokio_mpsc::unbounded_channel();
 
         let inner = Arc::new(OffererInner {
@@ -792,6 +795,8 @@ impl OffererSupervisor {
             signaling_base,
             poll_interval,
             passphrase: passphrase.map(|p| p.to_string()),
+            session_id,
+            session_base_key: OnceCell::new(),
             accepted_tx,
             peer_tasks: AsyncMutex::new(HashMap::new()),
             peer_states: AsyncMutex::new(HashMap::new()),
@@ -825,6 +830,34 @@ impl OffererSupervisor {
 }
 
 impl OffererInner {
+    async fn session_base_key(&self) -> Result<Option<Arc<[u8; 32]>>, TransportError> {
+        if !secure_transport_enabled() {
+            return Ok(None);
+        }
+        let passphrase = match &self.passphrase {
+            Some(passphrase) if should_encrypt(Some(passphrase.as_str())) => passphrase,
+            _ => return Ok(None),
+        };
+        let session_id = match &self.session_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        if let Some(existing) = self.session_base_key.get() {
+            return Ok(Some(existing.clone()));
+        }
+        let passphrase_owned = passphrase.clone();
+        let session_id_owned = session_id.clone();
+        let cell = &self.session_base_key;
+        let result = tokio::task::spawn_blocking(move || {
+            derive_pre_shared_key(passphrase_owned.as_str(), session_id_owned.as_str())
+        })
+        .await
+        .map_err(|err| TransportError::Setup(format!("session psk task failed: {err}")))??;
+        let arc_key = Arc::new(result);
+        let _ = cell.set(arc_key.clone());
+        Ok(cell.get().map(|key| key.clone()))
+    }
+
     fn start_event_loop(
         inner: Arc<Self>,
         mut remote_events: tokio_mpsc::UnboundedReceiver<RemotePeerEvent>,
@@ -1106,10 +1139,12 @@ async fn negotiate_offerer_peer(
     let handshake_id = Uuid::new_v4().to_string();
     let handshake_id_arc = Arc::new(handshake_id.clone());
     let pre_shared_key_cell = Arc::new(OnceCell::<Arc<[u8; 32]>>::new());
+    let session_base_key = inner.session_base_key().await?;
     prime_pre_shared_key(
         &pre_shared_key_cell,
         inner.passphrase.as_deref(),
         &handshake_id,
+        session_base_key.clone(),
     );
     let peer_id = peer.id.clone();
     let peer_id_for_candidates = peer_id.clone();
@@ -1314,6 +1349,7 @@ async fn negotiate_offerer_peer(
         &pre_shared_key_cell,
         inner.passphrase.as_deref(),
         &handshake_id,
+        session_base_key.clone(),
     )
     .await?;
     let payload = payload_from_description(
@@ -1694,11 +1730,23 @@ async fn connect_answerer(
     label: Option<&str>,
 ) -> Result<WebRtcConnection, TransportError> {
     let passphrase_owned = passphrase.map(|s| s.to_string());
+    let session_id = extract_session_id(signaling_url);
     let secure_transport_active = secure_transport_enabled()
         && passphrase_owned
             .as_ref()
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false);
+    let session_base_key = if secure_transport_active {
+        if let (Some(passphrase_value), Some(session_value)) =
+            (passphrase_owned.as_ref(), session_id.as_ref())
+        {
+            Some(derive_session_base_key(passphrase_value, session_value).await?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let (secure_tx, secure_rx) =
         oneshot::channel::<Result<Option<Arc<HandshakeResult>>, TransportError>>();
     let secure_sender = Arc::new(AsyncMutex::new(Some(secure_tx)));
@@ -1793,11 +1841,13 @@ async fn connect_answerer(
         &pre_shared_key_cell,
         passphrase_owned.as_deref(),
         &offer_payload.handshake_id,
+        session_base_key.clone(),
     );
     let shared_key = await_pre_shared_key(
         &pre_shared_key_cell,
         passphrase_owned.as_deref(),
         &offer_payload.handshake_id,
+        session_base_key.clone(),
     )
     .await?;
     let offer_desc = session_description_from_payload(
@@ -2538,18 +2588,59 @@ async fn fetch_sdp(
     }
 }
 
+async fn derive_session_base_key(
+    passphrase: &str,
+    session_id: &str,
+) -> Result<Arc<[u8; 32]>, TransportError> {
+    let passphrase_owned = passphrase.to_string();
+    let session_owned = session_id.to_string();
+    let key = tokio::task::spawn_blocking(move || {
+        derive_pre_shared_key(passphrase_owned.as_str(), session_owned.as_str())
+    })
+    .await
+    .map_err(|err| TransportError::Setup(format!("session psk task failed: {err}")))??;
+    Ok(Arc::new(key))
+}
+
+fn extract_session_id(signaling_base: &str) -> Option<String> {
+    if let Ok(url) = Url::parse(signaling_base) {
+        let mut segments = url.path_segments()?;
+        let first = segments.next()?;
+        if first != "sessions" {
+            return None;
+        }
+        segments.next().map(|s| s.to_string())
+    } else {
+        let trimmed = signaling_base.trim_start_matches(['h', 't', 'p', 's', ':', '/']);
+        let parts: Vec<&str> = trimmed.split('/').collect();
+        if parts.len() >= 3 && parts[1] == "sessions" {
+            return Some(parts[2].to_string());
+        }
+        None
+    }
+}
+
 fn prime_pre_shared_key(
     cell: &Arc<OnceCell<Arc<[u8; 32]>>>,
     passphrase: Option<&str>,
     handshake_id: &str,
+    session_base_key: Option<Arc<[u8; 32]>>,
 ) {
+    if cell.get().is_some() {
+        return;
+    }
+    if let Some(base_key) = session_base_key {
+        if let Ok(handshake_key) =
+            derive_handshake_key_from_session(base_key.as_ref(), handshake_id)
+        {
+            let _ = cell.set(Arc::new(handshake_key));
+        }
+        return;
+    }
     let Some(passphrase_value) = passphrase else {
         return;
     };
     if !should_encrypt(Some(passphrase_value)) {
-        return;
-    }
-    if cell.get().is_some() {
         return;
     }
     let passphrase_owned = passphrase_value.to_string();
@@ -2596,15 +2687,22 @@ async fn await_pre_shared_key(
     cell: &Arc<OnceCell<Arc<[u8; 32]>>>,
     passphrase: Option<&str>,
     handshake_id: &str,
+    session_base_key: Option<Arc<[u8; 32]>>,
 ) -> Result<Option<Arc<[u8; 32]>>, TransportError> {
+    if let Some(existing) = cell.get() {
+        return Ok(Some(existing.clone()));
+    }
+    if let Some(base_key) = session_base_key {
+        let derived = derive_handshake_key_from_session(base_key.as_ref(), handshake_id)?;
+        let arc_key = Arc::new(derived);
+        let _ = cell.set(arc_key.clone());
+        return Ok(Some(arc_key));
+    }
     let Some(passphrase_value) = passphrase else {
         return Ok(None);
     };
     if !should_encrypt(Some(passphrase_value)) {
         return Ok(None);
-    }
-    if let Some(existing) = cell.get() {
-        return Ok(Some(existing.clone()));
     }
     let passphrase_owned = passphrase_value.to_string();
     let handshake_owned = handshake_id.to_string();

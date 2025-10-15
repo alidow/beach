@@ -17,7 +17,7 @@ pub trait FrameProducer {
 }
 
 #[cfg(target_os = "macos")]
-pub type BoxedProducer = Box<dyn FrameProducer + Send>;
+pub type BoxedProducer = Box<dyn FrameProducer>;
 
 #[cfg(target_os = "macos")]
 pub mod macos;

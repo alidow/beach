@@ -1,19 +1,20 @@
 use crate::capture::{Frame, PixelFormat};
 use crate::platform::WindowApiError;
+use core_foundation::base::TCFType;
 use core_media::sample_buffer::{CMSampleBuffer, CMSampleBufferRef};
 use core_media::time::CMTime;
-use core_video::pixel_buffer::{CVPixelBuffer, CVPixelBufferLockFlags, kCVPixelFormatType_32BGRA};
+use core_video::pixel_buffer::{CVPixelBuffer, kCVPixelFormatType_32BGRA};
 use core_video::r#return::kCVReturnSuccess;
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender};
 use dispatch2::{Queue, QueueAttribute};
 use image::{ImageBuffer, Rgba};
 use objc2::{
     declare_class, msg_send_id, mutability,
-    rc::{Allocated, Id},
+    rc::Id,
     runtime::ProtocolObject,
     ClassType, DeclaredClass,
 };
-use objc2_foundation::{geometry::CGSize, NSArray, NSError, NSObject, NSObjectProtocol};
+use objc2_foundation::{CGRect, CGSize, NSArray, NSError, NSObject, NSObjectProtocol};
 use screen_capture_kit::{
     shareable_content::{SCDisplay, SCShareableContent, SCWindow},
     stream::{
@@ -22,7 +23,6 @@ use screen_capture_kit::{
     },
 };
 use std::env;
-use std::ffi::c_void;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -81,16 +81,6 @@ declare_class!(
         }
     }
 
-    unsafe impl StreamDelegate {
-        #[method_id(init)]
-        fn init(this: Allocated<Self>) -> Option<Id<Self>> {
-            // This initializer should not be called directly; use `with_sender`.
-            let this = this.set_ivars(StreamDelegateIvars {
-                sender: unbounded().0,
-            });
-            unsafe { msg_send_id![super(this), init] }
-        }
-    }
 );
 
 impl StreamDelegate {
@@ -246,9 +236,11 @@ fn select_target(
             .parse()
             .map_err(|_| WindowApiError::InvalidIdentifier(target.to_string()))?;
         let displays = content.displays();
-        for display in displays.to_vec() {
-            if display.display_id() == id {
-                return Ok(build_display_selection(&display));
+        for index in 0..displays.len() {
+            if let Some(display) = displays.get(index) {
+                if display.display_id() == id {
+                    return Ok(build_display_selection(display));
+                }
             }
         }
         return Err(WindowApiError::InvalidIdentifier(format!(
@@ -261,9 +253,11 @@ fn select_target(
         .parse()
         .map_err(|_| WindowApiError::InvalidIdentifier(target.to_string()))?;
     let windows = content.windows();
-    for window in windows.to_vec() {
-        if window.window_id() == window_id {
-            return Ok(build_window_selection(&window));
+    for index in 0..windows.len() {
+        if let Some(window) = windows.get(index) {
+            if window.window_id() == window_id {
+                return Ok(build_window_selection(window));
+            }
         }
     }
 
@@ -276,7 +270,8 @@ fn select_target(
 fn build_window_selection(window: &SCWindow) -> TargetSelection {
     let filter =
         SCContentFilter::init_with_desktop_independent_window(SCContentFilter::alloc(), window);
-    let configuration = make_configuration(window_frame_size(window.frame()));
+    let frame: CGRect = window.frame();
+    let configuration = make_configuration(frame.size);
     TargetSelection { filter, configuration }
 }
 
@@ -284,16 +279,11 @@ fn build_display_selection(display: &SCDisplay) -> TargetSelection {
     let empty = NSArray::new();
     let filter =
         SCContentFilter::init_with_display_exclude_windows(SCContentFilter::alloc(), display, &empty);
-    let configuration = make_configuration(display_surface(display));
+    let configuration = make_configuration(CGSize::new(
+        display.width() as f64,
+        display.height() as f64,
+    ));
     TargetSelection { filter, configuration }
-}
-
-fn window_frame_size(frame: screen_capture_kit::shareable_content::CGRect) -> CGSize {
-    frame.size
-}
-
-fn display_surface(display: &SCDisplay) -> CGSize {
-    CGSize::new(display.width() as f64, display.height() as f64)
 }
 
 fn make_configuration(size: CGSize) -> Id<SCStreamConfiguration> {
@@ -341,7 +331,7 @@ fn convert_pixel_buffer(pixel_buffer: &CVPixelBuffer) -> Result<Frame, String> {
         return Err("pixel buffer has empty dimensions".into());
     }
 
-    let status = pixel_buffer.lock_base_address(CVPixelBufferLockFlags::default());
+    let status = pixel_buffer.lock_base_address(0);
     if status != kCVReturnSuccess {
         return Err(format!("lock_base_address failed: {}", status));
     }
@@ -369,7 +359,7 @@ fn convert_pixel_buffer(pixel_buffer: &CVPixelBuffer) -> Result<Frame, String> {
         }
     };
 
-    let _ = pixel_buffer.unlock_base_address(CVPixelBufferLockFlags::default());
+    let _ = pixel_buffer.unlock_base_address(0);
     result
 }
 
@@ -397,7 +387,7 @@ pub fn stream_window(
         ));
     }
 
-    let mut stream = SckStream::new(target)?;
+    let stream = SckStream::new(target)?;
 
     let base_dir = if let Some(dir) = output_dir {
         dir

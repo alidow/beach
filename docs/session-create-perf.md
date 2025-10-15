@@ -12,19 +12,19 @@
 
 ## Plan
 1. **Shared Key Cell**
-   - Introduce a `tokio::sync::OnceCell<Arc<[u8; 32]>>` per handshake to store the derived key.
-   - Spawn a background task as soon as the handshake ID is created to fill the cell with `derive_pre_shared_key` output.
+   - ✅ Added a session-scoped `OnceCell<Arc<[u8; 32]>>` so we only stretch the passphrase once per session.
+   - ✅ Handshake-specific keys now fan out from this cached base via HKDF, eliminating duplicate Argon2 work.
 
 2. **Async Derivation Helper**
-   - Wrap the Argon2 call in `tokio::task::spawn_blocking` to avoid tying up the async runtime thread.
-   - Surface errors as `TransportError::Setup` so existing callers handle failures uniformly.
+   - ✅ Session-level stretches now run inside `spawn_blocking`, keeping the async runtime responsive.
+   - ✅ Failures propagate as `TransportError::Setup`, preserving existing error handling.
 
 3. **Payload Sealing Updates**
-   - Extend `payload_from_description` to accept an optional precomputed key.
-   - For secure sessions, await the cell before sealing; fall back to on-demand derivation only if the cell is empty.
+   - ✅ `payload_from_description`/`session_description_from_payload` accept precomputed keys and reuse them across offer/answer paths.
+   - ✅ ICE candidate sealing/decryption now taps the cached handshake key as well.
 
 4. **Answer Path Reuse**
-   - Plumb the shared key through both the offer and answer code paths so we never recompute within the same handshake.
+   - ✅ Answer-side signaling and ICE decryption reuse the cached session key, skipping redundant Argon2 work.
 
 5. **Diagnostics**
-   - Add tracing around the background derivation to confirm overlaps with the rest of the negotiation pipeline.
+   - ✅ Added trace markers (`via: 'session_base'`) to confirm when cached material is used.

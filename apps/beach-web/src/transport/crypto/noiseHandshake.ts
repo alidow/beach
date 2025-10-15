@@ -159,12 +159,36 @@ function createHandshake(
     role === 'initiator'
       ? noise.constants.NOISE_ROLE_INITIATOR
       : noise.constants.NOISE_ROLE_RESPONDER;
-  console.log('[DEBUG] noise module:', noise);
-  console.log('[DEBUG] noise.HandshakeState:', noise.HandshakeState);
-  console.log('[DEBUG] noise.constants:', noise.constants);
-  console.log('[DEBUG] PROTOCOL_NAME:', PROTOCOL_NAME);
-  console.log('[DEBUG] roleConstant:', roleConstant);
-  const handshake = new noise.HandshakeState(PROTOCOL_NAME, roleConstant);
+  const exportKeys = Object.keys(noise as unknown as Record<string, unknown>);
+  console.debug('[beach-web][noise] createHandshake', {
+    protocol: PROTOCOL_NAME,
+    role,
+    roleConstant,
+    exportKeys,
+    constants: noise.constants,
+    handshakeStateType: typeof (noise as unknown as Record<string, unknown>).HandshakeState,
+    patterns: (noise as unknown as Record<string, unknown>).HandshakePatterns ?? null,
+  });
+  let handshake: NoiseHandshake;
+  try {
+    handshake = new noise.HandshakeState(PROTOCOL_NAME, roleConstant);
+  } catch (error) {
+    console.error('[beach-web][noise] HandshakeState construction failed', {
+      protocol: PROTOCOL_NAME,
+      role,
+      roleConstant,
+      exportKeys,
+      constants: noise.constants,
+      patterns: (noise as unknown as Record<string, unknown>).HandshakePatterns ?? null,
+      error,
+    });
+    throw error;
+  }
+  console.debug('[beach-web][noise] HandshakeState constructed', {
+    protocol: PROTOCOL_NAME,
+    role,
+    roleConstant,
+  });
   handshake.Initialize(prologue, null, null, psk);
   return handshake;
 }
@@ -401,6 +425,10 @@ async function loadNoise(): Promise<NoiseModule> {
   if (!noiseModulePromise) {
     noiseModulePromise = (async () => {
       const wasmBinary = await resolveWasmBinary();
+      console.debug('[beach-web][noise] resolveWasmBinary result', {
+        providedBinary: Boolean(wasmBinary),
+        environment: typeof window === 'undefined' ? 'node' : 'browser',
+      });
       return await new Promise<NoiseModule>((resolve, reject) => {
         try {
           const options: { locateFile: (path: string) => string; wasmBinary?: Uint8Array } = {
@@ -408,10 +436,21 @@ async function loadNoise(): Promise<NoiseModule> {
           };
           if (wasmBinary) {
             options.wasmBinary = wasmBinary;
+            console.debug('[beach-web][noise] supplying wasmBinary bytes', {
+              byteLength: wasmBinary.byteLength,
+            });
           }
           createNoiseModule(options, (module) => {
             try {
-              resolve(module as NoiseModule);
+              const typed = module as NoiseModule;
+              const exports = Object.keys(module as unknown as Record<string, unknown>);
+              console.debug('[beach-web][noise] module resolved', {
+                exportKeys: exports,
+                hasHandshakeState: typeof (module as unknown as Record<string, unknown>).HandshakeState,
+                constants: typed.constants,
+                patterns: (module as unknown as Record<string, unknown>).HandshakePatterns ?? null,
+              });
+              resolve(typed);
             } catch (error) {
               reject(error);
             }
@@ -439,9 +478,11 @@ async function resolveWasmBinary(): Promise<Uint8Array | undefined> {
       : new URL('../../../../../node_modules/noise-c.wasm/src/noise-c.wasm', import.meta.url).toString();
     const fileUrl = new URL(resolvedUrl);
     const filePath = fileURLToPath(fileUrl);
+    console.debug('[beach-web][noise] resolved wasm file path', { filePath });
     const buffer = readFileSync(filePath);
     return new Uint8Array(buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength));
-  } catch {
+  } catch (error) {
+    console.error('[beach-web][noise] resolveWasmBinary failed', error);
     return undefined;
   }
 }

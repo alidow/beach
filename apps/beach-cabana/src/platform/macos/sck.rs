@@ -22,6 +22,7 @@ use screen_capture_kit::{
         SCStreamOutputType,
     },
 };
+use tracing::{debug, info, warn};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -104,7 +105,13 @@ pub struct SckStream {
 
 impl SckStream {
     pub fn new(target: &str) -> Result<Self, WindowApiError> {
+        info!(target, "initializing ScreenCaptureKit stream");
         let content = fetch_shareable_content()?;
+        debug!(
+            window_count = content.windows().len(),
+            display_count = content.displays().len(),
+            "shareable content enumerated"
+        );
         let selection = select_target(&content, target)?;
 
         let (sender, receiver) = unbounded();
@@ -117,12 +124,14 @@ impl SckStream {
             &selection.configuration,
             delegate_ref,
         );
+        info!("SCStream created; registering output");
 
         let queue = Queue::new("com.beach.cabana.sck", QueueAttribute::Serial);
         let output = ProtocolObject::from_ref(&*delegate);
         stream
             .add_stream_output(output, SCStreamOutputType::Screen, &queue)
             .map_err(|err| WindowApiError::CaptureFailed(format!("add_stream_output failed: {:?}", err)))?;
+        debug!("stream output registered");
 
         let (start_tx, start_rx) = bounded::<Option<String>>(1);
         stream.start_capture(move |error| {
@@ -133,20 +142,25 @@ impl SckStream {
         match start_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Some(message)) => {
                 let _ = stream.stop_capture(|_| {});
+                warn!(%message, "ScreenCaptureKit startCapture returned error");
                 return Err(WindowApiError::CaptureFailed(format!(
                     "ScreenCaptureKit startCapture failed: {}",
                     message
                 )));
             }
-            Ok(None) => {}
+            Ok(None) => {
+                info!("ScreenCaptureKit startCapture succeeded");
+            }
             Err(RecvTimeoutError::Timeout) => {
                 let _ = stream.stop_capture(|_| {});
+                warn!("ScreenCaptureKit startCapture timed out");
                 return Err(WindowApiError::CaptureFailed(
                     "ScreenCaptureKit startCapture timed out".into(),
                 ));
             }
             Err(RecvTimeoutError::Disconnected) => {
                 let _ = stream.stop_capture(|_| {});
+                warn!("ScreenCaptureKit startCapture channel closed unexpectedly");
                 return Err(WindowApiError::CaptureFailed(
                     "ScreenCaptureKit startCapture channel closed unexpectedly".into(),
                 ));
@@ -171,9 +185,12 @@ impl SckStream {
             Ok(StreamEvent::Stopped) => Err(WindowApiError::CaptureFailed(
                 "ScreenCaptureKit stream stopped".into(),
             )),
-            Err(RecvTimeoutError::Timeout) => Err(WindowApiError::CaptureFailed(
-                "ScreenCaptureKit frame timeout".into(),
-            )),
+            Err(RecvTimeoutError::Timeout) => {
+                warn!("ScreenCaptureKit frame receive timed out");
+                Err(WindowApiError::CaptureFailed(
+                    "ScreenCaptureKit frame timeout".into(),
+                ))
+            }
             Err(RecvTimeoutError::Disconnected) => Err(WindowApiError::CaptureFailed(
                 "ScreenCaptureKit stream disconnected".into(),
             )),
@@ -268,9 +285,25 @@ fn select_target(
 }
 
 fn build_window_selection(window: &SCWindow) -> TargetSelection {
+    let frame: CGRect = window.frame();
+    debug!(
+        window_id = window.window_id(),
+        width = frame.size.width,
+        height = frame.size.height,
+        x = frame.origin.x,
+        y = frame.origin.y,
+        "building ScreenCaptureKit window selection"
+    );
+    if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
+        warn!(
+            window_id = window.window_id(),
+            width = frame.size.width,
+            height = frame.size.height,
+            "window has non-positive dimensions; ScreenCaptureKit may fail"
+        );
+    }
     let filter =
         SCContentFilter::init_with_desktop_independent_window(SCContentFilter::alloc(), window);
-    let frame: CGRect = window.frame();
     let configuration = make_configuration(frame.size);
     TargetSelection { filter, configuration }
 }
@@ -289,6 +322,7 @@ fn build_display_selection(display: &SCDisplay) -> TargetSelection {
 fn make_configuration(size: CGSize) -> Id<SCStreamConfiguration> {
     let width = size.width.max(1.0).round() as usize;
     let height = size.height.max(1.0).round() as usize;
+    debug!(width, height, "configuring ScreenCaptureKit stream dimensions");
 
     let configuration = SCStreamConfiguration::new();
     configuration.set_width(width);

@@ -162,6 +162,7 @@ export class TerminalGridCache {
   private serverCursorRow: number | null = null;
   private serverCursorCol: number | null = null;
   private serverCursorMinCol: number | null = null;
+  private rowCursorFloors = new Map<number, number>();
   private predictedCursor: PredictedCursorState | null = null;
   private firstCursorReceived = false;
   private pendingInitialCursor: { visible: boolean; blink: boolean } | null = null;
@@ -332,6 +333,7 @@ export class TerminalGridCache {
     this.serverCursorRow = null;
     this.serverCursorCol = null;
     this.serverCursorMinCol = null;
+    this.rowCursorFloors.clear();
     this.predictedCursor = null;
     this.pendingInitialCursor = null;
     this.predictions.clear();
@@ -377,8 +379,10 @@ export class TerminalGridCache {
     if (baseRow === this.baseRow) {
       return false;
     }
+    const previousBase = this.baseRow;
     if (this.rows.length === 0) {
       this.baseRow = baseRow;
+      this.pruneRowCursorFloorsBelow(this.baseRow);
       return true;
     }
     let mutated = false;
@@ -405,6 +409,7 @@ export class TerminalGridCache {
       const newRows: RowSlot[] = [];
       for (let absolute = baseRow; absolute < this.baseRow; absolute += 1) {
         newRows.push(createPendingRow(absolute));
+        this.clearRowCursorFloor(absolute);
       }
       this.rows = newRows.concat(this.rows);
       this.baseRow = baseRow;
@@ -413,6 +418,12 @@ export class TerminalGridCache {
     this.trimToCapacity();
     this.reindexRows();
     this.clampCursor();
+    this.pruneRowCursorFloorsBelow(this.baseRow);
+    if (baseRow < previousBase) {
+      for (let absolute = baseRow; absolute < previousBase; absolute += 1) {
+        this.clearRowCursorFloor(absolute);
+      }
+    }
     return mutated;
   }
 
@@ -497,6 +508,7 @@ export class TerminalGridCache {
     this.ensureRowRange(absolute, absolute + 1);
     const index = absolute - this.baseRow;
     const existing = this.rows[index];
+    this.clearRowCursorFloor(absolute);
     if (existing && existing.kind === 'pending') {
       return false;
     }
@@ -512,6 +524,7 @@ export class TerminalGridCache {
     this.ensureRowRange(absolute, absolute + 1);
     const index = absolute - this.baseRow;
     const existing = this.rows[index];
+    this.clearRowCursorFloor(absolute);
     if (existing && existing.kind === 'missing') {
       return false;
     }
@@ -533,6 +546,7 @@ export class TerminalGridCache {
         this.rows[index] = createPendingRow(absolute);
         mutated = true;
       }
+      this.clearRowCursorFloor(absolute);
     }
     return mutated;
   }
@@ -739,6 +753,7 @@ export class TerminalGridCache {
       this.serverCursorRow = null;
       this.serverCursorCol = null;
       this.serverCursorMinCol = null;
+      this.rowCursorFloors.clear();
       this.predictedCursor = null;
       this.pendingInitialCursor = null;
     }
@@ -936,11 +951,36 @@ export class TerminalGridCache {
     return false;
   }
 
-  private minimumServerColumn(row: number): number {
-    if (this.serverCursorRow === row && this.serverCursorMinCol !== null) {
-      return this.serverCursorMinCol;
+  private updateRowCursorFloor(row: number): void {
+    if (row < this.baseRow) {
+      return;
     }
-    return 0;
+    const floor = this.committedRowWidth(row);
+    if (floor > 0) {
+      this.rowCursorFloors.set(row, floor);
+    } else {
+      this.rowCursorFloors.delete(row);
+    }
+  }
+
+  private clearRowCursorFloor(row: number): void {
+    this.rowCursorFloors.delete(row);
+  }
+
+  private pruneRowCursorFloorsBelow(row: number): void {
+    for (const key of Array.from(this.rowCursorFloors.keys())) {
+      if (key < row) {
+        this.rowCursorFloors.delete(key);
+      }
+    }
+  }
+
+  private minimumServerColumn(row: number): number {
+    const floor = this.rowCursorFloors.get(row) ?? 0;
+    if (this.serverCursorRow === row && this.serverCursorMinCol !== null) {
+      return Math.max(floor, this.serverCursorMinCol);
+    }
+    return floor;
   }
 
   private discardPredictionsFromColumn(row: number, col: number, reason: string): boolean {
@@ -965,6 +1005,14 @@ export class TerminalGridCache {
     }
     if (mutated) {
       this.predictiveLog('prediction_trim_apply', { row, col, reason });
+    }
+    if (reason === 'cursor_clamp') {
+      if (col > 0) {
+        const existing = this.rowCursorFloors.get(row) ?? 0;
+        this.rowCursorFloors.set(row, Math.max(existing, col));
+      } else {
+        this.rowCursorFloors.delete(row);
+      }
     }
     return mutated;
   }
@@ -1104,11 +1152,16 @@ export class TerminalGridCache {
       loaded.logicalWidth = Math.max(loaded.logicalWidth, col + 1);
       this.touchRow(row);
       this.maybeRevealPendingCursor();
+      this.updateRowCursorFloor(row);
       return true;
     }
     const viewportMoved = this.touchRow(row);
     this.maybeRevealPendingCursor();
-    return mutated || viewportMoved;
+    const changed = mutated || viewportMoved;
+    if (changed) {
+      this.updateRowCursorFloor(row);
+    }
+    return changed;
   }
 
   private applyRow(row: number, seq: number, cells: number[]): boolean {
@@ -1165,7 +1218,11 @@ export class TerminalGridCache {
     loaded.logicalWidth = allSpaces ? 0 : logical;
     const viewportMoved = this.touchRow(row);
     this.maybeRevealPendingCursor();
-    return mutated || viewportMoved;
+    const changed = mutated || viewportMoved;
+    if (changed) {
+      this.updateRowCursorFloor(row);
+    }
+    return changed;
   }
 
   private applyRowSegment(row: number, startCol: number, seq: number, cells: number[]): boolean {
@@ -1216,7 +1273,11 @@ export class TerminalGridCache {
     loaded.latestSeq = Math.max(loaded.latestSeq, seq);
     const viewportMoved = this.touchRow(row);
     this.maybeRevealPendingCursor();
-    return mutated || viewportMoved;
+    const changed = mutated || viewportMoved;
+    if (changed) {
+      this.updateRowCursorFloor(row);
+    }
+    return changed;
   }
 
   private applyRect(rowRange: [number, number], colRange: [number, number], seq: number, packed: number): boolean {
@@ -1251,6 +1312,7 @@ export class TerminalGridCache {
       const viewportMoved = this.touchRow(row);
       this.maybeRevealPendingCursor();
       mutated = mutated || viewportMoved;
+      this.updateRowCursorFloor(row);
     }
     return mutated;
   }
@@ -1269,6 +1331,9 @@ export class TerminalGridCache {
     if (removalStart < removalEnd) {
       const startIndex = removalStart - this.baseRow;
       const removeCount = removalEnd - removalStart;
+      for (let absolute = removalStart; absolute < removalEnd; absolute += 1) {
+        this.clearRowCursorFloor(absolute);
+      }
       this.rows.splice(startIndex, removeCount);
       mutated = removeCount > 0;
     }
@@ -1291,6 +1356,7 @@ export class TerminalGridCache {
     }
     this.reindexRows();
     this.clampCursor();
+    this.pruneRowCursorFloorsBelow(this.baseRow);
     mutated = this.prunePredictionsBelow(this.baseRow) || mutated;
     return mutated;
   }
@@ -1898,13 +1964,16 @@ export class TerminalGridCache {
   private trimToCapacity(): boolean {
     let mutated = false;
     while (this.rows.length > this.maxHistory) {
+      const removedAbsolute = this.baseRow;
       this.rows.shift();
+      this.clearRowCursorFloor(removedAbsolute);
       this.baseRow += 1;
       this.historyTrimmed = true;
       mutated = true;
     }
     if (mutated) {
       this.prunePredictionsBelow(this.baseRow);
+      this.pruneRowCursorFloorsBelow(this.baseRow);
     }
     return mutated;
   }

@@ -263,6 +263,38 @@ describe('TerminalGridCache cursor hints', () => {
     expect(snapshot.predictedCursor?.col).toBe(prompt.length);
   });
 
+  it('keeps prompt floor after cursor resets to column zero', () => {
+    const cache = new TerminalGridCache({ initialCols: 80 });
+    cache.setGridSize(2, 80);
+    const prompt = '(base) host %';
+    cache.enableCursorSupport(true);
+    cache.applyUpdates(
+      [
+        {
+          type: 'row',
+          row: 1,
+          seq: 1,
+          cells: packString(prompt),
+        },
+      ],
+      { authoritative: true, cursor: { row: 1, col: prompt.length, seq: 2, visible: true, blink: true } },
+    );
+
+    cache.applyUpdates([], {
+      cursor: { row: 1, col: 0, seq: 3, visible: true, blink: true },
+    });
+
+    let snapshot = cache.snapshot();
+    expect(snapshot.cursorCol).toBe(0);
+
+    const changed = cache.registerPrediction(4, Uint8Array.from([0x7f]));
+    expect(changed).toBe(false);
+
+    snapshot = cache.snapshot();
+    expect(snapshot.hasPredictions).toBe(false);
+    expect(snapshot.cursorCol).toBe(0);
+  });
+
   it('resets cursor when a row segment of spaces clears the line', () => {
     const cache = new TerminalGridCache({ initialCols: 80 });
     cache.setGridSize(1, 80);

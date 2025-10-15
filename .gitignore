@@ -1,5 +1,6 @@
 # Rust
-/target/
+target/
+**/target/
 **/*.rs.bk
 *.pdb
 
@@ -33,3 +34,15 @@ sessions/
 # temp data
 tmp/
 temp/
+
+# Redis dumps
+*.rdb
+dump.rdb
+
+# Profiling
+*.profraw
+
+# Test artifacts
+playwright-report/
+test-results/
+.nyc_output/

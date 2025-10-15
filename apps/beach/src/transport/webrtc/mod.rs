@@ -2541,6 +2541,13 @@ fn payload_from_description(
                 &associated,
                 desc.sdp.as_bytes(),
             )?;
+            tracing::debug!(
+                target = "webrtc",
+                handshake_id = %handshake_id,
+                nonce = sealed.nonce,
+                ciphertext_len = sealed.ciphertext.len(),
+                "offer sealed envelope created"
+            );
             payload.sdp.clear();
             payload.sealed = Some(sealed);
         }

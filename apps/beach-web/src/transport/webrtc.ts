@@ -705,6 +705,11 @@ async function connectAsAnswerer(options: {
     logger,
   );
   log(logger, 'SDP offer received');
+  if (offer.sealed) {
+    log(logger, `offer sealed envelope ${JSON.stringify(offer.sealed)}`);
+  } else {
+    log(logger, 'offer not sealed (plaintext)');
+  }
   const handshakeId = offer.handshake_id;
   if (!handshakeId) {
     throw new Error('offer missing handshake_id');

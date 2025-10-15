@@ -1,7 +1,7 @@
 import createNoiseModule from 'noise-c.wasm';
 import noiseWasmUrl from 'noise-c.wasm/src/noise-c.wasm?url';
 
-import { derivePreSharedKey, hkdfExpand } from './sharedKey';
+import { derivePreSharedKey, hkdfExpand, toHex } from './sharedKey';
 
 interface NoiseConstants {
   NOISE_ROLE_INITIATOR: number;
@@ -37,13 +37,20 @@ interface NoiseModule {
   HandshakeState: new (protocolName: string, role: number) => NoiseHandshakeState;
 }
 
-const PROTOCOL_NAME = 'Noise_XXpsk0_25519_ChaChaPoly_BLAKE2s';
+const PROTOCOL_NAME = 'Noise_XX_25519_ChaChaPoly_BLAKE2s';
 const PROLOGUE_PREFIX = 'beach:secure-handshake:v1';
 const FIELD_SEPARATOR = 0x1f;
 const TRANSPORT_DIRECTION_PREFIX = 'beach:secure-transport:direction:';
 const TRANSPORT_VERIFY_PREFIX = 'beach:secure-transport:verify:';
+const TRANSPORT_CHALLENGE_KEY_PREFIX = 'beach:secure-transport:challenge-key:';
+const TRANSPORT_CHALLENGE_MAC_PREFIX = 'beach:secure-transport:challenge-mac:';
+const CHALLENGE_FRAME_VERSION = 1;
+const CHALLENGE_NONCE_LENGTH = 16;
+const CHALLENGE_MAC_LENGTH = 32;
+const CHALLENGE_FRAME_LENGTH = 1 + 1 + 6 + CHALLENGE_NONCE_LENGTH + CHALLENGE_MAC_LENGTH;
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 
 type NoiseHandshake = NoiseHandshakeState;
 
@@ -101,12 +108,12 @@ export async function runBrowserHandshake(
   const noise = await loadNoise();
   const psk = await resolvePreSharedKey(params);
   const prologue = buildPrologue(params.prologueContext);
-  const handshake = createHandshake(noise, params.role, prologue, psk);
+  const handshake = createHandshake(noise, params.role, prologue);
   const queue = new DataChannelQueue(channel);
 
   try {
     await driveHandshake(noise, handshake, queue, channel);
-    const handshakeHash = handshake.GetHandshakeHash();
+    const handshakeHash = new Uint8Array(handshake.GetHandshakeHash());
     const [sendCipher, recvCipher] = handshake.Split();
     // Immediately free the cipher states to avoid leaking WASM memory.
     try {
@@ -115,8 +122,29 @@ export async function runBrowserHandshake(
     try {
       recvCipher.free();
     } catch {}
-    const material = await deriveTransportMaterial(params, psk, handshakeHash);
-    return material;
+    const secrets = await deriveNoiseTransportSecrets({
+      handshakeHash,
+      psk,
+      handshakeId: params.handshakeId,
+      localPeerId: params.localPeerId,
+      remotePeerId: params.remotePeerId,
+    });
+    await performVerificationExchange({
+      channel,
+      queue,
+      role: params.role,
+      handshakeId: params.handshakeId,
+      localPeerId: params.localPeerId,
+      remotePeerId: params.remotePeerId,
+      verificationCode: secrets.verificationCode,
+      challengeKey: secrets.challengeKey,
+      challengeContext: secrets.challengeContext,
+    });
+    return {
+      sendKey: secrets.sendKey,
+      recvKey: secrets.recvKey,
+      verificationCode: secrets.verificationCode,
+    };
   } finally {
     queue.dispose();
     try {
@@ -153,7 +181,6 @@ function createHandshake(
   noise: NoiseModule,
   role: BrowserHandshakeRole,
   prologue: Uint8Array,
-  psk: Uint8Array,
 ): NoiseHandshake {
   const roleConstant =
     role === 'initiator'
@@ -189,7 +216,7 @@ function createHandshake(
     role,
     roleConstant,
   });
-  handshake.Initialize(prologue, null, null, psk);
+  handshake.Initialize(prologue, null, null, null);
   return handshake;
 }
 
@@ -224,45 +251,290 @@ async function driveHandshake(
   }
 }
 
-async function deriveTransportMaterial(
-  params: BrowserHandshakeParams,
-  psk: Uint8Array,
-  handshakeHash: Uint8Array,
-): Promise<BrowserHandshakeResult> {
+export interface NoiseTransportSecrets {
+  sendKey: Uint8Array;
+  recvKey: Uint8Array;
+  verificationCode: string;
+  challengeKey: Uint8Array;
+  challengeContext: Uint8Array;
+}
+
+interface TransportSecretsInput {
+  handshakeHash: Uint8Array;
+  psk: Uint8Array;
+  handshakeId: string;
+  localPeerId: string;
+  remotePeerId: string;
+}
+
+export async function deriveNoiseTransportSecrets(
+  input: TransportSecretsInput,
+): Promise<NoiseTransportSecrets> {
   const directionOut = encoder.encode(
-    `${TRANSPORT_DIRECTION_PREFIX}${params.localPeerId}->${params.remotePeerId}`,
+    `${TRANSPORT_DIRECTION_PREFIX}${input.localPeerId}->${input.remotePeerId}`,
   );
   const directionIn = encoder.encode(
-    `${TRANSPORT_DIRECTION_PREFIX}${params.remotePeerId}->${params.localPeerId}`,
+    `${TRANSPORT_DIRECTION_PREFIX}${input.remotePeerId}->${input.localPeerId}`,
   );
-  const peers = [params.localPeerId, params.remotePeerId].sort();
+
+  const peers = [input.localPeerId, input.remotePeerId].sort();
   const verifyLabel = encoder.encode(
     `${TRANSPORT_VERIFY_PREFIX}${peers[0]}|${peers[1]}`,
   );
 
-  const sendMaterial = await hkdfExpand(handshakeHash, psk, directionOut, 32);
-  const recvMaterial = await hkdfExpand(handshakeHash, psk, directionIn, 32);
-  const verifyBytes = await hkdfExpand(handshakeHash, psk, verifyLabel, 4);
+  const sendMaterial = await hkdfExpand(input.handshakeHash, input.psk, directionOut, 32);
+  const recvMaterial = await hkdfExpand(input.handshakeHash, input.psk, directionIn, 32);
+  const verifyBytes = await hkdfExpand(input.handshakeHash, input.psk, verifyLabel, 4);
   const code =
-    ((verifyBytes[0]! << 24) |
-      (verifyBytes[1]! << 16) |
-      (verifyBytes[2]! << 8) |
-      verifyBytes[3]!) >>>
+    ((verifyBytes[0]!) |
+      (verifyBytes[1]! << 8) |
+      (verifyBytes[2]! << 16) |
+      (verifyBytes[3]! << 24)) >>>
     0;
   const verificationCode = `${code % 1_000_000}`.padStart(6, '0');
 
-  if (params.role === 'initiator') {
-    return {
-      sendKey: sendMaterial,
-      recvKey: recvMaterial,
-      verificationCode,
-    };
-  }
+  const challengeInfo = encoder.encode(
+    `${TRANSPORT_CHALLENGE_KEY_PREFIX}${input.handshakeId}|${peers[0]}|${peers[1]}`,
+  );
+  const challengeKey = await hkdfExpand(input.handshakeHash, input.psk, challengeInfo, 32);
+  const challengeContext = encoder.encode(
+    `${TRANSPORT_CHALLENGE_MAC_PREFIX}${input.handshakeId}|${peers[0]}|${peers[1]}`,
+  );
+
   return {
     sendKey: sendMaterial,
     recvKey: recvMaterial,
     verificationCode,
+    challengeKey,
+    challengeContext,
   };
+}
+
+interface VerificationExchangeParams {
+  channel: RTCDataChannel;
+  queue: DataChannelQueue;
+  role: BrowserHandshakeRole;
+  handshakeId: string;
+  localPeerId: string;
+  remotePeerId: string;
+  verificationCode: string;
+  challengeKey: Uint8Array;
+  challengeContext: Uint8Array;
+}
+
+async function performVerificationExchange(params: VerificationExchangeParams): Promise<void> {
+  const codeBytes = encoder.encode(params.verificationCode);
+  if (codeBytes.length !== 6) {
+    throw new Error('verification code must be 6 characters');
+  }
+
+  const roleByte = params.role === 'initiator' ? 0 : 1;
+  const expectedRemoteRole = params.role === 'initiator' ? 1 : 0;
+  const baseDetails = {
+    handshakeId: params.handshakeId,
+    localPeerId: params.localPeerId,
+    remotePeerId: params.remotePeerId,
+    role: params.role,
+  };
+
+  const nonce = new Uint8Array(CHALLENGE_NONCE_LENGTH);
+  crypto.getRandomValues(nonce);
+
+  try {
+    const outboundFrame = await buildChallengeFrame({
+      roleByte,
+      codeBytes,
+      nonce,
+      challengeKey: params.challengeKey,
+      challengeContext: params.challengeContext,
+    });
+    params.channel.send(toArrayBuffer(outboundFrame));
+
+    const remotePayload = await params.queue.next();
+    const remoteFrame = parseChallengeFrame(remotePayload);
+
+    if (remoteFrame.version !== CHALLENGE_FRAME_VERSION) {
+      verificationFailure(baseDetails, 'secure handshake verification failed', {
+        case: 'unexpected-version',
+        observedVersion: remoteFrame.version,
+      });
+    }
+
+    if (remoteFrame.role !== expectedRemoteRole) {
+      verificationFailure(baseDetails, 'secure handshake verification failed', {
+        case: 'unexpected-role',
+        observedRole: remoteFrame.role,
+        expectedRole: expectedRemoteRole,
+      });
+    }
+
+    const expectedMac = await computeChallengeMac({
+      roleByte: remoteFrame.role,
+      codeBytes: remoteFrame.codeBytes,
+      nonce: remoteFrame.nonce,
+      challengeKey: params.challengeKey,
+      challengeContext: params.challengeContext,
+    });
+
+    if (!timingSafeEqual(remoteFrame.mac, expectedMac)) {
+      verificationFailure(baseDetails, 'secure handshake verification failed', {
+        case: 'mac-mismatch',
+        expectedMac: toHex(expectedMac),
+        observedMac: toHex(remoteFrame.mac),
+      });
+    }
+
+    const remoteCode = decoder.decode(remoteFrame.codeBytes);
+    if (remoteCode !== params.verificationCode) {
+      verificationFailure(baseDetails, 'secure handshake verification failed', {
+        case: 'verification-code-mismatch',
+        localCode: params.verificationCode,
+        remoteCode,
+      });
+    }
+  } catch (error) {
+    const details =
+      error instanceof Error && (error as any).verificationDetails
+        ? (error as any).verificationDetails
+        : {
+            ...baseDetails,
+            case: 'unexpected-error',
+            reason: error instanceof Error ? error.message : String(error),
+          };
+    console.warn('[beach-web][noise] post-handshake verification failed', details);
+    try {
+      params.channel.close();
+    } catch {}
+    throw error instanceof Error ? error : new Error(String(error));
+  }
+}
+
+interface ChallengeFrame {
+  version: number;
+  role: number;
+  codeBytes: Uint8Array;
+  nonce: Uint8Array;
+  mac: Uint8Array;
+}
+
+interface ChallengeFrameInput {
+  roleByte: number;
+  codeBytes: Uint8Array;
+  nonce: Uint8Array;
+  challengeKey: Uint8Array;
+  challengeContext: Uint8Array;
+}
+
+async function buildChallengeFrame(input: ChallengeFrameInput): Promise<Uint8Array> {
+  if (input.codeBytes.length !== 6) {
+    throw new Error('challenge code must be 6 bytes');
+  }
+  if (input.nonce.length !== CHALLENGE_NONCE_LENGTH) {
+    throw new Error(`challenge nonce must be ${CHALLENGE_NONCE_LENGTH} bytes`);
+  }
+
+  const frame = new Uint8Array(CHALLENGE_FRAME_LENGTH);
+  frame[0] = CHALLENGE_FRAME_VERSION;
+  frame[1] = input.roleByte;
+  frame.set(input.codeBytes, 2);
+  frame.set(input.nonce, 2 + 6);
+
+  const mac = await computeChallengeMac({
+    roleByte: input.roleByte,
+    codeBytes: input.codeBytes,
+    nonce: input.nonce,
+    challengeKey: input.challengeKey,
+    challengeContext: input.challengeContext,
+  });
+
+  frame.set(mac, 2 + 6 + CHALLENGE_NONCE_LENGTH);
+  return frame;
+}
+
+function parseChallengeFrame(payload: Uint8Array): ChallengeFrame {
+  if (payload.length !== CHALLENGE_FRAME_LENGTH) {
+    throw new Error(`challenge frame length mismatch (${payload.length})`);
+  }
+  const codeStart = 2;
+  const codeEnd = codeStart + 6;
+  const nonceEnd = codeEnd + CHALLENGE_NONCE_LENGTH;
+  return {
+    version: payload[0]!,
+    role: payload[1]!,
+    codeBytes: payload.slice(codeStart, codeEnd),
+    nonce: payload.slice(codeEnd, nonceEnd),
+    mac: payload.slice(nonceEnd),
+  };
+}
+
+interface ChallengeMacInput {
+  roleByte: number;
+  codeBytes: Uint8Array;
+  nonce: Uint8Array;
+  challengeKey: Uint8Array;
+  challengeContext: Uint8Array;
+}
+
+async function computeChallengeMac(input: ChallengeMacInput): Promise<Uint8Array> {
+  const macInput = concatBytes(
+    input.challengeContext,
+    new Uint8Array([input.roleByte & 0xff]),
+    input.codeBytes,
+    input.nonce,
+  );
+  return await computeHmacSha256(input.challengeKey, macInput);
+}
+
+async function computeHmacSha256(key: Uint8Array, data: Uint8Array): Promise<Uint8Array> {
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    toArrayBuffer(key),
+    {
+      name: 'HMAC',
+      hash: 'SHA-256',
+    },
+    false,
+    ['sign'],
+  );
+  const mac = await crypto.subtle.sign('HMAC', cryptoKey, toArrayBuffer(data));
+  return new Uint8Array(mac);
+}
+
+function concatBytes(...chunks: Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return output;
+}
+
+function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    diff |= a[i]! ^ b[i]!;
+  }
+  return diff === 0;
+}
+
+function verificationFailure(
+  base: Record<string, unknown>,
+  reason: string,
+  extra: Record<string, unknown>,
+): never {
+  const error = new Error(reason);
+  Object.assign(error, {
+    verificationDetails: {
+      ...base,
+      ...extra,
+    },
+  });
+  throw error;
 }
 
 async function waitForChannelOpen(channel: RTCDataChannel): Promise<void> {

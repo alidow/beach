@@ -151,3 +151,8 @@ sequenceDiagram
 ## Stakeholder Outreach Log
 - 2025-10-11: Sent review request to `transport-wg@`, `infra-core@`, `security@` with link to this draft and requested feedback by 2025-10-18.
 - 2025-10-11: Filed tracking issues — TP-4821 (control plane fallback token minting & guardrail counters), INF-3377 (infra pipeline + registry), SEC-2190 (token signing keys review).
+
+## Open Source Boundary
+- The `apps/beach` workspace is expected to be open sourced, but `apps/beach-rescue` (server + infra) remains closed. Only the protocol-facing `beach-rescue-client` crate is shared so public builds can serialize `ClientHello` / `ServerHello` payloads.
+- Keep the client crate narrowly scoped: message structs, feature-bit definitions, and local-only helpers (e.g., ephemeral token minting) are acceptable; guardrail logic, Redis key conventions, and relay internals stay private behind the HTTP/WSS surface.
+- Document in the public repo that WebSocket fallback is optional and requires the proprietary beach-rescue deployment. Provide guidance on disabling the feature flag when the service is unavailable to avoid confusing OSS adopters.

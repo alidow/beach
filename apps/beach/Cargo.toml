@@ -36,6 +36,7 @@ argon2 = "0.5"
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
+hmac = "0.12"
 snow = "0.9"
 beach-rescue-client = { path = "../beach-rescue/client" }
 beach-rescue-core = { path = "../beach-rescue/core" }

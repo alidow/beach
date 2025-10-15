@@ -25,7 +25,7 @@ type RustInteropResponse = {
 function runRustInterop(payload: Record<string, unknown>): RustInteropResponse {
   const output = execFileSync(
     'cargo',
-    ['run', '--quiet', '--manifest-path', rustInteropManifest],
+    ['run', '--quiet', '--manifest-path', rustInteropManifest, '--bin', 'crypto-interop-test'],
     {
       cwd: repoRoot,
       input: JSON.stringify(payload),

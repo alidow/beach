@@ -118,3 +118,9 @@ Author: Codex (implementation planning)
 1. Harden operability: document the new Prometheus metrics + Redis keys, wire dashboards/alerts, and extend `/debug` endpoints so on-call can inspect sessions safely.
 2. Gate the fallback transport behind control-plane entitlements/feature flags (production default off) while documenting dev overrides (`BEACH_RESCUE_DISABLE_OIDC`, etc.).
 3. Exercise the load/chaos harness against the new session registry (target 5K active / 10K idle) and archive reports ahead of Phase 3 rollout planning.
+
+## Open Source Coordination
+- apps/beach is slated for open sourcing while `apps/beach-rescue` stays private; the public repo will only ship the lightweight `beach-rescue-client` crate needed for handshake message shapes and local testing helpers.
+- The client crate must remain protocol-only (no guardrail math, Redis keys, routing internals) so the proprietary relay logic stays encapsulated behind the `/fallback/token` API and WSS endpoint.
+- Fallback negotiation in the open project remains strictly optional and feature-flagged, allowing downstream users to disable it when the private beach-rescue service is unavailable.
+- Publish a short “Using beach-rescue fallback” guide alongside the public release to document the boundary and keep expectations clear without exposing private implementation details.

@@ -166,6 +166,42 @@ describe('TerminalGridCache cursor hints', () => {
     expect(snapshot.hasPredictions).toBe(false);
   });
 
+  it('drops predictions when server refuses to move past the prompt', () => {
+    const cache = new TerminalGridCache({ initialCols: 80 });
+    cache.setGridSize(1, 80);
+    const prompt = '(base) user@host %';
+    cache.applyUpdates(
+      [
+        {
+          type: 'row',
+          row: 0,
+          seq: 1,
+          cells: packString(prompt),
+        },
+      ],
+      { authoritative: true },
+    );
+    cache.enableCursorSupport(true);
+    cache.applyUpdates([], {
+      cursor: { row: 0, col: prompt.length, seq: 2, visible: true, blink: true },
+    });
+
+    cache.registerPrediction(3, Uint8Array.from([0x7f]));
+
+    let snapshot = cache.snapshot();
+    expect(snapshot.hasPredictions).toBe(true);
+    expect(snapshot.predictedCursor?.col).toBe(prompt.length - 1);
+
+    cache.applyUpdates([], {
+      cursor: { row: 0, col: prompt.length, seq: 4, visible: true, blink: true },
+    });
+
+    snapshot = cache.snapshot();
+    expect(snapshot.hasPredictions).toBe(false);
+    expect(snapshot.cursorCol).toBe(prompt.length);
+    expect(snapshot.predictedCursor).toBeNull();
+  });
+
   it('resets cursor when a row segment of spaces clears the line', () => {
     const cache = new TerminalGridCache({ initialCols: 80 });
     cache.setGridSize(1, 80);

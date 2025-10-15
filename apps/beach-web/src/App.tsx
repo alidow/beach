@@ -1,6 +1,7 @@
 import {
   type CSSProperties,
   type ComponentType,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
   useEffect,
   useLayoutEffect,
@@ -31,6 +32,7 @@ import {
 } from './components/ui/dialog';
 import { Input } from './components/ui/input';
 import { Label } from './components/ui/label';
+import { Switch } from './components/ui/switch';
 import { useConnectionController } from './hooks/useConnectionController';
 import { useDocumentTitle } from './hooks/useDocumentTitle';
 import { cn } from './lib/utils';
@@ -128,6 +130,12 @@ export default function App(): JSX.Element {
     connectDisabled,
     connectLabel,
     onStatusChange,
+    fallbackCohort,
+    setFallbackCohort,
+    fallbackEntitlement,
+    setFallbackEntitlement,
+    fallbackTelemetryOptIn,
+    setFallbackTelemetryOptIn,
   } = useConnectionController();
   useDocumentTitle({ sessionId: trimmedSessionId });
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -141,6 +149,7 @@ export default function App(): JSX.Element {
   const toolbarRef = useRef<HTMLDivElement | null>(null);
   const toolbarSizeRef = useRef<{ width: number; height: number } | null>(null);
   const dragStateRef = useRef<{ pointerId: number; offsetX: number; offsetY: number } | null>(null);
+  const layoutMetricsRef = useRef<LayoutMetrics | null>(null);
   const getLayoutMetrics = (): LayoutMetrics | null => {
     const shellElement = shellRef.current;
     if (!shellElement) {
@@ -167,7 +176,9 @@ export default function App(): JSX.Element {
       };
     }
 
-    return { shellRect, panelSize };
+    const metrics: LayoutMetrics = { shellRect, panelSize };
+    layoutMetricsRef.current = metrics;
+    return metrics;
   };
 
   const clampPosition = (desired: Position, metrics?: LayoutMetrics): Position => {
@@ -310,7 +321,7 @@ export default function App(): JSX.Element {
     setInfoVisible(true);
   };
 
-  const handlePointerDown = (event: React.PointerEvent<HTMLElement>): void => {
+  const handlePointerDown = (event: ReactPointerEvent<HTMLElement>): void => {
     if (event.button !== 0) {
       return;
     }
@@ -345,7 +356,7 @@ export default function App(): JSX.Element {
     event.currentTarget.setPointerCapture(event.pointerId);
   };
 
-  const handlePointerMove = (event: React.PointerEvent<HTMLElement>): void => {
+  const handlePointerMove = (event: ReactPointerEvent<HTMLElement>): void => {
     const dragState = dragStateRef.current;
     if (!dragState || dragState.pointerId !== event.pointerId) {
       return;
@@ -367,7 +378,7 @@ export default function App(): JSX.Element {
     });
   };
 
-  const handlePointerUp = (event: React.PointerEvent<HTMLElement>): void => {
+  const handlePointerUp = (event: ReactPointerEvent<HTMLElement>): void => {
     if (!dragStateRef.current || dragStateRef.current.pointerId !== event.pointerId) {
       return;
     }
@@ -400,12 +411,19 @@ export default function App(): JSX.Element {
     typeof measuredToolbarWidth === 'number' && Number.isFinite(measuredToolbarWidth)
       ? Math.round(measuredToolbarWidth)
       : null;
+  const availableWidth =
+    layoutMetricsRef.current != null
+      ? Math.max(Math.floor(layoutMetricsRef.current.shellRect.width - BOUNDARY_PADDING * 2), 0)
+      : null;
+  const resolvedWidthPx =
+    measuredWidthPx !== null && availableWidth !== null
+      ? Math.min(measuredWidthPx, availableWidth)
+      : measuredWidthPx ?? availableWidth ?? null;
   const toolbarWrapperStyle: CSSProperties = {
     top: baseToolbarPosition.top,
     left: baseToolbarPosition.left,
     visibility: toolbarPosition ? 'visible' : 'hidden',
-    width:
-      measuredWidthPx !== null && measuredWidthPx > 0 ? `${measuredWidthPx}px` : undefined,
+    width: resolvedWidthPx !== null && resolvedWidthPx > 0 ? `${resolvedWidthPx}px` : undefined,
   };
   const toolbarWrapperClass = cn(
     'pointer-events-none absolute',
@@ -604,16 +622,65 @@ export default function App(): JSX.Element {
               />
             </Field>
             {showAdvanced ? (
-              <Field label="Session Server" htmlFor="session-server-v2" hint="Beach session host URL.">
-                <Input
-                  id="session-server-v2"
-                  value={sessionServer}
-                  onChange={(event) => setSessionServer(event.target.value)}
-                  autoCapitalize="none"
-                  autoComplete="off"
-                  inputMode="url"
-                />
-              </Field>
+              <>
+                <Field label="Session Server" htmlFor="session-server-v2" hint="Beach session host URL.">
+                  <Input
+                    id="session-server-v2"
+                    value={sessionServer}
+                    onChange={(event) => setSessionServer(event.target.value)}
+                    autoCapitalize="none"
+                    autoComplete="off"
+                    inputMode="url"
+                  />
+                </Field>
+                <Field
+                  label="Fallback Cohort"
+                  htmlFor="fallback-cohort-v2"
+                  hint="Optional cohort override used when requesting WebSocket fallback tokens."
+                >
+                  <Input
+                    id="fallback-cohort-v2"
+                    value={fallbackCohort}
+                    onChange={(event) => setFallbackCohort(event.target.value)}
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
+                    placeholder="private-beaches"
+                  />
+                </Field>
+                <Field
+                  label="Entitlement Proof"
+                  htmlFor="fallback-entitlement-v2"
+                  hint="Future Clerk token – leave blank unless provided by support."
+                >
+                  <Input
+                    id="fallback-entitlement-v2"
+                    value={fallbackEntitlement}
+                    onChange={(event) => setFallbackEntitlement(event.target.value)}
+                    type="password"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
+                    placeholder="-----BEGIN PROOF-----"
+                  />
+                </Field>
+                <Field
+                  label="Fallback telemetry opt-in"
+                  htmlFor="fallback-telemetry-v2"
+                  hint="Share anonymised metrics when the WebSocket rescue path engages."
+                >
+                  <div className="flex items-center justify-between rounded-xl border border-white/5 bg-slate-950/40 px-4 py-2">
+                    <span className="text-sm text-slate-300">
+                      {fallbackTelemetryOptIn ? 'Telemetry enabled' : 'Telemetry disabled'}
+                    </span>
+                    <Switch
+                      id="fallback-telemetry-v2"
+                      checked={fallbackTelemetryOptIn}
+                      onCheckedChange={setFallbackTelemetryOptIn}
+                    />
+                  </div>
+                </Field>
+              </>
             ) : null}
             <div className="flex items-center justify-between">
               <button

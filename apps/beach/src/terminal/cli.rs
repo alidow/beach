@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum, builder::BoolishValueParser};
 use std::path::PathBuf;
 
 use crate::telemetry::logging::{LogConfig, LogLevel};
@@ -22,6 +22,9 @@ pub struct Cli {
 
     #[command(flatten)]
     pub logging: LoggingArgs,
+
+    #[command(flatten)]
+    pub fallback: FallbackArgs,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -54,6 +57,37 @@ impl LoggingArgs {
             file: self.file.clone(),
         }
     }
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct FallbackArgs {
+    #[arg(
+        long = "fallback-cohort",
+        env = "BEACH_FALLBACK_COHORT",
+        value_name = "COHORT",
+        help = "Override the fallback cohort/entitlement identifier when requesting WebSocket rescue tokens"
+    )]
+    pub cohort: Option<String>,
+
+    #[arg(
+        long = "fallback-entitlement-proof",
+        env = "BEACH_ENTITLEMENT_PROOF",
+        value_name = "TOKEN",
+        help = "Signed entitlement proof to accompany fallback token requests (future Clerk integration)",
+        hide_env_values = true
+    )]
+    pub entitlement_proof: Option<String>,
+
+    #[arg(
+        long = "fallback-telemetry-opt-in",
+        env = "BEACH_FALLBACK_TELEMETRY_OPT_IN",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = BoolishValueParser::new(),
+        value_name = "BOOL",
+        help = "Opt in to fallback-specific telemetry when requesting rescue tokens",
+    )]
+    pub telemetry_opt_in: Option<bool>,
 }
 
 #[derive(Subcommand, Debug)]

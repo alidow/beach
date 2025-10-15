@@ -157,6 +157,8 @@ export class TerminalGridCache {
   private cursorFeatureEnabled = false;
   private cursorAuthoritative = false;
   private cursorAuthoritativePending = false;
+  private serverCursorRow: number | null = null;
+  private serverCursorCol: number | null = null;
   private predictedCursor: PredictedCursorState | null = null;
   private firstCursorReceived = false;
   private pendingInitialCursor: { visible: boolean; blink: boolean } | null = null;
@@ -324,6 +326,8 @@ export class TerminalGridCache {
     this.cursorFeatureEnabled = false;
     this.cursorAuthoritative = false;
     this.cursorAuthoritativePending = false;
+    this.serverCursorRow = null;
+    this.serverCursorCol = null;
     this.predictedCursor = null;
     this.pendingInitialCursor = null;
     this.predictions.clear();
@@ -728,6 +732,8 @@ export class TerminalGridCache {
       this.cursorSeq = null;
       this.cursorVisible = true;
       this.cursorBlink = true;
+      this.serverCursorRow = null;
+      this.serverCursorCol = null;
       this.predictedCursor = null;
       this.pendingInitialCursor = null;
     }
@@ -744,20 +750,42 @@ export class TerminalGridCache {
     const prevBlink = this.cursorBlink;
     const prevPredicted = this.predictedCursor;
 
+    const prevServerRow = this.serverCursorRow;
+    const prevServerCol = this.serverCursorCol;
+
     this.ensureRowRange(row, row + 1);
     this.cursorRow = row;
     let targetCol = col;
     if (this.cols > 0) {
       targetCol = Math.min(targetCol, this.cols);
     }
+
+    const shouldTrimPredictions =
+      this.rowHasPredictions(row) && prevRow === row && prevCol !== null && targetCol > prevCol;
+    if (shouldTrimPredictions && prevCol !== null) {
+      const trimmed = this.discardPredictionsFromColumn(row, prevCol, 'cursor_clamp');
+      if (trimmed) {
+        this.predictiveLog('prediction_trim_cursor', {
+          row,
+          col: prevCol,
+          target: targetCol,
+          prevCursor: prevCol,
+          prevServer: { row: prevServerRow, col: prevServerCol },
+          frameSeq: frame.seq,
+        });
+      }
+    }
+
     if (this.rowHasPredictions(row)) {
-      targetCol = Math.max(targetCol, this.predictedRowWidth(row));
-      if (prevRow === row && prevCol !== null) {
-        targetCol = Math.max(targetCol, prevCol);
+      const predictedWidth = this.predictedRowWidth(row);
+      if (predictedWidth > targetCol) {
+        targetCol = predictedWidth;
       }
     }
     this.cursorCol = targetCol;
     this.cursorSeq = frame.seq;
+    this.serverCursorRow = row;
+    this.serverCursorCol = targetCol;
 
     // Suppress initial cursor at (0, 0) to avoid flash in upper-left corner
     if (!this.firstCursorReceived && row === 0 && col === 0) {
@@ -896,6 +924,32 @@ export class TerminalGridCache {
     return false;
   }
 
+  private discardPredictionsFromColumn(row: number, col: number, reason: string): boolean {
+    let mutated = false;
+    const rowPredictions = this.predictions.get(row);
+    if (rowPredictions && rowPredictions.size > 0) {
+      for (const predCol of Array.from(rowPredictions.keys())) {
+        if (predCol >= col) {
+          mutated = this.clearPredictionAt(row, predCol) || mutated;
+        }
+      }
+    }
+    for (const entry of this.pendingPredictions.values()) {
+      if (entry.cursorRow === row && entry.cursorCol >= col) {
+        entry.cursorCol = col;
+        mutated = true;
+      }
+    }
+    if (this.predictedCursor && this.predictedCursor.row === row && this.predictedCursor.col >= col) {
+      this.predictedCursor = null;
+      mutated = true;
+    }
+    if (mutated) {
+      this.predictiveLog('prediction_trim_apply', { row, col, reason });
+    }
+    return mutated;
+  }
+
   private maybeRevealPendingCursor(): void {
     if (!this.pendingInitialCursor) {
       return;
@@ -967,10 +1021,12 @@ export class TerminalGridCache {
     if (latest) {
       this.cursorRow = latest.row;
       this.cursorCol = latest.col;
+      return;
     }
-    // Note: We don't restore to server cursor here like Rust client does,
-    // because web client doesn't track separate server_cursor_row/col.
-    // The cursor will be updated when server sends cursor frames.
+    if (this.serverCursorRow !== null && this.serverCursorCol !== null) {
+      this.cursorRow = this.serverCursorRow;
+      this.cursorCol = this.serverCursorCol;
+    }
   }
 
   private inferRowCursorColumn(cells: number[]): number {

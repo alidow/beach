@@ -273,7 +273,7 @@ async fn connect_fallback_websocket(
 
     if !status.is_success() {
         if let Ok(error) = serde_json::from_str::<FallbackTokenErrorBody>(&body) {
-            if let Some(reason) = error.reason {
+            if let Some(reason) = error.reason.as_deref() {
                 return Err(match reason {
                     "fallback_paused" => {
                         "websocket fallback disabled by operator (kill switch engaged)".to_string()

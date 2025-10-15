@@ -132,13 +132,14 @@ sequenceDiagram
 ## Control Plane & Token API Decisions
 - **Endpoint:** `POST /v1/fallback/token` (authenticated via mTLS service account) returning `{ token, expires_at, cohort, guardrail_hint }`.
 - **Inputs:** `session_id`, `cohort_id`, `client_version`, `entitlement_proof` (optional JWT from future Clerk/OIDC integration), `telemetry_opt_in`.
-  - CLI already forwards overrides via `--fallback-*` flags (mirrored to `BEACH_FALLBACK_COHORT`, `BEACH_ENTITLEMENT_PROOF`, `BEACH_FALLBACK_TELEMETRY_OPT_IN`), and beach-web surfaces matching advanced controls, so Clerk proofs can slide in later without further protocol churn.
+  - CLI already forwards overrides via `--fallback-*` flags (mirrored to `BEACH_FALLBACK_COHORT`, `BEACH_ENTITLEMENT_PROOF`, `BEACH_FALLBACK_TELEMETRY_OPT_IN`), and beach-web surfaces matching advanced controls that are stored locally and injected into the connection handshake, so Clerk proofs can slide in later without further protocol churn.
 - **Validation Flow:** verify entitlement when proof provided (paid “private beaches” users); in dev or when entitlement disabled, skip OIDC checks. Ensure `fallback_ws_enabled` true. Guardrail counters stored in Redis (shared with beach-road) using hourly buckets.
 - **Token Format:** Ed25519-signed CBOR payload containing `session_id`, `issued_at`, `expires_at` (<= 5 min), `cohort_id`, `feature_bits`.
   - **Implementation note (Phase 1):** Tokens are currently returned as Base64-encoded JSON claims; Ed25519 signing will be introduced alongside production hardening.
 - **Counters:** Redis keys `fallback:cohort:{cohort_id}:yyyy-mm-dd-hh` with TTL 90 minutes; soft limit at 0.5% triggers alert but token still issued; hard kill switch toggles `fallback_ws_paused`.
 - **Privacy:** if `telemetry_opt_in=false`, control plane sets `feature_bits` to disable non-essential analytics; metrics aggregated per cohort only. Redis guardrail data stores counts only (no user identifiers).
 - **Entitlement Notes:** OIDC (via Clerk) integration handled once “private beaches” feature lands; beach-rescue exposes flag `BEACH_RESCUE_DISABLE_OIDC=1` to bypass entitlement checks in dev/local environments.
+- **Client integration:** CLI requests already pass cohort/proof/telemetry overrides into the fallback token fetch; the browser wiring captures the same overrides and logs them during transport setup, pending final wiring to the fallback HTTP call once WSS support lands.
 
 ## Load & Reliability Test Plan (Deferred)
 - Comprehensive load testing (10k idle / 5k active targets) will be scheduled after feature completion and dev validation.

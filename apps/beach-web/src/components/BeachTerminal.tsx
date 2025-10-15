@@ -13,6 +13,7 @@ import { encodeKeyEvent } from '../terminal/keymap';
 import type { TerminalTransport } from '../transport/terminalTransport';
 import { BackfillController } from '../terminal/backfillController';
 import { cn } from '../lib/utils';
+import { createConnectionTrace, type ConnectionTrace } from '../lib/connectionTrace';
 import type { ServerMessage } from '../transport/signaling';
 import type { SecureTransportSummary } from '../transport/webrtc';
 
@@ -300,6 +301,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const transportRef = useRef<TerminalTransport | null>(providedTransport ?? null);
   const predictionUxRef = useRef<PredictionUx>(new PredictionUx());
   const connectionRef = useRef<BrowserTransportConnection | null>(null);
+  const connectionTraceRef = useRef<ConnectionTrace | null>(null);
   const subscriptionRef = useRef<number | null>(null);
   const inputSeqRef = useRef(0);
   const lastSentViewportRows = useRef<number>(0);
@@ -331,6 +333,22 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const joinTimersRef = useRef<{ short?: number; long?: number; hide?: number }>({});
   const peerIdRef = useRef<string | null>(null);
   const handshakeReadyRef = useRef(false);
+  const markConnectionTrace = useCallback(
+    (name: string, extra: Record<string, unknown> = {}) => {
+      connectionTraceRef.current?.mark(name, extra);
+    },
+    [],
+  );
+  const finishConnectionTrace = useCallback(
+    (outcome: 'success' | 'error' | 'cancelled', extra: Record<string, unknown> = {}) => {
+      if (!connectionTraceRef.current) {
+        return;
+      }
+      connectionTraceRef.current.finish(outcome, extra);
+      connectionTraceRef.current = null;
+    },
+    [],
+  );
   const queryLabel = useMemo(() => {
     if (typeof window === 'undefined') {
       return undefined;
@@ -670,10 +688,17 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     if (!autoConnect || transportRef.current || !sessionId || !baseUrl) {
       return;
     }
+    finishConnectionTrace('cancelled', { reason: 'restart' });
+    connectionTraceRef.current = createConnectionTrace({ sessionId, baseUrl });
+    markConnectionTrace('beach_terminal:connect_initiated', {
+      autoConnect: true,
+      hasPasscode: Boolean(passcode),
+    });
     let cancelled = false;
     setStatus('connecting');
     setJoinState('connecting');
     setJoinMessage(JOIN_CONNECTING_MESSAGE);
+    markConnectionTrace('beach_terminal:status_connecting');
     handshakeReadyRef.current = false;
     clearJoinTimers();
     (async () => {
@@ -691,6 +716,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           log(message);
         };
 
+        markConnectionTrace('beach_terminal:transport_connect_start', { baseUrl, sessionId });
         const connection = await connectBrowserTransport({
           sessionId,
           baseUrl,
@@ -698,8 +724,13 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           logger: webrtcLogger,
           clientLabel: queryLabel,
           fallbackOverrides,
+          trace: connectionTraceRef.current,
+        });
+        markConnectionTrace('beach_terminal:transport_connect_success', {
+          remotePeerId: connection.remotePeerId ?? null,
         });
         if (cancelled) {
+          markConnectionTrace('beach_terminal:transport_connect_cancelled');
           connection.close();
           return;
         }
@@ -711,18 +742,26 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         setRemotePeerId(connection.remotePeerId ?? null);
         bindTransport(connection.transport);
         setStatus('connected');
+        markConnectionTrace('beach_terminal:status_connected');
       } catch (err) {
         if (cancelled) {
+          markConnectionTrace('beach_terminal:transport_connect_cancelled_error');
           return;
         }
-        console.error('[beach-web] transport connect failed', err);
-        setError(err instanceof Error ? err : new Error(String(err)));
+        const errorInstance = err instanceof Error ? err : new Error(String(err));
+        console.error('[beach-web] transport connect failed', errorInstance);
+        setError(errorInstance);
         setStatus('error');
+        markConnectionTrace('beach_terminal:transport_connect_error', {
+          message: errorInstance.message,
+        });
+        finishConnectionTrace('error', { stage: 'connect', message: errorInstance.message });
       }
     })();
 
     return () => {
       cancelled = true;
+      markConnectionTrace('beach_terminal:connect_effect_cleanup');
       if (connectionRef.current) {
         connectionRef.current.close();
       }
@@ -736,6 +775,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       clearJoinTimers();
       setJoinState('idle');
       setJoinMessage(null);
+      finishConnectionTrace('cancelled', { reason: 'cleanup' });
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoConnect, sessionId, baseUrl, passcode, queryLabel]);
@@ -1249,6 +1289,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       setSecureSummary(detail);
     });
     transport.addEventListener('open', () => {
+      markConnectionTrace('beach_terminal:data_channel_open', {
+        remotePeerId: remotePeerId ?? connectionRef.current?.remotePeerId ?? null,
+      });
       if (!handshakeReadyRef.current) {
         enterWaitingState();
       }
@@ -1258,6 +1301,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       () => {
         const remote = remotePeerId ?? connectionRef.current?.remotePeerId ?? null;
         log('transport closed', { remotePeerId: remote });
+        markConnectionTrace('beach_terminal:transport_close', { remotePeerId: remote });
+        finishConnectionTrace('error', { stage: 'transport', reason: 'closed' });
         handshakeReadyRef.current = false;
         if (subscriptionRef.current === null && joinStateRef.current !== 'denied') {
           enterDisconnectedState();
@@ -1272,6 +1317,11 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       const err = (event as any).error ?? new Error('transport error');
       const remote = remotePeerId ?? connectionRef.current?.remotePeerId ?? null;
       log('transport error', { message: err.message, remotePeerId: remote });
+       markConnectionTrace('beach_terminal:transport_error', {
+        message: err instanceof Error ? err.message : String(err),
+        remotePeerId: remote,
+      });
+      finishConnectionTrace('error', { stage: 'transport', message: err.message });
       setError(err);
       setStatus('error');
     });
@@ -1299,6 +1349,13 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         summarizeSnapshot(store);
         handshakeReadyRef.current = true;
         enterApprovedState(joinStateRef.current === 'approved' ? joinMessage ?? undefined : undefined);
+        markConnectionTrace('beach_terminal:hello_received', {
+          subscription: frame.subscription,
+        });
+        finishConnectionTrace('success', {
+          remotePeerId: remotePeerId ?? connectionRef.current?.remotePeerId ?? null,
+          subscription: frame.subscription,
+        });
         break;
       case 'grid':
         trace('frame grid', frame);

@@ -6,6 +6,7 @@ import { connectWebRtcTransport } from '../transport/webrtc';
 import { SignalingClient } from '../transport/signaling';
 import type { SignalingClientOptions } from '../transport/signaling';
 import type { SecureTransportSummary } from '../transport/webrtc';
+import type { ConnectionTrace } from '../lib/connectionTrace';
 
 export interface FallbackOverrides {
   cohort?: string;
@@ -31,34 +32,56 @@ export interface ConnectBrowserTransportOptions {
   createSocket?: SignalingClientOptions['createSocket'];
   clientLabel?: string;
   fallbackOverrides?: FallbackOverrides;
+  trace?: ConnectionTrace | null;
 }
 
 export async function connectBrowserTransport(
   options: ConnectBrowserTransportOptions,
 ): Promise<BrowserTransportConnection> {
+  const trace = options.trace ?? null;
+  trace?.mark('connect_browser_transport:start', { hasPasscode: Boolean(options.passcode) });
+
   const join = await fetchJoinMetadata(options);
+  trace?.mark('join_metadata:received', {
+    role: join.role,
+    pollIntervalMs: join.pollIntervalMs,
+    signalingUrl: join.signalingUrl,
+  });
   const websocketUrl = join.websocketUrl ?? deriveWebsocketUrl(options.baseUrl, options.sessionId);
+  trace?.mark('signaling:connect_start', { websocketUrl });
   const signaling = await SignalingClient.connect({
     url: websocketUrl,
     passphrase: options.passcode,
     supportedTransports: ['webrtc'],
     createSocket: options.createSocket,
     label: options.clientLabel,
+    trace,
   });
-  const {
-    transport: webRtcTransport,
+  trace?.mark('signaling:ready', { peerId: signaling.peerId });
+  let webrtcResult: Awaited<ReturnType<typeof connectWebRtcTransport>>;
+  try {
+    webrtcResult = await connectWebRtcTransport({
+      signaling,
+      signalingUrl: join.signalingUrl,
+      role: join.role,
+      pollIntervalMs: join.pollIntervalMs,
+      iceServers: options.iceServers,
+      logger: options.logger,
+      passphrase: options.passcode,
+      telemetryBaseUrl: options.baseUrl,
+      sessionId: options.sessionId,
+      trace,
+    });
+  } catch (error) {
+    trace?.mark('webrtc:connect_error', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+  const { transport: webRtcTransport, remotePeerId, secure } = webrtcResult;
+  trace?.mark('webrtc:connected', {
     remotePeerId,
-    secure,
-  } = await connectWebRtcTransport({
-    signaling,
-    signalingUrl: join.signalingUrl,
-    role: join.role,
-    pollIntervalMs: join.pollIntervalMs,
-    iceServers: options.iceServers,
-    logger: options.logger,
-    passphrase: options.passcode,
-    telemetryBaseUrl: options.baseUrl,
-    sessionId: options.sessionId,
+    secureMode: secure?.mode ?? 'plaintext',
   });
   const transport = new DataChannelTerminalTransport(webRtcTransport, {
     logger: options.logger,
@@ -100,19 +123,37 @@ async function fetchJoinMetadata(options: ConnectBrowserTransportOptions): Promi
   role: 'offerer' | 'answerer';
   pollIntervalMs: number;
 }> {
+  const trace = options.trace ?? null;
   const url = `${options.baseUrl.replace(/\/$/, '')}/sessions/${options.sessionId}/join`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ passphrase: options.passcode ?? null }),
-  });
+  trace?.mark('join_metadata:request', { url });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ passphrase: options.passcode ?? null }),
+    });
+  } catch (error) {
+    trace?.mark('join_metadata:error', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
+  trace?.mark('join_metadata:response', { status: response.status });
   if (!response.ok) {
+    trace?.mark('join_metadata:failure', {
+      status: response.status,
+      statusText: response.statusText,
+    });
     throw new Error(`join request failed: ${response.status} ${response.statusText}`);
   }
   const payload: JoinSessionResponse = await response.json();
   if (!payload.success) {
+    trace?.mark('join_metadata:rejected', {
+      message: payload.message ?? null,
+    });
     throw new Error(payload.message ?? 'join rejected');
   }
   const offerMetadata =

@@ -1,3 +1,5 @@
+import type { ConnectionTrace } from '../lib/connectionTrace';
+
 /*
  * WebSocket signaling client for negotiating terminal transports with beach-road.
  *
@@ -108,6 +110,7 @@ export interface SignalingClientOptions {
   preferredTransport?: TransportTypeJson;
   createSocket?: WebSocketFactory;
   label?: string;
+  trace?: ConnectionTrace | null;
 }
 
 const DEFAULT_SUPPORTED: TransportTypeJson[] = ['webrtc'];
@@ -116,12 +119,14 @@ export class SignalingClient extends EventTarget {
   readonly peerId: string;
   private readonly socket: WebSocket;
   private readonly url: string;
+  private readonly trace: ConnectionTrace | null | undefined;
 
-  private constructor(url: string, peerId: string, socket: WebSocket) {
+  private constructor(url: string, peerId: string, socket: WebSocket, trace?: ConnectionTrace | null) {
     super();
     this.peerId = peerId;
     this.url = url;
     this.socket = socket;
+    this.trace = trace;
   }
 
   static async connect(options: SignalingClientOptions): Promise<SignalingClient> {
@@ -133,6 +138,7 @@ export class SignalingClient extends EventTarget {
       preferredTransport,
       createSocket,
       label,
+      trace,
     } = options;
 
     const factory: WebSocketFactory = createSocket ?? ((target) => new WebSocket(target));
@@ -141,8 +147,9 @@ export class SignalingClient extends EventTarget {
 
     return await new Promise<SignalingClient>((resolve, reject) => {
       const handleOpen = () => {
-        const client = new SignalingClient(url, peerId, socket);
+        const client = new SignalingClient(url, peerId, socket, trace);
         client.attachSocketListeners();
+        trace?.mark('signaling:socket_open', { url });
         client.send({
           type: 'join',
           peer_id: peerId,
@@ -159,9 +166,13 @@ export class SignalingClient extends EventTarget {
       const handleError = (event: Event) => {
         socket.removeEventListener('open', handleOpen);
         socket.removeEventListener('error', handleError);
+        trace?.mark('signaling:socket_error', {
+          message: event instanceof ErrorEvent ? event.message : 'unknown',
+        });
         reject(event instanceof ErrorEvent ? event.error ?? event : event);
       };
 
+      trace?.mark('signaling:socket_connecting', { url });
       socket.addEventListener('open', handleOpen, { once: true });
       socket.addEventListener('error', handleError, { once: true });
     });
@@ -171,6 +182,17 @@ export class SignalingClient extends EventTarget {
     this.socket.addEventListener('message', (event) => {
       try {
         const message = parseServerMessage(event.data);
+        if (message.type === 'join_success') {
+          this.trace?.mark('signaling:join_success_received', {
+            peers: message.peers.length,
+            peerId: message.peer_id,
+          });
+        }
+        if (message.type === 'join_error') {
+          this.trace?.mark('signaling:join_error_received', {
+            reason: message.reason,
+          });
+        }
         this.dispatchEvent(new CustomEvent<ServerMessage>('message', { detail: message }));
       } catch (error) {
         const errEvent = new Event('error');
@@ -180,10 +202,16 @@ export class SignalingClient extends EventTarget {
     });
 
     this.socket.addEventListener('close', (event) => {
+      this.trace?.mark('signaling:socket_close', {
+        code: event.code,
+        wasClean: event.wasClean,
+      });
       this.dispatchEvent(new CustomEvent('close', { detail: event }));
     });
 
     this.socket.addEventListener('error', (event) => {
+      const detail = (event as ErrorEvent).message ?? 'unknown';
+      this.trace?.mark('signaling:socket_error_event', { message: detail });
       this.dispatchEvent(new CustomEvent('error', { detail: event }));
     });
 

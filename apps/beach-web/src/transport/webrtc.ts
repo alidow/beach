@@ -20,6 +20,7 @@ import {
 } from './crypto/secureDataChannel';
 import type { SignalingClient, ServerMessage } from './signaling';
 import { reportSecureTransportEvent } from '../lib/telemetry';
+import type { ConnectionTrace } from '../lib/connectionTrace';
 
 export interface SecureTransportSummary {
   mode: 'secure' | 'plaintext';
@@ -179,6 +180,7 @@ export interface ConnectWebRtcTransportOptions {
   passphrase?: string;
   telemetryBaseUrl?: string;
   sessionId?: string;
+  trace?: ConnectionTrace | null;
 }
 
 export interface ConnectedWebRtcTransport {
@@ -207,6 +209,8 @@ export async function connectWebRtcTransport(
   options: ConnectWebRtcTransportOptions,
 ): Promise<ConnectedWebRtcTransport> {
   const { signaling, logger } = options;
+  const trace = options.trace ?? null;
+  trace?.mark('webrtc:connect_start', { role: options.role });
   const passphrase = options.passphrase?.trim();
   const secureSignalingActive = Boolean(secureSignalingEnabled() && passphrase && passphrase.length > 0);
   let sealingKeyPromise: Promise<Uint8Array> | null = null;
@@ -215,15 +219,29 @@ export async function connectWebRtcTransport(
       if (!passphrase) {
         throw new Error('secure signaling requires passphrase');
       }
-      sealingKeyPromise = derivePreSharedKey(passphrase, handshakeId);
+      trace?.mark('webrtc:derive_psk_start', { handshakeId });
+      sealingKeyPromise = derivePreSharedKey(passphrase, handshakeId)
+        .then((value) => {
+          trace?.mark('webrtc:derive_psk_complete', { handshakeId });
+          return value;
+        })
+        .catch((error) => {
+          trace?.mark('webrtc:derive_psk_error', { handshakeId, message: String(error) });
+          throw error;
+        });
     }
     return sealingKeyPromise;
   };
   const getSealingKey = () => sealingKeyPromise;
   const join = await signaling.waitForMessage('join_success', 15_000);
+  trace?.mark('signaling:join_success', {
+    assignedPeerId: join.peer_id,
+    peers: join.peers.length,
+  });
   log(logger, `join_success payload: ${JSON.stringify(join)}`);
   const assignedPeerId = join.peer_id;
   const remotePeerId = await resolveRemotePeerId(signaling, join, options.preferredPeerId);
+  trace?.mark('webrtc:remote_peer_resolved', { remotePeerId });
   log(logger, `remote peer resolved: ${remotePeerId}`);
 
   const secureState = {
@@ -414,7 +432,7 @@ export async function connectWebRtcTransport(
     if (options.role !== 'answerer') {
       throw new Error(`webrtc role ${options.role} not supported in browser client yet`);
     }
-    return await connectAsAnswerer({
+    const connected = await connectAsAnswerer({
       pc,
       signaling,
       signalingUrl: options.signalingUrl,
@@ -449,13 +467,21 @@ export async function connectWebRtcTransport(
           scheduleFlush(ANSWER_FLUSH_DELAY_MS);
         }
       },
+      trace,
     }, (handshakeId) => {
       currentHandshakeId = handshakeId;
       log(logger, `handshake ready: ${handshakeId}`);
+      trace?.mark('webrtc:handshake_ready', { handshakeId });
       if (candidateSendState === 'ready') {
         void flushPendingCandidates();
       }
     });
+    trace?.mark('webrtc:connect_complete', {
+      remotePeerId: connected.remotePeerId,
+      dataChannelLabel: connected.dataChannel.label,
+      secureMode: connected.secure?.mode ?? 'plaintext',
+    });
+    return connected;
   } finally {
     disposeSignalListener();
     disposeGeneralListener();
@@ -676,6 +702,7 @@ async function connectAsAnswerer(options: {
   localPeerId: string;
   telemetryBaseUrl?: string;
   sessionId?: string;
+  trace?: ConnectionTrace | null;
   secure: {
     enabled: boolean;
     passphrase?: string;
@@ -695,8 +722,13 @@ async function connectAsAnswerer(options: {
     secure,
     telemetryBaseUrl,
     sessionId,
+    trace,
   } = options;
   let cachedSecureKey: Uint8Array | null = null;
+  trace?.mark('webrtc:offer_poll_start', {
+    url: `${signalingUrl.replace(/\/$/, '')}/offer`,
+    remotePeerId,
+  });
   log(logger, 'polling for SDP offer');
   const offer = await pollSdp(
     `${signalingUrl.replace(/\/$/, '')}/offer`,
@@ -704,6 +736,7 @@ async function connectAsAnswerer(options: {
     { peer_id: localPeerId },
     logger,
   );
+  trace?.mark('webrtc:offer_received', { handshakeId: offer.handshake_id, sealed: Boolean(offer.sealed) });
   log(logger, 'SDP offer received');
   if (offer.sealed) {
     log(logger, `offer sealed envelope ${JSON.stringify(offer.sealed)}`);
@@ -768,16 +801,19 @@ async function connectAsAnswerer(options: {
       : undefined,
     telemetryBaseUrl,
     sessionId,
+    trace,
   });
   log(logger, 'waiting for data channel announcement');
 
   await pc.setRemoteDescription({ type: offer.type as RTCSdpType, sdp: offer.sdp });
+  trace?.mark('webrtc:set_remote_description', { handshakeId });
   try {
     options.afterSetRemoteDescription?.();
   } catch {}
 
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
+  trace?.mark('webrtc:set_local_description', { handshakeId });
   try {
     options.beforePostAnswer?.();
   } catch {}
@@ -805,6 +841,7 @@ async function connectAsAnswerer(options: {
   }
 
   await postSdp(`${signalingUrl.replace(/\/$/, '')}/answer`, answerPayload);
+  trace?.mark('webrtc:answer_posted', { handshakeId });
   log(logger, 'SDP answer posted');
   try {
     options.afterPostAnswer?.();
@@ -821,8 +858,10 @@ async function waitForDataChannel(
     handshake?: HandshakeOptions;
     telemetryBaseUrl?: string;
     sessionId?: string;
+    trace?: ConnectionTrace | null;
   },
 ): Promise<ConnectedWebRtcTransport> {
+  const trace = options.trace ?? null;
   return await new Promise<ConnectedWebRtcTransport>((resolve, reject) => {
     let cleaned = false;
     const cleanupCallbacks: Array<() => void> = [];
@@ -858,6 +897,10 @@ async function waitForDataChannel(
     const handleDataChannel = (event: RTCDataChannelEvent) => {
       const channel = event.channel;
       log(options.logger, `data channel announced: ${channel.label}`);
+      trace?.mark('webrtc:data_channel_announced', {
+        label: channel.label,
+        readyState: channel.readyState,
+      });
 
       if (channel.label === HANDSHAKE_CHANNEL_LABEL) {
         if (!options.handshake) {
@@ -869,6 +912,10 @@ async function waitForDataChannel(
         }
         const cfg = options.handshake;
         const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        trace?.mark('webrtc:noise_handshake_start', {
+          handshakeId: cfg.handshakeId,
+          role: cfg.role,
+        });
         runBrowserHandshake(channel, {
           role: cfg.role,
           handshakeId: cfg.handshakeId,
@@ -883,6 +930,11 @@ async function waitForDataChannel(
               `secure handshake complete; verification ${result.verificationCode}`,
             );
             const finishedAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
+            trace?.mark('webrtc:noise_handshake_complete', {
+              handshakeId: cfg.handshakeId,
+              verificationCode: result.verificationCode,
+              latencyMs: Math.max(0, finishedAt - startedAt),
+            });
             void reportSecureTransportEvent(cfg.telemetryBaseUrl ?? options.telemetryBaseUrl, {
               sessionId: cfg.sessionId ?? options.sessionId,
               handshakeId: cfg.handshakeId,
@@ -897,6 +949,10 @@ async function waitForDataChannel(
             } catch {}
           })
           .catch((error) => {
+            trace?.mark('webrtc:noise_handshake_error', {
+              handshakeId: cfg.handshakeId,
+              message: error instanceof Error ? error.message : String(error),
+            });
             void reportSecureTransportEvent(cfg.telemetryBaseUrl ?? options.telemetryBaseUrl, {
               sessionId: cfg.sessionId ?? options.sessionId,
               handshakeId: cfg.handshakeId,
@@ -913,6 +969,9 @@ async function waitForDataChannel(
 
       const prepare = async () => {
         try {
+          trace?.mark('webrtc:data_channel_prepare', {
+            label: channel.label,
+          });
           const handshakeResult = await handshakePromise;
           const secureSummary: SecureTransportSummary =
             handshakeResult && options.handshake
@@ -930,6 +989,10 @@ async function waitForDataChannel(
                   recvKey: handshakeResult.recvKey,
                 })
               : channel;
+          trace?.mark('webrtc:data_channel_secure_ready', {
+            label: channel.label,
+            secureMode: secureSummary.mode,
+          });
 
           const transport = new WebRtcTransport({
             channel: wrappedChannel,
@@ -939,6 +1002,10 @@ async function waitForDataChannel(
           const handleOpen = () => {
             cleanup();
             log(options.logger, 'data channel open');
+            trace?.mark('webrtc:data_channel_open', {
+              label: channel.label,
+              readyState: channel.readyState,
+            });
             resolve({
               transport,
               peerConnection: pc,

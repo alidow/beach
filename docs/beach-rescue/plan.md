@@ -23,8 +23,9 @@ Author: Codex (implementation planning)
 - **Deployment posture:** production deployment stays paused until the relay is exercised end-to-end in the dev environment; manifests remain staging-only.
 - **What remains:** finalize activation gating (entitlement flags + kill switch endpoints), stand up load/perf harness + dashboards, and move into Phase 3 integration work once dev/staging validation passes.
 - **Control-plane kill switch:** beach-road now honours `FALLBACK_WS_PAUSED`; when enabled the `/fallback/token` endpoint refuses requests with a structured 403 so operators can halt fallback minting instantly.
-- **CLI & web toggles:** terminal fallback requests now honour CLI flags (`--fallback-cohort`, `--fallback-entitlement-proof`, `--fallback-telemetry-opt-in`) in addition to env overrides, and beach-web exposes matching advanced inputs that feed the connection controller/logs — giving rollout teams a UI/CLI surface while we wire Clerk-backed entitlements; paused responses surface a friendly error to users.
+- **CLI & web toggles:** terminal fallback requests now honour CLI flags (`--fallback-cohort`, `--fallback-entitlement-proof`, `--fallback-telemetry-opt-in`) in addition to env overrides, and beach-web exposes matching advanced inputs that feed both local storage and the transport connection — giving rollout teams a UI/CLI surface while we wire Clerk-backed entitlements; paused responses surface a friendly error to users.
 - **Token metrics:** beach-road exports `beach_fallback_token_requests_total` via `/metrics`, labelled by `outcome` (`issued`, `paused`, `entitlement_denied`, `invalid_session`, `error`) and guardrail state, so dashboards can track kill-switch use and entitlement failures.
+- **Browser plumbing:** advanced overrides from beach-web are now injected into the connection controller and logged alongside transport setup, ready to be forwarded once the browser fallback transport is wired to beach-rescue.
 ## Naming Options
 - **beach-rescue** (selected): Signals emergency-only fallback, aligns with “Plan B” intent.
 - **beach-buoy** (previous codename): Matches rescue/fallback metaphor, short and descriptive.
@@ -118,9 +119,10 @@ Author: Codex (implementation planning)
 **Exit Check:** Production incident drill proves we can detect, respond to, and roll back fallback within SLA; compliance/security sign-off received.
 
 ## Next Steps After Approval
-1. Harden operability: document the new Prometheus metrics + Redis keys, wire dashboards/alerts, and extend `/debug` endpoints so on-call can inspect sessions safely.
-2. Gate the fallback transport behind control-plane entitlements/feature flags (production default off) and integrate Clerk-based proofs; CLI already forwards cohort/proof hints and the kill switch toggle (`FALLBACK_WS_PAUSED`) is in place pending server-side verification hooks.
-3. Exercise the load/chaos harness against the new session registry (target 5K active / 10K idle) and archive reports ahead of Phase 3 rollout planning.
+1. Harden operability: wire the new Prometheus metrics into dashboards/alerts, add a `/debug` surface for paused state, and finish the SRE runbook.
+2. Gate fallback behind Clerk-backed entitlements: accept signed proofs in beach-road, honour cohort entitlements (`fallback_ws_enabled`), and retire the temporary override path once validation is live.
+3. Thread browser overrides through the upcoming WSS transport handshake so web clients pass cohort/proof/telemetry alongside the CLI when beach-rescue activates.
+4. Exercise the load/chaos harness against the new session registry (target 5K active / 10K idle) and archive reports ahead of Phase 3 rollout planning.
 
 ## Open Source Coordination
 - apps/beach is slated for open sourcing while `apps/beach-rescue` stays private; the public repo will only ship the lightweight `beach-rescue-client` crate needed for handshake message shapes and local testing helpers.

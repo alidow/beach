@@ -129,13 +129,13 @@ declare_class!(
                 return;
             }
             let sender = self.ivars().sender.clone();
-            info!("ScreenCaptureKit output callback received");
+            debug!("ScreenCaptureKit output callback received");
             match process_sample_buffer(sample_buffer) {
                 Ok(ProcessResult::Frame(frame)) => {
                     let _ = sender.send(StreamEvent::Frame(frame));
                 }
                 Ok(ProcessResult::Blank { status }) => {
-                    info!(status, "ScreenCaptureKit sample reported blank frame");
+                    debug!(status, "ScreenCaptureKit sample reported blank frame");
                     let _ = sender.send(StreamEvent::Blank { status });
                 }
                 Err(message) => {
@@ -398,7 +398,7 @@ fn build_window_selection(content: &SCShareableContent, window: &SCWindow) -> Ta
             unreachable!("display index calculated but not retrievable");
         };
         let include = NSArray::from_slice(&[window]);
-        info!(display_index = index, "using display include windows filter");
+        debug!(display_index = index, "using display include windows filter");
         SCContentFilter::init_with_display_include_windows(
             SCContentFilter::alloc(),
             &*display,
@@ -410,7 +410,7 @@ fn build_window_selection(content: &SCShareableContent, window: &SCWindow) -> Ta
             "failed to match window to a display; falling back to first display"
         );
         let include = NSArray::from_slice(&[window]);
-        info!("using fallback display include windows filter (first display)");
+        debug!("using fallback display include windows filter (first display)");
         SCContentFilter::init_with_display_include_windows(
             SCContentFilter::alloc(),
             &*display,
@@ -418,7 +418,7 @@ fn build_window_selection(content: &SCShareableContent, window: &SCWindow) -> Ta
         )
     } else {
         warn!("no displays reported by ScreenCaptureKit content");
-        info!("using desktop independent window filter");
+        debug!("using desktop independent window filter");
         SCContentFilter::init_with_desktop_independent_window(SCContentFilter::alloc(), window)
     };
     let configuration = make_configuration(frame.size, Some(frame));
@@ -457,19 +457,23 @@ fn make_configuration(size: CGSize, window_frame: Option<CGRect>) -> Id<SCStream
     configuration.set_scales_to_fit(true);
     configuration.set_minimum_frame_interval(CMTime::make(1, 60));
     if let Some(frame) = window_frame {
-        let rect = CGRect {
+        let source_rect = CGRect {
             origin: CGPoint::new(frame.origin.x, frame.origin.y),
             size: CGSize::new(frame.size.width, frame.size.height),
         };
+        let destination_rect = CGRect {
+            origin: CGPoint::new(0.0, 0.0),
+            size: CGSize::new(frame.size.width, frame.size.height),
+        };
         unsafe {
-            let _: () = msg_send![&*configuration, setSourceRect: rect];
-            let _: () = msg_send![&*configuration, setDestinationRect: rect];
+            let _: () = msg_send![&*configuration, setSourceRect: source_rect];
+            let _: () = msg_send![&*configuration, setDestinationRect: destination_rect];
         }
         debug!(
-            x = rect.origin.x,
-            y = rect.origin.y,
-            width = rect.size.width,
-            height = rect.size.height,
+            source_x = source_rect.origin.x,
+            source_y = source_rect.origin.y,
+            source_width = source_rect.size.width,
+            source_height = source_rect.size.height,
             "configured source/destination rects"
         );
     }
@@ -515,16 +519,15 @@ fn process_sample_buffer(sample_buffer: CMSampleBufferRef) -> Result<ProcessResu
         .as_ref()
         .map(|arr| arr.len())
         .unwrap_or(0);
-    let total_size = sample.get_total_sample_size();
     let Some(image_buffer) = sample.get_image_buffer() else {
-        info!(status = status.unwrap_or(-1), attachment_count, total_size, "blank sample missing image buffer");
+        debug!(status = status.unwrap_or(-1), attachment_count, "blank sample missing image buffer");
         return Ok(ProcessResult::Blank { status });
     };
     let Some(pixel_buffer) = image_buffer.downcast::<CVPixelBuffer>() else {
         return Err("unsupported pixel buffer type".into());
     };
     let frame = convert_pixel_buffer(&pixel_buffer)?;
-    info!(status, attachment_count, total_size, "produced ScreenCaptureKit frame");
+    debug!(status, attachment_count, "produced ScreenCaptureKit frame");
     Ok(ProcessResult::Frame(frame))
 }
 

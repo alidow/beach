@@ -105,13 +105,12 @@ export async function runBrowserHandshake(
   params: BrowserHandshakeParams,
 ): Promise<BrowserHandshakeResult> {
   channel.binaryType = 'arraybuffer';
+  const queue = new DataChannelQueue(channel);
   await waitForChannelOpen(channel);
-
   const noise = await loadNoise();
   const psk = await resolvePreSharedKey(params);
   const prologue = buildPrologue(params.prologueContext);
   const handshake = createHandshake(noise, params.role, prologue);
-  const queue = new DataChannelQueue(channel);
 
   try {
     await driveHandshake(noise, handshake, queue, channel, params);

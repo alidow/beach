@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -42,7 +42,7 @@ pub enum Commands {
         #[arg(long)]
         output_dir: Option<PathBuf>,
     },
-    /// Capture and encode a short session to an animated GIF.
+    /// Capture and encode a short session to an artifact.
     Encode {
         #[arg(long = "window-id")]
         window_id: String,
@@ -58,6 +58,9 @@ pub enum Commands {
         /// Output file path (will be overwritten).
         #[arg(long, default_value = "cabana-output.gif")]
         output: PathBuf,
+        /// Preferred encoder (macOS only).
+        #[arg(long, value_enum, default_value_t = EncodeCodec::Gif)]
+        codec: EncodeCodec,
     },
     /// Derive session keys and prepare to share a target over WebRTC.
     Start {
@@ -127,4 +130,11 @@ pub enum Commands {
         #[arg(long, default_value = "cabana-cli")]
         prologue: String,
     },
+}
+
+#[derive(Debug, Copy, Clone, ValueEnum)]
+pub enum EncodeCodec {
+    Gif,
+    #[value(name = "h264")]
+    H264,
 }

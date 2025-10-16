@@ -1071,16 +1071,38 @@ export class TerminalGridCache {
       });
       return;
     }
-    if (this.cursorRow === 0 && this.cursorCol === 0) {
+    const atOrigin =
+      this.cursorRow === 0 &&
+      this.cursorCol === 0;
+    if (atOrigin) {
       trace('maybeRevealPendingCursor: still at origin', {
         cursorRow: this.cursorRow,
         cursorCol: this.cursorCol,
       });
-      return;
     }
-    const row = this.cursorRow;
-    const committed = this.committedRowWidth(row);
-    const predicted = this.predictedRowWidth(row);
+    let row = this.cursorRow;
+    let committed = this.committedRowWidth(row);
+    let predicted = this.predictedRowWidth(row);
+    if (committed <= 0 && predicted <= 0) {
+      const fallback = this.findHighestLoadedRow();
+      if (fallback !== null && fallback !== row) {
+        const fallbackCommitted = this.committedRowWidth(fallback);
+        const fallbackPredicted = this.predictedRowWidth(fallback);
+        trace('maybeRevealPendingCursor: adopting fallback row', {
+          previousRow: row,
+          fallbackRow: fallback,
+          fallbackCommitted,
+          fallbackPredicted,
+        });
+        if (fallbackCommitted > 0 || fallbackPredicted > 0) {
+          row = fallback;
+          committed = fallbackCommitted;
+          predicted = fallbackPredicted;
+          this.cursorRow = row;
+          this.cursorCol = Math.max(0, Math.max(committed, predicted));
+        }
+      }
+    }
     if (committed <= 0 && predicted <= 0) {
       trace('maybeRevealPendingCursor: row empty', {
         row,
@@ -1089,6 +1111,7 @@ export class TerminalGridCache {
       });
       return;
     }
+    this.clampCursor();
     trace('maybeRevealPendingCursor: revealing cursor', {
       row,
       committed,

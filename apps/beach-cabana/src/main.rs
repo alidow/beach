@@ -219,10 +219,12 @@ fn run(cli: cli::Cli) -> Result<()> {
             fps,
             max_width,
             output,
+            codec,
         } => {
             #[cfg(target_os = "macos")]
             {
                 use crate::capture::create_producer;
+                use crate::cli::EncodeCodec;
                 use crate::encoder::{GifVideoEncoder, VideoEncoder};
 
                 let fps = fps.max(1);
@@ -245,6 +247,10 @@ fn run(cli: cli::Cli) -> Result<()> {
                 let mut encoder: Option<GifVideoEncoder> = None;
                 let mut frames_written = 0u32;
                 let frame_interval = Duration::from_secs_f32(1.0 / fps as f32);
+
+                if matches!(codec, EncodeCodec::H264) {
+                    println!("H264 encoder is not implemented yet; falling back to GIF output.");
+                }
 
                 for index in 0..total_frames {
                     let mut frame = match producer.next_frame() {
@@ -309,7 +315,10 @@ fn run(cli: cli::Cli) -> Result<()> {
             }
             #[cfg(not(target_os = "macos"))]
             {
-                println!("Encoding is not implemented for this platform yet.");
+                println!(
+                    "Encoding is not implemented for this platform yet (requested codec: {:?}).",
+                    codec
+                );
             }
         }
         cli::Commands::Start {

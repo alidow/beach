@@ -3415,13 +3415,48 @@ fn resolve_ice_candidate(
         })?;
         let associated = [from_peer, to_peer, handshake_id];
         let plaintext = if let Some(psk) = pre_shared_key {
-            open_message_with_psk(
+            match open_message_with_psk(
                 psk,
                 handshake_id,
                 MessageLabel::Ice,
                 &associated,
                 &sealed_env,
-            )?
+            ) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    let handshake_error = err.to_string();
+                    tracing::warn!(
+                        handshake_id,
+                        from_peer,
+                        to_peer,
+                        error = %handshake_error,
+                        "sealed ice candidate decrypt failed with handshake key; falling back to passphrase"
+                    );
+                    match open_message(
+                        passphrase_value,
+                        handshake_id,
+                        MessageLabel::Ice,
+                        &associated,
+                        &sealed_env,
+                    ) {
+                        Ok(bytes) => bytes,
+                        Err(passphrase_err) => {
+                            let passphrase_error = passphrase_err.to_string();
+                            tracing::error!(
+                                handshake_id,
+                                from_peer,
+                                to_peer,
+                                handshake_error = %handshake_error,
+                                passphrase_error = %passphrase_error,
+                                "sealed ice candidate decrypt failed with handshake key and passphrase"
+                            );
+                            return Err(TransportError::Setup(format!(
+                                "sealed ice candidate decrypt failed: handshake_key_error={handshake_error}; passphrase_error={passphrase_error}"
+                            )));
+                        }
+                    }
+                }
+            }
         } else {
             open_message(
                 passphrase_value,

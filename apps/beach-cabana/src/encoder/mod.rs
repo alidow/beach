@@ -4,6 +4,11 @@ use gif::{Encoder, Frame as GifFrame, Repeat};
 use std::fs::File;
 use std::path::Path;
 
+#[cfg(all(target_os = "macos", feature = "cabana_sck"))]
+mod videotoolbox;
+#[cfg(all(target_os = "macos", feature = "cabana_sck"))]
+pub use videotoolbox::VideoToolboxEncoder;
+
 pub trait VideoEncoder {
     fn write_frame(&mut self, frame: &Frame) -> Result<()>;
     fn finish(self) -> Result<()>;

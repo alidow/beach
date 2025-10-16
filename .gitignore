@@ -39,6 +39,7 @@ apps/*/dist/
 apps/*/build/
 apps/*/.turbo/
 apps/*/.tsbuildinfo
+apps/*/.next/
 
 # Beach Gate artifacts
 apps/beach-gate/node_modules/

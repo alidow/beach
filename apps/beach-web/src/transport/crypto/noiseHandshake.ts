@@ -28,7 +28,11 @@ interface NoiseHandshakeState {
   ): void;
   GetAction(): number;
   WriteMessage(payload: Uint8Array | null): Uint8Array;
-  ReadMessage(message: Uint8Array, payloadNeeded?: boolean, fallbackSupported?: boolean): Uint8Array | null;
+  ReadMessage(
+    message: Uint8Array,
+    payloadNeeded?: boolean,
+    fallbackSupported?: boolean,
+  ): Uint8Array | null;
   Split(): [NoiseCipherState, NoiseCipherState];
   GetHandshakeHash(): Uint8Array;
   free(): void;
@@ -82,13 +86,8 @@ export function buildPrologueContext(
   remotePeerId: string,
 ): Uint8Array {
   const peers = [localPeerId, remotePeerId].sort();
-  const parts = [
-    encoder.encode(handshakeId),
-    encoder.encode(peers[0]),
-    encoder.encode(peers[1]),
-  ];
-  const totalLength =
-    parts.reduce((sum, item) => sum + item.length, 0) + (parts.length - 1);
+  const parts = [encoder.encode(handshakeId), encoder.encode(peers[0]), encoder.encode(peers[1])];
+  const totalLength = parts.reduce((sum, item) => sum + item.length, 0) + (parts.length - 1);
   const output = new Uint8Array(totalLength);
   let offset = 0;
   parts.forEach((part, index) => {
@@ -115,7 +114,7 @@ export async function runBrowserHandshake(
   const queue = new DataChannelQueue(channel);
 
   try {
-    await driveHandshake(noise, handshake, queue, channel);
+    await driveHandshake(noise, handshake, queue, channel, params);
     const handshakeHash = new Uint8Array(handshake.GetHandshakeHash());
     const [sendCipher, recvCipher] = handshake.Split();
     // Immediately free the cipher states to avoid leaking WASM memory.
@@ -160,15 +159,40 @@ export async function runBrowserHandshake(
 
 async function resolvePreSharedKey(params: BrowserHandshakeParams): Promise<Uint8Array> {
   if (params.preSharedKey) {
+    console.debug('[beach-web][noise] preSharedKey resolved', {
+      handshakeId: params.handshakeId,
+      source: 'provided',
+      length: params.preSharedKey.length,
+    });
     return params.preSharedKey;
   }
   if (params.preSharedKeyPromise) {
-    return await params.preSharedKeyPromise;
+    console.debug('[beach-web][noise] waiting for preSharedKey promise', {
+      handshakeId: params.handshakeId,
+      source: 'promise',
+    });
+    const key = await params.preSharedKeyPromise;
+    console.debug('[beach-web][noise] preSharedKey promise fulfilled', {
+      handshakeId: params.handshakeId,
+      source: 'promise',
+      length: key.length,
+    });
+    return key;
   }
   if (!params.passphrase) {
     throw new Error('secure handshake requires passphrase or pre-shared key');
   }
-  return await derivePreSharedKey(params.passphrase, params.handshakeId);
+  console.debug('[beach-web][noise] deriving preSharedKey from passphrase', {
+    handshakeId: params.handshakeId,
+    source: 'passphrase',
+  });
+  const key = await derivePreSharedKey(params.passphrase, params.handshakeId);
+  console.debug('[beach-web][noise] derived preSharedKey from passphrase', {
+    handshakeId: params.handshakeId,
+    source: 'passphrase',
+    length: key.length,
+  });
+  return key;
 }
 
 function buildPrologue(context: Uint8Array): Uint8Array {
@@ -249,21 +273,44 @@ async function driveHandshake(
   handshake: NoiseHandshake,
   queue: DataChannelQueue,
   channel: RTCDataChannel,
+  params: BrowserHandshakeParams,
 ): Promise<void> {
+  let writeCount = 0;
+  let readCount = 0;
   while (true) {
     const action = handshake.GetAction();
     switch (action) {
       case noise.constants.NOISE_ACTION_WRITE_MESSAGE: {
         const message = handshake.WriteMessage(null);
+        console.debug('[beach-web][noise] handshake_write', {
+          handshakeId: params.handshakeId,
+          role: params.role,
+          index: writeCount,
+          bytes: message.length,
+        });
+        writeCount += 1;
         channel.send(toArrayBuffer(message));
         break;
       }
       case noise.constants.NOISE_ACTION_READ_MESSAGE: {
         const incoming = await queue.next();
+        console.debug('[beach-web][noise] handshake_read', {
+          handshakeId: params.handshakeId,
+          role: params.role,
+          index: readCount,
+          bytes: incoming.length,
+        });
+        readCount += 1;
         handshake.ReadMessage(incoming, false, false);
         break;
       }
       case noise.constants.NOISE_ACTION_SPLIT:
+        console.debug('[beach-web][noise] handshake_split', {
+          handshakeId: params.handshakeId,
+          role: params.role,
+          outboundMessages: writeCount,
+          inboundMessages: readCount,
+        });
         return;
       case noise.constants.NOISE_ACTION_NONE:
         await queue.idle();
@@ -302,15 +349,13 @@ export async function deriveNoiseTransportSecrets(
   );
 
   const peers = [input.localPeerId, input.remotePeerId].sort();
-  const verifyLabel = encoder.encode(
-    `${TRANSPORT_VERIFY_PREFIX}${peers[0]}|${peers[1]}`,
-  );
+  const verifyLabel = encoder.encode(`${TRANSPORT_VERIFY_PREFIX}${peers[0]}|${peers[1]}`);
 
   const sendMaterial = await hkdfExpand(input.handshakeHash, input.psk, directionOut, 32);
   const recvMaterial = await hkdfExpand(input.handshakeHash, input.psk, directionIn, 32);
   const verifyBytes = await hkdfExpand(input.handshakeHash, input.psk, verifyLabel, 4);
   const code =
-    ((verifyBytes[0]!) |
+    (verifyBytes[0]! |
       (verifyBytes[1]! << 8) |
       (verifyBytes[2]! << 16) |
       (verifyBytes[3]! << 24)) >>>
@@ -363,6 +408,12 @@ async function performVerificationExchange(params: VerificationExchangeParams): 
 
   const nonce = new Uint8Array(CHALLENGE_NONCE_LENGTH);
   crypto.getRandomValues(nonce);
+  console.debug('[beach-web][noise] challenge_prepare', {
+    ...baseDetails,
+    roleByte,
+    code: params.verificationCode,
+    nonce: toHex(nonce),
+  });
 
   try {
     const outboundFrame = await buildChallengeFrame({
@@ -372,10 +423,27 @@ async function performVerificationExchange(params: VerificationExchangeParams): 
       challengeKey: params.challengeKey,
       challengeContext: params.challengeContext,
     });
+    const outboundMac = outboundFrame.slice(2 + 6 + CHALLENGE_NONCE_LENGTH);
+    console.debug('[beach-web][noise] challenge_mac_computed', {
+      ...baseDetails,
+      mac: toHex(outboundMac),
+    });
     params.channel.send(toArrayBuffer(outboundFrame));
+    console.debug('[beach-web][noise] challenge_sent', baseDetails);
 
     const remotePayload = await params.queue.next();
+    console.debug('[beach-web][noise] challenge_received_raw', {
+      ...baseDetails,
+      bytes: remotePayload.length,
+    });
     const remoteFrame = parseChallengeFrame(remotePayload);
+    console.debug('[beach-web][noise] challenge_parsed', {
+      ...baseDetails,
+      remoteRole: remoteFrame.role,
+      remoteCodeHex: toHex(remoteFrame.codeBytes),
+      remoteNonce: toHex(remoteFrame.nonce),
+      remoteMac: toHex(remoteFrame.mac),
+    });
 
     if (remoteFrame.version !== CHALLENGE_FRAME_VERSION) {
       verificationFailure(baseDetails, 'secure handshake verification failed', {
@@ -407,6 +475,10 @@ async function performVerificationExchange(params: VerificationExchangeParams): 
         observedMac: toHex(remoteFrame.mac),
       });
     }
+    console.debug('[beach-web][noise] challenge_mac_verified', {
+      ...baseDetails,
+      expectedMac: toHex(expectedMac),
+    });
 
     const remoteCode = decoder.decode(remoteFrame.codeBytes);
     if (remoteCode !== params.verificationCode) {
@@ -416,6 +488,11 @@ async function performVerificationExchange(params: VerificationExchangeParams): 
         remoteCode,
       });
     }
+    console.debug('[beach-web][noise] challenge_codes_match', {
+      ...baseDetails,
+      remoteCode,
+      localCode: params.verificationCode,
+    });
   } catch (error) {
     const details =
       error instanceof Error && (error as any).verificationDetails
@@ -692,11 +769,7 @@ function normaliseData(data: unknown): Uint8Array {
     return new Uint8Array(data);
   }
   if (ArrayBuffer.isView(data)) {
-    const view = new Uint8Array(
-      data.buffer,
-      data.byteOffset,
-      data.byteLength,
-    );
+    const view = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
     return view.slice();
   }
   throw new Error('expected binary RTCDataChannel payload');
@@ -742,7 +815,8 @@ async function loadNoise(): Promise<NoiseModule> {
               const exports = Object.keys(module as unknown as Record<string, unknown>);
               console.debug('[beach-web][noise] module resolved', {
                 exportKeys: exports,
-                hasHandshakeState: typeof (module as unknown as Record<string, unknown>).HandshakeState,
+                hasHandshakeState: typeof (module as unknown as Record<string, unknown>)
+                  .HandshakeState,
                 constants: typed.constants,
                 patterns: (module as unknown as Record<string, unknown>).HandshakePatterns ?? null,
               });
@@ -769,14 +843,20 @@ async function resolveWasmBinary(): Promise<Uint8Array | undefined> {
       import('node:fs'),
       import('node:url'),
     ]);
-    const resolvedUrl = typeof (import.meta as any).resolve === 'function'
-      ? await (import.meta as any).resolve('noise-c.wasm/src/noise-c.wasm')
-      : new URL('../../../../../node_modules/noise-c.wasm/src/noise-c.wasm', import.meta.url).toString();
+    const resolvedUrl =
+      typeof (import.meta as any).resolve === 'function'
+        ? await (import.meta as any).resolve('noise-c.wasm/src/noise-c.wasm')
+        : new URL(
+            '../../../../../node_modules/noise-c.wasm/src/noise-c.wasm',
+            import.meta.url,
+          ).toString();
     const fileUrl = new URL(resolvedUrl);
     const filePath = fileURLToPath(fileUrl);
     console.debug('[beach-web][noise] resolved wasm file path', { filePath });
     const buffer = readFileSync(filePath);
-    return new Uint8Array(buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength));
+    return new Uint8Array(
+      buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength),
+    );
   } catch (error) {
     console.error('[beach-web][noise] resolveWasmBinary failed', error);
     return undefined;

@@ -109,10 +109,24 @@ pub async fn run_handshake(
     };
 
     let mut send_buf = vec![0u8; 1024];
+    let mut outbound_index: u32 = 0;
+    let mut inbound_index: u32 = 0;
     if matches!(role, HandshakeRole::Initiator) {
         let len = state
             .write_message(&[], &mut send_buf)
             .map_err(map_noise_error)?;
+        tracing::trace!(
+            target = "webrtc",
+            handshake_id = %params.handshake_id,
+            local_peer = %params.local_peer_id,
+            remote_peer = %params.remote_peer_id,
+            ?role,
+            action = "write",
+            message_index = outbound_index,
+            bytes = len,
+            "noise handshake wrote initial message"
+        );
+        outbound_index = outbound_index.saturating_add(1);
         let payload = Bytes::copy_from_slice(&send_buf[..len]);
         channel
             .send(&payload)
@@ -125,6 +139,18 @@ pub async fn run_handshake(
             .recv()
             .await
             .ok_or_else(|| TransportError::Setup("secure handshake channel closed".into()))?;
+        tracing::trace!(
+            target = "webrtc",
+            handshake_id = %params.handshake_id,
+            local_peer = %params.local_peer_id,
+            remote_peer = %params.remote_peer_id,
+            ?role,
+            action = "read",
+            message_index = inbound_index,
+            bytes = incoming.len(),
+            "noise handshake received message"
+        );
+        inbound_index = inbound_index.saturating_add(1);
         state
             .read_message(&incoming, &mut send_buf)
             .map_err(map_noise_error)?;
@@ -134,6 +160,18 @@ pub async fn run_handshake(
         let len = state
             .write_message(&[], &mut send_buf)
             .map_err(map_noise_error)?;
+        tracing::trace!(
+            target = "webrtc",
+            handshake_id = %params.handshake_id,
+            local_peer = %params.local_peer_id,
+            remote_peer = %params.remote_peer_id,
+            ?role,
+            action = "write",
+            message_index = outbound_index,
+            bytes = len,
+            "noise handshake wrote message"
+        );
+        outbound_index = outbound_index.saturating_add(1);
         let payload = Bytes::copy_from_slice(&send_buf[..len]);
         channel
             .send(&payload)
@@ -142,6 +180,16 @@ pub async fn run_handshake(
     }
 
     let handshake_hash = state.get_handshake_hash().to_vec();
+    tracing::trace!(
+        target = "webrtc",
+        handshake_id = %params.handshake_id,
+        local_peer = %params.local_peer_id,
+        remote_peer = %params.remote_peer_id,
+        ?role,
+        inbound_messages = inbound_index,
+        outbound_messages = outbound_index,
+        "noise handshake completed Diffie-Hellman exchange"
+    );
     state.into_transport_mode().map_err(map_noise_error)?;
 
     let (result, challenge_key, challenge_context) = derive_session_material(

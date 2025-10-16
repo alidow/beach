@@ -363,7 +363,7 @@ fn select_target(
     for index in 0..windows.len() {
         if let Some(window) = windows.get(index) {
             if window.window_id() == window_id {
-                return Ok(build_window_selection(window));
+                return Ok(build_window_selection(content, window));
             }
         }
     }
@@ -374,7 +374,7 @@ fn select_target(
     )))
 }
 
-fn build_window_selection(window: &SCWindow) -> TargetSelection {
+fn build_window_selection(content: &SCShareableContent, window: &SCWindow) -> TargetSelection {
     let frame: CGRect = window.frame();
     debug!(
         window_id = window.window_id(),
@@ -392,8 +392,32 @@ fn build_window_selection(window: &SCWindow) -> TargetSelection {
             "window has non-positive dimensions; ScreenCaptureKit may fail"
         );
     }
-    let filter =
-        SCContentFilter::init_with_desktop_independent_window(SCContentFilter::alloc(), window);
+    let displays = content.displays();
+    let filter = if let Some(index) = display_index_for_window(&displays, &frame) {
+        let Some(display) = displays.get(index) else {
+            unreachable!("display index calculated but not retrievable");
+        };
+        let include = NSArray::from_slice(&[window]);
+        SCContentFilter::init_with_display_include_windows(
+            SCContentFilter::alloc(),
+            &*display,
+            &include,
+        )
+    } else if let Some(display) = displays.get(0) {
+        warn!(
+            window_id = window.window_id(),
+            "failed to match window to a display; falling back to first display"
+        );
+        let include = NSArray::from_slice(&[window]);
+        SCContentFilter::init_with_display_include_windows(
+            SCContentFilter::alloc(),
+            &*display,
+            &include,
+        )
+    } else {
+        warn!("no displays reported by ScreenCaptureKit content");
+        SCContentFilter::init_with_desktop_independent_window(SCContentFilter::alloc(), window)
+    };
     let configuration = make_configuration(frame.size, Some(frame));
     TargetSelection { filter, configuration }
 }
@@ -447,6 +471,37 @@ fn make_configuration(size: CGSize, window_frame: Option<CGRect>) -> Id<SCStream
         );
     }
     configuration
+}
+
+fn display_index_for_window(displays: &NSArray<SCDisplay>, frame: &CGRect) -> Option<usize> {
+    let center = CGPoint::new(
+        frame.origin.x + frame.size.width / 2.0,
+        frame.origin.y + frame.size.height / 2.0,
+    );
+    for index in 0..displays.len() {
+        let Some(display) = displays.get(index) else {
+            continue;
+        };
+        let bounds = display.frame();
+        if point_in_rect(center, &bounds) {
+            debug!(
+                display_width = bounds.size.width,
+                display_height = bounds.size.height,
+                display_origin_x = bounds.origin.x,
+                display_origin_y = bounds.origin.y,
+                "matched window to display"
+            );
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn point_in_rect(point: CGPoint, rect: &CGRect) -> bool {
+    point.x >= rect.origin.x
+        && point.x <= rect.origin.x + rect.size.width
+        && point.y >= rect.origin.y
+        && point.y <= rect.origin.y + rect.size.height
 }
 
 fn process_sample_buffer(sample_buffer: CMSampleBufferRef) -> Result<ProcessResult, String> {

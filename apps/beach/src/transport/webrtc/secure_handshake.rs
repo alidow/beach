@@ -281,6 +281,19 @@ async fn perform_verification_exchange(
     OsRng.fill_bytes(&mut nonce);
     frame[8..8 + CHALLENGE_NONCE_LENGTH].copy_from_slice(&nonce);
 
+    tracing::debug!(
+        target = "webrtc",
+        handshake_id = %params.handshake_id,
+        local_peer = %params.local_peer_id,
+        remote_peer = %params.remote_peer_id,
+        ?role,
+        event = "challenge_prepare",
+        role_byte,
+        code = %verification_code,
+        nonce = %hex::encode(&nonce),
+        "prepared local verification challenge frame"
+    );
+
     let outbound_mac = compute_challenge_mac(
         challenge_key,
         challenge_context,
@@ -290,11 +303,32 @@ async fn perform_verification_exchange(
     )?;
     frame[8 + CHALLENGE_NONCE_LENGTH..].copy_from_slice(&outbound_mac);
 
+    tracing::debug!(
+        target = "webrtc",
+        handshake_id = %params.handshake_id,
+        local_peer = %params.local_peer_id,
+        remote_peer = %params.remote_peer_id,
+        ?role,
+        event = "challenge_mac_computed",
+        mac = %hex::encode(&outbound_mac),
+        "computed local verification challenge mac"
+    );
+
     let payload = Bytes::copy_from_slice(&frame);
     channel
         .send(&payload)
         .await
         .map_err(|err| TransportError::Setup(format!("secure handshake send failed: {err}")))?;
+
+    tracing::debug!(
+        target = "webrtc",
+        handshake_id = %params.handshake_id,
+        local_peer = %params.local_peer_id,
+        remote_peer = %params.remote_peer_id,
+        ?role,
+        event = "challenge_sent",
+        "sent local verification challenge frame"
+    );
 
     let remote_payload = match incoming_rx.recv().await {
         Some(payload) => payload,
@@ -313,6 +347,17 @@ async fn perform_verification_exchange(
             ));
         }
     };
+
+    tracing::debug!(
+        target = "webrtc",
+        handshake_id = %params.handshake_id,
+        local_peer = %params.local_peer_id,
+        remote_peer = %params.remote_peer_id,
+        ?role,
+        event = "challenge_received_raw",
+        bytes = remote_payload.len(),
+        "received remote verification payload"
+    );
 
     if remote_payload.len() != CHALLENGE_FRAME_LENGTH {
         tracing::warn!(
@@ -369,6 +414,20 @@ async fn perform_verification_exchange(
     let remote_code = &remote_payload[2..8];
     let remote_nonce = &remote_payload[8..8 + CHALLENGE_NONCE_LENGTH];
     let remote_mac = &remote_payload[8 + CHALLENGE_NONCE_LENGTH..];
+
+    tracing::debug!(
+        target = "webrtc",
+        handshake_id = %params.handshake_id,
+        local_peer = %params.local_peer_id,
+        remote_peer = %params.remote_peer_id,
+        ?role,
+        event = "challenge_parsed",
+        remote_role,
+        remote_code = %hex::encode(remote_code),
+        remote_nonce = %hex::encode(remote_nonce),
+        remote_mac = %hex::encode(remote_mac),
+        "parsed remote verification challenge frame"
+    );
 
     let expected_mac = compute_challenge_mac(
         challenge_key,
@@ -429,6 +488,28 @@ async fn perform_verification_exchange(
             "secure handshake verification failed".into(),
         ));
     }
+
+    tracing::debug!(
+        target = "webrtc",
+        handshake_id = %params.handshake_id,
+        local_peer = %params.local_peer_id,
+        remote_peer = %params.remote_peer_id,
+        ?role,
+        event = "challenge_codes_match",
+        remote_code = %remote_code_str,
+        local_code = %verification_code,
+        "verification codes matched"
+    );
+
+    tracing::debug!(
+        target = "webrtc",
+        handshake_id = %params.handshake_id,
+        local_peer = %params.local_peer_id,
+        remote_peer = %params.remote_peer_id,
+        ?role,
+        event = "challenge_verified",
+        "verification exchange completed successfully"
+    );
 
     Ok(())
 }

@@ -44,11 +44,12 @@ Another angle: browser caches handshake key per ID, but the offerer expects the 
 ## Progress (2025-10-16)
 
 - Host `secure_handshake` now accepts the cached pre-shared key instead of re-running per-handshake Argon2, so both sides share the HKDF-derived `handshake_key`. Offerer and answerer paths fetch the key from `await_pre_shared_key(...)` before starting Noise and log the truncated hash (`key_path=handshake_for_noise`). This removed the runtime divergence we observed in the new logging.
+- Added deep diagnostic logging around the answerer handshake task (key acquisition success/failure, explicit Noise entry) and inside the verification exchange (`challenge_prepare`, `challenge_sent`, `challenge_parsed`, `challenge_verified`). These traces capture the role byte, code, nonce, and MAC fingerprints so we can correlate inbound/outbound frames when the handshake stalls.
 
 ## Next Steps for Follow-up Agent
 
-1. Re-run beach-web with the updated binaries and confirm the Noise handshake succeeds (watch for `handshake_for_noise` hashes aligning on both sides).
-2. If any MAC mismatch persists, diff the logged hashes to spot stale keys, then trace the Noise challenge inputs (`role`, `nonce`, `code`) for discrepancies.
+1. Re-run beach-web with the updated binaries and confirm the new diagnostics: `handshake_for_noise` hashes should still align, and the console/host logs should show complementary `challenge_*` events.
+2. If the handshake stalls or a MAC mismatch persists, use the logged role/code/nonce/MAC fingerprints to pinpoint which side diverged (e.g., mismatched verification codes or altered payloads) before touching the Noise implementation.
 3. Once the connection stabilises, prune the temporary trace logging and capture a fresh timing profile for the end-to-end connect path.
 
 Shared log snippets in `/Users/arellidow/beach-debug/host.log` around lines `15921662` and `15937700` show the MAC mismatch details. 

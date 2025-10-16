@@ -1910,6 +1910,7 @@ async fn connect_answerer(
         passphrase_owned.as_deref(),
         shared_key.as_ref().map(|key| key.as_ref()),
     )?;
+    let remote_offer_peer = offer_payload.from_peer.clone();
     let handshake_id = Arc::new(offer_payload.handshake_id.clone());
     let answerer_span = tracing::trace_span!(
         target: "webrtc",
@@ -1920,7 +1921,6 @@ async fn connect_answerer(
         thread = %current_thread_label()
     );
     let _answerer_span_guard = answerer_span.enter();
-    let remote_offer_peer = offer_payload.from_peer.clone();
 
     let mut setting = SettingEngine::default();
     setting.set_ice_timeouts(

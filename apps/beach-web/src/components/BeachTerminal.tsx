@@ -977,8 +977,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       subscription: subscriptionRef.current,
     });
     transport.send({ type: 'input', seq, data: payload });
-    store.registerPrediction(seq, payload);
-    const overlayUpdate = predictionUxRef.current.recordSend(seq, timestampMs, predicts);
+    const predictionApplied = store.registerPrediction(seq, payload);
+    const overlayUpdate = predictionUxRef.current.recordSend(seq, timestampMs, predicts && predictionApplied);
     if (overlayUpdate) {
       setPredictionOverlay(overlayUpdate);
     }

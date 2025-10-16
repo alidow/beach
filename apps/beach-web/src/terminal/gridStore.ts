@@ -150,11 +150,13 @@ export class TerminalGridStore {
     }
   }
 
-  registerPrediction(seq: number, data: Uint8Array): void {
-    if (this.cache.registerPrediction(seq, data)) {
+  registerPrediction(seq: number, data: Uint8Array): boolean {
+    const changed = this.cache.registerPrediction(seq, data);
+    if (changed) {
       this.invalidate();
       this.notify();
     }
+    return changed;
   }
 
   clearPrediction(seq: number): void {

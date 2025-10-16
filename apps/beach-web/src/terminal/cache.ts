@@ -1424,6 +1424,17 @@ export class TerminalGridCache {
       return false;
     }
 
+    if (this.pendingInitialCursor) {
+      if (tracing) {
+        this.predictiveLog('prediction_skipped', {
+          seq,
+          byte_count: data.length,
+          reason: 'cursor_pending_initial_position',
+        });
+      }
+      return false;
+    }
+
     let mutated = false;
     let cursorMoved = false;
 

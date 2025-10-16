@@ -13,6 +13,7 @@ use crossbeam_channel::{
 use once_cell::sync::Lazy;
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OnceCell, SetError, mpsc as tokio_mpsc, oneshot};
 use tokio::time::{sleep, timeout};
@@ -2627,6 +2628,11 @@ fn extract_session_id(signaling_url: &str) -> Result<String, TransportError> {
     Ok(segments[1].to_string())
 }
 
+fn truncated_key_hash(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    hex::encode(&digest[..8])
+}
+
 fn prime_session_key(
     cell: &Arc<OnceCell<Arc<[u8; 32]>>>,
     passphrase: Option<&str>,
@@ -2772,34 +2778,103 @@ async fn await_pre_shared_key(
     handshake_id: &str,
 ) -> Result<Option<Arc<[u8; 32]>>, TransportError> {
     if let Some(existing) = handshake_cell.get() {
+        tracing::debug!(
+            target = "webrtc",
+            handshake_id = %handshake_id,
+            key_path = "handshake_cache",
+            key_hash = %truncated_key_hash(existing.as_ref()),
+            "using cached handshake key"
+        );
         return Ok(Some(existing.clone()));
     }
     let Some(passphrase_value) = passphrase else {
+        tracing::debug!(
+            target = "webrtc",
+            handshake_id = %handshake_id,
+            key_path = "passphrase_missing",
+            "handshake pre-shared key unavailable; no passphrase provided"
+        );
         return Ok(None);
     };
     if !should_encrypt(Some(passphrase_value)) {
+        tracing::debug!(
+            target = "webrtc",
+            handshake_id = %handshake_id,
+            key_path = "encryption_disabled",
+            "handshake pre-shared key bypassed; encryption disabled"
+        );
         return Ok(None);
     }
+    let session_cached_before = session_key_cell.get().is_some();
     let session_key =
         ensure_session_key(session_key_cell, Some(passphrase_value), session_id).await?;
     let Some(session_key) = session_key else {
+        tracing::warn!(
+            target = "webrtc",
+            handshake_id = %handshake_id,
+            key_path = "session_key_missing",
+            "expected session key but none was returned"
+        );
         return Ok(None);
     };
+    let session_key_hash = truncated_key_hash(session_key.as_ref());
+    let session_source: &'static str = if session_cached_before {
+        "cache"
+    } else if session_key_cell
+        .get()
+        .map(|existing| Arc::ptr_eq(existing, &session_key))
+        .unwrap_or(false)
+    {
+        "derived"
+    } else {
+        "race"
+    };
     let derived = derive_handshake_key_from_session(session_key.as_ref(), handshake_id)?;
+    let handshake_hash = truncated_key_hash(&derived);
     let arc_key = Arc::new(derived);
     match handshake_cell.set(arc_key.clone()) {
         Ok(()) => {
             tracing::debug!(
                 target = "webrtc",
                 handshake_id = %handshake_id,
+                key_path = "derived_from_session",
+                session_source = %session_source,
+                session_hash = %session_key_hash,
+                handshake_hash = %handshake_hash,
                 "handshake key cached"
             );
             Ok(Some(arc_key))
         }
         Err(SetError::AlreadyInitializedError(_)) => {
+            let cached_hash = handshake_cell
+                .get()
+                .map(|existing| truncated_key_hash(existing.as_ref()));
+            let cached_hash = cached_hash.as_deref().unwrap_or("unknown");
+            tracing::debug!(
+                target = "webrtc",
+                handshake_id = %handshake_id,
+                key_path = "handshake_cache_race",
+                session_source = %session_source,
+                session_hash = %session_key_hash,
+                attempted_hash = %handshake_hash,
+                cached_hash,
+                "handshake key already initialized"
+            );
             Ok(handshake_cell.get().cloned().or(Some(arc_key)))
         }
-        Err(SetError::InitializingError(value)) => Ok(Some(value)),
+        Err(SetError::InitializingError(value)) => {
+            let pending_hash = truncated_key_hash(value.as_ref());
+            tracing::debug!(
+                target = "webrtc",
+                handshake_id = %handshake_id,
+                key_path = "handshake_initializing",
+                session_source = %session_source,
+                session_hash = %session_key_hash,
+                pending_hash = %pending_hash,
+                "handshake key initialization in progress"
+            );
+            Ok(Some(value))
+        }
     }
 }
 
@@ -2938,6 +3013,34 @@ fn resolve_ice_candidate(
     from_peer: &str,
     to_peer: &str,
 ) -> Result<IceCandidateBlob, TransportError> {
+    if let Some(psk) = pre_shared_key {
+        tracing::debug!(
+            target = "webrtc",
+            handshake_id = %handshake_id,
+            key_path = "handshake_pre_shared",
+            key_hash = %truncated_key_hash(psk),
+            from_peer,
+            to_peer,
+            "pre-shared key provided for ice candidate"
+        );
+    } else if sealed.is_some() {
+        tracing::debug!(
+            target = "webrtc",
+            handshake_id = %handshake_id,
+            key_path = "passphrase_fallback",
+            from_peer,
+            to_peer,
+            "sealed ice candidate will use passphrase fallback"
+        );
+    } else {
+        tracing::trace!(
+            target = "webrtc",
+            handshake_id = %handshake_id,
+            from_peer,
+            to_peer,
+            "plain ice candidate; no key required"
+        );
+    }
     if let Some(sealed_env) = sealed {
         let passphrase_value = passphrase.ok_or_else(|| {
             TransportError::Setup("missing passphrase for sealed ice candidate".into())

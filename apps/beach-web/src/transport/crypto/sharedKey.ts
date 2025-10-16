@@ -3,6 +3,34 @@ import { deriveArgon2id } from './argon2';
 const encoder = new TextEncoder();
 const HANDSHAKE_INFO_BYTES = encoder.encode('beach:secure-signaling:handshake');
 
+function isCryptoTraceEnabled(): boolean {
+  if (typeof globalThis === 'undefined') {
+    return false;
+  }
+  const host = globalThis as {
+    __BEACH_TRACE?: boolean;
+    BEACH_TRACE?: boolean;
+  };
+  const flag =
+    host.__BEACH_TRACE ??
+    host.BEACH_TRACE ??
+    (typeof window !== 'undefined' ? window.__BEACH_TRACE ?? window.BEACH_TRACE : undefined);
+  return Boolean(flag);
+}
+
+function logKeyTrace(event: string, data: Record<string, unknown>): void {
+  if (!isCryptoTraceEnabled()) {
+    return;
+  }
+  // eslint-disable-next-line no-console
+  console.debug('[beach-web][crypto]', event, data);
+}
+
+async function truncatedHashHex(bytes: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(bytes)));
+  return toHex(digest.subarray(0, 8));
+}
+
 /**
  * Shared-secret derivation helpers for sealed signaling and post-handshake crypto.
  */
@@ -17,7 +45,12 @@ export async function derivePreSharedKey(
   salt: string,
 ): Promise<Uint8Array> {
   try {
-    return await deriveArgon2id({ passphrase, salt });
+    const key = await deriveArgon2id({ passphrase, salt });
+    logKeyTrace('session_key_derived', {
+      session_id: salt,
+      session_hash: await truncatedHashHex(key),
+    });
+    return key;
   } catch (error) {
     console.error('[beach-web] argon2 derive failed', error);
     throw error instanceof Error ? error : new Error(String(error));
@@ -60,7 +93,17 @@ export async function deriveHandshakeKey(
   handshakeId: string,
 ): Promise<Uint8Array> {
   const salt = encoder.encode(handshakeId);
-  return hkdfExpand(sessionKey, salt, HANDSHAKE_INFO_BYTES, 32);
+  const handshakeKey = await hkdfExpand(sessionKey, salt, HANDSHAKE_INFO_BYTES, 32);
+  const [sessionHash, handshakeHash] = await Promise.all([
+    truncatedHashHex(sessionKey),
+    truncatedHashHex(handshakeKey),
+  ]);
+  logKeyTrace('handshake_key_derived', {
+    handshake_id: handshakeId,
+    session_hash: sessionHash,
+    handshake_hash: handshakeHash,
+  });
+  return handshakeKey;
 }
 
 export function toHex(bytes: Uint8Array): string {

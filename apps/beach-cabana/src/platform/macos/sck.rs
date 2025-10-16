@@ -402,14 +402,14 @@ fn build_display_selection(display: &SCDisplay) -> TargetSelection {
     let empty = NSArray::new();
     let filter =
         SCContentFilter::init_with_display_exclude_windows(SCContentFilter::alloc(), display, &empty);
-    let configuration = make_configuration(CGSize::new(
-        display.width() as f64,
-        display.height() as f64,
-    ));
+    let configuration = make_configuration(
+        CGSize::new(display.width() as f64, display.height() as f64),
+        None,
+    );
     TargetSelection { filter, configuration }
 }
 
-fn make_configuration(size: CGSize) -> Id<SCStreamConfiguration> {
+fn make_configuration(size: CGSize, window_frame: Option<CGRect>) -> Id<SCStreamConfiguration> {
     let width = size.width.max(1.0).round() as usize;
     let height = size.height.max(1.0).round() as usize;
     debug!(width, height, "configuring ScreenCaptureKit stream dimensions");
@@ -429,6 +429,23 @@ fn make_configuration(size: CGSize) -> Id<SCStreamConfiguration> {
     }
     configuration.set_scales_to_fit(true);
     configuration.set_minimum_frame_interval(CMTime::make(1, 60));
+    if let Some(frame) = window_frame {
+        let rect = CGRect {
+            origin: CGPoint::new(frame.origin.x, frame.origin.y),
+            size: CGSize::new(frame.size.width, frame.size.height),
+        };
+        unsafe {
+            let _: () = msg_send![&*configuration, setSourceRect: rect];
+            let _: () = msg_send![&*configuration, setDestinationRect: rect];
+        }
+        debug!(
+            x = rect.origin.x,
+            y = rect.origin.y,
+            width = rect.size.width,
+            height = rect.size.height,
+            "configured source/destination rects"
+        );
+    }
     configuration
 }
 

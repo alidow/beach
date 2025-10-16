@@ -1475,9 +1475,28 @@ async fn negotiate_offerer_peer(
             channel_state = ?handshake_channel.ready_state(),
             "offerer: about to run handshake as Initiator"
         );
+        let handshake_key = await_pre_shared_key(
+            &pre_shared_key_cell,
+            &inner.session_key,
+            Some(passphrase.as_str()),
+            inner.session_id.as_str(),
+            &handshake_id,
+        )
+        .await?
+        .ok_or_else(|| {
+            TransportError::Setup("handshake key unavailable for secure transport".into())
+        })?;
+        tracing::debug!(
+            target = "webrtc",
+            role = "offerer",
+            handshake_id = %handshake_id,
+            key_path = "handshake_for_noise",
+            handshake_hash = %truncated_key_hash(handshake_key.as_ref()),
+            "acquired handshake key for Noise handshake"
+        );
         let prologue_context = build_prologue_context(&handshake_id, &offerer_peer_id, &peer_id);
         let params = HandshakeParams {
-            passphrase: passphrase.clone(),
+            handshake_key: handshake_key.clone(),
             handshake_id: handshake_id.clone(),
             local_peer_id: offerer_peer_id.clone(),
             remote_peer_id: peer_id.clone(),
@@ -2044,6 +2063,9 @@ async fn connect_answerer(
     let assigned_peer_for_secure = assigned_peer_id.clone();
     let remote_peer_for_secure = remote_offer_peer.clone();
     let handshake_for_secure = Arc::clone(&handshake_id);
+    let session_id_for_secure = session_id.clone();
+    let session_key_for_secure = Arc::clone(&session_key_cell);
+    let pre_shared_key_for_secure = Arc::clone(&pre_shared_key_cell);
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let pc = pc_for_dc.clone();
         let notify = notify_clone.clone();
@@ -2055,6 +2077,9 @@ async fn connect_answerer(
         let assigned_peer_value = assigned_peer_for_secure.clone();
         let remote_peer_value = remote_peer_for_secure.clone();
         let handshake_value = Arc::clone(&handshake_for_secure);
+        let session_id_value = session_id_for_secure.clone();
+        let session_key_cell_value = Arc::clone(&session_key_for_secure);
+        let pre_shared_key_cell_value = Arc::clone(&pre_shared_key_for_secure);
         Box::pin(async move {
             let label = dc.label().to_string();
             tracing::debug!(
@@ -2100,26 +2125,51 @@ async fn connect_answerer(
                         remote_peer = %remote_peer,
                         "handshake task started on answerer (inside spawned task)"
                     );
-                    let prologue_context = build_prologue_context(
-                        &handshake_id_value,
-                        local_peer.as_str(),
-                        remote_peer.as_str(),
-                    );
-                    let params = HandshakeParams {
-                        passphrase,
-                        handshake_id: handshake_id_value.clone(),
-                        local_peer_id: local_peer.clone(),
-                        remote_peer_id: remote_peer.clone(),
-                        prologue_context,
-                    };
-                    tracing::debug!(
-                        target = "webrtc",
-                        handshake_id = %handshake_id_value,
-                        "calling run_handshake as Responder"
-                    );
-                    let outcome = run_handshake(HandshakeRole::Responder, dc_for_handshake, params)
-                        .await
-                        .map(|res| Some(Arc::new(res)));
+                    let outcome = async {
+                        let handshake_key = await_pre_shared_key(
+                            &pre_shared_key_cell_value,
+                            &session_key_cell_value,
+                            Some(passphrase.as_str()),
+                            session_id_value.as_str(),
+                            handshake_id_value.as_str(),
+                        )
+                        .await?
+                        .ok_or_else(|| {
+                            TransportError::Setup(
+                                "handshake key unavailable for secure transport".into(),
+                            )
+                        })?;
+                        tracing::debug!(
+                            target = "webrtc",
+                            role = "answerer",
+                            handshake_id = %handshake_id_value,
+                            key_path = "handshake_for_noise",
+                            handshake_hash = %truncated_key_hash(handshake_key.as_ref()),
+                            "acquired handshake key for Noise handshake"
+                        );
+                        let prologue_context = build_prologue_context(
+                            &handshake_id_value,
+                            local_peer.as_str(),
+                            remote_peer.as_str(),
+                        );
+                        let params = HandshakeParams {
+                            handshake_key,
+                            handshake_id: handshake_id_value.clone(),
+                            local_peer_id: local_peer.clone(),
+                            remote_peer_id: remote_peer.clone(),
+                            prologue_context,
+                        };
+                        tracing::debug!(
+                            target = "webrtc",
+                            handshake_id = %handshake_id_value,
+                            "calling run_handshake as Responder"
+                        );
+                        let result =
+                            run_handshake(HandshakeRole::Responder, dc_for_handshake, params)
+                                .await?;
+                        Ok::<Option<Arc<HandshakeResult>>, TransportError>(Some(Arc::new(result)))
+                    }
+                    .await;
                     tracing::info!(
                         target = "webrtc",
                         handshake_id = %handshake_id_value,

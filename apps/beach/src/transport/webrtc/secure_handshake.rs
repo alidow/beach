@@ -16,8 +16,6 @@ use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 
 use crate::transport::TransportError;
 
-use super::secure_signaling::derive_pre_shared_key;
-
 pub const HANDSHAKE_CHANNEL_LABEL: &str = "beach-secure-handshake";
 const INSECURE_OVERRIDE_TOKEN: &str = "I_KNOW_THIS_IS_UNSAFE";
 const TRANSPORT_DIRECTION_PREFIX: &str = "beach:secure-transport:direction:";
@@ -44,7 +42,7 @@ pub struct HandshakeResult {
 
 #[derive(Clone, Debug)]
 pub struct HandshakeParams {
-    pub passphrase: String,
+    pub handshake_key: Arc<[u8; 32]>,
     pub handshake_id: String,
     pub local_peer_id: String,
     pub remote_peer_id: String,
@@ -93,7 +91,7 @@ pub async fn run_handshake(
         })
     }));
 
-    let psk = derive_pre_shared_key(&params.passphrase, &params.handshake_id)?;
+    let psk = params.handshake_key.as_ref();
     let mut prologue = Vec::with_capacity(params.prologue_context.len() + 32);
     prologue.extend_from_slice(b"beach:secure-handshake:v1");
     prologue.push(0x1f);
@@ -147,7 +145,7 @@ pub async fn run_handshake(
     state.into_transport_mode().map_err(map_noise_error)?;
 
     let (result, challenge_key, challenge_context) = derive_session_material(
-        &psk,
+        psk,
         &handshake_hash,
         &params.local_peer_id,
         &params.remote_peer_id,

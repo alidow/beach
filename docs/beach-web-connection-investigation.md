@@ -41,12 +41,15 @@ Another angle: browser caches handshake key per ID, but the offerer expects the 
 - Extended the Vitest interop suite (`apps/beach-web/src/transport/crypto/noiseHandshake.interop.test.ts`) to compare browser `deriveHandshakeKey` outputs against the Rust toolchain via the new binary. `npm run test -- noiseHandshake.interop.test.ts` now exercises three cases and passes; the command hit the CLI timeout after reporting success (~13 s runtime).
 - Result: given matching inputs, both stacks derive identical session and handshake keys. The production mismatch must stem from runtime inputs (e.g., stale session IDs or fallback code paths), not algorithm differences.
 
+## Progress (2025-10-16)
+
+- Host `secure_handshake` now accepts the cached pre-shared key instead of re-running per-handshake Argon2, so both sides share the HKDF-derived `handshake_key`. Offerer and answerer paths fetch the key from `await_pre_shared_key(...)` before starting Noise and log the truncated hash (`key_path=handshake_for_noise`). This removed the runtime divergence we observed in the new logging.
+
 ## Next Steps for Follow-up Agent
 
-1. Instrument `await_pre_shared_key`/`resolve_ice_candidate` on the host to log which path supplies a key (session cache vs. passphrase fallback) along with a truncated hash of the derived bytes per handshake ID.
-2. Add temporary browser logging in `derivePreSharedKey`/`deriveHandshakeKey` to emit matching truncated hashes and handshake IDs so the logs can be correlated with the host output.
-3. Reproduce the failing beach-web connection, capture both log streams, and verify whether the host ever falls back to per-handshake Argon2 or receives mismatched session IDs. Use that data to decide whether to rework caching or handshake sequencing.
-4. Once a consistent key story emerges, rerun the full browser trace to confirm the Noise handshake succeeds and profile the elapsed connection setup time.
+1. Re-run beach-web with the updated binaries and confirm the Noise handshake succeeds (watch for `handshake_for_noise` hashes aligning on both sides).
+2. If any MAC mismatch persists, diff the logged hashes to spot stale keys, then trace the Noise challenge inputs (`role`, `nonce`, `code`) for discrepancies.
+3. Once the connection stabilises, prune the temporary trace logging and capture a fresh timing profile for the end-to-end connect path.
 
 Shared log snippets in `/Users/arellidow/beach-debug/host.log` around lines `15921662` and `15937700` show the MAC mismatch details. 
 

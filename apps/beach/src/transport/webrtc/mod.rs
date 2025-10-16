@@ -2680,6 +2680,13 @@ async fn ensure_session_key(
         return Ok(None);
     }
     if let Some(existing) = cell.get() {
+        tracing::debug!(
+            target = "webrtc",
+            session_id = %session_id,
+            key_path = "session_cache",
+            session_hash = %truncated_key_hash(existing.as_ref()),
+            "using cached session key"
+        );
         return Ok(Some(existing.clone()));
     }
     let passphrase_owned = passphrase_value.to_string();
@@ -2690,17 +2697,43 @@ async fn ensure_session_key(
     .await
     .map_err(|err| TransportError::Setup(format!("session key derivation task failed: {err}")))??;
     let arc_key = Arc::new(result);
+    let session_hash = truncated_key_hash(arc_key.as_ref());
     match cell.set(arc_key.clone()) {
         Ok(()) => {
             tracing::debug!(
                 target = "webrtc",
                 session_id = %session_id,
+                key_path = "session_derived",
+                session_hash = %session_hash,
                 "session key cached"
             );
             Ok(Some(arc_key))
         }
-        Err(SetError::AlreadyInitializedError(_)) => Ok(cell.get().cloned().or(Some(arc_key))),
-        Err(SetError::InitializingError(value)) => Ok(Some(value)),
+        Err(SetError::AlreadyInitializedError(_)) => {
+            let cached_hash = cell
+                .get()
+                .map(|existing| truncated_key_hash(existing.as_ref()))
+                .unwrap_or_else(|| "unknown".to_string());
+            tracing::debug!(
+                target = "webrtc",
+                session_id = %session_id,
+                key_path = "session_cache_race",
+                attempted_hash = %session_hash,
+                cached_hash = %cached_hash,
+                "session key already initialized"
+            );
+            Ok(cell.get().cloned().or(Some(arc_key)))
+        }
+        Err(SetError::InitializingError(value)) => {
+            tracing::debug!(
+                target = "webrtc",
+                session_id = %session_id,
+                key_path = "session_initializing",
+                pending_hash = %truncated_key_hash(value.as_ref()),
+                "session key initialization in progress"
+            );
+            Ok(Some(value))
+        }
     }
 }
 
@@ -2740,10 +2773,15 @@ fn prime_pre_shared_key(
             ) {
                 Ok(derived) => {
                     let arc_key = Arc::new(derived);
+                    let session_hash = truncated_key_hash(session_key.as_ref());
+                    let handshake_hash = truncated_key_hash(arc_key.as_ref());
                     if handshake_cell_clone.set(arc_key.clone()).is_ok() {
                         tracing::debug!(
                             target = "webrtc",
                             handshake_id = %handshake_owned,
+                            key_path = "background_precompute",
+                            session_hash = %session_hash,
+                            handshake_hash = %handshake_hash,
                             "background handshake key derivation complete"
                         );
                     }

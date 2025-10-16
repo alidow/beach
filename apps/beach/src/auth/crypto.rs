@@ -1,12 +1,12 @@
 use crate::auth::error::AuthError;
 use argon2::{Algorithm, Argon2, ParamsBuilder, Version};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
     ChaCha20Poly1305, Key, Nonce,
+    aead::{Aead, KeyInit},
 };
-use rand::rngs::OsRng;
 use rand::RngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,7 +37,7 @@ pub fn encrypt(passphrase: &str, plaintext: &str) -> Result<EncryptedBlob, AuthE
         .build()
         .map_err(|err| AuthError::Encryption(err.to_string()))?;
 
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params.clone());
     let mut key = [0u8; 32];
     argon2
         .hash_password_into(passphrase.as_bytes(), &salt, &mut key)

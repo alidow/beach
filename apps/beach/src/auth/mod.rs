@@ -7,16 +7,17 @@ pub mod passphrase;
 
 use crate::auth::config::AuthConfig;
 use crate::auth::credentials::{
-    access_token_is_valid, build_profile_record, CredentialsStore, RefreshTokenRecord,
-    StoredProfile, FALLBACK_ENTITLEMENT,
+    CredentialsStore, FALLBACK_ENTITLEMENT, RefreshTokenRecord, StoredProfile,
+    access_token_is_valid,
 };
 use crate::auth::error::AuthError;
-use crate::auth::gate::{access_token_expired, BeachGateClient, DeviceStartResponse, TokenResponse};
+use crate::auth::gate::{
+    BeachGateClient, DeviceStartResponse, TokenResponse, access_token_expired,
+};
 use std::env;
 
 pub use config::AuthConfig as BeachAuthConfig;
 pub use credentials::{AccessTokenCache, FALLBACK_ENTITLEMENT as FALLBACK_ENTITLEMENT_FLAG};
-pub use error::AuthError;
 pub use gate::DeviceStartResponse as AuthDeviceStartResponse;
 pub use gate::TokenResponse as AuthTokenResponse;
 
@@ -30,11 +31,15 @@ pub fn save_store(store: &CredentialsStore) -> Result<(), AuthError> {
     store.save()
 }
 
-pub fn apply_profile_environment(profile_override: Option<&str>) -> Result<Option<String>, AuthError> {
+pub fn apply_profile_environment(
+    profile_override: Option<&str>,
+) -> Result<Option<String>, AuthError> {
     let store = load_store()?;
     let resolved = store.ensure_profile_environment(profile_override);
     if let Some(profile) = &resolved {
-        env::set_var("BEACH_PROFILE", profile);
+        unsafe {
+            env::set_var("BEACH_PROFILE", profile);
+        }
     }
     Ok(resolved)
 }
@@ -58,7 +63,7 @@ pub fn active_profile_name(profile_override: Option<&str>) -> Result<String, Aut
         }
     }
 
-    if let Some(current) = store.current_profile {
+    if let Some(current) = store.current_profile.clone() {
         return Ok(current);
     }
 
@@ -91,11 +96,7 @@ pub fn persist_profile_update(
     store: &mut CredentialsStore,
     config: &AuthConfig,
 ) -> Result<(), AuthError> {
-    let refresh = RefreshTokenRecord::write(
-        profile_name,
-        &config.gateway,
-        &tokens.refresh_token,
-    )?;
+    let refresh = RefreshTokenRecord::write(profile_name, &config.gateway, &tokens.refresh_token)?;
 
     let mut profile = store
         .profile(profile_name)
@@ -106,7 +107,7 @@ pub fn persist_profile_update(
             tier: None,
             email: None,
             beach_profile: None,
-            refresh,
+            refresh: refresh.clone(),
             entitlements: Vec::new(),
             access_token: None,
             updated_at: time::OffsetDateTime::now_utc(),
@@ -131,7 +132,7 @@ pub fn persist_profile_update(
 }
 
 pub async fn perform_device_login(
-    profile_name: &str,
+    _profile_name: &str,
     config: AuthConfig,
 ) -> Result<(DeviceStartResponse, BeachGateClient), AuthError> {
     let client = BeachGateClient::new(config)?;
@@ -175,6 +176,7 @@ pub fn status_for_profile(profile_name: Option<&str>) -> Result<Option<StoredPro
         Some(name) => name.to_string(),
         None => store
             .current_profile
+            .clone()
             .ok_or(AuthError::NotLoggedIn)?,
     };
     Ok(store.profile(&name).cloned())

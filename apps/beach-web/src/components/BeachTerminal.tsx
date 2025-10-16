@@ -36,6 +36,10 @@ const JOIN_DENIED_MESSAGE = 'Join request was declined by host.';
 const JOIN_DISCONNECTED_MESSAGE = 'Disconnected before approval.';
 const JOIN_CONNECTING_MESSAGE = 'Connecting to host...';
 const JOIN_OVERLAY_HIDE_DELAY_MS = 1500;
+const FALLBACK_ENTITLEMENT_SUBSTRING =
+  'WebSocket fallback is only available to Beach Auth subscribers';
+const FALLBACK_SIGNUP_MESSAGE =
+  "We couldn't negotiate a peer-to-peer connection. WebSocket fallback is reserved for Beach Auth subscribers - visit https://beach.sh to sign up and unlock fallback support.";
 
 declare global {
   interface Window {
@@ -750,6 +754,13 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         }
         const errorInstance = err instanceof Error ? err : new Error(String(err));
         console.error('[beach-web] transport connect failed', errorInstance);
+        const message = errorInstance.message ?? '';
+        const fallbackDenied = message.includes(FALLBACK_ENTITLEMENT_SUBSTRING);
+        setJoinState('denied');
+        const displayMessage = fallbackDenied
+          ? FALLBACK_SIGNUP_MESSAGE
+          : message || 'Unable to connect to the host.';
+        setJoinMessage(displayMessage);
         setError(errorInstance);
         setStatus('error');
         markConnectionTrace('beach_terminal:transport_connect_error', {
@@ -1231,7 +1242,11 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
 
   function renderStatus(): string {
     if (status === 'error' && error) {
-      return `Error: ${error.message}`;
+      const message = error.message ?? '';
+      if (message.includes(FALLBACK_ENTITLEMENT_SUBSTRING)) {
+        return 'Fallback unavailable - visit https://beach.sh to unlock Beach Auth support.';
+      }
+      return `Error: ${message}`;
     }
     if (status === 'connected') {
       return 'Connected';

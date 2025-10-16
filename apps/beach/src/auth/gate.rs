@@ -92,10 +92,7 @@ impl BeachGateClient {
         Ok(response.json().await?)
     }
 
-    pub async fn finish_device_flow(
-        &self,
-        device_code: &str,
-    ) -> Result<TokenResponse, AuthError> {
+    pub async fn finish_device_flow(&self, device_code: &str) -> Result<TokenResponse, AuthError> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct RequestBody<'a> {

@@ -128,8 +128,7 @@ impl StoredProfile {
         expires_in_seconds: u64,
         entitlements: Vec<String>,
     ) {
-        let expires_at =
-            OffsetDateTime::now_utc() + Duration::seconds(expires_in_seconds as i64);
+        let expires_at = OffsetDateTime::now_utc() + Duration::seconds(expires_in_seconds as i64);
         self.access_token = Some(AccessTokenCache {
             token,
             expires_at,
@@ -213,12 +212,7 @@ impl CredentialsStore {
         self.profiles.get_mut(name)
     }
 
-    pub fn upsert_profile(
-        &mut self,
-        name: String,
-        profile: StoredProfile,
-        set_current: bool,
-    ) {
+    pub fn upsert_profile(&mut self, name: String, profile: StoredProfile, set_current: bool) {
         self.profiles.insert(name.clone(), profile);
         if set_current || self.current_profile.is_none() {
             self.current_profile = Some(name);
@@ -251,10 +245,7 @@ impl CredentialsStore {
         Ok(())
     }
 
-    pub fn ensure_profile_environment(
-        &self,
-        override_profile: Option<&str>,
-    ) -> Option<String> {
+    pub fn ensure_profile_environment(&self, override_profile: Option<&str>) -> Option<String> {
         if let Some(name) = override_profile {
             return Some(name.to_string());
         }

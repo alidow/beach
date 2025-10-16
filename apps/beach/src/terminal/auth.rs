@@ -1,10 +1,13 @@
-use crate::auth::{self, AuthError, AuthTokenResponse, FRIENDLY_FALLBACK_MESSAGE};
-use crate::terminal::cli::{AuthCommand, AuthLoginArgs, AuthLogoutArgs, AuthStatusArgs, AuthSwitchArgs};
+use crate::auth::error::AuthError;
+use crate::auth::{self, AuthTokenResponse, FRIENDLY_FALLBACK_MESSAGE};
+use crate::terminal::cli::{
+    AuthCommand, AuthLoginArgs, AuthLogoutArgs, AuthStatusArgs, AuthSwitchArgs,
+};
 use crate::terminal::error::CliError;
 use std::io::{self, Write};
 use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
-use tokio::time::{sleep, Instant};
+use tokio::time::{Instant, sleep};
 
 const MIN_POLL_INTERVAL: u64 = 3;
 
@@ -13,7 +16,7 @@ pub async fn run(command: AuthCommand, profile_override: Option<String>) -> Resu
         AuthCommand::Login(args) => login(args, profile_override).await,
         AuthCommand::Logout(args) => logout(args, profile_override),
         AuthCommand::Status(args) => status(args, profile_override),
-        AuthCommand::SwitchProfile(args) => switch(args),
+        AuthCommand::SwitchProfile(args) => switch(args, profile_override),
     }
 }
 
@@ -44,7 +47,7 @@ async fn login(args: AuthLoginArgs, profile_override: Option<String>) -> Result<
     println!();
     println!("Waiting for approval...");
 
-    let mut interval = Duration::from_secs(start.interval.max(MIN_POLL_INTERVAL));
+    let interval = Duration::from_secs(start.interval.max(MIN_POLL_INTERVAL));
     let deadline = Instant::now() + Duration::from_secs(start.expires_in.max(60));
     let mut last_message = Instant::now();
 
@@ -61,7 +64,9 @@ async fn login(args: AuthLoginArgs, profile_override: Option<String>) -> Result<
             Ok(tokens) => {
                 if args.set_current {
                     auth::set_current_profile(Some(profile_name.clone())).map_err(auth_err)?;
-                    std::env::set_var("BEACH_PROFILE", &profile_name);
+                    unsafe {
+                        std::env::set_var("BEACH_PROFILE", &profile_name);
+                    }
                 }
 
                 print_login_summary(&profile_name, &tokens);
@@ -134,8 +139,13 @@ fn logout(args: AuthLogoutArgs, profile_override: Option<String>) -> Result<(), 
         }
         store.current_profile = None;
         store.save().map_err(auth_err)?;
-        std::env::remove_var("BEACH_PROFILE");
-        println!("Removed {count} Beach Auth profile(s).", count = names.len());
+        unsafe {
+            std::env::remove_var("BEACH_PROFILE");
+        }
+        println!(
+            "Removed {count} Beach Auth profile(s).",
+            count = names.len()
+        );
         return Ok(());
     }
 
@@ -151,7 +161,9 @@ fn logout(args: AuthLogoutArgs, profile_override: Option<String>) -> Result<(), 
             .map(|value| value == target)
             .unwrap_or(false)
         {
-            std::env::remove_var("BEACH_PROFILE");
+            unsafe {
+                std::env::remove_var("BEACH_PROFILE");
+            }
         }
         println!("Removed Beach Auth profile '{target}'.");
         Ok(())
@@ -227,7 +239,7 @@ fn status(args: AuthStatusArgs, profile_override: Option<String>) -> Result<(), 
     Ok(())
 }
 
-fn switch(args: AuthSwitchArgs) -> Result<(), CliError> {
+fn switch(args: AuthSwitchArgs, profile_hint: Option<String>) -> Result<(), CliError> {
     if args.unset && args.profile.is_some() {
         return Err(CliError::InvalidArgument(
             "cannot pass a profile name when --unset is provided".into(),
@@ -236,18 +248,23 @@ fn switch(args: AuthSwitchArgs) -> Result<(), CliError> {
 
     if args.unset {
         auth::set_current_profile(None).map_err(auth_err)?;
-        std::env::remove_var("BEACH_PROFILE");
+        unsafe {
+            std::env::remove_var("BEACH_PROFILE");
+        }
         println!("Cleared the active Beach Auth profile.");
         return Ok(());
     }
 
     let profile = args
         .profile
+        .or(profile_hint)
         .ok_or_else(|| CliError::InvalidArgument("provide a profile name or use --unset".into()))?;
 
     auth::set_current_profile(Some(profile.clone()))
         .map_err(|err| CliError::Auth(err.to_string()))?;
-    std::env::set_var("BEACH_PROFILE", &profile);
+    unsafe {
+        std::env::set_var("BEACH_PROFILE", &profile);
+    }
     println!("Active Beach Auth profile set to '{profile}'.");
     Ok(())
 }

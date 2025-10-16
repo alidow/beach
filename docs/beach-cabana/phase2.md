@@ -6,7 +6,7 @@ Deliverables accomplished:
 - Implemented `GifVideoEncoder` as the initial software fallback plus `encode` CLI command (animated GIF output, downscaling via `--max-width`).
 - Hooked CLI streaming/encoding commands into the capture abstraction, so future ScreenCaptureKit and hardware encoders can slot in without touching CLI surfaces.
 - Feature-gated ScreenCaptureKit bridge remains planned via `cabana_sck` following the spike instructions (`docs/beach-cabana/screencapturekit-spike.md`).
-- ScreenCaptureKit is now the default macOS capture backend with automatic CoreGraphics fallback and telemetry that logs blank-frame retries, frame dimensions, and delivery latency.
+- ScreenCaptureKit is now the default macOS capture backend with automatic CoreGraphics fallback and telemetry that logs blank-frame retries, frame dimensions, and delivery latency. The CLI `stream` command now emits per-run latency and byte metrics to help capture baselines.
 
 Next steps:
 

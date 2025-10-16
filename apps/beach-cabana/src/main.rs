@@ -11,7 +11,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use rand::{rngs::OsRng, RngCore};
 use std::fs;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, Instant};
 use tracing_subscriber::{fmt, EnvFilter};
 
 fn main() -> Result<()> {
@@ -120,10 +120,17 @@ fn run(cli: cli::Cli) -> Result<()> {
 
                 let mut captured_paths = Vec::new();
                 let interval = Duration::from_millis(interval_ms);
+                let mut capture_durations = Vec::with_capacity(frames as usize);
+                let mut total_data_bytes: usize = 0;
 
                 for index in 0..frames {
+                    let started = Instant::now();
                     match producer.next_frame() {
                         Ok(mut frame) => {
+                            let elapsed = started.elapsed();
+                            capture_durations.push(elapsed);
+                            total_data_bytes += frame.data.len();
+
                             if let Err(err) = adjust_frame_size(&mut frame, None) {
                                 println!("Failed to process frame {}: {}", index, err);
                                 continue;
@@ -169,6 +176,35 @@ fn run(cli: cli::Cli) -> Result<()> {
                     );
                     for path in captured_paths {
                         println!("  - {}", path.display());
+                    }
+                    if !capture_durations.is_empty() {
+                        let total_micros: u128 = capture_durations
+                            .iter()
+                            .map(|d| d.as_micros() as u128)
+                            .sum();
+                        let avg_ms = (total_micros as f64 / capture_durations.len() as f64) / 1000.0;
+                        let max_ms = capture_durations
+                            .iter()
+                            .map(|d| d.as_secs_f64() * 1000.0)
+                            .fold(0.0, f64::max);
+                        let min_ms = capture_durations
+                            .iter()
+                            .map(|d| d.as_secs_f64() * 1000.0)
+                            .fold(f64::INFINITY, f64::min);
+                        println!("Capture metrics:");
+                        println!(
+                            "  - Avg frame latency: {:.2} ms (min {:.2} ms, max {:.2} ms)",
+                            avg_ms, min_ms, max_ms
+                        );
+                        println!(
+                            "  - Approx total frame bytes: {} ({} bytes/frame avg)",
+                            total_data_bytes,
+                            if capture_durations.is_empty() {
+                                0
+                            } else {
+                                total_data_bytes / capture_durations.len()
+                            }
+                        );
                     }
                 }
             }

@@ -1,4 +1,5 @@
-use crate::auth::{self, AuthError, FRIENDLY_FALLBACK_MESSAGE};
+use crate::auth::error::AuthError;
+use crate::auth::{self, FRIENDLY_FALLBACK_MESSAGE};
 use crate::protocol::{self, HostFrame};
 use crate::session::{SessionHandle, SessionRole, TransportOffer};
 use crate::terminal::error::CliError;
@@ -302,10 +303,7 @@ async fn connect_fallback_websocket(
                     "fallback_paused" => {
                         "websocket fallback disabled by operator (kill switch engaged)".to_string()
                     }
-                    "entitlement_required" => {
-                        "websocket fallback requires private beaches entitlement; access denied"
-                            .to_string()
-                    }
+                    "entitlement_required" => FRIENDLY_FALLBACK_MESSAGE.to_string(),
                     "invalid_session_id" => "server rejected session identifier".to_string(),
                     other => {
                         format!("token request failed ({status}): server reported reason '{other}'")

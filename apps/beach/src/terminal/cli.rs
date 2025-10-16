@@ -110,6 +110,7 @@ pub enum Command {
     /// Query diagnostic state from a running session
     Debug(DebugArgs),
     /// Manage Beach Auth credentials and profiles
+    #[command(subcommand)]
     Auth(AuthCommand),
 }
 
@@ -178,10 +179,7 @@ pub struct AuthStatusArgs {
 
 #[derive(Args, Debug, Default)]
 pub struct AuthSwitchArgs {
-    #[arg(
-        value_name = "PROFILE",
-        help = "Profile name to mark as active"
-    )]
+    #[arg(value_name = "PROFILE", help = "Profile name to mark as active")]
     pub profile: Option<String>,
 
     #[arg(

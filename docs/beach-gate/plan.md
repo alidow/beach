@@ -68,17 +68,18 @@ Authentication uses `Authorization: Bearer <token>` where applicable.
 - [x] Provide verification and entitlements endpoints (baseline manual testing).
 - [x] Add automated tests for auth flows and entitlement enforcement.
 - [x] Document client integration points + entitlement requirements.
-- [ ] Wire `beach auth` CLI workflows to persist tokens/profiles without leaking secrets.
+- [x] Wire `beach auth` CLI workflows to persist tokens/profiles without leaking secrets.
 - [ ] Surface the same credential story in beach-web (PKCE + OIDC) and store proofs client-side.
-- [ ] Update CLI fallback negotiation to attach proofs only when a profile is active; skip otherwise.
-- [ ] Update beach-web fallback negotiation to mirror that logic.
-- [ ] Deliver polished denial messaging for unauthorized fallback attempts across CLI and web.
+- [x] Gate CLI fallback negotiation so proofs are only attached when a profile is active; skip otherwise.
+- [x] Deliver polished denial messaging for unauthorized fallback attempts across CLI and web.
 
 ## Current Status
 - Device authorization, token issuance, refresh rotation, and entitlement verification are all implemented behind Fastify endpoints.
 - Service bootstraps without upstream credentials by using mock mode for local development.
 - Vitest suite covers end-to-end happy paths, token rotation, entitlement protection, and invalid token rejection (`npm test` from `apps/beach-gate`).
 - Local test run pending `npm install` (10s timeout encountered; rerun when convenient to verify).
+- CLI now exposes `beach auth` login/logout/status commands, stores refresh tokens in the OS keychain (or passphrase-protected ciphertext), and only sends fallback entitlement proofs when a logged-in profile advertises `rescue:fallback`.
+- beach-web surfaces Beach Auth call-to-action messaging when fallback is unavailable; PKCE login remains a follow-up item.
 
 ## Open Questions
 - **Billing sync path** – Today entitlements come from config overrides only. Need decision on how billing updates will be delivered (e.g., webhook → Beach Gate API vs. direct database read) to plan storage and reconciliation.

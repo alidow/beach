@@ -1,6 +1,6 @@
 use crate::auth::error::AuthError;
-use once_cell::sync::OnceLock;
 use std::env;
+use std::sync::OnceLock;
 
 static PASSPHRASE: OnceLock<Option<String>> = OnceLock::new();
 

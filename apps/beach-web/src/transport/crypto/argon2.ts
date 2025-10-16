@@ -69,11 +69,24 @@ const argon2ModulePromise: Promise<Argon2Module> = (async () => {
     loadArgon2WasmBinary?: () => Promise<Uint8Array>;
   };
   const emscriptenModule = (globalScope.Module ??= {});
+  let wasmBinaryBuffer: ArrayBuffer;
+  const sharedArrayBufferSupported = typeof SharedArrayBuffer !== 'undefined';
+  if (
+    !sharedArrayBufferSupported ||
+    !(wasmBytes.buffer instanceof SharedArrayBuffer) ||
+    wasmBytes.byteLength === 0
+  ) {
+    if (wasmBytes.byteOffset === 0 && wasmBytes.byteLength === wasmBytes.buffer.byteLength) {
+      wasmBinaryBuffer = wasmBytes.buffer as ArrayBuffer;
+    } else {
+      wasmBinaryBuffer = wasmBytes.slice().buffer;
+    }
+  } else {
+    const copy = new Uint8Array(wasmBytes);
+    wasmBinaryBuffer = copy.buffer;
+  }
   if (typeof (emscriptenModule as { wasmBinary?: ArrayBuffer }).wasmBinary === 'undefined') {
-    (emscriptenModule as { wasmBinary?: ArrayBuffer }).wasmBinary = wasmBytes.buffer.slice(
-      wasmBytes.byteOffset,
-      wasmBytes.byteOffset + wasmBytes.byteLength,
-    );
+    (emscriptenModule as { wasmBinary?: ArrayBuffer }).wasmBinary = wasmBinaryBuffer;
   }
   if (typeof (emscriptenModule as { loadArgon2WasmBinary?: () => Promise<Uint8Array> }).loadArgon2WasmBinary !== 'function') {
     (emscriptenModule as { loadArgon2WasmBinary?: () => Promise<Uint8Array> }).loadArgon2WasmBinary =

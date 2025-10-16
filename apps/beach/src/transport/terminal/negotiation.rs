@@ -1,3 +1,4 @@
+use crate::auth::{self, AuthError, FRIENDLY_FALLBACK_MESSAGE};
 use crate::protocol::{self, HostFrame};
 use crate::session::{SessionHandle, SessionRole, TransportOffer};
 use crate::terminal::error::CliError;
@@ -249,8 +250,31 @@ async fn connect_fallback_websocket(
 
     let client = Client::new();
     let cohort_override = fallback_cohort_override();
-    let entitlement = fallback_entitlement_proof();
     let telemetry_opt_in = fallback_telemetry_opt_in();
+    let entitlement = match fallback_entitlement_override() {
+        Some(value) => Some(value),
+        None => match auth::resolve_fallback_access_token(None).await {
+            Ok(token) => Some(token),
+            Err(err) => {
+                return Err(match err {
+                    AuthError::NotLoggedIn
+                    | AuthError::ProfileNotFound(_)
+                    | AuthError::FallbackNotEntitled => {
+                        FRIENDLY_FALLBACK_MESSAGE.to_string()
+                    }
+                    AuthError::PassphraseMissing => "Beach Auth credentials are locked. Set BEACH_AUTH_PASSPHRASE to unlock them before retrying WebSocket fallback.".to_string(),
+                    other => {
+                        warn!(
+                            target: "beach::fallback",
+                            error = %other,
+                            "failed to resolve Beach Auth entitlement proof"
+                        );
+                        format!("failed to resolve Beach Auth entitlement proof: {other}")
+                    }
+                });
+            }
+        },
+    };
     let request = FallbackTokenRequest {
         session_id: handle.session_id().to_string(),
         cohort_id: cohort_override,
@@ -377,7 +401,7 @@ fn fallback_cohort_override() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn fallback_entitlement_proof() -> Option<String> {
+fn fallback_entitlement_override() -> Option<String> {
     env::var("BEACH_ENTITLEMENT_PROOF")
         .ok()
         .map(|value| value.trim().to_string())

@@ -1,0 +1,257 @@
+pub mod config;
+pub mod credentials;
+pub mod crypto;
+pub mod error;
+pub mod gate;
+pub mod passphrase;
+
+use crate::auth::config::AuthConfig;
+use crate::auth::credentials::{
+    access_token_is_valid, build_profile_record, CredentialsStore, RefreshTokenRecord,
+    StoredProfile, FALLBACK_ENTITLEMENT,
+};
+use crate::auth::error::AuthError;
+use crate::auth::gate::{access_token_expired, BeachGateClient, DeviceStartResponse, TokenResponse};
+use std::env;
+
+pub use config::AuthConfig as BeachAuthConfig;
+pub use credentials::{AccessTokenCache, FALLBACK_ENTITLEMENT as FALLBACK_ENTITLEMENT_FLAG};
+pub use error::AuthError;
+pub use gate::DeviceStartResponse as AuthDeviceStartResponse;
+pub use gate::TokenResponse as AuthTokenResponse;
+
+pub const FRIENDLY_FALLBACK_MESSAGE: &str = "WebSocket fallback is only available to Beach Auth subscribers. Sign up at https://beach.sh and run `beach auth login` to unlock this transport.";
+
+pub fn load_store() -> Result<CredentialsStore, AuthError> {
+    CredentialsStore::load()
+}
+
+pub fn save_store(store: &CredentialsStore) -> Result<(), AuthError> {
+    store.save()
+}
+
+pub fn apply_profile_environment(profile_override: Option<&str>) -> Result<Option<String>, AuthError> {
+    let store = load_store()?;
+    let resolved = store.ensure_profile_environment(profile_override);
+    if let Some(profile) = &resolved {
+        env::set_var("BEACH_PROFILE", profile);
+    }
+    Ok(resolved)
+}
+
+pub fn active_profile_name(profile_override: Option<&str>) -> Result<String, AuthError> {
+    let store = load_store()?;
+    if let Some(override_name) = profile_override {
+        if store.profile(override_name).is_some() {
+            return Ok(override_name.to_string());
+        }
+        return Err(AuthError::ProfileNotFound(override_name.to_string()));
+    }
+
+    if let Ok(env_profile) = env::var("BEACH_PROFILE") {
+        let trimmed = env_profile.trim();
+        if !trimmed.is_empty() {
+            if store.profile(trimmed).is_some() {
+                return Ok(trimmed.to_string());
+            }
+            return Err(AuthError::ProfileNotFound(trimmed.to_string()));
+        }
+    }
+
+    if let Some(current) = store.current_profile {
+        return Ok(current);
+    }
+
+    Err(AuthError::NotLoggedIn)
+}
+
+pub async fn refresh_profile_with_tokens(
+    profile_name: &str,
+    store: &mut CredentialsStore,
+    client: &BeachGateClient,
+) -> Result<StoredProfile, AuthError> {
+    let profile = store
+        .profile(profile_name)
+        .cloned()
+        .ok_or_else(|| AuthError::ProfileNotFound(profile_name.to_string()))?;
+
+    let refresh_token = profile.refresh_token()?;
+    let tokens = client.refresh_tokens(&refresh_token).await?;
+    persist_profile_update(profile_name, &tokens, store, client.config())?;
+    let updated = store
+        .profile(profile_name)
+        .cloned()
+        .ok_or_else(|| AuthError::ProfileNotFound(profile_name.to_string()))?;
+    Ok(updated)
+}
+
+pub fn persist_profile_update(
+    profile_name: &str,
+    tokens: &TokenResponse,
+    store: &mut CredentialsStore,
+    config: &AuthConfig,
+) -> Result<(), AuthError> {
+    let refresh = RefreshTokenRecord::write(
+        profile_name,
+        &config.gateway,
+        &tokens.refresh_token,
+    )?;
+
+    let mut profile = store
+        .profile(profile_name)
+        .cloned()
+        .unwrap_or_else(|| StoredProfile {
+            issuer: config.gateway.to_string(),
+            audience: config.audience.clone(),
+            tier: None,
+            email: None,
+            beach_profile: None,
+            refresh,
+            entitlements: Vec::new(),
+            access_token: None,
+            updated_at: time::OffsetDateTime::now_utc(),
+        });
+
+    profile.refresh = refresh;
+    profile.entitlements = tokens.entitlements.clone();
+    profile.tier = tokens.tier.clone();
+    profile.email = tokens.email.clone();
+    profile.beach_profile = tokens.profile.clone();
+    profile.cache_access_token(
+        tokens.access_token.clone(),
+        tokens.access_token_expires_in,
+        tokens.entitlements.clone(),
+    );
+    profile.issuer = config.gateway.to_string();
+    profile.audience = config.audience.clone();
+
+    store.upsert_profile(profile_name.to_string(), profile, false);
+    store.save()?;
+    Ok(())
+}
+
+pub async fn perform_device_login(
+    profile_name: &str,
+    config: AuthConfig,
+) -> Result<(DeviceStartResponse, BeachGateClient), AuthError> {
+    let client = BeachGateClient::new(config)?;
+    let start = client.start_device_flow().await?;
+    Ok((start, client))
+}
+
+pub async fn complete_device_login(
+    profile_name: &str,
+    client: &BeachGateClient,
+    device_code: &str,
+) -> Result<TokenResponse, AuthError> {
+    let tokens = client.finish_device_flow(device_code).await?;
+    let mut store = load_store()?;
+    persist_profile_update(profile_name, &tokens, &mut store, client.config())?;
+    Ok(tokens)
+}
+
+pub fn ensure_profile_exists(profile_name: &str) -> Result<bool, AuthError> {
+    let store = load_store()?;
+    Ok(store.profile(profile_name).is_some())
+}
+
+pub fn remove_profile(profile_name: &str) -> Result<bool, AuthError> {
+    let mut store = load_store()?;
+    let removed = store.remove_profile(profile_name).is_some();
+    store.save()?;
+    Ok(removed)
+}
+
+pub fn set_current_profile(profile_name: Option<String>) -> Result<(), AuthError> {
+    let mut store = load_store()?;
+    store.set_current_profile(profile_name)?;
+    store.save()?;
+    Ok(())
+}
+
+pub fn status_for_profile(profile_name: Option<&str>) -> Result<Option<StoredProfile>, AuthError> {
+    let store = load_store()?;
+    let name = match profile_name {
+        Some(name) => name.to_string(),
+        None => store
+            .current_profile
+            .ok_or(AuthError::NotLoggedIn)?,
+    };
+    Ok(store.profile(&name).cloned())
+}
+
+pub async fn resolve_fallback_access_token(
+    profile_override: Option<&str>,
+) -> Result<String, AuthError> {
+    let config = AuthConfig::from_env()?;
+    let mut store = load_store()?;
+    let profile_name = {
+        if let Some(name) = profile_override {
+            name.to_string()
+        } else if let Ok(env_profile) = env::var("BEACH_PROFILE") {
+            let trimmed = env_profile.trim();
+            if !trimmed.is_empty() {
+                trimmed.to_string()
+            } else {
+                store
+                    .current_profile
+                    .clone()
+                    .ok_or(AuthError::NotLoggedIn)?
+            }
+        } else {
+            store
+                .current_profile
+                .clone()
+                .ok_or(AuthError::NotLoggedIn)?
+        }
+    };
+
+    let profile = store
+        .profile(&profile_name)
+        .cloned()
+        .ok_or_else(|| AuthError::ProfileNotFound(profile_name.clone()))?;
+
+    if !profile.has_fallback_entitlement() {
+        return Err(AuthError::FallbackNotEntitled);
+    }
+
+    if let Some(cache) = profile.access_token.as_ref() {
+        if access_token_is_valid(cache)
+            && cache
+                .entitlements
+                .iter()
+                .any(|ent| ent == FALLBACK_ENTITLEMENT)
+        {
+            return Ok(cache.token.clone());
+        }
+        if !access_token_expired(cache.expires_at) {
+            return Ok(cache.token.clone());
+        }
+    }
+
+    let client = BeachGateClient::new(config.clone())?;
+    let refresh_token = profile.refresh_token()?;
+    let tokens = client.refresh_tokens(&refresh_token).await?;
+    if !tokens
+        .entitlements
+        .iter()
+        .any(|ent| ent == FALLBACK_ENTITLEMENT)
+    {
+        let mut store = load_store()?;
+        if let Some(entry) = store.profile_mut(&profile_name) {
+            entry.entitlements = tokens.entitlements.clone();
+            entry.clear_access_token();
+            store.save()?;
+        }
+        return Err(AuthError::FallbackNotEntitled);
+    }
+
+    persist_profile_update(&profile_name, &tokens, &mut store, client.config())?;
+    let entry = store
+        .profile(&profile_name)
+        .and_then(|profile| profile.access_token.as_ref())
+        .ok_or(AuthError::Other(
+            "failed to cache refreshed access token".into(),
+        ))?;
+    Ok(entry.token.clone())
+}

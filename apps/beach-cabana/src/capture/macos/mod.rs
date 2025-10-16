@@ -3,6 +3,9 @@ use crate::platform::WindowApiError;
 use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "cabana_sck")]
+use tracing::warn;
+
+#[cfg(feature = "cabana_sck")]
 use crate::platform::macos::sck;
 
 /// Temporary CoreGraphics-based frame producer until ScreenCaptureKit lands.
@@ -29,7 +32,7 @@ impl FrameProducer for CoreGraphicsProducer {
                 .unwrap_or_default()
                 .as_nanos()
         ));
-        let (dir, frames) = crate::platform::macos::stream_window(
+        let (dir, frames) = crate::platform::macos::stream_window_coregraphics(
             &self.target,
             1,
             Duration::from_millis(0),
@@ -61,6 +64,150 @@ impl FrameProducer for CoreGraphicsProducer {
     }
 
     fn stop(&mut self) {}
+}
+
+#[cfg(feature = "cabana_sck")]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ActiveBackend {
+    Uninitialized,
+    ScreenCaptureKit,
+    CoreGraphics,
+}
+
+#[cfg(feature = "cabana_sck")]
+pub struct AdaptiveProducer {
+    target: String,
+    sck: Option<ScreenCaptureKitProducer>,
+    attempted_sck: bool,
+    core: CoreGraphicsProducer,
+    active: ActiveBackend,
+}
+
+#[cfg(feature = "cabana_sck")]
+impl AdaptiveProducer {
+    fn new(target: String, sck: Option<ScreenCaptureKitProducer>) -> Self {
+        let core = CoreGraphicsProducer::new(target.clone());
+        Self {
+            target,
+            sck,
+            attempted_sck: false,
+            core,
+            active: ActiveBackend::Uninitialized,
+        }
+    }
+
+    fn promote_core(&mut self) -> anyhow::Result<()> {
+        self.core.start()?;
+        self.active = ActiveBackend::CoreGraphics;
+        Ok(())
+    }
+
+    fn handle_sck_failure(&mut self) {
+        if let Some(sck) = self.sck.as_mut() {
+            sck.stop();
+        }
+        self.sck = None;
+        self.active = ActiveBackend::Uninitialized;
+        self.attempted_sck = true;
+    }
+}
+
+#[cfg(feature = "cabana_sck")]
+impl FrameProducer for AdaptiveProducer {
+    fn start(&mut self) -> anyhow::Result<()> {
+        match self.active {
+            ActiveBackend::ScreenCaptureKit | ActiveBackend::CoreGraphics => return Ok(()),
+            ActiveBackend::Uninitialized => {}
+        }
+
+        if !self.attempted_sck {
+            if let Some(sck) = self.sck.as_mut() {
+                match sck.start() {
+                    Ok(()) => {
+                        self.attempted_sck = true;
+                        self.active = ActiveBackend::ScreenCaptureKit;
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        if let Some(window_err) = err.downcast_ref::<WindowApiError>() {
+                            match window_err {
+                                WindowApiError::InvalidIdentifier(_) |
+                                WindowApiError::EnumerationFailed(_) => {
+                                    return Err(err);
+                                }
+                                _ => {}
+                            }
+                        }
+                        let message = err.to_string();
+                        warn!(
+                            target = %self.target,
+                            error = %message,
+                            "ScreenCaptureKit start failed; using CoreGraphics fallback"
+                        );
+                        self.handle_sck_failure();
+                    }
+                }
+            }
+        }
+
+        self.promote_core()
+    }
+
+    fn next_frame(&mut self) -> anyhow::Result<Frame> {
+        loop {
+            match self.active {
+                ActiveBackend::ScreenCaptureKit => {
+                    let Some(sck) = self.sck.as_mut() else {
+                        self.active = ActiveBackend::Uninitialized;
+                        continue;
+                    };
+                    match sck.next_frame() {
+                        Ok(frame) => return Ok(frame),
+                        Err(err) => {
+                            if let Some(window_err) = err.downcast_ref::<WindowApiError>() {
+                                match window_err {
+                                    WindowApiError::InvalidIdentifier(_) |
+                                    WindowApiError::EnumerationFailed(_) => {
+                                        return Err(err);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            let message = err.to_string();
+                            warn!(
+                                target = %self.target,
+                                error = %message,
+                                "ScreenCaptureKit frame failed; switching to CoreGraphics fallback"
+                            );
+                            self.handle_sck_failure();
+                        }
+                    }
+                }
+                ActiveBackend::CoreGraphics => return self.core.next_frame(),
+                ActiveBackend::Uninitialized => {
+                    self.start()?;
+                }
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        match self.active {
+            ActiveBackend::ScreenCaptureKit => {
+                if let Some(sck) = self.sck.as_mut() {
+                    sck.stop();
+                }
+                if self.sck.is_some() {
+                    self.attempted_sck = false;
+                }
+            }
+            ActiveBackend::CoreGraphics => {
+                self.core.stop();
+            }
+            ActiveBackend::Uninitialized => {}
+        }
+        self.active = ActiveBackend::Uninitialized;
+    }
 }
 
 #[cfg(feature = "cabana_sck")]
@@ -135,16 +282,24 @@ impl FrameProducer for ScreenCaptureKitProducer {
     fn stop(&mut self) {}
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "cabana_sck"))]
 pub fn create_producer(target: impl Into<String>) -> Result<BoxedProducer, WindowApiError> {
     let target = target.into();
-
-    #[cfg(feature = "cabana_sck")]
-    {
-        if let Ok(producer) = ScreenCaptureKitProducer::new(target.clone()) {
-            return Ok(Box::new(producer));
+    let sck = match ScreenCaptureKitProducer::new(target.clone()) {
+        Ok(producer) => Some(producer),
+        Err(err) => {
+            warn!(
+                target = %target,
+                error = %err,
+                "ScreenCaptureKit producer unavailable; defaulting to CoreGraphics"
+            );
+            None
         }
-    }
+    };
+    Ok(Box::new(AdaptiveProducer::new(target, sck)))
+}
 
-    Ok(Box::new(CoreGraphicsProducer::new(target)))
+#[cfg(all(target_os = "macos", not(feature = "cabana_sck")))]
+pub fn create_producer(target: impl Into<String>) -> Result<BoxedProducer, WindowApiError> {
+    Ok(Box::new(CoreGraphicsProducer::new(target.into())))
 }

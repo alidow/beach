@@ -62,11 +62,28 @@ pub fn stream_window(
 ) -> Result<(PathBuf, Vec<PathBuf>), WindowApiError> {
     #[cfg(feature = "cabana_sck")]
     {
-        if let Ok(result) = sck::stream_window(target, frames, interval, output_dir.clone()) {
-            return Ok(result);
+        match sck::stream_window(target, frames, interval, output_dir.clone()) {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                tracing::warn!(
+                    target = target,
+                    error = %err,
+                    "ScreenCaptureKit stream failed; falling back to CoreGraphics"
+                );
+            }
         }
     }
 
+    stream_window_coregraphics(target, frames, interval, output_dir)
+}
+
+#[allow(dead_code)]
+pub(crate) fn stream_window_coregraphics(
+    target: &str,
+    frames: u32,
+    interval: Duration,
+    output_dir: Option<PathBuf>,
+) -> Result<(PathBuf, Vec<PathBuf>), WindowApiError> {
     if frames == 0 {
         return Err(WindowApiError::CaptureFailed("frames must be greater than zero".into()));
     }
@@ -318,5 +335,16 @@ impl CFDictionaryWrapper {
             return None;
         }
         unsafe { CFNumber::wrap_under_get_rule(value as _) }.to_i64()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_window_coregraphics_rejects_zero_frames() {
+        let result = stream_window_coregraphics("0", 0, Duration::from_millis(0), None);
+        assert!(matches!(result, Err(WindowApiError::CaptureFailed(_))));
     }
 }

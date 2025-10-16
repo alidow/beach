@@ -1,0 +1,77 @@
+# Private Beach Vision
+
+## Overview
+- Extend open-source `apps/beach` foundation with a paid "Private Beach" orchestration layer that unifies terminals, screen shares, and MCP-enabled automation.
+- Provide a single, customizable cockpit where humans and AI agents monitor, control, and collaborate across multiple sessions with fine-grained access.
+- Deliver durable collaboration primitives (authorization, storage, cross-session messaging) that unlock premium workflows while preserving self-hosting for core Beach.
+
+## Product Pillars
+- **Unified Workspace:** Responsive grid layout for terminals, Beach Cabana streams, and future widgets; drag-resize, presets, and multi-view dashboards.
+- **Access Control:** Integration with Beach Gate + OIDC/Clerk; per-private-beach ACLs, shareable links, and group management with admins.
+- **Agent Mediation:** Designate Beach CLI or external MCP agents as coordinators that can observe, trigger, or automate actions across member sessions.
+- **Shared State:** Persistent file storage and low-latency Redis-backed key-value store exposed through MCP for coordination and auditing.
+- **Observability & Events:** Real-time telemetry, session health indicators, and event bus hooks for alerts, automations, and future billing signals.
+
+## System Architecture (Draft)
+```
+┌────────────────────────────────────────────────────────────┐
+│                  Private Beach Manager (Next.js)            │
+│  UI, Dashboard Layouts, Auth, Billing, Admin APIs           │
+└───────────────┬──────────────────────┬──────────────────────┘
+                │                      │
+                ▼                      ▼
+       ┌───────────────┐      ┌─────────────────┐
+       │ Session Orchestrator│  │ Event + State Bus │
+       │ (Rust or Node MCP)  │  │ (Redis Streams,  │
+       │                     │  │ Postgres, MQ)    │
+       └───────────────┬──────┴─────────┬────────┘
+                       │                │
+         ┌─────────────▼─────┐  ┌───────▼──────────┐
+         │ Beach Core Agents │  │ Shared Storage    │
+         │ (apps/beach,      │  │ (Redis KV,        │
+         │ beach-cabana, etc)│  │ Object/File store)│
+         └─────────────┬─────┘  └───────┬──────────┘
+                       │                │
+               ┌───────▼──────┐   ┌─────▼──────────┐
+               │ Beach Gate   │   │ External Agents │
+               │ Auth Service │   │ (MCP)           │
+               └──────────────┘   └────────────────┘
+```
+- **Front-end:** Next.js + Tailwind + shadcn component library; multi-viewport layout manager; live WebRTC/WebSocket feeds.
+- **Backend:** Service boundary that tracks sessions, user-to-private-beach mapping, agent assignments, and share links; likely Rust (to reuse Beach primitives) or TypeScript (for speed of iteration).
+- **Data Layer:** Postgres for relational state (users, beaches, memberships, layouts); Redis for ephemeral state, KV, and pub/sub triggers; optional S3-compatible object store for file persistence.
+- **Integration Points:** `beach-web`, `beach-human`, `beach-cabana`, Beach Gate, and future CLI agents via MCP.
+
+## Implementation Roadmap (High-Level)
+1. **Foundations**
+   - Formalize product boundaries: open-source core vs. paid manager capabilities.
+   - Define API contracts between Private Beach manager and existing Beach clients.
+   - Catalog auth flows (OIDC login, Beach Gate tokens, share links).
+2. **Workspace MVP**
+   - Next.js dashboard consuming mocked session data.
+   - Implement session discovery endpoints and websocket updates.
+   - Ship basic drag-resize layout persisted per user/private beach.
+3. **Authorization & Sharing**
+   - CRUD for private beaches, groups, memberships.
+   - Shareable link issuance + revocation; enforcement layers in backend + clients.
+   - Audit log groundwork for future billing/compliance.
+4. **Shared State Layer**
+   - Provision Redis namespace per private beach; expose MCP endpoints for read/write.
+   - Provide file storage abstraction (object store + simple browser UI).
+5. **Agent Orchestration**
+   - Register agent-capable sessions; grant scoped tokens for control APIs.
+   - Implement cross-session command dispatch and event triggers.
+6. **Operational Hardening**
+   - Observability dashboard, rate limiting, billing hooks, multi-tenant isolation.
+   - Reliability testing across WebRTC/WS edges; failover strategies.
+
+## Critical Questions & Open Topics
+- **Tenant Isolation:** What hard boundaries (network, data) are required between private beaches to satisfy enterprise expectations?
+- **Session Identity:** How do sessions identify themselves to the manager (MCP handshake, JWT, mutual TLS)? How is trust bootstrapped?
+- **Layout Sync Semantics:** Should layouts be per-user, per-private-beach, or shared with optional overrides? How do we resolve conflicts?
+- **Agent Permissions:** What guardrails exist when granting an agent control over other sessions? Do we need scoped capabilities or approval workflows?
+- **Offline & History:** Is historical playback or transcript storage part of the paid value? How long should data persist?
+- **Billing Model:** Seat-based, usage-based, or per-private-beach pricing? How does this integrate with authentication and invite flows?
+- **Extensibility:** How do we let third parties add widgets or automations without compromising security or UX?
+- **Deployment Modes:** Will Private Beach only run on Beach Cloud, or will customers self-host? How does that affect packaging/licensing?
+

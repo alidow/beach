@@ -1,6 +1,7 @@
 #![recursion_limit = "1024"]
 
 pub mod cache;
+pub mod auth;
 pub mod client;
 pub mod debug;
 pub mod mcp;

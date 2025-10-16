@@ -20,6 +20,15 @@ pub struct Cli {
     )]
     pub session_server: String,
 
+    #[arg(
+        long = "profile",
+        global = true,
+        env = "BEACH_PROFILE",
+        value_name = "PROFILE",
+        help = "Select the Beach Auth profile to use for this command"
+    )]
+    pub profile: Option<String>,
+
     #[command(flatten)]
     pub logging: LoggingArgs,
 
@@ -73,7 +82,7 @@ pub struct FallbackArgs {
         long = "fallback-entitlement-proof",
         env = "BEACH_ENTITLEMENT_PROOF",
         value_name = "TOKEN",
-        help = "Signed entitlement proof to accompany fallback token requests (future Clerk integration)",
+        help = "Signed entitlement proof to accompany fallback token requests (Beach Auth override)",
         hide_env_values = true
     )]
     pub entitlement_proof: Option<String>,
@@ -100,6 +109,87 @@ pub enum Command {
     Ssh(SshArgs),
     /// Query diagnostic state from a running session
     Debug(DebugArgs),
+    /// Manage Beach Auth credentials and profiles
+    Auth(AuthCommand),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuthCommand {
+    /// Start a device login to acquire Beach Auth credentials
+    Login(AuthLoginArgs),
+    /// Remove Beach Auth credentials
+    Logout(AuthLogoutArgs),
+    /// Show stored Beach Auth status
+    Status(AuthStatusArgs),
+    /// Switch the active Beach Auth profile
+    SwitchProfile(AuthSwitchArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct AuthLoginArgs {
+    #[arg(
+        long = "name",
+        value_name = "PROFILE",
+        help = "Profile name to create or update (defaults to 'default')"
+    )]
+    pub profile: Option<String>,
+
+    #[arg(
+        long = "set-current",
+        action = clap::ArgAction::SetTrue,
+        help = "Set this profile as the active profile after login completes"
+    )]
+    pub set_current: bool,
+
+    #[arg(
+        long = "force",
+        action = clap::ArgAction::SetTrue,
+        help = "Overwrite existing credentials for the profile if present"
+    )]
+    pub force: bool,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct AuthLogoutArgs {
+    #[arg(
+        long = "profile",
+        value_name = "PROFILE",
+        help = "Remove only the specified profile (defaults to the active profile)"
+    )]
+    pub profile: Option<String>,
+
+    #[arg(
+        long = "all",
+        action = clap::ArgAction::SetTrue,
+        help = "Remove all stored Beach Auth credentials"
+    )]
+    pub all: bool,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct AuthStatusArgs {
+    #[arg(
+        long = "profile",
+        value_name = "PROFILE",
+        help = "Show status for a specific profile"
+    )]
+    pub profile: Option<String>,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct AuthSwitchArgs {
+    #[arg(
+        value_name = "PROFILE",
+        help = "Profile name to mark as active"
+    )]
+    pub profile: Option<String>,
+
+    #[arg(
+        long = "unset",
+        action = clap::ArgAction::SetTrue,
+        help = "Clear the active profile"
+    )]
+    pub unset: bool,
 }
 
 #[derive(Args, Debug, Default)]

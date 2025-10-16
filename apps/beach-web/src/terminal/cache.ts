@@ -771,6 +771,7 @@ export class TerminalGridCache {
     const prevPredicted = this.predictedCursor;
     const prevServerRow = this.serverCursorRow;
     const prevServerCol = this.serverCursorCol;
+    const pendingInitial = !this.firstCursorReceived && row === 0 && col === 0;
 
     this.ensureRowRange(row, row + 1);
     this.cursorRow = row;
@@ -815,7 +816,14 @@ export class TerminalGridCache {
     this.serverCursorCol = targetCol;
 
     // Suppress initial cursor at (0, 0) to avoid flash in upper-left corner
-    if (!this.firstCursorReceived && row === 0 && col === 0) {
+    if (pendingInitial) {
+      trace('cursor pending initial', {
+        row,
+        col,
+        seq: frame.seq,
+        visible: frame.visible,
+        blink: frame.blink,
+      });
       this.cursorVisible = false;
       this.pendingInitialCursor = { visible: frame.visible, blink: frame.blink };
       this.firstCursorReceived = true;
@@ -823,6 +831,13 @@ export class TerminalGridCache {
       this.cursorVisible = frame.visible;
       this.pendingInitialCursor = null;
       this.firstCursorReceived = true;
+      trace('cursor applied immediately', {
+        row,
+        col: targetCol,
+        seq: frame.seq,
+        visible: this.cursorVisible,
+        blink: frame.blink,
+      });
     }
 
     this.cursorBlink = frame.blink;
@@ -840,6 +855,19 @@ export class TerminalGridCache {
     if (this.predictedCursor && this.predictedCursor.seq <= frame.seq) {
       this.predictedCursor = null;
     }
+
+    trace('cursor state after frame', {
+      row: this.cursorRow,
+      col: this.cursorCol,
+      seq: this.cursorSeq,
+      visible: this.cursorVisible,
+      blink: this.cursorBlink,
+      pendingInitialCursor: Boolean(this.pendingInitialCursor),
+      baseRow: this.baseRow,
+      committedWidth: this.cursorRow !== null ? this.committedRowWidth(this.cursorRow) : null,
+      predictedWidth: this.cursorRow !== null ? this.predictedRowWidth(this.cursorRow) : null,
+      pendingInitial,
+    });
 
     return (
       viewportMoved ||
@@ -1036,17 +1064,37 @@ export class TerminalGridCache {
       return;
     }
     if (this.cursorRow === null || this.cursorCol === null) {
+      trace('maybeRevealPendingCursor: missing coordinates', {
+        cursorRow: this.cursorRow,
+        cursorCol: this.cursorCol,
+        pending: this.pendingInitialCursor,
+      });
       return;
     }
     if (this.cursorRow === 0 && this.cursorCol === 0) {
+      trace('maybeRevealPendingCursor: still at origin', {
+        cursorRow: this.cursorRow,
+        cursorCol: this.cursorCol,
+      });
       return;
     }
     const row = this.cursorRow;
     const committed = this.committedRowWidth(row);
     const predicted = this.predictedRowWidth(row);
     if (committed <= 0 && predicted <= 0) {
+      trace('maybeRevealPendingCursor: row empty', {
+        row,
+        committed,
+        predicted,
+      });
       return;
     }
+    trace('maybeRevealPendingCursor: revealing cursor', {
+      row,
+      committed,
+      predicted,
+      pending: this.pendingInitialCursor,
+    });
     this.cursorVisible = this.pendingInitialCursor.visible;
     this.cursorBlink = this.pendingInitialCursor.blink;
     this.pendingInitialCursor = null;

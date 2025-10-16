@@ -20,6 +20,8 @@ pub enum CliError {
     NoUsableTransport,
     #[error("terminal runtime error: {0}")]
     Runtime(String),
+    #[error("auth error: {0}")]
+    Auth(String),
     #[error("logging initialization failed: {0}")]
     Logging(String),
     #[error("bootstrap output failed: {0}")]

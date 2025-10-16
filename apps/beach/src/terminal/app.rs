@@ -1,5 +1,7 @@
+use crate::auth;
 use crate::client::terminal::{debug, join};
 use crate::server::terminal::host;
+use crate::terminal::auth as auth_cli;
 use crate::terminal::cli::{self, Command, HostArgs};
 use crate::terminal::error::CliError;
 use crate::transport::ssh;
@@ -8,6 +10,9 @@ use tracing::info;
 
 pub async fn run(cli: cli::Cli) -> Result<(), CliError> {
     let session_base = cli.session_server;
+
+    auth::apply_profile_environment(cli.profile.as_deref())
+        .map_err(|err| CliError::Auth(err.to_string()))?;
 
     apply_fallback_overrides(&cli.fallback);
 
@@ -19,6 +24,7 @@ pub async fn run(cli: cli::Cli) -> Result<(), CliError> {
             debug::run(args)?;
             Ok(())
         }
+        Some(Command::Auth(args)) => auth_cli::run(args, cli.profile.clone()).await,
         None => host::run(&session_base, HostArgs::default()).await,
     }
 }

@@ -252,6 +252,8 @@ impl SckStream {
 
     pub fn next_frame(&self, timeout: Duration) -> Result<Frame, WindowApiError> {
         let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let mut blank_frames = 0usize;
         loop {
             let now = Instant::now();
             if now >= deadline {
@@ -263,9 +265,26 @@ impl SckStream {
 
             let remaining = deadline.saturating_duration_since(now);
             match self.receiver.recv_timeout(remaining) {
-                Ok(StreamEvent::Frame(frame)) => return Ok(frame),
+                Ok(StreamEvent::Frame(frame)) => {
+                    let bytes = frame.data.len();
+                    let elapsed_ms = started.elapsed().as_millis();
+                    debug!(
+                        width = frame.width,
+                        height = frame.height,
+                        bytes,
+                        blank_frames_skipped = blank_frames,
+                        elapsed_ms,
+                        "ScreenCaptureKit delivered frame"
+                    );
+                    return Ok(frame);
+                }
                 Ok(StreamEvent::Blank { status }) => {
-                    debug!(status, "ScreenCaptureKit reported blank frame; awaiting next sample");
+                    blank_frames += 1;
+                    debug!(
+                        status,
+                        blank_frames_skipped = blank_frames,
+                        "ScreenCaptureKit reported blank frame; awaiting next sample"
+                    );
                 }
                 Ok(StreamEvent::Error(message)) => {
                     warn!(%message, "ScreenCaptureKit sample error");

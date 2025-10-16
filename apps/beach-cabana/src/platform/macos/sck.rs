@@ -398,6 +398,7 @@ fn build_window_selection(content: &SCShareableContent, window: &SCWindow) -> Ta
             unreachable!("display index calculated but not retrievable");
         };
         let include = NSArray::from_slice(&[window]);
+        info!(display_index = index, "using display include windows filter");
         SCContentFilter::init_with_display_include_windows(
             SCContentFilter::alloc(),
             &*display,
@@ -409,6 +410,7 @@ fn build_window_selection(content: &SCShareableContent, window: &SCWindow) -> Ta
             "failed to match window to a display; falling back to first display"
         );
         let include = NSArray::from_slice(&[window]);
+        info!("using fallback display include windows filter (first display)");
         SCContentFilter::init_with_display_include_windows(
             SCContentFilter::alloc(),
             &*display,
@@ -416,6 +418,7 @@ fn build_window_selection(content: &SCShareableContent, window: &SCWindow) -> Ta
         )
     } else {
         warn!("no displays reported by ScreenCaptureKit content");
+        info!("using desktop independent window filter");
         SCContentFilter::init_with_desktop_independent_window(SCContentFilter::alloc(), window)
     };
     let configuration = make_configuration(frame.size, Some(frame));

@@ -104,8 +104,8 @@ export async function runBrowserHandshake(
   channel: RTCDataChannel,
   params: BrowserHandshakeParams,
 ): Promise<BrowserHandshakeResult> {
-  await waitForChannelOpen(channel);
   channel.binaryType = 'arraybuffer';
+  await waitForChannelOpen(channel);
 
   const noise = await loadNoise();
   const psk = await resolvePreSharedKey(params);
@@ -681,6 +681,10 @@ class DataChannelQueue {
   private readonly onMessage = (event: MessageEvent) => {
     try {
       const payload = normaliseData(event.data);
+      console.debug('[beach-web][noise] queue_message', {
+        bytes: payload.length,
+        bufferedResolvers: this.resolvers.length,
+      });
       if (this.resolvers.length > 0) {
         const resolve = this.resolvers.shift()!;
         resolve(payload);
@@ -748,6 +752,9 @@ class DataChannelQueue {
       return;
     }
     this.settledError = error;
+    console.debug('[beach-web][noise] queue_fail', {
+      reason: error instanceof Error ? error.message : String(error),
+    });
     while (this.rejecters.length > 0) {
       const reject = this.rejecters.shift()!;
       reject(error);

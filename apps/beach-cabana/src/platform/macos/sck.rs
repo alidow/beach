@@ -394,7 +394,7 @@ fn build_window_selection(window: &SCWindow) -> TargetSelection {
     }
     let filter =
         SCContentFilter::init_with_desktop_independent_window(SCContentFilter::alloc(), window);
-    let configuration = make_configuration(frame.size);
+    let configuration = make_configuration(frame.size, Some(frame));
     TargetSelection { filter, configuration }
 }
 

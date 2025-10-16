@@ -1116,6 +1116,15 @@ async fn negotiate_offerer_peer(
     let channels = WebRtcChannels::new();
     let pending_ice = Arc::new(AsyncMutex::new(Vec::new()));
     let handshake_id = Uuid::new_v4().to_string();
+    let handshake_span = tracing::trace_span!(
+        target = "webrtc",
+        "webrtc_handshake",
+        role = "offerer",
+        handshake_id = %handshake_id,
+        remote_peer = %peer.id,
+        thread = %current_thread_label()
+    );
+    let _handshake_span_guard = handshake_span.enter();
     let handshake_id_arc = Arc::new(handshake_id.clone());
     let pre_shared_key_cell = Arc::new(OnceCell::<Arc<[u8; 32]>>::new());
     prime_pre_shared_key(
@@ -1475,6 +1484,13 @@ async fn negotiate_offerer_peer(
             channel_state = ?handshake_channel.ready_state(),
             "offerer: about to run handshake as Initiator"
         );
+        tracing::trace!(
+            target = "webrtc",
+            role = "offerer",
+            handshake_id = %handshake_id,
+            event = "pre_shared_key_wait",
+            thread = %current_thread_label()
+        );
         let handshake_key = await_pre_shared_key(
             &pre_shared_key_cell,
             &inner.session_key,
@@ -1486,6 +1502,13 @@ async fn negotiate_offerer_peer(
         .ok_or_else(|| {
             TransportError::Setup("handshake key unavailable for secure transport".into())
         })?;
+        tracing::trace!(
+            target = "webrtc",
+            role = "offerer",
+            handshake_id = %handshake_id,
+            event = "pre_shared_key_acquired",
+            thread = %current_thread_label()
+        );
         tracing::debug!(
             target = "webrtc",
             role = "offerer",
@@ -1769,7 +1792,22 @@ async fn connect_answerer(
         oneshot::channel::<Result<Option<Arc<HandshakeResult>>, TransportError>>();
     let secure_sender = Arc::new(AsyncMutex::new(Some(secure_tx)));
     if !secure_transport_active {
-        if let Some(sender) = secure_sender.lock().await.take() {
+        tracing::trace!(
+            target = "webrtc",
+            role = "answerer",
+            event = "secure_sender_lock_wait",
+            reason = "secure_transport_disabled",
+            thread = %current_thread_label()
+        );
+        let mut sender_guard = secure_sender.lock().await;
+        tracing::trace!(
+            target = "webrtc",
+            role = "answerer",
+            event = "secure_sender_lock_acquired",
+            reason = "secure_transport_disabled",
+            thread = %current_thread_label()
+        );
+        if let Some(sender) = sender_guard.take() {
             let _ = sender.send(Ok(None));
         }
     }
@@ -1876,6 +1914,15 @@ async fn connect_answerer(
         shared_key.as_ref().map(|key| key.as_ref()),
     )?;
     let handshake_id = Arc::new(offer_payload.handshake_id.clone());
+    let answerer_span = tracing::trace_span!(
+        target = "webrtc",
+        "webrtc_handshake",
+        role = "answerer",
+        handshake_id = %handshake_id.as_str(),
+        remote_peer = %remote_offer_peer,
+        thread = %current_thread_label()
+    );
+    let _answerer_span_guard = answerer_span.enter();
     let remote_offer_peer = offer_payload.from_peer.clone();
 
     let mut setting = SettingEngine::default();
@@ -2020,7 +2067,23 @@ async fn connect_answerer(
                 };
                 let has_remote = pc_for_incoming.remote_description().await.is_some();
                 if !has_remote {
+                    tracing::trace!(
+                        target = "webrtc",
+                        role = "answerer",
+                        handshake_id = %handshake_for_incoming.as_str(),
+                        event = "pending_ice_queue_lock_wait",
+                        reason = "queue_remote",
+                        thread = %current_thread_label()
+                    );
                     let mut queue = pending_for_incoming.lock().await;
+                    tracing::trace!(
+                        target = "webrtc",
+                        role = "answerer",
+                        handshake_id = %handshake_for_incoming.as_str(),
+                        event = "pending_ice_queue_lock_acquired",
+                        thread = %current_thread_label(),
+                        queue_len = queue.len()
+                    );
                     queue.push(init);
                     tracing::debug!(
                         target = "webrtc",
@@ -2035,7 +2098,24 @@ async fn connect_answerer(
                         error = %err,
                         "answerer failed to add remote ice candidate"
                     );
+                    tracing::trace!(
+                        target = "webrtc",
+                        role = "answerer",
+                        handshake_id = %handshake_for_incoming.as_str(),
+                        event = "pending_ice_queue_lock_wait",
+                        reason = "fallback_queue",
+                        thread = %current_thread_label()
+                    );
                     let mut queue = pending_for_incoming.lock().await;
+                    tracing::trace!(
+                        target = "webrtc",
+                        role = "answerer",
+                        handshake_id = %handshake_for_incoming.as_str(),
+                        event = "pending_ice_queue_lock_acquired",
+                        reason = "fallback_queue",
+                        thread = %current_thread_label(),
+                        queue_len = queue.len()
+                    );
                     queue.push(init);
                 }
             }
@@ -2091,13 +2171,43 @@ async fn connect_answerer(
 
             if label == HANDSHAKE_CHANNEL_LABEL {
                 if !secure_transport_active {
-                    if let Some(sender) = secure_sender.lock().await.take() {
+                    tracing::trace!(
+                        target = "webrtc",
+                        role = "answerer",
+                        event = "secure_sender_lock_wait",
+                        reason = "secure_transport_disabled",
+                        thread = %current_thread_label()
+                    );
+                    let mut sender_guard = secure_sender.lock().await;
+                    tracing::trace!(
+                        target = "webrtc",
+                        role = "answerer",
+                        event = "secure_sender_lock_acquired",
+                        reason = "secure_transport_disabled",
+                        thread = %current_thread_label()
+                    );
+                    if let Some(sender) = sender_guard.take() {
                         let _ = sender.send(Ok(None));
                     }
                     return;
                 }
                 let Some(passphrase) = passphrase_value.clone() else {
-                    if let Some(sender) = secure_sender.lock().await.take() {
+                    tracing::trace!(
+                        target = "webrtc",
+                        role = "answerer",
+                        event = "secure_sender_lock_wait",
+                        reason = "missing_passphrase",
+                        thread = %current_thread_label()
+                    );
+                    let mut sender_guard = secure_sender.lock().await;
+                    tracing::trace!(
+                        target = "webrtc",
+                        role = "answerer",
+                        event = "secure_sender_lock_acquired",
+                        reason = "missing_passphrase",
+                        thread = %current_thread_label()
+                    );
+                    if let Some(sender) = sender_guard.take() {
                         let _ = sender.send(Ok(None));
                     }
                     return;
@@ -2117,6 +2227,14 @@ async fn connect_answerer(
                     remote_peer = %remote_peer,
                     "spawning handshake task for answerer"
                 );
+                tracing::trace!(
+                    target = "webrtc",
+                    role = "answerer",
+                    handshake_id = %handshake_id_value,
+                    event = "handshake_task_spawn",
+                    thread = %current_thread_label(),
+                    "spawning answerer handshake task on global executor"
+                );
                 spawn_on_global(async move {
                     tracing::info!(
                         target = "webrtc",
@@ -2130,6 +2248,13 @@ async fn connect_answerer(
                         role = "answerer",
                         handshake_id = %handshake_id_value,
                         "answerer handshake task awaiting pre-shared key"
+                    );
+                    tracing::trace!(
+                        target = "webrtc",
+                        role = "answerer",
+                        handshake_id = %handshake_id_value,
+                        event = "pre_shared_key_wait",
+                        thread = %current_thread_label()
                     );
                     let handshake_key = match await_pre_shared_key(
                         &pre_shared_key_cell_value,
@@ -2148,11 +2273,28 @@ async fn connect_answerer(
                                 handshake_id = %handshake_id_value,
                                 "answerer handshake task could not obtain pre-shared key"
                             );
-                            let _ = sender_holder.lock().await.take().map(|sender| {
+                            tracing::trace!(
+                                target = "webrtc",
+                                role = "answerer",
+                                handshake_id = %handshake_id_value,
+                                event = "secure_sender_lock_wait",
+                                reason = "handshake_key_unavailable",
+                                thread = %current_thread_label()
+                            );
+                            let mut sender_guard = sender_holder.lock().await;
+                            tracing::trace!(
+                                target = "webrtc",
+                                role = "answerer",
+                                handshake_id = %handshake_id_value,
+                                event = "secure_sender_lock_acquired",
+                                reason = "handshake_key_unavailable",
+                                thread = %current_thread_label()
+                            );
+                            if let Some(sender) = sender_guard.take() {
                                 let _ = sender.send(Err(TransportError::Setup(
                                     "handshake key unavailable for secure transport".into(),
                                 )));
-                            });
+                            }
                             return;
                         }
                         Err(err) => {
@@ -2163,9 +2305,26 @@ async fn connect_answerer(
                                 error = %err,
                                 "answerer handshake task failed while deriving pre-shared key"
                             );
-                            let _ = sender_holder.lock().await.take().map(|sender| {
+                            tracing::trace!(
+                                target = "webrtc",
+                                role = "answerer",
+                                handshake_id = %handshake_id_value,
+                                event = "secure_sender_lock_wait",
+                                reason = "handshake_key_error",
+                                thread = %current_thread_label()
+                            );
+                            let mut sender_guard = sender_holder.lock().await;
+                            tracing::trace!(
+                                target = "webrtc",
+                                role = "answerer",
+                                handshake_id = %handshake_id_value,
+                                event = "secure_sender_lock_acquired",
+                                reason = "handshake_key_error",
+                                thread = %current_thread_label()
+                            );
+                            if let Some(sender) = sender_guard.take() {
                                 let _ = sender.send(Err(err));
-                            });
+                            }
                             return;
                         }
                     };
@@ -2181,6 +2340,13 @@ async fn connect_answerer(
                         &handshake_id_value,
                         local_peer.as_str(),
                         remote_peer.as_str(),
+                    );
+                    tracing::trace!(
+                        target = "webrtc",
+                        role = "answerer",
+                        handshake_id = %handshake_id_value,
+                        event = "pre_shared_key_acquired",
+                        thread = %current_thread_label()
                     );
                     let params = HandshakeParams {
                         handshake_key,
@@ -2227,7 +2393,24 @@ async fn connect_answerer(
                         outcome = ?outcome.as_ref().map(|_| "success").unwrap_or("error"),
                         "handshake task completed, sending result"
                     );
-                    if let Some(sender) = sender_holder.lock().await.take() {
+                    tracing::trace!(
+                        target = "webrtc",
+                        role = "answerer",
+                        handshake_id = %handshake_id_value,
+                        event = "secure_sender_lock_wait",
+                        reason = "handshake_result_delivery",
+                        thread = %current_thread_label()
+                    );
+                    let mut sender_guard = sender_holder.lock().await;
+                    tracing::trace!(
+                        target = "webrtc",
+                        role = "answerer",
+                        handshake_id = %handshake_id_value,
+                        event = "secure_sender_lock_acquired",
+                        reason = "handshake_result_delivery",
+                        thread = %current_thread_label()
+                    );
+                    if let Some(sender) = sender_guard.take() {
                         let _ = sender.send(outcome);
                     }
                 });
@@ -2251,7 +2434,22 @@ async fn connect_answerer(
                 await = "slot.lock",
                 state = "start"
             );
+            tracing::trace!(
+                target = "webrtc",
+                role = "answerer",
+                event = "transport_slot_lock_wait",
+                handshake_id = %handshake_value.as_str(),
+                thread = %current_thread_label()
+            );
             let mut slot_guard = slot.lock().await;
+            tracing::trace!(
+                target = "webrtc",
+                role = "answerer",
+                event = "transport_slot_lock_acquired",
+                handshake_id = %handshake_value.as_str(),
+                thread = %current_thread_label(),
+                populated = slot_guard.is_some()
+            );
             tracing::debug!(
                 target = "beach_human::transport::webrtc",
                 role = "answerer",
@@ -2325,7 +2523,22 @@ async fn connect_answerer(
 
     // Process queued ICE candidates now that remote description is set
     let pending_candidates = {
+        tracing::trace!(
+            target = "webrtc",
+            role = "answerer",
+            event = "pending_ice_queue_lock_wait",
+            reason = "drain_after_remote_description",
+            thread = %current_thread_label()
+        );
         let mut queue = pending_for_incoming_clone.lock().await;
+        tracing::trace!(
+            target = "webrtc",
+            role = "answerer",
+            event = "pending_ice_queue_lock_acquired",
+            reason = "drain_after_remote_description",
+            thread = %current_thread_label(),
+            queue_len = queue.len()
+        );
         let candidates = queue.drain(..).collect::<Vec<_>>();
         candidates
     };
@@ -2448,7 +2661,22 @@ async fn connect_answerer(
                 attempts
             );
         }
+        tracing::trace!(
+            target = "webrtc",
+            role = "answerer",
+            event = "transport_slot_lock_wait",
+            attempts,
+            thread = %current_thread_label()
+        );
         let mut transport_guard = transport_slot.lock().await;
+        tracing::trace!(
+            target = "webrtc",
+            role = "answerer",
+            event = "transport_slot_lock_acquired",
+            attempts,
+            thread = %current_thread_label(),
+            has_transport = transport_guard.is_some()
+        );
         if attempts == 1 || attempts % 100 == 0 {
             tracing::debug!(
                 target = "beach_human::transport::webrtc",
@@ -2518,8 +2746,25 @@ async fn connect_answerer(
 
     // Check if transport is already populated (data channel already opened)
     let already_ready = {
+        tracing::trace!(
+            target = "webrtc",
+            role = "answerer",
+            event = "transport_slot_lock_wait",
+            reason = "already_ready_check",
+            thread = %current_thread_label()
+        );
         let guard = transport_slot.lock().await;
-        guard.is_some()
+        let populated = guard.is_some();
+        tracing::trace!(
+            target = "webrtc",
+            role = "answerer",
+            event = "transport_slot_lock_acquired",
+            reason = "already_ready_check",
+            thread = %current_thread_label(),
+            has_transport = populated
+        );
+        drop(guard);
+        populated
     };
 
     if !already_ready {
@@ -2732,6 +2977,10 @@ fn extract_session_id(signaling_url: &str) -> Result<String, TransportError> {
 fn truncated_key_hash(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex::encode(&digest[..8])
+}
+
+fn current_thread_label() -> String {
+    format!("{:?}", std::thread::current().id())
 }
 
 fn prime_session_key(

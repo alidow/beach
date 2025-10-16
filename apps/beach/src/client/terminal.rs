@@ -643,6 +643,10 @@ impl TerminalClient {
                                 thread::sleep(Duration::from_millis(latency_ms));
                             }
                             telemetry::record_bytes("client_frame_bytes", bytes.len());
+                            trace!(
+                                bytes_len = bytes.len(),
+                                "received binary payload from transport"
+                            );
                             let decode_start = Instant::now();
                             let frame = protocol::decode_host_frame_binary(&bytes)?;
                             let decode_elapsed = decode_start.elapsed();
@@ -660,6 +664,10 @@ impl TerminalClient {
                                     decode_elapsed,
                                 ),
                             }
+                            trace!(
+                                frame_type = ?frame,
+                                "decoded host frame"
+                            );
                             match self.handle_host_frame(frame) {
                                 Ok(()) => {}
                                 Err(ClientError::Shutdown) => return Ok(()),

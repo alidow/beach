@@ -382,7 +382,7 @@ impl WebRtcTransport {
                         Ok(plaintext) => plaintext,
                         Err(err) => {
                             tracing::warn!(
-                                target = "webrtc",
+
                                 transport_id = ?log_id,
                                 error = %err,
                                 "failed to decrypt inbound frame"
@@ -395,7 +395,7 @@ impl WebRtcTransport {
                 };
                 if let Some(message) = decode_message(&payload) {
                     tracing::debug!(
-                        target = "webrtc",
+
                         transport_id = ?log_id,
                         frame_len = payload.len(),
                         sequence = message.sequence,
@@ -403,7 +403,7 @@ impl WebRtcTransport {
                     );
                     if let Err(err) = sender.send(message) {
                         tracing::warn!(
-                            target = "webrtc",
+
                             transport_id = ?log_id,
                             error = %err,
                             "failed to enqueue inbound message"
@@ -411,7 +411,7 @@ impl WebRtcTransport {
                     }
                 } else {
                     tracing::warn!(
-                        target = "webrtc",
+
                         transport_id = ?log_id,
                         frame_len = payload.len(),
                         "failed to decode message"
@@ -437,7 +437,7 @@ impl WebRtcTransport {
                 if let Some(flag) = handshake_for_close.as_ref() {
                     if !flag.load(Ordering::SeqCst) {
                         tracing::debug!(
-                            target = "webrtc",
+
                             transport_id = ?log_id,
                             pc_state = ?pc_state,
                             ice_state = ?ice_state,
@@ -447,7 +447,7 @@ impl WebRtcTransport {
                     }
                 }
                 tracing::debug!(
-                    target = "webrtc",
+
                     transport_id = ?log_id,
                     pc_state = ?pc_state,
                     ice_state = ?ice_state,
@@ -500,7 +500,7 @@ impl WebRtcTransport {
                     None => break,
                 };
                 tracing::debug!(
-                    target = "webrtc",
+
                     transport_id = ?transport_id,
                     queued_len = bytes.len(),
                     "dequeued outbound"
@@ -552,7 +552,7 @@ impl WebRtcTransport {
                             buffered_after = after
                         );
                         tracing::debug!(
-                            target = "webrtc",
+
                             transport_id = ?transport_id,
                             bytes_written,
                             ready_state = ?dc_clone.ready_state(),
@@ -566,14 +566,14 @@ impl WebRtcTransport {
                         let err_display = err.to_string();
                         if err_display.contains("DataChannel is not opened") {
                             tracing::debug!(
-                                target = "webrtc",
+
                                 transport_id = ?transport_id,
                                 error = %err_display,
                                 "dropping outbound frame: data channel not open"
                             );
                         } else {
                             tracing::warn!(
-                                target = "webrtc",
+
                                 transport_id = ?transport_id,
                                 error = %err_display,
                                 "webrtc send error"
@@ -583,7 +583,7 @@ impl WebRtcTransport {
                     }
                     Err(_) => {
                         tracing::warn!(
-                            target = "webrtc",
+
                             transport_id = ?transport_id,
                             "webrtc send timed out"
                         );
@@ -631,7 +631,7 @@ impl Transport for WebRtcTransport {
             bytes = self.encryption.encrypt(&bytes)?;
         }
         tracing::info!(
-            target = "webrtc",
+
             transport_id = ?self.id,
             payload_len = bytes.len(),
             sequence = message.sequence,
@@ -656,7 +656,7 @@ impl Transport for WebRtcTransport {
 
     fn recv(&self, timeout_duration: Duration) -> Result<TransportMessage, TransportError> {
         tracing::debug!(
-            target = "webrtc",
+
             transport_id = ?self.id,
             timeout = ?timeout_duration,
             "waiting for inbound message"
@@ -666,7 +666,7 @@ impl Transport for WebRtcTransport {
         match result {
             Ok(message) => {
                 tracing::debug!(
-                    target = "webrtc",
+
                     transport_id = ?self.id,
                     sequence = message.sequence,
                     payload = ?message.payload,
@@ -676,7 +676,7 @@ impl Transport for WebRtcTransport {
             }
             Err(CrossbeamRecvTimeoutError::Timeout) => {
                 tracing::debug!(
-                    target = "webrtc",
+
                     transport_id = ?self.id,
                     "recv timed out"
                 );
@@ -684,7 +684,7 @@ impl Transport for WebRtcTransport {
             }
             Err(CrossbeamRecvTimeoutError::Disconnected) => {
                 tracing::warn!(
-                    target = "webrtc",
+
                     transport_id = ?self.id,
                     "recv channel closed"
                 );
@@ -869,7 +869,7 @@ impl OffererInner {
     ) {
         if joined.peer.role != PeerRole::Client {
             tracing::debug!(
-                target = "webrtc",
+
                 peer_id = %joined.peer.id,
                 role = ?joined.peer.role,
                 "ignoring peer join for non-client role"
@@ -883,12 +883,12 @@ impl OffererInner {
                 match state {
                     PeerLifecycleState::Negotiating => {
                         tracing::trace!(
-                            target = "webrtc",
+
                             peer_id = %joined.peer.id,
                             "peer negotiator already active; ignoring new join"
                         );
                         tracing::debug!(
-                            target = "webrtc",
+
                             peer_id = %joined.peer.id,
                             "peer negotiator already active"
                         );
@@ -896,12 +896,12 @@ impl OffererInner {
                     }
                     PeerLifecycleState::Established => {
                         tracing::trace!(
-                            target = "webrtc",
+
                             peer_id = %joined.peer.id,
                             "peer already has established transport; ignoring join"
                         );
                         tracing::debug!(
-                            target = "webrtc",
+
                             peer_id = %joined.peer.id,
                             "peer already has established transport"
                         );
@@ -911,7 +911,7 @@ impl OffererInner {
             }
             states.insert(joined.peer.id.clone(), PeerLifecycleState::Negotiating);
             tracing::trace!(
-                target = "webrtc",
+
                 peer_id = %joined.peer.id,
                 "peer lifecycle transitioned to negotiating"
             );
@@ -920,7 +920,7 @@ impl OffererInner {
         let mut tasks = self.peer_tasks.lock().await;
         if tasks.contains_key(&joined.peer.id) {
             tracing::debug!(
-                target = "webrtc",
+
                 peer_id = %joined.peer.id,
                 "peer negotiator already active"
             );
@@ -928,7 +928,7 @@ impl OffererInner {
         }
         if tasks.len() >= self.max_negotiators {
             tracing::warn!(
-                target = "webrtc",
+
                 peer_id = %joined.peer.id,
                 active = tasks.len(),
                 max = self.max_negotiators,
@@ -938,12 +938,12 @@ impl OffererInner {
         }
 
         tracing::info!(
-            target = "webrtc",
+
             peer_id = %joined.peer.id,
             "registering peer negotiator"
         );
         tracing::debug!(
-            target = "webrtc",
+
             peer_id = %joined.peer.id,
             active_tasks = tasks.len(),
             "spawning negotiator task for joined peer"
@@ -970,7 +970,7 @@ impl OffererInner {
 
         let previous = tasks.insert(peer_id.clone(), PeerNegotiatorHandle { cancel, task });
         tracing::trace!(
-            target = "webrtc",
+
             peer_id = %peer_id,
             active_tasks = tasks.len(),
             replaced_existing = previous.is_some(),
@@ -982,14 +982,14 @@ impl OffererInner {
 
     async fn handle_peer_left(self: &Arc<Self>, peer_id: &str) {
         tracing::info!(
-            target = "webrtc",
+
             peer_id = %peer_id,
             "handling peer left event"
         );
         let mut tasks = self.peer_tasks.lock().await;
         if let Some(handle) = tasks.remove(peer_id) {
             tracing::debug!(
-                target = "webrtc",
+
                 peer_id = %peer_id,
                 "setting cancel flag and aborting negotiator task for departed peer"
             );
@@ -997,7 +997,7 @@ impl OffererInner {
             handle.task.abort();
         } else {
             tracing::debug!(
-                target = "webrtc",
+
                 peer_id = %peer_id,
                 "no active negotiator task found for departed peer"
             );
@@ -1028,7 +1028,7 @@ impl OffererInner {
                         states.insert(peer_id.to_string(), PeerLifecycleState::Established);
                     }
                     tracing::trace!(
-                        target = "webrtc",
+
                         peer_id = %peer_id,
                         state = ?states.get(peer_id),
                         "peer lifecycle updated to established"
@@ -1036,7 +1036,7 @@ impl OffererInner {
                 }
                 if self.accepted_tx.send(accepted).is_err() {
                     tracing::debug!(
-                        target = "webrtc",
+
                         peer_id = %peer_id,
                         "dropping accepted transport because receiver closed"
                     );
@@ -1047,13 +1047,13 @@ impl OffererInner {
                     let mut states = self.peer_states.lock().await;
                     states.remove(peer_id);
                     tracing::trace!(
-                        target = "webrtc",
+
                         peer_id = %peer_id,
                         "peer lifecycle entry removed after negotiator concluded without transport"
                     );
                 }
                 tracing::debug!(
-                    target = "webrtc",
+
                     peer_id = %peer_id,
                     cancelled = cancel_flag.load(Ordering::SeqCst),
                     "peer negotiation concluded without establishing transport"
@@ -1064,13 +1064,13 @@ impl OffererInner {
                     let mut states = self.peer_states.lock().await;
                     states.remove(peer_id);
                     tracing::trace!(
-                        target = "webrtc",
+
                         peer_id = %peer_id,
                         "peer lifecycle entry removed after negotiator error"
                     );
                 }
                 tracing::warn!(
-                    target = "webrtc",
+
                     peer_id = %peer_id,
                     cancelled = cancel_flag.load(Ordering::SeqCst),
                     error = %err,
@@ -1117,7 +1117,7 @@ async fn negotiate_offerer_peer(
     let pending_ice = Arc::new(AsyncMutex::new(Vec::new()));
     let handshake_id = Uuid::new_v4().to_string();
     let handshake_span = tracing::trace_span!(
-        target = "webrtc",
+        target: "webrtc",
         "webrtc_handshake",
         role = "offerer",
         handshake_id = %handshake_id,
@@ -1155,7 +1155,7 @@ async fn negotiate_offerer_peer(
                     .await
                 {
                     tracing::warn!(
-                        target = "webrtc",
+
                         peer_id = %peer_id,
                         error = %err,
                         "failed to send local ice candidate"
@@ -1195,7 +1195,7 @@ async fn negotiate_offerer_peer(
                 {
                     if handshake_id != handshake_for_incoming.as_str() {
                         tracing::debug!(
-                            target = "webrtc",
+
                             peer_id = %peer_id_for_incoming,
                             handshake_id = %handshake_id,
                             "ignoring remote ice candidate for stale handshake"
@@ -1218,7 +1218,7 @@ async fn negotiate_offerer_peer(
                         Ok(key) => key,
                         Err(err) => {
                             tracing::warn!(
-                                target = "webrtc",
+
                                 peer_id = %peer_id_for_incoming,
                                 error = %err,
                                 "failed to derive handshake key for remote ice candidate"
@@ -1240,7 +1240,7 @@ async fn negotiate_offerer_peer(
                         Ok(resolved) => resolved,
                         Err(err) => {
                             tracing::warn!(
-                                target = "webrtc",
+
                                 peer_id = %peer_id_for_incoming,
                                 error = %err,
                                 "failed to decode remote ice candidate"
@@ -1262,7 +1262,7 @@ async fn negotiate_offerer_peer(
                     }
                     if let Err(err) = pc_for_incoming.add_ice_candidate(init.clone()).await {
                         tracing::warn!(
-                            target = "webrtc",
+
                             peer_id = %peer_id_for_incoming,
                             error = %err,
                             "failed to add remote ice candidate"
@@ -1300,7 +1300,6 @@ async fn negotiate_offerer_peer(
             .map(|p| !p.trim().is_empty())
             .unwrap_or(false);
     tracing::info!(
-        target = "webrtc",
         role = "offerer",
         secure_transport_active,
         has_passphrase = inner.passphrase.is_some(),
@@ -1309,7 +1308,6 @@ async fn negotiate_offerer_peer(
     );
     let handshake_dc = if secure_transport_active {
         tracing::info!(
-            target = "webrtc",
             role = "offerer",
             label = HANDSHAKE_CHANNEL_LABEL,
             "offerer: creating handshake data channel"
@@ -1321,7 +1319,6 @@ async fn negotiate_offerer_peer(
         )
     } else {
         tracing::info!(
-            target = "webrtc",
             role = "offerer",
             "offerer: NOT creating handshake channel (secure transport disabled)"
         );
@@ -1329,7 +1326,7 @@ async fn negotiate_offerer_peer(
     };
     if let Some(ref dc) = handshake_dc {
         tracing::info!(
-            target = "webrtc",
+
             role = "offerer",
             channel_state = ?dc.ready_state(),
             "offerer: handshake channel created"
@@ -1403,7 +1400,7 @@ async fn negotiate_offerer_peer(
         for candidate in queued.drain(..) {
             if let Err(err) = pc.add_ice_candidate(candidate.clone()).await {
                 tracing::warn!(
-                    target = "webrtc",
+
                     peer_id = %peer.id,
                     error = %err,
                     "failed to add buffered remote ice candidate"
@@ -1419,7 +1416,7 @@ async fn negotiate_offerer_peer(
     }
 
     tracing::debug!(
-        target = "webrtc",
+
         peer_id = %peer.id,
         "waiting for datachannel to open (15s timeout)"
     );
@@ -1428,7 +1425,7 @@ async fn negotiate_offerer_peer(
         .is_err()
     {
         tracing::warn!(
-            target = "webrtc",
+
             peer_id = %peer.id,
             "datachannel open timeout, closing peer connection"
         );
@@ -1462,7 +1459,7 @@ async fn negotiate_offerer_peer(
     // The answerer will send __ready__ only after completing the handshake,
     // so the offerer must initiate the handshake first
     tracing::info!(
-        target = "webrtc",
+
         role = "offerer",
         peer_id = %peer.id,
         secure_transport_active,
@@ -1476,7 +1473,7 @@ async fn negotiate_offerer_peer(
         handshake_dc.clone(),
     ) {
         tracing::info!(
-            target = "webrtc",
+
             role = "offerer",
             handshake_id = %handshake_id,
             offerer_peer = %offerer_peer_id,
@@ -1485,7 +1482,7 @@ async fn negotiate_offerer_peer(
             "offerer: about to run handshake as Initiator"
         );
         tracing::trace!(
-            target = "webrtc",
+
             role = "offerer",
             handshake_id = %handshake_id,
             event = "pre_shared_key_wait",
@@ -1503,14 +1500,14 @@ async fn negotiate_offerer_peer(
             TransportError::Setup("handshake key unavailable for secure transport".into())
         })?;
         tracing::trace!(
-            target = "webrtc",
+
             role = "offerer",
             handshake_id = %handshake_id,
             event = "pre_shared_key_acquired",
             thread = %current_thread_label()
         );
         tracing::debug!(
-            target = "webrtc",
+
             role = "offerer",
             handshake_id = %handshake_id,
             key_path = "handshake_for_noise",
@@ -1526,14 +1523,14 @@ async fn negotiate_offerer_peer(
             prologue_context,
         };
         tracing::debug!(
-            target = "webrtc",
+
             role = "offerer",
             handshake_id = %handshake_id,
             "offerer: calling run_handshake as Initiator"
         );
         let result = run_handshake(HandshakeRole::Initiator, handshake_channel, params).await?;
         tracing::info!(
-            target = "webrtc",
+
             role = "offerer",
             handshake_id = %handshake_id,
             verification = %result.verification_code,
@@ -1543,7 +1540,7 @@ async fn negotiate_offerer_peer(
         Some(Arc::new(result))
     } else {
         tracing::info!(
-            target = "webrtc",
+
             role = "offerer",
             peer_id = %peer.id,
             secure_transport_active,
@@ -1555,7 +1552,7 @@ async fn negotiate_offerer_peer(
     };
 
     tracing::debug!(
-        target = "webrtc",
+
         peer_id = %peer.id,
         transport_id = ?local_id,
         dc_state = ?dc_state_before,
@@ -1566,7 +1563,7 @@ async fn negotiate_offerer_peer(
     // Give the data channel on_message callback a chance to fire and enqueue
     // any messages that arrived immediately when the channel opened
     tracing::trace!(
-        target = "webrtc",
+
         peer_id = %peer.id,
         "sleeping 10ms before polling for __ready__"
     );
@@ -1574,7 +1571,7 @@ async fn negotiate_offerer_peer(
     let dc_state_after = transport._dc.ready_state();
     let pc_state_after = pc.connection_state();
     tracing::trace!(
-        target = "webrtc",
+
         peer_id = %peer.id,
         dc_state_after_sleep = ?dc_state_after,
         pc_state_after_sleep = ?pc_state_after,
@@ -1582,7 +1579,7 @@ async fn negotiate_offerer_peer(
     );
 
     tracing::debug!(
-        target = "webrtc",
+
         peer_id = %peer.id,
         "beginning to poll for __ready__ sentinel"
     );
@@ -1593,7 +1590,7 @@ async fn negotiate_offerer_peer(
         readiness_attempts = attempt + 1;
         if cancel_flag.load(Ordering::SeqCst) {
             tracing::warn!(
-                target = "webrtc",
+
                 peer_id = %peer.id,
                 attempt = attempt,
                 "readiness handshake cancelled via cancel_flag, closing peer connection"
@@ -1605,7 +1602,7 @@ async fn negotiate_offerer_peer(
         match transport.try_recv() {
             Ok(Some(message)) => {
                 tracing::debug!(
-                    target = "webrtc",
+
                     peer_id = %peer.id,
                     attempt = attempt,
                     payload = ?message.payload,
@@ -1615,7 +1612,7 @@ async fn negotiate_offerer_peer(
                 if message.payload.as_text() == Some("__ready__") {
                     ready_seen = true;
                     tracing::info!(
-                        target = "webrtc",
+
                         peer_id = %peer.id,
                         attempt = attempt,
                         "received __ready__ sentinel from answerer"
@@ -1623,7 +1620,7 @@ async fn negotiate_offerer_peer(
                     break;
                 } else {
                     tracing::debug!(
-                        target = "webrtc",
+
                         peer_id = %peer.id,
                         payload = ?message.payload,
                         "received unexpected message during readiness handshake"
@@ -1633,7 +1630,7 @@ async fn negotiate_offerer_peer(
             Ok(None) => {}
             Err(err) => {
                 tracing::warn!(
-                    target = "webrtc",
+
                     peer_id = %peer.id,
                     error = %err,
                     "failed polling for readiness ack"
@@ -1647,7 +1644,7 @@ async fn negotiate_offerer_peer(
     }
 
     tracing::debug!(
-        target = "webrtc",
+
         peer_id = %peer.id,
         attempts = readiness_attempts,
         ready_seen = ready_seen,
@@ -1656,7 +1653,7 @@ async fn negotiate_offerer_peer(
 
     if !ready_seen {
         tracing::warn!(
-            target = "webrtc",
+
             peer_id = %peer.id,
             transport_id = ?local_id,
             "closing peer connection: did not receive __ready__ sentinel"
@@ -1669,13 +1666,13 @@ async fn negotiate_offerer_peer(
     }
 
     tracing::debug!(
-        target = "webrtc",
+
         peer_id = %peer.id,
         "sending __offer_ready__ sentinel to answerer"
     );
 
     tracing::debug!(
-        target = "webrtc",
+
         peer_id = %peer.id,
         handshake_id = %handshake_id,
         attempts = readiness_attempts,
@@ -1685,7 +1682,7 @@ async fn negotiate_offerer_peer(
 
     if let Err(err) = transport.send_text("__offer_ready__") {
         tracing::warn!(
-            target = "webrtc",
+
             peer_id = %peer.id,
             error = %err,
             "failed to send offer ready sentinel"
@@ -1693,7 +1690,7 @@ async fn negotiate_offerer_peer(
     }
 
     tracing::info!(
-        target = "webrtc",
+
         peer_id = %peer.id,
         handshake_id = %handshake_id,
         "offerer transport established"
@@ -1722,7 +1719,7 @@ async fn negotiate_offerer_peer(
         let mcp_transport_dyn: Arc<dyn Transport> = mcp_transport;
         channels.publish(MCP_CHANNEL_LABEL.to_string(), mcp_transport_dyn);
         tracing::info!(
-            target = "webrtc",
+
             peer_id = %peer.id,
             handshake_id = %handshake_id,
             "offerer published mcp data channel"
@@ -1793,7 +1790,7 @@ async fn connect_answerer(
     let secure_sender = Arc::new(AsyncMutex::new(Some(secure_tx)));
     if !secure_transport_active {
         tracing::trace!(
-            target = "webrtc",
+
             role = "answerer",
             event = "secure_sender_lock_wait",
             reason = "secure_transport_disabled",
@@ -1801,7 +1798,7 @@ async fn connect_answerer(
         );
         let mut sender_guard = secure_sender.lock().await;
         tracing::trace!(
-            target = "webrtc",
+
             role = "answerer",
             event = "secure_sender_lock_acquired",
             reason = "secure_transport_disabled",
@@ -1915,7 +1912,7 @@ async fn connect_answerer(
     )?;
     let handshake_id = Arc::new(offer_payload.handshake_id.clone());
     let answerer_span = tracing::trace_span!(
-        target = "webrtc",
+        target: "webrtc",
         "webrtc_handshake",
         role = "answerer",
         handshake_id = %handshake_id.as_str(),
@@ -1968,7 +1965,7 @@ async fn connect_answerer(
         Box::pin(async move {
             if let Some(cand) = candidate {
                 tracing::debug!(
-                    target = "webrtc",
+
                     role = "offerer",
                     candidate = %cand.to_string(),
                     "local ice candidate gathered"
@@ -1978,7 +1975,7 @@ async fn connect_answerer(
                     .await
                 {
                     tracing::warn!(
-                        target = "webrtc",
+
                         error = %err,
                         "answerer candidate send error"
                     );
@@ -2011,7 +2008,6 @@ async fn connect_answerer(
             {
                 if handshake_for_incoming.as_str() != handshake_id {
                     tracing::debug!(
-                        target = "webrtc",
                         handshake_id,
                         "answerer ignoring remote ICE candidate for stale handshake"
                     );
@@ -2029,7 +2025,7 @@ async fn connect_answerer(
                     Ok(key) => key,
                     Err(err) => {
                         tracing::warn!(
-                            target = "webrtc",
+
                             handshake_id,
                             error = %err,
                             "answerer failed to derive handshake key for remote ice candidate"
@@ -2051,7 +2047,7 @@ async fn connect_answerer(
                     Ok(resolved) => resolved,
                     Err(err) => {
                         tracing::warn!(
-                            target = "webrtc",
+
                             handshake_id,
                             error = %err,
                             "failed to decode remote ice candidate"
@@ -2068,7 +2064,7 @@ async fn connect_answerer(
                 let has_remote = pc_for_incoming.remote_description().await.is_some();
                 if !has_remote {
                     tracing::trace!(
-                        target = "webrtc",
+
                         role = "answerer",
                         handshake_id = %handshake_for_incoming.as_str(),
                         event = "pending_ice_queue_lock_wait",
@@ -2077,7 +2073,7 @@ async fn connect_answerer(
                     );
                     let mut queue = pending_for_incoming.lock().await;
                     tracing::trace!(
-                        target = "webrtc",
+
                         role = "answerer",
                         handshake_id = %handshake_for_incoming.as_str(),
                         event = "pending_ice_queue_lock_acquired",
@@ -2086,7 +2082,6 @@ async fn connect_answerer(
                     );
                     queue.push(init);
                     tracing::debug!(
-                        target = "webrtc",
                         role = "answerer",
                         "queued remote ice candidate (remote description not set yet)"
                     );
@@ -2094,12 +2089,12 @@ async fn connect_answerer(
                 }
                 if let Err(err) = pc_for_incoming.add_ice_candidate(init.clone()).await {
                     tracing::warn!(
-                        target = "webrtc",
+
                         error = %err,
                         "answerer failed to add remote ice candidate"
                     );
                     tracing::trace!(
-                        target = "webrtc",
+
                         role = "answerer",
                         handshake_id = %handshake_for_incoming.as_str(),
                         event = "pending_ice_queue_lock_wait",
@@ -2108,7 +2103,7 @@ async fn connect_answerer(
                     );
                     let mut queue = pending_for_incoming.lock().await;
                     tracing::trace!(
-                        target = "webrtc",
+
                         role = "answerer",
                         handshake_id = %handshake_for_incoming.as_str(),
                         event = "pending_ice_queue_lock_acquired",
@@ -2130,12 +2125,7 @@ async fn connect_answerer(
     let slot_clone = transport_slot.clone();
     let client_id = next_transport_id();
     let peer_id = next_transport_id();
-    tracing::debug!(
-        target = "webrtc",
-        ?client_id,
-        ?peer_id,
-        "answerer allocating transport ids"
-    );
+    tracing::debug!(?client_id, ?peer_id, "answerer allocating transport ids");
     let signaling_for_dc = Arc::clone(&signaling_client);
     let channels_registry = channels.clone();
     let secure_sender_holder = Arc::clone(&secure_sender);
@@ -2163,7 +2153,7 @@ async fn connect_answerer(
         Box::pin(async move {
             let label = dc.label().to_string();
             tracing::debug!(
-                target = "webrtc",
+
                 role = "answerer",
                 label = %label,
                 "incoming data channel announced"
@@ -2172,7 +2162,7 @@ async fn connect_answerer(
             if label == HANDSHAKE_CHANNEL_LABEL {
                 if !secure_transport_active {
                     tracing::trace!(
-                        target = "webrtc",
+
                         role = "answerer",
                         event = "secure_sender_lock_wait",
                         reason = "secure_transport_disabled",
@@ -2180,7 +2170,7 @@ async fn connect_answerer(
                     );
                     let mut sender_guard = secure_sender.lock().await;
                     tracing::trace!(
-                        target = "webrtc",
+
                         role = "answerer",
                         event = "secure_sender_lock_acquired",
                         reason = "secure_transport_disabled",
@@ -2193,7 +2183,7 @@ async fn connect_answerer(
                 }
                 let Some(passphrase) = passphrase_value.clone() else {
                     tracing::trace!(
-                        target = "webrtc",
+
                         role = "answerer",
                         event = "secure_sender_lock_wait",
                         reason = "missing_passphrase",
@@ -2201,7 +2191,7 @@ async fn connect_answerer(
                     );
                     let mut sender_guard = secure_sender.lock().await;
                     tracing::trace!(
-                        target = "webrtc",
+
                         role = "answerer",
                         event = "secure_sender_lock_acquired",
                         reason = "missing_passphrase",
@@ -2219,7 +2209,7 @@ async fn connect_answerer(
                 let remote_peer = remote_peer_value.clone();
                 let handshake_id_value = (*handshake_value).clone();
                 tracing::info!(
-                    target = "webrtc",
+
                     label = HANDSHAKE_CHANNEL_LABEL,
                     ?channel_state,
                     handshake_id = %handshake_id_value,
@@ -2228,7 +2218,7 @@ async fn connect_answerer(
                     "spawning handshake task for answerer"
                 );
                 tracing::trace!(
-                    target = "webrtc",
+
                     role = "answerer",
                     handshake_id = %handshake_id_value,
                     event = "handshake_task_spawn",
@@ -2237,20 +2227,20 @@ async fn connect_answerer(
                 );
                 spawn_on_global(async move {
                     tracing::info!(
-                        target = "webrtc",
+
                         handshake_id = %handshake_id_value,
                         local_peer = %local_peer,
                         remote_peer = %remote_peer,
                         "handshake task started on answerer (inside spawned task)"
                     );
                     tracing::debug!(
-                        target = "webrtc",
+
                         role = "answerer",
                         handshake_id = %handshake_id_value,
                         "answerer handshake task awaiting pre-shared key"
                     );
                     tracing::trace!(
-                        target = "webrtc",
+
                         role = "answerer",
                         handshake_id = %handshake_id_value,
                         event = "pre_shared_key_wait",
@@ -2268,13 +2258,13 @@ async fn connect_answerer(
                         Ok(Some(key)) => key,
                         Ok(None) => {
                             tracing::error!(
-                                target = "webrtc",
+
                                 role = "answerer",
                                 handshake_id = %handshake_id_value,
                                 "answerer handshake task could not obtain pre-shared key"
                             );
                             tracing::trace!(
-                                target = "webrtc",
+
                                 role = "answerer",
                                 handshake_id = %handshake_id_value,
                                 event = "secure_sender_lock_wait",
@@ -2283,7 +2273,7 @@ async fn connect_answerer(
                             );
                             let mut sender_guard = sender_holder.lock().await;
                             tracing::trace!(
-                                target = "webrtc",
+
                                 role = "answerer",
                                 handshake_id = %handshake_id_value,
                                 event = "secure_sender_lock_acquired",
@@ -2299,14 +2289,14 @@ async fn connect_answerer(
                         }
                         Err(err) => {
                             tracing::error!(
-                                target = "webrtc",
+
                                 role = "answerer",
                                 handshake_id = %handshake_id_value,
                                 error = %err,
                                 "answerer handshake task failed while deriving pre-shared key"
                             );
                             tracing::trace!(
-                                target = "webrtc",
+
                                 role = "answerer",
                                 handshake_id = %handshake_id_value,
                                 event = "secure_sender_lock_wait",
@@ -2315,7 +2305,7 @@ async fn connect_answerer(
                             );
                             let mut sender_guard = sender_holder.lock().await;
                             tracing::trace!(
-                                target = "webrtc",
+
                                 role = "answerer",
                                 handshake_id = %handshake_id_value,
                                 event = "secure_sender_lock_acquired",
@@ -2329,7 +2319,7 @@ async fn connect_answerer(
                         }
                     };
                     tracing::debug!(
-                        target = "webrtc",
+
                         role = "answerer",
                         handshake_id = %handshake_id_value,
                         key_path = "handshake_for_noise",
@@ -2342,7 +2332,7 @@ async fn connect_answerer(
                         remote_peer.as_str(),
                     );
                     tracing::trace!(
-                        target = "webrtc",
+
                         role = "answerer",
                         handshake_id = %handshake_id_value,
                         event = "pre_shared_key_acquired",
@@ -2356,7 +2346,7 @@ async fn connect_answerer(
                         prologue_context,
                     };
                     tracing::debug!(
-                        target = "webrtc",
+
                         handshake_id = %handshake_id_value,
                         "calling run_handshake as Responder"
                     );
@@ -2369,7 +2359,7 @@ async fn connect_answerer(
                     {
                         Ok(result) => {
                             tracing::info!(
-                                target = "webrtc",
+
                                 handshake_id = %handshake_id_value,
                                 "answerer handshake completed successfully as Responder"
                             );
@@ -2379,7 +2369,7 @@ async fn connect_answerer(
                         }
                         Err(err) => {
                             tracing::warn!(
-                                target = "webrtc",
+
                                 handshake_id = %handshake_id_value,
                                 error = %err,
                                 "answerer handshake failed"
@@ -2388,13 +2378,13 @@ async fn connect_answerer(
                         }
                     };
                     tracing::info!(
-                        target = "webrtc",
+
                         handshake_id = %handshake_id_value,
                         outcome = ?outcome.as_ref().map(|_| "success").unwrap_or("error"),
                         "handshake task completed, sending result"
                     );
                     tracing::trace!(
-                        target = "webrtc",
+
                         role = "answerer",
                         handshake_id = %handshake_id_value,
                         event = "secure_sender_lock_wait",
@@ -2403,7 +2393,7 @@ async fn connect_answerer(
                     );
                     let mut sender_guard = sender_holder.lock().await;
                     tracing::trace!(
-                        target = "webrtc",
+
                         role = "answerer",
                         handshake_id = %handshake_id_value,
                         event = "secure_sender_lock_acquired",
@@ -2435,7 +2425,7 @@ async fn connect_answerer(
                 state = "start"
             );
             tracing::trace!(
-                target = "webrtc",
+
                 role = "answerer",
                 event = "transport_slot_lock_wait",
                 handshake_id = %handshake_value.as_str(),
@@ -2443,7 +2433,7 @@ async fn connect_answerer(
             );
             let mut slot_guard = slot.lock().await;
             tracing::trace!(
-                target = "webrtc",
+
                 role = "answerer",
                 event = "transport_slot_lock_acquired",
                 handshake_id = %handshake_value.as_str(),
@@ -2475,24 +2465,16 @@ async fn connect_answerer(
                 drop(slot_guard);
 
                 if !secure_transport_active {
-                    tracing::debug!(
-                        target = "webrtc",
-                        role = "answerer",
-                        "sending __ready__ sentinel to offerer"
-                    );
+                    tracing::debug!(role = "answerer", "sending __ready__ sentinel to offerer");
 
                     if let Err(err) = transport_dyn.send_text("__ready__") {
                         tracing::warn!(
-                            target = "webrtc",
+
                             error = %err,
                             "answerer readiness ack failed"
                         );
                     } else {
-                        tracing::info!(
-                            target = "webrtc",
-                            role = "answerer",
-                            "sent __ready__ sentinel successfully"
-                        );
+                        tracing::info!(role = "answerer", "sent __ready__ sentinel successfully");
                     }
                 }
 
@@ -2524,7 +2506,7 @@ async fn connect_answerer(
     // Process queued ICE candidates now that remote description is set
     let pending_candidates = {
         tracing::trace!(
-            target = "webrtc",
+
             role = "answerer",
             event = "pending_ice_queue_lock_wait",
             reason = "drain_after_remote_description",
@@ -2532,7 +2514,7 @@ async fn connect_answerer(
         );
         let mut queue = pending_for_incoming_clone.lock().await;
         tracing::trace!(
-            target = "webrtc",
+
             role = "answerer",
             event = "pending_ice_queue_lock_acquired",
             reason = "drain_after_remote_description",
@@ -2544,7 +2526,6 @@ async fn connect_answerer(
     };
     if !pending_candidates.is_empty() {
         tracing::debug!(
-            target = "webrtc",
             role = "answerer",
             count = pending_candidates.len(),
             "processing queued remote ice candidates"
@@ -2552,7 +2533,7 @@ async fn connect_answerer(
         for init in pending_candidates {
             if let Err(err) = pc.add_ice_candidate(init).await {
                 tracing::warn!(
-                    target = "webrtc",
+
                     role = "answerer",
                     error = %err,
                     "failed to add queued remote ice candidate"
@@ -2662,7 +2643,7 @@ async fn connect_answerer(
             );
         }
         tracing::trace!(
-            target = "webrtc",
+
             role = "answerer",
             event = "transport_slot_lock_wait",
             attempts,
@@ -2670,7 +2651,7 @@ async fn connect_answerer(
         );
         let mut transport_guard = transport_slot.lock().await;
         tracing::trace!(
-            target = "webrtc",
+
             role = "answerer",
             event = "transport_slot_lock_acquired",
             attempts,
@@ -2747,7 +2728,7 @@ async fn connect_answerer(
     // Check if transport is already populated (data channel already opened)
     let already_ready = {
         tracing::trace!(
-            target = "webrtc",
+
             role = "answerer",
             event = "transport_slot_lock_wait",
             reason = "already_ready_check",
@@ -2756,7 +2737,7 @@ async fn connect_answerer(
         let guard = transport_slot.lock().await;
         let populated = guard.is_some();
         tracing::trace!(
-            target = "webrtc",
+
             role = "answerer",
             event = "transport_slot_lock_acquired",
             reason = "already_ready_check",
@@ -2806,13 +2787,12 @@ async fn connect_answerer(
     if let Some(ref result) = secure_context {
         transport.enable_encryption(result.as_ref())?;
         tracing::debug!(
-            target = "webrtc",
             role = "answerer",
             "sending encrypted __ready__ sentinel to offerer"
         );
         if let Err(err) = transport.send_text("__ready__") {
             tracing::warn!(
-                target = "webrtc",
+
                 error = %err,
                 "answerer encrypted readiness ack failed"
             );
@@ -3009,7 +2989,7 @@ fn prime_session_key(
         .await
         {
             tracing::error!(
-                target = "webrtc",
+
                 session_id = %session_id_owned,
                 error = %err,
                 "background session key derivation failed"
@@ -3031,7 +3011,7 @@ async fn ensure_session_key(
     }
     if let Some(existing) = cell.get() {
         tracing::debug!(
-            target = "webrtc",
+
             session_id = %session_id,
             key_path = "session_cache",
             session_hash = %truncated_key_hash(existing.as_ref()),
@@ -3051,7 +3031,7 @@ async fn ensure_session_key(
     match cell.set(arc_key.clone()) {
         Ok(()) => {
             tracing::debug!(
-                target = "webrtc",
+
                 session_id = %session_id,
                 key_path = "session_derived",
                 session_hash = %session_hash,
@@ -3065,7 +3045,7 @@ async fn ensure_session_key(
                 .map(|existing| truncated_key_hash(existing.as_ref()))
                 .unwrap_or_else(|| "unknown".to_string());
             tracing::debug!(
-                target = "webrtc",
+
                 session_id = %session_id,
                 key_path = "session_cache_race",
                 attempted_hash = %session_hash,
@@ -3076,7 +3056,7 @@ async fn ensure_session_key(
         }
         Err(SetError::InitializingError(value)) => {
             tracing::debug!(
-                target = "webrtc",
+
                 session_id = %session_id,
                 key_path = "session_initializing",
                 pending_hash = %truncated_key_hash(value.as_ref()),
@@ -3127,7 +3107,7 @@ fn prime_pre_shared_key(
                     let handshake_hash = truncated_key_hash(arc_key.as_ref());
                     if handshake_cell_clone.set(arc_key.clone()).is_ok() {
                         tracing::debug!(
-                            target = "webrtc",
+
                             handshake_id = %handshake_owned,
                             key_path = "background_precompute",
                             session_hash = %session_hash,
@@ -3138,7 +3118,7 @@ fn prime_pre_shared_key(
                 }
                 Err(err) => {
                     tracing::error!(
-                        target = "webrtc",
+
                         handshake_id = %handshake_owned,
                         error = %err,
                         "handshake key derivation failed"
@@ -3148,7 +3128,7 @@ fn prime_pre_shared_key(
             Ok(None) => {}
             Err(err) => {
                 tracing::error!(
-                    target = "webrtc",
+
                     handshake_id = %handshake_owned,
                     error = %err,
                     "background session key derivation for handshake failed"
@@ -3167,7 +3147,7 @@ async fn await_pre_shared_key(
 ) -> Result<Option<Arc<[u8; 32]>>, TransportError> {
     if let Some(existing) = handshake_cell.get() {
         tracing::debug!(
-            target = "webrtc",
+
             handshake_id = %handshake_id,
             key_path = "handshake_cache",
             key_hash = %truncated_key_hash(existing.as_ref()),
@@ -3177,7 +3157,7 @@ async fn await_pre_shared_key(
     }
     let Some(passphrase_value) = passphrase else {
         tracing::debug!(
-            target = "webrtc",
+
             handshake_id = %handshake_id,
             key_path = "passphrase_missing",
             "handshake pre-shared key unavailable; no passphrase provided"
@@ -3186,7 +3166,7 @@ async fn await_pre_shared_key(
     };
     if !should_encrypt(Some(passphrase_value)) {
         tracing::debug!(
-            target = "webrtc",
+
             handshake_id = %handshake_id,
             key_path = "encryption_disabled",
             "handshake pre-shared key bypassed; encryption disabled"
@@ -3198,7 +3178,7 @@ async fn await_pre_shared_key(
         ensure_session_key(session_key_cell, Some(passphrase_value), session_id).await?;
     let Some(session_key) = session_key else {
         tracing::warn!(
-            target = "webrtc",
+
             handshake_id = %handshake_id,
             key_path = "session_key_missing",
             "expected session key but none was returned"
@@ -3223,7 +3203,7 @@ async fn await_pre_shared_key(
     match handshake_cell.set(arc_key.clone()) {
         Ok(()) => {
             tracing::debug!(
-                target = "webrtc",
+
                 handshake_id = %handshake_id,
                 key_path = "derived_from_session",
                 session_source = %session_source,
@@ -3239,7 +3219,7 @@ async fn await_pre_shared_key(
                 .map(|existing| truncated_key_hash(existing.as_ref()));
             let cached_hash = cached_hash.as_deref().unwrap_or("unknown");
             tracing::debug!(
-                target = "webrtc",
+
                 handshake_id = %handshake_id,
                 key_path = "handshake_cache_race",
                 session_source = %session_source,
@@ -3253,7 +3233,7 @@ async fn await_pre_shared_key(
         Err(SetError::InitializingError(value)) => {
             let pending_hash = truncated_key_hash(value.as_ref());
             tracing::debug!(
-                target = "webrtc",
+
                 handshake_id = %handshake_id,
                 key_path = "handshake_initializing",
                 session_source = %session_source,
@@ -3296,7 +3276,7 @@ fn payload_from_description(
             };
             let associated = [from_peer, to_peer, typ.as_str()];
             tracing::debug!(
-                target = "webrtc",
+
                 handshake_id = %handshake_id,
                 from_peer,
                 to_peer,
@@ -3315,7 +3295,7 @@ fn payload_from_description(
                 )?
             };
             tracing::debug!(
-                target = "webrtc",
+
                 handshake_id = %handshake_id,
                 nonce = sealed.nonce,
                 ciphertext_len = sealed.ciphertext.len(),
@@ -3403,7 +3383,7 @@ fn resolve_ice_candidate(
 ) -> Result<IceCandidateBlob, TransportError> {
     if let Some(psk) = pre_shared_key {
         tracing::debug!(
-            target = "webrtc",
+
             handshake_id = %handshake_id,
             key_path = "handshake_pre_shared",
             key_hash = %truncated_key_hash(psk),
@@ -3413,7 +3393,7 @@ fn resolve_ice_candidate(
         );
     } else if sealed.is_some() {
         tracing::debug!(
-            target = "webrtc",
+
             handshake_id = %handshake_id,
             key_path = "passphrase_fallback",
             from_peer,
@@ -3422,7 +3402,7 @@ fn resolve_ice_candidate(
         );
     } else {
         tracing::trace!(
-            target = "webrtc",
+
             handshake_id = %handshake_id,
             from_peer,
             to_peer,

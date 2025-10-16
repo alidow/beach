@@ -7,7 +7,7 @@
 
 ## Current Evidence
 1. **Manual testing (2025-03-27):**
-   - Launching the Rust CLI (`cargo run -p beach-human`) shows the prompt with the cursor positioned near column 80.
+   - Launching the Rust CLI (`cargo run -p beach`) shows the prompt with the cursor positioned near column 80.
    - Typing a character inserts two glyphs (`ee`) where the predicted echo lands at col 0 while the server reports the prompt offset.
    - Predictive underline does not appear on the first line until after the first `Enter`.
 2. **User-provided screenshots:** Cursor visibly at the upper-right corner of the terminal immediately after the handshake.
@@ -16,7 +16,7 @@
    - `predictive_space_ack_clears_overlay` and the web equivalents confirm that ACKs clear overlays, but they start from a state where the prompt is already authoritative.
 4. **Manual reproduction steps:**
    ```bash
-   cargo run -p beach-human -- join <session-id>
+   cargo run -p beach -- join <session-id>
    ```
    Observe cursor at column ~79 before typing.
 
@@ -60,14 +60,14 @@
 ## Useful Commands
 ```bash
 # run rust tests (with new predictive coverage)
-cargo test -p beach-human
+cargo test -p beach
 
 # run web unit tests (ignores Playwright)
 npm --prefix apps/beach-web test -- --runInBand --passWithNoTests tests/header-overlap.spec.ts
 
 # enable trace logging for cursor debug
 export RUST_LOG=client::render=trace
-cargo run -p beach-human -- join <session>
+cargo run -p beach -- join <session>
 ```
 
 ## References

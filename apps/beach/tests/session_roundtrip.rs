@@ -3,16 +3,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Duration as StdDuration, Instant};
 
-use beach_human::cache::GridCache;
-use beach_human::cache::terminal::{self, Style, StyleId, TerminalGrid};
-use beach_human::model::terminal::diff::{CacheUpdate, RowSnapshot};
-use beach_human::protocol::{
+use beach::cache::GridCache;
+use beach::cache::terminal::{self, Style, StyleId, TerminalGrid};
+use beach::model::terminal::diff::{CacheUpdate, RowSnapshot};
+use beach::protocol::{
     self, ClientFrame as WireClientFrame, CursorFrame, HostFrame, Lane as WireLane,
     LaneBudgetFrame as WireLaneBudget, SyncConfigFrame as WireSyncConfig, Update as WireUpdate,
 };
-use beach_human::sync::terminal::{TerminalDeltaStream, TerminalSync};
-use beach_human::sync::{LaneBudget, PriorityLane, ServerSynchronizer, SubscriptionId, SyncConfig};
-use beach_human::transport::{
+use beach::sync::terminal::{TerminalDeltaStream, TerminalSync};
+use beach::sync::{LaneBudget, PriorityLane, ServerSynchronizer, SubscriptionId, SyncConfig};
+use beach::transport::{
     Payload, Transport, TransportError, TransportKind, TransportMessage, TransportPair,
 };
 use tokio::time::{Instant as TokioInstant, sleep};

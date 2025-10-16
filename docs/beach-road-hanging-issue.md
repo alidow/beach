@@ -339,7 +339,7 @@ This will be slower but easier to reason about and debug.
 1. Deploy beach-road to server
 2. Have a beach client connect via WebSocket:
    ```bash
-   cargo run --bin beach-human -- host --session-server https://api.beach.sh -- bash
+   cargo run --bin beach -- host --session-server https://api.beach.sh -- bash
    ```
 3. Forcefully kill the client (Ctrl+C or SIGKILL)
 4. Within seconds to minutes, observe server hang

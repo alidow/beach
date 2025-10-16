@@ -1,7 +1,7 @@
-# Private Beach Session Harness Specification
+# Beach Buggy Harness Specification
 
 ## Intent
-- Wrap any Beach session (terminal, GUI, future media types) with a sidecar that provides Private Beach awareness without modifying the hosted application.
+- Wrap any Beach session (terminal, GUI, future media types) with a `beach-buggy` sidecar that provides Private Beach awareness without modifying the hosted application.
 - Standardise state streaming, command intake, and telemetry so managers and agents interact with sessions through consistent MCP primitives.
 - Enable flexible transport choices (brokered vs. peer-to-peer) while enforcing security boundaries and audit trails.
 
@@ -39,9 +39,10 @@
 - `session.pull_actions`: harness-initiated long-poll or streaming subscription; returns ordered actions.
 - `session.ack_action`: harness reports result for each action ID.
 - `session.signal_health`: periodic heartbeat with latency histogram, queue depth, custom warnings.
+- Harness registration payload includes `harness_type` (e.g., `terminal_shim`, `cabana_adapter`) so the manager can map to the `session.harness_type` column.
 
 ## Implementation Outline
-- **Runtime:** Rust crate for terminal harness (leveraging existing Beach PTY plumbing), TypeScript/Node module for Cabana harness (integrated in web runtime), unified protocol module shared across clients.
+- **Runtime:** `crates/beach-buggy` (Rust) for terminal harness + structured GUI adapters, with TypeScript/Node bridge in Cabana where needed; unified protocol module shared across clients.
 - **Configuration:** JSON manifest per private beach defining harness policies (state cadence, allowed transports, encryption keys).
 - **Extensibility:** Capability registry so new media types (screen share, audio) publish their own diff format without changing manager core.
 - **Testing:** Harness simulator feeding synthetic terminal/GUI streams; chaos suite introducing latency spikes, command floods, and reconnect scenarios.
@@ -60,14 +61,13 @@
 ## Repository Layout Proposal
 ```
 apps/
-├─ beach/                # existing open-source terminal foundation
-├─ beach-human/          # desktop client
+├─ beach/                # core terminal + CLI client
 ├─ beach-cabana/         # GUI streaming surface (with harness module)
 ├─ private-beach/        # New Next.js frontend + API for Private Beach manager UI
 └─ beach-manager/        # Manager/control-plane service (Rust or TypeScript)
 
 crates/ or packages/
-├─ session-harness/      # Shared harness runtime (Rust core)
+├─ beach-buggy/          # Shared harness runtime (Rust core)
 ├─ harness-proto/        # MCP schema + generated bindings
 ├─ cabana-harness/       # JS/TS wrapper around Cabana capture
 └─ manager-sdk/          # Client library for managers/agents to consume harness APIs
@@ -77,7 +77,8 @@ docs/
    ├─ vision.md
    ├─ intra-beach-orchestration.md
    ├─ pong-demo.md
-   └─ session-harness-spec.md   # this document
+   ├─ beach-manager.md
+   └─ beach-buggy-spec.md   # this document
 
 infrastructure/
 ├─ terraform/             # environment provisioning

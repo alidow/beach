@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 static PERF_ENABLED: Lazy<bool> = Lazy::new(|| {
-    std::env::var("BEACH_HUMAN_PROFILE")
+    std::env::var("BEACH_PROFILE")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false)
 });

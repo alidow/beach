@@ -3,7 +3,7 @@
 _Last updated: 2025-09-29_
 
 ## Goals
-- Support up to 100 concurrent WebRTC data channels between a single host (`beach-human`) and many viewers (`beach-web`, CLI joiners, future native clients).
+- Support up to 100 concurrent WebRTC data channels between a single host (`beach`) and many viewers (`beach-web`, CLI joiners, future native clients).
 - Eliminate the single-offer bottleneck by multiplexing all signaling over the existing WebSocket (`/ws/:session_id`) and avoiding the HTTP poll endpoints.
 - Prevent stale transports from injecting input once a new handshake supersedes them, while preserving the low-latency properties we rely on today.
 - Introduce a lightweight, Mosh-style ordering model so the host can discard client keystrokes that were produced against an out-of-date terminal view.
@@ -21,7 +21,7 @@ _Last updated: 2025-09-29_
    - Host emits `transport_propose` with `{handshake_id, kind: 'webrtc', constraints}`.
    - Client acknowledges via `transport_accept` and starts exchanging signals tagged with the same `handshake_id`.
    - Either side may `transport_close` if negotiation fails or when the data channel is torn down.
-4. **Host-side handshake manager.** `beach-human` tracks `RemotePeerHandle`s keyed by WebSocket `peer_id`. Each handle owns a map of `{handshake_id -> PeerConnectionState}` so we can service multiple viewers concurrently and retire stale handshakes deterministically.
+4. **Host-side handshake manager.** `beach` tracks `RemotePeerHandle`s keyed by WebSocket `peer_id`. Each handle owns a map of `{handshake_id -> PeerConnectionState}` so we can service multiple viewers concurrently and retire stale handshakes deterministically.
 5. **Ordering & freshness.**
    - Introduce a `GlobalInputSeq` counter on the host. Every time the host applies an input frame it increments the counter and includes the new value in `HostFrame::InputAck { seq, global_seq }` (new field).
    - Clients cache the most recent `global_seq` they have seen. When they send `ClientFrame::Input`, they attach `base_seq` (the `global_seq` the UI snapshot was based on) alongside their monotonic `client_seq`.
@@ -111,7 +111,7 @@ HostFrame::InputAck {
     global_seq: u64,   // new: authoritative order index
 }
 ```
-Encoding changes propagate to the binary codec (`apps/beach-human/src/protocol/wire.rs`, `apps/beach-web/src/protocol/wire.ts`). Older clients that omit `base_seq` will be rejected during feature negotiation (handled via `protocol_version` bump).
+Encoding changes propagate to the binary codec (`apps/beach/src/protocol/wire.rs`, `apps/beach-web/src/protocol/wire.ts`). Older clients that omit `base_seq` will be rejected during feature negotiation (handled via `protocol_version` bump).
 
 ## Component Responsibilities
 ### beach-road
@@ -120,7 +120,7 @@ Encoding changes propagate to the binary codec (`apps/beach-human/src/protocol/w
 - Garbage-collect `HandshakeMeta` when either peer disconnects or emits `transport_close`.
 - Keep REST endpoints enabled but mark them deprecated; once all clients migrate we can remove.
 
-### beach-human (host)
+### beach (host)
 - Extend `SignalingClient`:
   - Track peers in a `DashMap<String, RemotePeerState>` where each state owns `active_handshake: Option<HandshakeId>` plus a bounded queue of incoming WebRTC signals.
   - Expose an API `begin_handshake(peer_id) -> HandshakeChannels` that returns outbound senders + inbound receivers tied to a handshake id.

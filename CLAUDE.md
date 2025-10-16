@@ -19,18 +19,18 @@ Beach is a terminal sharing application that uses WebRTC and WebSocket transport
 cargo build
 
 # Build specific package
-cargo build -p beach-human
+cargo build -p beach
 cargo build -p beach-road
 
 # Run tests
 cargo test
 
 # Run specific package tests
-cargo test -p beach-human
+cargo test -p beach
 cargo test -p beach-road
 
 # Run with logging
-RUST_LOG=debug cargo run -p beach-human
+RUST_LOG=debug cargo run -p beach
 
 # Format code
 cargo fmt
@@ -136,15 +136,15 @@ docker-compose up -d redis
 cargo run -p beach-road
 
 # In another terminal, host a session
-cargo run -p beach-human
+cargo run -p beach
 # Or with custom session server:
-cargo run -p beach-human -- --session-server http://localhost:8080
+cargo run -p beach -- --session-server http://localhost:8080
 ```
 
 ### Join a session:
 ```bash
 # Join via CLI
-cargo run -p beach-human -- join <SESSION_ID>
+cargo run -p beach -- join <SESSION_ID>
 
 # Or join via web client
 cd apps/beach-web && npm run dev
@@ -153,7 +153,7 @@ cd apps/beach-web && npm run dev
 
 ### SSH bootstrap:
 ```bash
-cargo run -p beach-human -- ssh user@host
+cargo run -p beach -- ssh user@host
 ```
 
 ## Environment Variables

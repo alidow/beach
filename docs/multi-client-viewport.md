@@ -12,7 +12,7 @@ When we added WebRTC fan-out, every viewer began participating in the same PTY r
 
 ## High-level changes
 
-- **Host (apps/beach-human):**
+- **Host (apps/beach):**
   - Continue honoring `ClientFrame::Resize` by resizing the PTY, updating the emulator, and trimming history.
   - Remove (or clearly mark as advisory) `viewport_rows` from the broadcast `HostFrame::Grid`. Optionally send the new viewport height only to the client that initiated the resize so it knows the PTY was updated.
   - Do *not* overwrite every other client’s viewport height when a resize arrives.
@@ -39,15 +39,15 @@ With these changes in place:
    - Document the decision in protocol comments/release notes so future work doesn’t reintroduce the field by accident.
 
 2. **Adjust protocol structs & encoding**
-   - Update `apps/beach-human/src/protocol/mod.rs` and `apps/beach-human/src/protocol/wire.rs` to remove (or make optional) `viewport_rows` from the `Grid` variant.
+   - Update `apps/beach/src/protocol/mod.rs` and `apps/beach/src/protocol/wire.rs` to remove (or make optional) `viewport_rows` from the `Grid` variant.
    - Update encoding/decoding tests and fixtures; ensure decoders tolerate the missing field for backwards compatibility.
 
 3. **Change host broadcast logic**
-   - In `apps/beach-human/src/main.rs`, keep resizing the PTY/emulator when handling `ClientFrame::Resize`, but emit `HostFrame::Grid` without `viewport_rows`.
+   - In `apps/beach/src/main.rs`, keep resizing the PTY/emulator when handling `ClientFrame::Resize`, but emit `HostFrame::Grid` without `viewport_rows`.
    - If the initiating client needs confirmation, optionally send a private acknowledgement (e.g., a targeted `Grid` frame or a new `resize_ack` message); otherwise rely on local measurement.
 
 4. **Update the Rust CLI client**
-   - Remove usage of `viewport_rows` in `apps/beach-human/src/client/terminal.rs` so the TUI relies solely on local `Event::Resize` measurements.
+   - Remove usage of `viewport_rows` in `apps/beach/src/client/terminal.rs` so the TUI relies solely on local `Event::Resize` measurements.
    - Ensure renderer helpers don’t try to force the viewport to match the broadcasted height.
 
 5. **Update beach-web**

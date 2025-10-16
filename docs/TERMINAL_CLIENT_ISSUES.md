@@ -164,7 +164,7 @@ From user testing:
 
 ### Summary
 
-When joining a WebRTC-hosted session (host on `apps/beach-human`, broker on `apps/beach-road`), the participant’s terminal renders prompts and command output with large leading spaces, stray line-number fragments (`4l`, `2004l`, etc.), and eventually collapses into an empty screen despite the host shell showing perfectly normal output. This occurs immediately after the client prints `Listening for session events…`—no error is raised, but the terminal state is unusable.
+When joining a WebRTC-hosted session (host on `apps/beach`, broker on `apps/beach-road`), the participant’s terminal renders prompts and command output with large leading spaces, stray line-number fragments (`4l`, `2004l`, etc.), and eventually collapses into an empty screen despite the host shell showing perfectly normal output. This occurs immediately after the client prints `Listening for session events…`—no error is raised, but the terminal state is unusable.
 
 ### Reproduction
 
@@ -175,7 +175,7 @@ When joining a WebRTC-hosted session (host on `apps/beach-human`, broker on `app
    ```
 2. Launch a host session:
    ```bash
-   cargo run -p beach-human -- \
+   cargo run -p beach -- \
      --session-server http://127.0.0.1:8080 \
      --log-level trace \
      --log-file ~/beach-debug/host.log
@@ -183,7 +183,7 @@ When joining a WebRTC-hosted session (host on `apps/beach-human`, broker on `app
    Example session id: `0d43a35d-d62d-4c15-9ed2-d272c5754a4d`, passcode `807438`.
 3. Join from a second terminal:
    ```bash
-   BEACH_LOG_FILTER=trace cargo run -p beach-human -- \
+   BEACH_LOG_FILTER=trace cargo run -p beach -- \
      --session-server http://127.0.0.1:8080 \
      --log-level trace \
      --log-file ~/beach-debug/client.log \

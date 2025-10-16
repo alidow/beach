@@ -14,6 +14,11 @@ use std::fs;
 use std::time::{Duration, SystemTime, Instant};
 use tracing_subscriber::{fmt, EnvFilter};
 
+#[cfg(target_os = "macos")]
+use crate::encoder::GifVideoEncoder;
+#[cfg(all(target_os = "macos", feature = "cabana_sck"))]
+use crate::encoder::VideoToolboxEncoder;
+
 fn main() -> Result<()> {
     init_tracing()?;
 
@@ -225,7 +230,6 @@ fn run(cli: cli::Cli) -> Result<()> {
             {
                 use crate::capture::create_producer;
                 use crate::cli::EncodeCodec;
-                use crate::encoder::{GifVideoEncoder, VideoEncoder};
 
                 let fps = fps.max(1);
                 let total_frames = duration_secs.saturating_mul(fps);
@@ -244,13 +248,10 @@ fn run(cli: cli::Cli) -> Result<()> {
 
                 producer.start()?;
 
-                let mut encoder: Option<GifVideoEncoder> = None;
+                let mut encoder: Option<ActiveEncoder> = None;
+                let mut active_codec = codec;
                 let mut frames_written = 0u32;
                 let frame_interval = Duration::from_secs_f32(1.0 / fps as f32);
-
-                if matches!(codec, EncodeCodec::H264) {
-                    println!("H264 encoder is not implemented yet; falling back to GIF output.");
-                }
 
                 for index in 0..total_frames {
                     let mut frame = match producer.next_frame() {
@@ -272,12 +273,56 @@ fn run(cli: cli::Cli) -> Result<()> {
                     }
 
                     if encoder.is_none() {
-                        match GifVideoEncoder::new(&output, frame.width, frame.height, fps) {
-                            Ok(enc) => encoder = Some(enc),
-                            Err(err) => {
-                                println!("Failed to initialize encoder: {}", err);
-                                break;
+                        let new_encoder = match active_codec {
+                            EncodeCodec::Gif => match GifVideoEncoder::new(&output, frame.width, frame.height, fps) {
+                                Ok(enc) => Some(ActiveEncoder::Gif(enc)),
+                                Err(err) => {
+                                    println!("Failed to initialize GIF encoder: {}", err);
+                                    None
+                                }
+                            },
+                            EncodeCodec::H264 => {
+                                #[cfg(feature = "cabana_sck")]
+                                {
+                                    match VideoToolboxEncoder::new(&output, frame.width, frame.height, fps) {
+                                        Ok(enc) => Some(ActiveEncoder::H264(enc)),
+                                        Err(err) => {
+                                            println!(
+                                                "VideoToolbox encoder failed to initialize ({}); falling back to GIF.",
+                                                err
+                                            );
+                                            active_codec = EncodeCodec::Gif;
+                                            match GifVideoEncoder::new(&output, frame.width, frame.height, fps) {
+                                                Ok(enc) => Some(ActiveEncoder::Gif(enc)),
+                                                Err(err) => {
+                                                    println!("Failed to initialize GIF encoder: {}", err);
+                                                    None
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                #[cfg(not(feature = "cabana_sck"))]
+                                {
+                                    println!(
+                                        "VideoToolbox encoder requires the cabana_sck feature; falling back to GIF."
+                                    );
+                                    active_codec = EncodeCodec::Gif;
+                                    match GifVideoEncoder::new(&output, frame.width, frame.height, fps) {
+                                        Ok(enc) => Some(ActiveEncoder::Gif(enc)),
+                                        Err(err) => {
+                                            println!("Failed to initialize GIF encoder: {}", err);
+                                            None
+                                        }
+                                    }
+                                }
                             }
+                        };
+
+                        if let Some(enc) = new_encoder {
+                            encoder = Some(enc);
+                        } else {
+                            break;
                         }
                     }
 
@@ -298,7 +343,7 @@ fn run(cli: cli::Cli) -> Result<()> {
 
                 if let Some(enc) = encoder {
                     if let Err(err) = enc.finish() {
-                        println!("Failed to finalize GIF: {}", err);
+                        println!("Failed to finalize encoder: {}", err);
                     }
                 }
 
@@ -306,9 +351,14 @@ fn run(cli: cli::Cli) -> Result<()> {
                     println!("No frames encoded; removing {}", output.display());
                     let _ = std::fs::remove_file(&output);
                 } else {
+                    let codec_label = match active_codec {
+                        EncodeCodec::Gif => "GIF",
+                        EncodeCodec::H264 => "H264 (Annex B)",
+                    };
                     println!(
-                        "Encoded {} frame(s) to {}",
+                        "Encoded {} frame(s) using {} to {}",
                         frames_written,
+                        codec_label,
                         output.display()
                     );
                 }
@@ -558,6 +608,35 @@ fn run(cli: cli::Cli) -> Result<()> {
 fn extract_session_id(url: &str) -> Option<String> {
     let trimmed = url.trim_end_matches('/');
     trimmed.rsplit('/').next().map(|segment| segment.to_string())
+}
+
+#[cfg(target_os = "macos")]
+use crate::encoder::VideoEncoder;
+
+#[cfg(target_os = "macos")]
+enum ActiveEncoder {
+    Gif(GifVideoEncoder),
+    #[cfg(feature = "cabana_sck")]
+    H264(VideoToolboxEncoder),
+}
+
+#[cfg(target_os = "macos")]
+impl ActiveEncoder {
+    fn write_frame(&mut self, frame: &capture::Frame) -> Result<()> {
+        match self {
+            ActiveEncoder::Gif(enc) => enc.write_frame(frame),
+            #[cfg(feature = "cabana_sck")]
+            ActiveEncoder::H264(enc) => enc.write_frame(frame),
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        match self {
+            ActiveEncoder::Gif(enc) => enc.finish(),
+            #[cfg(feature = "cabana_sck")]
+            ActiveEncoder::H264(enc) => enc.finish(),
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]

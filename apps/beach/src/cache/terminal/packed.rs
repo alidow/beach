@@ -2,7 +2,7 @@
 //! them in the cache.
 //!
 //! ```rust
-//! # use beach_human::cache::terminal::packed::{StyleTable, Style, pack_cell, unpack_cell};
+//! # use beach::cache::terminal::packed::{StyleTable, Style, pack_cell, unpack_cell};
 //! let table = StyleTable::new();
 //! let id = table.ensure_id(Style::default());
 //! let packed = pack_cell('x', id);

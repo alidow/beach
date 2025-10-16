@@ -1,11 +1,11 @@
-# beach-human Performance Migration Status
+# beach Performance Migration Status
 
 _Last updated: 2025-09-22_
 
 ## Current State
 
-- **Binary wire format (Phase 7a) is in place**. `apps/beach-human/src/protocol/wire.rs` defines the packed frame layout with varints, packed cells, and style-table references. All encode/decode helpers are committed and tested.
-- **Server pipeline (Phase 7b) now emits binary frames end-to-end**. `TransmitterCache` in `apps/beach-human/src/main.rs` deduplicates row/cell/style updates per sink, and the host always uses `send_host_frame(...)` with the packed protocol.
+- **Binary wire format (Phase 7a) is in place**. `apps/beach/src/protocol/wire.rs` defines the packed frame layout with varints, packed cells, and style-table references. All encode/decode helpers are committed and tested.
+- **Server pipeline (Phase 7b) now emits binary frames end-to-end**. `TransmitterCache` in `apps/beach/src/main.rs` deduplicates row/cell/style updates per sink, and the host always uses `send_host_frame(...)` with the packed protocol.
 - **Client runtime (Phase 7c) consumes binary frames end-to-end**. `TerminalClient` decodes `WireHostFrame`, applies the new row-segment updates, and emits binary input frames back to the host.
 - **Tests & perf harness (Phase 7d)**: CLI/unit tests (`webrtc_mock_session_flow`, `transport_sync`, `session_roundtrip`) now exchange `WireHostFrame`/`WireClientFrame` directly; the legacy JSON helpers in `main.rs` are gone. `tests/perf_harness.rs` still measures JSON vs. binary sizes (~80% reduction) for historical comparison.
 
@@ -33,8 +33,8 @@ _Last updated: 2025-09-22_
    - **Telemetry hooks**: extend `PerfGuard` counters to track encode/decode time separately for row segments vs. row snapshots.
 
 4. **Benchmark rerun**
-   - Re-run the perf harness (`cargo test -p beach-human --test perf_harness -- --ignored --show-output`) and the interactive vim benchmark to quantify headroom vs. SSH+tmux after each optimisation.
-   - Capture logs with `BEACH_HUMAN_PROFILE=1` to compare `sync_send_bytes`, `client_handle_frame`, and `pty_chunk_process` before vs. after micro-optimizations.
+   - Re-run the perf harness (`cargo test -p beach --test perf_harness -- --ignored --show-output`) and the interactive vim benchmark to quantify headroom vs. SSH+tmux after each optimisation.
+   - Capture logs with `BEACH_PROFILE=1` to compare `sync_send_bytes`, `client_handle_frame`, and `pty_chunk_process` before vs. after micro-optimizations.
 
 ## Handoff Notes
 

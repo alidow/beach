@@ -1,18 +1,18 @@
 # Client Join Authorization Prompt — Implementation Plan
 
-This document proposes and details a host-side authorization prompt for new client connections to the `beach-human` server runtime. When originally shipped, new clients required explicit approval from the host via a full-screen prompt in the host terminal. The feature could be disabled via a CLI flag (`--allow-all-clients`). As of flipping the default, sessions now auto-accept clients unless the host opts in with `--require-client-approval`.
+This document proposes and details a host-side authorization prompt for new client connections to the `beach` server runtime. When originally shipped, new clients required explicit approval from the host via a full-screen prompt in the host terminal. The feature could be disabled via a CLI flag (`--allow-all-clients`). As of flipping the default, sessions now auto-accept clients unless the host opts in with `--require-client-approval`.
 
 ## Background & Current State
 
-`beach-human` hosts a PTY and shares live terminal state with one or more remote viewers over transports (WebRTC, WebSocket, IPC). The host runtime attaches transports and starts streaming after transport negotiation completes.
+`beach` hosts a PTY and shares live terminal state with one or more remote viewers over transports (WebRTC, WebSocket, IPC). The host runtime attaches transports and starts streaming after transport negotiation completes.
 
 Relevant datapaths (server/host side):
-- Initial WebRTC negotiation acceptor: `apps/beach-human/src/main.rs:2865` (`spawn_webrtc_acceptor`).
-- Subsequent viewer accept loop (multi-peer): `apps/beach-human/src/main.rs:2997` (`spawn_viewer_accept_loop`).
+- Initial WebRTC negotiation acceptor: `apps/beach/src/main.rs:2865` (`spawn_webrtc_acceptor`).
+- Subsequent viewer accept loop (multi-peer): `apps/beach/src/main.rs:2997` (`spawn_viewer_accept_loop`).
 - Transport registration and sync start happens when we push the shared transport and send `ForwarderCommand::AddTransport` (handshake frames are emitted in `initialize_transport_snapshot`, invoked by the update forwarder after registration).
 - Local preview transport (IPC) is established when `--local-preview` is used; it is not a remote viewer and should not require approval.
-- Interactive detection and raw-mode guard are already present (`apps/beach-human/src/main.rs:340`, `apps/beach-human/src/main.rs:2177`).
-- Local stdin is forwarded to the PTY via `spawn_local_stdin_forwarder` (`apps/beach-human/src/main.rs:2489`).
+- Interactive detection and raw-mode guard are already present (`apps/beach/src/main.rs:340`, `apps/beach/src/main.rs:2177`).
+- Local stdin is forwarded to the PTY via `spawn_local_stdin_forwarder` (`apps/beach/src/main.rs:2489`).
 
 Observations:
 - If we gate the “attach transport” step and only proceed after authorization, we prevent sending `HostFrame::Hello`, snapshots, and deltas to unauthorized peers. The update forwarder only begins sending after a transport is registered via the forwarder channel.
@@ -32,8 +32,8 @@ Current behavior accepts viewers as soon as negotiation completes. This can surp
 - Clear observability (logs, trace) for prompts, decisions, timeouts, and drops.
 
 ## Implementation Status
-- ✅ Host runtime: CLI flag, stdin gate, interactive prompt, and join gating added in `apps/beach-human/src/main.rs` (emits `beach:status:*` hints for waiting clients).
-- ✅ Rust CLI client: status-line waiting UX, ASCII spinner, timed hints, and pre-handshake input gating in `apps/beach-human/src/client/terminal.rs`.
+- ✅ Host runtime: CLI flag, stdin gate, interactive prompt, and join gating added in `apps/beach/src/main.rs` (emits `beach:status:*` hints for waiting clients).
+- ✅ Rust CLI client: status-line waiting UX, ASCII spinner, timed hints, and pre-handshake input gating in `apps/beach/src/client/terminal.rs`.
 - ✅ beach-web: overlay UX with CSS spinner, timed hints, and status handling in `apps/beach-web/src/components/BeachTerminal.tsx`.
 - ✅ Host prompt now surfaces viewer metadata (optional label + remote address) collected from the signaling layer, with CLI/web clients able to opt-in via `--label` or `?label=`.
 
@@ -85,16 +85,16 @@ Data flow:
 ## Detailed Implementation Plan
 
 1) CLI additions
-- Modify `HostArgs` (apps/beach-human/src/main.rs:153) to include `#[arg(long = "require-client-approval", action = clap::ArgAction::SetTrue, help = "Prompt before accepting new clients")] pub require_client_approval: bool`.
-- In `handle_host`, compute `interactive` as it is today (`apps/beach-human/src/main.rs:340`). Determine authorizer mode:
+- Modify `HostArgs` (apps/beach/src/main.rs:153) to include `#[arg(long = "require-client-approval", action = clap::ArgAction::SetTrue, help = "Prompt before accepting new clients")] pub require_client_approval: bool`.
+- In `handle_host`, compute `interactive` as it is today (`apps/beach/src/main.rs:340`). Determine authorizer mode:
   - If `args.allow_all_clients` or not `interactive` or in bootstrap JSON mode → `AllowAll`.
   - Else → `Interactive`.
 
 2) HostInputGate
-- Add a small module near existing stdin utilities (`apps/beach-human/src/main.rs`):
+- Add a small module near existing stdin utilities (`apps/beach/src/main.rs`):
   - `struct HostInputGate { paused: AtomicBool, buffer: Mutex<Vec<u8>> }`.
   - `fn pause(&self)` sets paused; `fn resume(&self, flush: bool)` flips paused and optionally flushes to the PTY writer.
-- Update `spawn_local_stdin_forwarder` (`apps/beach-human/src/main.rs:2489`) to:
+- Update `spawn_local_stdin_forwarder` (`apps/beach/src/main.rs:2489`) to:
   - Check `gate.paused()` before writing; if paused, append to buffer (up to a bounded size) and continue.
   - On resume with `flush=false`, discard buffered bytes to avoid accidental command execution.
 - Gate is owned by `handle_host` and passed to `spawn_local_stdin_forwarder`.
@@ -118,10 +118,10 @@ Data flow:
   - Validate behavior when stdout/stderr aren’t ttys (no-op and return `Allow` if authorizer mode is `AllowAll`).
 
 5) Wire into accept loops
-- `spawn_webrtc_acceptor` (apps/beach-human/src/main.rs:2865):
+- `spawn_webrtc_acceptor` (apps/beach/src/main.rs:2865):
   - After `transport` is ready but before `SharedTransport::new(...)` is added and before `ForwarderCommand::AddTransport`, call `authorizer.authorize(meta).await`.
   - On `Allow`: proceed as today. On `Deny`/`Timeout`: do not push to `transports`, do not spawn input listener; drop transport.
-- `spawn_viewer_accept_loop` (apps/beach-human/src/main.rs:2997): same gating before registering the viewer transport.
+- `spawn_viewer_accept_loop` (apps/beach/src/main.rs:2997): same gating before registering the viewer transport.
 - Exempt local IPC preview transport from gating.
 
 6) Logging & Telemetry
@@ -156,10 +156,10 @@ Data flow:
 - Risk: Delayed acceptance may cause signaling retries → current supervisor loops handle reconnects; we are not registering transports until approved, so no server-state leak.
 
 ## References
-- Interactive detection and raw mode guard: `apps/beach-human/src/main.rs:340`, `apps/beach-human/src/main.rs:2177`.
-- Local stdin forwarder: `apps/beach-human/src/main.rs:2489`.
-- Initial negotiation acceptor: `apps/beach-human/src/main.rs:2865`.
-- Multi-viewer accept loop: `apps/beach-human/src/main.rs:2997`.
+- Interactive detection and raw mode guard: `apps/beach/src/main.rs:340`, `apps/beach/src/main.rs:2177`.
+- Local stdin forwarder: `apps/beach/src/main.rs:2489`.
+- Initial negotiation acceptor: `apps/beach/src/main.rs:2865`.
+- Multi-viewer accept loop: `apps/beach/src/main.rs:2997`.
 - Server handshake emission happens only after transport registration in the forwarder (see `initialize_transport_snapshot` call sites and `ForwarderCommand::AddTransport`).
 
 ## Future Enhancements

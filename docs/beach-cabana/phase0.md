@@ -90,7 +90,7 @@ Artifacts from each spike should be committed under `research/beach-cabana/` (pr
 
 ## Licensing / Boundary Notes
 
-- Open-source release (terminal-only) will include crates: `beach-core`, `beach-human`, `beach-web`, protocol definitions, and shared CLI scaffolding.
+- Open-source release (terminal-only) will include crates: `beach-core`, `beach`, `beach-web`, protocol definitions, and shared CLI scaffolding.
 - Proprietary modules: `apps/beach-cabana`, platform-specific capture adapters (`macos`, `windows`, `linux` subcrates), hardware encoder wrappers, picker UI assets.
 - Build Features:
   - `--features terminal` (default OSS build) compiles without beach-cabana.

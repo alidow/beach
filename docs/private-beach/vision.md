@@ -8,7 +8,8 @@
 ## Product Pillars
 - **Unified Workspace:** Responsive grid layout for terminals, Beach Cabana streams, and future widgets; drag-resize, presets, and multi-view dashboards.
 - **Access Control:** Integration with Beach Gate + OIDC/Clerk; per-private-beach ACLs, shareable links, and group management with admins.
-- **Agent Mediation:** Designate Beach CLI or external MCP agents as coordinators that can observe, trigger, or automate actions across member sessions.
+- **Agent Mediation:** Designate Beach CLI or external MCP agents as coordinators that can observe, trigger, or automate actions across member sessions; Beach Manager enforces policy and auditing around every automation path.
+- **Zero-Trust Control Plane:** Beach Manager validates every action, issues controller leases, and provides automation onboarding while assuming infrastructure compromise is possible.
 - **Shared State:** Persistent file storage and low-latency Redis-backed key-value store exposed through MCP for coordination and auditing; v1 favors simple last-write-wins semantics, small blobs, and per-beach quotas over complex transactions.
 - **Observability & Events:** Real-time telemetry, session health indicators, and event bus hooks for alerts, automations, and future billing signals.
 
@@ -23,21 +24,22 @@
 ## System Architecture (Draft)
 ```
 ┌────────────────────────────────────────────────────────────┐
-│                  Private Beach Manager (Next.js)            │
-│  UI, Dashboard Layouts, Auth, Billing, Admin APIs           │
+│                  Private Beach Web (Next.js)               │
+│  UI, Dashboard Layouts, Auth, Manager Workflows            │
 └───────────────┬──────────────────────┬──────────────────────┘
                 │                      │
                 ▼                      ▼
        ┌───────────────┐      ┌─────────────────┐
-       │ Session Orchestrator│  │ Event + State Bus │
-       │ (Rust or Node MCP)  │  │ (Redis Streams,  │
-       │                     │  │ Postgres, MQ)    │
+       │ Beach Manager │      │ Event + State Bus │
+       │ (Rust Control │      │ (Redis Streams,   │
+       │  Plane + MCP) │      │ Postgres, MQ)     │
        └───────────────┬──────┴─────────┬────────┘
                        │                │
          ┌─────────────▼─────┐  ┌───────▼──────────┐
-         │ Beach Core Agents │  │ Shared Storage    │
-         │ (apps/beach,      │  │ (Redis KV,        │
-         │ beach-cabana, etc)│  │ Object/File store)│
+         │ Beach Buggy       │  │ Shared Storage    │
+         │ Harnesses         │  │ (Redis KV,        │
+         │ (apps/beach,      │  │ Object/File store)│
+         │ beach-cabana, etc)│  │                  │
          └─────────────┬─────┘  └───────┬──────────┘
                        │                │
                ┌───────▼──────┐   ┌─────▼──────────┐
@@ -46,9 +48,17 @@
                └──────────────┘   └────────────────┘
 ```
 - **Front-end:** Next.js + Tailwind + shadcn component library; multi-viewport layout manager; live WebRTC/WebSocket feeds.
-- **Backend:** Service boundary that tracks sessions, user-to-private-beach mapping, agent assignments, and share links; likely Rust (to reuse Beach primitives) or TypeScript (for speed of iteration).
-- **Data Layer:** Postgres for relational state (users, beaches, memberships, layouts); Redis for ephemeral state, KV, and pub/sub triggers; optional S3-compatible object store for file persistence.
-- **Integration Points:** `beach-web`, `beach-human`, `beach-cabana`, Beach Gate, and future CLI agents via MCP.
+- **Beach Manager Control Plane:** Rust service that validates entitlements, manages the session registry, issues controller leases, bootstraps automation agents (prompt templates, MCP bridge config), enforces zero-trust policy, and persists audit events.
+- **Beach Buggy Harness Layer:** Rust crate powering terminal/Cabana harnesses with diff codecs, OCR/semantic extraction, and action execution under tight latency budgets.
+- **Data Layer:** Postgres for relational state (organizations, beaches, memberships, automation policies); Redis for ephemeral state, KV, and pub/sub triggers; optional S3-compatible object store for file persistence.
+- **Integration Points:** `beach-web`, `apps/beach`, `beach-cabana`, `apps/private-beach`, Beach Gate, and third-party MCP agents.
+
+### Beach Manager Responsibilities
+- **Session Registry:** authoritative inventory of sessions, harness metadata, controller leases, and layout assignments for each private beach.
+- **Policy Engine:** enforces org-level rules, rate limits, role-based access, and zero-trust assumptions; rejects actions outside declared scopes.
+- **Automation Onboarding:** verifies agent entitlements, generates task-specific prompt packs, wires MCP bridges or HTTP adapters, and rotates credentials.
+- **Telemetry & Audit:** captures controller events, state access logs, and automation outcomes; emits signals to billing, alerting, and analytics.
+- **Transport Coordination:** brokers WebRTC offers when direct P2P is possible, falls back to relays when necessary, and negotiates protocol upgrades with harnesses.
 
 ## Implementation Roadmap (High-Level)
 1. **Foundations**
@@ -69,6 +79,7 @@
 5. **Agent Orchestration**
    - Register agent-capable sessions; grant scoped tokens for control APIs.
    - Implement cross-session command dispatch and event triggers.
+   - Deliver manager onboarding workflows (prompt packs, MCP bridge catalogs, scoped credential issuance).
 6. **Operational Hardening**
    - Observability dashboard, rate limiting, billing hooks, multi-tenant isolation.
    - Reliability testing across WebRTC/WS edges; failover strategies.
@@ -82,3 +93,4 @@
 - **Billing Model:** Seat-based, usage-based, or per-private-beach pricing? How does this integrate with authentication and invite flows?
 - **Extensibility:** How do we let third parties add widgets or automations without compromising security or UX?
 - **Deployment Modes:** Will Private Beach only run on Beach Cloud, or will customers self-host? How does that affect packaging/licensing?
+- **Agent Attestation:** Can we verify AI manager identity/runtime (template trust, sandboxing) before granting orchestration privileges?

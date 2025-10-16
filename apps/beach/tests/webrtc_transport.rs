@@ -22,11 +22,11 @@ use tokio::time::{Instant, sleep, timeout};
 use tracing::debug;
 use tracing_subscriber::{EnvFilter, fmt::SubscriberBuilder};
 
-use beach_human::protocol::{self, ClientFrame as WireClientFrame, HostFrame};
-use beach_human::transport::webrtc::{
+use beach::protocol::{self, ClientFrame as WireClientFrame, HostFrame};
+use beach::transport::webrtc::{
     OffererSupervisor, WebRtcRole, connect_via_signaling, create_test_pair,
 };
-use beach_human::transport::{Payload, Transport, TransportError, TransportKind, TransportMessage};
+use beach::transport::{Payload, Transport, TransportError, TransportKind, TransportMessage};
 
 const HANDSHAKE_SENTINELS: [&str; 2] = ["__ready__", "__offer_ready__"];
 

@@ -1,6 +1,7 @@
 use super::VideoEncoder;
 use crate::capture::{Frame, PixelFormat};
 use anyhow::{anyhow, Context, Result};
+use core_foundation::base::TCFType;
 use core_foundation::boolean::CFBoolean;
 use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
@@ -8,10 +9,11 @@ use core_foundation_sys::base::{kCFAllocatorDefault, CFAllocatorRef, CFRelease, 
 use core_foundation_sys::dictionary::CFDictionaryRef;
 use core_foundation_sys::string::CFStringRef;
 use core_media::block_buffer::CMBlockBuffer;
-use core_media::format_description::{CMFormatDescription, CMVideoFormatDescription, kCMVideoCodecType_H264};
+use core_media::format_description::{CMVideoFormatDescription, kCMVideoCodecType_H264};
 use core_media::sample_buffer::{CMSampleBuffer, CMSampleBufferRef};
 use core_media::time::{CMTime, kCMTimeInvalid};
-use core_video::pixel_buffer::{kCVPixelFormatType_32BGRA, kCVReturnSuccess, CVPixelBuffer, CVPixelBufferRef};
+use core_video::pixel_buffer::{kCVPixelFormatType_32BGRA, CVPixelBuffer, CVPixelBufferRef};
+use core_video::r#return::kCVReturnSuccess;
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -20,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, warn};
 
 const VT_ENCODE_INFO_FRAME_DROPPED: u32 = 0x0000_0001;
+const START_CODE: &[u8] = &[0, 0, 0, 1];
 
 type VTCompressionSessionRef = *mut c_void;
 type VTEncodeInfoFlags = u32;
@@ -35,7 +38,7 @@ type VTCompressionOutputCallback = Option<
 >;
 
 #[link(name = "VideoToolbox", kind = "framework")]
-extern "C" {
+unsafe extern "C" {
     fn VTCompressionSessionCreate(
         allocator: CFAllocatorRef,
         width: i32,
@@ -187,7 +190,7 @@ impl VideoToolboxEncoder {
         let pixel_buffer = CVPixelBuffer::new(kCVPixelFormatType_32BGRA, width, height, None)
             .map_err(|status| anyhow!("CVPixelBuffer::new failed: {}", status))?;
 
-        let status = unsafe { pixel_buffer.lock_base_address(0) };
+        let status = pixel_buffer.lock_base_address(0);
         if status != kCVReturnSuccess {
             return Err(anyhow!(
                 "CVPixelBufferLockBaseAddress failed: {}",
@@ -195,11 +198,9 @@ impl VideoToolboxEncoder {
             ));
         }
 
-        let base = pixel_buffer.get_base_address() as *mut u8;
+        let base = unsafe { pixel_buffer.get_base_address() } as *mut u8;
         if base.is_null() {
-            unsafe {
-                pixel_buffer.unlock_base_address(0);
-            }
+            let _ = pixel_buffer.unlock_base_address(0);
             return Err(anyhow!("CVPixelBufferGetBaseAddress returned null"));
         }
 
@@ -234,7 +235,7 @@ impl VideoToolboxEncoder {
             }
         }
 
-        let status = unsafe { pixel_buffer.unlock_base_address(0) };
+        let status = pixel_buffer.unlock_base_address(0);
         if status != kCVReturnSuccess {
             warn!(
                 status,
@@ -356,10 +357,10 @@ unsafe extern "C" fn output_callback(
     sample_buffer_ref: CMSampleBufferRef,
 ) {
     let _ = source_frame_ref_con;
-    let sink_arc = Arc::from_raw(output_callback_ref_con as *const Mutex<EncoderSink>);
-    let sample = CMSampleBuffer::wrap_under_get_rule(sample_buffer_ref);
+    let sink_arc = unsafe { Arc::from_raw(output_callback_ref_con as *const Mutex<EncoderSink>) };
+    let sample = unsafe { CMSampleBuffer::wrap_under_get_rule(sample_buffer_ref) };
     let result = process_sample(status, info_flags, &sample, &sink_arc);
-    Arc::into_raw(Arc::clone(&sink_arc));
+    let _ = Arc::into_raw(Arc::clone(&sink_arc));
     drop(sink_arc);
 
     if let Err(err) = result {
@@ -425,7 +426,7 @@ fn write_parameter_sets(
             break;
         }
 
-        writer.write_all(super::videotoolbox::START_CODE)?;
+        writer.write_all(START_CODE)?;
         writer.write_all(parameter_set)?;
 
         if index + 1 >= total_sets {
@@ -454,7 +455,7 @@ fn write_sample(writer: &mut BufWriter<File>, block_buffer: &CMBlockBuffer) -> R
             .copy_data_bytes(offset, &mut nal)
             .map_err(|status| anyhow!("CMBlockBufferCopyDataBytes failed: {}", status))?;
         offset += nal_length;
-        writer.write_all(super::videotoolbox::START_CODE)?;
+        writer.write_all(START_CODE)?;
         writer.write_all(&nal)?;
     }
     Ok(())
@@ -494,6 +495,3 @@ fn set_property(session: VTCompressionSessionRef, key: &CFString, value: CFTypeR
         Ok(())
     }
 }
-
-// Public constant for reuse inside module without making START_CODE pub in parent scope.
-const START_CODE: &[u8] = &[0, 0, 0, 1];

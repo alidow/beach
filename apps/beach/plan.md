@@ -1,6 +1,6 @@
 # Session + Runtime Implementation Plan
 
-This document tracks the remaining milestones for the new `beach-human` stack. Each phase is scoped so we can land incremental tests and manually exercise the CLI as soon as possible.
+This document tracks the remaining milestones for the new `beach` stack. Each phase is scoped so we can land incremental tests and manually exercise the CLI as soon as possible.
 
 ## ✅ 1. Session Wiring Pass
 
@@ -37,9 +37,9 @@ This document tracks the remaining milestones for the new `beach-human` stack. E
 
 ## 🆕 6. Performance Harness & Benchmarks
 
-- Automate latency/throughput benchmarks comparing beach-human vs. `ssh $USER@localhost` + tmux, targeting ≥30% lower echo latency.
+- Automate latency/throughput benchmarks comparing beach vs. `ssh $USER@localhost` + tmux, targeting ≥30% lower echo latency.
 - Capture keystroke-to-render timings, steady-state frame cadence, and bandwidth utilisation, exporting CSV summaries.
-- Integrate with `BEACH_HUMAN_PROFILE=1` so emulator/sync timings feed the benchmark reports.
+- Integrate with `BEACH_PROFILE=1` so emulator/sync timings feed the benchmark reports.
 - Add loopback packet capture hooks so binary protocol payloads can be diffed against mosh baselines.
 
 ## 🆕 7. Binary Protocol + Diff Precision
@@ -127,7 +127,7 @@ Design goals: deterministic, high-fidelity validation against reference terminal
 
 5. **TTY Behaviour Diffing**
    - Side-by-side run: spawn tmux in a controlled PTY, capture output frames using `termwiz` or `ttyrec`.
-   - Run the same command transcript through beach-human client, diff frames cell-by-cell. Highlight divergences beyond a configurable tolerance.
+   - Run the same command transcript through beach client, diff frames cell-by-cell. Highlight divergences beyond a configurable tolerance.
 
 ### Automated Suites
 

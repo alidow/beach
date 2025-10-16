@@ -404,21 +404,48 @@ impl SignalingClient {
 
         if let Some(passphrase) = self.passphrase.as_deref() {
             if should_encrypt(Some(passphrase)) {
-                let local_peer_id = self
-                    .assigned_peer_id()
-                    .await
-                    .unwrap_or_else(|| self.peer_id.clone());
+                let (local_peer_id, assigned_ready) = match self.assigned_peer_id().await {
+                    Some(id) => (id, true),
+                    None => (self.peer_id.clone(), false),
+                };
+                if !assigned_ready {
+                    tracing::warn!(
+                        target = "webrtc",
+                        handshake_id = %handshake_id,
+                        provisional_peer = %local_peer_id,
+                        target_peer = %peer_id,
+                        "sealing ice candidate with provisional peer id (assigned id not yet available)"
+                    );
+                }
+                tracing::debug!(
+                    target = "webrtc",
+                    handshake_id = %handshake_id,
+                    aad_from = %local_peer_id,
+                    aad_to = %peer_id,
+                    aad_label = "ice",
+                    using_assigned_id = assigned_ready,
+                    "preparing to seal ice candidate"
+                );
                 let plaintext = serde_json::to_vec(&blob).map_err(|err| {
                     TransportError::Setup(format!("serialize ice candidate failed: {err}"))
                 })?;
                 let associated = [local_peer_id.as_str(), peer_id, handshake_id];
-                sealed = Some(seal_message(
+                let envelope = seal_message(
                     passphrase,
                     handshake_id,
                     MessageLabel::Ice,
                     &associated,
                     &plaintext,
-                )?);
+                )?;
+                tracing::debug!(
+                    target = "webrtc",
+                    handshake_id = %handshake_id,
+                    ciphertext_len = envelope.ciphertext.len(),
+                    nonce = envelope.nonce.as_str(),
+                    using_assigned_id = assigned_ready,
+                    "sealed ice candidate created"
+                );
+                sealed = Some(envelope);
                 candidate_text.clear();
                 sdp_mid = None;
                 sdp_mline_index = None;

@@ -87,14 +87,14 @@
 - Remove plaintext fallback once clients >90% adoption and publish migration notes.
 
 ## Phase 1 Implementation Notes (2025-02-15)
-- `beach-human` now seals WebRTC offers, answers, and ICE candidates whenever a session passphrase is present (the original `BEACH_SECURE_SIGNALING` rollout flag has been retired). The data channel handshake stayed plaintext until Phase 2 landed.
+- `beach` now seals WebRTC offers, answers, and ICE candidates whenever a session passphrase is present (the original `BEACH_SECURE_SIGNALING` rollout flag has been retired). The data channel handshake stayed plaintext until Phase 2 landed.
 - `beach-road` stores the new ciphertext envelopes transparently; plaintext fields are retained for backward compatibility but are blanked when sealing is active.
 - Secure signaling is off by default to avoid breaking older clients (including the web UI). Operators should enable the flag only when both peers run a build with this feature.
 - Transport-layer encryption remains pending (Phase 3); web parity follows in Phase 4.
 - **Next checkpoints:** (a) wrap terminal traffic with the derived keys (completed in Phase 3); (b) port sealed signaling + handshake to beach-web so the feature flags can be enabled for mixed-client sessions.
 
 ## Phase 2 Implementation Notes (2025-02-15)
-- `beach-human` spins up a dedicated `beach-secure-handshake` data channel whenever a passphrase is present. Both roles run a Noise `XXpsk2` exchange seeded by the Argon2id-derived key and handshake metadata (the legacy `BEACH_SECURE_TRANSPORT` flag is no longer required).
+- `beach` spins up a dedicated `beach-secure-handshake` data channel whenever a passphrase is present. Both roles run a Noise `XXpsk2` exchange seeded by the Argon2id-derived key and handshake metadata (the legacy `BEACH_SECURE_TRANSPORT` flag is no longer required).
 - The handshake yields symmetric send/receive keys (stored on the `WebRtcConnection`) plus a 6-digit verification string exposed via connection metadata (`secure_verification`) for hosts; values aren't yet used to wrap traffic.
 - Failures (or timeouts) abort the WebRTC negotiation so sessions don't silently fall back to plaintext once secure transport is requested.
 - The handshake currently skips DTLS exporter binding pending support in `webrtc-rs`; the session/peer IDs are mixed into the Noise prologue as an interim safeguard.

@@ -1,7 +1,7 @@
 # Multi-Peer WebRTC Roadmap – 2025-09-30
 
 ## Context
-- `beach-human` currently negotiates WebRTC as the *sole* offerer. When multiple viewers join a session, the host repeatedly reuses a single `remote_peer`, so only one viewer succeeds and the rest see `/webrtc/answer` 404s.
+- `beach` currently negotiates WebRTC as the *sole* offerer. When multiple viewers join a session, the host repeatedly reuses a single `remote_peer`, so only one viewer succeeds and the rest see `/webrtc/answer` 404s.
 - `beach-road` simply relays WebSocket messages and stores SDP blobs. With the single-remote host, it accumulates stale peer IDs and is spammed by infinite polling of `/webrtc/answer?handshake_id=…`.
 - The browser (beach-web) expects an offer targeted at its `peer_id`. Once the host retargets another viewer, the browser loops endlessly waiting for its answer.
 - Goal: keep **100 simultaneous viewers** connected to one host via WebRTC data channels without tearing each other down.
@@ -52,7 +52,7 @@
 - Optionally impose a hard cap (e.g. 120 peers) and drop oldest when capacity is reached.
 
 ### 5. Testing & Tooling
-- Update `apps/beach-human/tests/webrtc_transport.rs` to spawn N dummy answerers concurrently.
+- Update `apps/beach/tests/webrtc_transport.rs` to spawn N dummy answerers concurrently.
 - Ensure each answerer receives its offer, posts an answer, and gets broadcast frames.
 - Add chaos tests: random join/leave, delayed answers, forced disconnects.
 
@@ -78,7 +78,7 @@
 *This document captures the architecture and work plan so future Codex runs can implement the multi-peer WebRTC host without rediscovering the failure modes we are seeing today.*
 
 ## Reality Check – 2025-10-01
-- `SignalingClient` already fan-outs ICE/SDP into per-peer queues (`peer_channels`) and publishes lifecycle events, but the offerer still blocks on `wait_for_remote_peer_with_generation` and aborts if *any* other peer joins mid-handshake (`apps/beach-human/src/transport/webrtc/mod.rs:640`).
+- `SignalingClient` already fan-outs ICE/SDP into per-peer queues (`peer_channels`) and publishes lifecycle events, but the offerer still blocks on `wait_for_remote_peer_with_generation` and aborts if *any* other peer joins mid-handshake (`apps/beach/src/transport/webrtc/mod.rs:640`).
 - `connect_offerer_once` builds one `RTCPeerConnection`, pumps `/webrtc/offer`/`/webrtc/answer`, and aborts whenever `remote_generation` changes. In practice, the first joiner wins; everyone else hits endless `/webrtc/answer` 404s because the host keeps tearing down the handshake before they receive an answer.
 - The host runtime (`SharedTransport`, `TransportSupervisor`, per-sink broadcast loops) already supports many simultaneous transports. The missing piece is a handshake supervisor that can *safely* negotiate multiple viewers in parallel and hand each finished `WebRtcTransport` back to the runtime.
 - Without that supervisor, Beach Road still bears the load of repeated `/webrtc/offer` posts and answer polling retries, even though the peers would happily switch to data channels once established.
@@ -110,7 +110,7 @@
    - Surface metrics/hooks so load tests can assert we maintain 100 viewers with minimal Beach Road chatter.
 
 5. **Testing**
-   - Extend `apps/beach-human/tests/webrtc_transport.rs` to spin up many concurrent answerers, exercise overlapping joins, and assert every client receives its dedicated offer/transport without `/webrtc/answer` 404 loops.
+   - Extend `apps/beach/tests/webrtc_transport.rs` to spin up many concurrent answerers, exercise overlapping joins, and assert every client receives its dedicated offer/transport without `/webrtc/answer` 404 loops.
    - Add failure-path tests (late answers, disconnect during ICE, supervisor cap reached).
 
 ## Updated Work Breakdown

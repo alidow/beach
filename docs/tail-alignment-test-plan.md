@@ -29,7 +29,7 @@
    - Replace manual transport loops with helper functions ensuring minimal flakiness.
 2. Restore original trim logic once the regression test is failing-for-real.
 3. Implement fix to prevent base regression (likely in `finalize_backfill_range` logic) and update assertions.
-4. Run `cargo test -p beach-human tail_alignment_end_to_end_regression` to validate.
+4. Run `cargo test -p beach tail_alignment_end_to_end_regression` to validate.
 5. Optionally add server-side portion (mocked PTY grid) for comprehensive coverage.
 
 ## Notes for Next Engineer

@@ -93,7 +93,7 @@ Author: Codex (implementation planning)
 
 ## Phase 3 – Beach Client & Server Integration
 **Goal:** Introduce WebSocket fallback paths while keeping WebRTC default.
-- Extend transport abstraction (e.g., `TransportKind`) in `apps/beach` and `apps/beach-human` to include `WebSocketFallback`.
+- Extend transport abstraction (e.g., `TransportKind`) in `apps/beach` and `apps/beach` to include `WebSocketFallback`.
 - Implement fallback controller: attempt WebRTC N times with backoff; only initiate WebSocket handshake after failure quorum and feature flag.
 - Hook up serialization/deserialization for WebSocket frames in the existing transport pipeline; ensure encryption and auth reuse the same primitives as WebRTC.
 - Surface explicit UI/CLI signals when fallback is active and emit structured telemetry events for observability.

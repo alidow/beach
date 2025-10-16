@@ -21,9 +21,9 @@
 - **Scalability:** State cache is fronted by Redis Cluster for horizontal scaling; metrics monitor write amplification. Future optimisations (vector diff codecs, delta compression) plug into the harness without changing consumer APIs.
 
 ## Reference Architecture
-1. **Session Harness**
+1. **Session Harness (Beach Buggy)**
    - When a process joins a Private Beach, a thin wrapper spins up alongside it (Beach terminal shim or Cabana relay).
-   - Harnesses establish the MCP backchannel to the manager and declare capabilities (e.g., `supports_terminal_bytes`, `supports_gui_pointer`).
+   - Harnesses (implemented via `crates/beach-buggy`) establish the MCP backchannel to the manager and declare capabilities (e.g., `supports_terminal_bytes`, `supports_gui_pointer`).
    - Application binaries stay “dumb”; all Beach awareness lives in the harness.
 2. **State Replicator**
    - Receives incremental updates emitted by the harness (terminal diff, GUI frame hash, cursor state).

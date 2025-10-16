@@ -14,7 +14,7 @@ With host‑side authorization enabled, a client can complete transport setup (W
 - Keep behavior backward‑compatible with servers that don’t send explicit status signals.
 
 ## Implementation Status
-- ✅ Rust CLI client: status line overlay with ASCII spinner (`-|/`), 750 ms fallback, `beach:status:*` handling, and pre-handshake input gating (`apps/beach-human/src/client/terminal.rs`).
+- ✅ Rust CLI client: status line overlay with ASCII spinner (`-|/`), 750 ms fallback, `beach:status:*` handling, and pre-handshake input gating (`apps/beach/src/client/terminal.rs`).
 - ✅ Host runtime emits `beach:status:approval_{pending,granted,denied}` hints so the client can surface progress immediately.
 - ⬜ Optional CLI join-command pre-TUI spinner (nice-to-have).
 - ✅ Viewer can supply an identifier via `--label` (CLI) or `?label=` (web) that the host now displays during authorization.

@@ -463,14 +463,14 @@ impl WebRtcTransport {
         spawn_on_global(async move {
             if let Some(notify) = dc_ready_signal {
                 tracing::debug!(
-                    target = "beach_human::transport::webrtc",
+                    target = "beach::transport::webrtc",
                     transport_id = ?transport_id,
                     await = "dc_ready.notified",
                     state = "start"
                 );
                 notify.notified().await;
                 tracing::debug!(
-                    target = "beach_human::transport::webrtc",
+                    target = "beach::transport::webrtc",
                     transport_id = ?transport_id,
                     await = "dc_ready.notified",
                     state = "end"
@@ -482,14 +482,14 @@ impl WebRtcTransport {
             tracing::debug!(target = "webrtc", transport_id = ?transport_id, "sender loop start");
             loop {
                 tracing::debug!(
-                    target = "beach_human::transport::webrtc",
+                    target = "beach::transport::webrtc",
                     transport_id = ?transport_id,
                     await = "outbound_rx.recv",
                     state = "start"
                 );
                 let maybe_bytes = outbound_rx.recv().await;
                 tracing::debug!(
-                    target = "beach_human::transport::webrtc",
+                    target = "beach::transport::webrtc",
                     transport_id = ?transport_id,
                     await = "outbound_rx.recv",
                     state = "end",
@@ -507,21 +507,21 @@ impl WebRtcTransport {
                 );
                 let data = Bytes::from(bytes);
                 tracing::debug!(
-                    target = "beach_human::transport::webrtc",
+                    target = "beach::transport::webrtc",
                     transport_id = ?transport_id,
                     await = "dc.buffered_amount.before",
                     state = "start"
                 );
                 let before = dc_clone.buffered_amount().await;
                 tracing::debug!(
-                    target = "beach_human::transport::webrtc",
+                    target = "beach::transport::webrtc",
                     transport_id = ?transport_id,
                     await = "dc.buffered_amount.before",
                     state = "end",
                     buffered_before = before
                 );
                 tracing::debug!(
-                    target = "beach_human::transport::webrtc",
+                    target = "beach::transport::webrtc",
                     transport_id = ?transport_id,
                     await = "dc.send",
                     state = "start",
@@ -529,7 +529,7 @@ impl WebRtcTransport {
                 );
                 let send_result = timeout(CONNECT_TIMEOUT, dc_clone.send(&data)).await;
                 tracing::debug!(
-                    target = "beach_human::transport::webrtc",
+                    target = "beach::transport::webrtc",
                     transport_id = ?transport_id,
                     await = "dc.send",
                     state = "end",
@@ -538,14 +538,14 @@ impl WebRtcTransport {
                 match send_result {
                     Ok(Ok(bytes_written)) => {
                         tracing::debug!(
-                            target = "beach_human::transport::webrtc",
+                            target = "beach::transport::webrtc",
                             transport_id = ?transport_id,
                             await = "dc.buffered_amount.after",
                             state = "start"
                         );
                         let after = dc_clone.buffered_amount().await;
                         tracing::debug!(
-                            target = "beach_human::transport::webrtc",
+                            target = "beach::transport::webrtc",
                             transport_id = ?transport_id,
                             await = "dc.buffered_amount.after",
                             state = "end",
@@ -1282,7 +1282,7 @@ async fn negotiate_offerer_peer(
         ..Default::default()
     };
     let dc = pc
-        .create_data_channel("beach-human", Some(dc_init))
+        .create_data_channel("beach", Some(dc_init))
         .await
         .map_err(to_setup_error)?;
     dc.on_open(Box::new(move || {
@@ -1453,7 +1453,7 @@ async fn negotiate_offerer_peer(
         Some(Arc::clone(&handshake_complete)),
     ));
     let transport_dyn: Arc<dyn Transport> = transport.clone();
-    channels.publish("beach-human".to_string(), transport_dyn.clone());
+    channels.publish("beach".to_string(), transport_dyn.clone());
 
     // Run secure handshake BEFORE waiting for __ready__ sentinel
     // The answerer will send __ready__ only after completing the handshake,
@@ -1821,7 +1821,7 @@ async fn connect_answerer(
         .wait_for_remote_peer_with_generation()
         .await?;
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         role = "answerer",
         expected_remote = %expected_remote_peer,
         "initialized expected remote peer"
@@ -1836,7 +1836,7 @@ async fn connect_answerer(
 
     let offer_payload = loop {
         tracing::debug!(
-            target = "beach_human::transport::webrtc",
+            target = "beach::transport::webrtc",
             role = "answerer",
             await = "fetch_sdp.offer",
             state = "start"
@@ -1844,7 +1844,7 @@ async fn connect_answerer(
         let peer_param = [("peer_id", assigned_peer_id.as_str())];
         let fetch_attempt = fetch_sdp(&client, signaling_url, "offer", &peer_param).await;
         tracing::debug!(
-            target = "beach_human::transport::webrtc",
+            target = "beach::transport::webrtc",
             role = "answerer",
             await = "fetch_sdp.offer",
             state = "end",
@@ -1854,7 +1854,7 @@ async fn connect_answerer(
             Some(payload) => {
                 if payload.from_peer != expected_remote_peer {
                     tracing::warn!(
-                        target = "beach_human::transport::webrtc",
+                        target = "beach::transport::webrtc",
                         role = "answerer",
                         expected_remote = %expected_remote_peer,
                         received_remote = %payload.from_peer,
@@ -1863,7 +1863,7 @@ async fn connect_answerer(
                     continue;
                 }
                 tracing::info!(
-                    target = "beach_human::transport::webrtc",
+                    target = "beach::transport::webrtc",
                     role = "answerer",
                     handshake_id = %payload.handshake_id,
                     remote_peer = %payload.from_peer,
@@ -1873,7 +1873,7 @@ async fn connect_answerer(
             }
             None => {
                 tracing::debug!(
-                    target = "beach_human::transport::webrtc",
+                    target = "beach::transport::webrtc",
                     role = "answerer",
                     await = "sleep.poll_interval",
                     state = "start",
@@ -1881,7 +1881,7 @@ async fn connect_answerer(
                 );
                 sleep(poll_interval).await;
                 tracing::debug!(
-                    target = "beach_human::transport::webrtc",
+                    target = "beach::transport::webrtc",
                     role = "answerer",
                     await = "sleep.poll_interval",
                     state = "end"
@@ -1941,14 +1941,14 @@ async fn connect_answerer(
     }
 
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         role = "answerer",
         await = "api.new_peer_connection",
         state = "start"
     );
     let pc_result = api.new_peer_connection(config).await;
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         role = "answerer",
         await = "api.new_peer_connection",
         state = "end",
@@ -2419,7 +2419,7 @@ async fn connect_answerer(
             }));
 
             tracing::debug!(
-                target = "beach_human::transport::webrtc",
+                target = "beach::transport::webrtc",
                 role = "answerer",
                 await = "slot.lock",
                 state = "start"
@@ -2441,7 +2441,7 @@ async fn connect_answerer(
                 populated = slot_guard.is_some()
             );
             tracing::debug!(
-                target = "beach_human::transport::webrtc",
+                target = "beach::transport::webrtc",
                 role = "answerer",
                 await = "slot.lock",
                 state = "end",
@@ -2488,7 +2488,7 @@ async fn connect_answerer(
     }));
 
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         role = "answerer",
         await = "pc.set_remote_description",
         state = "start"
@@ -2497,7 +2497,7 @@ async fn connect_answerer(
         .await
         .map_err(to_setup_error)?;
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         role = "answerer",
         await = "pc.set_remote_description",
         state = "end"
@@ -2543,14 +2543,14 @@ async fn connect_answerer(
     }
 
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         role = "answerer",
         await = "pc.create_answer",
         state = "start"
     );
     let answer_result = pc.create_answer(None).await;
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         role = "answerer",
         await = "pc.create_answer",
         state = "end",
@@ -2566,7 +2566,7 @@ async fn connect_answerer(
         shared_key.as_ref().map(|key| key.as_ref()),
     )?;
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         role = "answerer",
         await = "pc.set_local_description",
         state = "start"
@@ -2575,21 +2575,21 @@ async fn connect_answerer(
         .await
         .map_err(to_setup_error)?;
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         role = "answerer",
         await = "pc.set_local_description",
         state = "end"
     );
     wait_for_local_description(&pc).await?;
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         role = "answerer",
         await = "post_sdp.answer",
         state = "start"
     );
     let post_result = post_sdp(&client, signaling_url, "answer", &[], &answer_payload).await;
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         role = "answerer",
         await = "post_sdp.answer",
         state = "end",
@@ -2635,7 +2635,7 @@ async fn connect_answerer(
         attempts = attempts.saturating_add(1);
         if attempts == 1 || attempts % 100 == 0 {
             tracing::debug!(
-                target = "beach_human::transport::webrtc",
+                target = "beach::transport::webrtc",
                 role = "answerer",
                 await = "transport_slot.lock",
                 state = "start",
@@ -2660,7 +2660,7 @@ async fn connect_answerer(
         );
         if attempts == 1 || attempts % 100 == 0 {
             tracing::debug!(
-                target = "beach_human::transport::webrtc",
+                target = "beach::transport::webrtc",
                 role = "answerer",
                 await = "transport_slot.lock",
                 state = "end",
@@ -2675,7 +2675,7 @@ async fn connect_answerer(
         if attempts >= max_attempts {
             drop(transport_guard);
             tracing::warn!(
-                target = "beach_human::transport::webrtc",
+                target = "beach::transport::webrtc",
                 role = "answerer",
                 attempts,
                 "timeout waiting for data channel to be announced"
@@ -2688,7 +2688,7 @@ async fn connect_answerer(
         drop(transport_guard);
         if attempts == 1 || attempts % 100 == 0 {
             tracing::debug!(
-                target = "beach_human::transport::webrtc",
+                target = "beach::transport::webrtc",
                 role = "answerer",
                 await = "sleep.retry",
                 state = "start",
@@ -2699,7 +2699,7 @@ async fn connect_answerer(
         sleep(Duration::from_millis(10)).await;
         if attempts == 1 || attempts % 100 == 0 {
             tracing::debug!(
-                target = "beach_human::transport::webrtc",
+                target = "beach::transport::webrtc",
                 role = "answerer",
                 await = "sleep.retry",
                 state = "end",
@@ -2710,14 +2710,14 @@ async fn connect_answerer(
     tracing::debug!(target = "webrtc", ?client_id, "answerer transport ready");
 
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         role = "answerer",
         await = "wait_for_connection",
         state = "start"
     );
     let wait_result = wait_for_connection(&pc).await;
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         role = "answerer",
         await = "wait_for_connection",
         state = "end",
@@ -2750,14 +2750,14 @@ async fn connect_answerer(
 
     if !already_ready {
         tracing::debug!(
-            target = "beach_human::transport::webrtc",
+            target = "beach::transport::webrtc",
             role = "answerer",
             await = "dc_open_notify.timeout",
             state = "start"
         );
         let notify_result = timeout(CONNECT_TIMEOUT, dc_open_notify.notified()).await;
         tracing::debug!(
-            target = "beach_human::transport::webrtc",
+            target = "beach::transport::webrtc",
             role = "answerer",
             await = "dc_open_notify.timeout",
             state = "end",
@@ -2766,7 +2766,7 @@ async fn connect_answerer(
         notify_result.map_err(|_| TransportError::Timeout)?;
     } else {
         tracing::debug!(
-            target = "beach_human::transport::webrtc",
+            target = "beach::transport::webrtc",
             role = "answerer",
             "data channel already open, skipping notify wait"
         );
@@ -2833,7 +2833,7 @@ async fn post_sdp(
 ) -> Result<(), TransportError> {
     let url = endpoint_with_params(base, suffix, params)?;
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         phase = "post_sdp",
         suffix,
         await = "client.send",
@@ -2841,7 +2841,7 @@ async fn post_sdp(
     );
     let send_attempt = client.post(url).json(payload).send().await;
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         phase = "post_sdp",
         suffix,
         await = "client.send",
@@ -2889,7 +2889,7 @@ async fn fetch_sdp(
 ) -> Result<Option<WebRtcSdpPayload>, TransportError> {
     let url = endpoint_with_params(base, suffix, params)?;
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         phase = "fetch_sdp",
         suffix,
         await = "client.send",
@@ -2897,7 +2897,7 @@ async fn fetch_sdp(
     );
     let send_attempt = client.get(url).send().await;
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         phase = "fetch_sdp",
         suffix,
         await = "client.send",
@@ -2909,7 +2909,7 @@ async fn fetch_sdp(
     match response.status() {
         StatusCode::OK => {
             tracing::debug!(
-                target = "beach_human::transport::webrtc",
+                target = "beach::transport::webrtc",
                 phase = "fetch_sdp",
                 suffix,
                 await = "response.json",
@@ -2917,7 +2917,7 @@ async fn fetch_sdp(
             );
             let payload_attempt = response.json::<WebRtcSdpPayload>().await;
             tracing::debug!(
-                target = "beach_human::transport::webrtc",
+                target = "beach::transport::webrtc",
                 phase = "fetch_sdp",
                 suffix,
                 await = "response.json",
@@ -3414,6 +3414,19 @@ fn resolve_ice_candidate(
             TransportError::Setup("missing passphrase for sealed ice candidate".into())
         })?;
         let associated = [from_peer, to_peer, handshake_id];
+        tracing::debug!(
+            target = "webrtc",
+            handshake_id = %handshake_id,
+            from_peer,
+            to_peer,
+            aad_from = %from_peer,
+            aad_to = %to_peer,
+            aad_label = "ice",
+            ciphertext_len = sealed_env.ciphertext.len(),
+            nonce = sealed_env.nonce.as_str(),
+            using_pre_shared_key = pre_shared_key.is_some(),
+            "attempting to open sealed ice candidate"
+        );
         let plaintext = if let Some(psk) = pre_shared_key {
             match open_message_with_psk(
                 psk,
@@ -3422,7 +3435,16 @@ fn resolve_ice_candidate(
                 &associated,
                 &sealed_env,
             ) {
-                Ok(bytes) => bytes,
+                Ok(bytes) => {
+                    tracing::debug!(
+                        target = "webrtc",
+                        handshake_id,
+                        from_peer,
+                        to_peer,
+                        "sealed ice candidate decrypted with handshake key"
+                    );
+                    bytes
+                }
                 Err(err) => {
                     let handshake_error = err.to_string();
                     tracing::warn!(
@@ -3439,7 +3461,16 @@ fn resolve_ice_candidate(
                         &associated,
                         &sealed_env,
                     ) {
-                        Ok(bytes) => bytes,
+                        Ok(bytes) => {
+                            tracing::debug!(
+                                target = "webrtc",
+                                handshake_id,
+                                from_peer,
+                                to_peer,
+                                "sealed ice candidate decrypted with passphrase fallback"
+                            );
+                            bytes
+                        }
                         Err(passphrase_err) => {
                             let passphrase_error = passphrase_err.to_string();
                             tracing::error!(
@@ -3458,13 +3489,21 @@ fn resolve_ice_candidate(
                 }
             }
         } else {
-            open_message(
+            let bytes = open_message(
                 passphrase_value,
                 handshake_id,
                 MessageLabel::Ice,
                 &associated,
                 &sealed_env,
-            )?
+            )?;
+            tracing::debug!(
+                target = "webrtc",
+                handshake_id,
+                from_peer,
+                to_peer,
+                "sealed ice candidate decrypted with passphrase (no handshake key available)"
+            );
+            bytes
         };
         let decoded: IceCandidateBlob = serde_json::from_slice(&plaintext).map_err(|err| {
             TransportError::Setup(format!("decode sealed ice candidate failed: {err}"))
@@ -3545,7 +3584,7 @@ async fn create_webrtc_pair() -> Result<TransportPair, TransportError> {
         ..Default::default()
     };
     let offer_dc = offer_pc
-        .create_data_channel("beach-human", Some(dc_init))
+        .create_data_channel("beach", Some(dc_init))
         .await
         .map_err(to_setup_error)?;
 
@@ -3732,14 +3771,14 @@ pub async fn create_test_pair() -> Result<TransportPair, TransportError> {
 
 async fn wait_for_local_description(pc: &Arc<RTCPeerConnection>) -> Result<(), TransportError> {
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         phase = "wait_for_local_description",
         await = "pc.local_description.initial",
         state = "start"
     );
     let already_present = pc.local_description().await.is_some();
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         phase = "wait_for_local_description",
         await = "pc.local_description.initial",
         state = "end",
@@ -3749,40 +3788,40 @@ async fn wait_for_local_description(pc: &Arc<RTCPeerConnection>) -> Result<(), T
         return Ok(());
     }
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         phase = "wait_for_local_description",
         await = "pc.gathering_complete_promise",
         state = "start"
     );
     let mut gather = pc.gathering_complete_promise().await;
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         phase = "wait_for_local_description",
         await = "pc.gathering_complete_promise",
         state = "end"
     );
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         phase = "wait_for_local_description",
         await = "gather.recv",
         state = "start"
     );
     let _ = gather.recv().await;
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         phase = "wait_for_local_description",
         await = "gather.recv",
         state = "end"
     );
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         phase = "wait_for_local_description",
         await = "pc.local_description.final",
         state = "start"
     );
     let final_present = pc.local_description().await.is_some();
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         phase = "wait_for_local_description",
         await = "pc.local_description.final",
         state = "end",
@@ -3817,14 +3856,14 @@ async fn wait_for_connection(pc: &Arc<RTCPeerConnection>) -> Result<(), Transpor
     }));
 
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         phase = "wait_for_connection",
         await = "timeout(rx)",
         state = "start"
     );
     let wait_result = timeout(CONNECT_TIMEOUT, rx).await;
     tracing::debug!(
-        target = "beach_human::transport::webrtc",
+        target = "beach::transport::webrtc",
         phase = "wait_for_connection",
         await = "timeout(rx)",
         state = "end",

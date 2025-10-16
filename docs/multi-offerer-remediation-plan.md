@@ -3,7 +3,7 @@
 authored by Codex
 
 ## Problem Statement
-When a beach-human host is already running an offerer supervisor, additional session participants are still acquiring WebRTC offers and acting as offerers. When a browser viewer joins after a CLI client, Beach Road stores multiple `/webrtc/offer` blobs targeting the browser’s peer ID. The browser can pick the participant’s offer first, completing a handshake that the host’s negotiator never sees. The host eventually tears down its peer connection because the `__ready__` sentinel never arrives, which closes the browser’s data channel a fraction of a second after it opened.
+When a beach host is already running an offerer supervisor, additional session participants are still acquiring WebRTC offers and acting as offerers. When a browser viewer joins after a CLI client, Beach Road stores multiple `/webrtc/offer` blobs targeting the browser’s peer ID. The browser can pick the participant’s offer first, completing a handshake that the host’s negotiator never sees. The host eventually tears down its peer connection because the `__ready__` sentinel never arrives, which closes the browser’s data channel a fraction of a second after it opened.
 
 This occurs because the client code still runs `OffererSupervisor::connect` for the participant role. The recent guard in `negotiate_transport` relies on `SessionHandle::role()`, but for joining clients the handle incorrectly reports `SessionRole::Host`, so offerer mode remains enabled everywhere.
 

@@ -1079,6 +1079,7 @@ export class TerminalGridCache {
         cursorRow: this.cursorRow,
         cursorCol: this.cursorCol,
       });
+      return;
     }
     let row = this.cursorRow;
     let committed = this.committedRowWidth(row);

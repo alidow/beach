@@ -1,6 +1,6 @@
 # Beach Web Client — Local Development
 
-This guide walks through running the React/WebRTC client locally and pointing it at a live beach-human host session.
+This guide walks through running the React/WebRTC client locally and pointing it at a live beach host session.
 
 ## 1. Install dependencies
 
@@ -13,12 +13,12 @@ pnpm install   # or npm install / yarn install if you prefer
 
 > **Tip:** pnpm is fastest, but the project works with npm/yarn as well.
 
-## 2. Start a beach-human host session
+## 2. Start a beach host session
 
 In a separate terminal, launch a host session so the browser client has something to connect to. Example:
 
 ```bash
-cargo run --bin beach-human -- host
+cargo run --bin beach -- host
 ```
 
 A session ID and (optionally) passcode will be printed in the terminal output when the host registers with beach-road. Leave this process running; it will maintain the live terminal.
@@ -40,7 +40,7 @@ Vite will boot a dev server at <http://localhost:5173>. The console will show th
    - `/` renders the legacy split layout (connection pane + terminal).
    - `/v2` (or append `?ui=v2`) loads the new terminal-first preview described below.
 3. Enter the session details supplied by your host:
-   - **Session ID**: the UUID printed by `beach-human host`.
+   - **Session ID**: the UUID printed by `beach host`.
    - **Session Server**: the beach-road base (e.g., `http://127.0.0.1:8080`).
    - **Passcode**: only if one was shown in the host output.
 4. Press **Connect**. Within a few seconds the terminal should attach and begin streaming live output.
@@ -65,7 +65,7 @@ pnpm test
 ## 6. Troubleshooting
 
 - If the page stays on “Connecting…”, check the browser console for network or ICE errors.
-- Ensure `beach-human` and `beach-road` are on compatible commits/protocol versions.
+- Ensure `beach` and `beach-road` are on compatible commits/protocol versions.
 - For remote testing, expose the dev server via `vite --host 0.0.0.0` and update the Base URL to point at the reachable beach-road instance.
 
 Happy hacking!

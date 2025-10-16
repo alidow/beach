@@ -2,7 +2,7 @@
 
 ## Summary
 
-Secure signaling now derives the same 32‑byte Argon2id key on both the Rust host (`beach-human`) and the browser client (`beach-web`). However, the browser still fails to decrypt the sealed SDP offer from the host with `authentication tag mismatch`. That indicates the ChaCha20-Poly1305 implementation (or associated-data handling) in the web bundle is not interoperable with the Rust implementation, despite identical inputs.
+Secure signaling now derives the same 32‑byte Argon2id key on both the Rust host (`beach`) and the browser client (`beach-web`). However, the browser still fails to decrypt the sealed SDP offer from the host with `authentication tag mismatch`. That indicates the ChaCha20-Poly1305 implementation (or associated-data handling) in the web bundle is not interoperable with the Rust implementation, despite identical inputs.
 
 ## Evidence
 

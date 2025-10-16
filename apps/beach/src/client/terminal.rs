@@ -4832,7 +4832,6 @@ enum PredictionDropReason {
     RendererTrim,
     Reset,
     Trimmed,
-    ServerMismatch,
     Skipped,
 }
 
@@ -4844,7 +4843,6 @@ impl PredictionDropReason {
             PredictionDropReason::RendererTrim => "renderer_trim",
             PredictionDropReason::Reset => "reset",
             PredictionDropReason::Trimmed => "trimmed",
-            PredictionDropReason::ServerMismatch => "server_mismatch",
             PredictionDropReason::Skipped => "skipped",
         }
     }

@@ -2,11 +2,11 @@
 
 ## Context
 
-- Client build: `beach-human` (Rust TUI) — branch HEAD after predictive trace logging landed.
+- Client build: `beach` (Rust TUI) — branch HEAD after predictive trace logging landed.
 - Environment: macOS local client + remote host `ec2-user@54.169.75.185` (Singapore).  Session started via
   ```bash
   rm -f /tmp/beach-debug.log \
-    && BEACH_LOG_FILTER=debug,client::predictive=trace cargo run -p beach-human -- \
+    && BEACH_LOG_FILTER=debug,client::predictive=trace cargo run -p beach -- \
          --log-level debug \
          --log-file /tmp/beach-debug.log \
          ssh --ssh-flag=-i --ssh-flag=/Users/arellidow/.ssh/beach-test-singapore.pem ec2-user@54.169.75.185

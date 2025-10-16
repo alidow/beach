@@ -104,7 +104,7 @@ impl BootstrapHandshake {
             transports,
             preferred_transport,
             host_binary,
-            host_version: env!("CARGO_PKG_VERSION").to_string(),
+            host_version: format!("{}-{}", env!("CARGO_PKG_VERSION"), env!("BUILD_TIMESTAMP")),
             timestamp,
             command: command.to_vec(),
             wait_for_peer,
@@ -277,7 +277,7 @@ async fn build_for_target(target: &str) -> Result<PathBuf, CliError> {
     command.arg("--target");
     command.arg(target);
     command.arg("-p");
-    command.arg("beach-human");
+    command.arg("beach");
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
@@ -311,13 +311,30 @@ async fn build_for_target(target: &str) -> Result<PathBuf, CliError> {
     }
 
     // Construct the path to the built binary
-    let workspace_root = std::env::current_dir()
+    // We need to find the workspace root, not just current_dir which might be a subdirectory
+    let mut workspace_root = std::env::current_dir()
         .map_err(|err| CliError::CrossCompile(format!("failed to get current directory: {err}")))?;
+
+    // Walk up to find the workspace root (the directory containing the top-level target/)
+    while !workspace_root
+        .join("target")
+        .join(target)
+        .join("release")
+        .join("beach")
+        .exists()
+    {
+        if let Some(parent) = workspace_root.parent() {
+            workspace_root = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+
     let binary_path = workspace_root
         .join("target")
         .join(target)
         .join("release")
-        .join("beach-human");
+        .join("beach");
 
     if !binary_path.exists() {
         return Err(CliError::CrossCompile(format!(

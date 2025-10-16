@@ -1,11 +1,11 @@
 # SSH Bootstrap Implementation Plan
 
-This plan defines the work required to let `beach-human` establish a WebRTC session by first hopping through SSH, mirroring the bootstrap flow that `mosh` uses. Each phase ends with concrete validation so we can land the work incrementally.
+This plan defines the work required to let `beach` establish a WebRTC session by first hopping through SSH, mirroring the bootstrap flow that `mosh` uses. Each phase ends with concrete validation so we can land the work incrementally.
 
 ## Phase 0 – Goals & Constraints
 - Preserve the existing `beach host`/`beach join` workflows; the SSH bootstrap is an additive UX.
 - Ensure the remote host session keeps running after the temporary SSH control channel drops.
-- Avoid bespoke daemons on the remote host: the SSH flow should only require the `beach-human` binary.
+- Avoid bespoke daemons on the remote host: the SSH flow should only require the `beach` binary.
 - Keep stdout noise predictable so callers can automate around it (scripts, other CLIs).
 
 ## Phase 1 – Host Handshake Envelope
@@ -61,7 +61,7 @@ This plan defines the work required to let `beach-human` establish a WebRTC sess
 ## Phase 5 – Documentation & Follow-ups
 **Implementation**
 - Add `docs/bootstrap.md` describing setup, handshake schema, and troubleshooting. ✅
-- Update existing plans (`apps/beach-human/plan.md`, `README` if present) to reference the new feature. ✅
+- Update existing plans (`apps/beach/plan.md`, `README` if present) to reference the new feature. ✅
 - Outline future enhancements (scp sync, persistent ssh mode, agentless bootstrap). ➡️ tracked under "Future Enhancements".
 
 **Validation**

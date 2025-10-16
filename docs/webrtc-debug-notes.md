@@ -11,7 +11,7 @@
 ## Tests
 - Added `webrtc_bidirectional_transport_delivers_messages` using in-memory pair (passes).
 - Added `webrtc_signaling_end_to_end` using real signaling server; reproduces timeout / warnings.
-- Tests located at `apps/beach-human/tests/webrtc_transport.rs`.
+- Tests located at `apps/beach/tests/webrtc_transport.rs`.
 
 ## Next Steps
 - Investigate ICE candidate exchange; ensure candidates exchanged via signaling.

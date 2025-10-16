@@ -387,7 +387,8 @@ async fn connect_fallback_websocket(
 
 #[derive(Debug, Deserialize)]
 struct FallbackTokenErrorBody {
-    success: bool,
+    #[serde(rename = "success")]
+    _success: bool,
     #[serde(default)]
     reason: Option<String>,
 }

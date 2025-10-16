@@ -38,8 +38,8 @@ enum RowState {
 /// # Examples
 ///
 /// ```
-/// # use beach_human::cache::grid::AtomicGrid;
-/// # use beach_human::cache::{GridCache, WriteOutcome};
+/// # use beach::cache::grid::AtomicGrid;
+/// # use beach::cache::{GridCache, WriteOutcome};
 /// let grid = AtomicGrid::new(2, 2, 0, 0);
 /// assert_eq!(grid.write_cell_if_newer(0, 0, 1, 42).unwrap(), WriteOutcome::Written);
 /// let snapshot = grid.get_cell_relaxed(0, 0).unwrap();

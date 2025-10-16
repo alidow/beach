@@ -1,0 +1,15 @@
+[package]
+name = "manager-sdk"
+version = "0.0.1"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.11", features = ["json", "gzip", "brotli", "rustls-tls"] }
+thiserror = "1.0"
+uuid = { version = "1", features = ["serde", "v4"] }
+tokio = { version = "1.35", features = ["rt", "macros"] }

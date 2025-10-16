@@ -7,7 +7,7 @@ shrinking payloads before we run interactive benchmarks.
 
 ```bash
 # Run the harness (ignored by default to keep CI fast)
-cargo test -p beach-human --test perf_harness -- --ignored --show-output
+cargo test -p beach --test perf_harness -- --ignored --show-output
 ```
 
 The test prints JSON vs. binary payload sizes for a representative handshake +
@@ -20,8 +20,8 @@ savings hold steady.
 1. Enable binary framing and perf counters:
    ```bash
    export BEACH_PROTO_BINARY=1
-   export BEACH_HUMAN_PROFILE=1
-   RUST_LOG=perf=debug,beach_human=debug cargo run -p beach-human -- --local-preview
+   export BEACH_PROFILE=1
+   RUST_LOG=perf=debug,beach=debug cargo run -p beach -- --local-preview
    ```
 2. Drive an editor workload (e.g. Vim) for ~30 seconds.
 3. Gather stats: perf counters are emitted through tracing; redirect the log and

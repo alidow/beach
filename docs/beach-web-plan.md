@@ -7,11 +7,11 @@ Goals
 
 Non‑Goals
 - Emulating VT sequences in the browser (xterm.js). All diffs come from the server.
-- Managing the session lifecycle server‑side (handled by beach-road and beach-human host).
+- Managing the session lifecycle server‑side (handled by beach-road and beach host).
 
 Architecture Overview
 - Transport: WebRTC data channel to host (primary), with signaling over beach-road WebSocket. (Optional WS transport can be added later if needed.)
-- Protocol: Binary wire codec in TS that exactly mirrors apps/beach-human protocol (varints + enums). Frames: Hello, Grid, Snapshot, SnapshotComplete, Delta, HistoryBackfill, InputAck, Shutdown. Client: Input, Resize, RequestBackfill.
+- Protocol: Binary wire codec in TS that exactly mirrors apps/beach protocol (varints + enums). Frames: Hello, Grid, Snapshot, SnapshotComplete, Delta, HistoryBackfill, InputAck, Shutdown. Client: Input, Resize, RequestBackfill.
 - State: Headless “grid store” modeled after GridRenderer, adapted for browser. Tracks base_row, cols, row slots (Pending | Loaded | Missing), styles, selection, followTail, predictions.
 - UI: React component renders the viewport using virtualized rows and styled spans. Native scroll and native selection for macOS Terminal feel.
 - Performance: Decode/batch on a worker, main-thread render via requestAnimationFrame; coalesce updates, virtualize rows, cap in-memory history, and on-demand backfill.

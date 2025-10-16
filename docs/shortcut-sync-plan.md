@@ -2,7 +2,7 @@
 
 ## Problem Statement
 
-Beach-human currently assumes that every key binding directly reaches the
+Beach currently assumes that every key binding directly reaches the
 server-side PTY. On macOS, Terminal.app intercepts `⌘K` (and a handful of other
 “UI” shortcuts) before user-space applications see them, so the host PTY never
 receives the clear-screen request. The Rust client clears its own view, but the
@@ -101,7 +101,7 @@ doesn’t rely on catching *every* key combination:
 
 - **Terminal detection:** we cannot programmatically detect `⌘K` if the emulator
   swallows the event before crossterm sees it. Our mitigation is to expose the
-  binding at the beach-human layer (e.g. bind `Ctrl-Shift-K`) and encourage
+  binding at the beach layer (e.g. bind `Ctrl-Shift-K`) and encourage
   users to rebind Terminal/iTerm2 to forward the shortcut. Document this in the
   CLI help and onboarding guide.
 - **Other shortcuts:** Audit the default terminal bindings (`⌘W`, `⌘T`, Mission

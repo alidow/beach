@@ -15,10 +15,10 @@ collapse as soon as the host confirms or rejects the prediction.
   bit (Rust & TypeScript).
 - Added `CursorFrame` structure and optional cursor payloads to `snapshot`,
   `delta`, and `history_backfill` frames, plus a standalone `cursor` frame.
-- Updated Rust (`apps/beach-human/src/protocol`) and TS
+- Updated Rust (`apps/beach/src/protocol`) and TS
   (`apps/beach-web/src/protocol`) encoders/decoders with round-trip tests.
 
-### Host Runtime (`apps/beach-human`)
+### Host Runtime (`apps/beach`)
 - `TransmitterCache` coalesces cursor updates and tracks last emitted cursor.
 - `spawn_update_forwarder` piggybacks cursor data on snapshot/delta/backfill
   batches and emits dedicated cursor frames when necessary.

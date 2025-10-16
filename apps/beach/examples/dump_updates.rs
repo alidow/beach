@@ -1,5 +1,5 @@
-use beach_human::cache::terminal::TerminalGrid;
-use beach_human::server::terminal::{AlacrittyEmulator, TerminalEmulator};
+use beach::cache::terminal::TerminalGrid;
+use beach::server::terminal::{AlacrittyEmulator, TerminalEmulator};
 
 fn main() {
     let grid = TerminalGrid::new(24, 80);

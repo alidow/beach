@@ -222,7 +222,7 @@ For initial prompt lines, don't register predictions until the first authoritati
 
 ```bash
 rm -f /tmp/beach-debug.log && \
-  BEACH_LOG_FILTER=debug,client::predictive=trace cargo run -p beach-human -- \
+  BEACH_LOG_FILTER=debug,client::predictive=trace cargo run -p beach -- \
     --log-level trace \
     --log-file /tmp/beach-debug.log \
     ssh --ssh-flag=-i --ssh-flag=/Users/arellidow/.ssh/beach-test-singapore.pem \

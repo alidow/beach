@@ -46,7 +46,7 @@ Located in `/tmp/`:
 
 ```bash
 # Clean up any existing sessions
-pkill -f "beach-human" 2>/dev/null || true
+pkill -f "beach" 2>/dev/null || true
 
 # Run automated test
 /tmp/launch-beach-client-fixed.sh
@@ -74,18 +74,18 @@ grep -c '"event":"prediction_cleared"' /tmp/beach-interactive-client.log
 grep -c '"event":"prediction_clear_deferred"' /tmp/beach-interactive-client.log
 
 # Clean up
-pkill -f "beach-human"
+pkill -f "beach"
 ```
 
 ### Manual Interactive Testing
 
 ```bash
 # Terminal 1: Start host
-cargo run -p beach-human -- host --local-preview
+cargo run -p beach -- host --local-preview
 
 # Terminal 2: Start client with trace logging and latency injection
 BEACH_LOG_FILTER=debug,client::predictive=trace \
-cargo run -p beach-human -- \
+cargo run -p beach -- \
   --log-level trace \
   --log-file /tmp/beach-test.log \
   join <SESSION_ID> --passcode <PASSCODE> \
@@ -95,7 +95,7 @@ cargo run -p beach-human -- \
 /tmp/test-predictive-bug-interactive.sh <SESSION_ID> /tmp/beach-test.log
 
 # Clean up
-pkill -f "beach-human"
+pkill -f "beach"
 ```
 
 ## Interpreting Results
@@ -241,7 +241,7 @@ Always clean up background processes after testing:
 
 ```bash
 # Kill all beach processes
-pkill -f "beach-human"
+pkill -f "beach"
 
 # Close Terminal.app tabs if using AppleScript automation
 # (Manual cleanup required)

@@ -1,4 +1,4 @@
-# beach-human tmux Parity – Progress Snapshot
+# beach tmux Parity – Progress Snapshot
 
 _Last updated: 2025-09-23 (afternoon)_  
 _Work-in-flight: Codex agent implementation pass_
@@ -25,7 +25,7 @@ _Work-in-flight: Codex agent implementation pass_
   - Terminal client detects unloaded viewport spans, issues targeted requests, and retires placeholders once data (or confirmed gaps) arrive.
 - **Tests & tooling**
   - Updated sync/transport/unit tests for new config field and lane semantics.
-  - Full `cargo test -p beach-human` passing.
+  - Full `cargo test -p beach` passing.
 
 ## Outstanding Work
 1. **Critical: handshake replay storm (server/client divergence)**
@@ -50,10 +50,10 @@ _Work-in-flight: Codex agent implementation pass_
 - Teach the client to predictively request refreshed snapshots/backfill spans before the local viewport approaches unloaded ranges so heavy scroll sessions stay ahead of user demand.
 
 ## Runbook Notes
-- Server host command: `cargo run -p beach-human -- --session-server http://127.0.0.1:8080 ...`
-- Client command: `cargo run -p beach-human -- --log-level trace --log-file ... join <session> --passcode ...`
+- Server host command: `cargo run -p beach -- --session-server http://127.0.0.1:8080 ...`
+- Client command: `cargo run -p beach -- --log-level trace --log-file ... join <session> --passcode ...`
 - Current branch: `main` (recent commits: backfill queue, sparse renderer, integration tests).
-- Tests: `cargo test -p beach-human`.
+- Tests: `cargo test -p beach`.
 
 ---
 

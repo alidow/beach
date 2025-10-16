@@ -16,7 +16,7 @@ echo "Setting up Beach server on Singapore instance..."
 ssh -i "$SSH_KEY" "$SSH_HOST" 'pkill -9 beach 2>/dev/null || true; rm -f /tmp/beach-server.log'
 
 # Start beach server on Singapore instance
-ssh -i "$SSH_KEY" "$SSH_HOST" 'nohup ~/beach-new/target/release/beach-human host bash > /tmp/beach-server.log 2>&1 &' >/dev/null 2>&1
+ssh -i "$SSH_KEY" "$SSH_HOST" 'nohup ~/beach-new/target/release/beach host bash > /tmp/beach-server.log 2>&1 &' >/dev/null 2>&1
 
 # Wait for server to start
 sleep 3

@@ -1,9 +1,9 @@
 # SSH Bootstrap Guide
 
-This document explains how to start a `beach-human` session through SSH, mirroring the familiar `mosh` workflow: establish a short-lived SSH control channel, spin up a beach host on the remote machine, then hand off to WebRTC for the active session.
+This document explains how to start a `beach` session through SSH, mirroring the familiar `mosh` workflow: establish a short-lived SSH control channel, spin up a beach host on the remote machine, then hand off to WebRTC for the active session.
 
 ## 1. Requirements
-- The `beach-human` binary must exist on the remote machine and be executable by the SSH user.
+- The `beach` binary must exist on the remote machine and be executable by the SSH user.
 - SSH key-based auth is recommended; the local command forces `BatchMode=yes` unless `--no-batch` is provided.
 - The remote node needs outbound connectivity to the session broker that both sides share (defaults to `http://127.0.0.1:8080`).
 

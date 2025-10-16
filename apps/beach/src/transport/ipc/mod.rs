@@ -150,7 +150,7 @@ async fn open_stream_pair() -> Result<(NamedPipeClient, NamedPipeServer), Transp
 
     static COUNTER: AtomicUsize = AtomicUsize::new(1);
     let id = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-    let pipe_name = format!(r"\\.\pipe\beach-human-{}", id);
+    let pipe_name = format!(r"\\.\pipe\beach-{}", id);
 
     let server = ServerOptions::new()
         .first_pipe_instance(true)

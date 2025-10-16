@@ -1,24 +1,24 @@
-# beach-human tmux Equivalence Spec
+# beach tmux Equivalence Spec
 
 ## Scope and Goals
-- Deliver a beach-human host + client experience that is indistinguishable from tmux in look, feel, hotkeys, and scrollback behaviour.
+- Deliver a beach host + client experience that is indistinguishable from tmux in look, feel, hotkeys, and scrollback behaviour.
 - Restore scrollback correctness with absolute row numbering and high-throughput history sync while keeping end-to-end latency competitive with native tmux.
-- Align configuration knobs (`history-limit`, key tables, status line) so tmux users can swap between tmux and beach-human without relearning muscle memory.
+- Align configuration knobs (`history-limit`, key tables, status line) so tmux users can swap between tmux and beach without relearning muscle memory.
 
 ## Current State and Gaps
 
 ### Terminal grid and emulator
-- `TerminalGrid` stores rows in a `VecDeque` with a rolling `base` offset, but rows are addressed by their current index; the `_absolute` argument to `RowEntry::new` is thrown away (`apps/beach-human/src/cache/terminal/cache.rs:24`).
-- The Alacritty-backed emulator uses `TermDimensions::new` with `total_lines = screen_lines`, so Alacritty never retains history and the server keeps overwriting the last viewport worth of rows (`apps/beach-human/src/server/terminal/emulator.rs:178-183`).
+- `TerminalGrid` stores rows in a `VecDeque` with a rolling `base` offset, but rows are addressed by their current index; the `_absolute` argument to `RowEntry::new` is thrown away (`apps/beach/src/cache/terminal/cache.rs:24`).
+- The Alacritty-backed emulator uses `TermDimensions::new` with `total_lines = screen_lines`, so Alacritty never retains history and the server keeps overwriting the last viewport worth of rows (`apps/beach/src/server/terminal/emulator.rs:178-183`).
 - Alacritty’s `viewport_top` is relative to the in-memory ring, so once scrollback is enabled we still need an explicit absolute row counter to prevent IDs from repeating after trims.
 
 ### Sync pipeline
-- `TerminalSync` already exposes three `PriorityLane`s, but all lanes iterate over the same `grid.dims()` slice; there is no special handling for “initial snapshot vs deltas vs archived history” (`apps/beach-human/src/sync/terminal/sync.rs:101-194`).
+- `TerminalSync` already exposes three `PriorityLane`s, but all lanes iterate over the same `grid.dims()` slice; there is no special handling for “initial snapshot vs deltas vs archived history” (`apps/beach/src/sync/terminal/sync.rs:101-194`).
 - Trim events are emitted, yet the client has no back-pressure semantics for requesting older history or for pausing until the backfill arrives.
 
 ### Client viewport and controls
-- `GridRenderer` tracks a `base_row` and scroll offsets, but it assumes that every row between `base_row` and `base_row + cells.len()` is resident (`apps/beach-human/src/client/grid_renderer.rs:90-186`). Missing rows result in blank gaps instead of tmux-like behaviour.
-- Copy-mode bindings and movement are partially implemented and do not match tmux’s vi/emacs tables; there is no unified prefix handling or status line parity in the beach-human CLI (`apps/beach-human/src/client/terminal.rs:200-320`).
+- `GridRenderer` tracks a `base_row` and scroll offsets, but it assumes that every row between `base_row` and `base_row + cells.len()` is resident (`apps/beach/src/client/grid_renderer.rs:90-186`). Missing rows result in blank gaps instead of tmux-like behaviour.
+- Copy-mode bindings and movement are partially implemented and do not match tmux’s vi/emacs tables; there is no unified prefix handling or status line parity in the beach CLI (`apps/beach/src/client/terminal.rs:200-320`).
 
 ### tmux reference highlights
 - tmux panes maintain `struct grid` with monotonic history via `hsize`/`hlimit` and drop 10% chunks when trimming (`tmp/tmux/grid.c:360-410`).
@@ -34,7 +34,7 @@
 
 **Key work**
 - Add `scripts/capture_tmux_transcript.sh` to spawn tmux, run a command script, and dump pane contents via `tmux capture-pane -e -p`.
-- Extend `tests/client_transcripts.rs` with dual replay: beach-human transcript vs tmux reference; fail on any divergence.
+- Extend `tests/client_transcripts.rs` with dual replay: beach transcript vs tmux reference; fail on any divergence.
 - Define a tmux parity checklist document in `docs/` enumerating baseline behaviours (default key table, copy-mode navigation, status line prompts).
 
 **Validation**
@@ -99,7 +99,7 @@
 - Surface status line hints identical to tmux (e.g., “(end of scrollback)”) when the user reaches the limit.
 
 ### Phase 4 – Prefix handling, status line, and command UX
-**Goals**: Align interactive controls so `Ctrl-b` driven workflows behave the same in both tmux and beach-human.
+**Goals**: Align interactive controls so `Ctrl-b` driven workflows behave the same in both tmux and beach.
 
 **Prefix + command mode**
 - Implement a prefix state machine with configurable `prefix` and `prefix2` keys, honouring tmux’s `prefix-timeout` semantics.
@@ -121,7 +121,7 @@
 - Route input focus, resize events, and copy-mode context to the active pane with the same key bindings (`Ctrl-b o`, `Ctrl-b %`, `Ctrl-b "`).
 
 **Window and session abstraction**
-- Add lightweight session/window registries to beach-human so commands like `new-window`, `next-window`, and `rename-session` map to tmux’s behaviour.
+- Add lightweight session/window registries to beach so commands like `new-window`, `next-window`, and `rename-session` map to tmux’s behaviour.
 - Model session attachment/detachment so multiple clients can share the same session while maintaining independent viewports.
 
 **Transport implications**
@@ -137,7 +137,7 @@
 ## Performance and Testing Strategy
 - **Benchmarks**: Extend the perf harness to stress-test history append (10k lines), backfill throughput, and copy-mode entry/exit latency. Track p99 enqueue→render timing per lane.
 - **Unit tests**: Cover cache trimming, absolute id translation, snapshot batching, and copy-mode key tables.
-- **Integration tests**: End-to-end transcript replays for long-running processes (`yes`, `ping`, `tail -f`) with asserts that the beach-human viewport exactly matches tmux.
+- **Integration tests**: End-to-end transcript replays for long-running processes (`yes`, `ping`, `tail -f`) with asserts that the beach viewport exactly matches tmux.
 - **Observability**: Expose Prometheus-style counters (`cache.rows_total`, `sync.initial_snapshot.delay_ms`) and structured log spans around lane processing and renderer ticks.
 
 ## Risks and Open Questions
@@ -146,4 +146,4 @@
 - **Multi-pane complexity**: Pane layout plus per-pane history dramatically increases state; consider shipping scrollback parity (Phases 1–3) before tackling panes to mitigate risk.
 - **tmux option coverage**: Decide how far to go replicating tmux’s option matrix before declaring parity for v1.
 
-Delivering these phases incrementally will restore scrollback fidelity first, then progressively layer tmux’s user-facing affordances until beach-human is a drop-in replacement for tmux.
+Delivering these phases incrementally will restore scrollback fidelity first, then progressively layer tmux’s user-facing affordances until beach is a drop-in replacement for tmux.

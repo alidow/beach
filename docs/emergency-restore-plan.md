@@ -51,7 +51,7 @@ unblock engineering as quickly as possible while preventing a repeat.
 
 ### 3.1 Baseline snapshot & guardrails
 
-- [ ] Create a working backup before starting (tar `apps/beach-human` + `apps/beach-road`).
+- [ ] Create a working backup before starting (tar `apps/beach` + `apps/beach-road`).
 - [ ] Draft a `scripts/git-safe-reset.sh` that performs safety checks.
 - [ ] Enable `includeIf "gitdir"` hooks to warn before `reset --hard`.
 
@@ -103,7 +103,7 @@ unblock engineering as quickly as possible while preventing a repeat.
 
 ### 3.5 Verification & sign-off
 
-- [ ] `cargo test -p beach-human` (including new transcript tests).
+- [ ] `cargo test -p beach` (including new transcript tests).
 - [ ] Manual session test: run `for i in {1..150}; do echo ...; done` and ensure
   history is identical on host/client.
 - [ ] Manual copy-mode script (search, mouse scroll, yank).

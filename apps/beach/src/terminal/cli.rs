@@ -8,7 +8,7 @@ use crate::telemetry::logging::{LogConfig, LogLevel};
     name = "beach",
     about = "🏖️  Share a terminal session with WebRTC/WebSocket transports",
     author,
-    version
+    version = concat!(env!("CARGO_PKG_VERSION"), "-", env!("BUILD_TIMESTAMP"))
 )]
 pub struct Cli {
     #[arg(

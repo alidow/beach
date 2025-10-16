@@ -3,13 +3,13 @@
 ## Current Symptom
 
 - Predictive overlay drifts right when typing quickly at the prompt, most visible once a space is entered after fast keystrokes.  The analyzer still reports mismatches such as `seq 5 row=0 col=31 mismatch` and repeated "acked but predictions never cleared" rows.
-- Behaviour reproduces reliably in the Singapore test session while running the Rust TUI (`beach-human`).
+- Behaviour reproduces reliably in the Singapore test session while running the Rust TUI (`beach`).
 
 ## Reproduction / "Litmus" Test
 
 ```bash
 rm -f /tmp/beach-debug.log && \
-  BEACH_LOG_FILTER=debug,client::predictive=trace cargo run -p beach-human -- \
+  BEACH_LOG_FILTER=debug,client::predictive=trace cargo run -p beach -- \
     --log-level trace \
     --log-file /tmp/beach-debug.log \
     ssh --ssh-flag=-i --ssh-flag=/Users/arellidow/.ssh/beach-test-singapore.pem \
@@ -43,7 +43,7 @@ rm -f /tmp/beach-debug.log && \
   - `predictive_server_overlap_moves_prediction_to_drop_queue`
   - `predictive_cursor_flushes_predictions_when_authoritative_pending`
 
-All tests in `cargo test -p beach-human` targeting the new cases pass, but the live SSH trace still reproduces the mismatch.
+All tests in `cargo test -p beach` targeting the new cases pass, but the live SSH trace still reproduces the mismatch.
 
 ## Outstanding Observations
 

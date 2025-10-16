@@ -3,12 +3,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use beach_human::cache::terminal::PackedCell;
-use beach_human::client::terminal::{ClientError, TerminalClient};
-use beach_human::protocol::{
+use beach::cache::terminal::PackedCell;
+use beach::client::terminal::{ClientError, TerminalClient};
+use beach::protocol::{
     self, ClientFrame as WireClientFrame, HostFrame, Lane, LaneBudgetFrame, SyncConfigFrame, Update,
 };
-use beach_human::transport::{Payload, Transport, TransportError, TransportKind, TransportPair};
+use beach::transport::{Payload, Transport, TransportError, TransportKind, TransportPair};
 
 fn send_host_frame(transport: &dyn Transport, frame: HostFrame) {
     let bytes = protocol::encode_host_frame_binary(&frame);

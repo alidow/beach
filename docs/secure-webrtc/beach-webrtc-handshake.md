@@ -519,14 +519,14 @@ warning: `beach-road` (bin "beach-road") generated 9 warnings (run `cargo fix --
 2025-09-28T22:49:02.624979Z DEBUG beach_road::websocket: Successfully parsed ClientMessage from Text frame: Ping
 ```
 
-server: ```(base) arellidow@Arels-MacBook-Pro beach-human % cd ~/development/beach/apps/beach-human
+server: ```(base) arellidow@Arels-MacBook-Pro beach % cd ~/development/beach/apps/beach
 
 cargo run -- \
   --session-server http://127.0.0.1:8080 \
   --log-file ~/beach-debug/host.log
-   Compiling beach-human v0.1.0 (/Users/arellidow/development/beach/apps/beach-human)
+   Compiling beach v0.1.0 (/Users/arellidow/development/beach/apps/beach)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.88s
-     Running `/Users/arellidow/development/beach/target/debug/beach-human --session-server 'http://127.0.0.1:8080' --log-file /Users/arellidow/beach-debug/host.log`
+     Running `/Users/arellidow/development/beach/target/debug/beach --session-server 'http://127.0.0.1:8080' --log-file /Users/arellidow/beach-debug/host.log`
 
 🏖️  beach session ready!
 
@@ -574,7 +574,7 @@ BeachTerminal.tsx:89 [beach-web] ice gathering state: complete```
 important: i connected the rust client first, then connected the beach-web client. it's only if i connect beach web AFTER connecting the rust client that it times out
 
 Diagnosis (2025-09-29):
-- The host-side signaling client (`apps/beach-human/src/transport/webrtc/signaling.rs`) freezes the first client peer ID it observes and keeps routing WebRTC signals to that peer. When the Rust CLI joins before beach-web, the offerer never retargets, so the browser's answer/ICE/readiness frames are dropped. The offerer times out waiting for `__ready__`, continues to speak into a closed channel, and the new client never finishes handshaking.
+- The host-side signaling client (`apps/beach/src/transport/webrtc/signaling.rs`) freezes the first client peer ID it observes and keeps routing WebRTC signals to that peer. When the Rust CLI joins before beach-web, the offerer never retargets, so the browser's answer/ICE/readiness frames are dropped. The offerer times out waiting for `__ready__`, continues to speak into a closed channel, and the new client never finishes handshaking.
 
 Proposed fix:
 - Teach the signaling helper to adopt the peer that is actually negotiating WebRTC: pick up the requester from `transport_proposal`, switch to whichever peer sends WebRTC `signal` frames, and clear the assignment when that participant drops. Once the remote peer ID follows the current negotiator, the browser's signals reach the offerer and the readiness exchange should succeed.
@@ -618,14 +618,14 @@ BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidat
 BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidate:5606886 1 udp 2113937151 f48d1ff3-9ed3-45c2-a73f-a9f7ac97b2e4.local 62250 typ host generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
 BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidate:3656812828 1 udp 1677729535 72.227.131.114 62250 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}```
 
-server: ```(base) arellidow@Arels-MacBook-Pro beach-human % cd ~/development/beach/apps/beach-human
+server: ```(base) arellidow@Arels-MacBook-Pro beach % cd ~/development/beach/apps/beach
 
 cargo run -- \
   --session-server http://127.0.0.1:8080 \
   --log-file ~/beach-debug/host.log
-   Compiling beach-human v0.1.0 (/Users/arellidow/development/beach/apps/beach-human)
+   Compiling beach v0.1.0 (/Users/arellidow/development/beach/apps/beach)
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.45s
-     Running `/Users/arellidow/development/beach/target/debug/beach-human --session-server 'http://127.0.0.1:8080' --log-file /Users/arellidow/beach-debug/host.log`
+     Running `/Users/arellidow/development/beach/target/debug/beach --session-server 'http://127.0.0.1:8080' --log-file /Users/arellidow/beach-debug/host.log`
 
 🏖️  beach session ready!
 

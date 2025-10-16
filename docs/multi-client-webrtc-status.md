@@ -1,7 +1,7 @@
 # Multi-Client WebRTC Status – 2025-09-30
 
 ## Context
-- `beach-human` operates as the WebRTC offerer (the host). Any number of viewers—CLI or browser—may join the same session.
+- `beach` operates as the WebRTC offerer (the host). Any number of viewers—CLI or browser—may join the same session.
 - `beach-road` fans out WebSocket signaling and exposes REST endpoints (`/webrtc/offer`, `/webrtc/answer`) that peers poll while handshaking.
 - We must support **100 simultaneous WebRTC viewers** without races, stalled handshakes, or runaway polling.
 
@@ -19,17 +19,17 @@
 5. **End-to-end coverage** – Update integration tests to exercise dozens of parallel viewers, ensuring each gets an offer, posts an answer, receives broadcast frames, and cleans up on disconnect.
 
 ## Implementation Tasks
-1. **Signaling (`apps/beach-human/src/transport/webrtc/signaling.rs`)**
+1. **Signaling (`apps/beach/src/transport/webrtc/signaling.rs`)**
    - Store per-peer channels.
    - Emit `RemotePeerEvent`s and route incoming SDP/ICE to the correct peer.
    - Provide helpers to send SDP/ICE to a specific peer ID.
-2. **Transport (`apps/beach-human/src/transport/webrtc/mod.rs`)**
+2. **Transport (`apps/beach/src/transport/webrtc/mod.rs`)**
    - Add `MultiPeerTransport` plus the supervisor that manages handshake tasks.
    - Rewrite the offerer handshake so each viewer gets its own `WebRtcTransport`.
    - Keep the answerer code path intact for viewers.
-3. **Host wiring (`apps/beach-human/src/main.rs`)**
+3. **Host wiring (`apps/beach/src/main.rs`)**
    - Ensure `TransportSupervisor`, heartbeats, and failover logic operate on `MultiPeerTransport`.
-4. **Testing (`apps/beach-human/tests/webrtc_transport.rs`)**
+4. **Testing (`apps/beach/tests/webrtc_transport.rs`)**
    - Add multi-viewer integration tests; guard existing single-viewer tests.
 5. **Docs & telemetry**
    - Maintain this status page.
@@ -43,12 +43,12 @@
 
 ## Runbook (after implementation)
 ```bash
-cargo test -p beach-human --test webrtc_transport
+cargo test -p beach --test webrtc_transport
 pnpm --filter beach-web test -- --runInBand
 
 # Manual smoke
 cargo run -p beach-road
-cargo run -p beach-human -- --session-server http://127.0.0.1:8080
+cargo run -p beach -- --session-server http://127.0.0.1:8080
 # Join from multiple browsers/CLIs and observe broadcast
 ```
 

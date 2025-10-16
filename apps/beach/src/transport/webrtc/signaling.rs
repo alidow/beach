@@ -1,5 +1,7 @@
 use super::IceCandidateBlob;
-use super::secure_signaling::{MessageLabel, SealedEnvelope, seal_message, should_encrypt};
+use super::secure_signaling::{
+    MessageLabel, SealedEnvelope, seal_message, seal_message_with_psk, should_encrypt,
+};
 use super::spawn_on_global;
 use crate::transport::TransportError;
 use futures_util::{SinkExt, StreamExt};

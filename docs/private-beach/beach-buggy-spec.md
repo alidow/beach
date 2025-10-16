@@ -41,6 +41,13 @@
 - `session.signal_health`: periodic heartbeat with latency histogram, queue depth, custom warnings.
 - Harness registration payload includes `harness_type` (e.g., `terminal_shim`, `cabana_adapter`) so the manager can map to the `session.harness_type` column.
 
+### Quick Interface Summary
+- **Attach:** Call `private_beach.register_session` (MCP) or `POST /sessions/register` with session + harness metadata → receive `harness_id`, `controller_token`, state/transport hints.
+- **State Push:** Stream diffs via `session.push_state` (MCP) or designated Redis/WebRTC channel; include sequence numbers for replay.
+- **Command Intake:** Listen on broker/WebRTC channel defined by manager; execute actions; respond with `session.ack_action` statuses (`ok`, `rejected`, `expired`, `preempted`).
+- **Health:** Send `session.signal_health` heartbeat containing queue depth, CPU load, degraded flags; absence signals trigger manager intervention.
+- **Controller Updates:** React to lease change notifications; discard queued actions when controller token changes to maintain policy compliance.
+
 ## Implementation Outline
 - **Runtime:** `crates/beach-buggy` (Rust) for terminal harness + structured GUI adapters, with TypeScript/Node bridge in Cabana where needed; unified protocol module shared across clients.
 - **Configuration:** JSON manifest per private beach defining harness policies (state cadence, allowed transports, encryption keys).

@@ -69,7 +69,7 @@ Authentication uses `Authorization: Bearer <token>` where applicable.
 - [x] Add automated tests for auth flows and entitlement enforcement.
 - [x] Document client integration points + entitlement requirements.
 - [x] Wire `beach auth` CLI workflows to persist tokens/profiles without leaking secrets.
-- [ ] Surface the same credential story in beach-web (PKCE + OIDC) and store proofs client-side.
+- [ ] Surface the same credential story in beach-surfer (PKCE + OIDC) and store proofs client-side.
 - [x] Gate CLI fallback negotiation so proofs are only attached when a profile is active; skip otherwise.
 - [x] Deliver polished denial messaging for unauthorized fallback attempts across CLI and web.
 
@@ -79,7 +79,7 @@ Authentication uses `Authorization: Bearer <token>` where applicable.
 - Vitest suite covers end-to-end happy paths, token rotation, entitlement protection, and invalid token rejection (`npm test` from `apps/beach-gate`).
 - Local test run pending `npm install` (10s timeout encountered; rerun when convenient to verify).
 - CLI now exposes `beach auth` login/logout/status commands, stores refresh tokens in the OS keychain (or passphrase-protected ciphertext), and only sends fallback entitlement proofs when a logged-in profile advertises `rescue:fallback`.
-- beach-web surfaces Beach Auth call-to-action messaging when fallback is unavailable; PKCE login remains a follow-up item.
+- beach-surfer surfaces Beach Auth call-to-action messaging when fallback is unavailable; PKCE login remains a follow-up item.
 
 ## Open Questions
 - **Billing sync path** – Today entitlements come from config overrides only. Need decision on how billing updates will be delivered (e.g., webhook → Beach Gate API vs. direct database read) to plan storage and reconciliation.

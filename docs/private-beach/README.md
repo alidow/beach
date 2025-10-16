@@ -6,6 +6,7 @@ This directory houses the plans, specs, and design notes for the Private Beach p
 - `vision.md` – product goals, pillars, architecture overview.
 - `data-model.md` – Postgres schema, enums, and relational layout.
 - `roadmap.md` – phased execution plan across harness, manager, and UI workstreams.
+- `engineering-cadence.md` – lightweight solo dev cadence and observability expectations.
 - `guiding-principles.md` – product boundary decisions, zero-trust stance, performance philosophy.
 - `beach-buggy-spec.md` – harness sidecar specification powered by the Beach Buggy runtime.
 - `beach-manager.md` – control-plane responsibilities, flows, and security posture.

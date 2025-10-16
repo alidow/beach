@@ -4,7 +4,7 @@
 - ✓ Ratify product boundaries (open-source Beach vs. paid Private Beach scope) and publish guiding principles.
 - ✓ Finalize Postgres schema (`docs/private-beach/data-model.md`) and ensure Beach Gate token claims cover required membership roles and share-link flows.
 - ✓ Stand up project scaffolding: `apps/private-beach` (Next.js), `apps/beach-manager` service skeleton, shared harness crates/packages.
-- ☐ Define engineering cadences, release channels, and observability baseline (logging/metrics stack shared with existing Beach infra).
+- ✓ Define engineering cadence, release cadence, and observability baseline (see `docs/private-beach/engineering-cadence.md`).
 
 ## Phase 1 – Session Harness (Beach Buggy) MVP
 - Implement `crates/beach-buggy` terminal shim wrapping Beach PTY streams with diff emission + command intake.
@@ -19,7 +19,7 @@
 - Create CLI/agent SDK (`manager-sdk`) exercising the APIs; include harness simulator for integration testing.
 - Enforce row-level security and claims validation across core endpoints; implement zero-trust auth middleware.
 
-## Phase 3 – Workspace Shell (Private Beach Web)
+## Phase 3 – Workspace Shell (Private Beach Surfer)
 - Prototype Next.js dashboard consuming mock data; implement responsive grid, tile management, and status overlays.
 - Integrate live data via WebSocket/WebRTC bindings to manager service.
 - Support session discovery, search, and basic metadata inspection (capabilities, location hints).

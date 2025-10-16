@@ -89,7 +89,7 @@ function writeBooleanSetting(key: string, value: boolean): void {
 
 function logFallbackSetting(event: string, payload: Record<string, unknown>): void {
   if (typeof console !== 'undefined') {
-    console.info('[beach-web] fallback override updated', { event, ...payload });
+    console.info('[beach-surfer] fallback override updated', { event, ...payload });
   }
 }
 

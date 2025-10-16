@@ -377,9 +377,10 @@ impl SignalingClient {
         &self,
         candidate: RTCIceCandidate,
         handshake_id: &str,
+        pre_shared_key: Option<Arc<[u8; 32]>>,
     ) -> Result<(), TransportError> {
         let (remote, _) = self.wait_for_remote_peer_with_generation().await?;
-        self.send_ice_candidate_to_peer(candidate, handshake_id, &remote)
+        self.send_ice_candidate_to_peer(candidate, handshake_id, &remote, pre_shared_key)
             .await
     }
 
@@ -388,6 +389,7 @@ impl SignalingClient {
         candidate: RTCIceCandidate,
         handshake_id: &str,
         peer_id: &str,
+        pre_shared_key: Option<Arc<[u8; 32]>>,
     ) -> Result<(), TransportError> {
         let json = candidate
             .to_json()
@@ -417,38 +419,81 @@ impl SignalingClient {
                         "sealing ice candidate with provisional peer id (assigned id not yet available)"
                     );
                 }
-                tracing::debug!(
-                    target = "webrtc",
-                    handshake_id = %handshake_id,
-                    aad_from = %local_peer_id,
-                    aad_to = %peer_id,
-                    aad_label = "ice",
-                    using_assigned_id = assigned_ready,
-                    "preparing to seal ice candidate"
-                );
                 let plaintext = serde_json::to_vec(&blob).map_err(|err| {
                     TransportError::Setup(format!("serialize ice candidate failed: {err}"))
                 })?;
                 let associated = [local_peer_id.as_str(), peer_id, handshake_id];
-                let envelope = seal_message(
-                    passphrase,
-                    handshake_id,
-                    MessageLabel::Ice,
-                    &associated,
-                    &plaintext,
-                )?;
-                tracing::debug!(
-                    target = "webrtc",
-                    handshake_id = %handshake_id,
-                    ciphertext_len = envelope.ciphertext.len(),
-                    nonce = envelope.nonce.as_str(),
-                    using_assigned_id = assigned_ready,
-                    "sealed ice candidate created"
-                );
-                sealed = Some(envelope);
-                candidate_text.clear();
-                sdp_mid = None;
-                sdp_mline_index = None;
+                if let Some(psk) = pre_shared_key.as_deref() {
+                    tracing::info!(
+                        target = "webrtc",
+                        handshake_id = %handshake_id,
+                        aad_from = %local_peer_id,
+                        aad_to = %peer_id,
+                        aad_label = "ice",
+                        using_assigned_id = assigned_ready,
+                        "sealing ice candidate with handshake key"
+                    );
+                    match seal_message_with_psk(
+                        psk,
+                        handshake_id,
+                        MessageLabel::Ice,
+                        &associated,
+                        &plaintext,
+                    ) {
+                        Ok(envelope) => {
+                            tracing::info!(
+                                target = "webrtc",
+                                handshake_id = %handshake_id,
+                                ciphertext_len = envelope.ciphertext.len(),
+                                nonce = envelope.nonce.as_str(),
+                                using_assigned_id = assigned_ready,
+                                "sealed ice candidate created with handshake key"
+                            );
+                            sealed = Some(envelope);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target = "webrtc",
+                                handshake_id = %handshake_id,
+                                error = %err,
+                                "failed to seal ice candidate with handshake key; falling back to passphrase"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::debug!(
+                        target = "webrtc",
+                        handshake_id = %handshake_id,
+                        aad_from = %local_peer_id,
+                        aad_to = %peer_id,
+                        aad_label = "ice",
+                        using_assigned_id = assigned_ready,
+                        "handshake key unavailable; sealing ice candidate with passphrase"
+                    );
+                }
+                if sealed.is_none() {
+                    let envelope = seal_message(
+                        passphrase,
+                        handshake_id,
+                        MessageLabel::Ice,
+                        &associated,
+                        &plaintext,
+                    )?;
+                    tracing::info!(
+                        target = "webrtc",
+                        handshake_id = %handshake_id,
+                        ciphertext_len = envelope.ciphertext.len(),
+                        nonce = envelope.nonce.as_str(),
+                        using_assigned_id = assigned_ready,
+                        "sealed ice candidate created with passphrase key"
+                    );
+                    sealed = Some(envelope);
+                }
+                if sealed.is_some() {
+                    candidate_text.clear();
+                    sdp_mid = None;
+                    sdp_mline_index = None;
+                }
             }
         }
 

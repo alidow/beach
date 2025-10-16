@@ -23,7 +23,7 @@ function logKeyTrace(event: string, data: Record<string, unknown>): void {
     return;
   }
   // eslint-disable-next-line no-console
-  console.debug('[beach-web][crypto]', event, data);
+  console.debug('[beach-surfer][crypto]', event, data);
 }
 
 async function truncatedHashHex(bytes: Uint8Array): Promise<string> {
@@ -52,7 +52,7 @@ export async function derivePreSharedKey(
     });
     return key;
   } catch (error) {
-    console.error('[beach-web] argon2 derive failed', error);
+    console.error('[beach-surfer] argon2 derive failed', error);
     throw error instanceof Error ? error : new Error(String(error));
   }
 }

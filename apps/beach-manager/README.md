@@ -2,7 +2,7 @@
 
 ## Purpose
 - Serve as the orchestration layer for Private Beach: session registry, controller leases, shared state APIs, automation hooks, and billing integration.
-- Provide authenticated REST + MCP endpoints consumed by Private Beach web clients and automation agents.
+- Provide authenticated REST + MCP endpoints consumed by Private Beach Surfer clients and automation agents.
 
 ## Planned Stack
 - Rust (Tokio + Axum) for async HTTP/WebSocket workloads.

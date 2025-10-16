@@ -16,7 +16,7 @@ if (!rootElement) {
 
 if (typeof window !== 'undefined' && window.__BEACH_TRACE) {
   // eslint-disable-next-line no-console
-  console.info('[beach-web] version', __APP_VERSION__);
+  console.info('[beach-surfer] version', __APP_VERSION__);
 }
 
 ReactDOM.createRoot(rootElement).render(<App />);

@@ -19,13 +19,13 @@
 - `secure-webrtc/dual-channel-webrtc-spec.md`: protocol baseline for dual-channel/Noise work.
 - `secure-webrtc/webrtc-dual-channel-status-and-plan.md`: status journal from the earlier rollout.
 - `secure-webrtc/zero-trust-webrtc-spec.md`: long-form design for zero-trust signaling/transport.
-- `secure-webrtc/beach-webrtc-handshake.md`: troubleshooting log for signaling/data-channel flows.
+- `secure-webrtc/beach-surferrtc-handshake.md`: troubleshooting log for signaling/data-channel flows.
 
 ## Status Overview
 - [x] **Phase 1 – Sealed Signaling (2025-02-15):** CLI offer/answer/ICE sealing landed (originally hidden behind `BEACH_SECURE_SIGNALING` during rollout; now enabled by default).
 - [x] **Phase 2 – Noise Key Confirmation (2025-02-15):** Post-connect Noise XXpsk2 handshake over a dedicated data channel derives send/recv keys and a verification string (initially behind `BEACH_SECURE_TRANSPORT`; now always on).
 - [x] **Phase 3 – Encrypted Transport Wrapper (2025-02-15):** CLI transports now wrap every frame with ChaCha20-Poly1305 using handshake-derived keys and per-direction nonces; replayed or tampered frames are rejected.
-- [ ] **Phase 4 – Web Client Parity & Rollout:** Ship sealed signaling + transport encryption in beach-web, remove plaintext fallback after adoption (pending).
+- [ ] **Phase 4 – Web Client Parity & Rollout:** Ship sealed signaling + transport encryption in beach-surfer, remove plaintext fallback after adoption (pending).
 
 ## High-Level Approach
 1. **Shared-secret derivation**
@@ -91,7 +91,7 @@
 - `beach-road` stores the new ciphertext envelopes transparently; plaintext fields are retained for backward compatibility but are blanked when sealing is active.
 - Secure signaling is off by default to avoid breaking older clients (including the web UI). Operators should enable the flag only when both peers run a build with this feature.
 - Transport-layer encryption remains pending (Phase 3); web parity follows in Phase 4.
-- **Next checkpoints:** (a) wrap terminal traffic with the derived keys (completed in Phase 3); (b) port sealed signaling + handshake to beach-web so the feature flags can be enabled for mixed-client sessions.
+- **Next checkpoints:** (a) wrap terminal traffic with the derived keys (completed in Phase 3); (b) port sealed signaling + handshake to beach-surfer so the feature flags can be enabled for mixed-client sessions.
 
 ## Phase 2 Implementation Notes (2025-02-15)
 - `beach` spins up a dedicated `beach-secure-handshake` data channel whenever a passphrase is present. Both roles run a Noise `XXpsk2` exchange seeded by the Argon2id-derived key and handshake metadata (the legacy `BEACH_SECURE_TRANSPORT` flag is no longer required).
@@ -107,8 +107,8 @@
 
 ## Phase 4 – Web Client Parity & Rollout Plan
 ### A. Web Client Cryptography
-- [x] **Shared key derivation:** Introduce `transport/crypto/sharedKey.ts` in `beach-web` mirroring the Argon pipeline (currently PBKDF2 placeholder, swap to Argon2id when the WASM build lands) plus HKDF helpers for sealing/transport keys.
-- [x] **Sealed signaling:** Encrypt/decrypt SDP and ICE payloads in `beach-web/src/transport` using the shared utilities and ChaCha20-Poly1305 envelopes that match the CLI implementation.
+- [x] **Shared key derivation:** Introduce `transport/crypto/sharedKey.ts` in `beach-surfer` mirroring the Argon pipeline (currently PBKDF2 placeholder, swap to Argon2id when the WASM build lands) plus HKDF helpers for sealing/transport keys.
+- [x] **Sealed signaling:** Encrypt/decrypt SDP and ICE payloads in `beach-surfer/src/transport` using the shared utilities and ChaCha20-Poly1305 envelopes that match the CLI implementation.
 - [ ] **Noise handshake (browser):** Implement the `beach-secure-handshake` data channel logic in TypeScript using a Noise JS/WASM library, preserving the prologue inputs and verification display.
   1. Evaluate candidate Noise libraries (`@chainsafe/libp2p-noise`, `noise-c.wasm`, etc.) and prototype initiator/responder flows.
   2. Encapsulate the handshake in `transport/crypto/noiseHandshake.ts` so both offerer/answerer call a shared helper returning `{ sendKey, recvKey, verificationCode }`.
@@ -148,7 +148,7 @@
 ## Phase 4/A1 – Browser Argon2 Parity Execution Plan
 
 ### Summary
-Bring `apps/beach-web` in line with the Rust toolchain by deriving sealed-signaling keys with Argon2id (64 MiB, 3 passes, parallelism = 1, 32-byte output). This removes the PBKDF2 stopgap and ensures browser clients can decrypt the CLI’s sealed SDP/ICE payloads.
+Bring `apps/beach-surfer` in line with the Rust toolchain by deriving sealed-signaling keys with Argon2id (64 MiB, 3 passes, parallelism = 1, 32-byte output). This removes the PBKDF2 stopgap and ensures browser clients can decrypt the CLI’s sealed SDP/ICE payloads.
 
 ### Deliverables
 - WASM-backed Argon2id helper that exposes `derivePreSharedKey(passphrase, handshakeId) -> Promise<Uint8Array>`.
@@ -159,13 +159,13 @@ Bring `apps/beach-web` in line with the Rust toolchain by deriving sealed-signal
 ### Work Breakdown
 1. **Library selection & integration**
    - Integrate `@noble/hashes/argon2id` for the initial parity pass, keeping the abstraction thin so we can swap in a dedicated WASM backend if later profiling justifies the trade.
-   - Add the dependency to `apps/beach-web` and configure Vite to emit the WASM artifact alongside the JS chunk (ensure `vite.config.ts` includes `wasm` in asset handling).
+   - Add the dependency to `apps/beach-surfer` and configure Vite to emit the WASM artifact alongside the JS chunk (ensure `vite.config.ts` includes `wasm` in asset handling).
    - Provide a thin loader (`transport/crypto/argon2.ts`) that initialises the WASM once, caches the promise, and surfaces a typed API.
 
 2. **Derivation helper implementation**
    - Replace `derivePreSharedKey` in `sharedKey.ts` to call the loader with parameters matching the Rust defaults (`memoryCost: 65536`, `timeCost: 3`, `parallelism: 1`, `hashLen: 32`, `type: Argon2id`).
    - Maintain the existing async contract and return a `Uint8Array` without base64 conversion.
-   - Emit `console.error('[beach-web] argon2 derive failed', err)` before rethrow so the UI surfaces actionable errors during rollout.
+   - Emit `console.error('[beach-surfer] argon2 derive failed', err)` before rethrow so the UI surfaces actionable errors during rollout.
 
 3. **Parity verification**
    - Add Jest/Vitest unit tests that compare the browser-derived output against known vectors exported from the Rust side (`derive_pre_shared_key`), covering different passphrase lengths and salts.
@@ -193,7 +193,7 @@ Bring `apps/beach-web` in line with the Rust toolchain by deriving sealed-signal
 
 ## Phase 4/A1 Progress Notes (2025-10-14)
 - Replaced the PBKDF2 stopgap with `@noble/hashes/argon2idAsync`, wiring it through `derivePreSharedKey` so the web client now derives the same 32-byte PSK (t=3, m=64 MiB, p=1) as the Rust toolchain.
-- Added a lazy loader (`apps/beach-web/src/transport/crypto/argon2.ts`) and parity test (`sharedKey.test.ts`) that asserts the browser output matches Rust vectors (`939fee58…943fc` for the reference input).
+- Added a lazy loader (`apps/beach-surfer/src/transport/crypto/argon2.ts`) and parity test (`sharedKey.test.ts`) that asserts the browser output matches Rust vectors (`939fee58…943fc` for the reference input).
 - Observed derivation latency of ~2.2 s under Vitest’s Node backend; need follow-up browser profiling to ensure UI stays responsive (consider yielding via `argon2idAsync`’s `asyncTick` if required).
 - Cleared the previous `argon2-browser` TODO in the decision log; noble’s pure JS implementation keeps the bundle dependency-free while we evaluate whether a dedicated WASM build is still necessary.
 
@@ -220,8 +220,8 @@ Bring `apps/beach-web` in line with the Rust toolchain by deriving sealed-signal
 
 ## Phase 4/A3 Progress Notes (2025-10-11)
 - Adopted `noise-c.wasm` for the browser handshake to stay aligned with the CLI’s `snow` implementation. It is the only JS option we found with first-class `XXpsk2` and PSK injection; bundle size lands at ~240 KB pre-minify and loads via Vite using an explicit `locateFile` + preloaded WASM binary shim.
-- Implemented `runBrowserHandshake` in `apps/beach-web/src/transport/crypto/noiseHandshake.ts`, mirroring the CLI prologue, channel binding, and HKDF derivation. The helper drives the data-channel handshake loop, returns `{ sendKey, recvKey, verificationCode }`, and reuses pre-shared keys derived during sealed signaling when available.
-- Added `SecureDataChannel` to wrap WebRTC payloads with ChaCha20-Poly1305 (`apps/beach-web/src/transport/crypto/secureDataChannel.ts`). The wrapper enforces versioned framing (`1 || counter_be || ciphertext`), maintains monotonic counters, and surfaces decrypted `message` events to the existing transport layer.
+- Implemented `runBrowserHandshake` in `apps/beach-surfer/src/transport/crypto/noiseHandshake.ts`, mirroring the CLI prologue, channel binding, and HKDF derivation. The helper drives the data-channel handshake loop, returns `{ sendKey, recvKey, verificationCode }`, and reuses pre-shared keys derived during sealed signaling when available.
+- Added `SecureDataChannel` to wrap WebRTC payloads with ChaCha20-Poly1305 (`apps/beach-surfer/src/transport/crypto/secureDataChannel.ts`). The wrapper enforces versioned framing (`1 || counter_be || ciphertext`), maintains monotonic counters, and surfaces decrypted `message` events to the existing transport layer.
 - Integrated the handshake and wrapper into `connectWebRtcTransport`: answerer now waits for `beach-secure-handshake`, runs `runBrowserHandshake` as the responder, and only exposes the terminal channel once the verification code and AEAD keys are live.
 - Surfaced secure status + SAS in `BeachTerminal` so hosts/participants see “Secure” or “Plaintext” badges alongside the 6-digit verification code; the badge updates via the new `secure` transport event.
 - Emitting structured telemetry to `/telemetry/secure-transport` for success/failure/fallback paths (latency, role, handshake id, reason) to feed the Grafana alerts.

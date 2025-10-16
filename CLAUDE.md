@@ -8,7 +8,7 @@ Beach is a terminal sharing application that uses WebRTC and WebSocket transport
 
 - **beach** (`apps/beach/`) — Rust terminal client for hosting/joining sessions
 - **beach-road** (`apps/beach-road/`) — Rust session server (broker/signaling)
-- **beach-web** (`apps/beach-web/`) — React/TypeScript web client
+- **beach-surfer** (`apps/beach-surfer/`) — React/TypeScript web client
 
 ## Development Commands
 
@@ -39,23 +39,23 @@ cargo fmt
 cargo clippy
 ```
 
-### Web Application (beach-web)
+### Web Application (beach-surfer)
 
 ```bash
 # Development server
-cd apps/beach-web && npm run dev
+cd apps/beach-surfer && npm run dev
 
 # Build
-cd apps/beach-web && npm run build
+cd apps/beach-surfer && npm run build
 
 # Run tests
-cd apps/beach-web && npm run test
+cd apps/beach-surfer && npm run test
 
 # Watch tests
-cd apps/beach-web && npm run test:watch
+cd apps/beach-surfer && npm run test:watch
 
 # Preview production build
-cd apps/beach-web && npm run preview
+cd apps/beach-surfer && npm run preview
 ```
 
 ### Integration Tests
@@ -114,7 +114,7 @@ Key modules:
 - **storage.rs** — Redis session storage
 - **cli.rs** — CLI with debug client commands
 
-### beach-web (`apps/beach-web/`)
+### beach-surfer (`apps/beach-surfer/`)
 
 React/TypeScript web client for joining terminal sessions:
 
@@ -147,7 +147,7 @@ cargo run -p beach -- --session-server http://localhost:8080
 cargo run -p beach -- join <SESSION_ID>
 
 # Or join via web client
-cd apps/beach-web && npm run dev
+cd apps/beach-surfer && npm run dev
 # Navigate to http://localhost:5173 and enter session ID
 ```
 
@@ -168,7 +168,7 @@ cargo run -p beach -- ssh user@host
 - `RUST_LOG` — Logging level (default: warn)
 - `BEACH_ROAD_PORT` — Server port (default: 8080)
 
-### Playwright Tests (beach-web)
+### Playwright Tests (beach-surfer)
 ```bash
 # Install browsers
 npx playwright install

@@ -24,7 +24,7 @@
 ## System Architecture (Draft)
 ```
 ┌────────────────────────────────────────────────────────────┐
-│                  Private Beach Web (Next.js)               │
+│               Private Beach Surfer (Next.js)              │
 │  UI, Dashboard Layouts, Auth, Manager Workflows            │
 └───────────────┬──────────────────────┬──────────────────────┘
                 │                      │
@@ -51,7 +51,7 @@
 - **Beach Manager Control Plane:** Rust service that validates entitlements, manages the session registry, issues controller leases, bootstraps automation agents (prompt templates, MCP bridge config), enforces zero-trust policy, and persists audit events.
 - **Beach Buggy Harness Layer:** Rust crate powering terminal/Cabana harnesses with diff codecs, OCR/semantic extraction, and action execution under tight latency budgets.
 - **Data Layer:** Postgres for relational state (organizations, beaches, memberships, automation policies); Redis for ephemeral state, KV, and pub/sub triggers; optional S3-compatible object store for file persistence.
-- **Integration Points:** `beach-web`, `apps/beach`, `beach-cabana`, `apps/private-beach`, Beach Gate, and third-party MCP agents.
+- **Integration Points:** `beach-surfer`, `apps/beach`, `beach-cabana`, `apps/private-beach`, Beach Gate, and third-party MCP agents.
 
 ### Beach Manager Responsibilities
 - **Session Registry:** authoritative inventory of sessions, harness metadata, controller leases, and layout assignments for each private beach.

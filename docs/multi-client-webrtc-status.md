@@ -44,7 +44,7 @@
 ## Runbook (after implementation)
 ```bash
 cargo test -p beach --test webrtc_transport
-pnpm --filter beach-web test -- --runInBand
+pnpm --filter beach-surfer test -- --runInBand
 
 # Manual smoke
 cargo run -p beach-road

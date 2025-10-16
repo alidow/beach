@@ -1,6 +1,6 @@
-# Beach Web — Join Authorization Waiting UX
+# Beach Surfer — Join Authorization Waiting UX
 
-This complements server and CLI plans by detailing the browser (beach‑web) experience while a viewer waits for host approval.
+This complements server and CLI plans by detailing the Beach Surfer browser experience while a viewer waits for host approval.
 
 ## Context
 - Host approval gates when the server begins sending sync frames (Hello/Grid). The WebRTC data channel may already be open, but the host has not authorized the viewer yet.
@@ -14,7 +14,7 @@ This complements server and CLI plans by detailing the browser (beach‑web) exp
 - Mobile‑friendly and resilient to slow networks.
 
 ## Implementation Status
-- ✅ Overlay UX wired into `apps/beach-web/src/components/BeachTerminal.tsx` with CSS spinner, timed hints, and `beach:status:*` handling.
+- ✅ Overlay UX wired into `apps/beach-surfer/src/components/BeachTerminal.tsx` with CSS spinner, timed hints, and `beach:status:*` handling.
 - ✅ Server sends `beach:status:approval_{pending,granted,denied}` so the browser can react immediately.
 - ✅ Optional viewer label supported via the `label` query parameter (forwarded to the host prompt).
 - ⬜ Optional telemetry and toast/CTA polish remain future work.
@@ -48,7 +48,7 @@ This complements server and CLI plans by detailing the browser (beach‑web) exp
 - No additional buffering is required—the client simply discards pre-handshake input.
 
 ## Component Design
-- Location: `apps/beach-web/src/components/BeachTerminal.tsx`.
+- Location: `apps/beach-surfer/src/components/BeachTerminal.tsx`.
 - `JoinStatusOverlay` renders within the wrapper (absolute positioning, pointer-events none) and receives the derived state/message.
 - State machine:
   - `idle` → `connecting` when an auto-connect attempt starts.
@@ -77,7 +77,7 @@ This complements server and CLI plans by detailing the browser (beach‑web) exp
 ## Telemetry
 - TODO: add timings such as `dc_open_to_hello_ms`, `waiting_duration_ms`, `denied_count` once instrumentation infrastructure lands.
 
-## Implementation Steps (beach-web)
+## Implementation Steps (beach-surfer)
 1) ✅ Overlay component + styles (`JoinStatusOverlay`) with accessibility-conscious copy.
 2) ✅ Extended `BeachTerminal` state machine (`joinState`, timers, `handshakeReadyRef`).
 3) ✅ Reused existing `subscriptionRef` gating for input; no additional buffering required.

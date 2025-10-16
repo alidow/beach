@@ -1,4 +1,4 @@
-# Beach Web Client (TypeScript + React) – Phased Plan
+# Beach Surfer Client (TypeScript + React) – Phased Plan
 
 Goals
 - Ergonomic: a drop‑in React component with a small, intuitive API; easy to mock, test, and theme.
@@ -20,8 +20,8 @@ Deliverables & Phases
 
 Phase 0 — Foundations
 - Deliverables
-  - apps/beach-web/ scaffold (Vite, React, TypeScript).
-  - Shared ESM package inside apps/beach-web/src for protocol types and codec.
+  - apps/beach-surfer/ scaffold (Vite, React, TypeScript).
+  - Shared ESM package inside apps/beach-surfer/src for protocol types and codec.
   - Tooling: ESLint, Prettier, tsconfig strict, vitest for unit tests.
 - DevX
   - Local .env support for session server base URL.

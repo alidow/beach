@@ -53,7 +53,7 @@ function trace(...args: unknown[]): void {
   if (typeof window !== 'undefined' && window.__BEACH_TRACE) {
     if (!versionLogged) {
       versionLogged = true;
-      console.info('[beach-web] version', __APP_VERSION__);
+      console.info('[beach-surfer] version', __APP_VERSION__);
     }
     console.debug('[beach-trace][terminal]', ...args);
   }
@@ -416,7 +416,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       return;
     }
     const current = peerIdRef.current;
-    const prefix = current ? `[beach-web:${current.slice(0, 8)}]` : '[beach-web]';
+    const prefix = current ? `[beach-surfer:${current.slice(0, 8)}]` : '[beach-surfer]';
     if (detail) {
       console.info(`${prefix} ${message}`, detail);
     } else {
@@ -753,7 +753,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           return;
         }
         const errorInstance = err instanceof Error ? err : new Error(String(err));
-        console.error('[beach-web] transport connect failed', errorInstance);
+        console.error('[beach-surfer] transport connect failed', errorInstance);
         const message = errorInstance.message ?? '';
         const fallbackDenied = message.includes(FALLBACK_ENTITLEMENT_SUBSTRING);
         setJoinState('denied');

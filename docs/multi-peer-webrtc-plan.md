@@ -3,7 +3,7 @@
 _Last updated: 2025-09-29_
 
 ## Goals
-- Support up to 100 concurrent WebRTC data channels between a single host (`beach`) and many viewers (`beach-web`, CLI joiners, future native clients).
+- Support up to 100 concurrent WebRTC data channels between a single host (`beach`) and many viewers (`beach-surfer`, CLI joiners, future native clients).
 - Eliminate the single-offer bottleneck by multiplexing all signaling over the existing WebSocket (`/ws/:session_id`) and avoiding the HTTP poll endpoints.
 - Prevent stale transports from injecting input once a new handshake supersedes them, while preserving the low-latency properties we rely on today.
 - Introduce a lightweight, Mosh-style ordering model so the host can discard client keystrokes that were produced against an out-of-date terminal view.
@@ -111,7 +111,7 @@ HostFrame::InputAck {
     global_seq: u64,   // new: authoritative order index
 }
 ```
-Encoding changes propagate to the binary codec (`apps/beach/src/protocol/wire.rs`, `apps/beach-web/src/protocol/wire.ts`). Older clients that omit `base_seq` will be rejected during feature negotiation (handled via `protocol_version` bump).
+Encoding changes propagate to the binary codec (`apps/beach/src/protocol/wire.rs`, `apps/beach-surfer/src/protocol/wire.ts`). Older clients that omit `base_seq` will be rejected during feature negotiation (handled via `protocol_version` bump).
 
 ## Component Responsibilities
 ### beach-road
@@ -132,7 +132,7 @@ Encoding changes propagate to the binary codec (`apps/beach/src/protocol/wire.rs
 - Update input pipeline (`spawn_input_listener`): record `global_input_seq` (AtomicU64 shared across transports), enforce the three drop rules, and echo `global_seq` back in `InputAck`.
 - Ensure rejects are silent (just drop) so we avoid extra host frames. The UI will quickly resync because clients refresh their `base_seq` on the next host frame.
 
-### beach-web (browser) & CLI joiners
+### beach-surfer (browser) & CLI joiners
 - Persist the latest `global_seq` from `HostFrame::InputAck` (and from initial snapshot/hello which we augment with the current value).
 - When sending input, fill the new `base_seq` field. If the browser receives `transport_closed` for its handshake, it tears down the RTC connection and awaits a new proposal.
 - Update the signaling client to understand the richer message set and to manage multiple concurrent handshakes (important for future multi-tab support).

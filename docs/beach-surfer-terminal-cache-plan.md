@@ -1,4 +1,4 @@
-# beach-web Terminal Cache Plan
+# Beach Surfer Terminal Cache Plan
 
 ## Context
 
@@ -25,7 +25,7 @@ Because the web client lacks this structure, we encounter issues:
 
 ### 1. Core Cache Module
 
-Create `apps/beach-web/src/terminal/cache.ts` that exports a `TerminalGridCache` class with behaviours parallel to Rust's `TerminalGrid`/`GridRenderer` combo:
+Create `apps/beach-surfer/src/terminal/cache.ts` that exports a `TerminalGridCache` class with behaviours parallel to Rust's `TerminalGrid`/`GridRenderer` combo:
 
 - Fixed-size ring buffer backing storage (configurable max history, default 5_000 rows)
 - `baseRow`, `rows`, `cols`, `followTail`, `scrollTop`, `viewportHeight`
@@ -88,7 +88,7 @@ Use fixtures derived from Rust tests where possible to ensure parity.
 3. Update `buildLines` to consume the cache's `visibleRows`
 4. Validate behaviour end-to-end (manual session + Vitest)
 5. Remove legacy map-based storage and temporary debug logs
-6. Document the architecture in `docs/beach-web-terminal-cache-plan.md` (this file)
+6. Document the architecture in `docs/beach-surfer-terminal-cache-plan.md` (this file)
 
 ## Open Questions
 

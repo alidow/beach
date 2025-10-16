@@ -2,7 +2,7 @@
 
 _Last updated: 2025-09-30_
 
-When we added WebRTC fan-out, every viewer began participating in the same PTY resize loop. The host accepts a `resize(cols, rows)` from whichever client sends it, adjusts the PTY, and broadcasts a `Grid` frame to all participants. Because that `Grid` frame currently includes the newly chosen `viewportRows`, every other client dutifully grows its own terminal, measures the larger viewport, and emits a *new* resize. The host honors it, rebroadcasts, and the loop repeats—Rust CLI, beach-web, everyone. The root problem is that we’re conflating the shared terminal buffer with each viewer’s local presentation geometry.
+When we added WebRTC fan-out, every viewer began participating in the same PTY resize loop. The host accepts a `resize(cols, rows)` from whichever client sends it, adjusts the PTY, and broadcasts a `Grid` frame to all participants. Because that `Grid` frame currently includes the newly chosen `viewportRows`, every other client dutifully grows its own terminal, measures the larger viewport, and emits a *new* resize. The host honors it, rebroadcasts, and the loop repeats—Rust CLI, beach-surfer, everyone. The root problem is that we’re conflating the shared terminal buffer with each viewer’s local presentation geometry.
 
 ## Guiding principles
 
@@ -17,7 +17,7 @@ When we added WebRTC fan-out, every viewer began participating in the same PTY r
   - Remove (or clearly mark as advisory) `viewport_rows` from the broadcast `HostFrame::Grid`. Optionally send the new viewport height only to the client that initiated the resize so it knows the PTY was updated.
   - Do *not* overwrite every other client’s viewport height when a resize arrives.
 
-- **Viewers (Rust CLI + beach-web):**
+- **Viewers (Rust CLI + beach-surfer):**
   - Measure the local container/window (crossterm `Event::Resize` in Rust; `ResizeObserver` in React) and keep that as the actual viewport height.
   - Ignore the server’s `viewport_rows` unless they were the original requester. In practice, clamp to `min(localMeasured, serverSuggestion)` or just drop the field entirely.
   - Only send a new resize when the user changes the local window size, not because the host shipped a bigger `Grid`.
@@ -50,8 +50,8 @@ With these changes in place:
    - Remove usage of `viewport_rows` in `apps/beach/src/client/terminal.rs` so the TUI relies solely on local `Event::Resize` measurements.
    - Ensure renderer helpers don’t try to force the viewport to match the broadcasted height.
 
-5. **Update beach-web**
-   - Drop remaining dependencies on server-supplied viewport heights in `apps/beach-web/src/components/BeachTerminal.tsx`; rely on `ResizeObserver` + internal clamps.
+5. **Update beach-surfer**
+   - Drop remaining dependencies on server-supplied viewport heights in `apps/beach-surfer/src/components/BeachTerminal.tsx`; rely on `ResizeObserver` + internal clamps.
    - Simplify temporary suppression logic once the host stops broadcasting the field.
 
 6. **Clean up tests & add regression coverage**

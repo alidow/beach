@@ -63,7 +63,7 @@
 cargo test -p beach
 
 # run web unit tests (ignores Playwright)
-npm --prefix apps/beach-web test -- --runInBand --passWithNoTests tests/header-overlap.spec.ts
+npm --prefix apps/beach-surfer test -- --runInBand --passWithNoTests tests/header-overlap.spec.ts
 
 # enable trace logging for cursor debug
 export RUST_LOG=client::render=trace

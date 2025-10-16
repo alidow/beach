@@ -1,11 +1,11 @@
-# Beach WebRTC Handshake Regression
+# Beach Surfer WebRTC Handshake Regression
 
 _Last updated: 2025-09-28_
 
 ## Repro setup
 - Host: `cargo run -- --session-server http://127.0.0.1:8080 --log-file ~/beach-debug/host.log`
 - Signaling (beach-road): `cargo run`
-- Browser client: `pnpm --filter beach-web dev` (open the advertised session URL in http://localhost:5173)
+- Browser client: `pnpm --filter beach-surfer dev` (open the advertised session URL in http://localhost:5173)
 
 ## What used to go wrong
 - Signaling completed (offer/answer exchange, ICE trickle), but the browser never rendered the host prompt.
@@ -19,7 +19,7 @@ The browser sent the `"__ready__"` sentinel from the RTCPeerConnection `onopen` 
 ## Fix implemented on 2025-09-28
 - `WebRtcTransport` now exposes an `isOpen()` helper so higher-level code can detect when the channel is actually ready.
 - `DataChannelTerminalTransport` sends the `"__ready__"` sentinel only after it has installed its message listeners. If the data channel opens later, it waits for the `open` event before sending.
-- Added regression tests (`apps/beach-web/src/transport/terminalTransport.test.ts`) to cover both the “already open” and “open later” paths, ensuring the sentinel fires exactly once.
+- Added regression tests (`apps/beach-surfer/src/transport/terminalTransport.test.ts`) to cover both the “already open” and “open later” paths, ensuring the sentinel fires exactly once.
 
 This guarantees the host will not send Hello/Grid/Snapshot until the browser is prepared to receive them.
 
@@ -549,32 +549,32 @@ hi
 
 console log: ```chunk-V2JXGMUL.js?v=5c52638e:21549 Download the React DevTools for a better development experience: https://reactjs.org/link/react-devtools
 favicon.ico:1  GET http://localhost:5173/favicon.ico 404 (Not Found)
-BeachTerminal.tsx:89 [beach-web] join_success payload: {"type":"join_success","session_id":"0dd900a5-ce1b-4fd6-b4af-e9f87aa6a038","peer_id":"5b1e4ad7-5e14-4b89-be6b-8c5a6a5762e2","peers":[{"id":"4a39cd87-ab32-423d-86aa-bb2a293d263e","role":"client","joined_at":1759099725,"supported_transports":["webrtc"],"preferred_transport":"webrtc"},{"id":"8dd3939f-bae1-48d8-82ff-6adc21787b51","role":"server","joined_at":1759099725,"supported_transports":["webrtc"],"preferred_transport":"webrtc"},{"id":"5b1e4ad7-5e14-4b89-be6b-8c5a6a5762e2","role":"client","joined_at":1759099725,"supported_transports":["webrtc"],"preferred_transport":null},{"id":"b5a95d8d-5dbf-44fa-b762-8f1b0d6fd7e3","role":"client","joined_at":1759099725,"supported_transports":["webrtc"],"preferred_transport":"webrtc"}],"available_transports":["webrtc"]}
-BeachTerminal.tsx:89 [beach-web] remote peer resolved: 8dd3939f-bae1-48d8-82ff-6adc21787b51
-BeachTerminal.tsx:89 [beach-web] polling for SDP offer
-BeachTerminal.tsx:89 [beach-web] polled SDP at http://127.0.0.1:8080/sessions/0dd900a5-ce1b-4fd6-b4af-e9f87aa6a038/webrtc/offer
-BeachTerminal.tsx:89 [beach-web] SDP offer received
-BeachTerminal.tsx:89 [beach-web] waiting for data channel announcement
-BeachTerminal.tsx:89 [beach-web] signaling state: have-remote-offer
-BeachTerminal.tsx:89 [beach-web] signaling state: stable
-BeachTerminal.tsx:89 [beach-web] ice gathering state: gathering
-BeachTerminal.tsx:89 [beach-web] local candidate queued: {"candidate":"candidate:2705597802 1 udp 2113937151 5c210355-1aca-4274-8a1c-7a9cd191743e.local 53821 typ host generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
-BeachTerminal.tsx:89 [beach-web] SDP answer posted
-BeachTerminal.tsx:89 [beach-web] local candidate queued: {"candidate":"candidate:2028413328 1 udp 1677729535 72.227.131.114 53821 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
-BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidate:2705597802 1 udp 2113937151 5c210355-1aca-4274-8a1c-7a9cd191743e.local 53821 typ host generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
-BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidate:2028413328 1 udp 1677729535 72.227.131.114 53821 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
-BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidate:2705597802 1 udp 2113937151 5c210355-1aca-4274-8a1c-7a9cd191743e.local 53821 typ host generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
-BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidate:2028413328 1 udp 1677729535 72.227.131.114 53821 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
-BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidate:2705597802 1 udp 2113937151 5c210355-1aca-4274-8a1c-7a9cd191743e.local 53821 typ host generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
-BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidate:2028413328 1 udp 1677729535 72.227.131.114 53821 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
-BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidate:2705597802 1 udp 2113937151 5c210355-1aca-4274-8a1c-7a9cd191743e.local 53821 typ host generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
-BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidate:2028413328 1 udp 1677729535 72.227.131.114 53821 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
-BeachTerminal.tsx:89 [beach-web] ice gathering state: complete```
+BeachTerminal.tsx:89 [beach-surfer] join_success payload: {"type":"join_success","session_id":"0dd900a5-ce1b-4fd6-b4af-e9f87aa6a038","peer_id":"5b1e4ad7-5e14-4b89-be6b-8c5a6a5762e2","peers":[{"id":"4a39cd87-ab32-423d-86aa-bb2a293d263e","role":"client","joined_at":1759099725,"supported_transports":["webrtc"],"preferred_transport":"webrtc"},{"id":"8dd3939f-bae1-48d8-82ff-6adc21787b51","role":"server","joined_at":1759099725,"supported_transports":["webrtc"],"preferred_transport":"webrtc"},{"id":"5b1e4ad7-5e14-4b89-be6b-8c5a6a5762e2","role":"client","joined_at":1759099725,"supported_transports":["webrtc"],"preferred_transport":null},{"id":"b5a95d8d-5dbf-44fa-b762-8f1b0d6fd7e3","role":"client","joined_at":1759099725,"supported_transports":["webrtc"],"preferred_transport":"webrtc"}],"available_transports":["webrtc"]}
+BeachTerminal.tsx:89 [beach-surfer] remote peer resolved: 8dd3939f-bae1-48d8-82ff-6adc21787b51
+BeachTerminal.tsx:89 [beach-surfer] polling for SDP offer
+BeachTerminal.tsx:89 [beach-surfer] polled SDP at http://127.0.0.1:8080/sessions/0dd900a5-ce1b-4fd6-b4af-e9f87aa6a038/webrtc/offer
+BeachTerminal.tsx:89 [beach-surfer] SDP offer received
+BeachTerminal.tsx:89 [beach-surfer] waiting for data channel announcement
+BeachTerminal.tsx:89 [beach-surfer] signaling state: have-remote-offer
+BeachTerminal.tsx:89 [beach-surfer] signaling state: stable
+BeachTerminal.tsx:89 [beach-surfer] ice gathering state: gathering
+BeachTerminal.tsx:89 [beach-surfer] local candidate queued: {"candidate":"candidate:2705597802 1 udp 2113937151 5c210355-1aca-4274-8a1c-7a9cd191743e.local 53821 typ host generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
+BeachTerminal.tsx:89 [beach-surfer] SDP answer posted
+BeachTerminal.tsx:89 [beach-surfer] local candidate queued: {"candidate":"candidate:2028413328 1 udp 1677729535 72.227.131.114 53821 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
+BeachTerminal.tsx:89 [beach-surfer] sending local candidate: {"candidate":"candidate:2705597802 1 udp 2113937151 5c210355-1aca-4274-8a1c-7a9cd191743e.local 53821 typ host generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
+BeachTerminal.tsx:89 [beach-surfer] sending local candidate: {"candidate":"candidate:2028413328 1 udp 1677729535 72.227.131.114 53821 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
+BeachTerminal.tsx:89 [beach-surfer] sending local candidate: {"candidate":"candidate:2705597802 1 udp 2113937151 5c210355-1aca-4274-8a1c-7a9cd191743e.local 53821 typ host generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
+BeachTerminal.tsx:89 [beach-surfer] sending local candidate: {"candidate":"candidate:2028413328 1 udp 1677729535 72.227.131.114 53821 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
+BeachTerminal.tsx:89 [beach-surfer] sending local candidate: {"candidate":"candidate:2705597802 1 udp 2113937151 5c210355-1aca-4274-8a1c-7a9cd191743e.local 53821 typ host generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
+BeachTerminal.tsx:89 [beach-surfer] sending local candidate: {"candidate":"candidate:2028413328 1 udp 1677729535 72.227.131.114 53821 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
+BeachTerminal.tsx:89 [beach-surfer] sending local candidate: {"candidate":"candidate:2705597802 1 udp 2113937151 5c210355-1aca-4274-8a1c-7a9cd191743e.local 53821 typ host generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
+BeachTerminal.tsx:89 [beach-surfer] sending local candidate: {"candidate":"candidate:2028413328 1 udp 1677729535 72.227.131.114 53821 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag urNL network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"urNL"}
+BeachTerminal.tsx:89 [beach-surfer] ice gathering state: complete```
 
-important: i connected the rust client first, then connected the beach-web client. it's only if i connect beach web AFTER connecting the rust client that it times out
+important: i connected the rust client first, then connected the beach-surfer client. it's only if i connect beach web AFTER connecting the rust client that it times out
 
 Diagnosis (2025-09-29):
-- The host-side signaling client (`apps/beach/src/transport/webrtc/signaling.rs`) freezes the first client peer ID it observes and keeps routing WebRTC signals to that peer. When the Rust CLI joins before beach-web, the offerer never retargets, so the browser's answer/ICE/readiness frames are dropped. The offerer times out waiting for `__ready__`, continues to speak into a closed channel, and the new client never finishes handshaking.
+- The host-side signaling client (`apps/beach/src/transport/webrtc/signaling.rs`) freezes the first client peer ID it observes and keeps routing WebRTC signals to that peer. When the Rust CLI joins before beach-surfer, the offerer never retargets, so the browser's answer/ICE/readiness frames are dropped. The offerer times out waiting for `__ready__`, continues to speak into a closed channel, and the new client never finishes handshaking.
 
 Proposed fix:
 - Teach the signaling helper to adopt the peer that is actually negotiating WebRTC: pick up the requester from `transport_proposal`, switch to whichever peer sends WebRTC `signal` frames, and clear the assignment when that participant drops. Once the remote peer ID follows the current negotiator, the browser's signals reach the offerer and the readiness exchange should succeed.
@@ -589,34 +589,34 @@ Latest most recent update:
 
 fixes didn't work.
 
-ok fixed the rust client connection issue, but the beach-web client still times out if it doesn't connect first
+ok fixed the rust client connection issue, but the beach-surfer client still times out if it doesn't connect first
 
 Console: ```chunk-V2JXGMUL.js?v=5c52638e:21549 Download the React DevTools for a better development experience: https://reactjs.org/link/react-devtools
 favicon.ico:1  GET http://localhost:5173/favicon.ico 404 (Not Found)
-BeachTerminal.tsx:89 [beach-web] join_success payload: {"type":"join_success","session_id":"37947890-7cc8-41e0-a1aa-007377847a99","peer_id":"ddc11e3a-0600-4319-ad59-edc8f9d5d914","peers":[{"id":"3ff99b94-7d73-4928-b6ac-14d706034172","role":"server","joined_at":1759105754,"supported_transports":["webrtc"],"preferred_transport":"webrtc"},{"id":"353847d9-67b8-4bb0-a33a-ecf99b651999","role":"client","joined_at":1759105754,"supported_transports":["webrtc"],"preferred_transport":"webrtc"},{"id":"93d239af-739e-41bd-a047-c2588aacf488","role":"client","joined_at":1759105754,"supported_transports":["webrtc"],"preferred_transport":"webrtc"},{"id":"ddc11e3a-0600-4319-ad59-edc8f9d5d914","role":"client","joined_at":1759105754,"supported_transports":["webrtc"],"preferred_transport":null}],"available_transports":["webrtc"]}
-BeachTerminal.tsx:89 [beach-web] remote peer resolved: 3ff99b94-7d73-4928-b6ac-14d706034172
-BeachTerminal.tsx:89 [beach-web] polling for SDP offer
-BeachTerminal.tsx:89 [beach-web] polled SDP at http://127.0.0.1:8080/sessions/37947890-7cc8-41e0-a1aa-007377847a99/webrtc/offer
-BeachTerminal.tsx:89 [beach-web] SDP offer received
-BeachTerminal.tsx:89 [beach-web] waiting for data channel announcement
-BeachTerminal.tsx:89 [beach-web] signaling state: have-remote-offer
-BeachTerminal.tsx:89 [beach-web] signaling state: stable
-BeachTerminal.tsx:89 [beach-web] ice gathering state: gathering
-BeachTerminal.tsx:89 [beach-web] local candidate queued: {"candidate":"candidate:5606886 1 udp 2113937151 f48d1ff3-9ed3-45c2-a73f-a9f7ac97b2e4.local 62250 typ host generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
-BeachTerminal.tsx:89 [beach-web] SDP answer posted
-BeachTerminal.tsx:89 [beach-web] local candidate queued: {"candidate":"candidate:3656812828 1 udp 1677729535 72.227.131.114 62250 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
-BeachTerminal.tsx:89 [beach-web] signal message: {"signal":{"candidate":"candidate:2193730423 1 udp 2130706431 100.88.228.18 56916 typ host","sdp_mid":"","sdp_mline_index":0,"signal_type":"ice_candidate"},"transport":"webrtc"}
-BeachTerminal.tsx:89 [beach-web] signal message: {"signal":{"candidate":"candidate:2839139417 1 udp 2130706431 fd7a:115c:a1e0::3601:e412 61891 typ host","sdp_mid":"","sdp_mline_index":0,"signal_type":"ice_candidate"},"transport":"webrtc"}
-BeachTerminal.tsx:89 [beach-web] signal message: {"signal":{"candidate":"candidate:3173101093 1 udp 2130706431 192.168.68.52 59052 typ host","sdp_mid":"","sdp_mline_index":0,"signal_type":"ice_candidate"},"transport":"webrtc"}
-BeachTerminal.tsx:89 [beach-web] signal message: {"signal":{"candidate":"candidate:2323497841 1 udp 1694498815 72.227.131.114 61132 typ srflx raddr 0.0.0.0 rport 61132","sdp_mid":"","sdp_mline_index":0,"signal_type":"ice_candidate"},"transport":"webrtc"}
-BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidate:5606886 1 udp 2113937151 f48d1ff3-9ed3-45c2-a73f-a9f7ac97b2e4.local 62250 typ host generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
-BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidate:3656812828 1 udp 1677729535 72.227.131.114 62250 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
-BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidate:5606886 1 udp 2113937151 f48d1ff3-9ed3-45c2-a73f-a9f7ac97b2e4.local 62250 typ host generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
-BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidate:3656812828 1 udp 1677729535 72.227.131.114 62250 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
-BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidate:5606886 1 udp 2113937151 f48d1ff3-9ed3-45c2-a73f-a9f7ac97b2e4.local 62250 typ host generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
-BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidate:3656812828 1 udp 1677729535 72.227.131.114 62250 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
-BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidate:5606886 1 udp 2113937151 f48d1ff3-9ed3-45c2-a73f-a9f7ac97b2e4.local 62250 typ host generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
-BeachTerminal.tsx:89 [beach-web] sending local candidate: {"candidate":"candidate:3656812828 1 udp 1677729535 72.227.131.114 62250 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}```
+BeachTerminal.tsx:89 [beach-surfer] join_success payload: {"type":"join_success","session_id":"37947890-7cc8-41e0-a1aa-007377847a99","peer_id":"ddc11e3a-0600-4319-ad59-edc8f9d5d914","peers":[{"id":"3ff99b94-7d73-4928-b6ac-14d706034172","role":"server","joined_at":1759105754,"supported_transports":["webrtc"],"preferred_transport":"webrtc"},{"id":"353847d9-67b8-4bb0-a33a-ecf99b651999","role":"client","joined_at":1759105754,"supported_transports":["webrtc"],"preferred_transport":"webrtc"},{"id":"93d239af-739e-41bd-a047-c2588aacf488","role":"client","joined_at":1759105754,"supported_transports":["webrtc"],"preferred_transport":"webrtc"},{"id":"ddc11e3a-0600-4319-ad59-edc8f9d5d914","role":"client","joined_at":1759105754,"supported_transports":["webrtc"],"preferred_transport":null}],"available_transports":["webrtc"]}
+BeachTerminal.tsx:89 [beach-surfer] remote peer resolved: 3ff99b94-7d73-4928-b6ac-14d706034172
+BeachTerminal.tsx:89 [beach-surfer] polling for SDP offer
+BeachTerminal.tsx:89 [beach-surfer] polled SDP at http://127.0.0.1:8080/sessions/37947890-7cc8-41e0-a1aa-007377847a99/webrtc/offer
+BeachTerminal.tsx:89 [beach-surfer] SDP offer received
+BeachTerminal.tsx:89 [beach-surfer] waiting for data channel announcement
+BeachTerminal.tsx:89 [beach-surfer] signaling state: have-remote-offer
+BeachTerminal.tsx:89 [beach-surfer] signaling state: stable
+BeachTerminal.tsx:89 [beach-surfer] ice gathering state: gathering
+BeachTerminal.tsx:89 [beach-surfer] local candidate queued: {"candidate":"candidate:5606886 1 udp 2113937151 f48d1ff3-9ed3-45c2-a73f-a9f7ac97b2e4.local 62250 typ host generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
+BeachTerminal.tsx:89 [beach-surfer] SDP answer posted
+BeachTerminal.tsx:89 [beach-surfer] local candidate queued: {"candidate":"candidate:3656812828 1 udp 1677729535 72.227.131.114 62250 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
+BeachTerminal.tsx:89 [beach-surfer] signal message: {"signal":{"candidate":"candidate:2193730423 1 udp 2130706431 100.88.228.18 56916 typ host","sdp_mid":"","sdp_mline_index":0,"signal_type":"ice_candidate"},"transport":"webrtc"}
+BeachTerminal.tsx:89 [beach-surfer] signal message: {"signal":{"candidate":"candidate:2839139417 1 udp 2130706431 fd7a:115c:a1e0::3601:e412 61891 typ host","sdp_mid":"","sdp_mline_index":0,"signal_type":"ice_candidate"},"transport":"webrtc"}
+BeachTerminal.tsx:89 [beach-surfer] signal message: {"signal":{"candidate":"candidate:3173101093 1 udp 2130706431 192.168.68.52 59052 typ host","sdp_mid":"","sdp_mline_index":0,"signal_type":"ice_candidate"},"transport":"webrtc"}
+BeachTerminal.tsx:89 [beach-surfer] signal message: {"signal":{"candidate":"candidate:2323497841 1 udp 1694498815 72.227.131.114 61132 typ srflx raddr 0.0.0.0 rport 61132","sdp_mid":"","sdp_mline_index":0,"signal_type":"ice_candidate"},"transport":"webrtc"}
+BeachTerminal.tsx:89 [beach-surfer] sending local candidate: {"candidate":"candidate:5606886 1 udp 2113937151 f48d1ff3-9ed3-45c2-a73f-a9f7ac97b2e4.local 62250 typ host generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
+BeachTerminal.tsx:89 [beach-surfer] sending local candidate: {"candidate":"candidate:3656812828 1 udp 1677729535 72.227.131.114 62250 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
+BeachTerminal.tsx:89 [beach-surfer] sending local candidate: {"candidate":"candidate:5606886 1 udp 2113937151 f48d1ff3-9ed3-45c2-a73f-a9f7ac97b2e4.local 62250 typ host generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
+BeachTerminal.tsx:89 [beach-surfer] sending local candidate: {"candidate":"candidate:3656812828 1 udp 1677729535 72.227.131.114 62250 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
+BeachTerminal.tsx:89 [beach-surfer] sending local candidate: {"candidate":"candidate:5606886 1 udp 2113937151 f48d1ff3-9ed3-45c2-a73f-a9f7ac97b2e4.local 62250 typ host generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
+BeachTerminal.tsx:89 [beach-surfer] sending local candidate: {"candidate":"candidate:3656812828 1 udp 1677729535 72.227.131.114 62250 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
+BeachTerminal.tsx:89 [beach-surfer] sending local candidate: {"candidate":"candidate:5606886 1 udp 2113937151 f48d1ff3-9ed3-45c2-a73f-a9f7ac97b2e4.local 62250 typ host generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}
+BeachTerminal.tsx:89 [beach-surfer] sending local candidate: {"candidate":"candidate:3656812828 1 udp 1677729535 72.227.131.114 62250 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag Q7sc network-cost 999","sdpMid":"0","sdpMLineIndex":0,"usernameFragment":"Q7sc"}```
 
 server: ```(base) arellidow@Arels-MacBook-Pro beach % cd ~/development/beach/apps/beach
 

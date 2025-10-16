@@ -9,7 +9,7 @@ Beach Manager is the zero-trust control plane that keeps Private Beach cohesive.
 
 ## High-Level Architecture
 1. **API Layer (Axum)**
-   - REST + WebSocket endpoints for the Private Beach web app.
+   - REST + WebSocket endpoints for the Private Beach Surfer app.
    - JSON-RPC/MCP endpoints for harnesses, agents, and CLI tools.
    - Beach Gate JWT verification middleware with capability scopes (e.g., `pb:session.read`, `pb:control.write`).
 2. **Domain Services**
@@ -23,7 +23,7 @@ Beach Manager is the zero-trust control plane that keeps Private Beach cohesive.
    - S3-compatible object store for persistent files and archival snapshots.
 4. **Integration Points**
    - Harness registration via `crates/beach-buggy` (terminal shim, Cabana adapter, future widgets).
-  - Private Beach web UI for human workflows.
+  - Private Beach Surfer UI for human workflows.
    - Agent SDKs (`crates/manager-sdk`) for bots or scripting.
    - Billing/analytics sinks (webhooks or internal pipelines).
 
@@ -67,7 +67,6 @@ Beach Manager is the zero-trust control plane that keeps Private Beach cohesive.
 - Self-hosting packaging: do we ship Helm charts/docker compose, and how does licensing enforcement work offline?
 
 ## Immediate Next Steps
-1. Flesh out API contracts (OpenAPI + MCP schema) covering registration, leases, actions, audit queries.
-2. Implement minimal data model migrations for organizations, private beaches, sessions, controller events.
-3. Build harness integration tests using `crates/beach-buggy` to validate registration and action round-trips.
-4. Draft agent onboarding templates (Pong demo, support SRE bot) to exercise prompt + capability wiring.
+1. Implement minimal data model migrations for organizations, private beaches, sessions, controller events.
+2. Build harness integration tests using `crates/beach-buggy` to validate registration and action round-trips.
+3. Draft agent onboarding templates (Pong demo, support SRE bot) to exercise prompt + capability wiring.

@@ -75,7 +75,7 @@ Integrate the existing Rust ↔ JS harness (`temp/crypto-interop`) into CI:
 
 ## Implementation Notes
 
-- Handshake flows in Rust (`apps/beach/src/transport/webrtc/secure_handshake.rs`) and the browser (`apps/beach-web/src/transport/crypto/noiseHandshake.ts`) now standardise on `Noise_XX_25519_ChaChaPoly_BLAKE2s` and deliberately omit Noise PSK variants.
+- Handshake flows in Rust (`apps/beach/src/transport/webrtc/secure_handshake.rs`) and the browser (`apps/beach-surfer/src/transport/crypto/noiseHandshake.ts`) now standardise on `Noise_XX_25519_ChaChaPoly_BLAKE2s` and deliberately omit Noise PSK variants.
 - Post-handshake verification is enforced by deriving the transport keys, a six-digit code, and a dedicated challenge key via HKDF, then exchanging an authenticated verification frame (`version | role | code | nonce | HMAC`). Any mismatch closes the channels and emits prominent warnings.
 - The interop harness (`temp/crypto-interop`) exposes a `noise-handshake` CLI, and Vitest coverage (`noiseHandshake.interop.test.ts`) keeps the JS and Rust derivations aligned.
 - These docs capture that the PSK enforcement is intentionally handled at the application layer until a PSK-capable WASM build exists.

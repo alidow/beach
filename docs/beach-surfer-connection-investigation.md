@@ -1,8 +1,8 @@
-# Beach Web Connection Investigation
+# Beach Surfer Connection Investigation
 
 ## Context
 
-We're chasing sub-second connection setup for beach-web. Baseline traces exceeded 7 s, dominated by two Argon2 derivations (one on the host, one in the browser). We changed the flow to stretch the passphrase once per session and use HKDF to derive a per-handshake key. The browser now front-loads the session key, and the host caches it. This should remove ~4 s of crypto work and pave the way for faster handshakes.
+We're chasing sub-second connection setup for beach-surfer. Baseline traces exceeded 7 s, dominated by two Argon2 derivations (one on the host, one in the browser). We changed the flow to stretch the passphrase once per session and use HKDF to derive a per-handshake key. The browser now front-loads the session key, and the host caches it. This should remove ~4 s of crypto work and pave the way for faster handshakes.
 
 ## Changes Made
 
@@ -14,7 +14,7 @@ All unit tests still pass (`cargo check`).
 
 ## Current Failure
 
-After deploying the changes, beach-web connects but fails the secure Noise handshake:
+After deploying the changes, beach-surfer connects but fails the secure Noise handshake:
 
 - Remote ICE candidates fail to decrypt with `authentication tag mismatch`.
 - Noise handshake aborts with `secure handshake verification failed (mac mismatch)` for handshake IDs `ba0d53e6-…` and `32612ea5-…`.
@@ -38,7 +38,7 @@ Another angle: browser caches handshake key per ID, but the offerer expects the 
 ## Progress (2025-10-15)
 
 - Added a `handshake_key` Rust utility (`temp/crypto-interop/src/bin/handshake_key.rs`) that derives the session-scoped key and handshake HKDF output from a passphrase/session/handshake triple, mirroring the host implementation.
-- Extended the Vitest interop suite (`apps/beach-web/src/transport/crypto/noiseHandshake.interop.test.ts`) to compare browser `deriveHandshakeKey` outputs against the Rust toolchain via the new binary. `npm run test -- noiseHandshake.interop.test.ts` now exercises three cases and passes; the command hit the CLI timeout after reporting success (~13 s runtime).
+- Extended the Vitest interop suite (`apps/beach-surfer/src/transport/crypto/noiseHandshake.interop.test.ts`) to compare browser `deriveHandshakeKey` outputs against the Rust toolchain via the new binary. `npm run test -- noiseHandshake.interop.test.ts` now exercises three cases and passes; the command hit the CLI timeout after reporting success (~13 s runtime).
 - Result: given matching inputs, both stacks derive identical session and handshake keys. The production mismatch must stem from runtime inputs (e.g., stale session IDs or fallback code paths), not algorithm differences.
 
 ## Progress (2025-10-16)
@@ -48,7 +48,7 @@ Another angle: browser caches handshake key per ID, but the offerer expects the 
 
 ## Next Steps for Follow-up Agent
 
-1. Re-run beach-web with the updated binaries and confirm the new diagnostics: `handshake_for_noise` hashes should still align, and the console/host logs should show complementary `challenge_*` events.
+1. Re-run beach-surfer with the updated binaries and confirm the new diagnostics: `handshake_for_noise` hashes should still align, and the console/host logs should show complementary `challenge_*` events.
 2. If the handshake stalls or a MAC mismatch persists, use the logged role/code/nonce/MAC fingerprints to pinpoint which side diverged (e.g., mismatched verification codes or altered payloads) before touching the Noise implementation.
 3. Once the connection stabilises, prune the temporary trace logging and capture a fresh timing profile for the end-to-end connect path.
 

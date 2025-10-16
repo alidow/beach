@@ -2,7 +2,7 @@ import { test, expect } from '@playwright/test';
 
 test.describe('Terminal Header Overlap', () => {
   test('should not overlap header with terminal content before connection', async ({ page }) => {
-    // Navigate to the beach-web app
+    // Navigate to the beach-surfer app
     await page.goto('http://localhost:5173/');
 
     // Wait for the page to load

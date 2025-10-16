@@ -50,14 +50,14 @@ Phased Delivery
 **Phase 3 — Zero-Trust Signaling & Media Pipeline**
 - Deliverables: Implement sealed signaling (Phase 1 spec in `docs/secure-webrtc/secure-shared-secret-webrtc-plan.md`) inside Cabana; run Noise `XXpsk2` handshake over data channel; wrap outgoing media frames (video + control) in AEAD using keys derived from the unique link + passcode.
 - Success: Cabana peers exchange unique link/passcode, establish WebRTC video channel via `beach-road` while keeping signaling opaque; tampering at the relay fails verification.
-- Progress: Added `noise` module with reusable `NoiseController`, media frame encoder/decoder, and replay-aware encrypt/decrypt helpers (`apps/beach-cabana/src/noise.rs`). `noise-diag` CLI now runs an end-to-end XXpsk2 exchange and validates encrypted payload flow. Temporary smoketest script lives at `temp/cabana-noise-smoketest.sh`, and `apps/beach-cabana/src/webrtc.rs` introduces a channel-agnostic `NoiseDriver` plus an optional `webrtc` feature that adapts the driver onto real data channels (`cargo test --features webrtc` keeps the bridge compiling). Cabana now tracks the same app-layer crypto used in the Beach CLI and beach-web clients, so the session material/Noise flows can be shared verbatim once the GUI transport hooks into WebRTC.
+- Progress: Added `noise` module with reusable `NoiseController`, media frame encoder/decoder, and replay-aware encrypt/decrypt helpers (`apps/beach-cabana/src/noise.rs`). `noise-diag` CLI now runs an end-to-end XXpsk2 exchange and validates encrypted payload flow. Temporary smoketest script lives at `temp/cabana-noise-smoketest.sh`, and `apps/beach-cabana/src/webrtc.rs` introduces a channel-agnostic `NoiseDriver` plus an optional `webrtc` feature that adapts the driver onto real data channels (`cargo test --features webrtc` keeps the bridge compiling). Cabana now tracks the same app-layer crypto used in the Beach CLI and beach-surfer clients, so the session material/Noise flows can be shared verbatim once the GUI transport hooks into WebRTC.
 
 **Phase 4 — Selection UX (Desktop App & CLI)**
 - Deliverables: Zoom-style picker modal in Cabana desktop app prototype; CLI TUI menu with arrow/enter flow plus `--window-id` flag; permission prompts surfaced with guidance; verification string surfaced post-handshake so users confirm zero-trust link.
 - Success: User selects target via app or CLI; correct target streams securely; UX validated across macOS/Windows/Linux.
 
 **Phase 5 — Web Viewer Experience**
-- Deliverables: Update beach-web to detect Cabana (GUI) session type, render video player with basic controls (pause, fit-to-window, resolution info), display verification hash; responsive layout coexisting with terminal viewer; metrics overlay for debugging.
+- Deliverables: Update beach-surfer to detect Cabana (GUI) session type, render video player with basic controls (pause, fit-to-window, resolution info), display verification hash; responsive layout coexisting with terminal viewer; metrics overlay for debugging.
 - Success: Viewers join via browser using unique link + passcode and watch at >=30fps with acceptable latency; verification hash matches host’s display.
 
 **Phase 6 — Integration with Beach Core**

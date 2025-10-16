@@ -1,4 +1,4 @@
-# Private Beach Web (Next.js)
+# Private Beach Surfer (Next.js)
 
 ## Purpose
 - Premium dashboard for orchestrating Beach sessions inside a Private Beach.

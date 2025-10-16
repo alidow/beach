@@ -1140,18 +1140,52 @@ async fn negotiate_offerer_peer(
     let signaling_for_candidates = Arc::clone(&inner.signaling_client);
     let cancel_for_candidates = Arc::clone(&cancel_flag);
     let handshake_for_candidates = handshake_id_arc.clone();
+    let pre_shared_key_for_candidates = Arc::clone(&pre_shared_key_cell);
+    let session_key_for_candidates = Arc::clone(&inner.session_key);
+    let session_id_for_candidates = inner.session_id.clone();
+    let passphrase_for_candidates = inner.passphrase.clone();
     pc.on_ice_candidate(Box::new(move |candidate| {
         let signaling = Arc::clone(&signaling_for_candidates);
         let peer_id = peer_id_for_candidates.clone();
         let cancel_flag = Arc::clone(&cancel_for_candidates);
         let handshake_id = handshake_for_candidates.clone();
+        let pre_shared_key_cell = Arc::clone(&pre_shared_key_for_candidates);
+        let session_key_cell = Arc::clone(&session_key_for_candidates);
+        let session_id = session_id_for_candidates.clone();
+        let passphrase = passphrase_for_candidates.clone();
         Box::pin(async move {
             if cancel_flag.load(Ordering::SeqCst) {
                 return;
             }
             if let Some(cand) = candidate {
+                let handshake_key = match await_pre_shared_key(
+                    &pre_shared_key_cell,
+                    &session_key_cell,
+                    passphrase.as_deref(),
+                    session_id.as_str(),
+                    handshake_id.as_str(),
+                )
+                .await
+                {
+                    Ok(key) => key,
+                    Err(err) => {
+                        tracing::warn!(
+                            target = "webrtc",
+                            handshake_id = %handshake_id.as_str(),
+                            peer_id = %peer_id,
+                            error = %err,
+                            "failed to derive handshake key before sending local ice candidate"
+                        );
+                        None
+                    }
+                };
                 if let Err(err) = signaling
-                    .send_ice_candidate_to_peer(cand, handshake_id.as_str(), &peer_id)
+                    .send_ice_candidate_to_peer(
+                        cand,
+                        handshake_id.as_str(),
+                        &peer_id,
+                        handshake_key,
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -1959,9 +1993,17 @@ async fn connect_answerer(
 
     let signaling_for_candidates = Arc::clone(&signaling_client);
     let handshake_for_candidates = Arc::clone(&handshake_id);
+    let pre_shared_key_for_candidates = Arc::clone(&pre_shared_key_cell);
+    let session_key_for_candidates = Arc::clone(&session_key_cell);
+    let session_id_for_candidates = session_id.clone();
+    let passphrase_for_candidates = passphrase_owned.clone();
     pc.on_ice_candidate(Box::new(move |candidate| {
         let signaling = Arc::clone(&signaling_for_candidates);
         let handshake_id = Arc::clone(&handshake_for_candidates);
+        let pre_shared_key_cell = Arc::clone(&pre_shared_key_for_candidates);
+        let session_key_cell = Arc::clone(&session_key_for_candidates);
+        let session_id = session_id_for_candidates.clone();
+        let passphrase = passphrase_for_candidates.clone();
         Box::pin(async move {
             if let Some(cand) = candidate {
                 tracing::debug!(
@@ -1970,8 +2012,27 @@ async fn connect_answerer(
                     candidate = %cand.to_string(),
                     "local ice candidate gathered"
                 );
+                let handshake_key = match await_pre_shared_key(
+                    &pre_shared_key_cell,
+                    &session_key_cell,
+                    passphrase.as_deref(),
+                    session_id.as_str(),
+                    handshake_id.as_str(),
+                )
+                .await
+                {
+                    Ok(key) => key,
+                    Err(err) => {
+                        tracing::warn!(
+                            handshake_id = %handshake_id.as_str(),
+                            error = %err,
+                            "answerer failed to derive handshake key before sending local ice candidate"
+                        );
+                        None
+                    }
+                };
                 if let Err(err) = signaling
-                    .send_ice_candidate(cand, handshake_id.as_str())
+                    .send_ice_candidate(cand, handshake_id.as_str(), handshake_key)
                     .await
                 {
                     tracing::warn!(

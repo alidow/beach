@@ -1,8 +1,8 @@
-# Beach Web Cursor Desync Implementation Notes
+# Beach Surfer Cursor Desync Implementation Notes
 
 ## Summary
 
-Authoritative cursor frames are being introduced so the Beach web client no
+Authoritative cursor frames are being introduced so the Beach Surfer client no
 longer relies on heuristic inference. Host and client now exchange explicit
 `cursor` data (position, visibility, blink, and sequence number) alongside the
 grid updates. Predictive typing is still supported, but speculative cursor moves
@@ -16,7 +16,7 @@ collapse as soon as the host confirms or rejects the prediction.
 - Added `CursorFrame` structure and optional cursor payloads to `snapshot`,
   `delta`, and `history_backfill` frames, plus a standalone `cursor` frame.
 - Updated Rust (`apps/beach/src/protocol`) and TS
-  (`apps/beach-web/src/protocol`) encoders/decoders with round-trip tests.
+  (`apps/beach-surfer/src/protocol`) encoders/decoders with round-trip tests.
 
 ### Host Runtime (`apps/beach`)
 - `TransmitterCache` coalesces cursor updates and tracks last emitted cursor.
@@ -28,7 +28,7 @@ collapse as soon as the host confirms or rejects the prediction.
   authoritatively, tracks predicted cursor positions, and reconciles predictions
   when host seq overtakes them.
 
-### Web Client (`apps/beach-web`)
+### Beach Surfer Client (`apps/beach-surfer`)
 - `TerminalGridCache` now owns:
   - Cursor feature flag, authoritative state, predicted cursor state, visibility
     and blink flags, and latest cursor seq.

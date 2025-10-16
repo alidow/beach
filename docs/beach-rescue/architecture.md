@@ -132,7 +132,7 @@ sequenceDiagram
 ## Control Plane & Token API Decisions
 - **Endpoint:** `POST /v1/fallback/token` (authenticated via mTLS service account) returning `{ token, expires_at, cohort, guardrail_hint }`.
 - **Inputs:** `session_id`, `cohort_id`, `client_version`, `entitlement_proof` (optional JWT from future Clerk/OIDC integration), `telemetry_opt_in`.
-  - CLI already forwards overrides via `--fallback-*` flags (mirrored to `BEACH_FALLBACK_COHORT`, `BEACH_ENTITLEMENT_PROOF`, `BEACH_FALLBACK_TELEMETRY_OPT_IN`), and beach-web surfaces matching advanced controls that are stored locally and injected into the connection handshake, so Clerk proofs can slide in later without further protocol churn.
+  - CLI already forwards overrides via `--fallback-*` flags (mirrored to `BEACH_FALLBACK_COHORT`, `BEACH_ENTITLEMENT_PROOF`, `BEACH_FALLBACK_TELEMETRY_OPT_IN`), and beach-surfer surfaces matching advanced controls that are stored locally and injected into the connection handshake, so Clerk proofs can slide in later without further protocol churn.
 - **Validation Flow:** verify entitlement when proof provided (paid “private beaches” users); in dev or when entitlement disabled, skip OIDC checks. Ensure `fallback_ws_enabled` true. Guardrail counters stored in Redis (shared with beach-road) using hourly buckets.
 - **Token Format:** Ed25519-signed CBOR payload containing `session_id`, `issued_at`, `expires_at` (<= 5 min), `cohort_id`, `feature_bits`.
   - **Implementation note (Phase 1):** Tokens are currently returned as Base64-encoded JSON claims; Ed25519 signing will be introduced alongside production hardening.

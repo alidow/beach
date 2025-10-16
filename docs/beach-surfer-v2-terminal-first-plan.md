@@ -1,4 +1,4 @@
-# Beach Web V2 Terminal-First UI Implementation Plan
+# Beach Surfer V2 Terminal-First UI Implementation Plan
 
 ## Context & Goals
 - Deliver a single-pane, terminal-first interface that feels effortless on desktop and mobile web.
@@ -50,5 +50,5 @@
 - [ ] Manual regression of connection lifecycle (idle → connect → approved → disconnect → reconnect) across `/` and `/v2` routes.
 - [ ] Confirm modal and drawer behavior with keyboard navigation and screen reader (VoiceOver or NVDA smoke test).
 - [ ] Responsive spot checks on common breakpoints: 360×640, 768×1024, 1440×900.
-- [ ] Update documentation (`docs/beach-web-dev.md`) with `/v2` access instructions and rollout notes.
+- [ ] Update documentation (`docs/beach-surfer-dev.md`) with `/v2` access instructions and rollout notes.
 - [ ] Prep follow-up tasks (migrate `/` to new shell, remove legacy panel) once adoption is confirmed.

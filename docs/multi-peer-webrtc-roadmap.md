@@ -3,7 +3,7 @@
 ## Context
 - `beach` currently negotiates WebRTC as the *sole* offerer. When multiple viewers join a session, the host repeatedly reuses a single `remote_peer`, so only one viewer succeeds and the rest see `/webrtc/answer` 404s.
 - `beach-road` simply relays WebSocket messages and stores SDP blobs. With the single-remote host, it accumulates stale peer IDs and is spammed by infinite polling of `/webrtc/answer?handshake_id=…`.
-- The browser (beach-web) expects an offer targeted at its `peer_id`. Once the host retargets another viewer, the browser loops endlessly waiting for its answer.
+- The browser (beach-surfer) expects an offer targeted at its `peer_id`. Once the host retargets another viewer, the browser loops endlessly waiting for its answer.
 - Goal: keep **100 simultaneous viewers** connected to one host via WebRTC data channels without tearing each other down.
 
 ## Problems to Solve

@@ -2,11 +2,11 @@
 
 **Status:** OPEN — multiple cursor regressions (missing initial cursor, incorrect scroll position, off-by-one after Enter)
 **Date:** October 7, 2025
-**Log File:** `/Users/arellidow/development/beach/temp/beach-web.log`
+**Log File:** `/Users/arellidow/development/beach/temp/beach-surfer.log`
 
 ## Problem Description
 
-After implementing predictive cursor advancement in beach-web, cursor positioning has two issues:
+After implementing predictive cursor advancement in beach-surfer, cursor positioning has two issues:
 
 1. **FIXED:** Cursor initially appeared in upper-left corner (0, 0) when first connecting
 2. **OPEN:** After typing a command and pressing Enter, cursor appears **one column to the left** of where it should be
@@ -23,7 +23,7 @@ The cursor `_` appears at column 38 when it should be at column 39 (after the `%
 
 ### Observed Behavior from Logs
 
-From `temp/beach-web.log`:
+From `temp/beach-surfer.log`:
 
 1. **Line 1012:** After Enter is pressed, cursor moves to new row 159:
    ```
@@ -66,8 +66,8 @@ The server position (col=38) appears to be **one column before** the actual inpu
 **Solution:** Added `firstCursorReceived` flag and logic to suppress cursor visibility if the first position received is (0, 0).
 
 **Files Changed:**
-- `apps/beach-web/src/terminal/cache.ts:161` - Added `firstCursorReceived` flag
-- `apps/beach-web/src/terminal/cache.ts:758-765` - Suppress initial (0, 0) cursor in `applyCursorFrame()`
+- `apps/beach-surfer/src/terminal/cache.ts:161` - Added `firstCursorReceived` flag
+- `apps/beach-surfer/src/terminal/cache.ts:758-765` - Suppress initial (0, 0) cursor in `applyCursorFrame()`
 
 **Code:**
 ```typescript
@@ -90,7 +90,7 @@ if (!this.firstCursorReceived && row === 0 && col === 0) {
 **Solution:** Implemented comprehensive predictive cursor system matching Rust client behavior.
 
 **Files Changed:**
-- `apps/beach-web/src/terminal/cache.ts`
+- `apps/beach-surfer/src/terminal/cache.ts`
   - Lines 65-70: Added `cursorRow` and `cursorCol` to `PendingPredictionEntry`
   - Lines 172, 320: Changed initial `cursorVisible` from `true` to `false`
   - Lines 899-920: Implemented `latestPredictionCursor()` method
@@ -99,7 +99,7 @@ if (!this.firstCursorReceived && row === 0 && col === 0) {
   - Line 1290: Store cursor position when creating predictions
   - Lines 1352-1355: Always update display cursor to latest prediction
 
-- `apps/beach-web/src/styles.css:63`
+- `apps/beach-surfer/src/styles.css:63`
   - Added `caret-color: transparent` to hide browser's default caret
 
 **Behavior:** Cursor now advances immediately when typing, before server confirms. Predictions chain correctly - each builds on previous prediction's cursor position.
@@ -116,7 +116,7 @@ The server is sending `col=38` but the actual cursor should be at `col=39`. Need
 
 ### Hypothesis 2: Client Clamping Regressions
 
-We removed the committed-width clamp in `applyCursorFrame()` (`apps/beach-web/src/terminal/cache.ts:744-756`) so the cursor now mirrors whatever column the server reports, up to the terminal width. That puts the spotlight back on the server data: if the prompt row really ends with a space, the emulator should be sending `col=39`, not `38`.
+We removed the committed-width clamp in `applyCursorFrame()` (`apps/beach-surfer/src/terminal/cache.ts:744-756`) so the cursor now mirrors whatever column the server reports, up to the terminal width. That puts the spotlight back on the server data: if the prompt row really ends with a space, the emulator should be sending `col=39`, not `38`.
 
 ### Hypothesis 3: Prediction Conflict
 
@@ -149,29 +149,29 @@ From logs line 1082, `predictedCursor: null` suggests predictions are cleared wh
 
 ```bash
 # View all cursor positions for row 160
-grep "row=160 col=" /Users/arellidow/development/beach/temp/beach-web.log
+grep "row=160 col=" /Users/arellidow/development/beach/temp/beach-surfer.log
 
 # View snapshot states with context
-grep -A 2 -B 2 "snapshot state" /Users/arellidow/development/beach/temp/beach-web.log
+grep -A 2 -B 2 "snapshot state" /Users/arellidow/development/beach/temp/beach-surfer.log
 
 # Find Enter key events
-grep -i "enter\|return" /Users/arellidow/development/beach/temp/beach-web.log
+grep -i "enter\|return" /Users/arellidow/development/beach/temp/beach-surfer.log
 
 # Examine cursor frames
-grep "applyCursorFrame\|cursor:" /Users/arellidow/development/beach/temp/beach-web.log
+grep "applyCursorFrame\|cursor:" /Users/arellidow/development/beach/temp/beach-surfer.log
 ```
 
 ## Related Files
 
 ### Primary Implementation
-- `apps/beach-web/src/terminal/cache.ts` - Core terminal state and cursor logic
-- `apps/beach-web/src/components/BeachTerminal.tsx` - Cursor rendering
+- `apps/beach-surfer/src/terminal/cache.ts` - Core terminal state and cursor logic
+- `apps/beach-surfer/src/components/BeachTerminal.tsx` - Cursor rendering
 
 ### Reference Implementation
 - `apps/beach/src/client/terminal.rs` - Rust client cursor handling
 
 ### Logs
-- `/Users/arellidow/development/beach/temp/beach-web.log` - Current reproduction log
+- `/Users/arellidow/development/beach/temp/beach-surfer.log` - Current reproduction log
 - Enable trace logging: `window.__BEACH_TRACE = true` in browser console
 
 ## Key Code Locations

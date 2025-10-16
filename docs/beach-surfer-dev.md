@@ -1,13 +1,13 @@
-# Beach Web Client — Local Development
+# Beach Surfer Client — Local Development
 
-This guide walks through running the React/WebRTC client locally and pointing it at a live beach host session.
+This guide walks through running the Beach Surfer React/WebRTC client locally and pointing it at a live beach host session.
 
 ## 1. Install dependencies
 
 From the repository root:
 
 ```bash
-cd apps/beach-web
+cd apps/beach-surfer
 pnpm install   # or npm install / yarn install if you prefer
 ```
 
@@ -25,7 +25,7 @@ A session ID and (optionally) passcode will be printed in the terminal output wh
 
 ## 3. Run the web client in dev mode
 
-Back in `apps/beach-web`:
+Back in `apps/beach-surfer`:
 
 ```bash
 pnpm dev

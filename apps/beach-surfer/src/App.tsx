@@ -711,7 +711,7 @@ export default function App(): JSX.Element {
             </p>
           ) : null}
           <p className="mt-8 text-center text-[10px] font-semibold uppercase tracking-[0.32em] text-slate-500">
-            beach-web {__APP_VERSION__}
+            beach-surfer {__APP_VERSION__}
           </p>
         </DialogContent>
       </Dialog>

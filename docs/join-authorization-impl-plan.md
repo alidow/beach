@@ -34,7 +34,7 @@ Current behavior accepts viewers as soon as negotiation completes. This can surp
 ## Implementation Status
 - ✅ Host runtime: CLI flag, stdin gate, interactive prompt, and join gating added in `apps/beach/src/main.rs` (emits `beach:status:*` hints for waiting clients).
 - ✅ Rust CLI client: status-line waiting UX, ASCII spinner, timed hints, and pre-handshake input gating in `apps/beach/src/client/terminal.rs`.
-- ✅ beach-web: overlay UX with CSS spinner, timed hints, and status handling in `apps/beach-web/src/components/BeachTerminal.tsx`.
+- ✅ beach-surfer: overlay UX with CSS spinner, timed hints, and status handling in `apps/beach-surfer/src/components/BeachTerminal.tsx`.
 - ✅ Host prompt now surfaces viewer metadata (optional label + remote address) collected from the signaling layer, with CLI/web clients able to opt-in via `--label` or `?label=`.
 
 ## Non-Goals

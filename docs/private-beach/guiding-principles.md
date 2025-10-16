@@ -33,6 +33,7 @@
 - **Zero Trust:** Assume central infrastructure (Beach Gate, Beach Road, state cache) can be compromised—enforce mutual auth, end-to-end encryption, and least-privilege authorization at the application layer.
 - **UX Minimalism:** Focus initial UX on the 80% workflows; prioritize intuitive, keyboard-forward actions and progressive disclosure before layering complexity.
 - **Developer Experience:** Provide clear APIs, SDKs, and tooling with minimal ceremony so teams can script and automate quickly; documentation and examples accompany every surface.
+- **Interface Contracts:** Keep boundaries between components explicit; prototype and test interfaces as soon as code lands (temporary harnesses/tests in `temp/` are encouraged but must converge to maintained suites).
 - **Transparency:** Clearly publish which repos, binaries, and endpoints require licenses; avoid subtle feature gating or regressions in source-available flows.
 - **Migration-Friendly:** Provide pathways for teams to start in open-source Beach and upgrade to Private Beach without rewriting scripts or losing data.
 - **Customer Trust:** Pricing and entitlement checks go through Beach Gate; users can self-verify what data leaves their sessions (state cache retention, shared storage policies).

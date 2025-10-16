@@ -1251,7 +1251,7 @@ function log(logger: ((message: string) => void) | undefined, message: string): 
   if (logger) {
     logger(message);
   } else {
-    console.log(`[beach-web] ${message}`);
+    console.log(`[beach-surfer] ${message}`);
   }
 }
 

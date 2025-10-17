@@ -1,4 +1,17 @@
 services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: beach-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: beach_manager
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - beach-network
   redis:
     image: redis:7-alpine
     container_name: beach-redis
@@ -28,6 +41,7 @@ services:
       - beach-network
 
 volumes:
+  postgres-data:
   redis-data:
   cargo-target:
   cargo-registry:

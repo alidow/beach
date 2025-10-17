@@ -5,6 +5,10 @@ members = [
   "apps/beach-rescue/core",
   "apps/beach-rescue/server",
   "apps/beach-rescue/client",
+  "apps/beach-manager",
+  "crates/beach-buggy",
+  "crates/harness-proto",
+  "crates/manager-sdk",
   "crates/test-timeout",
 ]
 exclude = [

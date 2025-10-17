@@ -7,17 +7,16 @@
 - ✓ Define engineering cadence, release cadence, and observability baseline (see `docs/private-beach/engineering-cadence.md`).
 
 ## Phase 1 – Session Harness (Beach Buggy) MVP
-- Implement `crates/beach-buggy` terminal shim wrapping Beach PTY streams with diff emission + command intake.
-- Extend Beach Cabana with GUI harness module producing metadata descriptors + input injector; establish harness-type taxonomy (`terminal_shim`, `cabana_adapter`, etc.) fed into the manager schema.
-- Wire harness authentication against Beach Gate service accounts; register capabilities through MCP.
-- Ship harness health reporting and attach/detach lifecycle handling (no direct manager UI yet).
+- ✓ Implement `crates/beach-buggy` terminal shim wrapping Beach PTY streams with diff emission + command intake.
+- ✓ Extend Beach Cabana with GUI harness module producing metadata descriptors + input injector; establish harness-type taxonomy (`terminal_shim`, `cabana_adapter`, etc.) fed into the manager schema.
+- ✓ Wire harness authentication against Beach Gate service accounts; register capabilities through MCP.
+- ✓ Ship harness health reporting and attach/detach lifecycle handling (no direct manager UI yet).
 
 ## Phase 2 – Beach Manager Core Services
 (see `docs/private-beach/beach-manager.md` for architecture details)
-- Build `apps/beach-manager` API: session registry (backed by Postgres), state cache ingest (Redis), controller lease + policy engine, audit logging.
-- Expose MCP methods: `private_beach.list_sessions`, `subscribe_state`, `queue_action`, `acquire_controller`, `controller_events.stream`.
-- Create CLI/agent SDK (`manager-sdk`) exercising the APIs; include harness simulator for integration testing.
-- Enforce row-level security and claims validation across core endpoints; implement zero-trust auth middleware.
+- In progress: REST surface implemented with in-memory session registry; Postgres migrations + optional pool wiring landed.
+- In progress: Phase 2 implementation plan drafted (`beach-manager.md#phase-2-implementation-plan`) covering Postgres persistence, Redis queues, Beach Gate auth, and MCP exposure.
+- Next: persist registry to Postgres, introduce Redis-backed state cache, expose MCP methods, tighten auth (Beach Gate JWTs), and expand integration tests via `manager-sdk`.
 
 ## Phase 3 – Workspace Shell (Private Beach Surfer)
 - Prototype Next.js dashboard consuming mock data; implement responsive grid, tile management, and status overlays.

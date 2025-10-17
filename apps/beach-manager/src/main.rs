@@ -1,39 +1,74 @@
-use axum::{
-    extract::State,
-    routing::{get, Router},
-    Json,
-};
-use serde::Serialize;
-use std::{net::SocketAddr, sync::Arc};
-use tracing::{info, Level};
+mod config;
+mod routes;
+mod state;
 
-#[derive(Clone)]
-struct AppState {
-    build: BuildInfo,
-}
-
-#[derive(Clone, Serialize)]
-struct BuildInfo {
-    name: &'static str,
-    version: &'static str,
-}
+use config::AppConfig;
+use redis::AsyncCommands;
+use routes::build_router;
+use sqlx::postgres::PgPoolOptions;
+use state::AppState;
+use std::net::SocketAddr;
+use tracing::{info, warn, Level};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
-    let state = AppState {
-        build: BuildInfo {
-            name: env!("CARGO_PKG_NAME"),
-            version: env!("CARGO_PKG_VERSION"),
-        },
+    let cfg = AppConfig::from_env();
+    let mut state = if let Some(db_url) = &cfg.database_url {
+        match PgPoolOptions::new()
+            .max_connections(5)
+            .connect(db_url)
+            .await
+        {
+            Ok(pool) => {
+                if let Err(err) = sqlx::migrate!("./migrations").run(&pool).await {
+                    warn!(error = %err, "failed to run database migrations");
+                } else {
+                    info!("database migrations applied");
+                }
+                AppState::with_db(pool)
+            }
+            Err(err) => {
+                warn!(error = %err, "failed to connect to database, continuing with in-memory state");
+                AppState::new()
+            }
+        }
+    } else {
+        info!("DATABASE_URL not set; running in in-memory mode");
+        AppState::new()
     };
 
-    let app = Router::new()
-        .route("/healthz", get(health_check))
-        .with_state(Arc::new(state));
+    if let Some(redis_url) = &cfg.redis_url {
+        match redis::Client::open(redis_url.clone()) {
+            Ok(client) => {
+                match client.get_async_connection().await {
+                    Ok(mut conn) => {
+                        if let Err(err) =
+                            redis::cmd("PING").query_async::<_, String>(&mut conn).await
+                        {
+                            warn!(error = %err, "failed to ping redis; continuing without redis");
+                        } else {
+                            info!("connected to redis at {}", redis_url);
+                            state = state.with_redis(client);
+                        }
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "failed to establish redis connection; continuing without redis");
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "invalid REDIS_URL; continuing without redis integration");
+            }
+        }
+    } else {
+        warn!("REDIS_URL not set; features requiring Redis will be disabled");
+    }
 
-    let addr: SocketAddr = "0.0.0.0:8080".parse()?;
+    let app = build_router(state);
+
+    let addr: SocketAddr = cfg.bind_addr.parse()?;
     info!("Starting Beach Manager on {addr}");
     axum::serve(
         tokio::net::TcpListener::bind(addr).await?,
@@ -42,10 +77,6 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
-}
-
-async fn health_check(State(state): State<Arc<AppState>>) -> Json<&BuildInfo> {
-    Json(&state.build)
 }
 
 fn init_tracing() {

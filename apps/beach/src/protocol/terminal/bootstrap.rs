@@ -3,8 +3,9 @@ use crate::terminal::cli::SshArgs;
 use crate::terminal::error::CliError;
 use crate::transport::TransportKind;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tokio::process::Command as TokioCommand;
@@ -145,6 +146,71 @@ pub fn scp_destination(target: &str, remote_path: &str) -> String {
     }
 }
 
+async fn compute_local_sha256(path: &Path) -> Result<String, CliError> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || -> Result<String, CliError> {
+        use std::fs::File;
+        use std::io::Read;
+
+        let mut file = File::open(&path)
+            .map_err(|err| CliError::CopyBinary(format!("hash open failed: {err}")))?;
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buf)
+                .map_err(|err| CliError::CopyBinary(format!("hash read failed: {err}")))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buf[..read]);
+        }
+        Ok(format!("{:x}", hasher.finalize()))
+    })
+    .await
+    .map_err(|err| CliError::CopyBinary(format!("hash task join failed: {err}")))?
+}
+
+async fn compute_remote_sha256(args: &SshArgs, remote_path: &str) -> Result<String, CliError> {
+    let mut command = TokioCommand::new(&args.ssh_binary);
+    if !args.no_batch {
+        command.arg("-o").arg("BatchMode=yes");
+    }
+    command.arg("-T");
+    command.arg("-C");
+    for flag in &args.ssh_flag {
+        command.arg(flag);
+    }
+    command.arg(&args.target);
+    command.arg(format!("sha256sum {}", shell_quote(remote_path)));
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+
+    let output = command
+        .output()
+        .await
+        .map_err(|err| CliError::CopyBinary(format!("failed to spawn ssh for sha256sum: {err}")))?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(CliError::CopyBinary(format!(
+            "sha256sum failed ({}): stdout='{}' stderr='{}'",
+            describe_exit_status(output.status),
+            stdout.trim(),
+            stderr.trim()
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let hash = stdout
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| CliError::CopyBinary("sha256sum returned empty output".into()))?;
+    Ok(hash.to_string())
+}
+
 pub fn render_remote_command(remote_args: &[String]) -> String {
     let quoted: Vec<String> = remote_args.iter().map(|arg| shell_quote(arg)).collect();
     let body = quoted.join(" ");
@@ -183,6 +249,7 @@ async fn detect_remote_architecture(args: &SshArgs) -> Result<String, CliError> 
     if !args.no_batch {
         command.arg("-o").arg("BatchMode=yes");
     }
+    command.arg("-C");
     command.arg("-T");
     for flag in &args.ssh_flag {
         command.arg(flag);
@@ -353,22 +420,22 @@ pub async fn copy_binary_to_remote(args: &SshArgs) -> Result<(), CliError> {
     }
 
     // Check if remote already has the correct version
-    let local_version = env!("CARGO_PKG_VERSION");
+    // Use build-time version string that includes timestamp, if available.
+    let local_version = option_env!("BEACH_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
     if let Ok(Some(remote_version)) = check_remote_beach_version(args).await {
-        if remote_version.contains(local_version) {
+        if remote_version.trim() == local_version.trim() {
             info!(
                 local_version = %local_version,
                 remote_version = %remote_version,
-                "remote beach binary is up to date, skipping copy"
+                "remote beach binary matches local build; skipping copy"
             );
             return Ok(());
-        } else {
-            info!(
-                local_version = %local_version,
-                remote_version = %remote_version,
-                "remote beach version mismatch, will copy new binary"
-            );
         }
+        info!(
+            local_version = %local_version,
+            remote_version = %remote_version,
+            "remote beach version differs; uploading fresh binary"
+        );
     }
 
     // Detect remote architecture and build for it
@@ -388,7 +455,14 @@ pub async fn copy_binary_to_remote(args: &SshArgs) -> Result<(), CliError> {
 
         build_for_target(target).await?
     };
-    let destination = scp_destination(&args.target, &args.remote_path);
+    let temp_remote_path = format!("{}.upload", args.remote_path);
+    let destination = scp_destination(&args.target, &temp_remote_path);
+    let local_hash = if args.verify_binary_hash {
+        info!("computing local binary sha256 for verification");
+        Some(compute_local_sha256(&source_path).await?)
+    } else {
+        None
+    };
 
     info!(
         source = %source_path.display(),
@@ -442,7 +516,7 @@ pub async fn copy_binary_to_remote(args: &SshArgs) -> Result<(), CliError> {
     // Make the remote binary executable
     info!(
         target = %args.target,
-        remote_path = %args.remote_path,
+        remote_path = %temp_remote_path,
         "making remote binary executable"
     );
 
@@ -451,11 +525,12 @@ pub async fn copy_binary_to_remote(args: &SshArgs) -> Result<(), CliError> {
         chmod_command.arg("-o").arg("BatchMode=yes");
     }
     chmod_command.arg("-T");
+    chmod_command.arg("-C");
     for flag in &args.ssh_flag {
         chmod_command.arg(flag);
     }
     chmod_command.arg(&args.target);
-    chmod_command.arg(format!("chmod +x {}", shell_quote(&args.remote_path)));
+    chmod_command.arg(format!("chmod +x {}", shell_quote(&temp_remote_path)));
     chmod_command.stdin(std::process::Stdio::null());
     chmod_command.stdout(std::process::Stdio::piped());
     chmod_command.stderr(std::process::Stdio::piped());
@@ -474,6 +549,64 @@ pub async fn copy_binary_to_remote(args: &SshArgs) -> Result<(), CliError> {
             stdout.trim(),
             stderr.trim()
         )));
+    }
+
+    // Atomically replace the target binary.
+    info!(
+        target = %args.target,
+        temp_remote_path = %temp_remote_path,
+        final_remote_path = %args.remote_path,
+        "replacing remote binary"
+    );
+
+    let mut mv_command = TokioCommand::new(&args.ssh_binary);
+    if !args.no_batch {
+        mv_command.arg("-o").arg("BatchMode=yes");
+    }
+    mv_command.arg("-T");
+    mv_command.arg("-C");
+    for flag in &args.ssh_flag {
+        mv_command.arg(flag);
+    }
+    mv_command.arg(&args.target);
+    mv_command.arg(format!(
+        "mv {} {}",
+        shell_quote(&temp_remote_path),
+        shell_quote(&args.remote_path)
+    ));
+    mv_command.stdin(std::process::Stdio::null());
+    mv_command.stdout(std::process::Stdio::piped());
+    mv_command.stderr(std::process::Stdio::piped());
+
+    let mv_output = mv_command
+        .output()
+        .await
+        .map_err(|err| CliError::CopyBinary(format!("failed to spawn ssh for mv: {err}")))?;
+
+    if !mv_output.status.success() {
+        let stdout = String::from_utf8_lossy(&mv_output.stdout);
+        let stderr = String::from_utf8_lossy(&mv_output.stderr);
+        return Err(CliError::CopyBinary(format!(
+            "mv failed ({}): stdout='{}' stderr='{}'",
+            describe_exit_status(mv_output.status),
+            stdout.trim(),
+            stderr.trim()
+        )));
+    }
+
+    if let Some(local_hash) = local_hash {
+        let remote_hash = compute_remote_sha256(args, &args.remote_path).await?;
+        if remote_hash != local_hash {
+            return Err(CliError::CopyBinary(format!(
+                "remote hash mismatch: local={} remote={}",
+                local_hash, remote_hash
+            )));
+        }
+        info!(
+            local_hash = %local_hash,
+            remote_hash = %remote_hash,
+            "verified remote binary hash"
+        );
     }
 
     Ok(())

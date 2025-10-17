@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use hkdf::Hkdf;
@@ -64,6 +65,33 @@ pub async fn run_handshake(
     channel: Arc<RTCDataChannel>,
     params: HandshakeParams,
 ) -> Result<HandshakeResult, TransportError> {
+    let handshake_start = Instant::now();
+    tracing::debug!(
+        target = "webrtc",
+        ?role,
+        handshake_id = %params.handshake_id,
+        local_peer = %params.local_peer_id,
+        remote_peer = %params.remote_peer_id,
+        key_preview = %hex_preview(params.handshake_key.as_ref()),
+        "configured secure handshake parameters"
+    );
+    let (incoming_tx, mut incoming_rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
+    channel.on_message(Box::new(move |msg: DataChannelMessage| {
+        let sender = incoming_tx.clone();
+        Box::pin(async move {
+            tracing::trace!(
+                target = "webrtc",
+                event = "handshake_channel_inbound_raw",
+                bytes = msg.data.len(),
+                preview = %hex_preview(&msg.data),
+                "secure handshake received raw datachannel message"
+            );
+            if sender.send(msg.data.to_vec()).is_err() {
+                tracing::debug!(target = "webrtc", "secure handshake message channel closed");
+            }
+        })
+    }));
+
     tracing::info!(
         target = "webrtc",
         ?role,
@@ -80,16 +108,6 @@ pub async fn run_handshake(
         handshake_id = %params.handshake_id,
         "handshake channel is now open, proceeding with noise protocol"
     );
-
-    let (incoming_tx, mut incoming_rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
-    channel.on_message(Box::new(move |msg: DataChannelMessage| {
-        let sender = incoming_tx.clone();
-        Box::pin(async move {
-            if sender.send(msg.data.to_vec()).is_err() {
-                tracing::debug!(target = "webrtc", "secure handshake message channel closed");
-            }
-        })
-    }));
 
     let psk = params.handshake_key.as_ref();
     let mut prologue = Vec::with_capacity(params.prologue_context.len() + 32);
@@ -124,6 +142,7 @@ pub async fn run_handshake(
             action = "write",
             message_index = outbound_index,
             bytes = len,
+            preview = %hex_preview(&send_buf[..len]),
             "noise handshake wrote initial message"
         );
         outbound_index = outbound_index.saturating_add(1);
@@ -135,6 +154,16 @@ pub async fn run_handshake(
     }
 
     while !state.is_handshake_finished() {
+        tracing::trace!(
+            target = "webrtc",
+            handshake_id = %params.handshake_id,
+            local_peer = %params.local_peer_id,
+            remote_peer = %params.remote_peer_id,
+            ?role,
+            action = "await_read",
+            message_index = inbound_index,
+            "noise handshake waiting for inbound message"
+        );
         let incoming = incoming_rx
             .recv()
             .await
@@ -148,6 +177,7 @@ pub async fn run_handshake(
             action = "read",
             message_index = inbound_index,
             bytes = incoming.len(),
+            preview = %hex_preview(&incoming),
             "noise handshake received message"
         );
         inbound_index = inbound_index.saturating_add(1);
@@ -169,6 +199,7 @@ pub async fn run_handshake(
             action = "write",
             message_index = outbound_index,
             bytes = len,
+            preview = %hex_preview(&send_buf[..len]),
             "noise handshake wrote message"
         );
         outbound_index = outbound_index.saturating_add(1);
@@ -219,6 +250,7 @@ pub async fn run_handshake(
         handshake_id = %params.handshake_id,
         peer = %params.remote_peer_id,
         verification = %result.verification_code,
+        duration_ms = %handshake_start.elapsed().as_millis(),
         "secure transport handshake established"
     );
 
@@ -375,6 +407,7 @@ async fn perform_verification_exchange(
         remote_peer = %params.remote_peer_id,
         ?role,
         event = "challenge_sent",
+        frame = %hex_preview(&frame),
         "sent local verification challenge frame"
     );
 
@@ -404,6 +437,7 @@ async fn perform_verification_exchange(
         ?role,
         event = "challenge_received_raw",
         bytes = remote_payload.len(),
+        preview = %hex_preview(&remote_payload),
         "received remote verification payload"
     );
 
@@ -590,6 +624,19 @@ fn timing_safe_equal(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+fn hex_preview(data: &[u8]) -> String {
+    const MAX_BYTES: usize = 32;
+    if data.is_empty() {
+        return String::from("∅");
+    }
+    let preview_len = data.len().min(MAX_BYTES);
+    let mut encoded = hex::encode(&data[..preview_len]);
+    if data.len() > MAX_BYTES {
+        encoded.push('…');
+    }
+    encoded
 }
 
 async fn wait_for_channel_open(channel: &RTCDataChannel) -> Result<(), TransportError> {

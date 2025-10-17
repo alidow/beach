@@ -17,6 +17,9 @@
 4. Prototype session registry endpoints (`GET /private-beaches/:id/sessions`).
 
 ## Development
+- `docker compose up postgres redis` to launch local dependencies (Postgres + Redis).
+- Set `DATABASE_URL` (e.g. `postgres://postgres:postgres@localhost:5432/beach_manager`) and `REDIS_URL` before running the manager.
+- `sqlx migrate run --source apps/beach-manager/migrations` applies schema changes.
 - `cargo run -p beach-manager` starts the local server (development mode).
 - `cargo test -p beach-manager` runs unit/integration tests.
 

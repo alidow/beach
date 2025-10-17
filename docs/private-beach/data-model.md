@@ -196,10 +196,36 @@
 | `event_type` | `controller_event_type` |
 | `controller_account_id` | `uuid` FK → `account` |
 | `issued_by_account_id` | `uuid` FK → `account` NULL | Manager/admin who triggered change |
-| `controller_token_id` | `uuid` | Reference to active token handle |
+| `controller_token_id` | `uuid` | FK → `controller_lease(id)` |
 | `payload` | `jsonb` | Additional context (reason, expiry) |
 | `occurred_at` | `timestamptz` DEFAULT now() |
 | Notes | | Emitted only on controller lease transitions (acquire/renew/release/preempt/revoke) |
+
+### controller_lease
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | `uuid` PK | `default uuid_generate_v7()`; doubles as `controller_token` |
+| `session_id` | `uuid` FK → `session` |
+| `controller_account_id` | `uuid` FK → `account` NULL | Null for anonymous harness bootstrap |
+| `issued_by_account_id` | `uuid` FK → `account` NULL | Actor (human/admin/agent) that granted the lease |
+| `reason` | `text` | Optional annotation shown in audit/UI |
+| `issued_at` | `timestamptz` DEFAULT now() |
+| `expires_at` | `timestamptz` | Lease expiry; manager enforces renewals before this timestamp |
+| `revoked_at` | `timestamptz` NULL | Populated when lease is forcefully ended |
+| Unique | `(session_id)` | Only one active lease per session |
+| Notes | | Token string issued to controllers equals `id`; RLS restricts to same private beach and scoped roles |
+
+### session_runtime
+| Column | Type | Notes |
+| --- | --- | --- |
+| `session_id` | `uuid` PK FK → `session` | 1:1 extension table; cascades on delete |
+| `state_cache_url` | `text` | Redis/WebRTC location provided to harness |
+| `transport_hints` | `jsonb` | Broker/WebRTC hinting returned in registration |
+| `last_health` | `jsonb` | Latest health heartbeat payload (optional) |
+| `last_health_at` | `timestamptz` | Timestamp of last heartbeat |
+| `last_state` | `jsonb` | Latest diff snapshot (for diagnostics) |
+| `last_state_at` | `timestamptz` | Timestamp of last diff |
+| Notes | | Supplements Redis cache so restarts can rebuild baseline metadata; contents mirrored from Redis on shutdown |
 
 ### file_record
 | Column | Type | Notes |
@@ -237,3 +263,5 @@
 - Sensitive columns (`token_hash`, `share_link.token_hash`) should use salted hashes with `pgcrypto`; file checksums may remain unhashed as they are non-secret integrity markers.
 - Add row-level security policies so that API services enforce Beach Gate claims: e.g., `private_beach_membership.role >= viewer` can `SELECT` session metadata for that private beach.
 - `controller_event` entries are emitted on lease lifecycle transitions (acquire/renew/release/preempt), not per render diff, keeping write volume modest while preserving an audit trail.
+- Persisted controller leases (`controller_lease`) drive token validation even if Redis loses state; invalidate on revoke/expiry via cron or LISTEN/NOTIFY hooks.
+- `session_runtime` holds diagnostic metadata so the manager can resume without waiting for Redis warm-up; treat it as advisory (Redis remains source of truth for real-time diffs).

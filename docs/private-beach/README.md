@@ -7,9 +7,9 @@ This directory houses the plans, specs, and design notes for the Private Beach p
 - `data-model.md` – Postgres schema, enums, and relational layout.
 - `roadmap.md` – phased execution plan across harness, manager, and UI workstreams.
 - `engineering-cadence.md` – lightweight solo dev cadence and observability expectations.
+- `beach-manager.md` – current control plane status, API contracts, and outstanding work.
 - `guiding-principles.md` – product boundary decisions, zero-trust stance, performance philosophy.
 - `beach-buggy-spec.md` – harness sidecar specification powered by the Beach Buggy runtime.
-- `beach-manager.md` – control-plane responsibilities, flows, and security posture.
 - `pong-demo.md` – flagship showcase experience outline.
 - `intra-beach-orchestration.md` – MCP surfaces and cross-session coordination blueprint.
 - Additional design docs under `secure-webrtc/`, `beach-rescue/`, etc.

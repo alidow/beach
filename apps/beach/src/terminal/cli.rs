@@ -373,6 +373,13 @@ pub struct SshArgs {
     pub scp_binary: String,
 
     #[arg(
+        long = "verify-binary-hash",
+        action = clap::ArgAction::SetTrue,
+        help = "Verify the remote binary's SHA-256 hash after upload"
+    )]
+    pub verify_binary_hash: bool,
+
+    #[arg(
         long = "keep-ssh",
         action = clap::ArgAction::SetTrue,
         help = "Leave the SSH control channel open for log tailing instead of closing after bootstrap"

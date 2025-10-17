@@ -4,6 +4,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::auth::{AuthConfig, AuthContext};
 use beach_buggy::{
     ActionAck, ActionCommand, HarnessType, HealthHeartbeat, RegisterSessionRequest,
     RegisterSessionResponse, StateDiff,
@@ -24,6 +25,7 @@ pub struct AppState {
     backend: Backend,
     fallback: Arc<InnerState>,
     redis: Option<Arc<redis::Client>>,
+    auth: Arc<AuthContext>,
 }
 
 #[derive(Clone)]
@@ -139,23 +141,38 @@ struct DbSessionIdentifiers {
 
 impl AppState {
     pub fn new() -> Self {
+        let auth_config = AuthConfig {
+            bypass: true,
+            ..AuthConfig::default()
+        };
         Self {
             backend: Backend::Memory,
             fallback: Arc::new(InnerState::new()),
             redis: None,
+            auth: Arc::new(AuthContext::new(auth_config)),
         }
     }
 
     pub fn with_db(pool: PgPool) -> Self {
+        let auth_config = AuthConfig {
+            bypass: true,
+            ..AuthConfig::default()
+        };
         Self {
             backend: Backend::Postgres(pool),
             fallback: Arc::new(InnerState::new()),
             redis: None,
+            auth: Arc::new(AuthContext::new(auth_config)),
         }
     }
 
     pub fn with_redis(mut self, client: redis::Client) -> Self {
         self.redis = Some(Arc::new(client));
+        self
+    }
+
+    pub fn with_auth(mut self, auth: AuthContext) -> Self {
+        self.auth = Arc::new(auth);
         self
     }
 
@@ -165,6 +182,10 @@ impl AppState {
             Backend::Postgres(pool) => Some(pool),
             Backend::Memory => None,
         }
+    }
+
+    pub fn auth_context(&self) -> Arc<AuthContext> {
+        self.auth.clone()
     }
 
     pub async fn register_session(
@@ -354,7 +375,7 @@ impl AppState {
                 .bind(requester_uuid)
                 .bind(reason.clone())
                 .bind(expires_at)
-                .execute(&mut *tx)
+                .execute(tx.as_mut())
                 .await?;
 
                 self.insert_controller_event(
@@ -406,7 +427,7 @@ impl AppState {
                 )
                 .bind(identifiers.session_id)
                 .bind(token_uuid)
-                .execute(&mut *tx)
+                .execute(tx.as_mut())
                 .await?;
 
                 if updated.rows_affected() == 0 {
@@ -1045,7 +1066,7 @@ impl AppState {
         .bind(Json(capabilities))
         .bind(Json(metadata))
         .bind(harness_type_to_db(&req.harness_type))
-        .fetch_one(&mut *tx)
+        .fetch_one(tx.as_mut())
         .await?;
         let db_session_id: Uuid = session_row.try_get("id")?;
 
@@ -1059,7 +1080,7 @@ impl AppState {
         )
         .bind(db_session_id)
         .bind(Json(transport_json))
-        .execute(&mut *tx)
+        .execute(tx.as_mut())
         .await?;
 
         sqlx::query(
@@ -1083,7 +1104,7 @@ impl AppState {
         .bind(controller_token)
         .bind(db_session_id)
         .bind(expires_at)
-        .execute(&mut *tx)
+        .execute(tx.as_mut())
         .await?;
 
         self.insert_controller_event(
@@ -1348,7 +1369,7 @@ impl AppState {
             "#,
         )
         .bind(session_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.as_mut())
         .await?;
 
         Ok(row.and_then(|record| {
@@ -1389,7 +1410,7 @@ impl AppState {
         .bind(controller_token)
         .bind(controller_account_id)
         .bind(reason)
-        .execute(&mut *tx)
+        .execute(tx.as_mut())
         .await?;
         Ok(())
     }

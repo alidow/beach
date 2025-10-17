@@ -3,29 +3,46 @@ use axum::{
     extract::FromRequestParts,
     http::{request::Parts, HeaderMap},
 };
+use tracing::warn;
+
+use crate::{auth::Claims, state::AppState};
 
 use super::ApiError;
 
 #[derive(Clone, Debug)]
-pub struct AuthToken(pub String);
+pub struct AuthToken {
+    raw: String,
+    claims: Claims,
+}
 
 #[async_trait]
-impl<S> FromRequestParts<S> for AuthToken
-where
-    S: Send + Sync,
-{
+impl FromRequestParts<AppState> for AuthToken {
     type Rejection = ApiError;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        extract_token(&parts.headers)
-            .map(AuthToken)
-            .ok_or(ApiError::Unauthorized)
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let token = extract_token(&parts.headers).ok_or(ApiError::Unauthorized)?;
+        let claims = state.auth_context().verify(&token).await.map_err(|err| {
+            warn!(error = ?err, "token verification failed");
+            ApiError::Unauthorized
+        })?;
+        Ok(AuthToken { raw: token, claims })
     }
 }
 
 impl AuthToken {
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.raw
+    }
+
+    pub fn claims(&self) -> &Claims {
+        &self.claims
+    }
+
+    pub fn has_scope(&self, scope: &str) -> bool {
+        self.claims.scopes().iter().any(|s| s == scope)
     }
 }
 

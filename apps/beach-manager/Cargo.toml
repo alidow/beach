@@ -21,6 +21,8 @@ sqlx = { version = "0.7", default-features = false, features = ["runtime-tokio-r
 redis = { version = "0.23", features = ["aio", "tokio-comp"] }
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 jsonwebtoken = "9"
+base64 = "0.21"
+chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 tokio = { version = "1.35", features = ["rt", "macros"] }

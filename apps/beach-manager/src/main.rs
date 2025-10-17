@@ -1,13 +1,15 @@
+mod auth;
 mod config;
 mod routes;
 mod state;
 
+use auth::{AuthConfig, AuthContext};
 use config::AppConfig;
 use redis::AsyncCommands;
 use routes::build_router;
 use sqlx::postgres::PgPoolOptions;
 use state::AppState;
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 use tracing::{info, warn, Level};
 
 #[tokio::main]
@@ -39,25 +41,30 @@ async fn main() -> anyhow::Result<()> {
         AppState::new()
     };
 
+    let auth_config = AuthConfig {
+        jwks_url: cfg.beach_gate_jwks_url.clone(),
+        issuer: cfg.beach_gate_issuer.clone(),
+        audience: cfg.beach_gate_audience.clone(),
+        bypass: cfg.auth_bypass || cfg.beach_gate_jwks_url.is_none(),
+        cache_ttl: Duration::from_secs(300),
+    };
+    state = state.with_auth(AuthContext::new(auth_config));
+
     if let Some(redis_url) = &cfg.redis_url {
         match redis::Client::open(redis_url.clone()) {
-            Ok(client) => {
-                match client.get_async_connection().await {
-                    Ok(mut conn) => {
-                        if let Err(err) =
-                            redis::cmd("PING").query_async::<_, String>(&mut conn).await
-                        {
-                            warn!(error = %err, "failed to ping redis; continuing without redis");
-                        } else {
-                            info!("connected to redis at {}", redis_url);
-                            state = state.with_redis(client);
-                        }
-                    }
-                    Err(err) => {
-                        warn!(error = %err, "failed to establish redis connection; continuing without redis");
+            Ok(client) => match client.get_async_connection().await {
+                Ok(mut conn) => {
+                    if let Err(err) = redis::cmd("PING").query_async::<_, String>(&mut conn).await {
+                        warn!(error = %err, "failed to ping redis; continuing without redis");
+                    } else {
+                        info!("connected to redis at {}", redis_url);
+                        state = state.with_redis(client);
                     }
                 }
-            }
+                Err(err) => {
+                    warn!(error = %err, "failed to establish redis connection; continuing without redis");
+                }
+            },
             Err(err) => {
                 warn!(error = %err, "invalid REDIS_URL; continuing without redis integration");
             }

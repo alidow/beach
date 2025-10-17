@@ -1971,6 +1971,21 @@ impl TerminalClient {
             target_col = target_col.min(total_cols);
         }
 
+        if new_row != previous_row {
+            let dropped = if new_row > previous_row {
+                self.drop_predictions_matching(PredictionDropReason::CursorAdvance, |pos| {
+                    pos.row < new_row
+                })
+            } else {
+                self.drop_predictions_matching(PredictionDropReason::CursorAdvance, |pos| {
+                    pos.row > new_row
+                })
+            };
+            if dropped {
+                self.update_prediction_overlay();
+            }
+        }
+
         let predicted_width = self.renderer.predicted_row_width(new_row as u64);
         let moving_left = new_row == previous_row && target_col < previous_col;
         let predictions_active = self.predictions_active();
@@ -4477,11 +4492,15 @@ impl TerminalClient {
             return;
         }
 
-        let trimmed_renderer = self.renderer.shrink_row_to_column(absolute_row, col);
         let trimmed_pending = self
             .drop_predictions_matching(PredictionDropReason::RendererTrim, |pos| {
                 pos.row == row && pos.col >= col
             });
+        let trimmed_renderer = if trimmed_pending {
+            self.renderer.shrink_row_to_column(absolute_row, col)
+        } else {
+            false
+        };
 
         let committed_after = self.renderer.committed_row_width(absolute_row);
         let predicted_after = self.renderer.predicted_row_width(absolute_row);
@@ -4851,6 +4870,7 @@ enum PredictionDropReason {
     Reset,
     Trimmed,
     Skipped,
+    CursorAdvance,
 }
 
 impl PredictionDropReason {
@@ -4862,6 +4882,7 @@ impl PredictionDropReason {
             PredictionDropReason::Reset => "reset",
             PredictionDropReason::Trimmed => "trimmed",
             PredictionDropReason::Skipped => "skipped",
+            PredictionDropReason::CursorAdvance => "cursor_advance",
         }
     }
 }

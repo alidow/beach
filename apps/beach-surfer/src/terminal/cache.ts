@@ -805,15 +805,21 @@ export class TerminalGridCache {
     this.cursorCol = targetCol;
     this.cursorSeq = frame.seq;
 
-    if (this.serverCursorRow !== row) {
-      this.serverCursorMinCol = targetCol;
-    } else if (this.serverCursorMinCol === null) {
-      this.serverCursorMinCol = targetCol;
-    } else {
-      this.serverCursorMinCol = Math.min(this.serverCursorMinCol, targetCol);
+    // Track the minimum server-allowed column for backspace predictions, but
+    // avoid seeding it from a synthetic initial (0,0) cursor which we
+    // deliberately suppress to prevent a flash. That synthetic frame should not
+    // relax the floor for the row.
+    if (!pendingInitial) {
+      if (this.serverCursorRow !== row) {
+        this.serverCursorMinCol = targetCol;
+      } else if (this.serverCursorMinCol === null) {
+        this.serverCursorMinCol = targetCol;
+      } else {
+        this.serverCursorMinCol = Math.min(this.serverCursorMinCol, targetCol);
+      }
+      this.serverCursorRow = row;
+      this.serverCursorCol = targetCol;
     }
-    this.serverCursorRow = row;
-    this.serverCursorCol = targetCol;
 
     // Suppress initial cursor at (0, 0) to avoid flash in upper-left corner
     if (pendingInitial) {
@@ -1019,10 +1025,17 @@ export class TerminalGridCache {
 
   private minimumServerColumn(row: number): number {
     const floor = this.rowCursorFloors.get(row) ?? 0;
-    if (this.serverCursorRow === row && this.serverCursorMinCol !== null) {
-      return Math.max(floor, this.serverCursorMinCol);
+    let bound = floor;
+    if (this.serverCursorRow === row) {
+      if (this.serverCursorCol !== null) {
+        // Never allow predictions (like backspace) to move left of the last
+        // authoritative cursor position on this row.
+        bound = Math.max(bound, this.serverCursorCol);
+      } else if (this.serverCursorMinCol !== null) {
+        bound = Math.max(bound, this.serverCursorMinCol);
+      }
     }
-    return floor;
+    return bound;
   }
 
   private discardPredictionsFromColumn(row: number, col: number, reason: string): boolean {

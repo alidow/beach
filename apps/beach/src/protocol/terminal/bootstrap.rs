@@ -132,8 +132,18 @@ pub fn remote_bootstrap_args(args: &SshArgs, session_server: &str) -> Vec<String
     ];
     command.extend(["--session-server".to_string(), session_server.to_string()]);
     if !args.command.is_empty() {
-        command.push("--".to_string());
-        command.extend(args.command.clone());
+        // Some shells/CLI usages may include a leading "--" in the captured
+        // command vector (e.g. when using a literal separator before the
+        // remote command). Strip a solitary leading "--" to avoid passing
+        // a duplicate end-of-options marker to the remote host.
+        let mut remote_cmd = args.command.clone();
+        if matches!(remote_cmd.first().map(String::as_str), Some("--")) {
+            remote_cmd.remove(0);
+        }
+        if !remote_cmd.is_empty() {
+            command.push("--".to_string());
+            command.extend(remote_cmd);
+        }
     }
     command
 }

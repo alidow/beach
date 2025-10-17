@@ -1390,6 +1390,11 @@ pub(crate) fn initialize_transport_snapshot(
             features,
         },
     )?;
+    // Signal UI clients that any approval gate has passed. This mirrors the
+    // acceptor path (which emits approval_granted on join), but ensures the
+    // signal is delivered even if it raced before the browser registered
+    // its status listener.
+    let _ = transport.send_text("beach:status:approval_granted");
     let (viewport_rows, cols) = terminal_sync.grid().viewport_size();
     let history_rows = terminal_sync.grid().rows();
     cache.reset(cols);

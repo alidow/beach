@@ -166,11 +166,18 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
 
 ## Current Implementation Status (2025‑10‑24)
 - REST API routes remain the primary surface; a JSON-RPC `/mcp` endpoint now mirrors the primary control-plane methods for harnesses/agents (streaming work pending).
-- `AppState` now persists sessions, controller leases, and controller events in Postgres via SQLx while preserving an in-memory fallback for tests/offline runs.
+- `AppState` now persists sessions, controller leases, and controller events in Postgres via SQLx while preserving an in-memory fallback for tests/offline runs. SQLx `FromRow` models wrap the Postgres queries so downstream clients can reuse the same schema metadata without duplicating SQL.
 - New migration `20250219120000_controller_leases_runtime.sql` adds `controller_lease`, `session_runtime`, and `session.harness_type`, keeping the schema aligned with `docs/private-beach/data-model.md`.
 - Redis integration powers action queues (Streams) plus TTL’d health/state caches; when Redis is unavailable the manager transparently falls back to in-memory queues.
 - Beach Gate JWT verification is wired through `AuthToken`, with JWKS caching and env-based bypass for local development.
 - Docker Compose workflow exercises Postgres + Redis; `cargo test -p beach-manager` still targets the in-memory implementation, so a Postgres-backed test harness is the next milestone.
+
+### Controller Harness Configuration (In Progress)
+- Controllers are ordinary Beach sessions whose harness currently holds a lease. To support automation templates we plan to capture, per controller, the following metadata:
+  - **Initial prompt** – instructions delivered once the controller lease is granted (e.g., “you orchestrate both Pong paddles…”).
+  - **Action prompt template** – concise, structured update that the harness emits whenever idle criteria are met.
+  - **Idle detection rules** – predicates (time since diff, regex on terminal output, etc.) that decide when to flush an update.
+- Action verbs stay generic (terminal byte writes, keyboard/mouse injections); domain logic lives entirely in the prompt. Spec still needs to document JSON schema and storage (likely `controller_profile` table or JSON column alongside automation assignments).
 
 ### Gaps / Follow-up Items
 - Fill in Redis consumer group semantics: implement `ack_actions`, dedupe handling, and latency metrics.
@@ -178,6 +185,8 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
 - Expose the documented MCP methods (currently only REST is live) and publish schema updates in `crates/harness-proto`.
 - Harden migration automation (CI `sqlx migrate run --check`) and add telemetry wiring (OpenTelemetry spans, Prometheus exporter).
 - Build regression tests against the Postgres/Redis path (docker-compose or `sqlx::test`) to guard future refactors.
+- Finalize controller-harness prompt/idle schema and wire it into onboarding templates.
+- Design the `beach action` CLI passthrough so non-MCP-aware agents can reuse the controller harness channel without bypassing lease enforcement.
 
 ## Database Migrations
 - Manage schema via `sqlx-cli` migrations stored in `apps/beach-manager/migrations/` (checked in). This repository remains the canonical source of database shape; other services (e.g. `apps/private-beach` via Drizzle ORM) consume the generated SQL rather than defining their own migrations.

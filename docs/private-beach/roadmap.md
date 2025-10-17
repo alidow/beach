@@ -22,6 +22,7 @@
 - Next: finish MCP streaming + bindings, surface queue depth/lag metrics, verify RLS via Postgres integration tests, and add dockerized integration tests via `manager-sdk`.
 - Next: publish schema metadata (drizzle-friendly SQL snapshots, enum maps) from `apps/beach-manager/migrations/` so `apps/private-beach` stays in lockstep without owning separate migrations.
 - Next: sync documentation/SDK terminology—`manager` (control plane) vs `controller` (leased session)—across repos so harness and UI teams share the same mental model.
+- Next: pin down controller harness prompt + idle-detection schema (initial prompt, action template, generic action verbs) and store it alongside automation templates.
 
 ## Phase 3 – Workspace Shell (Private Beach Surfer)
 - Prototype Next.js dashboard consuming mock data; implement responsive grid, tile management, and status overlays.
@@ -35,6 +36,7 @@
 - Optimize command transport with optional manager↔harness WebRTC data channels; fall back to broker seamlessly.
 - Capture controller events into audit log and surface them through UI + API.
 - Introduce manager onboarding workflow in the UI (template selection, capability review, scoped token issuance).
+- Surface the controller prompt/idle configuration in the UI so operators can author initial/action prompts and idle rules per automation.
 
 ## Phase 5 – Shared State & Storage
 - Deliver minimal key-value API (last-write-wins, per-beach quotas) and file browser for object storage metadata.

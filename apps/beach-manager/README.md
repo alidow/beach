@@ -22,6 +22,7 @@
 - `sqlx migrate run --source apps/beach-manager/migrations` applies schema changes.
 - `cargo run -p beach-manager` starts the local server (development mode).
 - `cargo test -p beach-manager` runs unit/integration tests.
+  - To run the Postgres-backed SQLx test: start Postgres, export `DATABASE_URL`, then `cargo test -p beach-manager -- --ignored postgres_sqlx_e2e`.
 
 ## Directory Layout (Draft)
 - `src/main.rs` – entrypoint + Axum router.

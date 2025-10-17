@@ -12,6 +12,7 @@ use std::{
 };
 
 use crate::auth::{AuthConfig, AuthContext};
+use crate::metrics;
 use beach_buggy::{
     AckStatus, ActionAck, ActionCommand, HarnessType, HealthHeartbeat, RegisterSessionRequest,
     RegisterSessionResponse, StateDiff,
@@ -19,7 +20,7 @@ use beach_buggy::{
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{types::Json, FromRow, PgPool, Row};
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use uuid::Uuid;
 
 const DEFAULT_LEASE_TTL_MS: u64 = 30_000;
@@ -34,6 +35,7 @@ pub struct AppState {
     fallback: Arc<InnerState>,
     redis: Option<Arc<redis::Client>>,
     auth: Arc<AuthContext>,
+    events: Arc<RwLock<HashMap<String, broadcast::Sender<StreamEvent>>>>,
 }
 
 #[derive(Clone)]
@@ -118,6 +120,27 @@ pub enum ControllerEventType {
     StateUpdated,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum StreamEvent {
+    ControllerEvent(ControllerEvent),
+    State(StateDiff),
+    Health(HealthHeartbeat),
+}
+
+impl StreamEvent {
+    pub fn as_named_json(&self) -> (&'static str, Option<String>) {
+        match self {
+            StreamEvent::ControllerEvent(ev) => (
+                "controller_event",
+                serde_json::to_string(ev).ok(),
+            ),
+            StreamEvent::State(diff) => ("state", serde_json::to_string(diff).ok()),
+            StreamEvent::Health(hb) => ("health", serde_json::to_string(hb).ok()),
+        }
+    }
+}
+
 /// Payload returned to a controller session when the manager grants (or renews) a lease.
 #[derive(Debug, Clone, Serialize)]
 pub struct ControllerLeaseResponse {
@@ -181,6 +204,7 @@ impl AppState {
             fallback: Arc::new(InnerState::new()),
             redis: None,
             auth: Arc::new(AuthContext::new(auth_config)),
+            events: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -194,6 +218,7 @@ impl AppState {
             fallback: Arc::new(InnerState::new()),
             redis: None,
             auth: Arc::new(AuthContext::new(auth_config)),
+            events: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -217,6 +242,22 @@ impl AppState {
 
     pub fn auth_context(&self) -> Arc<AuthContext> {
         self.auth.clone()
+    }
+
+    pub fn subscribe_session(&self, session_id: &str) -> broadcast::Receiver<StreamEvent> {
+        let mut map = self.events.blocking_write();
+        let tx = map
+            .entry(session_id.to_string())
+            .or_insert_with(|| broadcast::channel(128).0)
+            .clone();
+        tx.subscribe()
+    }
+
+    async fn publish(&self, session_id: &str, event: StreamEvent) {
+        let tx_opt = { self.events.read().await.get(session_id).cloned() };
+        if let Some(tx) = tx_opt {
+            let _ = tx.send(event);
+        }
     }
 
     pub async fn register_session(
@@ -251,10 +292,15 @@ impl AppState {
             }
             Backend::Postgres(pool) => {
                 let session_uuid = parse_uuid(session_id, "session_id")?;
+                // Discover identifiers and set RLS context inside a transaction.
+                let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
                 let (meta_json, loc) = (
                     metadata.unwrap_or_else(|| serde_json::json!({})),
                     location_hint,
                 );
+                let mut tx = pool.begin().await?;
+                self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
+                    .await?;
                 let result = sqlx::query(
                     r#"
                     UPDATE session
@@ -267,12 +313,13 @@ impl AppState {
                 .bind(session_uuid)
                 .bind(Json(meta_json))
                 .bind(loc)
-                .execute(pool)
+                .execute(tx.as_mut())
                 .await?;
 
                 if result.rows_affected() == 0 {
                     return Err(StateError::SessionNotFound);
                 }
+                tx.commit().await?;
                 Ok(())
             }
         }
@@ -294,6 +341,8 @@ impl AppState {
             }
             Backend::Postgres(pool) => {
                 let beach_uuid = parse_uuid(private_beach_id, "private_beach_id")?;
+                let mut tx = pool.begin().await?;
+                self.set_rls_context_tx(&mut tx, &beach_uuid).await?;
                 let rows: Vec<SessionRow> = sqlx::query_as(
                     r#"
                     SELECT
@@ -316,7 +365,7 @@ impl AppState {
                     "#,
                 )
                 .bind(beach_uuid)
-                .fetch_all(pool)
+                .fetch_all(tx.as_mut())
                 .await?;
 
                 let mut summaries = Vec::with_capacity(rows.len());
@@ -359,6 +408,7 @@ impl AppState {
                         last_health,
                     });
                 }
+                tx.commit().await?;
                 Ok(summaries)
             }
         }
@@ -373,7 +423,7 @@ impl AppState {
     ) -> Result<ControllerLeaseResponse, StateError> {
         match &self.backend {
             Backend::Memory => {
-                self.acquire_controller_memory(session_id, ttl_override, reason)
+                self.acquire_controller_memory(session_id, ttl_override, reason.clone())
                     .await
             }
             Backend::Postgres(pool) => {
@@ -385,6 +435,8 @@ impl AppState {
                 let requester_uuid = requester;
 
                 let mut tx = pool.begin().await?;
+                self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
+                    .await?;
                 sqlx::query(
                     r#"
                     INSERT INTO controller_lease (
@@ -428,6 +480,19 @@ impl AppState {
                     .acknowledge_controller(session_id, controller_token.to_string(), ttl)
                     .await;
 
+                // Emit a controller event on the SSE channel
+                self.publish(
+                    session_id,
+                    StreamEvent::ControllerEvent(ControllerEvent {
+                        id: Uuid::new_v4().to_string(),
+                        event_type: ControllerEventType::LeaseAcquired,
+                        controller_token: Some(controller_token.to_string()),
+                        timestamp_ms: now_ms(),
+                        reason,
+                    }),
+                )
+                .await;
+
                 Ok(ControllerLeaseResponse {
                     controller_token: controller_token.to_string(),
                     expires_at_ms: expires_at.timestamp_millis(),
@@ -453,6 +518,8 @@ impl AppState {
                 let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
 
                 let mut tx = pool.begin().await?;
+                self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
+                    .await?;
                 let updated = sqlx::query(
                     r#"
                     UPDATE controller_lease
@@ -482,6 +549,18 @@ impl AppState {
 
                 tx.commit().await?;
                 self.fallback.clear_controller(session_id).await;
+
+                self.publish(
+                    session_id,
+                    StreamEvent::ControllerEvent(ControllerEvent {
+                        id: Uuid::new_v4().to_string(),
+                        event_type: ControllerEventType::LeaseReleased,
+                        controller_token: Some(token_uuid.to_string()),
+                        timestamp_ms: now_ms(),
+                        reason: None,
+                    }),
+                )
+                .await;
                 Ok(())
             }
         }
@@ -531,7 +610,26 @@ impl AppState {
                 )
                 .await?;
 
+                // Metrics: enqueue count and queue depth gauge
+                let labels = [
+                    identifiers.private_beach_id.to_string(),
+                    session_uuid.to_string(),
+                ];
+                metrics::ACTIONS_ENQUEUED.with_label_values(&labels).inc_by(actions.len() as u64);
+                let depth = self
+                    .pending_actions_count(
+                        &identifiers.private_beach_id.to_string(),
+                        &session_uuid.to_string(),
+                    )
+                    .await
+                    .unwrap_or(0);
+                metrics::QUEUE_DEPTH
+                    .with_label_values(&labels)
+                    .set(depth as i64);
+
                 let mut tx = pool.begin().await?;
+                self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
+                    .await?;
                 self.insert_controller_event(
                     &mut tx,
                     identifiers.session_id,
@@ -545,6 +643,18 @@ impl AppState {
                 tx.commit().await?;
 
                 self.fallback.enqueue_actions(session_id, actions).await;
+
+                self.publish(
+                    session_id,
+                    StreamEvent::ControllerEvent(ControllerEvent {
+                        id: Uuid::new_v4().to_string(),
+                        event_type: ControllerEventType::ActionsQueued,
+                        controller_token: Some(token_uuid.to_string()),
+                        timestamp_ms: now_ms(),
+                        reason: None,
+                    }),
+                )
+                .await;
 
                 Ok(())
             }
@@ -567,7 +677,17 @@ impl AppState {
                     return Ok(actions);
                 }
 
+                let labels = [
+                    identifiers.private_beach_id.to_string(),
+                    session_uuid.to_string(),
+                ];
+                metrics::ACTIONS_DELIVERED
+                    .with_label_values(&labels)
+                    .inc_by(actions.len() as u64);
+
                 let mut tx = pool.begin().await?;
+                self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
+                    .await?;
                 if let Some(lease) = self
                     .fetch_active_lease_optional(&mut tx, identifiers.session_id)
                     .await?
@@ -585,6 +705,18 @@ impl AppState {
                 }
                 tx.commit().await?;
                 self.fallback.clear_pending_actions(session_id).await;
+
+                self.publish(
+                    session_id,
+                    StreamEvent::ControllerEvent(ControllerEvent {
+                        id: Uuid::new_v4().to_string(),
+                        event_type: ControllerEventType::ActionsAcked,
+                        controller_token: lease.map(|l| l.id.to_string()),
+                        timestamp_ms: now_ms(),
+                        reason: None,
+                    }),
+                )
+                .await;
                 Ok(actions)
             }
         }
@@ -626,14 +758,15 @@ impl AppState {
             Backend::Postgres(pool) => {
                 let session_uuid = parse_uuid(session_id, "session_id")?;
                 let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
-
                 self.store_health_redis(
                     &identifiers.private_beach_id.to_string(),
                     &session_uuid.to_string(),
                     &heartbeat,
                 )
                 .await?;
-
+                let mut tx = pool.begin().await?;
+                self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
+                    .await?;
                 sqlx::query(
                     r#"
                     INSERT INTO session_runtime (session_id, last_health, last_health_at)
@@ -644,10 +777,8 @@ impl AppState {
                 )
                 .bind(identifiers.session_id)
                 .bind(Json(serde_json::to_value(&heartbeat)?))
-                .execute(pool)
+                .execute(tx.as_mut())
                 .await?;
-
-                let mut tx = pool.begin().await?;
                 self.insert_controller_event(
                     &mut tx,
                     identifiers.session_id,
@@ -661,6 +792,13 @@ impl AppState {
                 tx.commit().await?;
 
                 self.fallback.store_health(session_id, heartbeat).await;
+
+                metrics::HEALTH_REPORTS
+                    .with_label_values(&[
+                        identifiers.private_beach_id.to_string(),
+                        session_uuid.to_string(),
+                    ])
+                    .inc();
                 Ok(())
             }
         }
@@ -672,14 +810,15 @@ impl AppState {
             Backend::Postgres(pool) => {
                 let session_uuid = parse_uuid(session_id, "session_id")?;
                 let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
-
                 self.store_state_redis(
                     &identifiers.private_beach_id.to_string(),
                     &session_uuid.to_string(),
                     &diff,
                 )
                 .await?;
-
+                let mut tx = pool.begin().await?;
+                self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
+                    .await?;
                 sqlx::query(
                     r#"
                     INSERT INTO session_runtime (session_id, last_state, last_state_at)
@@ -690,10 +829,8 @@ impl AppState {
                 )
                 .bind(identifiers.session_id)
                 .bind(Json(serde_json::to_value(&diff)?))
-                .execute(pool)
+                .execute(tx.as_mut())
                 .await?;
-
-                let mut tx = pool.begin().await?;
                 self.insert_controller_event(
                     &mut tx,
                     identifiers.session_id,
@@ -707,6 +844,13 @@ impl AppState {
                 tx.commit().await?;
 
                 self.fallback.store_state(session_id, diff).await;
+
+                metrics::STATE_REPORTS
+                    .with_label_values(&[
+                        identifiers.private_beach_id.to_string(),
+                        session_uuid.to_string(),
+                    ])
+                    .inc();
                 Ok(())
             }
         }
@@ -721,6 +865,9 @@ impl AppState {
             Backend::Postgres(pool) => {
                 let session_uuid = parse_uuid(session_id, "session_id")?;
                 let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
+                let mut tx = pool.begin().await?;
+                self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
+                    .await?;
                 let rows: Vec<ControllerEventRow> = sqlx::query_as(
                     r#"
                     SELECT id, event_type, controller_token, reason, occurred_at
@@ -731,7 +878,7 @@ impl AppState {
                     "#,
                 )
                 .bind(identifiers.session_id)
-                .fetch_all(pool)
+                .fetch_all(tx.as_mut())
                 .await?;
 
                 let events = rows
@@ -744,6 +891,7 @@ impl AppState {
                         reason: row.reason,
                     })
                     .collect();
+                tx.commit().await?;
                 Ok(events)
             }
         }
@@ -1106,6 +1254,8 @@ impl AppState {
         let expires_at = Utc::now() + Duration::milliseconds(DEFAULT_LEASE_TTL_MS as i64);
 
         let mut tx = pool.begin().await?;
+        // Set RLS context to the target private beach for the duration of this registration.
+        self.set_rls_context_tx(&mut tx, &private_beach_uuid).await?;
 
         let session_row = sqlx::query(
             r#"
@@ -1253,6 +1403,17 @@ impl AppState {
         }
         record.controller_token = None;
         record.append_event(ControllerEventType::LeaseReleased, None);
+        self.publish(
+            session_id,
+            StreamEvent::ControllerEvent(ControllerEvent {
+                id: Uuid::new_v4().to_string(),
+                event_type: ControllerEventType::LeaseReleased,
+                controller_token: None,
+                timestamp_ms: now_ms(),
+                reason: None,
+            }),
+        )
+        .await;
         Ok(())
     }
 
@@ -1273,6 +1434,17 @@ impl AppState {
             record.pending_actions.push_back(action);
         }
         record.append_event(ControllerEventType::ActionsQueued, None);
+        self.publish(
+            session_id,
+            StreamEvent::ControllerEvent(ControllerEvent {
+                id: Uuid::new_v4().to_string(),
+                event_type: ControllerEventType::ActionsQueued,
+                controller_token: record.controller_token.clone(),
+                timestamp_ms: now_ms(),
+                reason: None,
+            }),
+        )
+        .await;
         Ok(())
     }
 
@@ -1285,6 +1457,19 @@ impl AppState {
             .get_mut(session_id)
             .ok_or(StateError::SessionNotFound)?;
         let actions = record.pending_actions.drain(..).collect();
+        if !actions.is_empty() {
+            self.publish(
+                session_id,
+                StreamEvent::ControllerEvent(ControllerEvent {
+                    id: Uuid::new_v4().to_string(),
+                    event_type: ControllerEventType::ActionsAcked,
+                    controller_token: record.controller_token.clone(),
+                    timestamp_ms: now_ms(),
+                    reason: None,
+                }),
+            )
+            .await;
+        }
         Ok(actions)
     }
 
@@ -1299,6 +1484,7 @@ impl AppState {
             .ok_or(StateError::SessionNotFound)?;
         record.last_health = Some(heartbeat.clone());
         record.append_event(ControllerEventType::HealthReported, None);
+        self.publish(session_id, StreamEvent::Health(heartbeat)).await;
         Ok(())
     }
 
@@ -1313,6 +1499,8 @@ impl AppState {
             .ok_or(StateError::SessionNotFound)?;
         record.last_state = Some(diff);
         record.append_event(ControllerEventType::StateUpdated, None);
+        self.publish(session_id, StreamEvent::State(record.last_state.clone().unwrap()))
+            .await;
         Ok(())
     }
 
@@ -1452,6 +1640,18 @@ impl AppState {
         .bind(reason)
         .execute(tx.as_mut())
         .await?;
+        Ok(())
+    }
+
+    async fn set_rls_context_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        private_beach_id: &Uuid,
+    ) -> Result<(), StateError> {
+        sqlx::query("SELECT set_config('beach.private_beach_id', $1, true)")
+            .bind(private_beach_id.to_string())
+            .execute(tx.as_mut())
+            .await?;
         Ok(())
     }
 

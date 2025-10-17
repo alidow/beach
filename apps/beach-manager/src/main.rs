@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod routes;
+mod metrics;
 mod state;
 
 use auth::{AuthConfig, AuthContext};
@@ -55,21 +56,26 @@ async fn main() -> anyhow::Result<()> {
                 Ok(mut conn) => {
                     if let Err(err) = redis::cmd("PING").query_async::<_, String>(&mut conn).await {
                         warn!(error = %err, "failed to ping redis; continuing without redis");
+                        metrics::REDIS_AVAILABLE.set(0);
                     } else {
                         info!("connected to redis at {}", redis_url);
+                        metrics::REDIS_AVAILABLE.set(1);
                         state = state.with_redis(client);
                     }
                 }
                 Err(err) => {
                     warn!(error = %err, "failed to establish redis connection; continuing without redis");
+                    metrics::REDIS_AVAILABLE.set(0);
                 }
             },
             Err(err) => {
                 warn!(error = %err, "invalid REDIS_URL; continuing without redis integration");
+                metrics::REDIS_AVAILABLE.set(0);
             }
         }
     } else {
         warn!("REDIS_URL not set; features requiring Redis will be disabled");
+        metrics::REDIS_AVAILABLE.set(0);
     }
 
     let app = build_router(state);

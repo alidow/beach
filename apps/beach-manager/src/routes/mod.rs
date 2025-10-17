@@ -1,4 +1,5 @@
 mod auth;
+mod sse;
 mod mcp;
 mod sessions;
 
@@ -18,9 +19,14 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health_check))
         .route("/readyz", get(health_check))
+        .route("/metrics", get(sse::prometheus_metrics))
         .route("/sessions/register", post(register_session))
         .route("/sessions/:session_id", patch(update_session))
         .route("/sessions/:session_id/state", post(push_state))
+        .route(
+            "/sessions/:session_id/state/stream",
+            get(sse::stream_state),
+        )
         .route("/sessions/:session_id/actions", post(queue_actions))
         .route("/sessions/:session_id/actions/poll", get(poll_actions))
         .route("/sessions/:session_id/actions/ack", post(ack_actions))
@@ -31,6 +37,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/sessions/:session_id/controller-events",
             get(list_controller_events),
+        )
+        .route(
+            "/sessions/:session_id/events/stream",
+            get(sse::stream_events),
         )
         .route("/sessions/:session_id/health", post(signal_health))
         .route(

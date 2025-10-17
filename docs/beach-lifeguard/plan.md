@@ -12,8 +12,8 @@ Author: Codex (implementation planning)
 
 ## Status Snapshot
 - Current Phase: 2 – Data Plane & Reliability Enhancements (session registry + flow control in place, idle recycler online)
-- Completed: Phase 0 decisions, Phase 1 skeleton deliverables, Phase 2 routing/backpressure upgrades (DashMap/Slab registry, bounded channels, flow-control metrics), idle recycling with automated close frames, Redis + Prometheus telemetry (`/metrics`), optional OpenTelemetry stdout exporter, `/healthz` & `/debug/stats`
-- Next: lock activation gating (entitlements + kill switch), validate in dev/staging with load harness, then advance to Phase 3 client/server fallback integration
+- Completed: Phase 0 decisions, Phase 1 skeleton deliverables, Phase 2 routing/backpressure upgrades (DashMap/Slab registry, bounded channels, flow-control metrics), idle recycling with automated close frames, Redis + Prometheus telemetry (`/metrics`), optional OpenTelemetry stdout exporter, `/healthz` & `/debug/stats`, activation gating via Beach Gate entitlements (JWT proof → `fallback_authorized` bit enforced end-to-end)
+- Next: validate in dev/staging with the load harness, finish dashboards/runbook polish, then advance to Phase 3 client/server fallback integration
 
 ## Progress Summary
 - **Token exchange & guardrails:** `/v1/fallback/token` lives in beach-road, issues Redis-backed soft guardrail tokens (currently JSON + base64). CLI negotiator consumes the token before attempting fallback.
@@ -21,8 +21,8 @@ Author: Codex (implementation planning)
 - **Flow control & routing:** session registry now uses a DashMap + Slab fan-out table with bounded per-connection channels, flow-control drop metrics, and a recycler loop that emits idle closes (`close_code::POLICY`).
 - **Operator visibility:** `/healthz` for readiness, `/debug/stats` for active session inventory, and `/metrics` (Prometheus scrape) covering handshakes, connection lifecycle, and fan-out counters; OpenTelemetry stdout exporter available via `BEACH_LIFEGUARD_OTEL_STDOUT=1` for trace debugging.
 - **Deployment posture:** production deployment stays paused until the relay is exercised end-to-end in the dev environment; manifests remain staging-only.
-- **What remains:** finalize activation gating (entitlement flags + kill switch endpoints), stand up load/perf harness + dashboards, and move into Phase 3 integration work once dev/staging validation passes.
-- **Control-plane kill switch:** beach-road now honours `FALLBACK_WS_PAUSED`; when enabled the `/fallback/token` endpoint refuses requests with a structured 403 so operators can halt fallback minting instantly.
+- **What remains:** stand up the load/perf harness + dashboards, finish SRE runbook polish, and move into Phase 3 integration work once dev/staging validation passes.
+- **Control-plane kill switch:** beach-road now honours `FALLBACK_WS_PAUSED`; when enabled the `/fallback/token` endpoint refuses requests with a structured 403 so operators can halt fallback minting instantly. Entitlement proofs are required whenever `FALLBACK_REQUIRE_OIDC=1`, and verified tokens set a `fallback_authorized` bit consumed by the lifeguard handshake.
 - **CLI & web toggles:** terminal fallback requests now honour CLI flags (`--fallback-cohort`, `--fallback-entitlement-proof`, `--fallback-telemetry-opt-in`) alongside Beach Auth profiles, and beach-surfer exposes matching advanced inputs plus a Beach Auth call-to-action when fallback is locked — giving rollout teams a UI/CLI surface while full browser auth lands; paused responses surface a friendly error to users.
 - **Token metrics:** beach-road exports `beach_fallback_token_requests_total` via `/metrics`, labelled by `outcome` (`issued`, `paused`, `entitlement_denied`, `invalid_session`, `error`) and guardrail state, so dashboards can track kill-switch use and entitlement failures.
 - **Browser plumbing:** advanced overrides from beach-surfer are now injected into the connection controller and logged alongside transport setup, ready to be forwarded once the browser fallback transport is wired to beach-lifeguard.
@@ -120,7 +120,7 @@ Author: Codex (implementation planning)
 
 ## Next Steps After Approval
 1. Harden operability: wire the new Prometheus metrics into dashboards/alerts, add a `/debug` surface for paused state, and finish the SRE runbook.
-2. Gate fallback behind Clerk-backed entitlements: accept signed proofs in beach-road, honour cohort entitlements (`fallback_ws_enabled`), and retire the temporary override path once validation is live.
+2. 📦 Gate fallback behind Clerk-backed entitlements: **Done (dev/staging)** – beach-road now verifies Beach Gate JWTs, issues tokens with a `fallback_authorized` feature bit, and the lifeguard handshake refuses unauthorized clients. Follow-up: wire cohort toggles/metrics dashboards before GA.
 3. Thread browser overrides through the upcoming WSS transport handshake so web clients pass cohort/proof/telemetry alongside the CLI when beach-lifeguard activates.
 4. Exercise the load/chaos harness against the new session registry (target 5K active / 10K idle) and archive reports ahead of Phase 3 rollout planning.
 

@@ -38,9 +38,8 @@ pub struct AuthContext {
     client: reqwest::Client,
 }
 
-#[derive(Debug)]
 struct JwksCache {
-    keys: HashMap<String, DecodingKey<'static>>,
+    keys: HashMap<String, DecodingKey>,
     fetched_at: Instant,
 }
 
@@ -70,6 +69,7 @@ pub enum AuthError {
     Payload(String),
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Claims {
     pub sub: String,
@@ -93,6 +93,7 @@ pub struct Claims {
     pub exp: Option<i64>,
 }
 
+#[allow(dead_code)]
 impl Claims {
     pub fn scopes(&self) -> Vec<String> {
         let mut scopes = Vec::new();
@@ -135,13 +136,11 @@ impl AuthContext {
         if let Some(audience) = &self.config.audience {
             validation.set_audience(&[audience]);
         }
-        validation.insecure_disable_signature_validation = false;
-
         let data = decode::<Claims>(token, &key, &validation)?;
         Ok(data.claims)
     }
 
-    async fn decoding_key(&self, kid: &str) -> Result<DecodingKey<'static>, AuthError> {
+    async fn decoding_key(&self, kid: &str) -> Result<DecodingKey, AuthError> {
         {
             let cache = self.cache.read().await;
             if let Some(cache) = cache.as_ref() {
@@ -197,7 +196,6 @@ impl AuthContext {
     }
 
     fn decode_without_verification(&self, token: &str) -> Result<Claims, AuthError> {
-        let parts: Vec<&str> = token.split('.').collect();
         match Self::decode_payload(token) {
             Ok(claims) => Ok(claims),
             Err(_) => Ok(Claims {

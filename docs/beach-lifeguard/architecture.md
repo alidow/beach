@@ -57,7 +57,7 @@ sequenceDiagram
   - Token payload: `session_id`, `expires_at`, `capabilities = ["fallback-ws"]`, `signature` (Ed25519 using Beach control plane key). Token is delivered to participants via the existing secure signaling envelope so `beach-road` never sees it.
 - **Client ↔ beach-lifeguard handshake**
   1. Client opens HTTPS connection, upgrades to WSS, and sends `ClientHello { session_id, token, client_nonce, protocol_version, compression=none|brotli }`.
-  2. beach-lifeguard validates token signature and expiry, checks guardrail budget, returns `ServerHello { ack_nonce, server_nonce, negotiated_compression, features_bitmap }`.
+  2. beach-lifeguard validates token signature and expiry, checks guardrail budget, returns `ServerHello { ack_nonce, server_nonce, negotiated_compression, features_bitmap }`. When OIDC is enforced, tokens must carry `feature_bits.fallback_authorized=true`; otherwise the handshake aborts with `MissingEntitlement`.
   3. Both sides derive `hkdf(psk, "beach-lifeguard/handshake", client_nonce || server_nonce)` to obtain `K_send`/`K_recv` and 96-bit starting nonces; all subsequent frames use AES-GCM (default) with option to negotiate ChaCha20-Poly1305 when clients prefer it.
 - **Frame format**
   - `Frame = header || ciphertext || tag` where header packs:
@@ -132,8 +132,8 @@ sequenceDiagram
 ## Control Plane & Token API Decisions
 - **Endpoint:** `POST /v1/fallback/token` (authenticated via mTLS service account) returning `{ token, expires_at, cohort, guardrail_hint }`.
 - **Inputs:** `session_id`, `cohort_id`, `client_version`, `entitlement_proof` (optional JWT from future Clerk/OIDC integration), `telemetry_opt_in`.
-  - CLI already forwards overrides via `--fallback-*` flags (mirrored to `BEACH_FALLBACK_COHORT`, `BEACH_ENTITLEMENT_PROOF`, `BEACH_FALLBACK_TELEMETRY_OPT_IN`), and beach-surfer surfaces matching advanced controls that are stored locally and injected into the connection handshake, so Clerk proofs can slide in later without further protocol churn.
-- **Validation Flow:** verify entitlement when proof provided (paid “private beaches” users); in dev or when entitlement disabled, skip OIDC checks. Ensure `fallback_ws_enabled` true. Guardrail counters stored in Redis (shared with beach-road) using hourly buckets.
+  - CLI already forwards overrides via `--fallback-*` flags (mirrored to `BEACH_FALLBACK_COHORT`, `BEACH_ENTITLEMENT_PROOF`, `BEACH_FALLBACK_TELEMETRY_OPT_IN`), and beach-surfer surfaces matching advanced controls that are stored locally and injected into the connection handshake, so Clerk proofs can slide in later without further protocol churn. Beach-road now verifies proofs against Beach Gate’s ES256 JWKS (`BEACH_GATE_JWKS_URL` + issuer/audience envs) and encodes the outcome into `feature_bits.fallback_authorized`.
+- **Validation Flow:** verify entitlement when proof provided (paid “private beaches” users); in dev or when entitlement disabled, skip OIDC checks. Ensure `fallback_ws_enabled` true. Guardrail counters stored in Redis (shared with beach-road) using hourly buckets. Handshake enforcement rejects fallback connections if the authorization bit is missing while `FALLBACK_REQUIRE_OIDC=1`.
 - **Token Format:** Ed25519-signed CBOR payload containing `session_id`, `issued_at`, `expires_at` (<= 5 min), `cohort_id`, `feature_bits`.
   - **Implementation note (Phase 1):** Tokens are currently returned as Base64-encoded JSON claims; Ed25519 signing will be introduced alongside production hardening.
 - **Counters:** Redis keys `fallback:cohort:{cohort_id}:yyyy-mm-dd-hh` with TTL 90 minutes; soft limit at 0.5% triggers alert but token still issued; hard kill switch toggles `fallback_ws_paused`.

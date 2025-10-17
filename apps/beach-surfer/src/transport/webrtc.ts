@@ -204,6 +204,14 @@ interface HandshakeOptions {
   sessionId?: string;
 }
 
+interface IceCandidateSignal {
+  handshake_id: string;
+  candidate: string;
+  sdp_mid?: string;
+  sdp_mline_index?: number;
+  sealed?: SealedEnvelope;
+}
+
 export async function connectWebRtcTransport(
   options: ConnectWebRtcTransportOptions,
 ): Promise<ConnectedWebRtcTransport> {
@@ -305,6 +313,7 @@ export async function connectWebRtcTransport(
   // Queue remote ICE candidates until the remote description is set.
   let remoteDescriptionSet = false;
   const pendingRemoteCandidates: RTCIceCandidateInit[] = [];
+  const pendingCandidateSignals: IceCandidateSignal[] = [];
   const onRemoteCandidate = (cand: RTCIceCandidateInit) => {
     if (!remoteDescriptionSet) {
       pendingRemoteCandidates.push(cand);
@@ -315,12 +324,80 @@ export async function connectWebRtcTransport(
       .then(() => log(logger, `ice add ok: ${(cand.candidate ?? '').slice(0, 80)}`))
       .catch((error) => log(logger, `ice add failed: ${error}`));
   };
+  const processCandidateSignal = async (candidateSignal: IceCandidateSignal): Promise<void> => {
+    const handshakeId = currentHandshakeId;
+    if (!handshakeId) {
+      pendingCandidateSignals.push(candidateSignal);
+      return;
+    }
+    if (candidateSignal.handshake_id !== handshakeId) {
+      log(
+        logger,
+        `discarding candidate for stale handshake ${candidateSignal.handshake_id}`,
+      );
+      return;
+    }
+
+    let candidateInit: RTCIceCandidateInit;
+    if (secureState.enabled) {
+      const keyPromise = secureState.getKey();
+      if (!keyPromise) {
+        pendingCandidateSignals.push(candidateSignal);
+        return;
+      }
+      const sealed = candidateSignal.sealed;
+      if (!sealed) {
+        log(logger, 'ignoring remote candidate: sealed payload missing');
+        return;
+      }
+      try {
+        const key = await keyPromise;
+        const decoded = await openIceCandidate({
+          key,
+          handshakeId,
+          localPeerId: secureState.localPeerId,
+          remotePeerId,
+          envelope: sealed,
+        });
+        candidateInit = decoded;
+      } catch (error) {
+        log(logger, `failed to decrypt remote candidate: ${String(error)}`);
+        return;
+      }
+    } else {
+      candidateInit = {
+        candidate: candidateSignal.candidate,
+        sdpMid: candidateSignal.sdp_mid ?? undefined,
+        sdpMLineIndex: candidateSignal.sdp_mline_index ?? undefined,
+      };
+    }
+
+    log(logger, 'received remote ice candidate');
+    onRemoteCandidate(candidateInit);
+  };
+  const flushPendingCandidateSignals = () => {
+    if (pendingCandidateSignals.length === 0) {
+      return;
+    }
+    if (!currentHandshakeId) {
+      return;
+    }
+    if (secureState.enabled && !secureState.getKey()) {
+      return;
+    }
+    const signals = pendingCandidateSignals.splice(0, pendingCandidateSignals.length);
+    for (const signal of signals) {
+      void processCandidateSignal(signal);
+    }
+  };
+  const handleCandidateSignal = (signal: IceCandidateSignal) => {
+    pendingCandidateSignals.push(signal);
+    flushPendingCandidateSignals();
+  };
   const disposeSignalListener = attachSignalListener(
     signaling,
     remotePeerId,
-    () => currentHandshakeId,
-    onRemoteCandidate,
-    secureState,
+    handleCandidateSignal,
     logger,
   );
   const disposeGeneralListener = attachGeneralListener(signaling, remotePeerId, logger);
@@ -507,8 +584,15 @@ export async function connectWebRtcTransport(
       currentHandshakeId = handshakeId;
       log(logger, `handshake ready: ${handshakeId}`);
       trace?.mark('webrtc:handshake_ready', { handshakeId });
+      flushPendingCandidateSignals();
       if (secureState.enabled) {
-        void ensureSealingKey(handshakeId);
+        void ensureSealingKey(handshakeId)
+          .then(() => {
+            flushPendingCandidateSignals();
+          })
+          .catch((error) => {
+            log(logger, `failed to derive sealing key: ${String(error)}`);
+          });
       }
       if (candidateSendState === 'ready') {
         void flushPendingCandidates();
@@ -529,13 +613,7 @@ export async function connectWebRtcTransport(
 function attachSignalListener(
   signaling: SignalingClient,
   remotePeerId: string,
-  getHandshakeId: () => string | null,
-  onRemoteCandidate: (cand: RTCIceCandidateInit) => void,
-  secure: {
-    enabled: boolean;
-    getKey: () => Promise<Uint8Array> | null;
-    localPeerId: string;
-  },
+  onCandidateSignal: (signal: IceCandidateSignal) => void,
   logger?: (message: string) => void,
 ): () => void {
   const handler = (event: Event) => {
@@ -550,61 +628,8 @@ function attachSignalListener(
     if (!signal) {
       return;
     }
-    const handshakeId = getHandshakeId();
-    if (
-      handshakeId &&
-      signal.signal.handshake_id &&
-      signal.signal.handshake_id !== handshakeId
-    ) {
-      log(logger, `discarding signal for stale handshake ${signal.signal.handshake_id}`);
-      return;
-    }
     if (signal.signal.signal_type === 'ice_candidate') {
-      const candidateSignal = signal.signal;
-      void (async () => {
-        const handshakeId = getHandshakeId();
-        if (!handshakeId) {
-          log(logger, 'ignoring remote candidate: handshake not established');
-          return;
-        }
-
-        let candidateInit: RTCIceCandidateInit;
-        if (secure.enabled) {
-          const keyPromise = secure.getKey();
-          if (!keyPromise) {
-            log(logger, 'ignoring remote candidate: secure key not ready');
-            return;
-          }
-          const sealed = candidateSignal.sealed;
-          if (!sealed) {
-            log(logger, 'ignoring remote candidate: sealed payload missing');
-            return;
-          }
-          try {
-            const key = await keyPromise;
-            const decoded = await openIceCandidate({
-              key,
-              handshakeId,
-              localPeerId: secure.localPeerId,
-              remotePeerId,
-              envelope: sealed,
-            });
-            candidateInit = decoded;
-          } catch (error) {
-            log(logger, `failed to decrypt remote candidate: ${String(error)}`);
-            return;
-          }
-        } else {
-          candidateInit = {
-            candidate: candidateSignal.candidate,
-            sdpMid: candidateSignal.sdp_mid ?? undefined,
-            sdpMLineIndex: candidateSignal.sdp_mline_index ?? undefined,
-          };
-        }
-
-        log(logger, 'received remote ice candidate');
-        onRemoteCandidate(candidateInit);
-      })();
+      onCandidateSignal(signal.signal);
     }
   };
 

@@ -22,6 +22,22 @@ services:
       - redis-data:/data
     networks:
       - beach-network
+  coturn:
+    image: coturn/coturn:4.6-alpine
+    container_name: beach-coturn
+    command:
+      - turnserver
+      - --config=/etc/coturn/turnserver.conf
+      - --log-file=stdout
+    ports:
+      - "3478:3478"
+      - "3478:3478/udp"
+      - "5349:5349"
+      - "5349:5349/udp"
+    volumes:
+      - ./config/coturn/dev-turnserver.conf:/etc/coturn/turnserver.conf:ro
+    networks:
+      - beach-network
   beach-lifeguard:
     image: rust:1.80
     container_name: beach-lifeguard

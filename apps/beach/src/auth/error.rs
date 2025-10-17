@@ -23,6 +23,8 @@ pub enum AuthError {
     ProfileNotFound(String),
     #[error("profile lacks websocket fallback entitlement")]
     FallbackNotEntitled,
+    #[error("profile lacks TURN fallback entitlement")]
+    TurnNotEntitled,
     #[error("authorization is still pending")]
     AuthorizationPending,
     #[error("authorization request was denied")]

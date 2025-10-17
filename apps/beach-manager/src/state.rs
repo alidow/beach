@@ -1,16 +1,15 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::auth::{AuthConfig, AuthContext};
 use beach_buggy::{
-    ActionAck, ActionCommand, HarnessType, HealthHeartbeat, RegisterSessionRequest,
+    AckStatus, ActionAck, ActionCommand, HarnessType, HealthHeartbeat, RegisterSessionRequest,
     RegisterSessionResponse, StateDiff,
 };
 use chrono::{DateTime, Duration, Utc};
-use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use sqlx::{types::Json, PgPool, Row};
 use tokio::sync::RwLock;
@@ -19,6 +18,8 @@ use uuid::Uuid;
 const DEFAULT_LEASE_TTL_MS: u64 = 30_000;
 const REDIS_ACTION_STREAM_MAXLEN: usize = 2_048;
 const REDIS_TTL_SECONDS: usize = 120;
+const REDIS_ACTION_GROUP: &str = "controllers";
+const REDIS_ACTION_CONSUMER_PREFIX: &str = "poller";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -135,8 +136,6 @@ pub struct McpBridge {
 struct DbSessionIdentifiers {
     session_id: Uuid,
     private_beach_id: Uuid,
-    harness_type: Option<String>,
-    harness_id: Option<Uuid>,
 }
 
 impl AppState {
@@ -292,7 +291,7 @@ impl AppState {
                 for row in rows {
                     let origin_session: Uuid = row.try_get("origin_session_id")?;
                     let harness_id: Option<Uuid> = row.try_get("harness_id")?;
-                    let harness_type = row.try_get::<Option<String>, _>("harness_type");
+                    let harness_type: Option<String> = row.try_get("harness_type")?;
                     let harness = harness_type
                         .as_deref()
                         .and_then(harness_type_from_db)
@@ -339,17 +338,20 @@ impl AppState {
         session_id: &str,
         ttl_override: Option<u64>,
         reason: Option<String>,
-        requester: Option<String>,
+        requester: Option<Uuid>,
     ) -> Result<ControllerLeaseResponse, StateError> {
         match &self.backend {
-            Backend::Memory => self.acquire_controller_memory(session_id, ttl_override, reason),
+            Backend::Memory => {
+                self.acquire_controller_memory(session_id, ttl_override, reason)
+                    .await
+            }
             Backend::Postgres(pool) => {
                 let session_uuid = parse_uuid(session_id, "session_id")?;
                 let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
                 let ttl = ttl_override.unwrap_or(DEFAULT_LEASE_TTL_MS).max(1_000);
                 let expires_at = Utc::now() + Duration::milliseconds(ttl as i64);
                 let controller_token = Uuid::new_v4();
-                let requester_uuid = requester.as_deref().and_then(|s| Uuid::parse_str(s).ok());
+                let requester_uuid = requester;
 
                 let mut tx = pool.begin().await?;
                 sqlx::query(
@@ -384,6 +386,7 @@ impl AppState {
                     "lease_acquired",
                     Some(controller_token),
                     requester_uuid,
+                    requester_uuid,
                     reason,
                 )
                 .await?;
@@ -406,6 +409,7 @@ impl AppState {
         &self,
         session_id: &str,
         controller_token: &str,
+        actor_account_id: Option<Uuid>,
     ) -> Result<(), StateError> {
         match &self.backend {
             Backend::Memory => {
@@ -440,6 +444,7 @@ impl AppState {
                     "lease_released",
                     Some(token_uuid),
                     None,
+                    actor_account_id,
                     None,
                 )
                 .await?;
@@ -456,6 +461,7 @@ impl AppState {
         session_id: &str,
         controller_token: &str,
         actions: Vec<ActionCommand>,
+        actor_account_id: Option<Uuid>,
     ) -> Result<(), StateError> {
         if actions.is_empty() {
             return Ok(());
@@ -501,6 +507,7 @@ impl AppState {
                     "actions_queued",
                     Some(lease.id),
                     lease.controller_account_id,
+                    actor_account_id,
                     None,
                 )
                 .await?;
@@ -540,6 +547,7 @@ impl AppState {
                         "actions_acked",
                         Some(lease.id),
                         lease.controller_account_id,
+                        lease.controller_account_id,
                         None,
                     )
                     .await?;
@@ -554,11 +562,26 @@ impl AppState {
     pub async fn ack_actions(
         &self,
         session_id: &str,
-        _acks: Vec<ActionAck>,
+        acks: Vec<ActionAck>,
+        _actor_account_id: Option<Uuid>,
     ) -> Result<(), StateError> {
         match &self.backend {
-            Backend::Memory => Ok(()),
-            Backend::Postgres(_) => Ok(()),
+            Backend::Memory => {
+                self.fallback.remove_actions(session_id, &acks).await;
+                Ok(())
+            }
+            Backend::Postgres(pool) => {
+                let session_uuid = parse_uuid(session_id, "session_id")?;
+                let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
+                self.ack_actions_redis(
+                    &identifiers.private_beach_id.to_string(),
+                    &session_uuid.to_string(),
+                    &acks,
+                )
+                .await?;
+                self.fallback.remove_actions(session_id, &acks).await;
+                Ok(())
+            }
         }
     }
 
@@ -598,6 +621,7 @@ impl AppState {
                     &mut tx,
                     identifiers.session_id,
                     "health_reported",
+                    None,
                     None,
                     None,
                     None,
@@ -643,6 +667,7 @@ impl AppState {
                     &mut tx,
                     identifiers.session_id,
                     "state_updated",
+                    None,
                     None,
                     None,
                     None,
@@ -799,6 +824,23 @@ impl InnerState {
             for action in actions {
                 record.pending_actions.push_back(action);
             }
+        }
+    }
+
+    async fn remove_actions(&self, session_id: &str, acks: &[ActionAck]) {
+        let mut sessions = self.sessions.write().await;
+        if let Some(record) = sessions.get_mut(session_id) {
+            let ack_ids: HashSet<String> = acks
+                .iter()
+                .filter(|ack| matches!(ack.status, AckStatus::Ok))
+                .map(|ack| ack.id.clone())
+                .collect();
+            if ack_ids.is_empty() {
+                return;
+            }
+            record
+                .pending_actions
+                .retain(|action| !ack_ids.contains(&action.id));
         }
     }
 
@@ -981,6 +1023,10 @@ fn redis_state_key(private_beach_id: &str, session_id: &str) -> String {
     format!("pb:{private_beach_id}:sess:{session_id}:state")
 }
 
+fn redis_action_index_key(private_beach_id: &str, session_id: &str) -> String {
+    format!("pb:{private_beach_id}:sess:{session_id}:actions:index")
+}
+
 impl AppState {
     async fn register_session_memory(
         &self,
@@ -1114,6 +1160,7 @@ impl AppState {
             Some(controller_token),
             None,
             None,
+            None,
         )
         .await?;
 
@@ -1122,6 +1169,7 @@ impl AppState {
             db_session_id,
             "lease_acquired",
             Some(controller_token),
+            None,
             None,
             None,
         )
@@ -1303,7 +1351,7 @@ impl AppState {
     ) -> Result<DbSessionIdentifiers, StateError> {
         let row = sqlx::query(
             r#"
-            SELECT id, private_beach_id, harness_type, harness_id
+            SELECT id, private_beach_id
             FROM session
             WHERE origin_session_id = $1
             "#,
@@ -1316,8 +1364,6 @@ impl AppState {
             Ok(DbSessionIdentifiers {
                 session_id: row.try_get("id")?,
                 private_beach_id: row.try_get("private_beach_id")?,
-                harness_type: row.try_get("harness_type").ok(),
-                harness_id: row.try_get("harness_id").ok(),
             })
         } else {
             Err(StateError::SessionNotFound)
@@ -1393,6 +1439,7 @@ impl AppState {
         event_type: &str,
         controller_token: Option<Uuid>,
         controller_account_id: Option<Uuid>,
+        issued_by_account_id: Option<Uuid>,
         reason: Option<String>,
     ) -> Result<(), StateError> {
         sqlx::query(
@@ -1401,7 +1448,7 @@ impl AppState {
                 id, session_id, event_type, controller_token, controller_account_id,
                 issued_by_account_id, reason, occurred_at
             )
-            VALUES ($1, $2, $3::controller_event_type, $4, $5, $5, $6, NOW())
+            VALUES ($1, $2, $3::controller_event_type, $4, $5, $6, $7, NOW())
             "#,
         )
         .bind(Uuid::new_v4())
@@ -1409,6 +1456,7 @@ impl AppState {
         .bind(event_type)
         .bind(controller_token)
         .bind(controller_account_id)
+        .bind(issued_by_account_id)
         .bind(reason)
         .execute(tx.as_mut())
         .await?;
@@ -1424,21 +1472,51 @@ impl AppState {
         if let Some(client) = &self.redis {
             let mut conn = client.get_async_connection().await?;
             let key = redis_actions_key(private_beach_id, session_id);
+            let index_key = redis_action_index_key(private_beach_id, session_id);
+
+            if let Err(err) = redis::cmd("XGROUP")
+                .arg("CREATE")
+                .arg(&key)
+                .arg(REDIS_ACTION_GROUP)
+                .arg("0")
+                .arg("MKSTREAM")
+                .query_async::<_, ()>(&mut conn)
+                .await
+            {
+                if err.code() != Some("BUSYGROUP") {
+                    return Err(StateError::Redis(err));
+                }
+            }
+
             for action in &actions {
                 let payload = serde_json::to_string(action)?;
-                redis::cmd("XADD")
+                let entry_id: String = redis::cmd("XADD")
                     .arg(&key)
                     .arg("MAXLEN")
                     .arg("~")
                     .arg(REDIS_ACTION_STREAM_MAXLEN)
                     .arg("*")
+                    .arg("action_id")
+                    .arg(&action.id)
                     .arg("payload")
                     .arg(payload)
-                    .query_async::<_, String>(&mut conn)
+                    .query_async(&mut conn)
+                    .await?;
+
+                redis::cmd("HSET")
+                    .arg(&index_key)
+                    .arg(&action.id)
+                    .arg(&entry_id)
+                    .query_async::<_, ()>(&mut conn)
                     .await?;
             }
             redis::cmd("EXPIRE")
                 .arg(&key)
+                .arg(REDIS_TTL_SECONDS)
+                .query_async::<_, ()>(&mut conn)
+                .await?;
+            redis::cmd("EXPIRE")
+                .arg(&index_key)
                 .arg(REDIS_TTL_SECONDS)
                 .query_async::<_, ()>(&mut conn)
                 .await?;
@@ -1454,28 +1532,35 @@ impl AppState {
         if let Some(client) = &self.redis {
             let mut conn = client.get_async_connection().await?;
             let key = redis_actions_key(private_beach_id, session_id);
-            let range: Vec<(String, Vec<(String, String)>)> = redis::cmd("XRANGE")
+            let consumer = format!("{REDIS_ACTION_CONSUMER_PREFIX}:{session_id}");
+
+            let value: redis::Value = redis::cmd("XREADGROUP")
+                .arg("GROUP")
+                .arg(REDIS_ACTION_GROUP)
+                .arg(&consumer)
+                .arg("COUNT")
+                .arg(64)
+                .arg("STREAMS")
                 .arg(&key)
-                .arg("-")
-                .arg("+")
+                .arg(">")
                 .query_async(&mut conn)
                 .await?;
 
             let mut actions = Vec::new();
-            for (_id, fields) in range {
-                for (field, value) in fields {
-                    if field == "payload" {
-                        let action: ActionCommand = serde_json::from_str(&value)?;
-                        actions.push(action);
+
+            if !matches!(value, redis::Value::Nil) {
+                let streams: Vec<(String, Vec<(String, Vec<(String, String)>)>)> =
+                    redis::from_redis_value(&value)?;
+                for (_stream, entries) in streams {
+                    for (_entry_id, fields) in entries {
+                        for (field, value) in fields {
+                            if field == "payload" {
+                                let action: ActionCommand = serde_json::from_str(&value)?;
+                                actions.push(action);
+                            }
+                        }
                     }
                 }
-            }
-
-            if !actions.is_empty() {
-                redis::cmd("DEL")
-                    .arg(&key)
-                    .query_async::<_, ()>(&mut conn)
-                    .await?;
             }
 
             return Ok(actions);
@@ -1543,6 +1628,57 @@ impl AppState {
                 .arg(&key)
                 .arg(REDIS_TTL_SECONDS)
                 .arg(payload)
+                .query_async::<_, ()>(&mut conn)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn ack_actions_redis(
+        &self,
+        private_beach_id: &str,
+        session_id: &str,
+        acks: &[ActionAck],
+    ) -> Result<(), StateError> {
+        if let Some(client) = &self.redis {
+            let mut conn = client.get_async_connection().await?;
+            let key = redis_actions_key(private_beach_id, session_id);
+            let index_key = redis_action_index_key(private_beach_id, session_id);
+
+            for ack in acks {
+                if !matches!(ack.status, AckStatus::Ok) {
+                    continue;
+                }
+
+                let entry_id: Option<String> = redis::cmd("HGET")
+                    .arg(&index_key)
+                    .arg(&ack.id)
+                    .query_async(&mut conn)
+                    .await?;
+
+                if let Some(entry_id) = entry_id {
+                    redis::cmd("XACK")
+                        .arg(&key)
+                        .arg(REDIS_ACTION_GROUP)
+                        .arg(&entry_id)
+                        .query_async::<_, i64>(&mut conn)
+                        .await?;
+                    redis::cmd("XDEL")
+                        .arg(&key)
+                        .arg(&entry_id)
+                        .query_async::<_, i64>(&mut conn)
+                        .await?;
+                    redis::cmd("HDEL")
+                        .arg(&index_key)
+                        .arg(&ack.id)
+                        .query_async::<_, i64>(&mut conn)
+                        .await?;
+                }
+            }
+
+            redis::cmd("EXPIRE")
+                .arg(&index_key)
+                .arg(REDIS_TTL_SECONDS)
                 .query_async::<_, ()>(&mut conn)
                 .await?;
         }

@@ -56,7 +56,7 @@ pub fn issue_ephemeral_token(
     telemetry: TelemetryPreference,
 ) -> FallbackTokenClaims {
     let ttl = Duration::minutes(5);
-    FallbackTokenClaims::new(Uuid::new_v4(), cohort, ttl, telemetry)
+    FallbackTokenClaims::new(Uuid::new_v4(), cohort, ttl, telemetry, false)
 }
 
 /// Feature summary returned by the server after the handshake completes.

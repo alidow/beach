@@ -51,6 +51,7 @@ pub type ApiResult<T> = Result<Json<T>, ApiError>;
 #[derive(Debug)]
 pub enum ApiError {
     Unauthorized,
+    Forbidden(&'static str),
     NotFound(&'static str),
     Conflict(&'static str),
     BadRequest(String),
@@ -70,6 +71,14 @@ impl IntoResponse for ApiError {
                 Json(ApiErrorBody {
                     error: "unauthorized",
                     message: None,
+                }),
+            )
+                .into_response(),
+            ApiError::Forbidden(msg) => (
+                axum::http::StatusCode::FORBIDDEN,
+                Json(ApiErrorBody {
+                    error: "forbidden",
+                    message: Some(msg.to_string()),
                 }),
             )
                 .into_response(),
@@ -236,5 +245,85 @@ mod tests {
         let summaries: Vec<SessionSummary> = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].session_id, "sess-test");
+    }
+
+    #[tokio::test]
+    async fn mcp_register_and_list_sessions() {
+        let state = AppState::new();
+        let app = build_router(state.clone());
+
+        let register_rpc = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "private_beach.register_session",
+            "params": {
+                "session_id": "6a7a7d0a-1b8b-4d80-8c13-111111111111",
+                "private_beach_id": "ec1a9f74-91ff-4511-9cd8-222222222222",
+                "harness_type": "terminal_shim",
+                "capabilities": ["terminal_diff_v1"],
+                "location_hint": "us-test-1",
+                "metadata": { "tag": "demo" },
+                "version": "0.1.0"
+            }
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(register_rpc.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rpc_resp: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(rpc_resp.get("error").is_none());
+        let controller_token = rpc_resp["result"]["controller_token"]
+            .as_str()
+            .expect("controller token present")
+            .to_string();
+        assert!(!controller_token.is_empty());
+
+        let list_rpc = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "private_beach.list_sessions",
+            "params": {
+                "private_beach_id": "ec1a9f74-91ff-4511-9cd8-222222222222"
+            }
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(list_rpc.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let rpc_resp: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(rpc_resp.get("error").is_none());
+        let sessions = rpc_resp["result"].as_array().expect("sessions array");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0]["session_id"],
+            "6a7a7d0a-1b8b-4d80-8c13-111111111111"
+        );
     }
 }

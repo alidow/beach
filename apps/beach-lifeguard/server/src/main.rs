@@ -459,7 +459,7 @@ async fn perform_handshake(
         return Err(HandshakeError::SessionMismatch);
     }
 
-    if require_oidc && !claims.feature_bits.telemetry_enabled {
+    if require_oidc && !claims.feature_bits.fallback_authorized {
         return Err(HandshakeError::MissingEntitlement);
     }
 

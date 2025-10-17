@@ -14,6 +14,7 @@ use url::Url;
 
 const KEYRING_SERVICE: &str = "beach-auth";
 pub const FALLBACK_ENTITLEMENT: &str = "rescue:fallback";
+pub const TURN_ENTITLEMENT: &str = "private-beach:turn";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessTokenCache {
@@ -116,10 +117,16 @@ impl StoredProfile {
         self.refresh.read()
     }
 
+    pub fn has_entitlement(&self, entitlement: &str) -> bool {
+        self.entitlements.iter().any(|ent| ent == entitlement)
+    }
+
     pub fn has_fallback_entitlement(&self) -> bool {
-        self.entitlements
-            .iter()
-            .any(|ent| ent == FALLBACK_ENTITLEMENT)
+        self.has_entitlement(FALLBACK_ENTITLEMENT)
+    }
+
+    pub fn has_turn_entitlement(&self) -> bool {
+        self.has_entitlement(TURN_ENTITLEMENT)
     }
 
     pub fn cache_access_token(

@@ -98,10 +98,10 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
 - Self-hosting packaging: do we ship Helm charts/docker compose, and how does licensing enforcement work offline?
 
 ## Immediate Next Steps
-1. Stand up the MCP transport alongside REST so harnesses/agents can call `private_beach.*` methods without HTTP shims; publish updated bindings in `crates/harness-proto`.
-2. Harden the Redis queue: switch to consumer groups (`XREADGROUP`/`XACK`), fill in `ack_actions`, and add metrics/alerts for stalled streams.
-3. Enforce Beach Gate scopes end-to-end—thread authenticated principals into repository calls, add RLS policy tests, and wire `AuthToken::has_scope` checks to routes.
-4. Extend integration coverage in CI: docker-compose Postgres+Redis smoke tests, `sqlx migrate run --check`, and latency observability hooks (OpenTelemetry export stubs).
+1. Extend the new MCP surface with streaming support (`subscribe_state`, controller event feeds) and publish updated bindings in `crates/harness-proto`.
+2. Harden the Redis queue: add queue depth/lag metrics and stalled-consumer alerts now that consumer groups (`XREADGROUP`/`XACK`) and ack metadata are in place.
+3. Close the Beach Gate enforcement loop: add RLS/SQLx tests that validate scoped principals against Postgres now that controller events capture `issued_by_account_id`.
+4. Extend integration coverage in CI: docker-compose Postgres+Redis smoke tests, queue-depth/lag metrics with alerts, and OpenTelemetry instrumentation stubs for latency tracking.
 5. Flesh out agent onboarding templates (Pong demo, SRE runbook) now that prompt scaffolding and auth scopes exist.
 
 ## Phase 2 Implementation Plan
@@ -119,7 +119,7 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
 - **Follow-Ups:** Wire row-level policy checks against claims, ensure migrations cover backfill paths, and add periodic cleanup for expired leases.
 
 ### 2. Redis Cache & Command Queue
-- **Status:** Initial Redis integration is running. Action queues use Streams (`XADD`), health/state payloads sit in TTL'd keys, and the service gracefully degrades when Redis is absent.
+- **Status:** Action queues now run on Redis Streams with consumer groups and explicit `ack_actions` handling; health/state payloads sit in TTL'd keys, and the service gracefully degrades when Redis is absent.
 - **Scope:** Externalize transient state (`pending_actions`, `last_state`, `last_health`) to Redis so multiple manager instances and harnesses share a consistent view.
 - **Key Strategy:** Use namespaced keys `pb:{private_beach_id}:sess:{session_id}`. Store:
   - `actions` as a Redis Stream (XPUSH) to support fan-out and consumer groups for multiple harness workers; acknowledgements use XACK with `pending` semantics.
@@ -127,10 +127,10 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
   - `health` as a simple hash storing heartbeat payload + timestamp for monitoring.
 - **Implementation Steps:**
   1. ✅ `redis::Client` is optional; `AppState::with_redis` gates functionality and logs PING failures.
-  2. ✅ `queue_actions`/`poll_actions` operate on Redis Streams; `ack_actions` still needs to translate into `XACK` semantics.
+  2. ✅ `queue_actions`/`poll_actions` now use consumer groups; `ack_actions` issues `XACK`/`XDEL` and trims index mappings.
   3. ✅ Health/state writes go through `SETEX` with TTLs; `session_runtime` mirrors the latest snapshot for warm restart diagnostics.
   4. ◻ Update harness transport hints to advertise stream identifiers; today only REST paths are returned.
-  5. ◻ Instrument queue depth/lag and surface Prometheus-friendly metrics.
+  5. ◻ Instrument queue depth/lag and surface Prometheus-friendly metrics (currently pending).
 - **Open Questions:** Idempotency tokens, multi-harness consumer group design, and eviction strategies for long-lived sessions.
 
 - **Status:** JWT verification is live. `AuthToken` fetches Beach Gate JWKS, caches keys, and falls back to bypass mode if `BEACH_GATE_*` env vars are missing (for local dev).
@@ -139,7 +139,7 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
 - **Implementation Steps:**
   1. ✅ Env-driven config (`BEACH_GATE_JWKS_URL`, `BEACH_GATE_ISSUER`, `BEACH_GATE_AUDIENCE`, `AUTH_BYPASS`) populates an `AuthContext`.
   2. ✅ Tokens are validated via `jsonwebtoken`; JWKS keys cache with TTL refresh.
-  3. ◻ Route-level scope enforcement still pending; handlers log/auth but do not yet check capabilities.
+  3. ✅ REST and MCP handlers now reject requests without the required `pb:*` scopes; controller events capture both controller and issuing account. Remaining work is verifying RLS enforcement via automated tests.
   4. ◻ Persist authenticated principal metadata to Postgres when recording events.
   5. ◻ Add failure-mode/unit tests once a Beach Gate mock is available.
 - **Follow-On:** Document local JWKS fixtures and integrate scope checks with RLS enforcement.
@@ -147,12 +147,12 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
 ### 4. MCP Surface Exposure
 - **Scope:** Lift existing REST flows into MCP handlers so automation clients can interact without HTTP glue.
 - **Implementation Steps:**
-  1. Stand up an MCP server module (reusing `jsonrpc_v2` or `tower::Service`) that wraps the repository and Redis primitives. Host it alongside Axum within the same binary.
-  2. Implement the documented methods (`private_beach.register_session`, `...queue_action`, `...subscribe_state`, etc.) with shared logic to avoid drift between REST and MCP.
-  3. Publish schema definitions in `crates/harness-proto` and regenerate TypeScript bindings for surfacing inside harness SDKs.
-  4. Provide integration tests where a mock harness uses MCP to register, queue, and ack actions through the new server.
-  5. Update documentation/readme with connection instructions (transport URI, auth expectations, compatible SDK versions).
-- **Compatibility:** Maintain REST endpoints as public beta until MCP adoption is proven; dual-write controller events to ensure both surfaces stay in sync.
+  1. ✅ Inline MCP handler hosted under `/mcp` routes existing REST logic through JSON-RPC 2.0. Shared state/errors now flow through `AppState`.
+  2. ✅ Core unary methods (`register_session`, `list_sessions`, `acquire_controller`, `release_controller`, `queue_action`, `ack_actions`) return the same payloads as REST; streaming calls still stubbed.
+  3. ◻ Publish schema definitions in `crates/harness-proto`, regenerate bindings, and version the contract.
+  4. ✅ Test harness exercises MCP register + list against the in-memory backend; expand to Postgres/Redis once dockerized tests exist.
+  5. ◻ Document MCP connection instructions (auth requirements, payload examples) and ensure clients negotiate protocol versions.
+- **Compatibility:** REST endpoints stay public beta; MCP currently mirrors only unary flows. Streaming/back-pressure semantics remain a follow-up.
 
 ### 5. Agent Onboarding Templates
 - **Scope:** Flesh out templated prompt packs to validate the end-to-end control path.
@@ -160,7 +160,7 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
 - **Dependency:** Requires JWT claims/scopes to map templates to entitlements; coordinate with Beach Gate integration above.
 
 ## Current Implementation Status (2025‑10‑24)
-- REST API routes remain the primary surface; work-in-progress MCP support will mirror these soon.
+- REST API routes remain the primary surface; a JSON-RPC `/mcp` endpoint now mirrors the primary control-plane methods for harnesses/agents (streaming work pending).
 - `AppState` now persists sessions, controller leases, and controller events in Postgres via SQLx while preserving an in-memory fallback for tests/offline runs.
 - New migration `20250219120000_controller_leases_runtime.sql` adds `controller_lease`, `session_runtime`, and `session.harness_type`, keeping the schema aligned with `docs/private-beach/data-model.md`.
 - Redis integration powers action queues (Streams) plus TTL’d health/state caches; when Redis is unavailable the manager transparently falls back to in-memory queues.

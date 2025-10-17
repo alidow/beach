@@ -1,6 +1,7 @@
 use crate::auth::config::AuthConfig;
 use crate::auth::error::AuthError;
 use reqwest::{Client, StatusCode};
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -44,6 +45,100 @@ pub struct TokenResponse {
 struct ErrorBody {
     error: Option<String>,
     detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TurnCredentialsResponse {
+    pub realm: String,
+    pub ttl_seconds: u64,
+    #[serde(default)]
+    pub expires_at: Option<i64>,
+    #[serde(rename = "iceServers")]
+    pub ice_servers: Vec<TurnIceServer>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TurnIceServer {
+    #[serde(deserialize_with = "deserialize_urls")]
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub credential: Option<String>,
+    #[serde(default, rename = "credentialType")]
+    pub credential_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum UrlsField {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+fn deserialize_urls<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let field = UrlsField::deserialize(deserializer)?;
+    let mut urls: Vec<String> = match field {
+        UrlsField::Single(value) => vec![value],
+        UrlsField::Multiple(values) => values,
+    };
+    urls.retain(|url| !url.trim().is_empty());
+    if urls.is_empty() {
+        return Err(de::Error::custom("TURN server urls missing"));
+    }
+    Ok(urls)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turn_credentials_accept_single_url() {
+        let json = r#"{
+            "realm": "turn.example",
+            "ttl_seconds": 120,
+            "expires_at": null,
+            "iceServers": [
+                {
+                    "urls": "turn:turn.example:3478",
+                    "username": "alice",
+                    "credential": "secret"
+                }
+            ]
+        }"#;
+
+        let creds: TurnCredentialsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(creds.ice_servers.len(), 1);
+        assert_eq!(creds.ice_servers[0].urls, vec!["turn:turn.example:3478"]);
+        assert_eq!(creds.ice_servers[0].username.as_deref(), Some("alice"));
+        assert_eq!(creds.ice_servers[0].credential.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn turn_credentials_accept_multiple_urls() {
+        let json = r#"{
+            "realm": "turn.example",
+            "ttl_seconds": 120,
+            "expires_at": null,
+            "iceServers": [
+                {
+                    "urls": ["turn:one.example:3478", "turn:two.example:3478"]
+                }
+            ]
+        }"#;
+
+        let creds: TurnCredentialsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(creds.ice_servers.len(), 1);
+        assert_eq!(
+            creds.ice_servers[0].urls,
+            vec!["turn:one.example:3478", "turn:two.example:3478"]
+        );
+    }
 }
 
 impl BeachGateClient {
@@ -177,6 +272,55 @@ impl BeachGateClient {
 
         Err(AuthError::Gateway(format!(
             "token refresh failed ({status}): {}",
+            err_body
+                .detail
+                .or(err_body.error)
+                .unwrap_or_else(|| "unknown error".into())
+        )))
+    }
+
+    pub async fn turn_credentials(
+        &self,
+        access_token: &str,
+    ) -> Result<TurnCredentialsResponse, AuthError> {
+        let url = self.url("turn/credentials")?;
+        let response = self
+            .client
+            .post(url)
+            .bearer_auth(access_token)
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            return Ok(response.json().await?);
+        }
+
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        let err_body: ErrorBody = serde_json::from_str(&text).unwrap_or(ErrorBody {
+            error: None,
+            detail: Some(text.clone()),
+        });
+
+        if status == StatusCode::FORBIDDEN {
+            return Err(AuthError::TurnNotEntitled);
+        }
+
+        if status == StatusCode::UNAUTHORIZED {
+            return Err(AuthError::NotLoggedIn);
+        }
+
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            return Err(AuthError::Gateway(
+                err_body
+                    .detail
+                    .or(err_body.error)
+                    .unwrap_or_else(|| "turn credentials service unavailable".into()),
+            ));
+        }
+
+        Err(AuthError::Gateway(format!(
+            "turn credentials request failed ({status}): {}",
             err_body
                 .detail
                 .or(err_body.error)

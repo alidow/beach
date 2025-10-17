@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,10 +10,9 @@ use rand::rngs::OsRng;
 use sha2::Sha256;
 use snow::Builder as NoiseBuilder;
 use snow::params::NoiseParams;
-use tokio::sync::{Notify, mpsc as tokio_mpsc};
+use tokio::sync::{Mutex, Notify, mpsc as tokio_mpsc};
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 
 use crate::transport::TransportError;
@@ -48,6 +48,7 @@ pub struct HandshakeParams {
     pub local_peer_id: String,
     pub remote_peer_id: String,
     pub prologue_context: Vec<u8>,
+    pub inbox: Arc<HandshakeInbox>,
 }
 
 pub fn secure_transport_enabled() -> bool {
@@ -75,22 +76,7 @@ pub async fn run_handshake(
         key_preview = %hex_preview(params.handshake_key.as_ref()),
         "configured secure handshake parameters"
     );
-    let (incoming_tx, mut incoming_rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
-    channel.on_message(Box::new(move |msg: DataChannelMessage| {
-        let sender = incoming_tx.clone();
-        Box::pin(async move {
-            tracing::trace!(
-                target = "webrtc",
-                event = "handshake_channel_inbound_raw",
-                bytes = msg.data.len(),
-                preview = %hex_preview(&msg.data),
-                "secure handshake received raw datachannel message"
-            );
-            if sender.send(msg.data.to_vec()).is_err() {
-                tracing::debug!(target = "webrtc", "secure handshake message channel closed");
-            }
-        })
-    }));
+    let mut incoming_rx = params.inbox.bind().await;
 
     tracing::info!(
         target = "webrtc",
@@ -242,8 +228,7 @@ pub async fn run_handshake(
         &challenge_context,
     )
     .await?;
-
-    channel.on_message(Box::new(|_| Box::pin(async {})));
+    params.inbox.detach().await;
 
     tracing::info!(
         target = "webrtc",
@@ -626,7 +611,7 @@ fn timing_safe_equal(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn hex_preview(data: &[u8]) -> String {
+pub(crate) fn hex_preview(data: &[u8]) -> String {
     const MAX_BYTES: usize = 32;
     if data.is_empty() {
         return String::from("∅");
@@ -637,6 +622,50 @@ fn hex_preview(data: &[u8]) -> String {
         encoded.push('…');
     }
     encoded
+}
+
+#[derive(Default)]
+pub struct HandshakeInbox {
+    buffer: Mutex<Vec<Vec<u8>>>,
+    sender: Mutex<Option<tokio_mpsc::UnboundedSender<Vec<u8>>>>,
+}
+
+impl fmt::Debug for HandshakeInbox {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HandshakeInbox").finish_non_exhaustive()
+    }
+}
+
+impl HandshakeInbox {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn push(&self, payload: Vec<u8>) {
+        if let Some(sender) = self.sender.lock().await.as_ref().cloned() {
+            let _ = sender.send(payload);
+        } else {
+            self.buffer.lock().await.push(payload);
+        }
+    }
+
+    pub async fn bind(&self) -> tokio_mpsc::UnboundedReceiver<Vec<u8>> {
+        let (tx, rx) = tokio_mpsc::unbounded_channel();
+        {
+            let mut sender_guard = self.sender.lock().await;
+            *sender_guard = Some(tx.clone());
+        }
+        let mut buffer = self.buffer.lock().await;
+        for frame in buffer.drain(..) {
+            let _ = tx.send(frame);
+        }
+        rx
+    }
+
+    pub async fn detach(&self) {
+        self.sender.lock().await.take();
+        self.buffer.lock().await.clear();
+    }
 }
 
 async fn wait_for_channel_open(channel: &RTCDataChannel) -> Result<(), TransportError> {

@@ -10,6 +10,7 @@ use beach_buggy::{
 };
 use serde::Deserialize;
 use tracing::error;
+use uuid::Uuid;
 
 use crate::state::{
     AgentOnboardResponse, AppState, ControllerEvent, ControllerLeaseResponse, SessionSummary,
@@ -17,6 +18,14 @@ use crate::state::{
 };
 
 use super::{ApiError, ApiResult, AuthToken};
+
+fn ensure_scope(token: &AuthToken, scope: &'static str) -> Result<(), ApiError> {
+    if token.has_scope(scope) {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden(scope))
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SessionUpdateRequest {
@@ -57,7 +66,7 @@ pub async fn register_session(
     token: AuthToken,
     Json(request): Json<RegisterSessionRequest>,
 ) -> ApiResult<RegisterSessionResponse> {
-    let _ = token.as_str();
+    ensure_scope(&token, "pb:sessions.register")?;
     let response = state
         .register_session(request)
         .await
@@ -71,7 +80,7 @@ pub async fn update_session(
     Path(session_id): Path<String>,
     Json(body): Json<SessionUpdateRequest>,
 ) -> ApiResult<serde_json::Value> {
-    let _ = token.as_str();
+    ensure_scope(&token, "pb:sessions.write")?;
     state
         .update_session_metadata(&session_id, body.metadata, body.location_hint)
         .await
@@ -84,7 +93,7 @@ pub async fn list_sessions(
     token: AuthToken,
     Path(private_beach_id): Path<String>,
 ) -> ApiResult<Vec<SessionSummary>> {
-    let _ = token.as_str();
+    ensure_scope(&token, "pb:sessions.read")?;
     let sessions = state
         .list_sessions(&private_beach_id)
         .await
@@ -98,8 +107,12 @@ pub async fn acquire_controller(
     Path(session_id): Path<String>,
     Json(body): Json<ControllerLeaseRequest>,
 ) -> ApiResult<ControllerLeaseResponse> {
-    let requester = body.requesting_account_id.clone();
-    let _ = token.as_str();
+    ensure_scope(&token, "pb:control.write")?;
+    let requester = token.account_uuid().or_else(|| {
+        body.requesting_account_id
+            .as_deref()
+            .and_then(|s| Uuid::parse_str(s).ok())
+    });
     let response = state
         .acquire_controller(&session_id, body.ttl_ms, body.reason, requester)
         .await
@@ -113,9 +126,9 @@ pub async fn release_controller(
     Path(session_id): Path<String>,
     Json(body): Json<ReleaseControllerRequest>,
 ) -> ApiResult<serde_json::Value> {
-    let _ = token.as_str();
+    ensure_scope(&token, "pb:control.write")?;
     state
-        .release_controller(&session_id, &body.controller_token)
+        .release_controller(&session_id, &body.controller_token, token.account_uuid())
         .await
         .map_err(map_state_err)?;
     Ok(Json(serde_json::json!({ "released": true })))
@@ -127,13 +140,18 @@ pub async fn queue_actions(
     Path(session_id): Path<String>,
     Json(body): Json<QueueActionsRequest>,
 ) -> ApiResult<serde_json::Value> {
-    let _ = token.as_str();
+    ensure_scope(&token, "pb:control.write")?;
     if body.actions.is_empty() {
         return Err(ApiError::BadRequest("actions array required".into()));
     }
 
     state
-        .queue_actions(&session_id, &body.controller_token, body.actions)
+        .queue_actions(
+            &session_id,
+            &body.controller_token,
+            body.actions,
+            token.account_uuid(),
+        )
         .await
         .map_err(map_state_err)?;
 
@@ -145,7 +163,7 @@ pub async fn poll_actions(
     token: AuthToken,
     Path(session_id): Path<String>,
 ) -> ApiResult<Vec<ActionCommand>> {
-    let _ = token.as_str();
+    ensure_scope(&token, "pb:control.consume")?;
     let commands = state
         .poll_actions(&session_id)
         .await
@@ -159,9 +177,9 @@ pub async fn ack_actions(
     Path(session_id): Path<String>,
     Json(body): Json<Vec<ActionAck>>,
 ) -> ApiResult<serde_json::Value> {
-    let _ = token.as_str();
+    ensure_scope(&token, "pb:control.consume")?;
     state
-        .ack_actions(&session_id, body)
+        .ack_actions(&session_id, body, token.account_uuid())
         .await
         .map_err(map_state_err)?;
     Ok(Json(serde_json::json!({ "acknowledged": true })))
@@ -173,7 +191,7 @@ pub async fn signal_health(
     Path(session_id): Path<String>,
     Json(body): Json<HealthHeartbeat>,
 ) -> ApiResult<serde_json::Value> {
-    let _ = token.as_str();
+    ensure_scope(&token, "pb:harness.publish")?;
     state
         .record_health(&session_id, body)
         .await
@@ -187,7 +205,7 @@ pub async fn push_state(
     Path(session_id): Path<String>,
     Json(body): Json<StateDiff>,
 ) -> ApiResult<serde_json::Value> {
-    let _ = token.as_str();
+    ensure_scope(&token, "pb:harness.publish")?;
     state
         .record_state(&session_id, body)
         .await
@@ -200,7 +218,7 @@ pub async fn list_controller_events(
     token: AuthToken,
     Path(session_id): Path<String>,
 ) -> ApiResult<Vec<ControllerEvent>> {
-    let _ = token.as_str();
+    ensure_scope(&token, "pb:sessions.read")?;
     let events = state
         .controller_events(&session_id)
         .await
@@ -213,7 +231,7 @@ pub async fn onboard_agent(
     token: AuthToken,
     Json(body): Json<OnboardAgentRequest>,
 ) -> ApiResult<AgentOnboardResponse> {
-    let _ = token.as_str();
+    ensure_scope(&token, "pb:agents.onboard")?;
     let response = state
         .onboard_agent(
             &body.session_id,

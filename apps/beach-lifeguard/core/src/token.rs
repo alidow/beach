@@ -22,12 +22,15 @@ impl Default for TelemetryPreference {
 pub struct TokenFeatureBits {
     #[serde(default)]
     pub telemetry_enabled: bool,
+    #[serde(default)]
+    pub fallback_authorized: bool,
 }
 
 impl Default for TokenFeatureBits {
     fn default() -> Self {
         Self {
             telemetry_enabled: false,
+            fallback_authorized: false,
         }
     }
 }
@@ -35,6 +38,11 @@ impl Default for TokenFeatureBits {
 impl TokenFeatureBits {
     pub fn with_telemetry(mut self, enabled: bool) -> Self {
         self.telemetry_enabled = enabled;
+        self
+    }
+
+    pub fn with_fallback_authorized(mut self, authorized: bool) -> Self {
+        self.fallback_authorized = authorized;
         self
     }
 }
@@ -57,11 +65,13 @@ impl FallbackTokenClaims {
         cohort_id: CohortId,
         ttl: Duration,
         telemetry: TelemetryPreference,
+        fallback_authorized: bool,
     ) -> Self {
         let issued_at = OffsetDateTime::now_utc();
         let expires_at = issued_at + ttl;
         let feature_bits = TokenFeatureBits::default()
-            .with_telemetry(matches!(telemetry, TelemetryPreference::Enabled));
+            .with_telemetry(matches!(telemetry, TelemetryPreference::Enabled))
+            .with_fallback_authorized(fallback_authorized);
         Self {
             session_id,
             cohort_id,

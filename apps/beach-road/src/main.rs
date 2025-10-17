@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod entitlement;
 mod handlers;
 mod session;
 mod signaling;
@@ -10,8 +11,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
@@ -20,6 +20,7 @@ use tracing_subscriber;
 use crate::{
     cli::{Cli, Commands},
     config::Config,
+    entitlement::EntitlementVerifier,
     handlers::{
         get_session_status, get_webrtc_answer, get_webrtc_offer, health_check,
         issue_fallback_token, join_session, metrics_handler, post_webrtc_answer, post_webrtc_offer,
@@ -90,12 +91,39 @@ async fn main() {
     // Initialize WebSocket signaling state
     let signaling_state = SignalingState::new(shared_storage.clone());
 
+    if config.fallback_require_oidc && config.fallback_jwks_url.is_none() {
+        error!(
+            "FALLBACK_REQUIRE_OIDC=1 but BEACH_GATE_JWKS_URL is not set; fallback token minting will fail"
+        );
+    }
+
+    let entitlement_verifier = config.fallback_jwks_url.clone().map(|url| {
+        let cache_ttl = Duration::from_secs(config.fallback_jwks_cache_ttl_seconds);
+        EntitlementVerifier::new(
+            url,
+            config.fallback_jwt_issuer.clone(),
+            config.fallback_jwt_audience.clone(),
+            config.fallback_required_entitlement.clone(),
+            cache_ttl,
+        )
+    });
+
+    if let Some(verifier) = entitlement_verifier.as_ref() {
+        info!(
+            required_entitlement = verifier.required_entitlement(),
+            "fallback entitlement verification enabled"
+        );
+    } else if !config.fallback_require_oidc {
+        info!("fallback entitlement verification disabled (proof optional)");
+    }
+
     let fallback_state = FallbackContext {
         storage: shared_storage.clone(),
         guardrail_threshold: config.fallback_guardrail_threshold,
         token_ttl_seconds: config.fallback_token_ttl_seconds,
         require_oidc: config.fallback_require_oidc,
         paused: config.fallback_paused,
+        entitlements: entitlement_verifier,
     };
 
     // Build the Axum router - split into two parts with different states

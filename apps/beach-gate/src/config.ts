@@ -13,6 +13,14 @@ export interface EntitlementSeed {
   profile?: string;
 }
 
+export interface TurnConfig {
+  urls: string[];
+  realm: string;
+  secret: string;
+  ttlSeconds: number;
+  requiredEntitlements: string[];
+}
+
 export interface BeachGateConfig {
   port: number;
   host: string;
@@ -30,6 +38,7 @@ export interface BeachGateConfig {
   defaultEntitlements: string[];
   entitlementOverrides: Record<string, EntitlementSeed>;
   defaultProfile: string;
+  turn?: TurnConfig;
 }
 
 function readSigningKey(path?: string): SigningKeyMaterial {
@@ -70,6 +79,34 @@ function parseEntitlementOverrides(raw?: string): Record<string, EntitlementSeed
   }
 }
 
+function parseList(raw?: string): string[] {
+  if (!raw) {
+    return [];
+  }
+  return raw
+    .split(',')
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+}
+
+function loadTurnConfig(env: NodeJS.ProcessEnv): TurnConfig | undefined {
+  const secret = env.BEACH_GATE_TURN_SECRET;
+  const urls = parseList(env.BEACH_GATE_TURN_URLS);
+
+  if (!secret || urls.length === 0) {
+    return undefined;
+  }
+
+  const requiredEntitlements = parseList(env.BEACH_GATE_TURN_REQUIRED_ENTITLEMENTS);
+  return {
+    urls,
+    realm: env.BEACH_GATE_TURN_REALM ?? 'turn.beach.sh',
+    secret,
+    ttlSeconds: Number.parseInt(env.BEACH_GATE_TURN_TTL ?? '120', 10),
+    requiredEntitlements: requiredEntitlements.length > 0 ? requiredEntitlements : ['private-beach:turn'],
+  };
+}
+
 export function loadConfig(env = process.env): BeachGateConfig {
   const port = Number.parseInt(env.BEACH_GATE_PORT ?? '4133', 10);
   const host = env.BEACH_GATE_HOST ?? '0.0.0.0';
@@ -99,6 +136,7 @@ export function loadConfig(env = process.env): BeachGateConfig {
     defaultEntitlements,
     entitlementOverrides: parseEntitlementOverrides(env.BEACH_GATE_ENTITLEMENTS),
     defaultProfile: env.BEACH_GATE_DEFAULT_PROFILE ?? 'default',
+    turn: loadTurnConfig(env),
   };
 
   return config;

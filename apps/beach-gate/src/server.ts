@@ -1,9 +1,10 @@
+import { createHmac } from 'node:crypto';
 import Fastify, { FastifyInstance, FastifyReply, FastifyRequest, FastifyServerOptions } from 'fastify';
-import { BeachGateConfig } from './config.js';
+import { BeachGateConfig, TurnConfig } from './config.js';
 import { ClerkClient, createClerkClient } from './clerk.js';
 import { EntitlementStore } from './entitlements.js';
 import { RefreshTokenStore } from './refresh-store.js';
-import { TokenService } from './token-service.js';
+import { TokenService, VerifiedAccessToken } from './token-service.js';
 
 interface DeviceStartBody {
   scope?: string;
@@ -162,6 +163,32 @@ export async function buildServer(deps: ServerDependencies): Promise<FastifyInst
     };
   });
 
+  fastify.post('/turn/credentials', { preHandler: authenticate(tokens) }, async (request, reply) => {
+    if (!config.turn) {
+      request.log.warn('turn.credentials_unavailable');
+      return reply.status(503).send({ error: 'turn_unavailable' });
+    }
+
+    const token = request.accessToken!;
+    if (!hasRequiredEntitlement(token.entitlements, config.turn.requiredEntitlements)) {
+      request.log.warn({ userId: token.sub }, 'turn.credentials_forbidden');
+      return reply.status(403).send({ error: 'forbidden', detail: 'TURN access not granted.' });
+    }
+
+    const issued = issueTurnCredentials(token, config.turn);
+    return {
+      realm: config.turn.realm,
+      ttl_seconds: config.turn.ttlSeconds,
+      expires_at: issued.expiresAt,
+      iceServers: config.turn.urls.map((url) => ({
+        urls: url,
+        username: issued.username,
+        credential: issued.credential,
+        credentialType: 'password',
+      })),
+    };
+  });
+
   fastify.post('/authz/verify', async (request, reply) => {
     const headerToken = extractBearerToken(request);
     const body = request.body as VerifyBody | undefined;
@@ -220,4 +247,26 @@ function extractBearerToken(request: FastifyRequest): string | undefined {
     return undefined;
   }
   return token;
+}
+
+function hasRequiredEntitlement(entitlements: string[], required: string[]): boolean {
+  if (required.length === 0) {
+    return true;
+  }
+
+  const normalized = new Set(entitlements.map((value) => value.toLowerCase()));
+  return required.some((value) => normalized.has(value.toLowerCase()));
+}
+
+function issueTurnCredentials(token: VerifiedAccessToken, turn: TurnConfig) {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const expiresAtSeconds = nowSeconds + turn.ttlSeconds;
+  const username = `${expiresAtSeconds}:${token.sub}:${token.tier}`;
+  const credential = createHmac('sha1', turn.secret).update(username).digest('base64');
+
+  return {
+    username,
+    credential,
+    expiresAt: expiresAtSeconds * 1000,
+  };
 }

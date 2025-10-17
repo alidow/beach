@@ -1,18 +1,29 @@
-use axum::{
-    extract::State,
-    Json,
-};
+use axum::{extract::State, Json};
 use beach_buggy::{ActionAck, ActionCommand, RegisterSessionRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::error;
+use uuid::Uuid;
 
-use crate::state::{AppState, ControllerLeaseResponse, StateError};
+use crate::state::{AppState, StateError};
 
 use super::AuthToken;
 
+fn require_scope(
+    token: &AuthToken,
+    id: &Option<Value>,
+    scope: &'static str,
+) -> Option<JsonRpcResponse> {
+    if token.has_scope(scope) {
+        None
+    } else {
+        Some(scope_error(id.clone(), scope))
+    }
+}
+
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
-struct JsonRpcRequest {
+pub(super) struct JsonRpcRequest {
     pub jsonrpc: Option<String>,
     pub id: Option<Value>,
     pub method: String,
@@ -20,7 +31,7 @@ struct JsonRpcRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct JsonRpcResponse {
+pub(super) struct JsonRpcResponse {
     jsonrpc: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<Value>,
@@ -31,7 +42,7 @@ struct JsonRpcResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct JsonRpcError {
+pub(super) struct JsonRpcError {
     code: i32,
     message: String,
 }
@@ -73,11 +84,12 @@ pub async fn handle_mcp(
     token: AuthToken,
     Json(request): Json<JsonRpcRequest>,
 ) -> Json<JsonRpcResponse> {
-    let _ = token; // scopes enforced in follow-up work
-
     let id = request.id.clone();
     let response = match request.method.as_str() {
         "private_beach.register_session" => {
+            if let Some(resp) = require_scope(&token, &id, "pb:sessions.register") {
+                return Json(resp);
+            }
             match decode_params::<RegisterSessionRequest>(request.params) {
                 Ok(params) => match state.register_session(params).await {
                     Ok(result) => success(id, result),
@@ -86,35 +98,57 @@ pub async fn handle_mcp(
                 Err(err) => invalid_params(id, err),
             }
         }
-        "private_beach.list_sessions" => match decode_params::<ListSessionsParams>(request.params)
-        {
-            Ok(params) => match state.list_sessions(&params.private_beach_id).await {
-                Ok(rows) => success(id, rows),
-                Err(err) => state_error(id, err),
-            },
-            Err(err) => invalid_params(id, err),
-        },
-        "private_beach.acquire_controller" => {
-            match decode_params::<AcquireControllerParams>(request.params) {
-                Ok(params) => match state
-                    .acquire_controller(
-                        &params.session_id,
-                        params.ttl_ms,
-                        params.reason,
-                        params.requesting_account_id,
-                    )
-                    .await
-                {
-                    Ok(resp) => success(id, resp),
+        "private_beach.list_sessions" => {
+            if let Some(resp) = require_scope(&token, &id, "pb:sessions.read") {
+                return Json(resp);
+            }
+            match decode_params::<ListSessionsParams>(request.params) {
+                Ok(params) => match state.list_sessions(&params.private_beach_id).await {
+                    Ok(rows) => success(id, rows),
                     Err(err) => state_error(id, err),
                 },
                 Err(err) => invalid_params(id, err),
             }
         }
+        "private_beach.acquire_controller" => {
+            if let Some(resp) = require_scope(&token, &id, "pb:control.write") {
+                return Json(resp);
+            }
+            match decode_params::<AcquireControllerParams>(request.params) {
+                Ok(params) => {
+                    let requester = token.account_uuid().or_else(|| {
+                        params
+                            .requesting_account_id
+                            .as_deref()
+                            .and_then(|s| Uuid::parse_str(s).ok())
+                    });
+                    match state
+                        .acquire_controller(
+                            &params.session_id,
+                            params.ttl_ms,
+                            params.reason,
+                            requester,
+                        )
+                        .await
+                    {
+                        Ok(resp) => success(id, resp),
+                        Err(err) => state_error(id, err),
+                    }
+                }
+                Err(err) => invalid_params(id, err),
+            }
+        }
         "private_beach.release_controller" => {
+            if let Some(resp) = require_scope(&token, &id, "pb:control.write") {
+                return Json(resp);
+            }
             match decode_params::<ReleaseControllerParams>(request.params) {
                 Ok(params) => match state
-                    .release_controller(&params.session_id, &params.controller_token)
+                    .release_controller(
+                        &params.session_id,
+                        &params.controller_token,
+                        token.account_uuid(),
+                    )
                     .await
                 {
                     Ok(_) => success(id, serde_json::json!({ "released": true })),
@@ -123,23 +157,43 @@ pub async fn handle_mcp(
                 Err(err) => invalid_params(id, err),
             }
         }
-        "private_beach.queue_action" => match decode_params::<QueueActionsParams>(request.params) {
-            Ok(params) => match state
-                .queue_actions(&params.session_id, &params.controller_token, params.actions)
-                .await
-            {
-                Ok(_) => success(id, serde_json::json!({ "accepted": true })),
-                Err(err) => state_error(id, err),
-            },
-            Err(err) => invalid_params(id, err),
-        },
-        "private_beach.ack_actions" => match decode_params::<AckActionsParams>(request.params) {
-            Ok(params) => match state.ack_actions(&params.session_id, params.acks).await {
-                Ok(_) => success(id, serde_json::json!({ "acknowledged": true })),
-                Err(err) => state_error(id, err),
-            },
-            Err(err) => invalid_params(id, err),
-        },
+        "private_beach.queue_action" => {
+            if let Some(resp) = require_scope(&token, &id, "pb:control.write") {
+                resp
+            } else {
+                match decode_params::<QueueActionsParams>(request.params) {
+                    Ok(params) => match state
+                        .queue_actions(
+                            &params.session_id,
+                            &params.controller_token,
+                            params.actions,
+                            token.account_uuid(),
+                        )
+                        .await
+                    {
+                        Ok(_) => success(id, serde_json::json!({ "accepted": true })),
+                        Err(err) => state_error(id, err),
+                    },
+                    Err(err) => invalid_params(id, err),
+                }
+            }
+        }
+        "private_beach.ack_actions" => {
+            if let Some(resp) = require_scope(&token, &id, "pb:control.consume") {
+                resp
+            } else {
+                match decode_params::<AckActionsParams>(request.params) {
+                    Ok(params) => match state
+                        .ack_actions(&params.session_id, params.acks, token.account_uuid())
+                        .await
+                    {
+                        Ok(_) => success(id, serde_json::json!({ "acknowledged": true })),
+                        Err(err) => state_error(id, err),
+                    },
+                    Err(err) => invalid_params(id, err),
+                }
+            }
+        }
         "private_beach.subscribe_state" | "private_beach.controller_events.stream" => {
             JsonRpcResponse {
                 jsonrpc: "2.0",
@@ -210,6 +264,18 @@ fn state_error(id: Option<Value>, err: StateError) -> JsonRpcResponse {
         id,
         result: None,
         error: Some(JsonRpcError { code, message }),
+    }
+}
+
+fn scope_error(id: Option<Value>, scope: &str) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: "2.0",
+        id,
+        result: None,
+        error: Some(JsonRpcError {
+            code: -32003,
+            message: format!("missing scope {scope}"),
+        }),
     }
 }
 

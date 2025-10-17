@@ -22,6 +22,7 @@ use metrics::counter;
 use metrics_exporter_prometheus::PrometheusHandle;
 
 use crate::{
+    entitlement::{EntitlementError, EntitlementVerifier},
     session::{hash_passphrase, verify_passphrase},
     signaling::WebRtcSdpPayload,
     storage::{SessionInfo, Storage},
@@ -36,6 +37,7 @@ pub struct FallbackContext {
     pub token_ttl_seconds: u64,
     pub require_oidc: bool,
     pub paused: bool,
+    pub entitlements: Option<EntitlementVerifier>,
 }
 
 #[derive(Debug, Serialize, Clone, Copy)]
@@ -191,6 +193,7 @@ pub struct FallbackTokenResponse {
     pub guardrail_ratio: f64,
     pub guardrail_soft_breach: bool,
     pub telemetry_enabled: bool,
+    pub fallback_authorized: bool,
 }
 
 fn generate_join_code() -> String {
@@ -240,8 +243,16 @@ pub async fn issue_fallback_token(
         return Err(FallbackTokenErrorResponse::paused());
     }
 
+    if ctx.require_oidc && ctx.entitlements.is_none() {
+        error!("entitlement verification required but no verifier configured");
+        record_token_metric("error", "entitlement_config");
+        return Err(FallbackTokenErrorResponse::status(
+            StatusCode::SERVICE_UNAVAILABLE,
+        ));
+    }
+
     if ctx.require_oidc && payload.entitlement_proof.is_none() {
-        record_token_metric("entitlement_denied", "n/a");
+        record_token_metric("entitlement_denied", "missing_proof");
         return Err(FallbackTokenErrorResponse::with_reason(
             StatusCode::UNAUTHORIZED,
             "entitlement_required",
@@ -253,6 +264,77 @@ pub async fn issue_fallback_token(
         FallbackTokenErrorResponse::with_reason(StatusCode::BAD_REQUEST, "invalid_session_id")
     })?;
     let cohort_id = payload.cohort_id.as_deref().unwrap_or("public").to_string();
+
+    let telemetry_pref = if payload.telemetry_opt_in {
+        TelemetryPreference::Enabled
+    } else {
+        TelemetryPreference::Disabled
+    };
+
+    let mut fallback_authorized = false;
+
+    if let Some(proof) = payload.entitlement_proof.as_deref() {
+        if let Some(verifier) = ctx.entitlements.as_ref() {
+            match verifier.verify(proof).await {
+                Ok(verified) => {
+                    fallback_authorized = true;
+                    debug!(
+                        subject = %verified.subject,
+                        email = ?verified.email,
+                        entitlements = ?verified.entitlements,
+                        tier = ?verified.tier,
+                        profile = ?verified.profile,
+                        "entitlement proof verified"
+                    );
+                }
+                Err(EntitlementError::MissingEntitlement(required)) => {
+                    warn!(
+                        required = %required,
+                        "entitlement proof missing required fallback entitlement"
+                    );
+                    record_token_metric("entitlement_denied", "missing_entitlement");
+                    return Err(FallbackTokenErrorResponse::with_reason(
+                        StatusCode::FORBIDDEN,
+                        "entitlement_missing",
+                    ));
+                }
+                Err(EntitlementError::JwksFetch(reason)) => {
+                    error!(%reason, "failed to refresh beach gate jwks");
+                    record_token_metric("error", "entitlement_jwks");
+                    return Err(FallbackTokenErrorResponse::status(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                    ));
+                }
+                Err(EntitlementError::MissingJwksUrl) => {
+                    error!("entitlement verifier missing jwks url configuration");
+                    record_token_metric("error", "entitlement_config");
+                    return Err(FallbackTokenErrorResponse::status(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                    ));
+                }
+                Err(EntitlementError::Http(err)) => {
+                    error!(
+                        error = %err,
+                        "http error while validating entitlement proof"
+                    );
+                    record_token_metric("error", "entitlement_http");
+                    return Err(FallbackTokenErrorResponse::status(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                    ));
+                }
+                Err(other) => {
+                    warn!(error = %other, "entitlement proof validation failed");
+                    record_token_metric("entitlement_denied", "invalid_proof");
+                    return Err(FallbackTokenErrorResponse::with_reason(
+                        StatusCode::UNAUTHORIZED,
+                        "entitlement_invalid",
+                    ));
+                }
+            }
+        } else {
+            warn!("entitlement proof provided but verifier not configured; ignoring proof");
+        }
+    }
 
     let snapshot = ctx
         .storage
@@ -268,11 +350,6 @@ pub async fn issue_fallback_token(
         snapshot.soft_state(ctx.guardrail_threshold),
         SoftGuardrailState::Breaching
     );
-    let telemetry_pref = if payload.telemetry_opt_in {
-        TelemetryPreference::Enabled
-    } else {
-        TelemetryPreference::Disabled
-    };
 
     let ttl = Duration::seconds(ctx.token_ttl_seconds as i64);
     let claims = FallbackTokenClaims::new(
@@ -280,6 +357,7 @@ pub async fn issue_fallback_token(
         CohortId::from(cohort_id.clone()),
         ttl,
         telemetry_pref,
+        fallback_authorized,
     );
 
     let serialized = serde_json::to_vec(&claims).map_err(|err| {
@@ -302,6 +380,7 @@ pub async fn issue_fallback_token(
         guardrail_ratio: snapshot.counters.fallback_ratio(),
         guardrail_soft_breach,
         telemetry_enabled: is_telemetry_enabled(telemetry_pref),
+        fallback_authorized,
     }))
 }
 

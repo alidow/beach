@@ -9,6 +9,11 @@ pub struct Config {
     pub fallback_token_ttl_seconds: u64,
     pub fallback_require_oidc: bool,
     pub fallback_paused: bool,
+    pub fallback_jwks_url: Option<String>,
+    pub fallback_jwt_issuer: Option<String>,
+    pub fallback_jwt_audience: Option<String>,
+    pub fallback_required_entitlement: String,
+    pub fallback_jwks_cache_ttl_seconds: u64,
 }
 
 impl Config {
@@ -27,6 +32,15 @@ impl Config {
         let fallback_paused = env::var("FALLBACK_WS_PAUSED")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        let fallback_jwks_url = env::var("BEACH_GATE_JWKS_URL").ok();
+        let fallback_jwt_issuer = env::var("BEACH_GATE_ISSUER").ok();
+        let fallback_jwt_audience = env::var("BEACH_GATE_AUDIENCE").ok();
+        let fallback_required_entitlement =
+            env::var("FALLBACK_REQUIRED_ENTITLEMENT").unwrap_or_else(|_| "rescue:fallback".into());
+        let fallback_jwks_cache_ttl_seconds = env::var("FALLBACK_JWKS_CACHE_TTL")
+            .ok()
+            .and_then(|val| val.parse().ok())
+            .unwrap_or(300);
 
         Self {
             port: env::var("BEACH_ROAD_PORT")
@@ -43,6 +57,11 @@ impl Config {
             fallback_token_ttl_seconds,
             fallback_require_oidc,
             fallback_paused,
+            fallback_jwks_url,
+            fallback_jwt_issuer,
+            fallback_jwt_audience,
+            fallback_required_entitlement,
+            fallback_jwks_cache_ttl_seconds,
         }
     }
 }
@@ -57,6 +76,11 @@ impl Default for Config {
             fallback_token_ttl_seconds: 300,
             fallback_require_oidc: false,
             fallback_paused: false,
+            fallback_jwks_url: None,
+            fallback_jwt_issuer: None,
+            fallback_jwt_audience: None,
+            fallback_required_entitlement: "rescue:fallback".to_string(),
+            fallback_jwks_cache_ttl_seconds: 300,
         }
     }
 }

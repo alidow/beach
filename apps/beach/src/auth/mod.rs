@@ -7,19 +7,24 @@ pub mod passphrase;
 
 use crate::auth::config::AuthConfig;
 use crate::auth::credentials::{
-    CredentialsStore, FALLBACK_ENTITLEMENT, RefreshTokenRecord, StoredProfile,
+    CredentialsStore, FALLBACK_ENTITLEMENT, RefreshTokenRecord, StoredProfile, TURN_ENTITLEMENT,
     access_token_is_valid,
 };
 use crate::auth::error::AuthError;
 use crate::auth::gate::{
-    BeachGateClient, DeviceStartResponse, TokenResponse, access_token_expired,
+    BeachGateClient, DeviceStartResponse, TokenResponse, TurnCredentialsResponse,
+    access_token_expired,
 };
 use std::env;
 
 pub use config::AuthConfig as BeachAuthConfig;
-pub use credentials::{AccessTokenCache, FALLBACK_ENTITLEMENT as FALLBACK_ENTITLEMENT_FLAG};
+pub use credentials::{
+    AccessTokenCache, FALLBACK_ENTITLEMENT as FALLBACK_ENTITLEMENT_FLAG,
+    TURN_ENTITLEMENT as TURN_ENTITLEMENT_FLAG,
+};
 pub use gate::DeviceStartResponse as AuthDeviceStartResponse;
 pub use gate::TokenResponse as AuthTokenResponse;
+pub use gate::TurnCredentialsResponse as AuthTurnCredentials;
 
 pub const FRIENDLY_FALLBACK_MESSAGE: &str = "WebSocket fallback is only available to Beach Auth subscribers. Sign up at https://beach.sh and run `beach auth login` to unlock this transport.";
 
@@ -256,4 +261,61 @@ pub async fn resolve_fallback_access_token(
             "failed to cache refreshed access token".into(),
         ))?;
     Ok(entry.token.clone())
+}
+
+pub async fn resolve_turn_credentials(
+    profile_override: Option<&str>,
+) -> Result<TurnCredentialsResponse, AuthError> {
+    let config = AuthConfig::from_env()?;
+    let profile_name = active_profile_name(profile_override)?;
+    let mut store = load_store()?;
+    let profile = store
+        .profile(&profile_name)
+        .cloned()
+        .ok_or_else(|| AuthError::ProfileNotFound(profile_name.clone()))?;
+
+    if !profile.has_turn_entitlement() {
+        return Err(AuthError::TurnNotEntitled);
+    }
+
+    let mut access_token: Option<String> = None;
+    if let Some(cache) = profile.access_token.as_ref() {
+        if access_token_is_valid(cache)
+            && cache.entitlements.iter().any(|ent| ent == TURN_ENTITLEMENT)
+        {
+            access_token = Some(cache.token.clone());
+        } else if !access_token_expired(cache.expires_at) {
+            access_token = Some(cache.token.clone());
+        }
+    }
+
+    let client = BeachGateClient::new(config.clone())?;
+
+    if access_token.is_none() {
+        let refresh_token = profile.refresh_token()?;
+        let tokens = client.refresh_tokens(&refresh_token).await?;
+        if !tokens
+            .entitlements
+            .iter()
+            .any(|ent| ent == TURN_ENTITLEMENT)
+        {
+            if let Some(entry) = store.profile_mut(&profile_name) {
+                entry.entitlements = tokens.entitlements.clone();
+                entry.clear_access_token();
+                store.save()?;
+            }
+            return Err(AuthError::TurnNotEntitled);
+        }
+
+        persist_profile_update(&profile_name, &tokens, &mut store, client.config())?;
+        let updated = store
+            .profile(&profile_name)
+            .and_then(|profile| profile.access_token.as_ref())
+            .ok_or_else(|| AuthError::Other("failed to cache refreshed access token".into()))?;
+        access_token = Some(updated.token.clone());
+    }
+
+    let token = access_token.ok_or_else(|| AuthError::Other("missing access token".into()))?;
+    let credentials = client.turn_credentials(&token).await?;
+    Ok(credentials)
 }

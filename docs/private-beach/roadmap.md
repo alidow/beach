@@ -17,7 +17,9 @@
 - ✅ Postgres-backed session registry + new migrations (`controller_lease`, `session_runtime`) landed; in-memory mode now only used for local tests.
 - ✅ Redis Streams + TTL caches power the action/health/state plane with graceful fallback when Redis is offline.
 - ✅ Beach Gate JWT verification integrated with JWKS caching; scope enforcement + audit enrichment follow.
-- Next: expose MCP methods, finish Redis consumer group/ack semantics, thread scopes into RLS, and add dockerized integration tests via `manager-sdk`.
+- ✅ JSON-RPC `/mcp` endpoint serves the core `private_beach.*` methods with scope checks; streaming + schema publishing remain outstanding.
+- ✅ Controller events capture issuing accounts; Redis consumer groups + acknowledgements are now in production.
+- Next: finish MCP streaming + bindings, surface queue depth/lag metrics, verify RLS via Postgres integration tests, and add dockerized integration tests via `manager-sdk`.
 
 ## Phase 3 – Workspace Shell (Private Beach Surfer)
 - Prototype Next.js dashboard consuming mock data; implement responsive grid, tile management, and status overlays.
@@ -47,6 +49,7 @@
 
 ## Phase 7 – Operational Hardening & Monetization
 - Add billing integration (entitlement sync, usage tracking), plan enforcement, and licensing checks.
+- Roll out gated TURN fallback (`private-beach:turn` entitlements, Beach Gate issuance, coturn quotas) for paid tiers.
 - Harden deployment: HA Redis/Postgres, disaster recovery playbooks, security audits.
 - Ship admin tooling: audit log search, share-link management, support impersonation with guardrails.
 - Run load tests (100+ sessions) to validate cache throughput and command latency SLAs.

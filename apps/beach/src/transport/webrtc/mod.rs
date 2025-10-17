@@ -35,6 +35,8 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::util::vnet::net::{Net, NetConfig};
 use webrtc::util::vnet::router::{Router, RouterConfig};
 
+use crate::auth;
+use crate::auth::error::AuthError;
 use crate::transport::{
     Transport, TransportError, TransportId, TransportKind, TransportMessage, TransportPair,
     decode_message, encode_message, next_transport_id,
@@ -49,8 +51,9 @@ mod secure_signaling;
 mod signaling;
 
 use secure_handshake::{
-    HANDSHAKE_CHANNEL_LABEL, HandshakeParams, HandshakeResult, HandshakeRole,
-    build_prologue_context, handshake_channel_init, run_handshake, secure_transport_enabled,
+    HANDSHAKE_CHANNEL_LABEL, HandshakeInbox, HandshakeParams, HandshakeResult, HandshakeRole,
+    build_prologue_context, handshake_channel_init, hex_preview, run_handshake,
+    secure_transport_enabled,
 };
 use secure_signaling::{
     MessageLabel, SealedEnvelope, derive_handshake_key_from_session, derive_pre_shared_key,
@@ -118,6 +121,70 @@ impl WebRtcChannels {
 
 const TRANSPORT_ENCRYPTION_VERSION: u8 = 1;
 const TRANSPORT_ENCRYPTION_AAD: &[u8] = b"beach:secure-transport:v1";
+
+async fn load_turn_ice_servers() -> Option<Vec<webrtc::ice_transport::ice_server::RTCIceServer>> {
+    match auth::resolve_turn_credentials(None).await {
+        Ok(credentials) => {
+            let realm = credentials.realm.clone();
+            let ttl = credentials.ttl_seconds;
+            let servers: Vec<_> = credentials
+                .ice_servers
+                .into_iter()
+                .filter_map(|server| {
+                    let urls = server.urls;
+                    if urls.is_empty() {
+                        return None;
+                    }
+                    let username = server.username.unwrap_or_default();
+                    let credential = server.credential.unwrap_or_default();
+                    Some(webrtc::ice_transport::ice_server::RTCIceServer {
+                        urls,
+                        username,
+                        credential,
+                    })
+                })
+                .collect();
+            if servers.is_empty() {
+                tracing::warn!(
+                    target: "beach::transport::webrtc",
+                    realm = %realm,
+                    "TURN credentials returned no ICE servers"
+                );
+                None
+            } else {
+                tracing::debug!(
+                    target: "beach::transport::webrtc",
+                    realm = %realm,
+                    ttl_seconds = ttl,
+                    server_count = servers.len(),
+                    "using TURN credentials from Beach Gate"
+                );
+                Some(servers)
+            }
+        }
+        Err(err) => {
+            match err {
+                AuthError::NotLoggedIn
+                | AuthError::ProfileNotFound(_)
+                | AuthError::TurnNotEntitled => {
+                    tracing::debug!(
+                        target: "beach::transport::webrtc",
+                        error = %err,
+                        "TURN credentials unavailable"
+                    );
+                }
+                _ => {
+                    tracing::warn!(
+                        target: "beach::transport::webrtc",
+                        error = %err,
+                        "failed to fetch TURN credentials"
+                    );
+                }
+            }
+            None
+        }
+    }
+}
 
 struct EncryptionState {
     send_cipher: ChaCha20Poly1305,
@@ -1100,8 +1167,17 @@ async fn negotiate_offerer_peer(
         Some(Duration::from_millis(500)),
     );
     let api = build_api(setting)?;
+    let disable_stun = std::env::var("BEACH_WEBRTC_DISABLE_STUN").is_ok();
     let mut config = RTCConfiguration::default();
-    if std::env::var("BEACH_WEBRTC_DISABLE_STUN").is_err() {
+    if let Some(mut turn_servers) = load_turn_ice_servers().await {
+        if !disable_stun {
+            turn_servers.push(webrtc::ice_transport::ice_server::RTCIceServer {
+                urls: vec!["stun:stun.l.google.com:19302".to_string()],
+                ..Default::default()
+            });
+        }
+        config.ice_servers = turn_servers;
+    } else if !disable_stun {
         config.ice_servers = vec![webrtc::ice_transport::ice_server::RTCIceServer {
             urls: vec!["stun:stun.l.google.com:19302".to_string()],
             ..Default::default()
@@ -1346,11 +1422,26 @@ async fn negotiate_offerer_peer(
             label = HANDSHAKE_CHANNEL_LABEL,
             "offerer: creating handshake data channel"
         );
-        Some(
-            pc.create_data_channel(HANDSHAKE_CHANNEL_LABEL, Some(handshake_channel_init()))
-                .await
-                .map_err(to_setup_error)?,
-        )
+        let channel = pc
+            .create_data_channel(HANDSHAKE_CHANNEL_LABEL, Some(handshake_channel_init()))
+            .await
+            .map_err(to_setup_error)?;
+        let inbox = Arc::new(HandshakeInbox::new());
+        let inbox_for_dc = Arc::clone(&inbox);
+        channel.on_message(Box::new(move |msg: DataChannelMessage| {
+            let inbox = Arc::clone(&inbox_for_dc);
+            Box::pin(async move {
+                tracing::trace!(
+                    target = "webrtc",
+                    event = "handshake_channel_inbound_raw",
+                    bytes = msg.data.len(),
+                    preview = %hex_preview(&msg.data),
+                    "secure handshake received raw datachannel message (offerer)"
+                );
+                inbox.push(msg.data.to_vec()).await;
+            })
+        }));
+        Some((channel, inbox))
     } else {
         tracing::info!(
             role = "offerer",
@@ -1358,7 +1449,7 @@ async fn negotiate_offerer_peer(
         );
         None
     };
-    if let Some(ref dc) = handshake_dc {
+    if let Some((ref dc, _)) = handshake_dc {
         tracing::info!(
 
             role = "offerer",
@@ -1501,7 +1592,7 @@ async fn negotiate_offerer_peer(
         has_handshake_channel = handshake_dc.is_some(),
         "offerer: evaluating whether to run secure handshake"
     );
-    let secure_context = if let (true, Some(passphrase), Some(handshake_channel)) = (
+    let secure_context = if let (true, Some(passphrase), Some((handshake_channel, inbox))) = (
         secure_transport_active,
         inner.passphrase.as_ref(),
         handshake_dc.clone(),
@@ -1555,6 +1646,7 @@ async fn negotiate_offerer_peer(
             local_peer_id: offerer_peer_id.clone(),
             remote_peer_id: peer_id.clone(),
             prologue_context,
+            inbox,
         };
         tracing::debug!(
 
@@ -1966,8 +2058,17 @@ async fn connect_answerer(
     // Add a public STUN server so we gather server-reflexive candidates.
     // Without this, host-only candidates can fail in common NAT setups where the
     // browser uses mDNS/srflx and the offerer has no reflexive candidates.
+    let disable_stun = std::env::var("BEACH_WEBRTC_DISABLE_STUN").is_ok();
     let mut config = RTCConfiguration::default();
-    if std::env::var("BEACH_WEBRTC_DISABLE_STUN").is_err() {
+    if let Some(mut turn_servers) = load_turn_ice_servers().await {
+        if !disable_stun {
+            turn_servers.push(webrtc::ice_transport::ice_server::RTCIceServer {
+                urls: vec!["stun:stun.l.google.com:19302".to_string()],
+                ..Default::default()
+            });
+        }
+        config.ice_servers = turn_servers;
+    } else if !disable_stun {
         config.ice_servers = vec![webrtc::ice_transport::ice_server::RTCIceServer {
             urls: vec!["stun:stun.l.google.com:19302".to_string()],
             ..Default::default()
@@ -2211,8 +2312,37 @@ async fn connect_answerer(
         let session_id_value = session_id_for_secure.clone();
         let session_key_cell_value = Arc::clone(&session_key_for_secure);
         let pre_shared_key_cell_value = Arc::clone(&pre_shared_key_for_secure);
+        let label = dc.label().to_string();
+        let passphrase_setup = passphrase_value.clone();
+        let preregistered_inbox = if label == HANDSHAKE_CHANNEL_LABEL
+            && secure_transport_active
+            && passphrase_setup
+                .as_ref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+        {
+            let inbox = Arc::new(HandshakeInbox::new());
+            let inbox_for_dc = Arc::clone(&inbox);
+            dc.on_message(Box::new(move |msg: DataChannelMessage| {
+                let inbox = Arc::clone(&inbox_for_dc);
+                Box::pin(async move {
+                    tracing::trace!(
+                        target = "webrtc",
+                        event = "handshake_channel_inbound_raw",
+                        bytes = msg.data.len(),
+                        preview = %hex_preview(&msg.data),
+                        "secure handshake received raw datachannel message (answerer)"
+                    );
+                    inbox.push(msg.data.to_vec()).await;
+                })
+            }));
+            Some(inbox)
+        } else {
+            None
+        };
         Box::pin(async move {
-            let label = dc.label().to_string();
+            let mut preregistered_inbox = preregistered_inbox;
+            let label = label;
             tracing::debug!(
 
                 role = "answerer",
@@ -2263,6 +2393,27 @@ async fn connect_answerer(
                     }
                     return;
                 };
+                let inbox = if let Some(inbox) = preregistered_inbox.take() {
+                    inbox
+                } else {
+                    let inbox = Arc::new(HandshakeInbox::new());
+                    let inbox_for_dc = Arc::clone(&inbox);
+                    dc.on_message(Box::new(move |msg: DataChannelMessage| {
+                        let inbox = Arc::clone(&inbox_for_dc);
+                        Box::pin(async move {
+                            tracing::trace!(
+                                target = "webrtc",
+                                event = "handshake_channel_inbound_raw",
+                                bytes = msg.data.len(),
+                                preview = %hex_preview(&msg.data),
+                                "secure handshake received raw datachannel message (answerer)"
+                            );
+                            inbox.push(msg.data.to_vec()).await;
+                        })
+                    }));
+                    inbox
+                };
+
                 let dc_for_handshake = Arc::clone(&dc);
                 let channel_state = dc_for_handshake.ready_state();
                 let sender_holder = Arc::clone(&secure_sender);
@@ -2405,6 +2556,7 @@ async fn connect_answerer(
                         local_peer_id: local_peer.clone(),
                         remote_peer_id: remote_peer.clone(),
                         prologue_context,
+                        inbox: Arc::clone(&inbox),
                     };
                     tracing::debug!(
 

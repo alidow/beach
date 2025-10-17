@@ -3,19 +3,120 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { loadConfig, type BeachGateConfig } from './config.js';
 import { buildServer } from './server.js';
 
+const baseEnv = {
+  CLERK_MOCK: '1',
+  BEACH_GATE_PORT: '0',
+  BEACH_GATE_HOST: '127.0.0.1',
+};
+
 describe('Beach Gate server', () => {
   let server: FastifyInstance;
   let config: BeachGateConfig;
 
   beforeEach(async () => {
     config = loadConfig({
-      CLERK_MOCK: '1',
-      BEACH_GATE_PORT: '0',
-      BEACH_GATE_HOST: '127.0.0.1',
+      ...baseEnv,
       BEACH_GATE_DEFAULT_ENTITLEMENTS: 'rescue:fallback,session:group',
     });
 
     server = await buildServer({ config, logger: false });
+  });
+
+  describe('TURN credentials endpoint', () => {
+    it('returns 503 when TURN config is not available', async () => {
+      const localConfig = loadConfig({
+        ...baseEnv,
+        BEACH_GATE_DEFAULT_ENTITLEMENTS: 'private-beach:turn,rescue:fallback',
+      });
+      const localServer = await buildServer({ config: localConfig, logger: false });
+      try {
+        const session = await performDeviceFinish(localServer);
+        const response = await localServer.inject({
+          method: 'POST',
+          url: '/turn/credentials',
+          headers: {
+            authorization: `Bearer ${session.access_token}`,
+          },
+        });
+
+        expect(response.statusCode).toBe(503);
+        const body = response.json() as Record<string, unknown>;
+        expect(body.error).toBe('turn_unavailable');
+      } finally {
+        await localServer.close();
+      }
+    });
+
+    it('rejects callers without the required entitlement', async () => {
+      const localConfig = loadConfig({
+        ...baseEnv,
+        BEACH_GATE_DEFAULT_ENTITLEMENTS: 'rescue:fallback',
+        BEACH_GATE_TURN_SECRET: 'test-secret',
+        BEACH_GATE_TURN_URLS: 'turn:turn.private-beach.test:3478',
+        BEACH_GATE_TURN_REALM: 'turn.private-beach.test',
+        BEACH_GATE_TURN_TTL: '90',
+      });
+      const localServer = await buildServer({ config: localConfig, logger: false });
+      try {
+        const session = await performDeviceFinish(localServer);
+        const response = await localServer.inject({
+          method: 'POST',
+          url: '/turn/credentials',
+          headers: {
+            authorization: `Bearer ${session.access_token}`,
+          },
+        });
+
+        expect(response.statusCode).toBe(403);
+        const body = response.json() as Record<string, unknown>;
+        expect(body.error).toBe('forbidden');
+      } finally {
+        await localServer.close();
+      }
+    });
+
+    it('issues TURN credentials when the entitlement is present', async () => {
+      const localConfig = loadConfig({
+        ...baseEnv,
+        BEACH_GATE_DEFAULT_ENTITLEMENTS: 'rescue:fallback,private-beach:turn',
+        BEACH_GATE_TURN_SECRET: 'another-secret',
+        BEACH_GATE_TURN_URLS: 'turns:turn.private-beach.test:5349,turn:turn.private-beach.test:3478',
+        BEACH_GATE_TURN_REALM: 'turn.private-beach.test',
+        BEACH_GATE_TURN_TTL: '120',
+      });
+      const localServer = await buildServer({ config: localConfig, logger: false });
+      try {
+        const session = await performDeviceFinish(localServer);
+        const response = await localServer.inject({
+          method: 'POST',
+          url: '/turn/credentials',
+          headers: {
+            authorization: `Bearer ${session.access_token}`,
+          },
+        });
+
+        expect(response.statusCode).toBe(200);
+        const body = response.json() as Record<string, unknown>;
+
+        expect(body.realm).toBe('turn.private-beach.test');
+        expect(body.ttl_seconds).toBe(120);
+        expect(typeof body.expires_at).toBe('number');
+        expect(Array.isArray(body.iceServers)).toBe(true);
+
+        const servers = body.iceServers as Array<Record<string, unknown>>;
+        expect(servers.length).toBe(2);
+        for (const serverInfo of servers) {
+          expect(typeof serverInfo.urls).toBe('string');
+          expect(typeof serverInfo.username).toBe('string');
+          expect(typeof serverInfo.credential).toBe('string');
+          expect(serverInfo.credentialType).toBe('password');
+          expect((serverInfo.username as string).split(':')[2]).toBe('standard');
+          expect(serverInfo.username as string).toContain('mock-user');
+        }
+      } finally {
+        await localServer.close();
+      }
+    });
   });
 
   afterEach(async () => {

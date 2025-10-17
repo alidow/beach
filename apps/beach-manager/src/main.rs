@@ -5,7 +5,6 @@ mod state;
 
 use auth::{AuthConfig, AuthContext};
 use config::AppConfig;
-use redis::AsyncCommands;
 use routes::build_router;
 use sqlx::postgres::PgPoolOptions;
 use state::AppState;

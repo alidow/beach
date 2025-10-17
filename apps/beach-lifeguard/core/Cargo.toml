@@ -1,8 +1,8 @@
 [package]
-name = "beach-rescue-client"
+name = "beach-lifeguard-core"
 version = "0.1.0"
 edition = "2021"
-description = "Client harness utilities for the Beach WebSocket fallback transport."
+description = "Shared primitives for the Beach WebSocket fallback service."
 license = "MIT"
 publish = false
 
@@ -10,8 +10,8 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-beach-rescue-core = { path = "../core" }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-time = { version = "0.3", features = ["serde"] }
+serde_bytes = "0.11"
+thiserror = "1"
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 uuid = { version = "1", features = ["serde", "v4"] }

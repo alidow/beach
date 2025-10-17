@@ -1,4 +1,4 @@
-//! Core primitives shared by the `beach-rescue` transport implementation.
+//! Core primitives shared by the `beach-lifeguard` transport implementation.
 //!
 //! This crate intentionally keeps dependencies light so that both the server
 //! implementation and any local harnesses can consume a single source of

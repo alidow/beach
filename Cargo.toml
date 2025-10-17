@@ -2,9 +2,9 @@
 members = [
   "apps/beach",
   "apps/beach-road",
-  "apps/beach-rescue/core",
-  "apps/beach-rescue/server",
-  "apps/beach-rescue/client",
+  "apps/beach-lifeguard/core",
+  "apps/beach-lifeguard/server",
+  "apps/beach-lifeguard/client",
   "apps/beach-manager",
   "crates/beach-buggy",
   "crates/harness-proto",

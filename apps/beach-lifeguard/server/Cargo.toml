@@ -1,5 +1,5 @@
 [package]
-name = "beach-rescue-server"
+name = "beach-lifeguard-server"
 version = "0.1.0"
 edition = "2021"
 description = "Server binary for the Beach WebSocket fallback transport."
@@ -10,8 +10,8 @@ publish = false
 anyhow = "1"
 axum = { version = "0.7", features = ["ws", "json"] }
 base64 = "0.22"
-beach-rescue-core = { path = "../core" }
-beach-rescue-client = { path = "../client" }
+beach-lifeguard-core = { path = "../core" }
+beach-lifeguard-client = { path = "../client" }
 clap = { version = "4", features = ["derive", "env"] }
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 serde = { version = "1", features = ["derive"] }

@@ -98,47 +98,51 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
 - Self-hosting packaging: do we ship Helm charts/docker compose, and how does licensing enforcement work offline?
 
 ## Immediate Next Steps
-1. Wire Postgres persistence (replace in-memory registry with SQLx queries powered by the new migrations).
-2. Introduce Redis-backed state cache / command queue plumbing (currently stubbed in memory).
-3. Integrate Beach Gate JWT validation in the `AuthToken` extractor; replace placeholder bearer handling.
-4. Draft agent onboarding templates (Pong demo, support SRE bot) to exercise prompt + capability wiring.
+1. Stand up the MCP transport alongside REST so harnesses/agents can call `private_beach.*` methods without HTTP shims; publish updated bindings in `crates/harness-proto`.
+2. Harden the Redis queue: switch to consumer groups (`XREADGROUP`/`XACK`), fill in `ack_actions`, and add metrics/alerts for stalled streams.
+3. Enforce Beach Gate scopes end-to-end—thread authenticated principals into repository calls, add RLS policy tests, and wire `AuthToken::has_scope` checks to routes.
+4. Extend integration coverage in CI: docker-compose Postgres+Redis smoke tests, `sqlx migrate run --check`, and latency observability hooks (OpenTelemetry export stubs).
+5. Flesh out agent onboarding templates (Pong demo, SRE runbook) now that prompt scaffolding and auth scopes exist.
 
 ## Phase 2 Implementation Plan
 
 ### 1. Postgres-Backed Session Registry
+- **Status:** Core implementation landed. `AppState` persists sessions, controller leases, runtime metadata, and controller events to Postgres while keeping an in-memory fallback for tests/offline mode.
 - **Scope:** Transition `AppState` from the in-memory `HashMap` in `state.rs` to a repository layer backed by SQLx queries over the `session`, `controller_event`, and forthcoming `controller_lease` tables.
 - **Data Model Additions:** Introduce a `controller_lease` table (UUID PK, `session_id`, `controller_account_id`, `controller_token`, `issued_by_account_id`, `issued_at`, `expires_at`, `reason`) and optional `session_runtime` table for harness-specific metadata that should survive restarts (`state_cache_url`, `transport_hints`, `last_health_at`). Migrations must enforce RLS mirroring the rest of the schema.
 - **Implementation Steps:**
-  1. Define a `SessionRepository` trait with `register_session`, `update_session`, `list_sessions`, and `record_event` methods; provide a Postgres implementation plus an in-memory fallback used by existing tests.
-  2. Map `RegisterSessionRequest` into inserts for `session` (durable fields) and `controller_lease` (initial token + expiry). Persist controller events immediately for audit parity with the current in-memory list.
-  3. Replace the `SessionRecord` struct with thin DTOs built from DB rows, ensuring `capabilities` and `metadata` leverage JSON columns without extra serialization overhead.
-  4. Update the REST handlers to depend on the repository rather than the `RwLock`. Ensure transactions wrap multi-step operations (session insert + initial event).
-  5. Expand integration tests to cover both in-memory and Postgres-backed flows (`#[cfg(feature = "postgres")]` harness that spins up a test pool via `sqlx::test` macros).
-- **Deferred Items:** Redis-backed action queues (below) will own ephemeral `pending_actions`; keep a temporary memory queue until Redis lands to avoid blocking shipping the Postgres work.
+  1. ✅ Define a `SessionRepository`-style facade inside `AppState`; Postgres now handles `register_session`, `list_sessions`, metadata updates, and controller events.
+  2. ✅ `RegisterSessionRequest` inserts into `session`, `session_runtime`, and `controller_lease` (new migration `20250219120000_controller_leases_runtime.sql`), with transactional writes + audit events.
+  3. ✅ Response DTOs hydrate from DB rows; in-memory structs remain for fallback + tests.
+  4. ✅ REST handlers surface database errors through richer `StateError`.
+  5. ◻ Add dedicated Postgres integration tests (docker-backed) and `sqlx::query!` assertions; currently only the in-memory flow exercises the router.
+- **Follow-Ups:** Wire row-level policy checks against claims, ensure migrations cover backfill paths, and add periodic cleanup for expired leases.
 
 ### 2. Redis Cache & Command Queue
+- **Status:** Initial Redis integration is running. Action queues use Streams (`XADD`), health/state payloads sit in TTL'd keys, and the service gracefully degrades when Redis is absent.
 - **Scope:** Externalize transient state (`pending_actions`, `last_state`, `last_health`) to Redis so multiple manager instances and harnesses share a consistent view.
 - **Key Strategy:** Use namespaced keys `pb:{private_beach_id}:sess:{session_id}`. Store:
   - `actions` as a Redis Stream (XPUSH) to support fan-out and consumer groups for multiple harness workers; acknowledgements use XACK with `pending` semantics.
   - `state` snapshots as a Hash (`state:latest`) plus a capped list (`state:diffs`) for recent diffs (<=200 entries).
   - `health` as a simple hash storing heartbeat payload + timestamp for monitoring.
 - **Implementation Steps:**
-  1. Add `redis::Client` to `AppState` sourced from `REDIS_URL`. Provide no-op stubs when Redis is unavailable.
-  2. Refactor `queue_actions`, `poll_actions`, and `ack_actions` to use Redis Streams. Ensure controller token validation still happens via Postgres before enqueuing.
-  3. Replace `record_state` and `record_health` with Redis writes. Introduce TTL management (`EXPIRE`) so stale sessions age out gracefully.
-  4. Update transport hints returned to harnesses to include Redis stream identifiers (e.g., `actions_stream`) and WebSocket fallback URLs.
-  5. Add observability: metrics around queue depth (XLEN), pending ack count, and heartbeat staleness.
-- **Open Questions:** Whether we need idempotency tokens for Redis action enqueue; determine before finalizing API contract.
+  1. ✅ `redis::Client` is optional; `AppState::with_redis` gates functionality and logs PING failures.
+  2. ✅ `queue_actions`/`poll_actions` operate on Redis Streams; `ack_actions` still needs to translate into `XACK` semantics.
+  3. ✅ Health/state writes go through `SETEX` with TTLs; `session_runtime` mirrors the latest snapshot for warm restart diagnostics.
+  4. ◻ Update harness transport hints to advertise stream identifiers; today only REST paths are returned.
+  5. ◻ Instrument queue depth/lag and surface Prometheus-friendly metrics.
+- **Open Questions:** Idempotency tokens, multi-harness consumer group design, and eviction strategies for long-lived sessions.
 
+- **Status:** JWT verification is live. `AuthToken` fetches Beach Gate JWKS, caches keys, and falls back to bypass mode if `BEACH_GATE_*` env vars are missing (for local dev).
 ### 3. Beach Gate JWT Verification
 - **Scope:** Replace the permissive `AuthToken` extractor in `routes/auth.rs` with JWT validation against Beach Gate’s JWKS.
 - **Implementation Steps:**
-  1. Pull Beach Gate configuration from env (`BEACH_GATE_JWKS_URL`, `BEACH_GATE_AUDIENCE`). Cache JWKS keys with background refresh (e.g., `jsonwebtoken` + `cached` crate or `jwks_client` helper).
-  2. Decode bearer tokens, validate signature, expiry, issuer, and audience. Extract claims for `account_id`, `org_id`, `private_beach_id`, `roles`, and capability scopes.
-  3. Enforce capability scopes per route (`pb:sessions.register`, `pb:control.write`, etc.) via a lightweight policy helper invoked in the handlers.
-  4. Attach the authenticated principal to request extensions so downstream logic can persist audit context (e.g., who acquired a controller).
-  5. Write failure-mode tests covering expired tokens, missing scopes, and mismatched beaches. Keep a compile-time flag or env override (`AUTH_BYPASS=true`) for local smoke tests until Beach Gate can be mocked.
-- **Follow-On:** Document how to mock Beach Gate during local development (static JWKS file + deterministic test tokens).
+  1. ✅ Env-driven config (`BEACH_GATE_JWKS_URL`, `BEACH_GATE_ISSUER`, `BEACH_GATE_AUDIENCE`, `AUTH_BYPASS`) populates an `AuthContext`.
+  2. ✅ Tokens are validated via `jsonwebtoken`; JWKS keys cache with TTL refresh.
+  3. ◻ Route-level scope enforcement still pending; handlers log/auth but do not yet check capabilities.
+  4. ◻ Persist authenticated principal metadata to Postgres when recording events.
+  5. ◻ Add failure-mode/unit tests once a Beach Gate mock is available.
+- **Follow-On:** Document local JWKS fixtures and integrate scope checks with RLS enforcement.
 
 ### 4. MCP Surface Exposure
 - **Scope:** Lift existing REST flows into MCP handlers so automation clients can interact without HTTP glue.
@@ -155,26 +159,25 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
 - **Implementation Steps:** Curate `templates/` directory with JSON or YAML definitions, wire them into the onboarding flow, and add regression tests verifying the output contains required bridges and scopes.
 - **Dependency:** Requires JWT claims/scopes to map templates to entitlements; coordinate with Beach Gate integration above.
 
-## Current Implementation Status (2025‑10‑16)
-- REST API routes implemented in `apps/beach-manager/src/routes` covering session registration, action queueing, controller leases, health/state ingestion, and agent onboarding.
-- Bearer auth extractor (`AuthToken`) plumbed through every handler (currently accepts any token string until Beach Gate verification is wired).
-- In-memory session registry storing controller leases, pending actions, health snapshots, and audit events; structured responses exposed via new test coverage.
-- SQLx dependency + optional Postgres pool creation added (reads `DATABASE_URL`, applies initial migration automatically). Falling back to in-memory mode if Postgres is unavailable.
-- First SQL migration (`apps/beach-manager/migrations/20251016230211_initial_schema.sql`) mirrors the documented schema (orgs, memberships, sessions, controller events, automation assignments, files, share links).
-- Beach Buggy now ships an HTTP transport (with bearer auth) plus integration tests that register a session and exercise the full command/ACK loop against an embedded Axum server.
-- Docker Compose now provisions Postgres alongside Redis; README updated with local setup steps (`docker compose up postgres redis`, run `sqlx migrate`).
-- Roadmap updated to reflect completion of Phase 1 and the WIP state of Phase 2 (persistence + auth outstanding).
+## Current Implementation Status (2025‑10‑24)
+- REST API routes remain the primary surface; work-in-progress MCP support will mirror these soon.
+- `AppState` now persists sessions, controller leases, and controller events in Postgres via SQLx while preserving an in-memory fallback for tests/offline runs.
+- New migration `20250219120000_controller_leases_runtime.sql` adds `controller_lease`, `session_runtime`, and `session.harness_type`, keeping the schema aligned with `docs/private-beach/data-model.md`.
+- Redis integration powers action queues (Streams) plus TTL’d health/state caches; when Redis is unavailable the manager transparently falls back to in-memory queues.
+- Beach Gate JWT verification is wired through `AuthToken`, with JWKS caching and env-based bypass for local development.
+- Docker Compose workflow exercises Postgres + Redis; `cargo test -p beach-manager` still targets the in-memory implementation, so a Postgres-backed test harness is the next milestone.
 
 ### Gaps / Follow-up Items
-- Persist session metadata, controller leases, and audit events to Postgres instead of the in-memory map.
-- Add Redis connection + data plane (state cache streams, action fan-out) and update Beach Buggy transport hints accordingly.
-- Implement Beach Gate JWT verification + capability scoping in `routes::auth`.
-- Expose the documented MCP methods (currently only REST is available) and publish schema in `crates/harness-proto`.
-- Harden migration automation (CI `sqlx migrate run --check`) and introduce telemetry wiring (OpenTelemetry, Prometheus exporter).
+- Fill in Redis consumer group semantics: implement `ack_actions`, dedupe handling, and latency metrics.
+- Propagate authenticated principals into controller event rows, enforce per-route scopes, and prove RLS policies with automated tests.
+- Expose the documented MCP methods (currently only REST is live) and publish schema updates in `crates/harness-proto`.
+- Harden migration automation (CI `sqlx migrate run --check`) and add telemetry wiring (OpenTelemetry spans, Prometheus exporter).
+- Build regression tests against the Postgres/Redis path (docker-compose or `sqlx::test`) to guard future refactors.
 
 ## Database Migrations
 - Manage schema via `sqlx-cli` migrations stored in `apps/beach-manager/migrations/` (checked in).
 - Initial migration should create all tables/enums described in `docs/private-beach/data-model.md` (organizations, private beaches, memberships, sessions, automation assignments, controller events, file metadata, share links).
+- Follow-up migration `20250219120000_controller_leases_runtime.sql` introduces `controller_lease`, `session_runtime`, and `session.harness_type` to support the persisted registry.
 - Add supporting indexes for common lookups (`session.private_beach_id`, `controller_event.session_id DESC`, `private_beach_membership.account_id`).
 - Enforce row-level security policies in migrations so tests run against production-like posture.
 - CI should execute `sqlx migrate run --check` (or equivalent) to detect drift before deploys.

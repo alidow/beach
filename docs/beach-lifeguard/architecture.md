@@ -1,17 +1,17 @@
-# beach-rescue Architecture Outline
+# beach-lifeguard Architecture Outline
 
 Status: Phase 1 prototype – relay + telemetry online  
 Last Updated: 2025-10-11  
 Owner: Codex (transport planning)
 
 ## Purpose
-- Capture the technical boundaries between Beach, the new `beach-rescue` WebSocket relay, and existing infrastructure.
+- Capture the technical boundaries between Beach, the new `beach-lifeguard` WebSocket relay, and existing infrastructure.
 - Describe the failover detection logic and guardrails that keep WebSocket fallback as an absolute last resort.
 - Provide implementation scaffolding (contracts, repo layout, observability) ahead of Phase 2 reliability work.
 
 ## Fallback Decision Flow (Draft)
 - **Trigger inputs:** consecutive WebRTC offer/answer failures, ICE timeout spikes, transport-level telemetry (packet loss > threshold), manual override flag.
-- **Escalation ladder:** retry WebRTC `N` times with exponential backoff → attempt TURN relay if available → only then initiate beach-rescue handshake.
+- **Escalation ladder:** retry WebRTC `N` times with exponential backoff → attempt TURN relay if available → only then initiate beach-lifeguard handshake.
 - **Activation checks:** feature flag enabled, guardrail budget not exceeded, no active incident suppressing fallback.
 - **Telemetry:** emit structured event `transport.fallback.considered` with reason codes; promote to `transport.fallback.activated` only after successful WebSocket session creation.
 
@@ -22,7 +22,7 @@ sequenceDiagram
     participant Host as Beach Host
     participant Client as Beach Participant
     participant ControlPlane as Beach Control Plane
-    participant Rescue as beach-rescue
+    participant Rescue as beach-lifeguard
 
     Host->>ControlPlane: Request session create (includes secure signaling)
     ControlPlane-->>Host: Session ID + fallback token (sealed)
@@ -55,10 +55,10 @@ sequenceDiagram
 - **Identity & token distribution**
   - Beach host requests a short-lived fallback token from the coordination service (`beach` API) during session creation; token is derived from the same Argon2id pre-shared material used for secure WebRTC (see `docs/secure-shared-secret-webrtc-plan.md`).
   - Token payload: `session_id`, `expires_at`, `capabilities = ["fallback-ws"]`, `signature` (Ed25519 using Beach control plane key). Token is delivered to participants via the existing secure signaling envelope so `beach-road` never sees it.
-- **Client ↔ beach-rescue handshake**
+- **Client ↔ beach-lifeguard handshake**
   1. Client opens HTTPS connection, upgrades to WSS, and sends `ClientHello { session_id, token, client_nonce, protocol_version, compression=none|brotli }`.
-  2. beach-rescue validates token signature and expiry, checks guardrail budget, returns `ServerHello { ack_nonce, server_nonce, negotiated_compression, features_bitmap }`.
-  3. Both sides derive `hkdf(psk, "beach-rescue/handshake", client_nonce || server_nonce)` to obtain `K_send`/`K_recv` and 96-bit starting nonces; all subsequent frames use AES-GCM (default) with option to negotiate ChaCha20-Poly1305 when clients prefer it.
+  2. beach-lifeguard validates token signature and expiry, checks guardrail budget, returns `ServerHello { ack_nonce, server_nonce, negotiated_compression, features_bitmap }`.
+  3. Both sides derive `hkdf(psk, "beach-lifeguard/handshake", client_nonce || server_nonce)` to obtain `K_send`/`K_recv` and 96-bit starting nonces; all subsequent frames use AES-GCM (default) with option to negotiate ChaCha20-Poly1305 when clients prefer it.
 - **Frame format**
   - `Frame = header || ciphertext || tag` where header packs:
     - `u8 version`
@@ -70,16 +70,16 @@ sequenceDiagram
   - Heartbeats send empty payload frame every 15s; missing three heartbeats triggers reconnect attempt (still honoring guardrails).
   - Close frames carry reason codes (`NORMAL`, `RATE_LIMITED`, `GUARDRAIL_TRIPPED`, `SERVER_SHUTDOWN`).
 
-## beach-rescue Repo Layout (Draft)
-- **Workspace structure (in-monorepo under `apps/beach-rescue/`)**
-  - `apps/beach-rescue/core` – transport framing, auth, metrics, shared config.
-  - `apps/beach-rescue/server` – Axum/hyper server binary with WSS upgrade pipeline.
-  - `apps/beach-rescue/client` – lightweight client harness used by integration tests (published as workspace crate).
+## beach-lifeguard Repo Layout (Draft)
+- **Workspace structure (in-monorepo under `apps/beach-lifeguard/`)**
+  - `apps/beach-lifeguard/core` – transport framing, auth, metrics, shared config.
+  - `apps/beach-lifeguard/server` – Axum/hyper server binary with WSS upgrade pipeline.
+  - `apps/beach-lifeguard/client` – lightweight client harness used by integration tests (published as workspace crate).
   - `load/` – optional k6 + Rust load harness (added near GA).
   - `scripts/` – local dev helpers (build, run, generate self-signed certs).
 - **Build & Runtime**
   - Reuse existing workspace tooling (`cargo fmt`, `cargo clippy`, `cargo test`) from the monorepo; no dedicated CI pipeline yet.
-- Local development uses Docker Compose alongside existing Redis service; server binary can run natively or via compose service `beach-rescue`.
+- Local development uses Docker Compose alongside existing Redis service; server binary can run natively or via compose service `beach-lifeguard`.
 - Deployment manifests remain staging-only until dev environment validation completes; production still targets AWS ECS Fargate with a future path to Kubernetes (documented, not yet executed).
 
 ### Phase 1 Server State (2025-10-11)
@@ -87,11 +87,11 @@ sequenceDiagram
 - WebSocket handshake verifies base64 token payload (JSON claims for now), enforces expiry, optional OIDC entitlement bit, and session-id match with the `ClientHello` message.
 - On success, responds with `ServerHello` echoing compression + feature bits, registers the connection, and fans messages out to other peers in the same session (in-memory channel + Redis counters for active connections/messages). Writer/reader tasks are fully async; per-session UUIDs aid tracing.
 - `/debug/stats` returns active session inventory plus Redis-derived totals (`fallback:metrics:*`), giving on-call quick visibility, while `/metrics` exports counters/gauges for handshakes, connection lifecycle, and fan-out metrics.
-- Optional OpenTelemetry stdout exporter (`BEACH_RESCUE_OTEL_STDOUT=1`) mirrors tracing spans to aid local debugging; default builds keep tracing local only.
+- Optional OpenTelemetry stdout exporter (`BEACH_LIFEGUARD_OTEL_STDOUT=1`) mirrors tracing spans to aid local debugging; default builds keep tracing local only.
 
 ### Phase 2 Reliability State (2025-10-20)
-- Session routing now uses a DashMap + Slab registry with bounded mpsc fan-out queues—each connection gets a buffered channel (depth 64) and flow-control drops are surfaced via `beach_rescue_flow_control_drops_total`.
-- Idle recycler task runs every 30s, issuing policy close frames to sockets inactive for ≥120s and removing drained sessions (`beach_rescue_idle_pruned_total`, `beach_rescue_sessions_emptied_total`).
+- Session routing now uses a DashMap + Slab registry with bounded mpsc fan-out queues—each connection gets a buffered channel (depth 64) and flow-control drops are surfaced via `beach_lifeguard_flow_control_drops_total`.
+- Idle recycler task runs every 30s, issuing policy close frames to sockets inactive for ≥120s and removing drained sessions (`beach_lifeguard_idle_pruned_total`, `beach_lifeguard_sessions_emptied_total`).
 - Broadcast bookkeeping records delivered byte totals and per-message histograms so perf dashboards can track effective throughput per cohort.
 - Same handshake contract; compression negotiation remains a pass-through hint until Phase 3 aligns client/server encoding changes.
 - Beach CLI negotiator now requests fallback tokens (`POST /fallback/token`), performs the client hello/server hello exchange, and only then wraps the socket in the shared transport abstraction.
@@ -104,10 +104,10 @@ sequenceDiagram
 - `fallback:session:{session_id}:messages_forwarded` – frames forwarded for the session (debug/stats aggregates these).
 
 #### Prometheus Metrics (Phase 2 Additions)
-- `beach_rescue_connections_active` / `beach_rescue_sessions_active` (gauges) – real-time connection/session counts.
-- `beach_rescue_messages_forwarded_total`, `beach_rescue_bytes_forwarded_total`, `beach_rescue_message_size_bytes` – delivered frames + payload histograms.
-- `beach_rescue_flow_control_drops_total` – number of messages dropped due to bounded queue backpressure.
-- `beach_rescue_idle_pruned_total` / `beach_rescue_sessions_emptied_total` – idle recycler actions and session drains.
+- `beach_lifeguard_connections_active` / `beach_lifeguard_sessions_active` (gauges) – real-time connection/session counts.
+- `beach_lifeguard_messages_forwarded_total`, `beach_lifeguard_bytes_forwarded_total`, `beach_lifeguard_message_size_bytes` – delivered frames + payload histograms.
+- `beach_lifeguard_flow_control_drops_total` – number of messages dropped due to bounded queue backpressure.
+- `beach_lifeguard_idle_pruned_total` / `beach_lifeguard_sessions_emptied_total` – idle recycler actions and session drains.
 
 ## Guardrails & Operational Policy (Draft)
 - **Feature gating**
@@ -138,7 +138,7 @@ sequenceDiagram
   - **Implementation note (Phase 1):** Tokens are currently returned as Base64-encoded JSON claims; Ed25519 signing will be introduced alongside production hardening.
 - **Counters:** Redis keys `fallback:cohort:{cohort_id}:yyyy-mm-dd-hh` with TTL 90 minutes; soft limit at 0.5% triggers alert but token still issued; hard kill switch toggles `fallback_ws_paused`.
 - **Privacy:** if `telemetry_opt_in=false`, control plane sets `feature_bits` to disable non-essential analytics; metrics aggregated per cohort only. Redis guardrail data stores counts only (no user identifiers).
-- **Entitlement Notes:** OIDC (via Clerk) integration handled once “private beaches” feature lands; beach-rescue exposes flag `BEACH_RESCUE_DISABLE_OIDC=1` to bypass entitlement checks in dev/local environments.
+- **Entitlement Notes:** OIDC (via Clerk) integration handled once “private beaches” feature lands; beach-lifeguard exposes flag `BEACH_LIFEGUARD_DISABLE_OIDC=1` to bypass entitlement checks in dev/local environments.
 - **Client integration:** CLI requests already pass cohort/proof/telemetry overrides into the fallback token fetch; the browser wiring captures the same overrides and logs them during transport setup, pending final wiring to the fallback HTTP call once WSS support lands.
 
 ## Load & Reliability Test Plan (Deferred)
@@ -156,6 +156,6 @@ sequenceDiagram
 - 2025-10-11: Filed tracking issues — TP-4821 (control plane fallback token minting & guardrail counters), INF-3377 (infra pipeline + registry), SEC-2190 (token signing keys review).
 
 ## Open Source Boundary
-- The `apps/beach` workspace is expected to be open sourced, but `apps/beach-rescue` (server + infra) remains closed. Only the protocol-facing `beach-rescue-client` crate is shared so public builds can serialize `ClientHello` / `ServerHello` payloads.
+- The `apps/beach` workspace is expected to be open sourced, but `apps/beach-lifeguard` (server + infra) remains closed. Only the protocol-facing `beach-lifeguard-client` crate is shared so public builds can serialize `ClientHello` / `ServerHello` payloads.
 - Keep the client crate narrowly scoped: message structs, feature-bit definitions, and local-only helpers (e.g., ephemeral token minting) are acceptable; guardrail logic, Redis key conventions, and relay internals stay private behind the HTTP/WSS surface.
-- Document in the public repo that WebSocket fallback is optional and requires the proprietary beach-rescue deployment. Provide guidance on disabling the feature flag when the service is unavailable to avoid confusing OSS adopters.
+- Document in the public repo that WebSocket fallback is optional and requires the proprietary beach-lifeguard deployment. Provide guidance on disabling the feature flag when the service is unavailable to avoid confusing OSS adopters.

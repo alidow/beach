@@ -17,7 +17,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use beach_rescue_client::CompressionStrategy;
+use beach_lifeguard_client::CompressionStrategy;
 
 const DEFAULT_CHANNEL_DEPTH: usize = 64;
 
@@ -158,7 +158,7 @@ impl SessionRegistry {
             for connection_id in idle {
                 if let Some(close_msg) = state.prepare_idle_close(connection_id).await {
                     counter!(
-                        "beach_rescue_idle_pruned_total",
+                        "beach_lifeguard_idle_pruned_total",
                         1,
                         "session_id" => session_id.to_string()
                     );
@@ -173,7 +173,7 @@ impl SessionRegistry {
                 let removal = self.unregister(session_id, connection_id).await;
                 if removal.active_connections == 0 {
                     counter!(
-                        "beach_rescue_sessions_emptied_total",
+                        "beach_lifeguard_sessions_emptied_total",
                         1,
                         "session_id" => session_id.to_string()
                     );
@@ -332,7 +332,7 @@ impl SessionState {
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     metrics.dropped += 1;
                     counter!(
-                        "beach_rescue_flow_control_drops_total",
+                        "beach_lifeguard_flow_control_drops_total",
                         1,
                         "session_id" => self.session_id.to_string(),
                         "connection_id" => connection_id.to_string()

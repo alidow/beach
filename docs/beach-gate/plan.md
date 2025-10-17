@@ -8,7 +8,7 @@
 ## Scope & Goals
 - Support the standard OIDC device authorization flow for the Beach CLI and other non-browser clients.
 - Persist subscription tiers and feature entitlements fetched from billing.
-- Validate access tokens on behalf of downstream Beach services (Beach Rescue, future Private Beach).
+- Validate access tokens on behalf of downstream Beach services (Beach Lifeguard, future Private Beach).
 - Keep sensitive tokens off the CLI; rely on existing Beach transport encryption without introducing a new TLS layer.
 
 ## Components

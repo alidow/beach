@@ -12,7 +12,7 @@ This directory houses the plans, specs, and design notes for the Private Beach p
 - `beach-buggy-spec.md` – harness sidecar specification powered by the Beach Buggy runtime.
 - `pong-demo.md` – flagship showcase experience outline.
 - `intra-beach-orchestration.md` – MCP surfaces and cross-session coordination blueprint.
-- Additional design docs under `secure-webrtc/`, `beach-rescue/`, etc.
+- Additional design docs under `secure-webrtc/`, `beach-lifeguard/`, etc.
 
 ## How to Use
 1. Start with `vision.md` to understand the overall direction.

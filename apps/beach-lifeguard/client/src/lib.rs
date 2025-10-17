@@ -1,8 +1,8 @@
-//! Utilities for constructing client-side messages used by the `beach-rescue`
+//! Utilities for constructing client-side messages used by the `beach-lifeguard`
 //! WebSocket fallback transport. These helpers keep the eventual web/CLI
 //! implementations in sync without copying message shapes across crates.
 
-use beach_rescue_core::{CohortId, FallbackTokenClaims, TelemetryPreference, TokenFeatureBits};
+use beach_lifeguard_core::{CohortId, FallbackTokenClaims, TelemetryPreference, TokenFeatureBits};
 use serde::{Deserialize, Serialize};
 use time::Duration;
 use uuid::Uuid;

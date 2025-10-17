@@ -41,8 +41,8 @@ hkdf = "0.12"
 sha2 = "0.10"
 hmac = "0.12"
 snow = "0.9"
-beach-rescue-client = { path = "../beach-rescue/client" }
-beach-rescue-core = { path = "../beach-rescue/core" }
+beach-lifeguard-client = { path = "../beach-lifeguard/client" }
+beach-lifeguard-core = { path = "../beach-lifeguard/core" }
 time = { version = "0.3", features = ["serde"] }
 hex = "0.4"
 directories = "5"

@@ -14,9 +14,10 @@
 
 ## Phase 2 – Beach Manager Core Services
 (see `docs/private-beach/beach-manager.md` for architecture details)
-- In progress: REST surface implemented with in-memory session registry; Postgres migrations + optional pool wiring landed.
-- In progress: Phase 2 implementation plan drafted (`beach-manager.md#phase-2-implementation-plan`) covering Postgres persistence, Redis queues, Beach Gate auth, and MCP exposure.
-- Next: persist registry to Postgres, introduce Redis-backed state cache, expose MCP methods, tighten auth (Beach Gate JWTs), and expand integration tests via `manager-sdk`.
+- ✅ Postgres-backed session registry + new migrations (`controller_lease`, `session_runtime`) landed; in-memory mode now only used for local tests.
+- ✅ Redis Streams + TTL caches power the action/health/state plane with graceful fallback when Redis is offline.
+- ✅ Beach Gate JWT verification integrated with JWKS caching; scope enforcement + audit enrichment follow.
+- Next: expose MCP methods, finish Redis consumer group/ack semantics, thread scopes into RLS, and add dockerized integration tests via `manager-sdk`.
 
 ## Phase 3 – Workspace Shell (Private Beach Surfer)
 - Prototype Next.js dashboard consuming mock data; implement responsive grid, tile management, and status overlays.

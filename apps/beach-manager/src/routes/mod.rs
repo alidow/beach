@@ -1,4 +1,5 @@
 mod auth;
+mod mcp;
 mod sessions;
 
 use axum::{
@@ -37,6 +38,7 @@ pub fn build_router(state: AppState) -> Router {
             get(list_sessions),
         )
         .route("/agents/onboard", post(onboard_agent))
+        .route("/mcp", post(mcp::handle_mcp))
         .with_state(state)
 }
 

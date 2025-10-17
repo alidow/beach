@@ -1,0 +1,17 @@
+[package]
+name = "beach-lifeguard-client"
+version = "0.1.0"
+edition = "2021"
+description = "Client harness utilities for the Beach WebSocket fallback transport."
+license = "MIT"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+beach-lifeguard-core = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4"] }

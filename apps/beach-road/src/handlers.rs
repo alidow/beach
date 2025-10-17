@@ -5,7 +5,7 @@ use axum::{
 };
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
-use beach_rescue_core::{
+use beach_lifeguard_core::{
     guardrail::SoftGuardrailState, is_telemetry_enabled, CohortId, FallbackTokenClaims,
     TelemetryPreference,
 };

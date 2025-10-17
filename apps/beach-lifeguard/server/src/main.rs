@@ -11,8 +11,8 @@ use axum::{
 };
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
-use beach_rescue_client::CompressionStrategy;
-use beach_rescue_core::{
+use beach_lifeguard_client::CompressionStrategy;
+use beach_lifeguard_core::{
     is_telemetry_enabled, FallbackTokenClaims, TelemetryPreference, TokenValidationError,
 };
 use clap::Parser;
@@ -56,7 +56,7 @@ impl ServerConfig {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "beach-rescue-server",
+    name = "beach-lifeguard-server",
     author,
     version,
     about = "Beach WebSocket fallback server (handshake skeleton)"
@@ -65,7 +65,7 @@ struct Cli {
     /// Address to bind the websocket listener to.
     #[arg(
         long,
-        env = "BEACH_RESCUE_LISTEN_ADDR",
+        env = "BEACH_LIFEGUARD_LISTEN_ADDR",
         default_value = "127.0.0.1:9443"
     )]
     listen_addr: String,
@@ -73,21 +73,25 @@ struct Cli {
     /// Redis connection URI used for guardrail counters and token cache.
     #[arg(
         long,
-        env = "BEACH_RESCUE_REDIS_URL",
+        env = "BEACH_LIFEGUARD_REDIS_URL",
         default_value = "redis://127.0.0.1:6379"
     )]
     redis_url: String,
 
     /// Disable OIDC entitlement validation (development mode only).
-    #[arg(long, env = "BEACH_RESCUE_DISABLE_OIDC", default_value_t = false)]
+    #[arg(long, env = "BEACH_LIFEGUARD_DISABLE_OIDC", default_value_t = false)]
     disable_oidc: bool,
 
     /// Grace period applied during shutdown.
-    #[arg(long, env = "BEACH_RESCUE_SHUTDOWN_GRACE_SECS", default_value_t = 5)]
+    #[arg(long, env = "BEACH_LIFEGUARD_SHUTDOWN_GRACE_SECS", default_value_t = 5)]
     shutdown_grace_secs: u64,
 
     /// Maximum time clients have to send their ClientHello frame.
-    #[arg(long, env = "BEACH_RESCUE_HANDSHAKE_TIMEOUT_SECS", default_value_t = 5)]
+    #[arg(
+        long,
+        env = "BEACH_LIFEGUARD_HANDSHAKE_TIMEOUT_SECS",
+        default_value_t = 5
+    )]
     handshake_timeout_secs: u64,
 }
 
@@ -160,7 +164,7 @@ async fn main() -> Result<()> {
         listen_addr = %config.listen_addr,
         redis_url = %config.redis_url,
         oidc_enabled = config.oidc_enabled(),
-        "starting beach-rescue server"
+        "starting beach-lifeguard server"
     );
 
     run(config, telemetry.metrics_handle()).await
@@ -194,7 +198,7 @@ async fn run(config: ServerConfig, metrics: PrometheusHandle) -> Result<()> {
         .await
         .context("failed to bind listener")?;
 
-    info!("beach-rescue listening on {}", config.listen_addr);
+    info!("beach-lifeguard listening on {}", config.listen_addr);
 
     let graceful = axum::serve(listener, router).with_graceful_shutdown(shutdown_signal());
     graceful.await.context("server shutdown with error")?;
@@ -379,7 +383,7 @@ async fn upgrade_connection(
         )
         .await;
     counter!(
-        "beach_rescue_connections_closed_total",
+        "beach_lifeguard_connections_closed_total",
         1,
         "session_id" => claims.session_id.to_string()
     );
@@ -459,7 +463,7 @@ async fn perform_handshake(
         return Err(HandshakeError::MissingEntitlement);
     }
 
-    let server_response = beach_rescue_client::ServerHello {
+    let server_response = beach_lifeguard_client::ServerHello {
         accepted_compression: client_hello.compression,
         feature_bits: claims.feature_bits,
     };
@@ -478,13 +482,13 @@ impl AppState {
     async fn on_connection_added(&self, session_id: Uuid, active: usize, total_sessions: usize) {
         let session_label = session_id.to_string();
         gauge!(
-            "beach_rescue_connections_active",
+            "beach_lifeguard_connections_active",
             active as f64,
             "session_id" => session_label.clone()
         );
-        gauge!("beach_rescue_sessions_active", total_sessions as f64);
+        gauge!("beach_lifeguard_sessions_active", total_sessions as f64);
         counter!(
-            "beach_rescue_connections_total",
+            "beach_lifeguard_connections_total",
             1,
             "session_id" => session_label
         );
@@ -495,11 +499,11 @@ impl AppState {
     async fn on_connection_removed(&self, session_id: Uuid, active: usize, total_sessions: usize) {
         let session_label = session_id.to_string();
         gauge!(
-            "beach_rescue_connections_active",
+            "beach_lifeguard_connections_active",
             active as f64,
             "session_id" => session_label
         );
-        gauge!("beach_rescue_sessions_active", total_sessions as f64);
+        gauge!("beach_lifeguard_sessions_active", total_sessions as f64);
 
         self.record_connection_state(session_id, active).await;
     }
@@ -537,19 +541,19 @@ impl AppState {
 
         let session_label = session_id.to_string();
         counter!(
-            "beach_rescue_messages_forwarded_total",
+            "beach_lifeguard_messages_forwarded_total",
             delivered as u64,
             "session_id" => session_label.clone()
         );
         if bytes > 0 {
             counter!(
-                "beach_rescue_bytes_forwarded_total",
+                "beach_lifeguard_bytes_forwarded_total",
                 bytes as u64,
                 "session_id" => session_label.clone()
             );
             let per_message = bytes as f64 / delivered as f64;
             histogram!(
-                "beach_rescue_message_size_bytes",
+                "beach_lifeguard_message_size_bytes",
                 per_message,
                 "session_id" => session_label.clone()
             );
@@ -639,23 +643,23 @@ impl AppState {
 fn record_handshake_success(client_hello: &ClientHello, duration: Duration) {
     let protocol_label = client_hello.protocol_version.to_string();
     counter!(
-        "beach_rescue_handshakes_success_total",
+        "beach_lifeguard_handshakes_success_total",
         1,
         "protocol_version" => protocol_label.clone()
     );
     histogram!(
-        "beach_rescue_handshake_duration_ms",
+        "beach_lifeguard_handshake_duration_ms",
         duration.as_secs_f64() * 1000.0,
         "protocol_version" => protocol_label
     );
     if matches!(client_hello.telemetry, TelemetryPreference::Enabled) {
-        counter!("beach_rescue_telemetry_opt_in_handshakes_total", 1);
+        counter!("beach_lifeguard_telemetry_opt_in_handshakes_total", 1);
     }
 }
 
 fn record_handshake_failure(error: &HandshakeError) {
     counter!(
-        "beach_rescue_handshakes_failure_total",
+        "beach_lifeguard_handshakes_failure_total",
         1,
         "reason" => error.metric_label()
     );
@@ -663,7 +667,7 @@ fn record_handshake_failure(error: &HandshakeError) {
 
 fn record_token_error(error: &TokenError) {
     counter!(
-        "beach_rescue_token_validation_failure_total",
+        "beach_lifeguard_token_validation_failure_total",
         1,
         "reason" => error.metric_label()
     );

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use beach_rescue_core::{GuardrailCounters, GuardrailSnapshot};
+use beach_lifeguard_core::{GuardrailCounters, GuardrailSnapshot};
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client};
 use serde::{Deserialize, Serialize};

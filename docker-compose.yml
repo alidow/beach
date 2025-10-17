@@ -22,14 +22,14 @@ services:
       - redis-data:/data
     networks:
       - beach-network
-  beach-rescue:
+  beach-lifeguard:
     image: rust:1.80
-    container_name: beach-rescue
+    container_name: beach-lifeguard
     working_dir: /app
-    command: ["cargo", "run", "-p", "beach-rescue-server"]
+    command: ["cargo", "run", "-p", "beach-lifeguard-server"]
     environment:
-      BEACH_RESCUE_REDIS_URL: redis://beach-redis:6379
-      BEACH_RESCUE_DISABLE_OIDC: "1"
+      BEACH_LIFEGUARD_REDIS_URL: redis://beach-redis:6379
+      BEACH_LIFEGUARD_DISABLE_OIDC: "1"
       RUST_LOG: info
     volumes:
       - .:/app

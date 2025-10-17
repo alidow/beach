@@ -22,19 +22,19 @@ impl Telemetry {
 
         let mut tracer_provider = None;
 
-        if env_truthy("BEACH_RESCUE_OTEL_STDOUT") {
+        if env_truthy("BEACH_LIFEGUARD_OTEL_STDOUT") {
             let exporter = SpanExporter::default();
             let provider = SdkTracerProvider::builder()
                 .with_simple_exporter(exporter)
                 .with_sampler(Sampler::AlwaysOn)
                 .with_resource(
                     Resource::builder()
-                        .with_attributes(vec![KeyValue::new("service.name", "beach-rescue")])
+                        .with_attributes(vec![KeyValue::new("service.name", "beach-lifeguard")])
                         .build(),
                 )
                 .build();
 
-            let tracer = provider.tracer("beach-rescue");
+            let tracer = provider.tracer("beach-lifeguard");
 
             global::set_tracer_provider(provider.clone());
             tracing_subscriber::registry()
@@ -53,7 +53,7 @@ impl Telemetry {
         }
 
         if tracer_provider.is_some() {
-            info!("OpenTelemetry stdout exporter enabled (BEACH_RESCUE_OTEL_STDOUT=1)");
+            info!("OpenTelemetry stdout exporter enabled (BEACH_LIFEGUARD_OTEL_STDOUT=1)");
         }
 
         Ok(Self {

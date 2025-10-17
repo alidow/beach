@@ -248,7 +248,20 @@ function findTailGap(snapshot: TerminalGridSnapshot): { start: number; end: numb
       continue;
     }
     const slot = snapshot.rows[index];
-    if (!slot || slot.kind !== 'loaded') {
+    if (!slot) {
+      if (gapStart === null) {
+        gapStart = absolute;
+      }
+      continue;
+    }
+    if (slot.kind !== 'loaded') {
+      if (gapStart === null) {
+        gapStart = absolute;
+      }
+      continue;
+    }
+    if (slot.latestSeq === 0) {
+      // Row exists only because of local predictions and has never been confirmed.
       if (gapStart === null) {
         gapStart = absolute;
       }

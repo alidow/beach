@@ -4427,6 +4427,7 @@ impl TerminalClient {
 
         let mut trimmed_sequences: Vec<Value> = Vec::new();
         let mut trimmed_sequences_truncated = false;
+        let mut pending_positions_beyond = false;
         for (&seq, prediction) in &self.pending_predictions {
             let mut positions: Vec<Value> = Vec::new();
             let mut positions_truncated = false;
@@ -4434,6 +4435,7 @@ impl TerminalClient {
             for pos in &prediction.positions {
                 if pos.row == row && pos.col >= col {
                     trimmed_count += 1;
+                    pending_positions_beyond = true;
                     if positions.len() < PREDICTION_POSITION_SAMPLE_LIMIT {
                         positions.push(json!({ "col": pos.col, "ch": pos.ch }));
                     } else {
@@ -4457,6 +4459,10 @@ impl TerminalClient {
                     trimmed_sequences_truncated = true;
                 }
             }
+        }
+
+        if predicted_before <= col && !pending_positions_beyond {
+            return;
         }
 
         let trimmed_renderer = self.renderer.shrink_row_to_column(absolute_row, col);
@@ -5364,6 +5370,77 @@ mod tests {
         client.apply_wire_update(&pack_row_segment(0, 0, 2, prompt));
         assert_eq!(client.cursor_row, 0);
         assert_eq!(client.cursor_col, prompt.chars().count());
+    }
+
+    #[test]
+    fn cursor_move_left_without_predictions_preserves_committed_cells() {
+        let mut client = new_client();
+        client.renderer.ensure_size(1, 80);
+        client.cursor_support = true;
+
+        let row = 0;
+        let prompt = "$ ";
+        client.apply_wire_update(&pack_row_segment(row, 0, 1, prompt));
+
+        let command = "foo ";
+        let prompt_len = prompt.chars().count() as u32;
+        let command_len = command.chars().count() as u32;
+        client.apply_wire_update(&pack_row_segment(row, prompt_len, 2, command));
+
+        client.apply_wire_cursor(&CursorFrame {
+            row,
+            col: prompt_len + command_len,
+            seq: 3,
+            visible: true,
+            blink: false,
+        });
+        let width_before = client.renderer.committed_row_width(row as u64);
+        assert!(
+            !client.predictions_active(),
+            "setup should not activate predictions"
+        );
+
+        let before = client
+            .renderer
+            .row_text_for_test(row as u64)
+            .expect("row text before cursor move");
+        let expected = "$ foo ";
+        assert!(
+            before.len() >= expected.len(),
+            "row text shorter than expected prefix: {before:?}"
+        );
+        assert_eq!(
+            &before[..expected.len()],
+            expected,
+            "expected prompt text before cursor move, got {before:?}"
+        );
+
+        client.apply_wire_cursor(&CursorFrame {
+            row,
+            col: prompt_len + command_len - 1,
+            seq: 4,
+            visible: true,
+            blink: false,
+        });
+
+        let after = client
+            .renderer
+            .row_text_for_test(row as u64)
+            .expect("row text after cursor move");
+        assert!(
+            after.len() >= expected.len(),
+            "row text shorter than expected prefix after cursor move: {after:?}"
+        );
+        assert_eq!(
+            &after[..expected.len()],
+            expected,
+            "committed prompt text should remain intact after cursor move left, got {after:?}"
+        );
+        let width_after = client.renderer.committed_row_width(row as u64);
+        assert_eq!(
+            width_after, width_before,
+            "committed row width should remain unchanged when cursor moves left without predictions"
+        );
     }
 
     #[test]

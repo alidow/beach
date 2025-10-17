@@ -181,6 +181,7 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
 
 ## Database Migrations
 - Manage schema via `sqlx-cli` migrations stored in `apps/beach-manager/migrations/` (checked in). This repository remains the canonical source of database shape; other services (e.g. `apps/private-beach` via Drizzle ORM) consume the generated SQL rather than defining their own migrations.
+- Publish generated schema artifacts (`sqlx-data.json` snapshots, drizzle-friendly SQL dumps) alongside each migration bump so downstream clients can regenerate bindings without drift.
 - Initial migration should create all tables/enums described in `docs/private-beach/data-model.md` (organizations, private beaches, memberships, sessions, automation assignments, controller events, file metadata, share links).
 - Follow-up migration `20250219120000_controller_leases_runtime.sql` introduces `controller_lease`, `session_runtime`, and `session.harness_type` to support the persisted registry.
 - Add supporting indexes for common lookups (`session.private_beach_id`, `controller_event.session_id DESC`, `private_beach_membership.account_id`).

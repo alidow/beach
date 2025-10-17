@@ -1700,7 +1700,7 @@ impl GridRenderer {
                         (' ', None, false)
                     }
                 }
-                RowSlot::Pending => ('·', None, false),
+                RowSlot::Pending => (' ', None, false),
                 RowSlot::Missing => (' ', None, false),
             }
         } else {

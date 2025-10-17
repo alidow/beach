@@ -1,3 +1,10 @@
+//! Control-plane state for the Beach Manager service.
+//!
+//! The **manager** refers to this Rust control plane (`apps/beach-manager`). A **controller**
+//! is any Beach session whose Beach Buggy harness currently holds a controller lease via the
+//! manager APIs. Controllers drive other sessions; non-controller harnesses simply stream
+//! state into the manager until a lease is granted.
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
@@ -11,7 +18,7 @@ use beach_buggy::{
 };
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{types::Json, PgPool, Row};
+use sqlx::{types::Json, FromRow, PgPool, Row};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -111,6 +118,7 @@ pub enum ControllerEventType {
     StateUpdated,
 }
 
+/// Payload returned to a controller session when the manager grants (or renews) a lease.
 #[derive(Debug, Clone, Serialize)]
 pub struct ControllerLeaseResponse {
     pub controller_token: String,
@@ -132,10 +140,34 @@ pub struct McpBridge {
     pub endpoint: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, FromRow)]
 struct DbSessionIdentifiers {
     session_id: Uuid,
     private_beach_id: Uuid,
+}
+
+#[derive(Debug, FromRow)]
+struct SessionRow {
+    origin_session_id: Uuid,
+    private_beach_id: Uuid,
+    harness_id: Option<Uuid>,
+    harness_type: Option<String>,
+    capabilities: Option<Json<serde_json::Value>>,
+    metadata: Option<Json<serde_json::Value>>,
+    location_hint: Option<String>,
+    last_health: Option<Json<serde_json::Value>>,
+    controller_token: Option<Uuid>,
+    expires_at: Option<DateTime<Utc>>,
+    revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, FromRow)]
+struct ControllerEventRow {
+    id: Uuid,
+    event_type: String,
+    controller_token: Option<Uuid>,
+    reason: Option<String>,
+    occurred_at: DateTime<Utc>,
 }
 
 impl AppState {
@@ -262,7 +294,7 @@ impl AppState {
             }
             Backend::Postgres(pool) => {
                 let beach_uuid = parse_uuid(private_beach_id, "private_beach_id")?;
-                let rows = sqlx::query(
+                let rows: Vec<SessionRow> = sqlx::query_as(
                     r#"
                     SELECT
                         s.origin_session_id,
@@ -289,40 +321,39 @@ impl AppState {
 
                 let mut summaries = Vec::with_capacity(rows.len());
                 for row in rows {
-                    let origin_session: Uuid = row.try_get("origin_session_id")?;
-                    let harness_id: Option<Uuid> = row.try_get("harness_id")?;
-                    let harness_type: Option<String> = row.try_get("harness_type")?;
-                    let harness = harness_type
+                    let harness = row
+                        .harness_type
                         .as_deref()
                         .and_then(harness_type_from_db)
                         .unwrap_or(HarnessType::Custom);
-                    let capabilities: Json<serde_json::Value> = row.try_get("capabilities")?;
-                    let metadata: Json<serde_json::Value> = row.try_get("metadata")?;
-                    let location_hint: Option<String> = row.try_get("location_hint")?;
-                    let controller_token: Option<Uuid> = row.try_get("controller_token")?;
-                    let expires_at: Option<DateTime<Utc>> = row.try_get("expires_at")?;
-                    let revoked_at: Option<DateTime<Utc>> = row.try_get("revoked_at")?;
-                    let last_health: Option<Json<serde_json::Value>> =
-                        row.try_get("last_health").ok();
-
-                    let pending_actions = self
-                        .pending_actions_count(&beach_uuid.to_string(), &origin_session.to_string())
-                        .await?;
-                    let controller_token = controller_token
-                        .filter(|_| is_active_lease(expires_at, revoked_at))
+                    let capabilities = row
+                        .capabilities
+                        .map(|Json(value)| json_array_to_strings(&value))
+                        .unwrap_or_default();
+                    let metadata = row.metadata.map(|Json(value)| value);
+                    let controller_token = row
+                        .controller_token
+                        .filter(|_| is_active_lease(row.expires_at, row.revoked_at))
                         .map(|token| token.to_string());
-                    let last_health =
-                        last_health.and_then(|Json(value)| serde_json::from_value(value).ok());
+                    let last_health = row
+                        .last_health
+                        .and_then(|Json(value)| serde_json::from_value(value).ok());
+                    let pending_actions = self
+                        .pending_actions_count(
+                            &row.private_beach_id.to_string(),
+                            &row.origin_session_id.to_string(),
+                        )
+                        .await?;
 
                     summaries.push(SessionSummary {
-                        session_id: origin_session.to_string(),
-                        private_beach_id: beach_uuid.to_string(),
+                        session_id: row.origin_session_id.to_string(),
+                        private_beach_id: row.private_beach_id.to_string(),
                         harness_type: harness,
-                        capabilities: json_array_to_strings(&capabilities.0),
-                        location_hint,
-                        metadata: Some(metadata.0),
+                        capabilities,
+                        location_hint: row.location_hint.clone(),
+                        metadata,
                         version: "unknown".into(),
-                        harness_id: harness_id.unwrap_or_else(Uuid::new_v4).to_string(),
+                        harness_id: row.harness_id.unwrap_or_else(Uuid::new_v4).to_string(),
                         controller_token,
                         pending_actions,
                         last_health,
@@ -690,7 +721,7 @@ impl AppState {
             Backend::Postgres(pool) => {
                 let session_uuid = parse_uuid(session_id, "session_id")?;
                 let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
-                let rows = sqlx::query(
+                let rows: Vec<ControllerEventRow> = sqlx::query_as(
                     r#"
                     SELECT id, event_type, controller_token, reason, occurred_at
                     FROM controller_event
@@ -705,20 +736,12 @@ impl AppState {
 
                 let events = rows
                     .into_iter()
-                    .filter_map(|row| {
-                        let id: Uuid = row.try_get("id").ok()?;
-                        let event_type: String = row.try_get("event_type").ok()?;
-                        let controller_token: Option<Uuid> =
-                            row.try_get("controller_token").ok()?;
-                        let reason: Option<String> = row.try_get("reason").ok()?;
-                        let occurred_at: DateTime<Utc> = row.try_get("occurred_at").ok()?;
-                        Some(ControllerEvent {
-                            id: id.to_string(),
-                            event_type: controller_event_from_str(&event_type),
-                            controller_token: controller_token.map(|uuid| uuid.to_string()),
-                            timestamp_ms: occurred_at.timestamp_millis(),
-                            reason,
-                        })
+                    .map(|row| ControllerEvent {
+                        id: row.id.to_string(),
+                        event_type: controller_event_from_str(&row.event_type),
+                        controller_token: row.controller_token.map(|uuid| uuid.to_string()),
+                        timestamp_ms: row.occurred_at.timestamp_millis(),
+                        reason: row.reason,
                     })
                     .collect();
                 Ok(events)
@@ -1349,9 +1372,9 @@ impl AppState {
         pool: &PgPool,
         session_uuid: &Uuid,
     ) -> Result<DbSessionIdentifiers, StateError> {
-        let row = sqlx::query(
+        let row = sqlx::query_as::<_, DbSessionIdentifiers>(
             r#"
-            SELECT id, private_beach_id
+            SELECT id AS session_id, private_beach_id
             FROM session
             WHERE origin_session_id = $1
             "#,
@@ -1360,14 +1383,7 @@ impl AppState {
         .fetch_optional(pool)
         .await?;
 
-        if let Some(row) = row {
-            Ok(DbSessionIdentifiers {
-                session_id: row.try_get("id")?,
-                private_beach_id: row.try_get("private_beach_id")?,
-            })
-        } else {
-            Err(StateError::SessionNotFound)
-        }
+        row.ok_or(StateError::SessionNotFound)
     }
 
     async fn fetch_active_lease(
@@ -1375,7 +1391,7 @@ impl AppState {
         pool: &PgPool,
         session_id: Uuid,
     ) -> Result<LeaseRow, StateError> {
-        let row = sqlx::query(
+        let row: Option<LeaseRow> = sqlx::query_as(
             r#"
             SELECT id, controller_account_id, expires_at, revoked_at
             FROM controller_lease
@@ -1386,20 +1402,7 @@ impl AppState {
         .fetch_optional(pool)
         .await?;
 
-        let lease = row
-            .and_then(|record| {
-                let revoked_at: Option<DateTime<Utc>> = record.try_get("revoked_at").ok()?;
-                let expires_at: Option<DateTime<Utc>> = record.try_get("expires_at").ok()?;
-                let id: Uuid = record.try_get("id").ok()?;
-                Some(LeaseRow {
-                    id,
-                    controller_account_id: record.try_get("controller_account_id").ok()?,
-                    expires_at,
-                    revoked_at,
-                })
-            })
-            .ok_or(StateError::ControllerMismatch)?;
-        Ok(lease)
+        row.ok_or(StateError::ControllerMismatch)
     }
 
     async fn fetch_active_lease_optional(
@@ -1407,7 +1410,7 @@ impl AppState {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         session_id: Uuid,
     ) -> Result<Option<LeaseRow>, StateError> {
-        let row = sqlx::query(
+        let row: Option<LeaseRow> = sqlx::query_as(
             r#"
             SELECT id, controller_account_id, expires_at, revoked_at
             FROM controller_lease
@@ -1418,18 +1421,7 @@ impl AppState {
         .fetch_optional(tx.as_mut())
         .await?;
 
-        Ok(row.and_then(|record| {
-            let id: Uuid = record.try_get("id").ok()?;
-            let controller_account_id = record.try_get("controller_account_id").ok();
-            let expires_at = record.try_get("expires_at").ok();
-            let revoked_at = record.try_get("revoked_at").ok();
-            Some(LeaseRow {
-                id,
-                controller_account_id,
-                expires_at,
-                revoked_at,
-            })
-        }))
+        Ok(row)
     }
 
     async fn insert_controller_event(
@@ -1686,7 +1678,8 @@ impl AppState {
     }
 }
 
-#[derive(Debug)]
+#[allow(dead_code)]
+#[derive(Debug, FromRow)]
 struct LeaseRow {
     id: Uuid,
     controller_account_id: Option<Uuid>,

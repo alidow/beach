@@ -3911,6 +3911,9 @@ impl TerminalClient {
                     cursor_changed = true;
                 }
                 0x08 | 0x7f => {
+                    let ahead_of_server = (self.cursor_row > self.server_cursor_row)
+                        || (self.cursor_row == self.server_cursor_row
+                            && self.cursor_col > self.server_cursor_col);
                     let mut moved = false;
                     if cursor_col > 0 {
                         cursor_col = cursor_col.saturating_sub(1);
@@ -3926,8 +3929,22 @@ impl TerminalClient {
                     if moved {
                         let row = cursor_row;
                         let col = cursor_col;
-                        self.renderer.add_prediction(row, col, seq, ' ');
-                        push_position(row, col, ' ');
+                        if ahead_of_server {
+                            let dropped_existing = self.drop_predictions_matching(
+                                PredictionDropReason::CursorAdvance,
+                                |pos| pos.row == row && pos.col == col,
+                            );
+                            if dropped_existing {
+                                self.update_prediction_overlay();
+                            }
+                            self.renderer.add_prediction(row, col, seq, ' ');
+                            push_position(row, col, ' ');
+                        } else if self.drop_predictions_matching(
+                            PredictionDropReason::CursorAdvance,
+                            |pos| pos.row == row && pos.col == col,
+                        ) {
+                            self.update_prediction_overlay();
+                        }
                         cursor_changed = true;
                     }
                 }

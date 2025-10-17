@@ -21,6 +21,7 @@
 - ✅ Controller events capture issuing accounts; Redis consumer groups + acknowledgements are now in production.
 - Next: finish MCP streaming + bindings, surface queue depth/lag metrics, verify RLS via Postgres integration tests, and add dockerized integration tests via `manager-sdk`.
 - Next: publish schema metadata (drizzle-friendly SQL snapshots, enum maps) from `apps/beach-manager/migrations/` so `apps/private-beach` stays in lockstep without owning separate migrations.
+- Next: sync documentation/SDK terminology—`manager` (control plane) vs `controller` (leased session)—across repos so harness and UI teams share the same mental model.
 
 ## Phase 3 – Workspace Shell (Private Beach Surfer)
 - Prototype Next.js dashboard consuming mock data; implement responsive grid, tile management, and status overlays.

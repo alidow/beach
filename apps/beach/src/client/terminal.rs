@@ -1097,6 +1097,17 @@ impl TerminalClient {
         }
     }
 
+    fn prediction_ack_grace(&self) -> Duration {
+        let srtt_ms = self.prediction_srtt_ms.unwrap_or(0.0);
+        let srtt_duration = if srtt_ms.is_finite() && srtt_ms > 0.0 {
+            Duration::from_millis(srtt_ms.round() as u64)
+        } else {
+            Duration::from_millis(0)
+        };
+        let padded = srtt_duration.saturating_add(Duration::from_millis(50));
+        padded.max(PREDICTION_ACK_GRACE)
+    }
+
     fn maybe_request_backfill(&mut self) -> Result<(), ClientError> {
         let subscription = match self.subscription_id {
             Some(id) => id,
@@ -4013,13 +4024,14 @@ impl TerminalClient {
     }
     fn prune_acked_predictions(&mut self, now: Instant) {
         let mut expired: Vec<Seq> = Vec::new();
+        let ack_grace = self.prediction_ack_grace();
         for (&seq, prediction) in self.pending_predictions.iter_mut() {
             prediction
                 .positions
                 .retain(|pos| self.renderer.prediction_exists(pos.row, pos.col, seq));
 
             if let Some(acked_at) = prediction.acked_at {
-                if now.saturating_duration_since(acked_at) >= PREDICTION_ACK_GRACE {
+                if now.saturating_duration_since(acked_at) >= ack_grace {
                     expired.push(seq);
                 }
             }
@@ -4070,7 +4082,7 @@ impl TerminalClient {
 
             // Check if prediction has been acknowledged and grace period has expired
             let ack_expired = if let Some(acked_at) = prediction.acked_at {
-                now.saturating_duration_since(acked_at) >= PREDICTION_ACK_GRACE
+                now.saturating_duration_since(acked_at) >= self.prediction_ack_grace()
             } else {
                 false
             };
@@ -5440,6 +5452,40 @@ mod tests {
         assert_eq!(
             width_after, width_before,
             "committed row width should remain unchanged when cursor moves left without predictions"
+        );
+    }
+
+    #[test]
+    fn predictive_ack_respects_dynamic_grace_before_clearing() {
+        let mut client = new_client();
+        client.render_enabled = true;
+        client.predictive_input = true;
+        client.renderer.ensure_size(1, 8);
+        client.prediction_srtt_ms = Some(500.0);
+
+        client.register_prediction(1, b"e");
+        assert!(client.pending_predictions.contains_key(&1));
+        assert!(client.renderer.has_active_predictions());
+
+        client.handle_input_ack(1);
+        assert!(client.pending_predictions.contains_key(&1));
+
+        let ack_grace = client.prediction_ack_grace();
+    let adjust = ack_grace.saturating_sub(Duration::from_millis(10));
+    if let Some(prediction) = client.pending_predictions.get_mut(&1) {
+        let now = Instant::now();
+        let adjusted = now.checked_sub(adjust).unwrap_or(now);
+        prediction.acked_at = Some(adjusted);
+    }
+
+        client.update_prediction_overlay();
+        assert!(
+            client.pending_predictions.contains_key(&1),
+            "prediction should persist while within ack grace window"
+        );
+        assert!(
+            client.renderer.has_active_predictions(),
+            "overlay should remain visible before grace expires"
         );
     }
 

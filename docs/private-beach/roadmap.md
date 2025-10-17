@@ -20,6 +20,7 @@
 - ✅ JSON-RPC `/mcp` endpoint serves the core `private_beach.*` methods with scope checks; streaming + schema publishing remain outstanding.
 - ✅ Controller events capture issuing accounts; Redis consumer groups + acknowledgements are now in production.
 - Next: finish MCP streaming + bindings, surface queue depth/lag metrics, verify RLS via Postgres integration tests, and add dockerized integration tests via `manager-sdk`.
+- Next: publish schema metadata (drizzle-friendly SQL snapshots, enum maps) from `apps/beach-manager/migrations/` so `apps/private-beach` stays in lockstep without owning separate migrations.
 
 ## Phase 3 – Workspace Shell (Private Beach Surfer)
 - Prototype Next.js dashboard consuming mock data; implement responsive grid, tile management, and status overlays.

@@ -7,6 +7,11 @@ Beach Manager is the zero-trust control plane that keeps Private Beach cohesive.
 - Agent onboarding workflow (prompt packs, MCP bridge wiring, capability gating).
 - Audit logging and telemetry routed to billing, alerting, and analytics systems.
 
+## Terminology
+- **Manager (service):** This Rust control plane (`apps/beach-manager`) that arbitrates every action inside a private beach—authenticates tokens, owns the session/lease registry, fans out state, and records audits.
+- **Controller (session):** A Beach session plus its Beach Buggy harness that currently holds a controller lease for another session. Controllers call orchestration APIs (`queue_action`, `subscribe_state`, etc.) while still behaving like ordinary sessions when they are not leased.
+- **Harness:** The per-session Beach Buggy sidecar that streams diffs and consumes actions. Every controller is backed by a harness, but most harnesses are *not* controllers; they simply publish state until a controller lease is granted.
+
 ## High-Level Architecture
 1. **API Layer (Axum)**
    - REST + WebSocket endpoints for the Private Beach Surfer app.
@@ -175,7 +180,7 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
 - Build regression tests against the Postgres/Redis path (docker-compose or `sqlx::test`) to guard future refactors.
 
 ## Database Migrations
-- Manage schema via `sqlx-cli` migrations stored in `apps/beach-manager/migrations/` (checked in).
+- Manage schema via `sqlx-cli` migrations stored in `apps/beach-manager/migrations/` (checked in). This repository remains the canonical source of database shape; other services (e.g. `apps/private-beach` via Drizzle ORM) consume the generated SQL rather than defining their own migrations.
 - Initial migration should create all tables/enums described in `docs/private-beach/data-model.md` (organizations, private beaches, memberships, sessions, automation assignments, controller events, file metadata, share links).
 - Follow-up migration `20250219120000_controller_leases_runtime.sql` introduces `controller_lease`, `session_runtime`, and `session.harness_type` to support the persisted registry.
 - Add supporting indexes for common lookups (`session.private_beach_id`, `controller_event.session_id DESC`, `private_beach_membership.account_id`).

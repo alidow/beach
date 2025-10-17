@@ -4492,15 +4492,14 @@ impl TerminalClient {
             return;
         }
 
-        let trimmed_pending = self
-            .drop_predictions_matching(PredictionDropReason::RendererTrim, |pos| {
-                pos.row == row && pos.col >= col
-            });
-        let trimmed_renderer = if trimmed_pending {
-            self.renderer.shrink_row_to_column(absolute_row, col)
-        } else {
-            false
-        };
+        let trimmed_pending = self.drop_predictions_matching(
+            PredictionDropReason::RendererTrim,
+            |pos| pos.row == row && pos.col >= col,
+        );
+        if !trimmed_pending {
+            return;
+        }
+        let trimmed_renderer = self.renderer.shrink_row_to_column(absolute_row, col);
 
         let committed_after = self.renderer.committed_row_width(absolute_row);
         let predicted_after = self.renderer.predicted_row_width(absolute_row);

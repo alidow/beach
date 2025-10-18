@@ -218,7 +218,7 @@ impl AppState {
             events: Arc::new(RwLock::new(HashMap::new())),
             fast_paths: FastPathRegistry::new(),
             http: reqwest::Client::new(),
-            road_base_url: std::env::var("BEACH_ROAD_URL").unwrap_or_else(|_| "http://localhost:4132".into()),
+            road_base_url: std::env::var("BEACH_ROAD_URL").unwrap_or_else(|_| "https://api.beach.sh".into()),
             public_manager_url: std::env::var("PUBLIC_MANAGER_URL").unwrap_or_else(|_| "http://localhost:8080".into()),
         }
     }
@@ -236,7 +236,7 @@ impl AppState {
             events: Arc::new(RwLock::new(HashMap::new())),
             fast_paths: FastPathRegistry::new(),
             http: reqwest::Client::new(),
-            road_base_url: std::env::var("BEACH_ROAD_URL").unwrap_or_else(|_| "http://localhost:4132".into()),
+            road_base_url: std::env::var("BEACH_ROAD_URL").unwrap_or_else(|_| "https://api.beach.sh".into()),
             public_manager_url: std::env::var("PUBLIC_MANAGER_URL").unwrap_or_else(|_| "http://localhost:8080".into()),
         }
     }
@@ -479,9 +479,7 @@ impl AppState {
         let resp = self.http.post(url).json(&body).send().await.map_err(|_| ())?;
         if resp.status().is_success() { Ok(()) } else { Err(()) }
     }
-}
-
-// no extra impls
+    // impl AppState continues below
 
     pub async fn update_session_metadata(
         &self,

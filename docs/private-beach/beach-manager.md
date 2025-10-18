@@ -53,12 +53,12 @@ Beach Manager is the zero-trust control plane that keeps Private Beach cohesive.
    - UI presents copyable `beach run --private-beach <beach-id>` (and Cabana variant). CLI uses Beach Gate user token to mint a scoped token and registers directly to Manager at startup.
 
 APIs (Manager additions)
-- `POST /private-beaches/:private_beach_id/sessions/attach-by-code` → { ok, attach_method, mapping }
+- `POST /private-beaches/:private_beach_id/sessions/attach-by-code` → { ok, attach_method, session }
 - `POST /private-beaches/:private_beach_id/sessions/attach` → { attached: number, duplicates: number }
 - `POST /private-beaches/:private_beach_id/harness-bridge-token` → { token, expires_at_ms, audience }
 
 APIs (Beach Road additions)
-- `POST /sessions/:origin_session_id/verify-code` → { verified, owner_account_id, harness_hint }
+- `POST /sessions/:origin_session_id/verify-code` → { verified, owner_account_id }
 - `GET /me/sessions?status=active` → list of active sessions owned by caller
 - `POST /sessions/:origin_session_id/join-manager` { manager_url, bridge_token }
 
@@ -214,10 +214,21 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
 ## Current Implementation Status (2025‑10‑24)
 - REST API routes remain the primary surface; a JSON-RPC `/mcp` endpoint mirrors the primary control-plane methods for harnesses/agents. Streaming is provided via SSE endpoints, and MCP returns `sse_url` helpers.
 - `AppState` now persists sessions, controller leases, and controller events in Postgres via SQLx while preserving an in-memory fallback for tests/offline runs. SQLx `FromRow` models wrap the Postgres queries so downstream clients can reuse the same schema metadata without duplicating SQL.
-- New migration `20250219120000_controller_leases_runtime.sql` adds `controller_lease`, `session_runtime`, and `session.harness_type`, keeping the schema aligned with `docs/private-beach/data-model.md`.
+- New migration `20250102000000_controller_leases_runtime.sql` adds `controller_lease`, `session_runtime`, and `session.harness_type`, keeping the schema aligned with `docs/private-beach/data-model.md`.
 - Redis integration powers action queues (Streams) plus TTL’d health/state caches; when Redis is unavailable the manager transparently falls back to in-memory queues.
 - Beach Gate JWT verification is wired through `AuthToken`, with JWKS caching and env-based bypass for local development.
 - Docker Compose workflow exercises Postgres + Redis; Postgres-backed tests (ignored by default) exist, including RLS enforcement under a limited role.
+
+### Session Onboarding (Implemented)
+- Manager exposes: attach-by-code, attach, harness-bridge-token routes. In dev/bypass, bridge token is an opaque UUID; production should mint via Beach Gate.
+- Beach Road exposes: verify-code, me/sessions, join-manager (no-op nudge).
+- Surfer includes an “Add Session” modal with By Code, My Sessions, Launch New.
+- Defaults: Manager `BEACH_ROAD_URL` falls back to `https://api.beach.sh` if unset; compose sets a local Road service.
+
+### Gaps / Follow-up Items
+- Replace dev bridge token with scoped JWT; enforce ownership checks against Road/Gate.
+- Persist `session.attach_method` (migration present) and surface in UI.
+- CLI `beach run --private-beach <beach-id>` direct registration path (currently guidance only).
 
 ### Controller Harness Configuration (In Progress)
 - Controllers are ordinary Beach sessions whose harness currently holds a lease. To support automation templates we plan to capture, per controller, the following metadata:

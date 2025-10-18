@@ -79,6 +79,13 @@ fn ensure_appkit_initialized() {
         }
         let app: Id<NSObject> = msg_send_id![class!(NSApplication), sharedApplication];
         info!("obtained NSApplication.sharedApplication()");
+        // Reduce AppKit expectations about a main menu by switching to Accessory policy
+        // for our headless/CLI usage. This helps avoid NSMenu assertions when running
+        // under test harnesses or without a proper app bundle.
+        #[allow(non_camel_case_types)]
+        type NSApplicationActivationPolicy = isize; // 0=Regular, 1=Accessory, 2=Prohibited
+        let _: bool = msg_send![&app, setActivationPolicy: 1 as NSApplicationActivationPolicy];
+        info!("set NSApplication activation policy to Accessory");
         let _: () = msg_send![&app, finishLaunching];
         info!("sent finishLaunching to NSApplication");
     });
@@ -679,6 +686,10 @@ mod tests {
     #[test]
     #[ignore]
     fn sck_stream_produces_frames_on_display() {
+        if std::env::var("CABANA_RUN_SCK_TEST").ok().as_deref() != Some("1") {
+            eprintln!("Skipping SCK smoke test; set CABANA_RUN_SCK_TEST=1 to run.");
+            return;
+        }
         ensure_appkit_initialized();
 
         // Discover a display id via ScreenCaptureKit itself.

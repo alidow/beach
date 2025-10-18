@@ -21,7 +21,8 @@ Test/metrics notes (2025-10-18):
 
 How to run locally (macOS):
 - `cargo test --manifest-path apps/beach-cabana/Cargo.toml --features cabana_sck`
-- `cargo test --manifest-path apps/beach-cabana/Cargo.toml --features cabana_sck -- --ignored` (runs SCK smoke test)
+- `CABANA_RUN_SCK_TEST=1 cargo test --manifest-path apps/beach-cabana/Cargo.toml --features cabana_sck -- --ignored platform::macos::sck::tests::sck_stream_produces_frames_on_display` (runs only the SCK smoke test)
+- `RUST_LOG=info cargo run --manifest-path apps/beach-cabana/Cargo.toml -- list-windows` (find a `display:<ID>`)
 - `RUST_LOG=info cargo run --manifest-path apps/beach-cabana/Cargo.toml -- stream --window-id display:<ID> --frames 60 --interval-ms 16`
 
 ## 2025-10-15 – ScreenCaptureKit Integration Status

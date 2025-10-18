@@ -32,6 +32,7 @@ pub enum HandshakeRole {
 }
 
 /// Configuration for a Noise handshake.
+#[derive(Clone)]
 pub struct HandshakeConfig<'a> {
     pub material: &'a SessionMaterial,
     pub handshake_id: &'a HandshakeId,

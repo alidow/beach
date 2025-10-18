@@ -137,8 +137,11 @@ pub async fn run_with_notify(
         let _listener_handle =
             start_diagnostic_listener(session_id_for_debug.clone(), request_tx, response_rx);
 
+        let predictive_env = std::env::var("BEACH_PREDICTIVE")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1"|"true"|"yes"|"on"))
+            .unwrap_or(true);
         let mut client = TerminalClient::new(client_transport)
-            .with_predictive_input(interactive)
+            .with_predictive_input(interactive && predictive_env)
             .with_diagnostic_server(diagnostic_server);
 
         if let Some(latency_ms) = inject_latency {

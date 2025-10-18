@@ -104,7 +104,15 @@ services:
       PGPASSWORD: postgres
     volumes:
       - ./apps/beach-manager/migrations:/migrations:ro
-    entrypoint: ["sh", "-c", "set -e; until pg_isready -h beach-postgres -U postgres >/dev/null 2>&1; do echo 'waiting for postgres'; sleep 1; done; echo 'postgres is ready'; psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d beach_manager -c 'CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";'; psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d beach_manager -c 'CREATE EXTENSION IF NOT EXISTS citext;'; for f in /migrations/*.sql; do echo 'applying migration' $$f; psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d beach_manager -f $$f; done; echo 'migrations applied'"]
+    entrypoint: ["sh", "-c", "set -e; \
+      until pg_isready -h beach-postgres -U postgres >/dev/null 2>&1; do echo 'waiting for postgres'; sleep 1; done; echo 'postgres is ready'; \
+      psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d beach_manager -c 'CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";'; \
+      psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d beach_manager -c 'CREATE EXTENSION IF NOT EXISTS citext;'; \
+      if psql -tAc \"SELECT to_regclass('session') IS NOT NULL\" -h beach-postgres -U postgres -d beach_manager | grep -q 't'; then \
+        echo 'migrations already present; skipping raw apply'; exit 0; \
+      fi; \
+      for f in /migrations/*.sql; do echo 'applying migration' $$f; psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d beach_manager -f $$f; done; \
+      echo 'migrations applied' "]
     networks:
       - beach-network
   db-seed:

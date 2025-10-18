@@ -20,6 +20,7 @@ use std::io::{BufWriter, Write};
 use std::ptr::{null, null_mut};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, warn};
+use crossbeam_channel::Sender;
 
 const VT_ENCODE_INFO_FRAME_DROPPED: u32 = 0x0000_0001;
 const START_CODE: &[u8] = &[0, 0, 0, 1];
@@ -90,20 +91,32 @@ struct EncoderSink {
     parameter_sets_written: bool,
     frames_encoded: u64,
     frames_dropped: u64,
+    chunk_tx: Option<Sender<Vec<u8>>>,
 }
 
 impl VideoToolboxEncoder {
     pub fn new(path: &std::path::Path, width: u32, height: u32, fps: u32) -> Result<Self> {
+        Self::new_with_chunks(Some(path), width, height, fps, None)
+    }
+
+    pub fn new_with_chunks(
+        path: Option<&std::path::Path>,
+        width: u32,
+        height: u32,
+        fps: u32,
+        chunk_tx: Option<Sender<Vec<u8>>>,
+    ) -> Result<Self> {
         if fps == 0 {
             return Err(anyhow!("fps must be greater than zero"));
         }
 
-        let file = File::create(path)?;
+        let file = File::create(path.unwrap_or_else(|| std::path::Path::new("/dev/null")))?;
         let sink = Arc::new(Mutex::new(EncoderSink {
             writer: BufWriter::new(file),
             parameter_sets_written: false,
             frames_encoded: 0,
             frames_dropped: 0,
+            chunk_tx,
         }));
         let sink_refcon = Arc::into_raw(Arc::clone(&sink));
 
@@ -397,12 +410,14 @@ fn process_sample(
         .map_err(|_| anyhow!("VideoToolbox encoder sink poisoned"))?;
 
     if !guard.parameter_sets_written {
-        write_parameter_sets(&mut guard.writer, &video_desc)
+        let tx_opt = guard.chunk_tx.clone();
+        write_parameter_sets(&mut guard.writer, &video_desc, tx_opt.as_ref())
             .context("failed to write H264 parameter sets")?;
         guard.parameter_sets_written = true;
     }
 
-    write_sample(&mut guard.writer, &block_buffer)?;
+    let tx_opt = guard.chunk_tx.clone();
+    write_sample(&mut guard.writer, &block_buffer, tx_opt.as_ref())?;
     guard.frames_encoded += 1;
 
     if info_flags & VT_ENCODE_INFO_FRAME_DROPPED != 0 {
@@ -415,6 +430,7 @@ fn process_sample(
 fn write_parameter_sets(
     writer: &mut BufWriter<File>,
     format_desc: &CMVideoFormatDescription,
+    chunk_tx: Option<&Sender<Vec<u8>>>,
 ) -> Result<()> {
     let mut index = 0;
     loop {
@@ -428,6 +444,12 @@ fn write_parameter_sets(
 
         writer.write_all(START_CODE)?;
         writer.write_all(parameter_set)?;
+        if let Some(tx) = chunk_tx {
+            let mut out = Vec::with_capacity(START_CODE.len() + parameter_set.len());
+            out.extend_from_slice(START_CODE);
+            out.extend_from_slice(parameter_set);
+            let _ = tx.send(out);
+        }
 
         if index + 1 >= total_sets {
             break;
@@ -437,7 +459,11 @@ fn write_parameter_sets(
     Ok(())
 }
 
-fn write_sample(writer: &mut BufWriter<File>, block_buffer: &CMBlockBuffer) -> Result<()> {
+fn write_sample(
+    writer: &mut BufWriter<File>,
+    block_buffer: &CMBlockBuffer,
+    chunk_tx: Option<&Sender<Vec<u8>>>,
+) -> Result<()> {
     let length = block_buffer.get_data_length();
     let mut offset = 0usize;
     while offset + 4 <= length {
@@ -457,6 +483,12 @@ fn write_sample(writer: &mut BufWriter<File>, block_buffer: &CMBlockBuffer) -> R
         offset += nal_length;
         writer.write_all(START_CODE)?;
         writer.write_all(&nal)?;
+        if let Some(tx) = chunk_tx {
+            let mut out = Vec::with_capacity(START_CODE.len() + nal.len());
+            out.extend_from_slice(START_CODE);
+            out.extend_from_slice(&nal);
+            let _ = tx.send(out);
+        }
     }
     Ok(())
 }

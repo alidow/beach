@@ -600,6 +600,183 @@ fn run(cli: cli::Cli) -> Result<()> {
                 String::from_utf8_lossy(&reply_plaintext)
             );
         }
+        #[cfg(feature = "webrtc")]
+        cli::Commands::WebRtcLocal {
+            session_id,
+            passcode,
+            host_id,
+            viewer_id,
+            prologue,
+        } => {
+            let material = security::SessionMaterial::derive(&session_id, &passcode)?;
+            let handshake = security::HandshakeId::random();
+            let handle = tokio::runtime::Runtime::new()?;
+            let code = handle.block_on(async move {
+                webrtc::run_local_webrtc_noise_demo(
+                    material,
+                    handshake,
+                    host_id,
+                    viewer_id,
+                    prologue.into_bytes(),
+                )
+                .await
+            })?;
+            println!("Local WebRTC + Noise established");
+            println!("  Verification   : {}", code);
+            println!("  Note: this demo uses an in-process data channel.");
+        }
+        #[cfg(feature = "webrtc")]
+        cli::Commands::WebRtcHostRun {
+            session_id,
+            passcode,
+            codec,
+            road_url,
+            fixture_url,
+            fixture_dir,
+            prologue,
+            window_id,
+            frames,
+            interval_ms,
+            max_width,
+            from_id,
+            to_id,
+        } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            let code = rt.block_on(async move {
+                webrtc::host_run(
+                    session_id,
+                    passcode,
+                    codec,
+                    road_url,
+                    fixture_url,
+                    fixture_dir,
+                    prologue.into_bytes(),
+                    window_id,
+                    frames,
+                    interval_ms,
+                    max_width,
+                    from_id,
+                    to_id,
+                )
+                .await
+            })?;
+            println!("Host completed secure session");
+            println!("  Verification   : {}", code);
+        }
+        #[cfg(feature = "webrtc")]
+        cli::Commands::WebRtcViewerAnswer {
+            session_id,
+            passcode,
+            host_envelope,
+            host_envelope_file,
+            fixture_url,
+            prologue,
+        } => {
+            let env_str = if let Some(s) = host_envelope {
+                s
+            } else if let Some(path) = host_envelope_file {
+                std::fs::read_to_string(path)?
+            } else {
+                return Err(anyhow!("provide --host-envelope or --host-envelope-file"));
+            };
+            let rt = tokio::runtime::Runtime::new()?;
+            let result = rt.block_on(async move {
+                webrtc::viewer_answer(
+                    session_id,
+                    passcode,
+                    env_str,
+                    fixture_url,
+                    prologue.into_bytes(),
+                )
+                .await
+            })?;
+            println!("Viewer answer result: {}", result);
+        }
+        #[cfg(feature = "webrtc")]
+        cli::Commands::WebRtcViewerRun {
+            session_id,
+            passcode,
+            host_envelope,
+            host_envelope_file,
+            fixture_url,
+            prologue,
+            recv_frames,
+            output_dir,
+            road_url,
+            from_id,
+            to_id,
+        } => {
+            let env_str = if let Some(s) = host_envelope {
+                s
+            } else if let Some(path) = host_envelope_file {
+                std::fs::read_to_string(path)?
+            } else {
+                String::new()
+            };
+            let rt = tokio::runtime::Runtime::new()?;
+            let out_dir = rt.block_on(async move {
+                webrtc::viewer_run(
+                    session_id,
+                    passcode,
+                    env_str,
+                    fixture_url,
+                    prologue.into_bytes(),
+                    recv_frames,
+                    output_dir,
+                    road_url,
+                    from_id,
+                    to_id,
+                )
+                .await
+            })?;
+            println!("Viewer received {} frame(s) into {}", recv_frames, out_dir.display());
+        }
+        #[cfg(feature = "webrtc")]
+        cli::Commands::RoadCreateSession {
+            road_url,
+            session_id,
+            road_passphrase,
+        } => {
+            #[derive(serde::Serialize)]
+            struct CreateReq<'a> { session_id: &'a str, #[serde(skip_serializing_if = "Option::is_none")] passphrase: Option<&'a str> }
+            #[derive(serde::Deserialize)]
+            struct CreateResp { success: bool, session_url: String, message: Option<String>, session_id: Option<String>, join_code: Option<String> }
+            let base = road_url.unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
+            let sid = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let url = format!("{}/sessions", base.trim_end_matches('/'));
+            let resp = reqwest::blocking::Client::new()
+                .post(url)
+                .json(&CreateReq { session_id: &sid, passphrase: road_passphrase.as_deref() })
+                .send()?;
+            if !resp.status().is_success() {
+                println!("Failed to create session: {}", resp.status());
+                return Ok(());
+            }
+            let body: CreateResp = resp.json()?;
+            println!("Created session: {}", body.session_id.unwrap_or(sid));
+            println!("Session URL     : {}", body.session_url);
+            if let Some(code) = body.join_code { println!("Join code        : {}", code); }
+            if let Some(msg) = body.message { println!("Message          : {}", msg); }
+        }
+        #[cfg(feature = "webrtc")]
+        cli::Commands::RoadJoinSession { road_url, session_id, road_passphrase, mcp } => {
+            #[derive(serde::Serialize)]
+            struct JoinReq<'a> { #[serde(skip_serializing_if = "Option::is_none")] passphrase: Option<&'a str>, #[serde(default)] mcp: bool }
+            #[derive(serde::Deserialize)]
+            struct JoinResp { success: bool, message: Option<String> }
+            let base = road_url.unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
+            let url = format!("{}/sessions/{}/join", base.trim_end_matches('/'), session_id);
+            let resp = reqwest::blocking::Client::new()
+                .post(url)
+                .json(&JoinReq { passphrase: road_passphrase.as_deref(), mcp })
+                .send()?;
+            if !resp.status().is_success() {
+                println!("Failed to join session: {}", resp.status());
+                return Ok(());
+            }
+            let body: JoinResp = resp.json()?;
+            if body.success { println!("Joined session {}", session_id); } else { println!("Join failed: {}", body.message.unwrap_or_else(|| "unknown".into())); }
+        }
     }
 
     Ok(())

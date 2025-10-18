@@ -4582,8 +4582,13 @@ impl TerminalClient {
     }
 
     fn refresh_prediction_cursor(&mut self) {
-        if self.predictive_input {
+        // Show predicted cursor while predictions are active for responsive typing.
+        // Fall back to the latest server cursor when there are no active predictions.
+        if self.predictions_active() {
             self.update_cursor_from_predictions();
+        } else {
+            self.cursor_row = self.server_cursor_row;
+            self.cursor_col = self.server_cursor_col;
         }
         self.sync_renderer_cursor();
     }
@@ -5075,16 +5080,11 @@ fn encode_key_event(key: KeyEvent) -> Option<Vec<u8>> {
             Some(bytes)
         }
         KeyCode::Enter => {
-            let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
-            let has_other_mods = key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
-
-            if has_shift && !has_other_mods {
-                Some(vec![b'\n'])
-            } else {
-                Some(vec![b'\r'])
-            }
+            // Send LF by default to be robust against PTY configurations that
+            // don't map CR->NL on input. This avoids the "carriage return"
+            // behavior where Enter returns to column 0 without advancing the
+            // line on some hosts.
+            Some(vec![b'\n'])
         }
         KeyCode::Tab => Some(vec![b'\t']),
         KeyCode::Backspace => Some(vec![0x7f]),

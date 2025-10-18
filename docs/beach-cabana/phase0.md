@@ -81,11 +81,11 @@ Artifacts from each spike should be committed under `research/beach-cabana/` (pr
 
 ## Phase 1 Scaffold Snapshot
 
-- `apps/beach-cabana/` crate created as a standalone binary (`beach-cabana`) excluded from the main Beach workspace to avoid touching terminal code paths yet.
+- `apps/beach-cabana/` becomes a small workspace with `host/` (engine lib) and `cli/` (binary), excluded from the main Beach workspace to avoid touching terminal code paths.
 - CLI commands in place: `list-windows` (macOS returns live window + display metadata via Core Graphics; other OSs show placeholders), `preview` (macOS captures the selected window/display to a PNG in the temp directory), `stream` (loops captures into a temp directory to simulate continuous frames ahead of ScreenCaptureKit), `encode` (records a short session into an animated GIF as a first encoder integration), `start` (derives session keys, seals either random probes or real payloads via `--payload-file`, optionally POSTing to a local fixture), dev utilities `seal-probe` / `open-probe`, and `fixture-serve` (tiny_http-based beach-road stub that persists sealed envelopes to disk).
-- Capture module scaffolded (`apps/beach-cabana/src/capture/`) with a shared `FrameProducer` trait, Core Graphics fallback producer, and ScreenCaptureKit stubs behind the `cabana_sck` feature flag.
+- Capture module scaffolded (`apps/beach-cabana/host/src/capture/`) with a shared `FrameProducer` trait, Core Graphics fallback producer, and ScreenCaptureKit stubs behind the `cabana_sck` feature flag.
 - Security helpers implemented: Argon2id stretch + HKDF derivation, ChaCha20-Poly1305 sealing/unsealing, compact envelope format with base64 encoding, and handshake-id utilities.
-- Build hint: `cargo check --manifest-path apps/beach-cabana/Cargo.toml` validates without requiring other Beach crates.
+- Build hint: `cargo check --manifest-path apps/beach-cabana/host/Cargo.toml` (lib) or `cargo check --manifest-path apps/beach-cabana/cli/Cargo.toml` (CLI) validates without requiring other Beach crates.
 - Next up: integrate ScreenCaptureKit for continuous capture (current preview is a single-frame snapshot). See `docs/beach-cabana/screencapturekit-spike.md` for the detailed approach. After SCKit lands, wire sealed envelopes into a minimal WebRTC handshake harness so live frames exercise the zero-trust path.
 
 ## Licensing / Boundary Notes

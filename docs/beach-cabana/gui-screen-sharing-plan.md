@@ -51,8 +51,8 @@ Phased Delivery
 - Deliverables: Implement sealed signaling (Phase 1 spec in `docs/secure-webrtc/secure-shared-secret-webrtc-plan.md`) inside Cabana; run Noise `XXpsk2` handshake over data channel; wrap outgoing media frames (video + control) in AEAD using keys derived from the unique link + passcode.
 - Success: Cabana peers exchange unique link/passcode, establish WebRTC video channel via `beach-road` while keeping signaling opaque; tampering at the relay fails verification.
 - Progress:
-  - Noise stack implemented with `NoiseController`, transport AEAD, replay protection, and verification code (`apps/beach-cabana/src/noise.rs`).
-  - Channel-agnostic `NoiseDriver` plus a `webrtc` feature that adapts the driver to real data channels (`apps/beach-cabana/src/webrtc.rs`).
+  - Noise stack implemented with `NoiseController`, transport AEAD, replay protection, and verification code (`apps/beach-cabana/host/src/noise.rs`).
+  - Channel-agnostic `NoiseDriver` plus a `webrtc` feature that adapts the driver to real data channels (`apps/beach-cabana/host/src/webrtc.rs`).
   - New local E2E demo (behind `--features webrtc`): `beach-cabana webrtc-local --session-id ... --passcode ...` spins up two in-process peers, opens a real WebRTC data channel, performs the Noise handshake, returns a verification code, and exchanges encrypted media messages. This provides an agent-friendly way to exercise Phase 3 without external signaling.
   - Sealed signaling helpers are already integrated (Phase 1 `start` path) and remain the basis for offer/answer sealing. Next step is wiring sealed offer/answer to a fixture exchange and landing a minimal “host-offer/viewer-answer” CLI pairing.
 

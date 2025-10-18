@@ -7,7 +7,7 @@ Goal: prototype a macOS-only high-FPS capture path that replaces the current Cor
 - Produce BGRA frames (or CVPixelBuffer handles) that Cabana can hand to future encoder modules.
 - Maintain zero-trust guarantees: no additional secrets leave the host process.
 - Keep integration self-contained (no changes to open-source Beach crates yet).
-- Feature gated: enable with `cargo run --manifest-path apps/beach-cabana/Cargo.toml --features cabana_sck -- stream ...` so OSS builds remain unaffected.
+- Feature gated: enable with `cargo run --manifest-path apps/beach-cabana/cli/Cargo.toml --features cabana_sck -- stream ...` so OSS builds remain unaffected.
 
 ## Integration Approaches
 
@@ -29,7 +29,7 @@ Goal: prototype a macOS-only high-FPS capture path that replaces the current Cor
 
 ## Proposed Plan
 1. **Scaffold capture runtime**
-   - Add `apps/beach-cabana/src/capture/mod.rs` with trait `FrameProducer` and a macOS implementation behind `#[cfg(target_os = "macos")]`. (Module scaffold in place; trait still TODO.)
+   - Add `apps/beach-cabana/host/src/capture/mod.rs` with trait `FrameProducer` and a macOS implementation behind `#[cfg(target_os = "macos")]`. (Module scaffold in place; trait still TODO.)
    - For initial spike, include feature flag `cabana_sck` to compile the ScreenCaptureKit bridge.
 2. **Swift shim (if chosen)**
    - Create `apple/CabanaCaptureKit/Package.swift`.

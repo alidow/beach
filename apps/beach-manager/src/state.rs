@@ -79,6 +79,8 @@ pub enum StateError {
     SessionNotFound,
     #[error("controller token mismatch")]
     ControllerMismatch,
+    #[error("private beach not found")]
+    PrivateBeachNotFound,
     #[error("invalid identifier: {0}")]
     InvalidIdentifier(String),
     #[error("database error: {0}")]
@@ -183,7 +185,7 @@ struct SessionRow {
     origin_session_id: Uuid,
     private_beach_id: Uuid,
     harness_id: Option<Uuid>,
-    harness_type: Option<String>,
+    harness_type: Option<HarnessTypeDb>,
     capabilities: Option<Json<serde_json::Value>>,
     metadata: Option<Json<serde_json::Value>>,
     location_hint: Option<String>,
@@ -339,11 +341,21 @@ impl AppState {
                 let origin_uuid = parse_uuid(origin_session_id, "session_id")?;
                 let mut tx = pool.begin().await?;
                 self.set_rls_context_tx(&mut tx, &beach_uuid).await?;
+                // Ensure the target private beach exists to avoid FK violations
+                let exists: Option<(i32,)> = sqlx::query_as(
+                    r#"SELECT 1 FROM private_beach WHERE id = $1"#,
+                )
+                .bind(beach_uuid)
+                .fetch_optional(tx.as_mut())
+                .await?;
+                if exists.is_none() {
+                    return Err(StateError::PrivateBeachNotFound);
+                }
                 // Insert session row if not exists, leave harness fields null
                 let _ = sqlx::query(
                     r#"
-                    INSERT INTO session (private_beach_id, origin_session_id, kind, created_by_account_id)
-                    VALUES ($1, $2, 'terminal', $3)
+                    INSERT INTO session (private_beach_id, origin_session_id, kind, created_by_account_id, attach_method)
+                    VALUES ($1, $2, 'terminal', $3, 'code')
                     ON CONFLICT (private_beach_id, origin_session_id) DO NOTHING
                     "#,
                 )
@@ -415,13 +427,23 @@ impl AppState {
                 let beach_uuid = parse_uuid(private_beach_id, "private_beach_id")?;
                 let mut tx = pool.begin().await?;
                 self.set_rls_context_tx(&mut tx, &beach_uuid).await?;
+                // Ensure the target private beach exists to avoid FK violations
+                let exists: Option<(i32,)> = sqlx::query_as(
+                    r#"SELECT 1 FROM private_beach WHERE id = $1"#,
+                )
+                .bind(beach_uuid)
+                .fetch_optional(tx.as_mut())
+                .await?;
+                if exists.is_none() {
+                    return Err(StateError::PrivateBeachNotFound);
+                }
                 let mut ids_to_nudge: Vec<String> = Vec::new();
                 for id in origin_ids {
                     if let Ok(origin_uuid) = Uuid::parse_str(&id) {
                         let result = sqlx::query(
                             r#"
-                            INSERT INTO session (private_beach_id, origin_session_id, kind, created_by_account_id)
-                            VALUES ($1, $2, 'terminal', $3)
+                            INSERT INTO session (private_beach_id, origin_session_id, kind, created_by_account_id, attach_method)
+                            VALUES ($1, $2, 'terminal', $3, 'owned')
                             ON CONFLICT (private_beach_id, origin_session_id) DO NOTHING
                             "#,
                         )
@@ -583,8 +605,7 @@ impl AppState {
                 for row in rows {
                     let harness = row
                         .harness_type
-                        .as_deref()
-                        .and_then(harness_type_from_db)
+                        .map(HarnessType::from)
                         .unwrap_or(HarnessType::Custom);
                     let capabilities = row
                         .capabilities
@@ -1548,24 +1569,37 @@ fn parse_uuid(value: &str, label: &str) -> Result<Uuid, StateError> {
     Uuid::parse_str(value).map_err(|_| StateError::InvalidIdentifier(format!("{label}={value}")))
 }
 
-fn harness_type_to_db(value: &HarnessType) -> &'static str {
-    match value {
-        HarnessType::TerminalShim => "terminal_shim",
-        HarnessType::CabanaAdapter => "cabana_adapter",
-        HarnessType::RemoteWidget => "remote_widget",
-        HarnessType::ServiceProxy => "service_proxy",
-        HarnessType::Custom => "custom",
+#[derive(sqlx::Type, Debug, Clone, Copy, PartialEq, Eq)]
+#[sqlx(type_name = "harness_type", rename_all = "snake_case")]
+enum HarnessTypeDb {
+    TerminalShim,
+    CabanaAdapter,
+    RemoteWidget,
+    ServiceProxy,
+    Custom,
+}
+
+impl From<HarnessTypeDb> for HarnessType {
+    fn from(db: HarnessTypeDb) -> Self {
+        match db {
+            HarnessTypeDb::TerminalShim => HarnessType::TerminalShim,
+            HarnessTypeDb::CabanaAdapter => HarnessType::CabanaAdapter,
+            HarnessTypeDb::RemoteWidget => HarnessType::RemoteWidget,
+            HarnessTypeDb::ServiceProxy => HarnessType::ServiceProxy,
+            HarnessTypeDb::Custom => HarnessType::Custom,
+        }
     }
 }
 
-fn harness_type_from_db(value: &str) -> Option<HarnessType> {
-    match value {
-        "terminal_shim" => Some(HarnessType::TerminalShim),
-        "cabana_adapter" => Some(HarnessType::CabanaAdapter),
-        "remote_widget" => Some(HarnessType::RemoteWidget),
-        "service_proxy" => Some(HarnessType::ServiceProxy),
-        "custom" => Some(HarnessType::Custom),
-        _ => None,
+impl From<HarnessType> for HarnessTypeDb {
+    fn from(ht: HarnessType) -> Self {
+        match ht {
+            HarnessType::TerminalShim => HarnessTypeDb::TerminalShim,
+            HarnessType::CabanaAdapter => HarnessTypeDb::CabanaAdapter,
+            HarnessType::RemoteWidget => HarnessTypeDb::RemoteWidget,
+            HarnessType::ServiceProxy => HarnessTypeDb::ServiceProxy,
+            HarnessType::Custom => HarnessTypeDb::Custom,
+        }
     }
 }
 
@@ -1738,7 +1772,7 @@ impl AppState {
         .bind(req.location_hint.clone())
         .bind(Json(capabilities))
         .bind(Json(metadata))
-        .bind(harness_type_to_db(&req.harness_type))
+        .bind(HarnessTypeDb::from(req.harness_type.clone()))
         .fetch_one(tx.as_mut())
         .await?;
         let db_session_id: Uuid = session_row.try_get("id")?;

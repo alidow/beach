@@ -1,0 +1,58 @@
+[package]
+name = "beach-cabana-host"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+cabana_sck = [
+    "dep:screen-capture-kit",
+    "dep:core-media",
+    "dep:core-video",
+    "dep:dispatch2",
+    "dep:objc2",
+    "dep:objc2-foundation",
+]
+webrtc = ["dep:tokio", "dep:bytes", "dep:webrtc"]
+
+[dependencies]
+anyhow = "1"
+argon2 = "0.5"
+base64 = "0.21"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+hex = "0.4"
+hkdf = "0.12"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+tracing = "0.1"
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+tiny_http = "0.12"
+image = { version = "0.24", default-features = false, features = ["png"] }
+gif = "0.12"
+snow = "0.9"
+bytes = { version = "1", optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"], optional = true }
+webrtc = { version = "0.14", optional = true }
+crossbeam-channel = "0.5"
+urlencoding = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-graphics = "0.24"
+core-foundation-sys = "0.8"
+foreign-types = "0.5"
+screen-capture-kit = { version = "0.3", optional = true }
+core-media = { version = "0.5", features = ["objc"], optional = true }
+core-video = { version = "0.4", features = ["objc"], optional = true }
+dispatch2 = { version = "0.1", optional = true }
+objc2 = { version = "0.5", features = ["std"], optional = true }
+objc2-foundation = { version = "0.2", features = ["NSArray", "NSDictionary", "NSError", "NSGeometry", "NSString"], optional = true }
+
+[lib]
+name = "beach_cabana_host"
+path = "src/lib.rs"
+

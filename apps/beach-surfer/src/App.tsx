@@ -19,7 +19,8 @@ import {
   Server,
   ShieldAlert,
 } from 'lucide-react';
-import { BeachTerminal, type TerminalStatus } from './components/BeachTerminal';
+import type { TerminalStatus } from './components/BeachTerminal';
+import { BeachViewer } from './components/BeachViewer';
 import { Button } from './components/ui/button';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from './components/ui/collapsible';
 import {
@@ -455,7 +456,7 @@ export default function App(): JSX.Element {
 
       <div className="flex flex-1 min-h-0 flex-col">
         <div className="relative flex flex-1 min-h-0">
-          <BeachTerminal
+          <BeachViewer
             sessionId={trimmedSessionId || undefined}
             baseUrl={trimmedServer || undefined}
             passcode={passcode || undefined}

@@ -364,6 +364,7 @@ fn map_state_err(err: StateError) -> ApiError {
     match err {
         StateError::SessionNotFound => ApiError::NotFound("session not found"),
         StateError::ControllerMismatch => ApiError::Conflict("controller mismatch"),
+        StateError::PrivateBeachNotFound => ApiError::NotFound("private beach not found"),
         StateError::InvalidIdentifier(msg) => ApiError::BadRequest(msg),
         StateError::Database(e) => {
             error!(error = %e, "database operation failed");

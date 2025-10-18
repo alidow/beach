@@ -1,0 +1,26 @@
+[package]
+name = "beach-cabana"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+webrtc = ["beach-cabana-host/webrtc"]
+cabana_sck = ["beach-cabana-host/cabana_sck"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+image = { version = "0.24", default-features = false, features = ["png"] }
+hex = "0.4"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+beach-cabana-host = { path = "../host" }
+
+[[bin]]
+name = "beach-cabana"
+path = "src/main.rs"

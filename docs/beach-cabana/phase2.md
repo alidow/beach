@@ -15,15 +15,15 @@ Next steps:
 3. Add automated capture/encode tests once `cabana_sck` is available in CI (macOS).
 
 Test/metrics notes (2025-10-18):
-- Added unit test for VideoToolbox H.264 encoder that writes a short Annex B stream from synthetic frames: `apps/beach-cabana/src/encoder/videotoolbox.rs` (macOS + `--features cabana_sck`).
-- Added ignored smoke test for ScreenCaptureKit display streaming that captures a couple frames to a temp directory: `apps/beach-cabana/src/platform/macos/sck.rs` (run locally with GUI + screen-recording permission).
+- Added unit test for VideoToolbox H.264 encoder that writes a short Annex B stream from synthetic frames: `apps/beach-cabana/host/src/encoder/videotoolbox.rs` (macOS + `--features cabana_sck`).
+- Added ignored smoke test for ScreenCaptureKit display streaming that captures a couple frames to a temp directory: `apps/beach-cabana/host/src/platform/macos/sck.rs` (run locally with GUI + screen-recording permission).
 - The `stream` CLI now prints average/min/max frame latency and byte totals per run to aid baseline collection; SCK blank-frame events remain logged at `debug`.
 
 How to run locally (macOS):
-- `cargo test --manifest-path apps/beach-cabana/Cargo.toml --features cabana_sck`
-- `CABANA_RUN_SCK_TEST=1 cargo test --manifest-path apps/beach-cabana/Cargo.toml --features cabana_sck -- --ignored platform::macos::sck::tests::sck_stream_produces_frames_on_display` (runs only the SCK smoke test)
-- `RUST_LOG=info cargo run --manifest-path apps/beach-cabana/Cargo.toml -- list-windows` (find a `display:<ID>`)
-- `RUST_LOG=info cargo run --manifest-path apps/beach-cabana/Cargo.toml -- stream --window-id display:<ID> --frames 60 --interval-ms 16`
+- `cargo test --manifest-path apps/beach-cabana/host/Cargo.toml --features cabana_sck`
+- `CABANA_RUN_SCK_TEST=1 cargo test --manifest-path apps/beach-cabana/host/Cargo.toml --features cabana_sck -- --ignored platform::macos::sck::tests::sck_stream_produces_frames_on_display` (runs only the SCK smoke test)
+- `RUST_LOG=info cargo run --manifest-path apps/beach-cabana/cli/Cargo.toml -- list-windows` (find a `display:<ID>`)
+- `RUST_LOG=info cargo run --manifest-path apps/beach-cabana/cli/Cargo.toml -- stream --window-id display:<ID> --frames 60 --interval-ms 16`
 
 ## 2025-10-15 – ScreenCaptureKit Integration Status
 

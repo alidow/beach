@@ -14,21 +14,21 @@ Status (2025-10-18)
 
 How to run
 - Local E2E over data channel:
-  - `cargo run --manifest-path apps/beach-cabana/Cargo.toml --features webrtc -- webrtc-local --session-id demo --passcode secret`
+  - `cargo run --manifest-path apps/beach-cabana/cli/Cargo.toml --features webrtc -- webrtc-local --session-id demo --passcode secret`
 - ScreenCaptureKit stream metrics (macOS):
   - `bash temp/cabana-phase2-smoke.sh` (adds frames to `temp/beach-cabana-smoke/frames`)
 
 Host/Viewer pairing via sealed signaling (fixture-assisted)
 - Start the fixture:
-  - `cargo run --manifest-path apps/beach-cabana/Cargo.toml -- fixture-serve --listen 127.0.0.1:8081 --storage-dir ./cabana-fixture`
+  - `cargo run --manifest-path apps/beach-cabana/cli/Cargo.toml -- fixture-serve --listen 127.0.0.1:8081 --storage-dir ./cabana-fixture`
 - Host (generate offer, post to fixture, poll fixture dir, then complete and optionally stream over data channel):
-  - `cargo run --manifest-path apps/beach-cabana/Cargo.toml --features webrtc -- webrtc-host-run --session-id demo --passcode secret --fixture-url http://127.0.0.1:8081/signaling --fixture-dir ./cabana-fixture`
+  - `cargo run --manifest-path apps/beach-cabana/cli/Cargo.toml --features webrtc -- webrtc-host-run --session-id demo --passcode secret --fixture-url http://127.0.0.1:8081/signaling --fixture-dir ./cabana-fixture`
   - To stream frames (macOS): add `--window-id display:<ID> --frames 60 --interval-ms 33 [--max-width 1280] --codec h264|gif`
     - `--codec h264` sends H.264 Annex B chunks (viewer writes `out.h264`)
     - `--codec gif` sends PNG frames (viewer writes `frame_XXX.png`)
 - Viewer (unseal host offer, post sealed answer, then receive PNG frames to disk):
   - Get the host compact envelope from the printed host output or from the JSON file in `./cabana-fixture`.
-  - `cargo run --manifest-path apps/beach-cabana/Cargo.toml --features webrtc -- webrtc-viewer-run --session-id demo --passcode secret --host-envelope '<compact-string>' --fixture-url http://127.0.0.1:8081/signaling --recv-frames 60`
+  - `cargo run --manifest-path apps/beach-cabana/cli/Cargo.toml --features webrtc -- webrtc-viewer-run --session-id demo --passcode secret --host-envelope '<compact-string>' --fixture-url http://127.0.0.1:8081/signaling --recv-frames 60`
   - Saves into `temp/cabana-viewer-<ts>` by default (override with `--output-dir`).
 
 Notes

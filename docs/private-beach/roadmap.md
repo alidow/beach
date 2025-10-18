@@ -16,27 +16,33 @@
 (see `docs/private-beach/beach-manager.md` for architecture details)
 - ✅ Postgres-backed session registry + new migrations (`controller_lease`, `session_runtime`) landed; in-memory mode now only used for local tests.
 - ✅ Redis Streams + TTL caches power the action/health/state plane with graceful fallback when Redis is offline.
-- ✅ Beach Gate JWT verification integrated with JWKS caching; scope enforcement + audit enrichment follow.
-- ✅ JSON-RPC `/mcp` endpoint serves the core `private_beach.*` methods with scope checks; streaming + schema publishing remain outstanding.
-- ✅ Controller events capture issuing accounts; Redis consumer groups + acknowledgements are now in production.
-- Next: finish MCP streaming + bindings, surface queue depth/lag metrics, verify RLS via Postgres integration tests, and add dockerized integration tests via `manager-sdk`.
-- Next: publish schema metadata (drizzle-friendly SQL snapshots, enum maps) from `apps/beach-manager/migrations/` so `apps/private-beach` stays in lockstep without owning separate migrations.
-- Next: sync documentation/SDK terminology—`manager` (control plane) vs `controller` (leased session)—across repos so harness and UI teams share the same mental model.
-- Next: pin down controller harness prompt + idle-detection schema (initial prompt, action template, generic action verbs) and store it alongside automation templates.
+- ✅ Beach Gate JWT verification integrated with JWKS caching; scope checks enforced.
+- ✅ JSON-RPC `/mcp` endpoint serves the core `private_beach.*` methods with scope checks.
+- ✅ Streaming: SSE endpoints for state and controller events are live; MCP subscription methods return `sse_url` helpers.
+- ✅ Metrics: Prometheus counters/gauges at `/metrics` (queue depth, actions enqueued/delivered, health/state counts); Redis reachability gauge.
+- ✅ RLS policies applied via migrations; app sets per-request GUC; Postgres RLS tests added (ignored by default) with a limited role.
+- Next: publish schema metadata (drizzle-friendly SQL snapshots, enum maps) from `apps/beach-manager/migrations/` so `apps/private-beach` stays in lockstep.
+- Next: CI hardening (dockerized Postgres/Redis tests, `sqlx migrate run --check`), and OTEL tracing stubs.
+- Next: refine transport hints to include SSE endpoints and stream identifiers.
 
 ## Phase 3 – Workspace Shell (Private Beach Surfer)
-- Prototype Next.js dashboard consuming mock data; implement responsive grid, tile management, and status overlays.
-- Integrate live data via WebSocket/WebRTC bindings to manager service.
-- Support session discovery, search, and basic metadata inspection (capabilities, location hints).
-- Add authentication/authorization flows: login with Beach Gate, private beach switching, share-link redemption UI.
+- ✅ Next.js dashboard scaffolded (`apps/private-beach`) with a sessions view backed by Beach Manager.
+- ✅ Live updates via SSE to `/sessions/:id/state/stream` and `/sessions/:id/events/stream`.
+- ✅ Controller actions: acquire/release lease wired to REST endpoints.
+- ✅ Dev-friendly config: `NEXT_PUBLIC_MANAGER_URL` and localStorage overrides; manager CORS enabled; SSE supports `?access_token=` query for browser auth.
+
+Nice-to-haves (open):
+- Real Beach Gate login (OIDC) and token refresh; prefer cookies or Authorization-capable streams over `access_token` query.
+- Session search/filtering; richer health/queue indicators and layout grid.
+- Controller handoff UX, multi-beach switcher, share-link redemption UI.
 
 ## Phase 4 – Orchestration Mechanics
-- Implement controller lease countdowns, agent vs. human takeover UX, and emergency stop flows.
-- Add action queue visualization (latency, pending command depth) and per-session health indicators.
-- Optimize command transport with optional manager↔harness WebRTC data channels; fall back to broker seamlessly.
-- Capture controller events into audit log and surface them through UI + API.
-- Introduce manager onboarding workflow in the UI (template selection, capability review, scoped token issuance).
-- Surface the controller prompt/idle configuration in the UI so operators can author initial/action prompts and idle rules per automation.
+- ✅ Controller lease countdown in Surfer; emergency stop endpoint (+ UI button) to clear actions and revoke leases.
+- ✅ Action queue visualization groundwork: depth and lag (`actions_queue_pending`) metrics added; UI to surface badges next.
+- ◻ Latency histograms from `ActionAck` and harness freshness badges in Surfer.
+- ◻ Fast-path: design captured to reuse Beach WebRTC signaling with `mgr-actions`/`mgr-state` channels; Redis remains fallback.
+- ◻ Expand audit/event views with principals in API responses (controller/issuer IDs) and add list filters/time windows in Surfer.
+- ◻ Onboarding UI: templates, capability review, scoped token issuance; expose prompt/idle configuration for controller harnesses.
 
 ## Phase 5 – Shared State & Storage
 - Deliver minimal key-value API (last-write-wins, per-beach quotas) and file browser for object storage metadata.

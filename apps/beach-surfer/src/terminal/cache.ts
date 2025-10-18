@@ -1024,15 +1024,21 @@ export class TerminalGridCache {
   }
 
   private minimumServerColumn(row: number): number {
+    // Start with any computed floor from authoritative content on the row.
+    // This captures the full prompt width including trailing spaces.
     const floor = this.rowCursorFloors.get(row) ?? 0;
-    let bound = floor;
+    let bound = Math.max(floor, this.committedRowWidth(row));
+    // If we have a server-reported cursor on this row, never allow predictions
+    // (like backspace) to move left of that authoritative position.
     if (this.serverCursorRow === row) {
-      if (this.serverCursorCol !== null) {
-        // Never allow predictions (like backspace) to move left of the last
-        // authoritative cursor position on this row.
-        bound = Math.max(bound, this.serverCursorCol);
-      } else if (this.serverCursorMinCol !== null) {
-        bound = Math.max(bound, this.serverCursorMinCol);
+      const serverFloor =
+        this.serverCursorMinCol !== null
+          ? this.serverCursorMinCol
+          : this.serverCursorCol !== null
+          ? this.serverCursorCol
+          : null;
+      if (serverFloor !== null) {
+        bound = Math.max(bound, serverFloor);
       }
     }
     return bound;
@@ -1568,6 +1574,20 @@ export class TerminalGridCache {
         continue;
       }
       if (byte === 0x08 || byte === 0x7f) {
+        // If we haven't received either a server cursor or an authoritative
+        // row floor yet, block initial backspace predictions to avoid letting
+        // the cursor wander into the prompt before snapshots land.
+        const hasServerCursor = this.serverCursorRow !== null && this.serverCursorCol !== null;
+        const hasAuthoritativeFloor = this.committedRowWidth(currentRow) > 0;
+        if (!hasServerCursor && !hasAuthoritativeFloor) {
+          this.predictiveLog('backspace_blocked', {
+            seq,
+            reason: 'uninitialized_floor',
+            attemptRow: currentRow,
+            attemptCol: currentCol,
+          });
+          continue;
+        }
         let moved = false;
         const attemptRow = currentRow;
         const attemptCol = currentCol;

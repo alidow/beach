@@ -1,4 +1,5 @@
 mod auth;
+pub mod fastpath;
 mod sse;
 mod mcp;
 mod sessions;
@@ -8,6 +9,7 @@ use axum::{
     routing::{get, patch, post},
     Json, Router,
 };
+use tower_http::cors::{Any, CorsLayer};
 use serde::Serialize;
 
 use crate::state::AppState;
@@ -47,8 +49,26 @@ pub fn build_router(state: AppState) -> Router {
             "/private-beaches/:private_beach_id/sessions",
             get(list_sessions),
         )
+        .route(
+            "/sessions/:session_id/emergency-stop",
+            post(emergency_stop),
+        )
         .route("/agents/onboard", post(onboard_agent))
+        .route(
+            "/fastpath/sessions/:session_id/webrtc/offer",
+            post(fastpath::answer_offer),
+        )
+        .route(
+            "/fastpath/sessions/:session_id/webrtc/ice",
+            post(fastpath::add_remote_ice).get(fastpath::list_local_ice),
+        )
         .route("/mcp", post(mcp::handle_mcp))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
         .with_state(state)
 }
 

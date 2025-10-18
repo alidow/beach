@@ -63,7 +63,8 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let normalized_base = manager.config().base_url().to_string();
     let bootstrap_output = args.bootstrap_output;
     let bootstrap_mode = bootstrap_output == BootstrapOutput::Json;
-    configure_bootstrap_signal_handling(bootstrap_mode);
+    let ignore_sighup = bootstrap_mode && args.bootstrap_survive_sighup;
+    configure_bootstrap_signal_handling(ignore_sighup);
     let local_preview_requested = args.local_preview;
     let local_preview_enabled = local_preview_requested && !bootstrap_mode;
     if local_preview_requested && !local_preview_enabled {
@@ -1398,7 +1399,7 @@ mod tests {
         assert_eq!(bootstrap::shell_quote("path'with"), "'path'\"'\"'with'");
 
         let cmd = vec!["/opt/beach nightly".to_string(), "--flag".to_string()];
-        let rendered = bootstrap::render_remote_command(&cmd);
+        let rendered = bootstrap::render_remote_command(&cmd, true);
         assert!(rendered.starts_with("nohup '"));
         assert!(rendered.contains("'/opt/beach nightly'"));
         assert!(rendered.contains("'--flag'"));

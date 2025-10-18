@@ -4,13 +4,14 @@ use axum::{
     extract::{Path, State},
     response::sse::{Event, KeepAlive, Sse},
 };
-use futures::Stream;
+use futures_core::Stream;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use futures_util::future::ready;
 
 use crate::{metrics, state::AppState};
 
-use super::{AuthToken, ApiError, ApiResult};
+use super::{AuthToken, ApiError};
 
 pub async fn prometheus_metrics() -> String {
     metrics::export_prometheus()
@@ -23,15 +24,16 @@ pub async fn stream_state(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     ensure_scope(&token, "pb:sessions.read")?;
     let rx = state.subscribe_session(&session_id);
-    let stream = BroadcastStream::new(rx).filter_map(|msg| async move {
-        match msg {
-            Ok(crate::state::StreamEvent::State(diff)) => {
+    let stream = BroadcastStream::new(rx)
+        .filter(|msg| matches!(msg, Ok(crate::state::StreamEvent::State(_))))
+        .map(|msg| {
+            if let Ok(crate::state::StreamEvent::State(diff)) = msg {
                 let data = serde_json::to_string(&diff).unwrap_or_else(|_| "{}".into());
-                Some(Ok(Event::default().event("state").data(data)))
+                Ok(Event::default().event("state").data(data))
+            } else {
+                Ok(Event::default().event("noop").data("{}"))
             }
-            _ => None,
-        }
-    });
+        });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
@@ -60,4 +62,3 @@ fn ensure_scope(token: &AuthToken, scope: &'static str) -> Result<(), ApiError> 
         Err(ApiError::Forbidden(scope))
     }
 }
-

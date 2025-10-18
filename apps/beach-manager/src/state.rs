@@ -13,6 +13,7 @@ use std::{
 
 use crate::auth::{AuthConfig, AuthContext};
 use crate::metrics;
+use crate::fastpath::{send_actions_over_fast_path, FastPathRegistry, FastPathSession};
 use beach_buggy::{
     AckStatus, ActionAck, ActionCommand, HarnessType, HealthHeartbeat, RegisterSessionRequest,
     RegisterSessionResponse, StateDiff,
@@ -36,6 +37,7 @@ pub struct AppState {
     redis: Option<Arc<redis::Client>>,
     auth: Arc<AuthContext>,
     events: Arc<RwLock<HashMap<String, broadcast::Sender<StreamEvent>>>>,
+    fast_paths: FastPathRegistry,
 }
 
 #[derive(Clone)]
@@ -95,7 +97,9 @@ pub struct SessionSummary {
     pub version: String,
     pub harness_id: String,
     pub controller_token: Option<String>,
+    pub controller_expires_at_ms: Option<i64>,
     pub pending_actions: usize,
+    pub pending_unacked: usize,
     pub last_health: Option<HealthHeartbeat>,
 }
 
@@ -106,6 +110,8 @@ pub struct ControllerEvent {
     pub controller_token: Option<String>,
     pub timestamp_ms: i64,
     pub reason: Option<String>,
+    pub controller_account_id: Option<String>,
+    pub issued_by_account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -191,6 +197,8 @@ struct ControllerEventRow {
     controller_token: Option<Uuid>,
     reason: Option<String>,
     occurred_at: DateTime<Utc>,
+    controller_account_id: Option<Uuid>,
+    issued_by_account_id: Option<Uuid>,
 }
 
 impl AppState {
@@ -205,6 +213,7 @@ impl AppState {
             redis: None,
             auth: Arc::new(AuthContext::new(auth_config)),
             events: Arc::new(RwLock::new(HashMap::new())),
+            fast_paths: FastPathRegistry::new(),
         }
     }
 
@@ -219,6 +228,7 @@ impl AppState {
             redis: None,
             auth: Arc::new(AuthContext::new(auth_config)),
             events: Arc::new(RwLock::new(HashMap::new())),
+            fast_paths: FastPathRegistry::new(),
         }
     }
 
@@ -242,6 +252,15 @@ impl AppState {
 
     pub fn auth_context(&self) -> Arc<AuthContext> {
         self.auth.clone()
+    }
+
+    pub async fn attach_fast_path(&self, session_id: String, fps: FastPathSession) {
+        let arc = Arc::new(fps);
+        self.fast_paths.insert(session_id, arc).await;
+    }
+
+    pub async fn fast_path_for(&self, session_id: &str) -> Option<Arc<FastPathSession>> {
+        self.fast_paths.get(session_id).await
     }
 
     pub fn subscribe_session(&self, session_id: &str) -> broadcast::Receiver<StreamEvent> {
@@ -384,11 +403,22 @@ impl AppState {
                         .controller_token
                         .filter(|_| is_active_lease(row.expires_at, row.revoked_at))
                         .map(|token| token.to_string());
+                    let controller_expires_at_ms = if is_active_lease(row.expires_at, row.revoked_at) {
+                        row.expires_at.map(|t| t.timestamp_millis())
+                    } else {
+                        None
+                    };
                     let last_health = row
                         .last_health
                         .and_then(|Json(value)| serde_json::from_value(value).ok());
                     let pending_actions = self
                         .pending_actions_count(
+                            &row.private_beach_id.to_string(),
+                            &row.origin_session_id.to_string(),
+                        )
+                        .await?;
+                    let pending_unacked = self
+                        .pending_actions_pending_count(
                             &row.private_beach_id.to_string(),
                             &row.origin_session_id.to_string(),
                         )
@@ -404,7 +434,9 @@ impl AppState {
                         version: "unknown".into(),
                         harness_id: row.harness_id.unwrap_or_else(Uuid::new_v4).to_string(),
                         controller_token,
+                        controller_expires_at_ms,
                         pending_actions,
+                        pending_unacked,
                         last_health,
                     });
                 }
@@ -470,7 +502,7 @@ impl AppState {
                     Some(controller_token),
                     requester_uuid,
                     requester_uuid,
-                    reason,
+                    reason.clone(),
                 )
                 .await?;
 
@@ -489,6 +521,8 @@ impl AppState {
                         controller_token: Some(controller_token.to_string()),
                         timestamp_ms: now_ms(),
                         reason,
+                        controller_account_id: requester_uuid.map(|u| u.to_string()),
+                        issued_by_account_id: requester_uuid.map(|u| u.to_string()),
                     }),
                 )
                 .await;
@@ -558,6 +592,8 @@ impl AppState {
                         controller_token: Some(token_uuid.to_string()),
                         timestamp_ms: now_ms(),
                         reason: None,
+                        controller_account_id: None,
+                        issued_by_account_id: actor_account_id.map(|u| u.to_string()),
                     }),
                 )
                 .await;
@@ -603,6 +639,42 @@ impl AppState {
                     return Err(StateError::ControllerMismatch);
                 }
 
+                // Try fast-path first
+                if send_actions_over_fast_path(&self.fast_paths, &session_uuid.to_string(), &actions)
+                    .await
+                    .unwrap_or(false)
+                {
+                    let mut tx = pool.begin().await?;
+                    self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
+                        .await?;
+                    self.insert_controller_event(
+                        &mut tx,
+                        identifiers.session_id,
+                        "actions_queued",
+                        Some(lease.id),
+                        lease.controller_account_id,
+                        actor_account_id,
+                        None,
+                    )
+                    .await?;
+                    tx.commit().await?;
+
+                    self.publish(
+                        session_id,
+                        StreamEvent::ControllerEvent(ControllerEvent {
+                            id: Uuid::new_v4().to_string(),
+                            event_type: ControllerEventType::ActionsQueued,
+                            controller_token: Some(token_uuid.to_string()),
+                            timestamp_ms: now_ms(),
+                            reason: None,
+                            controller_account_id: lease.controller_account_id.map(|u| u.to_string()),
+                            issued_by_account_id: actor_account_id.map(|u| u.to_string()),
+                        }),
+                    )
+                    .await;
+                    return Ok(());
+                }
+
                 self.enqueue_actions_redis(
                     &identifiers.private_beach_id.to_string(),
                     &session_uuid.to_string(),
@@ -611,11 +683,12 @@ impl AppState {
                 .await?;
 
                 // Metrics: enqueue count and queue depth gauge
-                let labels = [
-                    identifiers.private_beach_id.to_string(),
-                    session_uuid.to_string(),
-                ];
-                metrics::ACTIONS_ENQUEUED.with_label_values(&labels).inc_by(actions.len() as u64);
+                let label0 = identifiers.private_beach_id.to_string();
+                let label1 = session_uuid.to_string();
+                let labels = [label0.as_str(), label1.as_str()];
+                metrics::ACTIONS_ENQUEUED
+                    .with_label_values(&labels)
+                    .inc_by(actions.len() as u64);
                 let depth = self
                     .pending_actions_count(
                         &identifiers.private_beach_id.to_string(),
@@ -623,9 +696,18 @@ impl AppState {
                     )
                     .await
                     .unwrap_or(0);
-                metrics::QUEUE_DEPTH
+                metrics::QUEUE_DEPTH.with_label_values(&labels).set(depth as i64);
+                // Pending (unacked) lag gauge
+                let pending = self
+                    .pending_actions_pending_count(
+                        &identifiers.private_beach_id.to_string(),
+                        &session_uuid.to_string(),
+                    )
+                    .await
+                    .unwrap_or(0);
+                metrics::QUEUE_LAG
                     .with_label_values(&labels)
-                    .set(depth as i64);
+                    .set(pending as i64);
 
                 let mut tx = pool.begin().await?;
                 self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
@@ -652,6 +734,8 @@ impl AppState {
                         controller_token: Some(token_uuid.to_string()),
                         timestamp_ms: now_ms(),
                         reason: None,
+                        controller_account_id: lease.controller_account_id.map(|u| u.to_string()),
+                        issued_by_account_id: actor_account_id.map(|u| u.to_string()),
                     }),
                 )
                 .await;
@@ -677,10 +761,9 @@ impl AppState {
                     return Ok(actions);
                 }
 
-                let labels = [
-                    identifiers.private_beach_id.to_string(),
-                    session_uuid.to_string(),
-                ];
+                let label0 = identifiers.private_beach_id.to_string();
+                let label1 = session_uuid.to_string();
+                let labels = [label0.as_str(), label1.as_str()];
                 metrics::ACTIONS_DELIVERED
                     .with_label_values(&labels)
                     .inc_by(actions.len() as u64);
@@ -692,6 +775,7 @@ impl AppState {
                     .fetch_active_lease_optional(&mut tx, identifiers.session_id)
                     .await?
                 {
+                    let token_str = lease.id.to_string();
                     self.insert_controller_event(
                         &mut tx,
                         identifiers.session_id,
@@ -702,21 +786,23 @@ impl AppState {
                         None,
                     )
                     .await?;
+                    // Publish while we have lease in scope
+                    self.publish(
+                        session_id,
+                        StreamEvent::ControllerEvent(ControllerEvent {
+                            id: Uuid::new_v4().to_string(),
+                            event_type: ControllerEventType::ActionsAcked,
+                            controller_token: Some(token_str),
+                            timestamp_ms: now_ms(),
+                            reason: None,
+                            controller_account_id: lease.controller_account_id.map(|u| u.to_string()),
+                            issued_by_account_id: lease.controller_account_id.map(|u| u.to_string()),
+                        }),
+                    )
+                    .await;
                 }
                 tx.commit().await?;
                 self.fallback.clear_pending_actions(session_id).await;
-
-                self.publish(
-                    session_id,
-                    StreamEvent::ControllerEvent(ControllerEvent {
-                        id: Uuid::new_v4().to_string(),
-                        event_type: ControllerEventType::ActionsAcked,
-                        controller_token: lease.map(|l| l.id.to_string()),
-                        timestamp_ms: now_ms(),
-                        reason: None,
-                    }),
-                )
-                .await;
                 Ok(actions)
             }
         }
@@ -742,6 +828,28 @@ impl AppState {
                     &acks,
                 )
                 .await?;
+                // Metrics: record latencies for successful acks
+                let label0 = identifiers.private_beach_id.to_string();
+                let label1 = session_uuid.to_string();
+                for ack in &acks {
+                    if matches!(ack.status, AckStatus::Ok) {
+                        if let Some(ms) = ack.latency_ms {
+                            metrics::ACTION_LATENCY_MS
+                                .with_label_values(&[label0.as_str(), label1.as_str()])
+                                .observe(ms as f64);
+                        }
+                    }
+                }
+                // Update pending gauge after acks
+                let label0 = identifiers.private_beach_id.to_string();
+                let label1 = session_uuid.to_string();
+                let pending = self
+                    .pending_actions_pending_count(&label0, &label1)
+                    .await
+                    .unwrap_or(0);
+                metrics::QUEUE_LAG
+                    .with_label_values(&[label0.as_str(), label1.as_str()])
+                    .set(pending as i64);
                 self.fallback.remove_actions(session_id, &acks).await;
                 Ok(())
             }
@@ -793,11 +901,10 @@ impl AppState {
 
                 self.fallback.store_health(session_id, heartbeat).await;
 
+                let label0 = identifiers.private_beach_id.to_string();
+                let label1 = session_uuid.to_string();
                 metrics::HEALTH_REPORTS
-                    .with_label_values(&[
-                        identifiers.private_beach_id.to_string(),
-                        session_uuid.to_string(),
-                    ])
+                    .with_label_values(&[label0.as_str(), label1.as_str()])
                     .inc();
                 Ok(())
             }
@@ -845,17 +952,101 @@ impl AppState {
 
                 self.fallback.store_state(session_id, diff).await;
 
+                let label0 = identifiers.private_beach_id.to_string();
+                let label1 = session_uuid.to_string();
                 metrics::STATE_REPORTS
-                    .with_label_values(&[
-                        identifiers.private_beach_id.to_string(),
-                        session_uuid.to_string(),
-                    ])
+                    .with_label_values(&[label0.as_str(), label1.as_str()])
                     .inc();
                 Ok(())
             }
         }
     }
 
+    pub async fn emergency_stop(
+        &self,
+        session_id: &str,
+        actor_account_id: Option<Uuid>,
+        reason: Option<String>,
+    ) -> Result<(), StateError> {
+        match &self.backend {
+            Backend::Memory => {
+                // Clear pending and release controller
+                self.fallback.clear_pending_actions(session_id).await;
+                self.fallback.clear_controller(session_id).await;
+                self.publish(
+                    session_id,
+                    StreamEvent::ControllerEvent(ControllerEvent {
+                        id: Uuid::new_v4().to_string(),
+                        event_type: ControllerEventType::LeaseReleased,
+                        controller_token: None,
+                        timestamp_ms: now_ms(),
+                        reason,
+                        controller_account_id: None,
+                        issued_by_account_id: actor_account_id.map(|u| u.to_string()),
+                    }),
+                )
+                .await;
+                Ok(())
+            }
+            Backend::Postgres(pool) => {
+                let session_uuid = parse_uuid(session_id, "session_id")?;
+                let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
+                // Clear Redis queues
+                self.clear_actions_redis(
+                    &identifiers.private_beach_id.to_string(),
+                    &session_uuid.to_string(),
+                )
+                .await?;
+
+                let mut tx = pool.begin().await?;
+                self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
+                    .await?;
+                // Revoke lease
+                sqlx::query(
+                    r#"
+                    UPDATE controller_lease
+                    SET revoked_at = NOW(), expires_at = NOW()
+                    WHERE session_id = $1
+                    "#,
+                )
+                .bind(identifiers.session_id)
+                .execute(tx.as_mut())
+                .await?;
+
+                // Audit event
+                self.insert_controller_event(
+                    &mut tx,
+                    identifiers.session_id,
+                    "lease_released",
+                    None,
+                    None,
+                    actor_account_id,
+                    reason.clone(),
+                )
+                .await?;
+
+                tx.commit().await?;
+
+                self.fallback.clear_pending_actions(session_id).await;
+                self.fallback.clear_controller(session_id).await;
+
+                self.publish(
+                    session_id,
+                    StreamEvent::ControllerEvent(ControllerEvent {
+                        id: Uuid::new_v4().to_string(),
+                        event_type: ControllerEventType::LeaseReleased,
+                        controller_token: None,
+                        timestamp_ms: now_ms(),
+                        reason,
+                        controller_account_id: None,
+                        issued_by_account_id: actor_account_id.map(|u| u.to_string()),
+                    }),
+                )
+                .await;
+                Ok(())
+            }
+        }
+    }
     pub async fn controller_events(
         &self,
         session_id: &str,
@@ -870,7 +1061,7 @@ impl AppState {
                     .await?;
                 let rows: Vec<ControllerEventRow> = sqlx::query_as(
                     r#"
-                    SELECT id, event_type, controller_token, reason, occurred_at
+                    SELECT id, event_type, controller_token, reason, occurred_at, controller_account_id, issued_by_account_id
                     FROM controller_event
                     WHERE session_id = $1
                     ORDER BY occurred_at DESC
@@ -889,9 +1080,66 @@ impl AppState {
                         controller_token: row.controller_token.map(|uuid| uuid.to_string()),
                         timestamp_ms: row.occurred_at.timestamp_millis(),
                         reason: row.reason,
+                        controller_account_id: row.controller_account_id.map(|u| u.to_string()),
+                        issued_by_account_id: row.issued_by_account_id.map(|u| u.to_string()),
                     })
                     .collect();
                 tx.commit().await?;
+                Ok(events)
+            }
+        }
+    }
+
+    pub async fn controller_events_filtered(
+        &self,
+        session_id: &str,
+        event_type: Option<String>,
+        since_ms: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<ControllerEvent>, StateError> {
+        match &self.backend {
+            Backend::Memory => self.controller_events(session_id).await,
+            Backend::Postgres(pool) => {
+                let session_uuid = parse_uuid(session_id, "session_id")?;
+                let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
+                let mut sql = String::from(
+                    "SELECT id, event_type, controller_token, reason, occurred_at, controller_account_id, issued_by_account_id FROM controller_event WHERE session_id = $1",
+                );
+                let mut idx = 2;
+                if event_type.is_some() {
+                    sql.push_str(" AND event_type = $2::controller_event_type");
+                    idx += 1;
+                }
+                if since_ms.is_some() {
+                    let pos = if event_type.is_some() { 3 } else { 2 };
+                    sql.push_str(&format!(" AND occurred_at >= to_timestamp(${} / 1000.0)", pos));
+                }
+                sql.push_str(" ORDER BY occurred_at DESC LIMIT $X");
+                // replace $X with next index
+                let lim_idx = if event_type.is_some() && since_ms.is_some() { 4 } else if event_type.is_some() || since_ms.is_some() { 3 } else { 2 };
+                let sql = sql.replace("$X", &format!("${}", lim_idx));
+
+                let mut query = sqlx::query_as::<_, ControllerEventRow>(&sql).bind(identifiers.session_id);
+                if let Some(et) = event_type {
+                    query = query.bind(et);
+                }
+                if let Some(since) = since_ms {
+                    query = query.bind(since);
+                }
+                query = query.bind(limit as i64);
+                let rows = query.fetch_all(pool).await?;
+                let events = rows
+                    .into_iter()
+                    .map(|row| ControllerEvent {
+                        id: row.id.to_string(),
+                        event_type: controller_event_from_str(&row.event_type),
+                        controller_token: row.controller_token.map(|uuid| uuid.to_string()),
+                        timestamp_ms: row.occurred_at.timestamp_millis(),
+                        reason: row.reason,
+                        controller_account_id: row.controller_account_id.map(|u| u.to_string()),
+                        issued_by_account_id: row.issued_by_account_id.map(|u| u.to_string()),
+                    })
+                    .collect();
                 Ok(events)
             }
         }
@@ -1068,6 +1316,8 @@ impl SessionRecord {
             controller_token: self.controller_token.clone(),
             timestamp_ms: now_ms(),
             reason,
+            controller_account_id: None,
+            issued_by_account_id: None,
         });
     }
 }
@@ -1084,7 +1334,12 @@ impl SessionSummary {
             version: record.version.clone(),
             harness_id: record.harness_id.clone(),
             controller_token: record.controller_token.clone(),
+            controller_expires_at_ms: record
+                .controller_token
+                .as_ref()
+                .map(|_| now_ms() + record.lease_ttl_ms as i64),
             pending_actions: record.pending_actions.len(),
+            pending_unacked: record.pending_actions.len(),
             last_health: record.last_health.clone(),
         }
     }
@@ -1149,6 +1404,13 @@ fn default_transport_hints(session_id: &str) -> HashMap<String, serde_json::Valu
     hints.insert(
         "health_post".into(),
         serde_json::json!({ "path": format!("/sessions/{session_id}/health") }),
+    );
+    // Fast-path (WebRTC) placeholder: surfaced to harness/clients so they can
+    // discover the experimental lane. Negotiation details documented in
+    // docs/private-beach/beach-manager.md and secure-webrtc plans.
+    hints.insert(
+        "fast_path_webrtc".into(),
+        serde_json::json!({ "status": "planned" }),
     );
     hints
 }
@@ -1411,6 +1673,8 @@ impl AppState {
                 controller_token: None,
                 timestamp_ms: now_ms(),
                 reason: None,
+                controller_account_id: None,
+                issued_by_account_id: None,
             }),
         )
         .await;
@@ -1442,6 +1706,8 @@ impl AppState {
                 controller_token: record.controller_token.clone(),
                 timestamp_ms: now_ms(),
                 reason: None,
+                controller_account_id: None,
+                issued_by_account_id: None,
             }),
         )
         .await;
@@ -1456,7 +1722,7 @@ impl AppState {
         let record = sessions
             .get_mut(session_id)
             .ok_or(StateError::SessionNotFound)?;
-        let actions = record.pending_actions.drain(..).collect();
+        let actions: Vec<ActionCommand> = record.pending_actions.drain(..).collect();
         if !actions.is_empty() {
             self.publish(
                 session_id,
@@ -1466,6 +1732,8 @@ impl AppState {
                     controller_token: record.controller_token.clone(),
                     timestamp_ms: now_ms(),
                     reason: None,
+                    controller_account_id: None,
+                    issued_by_account_id: None,
                 }),
             )
             .await;
@@ -1786,6 +2054,35 @@ impl AppState {
             .unwrap_or(0))
     }
 
+    async fn pending_actions_pending_count(
+        &self,
+        private_beach_id: &str,
+        session_id: &str,
+    ) -> Result<usize, StateError> {
+        if let Some(client) = &self.redis {
+            let mut conn = client.get_async_connection().await?;
+            let key = redis_actions_key(private_beach_id, session_id);
+            // XPENDING <key> <group>
+            let value: redis::Value = redis::cmd("XPENDING")
+                .arg(&key)
+                .arg(REDIS_ACTION_GROUP)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(redis::Value::Nil);
+            if let redis::Value::Bulk(items) = value {
+                if let Some(redis::Value::Int(count)) = items.get(0) {
+                    return Ok((*count).try_into().unwrap_or(0));
+                }
+            }
+            return Ok(0);
+        }
+        let sessions = self.fallback.sessions.read().await;
+        Ok(sessions
+            .get(session_id)
+            .map(|record| record.pending_actions.len())
+            .unwrap_or(0))
+    }
+
     async fn store_health_redis(
         &self,
         private_beach_id: &str,
@@ -1873,6 +2170,21 @@ impl AppState {
                 .arg(REDIS_TTL_SECONDS)
                 .query_async::<_, ()>(&mut conn)
                 .await?;
+        }
+        Ok(())
+    }
+
+    async fn clear_actions_redis(
+        &self,
+        private_beach_id: &str,
+        session_id: &str,
+    ) -> Result<(), StateError> {
+        if let Some(client) = &self.redis {
+            let mut conn = client.get_async_connection().await?;
+            let key = redis_actions_key(private_beach_id, session_id);
+            let index_key = redis_action_index_key(private_beach_id, session_id);
+            let _: () = redis::cmd("DEL").arg(&key).query_async(&mut conn).await.unwrap_or(());
+            let _: () = redis::cmd("DEL").arg(&index_key).query_async(&mut conn).await.unwrap_or(());
         }
         Ok(())
     }

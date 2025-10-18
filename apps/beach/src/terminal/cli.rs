@@ -269,6 +269,14 @@ pub struct HostArgs {
         help = "Allow MCP clients to inject input into the session"
     )]
     pub mcp_allow_write: bool,
+
+    #[arg(
+        long = "bootstrap-survive-sighup",
+        action = clap::ArgAction::SetTrue,
+        hide = true,
+        help = "In bootstrap mode, ignore SIGHUP so the host survives SSH disconnects (internal)"
+    )]
+    pub bootstrap_survive_sighup: bool,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -382,7 +390,7 @@ pub struct SshArgs {
     #[arg(
         long = "keep-ssh",
         action = clap::ArgAction::SetTrue,
-        help = "Leave the SSH control channel open for log tailing instead of closing after bootstrap"
+        help = "Tail remote output over SSH until transport connects (SSH closes automatically after connect)"
     )]
     pub keep_ssh: bool,
 
@@ -400,6 +408,13 @@ pub struct SshArgs {
         help = "Seconds to wait for the bootstrap handshake before failing"
     )]
     pub handshake_timeout: u64,
+
+    #[arg(
+        long = "ssh-keep-host-running",
+        action = clap::ArgAction::SetTrue,
+        help = "After bootstrap, keep the remote host running independently of the SSH session"
+    )]
+    pub ssh_keep_host_running: bool,
 
     #[arg(
         trailing_var_arg = true,

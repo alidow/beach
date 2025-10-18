@@ -1,5 +1,5 @@
 use once_cell::sync::Lazy;
-use prometheus::{Encoder, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
+use prometheus::{Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
 
 pub static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 
@@ -49,6 +49,16 @@ pub static QUEUE_DEPTH: Lazy<IntGaugeVec> = Lazy::new(|| {
     g
 });
 
+pub static QUEUE_LAG: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let g = IntGaugeVec::new(
+        Opts::new("actions_queue_pending", "Number of pending (unacked) actions"),
+        &["private_beach_id", "session_id"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(g.clone())).ok();
+    g
+});
+
 pub static HEALTH_REPORTS: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new("health_reports_total", "Health reports received"),
@@ -69,10 +79,23 @@ pub static STATE_REPORTS: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+pub static ACTION_LATENCY_MS: Lazy<HistogramVec> = Lazy::new(|| {
+    let h = HistogramVec::new(
+        HistogramOpts::new(
+            "action_latency_ms",
+            "Ack-reported action latency in milliseconds",
+        )
+        .buckets(vec![1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0]),
+        &["private_beach_id", "session_id"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(h.clone())).ok();
+    h
+});
+
 pub fn export_prometheus() -> String {
     let metric_families = REGISTRY.gather();
     let mut buf = Vec::new();
     TextEncoder::new().encode(&metric_families, &mut buf).ok();
     String::from_utf8(buf).unwrap_or_default()
 }
-

@@ -13,6 +13,30 @@ const TIME_COST = 3;
 const MEMORY_COST_KIB = 64 * 1024;
 const PARALLELISM = 1;
 
+function traceEnabled(): boolean {
+  try {
+    const host = globalThis as unknown as {
+      __BEACH_TRACE?: boolean;
+      BEACH_TRACE?: boolean;
+    };
+    return Boolean(
+      host?.__BEACH_TRACE ??
+        host?.BEACH_TRACE ??
+        (typeof window !== 'undefined' ? (window as any).__BEACH_TRACE ?? (window as any).BEACH_TRACE : false),
+    );
+  } catch {
+    return false;
+  }
+}
+
+function trace(event: string, detail?: Record<string, unknown>): void {
+  if (!traceEnabled()) return;
+  try {
+    // eslint-disable-next-line no-console
+    console.debug('[beach-surfer][argon2]', event, detail ?? {});
+  } catch {}
+}
+
 export interface DeriveParams {
   passphrase: string | Uint8Array;
   salt: string | Uint8Array;
@@ -37,6 +61,8 @@ async function loadWasmBytes(): Promise<Uint8Array> {
   if (wasmBytesCache) {
     return wasmBytesCache;
   }
+  const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  trace('module_load:start');
   const wasmUrl = new URL('../../assets/argon2.wasm', import.meta.url);
   const isNodeEnvironment = typeof process !== 'undefined' && !!process.versions?.node;
   if (isNodeEnvironment) {
@@ -59,11 +85,14 @@ async function loadWasmBytes(): Promise<Uint8Array> {
     const buffer = await response.arrayBuffer();
     wasmBytesCache = new Uint8Array(buffer);
   }
+  const t1 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  trace('module_load:complete', { ms: Math.max(0, t1 - t0) });
   return wasmBytesCache;
 }
 
 const argon2ModulePromise: Promise<Argon2Module> = (async () => {
   const wasmBytes = await loadWasmBytes();
+  const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
   const globalScope = globalThis as typeof globalThis & {
     Module?: Record<string, unknown>;
     loadArgon2WasmBinary?: () => Promise<Uint8Array>;
@@ -100,11 +129,15 @@ const argon2ModulePromise: Promise<Argon2Module> = (async () => {
   if (!resolved) {
     throw new Error('argon2 module failed to load');
   }
+  const t1 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  trace('module_init:complete', { ms: Math.max(0, t1 - t0) });
   return resolved;
 })();
 
 export async function deriveArgon2id(params: DeriveParams): Promise<Uint8Array> {
   const wasmModule = await argon2ModulePromise;
+  const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  trace('hash:start', { time: TIME_COST, memKiB: MEMORY_COST_KIB, parallelism: PARALLELISM });
   const result = await wasmModule.hash({
     pass: params.passphrase,
     salt: params.salt,
@@ -114,6 +147,8 @@ export async function deriveArgon2id(params: DeriveParams): Promise<Uint8Array> 
     parallelism: PARALLELISM,
     type: wasmModule.ArgonType.Argon2id,
   });
+  const t1 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  trace('hash:complete', { ms: Math.max(0, t1 - t0) });
 
   const { hash } = result;
   if (!(hash instanceof Uint8Array)) {

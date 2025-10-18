@@ -79,6 +79,11 @@ struct AckActionsParams {
     acks: Vec<ActionAck>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SubscribeParams {
+    session_id: String,
+}
+
 pub async fn handle_mcp(
     State(state): State<AppState>,
     token: AuthToken,
@@ -194,15 +199,32 @@ pub async fn handle_mcp(
                 }
             }
         }
-        "private_beach.subscribe_state" | "private_beach.controller_events.stream" => {
-            JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: None,
-                error: Some(JsonRpcError {
-                    code: -32001,
-                    message: "streaming methods are not yet supported".into(),
-                }),
+        "private_beach.subscribe_state" => {
+            if let Some(resp) = require_scope(&token, &id, "pb:sessions.read") {
+                return Json(resp);
+            }
+            match decode_params::<SubscribeParams>(request.params) {
+                Ok(params) => success(
+                    id,
+                    serde_json::json!({
+                        "sse_url": format!("/sessions/{}/state/stream", params.session_id)
+                    }),
+                ),
+                Err(err) => invalid_params(id, err),
+            }
+        }
+        "private_beach.controller_events.stream" => {
+            if let Some(resp) = require_scope(&token, &id, "pb:sessions.read") {
+                return Json(resp);
+            }
+            match decode_params::<SubscribeParams>(request.params) {
+                Ok(params) => success(
+                    id,
+                    serde_json::json!({
+                        "sse_url": format!("/sessions/{}/events/stream", params.session_id)
+                    }),
+                ),
+                Err(err) => invalid_params(id, err),
             }
         }
         _ => JsonRpcResponse {

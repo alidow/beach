@@ -130,6 +130,9 @@ pub fn remote_bootstrap_args(args: &SshArgs, session_server: &str) -> Vec<String
         "host".to_string(),
         "--bootstrap-output=json".to_string(),
     ];
+    if args.ssh_keep_host_running {
+        command.push("--bootstrap-survive-sighup".to_string());
+    }
     command.extend(["--session-server".to_string(), session_server.to_string()]);
     if !args.command.is_empty() {
         // Some shells/CLI usages may include a leading "--" in the captured
@@ -221,11 +224,17 @@ async fn compute_remote_sha256(args: &SshArgs, remote_path: &str) -> Result<Stri
     Ok(hash.to_string())
 }
 
-pub fn render_remote_command(remote_args: &[String]) -> String {
+pub fn render_remote_command(remote_args: &[String], keep_running: bool) -> String {
     let quoted: Vec<String> = remote_args.iter().map(|arg| shell_quote(arg)).collect();
     let body = quoted.join(" ");
-    let temp_file = "/tmp/beach-bootstrap-$$.json";
-    format!("nohup {body} >{temp_file} 2>&1 </dev/null & sleep 2 && cat {temp_file}")
+    if keep_running {
+        let temp_file = "/tmp/beach-bootstrap-$$.json";
+        format!("nohup {body} >{temp_file} 2>&1 </dev/null & sleep 2 && cat {temp_file}")
+    } else {
+        // Foreground execution so the process is tied to the SSH session;
+        // bootstrap JSON is emitted directly to stdout.
+        body
+    }
 }
 
 pub fn resolve_local_binary_path(args: &SshArgs) -> Result<PathBuf, CliError> {

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Json,
 };
 use beach_buggy::{
@@ -19,7 +19,7 @@ use crate::state::{
 
 use super::{ApiError, ApiResult, AuthToken};
 
-fn ensure_scope(token: &AuthToken, scope: &'static str) -> Result<(), ApiError> {
+pub(crate) fn ensure_scope(token: &AuthToken, scope: &'static str) -> Result<(), ApiError> {
     if token.has_scope(scope) {
         Ok(())
     } else {
@@ -59,6 +59,11 @@ pub struct OnboardAgentRequest {
     pub scoped_roles: Vec<String>,
     #[serde(default)]
     pub options: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EmergencyStopRequest {
+    pub reason: Option<String>,
 }
 
 pub async fn register_session(
@@ -217,13 +222,29 @@ pub async fn list_controller_events(
     State(state): State<AppState>,
     token: AuthToken,
     Path(session_id): Path<String>,
+    Query(filter): Query<EventsFilter>,
 ) -> ApiResult<Vec<ControllerEvent>> {
     ensure_scope(&token, "pb:sessions.read")?;
     let events = state
-        .controller_events(&session_id)
+        .controller_events_filtered(
+            &session_id,
+            filter.event_type.clone(),
+            filter.since_ms,
+            filter.limit.unwrap_or(200),
+        )
         .await
         .map_err(map_state_err)?;
     Ok(Json(events))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct EventsFilter {
+    #[serde(default)]
+    pub event_type: Option<String>,
+    #[serde(default)]
+    pub since_ms: Option<i64>,
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 pub async fn onboard_agent(
@@ -242,6 +263,20 @@ pub async fn onboard_agent(
         .await
         .map_err(map_state_err)?;
     Ok(Json(response))
+}
+
+pub async fn emergency_stop(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(session_id): Path<String>,
+    Json(body): Json<EmergencyStopRequest>,
+) -> ApiResult<serde_json::Value> {
+    ensure_scope(&token, "pb:control.write")?;
+    state
+        .emergency_stop(&session_id, token.account_uuid(), body.reason.clone())
+        .await
+        .map_err(map_state_err)?;
+    Ok(Json(serde_json::json!({ "stopped": true })))
 }
 
 fn map_state_err(err: StateError) -> ApiError {

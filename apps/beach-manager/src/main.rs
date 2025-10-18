@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod routes;
 mod metrics;
+mod fastpath;
 mod state;
 
 use auth::{AuthConfig, AuthContext};

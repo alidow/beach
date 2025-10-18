@@ -281,6 +281,8 @@ export async function connectWebRtcTransport(
         sessionKeyPromise = null;
         throw error;
       });
+    // Diagnose potential main-thread stalls after scheduling Argon2.
+    setTimeout(() => trace?.mark('webrtc:event_loop_tick_after_session_key_start'), 0);
   }
   const assignedPeerId = join.peer_id;
   const remotePeerId = await resolveRemotePeerId(signaling, join, options.preferredPeerId);
@@ -295,11 +297,13 @@ export async function connectWebRtcTransport(
   } as const;
 
   try {
+    trace?.mark('webrtc:negotiate_send_start', { remotePeerId });
     signaling.send({
       type: 'negotiate_transport',
       to_peer: remotePeerId,
       proposed_transport: 'webrtc',
     });
+    trace?.mark('webrtc:negotiate_send_complete', { remotePeerId });
   } catch (error) {
     log(logger, `transport negotiation proposal failed: ${String(error)}`);
   }
@@ -543,6 +547,7 @@ export async function connectWebRtcTransport(
     if (options.role !== 'answerer') {
       throw new Error(`webrtc role ${options.role} not supported in browser client yet`);
     }
+    trace?.mark('webrtc:answerer_connect_enter', { signalingUrl: options.signalingUrl });
     const connected = await connectAsAnswerer({
       pc,
       signaling,
@@ -787,6 +792,7 @@ async function connectAsAnswerer(options: {
     sessionId,
     trace,
   } = options;
+  trace?.mark('webrtc:answerer_start', { signalingUrl, remotePeerId });
   let cachedSecureKey: Uint8Array | null = null;
   trace?.mark('webrtc:offer_poll_start', {
     url: `${signalingUrl.replace(/\/$/, '')}/offer`,

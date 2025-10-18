@@ -17,6 +17,14 @@ use url::Url;
 use uuid::Uuid;
 
 pub async fn run(base_url: &str, args: JoinArgs) -> Result<(), CliError> {
+    run_with_notify(base_url, args, None).await
+}
+
+pub async fn run_with_notify(
+    base_url: &str,
+    args: JoinArgs,
+    connected_notify: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), CliError> {
     let JoinArgs {
         target,
         passcode,
@@ -59,6 +67,10 @@ pub async fn run(base_url: &str, args: JoinArgs) -> Result<(), CliError> {
     let selected_kind = transport.kind();
     info!(session_id = %joined.session_id(), transport = ?selected_kind, "joined session");
     print_join_banner(&joined, selected_kind);
+
+    if let Some(tx) = connected_notify {
+        let _ = tx.send(());
+    }
 
     if mcp {
         if let Some(channels) = webrtc_channels.clone() {

@@ -64,6 +64,20 @@ Beach Manager is the zero-trust control plane that keeps Private Beach cohesive.
 - Metrics: command latency histograms, queue depth, harness heartbeat freshness, lease churn.
 - Structured logs with correlation IDs (private beach, session, controller token) for incident response.
 
+## Fast-Path Transport (WebRTC Data Channel)
+- Goal: low-latency manager↔harness path for actions/state alongside Redis/HTTP.
+- Approach: reuse Beach’s existing WebRTC stack and signaling model instead of embedding a separate WebRTC engine into the manager.
+  - The harness will provision additional RTCDataChannels labelled `mgr-actions` (ordered, reliable) and `mgr-state` (unordered, low-latency) when a “manager peer” joins.
+  - The manager participates as a viewer-level peer via Beach Road signaling (same offer/answer/ICE envelope), authenticated with a scoped token and gated by the controller lease.
+  - Frames over `mgr-actions` map to the same `ActionCommand`/`ActionAck` envelopes used today; `mgr-state` carries `StateDiff`.
+- Fallbacks: if signaling/ICE fails, the system automatically uses Redis Streams + HTTP POSTs; both paths are first-class.
+- Phasing:
+  1. Add signaling primitives and channel labels across host/harness (no UI impact).
+  2. Teach `AppState` to multiplex action routes (Redis vs. WebRTC) and record per-lane metrics.
+  3. Harden auth (capability-scoped JWT + RLS correlation), alerting, and back-pressure.
+  4. Promote as default where TURN is available; retain Redis path for compatibility/debug.
+
+
 ## API Contracts
 
 ### REST (OpenAPI Draft v0.1)
@@ -135,7 +149,7 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
   2. ✅ `queue_actions`/`poll_actions` now use consumer groups; `ack_actions` issues `XACK`/`XDEL` and trims index mappings.
   3. ✅ Health/state writes go through `SETEX` with TTLs; `session_runtime` mirrors the latest snapshot for warm restart diagnostics.
   4. ◻ Update harness transport hints to advertise stream identifiers; today only REST paths are returned.
-  5. ◻ Instrument queue depth/lag and surface Prometheus-friendly metrics (currently pending).
+  5. ✅ Instrument queue depth and basic counters; add lag metric and alerting next.
 - **Open Questions:** Idempotency tokens, multi-harness consumer group design, and eviction strategies for long-lived sessions.
 
 - **Status:** JWT verification is live. `AuthToken` fetches Beach Gate JWKS, caches keys, and falls back to bypass mode if `BEACH_GATE_*` env vars are missing (for local dev).
@@ -153,7 +167,7 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
 - **Scope:** Lift existing REST flows into MCP handlers so automation clients can interact without HTTP glue.
 - **Implementation Steps:**
   1. ✅ Inline MCP handler hosted under `/mcp` routes existing REST logic through JSON-RPC 2.0. Shared state/errors now flow through `AppState`.
-  2. ✅ Core unary methods (`register_session`, `list_sessions`, `acquire_controller`, `release_controller`, `queue_action`, `ack_actions`) return the same payloads as REST; streaming calls still stubbed.
+  2. ✅ Core unary methods (`register_session`, `list_sessions`, `acquire_controller`, `release_controller`, `queue_action`, `ack_actions`) return the same payloads as REST; streaming calls now return SSE URLs.
   3. ◻ Publish schema definitions in `crates/harness-proto`, regenerate bindings, and version the contract.
   4. ✅ Test harness exercises MCP register + list against the in-memory backend; expand to Postgres/Redis once dockerized tests exist.
   5. ◻ Document MCP connection instructions (auth requirements, payload examples) and ensure clients negotiate protocol versions.
@@ -165,12 +179,12 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
 - **Dependency:** Requires JWT claims/scopes to map templates to entitlements; coordinate with Beach Gate integration above.
 
 ## Current Implementation Status (2025‑10‑24)
-- REST API routes remain the primary surface; a JSON-RPC `/mcp` endpoint now mirrors the primary control-plane methods for harnesses/agents (streaming work pending).
+- REST API routes remain the primary surface; a JSON-RPC `/mcp` endpoint mirrors the primary control-plane methods for harnesses/agents. Streaming is provided via SSE endpoints, and MCP returns `sse_url` helpers.
 - `AppState` now persists sessions, controller leases, and controller events in Postgres via SQLx while preserving an in-memory fallback for tests/offline runs. SQLx `FromRow` models wrap the Postgres queries so downstream clients can reuse the same schema metadata without duplicating SQL.
 - New migration `20250219120000_controller_leases_runtime.sql` adds `controller_lease`, `session_runtime`, and `session.harness_type`, keeping the schema aligned with `docs/private-beach/data-model.md`.
 - Redis integration powers action queues (Streams) plus TTL’d health/state caches; when Redis is unavailable the manager transparently falls back to in-memory queues.
 - Beach Gate JWT verification is wired through `AuthToken`, with JWKS caching and env-based bypass for local development.
-- Docker Compose workflow exercises Postgres + Redis; `cargo test -p beach-manager` still targets the in-memory implementation, so a Postgres-backed test harness is the next milestone.
+- Docker Compose workflow exercises Postgres + Redis; Postgres-backed tests (ignored by default) exist, including RLS enforcement under a limited role.
 
 ### Controller Harness Configuration (In Progress)
 - Controllers are ordinary Beach sessions whose harness currently holds a lease. To support automation templates we plan to capture, per controller, the following metadata:

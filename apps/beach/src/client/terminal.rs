@@ -51,6 +51,7 @@ const BACKFILL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MOUSE_SCROLL_LINES: isize = 5;
 const COPY_MODE_KEYSET_ENV: &str = "BEACH_COPY_MODE_KEYS";
 const SCROLL_TOGGLE_KEY_ENV: &str = "BEACH_SCROLL_TOGGLE_KEY";
+const COPY_SHORTCUTS_ENV: &str = "BEACH_COPY_SHORTCUTS";
 const SCROLL_TOGGLE_DOUBLE_ESC: Duration = Duration::from_millis(400);
 const TMUX_PREFIX_TIMEOUT: Duration = Duration::from_millis(500);
 const AUTH_SPINNER_FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
@@ -233,7 +234,7 @@ fn default_scroll_toggle_bindings() -> Vec<KeyBinding> {
     vec![KeyBinding::new(KeyCode::Esc, KeyModifiers::CONTROL)]
 }
 
-fn parse_scroll_toggle_binding(value: &str) -> Option<KeyBinding> {
+fn parse_key_binding(value: &str) -> Option<KeyBinding> {
     let mut modifiers = KeyModifiers::NONE;
     let mut key_token: Option<String> = None;
     for part in value.split('+') {
@@ -283,11 +284,43 @@ fn parse_scroll_toggle_binding(value: &str) -> Option<KeyBinding> {
     Some(KeyBinding::new(code, modifiers))
 }
 
-fn parse_scroll_toggle_bindings(value: &str) -> Vec<KeyBinding> {
+fn parse_key_bindings(value: &str) -> Vec<KeyBinding> {
     value
         .split(',')
-        .filter_map(|part| parse_scroll_toggle_binding(part.trim()))
+        .filter_map(|part| parse_key_binding(part.trim()))
         .collect()
+}
+
+fn format_key_binding(binding: &KeyBinding) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if binding.modifiers.contains(KeyModifiers::CONTROL) {
+        parts.push("CTRL".to_string());
+    }
+    if binding.modifiers.contains(KeyModifiers::ALT) {
+        parts.push("ALT".to_string());
+    }
+    if binding.modifiers.contains(KeyModifiers::SHIFT) {
+        parts.push("SHIFT".to_string());
+    }
+    if binding.modifiers.contains(KeyModifiers::SUPER) {
+        parts.push("CMD".to_string());
+    }
+    let key = match binding.code {
+        KeyCode::Esc => "ESC".to_string(),
+        KeyCode::Enter => "ENTER".to_string(),
+        KeyCode::Tab => "TAB".to_string(),
+        KeyCode::Backspace => "BACKSPACE".to_string(),
+        KeyCode::PageUp => "PAGEUP".to_string(),
+        KeyCode::PageDown => "PAGEDOWN".to_string(),
+        KeyCode::Home => "HOME".to_string(),
+        KeyCode::End => "END".to_string(),
+        KeyCode::Delete => "DELETE".to_string(),
+        KeyCode::Insert => "INSERT".to_string(),
+        KeyCode::Char(c) => c.to_ascii_uppercase().to_string(),
+        _ => format!("{:?}", binding.code).to_ascii_uppercase(),
+    };
+    parts.push(key);
+    parts.join("+")
 }
 
 #[derive(Clone, Debug)]
@@ -348,6 +381,8 @@ pub struct TerminalClient {
     prediction_overlay_logged_underline: bool,
     copy_mode: Option<CopyModeState>,
     scroll_toggle: Vec<KeyBinding>,
+    scroll_double_esc_enabled: bool,
+    copy_shortcuts: Vec<KeyBinding>,
     tail_flash_until: Option<Instant>,
     last_plain_esc: Option<Instant>,
     last_render_at: Option<Instant>,
@@ -400,21 +435,70 @@ impl TerminalClient {
             "predictive logging initialized"
         );
 
-        let scroll_toggle = env::var(SCROLL_TOGGLE_KEY_ENV)
-            .ok()
-            .map(|value| {
-                let parsed = parse_scroll_toggle_bindings(&value);
-                if parsed.is_empty() {
-                    debug!(
-                        target = "client::config",
-                        value, "invalid scroll toggle binding, using default"
-                    );
-                    default_scroll_toggle_bindings()
-                } else {
-                    parsed
-                }
-            })
-            .unwrap_or_else(default_scroll_toggle_bindings);
+        // Load user key config (config file overrides defaults; env vars override config file)
+        let user_config = crate::terminal::config::load_user_config();
+
+        // Scroll toggle bindings
+        let scroll_toggle = if let Ok(value) = env::var(SCROLL_TOGGLE_KEY_ENV) {
+            let parsed = parse_key_bindings(&value);
+            if parsed.is_empty() {
+                debug!(
+                    target = "client::config",
+                    value, "invalid scroll toggle binding, using default"
+                );
+                default_scroll_toggle_bindings()
+            } else {
+                parsed
+            }
+        } else if let Some(list) = user_config
+            .as_ref()
+            .and_then(|c| c.client.as_ref())
+            .and_then(|c| c.keys.as_ref())
+            .and_then(|k| k.scroll_toggle.as_ref())
+        {
+            let joined = list.join(",");
+            let parsed = parse_key_bindings(&joined);
+            if parsed.is_empty() {
+                default_scroll_toggle_bindings()
+            } else {
+                parsed
+            }
+        } else {
+            default_scroll_toggle_bindings()
+        };
+
+        // Double-ESC toggle behavior
+        let scroll_double_esc_enabled = user_config
+            .as_ref()
+            .and_then(|c| c.client.as_ref())
+            .and_then(|c| c.keys.as_ref())
+            .and_then(|k| k.double_esc)
+            .unwrap_or(true);
+
+        // Copy shortcuts in copy-mode
+        let copy_shortcuts = if let Ok(value) = env::var(COPY_SHORTCUTS_ENV) {
+            let parsed = parse_key_bindings(&value);
+            if parsed.is_empty() {
+                default_copy_shortcut_bindings()
+            } else {
+                parsed
+            }
+        } else if let Some(list) = user_config
+            .as_ref()
+            .and_then(|c| c.client.as_ref())
+            .and_then(|c| c.keys.as_ref())
+            .and_then(|k| k.copy_shortcuts.as_ref())
+        {
+            let joined = list.join(",");
+            let parsed = parse_key_bindings(&joined);
+            if parsed.is_empty() {
+                default_copy_shortcut_bindings()
+            } else {
+                parsed
+            }
+        } else {
+            default_copy_shortcut_bindings()
+        };
         let mut client = Self {
             transport,
             renderer,
@@ -445,6 +529,8 @@ impl TerminalClient {
             prediction_overlay_logged_underline: false,
             copy_mode: None,
             scroll_toggle,
+            scroll_double_esc_enabled,
+            copy_shortcuts,
             tail_flash_until: None,
             last_plain_esc: None,
             last_render_at: None,
@@ -2174,11 +2260,16 @@ impl TerminalClient {
         }
 
         if self.copy_mode.is_some() {
-            if self.consume_copy_mode_pending_input(key) {
+            // Configurable copy shortcuts (copy selection and exit copy-mode)
+            if self
+                .copy_shortcuts
+                .iter()
+                .any(|binding| binding.matches(key))
+            {
+                self.copy_selection_to_clipboard(true);
                 return true;
             }
-            if is_copy_shortcut(key) {
-                self.copy_selection_to_clipboard(true);
+            if self.consume_copy_mode_pending_input(key) {
                 return true;
             }
             let (mode, selection_active) = {
@@ -2675,14 +2766,27 @@ impl TerminalClient {
                 self.tail_flash_until = None;
             }
         }
+        let base = self.tail_highlight_text();
         let highlight = if self.tail_flash_until.is_some() {
-            "TAIL • ESC ESC to scrollback • CTRL+Q quit".to_string()
+            format!("TAIL • {base}")
         } else {
-            "ESC ESC to scrollback • CTRL+Q quit".to_string()
+            base
         };
         self.renderer
             .set_status_with_highlight(Some(self.tail_status_text()), Some(highlight));
         self.force_render = true;
+    }
+
+    fn tail_highlight_text(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.scroll_double_esc_enabled {
+            parts.push("ESC ESC to scrollback".to_string());
+        }
+        if let Some(binding) = self.scroll_toggle.first() {
+            parts.push(format!("{} to scrollback", format_key_binding(binding)));
+        }
+        parts.push("CTRL+Q quit".to_string());
+        parts.join(" • ")
     }
 
     fn apply_scrollback_status(&mut self) {
@@ -2816,7 +2920,7 @@ impl TerminalClient {
             .any(|binding| binding.matches(key))
         {
             triggered = true;
-        } else if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+        } else if self.scroll_double_esc_enabled && key.code == KeyCode::Esc && key.modifiers.is_empty() {
             let now = Instant::now();
             if let Some(last) = self.last_plain_esc {
                 if now.saturating_duration_since(last) <= SCROLL_TOGGLE_DOUBLE_ESC {
@@ -3275,10 +3379,6 @@ impl TerminalClient {
         match key.code {
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'q') => {
                 return Err(ClientError::Shutdown);
-            }
-            KeyCode::Char(c) if c.eq_ignore_ascii_case(&'c') && self.copy_mode.is_some() => {
-                self.copy_selection_to_clipboard(true);
-                return Ok(true);
             }
             _ => {}
         }
@@ -4962,6 +5062,7 @@ fn encode_key_event(key: KeyEvent) -> Option<Vec<u8>> {
     }
 }
 
+#[allow(dead_code)]
 fn is_copy_shortcut(key: &KeyEvent) -> bool {
     match key.code {
         KeyCode::Char(c) => {
@@ -4973,6 +5074,22 @@ fn is_copy_shortcut(key: &KeyEvent) -> bool {
         KeyCode::Insert => key.modifiers.contains(KeyModifiers::CONTROL),
         _ => false,
     }
+}
+
+fn default_copy_shortcut_bindings() -> Vec<KeyBinding> {
+    vec![
+        // Cmd/Ctrl(OS) + C
+        KeyBinding::new(KeyCode::Char('c'), KeyModifiers::SUPER),
+        // Ctrl+Shift+C (common in terminals)
+        KeyBinding::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+        ),
+        // Ctrl+Insert (Windows)
+        KeyBinding::new(KeyCode::Insert, KeyModifiers::CONTROL),
+        // Plain Ctrl+C while in copy-mode
+        KeyBinding::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    ]
 }
 
 fn copy_mode_command_for_key(

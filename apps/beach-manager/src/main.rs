@@ -50,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
         cache_ttl: Duration::from_secs(300),
     };
     state = state.with_auth(AuthContext::new(auth_config));
+    state = state.with_integrations(cfg.beach_road_url.clone(), cfg.public_manager_url.clone());
 
     if let Some(redis_url) = &cfg.redis_url {
         match redis::Client::open(redis_url.clone()) {

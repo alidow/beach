@@ -66,6 +66,42 @@ pub struct EmergencyStopRequest {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AttachByCodeRequest {
+    pub session_id: String,
+    pub code: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AttachOwnedRequest {
+    pub origin_session_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HarnessBridgeTokenRequest {
+    pub origin_session_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct AttachByCodeResponse {
+    pub ok: bool,
+    pub attach_method: &'static str,
+    pub session: SessionSummary,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct AttachOwnedResponse {
+    pub attached: usize,
+    pub duplicates: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct HarnessBridgeTokenResponse {
+    pub token: String,
+    pub expires_at_ms: i64,
+    pub audience: String,
+}
+
 pub async fn register_session(
     State(state): State<AppState>,
     token: AuthToken,
@@ -277,6 +313,51 @@ pub async fn emergency_stop(
         .await
         .map_err(map_state_err)?;
     Ok(Json(serde_json::json!({ "stopped": true })))
+}
+
+pub async fn attach_by_code(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(private_beach_id): Path<String>,
+    Json(body): Json<AttachByCodeRequest>,
+) -> ApiResult<AttachByCodeResponse> {
+    ensure_scope(&token, "pb:sessions.write")?;
+    let session = state
+        .attach_by_code(&private_beach_id, &body.session_id, &body.code, token.account_uuid())
+        .await
+        .map_err(map_state_err)?;
+    Ok(Json(AttachByCodeResponse { ok: true, attach_method: "code", session }))
+}
+
+pub async fn attach_owned(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(private_beach_id): Path<String>,
+    Json(body): Json<AttachOwnedRequest>,
+) -> ApiResult<AttachOwnedResponse> {
+    ensure_scope(&token, "pb:sessions.write")?;
+    if body.origin_session_ids.is_empty() {
+        return Err(ApiError::BadRequest("origin_session_ids required".into()));
+    }
+    let (attached, duplicates) = state
+        .attach_owned(&private_beach_id, body.origin_session_ids.clone(), token.account_uuid())
+        .await
+        .map_err(map_state_err)?;
+    Ok(Json(AttachOwnedResponse { attached, duplicates }))
+}
+
+pub async fn mint_harness_bridge_token(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(private_beach_id): Path<String>,
+    Json(body): Json<HarnessBridgeTokenRequest>,
+) -> ApiResult<HarnessBridgeTokenResponse> {
+    ensure_scope(&token, "pb:sessions.write")?;
+    let (token_str, expires_at_ms, audience) = state
+        .mint_bridge_token(&private_beach_id, &body.origin_session_id, token.account_uuid())
+        .await
+        .map_err(map_state_err)?;
+    Ok(Json(HarnessBridgeTokenResponse { token: token_str, expires_at_ms, audience }))
 }
 
 fn map_state_err(err: StateError) -> ApiError {

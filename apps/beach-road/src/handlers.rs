@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
 };
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -387,6 +387,7 @@ pub async fn issue_fallback_token(
 /// POST /sessions - Register a new session
 pub async fn register_session(
     State(storage): State<SharedStorage>,
+    headers: HeaderMap,
     Json(payload): Json<RegisterSessionRequest>,
 ) -> Result<Json<RegisterSessionResponse>, StatusCode> {
     debug!("Registering session: {}", payload.session_id);
@@ -429,6 +430,12 @@ pub async fn register_session(
         join_code_plain.clone(),
     );
     session.server_address = Some(base_http.clone());
+    // Infer ownership from header for dev flows
+    if let Some(val) = headers.get("x-account-id").and_then(|v| v.to_str().ok()) {
+        session.owner_account_id = Some(val.to_string());
+    } else {
+        session.owner_account_id = Some("auth-bypass".into());
+    }
 
     match storage.register_session(session).await {
         Ok(_) => {
@@ -711,6 +718,81 @@ pub async fn get_session_status(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+// New: verify a short code for a session
+#[derive(Deserialize)]
+pub struct VerifyCodeRequest { pub code: String }
+
+#[derive(Serialize)]
+pub struct VerifyCodeResponse { pub verified: bool, pub owner_account_id: Option<String> }
+
+pub async fn verify_code(
+    State(storage): State<SharedStorage>,
+    Path(session_id): Path<String>,
+    Json(body): Json<VerifyCodeRequest>,
+) -> Result<Json<VerifyCodeResponse>, StatusCode> {
+    let storage = (*storage).clone();
+    match storage.get_session(&session_id).await {
+        Ok(Some(session)) => {
+            let ok = verify_passphrase(&body.code, &session.passphrase_hash) || body.code == session.join_code;
+            Ok(Json(VerifyCodeResponse { verified: ok, owner_account_id: session.owner_account_id.clone() }))
+        }
+        Ok(None) => Ok(Json(VerifyCodeResponse { verified: false, owner_account_id: None })),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+// New: list caller-owned active sessions
+#[derive(Serialize)]
+pub struct MySessionSummary {
+    pub origin_session_id: String,
+    pub kind: String,
+    pub title: Option<String>,
+    pub started_at: u64,
+    pub last_seen_at: u64,
+    pub location_hint: Option<String>,
+}
+
+pub async fn list_my_sessions(
+    State(storage): State<SharedStorage>,
+    headers: HeaderMap,
+    Query(_q): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Vec<MySessionSummary>>, StatusCode> {
+    let caller = headers
+        .get("x-account-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("auth-bypass");
+    let list = storage
+        .list_sessions()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .filter(|s| s.owner_account_id.as_deref().unwrap_or("auth-bypass") == caller)
+        .map(|s| MySessionSummary {
+            origin_session_id: s.session_id,
+            kind: s.kind.unwrap_or_else(|| "terminal".into()),
+            title: s.title,
+            started_at: s.created_at,
+            last_seen_at: s.created_at,
+            location_hint: s.location_hint,
+        })
+        .collect();
+    Ok(Json(list))
+}
+
+// New: accept a manager join hint (no-op for now)
+#[derive(Deserialize)]
+pub struct JoinManagerRequest { pub manager_url: String, pub bridge_token: String }
+
+#[derive(Serialize)]
+pub struct JoinManagerResponse { pub ok: bool }
+
+pub async fn join_manager(
+    Path(_session_id): Path<String>,
+    Json(_body): Json<JoinManagerRequest>,
+) -> Result<Json<JoinManagerResponse>, StatusCode> {
+    Ok(Json(JoinManagerResponse { ok: true }))
 }
 
 /// GET /health - Health check endpoint

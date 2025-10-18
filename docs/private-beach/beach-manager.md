@@ -39,6 +39,29 @@ Beach Manager is the zero-trust control plane that keeps Private Beach cohesive.
 3. Manager stores session row, returns controller lease options, P2P hints, and state cache endpoints.
 4. Harness begins streaming diffs through Redis/WebRTC per negotiated transport.
 
+### Session Onboarding & Attach
+1. Add by Code (public session claim)
+   - UI posts `session_id` + `code` to Manager: `POST /private-beaches/:id/sessions/attach-by-code`.
+   - Manager verifies with Beach Road `POST /sessions/:id/verify-code` (proof of control, owner identity, harness hint).
+   - Manager mints a short‑lived bridge token (scopes: `pb:sessions.register pb:harness.publish`) via Beach Gate and instructs Road to nudge the harness.
+   - Harness connects to Manager and calls `POST /sessions/register` using the bridge token; Manager persists mapping (`session.origin_session_id`, beach ID) and emits events.
+2. Attach My Sessions (owned)
+   - UI calls Beach Road `GET /me/sessions?status=active` with user JWT; user selects one or more.
+   - UI posts to Manager: `POST /private-beaches/:id/sessions/attach` with `{ origin_session_ids: [] }`.
+   - Manager validates ownership via Beach Road, persists mappings, and (if not connected) mints a bridge token and asks Road to `POST /sessions/:id/join-manager`.
+3. Launch New (CLI)
+   - UI presents copyable `beach run --private-beach <beach-id>` (and Cabana variant). CLI uses Beach Gate user token to mint a scoped token and registers directly to Manager at startup.
+
+APIs (Manager additions)
+- `POST /private-beaches/:private_beach_id/sessions/attach-by-code` → { ok, attach_method, mapping }
+- `POST /private-beaches/:private_beach_id/sessions/attach` → { attached: number, duplicates: number }
+- `POST /private-beaches/:private_beach_id/harness-bridge-token` → { token, expires_at_ms, audience }
+
+APIs (Beach Road additions)
+- `POST /sessions/:origin_session_id/verify-code` → { verified, owner_account_id, harness_hint }
+- `GET /me/sessions?status=active` → list of active sessions owned by caller
+- `POST /sessions/:origin_session_id/join-manager` { manager_url, bridge_token }
+
 ### Controller Lease & Action Pipeline
 1. Client/agent acquires lease via `POST /sessions/:id/controller/lease`.
 2. Manager validates scopes, updates Postgres + emits `controller_event`.
@@ -55,6 +78,7 @@ Beach Manager is the zero-trust control plane that keeps Private Beach cohesive.
 ## Security Posture
 - **Zero Trust:** assume infra compromise; require signed JWTs + optional mutual TLS between harness and manager.
 - **Row-Level Security:** enforce per-private-beach access at the database layer in addition to application checks.
+- **Attach Authorization:** attaching a session requires beach admin/owner role and either proof‑of‑control (code) or ownership (Road lookup). Bridge tokens are short‑lived and scoped to a single session and beach.
 - **Rate Limits:** dynamic budgets per session and controller; throttle automation loops that risk flooding transports.
 - **Audit Completeness:** controller events, state reads, and agent command results must be stored before responses are acknowledged.
 - **Secrets Handling:** manager uses short-lived tokens (≤5 min) for agent/harness access; refresh tokens stored encrypted.

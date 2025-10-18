@@ -12,7 +12,17 @@ Next steps:
 
 1. Capture baseline metrics with the ScreenCaptureKit path (verify blank-frame telemetry and fallback logs under load).
 2. Integrate VideoToolbox / hardware encoders behind the `VideoEncoder` trait (reuse GIF fallback as debug option).
-3. Add automated capture/encode tests once `cabana_sck` is available in CI (macOS). 
+3. Add automated capture/encode tests once `cabana_sck` is available in CI (macOS).
+
+Test/metrics notes (2025-10-18):
+- Added unit test for VideoToolbox H.264 encoder that writes a short Annex B stream from synthetic frames: `apps/beach-cabana/src/encoder/videotoolbox.rs` (macOS + `--features cabana_sck`).
+- Added ignored smoke test for ScreenCaptureKit display streaming that captures a couple frames to a temp directory: `apps/beach-cabana/src/platform/macos/sck.rs` (run locally with GUI + screen-recording permission).
+- The `stream` CLI now prints average/min/max frame latency and byte totals per run to aid baseline collection; SCK blank-frame events remain logged at `debug`.
+
+How to run locally (macOS):
+- `cargo test --manifest-path apps/beach-cabana/Cargo.toml --features cabana_sck`
+- `cargo test --manifest-path apps/beach-cabana/Cargo.toml --features cabana_sck -- --ignored` (runs SCK smoke test)
+- `RUST_LOG=info cargo run --manifest-path apps/beach-cabana/Cargo.toml -- stream --window-id display:<ID> --frames 60 --interval-ms 16`
 
 ## 2025-10-15 – ScreenCaptureKit Integration Status
 

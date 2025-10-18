@@ -16,6 +16,10 @@ pub struct AppConfig {
     pub beach_gate_audience: Option<String>,
     #[serde(default)]
     pub auth_bypass: bool,
+    #[serde(default)]
+    pub beach_road_url: Option<String>,
+    #[serde(default)]
+    pub public_manager_url: Option<String>,
 }
 
 impl AppConfig {
@@ -32,6 +36,8 @@ impl AppConfig {
                 beach_gate_issuer: None,
                 beach_gate_audience: None,
                 auth_bypass: false,
+                beach_road_url: None,
+                public_manager_url: None,
             })
     }
 }

@@ -38,6 +38,9 @@ pub struct AppState {
     auth: Arc<AuthContext>,
     events: Arc<RwLock<HashMap<String, broadcast::Sender<StreamEvent>>>>,
     fast_paths: FastPathRegistry,
+    http: reqwest::Client,
+    road_base_url: String,
+    public_manager_url: String,
 }
 
 #[derive(Clone)]
@@ -214,6 +217,9 @@ impl AppState {
             auth: Arc::new(AuthContext::new(auth_config)),
             events: Arc::new(RwLock::new(HashMap::new())),
             fast_paths: FastPathRegistry::new(),
+            http: reqwest::Client::new(),
+            road_base_url: std::env::var("BEACH_ROAD_URL").unwrap_or_else(|_| "http://localhost:4132".into()),
+            public_manager_url: std::env::var("PUBLIC_MANAGER_URL").unwrap_or_else(|_| "http://localhost:8080".into()),
         }
     }
 
@@ -229,6 +235,9 @@ impl AppState {
             auth: Arc::new(AuthContext::new(auth_config)),
             events: Arc::new(RwLock::new(HashMap::new())),
             fast_paths: FastPathRegistry::new(),
+            http: reqwest::Client::new(),
+            road_base_url: std::env::var("BEACH_ROAD_URL").unwrap_or_else(|_| "http://localhost:4132".into()),
+            public_manager_url: std::env::var("PUBLIC_MANAGER_URL").unwrap_or_else(|_| "http://localhost:8080".into()),
         }
     }
 
@@ -239,6 +248,12 @@ impl AppState {
 
     pub fn with_auth(mut self, auth: AuthContext) -> Self {
         self.auth = Arc::new(auth);
+        self
+    }
+
+    pub fn with_integrations(mut self, road_base_url: Option<String>, public_manager_url: Option<String>) -> Self {
+        if let Some(url) = road_base_url { self.road_base_url = url; }
+        if let Some(url) = public_manager_url { self.public_manager_url = url; }
         self
     }
 
@@ -288,6 +303,185 @@ impl AppState {
             Backend::Postgres(pool) => self.register_session_postgres(pool, req).await,
         }
     }
+
+    // Session onboarding helpers
+    pub async fn attach_by_code(
+        &self,
+        private_beach_id: &str,
+        origin_session_id: &str,
+        code: &str,
+        requester: Option<Uuid>,
+    ) -> Result<SessionSummary, StateError> {
+        // Verify with Beach Road
+        let verified = self
+            .verify_code_with_road(origin_session_id, code)
+            .await
+            .unwrap_or(false);
+        if !verified {
+            return Err(StateError::InvalidIdentifier("invalid_code".into()));
+        }
+        // Create mapping if not exists
+        match &self.backend {
+            Backend::Memory => {
+                let mut sessions = self.fallback.sessions.write().await;
+                let rec = sessions
+                    .entry(origin_session_id.to_string())
+                    .or_insert_with(|| SessionRecord::new(origin_session_id, private_beach_id, &HarnessType::Custom));
+                rec.append_event(ControllerEventType::Registered, Some("attach_by_code".into()));
+                // Nudge harness via Beach Road with a bridge token (best-effort)
+                if let Ok((token, _exp, _aud)) = self.mint_bridge_token(private_beach_id, origin_session_id, requester).await {
+                    let _ = self.nudge_join_manager(origin_session_id, &token).await;
+                }
+                Ok(SessionSummary::from_record(rec))
+            }
+            Backend::Postgres(pool) => {
+                let beach_uuid = parse_uuid(private_beach_id, "private_beach_id")?;
+                let origin_uuid = parse_uuid(origin_session_id, "session_id")?;
+                let mut tx = pool.begin().await?;
+                self.set_rls_context_tx(&mut tx, &beach_uuid).await?;
+                // Insert session row if not exists, leave harness fields null
+                let _ = sqlx::query(
+                    r#"
+                    INSERT INTO session (private_beach_id, origin_session_id, kind, created_by_account_id)
+                    VALUES ($1, $2, 'terminal', $3)
+                    ON CONFLICT (private_beach_id, origin_session_id) DO NOTHING
+                    "#,
+                )
+                .bind(beach_uuid)
+                .bind(origin_uuid)
+                .bind(requester)
+                .execute(tx.as_mut())
+                .await?;
+
+                // Emit a controller_event of type registered to reflect attach
+                // Look up db session id
+                let ids = sqlx::query_as::<_, DbSessionIdentifiers>(
+                    r#"SELECT id AS session_id, private_beach_id FROM session WHERE private_beach_id = $1 AND origin_session_id = $2"#,
+                )
+                .bind(beach_uuid)
+                .bind(origin_uuid)
+                .fetch_one(tx.as_mut())
+                .await?;
+                self.insert_controller_event(
+                    &mut tx,
+                    ids.session_id,
+                    "registered",
+                    None,
+                    requester,
+                    requester,
+                    Some("attach_by_code".into()),
+                )
+                .await?;
+                tx.commit().await?;
+
+                if let Ok((token, _exp, _aud)) = self.mint_bridge_token(private_beach_id, origin_session_id, requester).await {
+                    let _ = self.nudge_join_manager(origin_session_id, &token).await;
+                }
+
+                // Return summary (best-effort from DB fields)
+                let mut list = self.list_sessions(private_beach_id).await?;
+                if let Some(found) = list.iter().find(|s| s.session_id == origin_session_id) {
+                    return Ok(found.clone());
+                }
+                Err(StateError::SessionNotFound)
+            }
+        }
+    }
+
+    pub async fn attach_owned(
+        &self,
+        private_beach_id: &str,
+        origin_ids: Vec<String>,
+        requester: Option<Uuid>,
+    ) -> Result<(usize, usize), StateError> {
+        let mut attached = 0usize;
+        let mut duplicates = 0usize;
+        match &self.backend {
+            Backend::Memory => {
+                let mut sessions = self.fallback.sessions.write().await;
+                for id in origin_ids {
+                    let existed = sessions.contains_key(&id);
+                    let entry = sessions.entry(id.clone()).or_insert_with(|| SessionRecord::new(&id, private_beach_id, &HarnessType::Custom));
+                    if existed {
+                        duplicates += 1;
+                    } else {
+                        attached += 1;
+                        entry.append_event(ControllerEventType::Registered, Some("attach_owned".into()));
+                    }
+                }
+                Ok((attached, duplicates))
+            }
+            Backend::Postgres(pool) => {
+                let beach_uuid = parse_uuid(private_beach_id, "private_beach_id")?;
+                let mut tx = pool.begin().await?;
+                self.set_rls_context_tx(&mut tx, &beach_uuid).await?;
+                let mut ids_to_nudge: Vec<String> = Vec::new();
+                for id in origin_ids {
+                    if let Ok(origin_uuid) = Uuid::parse_str(&id) {
+                        let result = sqlx::query(
+                            r#"
+                            INSERT INTO session (private_beach_id, origin_session_id, kind, created_by_account_id)
+                            VALUES ($1, $2, 'terminal', $3)
+                            ON CONFLICT (private_beach_id, origin_session_id) DO NOTHING
+                            "#,
+                        )
+                        .bind(beach_uuid)
+                        .bind(origin_uuid)
+                        .bind(requester)
+                        .execute(tx.as_mut())
+                        .await?;
+                        if result.rows_affected() == 0 { duplicates += 1; } else { attached += 1; ids_to_nudge.push(id.clone()); }
+                    }
+                }
+                tx.commit().await?;
+                // Best-effort nudge for newly attached sessions
+                for sid in ids_to_nudge {
+                    if let Ok((token, _exp, _aud)) = self.mint_bridge_token(private_beach_id, &sid, requester).await {
+                        let _ = self.nudge_join_manager(&sid, &token).await;
+                    }
+                }
+                Ok((attached, duplicates))
+            }
+        }
+    }
+
+    pub async fn mint_bridge_token(
+        &self,
+        _private_beach_id: &str,
+        _origin_session_id: &str,
+        _requester: Option<Uuid>,
+    ) -> Result<(String, i64, String), StateError> {
+        // In dev/bypass mode, any opaque token is accepted by the manager.
+        let token = Uuid::new_v4().to_string();
+        let expires_at_ms = now_ms() + 5 * 60 * 1000; // 5 minutes
+        let audience = "pb:sessions.register pb:harness.publish".to_string();
+        Ok((token, expires_at_ms, audience))
+    }
+
+    async fn verify_code_with_road(&self, origin_session_id: &str, code: &str) -> Result<bool, ()> {
+        let url = format!("{}/sessions/{}/verify-code", self.road_base_url.trim_end_matches('/'), origin_session_id);
+        let body = serde_json::json!({ "code": code });
+        let resp = self.http.post(url).json(&body).send().await.map_err(|_| ())?;
+        if !resp.status().is_success() {
+            return Ok(false);
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|_| ())?;
+        Ok(v.get("verified").and_then(|b| b.as_bool()).unwrap_or(false))
+    }
+
+    async fn nudge_join_manager(&self, origin_session_id: &str, bridge_token: &str) -> Result<(), ()> {
+        let url = format!(
+            "{}/sessions/{}/join-manager",
+            self.road_base_url.trim_end_matches('/'),
+            origin_session_id
+        );
+        let body = serde_json::json!({ "manager_url": self.public_manager_url, "bridge_token": bridge_token });
+        let resp = self.http.post(url).json(&body).send().await.map_err(|_| ())?;
+        if resp.status().is_success() { Ok(()) } else { Err(()) }
+    }
+}
+
+// no extra impls
 
     pub async fn update_session_metadata(
         &self,

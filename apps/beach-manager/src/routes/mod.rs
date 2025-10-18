@@ -50,6 +50,18 @@ pub fn build_router(state: AppState) -> Router {
             get(list_sessions),
         )
         .route(
+            "/private-beaches/:private_beach_id/sessions/attach-by-code",
+            post(attach_by_code),
+        )
+        .route(
+            "/private-beaches/:private_beach_id/sessions/attach",
+            post(attach_owned),
+        )
+        .route(
+            "/private-beaches/:private_beach_id/harness-bridge-token",
+            post(mint_harness_bridge_token),
+        )
+        .route(
             "/sessions/:session_id/emergency-stop",
             post(emergency_stop),
         )

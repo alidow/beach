@@ -41,6 +41,7 @@ Nice-to-haves (open):
 - Tracks:
   - Information Architecture: navigation model (beach switcher, sessions, automations, settings), URL structure, deep links.
   - Design System: tokenized color/typography/spacing, components (tiles, badges, toasts, dialogs), dark mode, density scale. Baseline stack: TailwindCSS + shadcn/ui.
+  - Session Onboarding: unified “Add Session” flows — By Code (ID+code claim), My Sessions (owned/active sessions), Launch New (CLI guidance with beach binding). Endpoints span Manager + Beach Road; bridge tokens via Beach Gate.
   - Session Surfaces: tile design, health/queue badges, lease countdown, activity glints, selection vs. focus, skeletons/empty/error states.
   - Live Streams: streaming state rendering guidelines, sticky status area, reconnection UX, back-pressure indicators.
   - Controller UX: acquire/release/takeover flows, role visibility, emergency stop affordances and confirmation patterns.
@@ -51,6 +52,8 @@ Nice-to-haves (open):
 - Deliverables:
   - UX spec with wireframes and component inventory (kept in docs/beach-web-plan.md).
   - Implemented design system + core components in apps/private-beach (TailwindCSS + shadcn/ui configured).
+  - Add Session modal (By Code, My Sessions, Launch New) + Manager/Beach Road contracts + bridge token mint/handshake.
+  - CLI supports `beach run --private-beach <beach-id>` to auto-register to Manager; UI guides with copyable commands.
   - Polished Sessions Overview and Session Detail views with live status and controls.
   - End-to-end tests for critical flows (acquire/release, stop, search/filter, share-link redemption).
   - Telemetry hooks (UI timings, error rates) and UX health dashboards.

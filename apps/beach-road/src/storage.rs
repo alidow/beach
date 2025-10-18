@@ -15,6 +15,14 @@ pub struct SessionInfo {
     pub created_at: u64,
     pub join_code: String,
     pub server_address: Option<String>,
+    #[serde(default)]
+    pub owner_account_id: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub location_hint: Option<String>,
 }
 
 impl SessionInfo {
@@ -30,6 +38,10 @@ impl SessionInfo {
             created_at,
             join_code,
             server_address: None,
+            owner_account_id: None,
+            kind: None,
+            title: None,
+            location_hint: None,
         }
     }
 }
@@ -72,6 +84,36 @@ impl Storage {
             }
             None => Ok(None),
         }
+    }
+
+    pub async fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
+        let mut conn = self.redis.clone();
+        let mut cursor: u64 = 0;
+        let mut results = Vec::new();
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .cursor_arg(cursor)
+                .arg("MATCH")
+                .arg("session:*")
+                .arg("COUNT")
+                .arg(100u32)
+                .query_async(&mut conn)
+                .await?;
+            cursor = next_cursor;
+            if !keys.is_empty() {
+                let values: Vec<Option<String>> = redis::cmd("MGET")
+                    .arg(keys)
+                    .query_async(&mut conn)
+                    .await?;
+                for v in values.into_iter().flatten() {
+                    if let Ok(s) = serde_json::from_str::<SessionInfo>(&v) {
+                        results.push(s);
+                    }
+                }
+            }
+            if cursor == 0 { break; }
+        }
+        Ok(results)
     }
 
     pub async fn session_exists(&self, session_id: &str) -> Result<bool> {

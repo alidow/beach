@@ -667,3 +667,48 @@ pub fn stream_window(
 
     Ok((base_dir, paths))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use screen_capture_kit::shareable_content::SCShareableContent;
+
+    // Smoke test for ScreenCaptureKit path. This requires macOS with Screen Recording
+    // permission and a GUI session; thus it is ignored by default and intended for
+    // local validation on a developer machine.
+    #[test]
+    #[ignore]
+    fn sck_stream_produces_frames_on_display() {
+        ensure_appkit_initialized();
+
+        // Discover a display id via ScreenCaptureKit itself.
+        let (tx, rx) = crossbeam_channel::bounded::<Result<u32, String>>(1);
+        SCShareableContent::get_shareable_content_with_completion_closure(move |content, error| {
+            let result = match content {
+                Some(c) => c
+                    .displays()
+                    .get(0)
+                    .map(|d| d.display_id())
+                    .ok_or_else(|| "no displays reported".to_string()),
+                None => Err(error
+                    .map(|e| format!("{:?}", e))
+                    .unwrap_or_else(|| "no content".into())),
+            };
+            let _ = tx.send(result);
+        });
+
+        let display_id = rx.recv_timeout(Duration::from_secs(3)).expect("content recv").expect("display id");
+        let target = format!("display:{}", display_id);
+
+        // Capture a couple frames quickly to verify the path works.
+        let dir = std::env::temp_dir().join("cabana-sck-smoketest");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mk temp dir");
+
+        let (out_dir, frames) = stream_window(&target, 2, Duration::from_millis(0), Some(dir)).expect("stream");
+        assert!(!frames.is_empty(), "expected at least one frame");
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(out_dir);
+    }
+}

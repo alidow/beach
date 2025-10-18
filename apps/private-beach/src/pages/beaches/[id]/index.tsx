@@ -5,6 +5,7 @@ import SessionListPanel from '../../../components/SessionListPanel';
 import TileCanvas from '../../../components/TileCanvas';
 import SessionDrawer from '../../../components/SessionDrawer';
 import { Button } from '../../../components/ui/button';
+import AddSessionModal from '../../../components/AddSessionModal';
 import { Select } from '../../../components/ui/select';
 import { SessionSummary, listSessions } from '../../../lib/api';
 import { BeachLayout, PrivateBeach, getBeach, loadLayout, saveLayout } from '../../../lib/beaches';
@@ -19,6 +20,7 @@ export default function BeachDashboard() {
   const [layout, setLayout] = useState<BeachLayout>({ tiles: [], preset: 'grid2x2' });
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [selected, setSelected] = useState<SessionSummary | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
 
   useEffect(() => {
     if (!id) return;
@@ -28,6 +30,7 @@ export default function BeachDashboard() {
   }, [id]);
 
   const managerUrl = beach?.managerUrl || process.env.NEXT_PUBLIC_MANAGER_URL || 'http://localhost:8080';
+  const roadUrl = process.env.NEXT_PUBLIC_ROAD_URL || process.env.NEXT_PUBLIC_SESSION_SERVER_URL || 'http://localhost:4132';
   const token = beach?.token || null;
 
   async function refresh() {
@@ -87,6 +90,7 @@ export default function BeachDashboard() {
             { value: 'onePlusThree', label: 'Layout: 1+3' },
             { value: 'focus', label: 'Layout: Focus' },
           ]} />
+          <Button variant="outline" onClick={() => setAddOpen(true)}>Add</Button>
           <Button onClick={refresh} disabled={loading}>{loading ? 'Loading…' : 'Refresh'}</Button>
         </div>
       } />
@@ -102,7 +106,17 @@ export default function BeachDashboard() {
         </div>
       </div>
       <SessionDrawer open={drawerOpen} onOpenChange={setDrawerOpen} session={selected} managerUrl={managerUrl} token={token} />
+      {id && (
+        <AddSessionModal
+          open={addOpen}
+          onOpenChange={setAddOpen}
+          privateBeachId={id}
+          managerUrl={managerUrl}
+          roadUrl={roadUrl}
+          token={token}
+          onAttached={() => refresh()}
+        />
+      )}
     </div>
   );
 }
-

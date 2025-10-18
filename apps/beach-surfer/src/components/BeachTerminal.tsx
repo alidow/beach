@@ -308,6 +308,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const connectionTraceRef = useRef<ConnectionTrace | null>(null);
   const subscriptionRef = useRef<number | null>(null);
   const inputSeqRef = useRef(0);
+  // Micro-batching input to reduce per-key overhead and make paste fast.
+  const pendingInputRef = useRef<Array<{ data: Uint8Array; predict: boolean }>>([]);
+  const flushTimerRef = useRef<number | null>(null);
   const lastSentViewportRows = useRef<number>(0);
   const lastMeasuredViewportRows = useRef<number>(24);
   const suppressNextResizeRef = useRef<boolean>(false);
@@ -958,6 +961,57 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     applyScroll();
   }, [snapshot.followTail, snapshot.baseRow, snapshot.rows.length, lastAbsolute, lineHeight, topPadding, bottomPadding, lines.length, effectiveLineHeight]);
 
+  const INPUT_MAX_FRAME_BYTES = 32 * 1024; // conservative cap per input frame
+
+  const flushPendingInput = useCallback(() => {
+    const transport = transportRef.current;
+    const subscription = subscriptionRef.current;
+    const queue = pendingInputRef.current;
+    flushTimerRef.current = null;
+    if (!transport || subscription === null || queue.length === 0) {
+      pendingInputRef.current = [];
+      return;
+    }
+    // Combine adjacent chunks, then send in size-capped frames.
+    let total = 0;
+    let allowPredict = true;
+    for (const entry of queue) {
+      total += entry.data.length;
+      if (!entry.predict) allowPredict = false;
+    }
+    const combined = new Uint8Array(total);
+    let offset = 0;
+    for (const entry of queue) {
+      combined.set(entry.data, offset);
+      offset += entry.data.length;
+    }
+    pendingInputRef.current = [];
+
+    let pos = 0;
+    while (pos < combined.length) {
+      const end = Math.min(pos + INPUT_MAX_FRAME_BYTES, combined.length);
+      const slice = combined.subarray(pos, end);
+      pos = end;
+      const seq = ++inputSeqRef.current;
+      const predicts = allowPredict && hasPredictiveByte(slice) && slice.length <= 32;
+      const timestampMs = now();
+      transport.send({ type: 'input', seq, data: slice });
+      const predictionApplied = predicts ? store.registerPrediction(seq, slice) : false;
+      const overlayUpdate = predictionUxRef.current.recordSend(seq, timestampMs, predicts && predictionApplied);
+      if (overlayUpdate) {
+        setPredictionOverlay(overlayUpdate);
+      }
+    }
+  }, [store]);
+
+  const enqueueInput = useCallback((data: Uint8Array, predict: boolean) => {
+    pendingInputRef.current.push({ data, predict });
+    if (flushTimerRef.current === null) {
+      // Micro-batch on the next task to allow multiple key events in one frame.
+      flushTimerRef.current = window.setTimeout(flushPendingInput, 2);
+    }
+  }, [flushPendingInput]);
+
   const handleKeyDown: React.KeyboardEventHandler<HTMLDivElement> = (event) => {
     const transport = transportRef.current;
     if (!transport) {
@@ -974,25 +1028,29 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       return;
     }
     event.preventDefault();
-    const seq = ++inputSeqRef.current;
-    const predicts = hasPredictiveByte(payload);
-    const timestampMs = now();
-    const payloadDebug = Array.from(payload).map(b => `0x${b.toString(16).padStart(2, '0')}`).join(' ');
-    trace('handleKeyDown: sending input', {
-      seq,
-      key: event.key,
-      code: event.code,
-      payload: payloadDebug,
-      payloadLength: payload.length,
-      predicts,
-      subscription: subscriptionRef.current,
-    });
-    transport.send({ type: 'input', seq, data: payload });
-    const predictionApplied = store.registerPrediction(seq, payload);
-    const overlayUpdate = predictionUxRef.current.recordSend(seq, timestampMs, predicts && predictionApplied);
-    if (overlayUpdate) {
-      setPredictionOverlay(overlayUpdate);
+    enqueueInput(payload, true);
+  };
+
+  const handlePaste: React.ClipboardEventHandler<HTMLDivElement> = (event) => {
+    const transport = transportRef.current;
+    if (!transport) {
+      trace('handlePaste: no transport');
+      return;
     }
+    if (subscriptionRef.current === null) {
+      trace('handlePaste: no subscription');
+      return;
+    }
+    const text = event.clipboardData?.getData('text') ?? '';
+    if (text.length === 0) {
+      trace('handlePaste: empty');
+      return;
+    }
+    event.preventDefault();
+    const encoder = new TextEncoder();
+    const bytes = encoder.encode(text);
+    // Treat as a single chunk and skip predictions to reduce CPU during large pastes.
+    enqueueInput(bytes, false);
   };
 
   useEffect(() => {
@@ -1159,6 +1217,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         className={containerClasses}
         tabIndex={0}
         onKeyDown={handleKeyDown}
+        onPaste={handlePaste}
         onScroll={handleScroll}
         style={containerStyle}
       >

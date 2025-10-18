@@ -132,6 +132,9 @@ async fn main() {
         .route("/sessions", post(register_session))
         .route("/sessions/:id", get(get_session_status))
         .route("/sessions/:id/join", post(join_session))
+        .route("/sessions/:id/verify-code", post(handlers::verify_code))
+        .route("/me/sessions", get(handlers::list_my_sessions))
+        .route("/sessions/:id/join-manager", post(handlers::join_manager))
         .route(
             "/sessions/:id/webrtc/offer",
             get(get_webrtc_offer).post(post_webrtc_offer),

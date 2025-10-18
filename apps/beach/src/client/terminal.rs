@@ -16,7 +16,7 @@ use copypasta::{ClipboardContext, ClipboardProvider};
 use crossterm::{
     cursor::{MoveTo, Show},
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        self, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
         KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
@@ -84,6 +84,10 @@ const PREDICTION_ACK_GRACE: Duration = Duration::from_millis(90);
 const PREDICTION_TRACE_MAX_HITS: usize = 64;
 const PREDICTION_SEQ_SAMPLE_LIMIT: usize = 4;
 const PREDICTION_POSITION_SAMPLE_LIMIT: usize = 8;
+
+// Conservative input frame size cap to avoid RTC/WebSocket message limits and
+// reduce per-message overhead for very large pastes. Adjust if needed.
+const INPUT_MAX_FRAME_BYTES: usize = 32 * 1024; // 32 KiB
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthorizationState {
@@ -2180,13 +2184,15 @@ impl TerminalClient {
     }
 
     fn pump_input(&mut self) -> Result<(), ClientError> {
-        let mut pending: Vec<Vec<u8>> = Vec::new();
+        // Collect input events and coalesce adjacent items to reduce per-frame overhead.
+        // Boolean flag indicates whether predictions are allowed for the chunk.
+        let mut pending: Vec<(Vec<u8>, bool)> = Vec::new();
         let mut disconnected = false;
 
         if let Some(rx) = &self.input_rx {
             loop {
                 match rx.try_recv() {
-                    Ok(bytes) => pending.push(bytes),
+                    Ok(bytes) => pending.push((bytes, true)),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         disconnected = true;
@@ -2214,11 +2220,14 @@ impl TerminalClient {
                             continue;
                         }
                         if let Some(bytes) = encode_key_event(key) {
-                            pending.push(bytes);
+                            // Key events may arrive rapidly during pastes when bracketed paste is unavailable.
+                            // Coalesce later to cut transport overhead.
+                            pending.push((bytes, true));
                         }
                     }
                     Ok(Event::Paste(data)) => {
-                        pending.push(data.into_bytes());
+                        // Treat OS paste as a single chunk and skip predictions to avoid client-side CPU overhead.
+                        pending.push((data.into_bytes(), false));
                     }
                     Ok(Event::Resize(cols, rows)) => {
                         self.renderer.on_resize(cols, rows);
@@ -2231,7 +2240,7 @@ impl TerminalClient {
                         }
                         if self.forward_mouse_to_host {
                             if let Some(encoded) = encode_mouse_event(&mouse) {
-                                pending.push(encoded);
+                                pending.push((encoded, true));
                             }
                         }
                     }
@@ -2248,8 +2257,29 @@ impl TerminalClient {
             self.input_rx = None;
         }
 
-        for bytes in pending {
-            self.send_input(&bytes)?;
+        // Coalesce adjacent chunks with the same prediction flag while preserving ordering.
+        if !pending.is_empty() {
+            let mut coalesced: Vec<(Vec<u8>, bool)> = Vec::new();
+            let mut current: Option<(Vec<u8>, bool)> = None;
+            for (bytes, allow_pred) in pending.into_iter() {
+                match &mut current {
+                    Some((acc, flag)) if *flag == allow_pred => {
+                        acc.extend_from_slice(&bytes);
+                    }
+                    Some((acc, flag)) => {
+                        coalesced.push((std::mem::take(acc), *flag));
+                        current = Some((bytes, allow_pred));
+                    }
+                    None => current = Some((bytes, allow_pred)),
+                }
+            }
+            if let Some((acc, flag)) = current.take() {
+                coalesced.push((acc, flag));
+            }
+
+            for (bytes, allow_pred) in coalesced.into_iter() {
+                self.send_input_internal(&bytes, allow_pred)?;
+            }
         }
         Ok(())
     }
@@ -3435,6 +3465,17 @@ impl TerminalClient {
         allow_predictions: bool,
     ) -> Result<(), ClientError> {
         if bytes.is_empty() {
+            return Ok(());
+        }
+        // Split very large payloads into multiple input frames to avoid transport message size limits.
+        if bytes.len() > INPUT_MAX_FRAME_BYTES {
+            let mut offset = 0usize;
+            while offset < bytes.len() {
+                let end = (offset + INPUT_MAX_FRAME_BYTES).min(bytes.len());
+                // Disable predictions for chunked payloads to reduce client CPU and avoid cursor drift.
+                self.send_input_internal(&bytes[offset..end], false)?;
+                offset = end;
+            }
             return Ok(());
         }
         if self.subscription_id.is_none() {
@@ -4839,7 +4880,7 @@ impl TerminalClient {
         enable_raw_mode()
             .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
             .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
         self.mouse_capture_enabled = false;
         let backend = CrosstermBackend::new(stdout);
@@ -4876,7 +4917,7 @@ impl TerminalClient {
         disable_raw_mode()
             .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
         let mut stdout = io::stdout();
-        execute!(stdout, DisableMouseCapture, LeaveAlternateScreen)
+        execute!(stdout, DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen)
             .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
         self.mouse_capture_enabled = false;
         Ok(())

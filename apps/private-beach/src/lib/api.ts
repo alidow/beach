@@ -87,3 +87,23 @@ export function eventsSseUrl(sessionId: string, baseUrl?: string, accessToken?: 
   const t = accessToken ? `?access_token=${encodeURIComponent(accessToken)}` : '';
   return `${base(baseUrl)}/sessions/${sessionId}/events/stream${t}`;
 }
+
+export async function attachByCode(privateBeachId: string, sessionId: string, code: string, token: string | null, baseUrl?: string) {
+  const res = await fetch(`${base(baseUrl)}/private-beaches/${privateBeachId}/sessions/attach-by-code`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify({ session_id: sessionId, code }),
+  });
+  if (!res.ok) throw new Error(`attachByCode failed ${res.status}`);
+  return res.json();
+}
+
+export async function attachOwned(privateBeachId: string, ids: string[], token: string | null, baseUrl?: string) {
+  const res = await fetch(`${base(baseUrl)}/private-beaches/${privateBeachId}/sessions/attach`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify({ origin_session_ids: ids }),
+  });
+  if (!res.ok) throw new Error(`attachOwned failed ${res.status}`);
+  return res.json();
+}

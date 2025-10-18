@@ -495,3 +495,66 @@ fn set_property(session: VTCompressionSessionRef, key: &CFString, value: CFTypeR
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    // This is a unit test for the VideoToolbox-backed H.264 encoder. It synthesizes a few
+    // RGBA frames and verifies the encoder writes non-empty Annex B output. Gate it behind
+    // the cabana_sck feature (same gate used for VT code in this crate).
+    // Ignored by default: requires macOS VideoToolbox availability and can trigger
+    // framework assertions under certain CI/headless contexts. Run locally.
+    #[test]
+    #[ignore]
+    fn videotoolbox_writes_h264_annexb() {
+        // Only run on macOS with cabana_sck feature enabled (module is cfg-gated already).
+        let tmp = std::env::temp_dir().join(format!(
+            "cabana-vt-{}.h264",
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+
+        let width = 128u32;
+        let height = 72u32;
+        let fps = 15u32;
+
+        let mut enc = VideoToolboxEncoder::new(&tmp, width, height, fps).expect("vt encoder");
+
+        // Generate a simple moving gradient pattern across a few frames to ensure NAL units
+        // contain non-trivial data.
+        for t in 0..10u32 {
+            let mut data = vec![0u8; (width * height * 4) as usize];
+            for y in 0..height {
+                for x in 0..width {
+                    let idx = ((y * width + x) * 4) as usize;
+                    let r = ((x + t) % 256) as u8;
+                    let g = ((y * 2 + t) % 256) as u8;
+                    let b = ((x ^ y ^ t) % 256) as u8;
+                    data[idx + 0] = r;
+                    data[idx + 1] = g;
+                    data[idx + 2] = b;
+                    data[idx + 3] = 255;
+                }
+            }
+            let frame = Frame {
+                timestamp: std::time::SystemTime::now(),
+                width,
+                height,
+                // Provide RGBA; encoder converts to BGRA for CVPixelBuffer.
+                pixel_format: PixelFormat::Rgba8888,
+                data,
+            };
+            enc.write_frame(&frame).expect("encode frame");
+        }
+
+        enc.finish().expect("finalize h264");
+
+        let meta = std::fs::metadata(&tmp).expect("metadata");
+        assert!(meta.len() > 0, "H264 output should be non-empty");
+        let _ = std::fs::remove_file(tmp);
+    }
+}

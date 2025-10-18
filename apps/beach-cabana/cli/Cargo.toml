@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 default = []
-webrtc = ["beach-cabana-host/webrtc"]
+webrtc = ["beach-cabana-host/webrtc", "dep:tokio"]
 cabana_sck = ["beach-cabana-host/cabana_sck"]
 
 [dependencies]
@@ -20,6 +20,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 beach-cabana-host = { path = "../host" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"], optional = true }
+crossterm = "0.27"
+ratatui = { version = "0.26", default-features = false, features = ["crossterm"] }
 
 [[bin]]
 name = "beach-cabana"

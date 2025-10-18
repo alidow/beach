@@ -9,6 +9,9 @@ use crate::security::{HandshakeId, SessionMaterial};
 #[cfg(target_os = "macos")]
 use crate::capture::{self, Frame, PixelFormat};
 
+#[derive(Debug, Copy, Clone)]
+pub enum EncodeCodec { Gif, H264 }
+
 #[derive(Serialize, Deserialize, Debug)]
 struct RoadSealedEnvelope<'a> {
     version: u32,
@@ -30,6 +33,79 @@ struct RoadSdpPayload<'a> {
 
 fn default_road_base(url: &Option<String>) -> String {
     url.clone().unwrap_or_else(|| "http://127.0.0.1:8080".to_string())
+}
+
+#[derive(Debug, Error)]
+pub enum NoiseDriverError {
+    #[error("noise handshake error: {0}")]
+    Noise(#[from] NoiseError),
+    #[error("channel send failed: {0}")]
+    ChannelSend(String),
+    #[error("channel closed")]
+    ChannelClosed,
+    #[error("handshake timeout exceeded")]
+    Timeout,
+    #[error("handshake not complete")]
+    HandshakeIncomplete,
+    #[error("unexpected plaintext during handshake")]
+    UnexpectedPlaintext,
+    #[error("received non-media frame post-handshake")]
+    UnexpectedFrame,
+    #[error("noise worker join failed: {0}")]
+    Join(String),
+}
+
+pub trait CabanaChannel: Send {
+    fn send(&mut self, payload: &[u8]) -> Result<(), NoiseDriverError>;
+    fn recv(&mut self, timeout: Duration) -> Result<Vec<u8>, NoiseDriverError>;
+}
+
+pub struct NoiseDriver<C: CabanaChannel> {
+    controller: NoiseController,
+    channel: C,
+}
+
+impl<C: CabanaChannel> NoiseDriver<C> {
+    pub fn new(channel: C, config: HandshakeConfig) -> Result<Self, NoiseDriverError> {
+        let controller = NoiseController::new(config)?;
+        Ok(Self { controller, channel })
+    }
+
+    fn flush_outgoing(&mut self) -> Result<(), NoiseDriverError> {
+        while let Some(message) = self.controller.take_outgoing() {
+            self.channel.send(&message)?;
+        }
+        Ok(())
+    }
+
+    pub fn run_handshake(&mut self, timeout: Duration) -> Result<(), NoiseDriverError> {
+        let start = Instant::now();
+        self.flush_outgoing()?;
+        while !self.controller.handshake_complete() {
+            let elapsed = start.elapsed();
+            if elapsed >= timeout { return Err(NoiseDriverError::Timeout); }
+            let remaining = timeout.saturating_sub(elapsed);
+            let payload = self.channel.recv(remaining)?;
+            if self.controller.process_incoming(&payload)?.is_some() { return Err(NoiseDriverError::UnexpectedPlaintext); }
+            self.flush_outgoing()?;
+        }
+        Ok(())
+    }
+
+    pub fn verification_code(&self) -> Option<&str> { self.controller.verification_code() }
+
+    pub fn send_media(&mut self, plaintext: &[u8]) -> Result<(), NoiseDriverError> {
+        if !self.controller.handshake_complete() { return Err(NoiseDriverError::HandshakeIncomplete); }
+        let frame = self.controller.seal_media(plaintext)?;
+        self.channel.send(&frame)?;
+        Ok(())
+    }
+
+    pub fn recv_media(&mut self, timeout: Duration) -> Result<Vec<u8>, NoiseDriverError> {
+        if !self.controller.handshake_complete() { return Err(NoiseDriverError::HandshakeIncomplete); }
+        let payload = self.channel.recv(timeout)?;
+        match self.controller.process_incoming(&payload)? { Some(plaintext) => Ok(plaintext), None => Err(NoiseDriverError::UnexpectedFrame) }
+    }
 }
 
 use std::sync::{Arc, Mutex};
@@ -119,7 +195,6 @@ pub async fn run_local_webrtc_noise_demo(
     { let v_pc = viewer_pc.clone(); tokio::spawn(async move { while let Some(c) = h2v_rx.recv().await { let _ = v_pc.add_ice_candidate(c).await; } }); }
     { let h_pc = host_pc.clone(); tokio::spawn(async move { while let Some(c) = v2h_rx.recv().await { let _ = h_pc.add_ice_candidate(c).await; } }); }
     let dc = host_pc.create_data_channel("cabana", None).await.map_err(|e| NoiseDriverError::Noise(NoiseError::Handshake(e.to_string())))?;
-    let dc = Arc::new(dc);
     let offer = host_pc.create_offer(None).await.map_err(|e| NoiseDriverError::Noise(NoiseError::Handshake(e.to_string())))?;
     host_pc.set_local_description(offer).await.map_err(|e| NoiseDriverError::Noise(NoiseError::Handshake(e.to_string())))?;
     wait_ice_complete(&host_pc, Duration::from_secs(10)).await?;
@@ -141,7 +216,7 @@ pub async fn run_local_webrtc_noise_demo(
 async fn wait_ice_complete(pc: &webrtc::peer_connection::RTCPeerConnection, timeout: Duration) -> Result<(), NoiseDriverError> {
     let deadline = Instant::now() + timeout;
     loop {
-        let state = pc.ice_gathering_state().await;
+        let state = pc.ice_gathering_state();
         if state == RTCIceGatheringState::Complete { return Ok(()); }
         if Instant::now() >= deadline { return Err(NoiseDriverError::Timeout); }
         time::sleep(Duration::from_millis(100)).await;
@@ -198,7 +273,7 @@ pub async fn host_run(
     let answer_sdp = String::from_utf8_lossy(&answer_bytes).to_string();
     let desc = RTCSessionDescription::answer(answer_sdp).map_err(|e| NoiseDriverError::Noise(NoiseError::Handshake(e.to_string())))?;
     pc.set_remote_description(desc).await.map_err(|e| NoiseDriverError::Noise(NoiseError::Handshake(e.to_string())))?;
-    let transport = negotiate_data_channel(Arc::new(dc), HandshakeConfig { material: &material, handshake_id: &handshake, role: crate::noise::HandshakeRole::Initiator, local_id: "host", remote_id: "viewer", prologue_context: &prologue }, Duration::from_secs(10)).await?;
+    let transport = negotiate_data_channel(dc.clone(), HandshakeConfig { material: &material, handshake_id: &handshake, role: crate::noise::HandshakeRole::Initiator, local_id: "host", remote_id: "viewer", prologue_context: &prologue }, Duration::from_secs(10)).await?;
     #[cfg(target_os = "macos")]
     if let (Some(target), n) = (window_id, frames) { if n > 0 { let interval = Duration::from_millis(interval_ms); match codec { EncodeCodec::Gif => { stream_png_frames(&transport, &target, n, interval, max_width).await?; } EncodeCodec::H264 => { #[cfg(all(target_os = "macos", feature = "cabana_sck"))] { let fps = (1000u64 / interval_ms.max(1)) as u32; stream_h264_frames(&transport, &target, n, interval, max_width, fps).await?; } #[cfg(not(all(target_os = "macos", feature = "cabana_sck")))] { stream_png_frames(&transport, &target, n, interval, max_width).await?; } } } } }
     Ok(transport.verification_code().unwrap_or("unknown").to_string())

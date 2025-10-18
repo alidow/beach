@@ -1,4 +1,5 @@
 mod cli;
+mod tui_pick;
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
@@ -71,6 +72,16 @@ fn run(cli: cli::Cli) -> Result<()> {
                 }
                 Err(cabana::platform::WindowApiError::CaptureFailed(reason)) => {
                     println!("Failed to capture preview: {}", reason);
+                }
+            }
+        }
+        cli::Commands::Pick {} => {
+            match tui_pick::run_picker()? {
+                Some(id) => {
+                    println!("{}", id);
+                }
+                None => {
+                    eprintln!("Selection canceled");
                 }
             }
         }

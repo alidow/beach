@@ -266,6 +266,7 @@ fn state_error(id: Option<Value>, err: StateError) -> JsonRpcResponse {
     let (code, message) = match &err {
         StateError::SessionNotFound => (-32004, "session not found".into()),
         StateError::ControllerMismatch => (-32005, "controller mismatch".into()),
+        StateError::PrivateBeachNotFound => (-32006, "private beach not found".into()),
         StateError::InvalidIdentifier(reason) => (-32602, reason.clone()),
         StateError::Database(db_err) => {
             error!(error = %db_err, "database error while processing MCP request");

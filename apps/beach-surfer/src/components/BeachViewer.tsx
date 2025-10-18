@@ -116,11 +116,18 @@ export function BeachViewer(props: BeachViewerProps): JSX.Element {
           }
         };
 
-        const onOpen = () => {
+        const sendReady = () => {
           // Prompt terminal hosts to start streaming by sending the readiness sentinel.
           try {
             transport.sendText('__ready__');
           } catch {}
+        };
+        // If the channel is already open, send immediately to avoid race with late listener.
+        if (transport.isOpen()) {
+          sendReady();
+        }
+        const onOpen = () => {
+          sendReady();
         };
         const onClose = () => {
           notify('closed');

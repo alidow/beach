@@ -23,6 +23,8 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Pick a capture target (interactive TUI). Prints the selected identifier.
+    Pick {},
     #[cfg(feature = "webrtc")]
     /// Host flow: generate sealed SDP offer, optionally POST to a fixture URL, then
     /// poll a fixture directory for the viewer's sealed answer, finalize the session,
@@ -278,4 +280,3 @@ pub enum EncodeCodec {
     #[value(name = "h264")]
     H264,
 }
-

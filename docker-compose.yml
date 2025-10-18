@@ -36,7 +36,7 @@ services:
       DATABASE_URL: postgres://postgres:postgres@beach-postgres:5432/beach_manager
       REDIS_URL: redis://beach-redis:6379
       AUTH_BYPASS: "1"
-      BEACH_ROAD_URL: http://beach-road:4132
+      BEACH_ROAD_URL: https://api.beach.sh
       PUBLIC_MANAGER_URL: http://localhost:8080
       RUST_LOG: info
     volumes:
@@ -80,7 +80,7 @@ services:
     command: sh -c "npm ci || npm install; npm run dev -- -p 3001"
     environment:
       NEXT_PUBLIC_MANAGER_URL: http://localhost:8080
-      NEXT_PUBLIC_ROAD_URL: http://localhost:4132
+      NEXT_PUBLIC_ROAD_URL: https://api.beach.sh
       TAILWIND_MODE: watch
       CHOKIDAR_USEPOLLING: "true"
     volumes:

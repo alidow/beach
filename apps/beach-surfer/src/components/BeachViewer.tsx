@@ -94,7 +94,9 @@ export function BeachViewer(props: BeachViewerProps): JSX.Element {
             decodeHostFrameBinary(detail.payload.data);
             sniffedRef.current = true;
             setMode('terminal');
-            const tt = new DataChannelTerminalTransport(transport);
+            const tt = new DataChannelTerminalTransport(transport, {
+              replayBinaryFirst: detail.payload.data,
+            });
             terminalTransportRef.current = tt;
             notify('connected');
           } catch {

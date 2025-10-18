@@ -48,6 +48,17 @@
 - **Health:** Send `session.signal_health` heartbeat containing queue depth, CPU load, degraded flags; absence signals trigger manager intervention.
 - **Controller Updates:** React to lease change notifications; discard queued actions when controller token changes to maintain policy compliance.
 
+### Fast‑Path Channels (WebRTC)
+- When fast‑path is enabled, the harness opens the following RTCDataChannels with the manager:
+  - `mgr-actions` (ordered, reliable): manager → harness `ActionCommand` envelopes (JSON lines).
+  - `mgr-acks` (ordered, reliable): harness → manager `ActionAck` envelopes (JSON lines).
+  - `mgr-state` (unordered): harness → manager `StateDiff` envelopes (JSON lines).
+- The manager provides an answerer-only handshake API:
+  - `POST /fastpath/sessions/:session_id/webrtc/offer` (returns SDP answer)
+  - `POST /fastpath/sessions/:session_id/webrtc/ice` / `GET .../ice` for ICE exchange.
+- All Private Beach policy (controller lease gating, rate limits) still applies; frames missing a valid lease token are ignored.
+- Harness should continue to support Redis/HTTP fallback and mirror critical telemetry even when fast‑path is active.
+
 ## Implementation Outline
 - **Runtime:** `crates/beach-buggy` (Rust) for terminal harness + structured GUI adapters, with TypeScript/Node bridge in Cabana where needed; unified protocol module shared across clients.
 - **Configuration:** JSON manifest per private beach defining harness policies (state cadence, allowed transports, encryption keys).

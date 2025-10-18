@@ -116,6 +116,9 @@ pub async fn run(base_url: &str, args: SshArgs) -> Result<(), CliError> {
     );
     println!("  passcode  : {}", handshake.join_code);
     println!("  join url  : {}", join_url);
+    if let Some(role) = &handshake.webrtc_offer_role {
+        println!("  host webrtc role (advertised): {}", role);
+    }
 
     let join_args = JoinArgs {
         target: handshake.session_id.clone(),

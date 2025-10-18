@@ -1114,6 +1114,12 @@ pub(crate) fn spawn_update_forwarder(
                     if let Some(command) = maybe_forwarder {
                         match command {
                             ForwarderCommand::AddTransport { transport, supervisor } => {
+                                info!(
+                                    target = "sync::forwarder",
+                                    transport_id = transport.id().0,
+                                    transport = ?transport.kind(),
+                                    "forwarder received AddTransport"
+                                );
                                 let mut sink = Sink {
                                     synchronizer: ServerSynchronizer::new(
                                         terminal_sync.clone(),
@@ -1143,6 +1149,12 @@ pub(crate) fn spawn_update_forwarder(
                                         sink.synchronizer = sync;
                                         sink.last_seq = seq;
                                         sink.handshake_complete = true;
+                                        info!(
+                                            target = "sync::handshake",
+                                            transport_id = sink.transport.id().0,
+                                            transport = ?sink.transport.kind(),
+                                            "server hello sent and snapshot initialized"
+                                        );
                                     }
                                     Err(err) => {
                                         sink.handshake_complete = false;

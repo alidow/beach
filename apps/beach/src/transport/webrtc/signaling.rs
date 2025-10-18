@@ -196,6 +196,11 @@ impl SignalingClient {
         let (ws_stream, _) = connect_async(websocket_url.as_str())
             .await
             .map_err(|err| TransportError::Setup(format!("websocket connect failed: {err}")))?;
+        tracing::debug!(
+            target = "webrtc",
+            url = %websocket_url,
+            "signaling websocket connected"
+        );
         let (mut ws_write, mut ws_read) = ws_stream.split();
 
         let (send_tx, mut send_rx) = mpsc::unbounded_channel::<ClientMessage>();
@@ -241,6 +246,7 @@ impl SignalingClient {
             while let Some(msg) = ws_read.next().await {
                 match msg {
                     Ok(Message::Text(text)) => {
+                        tracing::trace!(target = "webrtc", event = "ws_in", kind = "text", len = text.len());
                         if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) {
                             handle_server_message(
                                 &reader_client,
@@ -252,6 +258,7 @@ impl SignalingClient {
                         }
                     }
                     Ok(Message::Binary(data)) => {
+                        tracing::trace!(target = "webrtc", event = "ws_in", kind = "binary", len = data.len());
                         if let Ok(text) = String::from_utf8(data) {
                             if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) {
                                 handle_server_message(
@@ -304,9 +311,13 @@ impl SignalingClient {
             .send_tx
             .send(join_message)
             .map_err(|_| TransportError::ChannelClosed)?;
+        tracing::debug!(target = "webrtc", "sent signaling join message");
 
         match join_rx.await {
-            Ok(()) => Ok(client),
+            Ok(()) => {
+                tracing::debug!(target = "webrtc", "received signaling join_success");
+                Ok(client)
+            },
             Err(_) => {
                 tracing::warn!(target = "webrtc", "signaling join channel dropped");
                 Err(TransportError::ChannelClosed)
@@ -532,14 +543,18 @@ impl SignalingClient {
     }
 
     async fn register_client_peer(&self, peer: PeerInfo) {
-        if self.is_self_peer(&peer.id).await {
-            return;
-        }
-
+        // For non-client expected roles (e.g., Answerer expecting Server),
+        // prioritize role matching before self-check. This avoids a race where
+        // an incorrect assigned_peer_id equal to the server's id causes us to
+        // treat the remote server as "self" and never set the remote peer.
         if self.expected_remote_role != PeerRole::Client {
             if peer.role == self.expected_remote_role {
                 self.set_remote_peer(peer.id).await;
             }
+            return;
+        }
+
+        if self.is_self_peer(&peer.id).await {
             return;
         }
 
@@ -715,8 +730,20 @@ async fn handle_server_message(
             peers,
             ..
         } => {
+            tracing::debug!(
+                target = "webrtc",
+                assigned_peer = %assigned_id,
+                peers = peers.len(),
+                "signaling join_success received"
+            );
             *client.assigned_peer_id.write().await = Some(assigned_id.clone());
             for peer in peers {
+                tracing::trace!(
+                    target = "webrtc",
+                    peer_id = %peer.id,
+                    role = ?peer.role,
+                    "signaling known peer"
+                );
                 if peer.role != client.expected_remote_role {
                     continue;
                 }

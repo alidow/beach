@@ -12,6 +12,11 @@ services:
       - postgres-data:/var/lib/postgresql/data
     networks:
       - beach-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
   redis:
     image: redis:7-alpine
     container_name: beach-redis
@@ -22,13 +27,84 @@ services:
       - redis-data:/data
     networks:
       - beach-network
+  beach-manager:
+    image: rustlang/rust:nightly
+    container_name: beach-manager
+    working_dir: /app
+    command: ["cargo", "run", "-p", "beach-manager"]
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@beach-postgres:5432/beach_manager
+      REDIS_URL: redis://beach-redis:6379
+      AUTH_BYPASS: "1"
+      RUST_LOG: info
+    volumes:
+      - .:/app
+      - cargo-manager-target:/app/target
+      - cargo-manager-registry:/usr/local/cargo/registry
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    networks:
+      - beach-network
+  private-beach:
+    image: node:20
+    container_name: private-beach
+    working_dir: /app/apps/private-beach
+    command: sh -c "npm ci || npm install; npm run dev -- -p 3001"
+    environment:
+      NEXT_PUBLIC_MANAGER_URL: http://localhost:8080
+      TAILWIND_MODE: watch
+      CHOKIDAR_USEPOLLING: "true"
+    volumes:
+      - .:/app
+    depends_on:
+      beach-manager:
+        condition: service_started
+      db-seed:
+        condition: service_completed_successfully
+    ports:
+      - "3001:3001"
+    networks:
+      - beach-network
+  db-migrate:
+    image: postgres:15-alpine
+    container_name: beach-db-migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: postgres
+    volumes:
+      - ./apps/beach-manager/migrations:/migrations:ro
+    entrypoint: ["sh", "-c", "set -e; until pg_isready -h beach-postgres -U postgres >/dev/null 2>&1; do echo 'waiting for postgres'; sleep 1; done; echo 'postgres is ready'; psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d beach_manager -c 'CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";'; psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d beach_manager -c 'CREATE EXTENSION IF NOT EXISTS citext;'; for f in /migrations/*.sql; do echo 'applying migration' $$f; psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d beach_manager -f $$f; done; echo 'migrations applied'"]
+    networks:
+      - beach-network
+  db-seed:
+    image: postgres:15-alpine
+    container_name: beach-db-seed
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+    environment:
+      PGPASSWORD: postgres
+    volumes:
+      - ./config/dev-seed.sql:/seed/dev-seed.sql:ro
+    entrypoint: ["sh", "-c", "set -e; psql -v ON_ERROR_STOP=1 -h beach-postgres -U postgres -d beach_manager -f /seed/dev-seed.sql && echo 'seeded'"]
+    networks:
+      - beach-network
   coturn:
     image: coturn/coturn:4.6-alpine
     container_name: beach-coturn
     command:
       - turnserver
-      - --config=/etc/coturn/turnserver.conf
-      - --log-file=stdout
+      - -c
+      - /etc/coturn/turnserver.conf
+      - --log-file
+      - stdout
     ports:
       - "3478:3478"
       - "3478:3478/udp"
@@ -39,8 +115,9 @@ services:
     networks:
       - beach-network
   beach-lifeguard:
-    image: rust:1.80
+    image: rustlang/rust:nightly
     container_name: beach-lifeguard
+    profiles: ["lifeguard"]
     working_dir: /app
     command: ["cargo", "run", "-p", "beach-lifeguard-server"]
     environment:
@@ -49,8 +126,8 @@ services:
       RUST_LOG: info
     volumes:
       - .:/app
-      - cargo-target:/app/target
-      - cargo-registry:/usr/local/cargo/registry
+      - cargo-lifeguard-target:/app/target
+      - cargo-lifeguard-registry:/usr/local/cargo/registry
     depends_on:
       - redis
     networks:
@@ -59,8 +136,10 @@ services:
 volumes:
   postgres-data:
   redis-data:
-  cargo-target:
-  cargo-registry:
+  cargo-manager-target:
+  cargo-manager-registry:
+  cargo-lifeguard-target:
+  cargo-lifeguard-registry:
 
 networks:
   beach-network:

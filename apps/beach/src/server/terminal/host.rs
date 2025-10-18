@@ -23,7 +23,7 @@ use crate::server::terminal::{
 };
 use crate::session::terminal::authorization::{JoinAuthorizationMetadata, JoinAuthorizer};
 use crate::session::terminal::tty::{HostInputGate, RawModeGuard};
-use crate::session::{HostSession, SessionConfig, SessionHandle, SessionManager};
+use crate::session::{HostSession, SessionConfig, SessionHandle, SessionManager, TransportOffer};
 use crate::sync::SyncConfig;
 use crate::sync::terminal::server_pipeline::{
     BackfillCommand, ForwardTransport, ForwarderCommand, MAX_BACKFILL_ROWS_PER_REQUEST,
@@ -112,6 +112,16 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let hosted = manager.host().await?;
     let session_id = hosted.session_id().to_string();
     info!(session_id = %session_id, "session registered");
+    // Surface the advertised WebRTC offer metadata to aid role/negotiation debugging.
+    for offer in hosted.offers() {
+        if let TransportOffer::WebRtc { offer } = offer {
+            info!(
+                session_id = %session_id,
+                offer = %offer.to_string(),
+                "advertised webrtc offer"
+            );
+        }
+    }
     // In bootstrap mode, respect the --wait flag to control whether we wait for peer
     // (this allows SSH bootstrap to output JSON immediately without waiting)
     let wait_for_peer = args.wait;
@@ -836,6 +846,13 @@ fn spawn_webrtc_acceptor(
                         join_code.clone(),
                     ));
                     let primary_transport: Arc<dyn Transport> = shared_transport.clone();
+
+                    info!(
+                        target = "sync::acceptor",
+                        session_id = %session_id,
+                        transport = ?primary_transport.kind(),
+                        "primary transport ready; enqueuing to forwarder"
+                    );
 
                     if let (Some(handle), Some(channels)) =
                         (mcp_handle.clone(), webrtc_channels.clone())

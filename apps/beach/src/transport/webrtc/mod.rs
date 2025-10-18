@@ -934,6 +934,13 @@ impl OffererInner {
         joined: RemotePeerJoined,
         request_mcp_channel: bool,
     ) {
+        tracing::info!(
+            target = "beach::transport::webrtc",
+            event = "peer_joined",
+            peer_id = %joined.peer.id,
+            role = ?joined.peer.role,
+            "offerer observed peer join"
+        );
         if joined.peer.role != PeerRole::Client {
             tracing::debug!(
 
@@ -1473,6 +1480,13 @@ async fn negotiate_offerer_peer(
         .local_description()
         .await
         .ok_or_else(|| TransportError::Setup("missing local description".into()))?;
+    tracing::info!(
+        target = "beach::transport::webrtc",
+        role = "offerer",
+        handshake_id = %handshake_id,
+        sdp_len = local_desc.sdp.len(),
+        "offer created"
+    );
     let offerer_peer_id = inner
         .signaling_client
         .assigned_peer_id()
@@ -1503,6 +1517,13 @@ async fn negotiate_offerer_peer(
     }
 
     post_sdp(&inner.client, &inner.signaling_base, "offer", &[], &payload).await?;
+    tracing::info!(
+        target = "beach::transport::webrtc",
+        role = "offerer",
+        handshake_id = %handshake_id,
+        remote_peer = %peer.id,
+        "offer posted to signaling"
+    );
 
     let answer = poll_answer_for_peer(
         &inner.client,
@@ -1935,6 +1956,12 @@ async fn connect_answerer(
         }
     }
     let client = Client::new();
+    tracing::debug!(
+        target = "beach::transport::webrtc",
+        role = "answerer",
+        url = %signaling_url,
+        "connecting signaling client"
+    );
     let signaling_client = SignalingClient::connect(
         signaling_url,
         WebRtcRole::Answerer,
@@ -1943,6 +1970,11 @@ async fn connect_answerer(
         false,
     )
     .await?;
+    tracing::debug!(
+        target = "beach::transport::webrtc",
+        role = "answerer",
+        "signaling client connected"
+    );
     let (expected_remote_peer, _) = signaling_client
         .wait_for_remote_peer_with_generation()
         .await?;
@@ -2709,6 +2741,12 @@ async fn connect_answerer(
     pc.set_remote_description(offer_desc)
         .await
         .map_err(to_setup_error)?;
+    tracing::info!(
+        target = "beach::transport::webrtc",
+        role = "answerer",
+        handshake_id = %handshake_id.as_str(),
+        "offer applied"
+    );
     tracing::debug!(
         target = "beach::transport::webrtc",
         role = "answerer",
@@ -3045,32 +3083,66 @@ async fn post_sdp(
     payload: &WebRtcSdpPayload,
 ) -> Result<(), TransportError> {
     let url = endpoint_with_params(base, suffix, params)?;
+    let url_string = url.as_str().to_string();
     tracing::debug!(
         target = "beach::transport::webrtc",
         phase = "post_sdp",
         suffix,
         await = "client.send",
-        state = "start"
+        state = "start",
+        url = %url_string
     );
-    let send_attempt = client.post(url).json(payload).send().await;
+    let send_attempt = client.post(url.clone()).json(payload).send().await;
     tracing::debug!(
         target = "beach::transport::webrtc",
         phase = "post_sdp",
         suffix,
         await = "client.send",
         state = "end",
-        result = ?send_attempt.as_ref().map(reqwest::Response::status)
+        result = ?send_attempt.as_ref().map(reqwest::Response::status),
+        url = %url_string
     );
     let response = send_attempt.map_err(http_error)?;
 
     if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(TransportError::Setup(format!(
-            "unexpected signaling status {}",
-            response.status()
-        )))
+        return Ok(());
     }
+    if response.status() == StatusCode::NOT_FOUND {
+        if let Some(alt_base) = rewrite_signaling_base(base) {
+            let alt_url = endpoint_with_params(&alt_base, suffix, params)?;
+            let alt_url_string = alt_url.as_str().to_string();
+            tracing::warn!(
+                target = "beach::transport::webrtc",
+                phase = "post_sdp",
+                suffix,
+                url = %url_string,
+                alt_url = %alt_url_string,
+                "post returned 404; retrying alternate signaling path"
+            );
+            let alt_attempt = client.post(alt_url.clone()).json(payload).send().await;
+            tracing::debug!(
+                target = "beach::transport::webrtc",
+                phase = "post_sdp",
+                suffix,
+                await = "client.send.alt",
+                state = "end",
+                result = ?alt_attempt.as_ref().map(reqwest::Response::status),
+                url = %alt_url_string
+            );
+            let alt_resp = alt_attempt.map_err(http_error)?;
+            if alt_resp.status().is_success() {
+                return Ok(());
+            }
+            return Err(TransportError::Setup(format!(
+                "unexpected signaling status {} (alt)",
+                alt_resp.status()
+            )));
+        }
+    }
+    Err(TransportError::Setup(format!(
+        "unexpected signaling status {}",
+        response.status()
+    )))
 }
 
 async fn poll_answer_for_peer(
@@ -3101,21 +3173,24 @@ async fn fetch_sdp(
     params: &[(&str, &str)],
 ) -> Result<Option<WebRtcSdpPayload>, TransportError> {
     let url = endpoint_with_params(base, suffix, params)?;
+    let url_string = url.as_str().to_string();
     tracing::debug!(
         target = "beach::transport::webrtc",
         phase = "fetch_sdp",
         suffix,
         await = "client.send",
-        state = "start"
+        state = "start",
+        url = %url_string
     );
-    let send_attempt = client.get(url).send().await;
+    let send_attempt = client.get(url.clone()).send().await;
     tracing::debug!(
         target = "beach::transport::webrtc",
         phase = "fetch_sdp",
         suffix,
         await = "client.send",
         state = "end",
-        result = ?send_attempt.as_ref().map(reqwest::Response::status)
+        result = ?send_attempt.as_ref().map(reqwest::Response::status),
+        url = %url_string
     );
     let response = send_attempt.map_err(http_error)?;
 
@@ -3140,7 +3215,47 @@ async fn fetch_sdp(
             let payload = payload_attempt.map_err(http_error)?;
             Ok(Some(payload))
         }
-        StatusCode::NOT_FOUND => Ok(None),
+        StatusCode::NOT_FOUND => {
+            if let Some(alt_base) = rewrite_signaling_base(base) {
+                let alt_url = endpoint_with_params(&alt_base, suffix, params)?;
+                let alt_url_string = alt_url.as_str().to_string();
+                tracing::warn!(
+                    target = "beach::transport::webrtc",
+                    phase = "fetch_sdp",
+                    suffix,
+                    url = %url_string,
+                    alt_url = %alt_url_string,
+                    "fetch returned 404; retrying alternate signaling path"
+                );
+                let alt_attempt = client.get(alt_url.clone()).send().await;
+                tracing::debug!(
+                    target = "beach::transport::webrtc",
+                    phase = "fetch_sdp",
+                    suffix,
+                    await = "client.send.alt",
+                    state = "end",
+                    result = ?alt_attempt.as_ref().map(reqwest::Response::status),
+                    url = %alt_url_string
+                );
+                let alt_response = alt_attempt.map_err(http_error)?;
+                return match alt_response.status() {
+                    StatusCode::OK => {
+                        let payload = alt_response.json::<WebRtcSdpPayload>().await.map_err(http_error)?;
+                        Ok(Some(payload))
+                    }
+                    StatusCode::NOT_FOUND => Ok(None),
+                    status if status.is_server_error() => Err(TransportError::Setup(format!(
+                        "signaling server returned {} (alt)",
+                        status
+                    ))),
+                    status => Err(TransportError::Setup(format!(
+                        "unexpected signaling status {} (alt)",
+                        status
+                    ))),
+                };
+            }
+            Ok(None)
+        }
         status if status.is_server_error() => Err(TransportError::Setup(format!(
             "signaling server returned {status}"
         ))),
@@ -3148,6 +3263,36 @@ async fn fetch_sdp(
             "unexpected signaling status {status}"
         ))),
     }
+}
+
+fn rewrite_signaling_base(base: &str) -> Option<String> {
+    // Toggle between legacy /sessions/:id/webrtc and /fastpath/sessions/:id/webrtc
+    let trimmed = base.trim_end_matches('/');
+    if let Some(rest) = trimmed.strip_prefix("https://") {
+        let mut parts = rest.splitn(2, '/');
+        let host = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("");
+        if let Some(p) = path.strip_prefix("sessions/") {
+            // legacy -> fastpath
+            return Some(format!("https://{}/fastpath/sessions/{}", host, p));
+        }
+        if let Some(p) = path.strip_prefix("fastpath/sessions/") {
+            // fastpath -> legacy
+            return Some(format!("https://{}/sessions/{}", host, p));
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("http://") {
+        let mut parts = rest.splitn(2, '/');
+        let host = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("");
+        if let Some(p) = path.strip_prefix("sessions/") {
+            return Some(format!("http://{}/fastpath/sessions/{}", host, p));
+        }
+        if let Some(p) = path.strip_prefix("fastpath/sessions/") {
+            return Some(format!("http://{}/sessions/{}", host, p));
+        }
+    }
+    None
 }
 
 fn extract_session_id(signaling_url: &str) -> Result<String, TransportError> {

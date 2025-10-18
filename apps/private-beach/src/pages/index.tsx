@@ -124,6 +124,9 @@ export default function Dashboard() {
 
   return (
     <div style={{ maxWidth: 1100, margin: '0 auto', padding: 24 }}>
+      <div style={{ marginBottom: 12, padding: 8, border: '1px solid #eee', borderRadius: 6, background: '#f8f8f8' }}>
+        <a href="/beaches" style={{ fontSize: 13, fontWeight: 600 }}>New UI available → Beaches</a>
+      </div>
       <h1 style={{ marginBottom: 12 }}>Private Beach Surfer</h1>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
         <label style={labelStyle}>

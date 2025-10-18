@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS controller_lease (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     session_id UUID NOT NULL REFERENCES session(id) ON DELETE CASCADE,
     controller_account_id UUID REFERENCES account(id),
     issued_by_account_id UUID REFERENCES account(id),

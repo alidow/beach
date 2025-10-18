@@ -36,7 +36,26 @@ Nice-to-haves (open):
 - Session search/filtering; richer health/queue indicators and layout grid.
 - Controller handoff UX, multi-beach switcher, share-link redemption UI.
 
-## Phase 4 – Orchestration Mechanics
+## Phase 4 – Private Beach Surfer UX (Dedicated)
+- Objectives: deliver a cohesive, production-quality UI/UX for Private Beach that is intuitive, responsive, accessible, and resilient.
+- Tracks:
+  - Information Architecture: navigation model (beach switcher, sessions, automations, settings), URL structure, deep links.
+  - Design System: tokenized color/typography/spacing, components (tiles, badges, toasts, dialogs), dark mode, density scale. Baseline stack: TailwindCSS + shadcn/ui.
+  - Session Surfaces: tile design, health/queue badges, lease countdown, activity glints, selection vs. focus, skeletons/empty/error states.
+  - Live Streams: streaming state rendering guidelines, sticky status area, reconnection UX, back-pressure indicators.
+  - Controller UX: acquire/release/takeover flows, role visibility, emergency stop affordances and confirmation patterns.
+  - Search & Filtering: quick search, filters (harness type, tags, location, status), saved views.
+  - Onboarding & Sharing: create beach wizard, invite/share-link flows, role education, success/empty mentorship.
+  - Accessibility: WCAG 2.1 AA targets, keyboard navigation, focus rings, reduced motion, ARIA landmarks.
+  - Performance: SSR+CSR balance, streaming hydration, code-splitting, per-view performance budgets.
+- Deliverables:
+  - UX spec with wireframes and component inventory (kept in docs/beach-web-plan.md).
+  - Implemented design system + core components in apps/private-beach (TailwindCSS + shadcn/ui configured).
+  - Polished Sessions Overview and Session Detail views with live status and controls.
+  - End-to-end tests for critical flows (acquire/release, stop, search/filter, share-link redemption).
+  - Telemetry hooks (UI timings, error rates) and UX health dashboards.
+
+## Phase 5 – Orchestration Mechanics
 - ✅ Controller lease countdown in Surfer; emergency stop endpoint (+ UI button) to clear actions and revoke leases.
 - ✅ Action queue visualization groundwork: depth and lag (`actions_queue_pending`) metrics added; UI to surface badges next.
 - ◻ Latency histograms from `ActionAck` and harness freshness badges in Surfer.
@@ -44,20 +63,20 @@ Nice-to-haves (open):
 - ◻ Expand audit/event views with principals in API responses (controller/issuer IDs) and add list filters/time windows in Surfer.
 - ◻ Onboarding UI: templates, capability review, scoped token issuance; expose prompt/idle configuration for controller harnesses.
 
-## Phase 5 – Shared State & Storage
+## Phase 6 – Shared State & Storage
 - Deliver minimal key-value API (last-write-wins, per-beach quotas) and file browser for object storage metadata.
 - Instrument harness access to shared state via MCP tools (read/write, list, watch).
 - Implement retention policies and quota enforcement alarms; expose usage metrics in manager UI.
 - Document developer ergonomics for agents leveraging shared state.
 
-## Phase 6 – Agent Workflows & Pong Showcase
+## Phase 7 – Agent Workflows & Pong Showcase
 - Build automation assignment flows linking agent accounts to sessions/private beaches.
 - Implement fast agent manager loop with harness streaming, action dispatch, and controller lease renewals.
 - Assemble Pong demo MVP: TUI paddle, Cabana GUI paddle, scoreboard, manager agent, spectator layout.
 - Deliver prompt packs + MCP bridge catalog for demo scenarios; allow users to inspect/override prompts.
 - Capture telemetry (latency histograms, diff throughput) and package demo runbook for sales/marketing.
 
-## Phase 7 – Operational Hardening & Monetization
+## Phase 8 – Operational Hardening & Monetization
 - Add billing integration (entitlement sync, usage tracking), plan enforcement, and licensing checks.
 - Roll out gated TURN fallback (`private-beach:turn` entitlements, Beach Gate issuance, coturn quotas) for paid tiers.
 - Harden deployment: HA Redis/Postgres, disaster recovery playbooks, security audits.

@@ -10,16 +10,58 @@
 - Zustand (or similar) for client state, React Query for API data.
 - WebRTC/WebSocket bridges to stream terminal & Cabana feeds rendered via custom components.
 
-## Initial Tasks
-1. Scaffold Next.js app with TypeScript, ESLint, Tailwind.
-2. Implement auth wrapper that consumes Beach Gate tokens & entitlements.
-3. Build placeholder dashboard shell (top nav, private beach selector, empty grid).
-4. Integrate mock data service for local development before wiring to live manager.
+## Current UI (Phase 4 UX)
+- Beaches: list, create, and manage beaches stored locally for quick switching.
+- Dashboard: live Sessions panel and a tile canvas with layout presets (Grid / 1+3 / Focus), per‑tile controls (Acquire/Release/Stop), and a detail drawer streaming SSE events/state.
+- Settings: per‑beach Manager URL and token configuration (local dev); values are saved to localStorage.
+
+## How to Run
+1) Start Manager (see docs/private-beach/STATUS.md for Postgres/Redis and `cargo run -p beach-manager`).
+2) `cd apps/private-beach && npm install && npm run dev -- -p 3001`
+3) Open `http://localhost:3001/beaches`.
+4) Click New Beach, fill Name, optionally generate ID, set Manager URL (e.g., `http://localhost:8080`) and a dev token (e.g., `test-token`).
+5) Open the beach. Use the left Sessions panel to add sessions to the canvas. Use the layout selector and tile controls. Open the right drawer to view live SSE events.
+
+Notes:
+- The tile surface currently shows a live placeholder; WebRTC/WS stream rendering hooks are stubbed for later fast‑path work.
+- Auth is dev‑friendly (token field); OIDC/Beach Gate login will replace this in a follow‑up.
 
 ## Dev Scripts
 - `npm run dev` – local dev server (Next.js).
 - `npm run lint` – lint sources.
 - `npm run build` / `npm run start` – production build & serve.
+
+## Styling Setup (Tailwind + shadcn/ui)
+
+1. Install TailwindCSS + PostCSS deps:
+```
+npm install -D tailwindcss postcss autoprefixer
+npx tailwindcss init -p
+```
+
+2. Configure `tailwind.config.js` content paths:
+```
+  content: [
+    "./src/pages/**/*.{js,ts,jsx,tsx}",
+    "./src/components/**/*.{js,ts,jsx,tsx}",
+    "./src/app/**/*.{js,ts,jsx,tsx}",
+  ],
+```
+
+3. Create `src/styles/globals.css` with Tailwind directives and import it in `src/pages/_app.tsx`:
+```
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+```
+
+4. shadcn/ui: we use lightweight Tailwind primitives under `src/components/ui`. If you prefer full shadcn scaffolding, run:
+```
+npx shadcn-ui@latest init
+npx shadcn-ui@latest add button input dialog sheet badge card
+```
+
+5. Theme and tokens: keep colors/spacing as CSS variables in `globals.css`; prefer unstyled shadcn primitives + Tailwind utilities for layout.
 
 ## Folder Topology (Draft)
 - `src/app` – Next.js routes/app shell.

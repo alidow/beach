@@ -64,6 +64,15 @@ Beach Manager is the zero-trust control plane that keeps Private Beach cohesive.
 - Metrics: command latency histograms, queue depth, harness heartbeat freshness, lease churn.
 - Structured logs with correlation IDs (private beach, session, controller token) for incident response.
 
+## Fast‑Path Transport Status
+- Manager exposes WebRTC answerer endpoints for fast‑path negotiation:
+  - `POST /fastpath/sessions/:session_id/webrtc/offer` → returns SDP answer
+  - `POST /fastpath/sessions/:session_id/webrtc/ice` → add remote ICE
+  - `GET /fastpath/sessions/:session_id/webrtc/ice` → list local ICE candidates
+- Data channel labels: `mgr-actions` (ordered, reliable), `mgr-acks` (ordered, reliable), `mgr-state` (unordered).
+- Routing: `queue_actions` prefers fast‑path; falls back to Redis if unavailable. Metrics/events are recorded identically.
+- Next steps: manager listeners for `mgr-acks` → `ack_actions`, and `mgr-state` → `record_state`; feature‑flag and add per‑lane counters.
+
 ## Fast-Path Transport (WebRTC Data Channel)
 - Goal: low-latency manager↔harness path for actions/state alongside Redis/HTTP.
 - Approach: reuse Beach’s existing WebRTC stack and signaling model instead of embedding a separate WebRTC engine into the manager.

@@ -49,6 +49,8 @@ pub struct BootstrapHandshake {
     pub transports: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub preferred_transport: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub webrtc_offer_role: Option<String>,
     pub host_binary: String,
     pub host_version: String,
     pub timestamp: u64,
@@ -78,6 +80,13 @@ impl BootstrapHandshake {
             .map(|offer| offer.label().to_string())
             .collect();
         let preferred_transport = offers.first().map(|offer| offer.label().to_string());
+        let webrtc_offer_role = offers.iter().find_map(|offer| match offer {
+            crate::session::TransportOffer::WebRtc { offer } => offer
+                .get("role")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            _ => None,
+        });
         let warning = if transports.is_empty() {
             Some("session server returned no transport offers".to_string())
         } else {
@@ -104,6 +113,7 @@ impl BootstrapHandshake {
             active_transport: transport_kind_label(selected).to_string(),
             transports,
             preferred_transport,
+            webrtc_offer_role,
             host_binary,
             host_version: format!("{}-{}", env!("CARGO_PKG_VERSION"), env!("BUILD_TIMESTAMP")),
             timestamp,
@@ -125,11 +135,22 @@ pub fn remote_bootstrap_args(args: &SshArgs, session_server: &str) -> Vec<String
         format!("./{}", args.remote_path)
     };
 
-    let mut command = vec![
-        executable_path,
-        "host".to_string(),
-        "--bootstrap-output=json".to_string(),
-    ];
+    let mut command = if args.keep_ssh {
+        vec![
+            "env".to_string(),
+            "RUST_LOG=trace".to_string(),
+            "BEACH_LOG_LEVEL=trace".to_string(),
+            executable_path,
+            "host".to_string(),
+            "--bootstrap-output=json".to_string(),
+        ]
+    } else {
+        vec![
+            executable_path,
+            "host".to_string(),
+            "--bootstrap-output=json".to_string(),
+        ]
+    };
     if args.ssh_keep_host_running {
         command.push("--bootstrap-survive-sighup".to_string());
     }

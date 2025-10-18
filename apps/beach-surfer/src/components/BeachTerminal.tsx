@@ -1079,6 +1079,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     lineHeight: `${lineHeight}px`,
     letterSpacing: '0.01em',
     fontVariantLigatures: 'none',
+    // Prevent Chrome scroll anchoring from fighting spacer adjustments during
+    // zoom/resize, which can cause off-screen rows to jump into view.
+    overflowAnchor: 'none',
     '--beach-terminal-line-height': `${lineHeight}px`,
   };
 

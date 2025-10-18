@@ -1,12 +1,11 @@
 import type { AppProps } from 'next/app';
-import { useEffect, useState } from 'react';
+import '../styles/globals.css';
 
 export default function App({ Component, pageProps }: AppProps) {
   // Simple CSS reset + light container
   return (
-    <div style={{ fontFamily: 'system-ui, sans-serif', color: '#111', background: '#fafafa', minHeight: '100vh' }}>
+    <div className="min-h-screen bg-[rgb(var(--bg))] text-[rgb(var(--fg))]">
       <Component {...pageProps} />
     </div>
   );
 }
-

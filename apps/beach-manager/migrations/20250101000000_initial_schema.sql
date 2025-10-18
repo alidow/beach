@@ -1,4 +1,5 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS citext;
 CREATE TYPE account_type AS ENUM ('human', 'agent', 'service');
 CREATE TYPE account_status AS ENUM ('active', 'disabled');
 CREATE TYPE membership_role AS ENUM ('owner', 'admin', 'contributor', 'viewer');
@@ -10,7 +11,7 @@ CREATE TYPE automation_role AS ENUM ('observer', 'controller', 'coordinator');
 CREATE TYPE controller_event_type AS ENUM ('registered', 'lease_acquired', 'lease_released', 'actions_queued', 'actions_acked', 'health_reported', 'state_updated');
 
 CREATE TABLE organization (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     name TEXT NOT NULL,
     slug CITEXT UNIQUE NOT NULL,
     billing_email CITEXT,
@@ -21,7 +22,7 @@ CREATE TABLE organization (
 );
 
 CREATE TABLE account (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     type account_type NOT NULL,
     status account_status NOT NULL DEFAULT 'active',
     beach_gate_subject TEXT UNIQUE NOT NULL,
@@ -35,7 +36,7 @@ CREATE TABLE account (
 );
 
 CREATE TABLE organization_membership (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     organization_id UUID NOT NULL REFERENCES organization(id) ON DELETE CASCADE,
     account_id UUID NOT NULL REFERENCES account(id) ON DELETE CASCADE,
     role organization_role NOT NULL,
@@ -46,7 +47,7 @@ CREATE TABLE organization_membership (
 );
 
 CREATE TABLE private_beach (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     organization_id UUID REFERENCES organization(id) ON DELETE CASCADE,
     owner_account_id UUID REFERENCES account(id),
     name TEXT NOT NULL,
@@ -61,7 +62,7 @@ CREATE TABLE private_beach (
 );
 
 CREATE TABLE private_beach_membership (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     private_beach_id UUID NOT NULL REFERENCES private_beach(id) ON DELETE CASCADE,
     account_id UUID NOT NULL REFERENCES account(id) ON DELETE CASCADE,
     role membership_role NOT NULL,
@@ -78,18 +79,21 @@ CREATE TABLE private_beach_membership (
 );
 
 CREATE TABLE beach_group (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     private_beach_id UUID NOT NULL REFERENCES private_beach(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     description TEXT,
     created_by_account_id UUID REFERENCES account(id),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (private_beach_id, lower(name))
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Enforce case-insensitive uniqueness for group name within a beach
+CREATE UNIQUE INDEX IF NOT EXISTS idx_beach_group_name_ci
+  ON beach_group (private_beach_id, lower(name));
+
 CREATE TABLE group_membership (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     beach_group_id UUID NOT NULL REFERENCES beach_group(id) ON DELETE CASCADE,
     account_id UUID NOT NULL REFERENCES account(id) ON DELETE CASCADE,
     role group_role NOT NULL,
@@ -98,7 +102,7 @@ CREATE TABLE group_membership (
 );
 
 CREATE TABLE share_link (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     private_beach_id UUID NOT NULL REFERENCES private_beach(id) ON DELETE CASCADE,
     created_by_account_id UUID REFERENCES account(id),
     label TEXT,
@@ -112,7 +116,7 @@ CREATE TABLE share_link (
 );
 
 CREATE TABLE session (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     private_beach_id UUID NOT NULL REFERENCES private_beach(id) ON DELETE CASCADE,
     origin_session_id UUID NOT NULL,
     harness_id UUID,
@@ -130,15 +134,18 @@ CREATE TABLE session (
 );
 
 CREATE TABLE session_tag (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     session_id UUID NOT NULL REFERENCES session(id) ON DELETE CASCADE,
     tag TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (session_id, lower(tag))
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Enforce case-insensitive uniqueness for tags per session
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_tag_ci
+  ON session_tag (session_id, lower(tag));
+
 CREATE TABLE automation_assignment (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     private_beach_id UUID NOT NULL REFERENCES private_beach(id) ON DELETE CASCADE,
     controller_account_id UUID NOT NULL REFERENCES account(id) ON DELETE CASCADE,
     role automation_role NOT NULL,
@@ -154,7 +161,7 @@ ON automation_assignment(controller_account_id, session_id)
 WHERE session_id IS NOT NULL;
 
 CREATE TABLE controller_event (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     session_id UUID NOT NULL REFERENCES session(id) ON DELETE CASCADE,
     event_type controller_event_type NOT NULL,
     controller_token UUID,
@@ -163,7 +170,7 @@ CREATE TABLE controller_event (
 );
 
 CREATE TABLE file_record (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v7(),
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     private_beach_id UUID NOT NULL REFERENCES private_beach(id) ON DELETE CASCADE,
     path TEXT NOT NULL,
     version INTEGER NOT NULL DEFAULT 1,

@@ -72,7 +72,7 @@ pub async fn negotiate_transport(
                 errors.push("webrtc offer missing signaling_url".to_string());
                 continue;
             };
-            let role = match offer.get("role").and_then(Value::as_str) {
+            let meta_role = match offer.get("role").and_then(Value::as_str) {
                 Some("offerer") => WebRtcRole::Offerer,
                 Some("answerer") | None => WebRtcRole::Answerer,
                 Some(other) => {
@@ -81,10 +81,28 @@ pub async fn negotiate_transport(
                 }
             };
 
+            // Force host to attempt Offerer first even if metadata says Answerer.
+            // This avoids deadlocks when both ends are incorrectly assigned Answerer.
+            let effective_role = if matches!(handle.role(), SessionRole::Host)
+                && matches!(preferred_role, WebRtcRole::Offerer)
+            {
+                if !matches!(meta_role, WebRtcRole::Offerer) {
+                    warn!(
+                        transport = "webrtc",
+                        signaling_url = %signaling_url,
+                        metadata_role = ?meta_role,
+                        "overriding metadata: host will act as offerer"
+                    );
+                }
+                WebRtcRole::Offerer
+            } else {
+                meta_role
+            };
+
             let role_matches = matches!(preferred_role, WebRtcRole::Offerer)
-                && matches!(role, WebRtcRole::Offerer)
+                && matches!(effective_role, WebRtcRole::Offerer)
                 || matches!(preferred_role, WebRtcRole::Answerer)
-                    && matches!(role, WebRtcRole::Answerer);
+                    && matches!(effective_role, WebRtcRole::Answerer);
             if !role_matches {
                 continue;
             }
@@ -93,8 +111,8 @@ pub async fn negotiate_transport(
                 .and_then(Value::as_u64)
                 .unwrap_or(250);
 
-            debug!(transport = "webrtc", signaling_url = %signaling_url, ?role, "attempting webrtc transport");
-            match role {
+            debug!(transport = "webrtc", signaling_url = %signaling_url, role = ?effective_role, "attempting webrtc transport");
+            match effective_role {
                 WebRtcRole::Offerer => match OffererSupervisor::connect(
                     signaling_url,
                     Duration::from_millis(poll_ms),
@@ -124,7 +142,7 @@ pub async fn negotiate_transport(
                         warn!(
                             transport = "webrtc",
                             signaling_url = %signaling_url,
-                            ?role,
+                            role = ?effective_role,
                             error = %err,
                             "webrtc negotiation failed"
                         );
@@ -133,7 +151,7 @@ pub async fn negotiate_transport(
                 },
                 WebRtcRole::Answerer => match transport_mod::webrtc::connect_via_signaling(
                     signaling_url,
-                    role,
+                    effective_role,
                     Duration::from_millis(poll_ms),
                     passphrase,
                     client_label,
@@ -145,7 +163,7 @@ pub async fn negotiate_transport(
                         info!(
                             transport = "webrtc",
                             signaling_url = %signaling_url,
-                            ?role,
+                            role = ?effective_role,
                             "transport established"
                         );
                         return Ok(NegotiatedTransport::Single(NegotiatedSingle {
@@ -157,7 +175,7 @@ pub async fn negotiate_transport(
                         warn!(
                             transport = "webrtc",
                             signaling_url = %signaling_url,
-                            ?role,
+                            role = ?effective_role,
                             error = %err,
                             "webrtc negotiation failed"
                         );

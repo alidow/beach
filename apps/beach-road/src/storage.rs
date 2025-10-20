@@ -101,17 +101,17 @@ impl Storage {
                 .await?;
             cursor = next_cursor;
             if !keys.is_empty() {
-                let values: Vec<Option<String>> = redis::cmd("MGET")
-                    .arg(keys)
-                    .query_async(&mut conn)
-                    .await?;
+                let values: Vec<Option<String>> =
+                    redis::cmd("MGET").arg(keys).query_async(&mut conn).await?;
                 for v in values.into_iter().flatten() {
                     if let Ok(s) = serde_json::from_str::<SessionInfo>(&v) {
                         results.push(s);
                     }
                 }
             }
-            if cursor == 0 { break; }
+            if cursor == 0 {
+                break;
+            }
         }
         Ok(results)
     }

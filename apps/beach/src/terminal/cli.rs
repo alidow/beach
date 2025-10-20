@@ -320,6 +320,21 @@ pub struct JoinArgs {
         help = "Inject artificial latency (ms) to server responses for testing"
     )]
     pub inject_latency: Option<u64>,
+
+    #[arg(
+        long = "headless",
+        action = clap::ArgAction::SetTrue,
+        help = "Run without the interactive TUI and exit after the initial snapshot is received"
+    )]
+    pub headless: bool,
+
+    #[arg(
+        long = "headless-timeout",
+        value_name = "SECONDS",
+        default_value_t = 30u64,
+        help = "Maximum time to wait for headless mode to receive the initial snapshot"
+    )]
+    pub headless_timeout: u64,
 }
 
 #[derive(Args, Debug)]
@@ -393,6 +408,21 @@ pub struct SshArgs {
         help = "Tail remote output over SSH until transport connects (SSH closes automatically after connect)"
     )]
     pub keep_ssh: bool,
+
+    #[arg(
+        long = "headless",
+        action = clap::ArgAction::SetTrue,
+        help = "Run a headless validation client instead of attaching the interactive TUI"
+    )]
+    pub headless: bool,
+
+    #[arg(
+        long = "headless-timeout",
+        value_name = "SECONDS",
+        default_value_t = 30u64,
+        help = "Maximum time to wait for the headless validator to load the remote snapshot"
+    )]
+    pub headless_timeout: u64,
 
     #[arg(
         long = "request-tty",

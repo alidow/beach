@@ -80,7 +80,12 @@ async fn postgres_sqlx_e2e() {
         expires_at: None,
     };
     state
-        .queue_actions(&session_id, &lease.controller_token, vec![cmd.clone()], None)
+        .queue_actions(
+            &session_id,
+            &lease.controller_token,
+            vec![cmd.clone()],
+            None,
+        )
         .await
         .expect("queue actions");
     let polled = state.poll_actions(&session_id).await.expect("poll");
@@ -124,9 +129,6 @@ async fn postgres_sqlx_e2e() {
         .expect("record state");
 
     // Events should be present
-    let events = state
-        .controller_events(&session_id)
-        .await
-        .expect("events");
+    let events = state.controller_events(&session_id).await.expect("events");
     assert!(!events.is_empty());
 }

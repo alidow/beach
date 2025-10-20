@@ -152,12 +152,12 @@ pub enum Commands {
     /// Open a local preview for the given window identifier.
     Preview {
         #[arg(long = "window-id")]
-        window_id: String,
+        window_id: Option<String>,
     },
     /// Capture multiple frames for the given window/display and store them in a directory.
     Stream {
         #[arg(long = "window-id")]
-        window_id: String,
+        window_id: Option<String>,
         /// Number of frames to capture.
         #[arg(long, default_value_t = 30)]
         frames: u32,
@@ -171,7 +171,7 @@ pub enum Commands {
     /// Capture and encode a short session to an artifact.
     Encode {
         #[arg(long = "window-id")]
-        window_id: String,
+        window_id: Option<String>,
         /// Duration in seconds to capture.
         #[arg(long, default_value_t = 5)]
         duration_secs: u32,

@@ -16,6 +16,7 @@ Scope (MVP to unblock testing)
   - Fetch beaches and layout from Manager
   - “Create beach” calls Manager; server generates beach id
   - Continue to use live Beach Road (`https://api.beach.sh`) for attach-by-code
+  - Establish Drizzle ORM with a Postgres connection in `apps/private-beach` for any Surfer-specific persistence (e.g., saved tile layouts) that is not yet modeled by the Manager API.
 
 Out of scope (later follow-ups)
 - Full membership management UI (invite/roles)
@@ -120,4 +121,3 @@ Timeline (aggressive)
 Open questions
 - Layout scope: per beach (global) vs per account? MVP: per beach; later: per account override.
 - Slug management: allow rename with uniqueness? Enforce lowercased unique slug per org later.
-

@@ -7,10 +7,14 @@ use crate::session::{JoinedSession, SessionConfig, SessionManager, TransportOffe
 use crate::terminal::cli::JoinArgs;
 use crate::terminal::error::CliError;
 use crate::transport::TransportKind;
+use crate::transport::ssh::validate::{
+    HeadlessOptions, log_report as log_headless_report, run_headless_validation,
+};
 use crate::transport::terminal::negotiation::{
     NegotiatedSingle, NegotiatedTransport, negotiate_transport,
 };
 use std::io::{self, IsTerminal, Write};
+use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 use url::Url;
@@ -31,6 +35,8 @@ pub async fn run_with_notify(
         label,
         mcp,
         inject_latency,
+        headless,
+        headless_timeout,
     } = args;
 
     let (session_id, inferred_base) = interpret_session_target(&target)?;
@@ -46,6 +52,40 @@ pub async fn run_with_notify(
     let joined = manager
         .join(&session_id, trimmed_pass.as_str(), label.as_deref(), mcp)
         .await?;
+    let banner_kind = joined
+        .offers()
+        .iter()
+        .find_map(|offer| match offer {
+            TransportOffer::WebRtc { .. } => Some(TransportKind::WebRtc),
+            TransportOffer::WebSocket { .. } => Some(TransportKind::WebSocket),
+            TransportOffer::WebSocketFallback { .. } => Some(TransportKind::WebSocket),
+            TransportOffer::Ipc => Some(TransportKind::Ipc),
+        })
+        .unwrap_or(TransportKind::WebRtc);
+
+    info!(session_id = %joined.session_id(), transport = ?banner_kind, "joined session");
+    print_join_banner(&joined, banner_kind, headless);
+
+    if headless {
+        if let Some(tx) = connected_notify {
+            let _ = tx.send(());
+        }
+        let timeout_secs = headless_timeout.max(1);
+        println!(
+            "⚙️  Running headless client validation (timeout {}s)...",
+            timeout_secs
+        );
+        let options = HeadlessOptions {
+            timeout: Duration::from_secs(timeout_secs),
+            require_snapshot: true,
+        };
+        let report =
+            run_headless_validation(&base, &session_id, trimmed_pass.as_str(), options).await?;
+        log_headless_report(&report);
+        println!("✅ Session snapshot received ({report})");
+        return Ok(());
+    }
+
     let negotiated = negotiate_transport(
         joined.handle(),
         Some(trimmed_pass.as_str()),
@@ -65,12 +105,13 @@ pub async fn run_with_notify(
         }
     };
     let selected_kind = transport.kind();
-    info!(session_id = %joined.session_id(), transport = ?selected_kind, "joined session");
-    print_join_banner(&joined, selected_kind);
+    info!(session_id = %joined.session_id(), transport = ?selected_kind, "transport established");
 
     if let Some(tx) = connected_notify {
         let _ = tx.send(());
     }
+
+    let client_transport = transport.clone();
 
     if mcp {
         if let Some(channels) = webrtc_channels.clone() {
@@ -122,7 +163,6 @@ pub async fn run_with_notify(
         }
     }
 
-    let client_transport = transport.clone();
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     let session_id_for_debug = session_id.clone();
 
@@ -138,7 +178,12 @@ pub async fn run_with_notify(
             start_diagnostic_listener(session_id_for_debug.clone(), request_tx, response_rx);
 
         let predictive_env = std::env::var("BEACH_PREDICTIVE")
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1"|"true"|"yes"|"on"))
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
             .unwrap_or(true);
         let mut client = TerminalClient::new(client_transport)
             .with_predictive_input(interactive && predictive_env)
@@ -253,7 +298,7 @@ fn prompt_passcode() -> Result<String, CliError> {
     }
 }
 
-fn print_join_banner(session: &JoinedSession, selected: TransportKind) {
+fn print_join_banner(session: &JoinedSession, selected: TransportKind, headless: bool) {
     let handle = session.handle();
     println!("\n🌊 Joined session {}!", handle.session_id);
     println!(
@@ -264,7 +309,9 @@ fn print_join_banner(session: &JoinedSession, selected: TransportKind) {
         println!("  preferred transport : {}", offer_label(offer));
     }
     println!("  active transport     : {}", kind_label(selected));
-    println!("\nListening for session events...\n");
+    if !headless {
+        println!("\nListening for session events...\n");
+    }
 }
 
 pub(crate) fn summarize_offers(offers: &[TransportOffer]) -> String {

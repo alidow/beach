@@ -16,8 +16,9 @@ use copypasta::{ClipboardContext, ClipboardProvider};
 use crossterm::{
     cursor::{MoveTo, Show},
     event::{
-        self, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
     terminal::{
@@ -2950,7 +2951,10 @@ impl TerminalClient {
             .any(|binding| binding.matches(key))
         {
             triggered = true;
-        } else if self.scroll_double_esc_enabled && key.code == KeyCode::Esc && key.modifiers.is_empty() {
+        } else if self.scroll_double_esc_enabled
+            && key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+        {
             let now = Instant::now();
             if let Some(last) = self.last_plain_esc {
                 if now.saturating_duration_since(last) <= SCROLL_TOGGLE_DOUBLE_ESC {
@@ -4080,10 +4084,11 @@ impl TerminalClient {
                             }
                             self.renderer.add_prediction(row, col, seq, ' ');
                             push_position(row, col, ' ');
-                        } else if self.drop_predictions_matching(
-                            PredictionDropReason::CursorAdvance,
-                            |pos| pos.row == row && pos.col == col,
-                        ) {
+                        } else if self
+                            .drop_predictions_matching(PredictionDropReason::CursorAdvance, |pos| {
+                                pos.row == row && pos.col == col
+                            })
+                        {
                             self.update_prediction_overlay();
                         }
                         cursor_changed = true;
@@ -4655,10 +4660,10 @@ impl TerminalClient {
             return;
         }
 
-        let trimmed_pending = self.drop_predictions_matching(
-            PredictionDropReason::RendererTrim,
-            |pos| pos.row == row && pos.col >= col,
-        );
+        let trimmed_pending = self
+            .drop_predictions_matching(PredictionDropReason::RendererTrim, |pos| {
+                pos.row == row && pos.col >= col
+            });
         if !trimmed_pending {
             return;
         }
@@ -4922,8 +4927,13 @@ impl TerminalClient {
         disable_raw_mode()
             .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
         let mut stdout = io::stdout();
-        execute!(stdout, DisableMouseCapture, DisableBracketedPaste, LeaveAlternateScreen)
-            .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
+        execute!(
+            stdout,
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        )
+        .map_err(|err| ClientError::Transport(TransportError::Setup(err.to_string())))?;
         self.mouse_capture_enabled = false;
         Ok(())
     }
@@ -5666,12 +5676,12 @@ mod tests {
         assert!(client.pending_predictions.contains_key(&1));
 
         let ack_grace = client.prediction_ack_grace();
-    let adjust = ack_grace.saturating_sub(Duration::from_millis(10));
-    if let Some(prediction) = client.pending_predictions.get_mut(&1) {
-        let now = Instant::now();
-        let adjusted = now.checked_sub(adjust).unwrap_or(now);
-        prediction.acked_at = Some(adjusted);
-    }
+        let adjust = ack_grace.saturating_sub(Duration::from_millis(10));
+        if let Some(prediction) = client.pending_predictions.get_mut(&1) {
+            let now = Instant::now();
+            let adjusted = now.checked_sub(adjust).unwrap_or(now);
+            prediction.acked_at = Some(adjusted);
+        }
 
         client.update_prediction_overlay();
         assert!(

@@ -323,10 +323,19 @@ pub async fn attach_by_code(
 ) -> ApiResult<AttachByCodeResponse> {
     ensure_scope(&token, "pb:sessions.write")?;
     let session = state
-        .attach_by_code(&private_beach_id, &body.session_id, &body.code, token.account_uuid())
+        .attach_by_code(
+            &private_beach_id,
+            &body.session_id,
+            &body.code,
+            token.account_uuid(),
+        )
         .await
         .map_err(map_state_err)?;
-    Ok(Json(AttachByCodeResponse { ok: true, attach_method: "code", session }))
+    Ok(Json(AttachByCodeResponse {
+        ok: true,
+        attach_method: "code",
+        session,
+    }))
 }
 
 pub async fn attach_owned(
@@ -340,10 +349,17 @@ pub async fn attach_owned(
         return Err(ApiError::BadRequest("origin_session_ids required".into()));
     }
     let (attached, duplicates) = state
-        .attach_owned(&private_beach_id, body.origin_session_ids.clone(), token.account_uuid())
+        .attach_owned(
+            &private_beach_id,
+            body.origin_session_ids.clone(),
+            token.account_uuid(),
+        )
         .await
         .map_err(map_state_err)?;
-    Ok(Json(AttachOwnedResponse { attached, duplicates }))
+    Ok(Json(AttachOwnedResponse {
+        attached,
+        duplicates,
+    }))
 }
 
 pub async fn mint_harness_bridge_token(
@@ -354,10 +370,18 @@ pub async fn mint_harness_bridge_token(
 ) -> ApiResult<HarnessBridgeTokenResponse> {
     ensure_scope(&token, "pb:sessions.write")?;
     let (token_str, expires_at_ms, audience) = state
-        .mint_bridge_token(&private_beach_id, &body.origin_session_id, token.account_uuid())
+        .mint_bridge_token(
+            &private_beach_id,
+            &body.origin_session_id,
+            token.account_uuid(),
+        )
         .await
         .map_err(map_state_err)?;
-    Ok(Json(HarnessBridgeTokenResponse { token: token_str, expires_at_ms, audience }))
+    Ok(Json(HarnessBridgeTokenResponse {
+        token: token_str,
+        expires_at_ms,
+        audience,
+    }))
 }
 
 fn map_state_err(err: StateError) -> ApiError {

@@ -14,7 +14,10 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, Notify, RwLock, mpsc};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Error as WsError, Message, error::ProtocolError},
+};
 use url::Url;
 use uuid::Uuid;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
@@ -246,7 +249,12 @@ impl SignalingClient {
             while let Some(msg) = ws_read.next().await {
                 match msg {
                     Ok(Message::Text(text)) => {
-                        tracing::trace!(target = "webrtc", event = "ws_in", kind = "text", len = text.len());
+                        tracing::trace!(
+                            target = "webrtc",
+                            event = "ws_in",
+                            kind = "text",
+                            len = text.len()
+                        );
                         if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) {
                             handle_server_message(
                                 &reader_client,
@@ -258,7 +266,12 @@ impl SignalingClient {
                         }
                     }
                     Ok(Message::Binary(data)) => {
-                        tracing::trace!(target = "webrtc", event = "ws_in", kind = "binary", len = data.len());
+                        tracing::trace!(
+                            target = "webrtc",
+                            event = "ws_in",
+                            kind = "binary",
+                            len = data.len()
+                        );
                         if let Ok(text) = String::from_utf8(data) {
                             if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) {
                                 handle_server_message(
@@ -274,7 +287,22 @@ impl SignalingClient {
                     Ok(Message::Close(_)) => break,
                     Ok(_) => {}
                     Err(err) => {
-                        tracing::warn!(target = "webrtc", "signaling websocket error: {err}");
+                        match &err {
+                            WsError::ConnectionClosed
+                            | WsError::AlreadyClosed
+                            | WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => {
+                                tracing::debug!(
+                                    target = "webrtc",
+                                    "signaling websocket closed: {err}"
+                                );
+                            }
+                            _ => {
+                                tracing::warn!(
+                                    target = "webrtc",
+                                    "signaling websocket error: {err}"
+                                );
+                            }
+                        }
                         break;
                     }
                 }
@@ -317,7 +345,7 @@ impl SignalingClient {
             Ok(()) => {
                 tracing::debug!(target = "webrtc", "received signaling join_success");
                 Ok(client)
-            },
+            }
             Err(_) => {
                 tracing::warn!(target = "webrtc", "signaling join channel dropped");
                 Err(TransportError::ChannelClosed)

@@ -19,10 +19,10 @@ export default function SessionDrawer({ open, onOpenChange, session, managerUrl,
     evRef.current?.close();
     stRef.current?.close();
     setEvents([]);
-    if (!open || !session) return;
-    const ev = new EventSource(eventsSseUrl(session.session_id, managerUrl, token || undefined));
+    if (!open || !session || !token) return;
+    const ev = new EventSource(eventsSseUrl(session.session_id, managerUrl, token));
     ev.addEventListener('controller_event', (msg: MessageEvent) => setEvents((p) => [msg.data, ...p].slice(0, 200)));
-    const st = new EventSource(stateSseUrl(session.session_id, managerUrl, token || undefined));
+    const st = new EventSource(stateSseUrl(session.session_id, managerUrl, token));
     st.addEventListener('state', (msg: MessageEvent) => setEvents((p) => [msg.data, ...p].slice(0, 200)));
     evRef.current = ev;
     stRef.current = st;
@@ -40,7 +40,9 @@ export default function SessionDrawer({ open, onOpenChange, session, managerUrl,
           {session && <div className="font-mono text-xs text-neutral-600">{session.session_id}</div>}
         </div>
         <div className="min-h-0 flex-1 overflow-auto p-3">
-          {events.length === 0 ? (
+          {!token ? (
+            <div className="text-sm text-neutral-600">Add a manager token in Settings to stream controller and state events.</div>
+          ) : events.length === 0 ? (
             <div className="text-sm text-neutral-600">No events yet…</div>
           ) : (
             <div className="space-y-1">
@@ -54,4 +56,3 @@ export default function SessionDrawer({ open, onOpenChange, session, managerUrl,
     </Sheet>
   );
 }
-

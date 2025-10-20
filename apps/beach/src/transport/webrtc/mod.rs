@@ -207,7 +207,22 @@ impl EncryptionManager {
     }
 
     fn is_enabled(&self) -> bool {
-        self.enabled.load(Ordering::SeqCst)
+        if self.enabled.load(Ordering::SeqCst) {
+            true
+        } else {
+            let guard = self.state.lock().unwrap();
+            guard.is_some()
+        }
+    }
+
+    fn counters(&self) -> Option<(u64, u64)> {
+        let guard = self.state.lock().unwrap();
+        guard.as_ref().map(|state| {
+            (
+                state.send_counter.load(Ordering::SeqCst),
+                state.recv_counter.load(Ordering::SeqCst),
+            )
+        })
     }
 
     fn enable(&self, keys: &HandshakeResult) -> Result<(), TransportError> {
@@ -255,6 +270,14 @@ impl EncryptionManager {
         frame.push(TRANSPORT_ENCRYPTION_VERSION);
         frame.extend_from_slice(&counter.to_be_bytes());
         frame.extend_from_slice(&ciphertext);
+        tracing::trace!(
+            target = "beach::transport::webrtc::crypto",
+            direction = "send",
+            counter,
+            plaintext_len = plaintext.len(),
+            frame_len = frame.len(),
+            "encrypted payload"
+        );
         Ok(frame)
     }
 
@@ -279,6 +302,14 @@ impl EncryptionManager {
         let counter = u64::from_be_bytes(counter_bytes);
         let expected = state.recv_counter.load(Ordering::SeqCst);
         if counter != expected {
+            tracing::warn!(
+                target = "beach::transport::webrtc::crypto",
+                direction = "recv",
+                expected_counter = expected,
+                received_counter = counter,
+                frame_len = frame.len(),
+                "secure transport counter mismatch"
+            );
             return Err(TransportError::Setup(
                 "secure transport counter mismatch".into(),
             ));
@@ -298,6 +329,14 @@ impl EncryptionManager {
                 TransportError::Setup(format!("secure transport decrypt failed: {err}"))
             })?;
         state.recv_counter.fetch_add(1, Ordering::SeqCst);
+        tracing::trace!(
+            target = "beach::transport::webrtc::crypto",
+            direction = "recv",
+            counter,
+            ciphertext_len = frame.len().saturating_sub(9),
+            plaintext_len = plaintext.len(),
+            "decrypted payload"
+        );
         Ok(plaintext)
     }
 }
@@ -477,10 +516,27 @@ impl WebRtcTransport {
                         );
                     }
                 } else {
+                    if tracing::enabled!(tracing::Level::TRACE) {
+                        let (send_counter, recv_counter) = encryption.counters().unwrap_or((0, 0));
+                        let preview_len = payload.len().min(32);
+                        let preview = hex::encode(&payload[..preview_len]);
+                        tracing::trace!(
+                            target = "beach::transport::webrtc::crypto",
+                            transport_id = ?log_id,
+                            encryption_enabled = encryption.is_enabled(),
+                            send_counter,
+                            recv_counter,
+                            frame_len = payload.len(),
+                            payload_preview = %preview,
+                            payload_preview_len = preview_len,
+                            "inbound frame failed decode"
+                        );
+                    }
                     tracing::warn!(
 
                         transport_id = ?log_id,
                         frame_len = payload.len(),
+                        encryption_enabled = encryption.is_enabled(),
                         "failed to decode message"
                     );
                 }
@@ -3295,7 +3351,10 @@ async fn fetch_sdp(
                 let alt_response = alt_attempt.map_err(http_error)?;
                 return match alt_response.status() {
                     StatusCode::OK => {
-                        let payload = alt_response.json::<WebRtcSdpPayload>().await.map_err(http_error)?;
+                        let payload = alt_response
+                            .json::<WebRtcSdpPayload>()
+                            .await
+                            .map_err(http_error)?;
                         Ok(Some(payload))
                     }
                     StatusCode::NOT_FOUND => Ok(None),
@@ -4323,5 +4382,27 @@ mod tests {
         let client_msg = client.recv(timeout).expect("client recv");
         assert_eq!(client_msg.sequence, seq_server);
         assert_eq!(client_msg.payload.as_text(), Some("hello from server"));
+    }
+
+    #[test]
+    fn encryption_manager_reports_enabled_when_state_installed() {
+        let manager = EncryptionManager::new();
+        let mut send_key = [0u8; 32];
+        let mut recv_key = [0u8; 32];
+        send_key[0] = 1;
+        recv_key[0] = 2;
+        let result = HandshakeResult {
+            send_key,
+            recv_key,
+            verification_code: "123456".to_string(),
+        };
+
+        manager.enable(&result).expect("enable encryption");
+        manager.enabled.store(false, Ordering::SeqCst);
+
+        assert!(
+            manager.is_enabled(),
+            "encryption manager should report enabled once cipher state is installed"
+        );
     }
 }

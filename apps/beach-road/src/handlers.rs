@@ -722,10 +722,15 @@ pub async fn get_session_status(
 
 // New: verify a short code for a session
 #[derive(Deserialize)]
-pub struct VerifyCodeRequest { pub code: String }
+pub struct VerifyCodeRequest {
+    pub code: String,
+}
 
 #[derive(Serialize)]
-pub struct VerifyCodeResponse { pub verified: bool, pub owner_account_id: Option<String> }
+pub struct VerifyCodeResponse {
+    pub verified: bool,
+    pub owner_account_id: Option<String>,
+}
 
 pub async fn verify_code(
     State(storage): State<SharedStorage>,
@@ -735,10 +740,17 @@ pub async fn verify_code(
     let storage = (*storage).clone();
     match storage.get_session(&session_id).await {
         Ok(Some(session)) => {
-            let ok = verify_passphrase(&body.code, &session.passphrase_hash) || body.code == session.join_code;
-            Ok(Json(VerifyCodeResponse { verified: ok, owner_account_id: session.owner_account_id.clone() }))
+            let ok = verify_passphrase(&body.code, &session.passphrase_hash)
+                || body.code == session.join_code;
+            Ok(Json(VerifyCodeResponse {
+                verified: ok,
+                owner_account_id: session.owner_account_id.clone(),
+            }))
         }
-        Ok(None) => Ok(Json(VerifyCodeResponse { verified: false, owner_account_id: None })),
+        Ok(None) => Ok(Json(VerifyCodeResponse {
+            verified: false,
+            owner_account_id: None,
+        })),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -783,10 +795,15 @@ pub async fn list_my_sessions(
 
 // New: accept a manager join hint (no-op for now)
 #[derive(Deserialize)]
-pub struct JoinManagerRequest { pub manager_url: String, pub bridge_token: String }
+pub struct JoinManagerRequest {
+    pub manager_url: String,
+    pub bridge_token: String,
+}
 
 #[derive(Serialize)]
-pub struct JoinManagerResponse { pub ok: bool }
+pub struct JoinManagerResponse {
+    pub ok: bool,
+}
 
 pub async fn join_manager(
     Path(_session_id): Path<String>,

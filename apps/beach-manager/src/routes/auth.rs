@@ -25,10 +25,9 @@ impl FromRequestParts<AppState> for AuthToken {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let token =
-            extract_token(&parts.headers).or_else(|| extract_token_from_query(parts)).ok_or(
-                ApiError::Unauthorized,
-            )?;
+        let token = extract_token(&parts.headers)
+            .or_else(|| extract_token_from_query(parts))
+            .ok_or(ApiError::Unauthorized)?;
         let claims = state.auth_context().verify(&token).await.map_err(|err| {
             warn!(error = ?err, "token verification failed");
             ApiError::Unauthorized
@@ -104,5 +103,7 @@ fn extract_token_from_query(parts: &Parts) -> Option<String> {
 }
 
 fn percent_decode(s: &str) -> String {
-    percent_encoding::percent_decode_str(s).decode_utf8_lossy().to_string()
+    percent_encoding::percent_decode_str(s)
+        .decode_utf8_lossy()
+        .to_string()
 }

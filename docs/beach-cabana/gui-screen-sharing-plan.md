@@ -6,6 +6,12 @@ Goals
 - Ship a Zoom-style picker in the Beach desktop app and a TUI picker/flag-driven flow in the CLI.
 - Preserve the ability to open-source the terminal stack while keeping GUI capture code proprietary.
 
+Progress Snapshot (2025-10-18)
+- CLI webrtc flow now uses `host_bootstrap` + verification gate; capture only starts after the user confirms the Noise code matches.
+- TUI picker includes Displays/Windows tabs, live filter, refresh, and an ASCII preview generated from `platform::preview_window`.
+- macOS permission preflight wrappers live in `host::platform::macos::permissions`; the CLI warns and triggers the OS prompt before streaming.
+- Desktop picker workspace (`apps/beach-cabana/native-apps/desktop`) added with a terminal placeholder to be replaced by a Tauri modal.
+
 Non-Goals (Initial)
 - Native viewer apps for desktop/mobile (web viewer only for now).
 - Remote control/input for GUI sessions (view-only).
@@ -47,51 +53,42 @@ Phased Delivery
 - Success: Cabana can capture and downscale frames via the new producer API and encode them into a shareable artifact without relying on Beach core binaries.
 - Notes: Hardware VideoToolbox/Media Foundation integrations remain follow-ups (Phase 2.1) once the ScreenCaptureKit bridge lands; the encoder trait is ready to accept those adapters.
 
-**Phase 3 — Zero-Trust Signaling & Media Pipeline**
+**Phase 3 — Zero-Trust Signaling & Media Pipeline (Completed, 2025-10-20)**
 - Deliverables: Implement sealed signaling (Phase 1 spec in `docs/secure-webrtc/secure-shared-secret-webrtc-plan.md`) inside Cabana; run Noise `XXpsk2` handshake over data channel; wrap outgoing media frames (video + control) in AEAD using keys derived from the unique link + passcode.
-- Success: Cabana peers exchange unique link/passcode, establish WebRTC video channel via `beach-road` while keeping signaling opaque; tampering at the relay fails verification.
-- Progress:
-  - Noise stack implemented with `NoiseController`, transport AEAD, replay protection, and verification code (`apps/beach-cabana/host/src/noise.rs`).
-  - Channel-agnostic `NoiseDriver` plus a `webrtc` feature that adapts the driver to real data channels (`apps/beach-cabana/host/src/webrtc.rs`).
-  - New local E2E demo (behind `--features webrtc`): `beach-cabana webrtc-local --session-id ... --passcode ...` spins up two in-process peers, opens a real WebRTC data channel, performs the Noise handshake, returns a verification code, and exchanges encrypted media messages. This provides an agent-friendly way to exercise Phase 3 without external signaling.
-  - Sealed signaling helpers are already integrated (Phase 1 `start` path) and remain the basis for offer/answer sealing. Next step is wiring sealed offer/answer to a fixture exchange and landing a minimal “host-offer/viewer-answer” CLI pairing.
+- Success: Cabana peers exchange unique link/passcode, establish WebRTC video channel via `beach-road` while keeping signaling opaque; tampering at the relay fails verification. Host and viewer now require a matching verification string before media flows.
+- Highlights:
+  - Noise stack + data-channel driver power the secure transport (`apps/beach-cabana/host/src/noise.rs`, `webrtc.rs`).
+  - `host_bootstrap` can post sealed offers either to Beach Road or a local fixture and poll fixture directories/HTTP endpoints for the viewer reply, enabling fully offline rehearsals.
+  - `viewer_run` publishes sealed answers back to the selected relay and enforces a confirmation callback so operators must acknowledge the Noise verification code.
+  - CLI ergonomics: `webrtc-host-run` forwards `--fixture-url/--fixture-dir`, pauses for a picker when no window id is provided, and blocks streaming until the operator approves the verification string; `webrtc-viewer-run` now prompts for the matching code before frames are written.
+  - Local WebRTC demo (`webrtc-local`) remains available as a regression harness.
 
-Beach Road integration (done)
-- Host/Viewer now post/get sealed SDP via Beach Road endpoints. CLI helpers exist to create/join sessions (`road-create-session`, `road-join-session`). Host and viewer print a passcode fingerprint and the Noise verification code so users can confirm zero-trust linkage.
-
-CLI (feature `webrtc`) additions
-- `webrtc-local` — local in-process demo (no external signaling)
-- `webrtc-host-run` — host generates sealed offer (optionally POSTs to fixture), polls fixture dir for viewer answer, completes Noise over data channel, prints verification code
-- `webrtc-viewer-answer` — viewer unseals host offer, generates sealed answer, optionally POSTs to fixture
-
-Next Phase 3 steps:
-- Add sealed offer/answer subcommands and fixture polling glue for a manual two-terminal flow.
-- Hook the secure transport to stream encoded frames over data channel (start with GIF/H.264 keyframe pacing on macOS).
-
-**Phase 4 — Selection UX (Desktop App & CLI)**
+- **Phase 4 — Selection UX (Desktop App & CLI)**
 - Deliverables: Zoom-style picker modal in Cabana desktop app prototype; CLI TUI menu with arrow/enter flow plus `--window-id` flag; permission prompts surfaced with guidance; verification string surfaced post-handshake so users confirm zero-trust link.
-- Status (2025-10-18):
-  - CLI TUI picker implemented with Displays/Windows tabs, type-to-filter, refresh, and selection. Integrated into `webrtc-host-run`: if `--window-id` is absent and streaming requested, the picker launches.
-  - Post-handshake verification gate implemented: host bootstrap completes Noise + prints the 6-digit verification code; CLI prompts for confirmation before streaming frames.
-  - macOS permission preflight in host platform module; CLI surfaces guidance and calls request API before starting capture.
-  - Desktop picker scaffolded as a minimal native app under `apps/beach-cabana/native-apps/desktop` (terminal UI placeholder). Next step: replace with Tauri UI.
-- Success: User selects target via app or CLI; correct target streams securely; zero‑trust verification confirmed before streaming. Desktop UI to be upgraded next.
+- Status (2025-10-19):
+  - Completed. CLI commands auto-launch the picker when `--window-id` is omitted, request platform-specific screen-share permissions up front, and block streaming until operators accept the Noise verification code.
+  - Viewer flows now display the verification string and can abort gracefully (`NoiseDriverError::UserAborted`) when the code does not match, letting higher-level tooling branch cleanly.
+  - Desktop picker ships as an `eframe` modal with tabs, search, live previews, confirm/cancel controls, one-click copy/open preview actions, and banners for macOS, Windows, and Linux portal flows. Confirmed selections are published over the new `beach_cabana_host::desktop` relay so the host shell can subscribe. CLI consumers can set `CABANA_PICKER_RELAY=1` or `CABANA_PICKER_WAIT_MS=…` to wait for the desktop picker before falling back to the TUI.
+- Next actions: hook the desktop host shell into the relay when the GUI capture adapters land, and replace the placeholder Windows/Linux enumeration with actual window/display discovery.
 
 Suggested implementation notes (handoff-ready)
 - CLI TUI picker (ratatui/crossterm):
-  - Source window list from existing `platform::enumerate_windows()` and refresh on user request.
-  - Show two tabs: Displays and Windows; capture `CGWindowID`/`display:N` selection; produce a `CaptureTarget`.
-  - Integrate with `webrtc-host-run` by passing `--window-id` when the user confirms.
-- Desktop picker (Tauri/SwiftUI placeholder):
-  - Wrap the same enumeration calls via a small FFI layer; focus on macOS first.
-  - Show permissions guidance if Screen Recording is not granted; re-run permissions check after user interaction.
+  - Source window list from `platform::enumerate_windows()` and refresh on demand.
+  - Provide Displays/Windows tabs, filtering, and emit a `CaptureTarget` used by `webrtc-host-run` when `--window-id` is omitted.
+- Desktop picker (eframe prototype):
+  - Uses the shared enumeration API, renders live previews, surfaces permission guidance, exposes quick actions (copy identifier, open preview), and publishes selections through the host relay. Replace the placeholder enumeration/stub previews once platform adapters ship.
 - Post-handshake UX:
-  - Show the short Noise verification code in host and viewer UI; require user confirmation before starting capture stream.
-  - Surface pause/stop controls and an obvious “Stop Sharing” affordance.
+  - Host and viewer now display the verification code and require confirmation pre-stream.
+  - Still pending: dedicated pause/stop controls and a richer “sharing” HUD once capture begins.
 
-**Phase 5 — Web Viewer Experience**
+**Phase 5 — Web Viewer Experience (Completed, 2025-10-20)**
 - Deliverables: Update beach-surfer to detect Cabana (GUI) session type, render video player with basic controls (pause, fit-to-window, resolution info), display verification hash; responsive layout coexisting with terminal viewer; metrics overlay for debugging.
-- Success: Viewers join via browser using unique link + passcode and watch at >=30fps with acceptable latency; verification hash matches host’s display.
+- Highlights:
+  - `BeachViewer` now layers a control HUD with pause/resume, fit mode cycling (contain/cover/actual pixels), and live stats toggles. PNG streams use the upgraded canvas renderer, while H.264 streams feed a `MediaSource` player with the same control surface.
+  - Host-side H.264 output is packaged as fragmented MP4 via the new Rust `Fmp4Writer`, so `--codec h264` delivers browser-ready init segments + `moof/mdat` fragments without a transmux step.
+  - Both media paths surface per-second stats (resolution, FPS, bitrate, total frames, buffer depth) and expose codec fingerprints alongside the Noise verification badge.
+  - Viewer transports emit actionable errors (unsupported codec, append failures) and continue to honour the Noise confirmation gate introduced in Phase 4.
+- Follow-ups: extend the stats overlay with historical timelines, add keyboard shortcuts for controls, and wire the metrics feed into observability once Phase 7 begins.
 
 **Phase 6 — Integration with Beach Core**
 - Deliverables: Refactor `beach-core` traits to support both terminal and GUI media producers; feature gating to keep OSS builds terminal-only; CLI/app entry points delegate to Cabana modules when `gui` feature enabled.

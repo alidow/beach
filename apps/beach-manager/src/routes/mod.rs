@@ -1,23 +1,23 @@
 mod auth;
 pub mod fastpath;
-mod sse;
 mod mcp;
-mod sessions;
 mod private_beaches;
+mod sessions;
+mod sse;
 
 use axum::{
     response::{IntoResponse, Response},
     routing::{get, patch, post, put},
     Json, Router,
 };
-use tower_http::cors::{Any, CorsLayer};
 use serde::Serialize;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::state::AppState;
 
 pub use auth::AuthToken;
-pub use sessions::*;
 pub use private_beaches::*;
+pub use sessions::*;
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
@@ -27,10 +27,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/sessions/register", post(register_session))
         .route("/sessions/:session_id", patch(update_session))
         .route("/sessions/:session_id/state", post(push_state))
-        .route(
-            "/sessions/:session_id/state/stream",
-            get(sse::stream_state),
-        )
+        .route("/sessions/:session_id/state/stream", get(sse::stream_state))
         .route("/sessions/:session_id/actions", post(queue_actions))
         .route("/sessions/:session_id/actions/poll", get(poll_actions))
         .route("/sessions/:session_id/actions/ack", post(ack_actions))
@@ -63,10 +60,7 @@ pub fn build_router(state: AppState) -> Router {
             "/private-beaches/:private_beach_id/harness-bridge-token",
             post(mint_harness_bridge_token),
         )
-        .route(
-            "/sessions/:session_id/emergency-stop",
-            post(emergency_stop),
-        )
+        .route("/sessions/:session_id/emergency-stop", post(emergency_stop))
         .route("/agents/onboard", post(onboard_agent))
         .route(
             "/fastpath/sessions/:session_id/webrtc/offer",
@@ -78,8 +72,14 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/mcp", post(mcp::handle_mcp))
         // Private Beaches CRUD + layout
-        .route("/private-beaches", get(list_private_beaches).post(create_private_beach))
-        .route("/private-beaches/:id", get(get_private_beach).patch(update_private_beach))
+        .route(
+            "/private-beaches",
+            get(list_private_beaches).post(create_private_beach),
+        )
+        .route(
+            "/private-beaches/:id",
+            get(get_private_beach).patch(update_private_beach),
+        )
         .route(
             "/private-beaches/:id/layout",
             get(get_private_beach_layout).put(put_private_beach_layout),

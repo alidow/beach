@@ -1,3 +1,5 @@
+pub mod validate;
+
 use crate::client::terminal::join;
 use crate::protocol::terminal::bootstrap::{self, BootstrapHandshake};
 use crate::terminal::cli::{JoinArgs, SshArgs};
@@ -5,9 +7,10 @@ use crate::terminal::error::CliError;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-use tokio::process::{ChildStderr, Command as TokioCommand};
+use tokio::process::{Child as TokioChild, ChildStderr, Command as TokioCommand};
 use tracing::{debug, info, warn};
 use url::Url;
+use validate::{HeadlessOptions, log_report, run_headless_validation};
 
 pub async fn run(base_url: &str, args: SshArgs) -> Result<(), CliError> {
     bootstrap::copy_binary_to_remote(&args).await?;
@@ -79,6 +82,20 @@ pub async fn run(base_url: &str, args: SshArgs) -> Result<(), CliError> {
                 if !stderr_lines.is_empty() {
                     context = format!("{}; stderr: {}", context, stderr_lines.join(" | "));
                 }
+                let stdout_lines = captured_stdout.len();
+                let stdout_bytes: usize = captured_stdout.iter().map(|line| line.len()).sum();
+                let stderr_lines_count = stderr_lines.len();
+                warn!(
+                    target = "beach::ssh",
+                    remote = %args.target,
+                    remote_command = %remote_command,
+                    handshake_timeout = timeout_secs,
+                    stdout_lines,
+                    stdout_bytes,
+                    stderr_lines = stderr_lines_count,
+                    failure = %context,
+                    "bootstrap handshake failed"
+                );
                 return Err(CliError::BootstrapHandshake(context));
             }
         };
@@ -100,9 +117,15 @@ pub async fn run(base_url: &str, args: SshArgs) -> Result<(), CliError> {
 
     // Start draining SSH stdout/stderr to avoid backpressure. If --keep-ssh is set, log lines at info.
     let log_streams = args.keep_ssh;
-    let stdout_task = Some(tokio::spawn(forward_child_lines(reader, if log_streams { "stdout" } else { "stdout" })));
+    let stdout_task = Some(tokio::spawn(forward_child_lines(
+        reader,
+        if log_streams { "stdout" } else { "stdout" },
+    )));
     let stderr_task = if let Some(stderr) = stderr_pipe.take() {
-        Some(tokio::spawn(forward_child_lines(BufReader::new(stderr), if log_streams { "stderr" } else { "stderr" })))
+        Some(tokio::spawn(forward_child_lines(
+            BufReader::new(stderr),
+            if log_streams { "stderr" } else { "stderr" },
+        )))
     } else {
         None
     };
@@ -120,30 +143,64 @@ pub async fn run(base_url: &str, args: SshArgs) -> Result<(), CliError> {
         println!("  host webrtc role (advertised): {}", role);
     }
 
+    if args.headless {
+        let options = HeadlessOptions {
+            timeout: Duration::from_secs(args.headless_timeout.max(1)),
+            require_snapshot: true,
+        };
+        println!(
+            "⚙️  Running headless validation (timeout {}s)...",
+            options.timeout.as_secs()
+        );
+        let validation_result = run_headless_validation(
+            &handshake.session_server,
+            &handshake.session_id,
+            &handshake.join_code,
+            options,
+        )
+        .await;
+
+        // Close SSH channel now that validation is complete.
+        terminate_child(&mut child, "after headless validation").await;
+
+        if let Some(task) = stdout_task {
+            let _ = task.await;
+        }
+        if let Some(task) = stderr_task {
+            let _ = task.await;
+        }
+
+        match validation_result {
+            Ok(report) => {
+                log_report(&report);
+                println!("✅ Headless validation succeeded ({report})");
+                if args.ssh_keep_host_running {
+                    println!(
+                        "Remote host remains running on {}; attach later with:\n  beach join {} --passcode {}",
+                        args.target, handshake.session_id, handshake.join_code
+                    );
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                return Err(err);
+            }
+        }
+    }
+
     let join_args = JoinArgs {
         target: handshake.session_id.clone(),
         passcode: Some(handshake.join_code.clone()),
         label: None,
         mcp: false,
         inject_latency: None,
+        headless: false,
+        headless_timeout: 30,
     };
 
     // If we are keeping the remote host running, we can drop SSH immediately.
     if args.ssh_keep_host_running {
-        // Detach: close SSH immediately; remote host survives.
-        if let Err(err) = child.start_kill() {
-            warn!(error = %err, "failed to terminate ssh process after bootstrap");
-        }
-        match child.wait().await {
-            Ok(status) if !status.success() => {
-                warn!(
-                    status = %bootstrap::describe_exit_status(status),
-                    "ssh exited with non-zero status after bootstrap"
-                );
-            }
-            Err(err) => warn!(error = %err, "failed to await ssh process"),
-            _ => {}
-        }
+        terminate_child(&mut child, "after bootstrap").await;
     }
 
     // Otherwise, keep SSH open until the WebRTC/WebSocket transport connects, then close it.
@@ -160,19 +217,7 @@ pub async fn run(base_url: &str, args: SshArgs) -> Result<(), CliError> {
     // Close SSH channel now that transport is established (or join ended).
     // We cannot signal the child directly here (owned by wait_task). Abort wait and let it end.
     if !args.ssh_keep_host_running {
-        if let Err(err) = child.start_kill() {
-            warn!(error = %err, "failed to terminate ssh process after transport connect");
-        }
-        match child.wait().await {
-            Ok(status) if !status.success() => {
-                warn!(
-                    status = %bootstrap::describe_exit_status(status),
-                    "ssh exited with non-zero status after transport connect"
-                );
-            }
-            Err(err) => warn!(error = %err, "failed to await ssh process"),
-            _ => {}
-        }
+        terminate_child(&mut child, "after transport connect").await;
     }
 
     // Await the log drainers to finish after SSH is gone.
@@ -245,5 +290,36 @@ where
                 break;
             }
         }
+    }
+}
+
+async fn terminate_child(child: &mut TokioChild, context: &str) {
+    match child.start_kill() {
+        Ok(()) => {}
+        Err(err) => {
+            // If the process is already gone, ignore the error.
+            if err.kind() != std::io::ErrorKind::InvalidInput {
+                warn!(target = "beach::ssh", error = %err, context, "failed to terminate ssh process");
+            }
+        }
+    }
+    match child.wait().await {
+        Ok(status) if !status.success() => {
+            warn!(
+                target = "beach::ssh",
+                status = %bootstrap::describe_exit_status(status),
+                context,
+                "ssh exited with non-zero status"
+            );
+        }
+        Err(err) => {
+            warn!(
+                target = "beach::ssh",
+                error = %err,
+                context,
+                "failed to await ssh process"
+            );
+        }
+        _ => {}
     }
 }

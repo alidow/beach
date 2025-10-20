@@ -4,7 +4,10 @@
 //!   DATABASE_URL=postgres://postgres:postgres@localhost:5432/beach_manager \
 //!   cargo test -p beach-manager -- --ignored rls_policies_enforced
 
-use sqlx::{postgres::{PgConnectOptions, PgPoolOptions}, Connection, Executor};
+use sqlx::{
+    postgres::{PgConnectOptions, PgPoolOptions},
+    Connection, Executor,
+};
 use uuid::Uuid;
 
 #[ignore]
@@ -122,4 +125,3 @@ async fn rls_policies_enforced() {
         .expect("select under RLS");
     assert!(rows.is_empty(), "RLS should hide rows for other beaches");
 }
-

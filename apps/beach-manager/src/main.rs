@@ -1,8 +1,8 @@
 mod auth;
 mod config;
-mod routes;
-mod metrics;
 mod fastpath;
+mod metrics;
+mod routes;
 mod state;
 
 use auth::{AuthConfig, AuthContext};

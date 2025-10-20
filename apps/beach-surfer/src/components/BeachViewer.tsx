@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { TerminalStatus } from './BeachTerminal';
 import { BeachTerminal } from './BeachTerminal';
 import { decodeHostFrameBinary } from '../protocol/wire';
@@ -11,6 +11,9 @@ import type { WebRtcTransport } from '../transport/webrtc';
 import { MediaCanvas } from './MediaCanvas';
 import { MediaVideo } from './MediaVideo';
 import type { SecureTransportSummary } from '../transport/webrtc';
+import { ViewerControls } from './ViewerControls';
+import type { MediaStats, ViewerFitMode } from './viewerTypes';
+import { cn } from '../lib/utils';
 
 export interface BeachViewerProps {
   sessionId?: string;
@@ -55,6 +58,11 @@ export function BeachViewer(props: BeachViewerProps): JSX.Element {
   const mediaTransportRef = useRef<MediaTransport | null>(null);
   const sniffedRef = useRef<boolean>(false);
   const [secureSummary, setSecureSummary] = useState<SecureTransportSummary | null>(null);
+  const [paused, setPaused] = useState<boolean>(false);
+  const [fitMode, setFitMode] = useState<ViewerFitMode>('contain');
+  const [showStats, setShowStats] = useState<boolean>(true);
+  const [mediaStats, setMediaStats] = useState<MediaStats | null>(null);
+  const [mediaError, setMediaError] = useState<string | null>(null);
 
   const notify = (next: TerminalStatus) => {
     setStatus(next);
@@ -164,16 +172,33 @@ export function BeachViewer(props: BeachViewerProps): JSX.Element {
     return () => {
       cancelled = true;
       const conn = connectionRef.current;
-      connectionRef.current = null;
-      sniffedRef.current = false;
-      setMode('unknown');
-      setSecureSummary(null);
-      try {
-        conn?.close();
-      } catch {}
-    };
+        connectionRef.current = null;
+        sniffedRef.current = false;
+        setMode('unknown');
+        setSecureSummary(null);
+        setMediaStats(null);
+        setMediaError(null);
+        try {
+          conn?.close();
+        } catch {}
+      };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoConnect, sessionId, baseUrl, passcode]);
+
+  useEffect(() => {
+    setPaused(false);
+    setMediaStats(null);
+    setMediaError(null);
+  }, [mode]);
+
+  const handleStats = useCallback((stats: MediaStats) => {
+    setMediaStats(stats);
+    setMediaError(null);
+  }, []);
+
+  const handleMediaError = useCallback((message: string) => {
+    setMediaError(message);
+  }, []);
 
   const content = useMemo(() => {
     if (mode === 'terminal' && terminalTransportRef.current) {
@@ -181,26 +206,67 @@ export function BeachViewer(props: BeachViewerProps): JSX.Element {
         <BeachTerminal
           transport={terminalTransportRef.current}
           onStatusChange={onStatusChange}
-          className={className}
+          className="h-full w-full"
           showStatusBar={showStatusBar}
           showTopBar={showTopBar}
         />
       );
     }
     if (mode === 'media_png' && mediaTransportRef.current) {
-      return <MediaCanvas transport={mediaTransportRef.current} />;
+      return (
+        <MediaCanvas
+          transport={mediaTransportRef.current}
+          className="h-full w-full"
+          paused={paused}
+          fit={fitMode}
+          onStats={handleStats}
+          onError={handleMediaError}
+        />
+      );
     }
     if (mode === 'media_h264' && mediaTransportRef.current) {
-      return <MediaVideo transport={mediaTransportRef.current} />;
+      return (
+        <MediaVideo
+          transport={mediaTransportRef.current}
+          className="h-full w-full"
+          paused={paused}
+          fit={fitMode}
+          onStats={handleStats}
+          onError={handleMediaError}
+        />
+      );
     }
     // Placeholder while connecting/sniffing
-    return <div className={className} />;
+    return <div className="h-full w-full" />;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, className, showStatusBar, showTopBar]);
+  }, [mode, paused, fitMode, showStatusBar, showTopBar, handleStats, handleMediaError]);
+
+  const isMedia = mode === 'media_png' || mode === 'media_h264';
+  const playing = !paused;
+  const effectiveStats = mediaStats ?? undefined;
+  const controlsMode = mode === 'media_h264' ? 'media_h264' : 'media_png';
+
+  const togglePlay = () => setPaused((prev) => !prev);
+  const cycleFit = () =>
+    setFitMode((prev) => (prev === 'contain' ? 'cover' : prev === 'cover' ? 'actual' : 'contain'));
+  const toggleStats = () => setShowStats((prev) => !prev);
 
   return (
-    <div className={className}>
+    <div className={cn('relative h-full w-full', className)}>
       {content}
+      {isMedia ? (
+        <ViewerControls
+          playing={playing}
+          fit={fitMode}
+          showStats={showStats}
+          stats={effectiveStats}
+          mode={controlsMode}
+          error={mediaError}
+          onTogglePlay={togglePlay}
+          onCycleFit={cycleFit}
+          onToggleStats={toggleStats}
+        />
+      ) : null}
       {secureSummary && secureSummary.mode === 'secure' && secureSummary.verificationCode ? (
         <div className="pointer-events-none absolute top-3 right-4 z-10 rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-3 py-1 text-xs text-emerald-200">
           Verified • {secureSummary.verificationCode}

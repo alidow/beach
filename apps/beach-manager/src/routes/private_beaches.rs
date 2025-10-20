@@ -104,7 +104,13 @@ pub async fn update_private_beach(
 ) -> ApiResult<BeachMeta> {
     ensure_scope(&token, "pb:beaches.write")?;
     let updated = state
-        .update_private_beach(&id, body.name.as_deref(), body.slug.as_deref(), body.settings.clone(), token.account_uuid())
+        .update_private_beach(
+            &id,
+            body.name.as_deref(),
+            body.slug.as_deref(),
+            body.settings.clone(),
+            token.account_uuid(),
+        )
         .await
         .map_err(map_state_err)?;
     Ok(Json(updated))

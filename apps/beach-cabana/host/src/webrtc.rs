@@ -1,8 +1,7 @@
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use serde::{Serialize, Deserialize};
-#[cfg(target_os = "macos")]
-use std::time::SystemTime;
 
 use crate::noise::{HandshakeConfig, NoiseController, NoiseError};
 use crate::security::{HandshakeId, SessionMaterial};
@@ -35,6 +34,97 @@ fn default_road_base(url: &Option<String>) -> String {
     url.clone().unwrap_or_else(|| "http://127.0.0.1:8080".to_string())
 }
 
+fn latest_fixture_envelope_in_dir(dir: &Path, session_id: &str, handshake_b64: &str) -> Result<Option<String>, NoiseDriverError> {
+    let prefix = format!("{}-{}-", session_id, handshake_b64);
+    let mut latest: Option<(std::time::SystemTime, String)> = None;
+    let entries = std::fs::read_dir(dir).map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        if let Some(name) = file_name.to_str() {
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+        } else {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path()).map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
+        let doc: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(doc) => doc,
+            Err(err) => {
+                eprintln!("fixture dir parse error ({}): {}", entry.path().display(), err);
+                continue;
+            }
+        };
+        let Some(env) = doc.get("envelope").and_then(|v| v.as_str()) else { continue };
+        let metadata = entry.metadata().map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
+        let modified = metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        if latest.as_ref().map(|(ts, _)| modified > *ts).unwrap_or(true) {
+            latest = Some((modified, env.to_string()));
+        }
+    }
+    Ok(latest.map(|(_, env)| env))
+}
+
+fn wait_for_fixture_answer_dir(dir: &Path, session_id: &str, handshake_b64: &str, timeout: Duration) -> Result<String, NoiseDriverError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(env) = latest_fixture_envelope_in_dir(dir, session_id, handshake_b64)? {
+            return Ok(env);
+        }
+        if Instant::now() >= deadline {
+            return Err(NoiseDriverError::Timeout);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn wait_for_fixture_answer_http(base_url: &str, session_id: &str, handshake_b64: &str, timeout: Duration) -> Result<String, NoiseDriverError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match crate::fixture::client::get_latest_envelope(base_url, session_id, handshake_b64) {
+            Ok(Some(env)) => return Ok(env),
+            Ok(None) => {}
+            Err(err) => eprintln!("fixture latest fetch error: {}", err),
+        }
+        if Instant::now() >= deadline {
+            return Err(NoiseDriverError::Timeout);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn wait_for_road_answer(road_base: &str, session_id: &str, handshake_b64: &str, timeout: Duration) -> Result<String, NoiseDriverError> {
+    let get_url = format!(
+        "{}/sessions/{}/webrtc/answer?handshake_id={}",
+        road_base.trim_end_matches('/'),
+        session_id,
+        handshake_b64
+    );
+    let deadline = Instant::now() + timeout;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(NoiseDriverError::Timeout);
+        }
+        let resp = reqwest::blocking::get(&get_url).map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
+        if resp.status().is_success() {
+            let obj: serde_json::Value = resp.json().map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
+            if let Some(sealed) = obj.get("sealed") {
+                let nonce = sealed.get("nonce").and_then(|v| v.as_str()).unwrap_or("");
+                let ciphertext = sealed.get("ciphertext").and_then(|v| v.as_str()).unwrap_or("");
+                let version = sealed.get("version").and_then(|v| v.as_u64()).unwrap_or(1) as u8;
+                let env = crate::security::SealedEnvelope {
+                    version,
+                    handshake_b64: handshake_b64.to_string(),
+                    nonce_b64: nonce.to_string(),
+                    ciphertext_b64: ciphertext.to_string(),
+                };
+                return Ok(env.compact_encoding());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum NoiseDriverError {
     #[error("noise handshake error: {0}")]
@@ -51,6 +141,8 @@ pub enum NoiseDriverError {
     UnexpectedPlaintext,
     #[error("received non-media frame post-handshake")]
     UnexpectedFrame,
+    #[error("session aborted by user")]
+    UserAborted,
     #[error("noise worker join failed: {0}")]
     Join(String),
 }
@@ -113,7 +205,6 @@ use bytes::Bytes;
 use tokio::{runtime::Handle, sync::{mpsc, oneshot}, task, time};
 use webrtc::data_channel::{data_channel_message::DataChannelMessage, data_channel_state::RTCDataChannelState, RTCDataChannel};
 use webrtc::ice_transport::ice_gathering_state::RTCIceGatheringState;
-use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::api::{interceptor_registry::register_default_interceptors, media_engine::MediaEngine, APIBuilder};
 use webrtc::interceptor::registry::Registry;
@@ -246,7 +337,16 @@ pub async fn host_run(
     from_id: String,
     to_id: String,
 ) -> Result<String, NoiseDriverError> {
-    let (transport, _code) = host_bootstrap(session_id.clone(), passcode.clone(), road_url.clone(), prologue.clone(), from_id.clone(), to_id.clone()).await?;
+    let (transport, _code) = host_bootstrap(
+        session_id.clone(),
+        passcode.clone(),
+        road_url.clone(),
+        fixture_url.clone(),
+        fixture_dir.clone(),
+        prologue.clone(),
+        from_id.clone(),
+        to_id.clone(),
+    ).await?;
     #[cfg(target_os = "macos")]
     if let (Some(target), n) = (window_id, frames) { if n > 0 { let interval = Duration::from_millis(interval_ms); match codec { EncodeCodec::Gif => { stream_png_frames(&transport, &target, n, interval, max_width).await?; } EncodeCodec::H264 => { #[cfg(all(target_os = "macos", feature = "cabana_sck"))] { let fps = (1000u64 / interval_ms.max(1)) as u32; stream_h264_frames(&transport, &target, n, interval, max_width, fps).await?; } #[cfg(not(all(target_os = "macos", feature = "cabana_sck")))] { stream_png_frames(&transport, &target, n, interval, max_width).await?; } } } } }
     Ok(transport.verification_code().unwrap_or("unknown").to_string())
@@ -256,6 +356,8 @@ pub async fn host_bootstrap(
     session_id: String,
     passcode: String,
     road_url: Option<String>,
+    fixture_url: Option<String>,
+    fixture_dir: Option<PathBuf>,
     prologue: Vec<u8>,
     from_id: String,
     to_id: String,
@@ -272,17 +374,53 @@ pub async fn host_bootstrap(
     let handshake = HandshakeId::random();
     let envelope = crate::security::seal_signaling_payload(&material, &handshake, sdp.as_bytes()).map_err(|e| NoiseDriverError::Noise(NoiseError::Security(e)))?;
     let handshake_b64 = handshake.to_base64();
-    let road_base = default_road_base(&road_url);
-    let payload = RoadSdpPayload { sdp: "", typ: "offer", handshake_id: &handshake_b64, from_peer: &from_id, to_peer: &to_id, sealed: Some(RoadSealedEnvelope { version: envelope.version as u32, nonce: &envelope.nonce_b64, ciphertext: &envelope.ciphertext_b64 }) };
-    let post_url = format!("{}/sessions/{}/webrtc/offer", road_base.trim_end_matches('/'), session_id);
-    let res = reqwest::blocking::Client::new().post(post_url).json(&payload).send().map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
-    if !res.status().is_success() { return Err(NoiseDriverError::ChannelSend(format!("road offer POST failed: {}", res.status()))); }
-    println!("Host: posted sealed offer to Beach Road (handshake {})", handshake_b64);
+    let compact_offer = envelope.compact_encoding();
+
+    if let Some(ref url) = fixture_url {
+        crate::fixture::client::post_envelope(
+            url,
+            crate::fixture::client::FixtureEnvelope {
+                session_id: &session_id,
+                handshake_b64: &handshake_b64,
+                envelope: &compact_offer,
+            },
+        )
+        .map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
+        println!("Host: posted sealed offer to fixture {} (handshake {})", url, handshake_b64);
+    } else {
+        let road_base = default_road_base(&road_url);
+        let payload = RoadSdpPayload {
+            sdp: "",
+            typ: "offer",
+            handshake_id: &handshake_b64,
+            from_peer: &from_id,
+            to_peer: &to_id,
+            sealed: Some(RoadSealedEnvelope {
+                version: envelope.version as u32,
+                nonce: &envelope.nonce_b64,
+                ciphertext: &envelope.ciphertext_b64,
+            }),
+        };
+        let post_url = format!("{}/sessions/{}/webrtc/offer", road_base.trim_end_matches('/'), session_id);
+        let res = reqwest::blocking::Client::new().post(post_url).json(&payload).send().map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
+        if !res.status().is_success() { return Err(NoiseDriverError::ChannelSend(format!("road offer POST failed: {}", res.status()))); }
+        println!("Host: posted sealed offer to Beach Road (handshake {})", handshake_b64);
+    }
     println!("Passcode fingerprint: {}", material.passcode_fingerprint());
-    let get_url = format!("{}/sessions/{}/webrtc/answer?handshake_id={}", road_base.trim_end_matches('/'), session_id, handshake_b64);
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let answer_envelope = loop { if Instant::now() >= deadline { return Err(NoiseDriverError::Timeout); } let resp = reqwest::blocking::get(&get_url).map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?; if resp.status().is_success() { let obj: serde_json::Value = resp.json().map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?; if let Some(sealed) = obj.get("sealed") { let nonce = sealed.get("nonce").and_then(|v| v.as_str()).unwrap_or(""); let ciphertext = sealed.get("ciphertext").and_then(|v| v.as_str()).unwrap_or(""); let version = sealed.get("version").and_then(|v| v.as_u64()).unwrap_or(1) as u8; let env = crate::security::SealedEnvelope { version, handshake_b64: handshake_b64.clone(), nonce_b64: nonce.to_string(), ciphertext_b64: ciphertext.to_string() }; break env.compact_encoding(); } } std::thread::sleep(Duration::from_millis(500)); };
-    let answer = crate::security::SealedEnvelope::from_compact(&answer_envelope).map_err(|e| NoiseDriverError::Noise(NoiseError::Security(e)))?;
+
+    let answer_compact = if let Some(dir) = fixture_dir.as_ref() {
+        println!("Waiting for viewer answer in fixture dir {}", dir.display());
+        wait_for_fixture_answer_dir(dir, &session_id, &handshake_b64, Duration::from_secs(60))?
+    } else if let Some(ref url) = fixture_url {
+        println!("Waiting for viewer answer via fixture {}", url);
+        wait_for_fixture_answer_http(url, &session_id, &handshake_b64, Duration::from_secs(60))?
+    } else {
+        let road_base = default_road_base(&road_url);
+        println!("Waiting for viewer answer from Beach Road {}", road_base);
+        wait_for_road_answer(&road_base, &session_id, &handshake_b64, Duration::from_secs(60))?
+    };
+
+    let answer = crate::security::SealedEnvelope::from_compact(&answer_compact).map_err(|e| NoiseDriverError::Noise(NoiseError::Security(e)))?;
     let answer_bytes = crate::security::open_signaling_payload(&material, &answer).map_err(|e| NoiseDriverError::Noise(NoiseError::Security(e)))?;
     let answer_sdp = String::from_utf8_lossy(&answer_bytes).to_string();
     let desc = RTCSessionDescription::answer(answer_sdp).map_err(|e| NoiseDriverError::Noise(NoiseError::Handshake(e.to_string())))?;
@@ -358,9 +496,113 @@ async fn stream_png_frames(transport: &DataChannelSecureTransport, target: &str,
     for index in 0..frames { let mut frame = match producer.next_frame() { Ok(f) => f, Err(err) => { producer.stop(); return Err(NoiseDriverError::ChannelSend(format!("capture frame {} failed: {}", index, err))); } }; to_rgba(&mut frame); if let Err(e) = resize_frame(&mut frame, max_width) { producer.stop(); return Err(NoiseDriverError::ChannelSend(format!("resize failed: {}", e))); } let png = png_bytes_from_frame(&frame).map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?; let msg = encode_png_message(&png); transport.send_media(&msg).await.map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?; if index + 1 < frames && !interval.is_zero() { std::thread::sleep(interval); } } producer.stop(); Ok(()) }
 
 #[cfg(all(target_os = "macos", feature = "cabana_sck", feature = "webrtc"))]
-async fn stream_h264_frames(transport: &DataChannelSecureTransport, target: &str, frames: u32, interval: Duration, max_width: Option<u32>, fps: u32) -> Result<(), NoiseDriverError> { use crossbeam_channel as cb; use crate::encoder::VideoEncoder as _; use crate::encoder::VideoToolboxEncoder; let mut producer = match capture::create_producer(target) { Ok(p) => p, Err(err) => return Err(NoiseDriverError::ChannelSend(err.to_string())), }; producer.start().map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?; let mut first = producer.next_frame().map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?; to_rgba(&mut first); resize_frame(&mut first, max_width).map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?; let (tx, rx) = cb::unbounded::<Vec<u8>>(); let mut vt = VideoToolboxEncoder::new_with_chunks(None, first.width, first.height, fps.max(1), Some(tx)).map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?; vt.write_frame(&first).map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?; let mut sent = 1u32; while let Ok(chunk) = rx.try_recv() { let mut msg = Vec::with_capacity(1 + 4 + chunk.len()); msg.push(2u8); msg.extend_from_slice(&(chunk.len() as u32).to_be_bytes()); msg.extend_from_slice(&chunk); transport.send_media(&msg).await.map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?; } for _ in sent..frames { let mut frame = match producer.next_frame() { Ok(f) => f, Err(err) => { producer.stop(); return Err(NoiseDriverError::ChannelSend(err.to_string())); } }; to_rgba(&mut frame); if let Err(e) = resize_frame(&mut frame, max_width) { producer.stop(); return Err(NoiseDriverError::ChannelSend(e.to_string())); } vt.write_frame(&frame).map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?; while let Ok(chunk) = rx.try_recv() { let mut msg = Vec::with_capacity(1 + 4 + chunk.len()); msg.push(2u8); msg.extend_from_slice(&(chunk.len() as u32).to_be_bytes()); msg.extend_from_slice(&chunk); transport.send_media(&msg).await.map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?; } if !interval.is_zero() { std::thread::sleep(interval); } } vt.finish().map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?; while let Ok(chunk) = rx.try_recv() { let mut msg = Vec::with_capacity(1 + 4 + chunk.len()); msg.push(2u8); msg.extend_from_slice(&(chunk.len() as u32).to_be_bytes()); msg.extend_from_slice(&chunk); transport.send_media(&msg).await.map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?; } producer.stop(); Ok(()) }
+async fn stream_h264_frames(
+    transport: &DataChannelSecureTransport,
+    target: &str,
+    frames: u32,
+    interval: Duration,
+    max_width: Option<u32>,
+    fps: u32,
+) -> Result<(), NoiseDriverError> {
+    use crossbeam_channel as cb;
+    use crate::encoder::VideoEncoder as _;
+    use crate::encoder::VideoToolboxEncoder;
+    use crate::mp4::Fmp4Writer;
 
-pub async fn viewer_run(
+    let mut producer = match capture::create_producer(target) {
+        Ok(p) => p,
+        Err(err) => return Err(NoiseDriverError::ChannelSend(err.to_string())),
+    };
+    producer
+        .start()
+        .map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
+
+    let mut first = producer
+        .next_frame()
+        .map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
+    to_rgba(&mut first);
+    resize_frame(&mut first, max_width)
+        .map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
+
+    let (tx, rx) = cb::unbounded::<Vec<u8>>();
+    let mut vt = VideoToolboxEncoder::new_with_chunks(
+        None,
+        first.width,
+        first.height,
+        fps.max(1),
+        Some(tx),
+    )
+    .map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
+
+    let mut muxer = Fmp4Writer::new(first.width, first.height, fps)
+        .map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
+
+    vt.write_frame(&first)
+        .map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
+    drain_h264_queue(transport, &mut muxer, &rx).await?;
+
+    for _ in 1..frames {
+        let mut frame = match producer.next_frame() {
+            Ok(f) => f,
+            Err(err) => {
+                producer.stop();
+                return Err(NoiseDriverError::ChannelSend(err.to_string()));
+            }
+        };
+        to_rgba(&mut frame);
+        if let Err(e) = resize_frame(&mut frame, max_width) {
+            producer.stop();
+            return Err(NoiseDriverError::ChannelSend(e.to_string()));
+        }
+        vt.write_frame(&frame)
+            .map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
+        drain_h264_queue(transport, &mut muxer, &rx).await?;
+        if !interval.is_zero() {
+            std::thread::sleep(interval);
+        }
+    }
+
+    vt.finish()
+        .map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
+    drain_h264_queue(transport, &mut muxer, &rx).await?;
+    producer.stop();
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", feature = "cabana_sck", feature = "webrtc"))]
+async fn drain_h264_queue(
+    transport: &DataChannelSecureTransport,
+    muxer: &mut crate::mp4::Fmp4Writer,
+    rx: &crossbeam_channel::Receiver<Vec<u8>>,
+) -> Result<(), NoiseDriverError> {
+    while let Ok(chunk) = rx.try_recv() {
+        let segments = muxer
+            .push_annexb_sample(&chunk)
+            .map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
+        if let Some(init) = segments.init_segment {
+            send_media_segment(transport, &init).await?;
+        }
+        send_media_segment(transport, &segments.media_segment).await?;
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", feature = "cabana_sck", feature = "webrtc"))]
+async fn send_media_segment(
+    transport: &DataChannelSecureTransport,
+    segment: &[u8],
+) -> Result<(), NoiseDriverError> {
+    let mut msg = Vec::with_capacity(1 + 4 + segment.len());
+    msg.push(2u8);
+    msg.extend_from_slice(&(segment.len() as u32).to_be_bytes());
+    msg.extend_from_slice(segment);
+    transport
+        .send_media(&msg)
+        .await
+        .map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))
+}
+
+pub async fn viewer_run<F>(
     session_id: String,
     passcode: String,
     host_envelope: String,
@@ -371,7 +613,11 @@ pub async fn viewer_run(
     road_url: Option<String>,
     from_id: String,
     to_id: String,
-) -> Result<std::path::PathBuf, NoiseDriverError> {
+    mut confirm_start: F,
+) -> Result<std::path::PathBuf, NoiseDriverError>
+where
+    F: FnMut(&str) -> bool,
+{
     let api = build_api().await?;
     let config = RTCConfiguration { ice_servers: vec![], ..Default::default() };
     let pc = Arc::new(api.new_peer_connection(config).await.map_err(|e| NoiseDriverError::Noise(NoiseError::Handshake(e.to_string())))?);
@@ -388,15 +634,43 @@ pub async fn viewer_run(
     let handshake = HandshakeId::from_base64(&env.handshake_b64).map_err(|e| NoiseDriverError::Noise(NoiseError::Security(e)))?;
     let viewer_env = crate::security::seal_signaling_payload(&material, &handshake, sdp.as_bytes()).map_err(|e| NoiseDriverError::Noise(NoiseError::Security(e)))?;
     let compact = viewer_env.compact_encoding();
-    let road_base = default_road_base(&road_url);
-    let payload = RoadSdpPayload { sdp: "", typ: "answer", handshake_id: &handshake.to_base64(), from_peer: &from_id, to_peer: &to_id, sealed: Some(RoadSealedEnvelope { version: viewer_env.version as u32, nonce: &viewer_env.nonce_b64, ciphertext: &viewer_env.ciphertext_b64 }) };
-    let post_url = format!("{}/sessions/{}/webrtc/answer", road_base.trim_end_matches('/'), session_id);
-    let res = reqwest::blocking::Client::new().post(post_url).json(&payload).send().map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
-    if !res.status().is_success() { return Err(NoiseDriverError::ChannelSend(format!("road answer POST failed: {}", res.status()))); }
+    if let Some(url) = fixture_url.as_deref() {
+        crate::fixture::client::post_envelope(
+            url,
+            crate::fixture::client::FixtureEnvelope {
+                session_id: &session_id,
+                handshake_b64: &handshake.to_base64(),
+                envelope: &compact,
+            },
+        )
+        .map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
+        println!("Viewer: posted sealed answer to fixture {}", url);
+    } else {
+        let road_base = default_road_base(&road_url);
+        let payload = RoadSdpPayload {
+            sdp: "",
+            typ: "answer",
+            handshake_id: &handshake.to_base64(),
+            from_peer: &from_id,
+            to_peer: &to_id,
+            sealed: Some(RoadSealedEnvelope {
+                version: viewer_env.version as u32,
+                nonce: &viewer_env.nonce_b64,
+                ciphertext: &viewer_env.ciphertext_b64,
+            }),
+        };
+        let post_url = format!("{}/sessions/{}/webrtc/answer", road_base.trim_end_matches('/'), session_id);
+        let res = reqwest::blocking::Client::new().post(post_url).json(&payload).send().map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
+        if !res.status().is_success() { return Err(NoiseDriverError::ChannelSend(format!("road answer POST failed: {}", res.status()))); }
+    }
     let (viewer_dc_tx, mut viewer_dc_rx) = mpsc::unbounded_channel::<Arc<RTCDataChannel>>();
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| { let _ = viewer_dc_tx.send(dc); Box::pin(async {}) }));
     let channel = viewer_dc_rx.recv().await.ok_or_else(|| NoiseDriverError::ChannelClosed)?;
     let transport = negotiate_data_channel(channel, HandshakeConfig { material: &material, handshake_id: &handshake, role: crate::noise::HandshakeRole::Responder, local_id: "viewer", remote_id: "host", prologue_context: &prologue }, Duration::from_secs(10)).await?;
+    let verification_code = transport.verification_code().unwrap_or("unknown").to_string();
+    if !confirm_start(&verification_code) {
+        return Err(NoiseDriverError::UserAborted);
+    }
     let base_dir = if let Some(d) = output_dir { d } else { let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(); std::env::temp_dir().join(format!("cabana-viewer-{}", ts)) };
     std::fs::create_dir_all(&base_dir).map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
     let mut received = 0u32;

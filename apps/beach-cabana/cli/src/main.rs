@@ -5,6 +5,7 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 use rand::{rngs::OsRng, RngCore};
 use std::fs;
+use std::io::Write as _;
 use std::time::{Duration, SystemTime};
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -54,6 +55,11 @@ fn run(cli: cli::Cli) -> Result<()> {
             }
         }
         cli::Commands::Preview { window_id } => {
+            let Some(window_id) = resolve_window_id(window_id)? else {
+                eprintln!("Selection canceled");
+                return Ok(());
+            };
+            prompt_screen_recording_permission();
             match cabana::platform::preview_window(&window_id) {
                 Ok(path) => {
                     println!("Saved preview frame to {}", path.display());
@@ -95,6 +101,15 @@ fn run(cli: cli::Cli) -> Result<()> {
                     println!("Streaming requires at least one frame.");
                     return Ok(());
                 }
+
+                let window_id = match resolve_window_id(window_id)? {
+                    Some(id) => id,
+                    None => {
+                        eprintln!("Selection canceled");
+                        return Ok(());
+                    }
+                };
+                prompt_screen_recording_permission();
 
                 let mut producer = match create_producer(&window_id) {
                     Ok(p) => p,
@@ -228,6 +243,15 @@ fn run(cli: cli::Cli) -> Result<()> {
                 let total_frames = duration_secs.saturating_mul(fps);
                 if total_frames == 0 { println!("Encoding requires a positive duration and fps."); return Ok(()); }
 
+                let window_id = match resolve_window_id(window_id)? {
+                    Some(id) => id,
+                    None => {
+                        eprintln!("Selection canceled");
+                        return Ok(());
+                    }
+                };
+                prompt_screen_recording_permission();
+
                 let mut producer = match create_producer(&window_id) { Ok(p) => p, Err(err) => { println!("Failed to create capture producer: {}", err); return Ok(()); } };
                 producer.start()?;
 
@@ -310,6 +334,8 @@ fn run(cli: cli::Cli) -> Result<()> {
                     session_id.clone(),
                     passcode.clone(),
                     road_url.clone(),
+                    fixture_url.clone(),
+                    fixture_dir.clone(),
                     prologue.clone().into_bytes(),
                     from_id.clone(),
                     to_id.clone(),
@@ -321,20 +347,12 @@ fn run(cli: cli::Cli) -> Result<()> {
             // Gate: require confirmation before streaming
             if let Some(id) = selected {
                 println!("Start streaming '{}' now? [y/N]", id);
-                use std::io::{Read, Write};
                 let mut input = String::new();
                 std::io::stdout().flush().ok();
                 std::io::stdin().read_line(&mut input).ok();
                 if matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
                     // macOS permission guidance (best-effort) before starting
-                    #[cfg(target_os = "macos")]
-                    {
-                        use beach_cabana_host::platform::macos::permissions::{status, ScreenRecordingStatus, request_access};
-                        if status() != ScreenRecordingStatus::Granted {
-                            println!("Screen Recording permission not granted. If prompted, approve access.");
-                            let _ = request_access();
-                        }
-                    }
+                    prompt_screen_recording_permission();
                     rt.block_on(async move {
                         #[cfg(target_os = "macos")]
                         {
@@ -359,10 +377,40 @@ fn run(cli: cli::Cli) -> Result<()> {
         cli::Commands::WebRtcViewerRun { session_id, passcode, host_envelope, host_envelope_file, fixture_url, prologue, recv_frames, output_dir, road_url, from_id, to_id } => {
             let env_str = if let Some(s) = host_envelope { s } else if let Some(path) = host_envelope_file { std::fs::read_to_string(path)? } else { String::new() };
             let rt = tokio::runtime::Runtime::new()?;
-            let out_dir = rt.block_on(async move {
-                cabana::webrtc::viewer_run(session_id, passcode, env_str, fixture_url, prologue.into_bytes(), recv_frames, output_dir, road_url, from_id, to_id).await
-            })?;
-            println!("Viewer received {} frame(s) into {}", recv_frames, out_dir.display());
+            let outcome = rt.block_on(async move {
+                cabana::webrtc::viewer_run(
+                    session_id,
+                    passcode,
+                    env_str,
+                    fixture_url,
+                    prologue.into_bytes(),
+                    recv_frames,
+                    output_dir,
+                    road_url,
+                    from_id,
+                    to_id,
+                    |code| {
+                        println!("Viewer verification code: {}", code);
+                        print!("Does the code match the host? [y/N]: ");
+                        let _ = std::io::stdout().flush();
+                        let mut input = String::new();
+                        if std::io::stdin().read_line(&mut input).is_ok() {
+                            matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+                        } else {
+                            false
+                        }
+                    },
+                ).await
+            });
+            match outcome {
+                Ok(out_dir) => {
+                    println!("Viewer received {} frame(s) into {}", recv_frames, out_dir.display());
+                }
+                Err(cabana::webrtc::NoiseDriverError::UserAborted) => {
+                    println!("Viewer canceled playback before receiving frames.");
+                }
+                Err(err) => return Err(anyhow!(err)),
+            }
         }
         #[cfg(feature = "webrtc")]
         cli::Commands::WebRtcLocal { session_id, passcode, host_id, viewer_id, prologue } => {
@@ -378,6 +426,66 @@ fn run(cli: cli::Cli) -> Result<()> {
         _ => unreachable!(),
     }
     Ok(())
+}
+
+fn resolve_window_id(window_id: Option<String>) -> Result<Option<String>> {
+    if let Some(id) = window_id {
+        return Ok(Some(id));
+    }
+
+    if let Some(event) = cabana::desktop::last_selection() {
+        println!("Using desktop picker selection '{}'", event.target_id);
+        return Ok(Some(event.target_id));
+    }
+
+    let wait_ms_env = std::env::var("CABANA_PICKER_WAIT_MS")
+        .ok()
+        .and_then(|val| val.parse::<u64>().ok());
+    let relay_enabled = std::env::var("CABANA_PICKER_RELAY")
+        .ok()
+        .map(|val| matches!(val.as_str(), "1" | "true" | "TRUE" | "True"))
+        .unwrap_or(false);
+    let wait_ms = wait_ms_env.or_else(|| if relay_enabled { Some(1500) } else { None });
+
+    if let Some(ms) = wait_ms {
+        if ms > 0 {
+            println!(
+                "Waiting up to {} ms for desktop picker selection…",
+                ms
+            );
+            if let Some(event) =
+                cabana::desktop::wait_for_selection(Some(Duration::from_millis(ms)))
+            {
+                println!("Received desktop picker selection '{}'", event.target_id);
+                return Ok(Some(event.target_id));
+            } else {
+                println!("No desktop picker selection received; falling back to TUI picker.");
+            }
+        }
+    }
+
+    tui_pick::run_picker()
+}
+
+#[cfg(target_os = "macos")]
+fn prompt_screen_recording_permission() {
+    use beach_cabana_host::platform::macos::permissions::{
+        request_access, status, ScreenRecordingStatus,
+    };
+    if status() != ScreenRecordingStatus::Granted {
+        println!("Screen Recording permission not granted. If macOS prompts, approve access. If previously denied, enable it via System Settings ▸ Privacy & Security ▸ Screen Recording.");
+        let _ = request_access();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn prompt_screen_recording_permission() {
+    println!("Windows will show a one-time \"Screen capture\" toast the first time Cabana shares a window. If you dismissed it previously, enable access via Settings ▸ Privacy & security ▸ Screen capture.");
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+fn prompt_screen_recording_permission() {
+    println!("This platform relies on compositor/portal prompts for capture permissions. Accept the request from your desktop environment when it appears.");
 }
 
 fn extract_session_id(url: &str) -> Option<String> { let trimmed = url.trim_end_matches('/'); trimmed.rsplit('/').next().map(|segment| segment.to_string()) }

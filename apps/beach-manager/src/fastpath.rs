@@ -8,8 +8,8 @@ use uuid::Uuid;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
@@ -46,29 +46,33 @@ impl FastPathSession {
         })
     }
 
-    pub async fn set_remote_offer(&self, offer: RTCSessionDescription) -> Result<RTCSessionDescription, WebRtcError> {
+    pub async fn set_remote_offer(
+        &self,
+        offer: RTCSessionDescription,
+    ) -> Result<RTCSessionDescription, WebRtcError> {
         self.pc.set_remote_description(offer).await?;
 
         let this = self.clone();
-        self.pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
-            let label = dc.label().to_string();
-            let this2 = this.clone();
-            Box::pin(async move {
-                info!(label = %label, "fast-path data channel opened");
-                match label.as_str() {
-                    "mgr-actions" => {
-                        *this2.actions_tx.lock().await = Some(dc.clone());
+        self.pc
+            .on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+                let label = dc.label().to_string();
+                let this2 = this.clone();
+                Box::pin(async move {
+                    info!(label = %label, "fast-path data channel opened");
+                    match label.as_str() {
+                        "mgr-actions" => {
+                            *this2.actions_tx.lock().await = Some(dc.clone());
+                        }
+                        "mgr-acks" => {
+                            *this2.acks_rx.lock().await = Some(dc.clone());
+                        }
+                        "mgr-state" => {
+                            *this2.state_rx.lock().await = Some(dc.clone());
+                        }
+                        _ => {}
                     }
-                    "mgr-acks" => {
-                        *this2.acks_rx.lock().await = Some(dc.clone());
-                    }
-                    "mgr-state" => {
-                        *this2.state_rx.lock().await = Some(dc.clone());
-                    }
-                    _ => {}
-                }
-            })
-        }));
+                })
+            }));
 
         let this = self.clone();
         self.pc.on_ice_candidate(Box::new(move |c| {
@@ -125,8 +129,11 @@ pub async fn send_actions_over_fast_path(
         let guard = fps.actions_tx.lock().await;
         if let Some(dc) = guard.as_ref() {
             for a in actions {
-                let text = serde_json::to_string(&serde_json::json!({"type":"action","payload":a}))?;
-                dc.send_text(text).await.map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                let text =
+                    serde_json::to_string(&serde_json::json!({"type":"action","payload":a}))?;
+                dc.send_text(text)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
             }
             return Ok(true);
         }

@@ -12,8 +12,8 @@ use std::{
 };
 
 use crate::auth::{AuthConfig, AuthContext};
-use crate::metrics;
 use crate::fastpath::{send_actions_over_fast_path, FastPathRegistry, FastPathSession};
+use crate::metrics;
 use beach_buggy::{
     AckStatus, ActionAck, ActionCommand, HarnessType, HealthHeartbeat, RegisterSessionRequest,
     RegisterSessionResponse, StateDiff,
@@ -142,10 +142,9 @@ pub enum StreamEvent {
 impl StreamEvent {
     pub fn as_named_json(&self) -> (&'static str, Option<String>) {
         match self {
-            StreamEvent::ControllerEvent(ev) => (
-                "controller_event",
-                serde_json::to_string(ev).ok(),
-            ),
+            StreamEvent::ControllerEvent(ev) => {
+                ("controller_event", serde_json::to_string(ev).ok())
+            }
             StreamEvent::State(diff) => ("state", serde_json::to_string(diff).ok()),
             StreamEvent::Health(hb) => ("health", serde_json::to_string(hb).ok()),
         }
@@ -220,8 +219,10 @@ impl AppState {
             events: Arc::new(RwLock::new(HashMap::new())),
             fast_paths: FastPathRegistry::new(),
             http: reqwest::Client::new(),
-            road_base_url: std::env::var("BEACH_ROAD_URL").unwrap_or_else(|_| "https://api.beach.sh".into()),
-            public_manager_url: std::env::var("PUBLIC_MANAGER_URL").unwrap_or_else(|_| "http://localhost:8080".into()),
+            road_base_url: std::env::var("BEACH_ROAD_URL")
+                .unwrap_or_else(|_| "https://api.beach.sh".into()),
+            public_manager_url: std::env::var("PUBLIC_MANAGER_URL")
+                .unwrap_or_else(|_| "http://localhost:8080".into()),
         }
     }
 
@@ -238,8 +239,10 @@ impl AppState {
             events: Arc::new(RwLock::new(HashMap::new())),
             fast_paths: FastPathRegistry::new(),
             http: reqwest::Client::new(),
-            road_base_url: std::env::var("BEACH_ROAD_URL").unwrap_or_else(|_| "https://api.beach.sh".into()),
-            public_manager_url: std::env::var("PUBLIC_MANAGER_URL").unwrap_or_else(|_| "http://localhost:8080".into()),
+            road_base_url: std::env::var("BEACH_ROAD_URL")
+                .unwrap_or_else(|_| "https://api.beach.sh".into()),
+            public_manager_url: std::env::var("PUBLIC_MANAGER_URL")
+                .unwrap_or_else(|_| "http://localhost:8080".into()),
         }
     }
 
@@ -253,9 +256,17 @@ impl AppState {
         self
     }
 
-    pub fn with_integrations(mut self, road_base_url: Option<String>, public_manager_url: Option<String>) -> Self {
-        if let Some(url) = road_base_url { self.road_base_url = url; }
-        if let Some(url) = public_manager_url { self.public_manager_url = url; }
+    pub fn with_integrations(
+        mut self,
+        road_base_url: Option<String>,
+        public_manager_url: Option<String>,
+    ) -> Self {
+        if let Some(url) = road_base_url {
+            self.road_base_url = url;
+        }
+        if let Some(url) = public_manager_url {
+            self.public_manager_url = url;
+        }
         self
     }
 
@@ -328,10 +339,22 @@ impl AppState {
                 let mut sessions = self.fallback.sessions.write().await;
                 let rec = sessions
                     .entry(origin_session_id.to_string())
-                    .or_insert_with(|| SessionRecord::new(origin_session_id, private_beach_id, &HarnessType::Custom));
-                rec.append_event(ControllerEventType::Registered, Some("attach_by_code".into()));
+                    .or_insert_with(|| {
+                        SessionRecord::new(
+                            origin_session_id,
+                            private_beach_id,
+                            &HarnessType::Custom,
+                        )
+                    });
+                rec.append_event(
+                    ControllerEventType::Registered,
+                    Some("attach_by_code".into()),
+                );
                 // Nudge harness via Beach Road with a bridge token (best-effort)
-                if let Ok((token, _exp, _aud)) = self.mint_bridge_token(private_beach_id, origin_session_id, requester).await {
+                if let Ok((token, _exp, _aud)) = self
+                    .mint_bridge_token(private_beach_id, origin_session_id, requester)
+                    .await
+                {
                     let _ = self.nudge_join_manager(origin_session_id, &token).await;
                 }
                 Ok(SessionSummary::from_record(rec))
@@ -342,12 +365,11 @@ impl AppState {
                 let mut tx = pool.begin().await?;
                 self.set_rls_context_tx(&mut tx, &beach_uuid).await?;
                 // Ensure the target private beach exists to avoid FK violations
-                let exists: Option<(i32,)> = sqlx::query_as(
-                    r#"SELECT 1 FROM private_beach WHERE id = $1"#,
-                )
-                .bind(beach_uuid)
-                .fetch_optional(tx.as_mut())
-                .await?;
+                let exists: Option<(i32,)> =
+                    sqlx::query_as(r#"SELECT 1 FROM private_beach WHERE id = $1"#)
+                        .bind(beach_uuid)
+                        .fetch_optional(tx.as_mut())
+                        .await?;
                 if exists.is_none() {
                     return Err(StateError::PrivateBeachNotFound);
                 }
@@ -386,7 +408,10 @@ impl AppState {
                 .await?;
                 tx.commit().await?;
 
-                if let Ok((token, _exp, _aud)) = self.mint_bridge_token(private_beach_id, origin_session_id, requester).await {
+                if let Ok((token, _exp, _aud)) = self
+                    .mint_bridge_token(private_beach_id, origin_session_id, requester)
+                    .await
+                {
                     let _ = self.nudge_join_manager(origin_session_id, &token).await;
                 }
 
@@ -413,12 +438,17 @@ impl AppState {
                 let mut sessions = self.fallback.sessions.write().await;
                 for id in origin_ids {
                     let existed = sessions.contains_key(&id);
-                    let entry = sessions.entry(id.clone()).or_insert_with(|| SessionRecord::new(&id, private_beach_id, &HarnessType::Custom));
+                    let entry = sessions.entry(id.clone()).or_insert_with(|| {
+                        SessionRecord::new(&id, private_beach_id, &HarnessType::Custom)
+                    });
                     if existed {
                         duplicates += 1;
                     } else {
                         attached += 1;
-                        entry.append_event(ControllerEventType::Registered, Some("attach_owned".into()));
+                        entry.append_event(
+                            ControllerEventType::Registered,
+                            Some("attach_owned".into()),
+                        );
                     }
                 }
                 Ok((attached, duplicates))
@@ -428,12 +458,11 @@ impl AppState {
                 let mut tx = pool.begin().await?;
                 self.set_rls_context_tx(&mut tx, &beach_uuid).await?;
                 // Ensure the target private beach exists to avoid FK violations
-                let exists: Option<(i32,)> = sqlx::query_as(
-                    r#"SELECT 1 FROM private_beach WHERE id = $1"#,
-                )
-                .bind(beach_uuid)
-                .fetch_optional(tx.as_mut())
-                .await?;
+                let exists: Option<(i32,)> =
+                    sqlx::query_as(r#"SELECT 1 FROM private_beach WHERE id = $1"#)
+                        .bind(beach_uuid)
+                        .fetch_optional(tx.as_mut())
+                        .await?;
                 if exists.is_none() {
                     return Err(StateError::PrivateBeachNotFound);
                 }
@@ -452,13 +481,21 @@ impl AppState {
                         .bind(requester)
                         .execute(tx.as_mut())
                         .await?;
-                        if result.rows_affected() == 0 { duplicates += 1; } else { attached += 1; ids_to_nudge.push(id.clone()); }
+                        if result.rows_affected() == 0 {
+                            duplicates += 1;
+                        } else {
+                            attached += 1;
+                            ids_to_nudge.push(id.clone());
+                        }
                     }
                 }
                 tx.commit().await?;
                 // Best-effort nudge for newly attached sessions
                 for sid in ids_to_nudge {
-                    if let Ok((token, _exp, _aud)) = self.mint_bridge_token(private_beach_id, &sid, requester).await {
+                    if let Ok((token, _exp, _aud)) = self
+                        .mint_bridge_token(private_beach_id, &sid, requester)
+                        .await
+                    {
                         let _ = self.nudge_join_manager(&sid, &token).await;
                     }
                 }
@@ -481,9 +518,19 @@ impl AppState {
     }
 
     async fn verify_code_with_road(&self, origin_session_id: &str, code: &str) -> Result<bool, ()> {
-        let url = format!("{}/sessions/{}/verify-code", self.road_base_url.trim_end_matches('/'), origin_session_id);
+        let url = format!(
+            "{}/sessions/{}/verify-code",
+            self.road_base_url.trim_end_matches('/'),
+            origin_session_id
+        );
         let body = serde_json::json!({ "code": code });
-        let resp = self.http.post(url).json(&body).send().await.map_err(|_| ())?;
+        let resp = self
+            .http
+            .post(url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| ())?;
         if !resp.status().is_success() {
             return Ok(false);
         }
@@ -491,15 +538,29 @@ impl AppState {
         Ok(v.get("verified").and_then(|b| b.as_bool()).unwrap_or(false))
     }
 
-    async fn nudge_join_manager(&self, origin_session_id: &str, bridge_token: &str) -> Result<(), ()> {
+    async fn nudge_join_manager(
+        &self,
+        origin_session_id: &str,
+        bridge_token: &str,
+    ) -> Result<(), ()> {
         let url = format!(
             "{}/sessions/{}/join-manager",
             self.road_base_url.trim_end_matches('/'),
             origin_session_id
         );
         let body = serde_json::json!({ "manager_url": self.public_manager_url, "bridge_token": bridge_token });
-        let resp = self.http.post(url).json(&body).send().await.map_err(|_| ())?;
-        if resp.status().is_success() { Ok(()) } else { Err(()) }
+        let resp = self
+            .http
+            .post(url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| ())?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(())
+        }
     }
     // impl AppState continues below
 
@@ -616,11 +677,12 @@ impl AppState {
                         .controller_token
                         .filter(|_| is_active_lease(row.expires_at, row.revoked_at))
                         .map(|token| token.to_string());
-                    let controller_expires_at_ms = if is_active_lease(row.expires_at, row.revoked_at) {
-                        row.expires_at.map(|t| t.timestamp_millis())
-                    } else {
-                        None
-                    };
+                    let controller_expires_at_ms =
+                        if is_active_lease(row.expires_at, row.revoked_at) {
+                            row.expires_at.map(|t| t.timestamp_millis())
+                        } else {
+                            None
+                        };
                     let last_health = row
                         .last_health
                         .and_then(|Json(value)| serde_json::from_value(value).ok());
@@ -853,9 +915,13 @@ impl AppState {
                 }
 
                 // Try fast-path first
-                if send_actions_over_fast_path(&self.fast_paths, &session_uuid.to_string(), &actions)
-                    .await
-                    .unwrap_or(false)
+                if send_actions_over_fast_path(
+                    &self.fast_paths,
+                    &session_uuid.to_string(),
+                    &actions,
+                )
+                .await
+                .unwrap_or(false)
                 {
                     let mut tx = pool.begin().await?;
                     self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
@@ -880,7 +946,9 @@ impl AppState {
                             controller_token: Some(token_uuid.to_string()),
                             timestamp_ms: now_ms(),
                             reason: None,
-                            controller_account_id: lease.controller_account_id.map(|u| u.to_string()),
+                            controller_account_id: lease
+                                .controller_account_id
+                                .map(|u| u.to_string()),
                             issued_by_account_id: actor_account_id.map(|u| u.to_string()),
                         }),
                     )
@@ -909,7 +977,9 @@ impl AppState {
                     )
                     .await
                     .unwrap_or(0);
-                metrics::QUEUE_DEPTH.with_label_values(&labels).set(depth as i64);
+                metrics::QUEUE_DEPTH
+                    .with_label_values(&labels)
+                    .set(depth as i64);
                 // Pending (unacked) lag gauge
                 let pending = self
                     .pending_actions_pending_count(
@@ -1008,8 +1078,12 @@ impl AppState {
                             controller_token: Some(token_str),
                             timestamp_ms: now_ms(),
                             reason: None,
-                            controller_account_id: lease.controller_account_id.map(|u| u.to_string()),
-                            issued_by_account_id: lease.controller_account_id.map(|u| u.to_string()),
+                            controller_account_id: lease
+                                .controller_account_id
+                                .map(|u| u.to_string()),
+                            issued_by_account_id: lease
+                                .controller_account_id
+                                .map(|u| u.to_string()),
                         }),
                     )
                     .await;
@@ -1325,14 +1399,24 @@ impl AppState {
                 }
                 if since_ms.is_some() {
                     let pos = if event_type.is_some() { 3 } else { 2 };
-                    sql.push_str(&format!(" AND occurred_at >= to_timestamp(${} / 1000.0)", pos));
+                    sql.push_str(&format!(
+                        " AND occurred_at >= to_timestamp(${} / 1000.0)",
+                        pos
+                    ));
                 }
                 sql.push_str(" ORDER BY occurred_at DESC LIMIT $X");
                 // replace $X with next index
-                let lim_idx = if event_type.is_some() && since_ms.is_some() { 4 } else if event_type.is_some() || since_ms.is_some() { 3 } else { 2 };
+                let lim_idx = if event_type.is_some() && since_ms.is_some() {
+                    4
+                } else if event_type.is_some() || since_ms.is_some() {
+                    3
+                } else {
+                    2
+                };
                 let sql = sql.replace("$X", &format!("${}", lim_idx));
 
-                let mut query = sqlx::query_as::<_, ControllerEventRow>(&sql).bind(identifiers.session_id);
+                let mut query =
+                    sqlx::query_as::<_, ControllerEventRow>(&sql).bind(identifiers.session_id);
                 if let Some(et) = event_type {
                     query = query.bind(et);
                 }
@@ -1743,7 +1827,8 @@ impl AppState {
 
         let mut tx = pool.begin().await?;
         // Set RLS context to the target private beach for the duration of this registration.
-        self.set_rls_context_tx(&mut tx, &private_beach_uuid).await?;
+        self.set_rls_context_tx(&mut tx, &private_beach_uuid)
+            .await?;
 
         let session_row = sqlx::query(
             r#"
@@ -1978,7 +2063,8 @@ impl AppState {
             .ok_or(StateError::SessionNotFound)?;
         record.last_health = Some(heartbeat.clone());
         record.append_event(ControllerEventType::HealthReported, None);
-        self.publish(session_id, StreamEvent::Health(heartbeat)).await;
+        self.publish(session_id, StreamEvent::Health(heartbeat))
+            .await;
         Ok(())
     }
 
@@ -1993,8 +2079,11 @@ impl AppState {
             .ok_or(StateError::SessionNotFound)?;
         record.last_state = Some(diff);
         record.append_event(ControllerEventType::StateUpdated, None);
-        self.publish(session_id, StreamEvent::State(record.last_state.clone().unwrap()))
-            .await;
+        self.publish(
+            session_id,
+            StreamEvent::State(record.last_state.clone().unwrap()),
+        )
+        .await;
         Ok(())
     }
 
@@ -2422,8 +2511,16 @@ impl AppState {
             let mut conn = client.get_async_connection().await?;
             let key = redis_actions_key(private_beach_id, session_id);
             let index_key = redis_action_index_key(private_beach_id, session_id);
-            let _: () = redis::cmd("DEL").arg(&key).query_async(&mut conn).await.unwrap_or(());
-            let _: () = redis::cmd("DEL").arg(&index_key).query_async(&mut conn).await.unwrap_or(());
+            let _: () = redis::cmd("DEL")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(());
+            let _: () = redis::cmd("DEL")
+                .arg(&index_key)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(());
         }
         Ok(())
     }
@@ -2439,24 +2536,31 @@ impl AppState {
     ) -> Result<crate::routes::BeachSummary, StateError> {
         let pool = match &self.backend {
             Backend::Postgres(p) => p,
-            Backend::Memory => return Err(StateError::Database(sqlx::Error::Protocol("requires postgres backend".into()))),
+            Backend::Memory => {
+                return Err(StateError::Database(sqlx::Error::Protocol(
+                    "requires postgres backend".into(),
+                )))
+            }
         };
 
         let mut tx = pool.begin().await?;
         if let Some(owner_id) = owner {
-            self.set_account_context_tx(&mut tx, Some(&owner_id)).await?;
+            self.set_account_context_tx(&mut tx, Some(&owner_id))
+                .await?;
         } else {
             self.set_account_context_tx(&mut tx, None).await?;
         }
 
-        let base_slug = slug
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| slugify(name));
+        let base_slug = slug.map(|s| s.to_string()).unwrap_or_else(|| slugify(name));
 
         // Try up to 5 variants to avoid slug collisions
         let mut final_row: Option<(Uuid, String, String, chrono::DateTime<Utc>)> = None;
         for i in 0..5 {
-            let candidate = if i == 0 { base_slug.clone() } else { format!("{}-{}", base_slug, &Uuid::new_v4().to_string()[..8]) };
+            let candidate = if i == 0 {
+                base_slug.clone()
+            } else {
+                format!("{}-{}", base_slug, &Uuid::new_v4().to_string()[..8])
+            };
             let res = sqlx::query_as::<_, (Uuid, String, String, chrono::DateTime<Utc>)>(
                 r#"
                 INSERT INTO private_beach (name, slug, owner_account_id)
@@ -2470,15 +2574,24 @@ impl AppState {
             .fetch_one(tx.as_mut())
             .await;
             match res {
-                Ok(row) => { final_row = Some(row); break; }
-                Err(sqlx::Error::Database(db_err)) if db_err.constraint() == Some("private_beach_slug_key") => {
+                Ok(row) => {
+                    final_row = Some(row);
+                    break;
+                }
+                Err(sqlx::Error::Database(db_err))
+                    if db_err.constraint() == Some("private_beach_slug_key") =>
+                {
                     continue;
                 }
                 Err(e) => return Err(StateError::Database(e)),
             }
         }
 
-        let (id, name, slug, created_at) = final_row.ok_or_else(|| StateError::Database(sqlx::Error::Protocol("could not allocate unique slug".into())))?;
+        let (id, name, slug, created_at) = final_row.ok_or_else(|| {
+            StateError::Database(sqlx::Error::Protocol(
+                "could not allocate unique slug".into(),
+            ))
+        })?;
 
         // Insert owner membership when available (best-effort; RLS requires account + beach GUCs)
         if let Some(owner_id) = owner {
@@ -2497,7 +2610,12 @@ impl AppState {
         }
 
         tx.commit().await?;
-        Ok(crate::routes::BeachSummary { id: id.to_string(), name, slug, created_at: created_at.timestamp_millis() })
+        Ok(crate::routes::BeachSummary {
+            id: id.to_string(),
+            name,
+            slug,
+            created_at: created_at.timestamp_millis(),
+        })
     }
 
     pub async fn list_private_beaches(
@@ -2509,7 +2627,11 @@ impl AppState {
             Backend::Memory => return Ok(Vec::new()),
         };
         let mut tx = pool.begin().await?;
-        if let Some(a) = account { self.set_account_context_tx(&mut tx, Some(&a)).await?; } else { self.set_account_context_tx(&mut tx, None).await?; }
+        if let Some(a) = account {
+            self.set_account_context_tx(&mut tx, Some(&a)).await?;
+        } else {
+            self.set_account_context_tx(&mut tx, None).await?;
+        }
         let rows: Vec<(Uuid, String, String, chrono::DateTime<Utc>)> = sqlx::query_as(
             r#"
             SELECT id, name, slug, created_at
@@ -2522,7 +2644,12 @@ impl AppState {
         tx.commit().await?;
         Ok(rows
             .into_iter()
-            .map(|(id, name, slug, created_at)| crate::routes::BeachSummary { id: id.to_string(), name, slug, created_at: created_at.timestamp_millis() })
+            .map(|(id, name, slug, created_at)| crate::routes::BeachSummary {
+                id: id.to_string(),
+                name,
+                slug,
+                created_at: created_at.timestamp_millis(),
+            })
             .collect())
     }
 
@@ -2537,10 +2664,20 @@ impl AppState {
         };
         let id = parse_uuid(id_str, "id")?;
         let mut tx = pool.begin().await?;
-        if let Some(a) = account { self.set_account_context_tx(&mut tx, Some(&a)).await?; } else { self.set_account_context_tx(&mut tx, None).await?; }
+        if let Some(a) = account {
+            self.set_account_context_tx(&mut tx, Some(&a)).await?;
+        } else {
+            self.set_account_context_tx(&mut tx, None).await?;
+        }
         // Also set beach GUC to allow bypass mode SELECT for ownerless rows via policy OR clause
         self.set_rls_context_tx(&mut tx, &id).await?;
-        let row: Option<(Uuid, String, String, serde_json::Value, chrono::DateTime<Utc>)> = sqlx::query_as(
+        let row: Option<(
+            Uuid,
+            String,
+            String,
+            serde_json::Value,
+            chrono::DateTime<Utc>,
+        )> = sqlx::query_as(
             r#"
             SELECT id, name, slug, COALESCE(settings, '{}'::jsonb) AS settings, created_at
             FROM private_beach
@@ -2552,7 +2689,13 @@ impl AppState {
         .await?;
         tx.commit().await?;
         let (id, name, slug, settings, created_at) = row.ok_or(StateError::PrivateBeachNotFound)?;
-        Ok(crate::routes::BeachMeta { id: id.to_string(), name, slug, settings, created_at: created_at.timestamp_millis() })
+        Ok(crate::routes::BeachMeta {
+            id: id.to_string(),
+            name,
+            slug,
+            settings,
+            created_at: created_at.timestamp_millis(),
+        })
     }
 
     pub async fn update_private_beach(
@@ -2569,26 +2712,31 @@ impl AppState {
         };
         let id = parse_uuid(id_str, "id")?;
         let mut tx = pool.begin().await?;
-        if let Some(a) = account { self.set_account_context_tx(&mut tx, Some(&a)).await?; } else { self.set_account_context_tx(&mut tx, None).await?; }
+        if let Some(a) = account {
+            self.set_account_context_tx(&mut tx, Some(&a)).await?;
+        } else {
+            self.set_account_context_tx(&mut tx, None).await?;
+        }
         self.set_rls_context_tx(&mut tx, &id).await?;
 
         // Authorization: if no account, only allow ownerless beaches (dev bypass)
         if account.is_none() {
-            let ok: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM private_beach WHERE id = $1 AND owner_account_id IS NULL")
-                .bind(id)
-                .fetch_optional(tx.as_mut())
-                .await?;
+            let ok: Option<(Uuid,)> = sqlx::query_as(
+                "SELECT id FROM private_beach WHERE id = $1 AND owner_account_id IS NULL",
+            )
+            .bind(id)
+            .fetch_optional(tx.as_mut())
+            .await?;
             if ok.is_none() {
                 return Err(StateError::PrivateBeachNotFound);
             }
         } else {
             // Ensure caller can see the beach (membership/owner) before update
-            let exists: Option<(Uuid,)> = sqlx::query_as(
-                r#"SELECT id FROM private_beach WHERE id = $1"#,
-            )
-            .bind(id)
-            .fetch_optional(tx.as_mut())
-            .await?;
+            let exists: Option<(Uuid,)> =
+                sqlx::query_as(r#"SELECT id FROM private_beach WHERE id = $1"#)
+                    .bind(id)
+                    .fetch_optional(tx.as_mut())
+                    .await?;
             if exists.is_none() {
                 return Err(StateError::PrivateBeachNotFound);
             }
@@ -2597,9 +2745,15 @@ impl AppState {
         let new_name = name.map(|s| s.to_string());
         let new_slug = slug.map(|s| s.to_string());
         let mut parts: Vec<&str> = Vec::new();
-        if new_name.is_some() { parts.push("name = $2"); }
-        if new_slug.is_some() { parts.push("slug = $3"); }
-        if settings.is_some() { parts.push("settings = $4"); }
+        if new_name.is_some() {
+            parts.push("name = $2");
+        }
+        if new_slug.is_some() {
+            parts.push("slug = $3");
+        }
+        if settings.is_some() {
+            parts.push("settings = $4");
+        }
         if parts.is_empty() {
             drop(tx);
             return self.get_private_beach(id_str, account).await;
@@ -2609,7 +2763,13 @@ impl AppState {
             "UPDATE private_beach SET {assigns} , updated_at = NOW() WHERE id = $1 RETURNING id, name, slug, COALESCE(settings, '{{}}'::jsonb) AS settings, created_at",
             assigns = parts.join(", ")
         );
-        let row: (Uuid, String, String, serde_json::Value, chrono::DateTime<Utc>) = sqlx::query_as(&sql)
+        let row: (
+            Uuid,
+            String,
+            String,
+            serde_json::Value,
+            chrono::DateTime<Utc>,
+        ) = sqlx::query_as(&sql)
             .bind(id)
             .bind(new_name)
             .bind(new_slug)
@@ -2617,7 +2777,13 @@ impl AppState {
             .fetch_one(tx.as_mut())
             .await?;
         tx.commit().await?;
-        Ok(crate::routes::BeachMeta { id: row.0.to_string(), name: row.1, slug: row.2, settings: row.3, created_at: row.4.timestamp_millis() })
+        Ok(crate::routes::BeachMeta {
+            id: row.0.to_string(),
+            name: row.1,
+            slug: row.2,
+            settings: row.3,
+            created_at: row.4.timestamp_millis(),
+        })
     }
 
     pub async fn get_private_beach_layout(
@@ -2639,7 +2805,11 @@ impl AppState {
         let tiles = layout
             .get("tiles")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|t| t.as_str().map(|s| s.to_string())).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_else(|| Vec::new());
         Ok(crate::routes::BeachLayout { preset, tiles })
     }
@@ -2657,22 +2827,33 @@ impl AppState {
         };
         let id = parse_uuid(id_str, "id")?;
         let mut tx = pool.begin().await?;
-        if let Some(a) = account { self.set_account_context_tx(&mut tx, Some(&a)).await?; } else { self.set_account_context_tx(&mut tx, None).await?; }
+        if let Some(a) = account {
+            self.set_account_context_tx(&mut tx, Some(&a)).await?;
+        } else {
+            self.set_account_context_tx(&mut tx, None).await?;
+        }
         self.set_rls_context_tx(&mut tx, &id).await?;
 
         // Authorization: same as update
         if account.is_none() {
-            let ok: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM private_beach WHERE id = $1 AND owner_account_id IS NULL")
-                .bind(id)
-                .fetch_optional(tx.as_mut())
-                .await?;
-            if ok.is_none() { return Err(StateError::PrivateBeachNotFound); }
+            let ok: Option<(Uuid,)> = sqlx::query_as(
+                "SELECT id FROM private_beach WHERE id = $1 AND owner_account_id IS NULL",
+            )
+            .bind(id)
+            .fetch_optional(tx.as_mut())
+            .await?;
+            if ok.is_none() {
+                return Err(StateError::PrivateBeachNotFound);
+            }
         } else {
-            let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM private_beach WHERE id = $1")
-                .bind(id)
-                .fetch_optional(tx.as_mut())
-                .await?;
-            if exists.is_none() { return Err(StateError::PrivateBeachNotFound); }
+            let exists: Option<(Uuid,)> =
+                sqlx::query_as("SELECT id FROM private_beach WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(tx.as_mut())
+                    .await?;
+            if exists.is_none() {
+                return Err(StateError::PrivateBeachNotFound);
+            }
         }
 
         // Upsert settings->'layout'

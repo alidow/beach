@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
-import GridLayout, { type Layout, WidthProvider } from 'react-grid-layout';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import dynamic from 'next/dynamic';
+import type { Layout } from 'react-grid-layout';
 import { SessionSummary, acquireController, emergencyStop, releaseController } from '../lib/api';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
@@ -11,43 +12,19 @@ type Props = {
   onSelect: (s: SessionSummary) => void;
   token: string | null;
   managerUrl: string;
-  refresh: () => void;
+  refresh: () => Promise<void>;
   preset?: 'grid2x2' | 'onePlusThree' | 'focus';
-  beachId: string | undefined;
 };
 
-const AutoGrid = WidthProvider(GridLayout);
+const AutoGrid = dynamic(() => import('./AutoGrid'), {
+  ssr: false,
+  loading: () => <div className="h-[520px] rounded-xl border border-neutral-200 bg-white shadow-sm" />,
+});
 
 const COLS = 12;
 const DEFAULT_W = 4;
 const DEFAULT_H = 6;
-const LOCAL_LAYOUT_PREFIX = 'pb-tile-layout::';
-
 type LayoutCache = Record<string, Layout>;
-
-function loadLayoutCache(beachId: string | undefined): LayoutCache {
-  if (typeof window === 'undefined' || !beachId) return {};
-  const raw = window.localStorage.getItem(`${LOCAL_LAYOUT_PREFIX}${beachId}`);
-  if (!raw) return {};
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object') {
-      return parsed as LayoutCache;
-    }
-  } catch {
-    // ignore
-  }
-  return {};
-}
-
-function saveLayoutCache(beachId: string | undefined, cache: LayoutCache) {
-  if (typeof window === 'undefined' || !beachId) return;
-  try {
-    window.localStorage.setItem(`${LOCAL_LAYOUT_PREFIX}${beachId}`, JSON.stringify(cache));
-  } catch {
-    // ignore
-  }
-}
 
 function ensureLayout(cache: LayoutCache, tiles: SessionSummary[], preset: Props['preset']): Layout[] {
   const items: Layout[] = [];
@@ -132,23 +109,28 @@ function nextPosition(existing: Layout[]): Position {
   return { x: 0, y: maxY, w: DEFAULT_W, h: DEFAULT_H };
 }
 
-export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUrl, refresh, preset = 'grid2x2', beachId }: Props) {
-  const [now, setNow] = useState<number>(Date.now());
-  const [cache, setCache] = useState<LayoutCache>(() => loadLayoutCache(beachId));
+export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUrl, refresh, preset = 'grid2x2' }: Props) {
+  const [cache, setCache] = useState<LayoutCache>({});
   const [expanded, setExpanded] = useState<SessionSummary | null>(null);
+  const [isClient, setIsClient] = useState(false);
+
+  const renderNow = Date.now();
 
   useEffect(() => {
-    setCache(loadLayoutCache(beachId));
-  }, [beachId]);
-
-  useEffect(() => {
-    const t = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(t);
+    setIsClient(true);
   }, []);
 
   useEffect(() => {
     if (expanded && !tiles.some((t) => t.session_id === expanded.session_id)) {
       setExpanded(null);
+    }
+  }, [tiles, expanded]);
+
+  useEffect(() => {
+    if (!expanded) return;
+    const match = tiles.find((t) => t.session_id === expanded.session_id);
+    if (match && match !== expanded) {
+      setExpanded(match);
     }
   }, [tiles, expanded]);
 
@@ -160,7 +142,6 @@ export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUr
       nextCache[item.i] = { ...item };
     });
     setCache(nextCache);
-    saveLayoutCache(beachId, nextCache);
   };
 
   const handleAcquire = async (sessionId: string) => {
@@ -180,6 +161,25 @@ export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUr
     await refresh();
   };
 
+  const renderResizeHandle = useCallback(
+    (axis: string) => {
+      const label =
+        axis === 'se'
+          ? 'Resize'
+          : axis === 'e'
+            ? 'Resize width'
+            : axis === 's'
+              ? 'Resize height'
+              : 'Resize';
+      return <span className="react-resizable-handle" aria-label={label} />;
+    },
+    [],
+  );
+
+  if (!isClient) {
+    return <div className="h-[520px] rounded-xl border border-neutral-200 bg-white shadow-sm" />;
+  }
+
   return (
     <div className="relative">
       <AutoGrid
@@ -190,26 +190,29 @@ export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUr
         containerPadding={[8, 8]}
         compactType="vertical"
         preventCollision={false}
-        draggableHandle=".session-tile-drag-handle"
+        draggableHandle=".session-tile-drag-grip"
+        draggableCancel=".session-tile-actions"
+        resizeHandle={renderResizeHandle}
         onLayoutChange={handleLayoutChange}
       >
         {tiles.map((s) => {
+          const now = renderNow;
           const expires = s.controller_expires_at_ms || 0;
           const remain = Math.max(0, expires - now);
           const countdown = s.controller_token ? `${Math.floor(remain / 1000)}s` : '';
           return (
             <div key={s.session_id} className="flex h-full flex-col overflow-hidden rounded-xl border border-neutral-200 bg-white shadow-sm">
-              <div className="session-tile-drag-handle flex items-center justify-between border-b border-neutral-200 bg-neutral-50/80 px-3 py-2 backdrop-blur">
-                <div className="flex items-center gap-2">
-                  <span className="rounded bg-white/80 px-1 font-mono text-[11px] text-neutral-700">{s.session_id.slice(0, 8)}</span>
+              <div className="flex items-center justify-between border-b border-neutral-200 bg-neutral-50/80 px-3 py-2 backdrop-blur">
+                <div className="session-tile-drag-grip flex cursor-grab items-center gap-2 text-xs text-neutral-700 active:cursor-grabbing" role="button" tabIndex={0}>
+                  <span className="rounded bg-white/80 px-1 font-mono text-[11px] tracking-tight">{s.session_id.slice(0, 8)}</span>
                   <Badge variant="muted">{s.harness_type}</Badge>
                   <Badge variant={s.last_health?.degraded ? 'warning' : 'success'}>{s.last_health?.degraded ? 'degraded' : 'healthy'}</Badge>
                   <Badge variant="muted">{s.pending_actions}/{s.pending_unacked}</Badge>
                   {s.controller_token && <Badge variant="muted">{countdown}</Badge>}
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="session-tile-actions flex items-center gap-2">
                   <Button size="sm" variant="ghost" onClick={() => onSelect(s)}>Details</Button>
-                  <Button size="sm" variant="ghost" onClick={() => setExpanded(s)}>Expand</Button>
+                  <Button size="sm" variant="ghost" onClick={() => setExpanded(s)}>Expand ⤢</Button>
                   <Button size="sm" variant="ghost" onClick={() => onRemove(s.session_id)}>Remove</Button>
                 </div>
               </div>

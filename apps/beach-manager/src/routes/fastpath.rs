@@ -1,14 +1,20 @@
-use axum::{extract::{Path, State}, Json};
+use axum::{
+    extract::{Path, State},
+    Json,
+};
 use serde::Deserialize;
+use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription as _;
 use webrtc::peer_connection::sdp::session_description::*;
-use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
-use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 
-use crate::{routes::{ApiError, ApiResult, AuthToken}, state::AppState};
 pub use crate::fastpath::FastPathSession;
 pub use crate::fastpath::{send_actions_over_fast_path, FastPathRegistry};
+use crate::{
+    routes::{ApiError, ApiResult, AuthToken},
+    state::AppState,
+};
 
 #[derive(Deserialize)]
 pub struct OfferBody {

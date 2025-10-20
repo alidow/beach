@@ -5,13 +5,13 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
 };
 use futures_core::Stream;
+use futures_util::future::ready;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
-use futures_util::future::ready;
 
 use crate::{metrics, state::AppState};
 
-use super::{AuthToken, ApiError};
+use super::{ApiError, AuthToken};
 
 pub async fn prometheus_metrics() -> String {
     metrics::export_prometheus()

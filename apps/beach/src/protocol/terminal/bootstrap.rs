@@ -248,13 +248,27 @@ async fn compute_remote_sha256(args: &SshArgs, remote_path: &str) -> Result<Stri
 pub fn render_remote_command(remote_args: &[String], keep_running: bool) -> String {
     let quoted: Vec<String> = remote_args.iter().map(|arg| shell_quote(arg)).collect();
     let body = quoted.join(" ");
+    // Keep the remote bootstrap workspace tidy before launching a new host.
+    let log_cleanup = "find /tmp -maxdepth 1 -name 'beach-bootstrap-*.json' -type f -size 0 -delete \
+         >/dev/null 2>&1 || true;";
+    let cleanup = if keep_running {
+        log_cleanup.to_string()
+    } else {
+        format!(
+            "pkill -f 'beach host --bootstrap-output=json' >/dev/null 2>&1 || true; {log_cleanup}"
+        )
+    };
     if keep_running {
         let temp_file = "/tmp/beach-bootstrap-$$.json";
-        format!("nohup {body} >{temp_file} 2>&1 </dev/null & sleep 2 && cat {temp_file}")
+        format!(
+            "( {cleanup} temp_file={temp_file}; rm -f \"$temp_file\"; \
+               nohup {body} >\"$temp_file\" 2>&1 </dev/null & \
+               sleep 2 && cat \"$temp_file\" )"
+        )
     } else {
         // Foreground execution so the process is tied to the SSH session;
         // bootstrap JSON is emitted directly to stdout.
-        body
+        format!("( {cleanup} {body} )")
     }
 }
 

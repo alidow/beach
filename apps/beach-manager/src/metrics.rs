@@ -1,5 +1,8 @@
 use once_cell::sync::Lazy;
-use prometheus::{Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
+use prometheus::{
+    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+    TextEncoder,
+};
 
 pub static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 
@@ -51,7 +54,10 @@ pub static QUEUE_DEPTH: Lazy<IntGaugeVec> = Lazy::new(|| {
 
 pub static QUEUE_LAG: Lazy<IntGaugeVec> = Lazy::new(|| {
     let g = IntGaugeVec::new(
-        Opts::new("actions_queue_pending", "Number of pending (unacked) actions"),
+        Opts::new(
+            "actions_queue_pending",
+            "Number of pending (unacked) actions",
+        ),
         &["private_beach_id", "session_id"],
     )
     .unwrap();
@@ -85,7 +91,9 @@ pub static ACTION_LATENCY_MS: Lazy<HistogramVec> = Lazy::new(|| {
             "action_latency_ms",
             "Ack-reported action latency in milliseconds",
         )
-        .buckets(vec![1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0]),
+        .buckets(vec![
+            1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0,
+        ]),
         &["private_beach_id", "session_id"],
     )
     .unwrap();

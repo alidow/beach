@@ -43,6 +43,7 @@ use crate::transport::{Payload, Transport, TransportError, TransportKind};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Read, Write};
+use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -51,13 +52,21 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
+use tracing::field::display;
 use tracing::{Level, debug, error, info, trace, warn};
 use transport_mod::webrtc::{OffererAcceptedTransport, OffererSupervisor};
 
 pub(crate) const MCP_CHANNEL_LABEL: &str = "mcp-jsonrpc";
 pub(crate) const MCP_CHANNEL_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[tracing::instrument(
+    name = "beach::terminal::host::run",
+    skip(args),
+    fields(session_id = tracing::field::Empty, pid = tracing::field::Empty)
+)]
 pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
+    let pid = process::id();
+    tracing::Span::current().record("pid", &display(pid));
     let manager = SessionManager::new(SessionConfig::new(base_url)?)?;
     let cursor_sync = cursor_sync_enabled();
     let normalized_base = manager.config().base_url().to_string();
@@ -111,6 +120,24 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
 
     let hosted = manager.host().await?;
     let session_id = hosted.session_id().to_string();
+    tracing::Span::current().record("session_id", &display(&session_id));
+    if bootstrap_mode {
+        info!(
+            session_id = %session_id,
+            pid,
+            wait_for_peer = args.wait,
+            survive_sighup = args.bootstrap_survive_sighup,
+            "bootstrap host starting"
+        );
+    } else {
+        info!(
+            session_id = %session_id,
+            pid,
+            wait_for_peer = args.wait,
+            interactive,
+            "terminal host starting"
+        );
+    }
     info!(session_id = %session_id, "session registered");
     // Surface the advertised WebRTC offer metadata to aid role/negotiation debugging.
     for offer in hosted.offers() {
@@ -371,7 +398,13 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     }
 
     if let Err(err) = updates_task.await {
-        eprintln!("⚠️  update forwarder ended unexpectedly: {err}");
+        warn!(
+            target = "beach::terminal::host",
+            session_id = %session_id,
+            pid,
+            error = %err,
+            "update forwarder ended unexpectedly"
+        );
     }
 
     if let Some(handle) = local_preview_task {
@@ -400,9 +433,16 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     }
 
     if !bootstrap_mode {
-        println!("\n✅ command '{command_display}' completed");
+        let mut stdout = io::stdout().lock();
+        blank_line(&mut stdout);
+        writeln_cleared(
+            &mut stdout,
+            format_args!("✅ command '{command_display}' completed"),
+        );
+        blank_line(&mut stdout);
+        let _ = stdout.flush();
     }
-    info!(session_id = %session_id, "host command completed");
+    info!(session_id = %session_id, pid, "host command completed");
     Ok(())
 }
 
@@ -453,6 +493,20 @@ fn configure_bootstrap_signal_handling(bootstrap_mode: bool) {
     }
 }
 
+fn clear_line<W: Write>(out: &mut W) {
+    let _ = out.write_all(b"\r\x1b[2K");
+}
+
+fn writeln_cleared(out: &mut io::StdoutLock<'_>, args: std::fmt::Arguments<'_>) {
+    clear_line(out);
+    let _ = out.write_fmt(args);
+    let _ = out.write_all(b"\n");
+}
+
+fn blank_line(out: &mut io::StdoutLock<'_>) {
+    let _ = out.write_all(b"\r\x1b[2K\n");
+}
+
 fn print_host_banner(
     session: &HostSession,
     base: &str,
@@ -460,29 +514,67 @@ fn print_host_banner(
     mcp_enabled: bool,
 ) {
     let handle = session.handle();
-    println!("\n🏖️  beach session ready!\n");
-    println!("  session id : {}", handle.session_id);
-    println!("  share url  : {}", handle.session_url);
-    println!("  passcode   : {}", session.join_code());
-    println!(
-        "\n  share command:\n    beach --session-server {} join {} --passcode {}\n",
-        base,
-        handle.session_id,
-        session.join_code()
-    );
-    println!("  transports : {}", summarize_offers(handle.offers()));
-    println!("  active     : {}", kind_label(selected));
+    let mut stdout = io::stdout().lock();
 
-    if mcp_enabled {
-        println!(
-            "  mcp bridge  : beach --session-server {} join {} --passcode {} --mcp",
+    blank_line(&mut stdout);
+    writeln_cleared(&mut stdout, format_args!("🏖️  beach session ready!"));
+    blank_line(&mut stdout);
+    writeln_cleared(
+        &mut stdout,
+        format_args!("{:<12} : {}", "session id", handle.session_id),
+    );
+    writeln_cleared(
+        &mut stdout,
+        format_args!("{:<12} : {}", "share url", handle.session_url),
+    );
+    writeln_cleared(
+        &mut stdout,
+        format_args!("{:<12} : {}", "passcode", session.join_code()),
+    );
+    blank_line(&mut stdout);
+    writeln_cleared(&mut stdout, format_args!("share command:"));
+    writeln_cleared(
+        &mut stdout,
+        format_args!(
+            "  beach --session-server {} join {} --passcode {}",
             base,
             handle.session_id,
             session.join_code()
+        ),
+    );
+    blank_line(&mut stdout);
+    writeln_cleared(
+        &mut stdout,
+        format_args!(
+            "{:<12} : {}",
+            "transports",
+            summarize_offers(handle.offers())
+        ),
+    );
+    writeln_cleared(
+        &mut stdout,
+        format_args!("{:<12} : {}", "active", kind_label(selected)),
+    );
+
+    if mcp_enabled {
+        writeln_cleared(
+            &mut stdout,
+            format_args!(
+                "{:<12} : beach --session-server {} join {} --passcode {} --mcp",
+                "mcp bridge",
+                base,
+                handle.session_id,
+                session.join_code()
+            ),
         );
     }
-    println!();
-    println!("🌊 Launching host process... type 'exit' to end the session.\n");
+    blank_line(&mut stdout);
+    writeln_cleared(
+        &mut stdout,
+        format_args!("🌊 Launching host process... type 'exit' to end the session."),
+    );
+    blank_line(&mut stdout);
+    let _ = stdout.flush();
 }
 
 #[allow(clippy::too_many_arguments)]

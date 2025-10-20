@@ -9,7 +9,9 @@ import { BeachSummary, listBeaches } from '../../lib/api';
 export default function BeachesIndex() {
   const [beaches, setBeaches] = useState<BeachSummary[]>([]);
   const [query, setQuery] = useState('');
-  useEffect(() => { listBeaches(null).then(setBeaches).catch(() => setBeaches([])); }, []);
+  useEffect(() => {
+    listBeaches(null).then(setBeaches).catch(() => setBeaches([]));
+  }, []);
 
   const filtered = beaches.filter((b) => b.name.toLowerCase().includes(query.toLowerCase()) || b.id.startsWith(query));
 

@@ -62,8 +62,13 @@ export function useSessionTerminal(sessionId: string | null | undefined, manager
 
   useEffect(() => {
     sourceRef.current?.close();
-    if (!sessionId) {
-      setState({ lines: [], cursor: null, sequence: 0, connecting: false, error: null });
+    if (!sessionId || !token) {
+      setState((prev) => {
+        if (!prev.connecting && prev.lines.length === 0 && prev.error == null) {
+          return prev;
+        }
+        return { lines: [], cursor: null, sequence: 0, connecting: false, lastUpdatedAt: prev.lastUpdatedAt, error: null };
+      });
       return () => {};
     }
     setState((prev) => ({ ...prev, connecting: true, error: null }));
@@ -94,7 +99,11 @@ export function useSessionTerminal(sessionId: string | null | undefined, manager
 
     es.addEventListener('state', handleState);
     es.onerror = () => {
-      setState((prev) => ({ ...prev, error: prev.error ?? 'Disconnected', connecting: true }));
+      setState((prev) => ({
+        ...prev,
+        error: prev.error ?? 'Stream unavailable (check token and manager reachability)',
+        connecting: false,
+      }));
     };
 
     return () => {

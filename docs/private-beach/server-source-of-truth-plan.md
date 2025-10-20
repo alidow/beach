@@ -94,6 +94,8 @@ Defaults and env
 - Keep `BEACH_ROAD_URL=https://api.beach.sh` by default (already updated in compose).
 - Keep `NEXT_PUBLIC_ROAD_URL=https://api.beach.sh` (already updated in compose).
 - Dev auth bypass remains for local; production uses Beach Gate JWT.
+- Set `PRIVATE_BEACH_DATABASE_URL` to the Surfer Postgres database (compose defaults to `postgres://postgres:postgres@beach-postgres:5432/private_beach_surfer` so the UI tables live alongside the manager on the same server).
+- `docker-compose` boots a `private-beach-migrate` helper that applies every SQL file under `apps/private-beach/drizzle/` via `psql` automatically after Postgres and the manager schema are ready.
 
 Migration strategy
 1) Add RLS policies (membership-based SELECT) and `beach.account_id` handling in Manager.

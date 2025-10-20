@@ -291,8 +291,8 @@ impl AppState {
         self.fast_paths.get(session_id).await
     }
 
-    pub fn subscribe_session(&self, session_id: &str) -> broadcast::Receiver<StreamEvent> {
-        let mut map = self.events.blocking_write();
+    pub async fn subscribe_session(&self, session_id: &str) -> broadcast::Receiver<StreamEvent> {
+        let mut map = self.events.write().await;
         let tx = map
             .entry(session_id.to_string())
             .or_insert_with(|| broadcast::channel(128).0)
@@ -2565,25 +2565,19 @@ impl AppState {
                 r#"
                 INSERT INTO private_beach (name, slug, owner_account_id)
                 VALUES ($1, $2, $3)
+                ON CONFLICT (slug) DO NOTHING
                 RETURNING id, name, slug, created_at
                 "#,
             )
             .bind(name)
             .bind(&candidate)
             .bind(owner)
-            .fetch_one(tx.as_mut())
-            .await;
-            match res {
-                Ok(row) => {
-                    final_row = Some(row);
-                    break;
-                }
-                Err(sqlx::Error::Database(db_err))
-                    if db_err.constraint() == Some("private_beach_slug_key") =>
-                {
-                    continue;
-                }
-                Err(e) => return Err(StateError::Database(e)),
+            .fetch_optional(tx.as_mut())
+            .await?;
+
+            if let Some(row) = res {
+                final_row = Some(row);
+                break;
             }
         }
 

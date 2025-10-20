@@ -3,7 +3,6 @@ import { createContext, ReactNode, useContext } from 'react';
 export type ManagerSettings = {
   managerUrl: string;
   roadUrl: string;
-  token: string;
 };
 
 export type BeachSettingsContextValue = {
@@ -30,4 +29,3 @@ export function useBeachManagerSettings(): BeachSettingsContextValue {
   }
   return ctx;
 }
-

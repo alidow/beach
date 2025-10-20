@@ -4,7 +4,7 @@ This document captures what’s built, how to run it locally, what’s left, and
 
 ## TL;DR
 - Manager (Rust) persists sessions, leases, and controller events in Postgres; commands/health/state use Redis Streams + TTL caches; SSE endpoints provide live updates; RLS is enforced via GUC.
-- Surfer (Next.js) shows a sessions table with live events, queue depth/lag, lease countdown, and controls (acquire/release/stop). Auth bypass works with any token in local dev.
+- Surfer (Next.js) is Clerk-gated, streams live terminal previews/events, and issues Manager requests with Clerk JWTs (no more dev token fallback).
 - Fast‑path (WebRTC) is scaffolded in the manager with answerer endpoints and routing to send actions over data channels when available. Harness‑side fast‑path client is next.
 
 ## New: Session Onboarding (Attach) — Current Status
@@ -28,7 +28,8 @@ This document captures what’s built, how to run it locally, what’s left, and
 - Environment:
   - `DATABASE_URL=postgres://postgres:postgres@localhost:5432/beach_manager`
   - `REDIS_URL=redis://localhost:6379`
-  - `AUTH_BYPASS=1` (implicit when Beach Gate vars are missing)
+  - Clerk auth (Manager): `BEACH_GATE_JWKS_URL=<clerk-jwks>`, `BEACH_GATE_ISSUER=<clerk-issuer>`, `BEACH_GATE_AUDIENCE=<audience>`; set `AUTH_BYPASS=1` only for dev overrides.
+  - Clerk auth (Surfer): `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, optionally `NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE`.
 
 2) Manager
 - `cargo run -p beach-manager`
@@ -52,8 +53,8 @@ This document captures what’s built, how to run it locally, what’s left, and
 
 6) Surfer (Next.js)
 - `cd apps/private-beach && npm install && npm run dev -- -p 3001`
-- Open `http://localhost:3001`. Set Manager URL (`http://localhost:8080`), Private Beach ID, and a token (`test-token`). Click Refresh.
-- Live controls: Acquire/Release controller, Emergency Stop; see events/state via SSE.
+- Open `http://localhost:3001`, sign in with Clerk, and select a private beach. Manager URL defaults to `http://localhost:8080` and can be overridden in Settings.
+- Live controls: Acquire/Release controller, Emergency Stop; see events/state via SSE and live terminal tiles (requires valid Clerk session token).
 
 ## End‑to‑End: Onboarding (Attach) — How to Test
 
@@ -97,9 +98,9 @@ Against api.beach.sh:
 ## What’s Built (Surfer)
 - Sessions view listing session metadata + health with live SSE feed.
 - Queue column shows `depth / lag` from Prometheus-backed state.
-- Per‑session controls: Acquire/Release + Emergency Stop.
+- Per‑session controls: Acquire/Release + Emergency Stop, gated by Clerk-issued Manager tokens.
 - Lease countdown shown when controller is active.
-- Configurable manager URL + token in UI; SSE supports `?access_token=` for local testing.
+- Settings allows overriding Manager/Road URLs; Clerk user tokens are fetched transparently for all Manager requests/SSE streams.
 - Add Session modal:
   - Tabs: By Code (verifies with Road via Manager), My Sessions (lists from Road, bulk attach), Launch New (copyable CLI).
 

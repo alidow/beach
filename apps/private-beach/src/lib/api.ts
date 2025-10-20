@@ -31,8 +31,12 @@ function base(baseUrl?: string) {
 }
 
 function authHeaders(token: string | null) {
+  if (!token || token.trim().length === 0) {
+    throw new Error('missing manager auth token');
+  }
+  const trimmed = token.trim();
   const headers: Record<string, string> = { 'content-type': 'application/json' };
-  headers['authorization'] = `Bearer ${token || 'test-token'}`;
+  headers['authorization'] = `Bearer ${trimmed}`;
   return headers;
 }
 
@@ -73,12 +77,18 @@ export async function emergencyStop(sessionId: string, token: string | null, bas
 }
 
 export function stateSseUrl(sessionId: string, baseUrl?: string, accessToken?: string): string {
-  const t = accessToken ? `?access_token=${encodeURIComponent(accessToken)}` : '';
+  if (!accessToken || accessToken.trim().length === 0) {
+    throw new Error('missing manager auth token');
+  }
+  const t = `?access_token=${encodeURIComponent(accessToken.trim())}`;
   return `${base(baseUrl)}/sessions/${sessionId}/state/stream${t}`;
 }
 
 export function eventsSseUrl(sessionId: string, baseUrl?: string, accessToken?: string): string {
-  const t = accessToken ? `?access_token=${encodeURIComponent(accessToken)}` : '';
+  if (!accessToken || accessToken.trim().length === 0) {
+    throw new Error('missing manager auth token');
+  }
+  const t = `?access_token=${encodeURIComponent(accessToken.trim())}`;
   return `${base(baseUrl)}/sessions/${sessionId}/events/stream${t}`;
 }
 
@@ -131,17 +141,17 @@ export async function getBeachMeta(id: string, token: string | null, baseUrl?: s
   return res.json();
 }
 
-export async function getBeachLayout(id: string, token: string | null, baseUrl?: string): Promise<BeachLayout> {
-  const res = await fetch(`${base(baseUrl)}/private-beaches/${id}/layout`, { headers: authHeaders(token) });
+export async function getBeachLayout(id: string, _token: string | null): Promise<BeachLayout> {
+  const res = await fetch(`/api/layout/${encodeURIComponent(id)}`);
   if (!res.ok) throw new Error(`getBeachLayout failed ${res.status}`);
   const data = await res.json();
   return { preset: (data.preset || 'grid2x2') as BeachLayout['preset'], tiles: Array.isArray(data.tiles) ? data.tiles : [] };
 }
 
-export async function putBeachLayout(id: string, layout: BeachLayout, token: string | null, baseUrl?: string): Promise<void> {
-  const res = await fetch(`${base(baseUrl)}/private-beaches/${id}/layout`, {
+export async function putBeachLayout(id: string, layout: BeachLayout, _token: string | null): Promise<void> {
+  const res = await fetch(`/api/layout/${encodeURIComponent(id)}`, {
     method: 'PUT',
-    headers: authHeaders(token),
+    headers: { 'content-type': 'application/json' },
     body: JSON.stringify(layout),
   });
   if (!res.ok) throw new Error(`putBeachLayout failed ${res.status}`);

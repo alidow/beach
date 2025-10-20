@@ -13,10 +13,14 @@ function baseRoad(baseUrl?: string) {
 }
 
 export async function listMySessions(token: string | null, roadUrl?: string): Promise<RoadMySession[]> {
+  if (!token || token.trim().length === 0) {
+    throw new Error('missing manager auth token for road request');
+  }
+  const effective = token.trim();
   const res = await fetch(`${baseRoad(roadUrl)}/me/sessions?status=active`, {
     headers: {
       'content-type': 'application/json',
-      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      authorization: `Bearer ${effective}`,
     },
   });
   if (!res.ok) throw new Error(`road listMySessions failed ${res.status}`);

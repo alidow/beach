@@ -1,5 +1,6 @@
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
+import { useAuth } from '@clerk/nextjs';
 import TopNav from '../../components/TopNav';
 import { Card, CardContent, CardHeader } from '../../components/ui/card';
 import { Button } from '../../components/ui/button';
@@ -9,9 +10,31 @@ import { BeachSummary, listBeaches } from '../../lib/api';
 export default function BeachesIndex() {
   const [beaches, setBeaches] = useState<BeachSummary[]>([]);
   const [query, setQuery] = useState('');
+  const { isLoaded, isSignedIn, getToken } = useAuth();
+  const tokenTemplate = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
+
   useEffect(() => {
-    listBeaches(null).then(setBeaches).catch(() => setBeaches([]));
-  }, []);
+    if (!isLoaded || !isSignedIn) {
+      setBeaches([]);
+      return;
+    }
+    let active = true;
+    (async () => {
+      try {
+        const token = await getToken(
+          tokenTemplate ? { template: tokenTemplate } : undefined,
+        );
+        if (!token || !active) return;
+        const data = await listBeaches(token);
+        if (active) setBeaches(data);
+      } catch {
+        if (active) setBeaches([]);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [isLoaded, isSignedIn, getToken, tokenTemplate]);
 
   const filtered = beaches.filter((b) => b.name.toLowerCase().includes(query.toLowerCase()) || b.id.startsWith(query));
 
@@ -28,7 +51,7 @@ export default function BeachesIndex() {
         <div className="mb-3"><Input placeholder="Search by name or id…" value={query} onChange={(e) => setQuery(e.target.value)} /></div>
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
           {filtered.length === 0 ? (
-            <div className="text-sm text-neutral-600">No beaches yet. Create one to get started.</div>
+            <div className="text-sm text-muted-foreground">No beaches yet. Create one to get started.</div>
           ) : (
             filtered.map((b) => (
               <Card key={b.id}>
@@ -36,7 +59,7 @@ export default function BeachesIndex() {
                   <div className="flex items-center justify-between">
                     <div>
                       <div className="text-sm font-semibold">{b.name}</div>
-                      <div className="text-xs text-neutral-500">{b.id}</div>
+                      <div className="text-xs text-muted-foreground">{b.id}</div>
                     </div>
                     <div className="flex items-center gap-2">
                       <Link href={`/beaches/${b.id}`}><Button size="sm">Open</Button></Link>

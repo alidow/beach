@@ -5,7 +5,6 @@ use axum::{
     response::sse::{Event, KeepAlive, Sse},
 };
 use futures_core::Stream;
-use futures_util::future::ready;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
@@ -23,7 +22,7 @@ pub async fn stream_state(
     Path(session_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     ensure_scope(&token, "pb:sessions.read")?;
-    let rx = state.subscribe_session(&session_id);
+    let rx = state.subscribe_session(&session_id).await;
     let stream = BroadcastStream::new(rx)
         .filter(|msg| matches!(msg, Ok(crate::state::StreamEvent::State(_))))
         .map(|msg| {
@@ -43,7 +42,7 @@ pub async fn stream_events(
     Path(session_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     ensure_scope(&token, "pb:sessions.read")?;
-    let rx = state.subscribe_session(&session_id);
+    let rx = state.subscribe_session(&session_id).await;
     let stream = BroadcastStream::new(rx).map(|msg| match msg {
         Ok(ev) => {
             let (name, payload) = ev.as_named_json();

@@ -38,7 +38,7 @@
 - ✅ Live updates via SSE to `/sessions/:id/state/stream` and `/sessions/:id/events/stream`.
 - ✅ Controller actions: acquire/release lease wired to REST endpoints.
 - ✅ Dev-friendly config: `NEXT_PUBLIC_MANAGER_URL` and localStorage overrides; manager CORS enabled; SSE supports `?access_token=` query for browser auth.
-- ◻ Surfer persistence: stand up a Postgres connection for `apps/private-beach` with Drizzle ORM so layout/tile state and other UX-specific data live in the database instead of browser storage.
+- ✅ Surfer persistence: stand up a Postgres connection for `apps/private-beach` with Drizzle ORM so layout/tile state and other UX-specific data live in the database instead of browser storage.
 
 Nice-to-haves (open):
 - Real Beach Gate login (OIDC) and token refresh; prefer cookies or Authorization-capable streams over `access_token` query.

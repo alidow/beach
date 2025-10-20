@@ -155,6 +155,10 @@ pub fn remote_bootstrap_args(args: &SshArgs, session_server: &str) -> Vec<String
         command.push("--bootstrap-survive-sighup".to_string());
     }
     command.extend(["--session-server".to_string(), session_server.to_string()]);
+    if let Some(delay_ms) = args.dev_offer_encryption_delay_ms {
+        command.push("--dev-offer-encryption-delay".to_string());
+        command.push(delay_ms.to_string());
+    }
     if !args.command.is_empty() {
         // Some shells/CLI usages may include a leading "--" in the captured
         // command vector (e.g. when using a literal separator before the

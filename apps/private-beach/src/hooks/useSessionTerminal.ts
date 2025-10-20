@@ -62,7 +62,7 @@ export function useSessionTerminal(sessionId: string | null | undefined, manager
 
   useEffect(() => {
     sourceRef.current?.close();
-    if (!sessionId || !token) {
+    if (!sessionId || !token || token.trim().length === 0) {
       setState((prev) => {
         if (!prev.connecting && prev.lines.length === 0 && prev.error == null) {
           return prev;
@@ -72,7 +72,8 @@ export function useSessionTerminal(sessionId: string | null | undefined, manager
       return () => {};
     }
     setState((prev) => ({ ...prev, connecting: true, error: null }));
-    const url = stateSseUrl(sessionId, managerUrl, token || undefined);
+    const trimmedToken = token.trim();
+    const url = stateSseUrl(sessionId, managerUrl, trimmedToken);
     const es = new EventSource(url);
     sourceRef.current = es;
 

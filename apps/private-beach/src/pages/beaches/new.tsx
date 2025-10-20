@@ -1,5 +1,6 @@
 import { useRouter } from 'next/router';
 import { useState } from 'react';
+import { useAuth } from '@clerk/nextjs';
 import TopNav from '../../components/TopNav';
 import { Button } from '../../components/ui/button';
 import { Card, CardContent, CardHeader } from '../../components/ui/card';
@@ -11,11 +12,18 @@ export default function NewBeach() {
   const [name, setName] = useState('My Private Beach');
   const [slug, setSlug] = useState('');
   const [creating, setCreating] = useState(false);
+  const { isLoaded, isSignedIn, getToken } = useAuth();
+  const tokenTemplate = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
 
   async function onCreate() {
+    if (!isLoaded || !isSignedIn) return;
     setCreating(true);
     try {
-      const created = await createBeach(name.trim() || 'Private Beach', slug.trim() || undefined, null);
+      const token = await getToken(
+        tokenTemplate ? { template: tokenTemplate } : undefined,
+      );
+      if (!token) throw new Error('Missing manager auth token');
+      const created = await createBeach(name.trim() || 'Private Beach', slug.trim() || undefined, token);
       router.push(`/beaches/${created.id}`);
     } finally {
       setCreating(false);
@@ -33,15 +41,17 @@ export default function NewBeach() {
           <CardContent>
             <div className="space-y-3">
               <div>
-                <label className="mb-1 block text-xs text-neutral-700">Name</label>
+                <label className="mb-1 block text-xs text-muted-foreground">Name</label>
                 <Input value={name} onChange={(e) => setName(e.target.value)} />
               </div>
               <div>
-                <label className="mb-1 block text-xs text-neutral-700">Slug (optional)</label>
+                <label className="mb-1 block text-xs text-muted-foreground">Slug (optional)</label>
                 <Input value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="lowercase-with-dashes" />
               </div>
               <div className="pt-2">
-                <Button onClick={onCreate} disabled={creating}>{creating ? 'Creating…' : 'Create'}</Button>
+                <Button onClick={onCreate} disabled={creating || !isLoaded || !isSignedIn}>
+                  {creating ? 'Creating…' : 'Create'}
+                </Button>
               </div>
             </div>
           </CardContent>

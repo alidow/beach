@@ -16,11 +16,11 @@ export function Sheet({ open, onOpenChange, side = 'right', children }: SheetPro
 
   if (!open) return null;
   const align = side === 'right' ? 'right-0' : 'left-0';
+  const borderSide = side === 'right' ? 'border-l' : 'border-r';
   return (
     <div className="fixed inset-0 z-50">
-      <div className="absolute inset-0 bg-black/30" onClick={() => onOpenChange(false)} />
-      <div className={`absolute top-0 ${align} h-full w-[420px] bg-white shadow-xl`}>{children}</div>
+      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm transition-opacity dark:bg-black/70" onClick={() => onOpenChange(false)} />
+      <div className={`absolute top-0 ${align} h-full w-[420px] bg-card text-card-foreground shadow-xl ${borderSide} border-border`}>{children}</div>
     </div>
   );
 }
-

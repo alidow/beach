@@ -46,9 +46,12 @@ async fn main() -> anyhow::Result<()> {
         jwks_url: cfg.beach_gate_jwks_url.clone(),
         issuer: cfg.beach_gate_issuer.clone(),
         audience: cfg.beach_gate_audience.clone(),
-        bypass: cfg.auth_bypass || cfg.beach_gate_jwks_url.is_none(),
+        bypass: cfg.auth_bypass,
         cache_ttl: Duration::from_secs(300),
     };
+    if !auth_config.bypass && auth_config.jwks_url.is_none() {
+        warn!("authentication bypass disabled but BEACH_GATE_JWKS_URL is not set; token verification will fail");
+    }
     state = state.with_auth(AuthContext::new(auth_config));
     state = state.with_integrations(cfg.beach_road_url.clone(), cfg.public_manager_url.clone());
 

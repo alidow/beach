@@ -1,5 +1,6 @@
 import { useRouter } from 'next/router';
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useAuth } from '@clerk/nextjs';
 import TopNav from '../../../components/TopNav';
 import SessionListPanel from '../../../components/SessionListPanel';
 import TileCanvas from '../../../components/TileCanvas';
@@ -30,6 +31,9 @@ export default function BeachDashboard() {
     'https://api.beach.sh';
   const [settingsJson, setSettingsJson] = useState<any>({});
   const [savingSettings, setSavingSettings] = useState(false);
+  const { isLoaded, isSignedIn, getToken } = useAuth();
+  const tokenTemplate = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
+  const [managerToken, setManagerToken] = useState<string | null>(null);
 
   const managerSettings = useMemo<ManagerSettings>(() => {
     const raw = settingsJson && typeof settingsJson === 'object' ? (settingsJson.manager as any) || {} : {};
@@ -42,52 +46,103 @@ export default function BeachDashboard() {
         typeof raw?.road_url === 'string' && raw.road_url.trim().length > 0
           ? raw.road_url.trim()
           : defaultRoadUrl,
-      token: typeof raw?.token === 'string' ? raw.token : '',
     };
   }, [settingsJson, defaultManagerUrl, defaultRoadUrl]);
 
   const managerUrl = managerSettings.managerUrl;
   const roadUrl = managerSettings.roadUrl;
-  const token = managerSettings.token ? managerSettings.token : null;
+
+  const refreshManagerToken = useCallback(async () => {
+    if (!isLoaded || !isSignedIn) {
+      setManagerToken(null);
+      return null;
+    }
+    const token = await getToken(
+      tokenTemplate ? { template: tokenTemplate } : undefined,
+    );
+    setManagerToken(token ?? null);
+    return token ?? null;
+  }, [isLoaded, isSignedIn, getToken, tokenTemplate]);
+
+  const ensureManagerToken = useCallback(async () => {
+    if (managerToken && managerToken.trim().length > 0) {
+      return managerToken;
+    }
+    return await refreshManagerToken();
+  }, [managerToken, refreshManagerToken]);
+
+  useEffect(() => {
+    if (!isLoaded) return;
+    if (!isSignedIn) {
+      router.replace('/sign-in');
+    }
+  }, [isLoaded, isSignedIn, router]);
+
+  useEffect(() => {
+    if (!isLoaded) return;
+    refreshManagerToken().catch(() => {});
+  }, [isLoaded, refreshManagerToken]);
+
+  useEffect(() => {
+    if (!isLoaded || !isSignedIn) {
+      setManagerToken(null);
+      return;
+    }
+    const interval = setInterval(() => {
+      refreshManagerToken().catch(() => {});
+    }, 60_000);
+    return () => clearInterval(interval);
+  }, [isLoaded, isSignedIn, refreshManagerToken]);
 
   useEffect(() => {
     if (!id) return;
+    let active = true;
     (async () => {
       try {
+        const token = await ensureManagerToken();
+        if (!token || !active) {
+          setError('Not authorized to load beach.');
+          return;
+        }
         const meta = await getBeachMeta(id, token);
+        if (!active) return;
         setBeachName(meta.name);
         setSettingsJson(meta.settings || {});
       } catch (e: any) {
-        if (e.message === 'not_found') setError('Beach not found'); else setError('Failed to load beach');
+        if (!active) return;
+        if (e?.message === 'not_found') setError('Beach not found'); else setError('Failed to load beach');
       }
       try {
-        const l = await getBeachLayout(id, token);
-        setLayout(l);
+        const l = await getBeachLayout(id, managerToken);
+        if (active) setLayout(l);
       } catch {
         // ignore, keep default
       }
     })();
-  }, [id, token]);
+    return () => {
+      active = false;
+    };
+  }, [id, ensureManagerToken, managerToken]);
 
-  type RefreshOverride = { managerUrl?: string; token?: string | null };
+  type RefreshOverride = { managerUrl?: string };
 
   const refresh = useCallback(
     async (override?: RefreshOverride) => {
       if (!id) return;
       setLoading(true);
       setError(null);
-      const effectiveManagerUrl = override?.managerUrl && override.managerUrl.length > 0 ? override.managerUrl : managerSettings.managerUrl;
-      const overrideToken = override?.token;
-      const effectiveToken =
-        overrideToken !== undefined
-          ? overrideToken && overrideToken.length > 0
-            ? overrideToken
-            : null
-          : managerSettings.token && managerSettings.token.length > 0
-            ? managerSettings.token
-            : null;
+      const effectiveManagerUrl =
+        override?.managerUrl && override.managerUrl.length > 0
+          ? override.managerUrl
+          : managerSettings.managerUrl;
       try {
-        const data = await listSessions(id, effectiveToken, effectiveManagerUrl);
+        const token = await ensureManagerToken();
+        if (!token) {
+          setSessions([]);
+          setError('Missing manager auth token');
+          return;
+        }
+        const data = await listSessions(id, token, effectiveManagerUrl);
         setSessions(data);
       } catch (e: any) {
         setError(e.message || 'Failed to load sessions');
@@ -95,7 +150,7 @@ export default function BeachDashboard() {
         setLoading(false);
       }
     },
-    [id, managerSettings],
+    [id, managerSettings.managerUrl, ensureManagerToken],
   );
 
   const updateManagerSettings = useCallback(
@@ -107,26 +162,28 @@ export default function BeachDashboard() {
       const nextManager: ManagerSettings = {
         managerUrl: partial.managerUrl !== undefined ? partial.managerUrl : managerSettings.managerUrl,
         roadUrl: partial.roadUrl !== undefined ? partial.roadUrl : managerSettings.roadUrl,
-        token: partial.token !== undefined ? partial.token : managerSettings.token,
       };
       const nextSettings = {
         ...(prevSettings && typeof prevSettings === 'object' ? prevSettings : {}),
         manager: {
           manager_url: nextManager.managerUrl,
           road_url: nextManager.roadUrl,
-          token: nextManager.token,
         },
       };
       setSettingsJson(nextSettings);
       setSavingSettings(true);
       try {
+        const token = await ensureManagerToken();
+        if (!token) {
+          throw new Error('Missing manager auth token');
+        }
         await updateBeach(
           id,
           { settings: nextSettings },
-          nextManager.token && nextManager.token.length > 0 ? nextManager.token : null,
+          token,
           nextManager.managerUrl && nextManager.managerUrl.length > 0 ? nextManager.managerUrl : defaultManagerUrl,
         );
-        await refresh({ managerUrl: nextManager.managerUrl, token: nextManager.token });
+        await refresh({ managerUrl: nextManager.managerUrl });
       } catch (err) {
         setSettingsJson(prevSettings);
         throw err;
@@ -134,7 +191,7 @@ export default function BeachDashboard() {
         setSavingSettings(false);
       }
     },
-    [id, settingsJson, managerSettings, defaultManagerUrl, refresh],
+    [id, settingsJson, managerSettings, defaultManagerUrl, refresh, ensureManagerToken],
   );
 
   useEffect(() => {
@@ -145,19 +202,19 @@ export default function BeachDashboard() {
     if (!id) return;
     const next = { ...layout, tiles: Array.from(new Set([sessionId, ...layout.tiles])).slice(0, 6) };
     setLayout(next);
-    putBeachLayout(id, next, token).catch(() => {});
+    putBeachLayout(id, next, managerToken).catch(() => {});
   }
   function removeTile(sessionId: string) {
     if (!id) return;
     const next = { ...layout, tiles: layout.tiles.filter((t) => t !== sessionId) };
     setLayout(next);
-    putBeachLayout(id, next, token).catch(() => {});
+    putBeachLayout(id, next, managerToken).catch(() => {});
   }
   function changePreset(preset: BeachLayout['preset']) {
     if (!id) return;
     const next = { ...layout, preset };
     setLayout(next);
-    putBeachLayout(id, next, token).catch(() => {});
+    putBeachLayout(id, next, managerToken).catch(() => {});
   }
 
   const tileSessions = useMemo(() => {
@@ -204,24 +261,24 @@ export default function BeachDashboard() {
         />
         <div className="grid grid-cols-12 gap-3 p-3">
           <div className="col-span-12 md:col-span-3">
-            <div className="h-[calc(100vh-4rem)] rounded-lg border border-neutral-200 bg-white">
+            <div className="h-[calc(100vh-4rem)] rounded-lg border border-border bg-card text-card-foreground shadow-sm">
               <SessionListPanel sessions={sessions} onAdd={addTile} />
             </div>
           </div>
           <div className="col-span-12 md:col-span-9">
-            {error && <div className="mb-2 rounded-md border border-red-200 bg-red-50 p-2 text-sm text-red-700">{error}</div>}
+            {error && <div className="mb-2 rounded-md border border-red-500/40 bg-red-500/10 p-2 text-sm text-red-600 dark:text-red-400">{error}</div>}
             <TileCanvas
               tiles={tileSessions}
               onRemove={removeTile}
               onSelect={onSelect}
-              token={token}
+              token={managerToken}
               managerUrl={managerUrl}
               refresh={() => refresh()}
               preset={layout.preset}
             />
           </div>
         </div>
-        <SessionDrawer open={drawerOpen} onOpenChange={setDrawerOpen} session={selected} managerUrl={managerUrl} token={token} />
+        <SessionDrawer open={drawerOpen} onOpenChange={setDrawerOpen} session={selected} managerUrl={managerUrl} token={managerToken} />
         {id && (
           <AddSessionModal
             open={addOpen}
@@ -229,7 +286,7 @@ export default function BeachDashboard() {
             privateBeachId={id}
             managerUrl={managerUrl}
             roadUrl={roadUrl}
-            token={token}
+            token={managerToken}
             onAttached={() => refresh()}
           />
         )}

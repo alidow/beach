@@ -18,7 +18,7 @@ type Props = {
 
 const AutoGrid = dynamic(() => import('./AutoGrid'), {
   ssr: false,
-  loading: () => <div className="h-[520px] rounded-xl border border-neutral-200 bg-white shadow-sm" />,
+  loading: () => <div className="h-[520px] rounded-xl border border-border bg-card shadow-sm" />,
 });
 
 const COLS = 12;
@@ -145,18 +145,21 @@ export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUr
   };
 
   const handleAcquire = async (sessionId: string) => {
+    if (!token || token.trim().length === 0) return;
     await acquireController(sessionId, 30000, token, managerUrl).catch(() => {});
     await refresh();
   };
 
   const handleRelease = async (sessionId: string, controllerToken: string | null | undefined) => {
     if (!controllerToken) return;
+    if (!token || token.trim().length === 0) return;
     await releaseController(sessionId, controllerToken, token, managerUrl).catch(() => {});
     await refresh();
   };
 
   const handleStop = async (sessionId: string) => {
     if (!confirm('Emergency stop?')) return;
+    if (!token || token.trim().length === 0) return;
     await emergencyStop(sessionId, token, managerUrl).catch(() => {});
     await refresh();
   };
@@ -177,7 +180,7 @@ export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUr
   );
 
   if (!isClient) {
-    return <div className="h-[520px] rounded-xl border border-neutral-200 bg-white shadow-sm" />;
+    return <div className="h-[520px] rounded-xl border border-border bg-card shadow-sm" />;
   }
 
   return (
@@ -201,10 +204,10 @@ export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUr
           const remain = Math.max(0, expires - now);
           const countdown = s.controller_token ? `${Math.floor(remain / 1000)}s` : '';
           return (
-            <div key={s.session_id} className="flex h-full flex-col overflow-hidden rounded-xl border border-neutral-200 bg-white shadow-sm">
-              <div className="flex items-center justify-between border-b border-neutral-200 bg-neutral-50/80 px-3 py-2 backdrop-blur">
-                <div className="session-tile-drag-grip flex cursor-grab items-center gap-2 text-xs text-neutral-700 active:cursor-grabbing" role="button" tabIndex={0}>
-                  <span className="rounded bg-white/80 px-1 font-mono text-[11px] tracking-tight">{s.session_id.slice(0, 8)}</span>
+            <div key={s.session_id} className="flex h-full flex-col overflow-hidden rounded-xl border border-border bg-card text-card-foreground shadow-sm">
+              <div className="flex items-center justify-between border-b border-border bg-muted/60 px-3 py-2 backdrop-blur dark:bg-muted/30">
+                <div className="session-tile-drag-grip flex cursor-grab items-center gap-2 text-xs text-muted-foreground active:cursor-grabbing" role="button" tabIndex={0}>
+                  <span className="rounded border border-border/60 bg-background/80 px-1 font-mono text-[11px] tracking-tight">{s.session_id.slice(0, 8)}</span>
                   <Badge variant="muted">{s.harness_type}</Badge>
                   <Badge variant={s.last_health?.degraded ? 'warning' : 'success'}>{s.last_health?.degraded ? 'degraded' : 'healthy'}</Badge>
                   <Badge variant="muted">{s.pending_actions}/{s.pending_unacked}</Badge>
@@ -219,14 +222,18 @@ export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUr
               <div className="relative flex min-h-0 flex-1 bg-neutral-900">
                 <SessionTerminalPreview sessionId={s.session_id} managerUrl={managerUrl} token={token} className="w-full" />
               </div>
-              <div className="border-t border-neutral-200 px-3 py-2">
+              <div className="border-t border-border px-3 py-2">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <Button size="sm" onClick={() => handleAcquire(s.session_id)}>Acquire</Button>
-                    <Button size="sm" variant="outline" onClick={() => handleRelease(s.session_id, s.controller_token)}>Release</Button>
-                    <Button size="sm" variant="danger" onClick={() => handleStop(s.session_id)}>Stop</Button>
+                    <Button size="sm" onClick={() => handleAcquire(s.session_id)} disabled={!token || token.trim().length === 0}>Acquire</Button>
+                    <Button size="sm" variant="outline" onClick={() => handleRelease(s.session_id, s.controller_token)} disabled={!token || token.trim().length === 0}>
+                      Release
+                    </Button>
+                    <Button size="sm" variant="danger" onClick={() => handleStop(s.session_id)} disabled={!token || token.trim().length === 0}>
+                      Stop
+                    </Button>
                   </div>
-                  <div className="text-[11px] text-neutral-600">{s.location_hint || '—'}</div>
+                  <div className="text-[11px] text-muted-foreground">{s.location_hint || '—'}</div>
                 </div>
               </div>
             </div>
@@ -234,27 +241,38 @@ export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUr
         })}
       </AutoGrid>
       {tiles.length === 0 && (
-        <div className="flex h-80 items-center justify-center rounded-xl border border-dashed border-neutral-300 text-sm text-neutral-500">
+        <div className="flex h-80 items-center justify-center rounded-xl border border-dashed border-border/70 text-sm text-muted-foreground">
           Add sessions from the sidebar to build your dashboard.
         </div>
       )}
       {expanded && (
-        <div className="fixed inset-0 z-50 flex flex-col bg-neutral-950/95 text-white backdrop-blur">
-          <div className="flex items-center justify-between border-b border-white/10 px-6 py-4">
+        <div className="fixed inset-0 z-50 flex flex-col bg-background/95 text-foreground backdrop-blur dark:bg-black/80">
+          <div className="flex items-center justify-between border-b border-border/40 px-6 py-4">
             <div className="flex flex-wrap items-center gap-3">
-              <span className="rounded bg-white/10 px-2 py-1 font-mono text-sm text-white">{expanded.session_id}</span>
-              <span className="text-xs uppercase tracking-wide text-white/70">{expanded.harness_type}</span>
-              <span className="text-xs text-white/60">{expanded.location_hint || '—'}</span>
+              <span className="rounded border border-border/50 bg-card/80 px-2 py-1 font-mono text-sm text-card-foreground">{expanded.session_id}</span>
+              <span className="text-xs uppercase tracking-wide text-muted-foreground">{expanded.harness_type}</span>
+              <span className="text-xs text-muted-foreground">{expanded.location_hint || '—'}</span>
               {expanded.controller_token && (
-                <span className="rounded-full bg-emerald-500/20 px-3 py-1 text-xs text-emerald-200">
+                <span className="rounded-full bg-emerald-500/20 px-3 py-1 text-xs text-emerald-900 dark:text-emerald-100">
                   Lease active
                 </span>
               )}
             </div>
             <div className="flex items-center gap-2">
-              <Button size="sm" variant="outline" onClick={() => handleAcquire(expanded.session_id)}>Acquire</Button>
-              <Button size="sm" variant="outline" onClick={() => handleRelease(expanded.session_id, expanded.controller_token)}>Release</Button>
-              <Button size="sm" variant="danger" onClick={() => handleStop(expanded.session_id)}>Stop</Button>
+              <Button size="sm" variant="outline" onClick={() => handleAcquire(expanded.session_id)} disabled={!token || token.trim().length === 0}>
+                Acquire
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => handleRelease(expanded.session_id, expanded.controller_token)}
+                disabled={!token || token.trim().length === 0}
+              >
+                Release
+              </Button>
+              <Button size="sm" variant="danger" onClick={() => handleStop(expanded.session_id)} disabled={!token || token.trim().length === 0}>
+                Stop
+              </Button>
               <Button size="sm" variant="ghost" onClick={() => setExpanded(null)}>Close</Button>
             </div>
           </div>

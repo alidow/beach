@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -8,7 +8,8 @@ use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use crossbeam_channel::{
     Receiver as CrossbeamReceiver, RecvTimeoutError as CrossbeamRecvTimeoutError,
-    TryRecvError as CrossbeamTryRecvError, unbounded as crossbeam_unbounded,
+    Sender as CrossbeamSender, TryRecvError as CrossbeamTryRecvError,
+    unbounded as crossbeam_unbounded,
 };
 use once_cell::sync::Lazy;
 use reqwest::{Client, StatusCode, Url};
@@ -49,6 +50,35 @@ const MCP_CHANNEL_LABEL: &str = "mcp-jsonrpc";
 mod secure_handshake;
 mod secure_signaling;
 mod signaling;
+
+static OFFER_ENCRYPTION_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+pub struct OfferEncryptionDelayGuard {
+    previous: u64,
+}
+
+pub fn install_offer_encryption_delay(delay: Option<Duration>) -> OfferEncryptionDelayGuard {
+    let millis = delay
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0);
+    let previous = OFFER_ENCRYPTION_DELAY_MS.swap(millis, Ordering::SeqCst);
+    OfferEncryptionDelayGuard { previous }
+}
+
+impl Drop for OfferEncryptionDelayGuard {
+    fn drop(&mut self) {
+        OFFER_ENCRYPTION_DELAY_MS.store(self.previous, Ordering::SeqCst);
+    }
+}
+
+fn offer_encryption_delay() -> Option<Duration> {
+    let millis = OFFER_ENCRYPTION_DELAY_MS.load(Ordering::SeqCst);
+    if millis == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(millis))
+    }
+}
 
 use secure_handshake::{
     HANDSHAKE_CHANNEL_LABEL, HandshakeInbox, HandshakeParams, HandshakeResult, HandshakeRole,
@@ -347,6 +377,10 @@ fn nonce_from_counter(counter: u64) -> [u8; 12] {
     nonce
 }
 
+fn looks_like_encrypted_frame(bytes: &[u8]) -> bool {
+    bytes.len() >= 9 && bytes[0] == TRANSPORT_ENCRYPTION_VERSION
+}
+
 #[derive(Clone)]
 pub struct WebRtcConnection {
     transport: Arc<dyn Transport>,
@@ -450,12 +484,14 @@ struct WebRtcTransport {
     peer: TransportId,
     outbound_seq: AtomicU64,
     outbound_tx: tokio_mpsc::UnboundedSender<Vec<u8>>,
+    inbound_tx: CrossbeamSender<TransportMessage>,
     inbound_rx: Mutex<CrossbeamReceiver<TransportMessage>>,
     _pc: Arc<RTCPeerConnection>,
     _dc: Arc<RTCDataChannel>,
     _router: Option<Arc<AsyncMutex<Router>>>,
     _signaling: Option<Arc<SignalingClient>>,
     encryption: Arc<EncryptionManager>,
+    pending_encrypted: Arc<Mutex<VecDeque<Vec<u8>>>>,
 }
 
 impl WebRtcTransport {
@@ -471,75 +507,33 @@ impl WebRtcTransport {
         signaling: Option<Arc<SignalingClient>>,
         handshake_complete: Option<Arc<AtomicBool>>,
     ) -> Self {
-        let (inbound_tx, inbound_rx) = crossbeam_unbounded();
+        let (inbound_tx_raw, inbound_rx) = crossbeam_unbounded();
         let handler_id = id;
-        let tx_clone = inbound_tx.clone();
+        let inbound_tx_for_handler = inbound_tx_raw.clone();
         tracing::debug!(target = "webrtc", transport_id = ?handler_id, "registering data channel handler");
         let encryption = Arc::new(EncryptionManager::new());
         let encryption_clone_for_handler = Arc::clone(&encryption);
+        let pending_encrypted = Arc::new(Mutex::new(VecDeque::new()));
+        let pending_for_handler = Arc::clone(&pending_encrypted);
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
-            let sender = tx_clone.clone();
+            let sender = inbound_tx_for_handler.clone();
             let log_id = handler_id;
             let encryption = Arc::clone(&encryption_clone_for_handler);
+            let pending = Arc::clone(&pending_for_handler);
             Box::pin(async move {
                 let bytes = msg.data.to_vec();
-                let payload = if encryption.is_enabled() {
-                    match encryption.decrypt(&bytes) {
-                        Ok(plaintext) => plaintext,
-                        Err(err) => {
-                            tracing::warn!(
-
-                                transport_id = ?log_id,
-                                error = %err,
-                                "failed to decrypt inbound frame"
-                            );
-                            return;
-                        }
-                    }
-                } else {
-                    bytes
-                };
-                if let Some(message) = decode_message(&payload) {
+                if !encryption.is_enabled() && looks_like_encrypted_frame(&bytes) {
+                    let mut queue = pending.lock().unwrap();
+                    queue.push_back(bytes);
                     tracing::debug!(
-
+                        target = "beach::transport::webrtc::crypto",
                         transport_id = ?log_id,
-                        frame_len = payload.len(),
-                        sequence = message.sequence,
-                        "received frame"
+                        queued_frames = queue.len(),
+                        "queued encrypted frame until transport keys are installed"
                     );
-                    if let Err(err) = sender.send(message) {
-                        tracing::warn!(
-
-                            transport_id = ?log_id,
-                            error = %err,
-                            "failed to enqueue inbound message"
-                        );
-                    }
-                } else {
-                    if tracing::enabled!(tracing::Level::TRACE) {
-                        let (send_counter, recv_counter) = encryption.counters().unwrap_or((0, 0));
-                        let preview_len = payload.len().min(32);
-                        let preview = hex::encode(&payload[..preview_len]);
-                        tracing::trace!(
-                            target = "beach::transport::webrtc::crypto",
-                            transport_id = ?log_id,
-                            encryption_enabled = encryption.is_enabled(),
-                            send_counter,
-                            recv_counter,
-                            frame_len = payload.len(),
-                            payload_preview = %preview,
-                            payload_preview_len = preview_len,
-                            "inbound frame failed decode"
-                        );
-                    }
-                    tracing::warn!(
-
-                        transport_id = ?log_id,
-                        frame_len = payload.len(),
-                        encryption_enabled = encryption.is_enabled(),
-                        "failed to decode message"
-                    );
+                    return;
                 }
+                Self::process_incoming_frame(&encryption, bytes, &sender, log_id);
             })
         }));
         let pc_for_close = pc.clone();
@@ -723,17 +717,98 @@ impl WebRtcTransport {
             peer,
             outbound_seq: AtomicU64::new(0),
             outbound_tx,
+            inbound_tx: inbound_tx_raw,
             inbound_rx: Mutex::new(inbound_rx),
             _pc: pc,
             _dc: dc,
             _router: router,
             _signaling: signaling,
             encryption,
+            pending_encrypted,
         }
     }
 
     fn enable_encryption(&self, result: &HandshakeResult) -> Result<(), TransportError> {
-        self.encryption.enable(result)
+        self.encryption.enable(result)?;
+        self.flush_pending_encrypted();
+        Ok(())
+    }
+
+    fn flush_pending_encrypted(&self) {
+        let mut pending = self.pending_encrypted.lock().unwrap();
+        if pending.is_empty() {
+            return;
+        }
+        tracing::debug!(
+            target = "beach::transport::webrtc::crypto",
+            transport_id = ?self.id,
+            frames = pending.len(),
+            "flushing encrypted frames queued before enable"
+        );
+        while let Some(bytes) = pending.pop_front() {
+            Self::process_incoming_frame(&self.encryption, bytes, &self.inbound_tx, self.id);
+        }
+    }
+
+    fn process_incoming_frame(
+        encryption: &Arc<EncryptionManager>,
+        bytes: Vec<u8>,
+        sender: &CrossbeamSender<TransportMessage>,
+        log_id: TransportId,
+    ) {
+        let payload = if encryption.is_enabled() {
+            match encryption.decrypt(&bytes) {
+                Ok(plaintext) => plaintext,
+                Err(err) => {
+                    tracing::warn!(
+                        transport_id = ?log_id,
+                        error = %err,
+                        "failed to decrypt inbound frame"
+                    );
+                    return;
+                }
+            }
+        } else {
+            bytes
+        };
+        if let Some(message) = decode_message(&payload) {
+            tracing::debug!(
+                transport_id = ?log_id,
+                frame_len = payload.len(),
+                sequence = message.sequence,
+                "received frame"
+            );
+            if let Err(err) = sender.send(message) {
+                tracing::warn!(
+                    transport_id = ?log_id,
+                    error = %err,
+                    "failed to enqueue inbound message"
+                );
+            }
+        } else {
+            if tracing::enabled!(tracing::Level::TRACE) {
+                let (send_counter, recv_counter) = encryption.counters().unwrap_or((0, 0));
+                let preview_len = payload.len().min(32);
+                let preview = hex::encode(&payload[..preview_len]);
+                tracing::trace!(
+                    target = "beach::transport::webrtc::crypto",
+                    transport_id = ?log_id,
+                    encryption_enabled = encryption.is_enabled(),
+                    send_counter,
+                    recv_counter,
+                    frame_len = payload.len(),
+                    payload_preview = %preview,
+                    payload_preview_len = preview_len,
+                    "inbound frame failed decode"
+                );
+            }
+            tracing::warn!(
+                transport_id = ?log_id,
+                frame_len = payload.len(),
+                encryption_enabled = encryption.is_enabled(),
+                "failed to decode message"
+            );
+        }
     }
 }
 
@@ -1739,6 +1814,15 @@ async fn negotiate_offerer_peer(
             verification = %result.verification_code,
             "offerer: handshake completed successfully as Initiator"
         );
+        if let Some(delay) = offer_encryption_delay() {
+            tracing::debug!(
+                role = "offerer",
+                handshake_id = %handshake_id,
+                delay_ms = delay.as_millis(),
+                "development encryption delay active before enabling transport"
+            );
+            sleep(delay).await;
+        }
         transport.enable_encryption(&result)?;
         Some(Arc::new(result))
     } else {

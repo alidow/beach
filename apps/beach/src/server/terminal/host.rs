@@ -67,6 +67,12 @@ pub(crate) const MCP_CHANNEL_TIMEOUT: Duration = Duration::from_secs(30);
 pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let pid = process::id();
     tracing::Span::current().record("pid", &display(pid));
+    let delay_ms = args.dev_offer_encryption_delay_ms;
+    if let Some(ms) = delay_ms {
+        info!(delay_ms = ms, "development encryption delay enabled");
+    }
+    let _encryption_delay_guard =
+        transport_mod::webrtc::install_offer_encryption_delay(delay_ms.map(Duration::from_millis));
     let manager = SessionManager::new(SessionConfig::new(base_url)?)?;
     let cursor_sync = cursor_sync_enabled();
     let normalized_base = manager.config().base_url().to_string();

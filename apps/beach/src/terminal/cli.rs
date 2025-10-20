@@ -277,6 +277,14 @@ pub struct HostArgs {
         help = "In bootstrap mode, ignore SIGHUP so the host survives SSH disconnects (internal)"
     )]
     pub bootstrap_survive_sighup: bool,
+
+    #[arg(
+        long = "dev-offer-encryption-delay",
+        value_name = "MS",
+        hide = true,
+        help = "Development-only: delay the offerer's secure transport enablement by N milliseconds after the Noise handshake completes"
+    )]
+    pub dev_offer_encryption_delay_ms: Option<u64>,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -438,6 +446,14 @@ pub struct SshArgs {
         help = "Seconds to wait for the bootstrap handshake before failing"
     )]
     pub handshake_timeout: u64,
+
+    #[arg(
+        long = "dev-offer-encryption-delay",
+        value_name = "MS",
+        hide = true,
+        help = "Development-only: delay the remote offerer's secure transport enablement by N milliseconds after the Noise handshake completes"
+    )]
+    pub dev_offer_encryption_delay_ms: Option<u64>,
 
     #[arg(
         long = "ssh-keep-host-running",

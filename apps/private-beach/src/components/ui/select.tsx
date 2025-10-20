@@ -11,7 +11,7 @@ type SelectProps = {
 export function Select({ value, onChange, options, className = '' }: SelectProps) {
   return (
     <select
-      className={`h-9 rounded-md border border-neutral-300 bg-white px-2 text-sm focus:outline-none focus:ring-2 focus:ring-black focus:ring-offset-2 ${className}`}
+      className={`h-9 rounded-md border border-input bg-background px-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 ring-offset-background ${className}`}
       value={value}
       onChange={(e) => onChange(e.target.value)}
     >
@@ -23,4 +23,3 @@ export function Select({ value, onChange, options, className = '' }: SelectProps
     </select>
   );
 }
-

@@ -11,9 +11,9 @@
 - WebRTC/WebSocket bridges to stream terminal & Cabana feeds rendered via custom components.
 
 ## Current UI (Phase 4 UX)
-- Beaches: list, create, and manage beaches stored locally for quick switching.
+- Beaches: list, create, and manage beaches backed by Beach Manager (Postgres).
 - Dashboard: live Sessions panel and a tile canvas with layout presets (Grid / 1+3 / Focus), per‑tile controls (Acquire/Release/Stop), and a detail drawer streaming SSE events/state.
-- Settings: per‑beach Manager URL and token configuration (local dev); values are saved to localStorage.
+- Settings: per‑beach Manager URL and token configuration (local dev) stored via Manager metadata.
 
 ## How to Run
 1) Start Manager (see docs/private-beach/STATUS.md for Postgres/Redis and `cargo run -p beach-manager`).
@@ -25,11 +25,14 @@
 Notes:
 - The tile surface currently shows a live placeholder; WebRTC/WS stream rendering hooks are stubbed for later fast‑path work.
 - Auth is dev‑friendly (token field); OIDC/Beach Gate login will replace this in a follow‑up.
+- Tile layouts are persisted server-side via Drizzle + Postgres (`PRIVATE_BEACH_DATABASE_URL`); no LocalStorage is used for durable state.
+- When using `docker compose up`, the `private-beach-migrate` one-shot service runs the SQL files under `apps/private-beach/drizzle/` against the Surfer database before the dev server starts.
 
 ## Dev Scripts
 - `npm run dev` – local dev server (Next.js).
 - `npm run lint` – lint sources.
 - `npm run build` / `npm run start` – production build & serve.
+- `npm run db:generate` / `npm run db:migrate` – Drizzle schema snapshot + migrations.
 
 ## Styling Setup (Tailwind + shadcn/ui)
 
@@ -72,3 +75,4 @@ npx shadcn-ui@latest add button input dialog sheet badge card
 ## Notes
 - Keep core UI logic open for plugin-style extension as we explore partner experiences.
 - Respect the “UX Minimalism” principle: optimize first for session overview, controller handoff, share-link flow.
+- Set `PRIVATE_BEACH_DATABASE_URL` (defaults in docker-compose to `postgres://postgres:postgres@beach-postgres:5432/private_beach_surfer`) to run the Surfer persistence locally.

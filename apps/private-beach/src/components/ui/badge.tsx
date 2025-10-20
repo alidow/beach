@@ -7,11 +7,10 @@ type BadgeProps = {
 };
 
 export function Badge({ children, variant = 'default', className = '' }: BadgeProps) {
-  let styles = 'bg-neutral-900 text-white';
-  if (variant === 'success') styles = 'bg-emerald-600 text-white';
-  if (variant === 'warning') styles = 'bg-amber-500 text-white';
-  if (variant === 'danger') styles = 'bg-red-600 text-white';
-  if (variant === 'muted') styles = 'bg-neutral-200 text-neutral-800';
+  let styles = 'bg-secondary text-secondary-foreground';
+  if (variant === 'success') styles = 'bg-emerald-500/90 text-emerald-950 dark:text-emerald-50';
+  if (variant === 'warning') styles = 'bg-amber-400/90 text-amber-950';
+  if (variant === 'danger') styles = 'bg-destructive text-destructive-foreground';
+  if (variant === 'muted') styles = 'bg-muted text-muted-foreground';
   return <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-medium ${styles} ${className}`}>{children}</span>;
 }
-

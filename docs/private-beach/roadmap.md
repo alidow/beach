@@ -1,5 +1,13 @@
 # Private Beach Roadmap
 
+## NEXT (Critical): Server Source of Truth (no LocalStorage)
+- Implement Manager-backed CRUD for private beaches (create/list/get/patch).
+- Add membership-aware RLS policies using `beach.account_id` GUC to allow listing caller’s beaches.
+- Persist dashboard layout server-side; add `GET/PUT /private-beaches/:id/layout`.
+- Migrate Surfer to use Manager APIs; remove all LocalStorage for beaches and layout.
+- Keep live Road defaults (`https://api.beach.sh`) for attach flows.
+- See `server-source-of-truth-plan.md` for detailed spec and acceptance criteria.
+
 ## Phase 0 – Alignment & Foundations
 - ✓ Ratify product boundaries (open-source Beach vs. paid Private Beach scope) and publish guiding principles.
 - ✓ Finalize Postgres schema (`docs/private-beach/data-model.md`) and ensure Beach Gate token claims cover required membership roles and share-link flows.

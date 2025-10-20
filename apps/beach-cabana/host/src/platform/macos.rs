@@ -40,6 +40,26 @@ mod sck {
 #[cfg(not(feature = "cabana_sck"))]
 mod sck_stub;
 
+pub mod permissions {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ScreenRecordingStatus { Granted, Denied }
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+        fn CGRequestScreenCaptureAccess() -> bool;
+    }
+
+    pub fn status() -> ScreenRecordingStatus {
+        let granted = unsafe { CGPreflightScreenCaptureAccess() };
+        if granted { ScreenRecordingStatus::Granted } else { ScreenRecordingStatus::Denied }
+    }
+
+    pub fn request_access() -> bool {
+        unsafe { CGRequestScreenCaptureAccess() }
+    }
+}
+
 const MAX_DISPLAYS: usize = 16;
 
 pub fn enumerate_windows() -> Result<Vec<WindowInfo>, WindowApiError> {
@@ -348,4 +368,3 @@ mod tests {
         assert!(matches!(result, Err(WindowApiError::CaptureFailed(_))));
     }
 }
-

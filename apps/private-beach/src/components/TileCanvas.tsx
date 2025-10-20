@@ -1,11 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
+import GridLayout, { type Layout, WidthProvider } from 'react-grid-layout';
 import { SessionSummary, acquireController, emergencyStop, releaseController } from '../lib/api';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
-
-export type Tile = {
-  session: SessionSummary;
-};
+import { SessionTerminalPreview } from './SessionTerminalPreview';
 
 type Props = {
   tiles: SessionSummary[];
@@ -15,60 +13,253 @@ type Props = {
   managerUrl: string;
   refresh: () => void;
   preset?: 'grid2x2' | 'onePlusThree' | 'focus';
+  beachId: string | undefined;
 };
 
-export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUrl, refresh, preset = 'grid2x2' }: Props) {
+const AutoGrid = WidthProvider(GridLayout);
+
+const COLS = 12;
+const DEFAULT_W = 4;
+const DEFAULT_H = 6;
+const LOCAL_LAYOUT_PREFIX = 'pb-tile-layout::';
+
+type LayoutCache = Record<string, Layout>;
+
+function loadLayoutCache(beachId: string | undefined): LayoutCache {
+  if (typeof window === 'undefined' || !beachId) return {};
+  const raw = window.localStorage.getItem(`${LOCAL_LAYOUT_PREFIX}${beachId}`);
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      return parsed as LayoutCache;
+    }
+  } catch {
+    // ignore
+  }
+  return {};
+}
+
+function saveLayoutCache(beachId: string | undefined, cache: LayoutCache) {
+  if (typeof window === 'undefined' || !beachId) return;
+  try {
+    window.localStorage.setItem(`${LOCAL_LAYOUT_PREFIX}${beachId}`, JSON.stringify(cache));
+  } catch {
+    // ignore
+  }
+}
+
+function ensureLayout(cache: LayoutCache, tiles: SessionSummary[], preset: Props['preset']): Layout[] {
+  const items: Layout[] = [];
+  const taken = new Set<string>();
+  const orderedTiles = tiles.slice();
+
+  const basePositions = presetPositions(preset, orderedTiles.length);
+
+  orderedTiles.forEach((session, index) => {
+    const id = session.session_id;
+    const cached = cache[id];
+    if (cached) {
+      items.push({ ...cached, i: id });
+      taken.add(id);
+      return;
+    }
+    const base = basePositions[index] ?? nextPosition(items);
+    const layout: Layout = {
+      i: id,
+      x: base.x,
+      y: base.y,
+      w: base.w,
+      h: base.h,
+      minW: 3,
+      minH: 4,
+    };
+    items.push(layout);
+    taken.add(id);
+  });
+
+  return items;
+}
+
+type Position = { x: number; y: number; w: number; h: number };
+
+function presetPositions(preset: Props['preset'], count: number): Position[] {
+  if (preset === 'focus') {
+    return Array.from({ length: count }).map((_, idx) => ({
+      x: 0,
+      y: idx * DEFAULT_H,
+      w: COLS,
+      h: DEFAULT_H,
+    }));
+  }
+  if (preset === 'onePlusThree') {
+    const positions: Position[] = [];
+    positions.push({ x: 0, y: 0, w: COLS, h: DEFAULT_H });
+    let row = DEFAULT_H;
+    for (let i = 1; i < count; i += 1) {
+      const colIndex = (i - 1) % 3;
+      const x = colIndex * 4;
+      positions.push({
+        x,
+        y: row,
+        w: 4,
+        h: DEFAULT_H,
+      });
+      if (colIndex === 2) {
+        row += DEFAULT_H;
+      }
+    }
+    return positions;
+  }
+  // default grid2x2
+  const positions: Position[] = [];
+  let y = 0;
+  for (let i = 0; i < count; i += 1) {
+    const x = (i % 3) * DEFAULT_W;
+    positions.push({ x, y, w: DEFAULT_W, h: DEFAULT_H });
+    if ((i + 1) % 3 === 0) {
+      y += DEFAULT_H;
+    }
+  }
+  return positions;
+}
+
+function nextPosition(existing: Layout[]): Position {
+  if (existing.length === 0) {
+    return { x: 0, y: 0, w: DEFAULT_W, h: DEFAULT_H };
+  }
+  const maxY = existing.reduce((acc, item) => Math.max(acc, item.y + item.h), 0);
+  return { x: 0, y: maxY, w: DEFAULT_W, h: DEFAULT_H };
+}
+
+export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUrl, refresh, preset = 'grid2x2', beachId }: Props) {
   const [now, setNow] = useState<number>(Date.now());
+  const [cache, setCache] = useState<LayoutCache>(() => loadLayoutCache(beachId));
+  const [expanded, setExpanded] = useState<SessionSummary | null>(null);
+
   useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
+    setCache(loadLayoutCache(beachId));
+  }, [beachId]);
+
+  useEffect(() => {
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
   }, []);
 
-  const gridClass = useMemo(() => {
-    if (preset === 'focus') return 'grid-cols-1';
-    if (preset === 'onePlusThree') return 'grid-cols-2 md:grid-cols-3';
-    // grid2x2 default
-    const count = tiles.length;
-    if (count <= 1) return 'grid-cols-1';
-    if (count <= 2) return 'grid-cols-2';
-    if (count <= 4) return 'grid-cols-2 md:grid-cols-2';
-    return 'grid-cols-3';
-  }, [tiles.length, preset]);
+  useEffect(() => {
+    if (expanded && !tiles.some((t) => t.session_id === expanded.session_id)) {
+      setExpanded(null);
+    }
+  }, [tiles, expanded]);
+
+  const layout = useMemo(() => ensureLayout(cache, tiles, preset), [cache, tiles, preset]);
+
+  const handleLayoutChange = (next: Layout[]) => {
+    const nextCache: LayoutCache = { ...cache };
+    next.forEach((item) => {
+      nextCache[item.i] = { ...item };
+    });
+    setCache(nextCache);
+    saveLayoutCache(beachId, nextCache);
+  };
+
+  const handleAcquire = async (sessionId: string) => {
+    await acquireController(sessionId, 30000, token, managerUrl).catch(() => {});
+    await refresh();
+  };
+
+  const handleRelease = async (sessionId: string, controllerToken: string | null | undefined) => {
+    if (!controllerToken) return;
+    await releaseController(sessionId, controllerToken, token, managerUrl).catch(() => {});
+    await refresh();
+  };
+
+  const handleStop = async (sessionId: string) => {
+    if (!confirm('Emergency stop?')) return;
+    await emergencyStop(sessionId, token, managerUrl).catch(() => {});
+    await refresh();
+  };
 
   return (
-    <div className={`grid ${gridClass} gap-3`}>
-      {tiles.map((s) => {
-        const expires = s.controller_expires_at_ms || 0;
-        const remain = Math.max(0, expires - now);
-        const countdown = s.controller_token ? `${Math.floor(remain / 1000)}s` : '';
-        return (
-          <div key={s.session_id} className="relative overflow-hidden rounded-lg border border-neutral-200 bg-white shadow-sm">
-            <div className="absolute right-2 top-2 z-10 flex items-center gap-2">
-              <Badge variant={s.last_health?.degraded ? 'warning' : 'success'}>{s.last_health?.degraded ? 'degraded' : 'ok'}</Badge>
-              <Badge variant="muted">{s.pending_actions}/{s.pending_unacked}</Badge>
-              {s.controller_token && <Badge variant="muted">{countdown}</Badge>}
-            </div>
-            <div className="absolute left-2 top-2 z-10 flex items-center gap-2">
-              <span className="font-mono text-xs bg-white/60 px-1 rounded">{s.session_id.slice(0, 8)}</span>
-              <span className="text-[11px] text-neutral-700 bg-white/60 px-1 rounded">{s.harness_type}</span>
-            </div>
-            <div className="flex h-48 items-center justify-center bg-neutral-50">
-              <div className="text-sm text-neutral-500">Live stream placeholder</div>
-            </div>
-            <div className="border-t border-neutral-200 p-2">
-              <div className="flex items-center justify-between">
+    <div className="relative">
+      <AutoGrid
+        layout={layout}
+        cols={COLS}
+        rowHeight={110}
+        margin={[16, 16]}
+        containerPadding={[8, 8]}
+        compactType="vertical"
+        preventCollision={false}
+        draggableHandle=".session-tile-drag-handle"
+        onLayoutChange={handleLayoutChange}
+      >
+        {tiles.map((s) => {
+          const expires = s.controller_expires_at_ms || 0;
+          const remain = Math.max(0, expires - now);
+          const countdown = s.controller_token ? `${Math.floor(remain / 1000)}s` : '';
+          return (
+            <div key={s.session_id} className="flex h-full flex-col overflow-hidden rounded-xl border border-neutral-200 bg-white shadow-sm">
+              <div className="session-tile-drag-handle flex items-center justify-between border-b border-neutral-200 bg-neutral-50/80 px-3 py-2 backdrop-blur">
                 <div className="flex items-center gap-2">
-                  <Button size="sm" variant="outline" onClick={() => onSelect(s)}>Details</Button>
-                  <Button size="sm" onClick={async () => { await acquireController(s.session_id, 30000, token, managerUrl).catch(()=>{}); refresh(); }}>Acquire</Button>
-                  <Button size="sm" variant="outline" onClick={async () => { if (!s.controller_token) return; await releaseController(s.session_id, s.controller_token, token, managerUrl).catch(()=>{}); refresh(); }}>Release</Button>
-                  <Button size="sm" variant="danger" onClick={async () => { if (!confirm('Emergency stop?')) return; await emergencyStop(s.session_id, token, managerUrl).catch(()=>{}); refresh(); }}>Stop</Button>
+                  <span className="rounded bg-white/80 px-1 font-mono text-[11px] text-neutral-700">{s.session_id.slice(0, 8)}</span>
+                  <Badge variant="muted">{s.harness_type}</Badge>
+                  <Badge variant={s.last_health?.degraded ? 'warning' : 'success'}>{s.last_health?.degraded ? 'degraded' : 'healthy'}</Badge>
+                  <Badge variant="muted">{s.pending_actions}/{s.pending_unacked}</Badge>
+                  {s.controller_token && <Badge variant="muted">{countdown}</Badge>}
                 </div>
-                <button className="text-xs text-neutral-600 underline" onClick={() => onRemove(s.session_id)}>Remove</button>
+                <div className="flex items-center gap-2">
+                  <Button size="sm" variant="ghost" onClick={() => onSelect(s)}>Details</Button>
+                  <Button size="sm" variant="ghost" onClick={() => setExpanded(s)}>Expand</Button>
+                  <Button size="sm" variant="ghost" onClick={() => onRemove(s.session_id)}>Remove</Button>
+                </div>
+              </div>
+              <div className="relative flex min-h-0 flex-1 bg-neutral-900">
+                <SessionTerminalPreview sessionId={s.session_id} managerUrl={managerUrl} token={token} className="w-full" />
+              </div>
+              <div className="border-t border-neutral-200 px-3 py-2">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Button size="sm" onClick={() => handleAcquire(s.session_id)}>Acquire</Button>
+                    <Button size="sm" variant="outline" onClick={() => handleRelease(s.session_id, s.controller_token)}>Release</Button>
+                    <Button size="sm" variant="danger" onClick={() => handleStop(s.session_id)}>Stop</Button>
+                  </div>
+                  <div className="text-[11px] text-neutral-600">{s.location_hint || '—'}</div>
+                </div>
               </div>
             </div>
+          );
+        })}
+      </AutoGrid>
+      {tiles.length === 0 && (
+        <div className="flex h-80 items-center justify-center rounded-xl border border-dashed border-neutral-300 text-sm text-neutral-500">
+          Add sessions from the sidebar to build your dashboard.
+        </div>
+      )}
+      {expanded && (
+        <div className="fixed inset-0 z-50 flex flex-col bg-neutral-950/95 text-white backdrop-blur">
+          <div className="flex items-center justify-between border-b border-white/10 px-6 py-4">
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="rounded bg-white/10 px-2 py-1 font-mono text-sm text-white">{expanded.session_id}</span>
+              <span className="text-xs uppercase tracking-wide text-white/70">{expanded.harness_type}</span>
+              <span className="text-xs text-white/60">{expanded.location_hint || '—'}</span>
+              {expanded.controller_token && (
+                <span className="rounded-full bg-emerald-500/20 px-3 py-1 text-xs text-emerald-200">
+                  Lease active
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="outline" onClick={() => handleAcquire(expanded.session_id)}>Acquire</Button>
+              <Button size="sm" variant="outline" onClick={() => handleRelease(expanded.session_id, expanded.controller_token)}>Release</Button>
+              <Button size="sm" variant="danger" onClick={() => handleStop(expanded.session_id)}>Stop</Button>
+              <Button size="sm" variant="ghost" onClick={() => setExpanded(null)}>Close</Button>
+            </div>
           </div>
-        );
-      })}
+          <div className="flex-1 overflow-hidden">
+            <SessionTerminalPreview sessionId={expanded.session_id} managerUrl={managerUrl} token={token} variant="full" className="h-full w-full" />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -34,12 +34,14 @@ sessions/
 # temp data
 tmp/
 temp/
-apps/*/node_modules/
-apps/*/dist/
-apps/*/build/
-apps/*/.turbo/
-apps/*/.tsbuildinfo
-apps/*/.next/
+apps/**/node_modules/
+apps/**/dist/
+apps/**/build/
+apps/**/.turbo/
+apps/**/.tsbuildinfo
+apps/**/.next/
+# Tauri targets (native apps)
+apps/**/src-tauri/target/
 
 # Beach Gate artifacts
 apps/beach-gate/node_modules/

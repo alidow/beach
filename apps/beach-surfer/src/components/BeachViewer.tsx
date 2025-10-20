@@ -9,6 +9,8 @@ import { DataChannelMediaTransport } from '../transport/mediaTransport';
 import { connectUnified, type UnifiedConnection } from '../viewer/connectUnified';
 import type { WebRtcTransport } from '../transport/webrtc';
 import { MediaCanvas } from './MediaCanvas';
+import { MediaVideo } from './MediaVideo';
+import type { SecureTransportSummary } from '../transport/webrtc';
 
 export interface BeachViewerProps {
   sessionId?: string;
@@ -21,7 +23,7 @@ export interface BeachViewerProps {
   showTopBar?: boolean;
 }
 
-type ViewerMode = 'unknown' | 'terminal' | 'media';
+type ViewerMode = 'unknown' | 'terminal' | 'media_png' | 'media_h264';
 
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
@@ -52,6 +54,7 @@ export function BeachViewer(props: BeachViewerProps): JSX.Element {
   const terminalTransportRef = useRef<TerminalTransport | null>(null);
   const mediaTransportRef = useRef<MediaTransport | null>(null);
   const sniffedRef = useRef<boolean>(false);
+  const [secureSummary, setSecureSummary] = useState<SecureTransportSummary | null>(null);
 
   const notify = (next: TerminalStatus) => {
     setStatus(next);
@@ -103,14 +106,20 @@ export function BeachViewer(props: BeachViewerProps): JSX.Element {
             const bytes = detail.payload.data as Uint8Array;
             if (isPng(bytes)) {
               sniffedRef.current = true;
-              setMode('media');
+              setMode('media_png');
+              const mt = new DataChannelMediaTransport(transport);
+              mediaTransportRef.current = mt;
+              notify('connected');
+            } else if (looksLikeFmp4(bytes)) {
+              sniffedRef.current = true;
+              setMode('media_h264');
               const mt = new DataChannelMediaTransport(transport);
               mediaTransportRef.current = mt;
               notify('connected');
             } else {
               sniffedRef.current = true;
               // Unknown stream type; keep media path to allow custom handling in future.
-              setMode('media');
+              setMode('media_png');
               const mt = new DataChannelMediaTransport(transport);
               mediaTransportRef.current = mt;
               notify('connected');
@@ -137,7 +146,12 @@ export function BeachViewer(props: BeachViewerProps): JSX.Element {
         const onError = () => {
           notify('error');
         };
+        const onSecure = (event: Event) => {
+          const detail = (event as CustomEvent<SecureTransportSummary>).detail;
+          setSecureSummary(detail);
+        };
         transport.addEventListener('message', onMessage as any);
+        transport.addEventListener('secure', onSecure as any);
         transport.addEventListener('open', onOpen);
         transport.addEventListener('close', onClose);
         transport.addEventListener('error', onError);
@@ -153,6 +167,7 @@ export function BeachViewer(props: BeachViewerProps): JSX.Element {
       connectionRef.current = null;
       sniffedRef.current = false;
       setMode('unknown');
+      setSecureSummary(null);
       try {
         conn?.close();
       } catch {}
@@ -172,13 +187,40 @@ export function BeachViewer(props: BeachViewerProps): JSX.Element {
         />
       );
     }
-    if (mode === 'media' && mediaTransportRef.current) {
+    if (mode === 'media_png' && mediaTransportRef.current) {
       return <MediaCanvas transport={mediaTransportRef.current} />;
+    }
+    if (mode === 'media_h264' && mediaTransportRef.current) {
+      return <MediaVideo transport={mediaTransportRef.current} />;
     }
     // Placeholder while connecting/sniffing
     return <div className={className} />;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, className, showStatusBar, showTopBar]);
 
-  return content;
+  return (
+    <div className={className}>
+      {content}
+      {secureSummary && secureSummary.mode === 'secure' && secureSummary.verificationCode ? (
+        <div className="pointer-events-none absolute top-3 right-4 z-10 rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-3 py-1 text-xs text-emerald-200">
+          Verified • {secureSummary.verificationCode}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function looksLikeFmp4(bytes: Uint8Array): boolean {
+  // MP4 'ftyp' at offset 4 or moof/mdat fragments
+  if (bytes.length >= 12) {
+    const a = bytes[4], b = bytes[5], c = bytes[6], d = bytes[7];
+    if (a === 0x66 && b === 0x74 && c === 0x79 && d === 0x70) return true; // 'ftyp'
+  }
+  const limit = Math.min(bytes.length - 4, 64 * 1024);
+  for (let i = 0; i < limit; i += 1) {
+    const a = bytes[i], b = bytes[i + 1], c = bytes[i + 2], d = bytes[i + 3];
+    if (a === 0x6d && b === 0x6f && c === 0x6f && d === 0x66) return true; // 'moof'
+    if (a === 0x6d && b === 0x64 && c === 0x61 && d === 0x74) return true; // 'mdat'
+  }
+  return false;
 }

@@ -4,20 +4,16 @@ import TopNav from '../../components/TopNav';
 import { Card, CardContent, CardHeader } from '../../components/ui/card';
 import { Button } from '../../components/ui/button';
 import { Input } from '../../components/ui/input';
-import { PrivateBeach, deleteBeach, listBeaches } from '../../lib/beaches';
+import { BeachSummary, listBeaches } from '../../lib/api';
 
 export default function BeachesIndex() {
-  const [beaches, setBeaches] = useState<PrivateBeach[]>([]);
+  const [beaches, setBeaches] = useState<BeachSummary[]>([]);
   const [query, setQuery] = useState('');
-  useEffect(() => setBeaches(listBeaches()), []);
+  useEffect(() => { listBeaches(null).then(setBeaches).catch(() => setBeaches([])); }, []);
 
   const filtered = beaches.filter((b) => b.name.toLowerCase().includes(query.toLowerCase()) || b.id.startsWith(query));
 
-  function onDelete(id: string) {
-    if (!confirm('Delete this beach from local list? (Does not delete server data)')) return;
-    deleteBeach(id);
-    setBeaches(listBeaches());
-  }
+  function onDelete(_id: string) {}
 
   return (
     <div className="min-h-screen">
@@ -47,9 +43,7 @@ export default function BeachesIndex() {
                     </div>
                   </div>
                 </CardHeader>
-                <CardContent>
-                  <div className="text-xs text-neutral-600">Manager: {b.managerUrl}</div>
-                </CardContent>
+                {/* no extra content for now */}
               </Card>
             ))
           )}
@@ -58,4 +52,3 @@ export default function BeachesIndex() {
     </div>
   );
 }
-

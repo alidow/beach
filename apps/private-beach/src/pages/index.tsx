@@ -2,18 +2,10 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import SessionTable from '../components/SessionTable';
 import { SessionSummary, listSessions, acquireController, releaseController, eventsSseUrl, stateSseUrl, emergencyStop } from '../lib/api';
 
-function useLocalStorage(key: string, initial: string) {
-  const [value, setValue] = useState<string>(() => (typeof window !== 'undefined' ? localStorage.getItem(key) || initial : initial));
-  useEffect(() => {
-    if (typeof window !== 'undefined') localStorage.setItem(key, value);
-  }, [key, value]);
-  return [value, setValue] as const;
-}
-
 export default function Dashboard() {
-  const [managerUrl, setManagerUrl] = useLocalStorage('pb.manager', process.env.NEXT_PUBLIC_MANAGER_URL || 'http://localhost:3000');
-  const [beachId, setBeachId] = useLocalStorage('pb.beach', '');
-  const [token, setToken] = useLocalStorage('pb.token', 'test-token');
+  const [managerUrl, setManagerUrl] = useState(process.env.NEXT_PUBLIC_MANAGER_URL || 'http://localhost:8080');
+  const [beachId, setBeachId] = useState('');
+  const [token, setToken] = useState('test-token');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -23,12 +15,7 @@ export default function Dashboard() {
   const sseRef = useRef<EventSource | null>(null);
   const sseStateRef = useRef<EventSource | null>(null);
 
-  useEffect(() => {
-    // Keep NEXT_PUBLIC_MANAGER_URL in sync if user edits the input
-    if (typeof window !== 'undefined') {
-      (window as any).NEXT_PUBLIC_MANAGER_URL = managerUrl;
-    }
-  }, [managerUrl]);
+  useEffect(() => {}, [managerUrl]);
 
   async function refresh() {
     if (!beachId) return;

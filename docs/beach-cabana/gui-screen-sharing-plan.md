@@ -70,7 +70,12 @@ Next Phase 3 steps:
 
 **Phase 4 — Selection UX (Desktop App & CLI)**
 - Deliverables: Zoom-style picker modal in Cabana desktop app prototype; CLI TUI menu with arrow/enter flow plus `--window-id` flag; permission prompts surfaced with guidance; verification string surfaced post-handshake so users confirm zero-trust link.
-- Success: User selects target via app or CLI; correct target streams securely; UX validated across macOS/Windows/Linux.
+- Status (2025-10-18):
+  - CLI TUI picker implemented with Displays/Windows tabs, type-to-filter, refresh, and selection. Integrated into `webrtc-host-run`: if `--window-id` is absent and streaming requested, the picker launches.
+  - Post-handshake verification gate implemented: host bootstrap completes Noise + prints the 6-digit verification code; CLI prompts for confirmation before streaming frames.
+  - macOS permission preflight in host platform module; CLI surfaces guidance and calls request API before starting capture.
+  - Desktop picker scaffolded as a minimal native app under `apps/beach-cabana/native-apps/desktop` (terminal UI placeholder). Next step: replace with Tauri UI.
+- Success: User selects target via app or CLI; correct target streams securely; zero‑trust verification confirmed before streaming. Desktop UI to be upgraded next.
 
 Suggested implementation notes (handoff-ready)
 - CLI TUI picker (ratatui/crossterm):

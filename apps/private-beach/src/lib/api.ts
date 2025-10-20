@@ -27,18 +27,12 @@ export type ControllerLeaseResponse = {
 
 function base(baseUrl?: string) {
   if (baseUrl) return baseUrl;
-  if (typeof window !== 'undefined') {
-    const w = window as any;
-    if (w.NEXT_PUBLIC_MANAGER_URL) return w.NEXT_PUBLIC_MANAGER_URL as string;
-    const ls = localStorage.getItem('pb.manager');
-    if (ls) return ls;
-  }
-  return process.env.NEXT_PUBLIC_MANAGER_URL || 'http://localhost:3000';
+  return process.env.NEXT_PUBLIC_MANAGER_URL || 'http://localhost:8080';
 }
 
 function authHeaders(token: string | null) {
   const headers: Record<string, string> = { 'content-type': 'application/json' };
-  if (token) headers['authorization'] = `Bearer ${token}`;
+  headers['authorization'] = `Bearer ${token || 'test-token'}`;
   return headers;
 }
 
@@ -105,5 +99,60 @@ export async function attachOwned(privateBeachId: string, ids: string[], token: 
     body: JSON.stringify({ origin_session_ids: ids }),
   });
   if (!res.ok) throw new Error(`attachOwned failed ${res.status}`);
+  return res.json();
+}
+
+// ---- Private Beaches API ----
+
+export type BeachSummary = { id: string; name: string; slug: string; created_at: number };
+export type BeachMeta = BeachSummary & { settings: any };
+export type BeachLayout = { preset: 'grid2x2' | 'onePlusThree' | 'focus'; tiles: string[] };
+
+export async function listBeaches(token: string | null, baseUrl?: string): Promise<BeachSummary[]> {
+  const res = await fetch(`${base(baseUrl)}/private-beaches`, { headers: authHeaders(token) });
+  if (!res.ok) throw new Error(`listBeaches failed ${res.status}`);
+  return res.json();
+}
+
+export async function createBeach(name: string, slug: string | undefined, token: string | null, baseUrl?: string): Promise<BeachSummary> {
+  const res = await fetch(`${base(baseUrl)}/private-beaches`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify({ name, slug }),
+  });
+  if (!res.ok) throw new Error(`createBeach failed ${res.status}`);
+  return res.json();
+}
+
+export async function getBeachMeta(id: string, token: string | null, baseUrl?: string): Promise<BeachMeta> {
+  const res = await fetch(`${base(baseUrl)}/private-beaches/${id}`, { headers: authHeaders(token) });
+  if (res.status === 404) throw new Error('not_found');
+  if (!res.ok) throw new Error(`getBeachMeta failed ${res.status}`);
+  return res.json();
+}
+
+export async function getBeachLayout(id: string, token: string | null, baseUrl?: string): Promise<BeachLayout> {
+  const res = await fetch(`${base(baseUrl)}/private-beaches/${id}/layout`, { headers: authHeaders(token) });
+  if (!res.ok) throw new Error(`getBeachLayout failed ${res.status}`);
+  const data = await res.json();
+  return { preset: (data.preset || 'grid2x2') as BeachLayout['preset'], tiles: Array.isArray(data.tiles) ? data.tiles : [] };
+}
+
+export async function putBeachLayout(id: string, layout: BeachLayout, token: string | null, baseUrl?: string): Promise<void> {
+  const res = await fetch(`${base(baseUrl)}/private-beaches/${id}/layout`, {
+    method: 'PUT',
+    headers: authHeaders(token),
+    body: JSON.stringify(layout),
+  });
+  if (!res.ok) throw new Error(`putBeachLayout failed ${res.status}`);
+}
+
+export async function updateBeach(id: string, patch: { name?: string; slug?: string; settings?: any }, token: string | null, baseUrl?: string): Promise<BeachMeta> {
+  const res = await fetch(`${base(baseUrl)}/private-beaches/${id}`, {
+    method: 'PATCH',
+    headers: authHeaders(token),
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) throw new Error(`updateBeach failed ${res.status}`);
   return res.json();
 }

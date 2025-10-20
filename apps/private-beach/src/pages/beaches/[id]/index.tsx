@@ -7,13 +7,13 @@ import SessionDrawer from '../../../components/SessionDrawer';
 import { Button } from '../../../components/ui/button';
 import AddSessionModal from '../../../components/AddSessionModal';
 import { Select } from '../../../components/ui/select';
-import { SessionSummary, listSessions } from '../../../lib/api';
-import { BeachLayout, PrivateBeach, getBeach, loadLayout, saveLayout } from '../../../lib/beaches';
+import { SessionSummary, listSessions, getBeachMeta, getBeachLayout, putBeachLayout } from '../../../lib/api';
+import type { BeachLayout } from '../../../lib/api';
 
 export default function BeachDashboard() {
   const router = useRouter();
   const { id } = router.query as { id?: string };
-  const [beach, setBeach] = useState<PrivateBeach | null>(null);
+  const [beachName, setBeachName] = useState<string>('');
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -24,21 +24,32 @@ export default function BeachDashboard() {
 
   useEffect(() => {
     if (!id) return;
-    const b = getBeach(id);
-    setBeach(b);
-    setLayout(loadLayout(id));
+    (async () => {
+      try {
+        const meta = await getBeachMeta(id, null);
+        setBeachName(meta.name);
+      } catch (e: any) {
+        if (e.message === 'not_found') setError('Beach not found'); else setError('Failed to load beach');
+      }
+      try {
+        const l = await getBeachLayout(id, null);
+        setLayout(l);
+      } catch {
+        // ignore, keep default
+      }
+    })();
   }, [id]);
 
-  const managerUrl = beach?.managerUrl || process.env.NEXT_PUBLIC_MANAGER_URL || 'http://localhost:8080';
-  const roadUrl = process.env.NEXT_PUBLIC_ROAD_URL || process.env.NEXT_PUBLIC_SESSION_SERVER_URL || 'http://localhost:4132';
-  const token = beach?.token || null;
+  const managerUrl = process.env.NEXT_PUBLIC_MANAGER_URL || 'http://localhost:8080';
+  const roadUrl = process.env.NEXT_PUBLIC_ROAD_URL || process.env.NEXT_PUBLIC_SESSION_SERVER_URL || 'https://api.beach.sh';
+  const token = null;
 
   async function refresh() {
-    if (!beach) return;
+    if (!id) return;
     setLoading(true);
     setError(null);
     try {
-      const data = await listSessions(beach.id, token, managerUrl);
+      const data = await listSessions(id, token, managerUrl);
       setSessions(data);
     } catch (e: any) {
       setError(e.message || 'Failed to load sessions');
@@ -50,25 +61,25 @@ export default function BeachDashboard() {
   useEffect(() => {
     refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [beach?.id, managerUrl, token]);
+  }, [id, managerUrl, token]);
 
   function addTile(sessionId: string) {
     if (!id) return;
     const next = { ...layout, tiles: Array.from(new Set([sessionId, ...layout.tiles])).slice(0, 6) };
     setLayout(next);
-    saveLayout(id, next);
+    putBeachLayout(id, next, null).catch(() => {});
   }
   function removeTile(sessionId: string) {
     if (!id) return;
     const next = { ...layout, tiles: layout.tiles.filter((t) => t !== sessionId) };
     setLayout(next);
-    saveLayout(id, next);
+    putBeachLayout(id, next, null).catch(() => {});
   }
   function changePreset(preset: BeachLayout['preset']) {
     if (!id) return;
     const next = { ...layout, preset };
     setLayout(next);
-    saveLayout(id, next);
+    putBeachLayout(id, next, null).catch(() => {});
   }
 
   const tileSessions = useMemo(() => {
@@ -83,7 +94,7 @@ export default function BeachDashboard() {
 
   return (
     <div className="min-h-screen">
-      <TopNav current={beach} onSwitch={(v) => router.push(`/beaches/${v}`)} right={
+      <TopNav currentId={id} onSwitch={(v) => router.push(`/beaches/${v}`)} right={
         <div className="flex items-center gap-2">
           <Select value={layout.preset} onChange={(v) => changePreset(v as any)} options={[
             { value: 'grid2x2', label: 'Layout: Grid' },
@@ -102,7 +113,16 @@ export default function BeachDashboard() {
         </div>
         <div className="col-span-12 md:col-span-9">
           {error && <div className="mb-2 rounded-md border border-red-200 bg-red-50 p-2 text-sm text-red-700">{error}</div>}
-          <TileCanvas tiles={tileSessions} onRemove={removeTile} onSelect={onSelect} token={token} managerUrl={managerUrl} refresh={refresh} preset={layout.preset} />
+          <TileCanvas
+            tiles={tileSessions}
+            onRemove={removeTile}
+            onSelect={onSelect}
+            token={token}
+            managerUrl={managerUrl}
+            refresh={refresh}
+            preset={layout.preset}
+            beachId={id}
+          />
         </div>
       </div>
       <SessionDrawer open={drawerOpen} onOpenChange={setDrawerOpen} session={selected} managerUrl={managerUrl} token={token} />

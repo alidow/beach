@@ -3109,16 +3109,45 @@ async fn post_sdp(
     }
     if response.status() == StatusCode::NOT_FOUND {
         if let Some(alt_base) = rewrite_signaling_base(base) {
+            // If switching to fastpath for answers, skip: manager doesn't expose answer endpoint.
+            let alt_is_fastpath = alt_base.contains("/fastpath/sessions/");
+            if alt_is_fastpath && suffix == "answer" {
+                tracing::debug!(
+                    target = "beach::transport::webrtc",
+                    phase = "post_sdp",
+                    suffix,
+                    url = %url_string,
+                    alt_base = %alt_base,
+                    "post 404; skipping fastpath alt for answer"
+                );
+                return Err(TransportError::Setup(format!(
+                    "unexpected signaling status {}",
+                    response.status()
+                )));
+            }
+
             let alt_url = endpoint_with_params(&alt_base, suffix, params)?;
             let alt_url_string = alt_url.as_str().to_string();
-            tracing::warn!(
-                target = "beach::transport::webrtc",
-                phase = "post_sdp",
-                suffix,
-                url = %url_string,
-                alt_url = %alt_url_string,
-                "post returned 404; retrying alternate signaling path"
-            );
+            let level_is_warn = !alt_is_fastpath; // warn only when switching fastpath -> sessions
+            if level_is_warn {
+                tracing::warn!(
+                    target = "beach::transport::webrtc",
+                    phase = "post_sdp",
+                    suffix,
+                    url = %url_string,
+                    alt_url = %alt_url_string,
+                    "post returned 404; retrying alternate signaling path"
+                );
+            } else {
+                tracing::debug!(
+                    target = "beach::transport::webrtc",
+                    phase = "post_sdp",
+                    suffix,
+                    url = %url_string,
+                    alt_url = %alt_url_string,
+                    "post returned 404; retrying alternate signaling path"
+                );
+            }
             let alt_attempt = client.post(alt_url.clone()).json(payload).send().await;
             tracing::debug!(
                 target = "beach::transport::webrtc",
@@ -3217,16 +3246,42 @@ async fn fetch_sdp(
         }
         StatusCode::NOT_FOUND => {
             if let Some(alt_base) = rewrite_signaling_base(base) {
+                let alt_is_fastpath = alt_base.contains("/fastpath/sessions/");
+                // Skip useless fastpath retry for answers; manager doesn't expose answer endpoint
+                if alt_is_fastpath && suffix == "answer" {
+                    tracing::debug!(
+                        target = "beach::transport::webrtc",
+                        phase = "fetch_sdp",
+                        suffix,
+                        url = %url_string,
+                        alt_base = %alt_base,
+                        "fetch 404; skipping fastpath alt for answer"
+                    );
+                    return Ok(None);
+                }
+
                 let alt_url = endpoint_with_params(&alt_base, suffix, params)?;
                 let alt_url_string = alt_url.as_str().to_string();
-                tracing::warn!(
-                    target = "beach::transport::webrtc",
-                    phase = "fetch_sdp",
-                    suffix,
-                    url = %url_string,
-                    alt_url = %alt_url_string,
-                    "fetch returned 404; retrying alternate signaling path"
-                );
+                let level_is_warn = !alt_is_fastpath; // warn when switching fastpath -> sessions
+                if level_is_warn {
+                    tracing::warn!(
+                        target = "beach::transport::webrtc",
+                        phase = "fetch_sdp",
+                        suffix,
+                        url = %url_string,
+                        alt_url = %alt_url_string,
+                        "fetch returned 404; retrying alternate signaling path"
+                    );
+                } else {
+                    tracing::debug!(
+                        target = "beach::transport::webrtc",
+                        phase = "fetch_sdp",
+                        suffix,
+                        url = %url_string,
+                        alt_url = %alt_url_string,
+                        "fetch returned 404; retrying alternate signaling path"
+                    );
+                }
                 let alt_attempt = client.get(alt_url.clone()).send().await;
                 tracing::debug!(
                     target = "beach::transport::webrtc",

@@ -104,25 +104,29 @@ Against api.beach.sh:
   - Tabs: By Code (verifies with Road via Manager), My Sessions (lists from Road, bulk attach), Launch New (copyable CLI).
 
 ## Handoff TODOs (Ordered)
-1. Harness fast‑path client (beach-buggy):
+1. Surfer session tiles (live terminal preview):
+   - Replace the TileCanvas placeholder with the existing terminal renderer streaming real PTY diffs so attached sessions show activity immediately.
+   - Add drag-resize handles and persist a simple per-beach layout (local state for now, Manager layout API later) so tiles can be rearranged.
+   - Provide a maximize button to pop the tile into the full terminal view while keeping the minimized live preview.
+2. Harness fast‑path client (beach-buggy):
    - Dial manager endpoints (offer/answer/ICE) and open `mgr-actions`, `mgr-acks`, `mgr-state`.
    - Map ActionCommand/ActionAck/StateDiff over channels; enforce controller token.
    - Back-pressure + batching; fallback to Redis/HTTP if channel drops.
-2. Manager fast‑path receive loops:
+3. Manager fast‑path receive loops:
    - Listen on `mgr-acks` and call `ack_actions` with parsed acks (feed histograms/metrics as done for REST path).
    - Listen on `mgr-state` and call `record_state` (mirror to Redis + session_runtime).
    - Make both optional (feature flag) and observable (counters).
-3. Surfer UX phase (see roadmap Phase 4):
+4. Surfer UX phase (see roadmap Phase 4):
    - Design system + components, IA, search/filtering, accessibility, performance budgets, polished session detail.
    - Auth via Beach Gate (OIDC); remove `access_token` query fallback.
-4. Session onboarding hardening:
+5. Session onboarding hardening:
    - Replace dev bridge token with Beach Gate–minted scoped JWT; gate by beach/session.
    - Enforce ownership check against Beach Road for `attach` (currently trusting dev owner header).
    - Persist `session.attach_method` for audit (migration added; wire writes).
-5. CI hardening:
+6. CI hardening:
    - Dockerized Postgres/Redis tests with `sqlx migrate run --check`.
    - Add an ignored integration test that mocks fast‑path (no WebRTC) to validate manager multiplex + acks/state.
-6. Schema artifacts: generate drizzle-friendly SQL + enum maps for Surfer; publish alongside migrations.
+7. Schema artifacts: generate drizzle-friendly SQL + enum maps for Surfer; publish alongside migrations.
 
 ## Manual Fast‑Path Test (for developers)
 1. Start manager and register a session (as above).

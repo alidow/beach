@@ -1,0 +1,161 @@
+use axum::{
+    extract::{Path, State},
+    Json,
+};
+use serde::{Deserialize, Serialize};
+use tracing::warn;
+use uuid::Uuid;
+
+use crate::state::{AppState, StateError};
+
+use super::{sessions::ensure_scope, ApiError, ApiResult, AuthToken};
+
+#[derive(Debug, Deserialize)]
+pub struct CreateBeachRequest {
+    pub name: String,
+    #[serde(default)]
+    pub slug: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateBeachRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub slug: Option<String>,
+    #[serde(default)]
+    pub settings: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BeachSummary {
+    pub id: String,
+    pub name: String,
+    pub slug: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BeachMeta {
+    pub id: String,
+    pub name: String,
+    pub slug: String,
+    pub settings: serde_json::Value,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LayoutUpsert {
+    pub preset: Option<String>,
+    #[serde(default)]
+    pub tiles: Option<Vec<String>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BeachLayout {
+    pub preset: String,
+    pub tiles: Vec<String>,
+}
+
+pub async fn create_private_beach(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Json(body): Json<CreateBeachRequest>,
+) -> ApiResult<BeachSummary> {
+    ensure_scope(&token, "pb:beaches.write")?;
+    let owner = token.account_uuid();
+    let created = state
+        .create_private_beach(&body.name, body.slug.as_deref(), owner)
+        .await
+        .map_err(map_state_err)?;
+    Ok(Json(created))
+}
+
+pub async fn list_private_beaches(
+    State(state): State<AppState>,
+    token: AuthToken,
+) -> ApiResult<Vec<BeachSummary>> {
+    ensure_scope(&token, "pb:beaches.read")?;
+    let list = state
+        .list_private_beaches(token.account_uuid())
+        .await
+        .map_err(map_state_err)?;
+    Ok(Json(list))
+}
+
+pub async fn get_private_beach(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(id): Path<String>,
+) -> ApiResult<BeachMeta> {
+    ensure_scope(&token, "pb:beaches.read")?;
+    let meta = state
+        .get_private_beach(&id, token.account_uuid())
+        .await
+        .map_err(map_state_err)?;
+    Ok(Json(meta))
+}
+
+pub async fn update_private_beach(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateBeachRequest>,
+) -> ApiResult<BeachMeta> {
+    ensure_scope(&token, "pb:beaches.write")?;
+    let updated = state
+        .update_private_beach(&id, body.name.as_deref(), body.slug.as_deref(), body.settings.clone(), token.account_uuid())
+        .await
+        .map_err(map_state_err)?;
+    Ok(Json(updated))
+}
+
+pub async fn get_private_beach_layout(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(id): Path<String>,
+) -> ApiResult<BeachLayout> {
+    ensure_scope(&token, "pb:beaches.read")?;
+    let layout = state
+        .get_private_beach_layout(&id, token.account_uuid())
+        .await
+        .map_err(map_state_err)?;
+    Ok(Json(layout))
+}
+
+pub async fn put_private_beach_layout(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(id): Path<String>,
+    Json(body): Json<LayoutUpsert>,
+) -> ApiResult<serde_json::Value> {
+    ensure_scope(&token, "pb:beaches.write")?;
+    let preset = body.preset.unwrap_or_else(|| "grid2x2".to_string());
+    let tiles = body.tiles.unwrap_or_default();
+    state
+        .put_private_beach_layout(&id, preset, tiles, token.account_uuid())
+        .await
+        .map_err(map_state_err)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+fn map_state_err(err: StateError) -> ApiError {
+    match err {
+        StateError::SessionNotFound => ApiError::NotFound("session not found"),
+        StateError::ControllerMismatch => ApiError::Conflict("controller mismatch"),
+        StateError::PrivateBeachNotFound => ApiError::NotFound("private beach not found"),
+        StateError::InvalidIdentifier(msg) => ApiError::BadRequest(msg),
+        StateError::Database(e) => {
+            warn!(error = %e, "database error");
+            ApiError::Conflict("database error")
+        }
+        StateError::Redis(e) => {
+            warn!(error = %e, "redis error");
+            ApiError::Conflict("redis error")
+        }
+        StateError::Serde(e) => {
+            warn!(error = %e, "serialization failure");
+            ApiError::BadRequest("serialization error".into())
+        }
+    }
+}

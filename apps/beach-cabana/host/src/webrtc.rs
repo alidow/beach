@@ -246,6 +246,20 @@ pub async fn host_run(
     from_id: String,
     to_id: String,
 ) -> Result<String, NoiseDriverError> {
+    let (transport, _code) = host_bootstrap(session_id.clone(), passcode.clone(), road_url.clone(), prologue.clone(), from_id.clone(), to_id.clone()).await?;
+    #[cfg(target_os = "macos")]
+    if let (Some(target), n) = (window_id, frames) { if n > 0 { let interval = Duration::from_millis(interval_ms); match codec { EncodeCodec::Gif => { stream_png_frames(&transport, &target, n, interval, max_width).await?; } EncodeCodec::H264 => { #[cfg(all(target_os = "macos", feature = "cabana_sck"))] { let fps = (1000u64 / interval_ms.max(1)) as u32; stream_h264_frames(&transport, &target, n, interval, max_width, fps).await?; } #[cfg(not(all(target_os = "macos", feature = "cabana_sck")))] { stream_png_frames(&transport, &target, n, interval, max_width).await?; } } } } }
+    Ok(transport.verification_code().unwrap_or("unknown").to_string())
+}
+
+pub async fn host_bootstrap(
+    session_id: String,
+    passcode: String,
+    road_url: Option<String>,
+    prologue: Vec<u8>,
+    from_id: String,
+    to_id: String,
+) -> Result<(DataChannelSecureTransport, String), NoiseDriverError> {
     let api = build_api().await?;
     let config = RTCConfiguration { ice_servers: vec![], ..Default::default() };
     let pc = Arc::new(api.new_peer_connection(config).await.map_err(|e| NoiseDriverError::Noise(NoiseError::Handshake(e.to_string())))?);
@@ -274,9 +288,26 @@ pub async fn host_run(
     let desc = RTCSessionDescription::answer(answer_sdp).map_err(|e| NoiseDriverError::Noise(NoiseError::Handshake(e.to_string())))?;
     pc.set_remote_description(desc).await.map_err(|e| NoiseDriverError::Noise(NoiseError::Handshake(e.to_string())))?;
     let transport = negotiate_data_channel(dc.clone(), HandshakeConfig { material: &material, handshake_id: &handshake, role: crate::noise::HandshakeRole::Initiator, local_id: "host", remote_id: "viewer", prologue_context: &prologue }, Duration::from_secs(10)).await?;
-    #[cfg(target_os = "macos")]
-    if let (Some(target), n) = (window_id, frames) { if n > 0 { let interval = Duration::from_millis(interval_ms); match codec { EncodeCodec::Gif => { stream_png_frames(&transport, &target, n, interval, max_width).await?; } EncodeCodec::H264 => { #[cfg(all(target_os = "macos", feature = "cabana_sck"))] { let fps = (1000u64 / interval_ms.max(1)) as u32; stream_h264_frames(&transport, &target, n, interval, max_width, fps).await?; } #[cfg(not(all(target_os = "macos", feature = "cabana_sck")))] { stream_png_frames(&transport, &target, n, interval, max_width).await?; } } } } }
-    Ok(transport.verification_code().unwrap_or("unknown").to_string())
+    let code = transport.verification_code().unwrap_or("unknown").to_string();
+    Ok((transport, code))
+}
+
+#[cfg(target_os = "macos")]
+pub async fn host_stream(
+    transport: &DataChannelSecureTransport,
+    codec: EncodeCodec,
+    window_id: &str,
+    frames: u32,
+    interval_ms: u64,
+    max_width: Option<u32>,
+) -> Result<(), NoiseDriverError> {
+    let interval = Duration::from_millis(interval_ms);
+    match codec { EncodeCodec::Gif => { stream_png_frames(transport, window_id, frames, interval, max_width).await } EncodeCodec::H264 => {
+        #[cfg(all(target_os = "macos", feature = "cabana_sck"))]
+        { let fps = (1000u64 / interval_ms.max(1)) as u32; stream_h264_frames(transport, window_id, frames, interval, max_width, fps).await }
+        #[cfg(not(all(target_os = "macos", feature = "cabana_sck")))]
+        { stream_png_frames(transport, window_id, frames, interval, max_width).await }
+    } }
 }
 
 pub async fn viewer_answer(

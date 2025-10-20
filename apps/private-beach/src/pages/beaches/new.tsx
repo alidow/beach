@@ -4,33 +4,22 @@ import TopNav from '../../components/TopNav';
 import { Button } from '../../components/ui/button';
 import { Card, CardContent, CardHeader } from '../../components/ui/card';
 import { Input } from '../../components/ui/input';
-import { PrivateBeach, ensureId, upsertBeach } from '../../lib/beaches';
+import { createBeach } from '../../lib/api';
 
 export default function NewBeach() {
   const router = useRouter();
   const [name, setName] = useState('My Private Beach');
-  const [id, setId] = useState('');
-  const [managerUrl, setManagerUrl] = useState<string>('');
-  const [token, setToken] = useState<string>('test-token');
+  const [slug, setSlug] = useState('');
+  const [creating, setCreating] = useState(false);
 
-  useEffect(() => {
-    setManagerUrl(process.env.NEXT_PUBLIC_MANAGER_URL || 'http://localhost:8080');
-  }, []);
-
-  function onGenerate() {
-    setId(ensureId());
-  }
-
-  function onCreate() {
-    const beach: PrivateBeach = {
-      id: ensureId(id),
-      name: name.trim() || 'Private Beach',
-      managerUrl: managerUrl.trim() || 'http://localhost:8080',
-      token: token || null,
-      createdAt: Date.now(),
-    };
-    upsertBeach(beach);
-    router.push(`/beaches/${beach.id}`);
+  async function onCreate() {
+    setCreating(true);
+    try {
+      const created = await createBeach(name.trim() || 'Private Beach', slug.trim() || undefined, null);
+      router.push(`/beaches/${created.id}`);
+    } finally {
+      setCreating(false);
+    }
   }
 
   return (
@@ -48,22 +37,11 @@ export default function NewBeach() {
                 <Input value={name} onChange={(e) => setName(e.target.value)} />
               </div>
               <div>
-                <div className="mb-1 flex items-center justify-between">
-                  <label className="text-xs text-neutral-700">ID (UUID)</label>
-                  <button className="text-xs text-neutral-600 underline" onClick={onGenerate}>Generate</button>
-                </div>
-                <Input value={id} onChange={(e) => setId(e.target.value)} placeholder="leave blank to auto-generate" />
-              </div>
-              <div>
-                <label className="mb-1 block text-xs text-neutral-700">Manager URL</label>
-                <Input value={managerUrl} onChange={(e) => setManagerUrl(e.target.value)} placeholder="http://localhost:8080" />
-              </div>
-              <div>
-                <label className="mb-1 block text-xs text-neutral-700">Token (dev)</label>
-                <Input value={token} onChange={(e) => setToken(e.target.value)} placeholder="test-token" />
+                <label className="mb-1 block text-xs text-neutral-700">Slug (optional)</label>
+                <Input value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="lowercase-with-dashes" />
               </div>
               <div className="pt-2">
-                <Button onClick={onCreate}>Create</Button>
+                <Button onClick={onCreate} disabled={creating}>{creating ? 'Creating…' : 'Create'}</Button>
               </div>
             </div>
           </CardContent>
@@ -72,4 +50,3 @@ export default function NewBeach() {
     </div>
   );
 }
-

@@ -9,13 +9,7 @@ export type RoadMySession = {
 
 function baseRoad(baseUrl?: string) {
   if (baseUrl) return baseUrl;
-  if (typeof window !== 'undefined') {
-    const w = window as any;
-    if (w.NEXT_PUBLIC_ROAD_URL) return w.NEXT_PUBLIC_ROAD_URL as string;
-    const ls = localStorage.getItem('pb.road');
-    if (ls) return ls;
-  }
-  return process.env.NEXT_PUBLIC_ROAD_URL || process.env.NEXT_PUBLIC_SESSION_SERVER_URL || 'http://localhost:4132';
+  return process.env.NEXT_PUBLIC_ROAD_URL || process.env.NEXT_PUBLIC_SESSION_SERVER_URL || 'https://api.beach.sh';
 }
 
 export async function listMySessions(token: string | null, roadUrl?: string): Promise<RoadMySession[]> {
@@ -28,4 +22,3 @@ export async function listMySessions(token: string | null, roadUrl?: string): Pr
   if (!res.ok) throw new Error(`road listMySessions failed ${res.status}`);
   return res.json();
 }
-

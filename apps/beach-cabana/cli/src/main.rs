@@ -299,26 +299,54 @@ fn run(cli: cli::Cli) -> Result<()> {
             println!("Noise diagnostic flow is moving under the host crate; not wired in this refactor step.");
         }
         #[cfg(feature = "webrtc")]
-        cli::Commands::WebRtcHostRun { session_id, passcode, codec, road_url, fixture_url, fixture_dir, prologue, window_id, frames, interval_ms, max_width, from_id, to_id } => {
+        cli::Commands::WebRtcHostRun { session_id, passcode, codec, road_url, fixture_url, fixture_dir, prologue, mut window_id, frames, interval_ms, max_width, from_id, to_id } => {
+            // Optional interactive picker if no window selected and streaming requested
+            if window_id.is_none() && frames > 0 {
+                if let Some(id) = crate::tui_pick::run_picker()? { window_id = Some(id); } else { println!("Canceled."); return Ok(()); }
+            }
             let rt = tokio::runtime::Runtime::new()?;
-            let code = rt.block_on(async move {
-                cabana::webrtc::host_run(
-                    session_id,
-                    passcode,
-                    match codec { cli::EncodeCodec::Gif => cabana::webrtc::EncodeCodec::Gif, cli::EncodeCodec::H264 => cabana::webrtc::EncodeCodec::H264 },
-                    road_url,
-                    fixture_url,
-                    fixture_dir,
-                    prologue.into_bytes(),
-                    window_id,
-                    frames,
-                    interval_ms,
-                    max_width,
-                    from_id,
-                    to_id,
-                ).await
+            let (transport, code, selected, codec_host) = rt.block_on(async move {
+                let (t, c) = cabana::webrtc::host_bootstrap(
+                    session_id.clone(),
+                    passcode.clone(),
+                    road_url.clone(),
+                    prologue.clone().into_bytes(),
+                    from_id.clone(),
+                    to_id.clone(),
+                ).await?;
+                Ok::<_, anyhow::Error>((t, c, window_id, match codec { cli::EncodeCodec::Gif => cabana::webrtc::EncodeCodec::Gif, cli::EncodeCodec::H264 => cabana::webrtc::EncodeCodec::H264 }))
             })?;
-            println!("Host completed secure session\n  Verification   : {}", code);
+            println!("Host secured channel");
+            println!("  Verification   : {}", code);
+            // Gate: require confirmation before streaming
+            if let Some(id) = selected {
+                println!("Start streaming '{}' now? [y/N]", id);
+                use std::io::{Read, Write};
+                let mut input = String::new();
+                std::io::stdout().flush().ok();
+                std::io::stdin().read_line(&mut input).ok();
+                if matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+                    // macOS permission guidance (best-effort) before starting
+                    #[cfg(target_os = "macos")]
+                    {
+                        use beach_cabana_host::platform::macos::permissions::{status, ScreenRecordingStatus, request_access};
+                        if status() != ScreenRecordingStatus::Granted {
+                            println!("Screen Recording permission not granted. If prompted, approve access.");
+                            let _ = request_access();
+                        }
+                    }
+                    rt.block_on(async move {
+                        #[cfg(target_os = "macos")]
+                        {
+                            cabana::webrtc::host_stream(&transport, codec_host, &id, frames, interval_ms, max_width).await.map_err(|e| anyhow::anyhow!(e.to_string()))
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        { Ok::<_, anyhow::Error>(()) }
+                    })?;
+                } else {
+                    println!("Streaming skipped by user.");
+                }
+            }
         }
         #[cfg(feature = "webrtc")]
         cli::Commands::WebRtcViewerAnswer { session_id, passcode, host_envelope, host_envelope_file, fixture_url, prologue } => {

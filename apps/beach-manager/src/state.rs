@@ -2149,6 +2149,19 @@ impl AppState {
         Ok(())
     }
 
+    async fn set_account_context_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        account_id: Option<&Uuid>,
+    ) -> Result<(), StateError> {
+        let value = account_id.map(|u| u.to_string()).unwrap_or_default();
+        sqlx::query("SELECT set_config('beach.account_id', $1, true)")
+            .bind(value)
+            .execute(tx.as_mut())
+            .await?;
+        Ok(())
+    }
+
     async fn enqueue_actions_redis(
         &self,
         private_beach_id: &str,
@@ -2416,6 +2429,271 @@ impl AppState {
     }
 }
 
+// ---- Private Beaches: CRUD + layout ----
+impl AppState {
+    pub async fn create_private_beach(
+        &self,
+        name: &str,
+        slug: Option<&str>,
+        owner: Option<Uuid>,
+    ) -> Result<crate::routes::BeachSummary, StateError> {
+        let pool = match &self.backend {
+            Backend::Postgres(p) => p,
+            Backend::Memory => return Err(StateError::Database(sqlx::Error::Protocol("requires postgres backend".into()))),
+        };
+
+        let mut tx = pool.begin().await?;
+        if let Some(owner_id) = owner {
+            self.set_account_context_tx(&mut tx, Some(&owner_id)).await?;
+        } else {
+            self.set_account_context_tx(&mut tx, None).await?;
+        }
+
+        let base_slug = slug
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| slugify(name));
+
+        // Try up to 5 variants to avoid slug collisions
+        let mut final_row: Option<(Uuid, String, String, chrono::DateTime<Utc>)> = None;
+        for i in 0..5 {
+            let candidate = if i == 0 { base_slug.clone() } else { format!("{}-{}", base_slug, &Uuid::new_v4().to_string()[..8]) };
+            let res = sqlx::query_as::<_, (Uuid, String, String, chrono::DateTime<Utc>)>(
+                r#"
+                INSERT INTO private_beach (name, slug, owner_account_id)
+                VALUES ($1, $2, $3)
+                RETURNING id, name, slug, created_at
+                "#,
+            )
+            .bind(name)
+            .bind(&candidate)
+            .bind(owner)
+            .fetch_one(tx.as_mut())
+            .await;
+            match res {
+                Ok(row) => { final_row = Some(row); break; }
+                Err(sqlx::Error::Database(db_err)) if db_err.constraint() == Some("private_beach_slug_key") => {
+                    continue;
+                }
+                Err(e) => return Err(StateError::Database(e)),
+            }
+        }
+
+        let (id, name, slug, created_at) = final_row.ok_or_else(|| StateError::Database(sqlx::Error::Protocol("could not allocate unique slug".into())))?;
+
+        // Insert owner membership when available (best-effort; RLS requires account + beach GUCs)
+        if let Some(owner_id) = owner {
+            self.set_rls_context_tx(&mut tx, &id).await?;
+            let _ = sqlx::query(
+                r#"
+                INSERT INTO private_beach_membership (private_beach_id, account_id, role, status, invited_by_account_id, invited_at, activated_at)
+                VALUES ($1, $2, 'owner', 'active', $2, NOW(), NOW())
+                ON CONFLICT (private_beach_id, account_id) DO NOTHING
+                "#,
+            )
+            .bind(id)
+            .bind(owner_id)
+            .execute(tx.as_mut())
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(crate::routes::BeachSummary { id: id.to_string(), name, slug, created_at: created_at.timestamp_millis() })
+    }
+
+    pub async fn list_private_beaches(
+        &self,
+        account: Option<Uuid>,
+    ) -> Result<Vec<crate::routes::BeachSummary>, StateError> {
+        let pool = match &self.backend {
+            Backend::Postgres(p) => p,
+            Backend::Memory => return Ok(Vec::new()),
+        };
+        let mut tx = pool.begin().await?;
+        if let Some(a) = account { self.set_account_context_tx(&mut tx, Some(&a)).await?; } else { self.set_account_context_tx(&mut tx, None).await?; }
+        let rows: Vec<(Uuid, String, String, chrono::DateTime<Utc>)> = sqlx::query_as(
+            r#"
+            SELECT id, name, slug, created_at
+            FROM private_beach
+            ORDER BY created_at DESC
+            "#,
+        )
+        .fetch_all(tx.as_mut())
+        .await?;
+        tx.commit().await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, name, slug, created_at)| crate::routes::BeachSummary { id: id.to_string(), name, slug, created_at: created_at.timestamp_millis() })
+            .collect())
+    }
+
+    pub async fn get_private_beach(
+        &self,
+        id_str: &str,
+        account: Option<Uuid>,
+    ) -> Result<crate::routes::BeachMeta, StateError> {
+        let pool = match &self.backend {
+            Backend::Postgres(p) => p,
+            Backend::Memory => return Err(StateError::PrivateBeachNotFound),
+        };
+        let id = parse_uuid(id_str, "id")?;
+        let mut tx = pool.begin().await?;
+        if let Some(a) = account { self.set_account_context_tx(&mut tx, Some(&a)).await?; } else { self.set_account_context_tx(&mut tx, None).await?; }
+        // Also set beach GUC to allow bypass mode SELECT for ownerless rows via policy OR clause
+        self.set_rls_context_tx(&mut tx, &id).await?;
+        let row: Option<(Uuid, String, String, serde_json::Value, chrono::DateTime<Utc>)> = sqlx::query_as(
+            r#"
+            SELECT id, name, slug, COALESCE(settings, '{}'::jsonb) AS settings, created_at
+            FROM private_beach
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(tx.as_mut())
+        .await?;
+        tx.commit().await?;
+        let (id, name, slug, settings, created_at) = row.ok_or(StateError::PrivateBeachNotFound)?;
+        Ok(crate::routes::BeachMeta { id: id.to_string(), name, slug, settings, created_at: created_at.timestamp_millis() })
+    }
+
+    pub async fn update_private_beach(
+        &self,
+        id_str: &str,
+        name: Option<&str>,
+        slug: Option<&str>,
+        settings: Option<serde_json::Value>,
+        account: Option<Uuid>,
+    ) -> Result<crate::routes::BeachMeta, StateError> {
+        let pool = match &self.backend {
+            Backend::Postgres(p) => p,
+            Backend::Memory => return Err(StateError::PrivateBeachNotFound),
+        };
+        let id = parse_uuid(id_str, "id")?;
+        let mut tx = pool.begin().await?;
+        if let Some(a) = account { self.set_account_context_tx(&mut tx, Some(&a)).await?; } else { self.set_account_context_tx(&mut tx, None).await?; }
+        self.set_rls_context_tx(&mut tx, &id).await?;
+
+        // Authorization: if no account, only allow ownerless beaches (dev bypass)
+        if account.is_none() {
+            let ok: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM private_beach WHERE id = $1 AND owner_account_id IS NULL")
+                .bind(id)
+                .fetch_optional(tx.as_mut())
+                .await?;
+            if ok.is_none() {
+                return Err(StateError::PrivateBeachNotFound);
+            }
+        } else {
+            // Ensure caller can see the beach (membership/owner) before update
+            let exists: Option<(Uuid,)> = sqlx::query_as(
+                r#"SELECT id FROM private_beach WHERE id = $1"#,
+            )
+            .bind(id)
+            .fetch_optional(tx.as_mut())
+            .await?;
+            if exists.is_none() {
+                return Err(StateError::PrivateBeachNotFound);
+            }
+        }
+
+        let new_name = name.map(|s| s.to_string());
+        let new_slug = slug.map(|s| s.to_string());
+        let mut parts: Vec<&str> = Vec::new();
+        if new_name.is_some() { parts.push("name = $2"); }
+        if new_slug.is_some() { parts.push("slug = $3"); }
+        if settings.is_some() { parts.push("settings = $4"); }
+        if parts.is_empty() {
+            drop(tx);
+            return self.get_private_beach(id_str, account).await;
+        }
+
+        let sql = format!(
+            "UPDATE private_beach SET {assigns} , updated_at = NOW() WHERE id = $1 RETURNING id, name, slug, COALESCE(settings, '{{}}'::jsonb) AS settings, created_at",
+            assigns = parts.join(", ")
+        );
+        let row: (Uuid, String, String, serde_json::Value, chrono::DateTime<Utc>) = sqlx::query_as(&sql)
+            .bind(id)
+            .bind(new_name)
+            .bind(new_slug)
+            .bind(settings)
+            .fetch_one(tx.as_mut())
+            .await?;
+        tx.commit().await?;
+        Ok(crate::routes::BeachMeta { id: row.0.to_string(), name: row.1, slug: row.2, settings: row.3, created_at: row.4.timestamp_millis() })
+    }
+
+    pub async fn get_private_beach_layout(
+        &self,
+        id_str: &str,
+        account: Option<Uuid>,
+    ) -> Result<crate::routes::BeachLayout, StateError> {
+        let meta = self.get_private_beach(id_str, account).await?;
+        let layout = meta
+            .settings
+            .get("layout")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({ "preset": "grid2x2", "tiles": [] }));
+        let preset = layout
+            .get("preset")
+            .and_then(|v| v.as_str())
+            .unwrap_or("grid2x2")
+            .to_string();
+        let tiles = layout
+            .get("tiles")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|t| t.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_else(|| Vec::new());
+        Ok(crate::routes::BeachLayout { preset, tiles })
+    }
+
+    pub async fn put_private_beach_layout(
+        &self,
+        id_str: &str,
+        preset: String,
+        tiles: Vec<String>,
+        account: Option<Uuid>,
+    ) -> Result<(), StateError> {
+        let pool = match &self.backend {
+            Backend::Postgres(p) => p,
+            Backend::Memory => return Ok(()),
+        };
+        let id = parse_uuid(id_str, "id")?;
+        let mut tx = pool.begin().await?;
+        if let Some(a) = account { self.set_account_context_tx(&mut tx, Some(&a)).await?; } else { self.set_account_context_tx(&mut tx, None).await?; }
+        self.set_rls_context_tx(&mut tx, &id).await?;
+
+        // Authorization: same as update
+        if account.is_none() {
+            let ok: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM private_beach WHERE id = $1 AND owner_account_id IS NULL")
+                .bind(id)
+                .fetch_optional(tx.as_mut())
+                .await?;
+            if ok.is_none() { return Err(StateError::PrivateBeachNotFound); }
+        } else {
+            let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM private_beach WHERE id = $1")
+                .bind(id)
+                .fetch_optional(tx.as_mut())
+                .await?;
+            if exists.is_none() { return Err(StateError::PrivateBeachNotFound); }
+        }
+
+        // Upsert settings->'layout'
+        let layout = serde_json::json!({ "preset": preset, "tiles": tiles });
+        sqlx::query(
+            r#"
+            UPDATE private_beach
+            SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), '{layout}', $2::jsonb, true),
+                updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(Json(layout).0)
+        .execute(tx.as_mut())
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Debug, FromRow)]
 struct LeaseRow {
@@ -2423,4 +2701,27 @@ struct LeaseRow {
     controller_account_id: Option<Uuid>,
     expires_at: Option<DateTime<Utc>>,
     revoked_at: Option<DateTime<Utc>>,
+}
+
+fn slugify(name: &str) -> String {
+    let mut s = name.to_lowercase();
+    s = s
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+    // collapse repeated '-'
+    let mut out = String::with_capacity(s.len());
+    let mut prev_dash = false;
+    for ch in s.chars() {
+        if ch == '-' {
+            if !prev_dash {
+                out.push('-');
+                prev_dash = true;
+            }
+        } else {
+            out.push(ch);
+            prev_dash = false;
+        }
+    }
+    out.trim_matches('-').to_string()
 }

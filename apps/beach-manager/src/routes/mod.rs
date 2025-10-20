@@ -3,10 +3,11 @@ pub mod fastpath;
 mod sse;
 mod mcp;
 mod sessions;
+mod private_beaches;
 
 use axum::{
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
+    routing::{get, patch, post, put},
     Json, Router,
 };
 use tower_http::cors::{Any, CorsLayer};
@@ -16,6 +17,7 @@ use crate::state::AppState;
 
 pub use auth::AuthToken;
 pub use sessions::*;
+pub use private_beaches::*;
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
@@ -75,6 +77,13 @@ pub fn build_router(state: AppState) -> Router {
             post(fastpath::add_remote_ice).get(fastpath::list_local_ice),
         )
         .route("/mcp", post(mcp::handle_mcp))
+        // Private Beaches CRUD + layout
+        .route("/private-beaches", get(list_private_beaches).post(create_private_beach))
+        .route("/private-beaches/:id", get(get_private_beach).patch(update_private_beach))
+        .route(
+            "/private-beaches/:id/layout",
+            get(get_private_beach_layout).put(put_private_beach_layout),
+        )
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)

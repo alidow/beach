@@ -31,6 +31,7 @@ export interface CabanaSessionPlayerProps {
   inactiveLabel?: string;
   onStatusChange?: (status: TerminalStatus) => void;
   telemetry?: CabanaTelemetryHandlers;
+  showStatusBadges?: boolean;
 }
 
 const STATUS_BADGES: Record<
@@ -125,6 +126,7 @@ export function CabanaSessionPlayer(props: CabanaSessionPlayerProps): JSX.Elemen
     inactiveLabel,
     onStatusChange,
     telemetry,
+    showStatusBadges = true,
   } = props;
 
   const trimmedSessionId = sessionId?.trim() ?? '';
@@ -327,22 +329,24 @@ export function CabanaSessionPlayer(props: CabanaSessionPlayerProps): JSX.Elemen
       />
 
       <div className="pointer-events-none absolute inset-0">
-        <div className="absolute left-3 top-3 z-20 flex flex-col gap-2">
-          <span
-            className={cn(
-              'inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold backdrop-blur',
-              statusBadge.className,
-            )}
-          >
-            <span className={cn('size-2 rounded-full', statusBadge.indicator)} />
-            {statusBadge.label}
-          </span>
-          {mode !== 'unknown' ? (
-            <span className="inline-flex items-center gap-2 rounded-full border border-slate-800/70 bg-slate-950/70 px-3 py-1 text-[11px] font-medium text-slate-200 backdrop-blur">
-              {modeLabel}
+        {showStatusBadges ? (
+          <div className="absolute left-3 top-3 z-20 flex flex-col gap-2">
+            <span
+              className={cn(
+                'inline-flex items-center gap-2 rounded-full px-3 py-1 text-xs font-semibold backdrop-blur',
+                statusBadge.className,
+              )}
+            >
+              <span className={cn('size-2 rounded-full', statusBadge.indicator)} />
+              {statusBadge.label}
             </span>
-          ) : null}
-        </div>
+            {mode !== 'unknown' ? (
+              <span className="inline-flex items-center gap-2 rounded-full border border-slate-800/70 bg-slate-950/70 px-3 py-1 text-[11px] font-medium text-slate-200 backdrop-blur">
+                {modeLabel}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
         {secureSummary && secureSummary.mode === 'secure' && secureSummary.verificationCode ? (
           <div className="pointer-events-none absolute right-3 top-3 z-20 rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-3 py-1 text-xs text-emerald-100 backdrop-blur">
             Verified • {secureSummary.verificationCode}

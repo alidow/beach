@@ -8,12 +8,19 @@ import {
 } from '../../../beach-surfer/src/terminal/connect';
 import { TerminalGridStore } from '../../../beach-surfer/src/terminal/gridStore';
 import type { TerminalTransport } from '../../../beach-surfer/src/transport/terminalTransport';
+import type { SecureTransportSummary } from '../../../beach-surfer/src/transport/webrtc';
+import type { HostFrame } from '../../../beach-surfer/src/protocol/types';
+
+export type TerminalViewerStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error';
 
 export type TerminalViewerState = {
   store: TerminalGridStore | null;
   transport: TerminalTransport | null;
   connecting: boolean;
   error: string | null;
+  status: TerminalViewerStatus;
+  secureSummary: SecureTransportSummary | null;
+  latencyMs: number | null;
 };
 
 export function useSessionTerminal(
@@ -26,7 +33,12 @@ export function useSessionTerminal(
   const [transport, setTransport] = useState<TerminalTransport | null>(null);
   const [connecting, setConnecting] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+  const [status, setStatus] = useState<TerminalViewerStatus>('idle');
+  const [secureSummary, setSecureSummary] = useState<SecureTransportSummary | null>(null);
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const connectionRef = useRef<BrowserTransportConnection | null>(null);
+  const lastHeartbeatRef = useRef<number | null>(null);
+  const wasConnectedRef = useRef<boolean>(false);
   const [reconnectTick, setReconnectTick] = useState(0);
 
   useEffect(() => {
@@ -51,6 +63,9 @@ export function useSessionTerminal(
     setTransport(null);
     store.reset();
     store.setFollowTail(true);
+    setSecureSummary(null);
+    setLatencyMs(null);
+    lastHeartbeatRef.current = null;
 
     const trimmedToken = token?.trim();
     if (!sessionId || !privateBeachId || !trimmedToken) {
@@ -58,6 +73,8 @@ export function useSessionTerminal(
       if (!trimmedToken) {
         setError(null);
       }
+      setStatus('idle');
+      wasConnectedRef.current = false;
       return () => {
         cancelled = true;
         for (const fn of cleanupListeners) {
@@ -75,6 +92,9 @@ export function useSessionTerminal(
 
     setConnecting(true);
     setError(null);
+    setStatus(wasConnectedRef.current ? 'reconnecting' : 'connecting');
+    setSecureSummary(null);
+    setLatencyMs(null);
 
     const scheduleReconnect = (source: string) => {
       if (cancelled) {
@@ -129,9 +149,14 @@ export function useSessionTerminal(
           return;
         }
         connectionRef.current = connection;
+        wasConnectedRef.current = true;
         setTransport(connection.transport);
         setConnecting(false);
         setError(null);
+        setStatus('connected');
+        setSecureSummary(connection.secure ?? null);
+        setLatencyMs(null);
+        lastHeartbeatRef.current = null;
 
         const transportTarget = connection.transport;
 
@@ -150,6 +175,35 @@ export function useSessionTerminal(
           transportTarget.removeEventListener('open', openHandler as EventListener),
         );
 
+        const secureHandler = (event: Event) => {
+          if (cancelled) {
+            return;
+          }
+          const detail = (event as CustomEvent<SecureTransportSummary>).detail;
+          setSecureSummary(detail);
+        };
+        transportTarget.addEventListener('secure', secureHandler as EventListener);
+        cleanupListeners.push(() =>
+          transportTarget.removeEventListener('secure', secureHandler as EventListener),
+        );
+
+        const frameHandler = (event: Event) => {
+          if (cancelled) {
+            return;
+          }
+          const detail = (event as CustomEvent<HostFrame>).detail;
+          if (detail?.type === 'heartbeat' && typeof detail.timestampMs === 'number') {
+            lastHeartbeatRef.current = detail.timestampMs;
+            const now = Date.now();
+            const latency = Math.max(0, now - detail.timestampMs);
+            setLatencyMs(latency);
+          }
+        };
+        transportTarget.addEventListener('frame', frameHandler as EventListener);
+        cleanupListeners.push(() =>
+          transportTarget.removeEventListener('frame', frameHandler as EventListener),
+        );
+
         const closeHandler = () => {
           if (cancelled) {
             return;
@@ -161,7 +215,10 @@ export function useSessionTerminal(
           });
           setTransport(null);
           setConnecting(true);
-          setError('Viewer disconnected');
+          setError(null);
+          setStatus('reconnecting');
+          setSecureSummary(null);
+          setLatencyMs(null);
           scheduleReconnect('transport-close');
         };
         transportTarget.addEventListener('close', closeHandler as EventListener);
@@ -181,6 +238,9 @@ export function useSessionTerminal(
             message,
           });
           setError(message);
+          setStatus('error');
+          setSecureSummary(null);
+          setLatencyMs(null);
         };
         transportTarget.addEventListener('error', errorHandler as EventListener);
         cleanupListeners.push(() =>
@@ -242,6 +302,9 @@ export function useSessionTerminal(
         });
         setError(message);
         setConnecting(false);
+        setStatus('error');
+        setSecureSummary(null);
+        setLatencyMs(null);
       }
     })();
 

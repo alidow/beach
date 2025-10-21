@@ -492,6 +492,7 @@ export default function App(): JSX.Element {
             className="flex-1"
             clientLabel="beach-surfer"
             telemetry={cabanaTelemetry}
+            showStatusBadges={false}
           />
         </div>
       </div>

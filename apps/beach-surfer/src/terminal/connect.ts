@@ -27,6 +27,7 @@ export interface ConnectBrowserTransportOptions {
   sessionId: string;
   baseUrl: string;
   passcode?: string;
+  viewerToken?: string | null;
   iceServers?: RTCIceServer[];
   logger?: (message: string) => void;
   createSocket?: SignalingClientOptions['createSocket'];
@@ -40,7 +41,10 @@ export async function connectBrowserTransport(
   options: ConnectBrowserTransportOptions,
 ): Promise<BrowserTransportConnection> {
   const trace = options.trace ?? null;
-  trace?.mark('connect_browser_transport:start', { hasPasscode: Boolean(options.passcode) });
+  trace?.mark('connect_browser_transport:start', {
+    hasPasscode: Boolean(options.passcode),
+    hasViewerToken: Boolean(options.viewerToken),
+  });
 
   const join = await fetchJoinMetadata(options);
   trace?.mark('join_metadata:received', {
@@ -53,6 +57,7 @@ export async function connectBrowserTransport(
   const signaling = await SignalingClient.connect({
     url: websocketUrl,
     passphrase: options.passcode,
+    viewerToken: options.viewerToken ?? undefined,
     supportedTransports: ['webrtc'],
     createSocket: options.createSocket,
     label: options.clientLabel,
@@ -69,6 +74,7 @@ export async function connectBrowserTransport(
       iceServers: options.iceServers,
       logger: options.logger,
       passphrase: options.passcode,
+      viewerToken: options.viewerToken ?? undefined,
     telemetryBaseUrl: options.baseUrl,
     sessionId: options.sessionId,
     trace,
@@ -135,10 +141,16 @@ async function fetchJoinMetadata(options: ConnectBrowserTransportOptions): Promi
     if (options.authorizationToken && options.authorizationToken.trim().length > 0) {
       headers['Authorization'] = `Bearer ${options.authorizationToken.trim()}`;
     }
+    const payload: Record<string, unknown> = {
+      passphrase: options.passcode ?? null,
+    };
+    if (options.viewerToken && options.viewerToken.trim().length > 0) {
+      payload.viewer_token = options.viewerToken.trim();
+    }
     response = await fetch(url, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ passphrase: options.passcode ?? null }),
+      body: JSON.stringify(payload),
     });
   } catch (error) {
     trace?.mark('join_metadata:error', {

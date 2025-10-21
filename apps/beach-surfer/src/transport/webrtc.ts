@@ -177,6 +177,7 @@ export interface ConnectWebRtcTransportOptions {
   preferredPeerId?: string;
   logger?: (message: string) => void;
   passphrase?: string;
+  viewerToken?: string;
   telemetryBaseUrl?: string;
   sessionId?: string;
   trace?: ConnectionTrace | null;

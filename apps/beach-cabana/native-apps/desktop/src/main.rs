@@ -2,16 +2,11 @@ use anyhow::Result;
 use beach_cabana_host::{self as cabana, desktop::{publish_selection, SelectionEvent}};
 use crossbeam_channel::{self, Receiver, Sender};
 use eframe::{
-    egui::{
-        self, Align, Color32, Image, Layout, Margin, RichText, ScrollArea, TextEdit, TextureHandle,
-        TextureOptions, Vec2, ViewportBuilder,
-    },
+    egui::{self, Align, Color32, Layout, RichText, ScrollArea, TextEdit, Vec2, ViewportBuilder},
     NativeOptions,
 };
-use image::imageops::FilterType;
 use std::{
-    collections::{HashMap, VecDeque},
-    fs,
+    collections::VecDeque,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -32,9 +27,6 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
-    native_picker::bootstrap();
-
     eframe::run_native(
         "Beach Cabana Picker",
         options,
@@ -42,99 +34,6 @@ fn main() -> Result<()> {
     )
     .map_err(|err| anyhow::anyhow!(err))?;
     Ok(())
-}
-
-#[derive(Clone)]
-struct Item {
-    id: String,
-    title: String,
-    title_lower: String,
-    application: String,
-    application_lower: String,
-    is_display: bool,
-}
-
-impl Item {
-    fn from_window(window: cabana::platform::WindowInfo) -> Self {
-        let title = if window.title.is_empty() {
-            "(Untitled)".to_string()
-        } else {
-            window.title
-        };
-        let application = window.application;
-        Self {
-            id: window.identifier,
-            title_lower: title.to_lowercase(),
-            application_lower: application.to_lowercase(),
-            title,
-            application,
-            is_display: matches!(window.kind, cabana::platform::WindowKind::Display),
-        }
-    }
-
-    fn matches_filter(&self, filter: &str) -> bool {
-        filter.is_empty()
-            || self.title_lower.contains(filter)
-            || self.application_lower.contains(filter)
-    }
-
-    fn prefix(&self) -> &'static str {
-        if self.is_display {
-            "🖥 "
-        } else {
-            "🪟 "
-        }
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum PickerTab {
-    Displays,
-    Windows,
-}
-
-impl PickerTab {
-    fn matches(self, item: &Item) -> bool {
-        match self {
-            PickerTab::Displays => item.is_display,
-            PickerTab::Windows => !item.is_display,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            PickerTab::Displays => "Displays",
-            PickerTab::Windows => "Windows",
-        }
-    }
-}
-
-#[derive(Clone)]
-struct PreviewCacheEntry {
-    texture: Option<TextureHandle>,
-    path: Option<PathBuf>,
-    error: Option<String>,
-    attempted: bool,
-}
-
-impl PreviewCacheEntry {
-    fn new() -> Self {
-        Self {
-            texture: None,
-            path: None,
-            error: None,
-            attempted: false,
-        }
-    }
-
-    fn cleanup(&mut self) {
-        if let Some(path) = self.path.take() {
-            let _ = fs::remove_file(path);
-        }
-        self.texture = None;
-        self.error = None;
-        self.attempted = false;
-    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -200,7 +99,7 @@ struct ShareConfig {
     fixture_dir: Option<PathBuf>,
     from_peer: String,
     to_peer: String,
-    window_id: String,
+    target_id: String,
     codec: cabana::webrtc::EncodeCodec,
     interval_ms: u64,
     max_width: Option<u32>,
@@ -241,12 +140,18 @@ enum SharingState {
     Stopping,
 }
 
+#[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+use cabana_macos_picker::PickerResult;
+#[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+use native_picker::{NativePickerClient, NativePickerMessage};
+
 struct PickerApp {
-    items: Vec<Item>,
-    filter: String,
-    tab: PickerTab,
-    selected_id: Option<String>,
-    preview_cache: HashMap<String, PreviewCacheEntry>,
+    #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+    picker: Option<NativePickerClient>,
+    #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+    picker_error: Option<String>,
+    #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+    selection: Option<PickerResult>,
     status_message: Option<String>,
     share_form: ShareForm,
     share_state: SharingState,
@@ -258,117 +163,36 @@ struct PickerApp {
 
 impl PickerApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let mut app = Self {
-            items: Vec::new(),
-            filter: String::new(),
-            tab: PickerTab::Displays,
-            selected_id: None,
-            preview_cache: HashMap::new(),
-            status_message: None,
+        #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+        let (picker, picker_error) = match NativePickerClient::new() {
+            Ok(client) => (Some(client), None),
+            Err(err) => (None, Some(format!("Native picker unavailable: {}", err))),
+        };
+
+        #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+        let initial_status = picker_error.clone();
+
+        #[cfg(not(any(feature = "picker-mock", feature = "picker-native")))]
+        let initial_status: Option<String> = None;
+
+        #[cfg(not(any(feature = "picker-mock", feature = "picker-native")))]
+        let picker_error: Option<String> = None;
+
+        Self {
+            #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+            picker,
+            #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+            picker_error,
+            #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+            selection: None,
+            status_message: initial_status,
             share_form: ShareForm::default(),
             share_state: SharingState::Idle,
             share_worker: None,
             share_status_log: VecDeque::new(),
             share_error: None,
             share_verification: None,
-        };
-        app.refresh_items();
-        app
-    }
-
-    fn reset_preview_cache(&mut self) {
-        for entry in self.preview_cache.values_mut() {
-            entry.cleanup();
         }
-        self.preview_cache.clear();
-    }
-
-    fn refresh_items(&mut self) {
-        self.reset_preview_cache();
-        let previous_selection = self.selected_id.clone();
-        match cabana::platform::enumerate_windows() {
-            Ok(windows) => {
-                self.items = windows.into_iter().map(Item::from_window).collect();
-                self.items
-                    .sort_by(|a, b| a.title_lower.cmp(&b.title_lower));
-                self.status_message = None;
-            }
-            Err(err) => {
-                self.items.clear();
-                self.status_message =
-                    Some(format!("Failed to enumerate windows: {}", err));
-            }
-        }
-
-        if let Some(sel) = previous_selection {
-            if self.items.iter().any(|item| item.id == sel) {
-                self.selected_id = Some(sel);
-            } else {
-                self.selected_id = None;
-            }
-        }
-
-        if self.selected_id.is_none() {
-            if let Some(first) = self
-                .filtered_items()
-                .first()
-                .map(|item| item.id.clone())
-            {
-                self.selected_id = Some(first);
-            }
-        }
-    }
-
-    fn filtered_items(&self) -> Vec<Item> {
-        let filter = self.filter.trim().to_lowercase();
-        self.items
-            .iter()
-            .filter(|item| self.tab.matches(item) && item.matches_filter(&filter))
-            .cloned()
-            .collect()
-    }
-
-    fn select_id(&mut self, id: &str) {
-        if self.selected_id.as_deref() != Some(id) {
-            self.selected_id = Some(id.to_string());
-        }
-    }
-
-    fn ensure_preview(&mut self, ctx: &egui::Context, id: &str) -> &PreviewCacheEntry {
-        let entry = self
-            .preview_cache
-            .entry(id.to_string())
-            .or_insert_with(PreviewCacheEntry::new);
-        if entry.texture.is_none() && entry.error.is_none() && !entry.attempted {
-            entry.attempted = true;
-            match cabana::platform::preview_window(id) {
-                Ok(path) => match load_texture_from_path(ctx, &path) {
-                    Ok(texture) => {
-                        entry.texture = Some(texture);
-                        entry.path = Some(path);
-                    }
-                    Err(err) => {
-                        entry.error = Some(err);
-                        let _ = fs::remove_file(path);
-                    }
-                },
-                Err(err) => {
-                    entry.error = Some(format!("Preview unavailable: {}", err));
-                }
-            }
-        }
-        entry
-    }
-
-    fn selected_item(&self) -> Option<&Item> {
-        let id = self.selected_id.as_ref()?;
-        self.items.iter().find(|item| &item.id == id)
-    }
-
-    fn selection_preview_path(&self, id: &str) -> Option<PathBuf> {
-        self.preview_cache
-            .get(id)
-            .and_then(|entry| entry.path.clone())
     }
 
     fn append_share_status(&mut self, message: impl Into<String>) {
@@ -431,7 +255,7 @@ impl PickerApp {
         }
     }
 
-    fn build_share_config(&self, window_id: &str) -> Result<ShareConfig, String> {
+    fn build_share_config(&self) -> Result<ShareConfig, String> {
         let session_id = self.share_form.session_id.trim();
         if session_id.is_empty() {
             return Err("Enter a session ID.".to_string());
@@ -472,6 +296,10 @@ impl PickerApp {
         let fixture_dir =
             Self::optional_trimmed(&self.share_form.fixture_dir).map(PathBuf::from);
 
+        let target_id = self
+            .current_target_id()
+            .ok_or_else(|| "Select a window or display using the native picker.".to_string())?;
+
         Ok(ShareConfig {
             session_id: session_id.to_string(),
             passcode: passcode.to_string(),
@@ -480,7 +308,7 @@ impl PickerApp {
             fixture_dir,
             from_peer: self.share_form.from_peer.trim().to_string(),
             to_peer: self.share_form.to_peer.trim().to_string(),
-            window_id: window_id.to_string(),
+            target_id,
             codec: self.share_form.codec.to_host(),
             interval_ms,
             max_width,
@@ -490,7 +318,7 @@ impl PickerApp {
 
     fn can_start_sharing(&self) -> bool {
         matches!(self.share_state, SharingState::Idle)
-            && self.selected_id.is_some()
+            && self.current_target_id().is_some()
             && !self.share_form.session_id.trim().is_empty()
             && !self.share_form.passcode.trim().is_empty()
     }
@@ -505,11 +333,11 @@ impl PickerApp {
         if let Some(mut worker) = self.share_worker.take() {
             worker.join();
         }
-        let Some(window_id) = self.selected_id.clone() else {
+        if self.current_target_id().is_none() {
             self.share_error = Some("Pick a window or display before starting.".to_string());
             return;
-        };
-        let config = match self.build_share_config(&window_id) {
+        }
+        let config = match self.build_share_config() {
             Ok(cfg) => cfg,
             Err(err) => {
                 self.share_error = Some(err.clone());
@@ -691,79 +519,6 @@ impl PickerApp {
         }
     }
 
-    fn render_selection_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-            let selected_id = self.selected_id.clone();
-            let selected_info = selected_id
-                .as_ref()
-                .and_then(|id| self.items.iter().find(|item| &item.id == id))
-                .cloned();
-            if ui.button("Confirm selection").clicked() {
-                if let Some(item) = selected_info.clone() {
-                    self.ensure_preview(ctx, &item.id);
-                    println!("{}", item.id);
-                    let preview_path = self.selection_preview_path(&item.id);
-                    let delivered =
-                        publish_selection(SelectionEvent::new(item.id.clone(), preview_path));
-                    self.status_message = Some(if delivered == 0 {
-                        "Selection ready (no active listeners detected yet).".to_string()
-                    } else if delivered == 1 {
-                        "Selection sent to 1 listener.".to_string()
-                    } else {
-                        format!("Selection sent to {} listeners.", delivered)
-                    });
-                } else {
-                    self.status_message =
-                        Some("Pick a window or display before confirming.".to_string());
-                }
-            }
-            if ui.button("Copy identifier").clicked() {
-                if let Some(item) = selected_info.as_ref() {
-                    ctx.output_mut(|output| {
-                        output.copied_text = item.id.clone();
-                    });
-                    self.status_message =
-                        Some("Identifier copied to clipboard.".to_string());
-                }
-            }
-            if let Some(item) = selected_info {
-                ui.separator();
-                ui.label(format!(
-                    "Selected: {} — {}",
-                    item.title,
-                    if item.application.is_empty() {
-                        "System".to_string()
-                    } else {
-                        item.application.clone()
-                    }
-                ));
-                let preview_available = self
-                    .selection_preview_path(&item.id)
-                    .as_ref()
-                    .map(|path| path.exists())
-                    .unwrap_or(false);
-                ui.add_enabled_ui(preview_available, |ui| {
-                    if ui.button("Open preview file").clicked() {
-                        if let Some(path) = self.selection_preview_path(&item.id) {
-                            match open::that(&path) {
-                                Ok(_) => {
-                                    self.status_message = Some(
-                                        "Opening preview with the system viewer…".to_string(),
-                                    );
-                                }
-                                Err(err) => {
-                                    self.status_message = Some(format!(
-                                        "Failed to open preview: {}",
-                                        err
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        });
-    }
 }
 
 impl eframe::App for PickerApp {

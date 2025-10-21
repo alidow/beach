@@ -6,6 +6,7 @@ mod session;
 mod signaling;
 mod storage;
 mod websocket;
+mod viewer_token;
 
 use axum::{
     routing::{get, post},
@@ -27,6 +28,7 @@ use crate::{
         register_session, FallbackContext, SharedStorage,
     },
     storage::Storage,
+    viewer_token::ViewerTokenVerifier,
     websocket::{websocket_handler, SignalingState},
 };
 use clap::Parser;

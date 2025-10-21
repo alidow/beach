@@ -174,10 +174,20 @@ export function useSessionTerminal(
         if (canceled) {
           return;
         }
+        const viewerToken =
+          credential.credential_type === 'viewer_token' ? credential.credential : undefined;
+        const effectivePasscode =
+          credential.credential_type === 'viewer_token'
+            ? credential.passcode ?? null
+            : credential.credential;
+        if (!effectivePasscode || effectivePasscode.trim().length === 0) {
+          throw new Error('viewer passcode unavailable');
+        }
         const connection = await connectBrowserTransport({
           sessionId,
           baseUrl: managerUrl,
-          passcode: credential.credential,
+          passcode: effectivePasscode,
+          viewerToken,
           clientLabel: 'manager-viewer',
           authorizationToken: trimmedToken,
         });

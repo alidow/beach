@@ -1,77 +1,98 @@
-use std::thread;
-
-use cabana_macos_picker::{PickerEvent, PickerHandle};
+use cabana_macos_picker::{PickerEvent, PickerHandle, PickerResult, PickerError};
+use crossbeam_channel::{unbounded, Receiver};
 use futures_util::StreamExt;
+use std::{sync::Arc, thread};
+use tokio::{runtime::Runtime, sync::oneshot};
 
-/// Launch the native picker mock/bridge in a background thread when the
-/// `CABANA_NATIVE_PICKER_BOOTSTRAP=1` environment variable is set.  This keeps
-/// the current egui UI intact while allowing developers to exercise the picker
-/// facade and observe emitted events.
-pub fn bootstrap() {
-    let should_launch = std::env::var("CABANA_NATIVE_PICKER_BOOTSTRAP")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    if !should_launch {
-        return;
-    }
-
-    thread::spawn(|| {
-        let picker = match PickerHandle::new() {
-            Ok(handle) => handle,
-            Err(err) => {
-                eprintln!("[cabana-picker] failed to construct picker handle: {err}");
-                return;
-            }
-        };
-
-        if let Err(err) = picker.launch() {
-            eprintln!("[cabana-picker] picker launch failed: {err}");
-            return;
-        }
-
-        let stream_handle = picker.clone();
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(err) => {
-                eprintln!("[cabana-picker] tokio runtime init failed: {err}");
-                return;
-            }
-        };
-
-        runtime.block_on(async move {
-            let events = stream_handle.listen();
-            futures_util::pin_mut!(events);
-
-            let mut seen = 0usize;
-            while let Some(event) = events.next().await {
-                log_event(&event);
-                seen += 1;
-                if matches!(event, PickerEvent::Cancelled) || seen >= 8 {
-                    break;
-                }
-            }
-
-            if let Err(err) = picker.stop() {
-                eprintln!("[cabana-picker] picker stop failed: {err}");
-            }
-        });
-    });
+#[derive(Debug, Clone)]
+pub enum NativePickerMessage {
+    Selection(PickerResult),
+    Cancelled,
+    Error(String),
 }
 
-fn log_event(event: &PickerEvent) {
-    match event {
-        PickerEvent::Selection(result) => {
-            eprintln!(
-                "[cabana-picker] selected: {} ({:?})",
-                result.label, result.kind
-            );
+pub struct NativePickerClient {
+    handle: PickerHandle,
+    rx: Receiver<NativePickerMessage>,
+    shutdown: Option<oneshot::Sender<()>>,
+    listener: Option<thread::JoinHandle<()>>,
+}
+
+impl NativePickerClient {
+    pub fn new() -> Result<Self, PickerError> {
+        let handle = PickerHandle::new()?;
+        let (tx, rx) = unbounded();
+        let listener_handle = handle.clone();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let listener = thread::spawn(move || {
+            let runtime = Runtime::new()
+                .expect("failed to build tokio runtime for native picker");
+            runtime.block_on(async move {
+                let mut events = listener_handle.listen();
+                futures_util::pin_mut!(events);
+                let mut shutdown_rx = shutdown_rx;
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => {
+                            break;
+                        }
+                        maybe_event = events.next() => {
+                            match maybe_event {
+                                Some(PickerEvent::Selection(result)) => {
+                                    let _ = tx.send(NativePickerMessage::Selection(result));
+                                }
+                                Some(PickerEvent::Cancelled) => {
+                                    let _ = tx.send(NativePickerMessage::Cancelled);
+                                }
+                                Some(PickerEvent::Error { message }) => {
+                                    let _ = tx.send(NativePickerMessage::Error(message));
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                }
+            });
+        });
+
+        Ok(Self {
+            handle,
+            rx,
+            shutdown: Some(shutdown_tx),
+            listener: Some(listener),
+        })
+    }
+
+    pub fn poll(&self) -> Vec<NativePickerMessage> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.rx.try_recv() {
+            events.push(event);
         }
-        PickerEvent::Cancelled => {
-            eprintln!("[cabana-picker] picker cancelled");
+        events
+    }
+
+    pub fn launch(&self) -> Result<(), PickerError> {
+        self.handle.launch()
+    }
+
+    pub fn stop(&self) -> Result<(), PickerError> {
+        self.handle.stop()
+    }
+}
+
+impl Drop for NativePickerClient {
+    fn drop(&mut self) {
+        let _ = self.handle.stop();
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(listener) = self.listener.take() {
+            let _ = listener.join();
         }
     }
+}
+
+pub fn available() -> bool {
+    PickerHandle::new().is_ok()
 }

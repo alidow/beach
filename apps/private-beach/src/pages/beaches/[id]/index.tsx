@@ -20,7 +20,7 @@ export default function BeachDashboard() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [layout, setLayout] = useState<BeachLayout>({ tiles: [], preset: 'grid2x2' });
+  const [layout, setLayout] = useState<BeachLayout>({ tiles: [], preset: 'grid2x2', layout: [] });
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [selected, setSelected] = useState<SessionSummary | null>(null);
   const [addOpen, setAddOpen] = useState(false);
@@ -215,21 +215,39 @@ export default function BeachDashboard() {
     refresh();
   }, [refresh]);
 
+  const persistLayoutSnapshot = useCallback(
+    (items: BeachLayout['layout']) => {
+      if (!id) return;
+      setLayout((prev) => {
+        const allowed = new Set(prev.tiles);
+        const filtered = items.filter((entry) => allowed.has(entry.id));
+        const next = { ...prev, layout: filtered };
+        void putBeachLayout(id, next, managerToken).catch(() => {});
+        return next;
+      });
+    },
+    [id, managerToken],
+  );
+
   function addTile(sessionId: string) {
     if (!id) return;
-    const next = { ...layout, tiles: Array.from(new Set([sessionId, ...layout.tiles])).slice(0, 6) };
+    const tiles = Array.from(new Set([sessionId, ...layout.tiles])).slice(0, 6);
+    const allowed = new Set(tiles);
+    const next = { ...layout, tiles, layout: layout.layout.filter((entry) => allowed.has(entry.id)) };
     setLayout(next);
     putBeachLayout(id, next, managerToken).catch(() => {});
   }
   function removeTile(sessionId: string) {
     if (!id) return;
-    const next = { ...layout, tiles: layout.tiles.filter((t) => t !== sessionId) };
+    const tiles = layout.tiles.filter((t) => t !== sessionId);
+    const allowed = new Set(tiles);
+    const next = { ...layout, tiles, layout: layout.layout.filter((entry) => allowed.has(entry.id)) };
     setLayout(next);
     putBeachLayout(id, next, managerToken).catch(() => {});
   }
   function changePreset(preset: BeachLayout['preset']) {
     if (!id) return;
-    const next = { ...layout, preset };
+    const next = { ...layout, preset, layout: [] };
     setLayout(next);
     putBeachLayout(id, next, managerToken).catch(() => {});
   }
@@ -292,6 +310,8 @@ export default function BeachDashboard() {
               managerUrl={managerUrl}
               refresh={() => refresh()}
               preset={layout.preset}
+              savedLayout={layout.layout}
+              onLayoutPersist={persistLayoutSnapshot}
             />
           </div>
         </div>

@@ -31,6 +31,8 @@ export type ViewerCredential = {
   session_id: string;
   private_beach_id: string;
   issued_at_ms?: number | null;
+  expires_at_ms?: number | null;
+  passcode?: string | null;
 };
 
 function base(baseUrl?: string) {
@@ -137,7 +139,32 @@ export async function attachOwned(privateBeachId: string, ids: string[], token: 
 
 export type BeachSummary = { id: string; name: string; slug: string; created_at: number };
 export type BeachMeta = BeachSummary & { settings: any };
-export type BeachLayout = { preset: 'grid2x2' | 'onePlusThree' | 'focus'; tiles: string[] };
+export type BeachLayoutItem = { id: string; x: number; y: number; w: number; h: number };
+export type BeachLayout = {
+  preset: 'grid2x2' | 'onePlusThree' | 'focus';
+  tiles: string[];
+  layout: BeachLayoutItem[];
+};
+
+function normalizeLayoutItems(input: unknown): BeachLayoutItem[] {
+  if (!Array.isArray(input)) return [];
+  const seen = new Set<string>();
+  const clean: BeachLayoutItem[] = [];
+  for (const raw of input) {
+    if (!raw || typeof raw !== 'object') continue;
+    const id = typeof (raw as any).id === 'string' ? (raw as any).id.trim() : '';
+    if (!id || seen.has(id)) continue;
+    const x = Number.isFinite((raw as any).x) ? Math.max(0, Math.floor((raw as any).x)) : null;
+    const y = Number.isFinite((raw as any).y) ? Math.max(0, Math.floor((raw as any).y)) : null;
+    const w = Number.isFinite((raw as any).w) ? Math.max(1, Math.floor((raw as any).w)) : null;
+    const h = Number.isFinite((raw as any).h) ? Math.max(1, Math.floor((raw as any).h)) : null;
+    if (x === null || y === null || w === null || h === null) continue;
+    clean.push({ id, x, y, w, h });
+    seen.add(id);
+    if (clean.length >= 12) break;
+  }
+  return clean;
+}
 
 export async function listBeaches(token: string | null, baseUrl?: string): Promise<BeachSummary[]> {
   const res = await fetch(`${base(baseUrl)}/private-beaches`, { headers: authHeaders(token) });
@@ -166,14 +193,22 @@ export async function getBeachLayout(id: string, _token: string | null): Promise
   const res = await fetch(`/api/layout/${encodeURIComponent(id)}`);
   if (!res.ok) throw new Error(`getBeachLayout failed ${res.status}`);
   const data = await res.json();
-  return { preset: (data.preset || 'grid2x2') as BeachLayout['preset'], tiles: Array.isArray(data.tiles) ? data.tiles : [] };
+  return {
+    preset: (data.preset || 'grid2x2') as BeachLayout['preset'],
+    tiles: Array.isArray(data.tiles) ? data.tiles : [],
+    layout: normalizeLayoutItems(data.layout),
+  };
 }
 
 export async function putBeachLayout(id: string, layout: BeachLayout, _token: string | null): Promise<void> {
   const res = await fetch(`/api/layout/${encodeURIComponent(id)}`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(layout),
+    body: JSON.stringify({
+      preset: layout.preset,
+      tiles: layout.tiles,
+      layout: normalizeLayoutItems(layout.layout),
+    }),
   });
   if (!res.ok) throw new Error(`putBeachLayout failed ${res.status}`);
 }

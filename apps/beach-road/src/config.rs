@@ -14,6 +14,9 @@ pub struct Config {
     pub fallback_jwt_audience: Option<String>,
     pub fallback_required_entitlement: String,
     pub fallback_jwks_cache_ttl_seconds: u64,
+    pub viewer_token_audience: String,
+    pub viewer_token_mac_secret: Option<String>,
+    pub viewer_token_jwks_cache_ttl_seconds: u64,
 }
 
 impl Config {
@@ -41,6 +44,14 @@ impl Config {
             .ok()
             .and_then(|val| val.parse().ok())
             .unwrap_or(300);
+        let viewer_token_audience = env
+            .var("BEACH_GATE_VIEWER_TOKEN_AUDIENCE")
+            .unwrap_or_else(|_| "beach-road".into());
+        let viewer_token_mac_secret = env::var("BEACH_GATE_VIEWER_TOKEN_SECRET").ok();
+        let viewer_token_jwks_cache_ttl_seconds = env::var("VIEWER_TOKEN_JWKS_CACHE_TTL")
+            .ok()
+            .and_then(|val| val.parse().ok())
+            .unwrap_or(fallback_jwks_cache_ttl_seconds);
 
         Self {
             port: env::var("BEACH_ROAD_PORT")
@@ -62,6 +73,9 @@ impl Config {
             fallback_jwt_audience,
             fallback_required_entitlement,
             fallback_jwks_cache_ttl_seconds,
+            viewer_token_audience,
+            viewer_token_mac_secret,
+            viewer_token_jwks_cache_ttl_seconds,
         }
     }
 }
@@ -81,6 +95,9 @@ impl Default for Config {
             fallback_jwt_audience: None,
             fallback_required_entitlement: "rescue:fallback".to_string(),
             fallback_jwks_cache_ttl_seconds: 300,
+            viewer_token_audience: "beach-road".to_string(),
+            viewer_token_mac_secret: None,
+            viewer_token_jwks_cache_ttl_seconds: 300,
         }
     }
 }

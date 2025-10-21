@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import dynamic from 'next/dynamic';
 import type { Layout } from 'react-grid-layout';
-import { SessionSummary, acquireController, emergencyStop, releaseController } from '../lib/api';
+import { SessionSummary, acquireController, emergencyStop, releaseController, type BeachLayoutItem } from '../lib/api';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
 import { SessionTerminalPreview } from './SessionTerminalPreview';
@@ -14,6 +14,8 @@ type Props = {
   managerUrl: string;
   refresh: () => Promise<void>;
   preset?: 'grid2x2' | 'onePlusThree' | 'focus';
+  savedLayout?: BeachLayoutItem[];
+  onLayoutPersist?: (layout: BeachLayoutItem[]) => void;
 };
 
 const AutoGrid = dynamic(() => import('./AutoGrid'), {
@@ -26,6 +28,7 @@ const DEFAULT_W = 4;
 const DEFAULT_H = 6;
 type LayoutCache = Record<string, Layout>;
 type ResizeHandleAxis = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
+type LayoutSnapshot = BeachLayoutItem;
 const RESIZE_HANDLE_LABELS: Record<ResizeHandleAxis, string> = {
   n: 'Resize top edge',
   s: 'Resize bottom edge',
@@ -37,10 +40,24 @@ const RESIZE_HANDLE_LABELS: Record<ResizeHandleAxis, string> = {
   sw: 'Resize bottom-left corner',
 };
 
-function ensureLayout(cache: LayoutCache, tiles: SessionSummary[], preset: Props['preset']): Layout[] {
+function ensureLayout(
+  cache: LayoutCache,
+  saved: LayoutSnapshot[] | undefined,
+  tiles: SessionSummary[],
+  preset: Props['preset'],
+): Layout[] {
   const items: Layout[] = [];
   const taken = new Set<string>();
   const orderedTiles = tiles.slice();
+  const savedMap = new Map<string, LayoutSnapshot>();
+
+  saved?.forEach((item) => {
+    const w = Math.min(COLS, Math.max(3, Math.floor(item.w)));
+    const h = Math.max(4, Math.floor(item.h));
+    const x = Math.max(0, Math.min(Math.floor(item.x), COLS - w));
+    const y = Math.max(0, Math.floor(item.y));
+    savedMap.set(item.id, { id: item.id, x, y, w, h });
+  });
 
   const basePositions = presetPositions(preset, orderedTiles.length);
 
@@ -48,7 +65,29 @@ function ensureLayout(cache: LayoutCache, tiles: SessionSummary[], preset: Props
     const id = session.session_id;
     const cached = cache[id];
     if (cached) {
-      items.push({ ...cached, i: id });
+      items.push({
+        i: id,
+        x: cached.x,
+        y: cached.y,
+        w: cached.w,
+        h: cached.h,
+        minW: cached.minW ?? 3,
+        minH: cached.minH ?? 4,
+      });
+      taken.add(id);
+      return;
+    }
+    const savedItem = savedMap.get(id);
+    if (savedItem) {
+      items.push({
+        i: id,
+        x: savedItem.x,
+        y: savedItem.y,
+        w: savedItem.w,
+        h: savedItem.h,
+        minW: 3,
+        minH: 4,
+      });
       taken.add(id);
       return;
     }
@@ -120,7 +159,17 @@ function nextPosition(existing: Layout[]): Position {
   return { x: 0, y: maxY, w: DEFAULT_W, h: DEFAULT_H };
 }
 
-export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUrl, refresh, preset = 'grid2x2' }: Props) {
+export default function TileCanvas({
+  tiles,
+  onRemove,
+  onSelect,
+  token,
+  managerUrl,
+  refresh,
+  preset = 'grid2x2',
+  savedLayout,
+  onLayoutPersist,
+}: Props) {
   const [cache, setCache] = useState<LayoutCache>({});
   const [expanded, setExpanded] = useState<SessionSummary | null>(null);
   const [isClient, setIsClient] = useState(false);
@@ -145,15 +194,67 @@ export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUr
     }
   }, [tiles, expanded]);
 
-  const layout = useMemo(() => ensureLayout(cache, tiles, preset), [cache, tiles, preset]);
+  const layout = useMemo(
+    () => ensureLayout(cache, savedLayout, tiles, preset),
+    [cache, savedLayout, tiles, preset],
+  );
 
   const handleLayoutChange = (next: Layout[]) => {
     const nextCache: LayoutCache = { ...cache };
     next.forEach((item) => {
-      nextCache[item.i] = { ...item };
+      nextCache[item.i] = {
+        ...item,
+        minW: item.minW ?? 3,
+        minH: item.minH ?? 4,
+      };
     });
     setCache(nextCache);
   };
+
+  const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
+
+  const snapshotLayout = useCallback(
+    (next: Layout[]): BeachLayoutItem[] => {
+      if (tileOrder.length === 0) return [];
+      const allowed = new Set(tileOrder);
+      const byId = new Map<string, BeachLayoutItem>();
+      next.forEach((item) => {
+        if (!allowed.has(item.i)) return;
+        const w = Math.min(COLS, Math.max(3, Math.floor(item.w)));
+        const h = Math.max(4, Math.floor(item.h));
+        const x = Math.max(0, Math.min(Math.floor(item.x), COLS - w));
+        const y = Math.max(0, Math.floor(item.y));
+        byId.set(item.i, { id: item.i, x, y, w, h });
+      });
+      return tileOrder
+        .map((id) => byId.get(id))
+        .filter((entry): entry is BeachLayoutItem => Boolean(entry));
+    },
+    [tileOrder],
+  );
+
+  const handleLayoutCommit = useCallback(
+    (next: Layout[]) => {
+      if (!onLayoutPersist) return;
+      const snapshot = snapshotLayout(next);
+      onLayoutPersist(snapshot);
+    },
+    [onLayoutPersist, snapshotLayout],
+  );
+
+  const handleDragStop = useCallback(
+    (next: Layout[]) => {
+      handleLayoutCommit(next);
+    },
+    [handleLayoutCommit],
+  );
+
+  const handleResizeStop = useCallback(
+    (next: Layout[]) => {
+      handleLayoutCommit(next);
+    },
+    [handleLayoutCommit],
+  );
 
   const handleAcquire = async (sessionId: string) => {
     console.info('[tile] acquire controller', { sessionId, managerUrl, tokenPresent: Boolean(token && token.trim().length > 0) });
@@ -202,12 +303,14 @@ export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUr
         rowHeight={110}
         margin={[16, 16]}
         containerPadding={[8, 8]}
-        compactType="vertical"
+        compactType={null}
         preventCollision={false}
         draggableHandle=".session-tile-drag-grip"
         draggableCancel=".session-tile-actions"
         resizeHandle={renderResizeHandle}
         resizeHandles={['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw']}
+        onDragStop={handleDragStop}
+        onResizeStop={handleResizeStop}
         onLayoutChange={handleLayoutChange}
       >
         {tiles.map((s) => {

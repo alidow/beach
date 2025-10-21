@@ -17,6 +17,7 @@ export type ClientMessage =
       type: 'join';
       peer_id: string;
       passphrase?: string | null;
+      viewer_token?: string | null;
       supported_transports: TransportTypeJson[];
       preferred_transport?: TransportTypeJson;
       label?: string | null;
@@ -106,6 +107,7 @@ export interface SignalingClientOptions {
   url: string;
   peerId?: string;
   passphrase?: string;
+  viewerToken?: string;
   supportedTransports?: TransportTypeJson[];
   preferredTransport?: TransportTypeJson;
   createSocket?: WebSocketFactory;
@@ -134,6 +136,7 @@ export class SignalingClient extends EventTarget {
       url,
       peerId = generatePeerId(),
       passphrase,
+      viewerToken,
       supportedTransports = DEFAULT_SUPPORTED,
       preferredTransport,
       createSocket,
@@ -154,6 +157,7 @@ export class SignalingClient extends EventTarget {
           type: 'join',
           peer_id: peerId,
           passphrase: passphrase ?? null,
+          viewer_token: viewerToken ?? null,
           supported_transports: supportedTransports,
           preferred_transport: preferredTransport,
           label: label ?? null,

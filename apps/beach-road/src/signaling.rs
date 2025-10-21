@@ -98,6 +98,8 @@ pub enum ClientMessage {
     Join {
         peer_id: String,
         passphrase: Option<String>,
+        #[serde(default)]
+        viewer_token: Option<String>,
         /// Transports this peer supports
         supported_transports: Vec<TransportType>,
         /// Preferred transport order

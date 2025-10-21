@@ -101,6 +101,8 @@ pub struct JoinSessionRequest {
     pub passphrase: Option<String>,
     #[serde(default)]
     pub mcp: bool,
+    #[serde(default)]
+    pub viewer_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

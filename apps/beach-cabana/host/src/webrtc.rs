@@ -7,6 +7,8 @@ use crate::noise::{HandshakeConfig, NoiseController, NoiseError};
 use crate::security::{HandshakeId, SessionMaterial};
 #[cfg(target_os = "macos")]
 use crate::capture::{self, Frame, PixelFormat};
+#[cfg(target_os = "macos")]
+use crate::desktop::ScreenCaptureDescriptor;
 
 #[derive(Debug, Copy, Clone)]
 pub enum EncodeCodec { Gif, H264 }

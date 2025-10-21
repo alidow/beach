@@ -18,6 +18,9 @@
 1. **UX polish**
    - Surface transport health (secure/plaintext badge, latency) in the tile chrome.
    - Add a reconnection banner when the viewer falls back to reconnect loops.
-2. **Hardening**
+2. **Credential hardening & legacy removal**
+   - Land Gate/Beach Road support for signed viewer tokens, update the manager API to prefer them, and remove the fallback once hosts understand the new credential.
+   - Migrate any remaining consumers off `/sessions/:id/events/stream`, then delete the SSE endpoint.
+3. **Hardening**
    - Add an integration test that asserts `WireUpdate::Style` survives the viewer pipeline.
    - Simulate TURN-only environments to ensure the keepalive cadence doesn’t trigger quota alarms.

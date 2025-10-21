@@ -33,8 +33,8 @@
 - **Docs plan status** — Phase 0 tasks are partially complete (crate extraction ✅, entitlement audit ✅, credential design 🟡). Earlier sections now note status for quick scan.
 - **Open risks / follow-ups**
   1. Observer diff pipeline — ✅ viewer worker now emits `StreamEvent::State` and writes to Redis/`session_runtime`. Follow-up: add a smoke test that runs `spawn_viewer_worker` against a mocked session to guard regressions.
-  2. Viewer credential story — We currently return the stored passcode (`GET /private-beaches/:id/sessions/:sid/viewer-credential`). Once Gate policy lands, migrate to a short-lived signed viewer token.
-  3. Frontend parity — Dashboard tiles stream via WebRTC, but the drawer/event views still rely on SSE payloads. Align those components with the shared surfer viewer and expose latency/secure-state badges.
+  2. Viewer credential story — We currently return the stored passcode (`GET /private-beaches/:id/sessions/:sid/viewer-credential`). Once Gate policy lands, migrate to a short-lived signed viewer token and remove the fallback once hosts validate the new credential.
+  3. Frontend parity — Tiles and drawers run on WebRTC/REST, but we still need to surface latency + secure badges, add reconnect messaging, and remove the legacy `/sessions/:id/events/stream` SSE endpoint once no clients depend on it.
   4. Harness transforms — After transport parity, re-scope Beach Buggy to opt-in transforms with dedicated data channels; HTTP endpoints remain removed.
   5. TypeScript parity — Shared Beach Surfer imports require type stubs for `argon2-browser`/`noise-c.wasm` and raising the TS target to ES2020 so BigInt is legal.
 - **Quick verification** — `cargo check -p beach-manager` and `cargo check -p beach-road` pass (noise-only warnings). Whole-workspace `cargo check` still fails for the pre-existing lifeguard fallback token drift. `npx tsc --noEmit` in `apps/private-beach` now reaches cross-repo imports; it fails until we add type stubs for `argon2-browser`/`noise-c.wasm` and bump the TS target to ES2020 (BigInt usage).

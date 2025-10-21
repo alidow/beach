@@ -197,6 +197,14 @@ export function CabanaPrivateBeachPlayer(props: CabanaPrivateBeachPlayerProps): 
     );
   }
 
+  if (!credential) {
+    return (
+      <div className={cn('relative flex h-full w-full items-center justify-center bg-slate-950', className)}>
+        {credentialErrorState('Viewer credential is unavailable.')}
+      </div>
+    );
+  }
+
   return (
     <CabanaSessionPlayer
       sessionId={sessionId}

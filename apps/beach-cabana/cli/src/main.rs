@@ -12,6 +12,10 @@ use tracing_subscriber::{fmt, EnvFilter};
 use beach_cabana_host as cabana;
 
 #[cfg(target_os = "macos")]
+use cabana::capture::create_producer_from_descriptor;
+#[cfg(target_os = "macos")]
+use cabana::desktop::ScreenCaptureDescriptor;
+#[cfg(target_os = "macos")]
 use cabana::encoder::GifVideoEncoder;
 #[cfg(all(target_os = "macos", feature = "cabana_sck"))]
 use cabana::encoder::VideoToolboxEncoder;
@@ -55,29 +59,61 @@ fn run(cli: cli::Cli) -> Result<()> {
             }
         }
         cli::Commands::Preview { window_id } => {
-            let Some(window_id) = resolve_window_id(window_id)? else {
-                eprintln!("Selection canceled");
-                return Ok(());
-            };
-            prompt_screen_recording_permission();
-            match cabana::platform::preview_window(&window_id) {
-                Ok(path) => {
-                    println!("Saved preview frame to {}", path.display());
+            #[cfg(target_os = "macos")]
+            {
+                let Some(descriptor) = resolve_capture_descriptor(window_id)? else {
+                    eprintln!("Selection canceled");
+                    return Ok(());
+                };
+                let target_id = descriptor.target_id.clone();
+                prompt_screen_recording_permission();
+                match cabana::platform::preview_window(&target_id) {
+                    Ok(path) => {
+                        println!("Saved preview frame to {}", path.display());
+                    }
+                    Err(cabana::platform::WindowApiError::PreviewNotImplemented) => {
+                        println!("Preview not yet implemented; target id: {}", target_id);
+                    }
+                    Err(cabana::platform::WindowApiError::EnumerationFailed(reason)) => {
+                        println!(
+                            "Preview unavailable because enumeration failed: {}",
+                            reason
+                        );
+                    }
+                    Err(cabana::platform::WindowApiError::InvalidIdentifier(reason)) => {
+                        println!("Invalid target: {}", reason);
+                    }
+                    Err(cabana::platform::WindowApiError::CaptureFailed(reason)) => {
+                        println!("Failed to capture preview: {}", reason);
+                    }
                 }
-                Err(cabana::platform::WindowApiError::PreviewNotImplemented) => {
-                    println!("Preview not yet implemented; window id: {}", window_id);
-                }
-                Err(cabana::platform::WindowApiError::EnumerationFailed(reason)) => {
-                    println!(
-                        "Preview unavailable because enumeration failed: {}",
-                        reason
-                    );
-                }
-                Err(cabana::platform::WindowApiError::InvalidIdentifier(reason)) => {
-                    println!("Invalid target: {}", reason);
-                }
-                Err(cabana::platform::WindowApiError::CaptureFailed(reason)) => {
-                    println!("Failed to capture preview: {}", reason);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let Some(window_id) = resolve_window_id(window_id)? else {
+                    eprintln!("Selection canceled");
+                    return Ok(());
+                };
+                prompt_screen_recording_permission();
+                match cabana::platform::preview_window(&window_id) {
+                    Ok(path) => {
+                        println!("Saved preview frame to {}", path.display());
+                    }
+                    Err(cabana::platform::WindowApiError::PreviewNotImplemented) => {
+                        println!("Preview not yet implemented; window id: {}", window_id);
+                    }
+                    Err(cabana::platform::WindowApiError::EnumerationFailed(reason)) => {
+                        println!(
+                            "Preview unavailable because enumeration failed: {}",
+                            reason
+                        );
+                    }
+                    Err(cabana::platform::WindowApiError::InvalidIdentifier(reason)) => {
+                        println!("Invalid target: {}", reason);
+                    }
+                    Err(cabana::platform::WindowApiError::CaptureFailed(reason)) => {
+                        println!("Failed to capture preview: {}", reason);
+                    }
                 }
             }
         }
@@ -94,7 +130,6 @@ fn run(cli: cli::Cli) -> Result<()> {
         cli::Commands::Stream { window_id, frames, interval_ms, output_dir } => {
             #[cfg(target_os = "macos")]
             {
-                use cabana::capture::create_producer;
                 use image::{DynamicImage, ImageBuffer};
 
                 if frames == 0 {
@@ -102,16 +137,17 @@ fn run(cli: cli::Cli) -> Result<()> {
                     return Ok(());
                 }
 
-                let window_id = match resolve_window_id(window_id)? {
-                    Some(id) => id,
+                let descriptor = match resolve_capture_descriptor(window_id)? {
+                    Some(desc) => desc,
                     None => {
                         eprintln!("Selection canceled");
                         return Ok(());
                     }
                 };
+                let target_label = descriptor.target_id.clone();
                 prompt_screen_recording_permission();
 
-                let mut producer = match create_producer(&window_id) {
+                let mut producer = match create_producer_from_descriptor(&descriptor) {
                     Ok(p) => p,
                     Err(err) => {
                         println!("Failed to create capture producer: {}", err);
@@ -236,15 +272,14 @@ fn run(cli: cli::Cli) -> Result<()> {
         cli::Commands::Encode { window_id, duration_secs, fps, max_width, output, codec } => {
             #[cfg(target_os = "macos")]
             {
-                use cabana::capture::create_producer;
                 use cli::EncodeCodec;
 
                 let fps = fps.max(1);
                 let total_frames = duration_secs.saturating_mul(fps);
                 if total_frames == 0 { println!("Encoding requires a positive duration and fps."); return Ok(()); }
 
-                let window_id = match resolve_window_id(window_id)? {
-                    Some(id) => id,
+                let descriptor = match resolve_capture_descriptor(window_id)? {
+                    Some(desc) => desc,
                     None => {
                         eprintln!("Selection canceled");
                         return Ok(());
@@ -252,7 +287,13 @@ fn run(cli: cli::Cli) -> Result<()> {
                 };
                 prompt_screen_recording_permission();
 
-                let mut producer = match create_producer(&window_id) { Ok(p) => p, Err(err) => { println!("Failed to create capture producer: {}", err); return Ok(()); } };
+                let mut producer = match create_producer_from_descriptor(&descriptor) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        println!("Failed to create capture producer: {}", err);
+                        return Ok(());
+                    }
+                };
                 producer.start()?;
 
                 let mut encoder: Option<ActiveEncoder> = None;
@@ -323,47 +364,84 @@ fn run(cli: cli::Cli) -> Result<()> {
             println!("Noise diagnostic flow is moving under the host crate; not wired in this refactor step.");
         }
         #[cfg(feature = "webrtc")]
-        cli::Commands::WebRtcHostRun { session_id, passcode, codec, road_url, fixture_url, fixture_dir, prologue, mut window_id, frames, interval_ms, max_width, from_id, to_id } => {
-            // Optional interactive picker if no window selected and streaming requested
-            if window_id.is_none() && frames > 0 {
-                if let Some(id) = crate::tui_pick::run_picker()? { window_id = Some(id); } else { println!("Canceled."); return Ok(()); }
-            }
-            let rt = tokio::runtime::Runtime::new()?;
-            let (transport, code, selected, codec_host) = rt.block_on(async move {
-                let (t, c) = cabana::webrtc::host_bootstrap(
-                    session_id.clone(),
-                    passcode.clone(),
-                    road_url.clone(),
-                    fixture_url.clone(),
-                    fixture_dir.clone(),
-                    prologue.clone().into_bytes(),
-                    from_id.clone(),
-                    to_id.clone(),
-                ).await?;
-                Ok::<_, anyhow::Error>((t, c, window_id, match codec { cli::EncodeCodec::Gif => cabana::webrtc::EncodeCodec::Gif, cli::EncodeCodec::H264 => cabana::webrtc::EncodeCodec::H264 }))
-            })?;
-            println!("Host secured channel");
-            println!("  Verification   : {}", code);
-            // Gate: require confirmation before streaming
-            if let Some(id) = selected {
-                println!("Start streaming '{}' now? [y/N]", id);
-                let mut input = String::new();
-                std::io::stdout().flush().ok();
-                std::io::stdin().read_line(&mut input).ok();
-                if matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
-                    // macOS permission guidance (best-effort) before starting
-                    prompt_screen_recording_permission();
-                    rt.block_on(async move {
-                        #[cfg(target_os = "macos")]
-                        {
-                            cabana::webrtc::host_stream(&transport, codec_host, &id, frames, interval_ms, max_width).await.map_err(|e| anyhow::anyhow!(e.to_string()))
+        cli::Commands::WebRtcHostRun { session_id, passcode, codec, road_url, fixture_url, fixture_dir, prologue, window_id, frames, interval_ms, max_width, from_id, to_id } => {
+            #[cfg(target_os = "macos")]
+            {
+                let descriptor = if frames > 0 {
+                    match resolve_capture_descriptor(window_id)? {
+                        Some(desc) => Some(desc),
+                        None => {
+                            println!("Canceled.");
+                            return Ok(());
                         }
-                        #[cfg(not(target_os = "macos"))]
-                        { Ok::<_, anyhow::Error>(()) }
-                    })?;
+                    }
                 } else {
-                    println!("Streaming skipped by user.");
+                    None
+                };
+                let rt = tokio::runtime::Runtime::new()?;
+                let (transport, code, selected, codec_host) = rt.block_on(async move {
+                    let (t, c) = cabana::webrtc::host_bootstrap(
+                        session_id.clone(),
+                        passcode.clone(),
+                        road_url.clone(),
+                        fixture_url.clone(),
+                        fixture_dir.clone(),
+                        prologue.clone().into_bytes(),
+                        from_id.clone(),
+                        to_id.clone(),
+                    ).await?;
+                    Ok::<_, anyhow::Error>((t, c, descriptor, match codec { cli::EncodeCodec::Gif => cabana::webrtc::EncodeCodec::Gif, cli::EncodeCodec::H264 => cabana::webrtc::EncodeCodec::H264 }))
+                })?;
+                println!("Host secured channel");
+                println!("  Verification   : {}", code);
+                if let (Some(descriptor), true) = (selected, frames > 0) {
+                    let target_label = descriptor.target_id.clone();
+                    println!("Start streaming '{}' now? [y/N]", target_label);
+                    let mut input = String::new();
+                    std::io::stdout().flush().ok();
+                    std::io::stdin().read_line(&mut input).ok();
+                    if matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+                        prompt_screen_recording_permission();
+                        let descriptor_clone = descriptor.clone();
+                        rt.block_on(async move {
+                            cabana::webrtc::host_stream(
+                                &transport,
+                                codec_host,
+                                &descriptor_clone,
+                                frames,
+                                interval_ms,
+                                max_width,
+                            )
+                            .await
+                            .map_err(|e| anyhow::anyhow!(e.to_string()))
+                        })?;
+                    } else {
+                        println!("Streaming skipped by user.");
+                    }
                 }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let rt = tokio::runtime::Runtime::new()?;
+                let (transport, code, selected, codec_host) = rt.block_on(async move {
+                    let (t, c) = cabana::webrtc::host_bootstrap(
+                        session_id.clone(),
+                        passcode.clone(),
+                        road_url.clone(),
+                        fixture_url.clone(),
+                        fixture_dir.clone(),
+                        prologue.clone().into_bytes(),
+                        from_id.clone(),
+                        to_id.clone(),
+                    ).await?;
+                    Ok::<_, anyhow::Error>((t, c, window_id, match codec { cli::EncodeCodec::Gif => cabana::webrtc::EncodeCodec::Gif, cli::EncodeCodec::H264 => cabana::webrtc::EncodeCodec::H264 }))
+                })?;
+                println!("Host secured channel");
+                println!("  Verification   : {}", code);
+                if let Some(id) = selected {
+                    println!("Streaming '{}' is currently supported on macOS only.", id);
+                }
+                drop((transport, codec_host));
             }
         }
         #[cfg(feature = "webrtc")]
@@ -428,6 +506,55 @@ fn run(cli: cli::Cli) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn resolve_capture_descriptor(
+    window_id: Option<String>,
+) -> Result<Option<ScreenCaptureDescriptor>> {
+    if let Some(id) = window_id {
+        return Ok(Some(ScreenCaptureDescriptor::legacy(id)));
+    }
+
+    if let Some(event) = cabana::desktop::last_selection() {
+        println!(
+            "Using desktop picker selection '{}'",
+            event.descriptor.target_id
+        );
+        return Ok(Some(event.descriptor));
+    }
+
+    let wait_ms_env = std::env::var("CABANA_PICKER_WAIT_MS")
+        .ok()
+        .and_then(|val| val.parse::<u64>().ok());
+    let relay_enabled = std::env::var("CABANA_PICKER_RELAY")
+        .ok()
+        .map(|val| matches!(val.as_str(), "1" | "true" | "TRUE" | "True"))
+        .unwrap_or(false);
+    let wait_ms = wait_ms_env.or_else(|| if relay_enabled { Some(1500) } else { None });
+
+    if let Some(ms) = wait_ms {
+        if ms > 0 {
+            println!("Waiting up to {} ms for desktop picker selection…", ms);
+            if let Some(event) =
+                cabana::desktop::wait_for_selection(Some(Duration::from_millis(ms)))
+            {
+                println!(
+                    "Received desktop picker selection '{}'",
+                    event.descriptor.target_id
+                );
+                return Ok(Some(event.descriptor));
+            } else {
+                println!("No desktop picker selection received; falling back to TUI picker.");
+            }
+        }
+    }
+
+    match tui_pick::run_picker()? {
+        Some(id) => Ok(Some(ScreenCaptureDescriptor::legacy(id))),
+        None => Ok(None),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 fn resolve_window_id(window_id: Option<String>) -> Result<Option<String>> {
     if let Some(id) = window_id {
         return Ok(Some(id));

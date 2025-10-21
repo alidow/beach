@@ -94,11 +94,7 @@ impl ViewerTokenVerifier {
         }
     }
 
-    pub async fn verify(
-        &self,
-        token: &str,
-        session: &SessionInfo,
-    ) -> Result<(), ViewerTokenError> {
+    pub async fn verify(&self, token: &str, session: &SessionInfo) -> Result<(), ViewerTokenError> {
         let header = decode_header(token)?;
         let kid = header.kid.ok_or(ViewerTokenError::MissingKid)?;
         let key = self.decoding_key(&kid).await?;

@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "copy:wasm": "node ./scripts/copy-wasm.mjs",
+    "prepare": "node ./scripts/copy-wasm.mjs",
+    "predev": "node ./scripts/copy-wasm.mjs",
+    "prebuild": "node ./scripts/copy-wasm.mjs",
     "dev": "vite",
     "build": "tsc --project tsconfig.build.json && vite build",
     "preview": "vite preview",

@@ -5,13 +5,17 @@ mod handlers;
 mod session;
 mod signaling;
 mod storage;
-mod websocket;
 mod viewer_token;
+mod websocket;
 
 use axum::{
     routing::{get, post},
     Extension, Router,
 };
+use base64::engine::general_purpose::{
+    STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_SAFE,
+};
+use base64::Engine;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -91,7 +95,28 @@ async fn main() {
     let shared_storage: SharedStorage = Arc::new(storage);
 
     // Initialize WebSocket signaling state
-    let signaling_state = SignalingState::new(shared_storage.clone());
+    let viewer_token_verifier = config.viewer_token_mac_secret.clone().and_then(|secret| {
+        let jwks_url = config.fallback_jwks_url.clone()?;
+        let issuer = config.fallback_jwt_issuer.clone();
+        let audience = config.viewer_token_audience.clone();
+        let cache_ttl = Duration::from_secs(config.viewer_token_jwks_cache_ttl_seconds);
+        Some(ViewerTokenVerifier::new(
+            jwks_url,
+            issuer,
+            audience,
+            cache_ttl,
+            decode_viewer_secret(&secret),
+        ))
+    });
+
+    if viewer_token_verifier.is_some() {
+        info!("viewer token verification enabled");
+    } else {
+        info!("viewer token verification disabled");
+    }
+
+    let signaling_state =
+        SignalingState::new(shared_storage.clone(), viewer_token_verifier.clone());
 
     if config.fallback_require_oidc && config.fallback_jwks_url.is_none() {
         error!(
@@ -145,7 +170,8 @@ async fn main() {
             get(get_webrtc_answer).post(post_webrtc_answer),
         )
         .with_state(shared_storage.clone())
-        .layer(Extension(signaling_state.clone()));
+        .layer(Extension(signaling_state.clone()))
+        .layer(Extension(viewer_token_verifier.clone()));
 
     let fallback_routes = Router::new()
         .route("/fallback/token", post(issue_fallback_token))
@@ -183,6 +209,20 @@ async fn main() {
     axum::serve(listener, service)
         .await
         .expect("Failed to start server");
+}
+
+fn decode_viewer_secret(secret: &str) -> Vec<u8> {
+    if let Ok(decoded) = BASE64_STANDARD.decode(secret) {
+        if !decoded.is_empty() {
+            return decoded;
+        }
+    }
+    if let Ok(decoded) = BASE64_URL_SAFE.decode(secret) {
+        if !decoded.is_empty() {
+            return decoded;
+        }
+    }
+    secret.as_bytes().to_vec()
 }
 
 fn install_metrics_recorder() -> PrometheusHandle {

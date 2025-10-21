@@ -8,14 +8,14 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
-    time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
+    time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::auth::{AuthConfig, AuthContext};
-use crate::fastpath::{send_actions_over_fast_path, FastPathRegistry, FastPathSession};
+use crate::fastpath::{FastPathRegistry, FastPathSession, send_actions_over_fast_path};
 use crate::metrics;
 use beach_buggy::{
     AckStatus, ActionAck, ActionCommand, CursorPosition, HarnessType, HealthHeartbeat,
@@ -23,18 +23,17 @@ use beach_buggy::{
 };
 use beach_client_core::protocol::{CursorFrame, Update as WireUpdate};
 use beach_client_core::{
-    decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
-    ClientFrame as WireClientFrame, HostFrame as WireHostFrame, NegotiatedSingle,
-    NegotiatedTransport, PackedCell, Payload, SessionConfig, SessionError, SessionManager,
-    TerminalGrid, TransportError,
+    CliError, ClientFrame as WireClientFrame, HostFrame as WireHostFrame, NegotiatedSingle,
+    NegotiatedTransport, PackedCell, Payload, SessionConfig, SessionError, SessionManager, Style,
+    StyleId, TerminalGrid, TransportError, decode_host_frame_binary, encode_client_frame_binary,
+    negotiate_transport,
 };
 use chrono::{DateTime, Duration, Utc};
-use reqwest::StatusCode;
 use prometheus::IntGauge;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use sqlx::{types::Json, FromRow, PgPool, Row};
-use tokio::sync::{broadcast, RwLock};
+use sqlx::{FromRow, PgPool, Row, types::Json};
+use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
@@ -45,6 +44,7 @@ const REDIS_ACTION_STREAM_MAXLEN: usize = 2_048;
 const REDIS_TTL_SECONDS: usize = 120;
 const REDIS_ACTION_GROUP: &str = "controllers";
 const REDIS_ACTION_CONSUMER_PREFIX: &str = "poller";
+const VIEWER_KEEPALIVE_INTERVAL: StdDuration = StdDuration::from_secs(20);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -146,10 +146,8 @@ impl ViewerTokenClient {
             )));
         }
 
-        let payload: ViewerTokenGatewayResponse = response
-            .json()
-            .await
-            .map_err(ViewerTokenError::Http)?;
+        let payload: ViewerTokenGatewayResponse =
+            response.json().await.map_err(ViewerTokenError::Http)?;
 
         Ok(ViewerTokenIssued {
             token: payload.token,
@@ -291,8 +289,21 @@ impl ManagerViewerState {
                     self.grid.set_row_offset(new_base);
                 }
             }
-            WireUpdate::Style { .. } => {
-                // Style updates are not required for textual diffs today.
+            WireUpdate::Style {
+                id, fg, bg, attrs, ..
+            } => {
+                let style = Style {
+                    fg: *fg,
+                    bg: *bg,
+                    attrs: *attrs,
+                };
+                if !self.grid.style_table.set(StyleId(*id), style) {
+                    debug!(
+                        target = "private_beach",
+                        style_id = *id,
+                        "manager viewer received style update for missing style id"
+                    );
+                }
             }
         }
     }
@@ -622,9 +633,11 @@ impl AppState {
         join_code: &str,
     ) -> Result<ViewerTokenIssued, ViewerTokenError> {
         match &self.viewer_tokens {
-            Some(client) => client
-                .issue(&self.http, session_id, private_beach_id, join_code)
-                .await,
+            Some(client) => {
+                client
+                    .issue(&self.http, session_id, private_beach_id, join_code)
+                    .await
+            }
             None => Err(ViewerTokenError::Unavailable),
         }
     }
@@ -3516,8 +3529,21 @@ async fn viewer_connect_once(
     }
 
     let mut viewer_state = ManagerViewerState::new();
+    let mut next_keepalive = Instant::now() + VIEWER_KEEPALIVE_INTERVAL;
 
     loop {
+        let now = Instant::now();
+        if now >= next_keepalive {
+            if let Err(err) = transport.send_text("__ready__") {
+                debug!(
+                    target = "private_beach",
+                    session_id = %session_id,
+                    error = %err,
+                    "manager viewer keepalive failed"
+                );
+            }
+            next_keepalive = now + VIEWER_KEEPALIVE_INTERVAL;
+        }
         match transport.recv(StdDuration::from_millis(500)) {
             Ok(message) => match message.payload {
                 Payload::Binary(bytes) => match decode_host_frame_binary(&bytes) {
@@ -3786,11 +3812,11 @@ mod tests {
     use beach_buggy::{HarnessType, RegisterSessionRequest};
     use serde_json::json;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use std::time::SystemTime;
-    use tokio::time::{sleep, timeout, Duration};
+    use tokio::time::{Duration, sleep, timeout};
 
     #[test_timeout::tokio_timeout_test(10)]
     async fn spawn_viewer_worker_smoke_test_records_state_and_stream() {

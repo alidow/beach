@@ -6,6 +6,7 @@ export interface ConnectUnifiedOptions {
   sessionId: string;
   baseUrl: string;
   passcode?: string;
+  viewerToken?: string;
   iceServers?: RTCIceServer[];
   logger?: (msg: string) => void;
   createSocket?: SignalingClientOptions['createSocket'];
@@ -24,6 +25,7 @@ export async function connectUnified(options: ConnectUnifiedOptions): Promise<Un
   const signaling = await SignalingClient.connect({
     url: websocketUrl,
     passphrase: options.passcode,
+    viewerToken: options.viewerToken,
     supportedTransports: ['webrtc'],
     createSocket: options.createSocket,
     label: options.clientLabel,
@@ -37,6 +39,7 @@ export async function connectUnified(options: ConnectUnifiedOptions): Promise<Un
     iceServers: options.iceServers,
     logger: options.logger,
     passphrase: options.passcode,
+    viewerToken: options.viewerToken,
     telemetryBaseUrl: options.baseUrl,
     sessionId: options.sessionId,
   });
@@ -86,7 +89,10 @@ async function fetchJoinMetadataUnified(options: ConnectUnifiedOptions): Promise
   const response = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ passphrase: options.passcode ?? null }),
+    body: JSON.stringify({
+      passphrase: options.passcode ?? null,
+      viewer_token: options.viewerToken ?? null,
+    }),
   });
   if (!response.ok) {
     throw new Error(`join request failed: ${response.status} ${response.statusText}`);
@@ -137,4 +143,3 @@ interface JoinSessionResponse {
   transports?: Array<{ kind: string; metadata?: OfferMetadata }>;
   websocket_url?: string;
 }
-

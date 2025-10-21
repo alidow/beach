@@ -221,6 +221,22 @@ export default function BeachDashboard() {
       setLayout((prev) => {
         const allowed = new Set(prev.tiles);
         const filtered = items.filter((entry) => allowed.has(entry.id));
+        const unchanged =
+          filtered.length === prev.layout.length &&
+          filtered.every((entry, index) => {
+            const existing = prev.layout[index];
+            return (
+              !!existing &&
+              existing.id === entry.id &&
+              existing.x === entry.x &&
+              existing.y === entry.y &&
+              existing.w === entry.w &&
+              existing.h === entry.h
+            );
+          });
+        if (unchanged) {
+          return prev;
+        }
         const next = { ...prev, layout: filtered };
         void putBeachLayout(id, next, managerToken).catch(() => {});
         return next;

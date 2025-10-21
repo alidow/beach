@@ -1,8 +1,23 @@
 # macOS Native Picker & Session Builder – Implementation Plan
 
-Last updated: 2025-10-21  
+Last updated: 2025-11-02  
 Owner: Cabana team (macOS lead)  
 Goal window: Phase 4.1 (picker parity) → Phase 4.2 (session creation UX)
+
+## Status snapshot (2025-11-02)
+
+- ✅ `cabana-macos-picker` crate now exposes a real macOS bridge: the Swift/ObjC layer wraps `SCContentSharingPicker`, serializes `SCContentFilter`, and streams selection events into Rust. A mock backend still ships for CI/non-macOS.
+- ✅ Desktop binary links the crate under feature flags; a background listener can already emit selection events for manual vetting.
+- ⚠️ The legacy egui gallery remains on-screen. We still need to replace it with the native picker-driven UX (tiles, session sheet, auth).
+- ⚠️ Host runtime, Clerk auth, and Beach Road/Private Beach wiring continue to expect the old window-id contract.
+
+## Path to Beach-ready UX
+
+To achieve the product milestone (“launch, pick any non-minimized screen, sign in, publish publicly or to a private beach, and view in Beach Surfer”), we will execute the remaining work in the phases below. Each phase calls out blockers toward the three headline behaviours:
+
+1. **Tile view of all windows/displays (native picker parity).**
+2. **Clerk-powered authentication + private beach selection.**
+3. **End-to-end streaming: Cabana ▶ Beach Road/Private Beach ▶ Beach Surfer React components.**
 
 ## Why we are doing this
 
@@ -77,66 +92,67 @@ This plan replaces the custom picker on macOS with a native picker + session set
 Deliverables:
 - `docs/beach-cabana/macos-picker/spike-notes.md` capturing API findings and recommended bridge approach.
 
-### Phase 1 – Native picker bridge (3–4 days)
+### Phase 1 – Native picker bridge (Status: **Complete**)
 
-1. Create `apps/beach-cabana/native-apps/desktop/bridge/macos_picker`:
-   - `PickerBridge.swift` containing:
-     - class `CabanaPickerController` implementing `SCContentSharingPickerDelegate`
-     - bridging functions `cabana_picker_start`, `cabana_picker_stop`, `cabana_picker_current_selection`.
-   - Use `@MainActor` and `DispatchQueue.main.async` to ensure UI operations happen on the main run loop.
+**What’s done**
+- Objective-C bridge compiled via `build.rs`, linking ScreenCaptureKit/AppKit and exporting a C ABI.
+- Rust `PickerHandle` provides `launch`, `listen`, `stop` with async stream of `PickerEvent::{Selection,Cancelled,Error}`.
+- Mock feature gate retains CI coverage.
 
-2. Add new Rust crate `crates/cabana-macos-picker`:
-   - Build script to compile the Swift sources via `swiftc` into a static library.  
-   - `ffi.rs` with extern functions and conversion to Rust types.  
-   - `PickerHandle` struct exposing:
-     ```rust
-     pub struct PickerHandle { /* ... */ }
-     impl PickerHandle {
-         pub fn launch(&self) -> Result<PickerResult>;
-         pub fn listen(&self) -> impl Stream<Item = PickerResult>;
-         pub fn stop(&self);
-     }
-     ```
+**Remaining acceptance items**
+- [ ] Harden error reporting/telemetry for picker availability (wire into desktop logger once UI lands).
 
-3. Integrate bridging crate into `apps/beach-cabana/native-apps/desktop`:
-   - On macOS, instantiate `PickerHandle` at startup; call `.launch()` to show the native picker.  
-   - Replace egui gallery with new Swift sheet (the existing window can minimize/hide while the picker is shown).
+### Phase 2 – Picker-driven desktop UX (**In progress**)
 
-4. Provide a fallback path for unit tests (mock results) to keep CI green on non-mac platforms.
+**Goals**
+1. Display picker-provided tiles (including hidden/minimized windows and displays) in the Cabana shell.
+2. Persist the latest `PickerResult` (filter blob + metadata) for reuse (desktop relay + CLI).
+3. Provide a Swift/egui session sheet that can:
+   - Trigger native picker re-open.
+   - Surface preview thumbnail, session type (Public / Private), and quick actions (copy link, open Surfer).
 
-Deliverables:
-- Swift bridge compiling in the workspace (`cargo check --target x86_64-apple-darwin`).  
-- Rust wrapper crate with simple demo (log selected identifier).  
-- Basic manual test demonstrating the native picker returning selections.
+**Tasks**
+- [ ] Replace egui gallery with a view that consumes `PickerHandle::listen()` and renders tiles (no SwiftUI yet—initially egui backed by picker metadata).
+- [ ] Serialize `SCContentFilter` + optional `SCStreamConfiguration` into a `ScreenCaptureDescriptor` struct and attach it to `SelectionEvent`.
+- [ ] Update `beach_cabana_host::desktop::publish_selection` callers to forward descriptors so CLI and desktop remain in sync.
+- [ ] Build minimal “session sheet” inside the desktop shell (can remain egui while we iterate) showing:
+  - Current selection metadata (title, bundle id, secure badge if private beach).
+  - Session inputs (passcode, session id).
+  - Buttons for `Start public share` / `Attach to private beach` (stubbed until Phase 3).
+- [ ] Wire telemetry hooks (`picker_open`, `picker_selection`) once tiles render.
 
-### Phase 2 – Session setup UX (3–4 days)
+**Exit criteria**
+- Launching the macOS binary shows all non-minimized screens/windows as tiles populated from the native picker (goal #1).
+- Selecting a tile updates desktop state + publishes to the relay (e.g., CLI sees the same descriptor).
+- Manual smoke test logs streamed picker events in the new UI.
 
-1. Replace egui-based control panel with a native session sheet (SwiftUI or egui with simpler layout):
-   - Fields: session name, stream type (Public / Private), passcode (auto-generated or custom).  
-   - Buttons: “Copy Link,” “Open Beach Surfer,” “Stop Sharing,” “Switch Source.”
-   - Show live preview thumbnail from the picker (ScreenCaptureKit provides preview frames; otherwise snapshot once).
+### Phase 3 – Auth + session orchestration (**Not started**)
 
-2. Integrate Clerk authentication:
-   - Reuse existing Desktop authenticator or embed Clerk’s Swift SDK (if available).  
-   - Persist auth token securely (Keychain).  
-   - `if authenticated` → fetch list of private beaches (REST call) and allow selecting one from a picker; otherwise show sign-in CTA.
+Focus: deliver goals #2 and #3 (Clerk auth, Beach session wiring, Beach Surfer playback).
 
-3. Implement session creation flow:
-   - Public session: call Beach Road (POST `/sessions`) to create link + join code.  
-   - Private session: call Private Beach API to create/update session with viewer credentials.  
-   - Store session metadata in app state so the host runtime can use it during streaming.
+**Auth & session creation**
+- [ ] Integrate Clerk desktop sign-in (reuse `beach login` flow; share tokens via secure Keychain storage).
+- [ ] Fetch private beach inventory post-login; expose picker allowing users to choose target private beach or fallback to “Public Share”.
+- [ ] Public path: call Beach Road to allocate session id + passcode, auto-fill sheet, generate copy / open actions.
+- [ ] Private path: PATCH/POST to Private Beach API attaching Cabana session metadata (viewer worker + credentials) to the selected beach.
+- [ ] Surface verification code, session link, and clipboard/share buttons in-session sheet.
 
-4. Hook the host runtime:
-   - Extend `beach_cabana_host::webrtc::host_bootstrap` to accept `ScreenCaptureKitDescriptor` instead of plain window IDs.  
-   - If SCK capture fails (unsupported OS), fall back to CoreGraphics via identifier as today.
+**Streaming pipeline**
+- [ ] Extend host runtime (`host_bootstrap`, ScreenCaptureKit adapter) to consume serialized descriptors; implement fallback to CGWindow capture when building older binaries.
+- [ ] Update `beach_cabana_host::webrtc::host_stream` to detect descriptor type and spin up ScreenCaptureKit streaming with live updates.
+- [ ] Ensure CLI flows remain functional by accepting descriptors (no regression for terminal sessions).
 
-Deliverables:
-- Native session sheet with complete flow from selection → session creation → streaming start.  
-- Authentication envelope tied to session creation API calls.  
-- Manual test: select window, create public session, copy link, open in Surfer (verify playback).  
-- Private beach test: sign in with Clerk, publish to private beach, verify entry exists.
+**Beach Surfer React components**
+- [ ] Introduce reusable Surfer player components capable of rendering PNG/H.264 Cabana sessions (public + private) with minimal props (session id/passcode OR private beach id).
+- [ ] Update Surfer pages to consume the new components and handle real-time updates (Noise handshake, viewer metrics).
+- [ ] Document ergonomic usage patterns for other Beach surfaces.
 
-### Phase 3 – Polish & parity (2–3 days)
+**Exit criteria**
+- User can sign in via Clerk, select either public session or private beach target, and start streaming.
+- Beach Surfer shows the live feed when given session id/passcode or when visiting the chosen private beach.
+- QA script covers both flows end-to-end.
+
+### Phase 4 – Polish & parity (2–3 days)
 
 1. UX improvements:
    - Allow reopening picker to switch windows without restarting host stream.  
@@ -157,15 +173,16 @@ Deliverables:
    - Write regression checklist for QA (permissions, login, link copy).
 
 Deliverables:
-- Fully operational macOS native picker & session builder shipping in Cabana desktop app.  
+- Fully operational macOS native picker & session builder shipping in Cabana desktop app (tiles + session sheet + streaming).  
 - QA checklist + telemetry dashboards instruments defined.  
 - Updated docs referencing new flow.
 
 ## Dependencies & open questions
 
-- **Clerk integration:** confirm desktop app already has a sign-in flow; if not, add one (webview or native).  
-- **Distribution:** Swift bridge needs to compile for both Intel & Apple Silicon; ensure `swiftc` invocation produces universal binary.  
+- **Clerk integration:** confirm desktop app already has a sign-in flow; if not, add one (webview or native). Tokens must be reusable by CLI (`beach login`).
+- **Distribution:** Swift bridge needs to compile for both Intel & Apple Silicon; ensure `swiftc` invocation produces universal binary.
 - **Testing on CI:** we may need to stub the picker by running tests in headless mode (no GUI). Provide environment variable `CABANA_NATIVE_PICKER=mock` to bypass UI during CI.
+- **Private beach APIs:** verify attach/update endpoints support ScreenCaptureKit descriptors and multi-session state before wiring the UI.
 
 ## Risks & mitigations
 

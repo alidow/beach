@@ -2,6 +2,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
+    Extension,
 };
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
@@ -26,9 +27,41 @@ use crate::{
     session::{hash_passphrase, verify_passphrase},
     signaling::WebRtcSdpPayload,
     storage::{SessionInfo, Storage},
+    viewer_token::{ViewerTokenError, ViewerTokenVerifier},
 };
 
 pub type SharedStorage = Arc<Storage>;
+
+#[derive(Debug)]
+pub(crate) enum ViewerAuthError {
+    TokensDisabled,
+    TokenInvalid,
+    TokenService,
+}
+
+pub(crate) async fn verify_viewer_token(
+    verifier: Option<&ViewerTokenVerifier>,
+    token: Option<&str>,
+    session: &SessionInfo,
+) -> Result<(), ViewerAuthError> {
+    let token = match token.map(|value| value.trim()) {
+        Some(value) if !value.is_empty() => value,
+        _ => return Ok(()),
+    };
+
+    let verifier = verifier.ok_or(ViewerAuthError::TokensDisabled)?;
+    match verifier.verify(token, session).await {
+        Ok(()) => Ok(()),
+        Err(ViewerTokenError::MissingJwksUrl) => Err(ViewerAuthError::TokensDisabled),
+        Err(ViewerTokenError::Http(_)) | Err(ViewerTokenError::JwksFetch(_)) => {
+            Err(ViewerAuthError::TokenService)
+        }
+        Err(other) => {
+            warn!(error = ?other, "viewer token rejected");
+            Err(ViewerAuthError::TokenInvalid)
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct FallbackContext {
@@ -482,19 +515,60 @@ pub async fn register_session(
 /// POST /sessions/{id}/join - Join an existing session
 pub async fn join_session(
     State(storage): State<SharedStorage>,
+    Extension(viewer_tokens): Extension<Option<ViewerTokenVerifier>>,
     Path(session_id): Path<String>,
-    Json(payload): Json<JoinSessionRequest>,
+    Json(body): Json<JoinSessionRequest>,
 ) -> Result<Json<JoinSessionResponse>, StatusCode> {
     debug!("Client attempting to join session: {}", session_id);
 
     let storage = (*storage).clone();
 
+    let JoinSessionRequest {
+        passphrase,
+        mcp,
+        viewer_token,
+    } = body;
+
     match storage.get_session(&session_id).await {
         Ok(Some(session)) => {
+            let viewer_token_str = viewer_token
+                .as_ref()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty());
+
+            if let Some(token_value) = viewer_token_str {
+                match verify_viewer_token(viewer_tokens.as_ref(), Some(token_value), &session).await
+                {
+                    Ok(()) => {}
+                    Err(ViewerAuthError::TokensDisabled) => {
+                        error!(session_id = %session_id, "viewer token requested but verifier not configured");
+                        return Err(StatusCode::SERVICE_UNAVAILABLE);
+                    }
+                    Err(ViewerAuthError::TokenService) => {
+                        error!(session_id = %session_id, "viewer token verification failed");
+                        return Err(StatusCode::BAD_GATEWAY);
+                    }
+                    Err(ViewerAuthError::TokenInvalid) => {
+                        return Ok(Json(JoinSessionResponse {
+                            success: false,
+                            message: Some("viewer credential invalid".to_string()),
+                            webrtc_offer: None,
+                            session_url: None,
+                            transports: Vec::new(),
+                            websocket_url: None,
+                        }));
+                    }
+                }
+            }
+
             // Verify passphrase if the session has one
             if !session.passphrase_hash.is_empty() {
-                if let Some(passphrase) = payload.passphrase {
-                    if !verify_passphrase(&passphrase, &session.passphrase_hash) {
+                if let Some(passphrase_value) = passphrase
+                    .as_ref()
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                {
+                    if !verify_passphrase(passphrase_value, &session.passphrase_hash) {
                         return Ok(Json(JoinSessionResponse {
                             success: false,
                             message: Some("Invalid passphrase".to_string()),

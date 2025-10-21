@@ -14,10 +14,12 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
-use crate::handlers::SharedStorage;
+use crate::handlers::{verify_viewer_token, SharedStorage, ViewerAuthError};
+use crate::session::verify_passphrase;
 use crate::signaling::{
     generate_peer_id, ClientMessage, PeerInfo, PeerRole, ServerMessage, TransportType,
 };
+use crate::viewer_token::ViewerTokenVerifier;
 
 /// Connection state for a single WebSocket peer
 #[derive(Clone)]
@@ -41,13 +43,15 @@ pub struct SignalingState {
     sessions: Arc<DashMap<String, DashMap<String, PeerConnection>>>,
     /// Storage for session validation
     storage: SharedStorage,
+    viewer_tokens: Option<ViewerTokenVerifier>,
 }
 
 impl SignalingState {
-    pub fn new(storage: SharedStorage) -> Self {
+    pub fn new(storage: SharedStorage, viewer_tokens: Option<ViewerTokenVerifier>) -> Self {
         let state = Self {
             sessions: Arc::new(DashMap::new()),
             storage,
+            viewer_tokens,
         };
 
         // Start heartbeat monitor task
@@ -447,7 +451,8 @@ async fn handle_client_message(
     match message {
         ClientMessage::Join {
             peer_id: client_peer_id,
-            passphrase: _,
+            passphrase,
+            viewer_token,
             supported_transports,
             preferred_transport,
             label,
@@ -458,8 +463,76 @@ async fn handle_client_message(
                 peer_id, client_peer_id, session_id
             );
 
-            // Validate session exists and passphrase if required
-            // TODO: Check with storage if session exists and passphrase matches
+            let session = match self.storage.get_session(session_id).await {
+                Ok(Some(session)) => session,
+                Ok(None) => {
+                    warn!(session_id = %session_id, "join attempted for missing session");
+                    let _ = tx.send(ServerMessage::JoinError {
+                        reason: "Session not found".into(),
+                    });
+                    return Ok(());
+                }
+                Err(err) => {
+                    error!(session_id = %session_id, error = %err, "failed to load session during join");
+                    let _ = tx.send(ServerMessage::JoinError {
+                        reason: "Internal error".into(),
+                    });
+                    return Ok(());
+                }
+            };
+
+            let viewer_token_str = viewer_token
+                .as_ref()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty());
+
+            if let Some(token_value) = viewer_token_str {
+                match verify_viewer_token(self.viewer_tokens.as_ref(), Some(token_value), &session)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(ViewerAuthError::TokensDisabled) => {
+                        warn!(session_id = %session_id, "viewer token provided but verifier disabled");
+                        let _ = tx.send(ServerMessage::JoinError {
+                            reason: "viewer tokens unavailable".into(),
+                        });
+                        return Ok(());
+                    }
+                    Err(ViewerAuthError::TokenService) => {
+                        error!(session_id = %session_id, "viewer token verification failure");
+                        let _ = tx.send(ServerMessage::JoinError {
+                            reason: "viewer token verification failed".into(),
+                        });
+                        return Ok(());
+                    }
+                    Err(ViewerAuthError::TokenInvalid) => {
+                        let _ = tx.send(ServerMessage::JoinError {
+                            reason: "viewer credential invalid".into(),
+                        });
+                        return Ok(());
+                    }
+                }
+            }
+
+            if !session.passphrase_hash.is_empty() {
+                let passphrase_trimmed = passphrase
+                    .as_ref()
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty());
+                if let Some(passphrase_value) = passphrase_trimmed {
+                    if !verify_passphrase(passphrase_value, &session.passphrase_hash) {
+                        let _ = tx.send(ServerMessage::JoinError {
+                            reason: "Invalid passphrase".into(),
+                        });
+                        return Ok(());
+                    }
+                } else {
+                    let _ = tx.send(ServerMessage::JoinError {
+                        reason: "Passphrase required".into(),
+                    });
+                    return Ok(());
+                }
+            }
 
             // Determine role based on whether this is the first peer in the session
             // First peer is assumed to be the server

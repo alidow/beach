@@ -623,6 +623,40 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
+    #[test]
+    fn defaults_to_https_for_public_hosts() {
+        assert_eq!(infer_scheme("api.beach.sh"), "https://");
+        assert_eq!(infer_scheme("beach.sh/some/path"), "https://");
+        assert_eq!(infer_scheme("13.215.162.4"), "https://");
+    }
+
+    #[test]
+    fn defaults_to_http_for_local_hosts() {
+        for host in [
+            "localhost",
+            "localhost:4132",
+            "127.0.0.1",
+            "127.0.0.1:8080",
+            "0.0.0.0",
+            "10.0.0.5",
+            "192.168.1.10",
+            "172.16.0.1",
+            "172.31.255.255",
+            "[::1]",
+        ] {
+            assert_eq!(infer_scheme(host), "http://");
+        }
+    }
+
+    #[test]
+    fn session_config_infers_scheme() {
+        let https = SessionConfig::new("api.beach.sh").unwrap();
+        assert_eq!(https.base_url().as_str(), "https://api.beach.sh/");
+
+        let http = SessionConfig::new("localhost:8080").unwrap();
+        assert_eq!(http.base_url().as_str(), "http://localhost:8080/");
+    }
+
     #[derive(Clone)]
     struct MockSessionBackend {
         sessions: Arc<Mutex<HashMap<String, String>>>,

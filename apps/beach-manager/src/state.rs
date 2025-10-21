@@ -3538,6 +3538,9 @@ async fn viewer_connect_once(
     loop {
         let now = Instant::now();
         if now >= next_keepalive {
+            metrics::MANAGER_VIEWER_KEEPALIVE_SENT
+                .with_label_values(&[private_beach_id, session_id])
+                .inc();
             if let Err(err) = transport.send_text(VIEWER_KEEPALIVE_PAYLOAD) {
                 metrics::MANAGER_VIEWER_KEEPALIVE_FAILURES
                     .with_label_values(&[private_beach_id, session_id])
@@ -3553,6 +3556,11 @@ async fn viewer_connect_once(
         }
         match transport.recv(StdDuration::from_millis(500)) {
             Ok(message) => {
+                if idle_warned {
+                    metrics::MANAGER_VIEWER_IDLE_RECOVERIES
+                        .with_label_values(&[private_beach_id, session_id])
+                        .inc();
+                }
                 last_frame_at = Instant::now();
                 idle_warned = false;
                 match message.payload {

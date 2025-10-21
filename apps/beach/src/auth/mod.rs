@@ -122,9 +122,13 @@ mod tests {
 
     #[test]
     fn env_override_forces_auth() {
-        std::env::set_var("BEACH_MANAGER_REQUIRE_AUTH", "true");
+        unsafe {
+            std::env::set_var("BEACH_MANAGER_REQUIRE_AUTH", "true");
+        }
         assert!(manager_requires_access_token("https://api.beach.sh"));
-        std::env::remove_var("BEACH_MANAGER_REQUIRE_AUTH");
+        unsafe {
+            std::env::remove_var("BEACH_MANAGER_REQUIRE_AUTH");
+        }
     }
 }
 pub fn apply_profile_environment(

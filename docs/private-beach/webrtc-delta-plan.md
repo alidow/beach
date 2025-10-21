@@ -10,7 +10,7 @@
   - `useSessionTerminal` logs data-channel open/close events and signaling errors, making reconnect root-cause analysis possible from browser logs.
   - Cabana sessions short‑circuit to `CabanaPrivateBeachPlayer`, keeping media‑specific UX intact while terminals reuse Beach Surfer.
 - **Reconnect metrics**
-  - Prometheus counters `manager_viewer_keepalive_failures_total` and `manager_viewer_idle_warnings_total` expose failed pings and idle intervals per session, unlocking Grafana/Honeycomb alerting.
+  - Prometheus counters `manager_viewer_keepalive_sent_total`, `manager_viewer_keepalive_failures_total`, `manager_viewer_idle_warnings_total`, and `manager_viewer_idle_recoveries_total` expose ping cadence, failures, idle intervals, and recoveries per session, unlocking Grafana/Honeycomb alerting.
 - **Dashboard drawer parity**
   - Session drawers now poll `GET /sessions/:id/controller-events` with bearer auth (no SSE), reuse trimmed tokens, and render structured controller events alongside the terminal.
 

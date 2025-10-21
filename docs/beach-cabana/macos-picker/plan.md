@@ -129,7 +129,7 @@ Deliverables:
 - CLI now consumes the descriptor via `SelectionEvent.descriptor` for compatibility.
 
 **Follow-ups**
-- [ ] Align with Workstream B on ScreenCaptureDescriptor hydration (host fallback + tests).
+- [ ] Align with Workstream B on ScreenCaptureDescriptor consumption: confirm field contract, expose a `create_producer_from_descriptor` entry-point with CoreGraphics fallback, and wire descriptor passthrough for CLI relay + telemetry.
 - [ ] Replace stdout telemetry shim with production metrics pipeline hook once available.
 - [ ] Integrate Clerk auth + Beach Road/Private Beach APIs (Workstream C dependency).
 
@@ -152,11 +152,11 @@ Deliverables:
 - [ ] Add unit/integration tests for descriptor parsing; ensure mock mode works for CI.
 - [ ] Emit telemetry around capture start/fallback.
 
-**Progress – 2025-02-14**
-- ✅ `SelectionEvent` now carries a `ScreenCaptureDescriptor` (target id, serialized ScreenCaptureKit filter/config blobs, optional metadata) and Cabana desktop publishes it on selection.
-- ✅ `beach_cabana_host` decodes ScreenCaptureKit descriptors via `NSKeyedUnarchiver`; capture promotes SCK when hydration succeeds and logs `capture.backend` telemetry for both SCK and CoreGraphics backends.
-- ✅ Automatic CoreGraphics fallback engages when descriptor decoding/enumeration fails or filters are unavailable; CLI consumers wrap legacy ids through `ScreenCaptureDescriptor::legacy`.
-- ✅ Added identifier parsing coverage so `window:bundle:id` / `display:external:id` schemas function across SCK + CG paths; mock backend continues to work for CI.
+**Progress – 2025-11-04 (Workstream B sync)**
+- ✅ `create_producer_from_descriptor(&ScreenCaptureDescriptor)` is available; it hydrates ScreenCaptureKit when `filter_blob` is present and automatically falls back to CoreGraphics on empty blobs or hydration failure. Legacy `create_producer(target_id)` remains for older callers.
+- ✅ Selection relay persists full descriptors (`target_id`, `filter_blob`, `stream_config_blob`, `metadata_json`) and CLI consumers now receive identical payloads via `SelectionEvent`.
+- ✅ Capture telemetry now emits `capture.backend` labels (`screencapturekit` / `coregraphics`) with fallback reasons so Workstream A can correlate picker UX with runtime behavior.
+- ✅ No further schema changes expected; Workstream A can continue emitting base64 ScreenCaptureKit blobs plus optional metadata.
 
 **Exit criteria**
 - Host can stream using ScreenCaptureKit descriptor provided by desktop UI.

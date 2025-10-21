@@ -68,8 +68,8 @@ export default function SessionDrawer({ open, onOpenChange, session, managerUrl,
       try {
         const params: { since_ms?: number; limit?: number } = {};
         if (incremental && latestTimestampRef.current > 0) {
-          params.since_ms = latestTimestampRef.current;
-          params.limit = 50;
+          params.since_ms = latestTimestampRef.current + 1;
+          params.limit = 100;
         } else {
           params.limit = 200;
         }
@@ -104,6 +104,8 @@ export default function SessionDrawer({ open, onOpenChange, session, managerUrl,
     const timestamp = new Date(event.timestamp_ms).toLocaleString();
     const reason = event.reason ? event.reason : null;
     const controllerToken = event.controller_token ? redactToken(event.controller_token) : null;
+    const controllerAccount = event.controller_account_id ? `acct_${event.controller_account_id.slice(0, 8)}` : null;
+    const issuedBy = event.issued_by_account_id ? `acct_${event.issued_by_account_id.slice(0, 8)}` : null;
     return (
       <div key={event.id} className="space-y-2 rounded border border-border bg-muted/40 p-2">
         <div className="flex items-center justify-between">
@@ -114,6 +116,10 @@ export default function SessionDrawer({ open, onOpenChange, session, managerUrl,
         {controllerToken && (
           <div className="text-xs text-muted-foreground">Token: {controllerToken}</div>
         )}
+        {controllerAccount && (
+          <div className="text-xs text-muted-foreground">Controller: {controllerAccount}</div>
+        )}
+        {issuedBy && <div className="text-xs text-muted-foreground">Issued by: {issuedBy}</div>}
         <pre className="whitespace-pre-wrap break-words text-[11px] text-muted-foreground">
           {JSON.stringify(event, null, 2)}
         </pre>

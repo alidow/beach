@@ -131,8 +131,13 @@ pub async fn run_headless_validation(
     session_id: &str,
     passcode: &str,
     options: HeadlessOptions,
+    auth_token: Option<&str>,
 ) -> Result<ValidationReport, CliError> {
-    let manager = SessionManager::new(SessionConfig::new(base_url)?)?;
+    let mut config = SessionConfig::new(base_url)?;
+    if let Some(token) = auth_token {
+        config = config.with_bearer_token(Some(token.to_string()));
+    }
+    let manager = SessionManager::new(config)?;
     let joined = manager
         .join(session_id, passcode, Some("headless-validator"), false)
         .await?;

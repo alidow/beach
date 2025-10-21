@@ -21,7 +21,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, trace, warn};
-use transport_mod::webrtc::{OffererSupervisor, WebRtcChannels, WebRtcConnection, WebRtcRole};
+use transport_mod::webrtc::{
+    OffererSupervisor, SignalingClient, WebRtcChannels, WebRtcConnection, WebRtcRole,
+};
 use url::Url;
 use uuid::Uuid;
 
@@ -29,6 +31,7 @@ use uuid::Uuid;
 pub struct NegotiatedSingle {
     pub transport: Arc<dyn Transport>,
     pub webrtc_channels: Option<WebRtcChannels>,
+    pub signaling_client: Option<Arc<SignalingClient>>,
 }
 
 pub enum NegotiatedTransport {
@@ -169,6 +172,7 @@ pub async fn negotiate_transport(
                         return Ok(NegotiatedTransport::Single(NegotiatedSingle {
                             transport: connection.transport(),
                             webrtc_channels: Some(connection.channels()),
+                            signaling_client: connection.signaling_client(),
                         }));
                     }
                     Err(err) => {
@@ -196,6 +200,7 @@ pub async fn negotiate_transport(
                     return Ok(NegotiatedTransport::Single(NegotiatedSingle {
                         transport,
                         webrtc_channels: None,
+                        signaling_client: None,
                     }));
                 }
                 Err(err) => {
@@ -215,6 +220,7 @@ pub async fn negotiate_transport(
                     return Ok(NegotiatedTransport::Single(NegotiatedSingle {
                         transport,
                         webrtc_channels: None,
+                        signaling_client: None,
                     }));
                 }
                 Err(err) => {

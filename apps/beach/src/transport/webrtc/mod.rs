@@ -50,6 +50,7 @@ const MCP_CHANNEL_LABEL: &str = "mcp-jsonrpc";
 mod secure_handshake;
 mod secure_signaling;
 mod signaling;
+pub use signaling::{ManagerBridgeHint, SignalingClient};
 
 static OFFER_ENCRYPTION_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -89,7 +90,7 @@ use secure_signaling::{
     MessageLabel, SealedEnvelope, derive_handshake_key_from_session, derive_pre_shared_key,
     open_message, open_message_with_psk, seal_message, seal_message_with_psk, should_encrypt,
 };
-use signaling::{PeerRole, RemotePeerEvent, RemotePeerJoined, SignalingClient, WebRTCSignal};
+use signaling::{PeerRole, RemotePeerEvent, RemotePeerJoined, WebRTCSignal};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct IceCandidateBlob {
@@ -386,6 +387,7 @@ pub struct WebRtcConnection {
     transport: Arc<dyn Transport>,
     channels: WebRtcChannels,
     secure: Option<Arc<HandshakeResult>>,
+    signaling_client: Option<Arc<SignalingClient>>,
 }
 
 impl WebRtcConnection {
@@ -393,11 +395,13 @@ impl WebRtcConnection {
         transport: Arc<dyn Transport>,
         channels: WebRtcChannels,
         secure: Option<Arc<HandshakeResult>>,
+        signaling_client: Option<Arc<SignalingClient>>,
     ) -> Self {
         Self {
             transport,
             channels,
             secure,
+            signaling_client,
         }
     }
 
@@ -411,6 +415,10 @@ impl WebRtcConnection {
 
     pub fn secure(&self) -> Option<Arc<HandshakeResult>> {
         self.secure.clone()
+    }
+
+    pub fn signaling_client(&self) -> Option<Arc<SignalingClient>> {
+        self.signaling_client.clone()
     }
 }
 
@@ -2024,7 +2032,12 @@ async fn negotiate_offerer_peer(
         peer_id: peer_id,
         handshake_id,
         metadata: peer_metadata,
-        connection: WebRtcConnection::new(transport_dyn, channels, secure_context),
+        connection: WebRtcConnection::new(
+            transport_dyn,
+            channels,
+            secure_context,
+            Some(Arc::clone(&inner.signaling_client)),
+        ),
     }))
 }
 
@@ -3195,6 +3208,7 @@ async fn connect_answerer(
         transport_dyn,
         channels,
         secure_context,
+        Some(Arc::clone(&signaling_client)),
     ))
 }
 

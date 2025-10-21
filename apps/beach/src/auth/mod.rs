@@ -16,6 +16,7 @@ use crate::auth::gate::{
     access_token_expired,
 };
 use std::env;
+use url::Url;
 
 pub use config::AuthConfig as BeachAuthConfig;
 pub use credentials::{
@@ -36,6 +37,96 @@ pub fn save_store(store: &CredentialsStore) -> Result<(), AuthError> {
     store.save()
 }
 
+fn env_truthy(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+pub fn manager_requires_access_token(base_url: &str) -> bool {
+    if env_truthy("BEACH_MANAGER_REQUIRE_AUTH") {
+        return true;
+    }
+
+    if let Ok(url) = Url::parse(base_url) {
+        if let Some(host) = url.host_str() {
+            let host = host.to_ascii_lowercase();
+            if host.starts_with("private.")
+                || host.contains(".private.")
+                || host.contains("private-beach")
+                || host.contains("pb-manager")
+                || host.contains("beach-manager")
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+pub async fn maybe_access_token(
+    profile_override: Option<&str>,
+    refresh_if_needed: bool,
+) -> Result<Option<String>, AuthError> {
+    let profile_name = match active_profile_name(profile_override) {
+        Ok(name) => name,
+        Err(AuthError::NotLoggedIn) | Err(AuthError::ProfileNotFound(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+
+    let mut store = load_store()?;
+    let profile = match store.profile(&profile_name).cloned() {
+        Some(profile) => profile,
+        None => return Ok(None),
+    };
+
+    if let Some(cache) = profile.access_token.as_ref() {
+        if access_token_is_valid(cache) {
+            return Ok(Some(cache.token.clone()));
+        }
+        if !refresh_if_needed {
+            return Ok(None);
+        }
+    } else if !refresh_if_needed {
+        return Ok(None);
+    }
+
+    let config = AuthConfig::from_env()?;
+    let client = BeachGateClient::new(config.clone())?;
+    let refresh_token = profile.refresh_token()?;
+    let tokens = client.refresh_tokens(&refresh_token).await?;
+    persist_profile_update(&profile_name, &tokens, &mut store, client.config())?;
+    let entry = store
+        .profile(&profile_name)
+        .and_then(|profile| profile.access_token.as_ref())
+        .ok_or_else(|| AuthError::Other("failed to cache refreshed access token".into()))?;
+    Ok(Some(entry.token.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_private_hosts() {
+        assert!(manager_requires_access_token("https://private.example.com"));
+        assert!(manager_requires_access_token("https://pb-manager.test"));
+        assert!(!manager_requires_access_token("https://api.beach.sh"));
+    }
+
+    #[test]
+    fn env_override_forces_auth() {
+        std::env::set_var("BEACH_MANAGER_REQUIRE_AUTH", "true");
+        assert!(manager_requires_access_token("https://api.beach.sh"));
+        std::env::remove_var("BEACH_MANAGER_REQUIRE_AUTH");
+    }
+}
 pub fn apply_profile_environment(
     profile_override: Option<&str>,
 ) -> Result<Option<String>, AuthError> {

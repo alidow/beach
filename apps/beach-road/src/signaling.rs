@@ -167,6 +167,12 @@ pub enum ServerMessage {
     Error { message: String },
     /// Debug response with terminal state
     Debug { response: DebugResponse },
+    /// Hint instructing the harness to connect to the manager
+    ManagerBridgeHint {
+        manager_url: String,
+        bridge_token: String,
+        private_beach_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

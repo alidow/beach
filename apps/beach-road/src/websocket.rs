@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
-use crate::handlers::SharedStorage;
+use crate::handlers::{JoinManagerRequest, SharedStorage};
 use crate::signaling::{
     generate_peer_id, ClientMessage, PeerInfo, PeerRole, ServerMessage, TransportType,
 };
@@ -41,6 +41,8 @@ pub struct SignalingState {
     sessions: Arc<DashMap<String, DashMap<String, PeerConnection>>>,
     /// Storage for session validation
     storage: SharedStorage,
+    /// Pending manager join hints for sessions whose harness is offline
+    pending_manager_hints: Arc<DashMap<String, Vec<JoinManagerRequest>>>,
 }
 
 impl SignalingState {
@@ -48,6 +50,7 @@ impl SignalingState {
         let state = Self {
             sessions: Arc::new(DashMap::new()),
             storage,
+            pending_manager_hints: Arc::new(DashMap::new()),
         };
 
         // Start heartbeat monitor task
@@ -121,11 +124,40 @@ impl SignalingState {
 
     /// Add a peer to a session
     fn add_peer(&self, session_id: String, peer: PeerConnection) {
+        let is_server = matches!(peer.role, PeerRole::Server);
+        let tx = peer.tx.clone();
         let peers = self
             .sessions
             .entry(session_id.clone())
             .or_insert_with(|| DashMap::new());
         peers.insert(peer.peer_id.clone(), peer);
+
+        if is_server {
+            if let Some((_, pending)) = self.pending_manager_hints.remove(&session_id) {
+                for hint in pending {
+                    let message = ServerMessage::ManagerBridgeHint {
+                        manager_url: hint.manager_url.clone(),
+                        bridge_token: hint.bridge_token.clone(),
+                        private_beach_id: hint.private_beach_id.clone(),
+                    };
+                    if tx.send(message).is_err() {
+                        warn!(
+                            session_id = %session_id,
+                            "failed to deliver queued join-manager hint to harness"
+                        );
+                        self.pending_manager_hints
+                            .entry(session_id.clone())
+                            .or_insert_with(Vec::new)
+                            .push(hint);
+                    } else {
+                        info!(
+                            session_id = %session_id,
+                            "delivered queued join-manager hint to harness"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Remove a peer from a session
@@ -231,6 +263,64 @@ impl SignalingState {
             }
         }
         Ok(())
+    }
+
+    pub fn notify_join_manager(
+        &self,
+        session_id: &str,
+        manager_url: String,
+        bridge_token: String,
+        private_beach_id: String,
+    ) -> usize {
+        let mut delivered = 0usize;
+        if let Some(peers) = self.sessions.get(session_id) {
+            for peer in peers.iter() {
+                if matches!(peer.role, PeerRole::Server) {
+                    let message = ServerMessage::ManagerBridgeHint {
+                        manager_url: manager_url.clone(),
+                        bridge_token: bridge_token.clone(),
+                        private_beach_id: private_beach_id.clone(),
+                    };
+                    match peer.tx.send(message) {
+                        Ok(_) => delivered += 1,
+                        Err(err) => {
+                            warn!(
+                                "failed to deliver join-manager hint to peer {}: {}",
+                                peer.peer_id, err
+                            );
+                            self.pending_manager_hints
+                                .entry(session_id.to_string())
+                                .or_insert_with(Vec::new)
+                                .push(JoinManagerRequest {
+                                    manager_url: manager_url.clone(),
+                                    bridge_token: bridge_token.clone(),
+                                    private_beach_id: private_beach_id.clone(),
+                                });
+                        }
+                    }
+                }
+            }
+        } else {
+            warn!(
+                "session {} not found while delivering join-manager hint",
+                session_id
+            );
+        }
+        if delivered == 0 {
+            self.pending_manager_hints
+                .entry(session_id.to_string())
+                .or_insert_with(Vec::new)
+                .push(JoinManagerRequest {
+                    manager_url,
+                    bridge_token,
+                    private_beach_id,
+                });
+            info!(
+                session_id = %session_id,
+                "queued join-manager hint until harness reconnects"
+            );
+        }
+        delivered
     }
 }
 

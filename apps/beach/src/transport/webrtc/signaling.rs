@@ -115,6 +115,13 @@ pub enum RemotePeerEvent {
     Left(RemotePeerLeft),
 }
 
+#[derive(Debug, Clone)]
+pub struct ManagerBridgeHint {
+    pub manager_url: String,
+    pub bridge_token: String,
+    pub private_beach_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
@@ -161,6 +168,11 @@ pub enum ServerMessage {
     Error {
         message: String,
     },
+    ManagerBridgeHint {
+        manager_url: String,
+        bridge_token: String,
+        private_beach_id: String,
+    },
 }
 
 pub struct SignalingClient {
@@ -177,6 +189,8 @@ pub struct SignalingClient {
     peer_channels: RwLock<HashMap<String, PeerChannelEntry>>,
     remote_events_tx: mpsc::UnboundedSender<RemotePeerEvent>,
     remote_events_rx: AsyncMutex<Option<mpsc::UnboundedReceiver<RemotePeerEvent>>>,
+    manager_hint_tx: mpsc::UnboundedSender<ManagerBridgeHint>,
+    manager_hint_rx: AsyncMutex<Option<mpsc::UnboundedReceiver<ManagerBridgeHint>>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     passphrase: Option<String>,
 }
@@ -209,6 +223,7 @@ impl SignalingClient {
         let (send_tx, mut send_rx) = mpsc::unbounded_channel::<ClientMessage>();
         let (signal_tx, signal_rx) = mpsc::unbounded_channel::<WebRTCSignal>();
         let (remote_events_tx, remote_events_rx) = mpsc::unbounded_channel::<RemotePeerEvent>();
+        let (manager_hint_tx, manager_hint_rx) = mpsc::unbounded_channel::<ManagerBridgeHint>();
         let passphrase_owned = passphrase.map(|s| s.to_string());
 
         let client = Arc::new(SignalingClient {
@@ -225,6 +240,8 @@ impl SignalingClient {
             peer_channels: RwLock::new(HashMap::new()),
             remote_events_tx,
             remote_events_rx: AsyncMutex::new(Some(remote_events_rx)),
+            manager_hint_tx,
+            manager_hint_rx: AsyncMutex::new(Some(manager_hint_rx)),
             tasks: Mutex::new(Vec::new()),
             passphrase: passphrase_owned.clone(),
         });
@@ -368,6 +385,15 @@ impl SignalingClient {
         guard
             .take()
             .ok_or_else(|| TransportError::Setup("remote event stream already taken".into()))
+    }
+
+    pub async fn manager_hints(
+        &self,
+    ) -> Result<mpsc::UnboundedReceiver<ManagerBridgeHint>, TransportError> {
+        let mut guard = self.manager_hint_rx.lock().await;
+        guard
+            .take()
+            .ok_or_else(|| TransportError::Setup("manager hint stream already taken".into()))
     }
 
     pub fn peer_id(&self) -> &str {
@@ -806,6 +832,25 @@ async fn handle_server_message(
                         "global signaling channel closed"
                     );
                 }
+            }
+        }
+        ServerMessage::ManagerBridgeHint {
+            manager_url,
+            bridge_token,
+            private_beach_id,
+        } => {
+            tracing::info!(
+                target = "webrtc",
+                session_manager_url = %manager_url,
+                "received manager bridge hint"
+            );
+            let hint = ManagerBridgeHint {
+                manager_url,
+                bridge_token,
+                private_beach_id,
+            };
+            if client.manager_hint_tx.send(hint).is_err() {
+                tracing::debug!(target = "webrtc", "manager hint receiver dropped");
             }
         }
         _ => {}

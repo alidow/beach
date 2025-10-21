@@ -25,6 +25,17 @@ const COLS = 12;
 const DEFAULT_W = 4;
 const DEFAULT_H = 6;
 type LayoutCache = Record<string, Layout>;
+type ResizeHandleAxis = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
+const RESIZE_HANDLE_LABELS: Record<ResizeHandleAxis, string> = {
+  n: 'Resize top edge',
+  s: 'Resize bottom edge',
+  e: 'Resize right edge',
+  w: 'Resize left edge',
+  ne: 'Resize top-right corner',
+  nw: 'Resize top-left corner',
+  se: 'Resize bottom-right corner',
+  sw: 'Resize bottom-left corner',
+};
 
 function ensureLayout(cache: LayoutCache, tiles: SessionSummary[], preset: Props['preset']): Layout[] {
   const items: Layout[] = [];
@@ -167,20 +178,17 @@ export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUr
     await refresh();
   };
 
-  const renderResizeHandle = useCallback(
-    (axis: string) => {
-      const label =
-        axis === 'se'
-          ? 'Resize'
-          : axis === 'e'
-            ? 'Resize width'
-            : axis === 's'
-              ? 'Resize height'
-              : 'Resize';
-      return <span className="react-resizable-handle" aria-label={label} />;
-    },
-    [],
-  );
+  const renderResizeHandle = useCallback((axis: string) => {
+    const key = axis as ResizeHandleAxis;
+    const label = RESIZE_HANDLE_LABELS[key] ?? 'Resize';
+    return (
+      <span
+        className={`react-resizable-handle grid-resize-handle grid-resize-handle-${axis}`}
+        aria-label={label}
+        data-axis={axis}
+      />
+    );
+  }, []);
 
   if (!isClient) {
     return <div className="h-[520px] rounded-xl border border-border bg-card shadow-sm" />;
@@ -199,6 +207,7 @@ export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUr
         draggableHandle=".session-tile-drag-grip"
         draggableCancel=".session-tile-actions"
         resizeHandle={renderResizeHandle}
+        resizeHandles={['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw']}
         onLayoutChange={handleLayoutChange}
       >
         {tiles.map((s) => {

@@ -112,6 +112,9 @@ pub enum Command {
     /// Manage Beach Auth credentials and profiles
     #[command(subcommand)]
     Auth(AuthCommand),
+    /// Start a device login (alias for `beach auth login`)
+    #[command(name = "login")]
+    Login(AuthLoginArgs),
 }
 
 #[derive(Subcommand, Debug)]

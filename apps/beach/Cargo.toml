@@ -22,6 +22,7 @@ rand = "0.8"
 uuid = { version = "1", features = ["v4"] }
 serde_json = "1"
 async-trait = "0.1"
+dotenvy = "0.15"
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 portable-pty = "0.8"
@@ -43,6 +44,7 @@ hmac = "0.12"
 snow = "0.9"
 beach-lifeguard-client = { path = "../beach-lifeguard/client" }
 beach-lifeguard-core = { path = "../beach-lifeguard/core" }
+beach-buggy = { path = "../../crates/beach-buggy" }
 time = { version = "0.3", features = ["serde"] }
 hex = "0.4"
 directories = "5"

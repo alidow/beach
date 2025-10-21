@@ -1,5 +1,8 @@
 # CLI Authentication Integration Plan
 
+## Status
+- ✅ Implemented (device login alias, env loading, private bearer propagation, and docker-compose mock service)
+
 ## TL;DR
 - Preserve frictionless public-mode usage (`beach host|join`) with zero prerequisite login.
 - Introduce an optional `beach login` (or `beach auth login`) flow backed by Clerk/Beach Gate device authorization, mirroring the Private Beach web stack.
@@ -49,6 +52,7 @@
 - Expected env vars:
   - `BEACH_AUTH_GATEWAY` (default `https://auth.beach.sh`)
   - `BEACH_AUTH_SCOPE`, `BEACH_AUTH_AUDIENCE` (optional)
+  - `BEACH_MANAGER_REQUIRE_AUTH=1` to force bearer tokens for custom/local hosts.
   - Clerk/Beach Gate mock helpers for local dev: `CLERK_MOCK=1`, `BEACH_GATE_PORT`, etc.
 - Add sample `.env.cli` (document-only) illustrating local values.
 - Update docs to highlight precedence (`--profile` > `BEACH_PROFILE` > stored current profile).
@@ -111,4 +115,3 @@
 - `apps/private-beach/.env.local` – example Clerk keys for Surfer.
 - `docs/private-beach/STATUS.md` – environment expectations for private stack.
 - `docs/beach-transport-evolution-phases.md` – Phase 7 private mode roadmap. 
-

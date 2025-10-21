@@ -75,6 +75,22 @@ services:
       - "4132:4132"
     networks:
       - beach-network
+  beach-gate:
+    image: node:20
+    container_name: beach-gate
+    working_dir: /app/apps/beach-gate
+    command: sh -c "npm ci || npm install; npm run dev"
+    environment:
+      CLERK_MOCK: "1"
+      BEACH_GATE_PORT: 4133
+      BEACH_GATE_TOKEN_ISSUER: beach-gate
+      BEACH_GATE_SERVICE_AUDIENCE: beach-services
+    volumes:
+      - .:/app
+    ports:
+      - "4133:4133"
+    networks:
+      - beach-network
   private-beach:
     image: node:20
     container_name: private-beach

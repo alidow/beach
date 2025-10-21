@@ -1,4 +1,5 @@
 use super::{ClientError, TerminalClient};
+use crate::auth;
 use crate::mcp::client_proxy::spawn_client_proxy;
 use crate::mcp::default_socket_path as mcp_default_socket_path;
 use crate::protocol::terminal::bootstrap;
@@ -20,13 +21,18 @@ use tracing::{debug, info, warn};
 use url::Url;
 use uuid::Uuid;
 
-pub async fn run(base_url: &str, args: JoinArgs) -> Result<(), CliError> {
-    run_with_notify(base_url, args, None).await
+pub async fn run(
+    base_url: &str,
+    args: JoinArgs,
+    profile_override: Option<String>,
+) -> Result<(), CliError> {
+    run_with_notify(base_url, args, profile_override, None).await
 }
 
 pub async fn run_with_notify(
     base_url: &str,
     args: JoinArgs,
+    profile_override: Option<String>,
     connected_notify: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), CliError> {
     let JoinArgs {
@@ -42,7 +48,22 @@ pub async fn run_with_notify(
     let (session_id, inferred_base) = interpret_session_target(&target)?;
     let base = inferred_base.unwrap_or_else(|| base_url.to_string());
 
-    let manager = SessionManager::new(SessionConfig::new(&base)?)?;
+    let requires_token = auth::manager_requires_access_token(&base);
+    let access_token = auth::maybe_access_token(profile_override.as_deref(), requires_token)
+        .await
+        .map_err(|err| CliError::Auth(err.to_string()))?;
+    if requires_token && access_token.is_none() {
+        return Err(CliError::Auth(
+            "This private beach requires authentication. Run `beach login` and try again.".into(),
+        ));
+    }
+
+    let mut config = SessionConfig::new(&base)?;
+    if let Some(token) = access_token.clone() {
+        config = config.with_bearer_token(Some(token));
+    }
+
+    let manager = SessionManager::new(config)?;
     let passcode = match passcode {
         Some(code) => code,
         None => prompt_passcode()?,
@@ -79,8 +100,14 @@ pub async fn run_with_notify(
             timeout: Duration::from_secs(timeout_secs),
             require_snapshot: true,
         };
-        let report =
-            run_headless_validation(&base, &session_id, trimmed_pass.as_str(), options).await?;
+        let report = run_headless_validation(
+            &base,
+            &session_id,
+            trimmed_pass.as_str(),
+            options,
+            access_token.as_deref(),
+        )
+        .await?;
         log_headless_report(&report);
         println!("✅ Session snapshot received ({report})");
         return Ok(());
@@ -97,6 +124,7 @@ pub async fn run_with_notify(
         NegotiatedTransport::Single(NegotiatedSingle {
             transport,
             webrtc_channels,
+            ..
         }) => (transport, webrtc_channels),
         NegotiatedTransport::WebRtcOfferer { .. } => {
             return Err(CliError::TransportNegotiation(

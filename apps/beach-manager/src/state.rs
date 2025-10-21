@@ -22,7 +22,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{types::Json, FromRow, PgPool, Row};
 use tokio::sync::{broadcast, RwLock};
-use tracing::info;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 const DEFAULT_LEASE_TTL_MS: u64 = 30_000;
@@ -368,7 +368,9 @@ impl AppState {
                     .mint_bridge_token(private_beach_id, origin_session_id, requester)
                     .await
                 {
-                    let _ = self.nudge_join_manager(origin_session_id, &token).await;
+                    let _ = self
+                        .nudge_join_manager(private_beach_id, origin_session_id, &token)
+                        .await;
                 }
                 Ok(SessionSummary::from_record(rec))
             }
@@ -437,7 +439,9 @@ impl AppState {
                         bridge_token_preview = %token_preview,
                         "minted bridge token and nudging harness"
                     );
-                    let _ = self.nudge_join_manager(origin_session_id, &token).await;
+                    let _ = self
+                        .nudge_join_manager(private_beach_id, origin_session_id, &token)
+                        .await;
                 }
 
                 // Return summary (best-effort from DB fields)
@@ -527,7 +531,9 @@ impl AppState {
                             bridge_token_preview = %token_preview,
                             "minted bridge token for owned session and nudging harness"
                         );
-                        let _ = self.nudge_join_manager(&sid, &token).await;
+                        let _ = self
+                            .nudge_join_manager(private_beach_id, &sid, &token)
+                            .await;
                     }
                 }
                 Ok((attached, duplicates))
@@ -571,6 +577,7 @@ impl AppState {
 
     async fn nudge_join_manager(
         &self,
+        private_beach_id: &str,
         origin_session_id: &str,
         bridge_token: &str,
     ) -> Result<(), ()> {
@@ -579,7 +586,11 @@ impl AppState {
             self.road_base_url.trim_end_matches('/'),
             origin_session_id
         );
-        let body = serde_json::json!({ "manager_url": self.public_manager_url, "bridge_token": bridge_token });
+        let body = serde_json::json!({
+            "manager_url": self.public_manager_url,
+            "bridge_token": bridge_token,
+            "private_beach_id": private_beach_id,
+        });
         let resp = self
             .http
             .post(url)
@@ -588,8 +599,22 @@ impl AppState {
             .await
             .map_err(|_| ())?;
         if resp.status().is_success() {
+            let preview = bridge_token.get(..8).unwrap_or(bridge_token);
+            info!(
+                private_beach_id = %private_beach_id,
+                origin_session_id = %origin_session_id,
+                manager_url = %self.public_manager_url,
+                bridge_token_preview = %preview,
+                "nudged beach-road to join manager"
+            );
             Ok(())
         } else {
+            warn!(
+                private_beach_id = %private_beach_id,
+                origin_session_id = %origin_session_id,
+                status = %resp.status(),
+                "join-manager nudge failed"
+            );
             Err(())
         }
     }

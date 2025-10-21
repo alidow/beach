@@ -1,5 +1,6 @@
 pub mod validate;
 
+use crate::auth;
 use crate::client::terminal::join;
 use crate::protocol::terminal::bootstrap::{self, BootstrapHandshake};
 use crate::terminal::cli::{JoinArgs, SshArgs};
@@ -12,7 +13,11 @@ use tracing::{debug, info, warn};
 use url::Url;
 use validate::{HeadlessOptions, log_report, run_headless_validation};
 
-pub async fn run(base_url: &str, args: SshArgs) -> Result<(), CliError> {
+pub async fn run(
+    base_url: &str,
+    args: SshArgs,
+    profile_override: Option<String>,
+) -> Result<(), CliError> {
     bootstrap::copy_binary_to_remote(&args).await?;
 
     let remote_args = bootstrap::remote_bootstrap_args(&args, base_url);
@@ -115,6 +120,17 @@ pub async fn run(base_url: &str, args: SshArgs) -> Result<(), CliError> {
         debug!(lines = ?captured_stdout, "ssh stdout before handshake");
     }
 
+    let requires_token = auth::manager_requires_access_token(&handshake.session_server);
+    let access_token = auth::maybe_access_token(profile_override.as_deref(), requires_token)
+        .await
+        .map_err(|err| CliError::Auth(err.to_string()))?;
+    if requires_token && access_token.is_none() {
+        terminate_child(&mut child, "private session requires login").await;
+        return Err(CliError::Auth(
+            "This private beach requires authentication. Run `beach login` and try again.".into(),
+        ));
+    }
+
     // Start draining SSH stdout/stderr to avoid backpressure. If --keep-ssh is set, log lines at info.
     let log_streams = args.keep_ssh;
     let stdout_task = Some(tokio::spawn(forward_child_lines(
@@ -157,6 +173,7 @@ pub async fn run(base_url: &str, args: SshArgs) -> Result<(), CliError> {
             &handshake.session_id,
             &handshake.join_code,
             options,
+            access_token.as_deref(),
         )
         .await;
 
@@ -207,9 +224,16 @@ pub async fn run(base_url: &str, args: SshArgs) -> Result<(), CliError> {
     use tokio::sync::oneshot;
     let (connected_tx, connected_rx) = oneshot::channel::<()>();
     let session_server_owned = handshake.session_server.clone();
+    let profile_for_join = profile_override.clone();
     // Wait until we connect or the join task finishes early (error/exit), then close SSH.
     let join_task = tokio::spawn(async move {
-        join::run_with_notify(&session_server_owned, join_args, Some(connected_tx)).await
+        join::run_with_notify(
+            &session_server_owned,
+            join_args,
+            profile_for_join,
+            Some(connected_tx),
+        )
+        .await
     });
 
     let _ = connected_rx.await; // Either Ok(()) on connect or Err if join ended early

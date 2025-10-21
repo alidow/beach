@@ -9,7 +9,7 @@ mod websocket;
 
 use axum::{
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tower_http::cors::CorsLayer;
@@ -143,7 +143,8 @@ async fn main() {
             "/sessions/:id/webrtc/answer",
             get(get_webrtc_answer).post(post_webrtc_answer),
         )
-        .with_state(shared_storage);
+        .with_state(shared_storage.clone())
+        .layer(Extension(signaling_state.clone()));
 
     let fallback_routes = Router::new()
         .route("/fallback/token", post(issue_fallback_token))

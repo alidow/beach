@@ -7,23 +7,88 @@
   border: 1px solid rgba(59, 130, 246, 0.5);
 }
 
-.react-resizable-handle {
+.react-grid-item > .grid-resize-handle {
   position: absolute;
-  width: 14px;
-  height: 14px;
-  bottom: 10px;
-  right: 10px;
-  border-radius: 50%;
-  background: rgba(15, 23, 42, 0.7);
-  border: 2px solid rgba(255, 255, 255, 0.9);
-  cursor: se-resize;
-  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.2);
+  z-index: 30;
+  display: block;
+  pointer-events: auto;
+  background: transparent;
+  touch-action: none;
 }
 
-.react-resizable-handle::after {
+.react-grid-item > .grid-resize-handle::after {
   content: '';
   position: absolute;
-  inset: 3px;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.8);
+  inset: 0;
+  background: transparent;
+  transition: background 120ms ease;
+}
+
+.react-grid-item > .grid-resize-handle:hover::after,
+.react-grid-item > .grid-resize-handle:focus-visible::after {
+  background: rgba(59, 130, 246, 0.08);
+}
+
+.react-grid-item > .grid-resize-handle.grid-resize-handle-n,
+.react-grid-item > .grid-resize-handle.grid-resize-handle-s {
+  left: 6px;
+  right: 6px;
+  height: 8px;
+  cursor: ns-resize;
+}
+
+.react-grid-item > .grid-resize-handle.grid-resize-handle-n {
+  top: -4px;
+}
+
+.react-grid-item > .grid-resize-handle.grid-resize-handle-s {
+  bottom: -4px;
+}
+
+.react-grid-item > .grid-resize-handle.grid-resize-handle-e,
+.react-grid-item > .grid-resize-handle.grid-resize-handle-w {
+  top: 6px;
+  bottom: 6px;
+  width: 8px;
+  cursor: ew-resize;
+}
+
+.react-grid-item > .grid-resize-handle.grid-resize-handle-e {
+  right: -4px;
+}
+
+.react-grid-item > .grid-resize-handle.grid-resize-handle-w {
+  left: -4px;
+}
+
+.react-grid-item > .grid-resize-handle.grid-resize-handle-ne,
+.react-grid-item > .grid-resize-handle.grid-resize-handle-nw,
+.react-grid-item > .grid-resize-handle.grid-resize-handle-se,
+.react-grid-item > .grid-resize-handle.grid-resize-handle-sw {
+  width: 12px;
+  height: 12px;
+}
+
+.react-grid-item > .grid-resize-handle.grid-resize-handle-ne {
+  top: -4px;
+  right: -4px;
+  cursor: nesw-resize;
+}
+
+.react-grid-item > .grid-resize-handle.grid-resize-handle-nw {
+  top: -4px;
+  left: -4px;
+  cursor: nwse-resize;
+}
+
+.react-grid-item > .grid-resize-handle.grid-resize-handle-se {
+  bottom: -4px;
+  right: -4px;
+  cursor: nwse-resize;
+}
+
+.react-grid-item > .grid-resize-handle.grid-resize-handle-sw {
+  bottom: -4px;
+  left: -4px;
+  cursor: nesw-resize;
 }

@@ -30,6 +30,7 @@ This document captures what’s built, how to run it locally, what’s left, and
   - `REDIS_URL=redis://localhost:6379`
   - Clerk auth (Manager): `BEACH_GATE_JWKS_URL=<clerk-jwks>`, `BEACH_GATE_ISSUER=<clerk-issuer>`, `BEACH_GATE_AUDIENCE=<audience>`; set `AUTH_BYPASS=1` only for dev overrides.
   - Clerk auth (Surfer): `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, optionally `NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE`.
+  - CLI auth: `CLERK_MOCK=1 beach login` (or `cargo run -p beach login`) seeds a local profile for private beaches; `BEACH_MANAGER_REQUIRE_AUTH=1` forces bearer tokens when working against custom hosts like `localhost`.
 
 2) Manager
 - `cargo run -p beach-manager`

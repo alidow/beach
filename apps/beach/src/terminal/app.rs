@@ -2,7 +2,7 @@ use crate::auth;
 use crate::client::terminal::{debug, join};
 use crate::server::terminal::host;
 use crate::terminal::auth as auth_cli;
-use crate::terminal::cli::{self, Command, HostArgs};
+use crate::terminal::cli::{self, AuthCommand, Command, HostArgs};
 use crate::terminal::error::CliError;
 use crate::transport::ssh;
 use std::env;
@@ -17,14 +17,17 @@ pub async fn run(cli: cli::Cli) -> Result<(), CliError> {
     apply_fallback_overrides(&cli.fallback);
 
     match cli.command {
-        Some(Command::Join(args)) => join::run(&session_base, args).await,
-        Some(Command::Ssh(args)) => ssh::run(&session_base, args).await,
+        Some(Command::Join(args)) => join::run(&session_base, args, cli.profile.clone()).await,
+        Some(Command::Ssh(args)) => ssh::run(&session_base, args, cli.profile.clone()).await,
         Some(Command::Host(args)) => host::run(&session_base, args).await,
         Some(Command::Debug(args)) => {
             debug::run(args)?;
             Ok(())
         }
         Some(Command::Auth(args)) => auth_cli::run(args, cli.profile.clone()).await,
+        Some(Command::Login(args)) => {
+            auth_cli::run(AuthCommand::Login(args), cli.profile.clone()).await
+        }
         None => host::run(&session_base, HostArgs::default()).await,
     }
 }

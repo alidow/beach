@@ -14,6 +14,7 @@ use uuid::Uuid;
 #[derive(Clone, Debug)]
 pub struct SessionConfig {
     base_url: Url,
+    bearer_token: Option<String>,
 }
 
 impl SessionConfig {
@@ -30,11 +31,27 @@ impl SessionConfig {
         let parsed = Url::parse(&base).map_err(|err| {
             SessionError::InvalidConfig(format!("invalid session server url: {err}"))
         })?;
-        Ok(Self { base_url: parsed })
+        Ok(Self {
+            base_url: parsed,
+            bearer_token: None,
+        })
     }
 
     pub fn base_url(&self) -> &Url {
         &self.base_url
+    }
+
+    pub fn with_bearer_token(mut self, token: Option<String>) -> Self {
+        self.bearer_token = token;
+        self
+    }
+
+    pub fn set_bearer_token(&mut self, token: Option<String>) {
+        self.bearer_token = token;
+    }
+
+    pub fn bearer_token(&self) -> Option<&str> {
+        self.bearer_token.as_deref()
     }
 }
 
@@ -74,7 +91,7 @@ impl SessionManager {
 
         let response = self
             .backend
-            .register_session(self.config.base_url(), &request)
+            .register_session(self.config.base_url(), self.config.bearer_token(), &request)
             .await?;
 
         let RegisterSessionResponse {
@@ -142,7 +159,12 @@ impl SessionManager {
 
         let response = self
             .backend
-            .join_session(self.config.base_url(), session_id, &request)
+            .join_session(
+                self.config.base_url(),
+                self.config.bearer_token(),
+                session_id,
+                &request,
+            )
             .await?;
 
         let JoinSessionResponse {
@@ -340,12 +362,14 @@ trait SessionBackend: Send + Sync {
     async fn register_session(
         &self,
         base_url: &Url,
+        auth_token: Option<&str>,
         request: &RegisterSessionRequest,
     ) -> Result<RegisterSessionResponse, SessionError>;
 
     async fn join_session(
         &self,
         base_url: &Url,
+        auth_token: Option<&str>,
         session_id: &str,
         request: &JoinSessionRequest,
     ) -> Result<JoinSessionResponse, SessionError>;
@@ -371,12 +395,17 @@ impl SessionBackend for ReqwestSessionBackend {
     async fn register_session(
         &self,
         base_url: &Url,
+        auth_token: Option<&str>,
         request: &RegisterSessionRequest,
     ) -> Result<RegisterSessionResponse, SessionError> {
         let endpoint = base_url.join("sessions").map_err(|err| {
             SessionError::InvalidConfig(format!("invalid sessions endpoint: {err}"))
         })?;
-        let response = self.client.post(endpoint).json(request).send().await?;
+        let mut builder = self.client.post(endpoint);
+        if let Some(token) = auth_token {
+            builder = builder.bearer_auth(token);
+        }
+        let response = builder.json(request).send().await?;
         if !response.status().is_success() {
             return Err(SessionError::HttpStatus(response.status()));
         }
@@ -387,6 +416,7 @@ impl SessionBackend for ReqwestSessionBackend {
     async fn join_session(
         &self,
         base_url: &Url,
+        auth_token: Option<&str>,
         session_id: &str,
         request: &JoinSessionRequest,
     ) -> Result<JoinSessionResponse, SessionError> {
@@ -397,7 +427,11 @@ impl SessionBackend for ReqwestSessionBackend {
                     "invalid join endpoint for session {session_id}: {err}"
                 ))
             })?;
-        let response = self.client.post(endpoint).json(request).send().await?;
+        let mut builder = self.client.post(endpoint);
+        if let Some(token) = auth_token {
+            builder = builder.bearer_auth(token);
+        }
+        let response = builder.json(request).send().await?;
         if !response.status().is_success() {
             return Err(SessionError::HttpStatus(response.status()));
         }
@@ -562,13 +596,19 @@ mod tests {
     #[derive(Clone)]
     struct MockSessionBackend {
         sessions: Arc<Mutex<HashMap<String, String>>>,
+        last_token: Arc<Mutex<Option<String>>>,
     }
 
     impl MockSessionBackend {
         fn new() -> Self {
             Self {
                 sessions: Arc::new(Mutex::new(HashMap::new())),
+                last_token: Arc::new(Mutex::new(None)),
             }
+        }
+
+        async fn last_token(&self) -> Option<String> {
+            self.last_token.lock().await.clone()
         }
     }
 
@@ -577,6 +617,7 @@ mod tests {
         async fn register_session(
             &self,
             _base_url: &Url,
+            auth_token: Option<&str>,
             request: &RegisterSessionRequest,
         ) -> Result<RegisterSessionResponse, SessionError> {
             let mut sessions = self.sessions.lock().await;
@@ -597,6 +638,11 @@ mod tests {
 
             let code = "654321".to_string();
             sessions.insert(request.session_id.clone(), code.clone());
+
+            {
+                let mut slot = self.last_token.lock().await;
+                *slot = auth_token.map(|token| token.to_string());
+            }
 
             Ok(RegisterSessionResponse {
                 success: true,
@@ -619,30 +665,37 @@ mod tests {
         async fn join_session(
             &self,
             _base_url: &Url,
+            auth_token: Option<&str>,
             session_id: &str,
             request: &JoinSessionRequest,
         ) -> Result<JoinSessionResponse, SessionError> {
             let sessions = self.sessions.lock().await;
             match sessions.get(session_id) {
-                Some(expected) if *expected == request.passphrase => Ok(JoinSessionResponse {
-                    success: true,
-                    message: None,
-                    session_url: Some(format!("http://mock/{session_id}")),
-                    transports: vec![
-                        AdvertisedTransport {
-                            kind: AdvertisedTransportKind::WebRtc,
-                            url: None,
-                            metadata: Some(json!({ "type": "offer", "sdp": "mock" })),
-                        },
-                        AdvertisedTransport {
-                            kind: AdvertisedTransportKind::WebSocket,
-                            url: Some("ws://mock/relay".into()),
-                            metadata: None,
-                        },
-                    ],
-                    webrtc_offer: Some(json!({ "type": "offer", "sdp": "mock" })),
-                    websocket_url: None,
-                }),
+                Some(expected) if *expected == request.passphrase => {
+                    {
+                        let mut slot = self.last_token.lock().await;
+                        *slot = auth_token.map(|token| token.to_string());
+                    }
+                    Ok(JoinSessionResponse {
+                        success: true,
+                        message: None,
+                        session_url: Some(format!("http://mock/{session_id}")),
+                        transports: vec![
+                            AdvertisedTransport {
+                                kind: AdvertisedTransportKind::WebRtc,
+                                url: None,
+                                metadata: Some(json!({ "type": "offer", "sdp": "mock" })),
+                            },
+                            AdvertisedTransport {
+                                kind: AdvertisedTransportKind::WebSocket,
+                                url: Some("ws://mock/relay".into()),
+                                metadata: None,
+                            },
+                        ],
+                        webrtc_offer: Some(json!({ "type": "offer", "sdp": "mock" })),
+                        websocket_url: None,
+                    })
+                }
                 Some(_) => Ok(JoinSessionResponse {
                     success: false,
                     message: Some("invalid code".into()),
@@ -728,5 +781,19 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, SessionError::AuthenticationFailed(_)));
+    }
+
+    #[test_timeout::tokio_timeout_test]
+    async fn register_session_passes_bearer_token_to_backend() {
+        let backend = Arc::new(MockSessionBackend::new());
+        let config = SessionConfig::new("http://mock.server")
+            .unwrap()
+            .with_bearer_token(Some("token-123".into()));
+        let manager = SessionManager::with_backend(config, backend.clone());
+
+        let _ = manager.host().await.unwrap();
+
+        let observed = backend.last_token().await;
+        assert_eq!(observed.as_deref(), Some("token-123"));
     }
 }

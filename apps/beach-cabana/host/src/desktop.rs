@@ -165,3 +165,17 @@ pub fn wait_for_selection(timeout: Option<Duration>) -> Option<SelectionEvent> {
         None => rx.recv().ok(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_descriptor_has_no_filter() {
+        let descriptor = ScreenCaptureDescriptor::legacy("window:42");
+        assert_eq!(descriptor.target_id, "window:42");
+        assert!(!descriptor.has_filter());
+        assert!(descriptor.stream_config_blob.is_none());
+        assert!(descriptor.metadata_json.is_none());
+    }
+}

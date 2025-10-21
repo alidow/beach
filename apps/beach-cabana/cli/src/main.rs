@@ -5,6 +5,7 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 use rand::{rngs::OsRng, RngCore};
 use std::fs;
+#[cfg(feature = "webrtc")]
 use std::io::Write as _;
 use std::time::{Duration, SystemTime};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -144,7 +145,6 @@ fn run(cli: cli::Cli) -> Result<()> {
                         return Ok(());
                     }
                 };
-                let target_label = descriptor.target_id.clone();
                 prompt_screen_recording_permission();
 
                 let mut producer = match create_producer_from_descriptor(&descriptor) {

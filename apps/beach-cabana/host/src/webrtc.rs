@@ -350,7 +350,29 @@ pub async fn host_run(
         to_id.clone(),
     ).await?;
     #[cfg(target_os = "macos")]
-    if let (Some(target), n) = (window_id, frames) { if n > 0 { let interval = Duration::from_millis(interval_ms); match codec { EncodeCodec::Gif => { stream_png_frames(&transport, &target, n, interval, max_width).await?; } EncodeCodec::H264 => { #[cfg(all(target_os = "macos", feature = "cabana_sck"))] { let fps = (1000u64 / interval_ms.max(1)) as u32; stream_h264_frames(&transport, &target, n, interval, max_width, fps).await?; } #[cfg(not(all(target_os = "macos", feature = "cabana_sck")))] { stream_png_frames(&transport, &target, n, interval, max_width).await?; } } } } }
+    if let (Some(target), n) = (window_id, frames) {
+        if n > 0 {
+            let descriptor = ScreenCaptureDescriptor::legacy(target);
+            let interval = Duration::from_millis(interval_ms);
+            match codec {
+                EncodeCodec::Gif => {
+                    stream_png_frames(&transport, &descriptor, n, interval, max_width).await?;
+                }
+                EncodeCodec::H264 => {
+                    #[cfg(all(target_os = "macos", feature = "cabana_sck"))]
+                    {
+                        let fps = (1000u64 / interval_ms.max(1)) as u32;
+                        stream_h264_frames(&transport, &descriptor, n, interval, max_width, fps)
+                            .await?;
+                    }
+                    #[cfg(not(all(target_os = "macos", feature = "cabana_sck")))]
+                    {
+                        stream_png_frames(&transport, &descriptor, n, interval, max_width).await?;
+                    }
+                }
+            }
+        }
+    }
     Ok(transport.verification_code().unwrap_or("unknown").to_string())
 }
 
@@ -436,17 +458,17 @@ pub async fn host_bootstrap(
 pub async fn host_stream(
     transport: &DataChannelSecureTransport,
     codec: EncodeCodec,
-    window_id: &str,
+    descriptor: &ScreenCaptureDescriptor,
     frames: u32,
     interval_ms: u64,
     max_width: Option<u32>,
 ) -> Result<(), NoiseDriverError> {
     let interval = Duration::from_millis(interval_ms);
-    match codec { EncodeCodec::Gif => { stream_png_frames(transport, window_id, frames, interval, max_width).await } EncodeCodec::H264 => {
+    match codec { EncodeCodec::Gif => { stream_png_frames(transport, descriptor, frames, interval, max_width).await } EncodeCodec::H264 => {
         #[cfg(all(target_os = "macos", feature = "cabana_sck"))]
-        { let fps = (1000u64 / interval_ms.max(1)) as u32; stream_h264_frames(transport, window_id, frames, interval, max_width, fps).await }
+        { let fps = (1000u64 / interval_ms.max(1)) as u32; stream_h264_frames(transport, descriptor, frames, interval, max_width, fps).await }
         #[cfg(not(all(target_os = "macos", feature = "cabana_sck")))]
-        { stream_png_frames(transport, window_id, frames, interval, max_width).await }
+        { stream_png_frames(transport, descriptor, frames, interval, max_width).await }
     } }
 }
 
@@ -492,15 +514,29 @@ fn resize_frame(frame: &mut Frame, max_width: Option<u32>) -> anyhow::Result<()>
 fn encode_png_message(png: &[u8]) -> Vec<u8> { let mut out = Vec::with_capacity(1 + 4 + png.len()); out.push(1u8); out.extend_from_slice(&(png.len() as u32).to_be_bytes()); out.extend_from_slice(png); out }
 
 #[cfg(all(target_os = "macos", feature = "webrtc"))]
-async fn stream_png_frames(transport: &DataChannelSecureTransport, target: &str, frames: u32, interval: Duration, max_width: Option<u32>) -> Result<(), NoiseDriverError> {
-    let mut producer = match capture::create_producer(target) { Ok(p) => p, Err(err) => { return Err(NoiseDriverError::ChannelSend(format!("capture init failed: {}", err))); } };
+async fn stream_png_frames(
+    transport: &DataChannelSecureTransport,
+    descriptor: &ScreenCaptureDescriptor,
+    frames: u32,
+    interval: Duration,
+    max_width: Option<u32>,
+) -> Result<(), NoiseDriverError> {
+    let mut producer = match capture::create_producer_from_descriptor(descriptor) {
+        Ok(p) => p,
+        Err(err) => {
+            return Err(NoiseDriverError::ChannelSend(format!(
+                "capture init failed: {}",
+                err
+            )));
+        }
+    };
     producer.start().map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?;
     for index in 0..frames { let mut frame = match producer.next_frame() { Ok(f) => f, Err(err) => { producer.stop(); return Err(NoiseDriverError::ChannelSend(format!("capture frame {} failed: {}", index, err))); } }; to_rgba(&mut frame); if let Err(e) = resize_frame(&mut frame, max_width) { producer.stop(); return Err(NoiseDriverError::ChannelSend(format!("resize failed: {}", e))); } let png = png_bytes_from_frame(&frame).map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?; let msg = encode_png_message(&png); transport.send_media(&msg).await.map_err(|e| NoiseDriverError::ChannelSend(e.to_string()))?; if index + 1 < frames && !interval.is_zero() { std::thread::sleep(interval); } } producer.stop(); Ok(()) }
 
 #[cfg(all(target_os = "macos", feature = "cabana_sck", feature = "webrtc"))]
 async fn stream_h264_frames(
     transport: &DataChannelSecureTransport,
-    target: &str,
+    descriptor: &ScreenCaptureDescriptor,
     frames: u32,
     interval: Duration,
     max_width: Option<u32>,
@@ -511,7 +547,7 @@ async fn stream_h264_frames(
     use crate::encoder::VideoToolboxEncoder;
     use crate::mp4::Fmp4Writer;
 
-    let mut producer = match capture::create_producer(target) {
+    let mut producer = match capture::create_producer_from_descriptor(descriptor) {
         Ok(p) => p,
         Err(err) => return Err(NoiseDriverError::ChannelSend(err.to_string())),
     };

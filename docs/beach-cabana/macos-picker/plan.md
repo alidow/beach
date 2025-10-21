@@ -157,6 +157,7 @@ Deliverables:
 - ✅ Selection relay persists full descriptors (`target_id`, `filter_blob`, `stream_config_blob`, `metadata_json`) and CLI consumers now receive identical payloads via `SelectionEvent`.
 - ✅ Capture telemetry now emits `capture.backend` labels (`screencapturekit` / `coregraphics`) with fallback reasons so Workstream A can correlate picker UX with runtime behavior.
 - ✅ No further schema changes expected; Workstream A can continue emitting base64 ScreenCaptureKit blobs plus optional metadata.
+- ✅ CLI streaming/encoding paths and the WebRTC host flow now launch capture through `create_producer_from_descriptor`, so picker-provided ScreenCaptureKit descriptors drive capture end-to-end while the legacy `create_producer(target_id)` shim remains for manual IDs.
 
 **Exit criteria**
 - Host can stream using ScreenCaptureKit descriptor provided by desktop UI.
@@ -178,12 +179,71 @@ Focus: deliver goals #2 and #3 (Clerk auth, Beach session wiring, Beach Surfer p
 - ✅ Desktop app now hosts a “session actions” sheet wired to the native picker selection. Auth controls trigger the Beach Auth device flow (`AuthStatus::Pending`) and persist tokens via the shared credential store/keychain. Successful logins refresh access tokens automatically using `auth::maybe_access_token`.
 - ✅ After authentication the app fetches the caller’s private beach inventory via `GET /private-beaches`, surfaces a combo box to pick a target, and remembers the last selection. The control disables gracefully when tokens expire.
 - ✅ Clicking “Create public session” invokes `SessionManager::host()` against the configured Beach Road base, storing the new session id/join code, copying them into the UI, and offering one-click Surfer launch + clipboard copy.
-- ✅ “Attach session” issues `POST /private-beaches/:id/sessions/attach-by-code` with an embedded `capture_descriptor` payload (target id + base64 ScreenCaptureKit filter/config). It then patches `/sessions/:id` metadata to include `cabana.descriptor`, picker metadata, and the optional nickname.
+- ✅ “Attach session” issues `POST /private-beaches/:id/sessions/attach-by-code` with the session id/join code, then patches `/sessions/:id` metadata to include a `cabana.descriptor` block (target id + base64 ScreenCaptureKit filter/config) plus picker metadata and the optional nickname.
 - ✅ Session log + telemetry entries document login progress, session creation, and private beach attachments for QA.
 - 🔬 Manual smoke: exercised mock picker selection → Beach Auth login → Beach Road session creation → private beach attach (mock manager) using the desktop UI; verified descriptors persist in manager metadata.
 
 **Dependencies**
 - Works closely with Workstream B (descriptor content for host launch) and Workstream D (viewer contract).
+- Telemetry client swap depends on the shared metrics SDK (`beach-telemetry`) landing in the workspace (tracked below).
+
+#### Clerk + Beach flows (2025-11-04)
+
+- **Device authorization endpoints:** desktop app should continue to hit Beach Gate in production — `POST https://auth.beach.sh/device/start` followed by `POST https://auth.beach.sh/device/finish`. Both endpoints accept JSON; the existing `BeachAuthConfig::from_env()` already points to this base.
+- **Scopes & audience:** allow Beach Gate to supply defaults unless we ship overrides. Production scope remains `openid email offline_access`; Beach Gate injects entitlement-specific scopes (`pb:sessions.read`, `pb:sessions.write`, `pb:sessions.register`, `pb:beaches.read`) for accounts flagged in `BEACH_GATE_ENTITLEMENTS`. No additional scope tweaking is required in the desktop UI.
+- **Token persistence/refresh:** we rely on `beach_client_core::auth` — refresh tokens are written to the OS keychain under service `beach-auth`; the profile manifest lives at `~/.beach/credentials`. The desktop app must keep using `auth::persist_profile_update`/`auth::maybe_access_token` so the CLI and desktop share the same cache. Tokens auto-refresh via Beach Gate’s `/token/refresh` when `maybe_access_token(.., refresh_if_needed=true)` is called.
+- **Public Beach Road payload:** `POST {BEACH_SESSION_SERVER}/sessions` with body `{"session_id":"<uuid>","passphrase":null}` (the helper already generates a UUID). Required headers: `content-type: application/json`. Optional `x-account-id` is accepted for dev/test but not required. Success payload mirrors `RegisterSessionResponse` (session_id, join_code, transports, websocket_url). No auth header needed for public sessions.
+- **Private Beach attach payloads:**
+  1. `POST {MANAGER_URL}/private-beaches/{private_beach_id}/sessions/attach-by-code` with body `{"session_id":"<road session id>","code":"<join code>"}` and header `authorization: Bearer <Beach Auth access token>`. Tokens must carry the `pb:sessions.write` scope; Manager will respond `403` otherwise.
+  2. Patch metadata via `PATCH {MANAGER_URL}/sessions/{session_id}` with body:
+     ```json
+     {
+       "metadata": {
+         "cabana": {
+           "session_name": "Optional nickname",
+           "label": "Picker label",
+           "application": "Bundle/Window title",
+           "kind": "window|display|application",
+           "descriptor": {
+             "target_id": "picker target id",
+             "filter_base64": "<base64 ScreenCaptureKit filter blob>",
+             "stream_config_base64": "<base64 stream config blob or null>"
+           },
+           "picker_metadata": { "...": "raw metadata forwarded from picker" }
+         }
+       }
+     }
+     ```
+     `location_hint` stays `null` for now. The manager stores arbitrary metadata blobs; Workstream B should tolerate `cabana.descriptor` on the harness side. On attach, Manager returns the standard `SessionSummary` (no schema change).
+- **Error handling expectations:** `attach-by-code` returns `409` if the mapping already exists, `404` if the private beach id is invalid, `401/403` if the token is missing the required scope. The desktop sheet should surface these outcomes and leave the session metadata untouched.
+
+#### Shared metrics pipeline handoff (2025-11-04)
+
+- **Ingestion endpoint:** use the new metrics proxy at `https://metrics.beach.sh/v1/events`. It accepts JSON batches (array of objects) via `POST` with `content-type: application/json` and `authorization: Bearer <service token>`. Workstream A can request a service token via `INFRA-1763`; for local dev the proxy mirrors requests to stdout when `METRICS_MIRROR_STDOUT=1`.
+- **Rust client:** instrumentation will land in the shared `beach-telemetry` crate (WIP, ETA 2025-11-08). Until the crate is published, call the lightweight helper in `beach_client_core::telemetry::emit_event(event: PickerEvent)` (tracked in TODO below). Events are buffered and flushed every 5 records or 2 seconds; the helper handles retries/backoff.
+- **Event schema:** send the following event names with the listed attributes:
+  | Event | Required attributes | Optional attributes |
+  | --- | --- | --- |
+  | `picker_open` | `source` (`auto`/`manual`), `picker_version` | `platform`, `duration_ms` |
+  | `picker_discovered` | `target_id`, `kind` | `application`, `bundle_id` |
+  | `picker_selection` | `target_id`, `kind`, `source` (`stream-initial`/`stream-refresh`/`tile`) | `application`, `bundle_id`, `display_id` |
+  | `auth_flow_started` | `profile`, `gateway` | `previous_state` |
+  | `auth_flow_completed` | `profile`, `elapsed_ms` | `tier`, `email`, `result` (`success`/`denied`/`timeout`) |
+  | `session_created` | `session_id`, `join_code_prefix`, `road_base` | `elapsed_ms`, `picker_kind`, `capture_backend` (`sck`/`cg`), `metadata_size_bytes` |
+  | `private_attach_started` | `session_id`, `private_beach_id` | `label`, `has_descriptor` |
+  | `private_attach_completed` | `session_id`, `private_beach_id`, `elapsed_ms` | `label`, `descriptor_bytes` |
+  | `private_attach_failed` | `session_id`, `private_beach_id`, `error_type` | `http_status`, `error_message` |
+  | `stream_started` | `session_id`, `backend` (`sck`/`cg`), `verification_code` | `first_frame_ms`, `width`, `height`, `fps` |
+- **Batching:** ship events in small batches (<= 16 events) to limit payload size; include `sent_at` ISO8601 on each event. The telemetry helper will append `client=device-desktop`, `version`, and `platform` automatically.
+- **Outstanding work:**
+  - [ ] Land `beach-telemetry` crate with `emit_event` helper and OTLP adapter (Workstream C, ETA 2025-11-08).
+  - [ ] Update desktop session sheet to swap `record_telemetry` stdout shim for the helper once published.
+
+#### TODO / follow-ups
+
+- [ ] Surface verification code + secure badge in the session sheet after `stream_started` (Workstream A dependency).
+- [ ] Handle `attach-by-code` duplicate responses with a dedicated user-facing message.
+- [ ] Schedule end-to-end QA with production Beach Road / Manager once the telemetry helper crate lands.
 
 ### Workstream D – Beach Surfer Viewer (**In progress**)
 

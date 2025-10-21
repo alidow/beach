@@ -95,14 +95,25 @@ export class DataChannelTerminalTransport extends EventTarget implements Termina
     // If the first terminal frame was already seen by the viewer's sniffer,
     // replay it so we don't miss the Hello and get stuck on the approval UI.
     if (options.replayBinaryFirst && options.replayBinaryFirst.length > 0) {
-      try {
-        const frame = decodeHostFrameBinary(options.replayBinaryFirst);
-        this.framesSeen += 1;
-        this.dispatchEvent(new CustomEvent<HostFrame>('frame', { detail: frame }));
-      } catch (error) {
-        this.log(
-          `failed to replay initial frame: ${error instanceof Error ? error.message : String(error)}`,
-        );
+      const replay = () => {
+        try {
+          const frame = decodeHostFrameBinary(options.replayBinaryFirst!);
+          this.framesSeen += 1;
+          this.dispatchEvent(new CustomEvent<HostFrame>('frame', { detail: frame }));
+        } catch (error) {
+          this.log(
+            `failed to replay initial frame: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      };
+      if (typeof queueMicrotask === 'function') {
+        queueMicrotask(replay);
+      } else {
+        Promise.resolve()
+          .then(replay)
+          .catch(() => {
+            // The replay function already logs its own errors.
+          });
       }
     }
 

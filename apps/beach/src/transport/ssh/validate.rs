@@ -139,7 +139,13 @@ pub async fn run_headless_validation(
     }
     let manager = SessionManager::new(config)?;
     let joined = manager
-        .join(session_id, passcode, Some("headless-validator"), false)
+        .join(
+            session_id,
+            Some(passcode),
+            None,
+            Some("headless-validator"),
+            false,
+        )
         .await?;
 
     let negotiated = negotiation::negotiate_transport(

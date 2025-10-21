@@ -379,7 +379,12 @@ pub async fn join_session(
 ) -> ApiResult<JoinSessionResponsePayload> {
     ensure_scope(&token, "pb:sessions.read")?;
     let (status, payload) = state
-        .join_session_via_road(&session_id, body.passphrase.clone(), body.mcp)
+        .join_session_via_road(
+            &session_id,
+            body.passphrase.clone(),
+            body.viewer_token.clone(),
+            body.mcp,
+        )
         .await
         .map_err(|err| {
             warn!(

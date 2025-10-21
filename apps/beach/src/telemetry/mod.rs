@@ -137,6 +137,16 @@ pub mod logging {
     }
 
     impl LogLevel {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                LogLevel::Error => "error",
+                LogLevel::Warn => "warn",
+                LogLevel::Info => "info",
+                LogLevel::Debug => "debug",
+                LogLevel::Trace => "trace",
+            }
+        }
+
         pub fn to_filter(self) -> LevelFilter {
             match self {
                 LogLevel::Error => LevelFilter::ERROR,

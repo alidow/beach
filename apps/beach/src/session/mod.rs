@@ -144,14 +144,31 @@ impl SessionManager {
     pub async fn join(
         &self,
         session_id: &str,
-        join_code: &str,
+        passphrase: Option<&str>,
+        viewer_token: Option<&str>,
         label: Option<&str>,
         request_mcp: bool,
     ) -> Result<JoinedSession, SessionError> {
-        validate_join_code(join_code)?;
+        let cleaned_passphrase = passphrase
+            .map(|code| {
+                validate_join_code(code)?;
+                Ok(code.trim().to_string())
+            })
+            .transpose()?;
+
+        let cleaned_viewer_token = viewer_token
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty());
+
+        if cleaned_passphrase.is_none() && cleaned_viewer_token.is_none() {
+            return Err(SessionError::InvalidConfig(
+                "passphrase or viewer token required".into(),
+            ));
+        }
 
         let request = JoinSessionRequest {
-            passphrase: join_code.to_string(),
+            passphrase: cleaned_passphrase.clone(),
+            viewer_token: cleaned_viewer_token,
             label: label
                 .map(|value| value.trim().to_string())
                 .filter(|s| !s.is_empty()),
@@ -495,7 +512,10 @@ struct RegisterSessionResponse {
 
 #[derive(Debug, Serialize)]
 struct JoinSessionRequest {
-    passphrase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    passphrase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    viewer_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -735,7 +755,13 @@ mod tests {
         ) -> Result<JoinSessionResponse, SessionError> {
             let sessions = self.sessions.lock().await;
             match sessions.get(session_id) {
-                Some(expected) if *expected == request.passphrase => {
+                Some(expected)
+                    if request
+                        .passphrase
+                        .as_ref()
+                        .map(|value| value == expected)
+                        .unwrap_or(false) =>
+                {
                     {
                         let mut slot = self.last_token.lock().await;
                         *slot = auth_token.map(|token| token.to_string());
@@ -816,7 +842,13 @@ mod tests {
 
         let hosted = manager.host().await.unwrap();
         let joiner = manager
-            .join(hosted.session_id(), hosted.join_code(), None, false)
+            .join(
+                hosted.session_id(),
+                Some(hosted.join_code()),
+                None,
+                None,
+                false,
+            )
             .await
             .unwrap();
 
@@ -840,7 +872,13 @@ mod tests {
 
         let hosted = manager.host().await.unwrap();
         let err = manager
-            .join(hosted.session_id(), "000000", None, false)
+            .join(
+                hosted.session_id(),
+                Some("000000"),
+                None,
+                None,
+                false,
+            )
             .await
             .unwrap_err();
 

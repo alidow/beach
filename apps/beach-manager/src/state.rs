@@ -1700,7 +1700,7 @@ impl AppState {
     }
 
     pub async fn spawn_viewer_worker(&self, session_id: &str) -> Result<(), StateError> {
-        let (private_beach_id, passcode) = {
+        let (private_beach_id, join_code) = {
             let sessions = self.fallback.sessions.read().await;
             let record = sessions
                 .get(session_id)
@@ -1731,7 +1731,7 @@ impl AppState {
                 state_clone,
                 session_id_owned,
                 private_beach_id,
-                passcode,
+                join_code,
                 base_url,
             )
             .await;
@@ -3410,12 +3410,19 @@ async fn run_viewer_worker(
     state: AppState,
     session_id: String,
     private_beach_id: String,
-    passcode: String,
+    join_code: String,
     road_base_url: String,
 ) {
     #[cfg(test)]
     if let Some(override_fn) = test_support::viewer_worker_override() {
-        override_fn(state, session_id, private_beach_id, passcode, road_base_url).await;
+        override_fn(
+            state,
+            session_id,
+            private_beach_id,
+            join_code,
+            road_base_url,
+        )
+        .await;
         return;
     }
     let _ = &state;
@@ -3437,7 +3444,7 @@ async fn run_viewer_worker(
             &state,
             &session_id,
             &private_beach_id,
-            &passcode,
+            &join_code,
             &road_base_url,
             label,
         )
@@ -3472,7 +3479,7 @@ async fn viewer_connect_once(
     state: &AppState,
     session_id: &str,
     private_beach_id: &str,
-    passcode: &str,
+    join_code: &str,
     road_base_url: &str,
     label: &str,
 ) -> Result<(), ViewerError> {
@@ -3483,15 +3490,28 @@ async fn viewer_connect_once(
     let latency_hist =
         metrics::MANAGER_VIEWER_LATENCY_MS.with_label_values(&[private_beach_id, session_id]);
 
+    let issued_token = state
+        .viewer_token(session_id, private_beach_id, join_code)
+        .await
+        .map_err(ViewerError::Credential)?;
+    let viewer_token = issued_token.token;
+
     let config = SessionConfig::new(road_base_url).map_err(ViewerError::Join)?;
     let manager = SessionManager::new(config).map_err(ViewerError::Join)?;
     let joined = manager
-        .join(session_id, passcode, Some(label), false)
+        .join(
+            session_id,
+            Some(join_code),
+            Some(viewer_token.as_str()),
+            Some(label),
+            false,
+        )
         .await
         .map_err(ViewerError::Join)?;
-    let negotiated = negotiate_transport(joined.handle(), Some(passcode), Some(label), false)
-        .await
-        .map_err(ViewerError::Negotiation)?;
+    let negotiated =
+        negotiate_transport(joined.handle(), Some(join_code), Some(label), false)
+            .await
+            .map_err(ViewerError::Negotiation)?;
     let transport = match negotiated {
         NegotiatedTransport::Single(NegotiatedSingle { transport, .. }) => transport,
         NegotiatedTransport::WebRtcOfferer { .. } => {
@@ -3705,6 +3725,8 @@ enum ViewerError {
     Transport(TransportError),
     #[error("unsupported transport: {0}")]
     UnsupportedTransport(&'static str),
+    #[error("viewer credential failure: {0}")]
+    Credential(ViewerTokenError),
 }
 
 #[derive(Debug, thiserror::Error)]

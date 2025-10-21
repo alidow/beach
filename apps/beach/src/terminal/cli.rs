@@ -362,6 +362,23 @@ pub struct SshArgs {
     pub remote_path: String,
 
     #[arg(
+        long = "remote-log-level",
+        value_enum,
+        env = "BEACH_REMOTE_LOG_LEVEL",
+        default_value_t = LogLevel::Info,
+        help = "Minimum log level for the remote host process"
+    )]
+    pub remote_log_level: LogLevel,
+
+    #[arg(
+        long = "remote-log-file",
+        value_name = "PATH",
+        env = "BEACH_REMOTE_LOG_FILE",
+        help = "Write remote host logs to PATH on the SSH target instead of stdout"
+    )]
+    pub remote_log_file: Option<String>,
+
+    #[arg(
         long = "ssh-binary",
         default_value = "ssh",
         value_name = "BIN",

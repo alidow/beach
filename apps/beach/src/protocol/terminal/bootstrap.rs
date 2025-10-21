@@ -135,22 +135,21 @@ pub fn remote_bootstrap_args(args: &SshArgs, session_server: &str) -> Vec<String
         format!("./{}", args.remote_path)
     };
 
-    let mut command = if args.keep_ssh {
-        vec![
-            "env".to_string(),
-            "RUST_LOG=trace".to_string(),
-            "BEACH_LOG_LEVEL=trace".to_string(),
-            executable_path,
-            "host".to_string(),
-            "--bootstrap-output=json".to_string(),
-        ]
-    } else {
-        vec![
-            executable_path,
-            "host".to_string(),
-            "--bootstrap-output=json".to_string(),
-        ]
-    };
+    let mut command = Vec::new();
+    let mut env_vars = vec![
+        format!("RUST_LOG={}", args.remote_log_level.as_str()),
+        format!("BEACH_LOG_LEVEL={}", args.remote_log_level.as_str()),
+    ];
+    if let Some(file) = &args.remote_log_file {
+        env_vars.push(format!("BEACH_LOG_FILE={file}"));
+    }
+    if !env_vars.is_empty() {
+        command.push("env".to_string());
+        command.extend(env_vars);
+    }
+    command.push(executable_path);
+    command.push("host".to_string());
+    command.push("--bootstrap-output=json".to_string());
     if args.ssh_keep_host_running {
         command.push("--bootstrap-survive-sighup".to_string());
     }

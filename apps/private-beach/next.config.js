@@ -33,10 +33,13 @@ const nextConfig = {
       },
     );
 
+    const path = require('path');
     const noiseWasmPath = require.resolve('noise-c.wasm/src/noise-c.wasm');
     config.resolve.alias = {
       ...(config.resolve.alias || {}),
       'noise-c.wasm/src/noise-c.wasm': noiseWasmPath,
+      react: path.resolve(__dirname, 'node_modules/react'),
+      'react-dom': path.resolve(__dirname, 'node_modules/react-dom'),
     };
 
     return config;

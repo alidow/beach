@@ -71,7 +71,13 @@ pub async fn run_with_notify(
 
     let trimmed_pass = passcode.trim().to_ascii_uppercase();
     let joined = manager
-        .join(&session_id, trimmed_pass.as_str(), label.as_deref(), mcp)
+        .join(
+            &session_id,
+            Some(trimmed_pass.as_str()),
+            None,
+            label.as_deref(),
+            mcp,
+        )
         .await?;
     let banner_kind = joined
         .offers()

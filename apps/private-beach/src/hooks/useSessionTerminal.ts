@@ -1,177 +1,111 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { fetchViewerCredential } from '../lib/api';
-import { connectBrowserTransport, type BrowserTransportConnection } from '../../../beach-surfer/src/terminal/connect';
-import type { HostFrame } from '../../../beach-surfer/src/protocol/types';
+import {
+  connectBrowserTransport,
+  type BrowserTransportConnection,
+} from '../../../beach-surfer/src/terminal/connect';
 import { TerminalGridStore } from '../../../beach-surfer/src/terminal/gridStore';
+import type { TerminalTransport } from '../../../beach-surfer/src/transport/terminalTransport';
 
-type Cursor = { row: number; col: number } | null;
-
-export type TerminalPreview = {
-  lines: string[];
-  cursor: Cursor;
-  sequence: number;
+export type TerminalViewerState = {
+  store: TerminalGridStore | null;
+  transport: TerminalTransport | null;
   connecting: boolean;
-  lastUpdatedAt?: number;
-  error?: string | null;
-  latencyMs?: number | null;
+  error: string | null;
 };
-
-function trimLine(line: string): string {
-  let end = line.length;
-  while (end > 0 && line[end - 1] === ' ') {
-    end -= 1;
-  }
-  return line.slice(0, end);
-}
 
 export function useSessionTerminal(
   sessionId: string | null | undefined,
   privateBeachId: string | null | undefined,
   managerUrl: string,
   token: string | null,
-): TerminalPreview {
-  const [state, setState] = useState<TerminalPreview>({
-    lines: [],
-    cursor: null,
-    sequence: 0,
-    connecting: Boolean(sessionId),
-    error: null,
-    latencyMs: null,
-  });
+): TerminalViewerState {
+  const store = useMemo(() => new TerminalGridStore(80), [sessionId]);
+  const [transport, setTransport] = useState<TerminalTransport | null>(null);
+  const [connecting, setConnecting] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
   const connectionRef = useRef<BrowserTransportConnection | null>(null);
-  const storeRef = useRef<TerminalGridStore | null>(null);
-  const lastSeqRef = useRef<number>(0);
-  const lastLatencyRef = useRef<number | null>(null);
+  const [reconnectTick, setReconnectTick] = useState(0);
 
   useEffect(() => {
-    connectionRef.current?.close();
-    connectionRef.current = null;
-    storeRef.current = null;
+    let cancelled = false;
+    let reconnectTimer: number | null = null;
+    const cleanupListeners: Array<() => void> = [];
 
-    if (!sessionId || !privateBeachId || !token || token.trim().length === 0) {
-      setState((prev) => ({
-        lines: [],
-        cursor: null,
-        sequence: 0,
-        connecting: false,
-        lastUpdatedAt: prev.lastUpdatedAt,
-        error: prev.error ?? null,
-        latencyMs: null,
-      }));
-      return () => {};
-    }
-
-    let canceled = false;
-    const cleanups: Array<() => void> = [];
-    const trimmedToken = token.trim();
-    const store = new TerminalGridStore(80);
-    storeRef.current = store;
-    lastSeqRef.current = 0;
-    lastLatencyRef.current = null;
-
-    const updateFromStore = (latencyMs: number | null = null) => {
-      const snapshot = store.getSnapshot();
-      const visible = snapshot.visibleRows(80);
-      const lines = visible.map((row) => {
-        if (row.kind !== 'loaded') {
-          return '';
-        }
-        const text = row.cells.map((cell) => cell.char).join('');
-        return trimLine(text);
-      });
-      let cursor: Cursor = null;
-      if (snapshot.cursorRow != null && snapshot.cursorCol != null) {
-        const idx = visible.findIndex((row) => row.kind === 'loaded' && row.absolute === snapshot.cursorRow);
-        if (idx >= 0) {
-          cursor = { row: idx, col: snapshot.cursorCol ?? 0 };
-        }
-      }
-      const effectiveLatency = latencyMs ?? lastLatencyRef.current ?? null;
-      lastLatencyRef.current = effectiveLatency;
-      setState({
-        lines,
-        cursor,
-        sequence: lastSeqRef.current,
-        connecting: false,
-        lastUpdatedAt: Date.now(),
-        error: null,
-        latencyMs: effectiveLatency,
-      });
-    };
-
-    const handleHostFrame = (frame: HostFrame) => {
-      if (canceled) {
+    const closeCurrentConnection = () => {
+      const current = connectionRef.current;
+      if (!current) {
         return;
       }
-      switch (frame.type) {
-        case 'hello': {
-          store.reset();
-          store.setCursorSupport(Boolean(frame.features & 1));
-          break;
-        }
-        case 'grid': {
-          store.setBaseRow(frame.baseRow);
-          store.setGridSize(frame.historyRows, frame.cols);
-          const historyEnd = frame.baseRow + frame.historyRows;
-          const viewportRows = Math.max(1, frame.viewportRows ?? 40);
-          const viewportTop = Math.max(frame.baseRow, historyEnd - viewportRows);
-          store.setViewport(viewportTop, viewportRows);
-          store.setFollowTail(true);
-          break;
-        }
-        case 'snapshot':
-        case 'delta':
-        case 'history_backfill': {
-          const authoritative = frame.type !== 'delta';
-          store.applyUpdates(frame.updates, {
-            authoritative,
-            origin: frame.type,
-            cursor: frame.cursor ?? null,
-          });
-          if (frame.type === 'snapshot' && !frame.hasMore) {
-            store.setFollowTail(true);
-          }
-          if (frame.type === 'history_backfill' && !frame.more) {
-            store.setFollowTail(true);
-          }
-          if (frame.type === 'snapshot' || frame.type === 'delta') {
-            lastSeqRef.current = frame.watermark;
-          }
-          break;
-        }
-        case 'cursor': {
-          store.applyCursorFrame(frame.cursor);
-          break;
-        }
-        case 'heartbeat': {
-          const latency = Math.max(0, Date.now() - frame.timestampMs);
-          updateFromStore(latency);
-          return;
-        }
-        case 'snapshot_complete':
-        case 'input_ack':
-          return;
-        case 'shutdown': {
-          setState((prev) => ({
-            ...prev,
-            connecting: false,
-            error: prev.error ?? 'Viewer disconnected',
-            latencyMs: prev.latencyMs ?? null,
-          }));
-          return;
-        }
+      try {
+        current.close();
+      } catch (err) {
+        console.warn('[terminal] error closing previous connection', err);
       }
-
-      updateFromStore();
+      connectionRef.current = null;
     };
 
-    const connect = async () => {
+    closeCurrentConnection();
+    setTransport(null);
+    store.reset();
+    store.setFollowTail(true);
+
+    const trimmedToken = token?.trim();
+    if (!sessionId || !privateBeachId || !trimmedToken) {
+      setConnecting(false);
+      if (!trimmedToken) {
+        setError(null);
+      }
+      return () => {
+        cancelled = true;
+        for (const fn of cleanupListeners) {
+          try {
+            fn();
+          } catch (err) {
+            console.warn('[terminal] cleanup error', err);
+          }
+        }
+        if (reconnectTimer !== null) {
+          window.clearTimeout(reconnectTimer);
+        }
+      };
+    }
+
+    setConnecting(true);
+    setError(null);
+
+    const scheduleReconnect = (source: string) => {
+      if (cancelled) {
+        return;
+      }
+      if (reconnectTimer !== null) {
+        return;
+      }
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        if (cancelled) {
+          return;
+        }
+        console.info('[terminal] scheduling viewer reconnect', {
+          sessionId,
+          privateBeachId,
+          source,
+        });
+        setReconnectTick((tick) => tick + 1);
+      }, 1_500);
+    };
+
+    (async () => {
       try {
-        setState((prev) => ({ ...prev, connecting: true, error: null }));
-        const credential = await fetchViewerCredential(privateBeachId, sessionId, trimmedToken, managerUrl);
-        if (canceled) {
+        const credential = await fetchViewerCredential(
+          privateBeachId,
+          sessionId,
+          trimmedToken,
+          managerUrl,
+        );
+        if (cancelled) {
           return;
         }
         const viewerToken =
@@ -188,85 +122,122 @@ export function useSessionTerminal(
           baseUrl: managerUrl,
           passcode: effectivePasscode,
           viewerToken,
-          clientLabel: 'manager-viewer',
+          clientLabel: 'private-beach-dashboard',
           authorizationToken: trimmedToken,
         });
-        if (canceled) {
+        if (cancelled) {
           connection.close();
           return;
         }
         connectionRef.current = connection;
-        const transport = connection.transport;
-        const frameListener = (event: Event) => handleHostFrame((event as CustomEvent<HostFrame>).detail);
-        transport.addEventListener('frame', frameListener as EventListener);
-        cleanups.push(() => transport.removeEventListener('frame', frameListener as EventListener));
+        setTransport(connection.transport);
+        setConnecting(false);
+        setError(null);
 
-        const errorListener = (event: Event) => {
-          if (canceled) return;
-          const err = (event as any).error ?? new Error('transport error');
-          setState((prev) => ({
-            ...prev,
-            connecting: false,
-            error: err instanceof Error ? err.message : String(err),
-          }));
+        const transportTarget = connection.transport;
+
+        const closeHandler = () => {
+          if (cancelled) {
+            return;
+          }
+          console.warn('[terminal] data channel closed', {
+            sessionId,
+            privateBeachId,
+            remotePeerId: connection.remotePeerId ?? null,
+          });
+          setTransport(null);
+          setConnecting(true);
+          setError('Viewer disconnected');
+          scheduleReconnect('transport-close');
         };
-        transport.addEventListener('error', errorListener as EventListener);
-        cleanups.push(() => transport.removeEventListener('error', errorListener as EventListener));
+        transportTarget.addEventListener('close', closeHandler as EventListener);
+        cleanupListeners.push(() =>
+          transportTarget.removeEventListener('close', closeHandler as EventListener),
+        );
 
-        const closeListener = () => {
-          if (canceled) return;
-          setState((prev) => ({
-            ...prev,
-            connecting: false,
-            error: prev.error ?? 'Viewer disconnected',
-          }));
+        const errorHandler = (event: Event) => {
+          if (cancelled) {
+            return;
+          }
+          const err = (event as any).error;
+          const message = err instanceof Error ? err.message : String(err ?? 'transport error');
+          console.error('[terminal] data channel error', {
+            sessionId,
+            privateBeachId,
+            message,
+          });
+          setError(message);
         };
-        transport.addEventListener('close', closeListener, { once: true });
-        cleanups.push(() => transport.removeEventListener('close', closeListener as EventListener));
+        transportTarget.addEventListener('error', errorHandler as EventListener);
+        cleanupListeners.push(() =>
+          transportTarget.removeEventListener('error', errorHandler as EventListener),
+        );
 
-        const statusListener = (event: Event) => {
+        const statusHandler = (event: Event) => {
           const detail = (event as CustomEvent<string>).detail;
-          if (detail === 'beach:status:approval_granted') {
-            setState((prev) => ({ ...prev, connecting: false }));
+          if (detail?.startsWith('beach:status:')) {
+            console.debug('[terminal] status signal', { sessionId, detail });
           }
         };
-        transport.addEventListener('status', statusListener as EventListener);
-        cleanups.push(() => transport.removeEventListener('status', statusListener as EventListener));
-      } catch (error) {
-        if (canceled) {
+        transportTarget.addEventListener('status', statusHandler as EventListener);
+        cleanupListeners.push(() =>
+          transportTarget.removeEventListener('status', statusHandler as EventListener),
+        );
+
+        const signalingCloseHandler = (event: Event) => {
+          const detail = (event as CustomEvent<CloseEvent>).detail;
+          console.warn('[terminal] signaling closed', {
+            sessionId,
+            privateBeachId,
+            code: detail?.code ?? null,
+            reason: detail?.reason ?? '',
+            wasClean: detail?.wasClean ?? null,
+          });
+        };
+        connection.signaling.addEventListener('close', signalingCloseHandler as EventListener);
+        cleanupListeners.push(() =>
+          connection.signaling.removeEventListener(
+            'close',
+            signalingCloseHandler as EventListener,
+          ),
+        );
+      } catch (err) {
+        if (cancelled) {
           return;
         }
-        const message = error instanceof Error ? error.message : String(error);
+        const message = err instanceof Error ? err.message : String(err);
         console.error('[terminal] viewer connect failed', {
           sessionId,
           managerUrl,
           error: message,
         });
-        setState((prev) => ({
-          ...prev,
-          connecting: false,
-          error: message,
-        }));
+        setError(message);
+        setConnecting(false);
       }
-    };
-
-    connect();
+    })();
 
     return () => {
-      canceled = true;
-      for (const fn of cleanups) {
+      cancelled = true;
+      for (const fn of cleanupListeners) {
         try {
           fn();
-        } catch (error) {
-          console.warn('[terminal] error during cleanup', error);
+        } catch (err) {
+          console.warn('[terminal] cleanup error', err);
         }
       }
-      connectionRef.current?.close();
-      connectionRef.current = null;
-      storeRef.current = null;
-      lastLatencyRef.current = null;
+      cleanupListeners.length = 0;
+      closeCurrentConnection();
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+      }
     };
-  }, [sessionId, privateBeachId, managerUrl, token]);
+  }, [sessionId, privateBeachId, managerUrl, token, store, reconnectTick]);
 
-  return state;
+  return {
+    store,
+    transport,
+    connecting,
+    error,
+  };
 }
+

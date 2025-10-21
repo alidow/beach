@@ -26,7 +26,7 @@
 - **Shared client crate** — `apps/beach` now builds as `beach-client-core`; the CLI links it as a bin target. Negotiation helpers, terminal cache, and protocol types are exported for reuse. All existing unit tests were adjusted to import from `beach_client_core::…`.
 - **TURN entitlement check** — WebRTC negotiation fails fast if the caller lacks `pb:transport.turn`; we no longer hit HTTP/SSE fallbacks silently. STUN-only paths still operate for non-entitled users.
 - **Manager viewer worker (authoritative)** — `AppState::spawn_viewer_worker` now negotiates WebRTC, decodes frames, and persists them to both Redis and `session_runtime` while emitting `StreamEvent::State`. Metrics (`manager_viewer_connected`, `manager_viewer_latency_ms`, `manager_viewer_reconnects_total`) track health, and the worker auto-reconnects until shut down.
-- **Credential plumbing & API** — `RegisterSessionRequest` carries an optional `viewer_passcode` (migrated into `session_runtime.viewer_passcode`). Managers and dashboards retrieve it via `GET /private-beaches/:bid/sessions/:sid/viewer-credential`. Signed tokens remain a follow-up.
+- **Credential plumbing & API** — `RegisterSessionRequest` carries an optional `viewer_passcode` (migrated into `session_runtime.viewer_passcode`). Managers and dashboards retrieve a short-lived Gate-signed viewer token (plus legacy passcode for the handshake) via `GET /private-beaches/:bid/sessions/:sid/viewer-credential`. Beach Road verifies the token before honoring joins.
 - **Legacy harness removed** — Manager no longer exposes the HTTP pump (`handle_manager_hints`). The viewer worker now publishes directly to Redis and `session_runtime`, enabling HTTP bridge code to be deleted from the host.
 - **CLI host cleanup** — `apps/beach` no longer listens for manager bridge hints or pushes HTTP diffs; the WebRTC path is the only authority. Bridge-token mint/nudge endpoints were deleted from Beach Road and Manager.
 - **Dashboard preview migrated** — Private Beach tiles now fetch viewer credentials and render via the shared Beach Surfer WebRTC transport (Next.js `externalDir` enabled). Session drawers still read SSE for history/events and need parity work.
@@ -140,8 +140,8 @@ Deliverables:
   - Migration script to disable HTTP path across environments once WebRTC viewer stable.
 
 ## Immediate To-Do (next sprint)
-1. Add an automated smoke test for `spawn_viewer_worker` (mock session, assert Redis + state stream).
-2. Define and implement the signed viewer credential contract (Gate + Beach Road validation).
+1. ✅ Add an automated smoke test for `spawn_viewer_worker` (mock session, assert Redis + state stream).
+2. ✅ Define and implement the signed viewer credential contract (Gate + Beach Road validation).
 3. Finish dashboard parity: migrate drawer/event panes off SSE, surface latency/secure badges, and write UX docs.
 4. Document operational guidance (TURN quotas, viewer metrics dashboards) now that WebRTC is the sole transport.
 5. Unblock `npx tsc --noEmit` by adding module declarations for `argon2-browser`/`noise-c.wasm` and bumping the TS target to ES2020 (or shim BigInt usage).

@@ -280,6 +280,10 @@ fn state_error(id: Option<Value>, err: StateError) -> JsonRpcResponse {
             error!(error = %serde_err, "serialization error while processing MCP request");
             (-32603, "serialization error".into())
         }
+        StateError::External(message) => {
+            error!(message = %message, "external service error while processing MCP request");
+            (-32012, "external service error".into())
+        }
     };
 
     JsonRpcResponse {

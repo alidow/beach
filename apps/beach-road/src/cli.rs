@@ -94,6 +94,7 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
     let join_msg = ClientMessage::Join {
         peer_id: peer_id.clone(),
         passphrase: None,
+        viewer_token: None,
         supported_transports: vec![TransportType::Direct],
         preferred_transport: Some(TransportType::Direct),
         label: None,

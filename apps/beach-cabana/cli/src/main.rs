@@ -434,8 +434,11 @@ fn resolve_window_id(window_id: Option<String>) -> Result<Option<String>> {
     }
 
     if let Some(event) = cabana::desktop::last_selection() {
-        println!("Using desktop picker selection '{}'", event.target_id);
-        return Ok(Some(event.target_id));
+        println!(
+            "Using desktop picker selection '{}'",
+            event.descriptor.target_id
+        );
+        return Ok(Some(event.descriptor.target_id));
     }
 
     let wait_ms_env = std::env::var("CABANA_PICKER_WAIT_MS")
@@ -456,8 +459,11 @@ fn resolve_window_id(window_id: Option<String>) -> Result<Option<String>> {
             if let Some(event) =
                 cabana::desktop::wait_for_selection(Some(Duration::from_millis(ms)))
             {
-                println!("Received desktop picker selection '{}'", event.target_id);
-                return Ok(Some(event.target_id));
+                println!(
+                    "Received desktop picker selection '{}'",
+                    event.descriptor.target_id
+                );
+                return Ok(Some(event.descriptor.target_id));
             } else {
                 println!("No desktop picker selection received; falling back to TUI picker.");
             }

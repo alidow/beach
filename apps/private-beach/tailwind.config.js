@@ -7,6 +7,7 @@ module.exports = {
     './src/pages/**/*.{js,ts,jsx,tsx}',
     './src/components/**/*.{js,ts,jsx,tsx}',
     './src/app/**/*.{js,ts,jsx,tsx}',
+    '../beach-surfer/src/**/*.{js,ts,jsx,tsx}',
   ],
   theme: {
     container: {

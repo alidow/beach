@@ -13,11 +13,17 @@ Goal window: Phase 4.1 (picker parity) → Phase 4.2 (session creation UX)
 
 ## Path to Beach-ready UX
 
-To achieve the product milestone (“launch, pick any non-minimized screen, sign in, publish publicly or to a private beach, and view in Beach Surfer”), we will execute the remaining work in the phases below. Each phase calls out blockers toward the three headline behaviours:
+To achieve the product milestone (“launch, pick any non-minimized screen, sign in, publish publicly or to a private beach, and view in Beach Surfer”), we are splitting the remaining work into four parallel workstreams. Each workstream owns a vertical slice but collaborates on shared contracts (selection descriptor schema, API payloads, telemetry event names).
 
-1. **Tile view of all windows/displays (native picker parity).**
-2. **Clerk-powered authentication + private beach selection.**
-3. **End-to-end streaming: Cabana ▶ Beach Road/Private Beach ▶ Beach Surfer React components.**
+1. **Workstream A – Desktop Picker UX**: native tiles, session sheet, telemetry, user affordances.
+2. **Workstream B – Host Runtime & Relay**: ScreenCaptureKit descriptor plumbing, capture fallback, CLI parity.
+3. **Workstream C – Auth & Session Services**: Clerk integration, Beach Road/private beach APIs, attach flows.
+4. **Workstream D – Beach Surfer Viewer**: reusable React components, public/private playback, ergonomics.
+
+👉 Coordination checkpoints (weekly or when schemas change):
+- Selection descriptor (`PickerResult` → `SelectionEvent` → host runtime) – A + B.
+- Session creation payloads (Beach Road + Private Beach) – C + B (for streaming inputs) + D (viewer expectations).
+- Telemetry + QA scripts – all workstreams.
 
 ## Why we are doing this
 
@@ -102,31 +108,44 @@ Deliverables:
 **Remaining acceptance items**
 - [ ] Harden error reporting/telemetry for picker availability (wire into desktop logger once UI lands).
 
-### Phase 2 – Picker-driven desktop UX (**In progress**)
+### Workstream A – Desktop Picker UX (**In progress**)
 
 **Goals**
 1. Display picker-provided tiles (including hidden/minimized windows and displays) in the Cabana shell.
 2. Persist the latest `PickerResult` (filter blob + metadata) for reuse (desktop relay + CLI).
-3. Provide a Swift/egui session sheet that can:
-   - Trigger native picker re-open.
-   - Surface preview thumbnail, session type (Public / Private), and quick actions (copy link, open Surfer).
+3. Provide a Swift/egui session sheet that can trigger native picker re-open, surface preview, session type (Public / Private), and quick actions (copy link, open Surfer).
 
-**Tasks**
-- [ ] Replace egui gallery with a view that consumes `PickerHandle::listen()` and renders tiles (no SwiftUI yet—initially egui backed by picker metadata).
-- [ ] Serialize `SCContentFilter` + optional `SCStreamConfiguration` into a `ScreenCaptureDescriptor` struct and attach it to `SelectionEvent`.
-- [ ] Update `beach_cabana_host::desktop::publish_selection` callers to forward descriptors so CLI and desktop remain in sync.
-- [ ] Build minimal “session sheet” inside the desktop shell (can remain egui while we iterate) showing:
-  - Current selection metadata (title, bundle id, secure badge if private beach).
-  - Session inputs (passcode, session id).
-  - Buttons for `Start public share` / `Attach to private beach` (stubbed until Phase 3).
-- [ ] Wire telemetry hooks (`picker_open`, `picker_selection`) once tiles render.
+- [ ] Replace egui gallery with a view that consumes `PickerHandle::listen()` and renders tiles (egui or SwiftUI shell TBD).
+- [ ] Define/UI-bind a `ScreenCaptureDescriptor` struct (mirrors Workstream B contract) and store it alongside metadata.
+- [ ] Publish selections (with descriptor) to relay/CLI (`SelectionEvent`).
+- [ ] Build minimal “session sheet” showing selection metadata, session inputs, and stub buttons for `Start public`, `Attach to private beach`.
+- [ ] Wire telemetry hooks (`picker_open`, `picker_selection`).
 
 **Exit criteria**
 - Launching the macOS binary shows all non-minimized screens/windows as tiles populated from the native picker (goal #1).
 - Selecting a tile updates desktop state + publishes to the relay (e.g., CLI sees the same descriptor).
 - Manual smoke test logs streamed picker events in the new UI.
 
-### Phase 3 – Auth + session orchestration (**Not started**)
+### Workstream B – Host Runtime & Relay (**Not started**)
+
+**Goals**
+1. Teach `beach_cabana_host` to consume ScreenCaptureKit descriptors (with CG fallback) when launching streams.
+2. Maintain CLI + desktop compatibility via extended `SelectionEvent` relay.
+3. Provide test/mocks for CI (mock descriptor acceptance, ScreenCaptureKit gating).
+
+**Tasks**
+- [ ] Extend `SelectionEvent` to include serialized descriptor + metadata (agreement with Workstream A).
+- [ ] Update `host_bootstrap` / `host_stream` to accept descriptors; branch to ScreenCaptureKit capture when available.
+- [ ] Preserve legacy window-id path for older builds (feature toggle or env-based fallback).
+- [ ] Add unit/integration tests for descriptor parsing; ensure mock mode works for CI.
+- [ ] Emit telemetry around capture start/fallback.
+
+**Exit criteria**
+- Host can stream using ScreenCaptureKit descriptor provided by desktop UI.
+- CLI workflows still function (no regressions).
+- Tests cover descriptor parsing + fallback, CI green with mock path.
+
+### Workstream C – Auth & Session Services (**Not started**)
 
 Focus: deliver goals #2 and #3 (Clerk auth, Beach session wiring, Beach Surfer playback).
 
@@ -137,15 +156,26 @@ Focus: deliver goals #2 and #3 (Clerk auth, Beach session wiring, Beach Surfer p
 - [ ] Private path: PATCH/POST to Private Beach API attaching Cabana session metadata (viewer worker + credentials) to the selected beach.
 - [ ] Surface verification code, session link, and clipboard/share buttons in-session sheet.
 
-**Streaming pipeline**
-- [ ] Extend host runtime (`host_bootstrap`, ScreenCaptureKit adapter) to consume serialized descriptors; implement fallback to CGWindow capture when building older binaries.
-- [ ] Update `beach_cabana_host::webrtc::host_stream` to detect descriptor type and spin up ScreenCaptureKit streaming with live updates.
-- [ ] Ensure CLI flows remain functional by accepting descriptors (no regression for terminal sessions).
+**Dependencies**
+- Works closely with Workstream B (descriptor content for host launch) and Workstream D (viewer contract).
 
-**Beach Surfer React components**
-- [ ] Introduce reusable Surfer player components capable of rendering PNG/H.264 Cabana sessions (public + private) with minimal props (session id/passcode OR private beach id).
-- [ ] Update Surfer pages to consume the new components and handle real-time updates (Noise handshake, viewer metrics).
-- [ ] Document ergonomic usage patterns for other Beach surfaces.
+### Workstream D – Beach Surfer Viewer (**Not started**)
+
+**Goals**
+1. Provide reusable React components that can render Cabana sessions (public + private) with ergonomic props.
+2. Update Beach Surfer routes to use the new components and display real-time streaming/metadata.
+
+**Tasks**
+- [ ] Design component API (inputs: session id/passcode or private beach id; outputs: playback state, error handling).
+- [ ] Implement viewer components and wire to existing Noise/WebRTC transport.
+- [ ] Update public session entry page + private beach page to consume new components.
+- [ ] Add telemetry hooks + UX polish (loading, secure badges, latency metrics).
+- [ ] Document usage for other teams.
+
+**Exit criteria**
+- Surfer renders Cabana streams in both public and private flows using the new components.
+- Components are reusable (documented props, storybook/README optional).
+- Telemetry + manual QA checklist complete.
 
 **Exit criteria**
 - User can sign in via Clerk, select either public session or private beach target, and start streaming.

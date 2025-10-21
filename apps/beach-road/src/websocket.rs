@@ -463,7 +463,7 @@ async fn handle_client_message(
                 peer_id, client_peer_id, session_id
             );
 
-            let session = match self.storage.get_session(session_id).await {
+            let session = match state.storage.get_session(session_id).await {
                 Ok(Some(session)) => session,
                 Ok(None) => {
                     warn!(session_id = %session_id, "join attempted for missing session");
@@ -487,7 +487,7 @@ async fn handle_client_message(
                 .filter(|value| !value.is_empty());
 
             if let Some(token_value) = viewer_token_str {
-                match verify_viewer_token(self.viewer_tokens.as_ref(), Some(token_value), &session)
+                match verify_viewer_token(state.viewer_tokens.as_ref(), Some(token_value), &session)
                     .await
                 {
                     Ok(()) => {}

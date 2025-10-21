@@ -8,14 +8,14 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
     time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::auth::{AuthConfig, AuthContext};
-use crate::fastpath::{FastPathRegistry, FastPathSession, send_actions_over_fast_path};
+use crate::fastpath::{send_actions_over_fast_path, FastPathRegistry, FastPathSession};
 use crate::metrics;
 use beach_buggy::{
     AckStatus, ActionAck, ActionCommand, CursorPosition, HarnessType, HealthHeartbeat,
@@ -23,17 +23,17 @@ use beach_buggy::{
 };
 use beach_client_core::protocol::{CursorFrame, Update as WireUpdate};
 use beach_client_core::{
-    CliError, ClientFrame as WireClientFrame, HostFrame as WireHostFrame, NegotiatedSingle,
+    decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
+    ClientFrame as WireClientFrame, HostFrame as WireHostFrame, NegotiatedSingle,
     NegotiatedTransport, PackedCell, Payload, SessionConfig, SessionError, SessionManager, Style,
-    StyleId, TerminalGrid, TransportError, decode_host_frame_binary, encode_client_frame_binary,
-    negotiate_transport,
+    StyleId, TerminalGrid, TransportError,
 };
 use chrono::{DateTime, Duration, Utc};
 use prometheus::IntGauge;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool, Row, types::Json};
-use tokio::sync::{RwLock, broadcast};
+use sqlx::{types::Json, FromRow, PgPool, Row};
+use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
@@ -165,9 +165,9 @@ struct ViewerTokenGatewayResponse {
     expires_in: Option<u64>,
 }
 
-struct ViewerTokenIssued {
-    token: String,
-    expires_at_ms: Option<i64>,
+pub(crate) struct ViewerTokenIssued {
+    pub token: String,
+    pub expires_at_ms: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -626,7 +626,7 @@ impl AppState {
         self
     }
 
-    pub async fn viewer_token(
+    pub(crate) async fn viewer_token(
         &self,
         session_id: &str,
         private_beach_id: &str,
@@ -3812,11 +3812,11 @@ mod tests {
     use beach_buggy::{HarnessType, RegisterSessionRequest};
     use serde_json::json;
     use std::sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     };
     use std::time::SystemTime;
-    use tokio::time::{Duration, sleep, timeout};
+    use tokio::time::{sleep, timeout, Duration};
 
     #[test_timeout::tokio_timeout_test(10)]
     async fn spawn_viewer_worker_smoke_test_records_state_and_stream() {

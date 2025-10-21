@@ -4,18 +4,53 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Descriptor persisted alongside picker metadata so downstream components can
+/// hydrate ScreenCaptureKit sessions or fall back when necessary.
+#[derive(Clone, Debug)]
+pub struct ScreenCaptureDescriptor {
+    pub target_id: String,
+    pub filter_blob: Vec<u8>,
+    pub stream_config_blob: Option<Vec<u8>>,
+    pub metadata_json: Option<String>,
+}
+
+impl ScreenCaptureDescriptor {
+    pub fn new(
+        target_id: impl Into<String>,
+        filter_blob: Vec<u8>,
+        stream_config_blob: Option<Vec<u8>>,
+        metadata_json: Option<String>,
+    ) -> Self {
+        Self {
+            target_id: target_id.into(),
+            filter_blob,
+            stream_config_blob,
+            metadata_json,
+        }
+    }
+}
+
 /// Event emitted when the desktop picker confirms a target.
 #[derive(Clone, Debug)]
 pub struct SelectionEvent {
-    pub target_id: String,
+    pub descriptor: ScreenCaptureDescriptor,
+    pub label: String,
+    pub application: Option<String>,
     pub preview_path: Option<PathBuf>,
     pub confirmed_at: SystemTime,
 }
 
 impl SelectionEvent {
-    pub fn new(target_id: impl Into<String>, preview_path: Option<PathBuf>) -> Self {
+    pub fn new(
+        descriptor: ScreenCaptureDescriptor,
+        label: impl Into<String>,
+        application: Option<String>,
+        preview_path: Option<PathBuf>,
+    ) -> Self {
         Self {
-            target_id: target_id.into(),
+            descriptor,
+            label: label.into(),
+            application,
             preview_path,
             confirmed_at: SystemTime::now(),
         }
@@ -24,12 +59,16 @@ impl SelectionEvent {
     /// Helper primarily for tests that prefer a precise timestamp.
     #[allow(dead_code)]
     pub fn with_timestamp(
-        target_id: impl Into<String>,
+        descriptor: ScreenCaptureDescriptor,
+        label: impl Into<String>,
+        application: Option<String>,
         preview_path: Option<PathBuf>,
         confirmed_at: SystemTime,
     ) -> Self {
         Self {
-            target_id: target_id.into(),
+            descriptor,
+            label: label.into(),
+            application,
             preview_path,
             confirmed_at,
         }

@@ -187,13 +187,7 @@ impl ViewerTokenVerifier {
                 continue;
             }
             if let (Some(kid), Some(x), Some(y)) = (entry.kid, entry.x, entry.y) {
-                let decoded_x = URL_SAFE_NO_PAD
-                    .decode(x)
-                    .map_err(|err| ViewerTokenError::JwksFetch(err.to_string()))?;
-                let decoded_y = URL_SAFE_NO_PAD
-                    .decode(y)
-                    .map_err(|err| ViewerTokenError::JwksFetch(err.to_string()))?;
-                let key = DecodingKey::from_ec_components(&decoded_x, &decoded_y)?;
+                let key = DecodingKey::from_ec_components(&x, &y)?;
                 keys.insert(kid, key);
             }
         }

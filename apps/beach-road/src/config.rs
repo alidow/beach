@@ -44,9 +44,8 @@ impl Config {
             .ok()
             .and_then(|val| val.parse().ok())
             .unwrap_or(300);
-        let viewer_token_audience = env
-            .var("BEACH_GATE_VIEWER_TOKEN_AUDIENCE")
-            .unwrap_or_else(|_| "beach-road".into());
+        let viewer_token_audience =
+            env::var("BEACH_GATE_VIEWER_TOKEN_AUDIENCE").unwrap_or_else(|_| "beach-road".into());
         let viewer_token_mac_secret = env::var("BEACH_GATE_VIEWER_TOKEN_SECRET").ok();
         let viewer_token_jwks_cache_ttl_seconds = env::var("VIEWER_TOKEN_JWKS_CACHE_TTL")
             .ok()

@@ -424,5 +424,9 @@ fn map_state_err(err: StateError) -> ApiError {
             error!(error = %e, "serialization failure");
             ApiError::BadRequest("serialization error".into())
         }
+        StateError::External(msg) => {
+            error!(message = %msg, "external dependency failure");
+            ApiError::Upstream("external service failure")
+        }
     }
 }

@@ -8,6 +8,8 @@ Add sessions to a Private Beach via three intuitive flows:
 
 This plan specifies UI/UX, API contracts (Manager + Beach Road), data usage, security, and a single pass implementation plan that another engineer can execute end‑to‑end.
 
+> **Update (Jan 2025):** The legacy HTTP bridge-token flow described below has been superseded by Manager's WebRTC viewer. `POST /private-beaches/:id/harness-bridge-token` and `Beach Road /join-manager` no longer exist; the remaining notes are kept for historical context until the onboarding UX is rewritten.
+
 ## Goals
 - Zero‑trust attach: prove control (code) or ownership (Road) before mapping a session to a beach.
 - Minimal friction for users: simple UI, copyable CLI, immediate appearance in the dashboard.
@@ -142,4 +144,3 @@ Harness
 - Dev mode can stub Beach Road APIs (local mock) until real endpoints land.
 - Keep AUTH_BYPASS for local testing; ensure scopes in prod.
 - Document CLI and UI guidance in Surfer README.
-

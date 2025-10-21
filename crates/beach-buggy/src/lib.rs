@@ -49,6 +49,8 @@ pub struct RegisterSessionRequest {
     pub location_hint: Option<String>,
     pub metadata: Option<serde_json::Value>,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer_passcode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +206,7 @@ pub struct HarnessConfig {
     pub capabilities: Vec<String>,
     pub location_hint: Option<String>,
     pub version: String,
+    pub viewer_passcode: Option<String>,
 }
 
 impl HarnessConfig {
@@ -219,6 +222,7 @@ impl HarnessConfig {
             location_hint: self.location_hint,
             metadata,
             version: self.version,
+            viewer_passcode: self.viewer_passcode,
         }
     }
 }
@@ -719,6 +723,7 @@ mod tests {
                 capabilities: vec!["terminal_diff_v1".into()],
                 location_hint: Some("us-east-1".into()),
                 version: "0.1.0".into(),
+                viewer_passcode: None,
             },
             transport.clone(),
         );
@@ -754,6 +759,7 @@ mod tests {
                 capabilities: vec!["terminal_diff_v1".into()],
                 location_hint: None,
                 version: "0.1.0".into(),
+                viewer_passcode: None,
             },
             transport.clone(),
         );
@@ -807,6 +813,7 @@ mod tests {
                 capabilities: vec!["gui_frame_meta_v1".into()],
                 location_hint: None,
                 version: "0.1.0".into(),
+                viewer_passcode: None,
             },
             transport.clone(),
         );
@@ -841,6 +848,7 @@ mod tests {
                 capabilities: vec!["gui_frame_meta_v1".into()],
                 location_hint: Some("eu-west-1".into()),
                 version: "0.1.0".into(),
+                viewer_passcode: None,
             },
             transport.clone(),
         );
@@ -984,6 +992,7 @@ mod tests {
                 capabilities: vec!["terminal_diff_v1".into()],
                 location_hint: None,
                 version: "0.1.0".into(),
+                viewer_passcode: None,
             },
             transport,
         );

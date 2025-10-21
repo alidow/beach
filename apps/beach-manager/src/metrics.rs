@@ -85,6 +85,48 @@ pub static STATE_REPORTS: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+pub static MANAGER_VIEWER_CONNECTED: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let g = IntGaugeVec::new(
+        Opts::new(
+            "manager_viewer_connected",
+            "Manager WebRTC viewer connection state (0=disconnected, 1=connected)",
+        ),
+        &["private_beach_id", "session_id"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(g.clone())).ok();
+    g
+});
+
+pub static MANAGER_VIEWER_RECONNECTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "manager_viewer_reconnects_total",
+            "Total reconnect attempts for manager WebRTC viewer",
+        ),
+        &["private_beach_id", "session_id"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+pub static MANAGER_VIEWER_LATENCY_MS: Lazy<HistogramVec> = Lazy::new(|| {
+    let h = HistogramVec::new(
+        HistogramOpts::new(
+            "manager_viewer_latency_ms",
+            "Observed latency (ms) between host heartbeat timestamp and manager receipt",
+        )
+        .buckets(vec![
+            1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0,
+        ]),
+        &["private_beach_id", "session_id"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(h.clone())).ok();
+    h
+});
+
 pub static ACTION_LATENCY_MS: Lazy<HistogramVec> = Lazy::new(|| {
     let h = HistogramVec::new(
         HistogramOpts::new(

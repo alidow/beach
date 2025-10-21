@@ -7,21 +7,34 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration as StdDuration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::auth::{AuthConfig, AuthContext};
 use crate::fastpath::{send_actions_over_fast_path, FastPathRegistry, FastPathSession};
 use crate::metrics;
 use beach_buggy::{
-    AckStatus, ActionAck, ActionCommand, HarnessType, HealthHeartbeat, RegisterSessionRequest,
-    RegisterSessionResponse, StateDiff,
+    AckStatus, ActionAck, ActionCommand, CursorPosition, HarnessType, HealthHeartbeat,
+    RegisterSessionRequest, RegisterSessionResponse, StateDiff, TerminalFrame,
 };
+use beach_client_core::{
+    decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
+    ClientFrame as WireClientFrame, HostFrame as WireHostFrame, NegotiatedSingle,
+    NegotiatedTransport, PackedCell, Payload, SessionConfig, SessionError, SessionManager,
+    TerminalGrid, TransportError,
+};
+use beach_client_core::protocol::{CursorFrame, Update as WireUpdate};
 use chrono::{DateTime, Duration, Utc};
+use prometheus::IntGauge;
 use serde::{Deserialize, Serialize};
 use sqlx::{types::Json, FromRow, PgPool, Row};
 use tokio::sync::{broadcast, RwLock};
+use tokio::task::JoinHandle;
+use tokio::time::sleep;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -39,6 +52,7 @@ pub struct AppState {
     auth: Arc<AuthContext>,
     events: Arc<RwLock<HashMap<String, broadcast::Sender<StreamEvent>>>>,
     fast_paths: FastPathRegistry,
+    viewer_workers: Arc<RwLock<HashMap<String, ViewerWorker>>>,
     http: reqwest::Client,
     road_base_url: String,
     public_manager_url: String,
@@ -65,6 +79,7 @@ struct SessionRecord {
     version: String,
     harness_id: String,
     controller_token: Option<String>,
+    viewer_passcode: Option<String>,
     lease_ttl_ms: u64,
     transport_hints: HashMap<String, serde_json::Value>,
     state_cache_url: Option<String>,
@@ -72,6 +87,231 @@ struct SessionRecord {
     controller_events: Vec<ControllerEvent>,
     last_health: Option<HealthHeartbeat>,
     last_state: Option<StateDiff>,
+}
+
+struct ViewerWorker {
+    handle: JoinHandle<()>,
+}
+#[derive(Clone, Copy, Debug)]
+struct ViewerCursor {
+    abs_row: usize,
+    col: usize,
+}
+
+struct ManagerViewerState {
+    grid: TerminalGrid,
+    cursor: Option<ViewerCursor>,
+    diff_seq: AtomicU64,
+}
+
+impl ManagerViewerState {
+    fn new() -> Self {
+        Self {
+            grid: TerminalGrid::with_history_limit(1, 1, 1024),
+            cursor: None,
+            diff_seq: AtomicU64::new(0),
+        }
+    }
+
+    fn reset_grid(
+        &mut self,
+        cols: u32,
+        history_rows: u32,
+        base_row: u64,
+        viewport_rows: Option<u32>,
+    ) {
+        let viewport = viewport_rows.unwrap_or(history_rows).max(1) as usize;
+        let cols = cols.max(1) as usize;
+        let history_limit = history_rows.max(viewport_rows.unwrap_or(history_rows)) as usize;
+        self.grid = TerminalGrid::with_history_limit(viewport, cols, history_limit.max(viewport));
+        self.grid.set_viewport_size(viewport, cols);
+        self.grid.set_row_offset(base_row);
+        self.cursor = None;
+    }
+
+    fn apply_updates(&self, updates: &[WireUpdate]) {
+        for update in updates {
+            self.apply_update(update);
+        }
+    }
+
+    fn apply_update(&self, update: &WireUpdate) {
+        match update {
+            WireUpdate::Cell {
+                row,
+                col,
+                seq,
+                cell,
+            } => {
+                let _ = self.grid.write_packed_cell_if_newer(
+                    *row as usize,
+                    *col as usize,
+                    *seq,
+                    PackedCell::from(*cell),
+                );
+            }
+            WireUpdate::Row { row, seq, cells } => {
+                let row_idx = *row as usize;
+                for (offset, cell) in cells.iter().enumerate() {
+                    let _ = self.grid.write_packed_cell_if_newer(
+                        row_idx,
+                        offset,
+                        *seq,
+                        PackedCell::from(*cell),
+                    );
+                }
+            }
+            WireUpdate::RowSegment {
+                row,
+                start_col,
+                seq,
+                cells,
+            } => {
+                let row_idx = *row as usize;
+                let base_col = *start_col as usize;
+                for (offset, cell) in cells.iter().enumerate() {
+                    let _ = self.grid.write_packed_cell_if_newer(
+                        row_idx,
+                        base_col + offset,
+                        *seq,
+                        PackedCell::from(*cell),
+                    );
+                }
+            }
+            WireUpdate::Rect {
+                rows,
+                cols,
+                seq,
+                cell,
+            } => {
+                let row0 = rows[0] as usize;
+                let row1 = rows[1] as usize;
+                let col0 = cols[0] as usize;
+                let col1 = cols[1] as usize;
+                let _ = self.grid.fill_rect_with_cell_if_newer(
+                    row0,
+                    col0,
+                    row1,
+                    col1,
+                    *seq,
+                    PackedCell::from(*cell),
+                );
+            }
+            WireUpdate::Trim { count, .. } => {
+                if *count > 0 {
+                    let base = self.grid.row_offset();
+                    let new_base = base.saturating_add(*count as u64);
+                    self.grid.set_row_offset(new_base);
+                }
+            }
+            WireUpdate::Style { .. } => {
+                // Style updates are not required for textual diffs today.
+            }
+        }
+    }
+
+    fn update_cursor(&mut self, frame: &CursorFrame) {
+        self.cursor = Some(ViewerCursor {
+            abs_row: frame.row as usize,
+            col: frame.col as usize,
+        });
+    }
+
+    fn handle_host_frame(&mut self, frame: &WireHostFrame) -> Option<StateDiff> {
+        match frame {
+            WireHostFrame::Hello { .. } => {
+                self.cursor = None;
+                self.diff_seq.store(0, Ordering::SeqCst);
+                None
+            }
+            WireHostFrame::Grid {
+                cols,
+                history_rows,
+                base_row,
+                viewport_rows,
+            } => {
+                self.reset_grid(*cols, *history_rows, *base_row, *viewport_rows);
+                None
+            }
+            WireHostFrame::Snapshot {
+                updates, cursor, ..
+            }
+            | WireHostFrame::Delta {
+                updates, cursor, ..
+            }
+            | WireHostFrame::HistoryBackfill {
+                updates, cursor, ..
+            } => {
+                self.apply_updates(updates);
+                if let Some(cursor_frame) = cursor {
+                    self.update_cursor(cursor_frame);
+                }
+                Some(self.build_diff())
+            }
+            WireHostFrame::Cursor { cursor, .. } => {
+                self.update_cursor(cursor);
+                Some(self.build_diff())
+            }
+            WireHostFrame::SnapshotComplete { .. }
+            | WireHostFrame::Heartbeat { .. }
+            | WireHostFrame::InputAck { .. }
+            | WireHostFrame::Shutdown => None,
+        }
+    }
+
+    fn build_diff(&self) -> StateDiff {
+        let frame = capture_terminal_frame_simple(&self.grid, self.cursor.as_ref());
+        let sequence = self.diff_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        StateDiff {
+            sequence,
+            emitted_at: SystemTime::now(),
+            payload: build_terminal_payload(&frame),
+        }
+    }
+}
+
+fn capture_terminal_frame_simple(
+    grid: &TerminalGrid,
+    cursor: Option<&ViewerCursor>,
+) -> TerminalFrame {
+    let (viewport_rows, viewport_cols) = grid.viewport_size();
+    let total_rows = grid.rows();
+    let rows = viewport_rows.min(total_rows);
+    let style_table = grid.style_table.clone();
+    let mut lines = Vec::with_capacity(rows);
+
+    for row in 0..rows {
+        let mut line = String::with_capacity(viewport_cols);
+        for col in 0..viewport_cols {
+            let ch = grid
+                .get_cell_relaxed(row, col)
+                .map(|snapshot| snapshot.unpack(style_table.as_ref()).char)
+                .unwrap_or(' ');
+            line.push(ch);
+        }
+        while line.ends_with(' ') {
+            line.pop();
+        }
+        lines.push(line);
+    }
+
+    let cursor = cursor.map(|cursor| CursorPosition {
+        row: cursor.abs_row,
+        col: cursor.col,
+    });
+
+    TerminalFrame { lines, cursor }
+}
+
+fn build_terminal_payload(frame: &TerminalFrame) -> serde_json::Value {
+    serde_json::json!({
+        "type": "terminal_full",
+        "lines": frame.lines,
+        "cursor": frame.cursor.map(|cursor| serde_json::json!({
+            "row": cursor.row,
+            "col": cursor.col,
+        })),
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -219,6 +459,7 @@ impl AppState {
             auth: Arc::new(AuthContext::new(auth_config)),
             events: Arc::new(RwLock::new(HashMap::new())),
             fast_paths: FastPathRegistry::new(),
+            viewer_workers: Arc::new(RwLock::new(HashMap::new())),
             http: reqwest::Client::new(),
             road_base_url: std::env::var("BEACH_ROAD_URL")
                 .unwrap_or_else(|_| "https://api.beach.sh".into()),
@@ -239,6 +480,7 @@ impl AppState {
             auth: Arc::new(AuthContext::new(auth_config)),
             events: Arc::new(RwLock::new(HashMap::new())),
             fast_paths: FastPathRegistry::new(),
+            viewer_workers: Arc::new(RwLock::new(HashMap::new())),
             http: reqwest::Client::new(),
             road_base_url: std::env::var("BEACH_ROAD_URL")
                 .unwrap_or_else(|_| "https://api.beach.sh".into()),
@@ -363,15 +605,6 @@ impl AppState {
                     ControllerEventType::Registered,
                     Some("attach_by_code".into()),
                 );
-                // Nudge harness via Beach Road with a bridge token (best-effort)
-                if let Ok((token, _exp, _aud)) = self
-                    .mint_bridge_token(private_beach_id, origin_session_id, requester)
-                    .await
-                {
-                    let _ = self
-                        .nudge_join_manager(private_beach_id, origin_session_id, &token)
-                        .await;
-                }
                 Ok(SessionSummary::from_record(rec))
             }
             Backend::Postgres(pool) => {
@@ -428,21 +661,6 @@ impl AppState {
                 )
                 .await?;
                 tx.commit().await?;
-
-                if let Ok((token, _exp, _aud)) = self
-                    .mint_bridge_token(private_beach_id, origin_session_id, requester)
-                    .await
-                {
-                    let token_preview = token.get(..8).unwrap_or(&token);
-                    info!(
-                        origin_session_id = %origin_uuid,
-                        bridge_token_preview = %token_preview,
-                        "minted bridge token and nudging harness"
-                    );
-                    let _ = self
-                        .nudge_join_manager(private_beach_id, origin_session_id, &token)
-                        .await;
-                }
 
                 // Return summary (best-effort from DB fields)
                 let mut list = self.list_sessions(private_beach_id).await?;
@@ -519,39 +737,9 @@ impl AppState {
                     }
                 }
                 tx.commit().await?;
-                // Best-effort nudge for newly attached sessions
-                for sid in ids_to_nudge {
-                    if let Ok((token, _exp, _aud)) = self
-                        .mint_bridge_token(private_beach_id, &sid, requester)
-                        .await
-                    {
-                        let token_preview = token.get(..8).unwrap_or(&token);
-                        info!(
-                            origin_session_id = %sid,
-                            bridge_token_preview = %token_preview,
-                            "minted bridge token for owned session and nudging harness"
-                        );
-                        let _ = self
-                            .nudge_join_manager(private_beach_id, &sid, &token)
-                            .await;
-                    }
-                }
                 Ok((attached, duplicates))
             }
         }
-    }
-
-    pub async fn mint_bridge_token(
-        &self,
-        _private_beach_id: &str,
-        _origin_session_id: &str,
-        _requester: Option<Uuid>,
-    ) -> Result<(String, i64, String), StateError> {
-        // In dev/bypass mode, any opaque token is accepted by the manager.
-        let token = Uuid::new_v4().to_string();
-        let expires_at_ms = now_ms() + 5 * 60 * 1000; // 5 minutes
-        let audience = "pb:sessions.register pb:harness.publish".to_string();
-        Ok((token, expires_at_ms, audience))
     }
 
     async fn verify_code_with_road(&self, origin_session_id: &str, code: &str) -> Result<bool, ()> {
@@ -574,51 +762,6 @@ impl AppState {
         let v: serde_json::Value = resp.json().await.map_err(|_| ())?;
         Ok(v.get("verified").and_then(|b| b.as_bool()).unwrap_or(false))
     }
-
-    async fn nudge_join_manager(
-        &self,
-        private_beach_id: &str,
-        origin_session_id: &str,
-        bridge_token: &str,
-    ) -> Result<(), ()> {
-        let url = format!(
-            "{}/sessions/{}/join-manager",
-            self.road_base_url.trim_end_matches('/'),
-            origin_session_id
-        );
-        let body = serde_json::json!({
-            "manager_url": self.public_manager_url,
-            "bridge_token": bridge_token,
-            "private_beach_id": private_beach_id,
-        });
-        let resp = self
-            .http
-            .post(url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|_| ())?;
-        if resp.status().is_success() {
-            let preview = bridge_token.get(..8).unwrap_or(bridge_token);
-            info!(
-                private_beach_id = %private_beach_id,
-                origin_session_id = %origin_session_id,
-                manager_url = %self.public_manager_url,
-                bridge_token_preview = %preview,
-                "nudged beach-road to join manager"
-            );
-            Ok(())
-        } else {
-            warn!(
-                private_beach_id = %private_beach_id,
-                origin_session_id = %origin_session_id,
-                status = %resp.status(),
-                "join-manager nudge failed"
-            );
-            Err(())
-        }
-    }
-    // impl AppState continues below
 
     pub async fn update_session_metadata(
         &self,
@@ -1316,6 +1459,92 @@ impl AppState {
         }
     }
 
+    pub async fn viewer_passcode(
+        &self,
+        private_beach_id: &str,
+        session_id: &str,
+    ) -> Result<Option<String>, StateError> {
+        match &self.backend {
+            Backend::Memory => {
+                let sessions = self.fallback.sessions.read().await;
+                let record = sessions
+                    .get(session_id)
+                    .ok_or(StateError::SessionNotFound)?;
+                if record.private_beach_id != private_beach_id {
+                    return Err(StateError::PrivateBeachNotFound);
+                }
+                Ok(record.viewer_passcode.clone())
+            }
+            Backend::Postgres(pool) => {
+                let session_uuid = parse_uuid(session_id, "session_id")?;
+                let beach_uuid = parse_uuid(private_beach_id, "private_beach_id")?;
+                let identifiers = self
+                    .fetch_session_identifiers(pool, &session_uuid)
+                    .await?;
+                if identifiers.private_beach_id != beach_uuid {
+                    return Err(StateError::PrivateBeachNotFound);
+                }
+
+                let mut tx = pool.begin().await?;
+                self.set_rls_context_tx(&mut tx, &beach_uuid).await?;
+                let passcode = sqlx::query_scalar::<_, Option<String>>(
+                    r#"
+                    SELECT viewer_passcode
+                    FROM session_runtime
+                    WHERE session_id = $1
+                    "#,
+                )
+                .bind(identifiers.session_id)
+                .fetch_optional(tx.as_mut())
+                .await?
+                .flatten();
+                tx.commit().await?;
+                Ok(passcode)
+            }
+        }
+    }
+
+    pub async fn spawn_viewer_worker(&self, session_id: &str) -> Result<(), StateError> {
+        let (private_beach_id, passcode) = {
+            let sessions = self.fallback.sessions.read().await;
+            let record = sessions
+                .get(session_id)
+                .ok_or(StateError::SessionNotFound)?;
+            let passcode = match &record.viewer_passcode {
+                Some(code) => code.clone(),
+                None => {
+                    debug!(
+                        target = "private_beach",
+                        session_id = %session_id,
+                        "viewer passcode not set; skipping viewer worker"
+                    );
+                    return Ok(());
+                }
+            };
+            (record.private_beach_id.clone(), passcode)
+        };
+
+        let base_url = self.road_base_url.clone();
+        let mut workers = self.viewer_workers.write().await;
+        if let Some(existing) = workers.remove(session_id) {
+            existing.handle.abort();
+        }
+        let state_clone = self.clone();
+        let session_id_owned = session_id.to_string();
+        let handle = tokio::spawn(async move {
+            run_viewer_worker(
+                state_clone,
+                session_id_owned,
+                private_beach_id,
+                passcode,
+                base_url,
+            )
+            .await;
+        });
+        workers.insert(session_id.to_string(), ViewerWorker { handle });
+        Ok(())
+    }
+
     pub async fn emergency_stop(
         &self,
         session_id: &str,
@@ -1584,6 +1813,7 @@ impl InnerState {
         entry.harness_type = req.harness_type.clone();
         entry.harness_id = harness_id.to_string();
         entry.controller_token = controller_token;
+        entry.viewer_passcode = req.viewer_passcode.clone();
     }
 
     async fn acknowledge_controller(&self, session_id: &str, token: String, ttl: u64) {
@@ -1663,6 +1893,7 @@ impl SessionRecord {
             version: "unknown".into(),
             harness_id,
             controller_token: None,
+            viewer_passcode: None,
             lease_ttl_ms: DEFAULT_LEASE_TTL_MS,
             transport_hints,
             state_cache_url: None,
@@ -1852,12 +2083,22 @@ impl AppState {
         entry.metadata = req.metadata.clone();
         entry.version = req.version.clone();
         entry.harness_type = req.harness_type.clone();
+        entry.viewer_passcode = req.viewer_passcode.clone();
 
         if entry.controller_token.is_none() {
             entry.controller_token = Some(Uuid::new_v4().to_string());
         }
 
         entry.append_event(ControllerEventType::Registered, None);
+
+        if let Err(err) = self.spawn_viewer_worker(&req.session_id).await {
+            warn!(
+                target = "private_beach",
+                session_id = %req.session_id,
+                error = %err,
+                "failed to start manager viewer worker"
+            );
+        }
 
         Ok(RegisterSessionResponse {
             harness_id: entry.harness_id.clone(),
@@ -1931,14 +2172,17 @@ impl AppState {
 
         sqlx::query(
             r#"
-            INSERT INTO session_runtime (session_id, transport_hints)
-            VALUES ($1, $2)
+            INSERT INTO session_runtime (session_id, transport_hints, viewer_passcode)
+            VALUES ($1, $2, $3)
             ON CONFLICT (session_id)
-            DO UPDATE SET transport_hints = EXCLUDED.transport_hints
+            DO UPDATE SET
+                transport_hints = EXCLUDED.transport_hints,
+                viewer_passcode = EXCLUDED.viewer_passcode
             "#,
         )
         .bind(db_session_id)
         .bind(Json(transport_json))
+        .bind(req.viewer_passcode.clone())
         .execute(tx.as_mut())
         .await?;
 
@@ -1997,6 +2241,15 @@ impl AppState {
                 Some(controller_token.to_string()),
             )
             .await;
+
+        if let Err(err) = self.spawn_viewer_worker(&req.session_id).await {
+            warn!(
+                target = "private_beach",
+                session_id = %req.session_id,
+                error = %err,
+                "failed to start manager viewer worker"
+            );
+        }
 
         info!(
             session_id = %req.session_id,
@@ -2950,6 +3203,256 @@ struct LeaseRow {
     controller_account_id: Option<Uuid>,
     expires_at: Option<DateTime<Utc>>,
     revoked_at: Option<DateTime<Utc>>,
+}
+
+async fn run_viewer_worker(
+    state: AppState,
+    session_id: String,
+    private_beach_id: String,
+    passcode: String,
+    road_base_url: String,
+) {
+    let _ = &state;
+    let label = "beach-manager";
+    let label_private = private_beach_id.clone();
+    let label_session = session_id.clone();
+    metrics::MANAGER_VIEWER_CONNECTED
+        .with_label_values(&[label_private.as_str(), label_session.as_str()])
+        .set(0);
+    let mut attempts: usize = 0;
+    loop {
+        if attempts > 0 {
+            metrics::MANAGER_VIEWER_RECONNECTS
+                .with_label_values(&[label_private.as_str(), label_session.as_str()])
+                .inc();
+        }
+        attempts = attempts.saturating_add(1);
+        match viewer_connect_once(
+            &state,
+            &session_id,
+            &private_beach_id,
+            &passcode,
+            &road_base_url,
+            label,
+        )
+        .await
+        {
+            Ok(()) => {
+                info!(
+                    target = "private_beach",
+                    session_id = %session_id,
+                    private_beach_id = %private_beach_id,
+                    "manager viewer disconnected cleanly"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    target = "private_beach",
+                    session_id = %session_id,
+                    private_beach_id = %private_beach_id,
+                    error = %err,
+                    "manager viewer connection failed"
+                );
+            }
+        }
+        metrics::MANAGER_VIEWER_CONNECTED
+            .with_label_values(&[label_private.as_str(), label_session.as_str()])
+            .set(0);
+        sleep(StdDuration::from_secs(3)).await;
+    }
+}
+
+async fn viewer_connect_once(
+    state: &AppState,
+    session_id: &str,
+    private_beach_id: &str,
+    passcode: &str,
+    road_base_url: &str,
+    label: &str,
+) -> Result<(), ViewerError> {
+    let gauge = metrics::MANAGER_VIEWER_CONNECTED.with_label_values(&[
+        private_beach_id,
+        session_id,
+    ]);
+    gauge.set(0);
+    let gauge_guard = ViewerGaugeGuard::new(gauge.clone());
+    let latency_hist = metrics::MANAGER_VIEWER_LATENCY_MS.with_label_values(&[
+        private_beach_id,
+        session_id,
+    ]);
+
+    let config = SessionConfig::new(road_base_url).map_err(ViewerError::Join)?;
+    let manager = SessionManager::new(config).map_err(ViewerError::Join)?;
+    let joined = manager
+        .join(session_id, passcode, Some(label), false)
+        .await
+        .map_err(ViewerError::Join)?;
+    let negotiated = negotiate_transport(joined.handle(), Some(passcode), Some(label), false)
+        .await
+        .map_err(ViewerError::Negotiation)?;
+    let transport = match negotiated {
+        NegotiatedTransport::Single(NegotiatedSingle { transport, .. }) => transport,
+        NegotiatedTransport::WebRtcOfferer { .. } => {
+            return Err(ViewerError::UnsupportedTransport("offerer"));
+        }
+    };
+
+    info!(
+        target = "private_beach",
+        session_id = %session_id,
+        private_beach_id = %private_beach_id,
+        "manager viewer connected via webrtc"
+    );
+    gauge_guard.mark_connected();
+
+    if let Err(err) = transport.send_text("__ready__") {
+        debug!(
+            target = "private_beach",
+            session_id = %session_id,
+            error = %err,
+            "manager viewer failed to send ready sentinel"
+        );
+    }
+
+    let resize_frame = WireClientFrame::Resize {
+        cols: 120,
+        rows: 40,
+    };
+    let resize_bytes = encode_client_frame_binary(&resize_frame);
+    if let Err(err) = transport.send_bytes(&resize_bytes) {
+        debug!(
+            target = "private_beach",
+            session_id = %session_id,
+            error = %err,
+            "manager viewer failed to send resize frame"
+        );
+    }
+
+    let mut viewer_state = ManagerViewerState::new();
+
+    loop {
+        match transport.recv(StdDuration::from_millis(500)) {
+            Ok(message) => match message.payload {
+                Payload::Binary(bytes) => match decode_host_frame_binary(&bytes) {
+                    Ok(frame) => {
+                        let frame_type = match &frame {
+                            WireHostFrame::Hello { .. } => "hello",
+                            WireHostFrame::Grid { .. } => "grid",
+                            WireHostFrame::Snapshot { .. } => "snapshot",
+                            WireHostFrame::SnapshotComplete { .. } => "snapshot_complete",
+                            WireHostFrame::Delta { .. } => "delta",
+                            WireHostFrame::HistoryBackfill { .. } => "history_backfill",
+                            WireHostFrame::InputAck { .. } => "input_ack",
+                            WireHostFrame::Cursor { .. } => "cursor",
+                            WireHostFrame::Heartbeat { .. } => "heartbeat",
+                            WireHostFrame::Shutdown => "shutdown",
+                        };
+                        debug!(
+                            target = "private_beach",
+                            session_id = %session_id,
+                            frame = frame_type,
+                            "manager viewer received host frame"
+                        );
+                        if let WireHostFrame::Heartbeat { timestamp_ms, .. } = &frame {
+                            let now_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            if now_ms >= *timestamp_ms {
+                                let latency_ms = now_ms - *timestamp_ms;
+                                latency_hist.observe(latency_ms as f64);
+                            }
+                        }
+                        if let Some(diff) = viewer_state.handle_host_frame(&frame) {
+                            let sequence = diff.sequence;
+                            if let Err(err) = state.record_state(session_id, diff).await {
+                                warn!(
+                                    target = "private_beach",
+                                    session_id = %session_id,
+                                    private_beach_id = %private_beach_id,
+                                    error = %err,
+                                    sequence,
+                                    "manager viewer failed to persist diff"
+                                );
+                            }
+                        }
+                        if matches!(frame, WireHostFrame::Shutdown) {
+                            info!(
+                                target = "private_beach",
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                "manager viewer received shutdown frame"
+                            );
+                            return Ok(());
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            target = "private_beach",
+                            session_id = %session_id,
+                            error = %err,
+                            "manager viewer failed to decode host frame"
+                        );
+                    }
+                },
+                Payload::Text(text) => {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        debug!(
+                            target = "private_beach",
+                            session_id = %session_id,
+                            payload = %trimmed,
+                            "manager viewer received text payload"
+                        );
+                    }
+                }
+            },
+            Err(TransportError::Timeout) => continue,
+            Err(TransportError::ChannelClosed) => {
+                info!(
+                    target = "private_beach",
+                    session_id = %session_id,
+                    "manager viewer transport closed by peer"
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                return Err(ViewerError::Transport(err));
+            }
+        }
+    }
+}
+
+struct ViewerGaugeGuard {
+    gauge: IntGauge,
+}
+
+impl ViewerGaugeGuard {
+    fn new(gauge: IntGauge) -> Self {
+        Self { gauge }
+    }
+
+    fn mark_connected(&self) {
+        self.gauge.set(1);
+    }
+}
+
+impl Drop for ViewerGaugeGuard {
+    fn drop(&mut self) {
+        self.gauge.set(0);
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ViewerError {
+    #[error("session join failed: {0}")]
+    Join(SessionError),
+    #[error("transport negotiation failed: {0}")]
+    Negotiation(CliError),
+    #[error("transport error: {0}")]
+    Transport(TransportError),
+    #[error("unsupported transport: {0}")]
+    UnsupportedTransport(&'static str),
 }
 
 fn slugify(name: &str) -> String {

@@ -50,7 +50,7 @@ const MCP_CHANNEL_LABEL: &str = "mcp-jsonrpc";
 mod secure_handshake;
 mod secure_signaling;
 mod signaling;
-pub use signaling::{ManagerBridgeHint, SignalingClient};
+pub use signaling::SignalingClient;
 
 static OFFER_ENCRYPTION_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -153,7 +153,8 @@ impl WebRtcChannels {
 const TRANSPORT_ENCRYPTION_VERSION: u8 = 1;
 const TRANSPORT_ENCRYPTION_AAD: &[u8] = b"beach:secure-transport:v1";
 
-async fn load_turn_ice_servers() -> Option<Vec<webrtc::ice_transport::ice_server::RTCIceServer>> {
+async fn load_turn_ice_servers()
+-> Result<Option<Vec<webrtc::ice_transport::ice_server::RTCIceServer>>, AuthError> {
     match auth::resolve_turn_credentials(None).await {
         Ok(credentials) => {
             let realm = credentials.realm.clone();
@@ -181,7 +182,7 @@ async fn load_turn_ice_servers() -> Option<Vec<webrtc::ice_transport::ice_server
                     realm = %realm,
                     "TURN credentials returned no ICE servers"
                 );
-                None
+                Ok(None)
             } else {
                 tracing::debug!(
                     target: "beach::transport::webrtc",
@@ -190,14 +191,13 @@ async fn load_turn_ice_servers() -> Option<Vec<webrtc::ice_transport::ice_server
                     server_count = servers.len(),
                     "using TURN credentials from Beach Gate"
                 );
-                Some(servers)
+                Ok(Some(servers))
             }
         }
+        Err(err @ AuthError::TurnNotEntitled) => Err(err),
         Err(err) => {
             match err {
-                AuthError::NotLoggedIn
-                | AuthError::ProfileNotFound(_)
-                | AuthError::TurnNotEntitled => {
+                AuthError::NotLoggedIn | AuthError::ProfileNotFound(_) => {
                     tracing::debug!(
                         target: "beach::transport::webrtc",
                         error = %err,
@@ -212,7 +212,7 @@ async fn load_turn_ice_servers() -> Option<Vec<webrtc::ice_transport::ice_server
                     );
                 }
             }
-            None
+            Ok(None)
         }
     }
 }
@@ -1315,19 +1315,37 @@ async fn negotiate_offerer_peer(
     let api = build_api(setting)?;
     let disable_stun = std::env::var("BEACH_WEBRTC_DISABLE_STUN").is_ok();
     let mut config = RTCConfiguration::default();
-    if let Some(mut turn_servers) = load_turn_ice_servers().await {
-        if !disable_stun {
-            turn_servers.push(webrtc::ice_transport::ice_server::RTCIceServer {
-                urls: vec!["stun:stun.l.google.com:19302".to_string()],
-                ..Default::default()
-            });
+    match load_turn_ice_servers().await {
+        Ok(Some(mut turn_servers)) => {
+            if !disable_stun {
+                turn_servers.push(webrtc::ice_transport::ice_server::RTCIceServer {
+                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
+                    ..Default::default()
+                });
+            }
+            config.ice_servers = turn_servers;
         }
-        config.ice_servers = turn_servers;
-    } else if !disable_stun {
-        config.ice_servers = vec![webrtc::ice_transport::ice_server::RTCIceServer {
-            urls: vec!["stun:stun.l.google.com:19302".to_string()],
-            ..Default::default()
-        }];
+        Ok(None) => {
+            if !disable_stun {
+                config.ice_servers = vec![webrtc::ice_transport::ice_server::RTCIceServer {
+                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
+                    ..Default::default()
+                }];
+            }
+        }
+        Err(AuthError::TurnNotEntitled) => {
+            return Err(TransportError::Setup(
+                "TURN transport requires pb:transport.turn entitlement".into(),
+            ));
+        }
+        Err(_) => {
+            if !disable_stun {
+                config.ice_servers = vec![webrtc::ice_transport::ice_server::RTCIceServer {
+                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
+                    ..Default::default()
+                }];
+            }
+        }
     }
 
     let pc = Arc::new(
@@ -2245,19 +2263,37 @@ async fn connect_answerer(
     // browser uses mDNS/srflx and the offerer has no reflexive candidates.
     let disable_stun = std::env::var("BEACH_WEBRTC_DISABLE_STUN").is_ok();
     let mut config = RTCConfiguration::default();
-    if let Some(mut turn_servers) = load_turn_ice_servers().await {
-        if !disable_stun {
-            turn_servers.push(webrtc::ice_transport::ice_server::RTCIceServer {
-                urls: vec!["stun:stun.l.google.com:19302".to_string()],
-                ..Default::default()
-            });
+    match load_turn_ice_servers().await {
+        Ok(Some(mut turn_servers)) => {
+            if !disable_stun {
+                turn_servers.push(webrtc::ice_transport::ice_server::RTCIceServer {
+                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
+                    ..Default::default()
+                });
+            }
+            config.ice_servers = turn_servers;
         }
-        config.ice_servers = turn_servers;
-    } else if !disable_stun {
-        config.ice_servers = vec![webrtc::ice_transport::ice_server::RTCIceServer {
-            urls: vec!["stun:stun.l.google.com:19302".to_string()],
-            ..Default::default()
-        }];
+        Ok(None) => {
+            if !disable_stun {
+                config.ice_servers = vec![webrtc::ice_transport::ice_server::RTCIceServer {
+                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
+                    ..Default::default()
+                }];
+            }
+        }
+        Err(AuthError::TurnNotEntitled) => {
+            return Err(TransportError::Setup(
+                "TURN transport requires pb:transport.turn entitlement".into(),
+            ));
+        }
+        Err(_) => {
+            if !disable_stun {
+                config.ice_servers = vec![webrtc::ice_transport::ice_server::RTCIceServer {
+                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
+                    ..Default::default()
+                }];
+            }
+        }
     }
 
     tracing::debug!(

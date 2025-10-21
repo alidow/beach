@@ -2,9 +2,9 @@ use axum::{
     extract::{Path, State},
     Json,
 };
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
-use uuid::Uuid;
 
 use crate::state::{AppState, StateError};
 
@@ -55,6 +55,16 @@ pub struct LayoutUpsert {
 pub struct BeachLayout {
     pub preset: String,
     pub tiles: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ViewerCredentialResponse {
+    pub credential_type: String,
+    pub credential: String,
+    pub session_id: String,
+    pub private_beach_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issued_at_ms: Option<i64>,
 }
 
 pub async fn create_private_beach(
@@ -143,6 +153,28 @@ pub async fn put_private_beach_layout(
         .await
         .map_err(map_state_err)?;
     Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+pub async fn get_viewer_credential(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path((private_beach_id, session_id)): Path<(String, String)>,
+) -> ApiResult<ViewerCredentialResponse> {
+    ensure_scope(&token, "pb:sessions.read")?;
+    let passcode = state
+        .viewer_passcode(&private_beach_id, &session_id)
+        .await
+        .map_err(map_state_err)?
+        .ok_or(ApiError::NotFound("viewer credential not available"))?;
+
+    let response = ViewerCredentialResponse {
+        credential_type: "passcode".to_string(),
+        credential: passcode,
+        session_id,
+        private_beach_id,
+        issued_at_ms: Some(Utc::now().timestamp_millis()),
+    };
+    Ok(Json(response))
 }
 
 fn map_state_err(err: StateError) -> ApiError {

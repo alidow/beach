@@ -1,7 +1,11 @@
 [package]
-name = "beach"
+name = "beach-client-core"
 version = "0.1.0"
 edition = "2024"
+
+[[bin]]
+name = "beach"
+path = "src/main.rs"
 
 [build-dependencies]
 chrono = "0.4"

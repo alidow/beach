@@ -1,4 +1,6 @@
-use beach::protocol::{self, HostFrame, Lane, LaneBudgetFrame, SyncConfigFrame, Update};
+use beach_client_core::protocol::{
+    self, HostFrame, Lane, LaneBudgetFrame, SyncConfigFrame, Update,
+};
 
 fn pack_char(ch: char) -> u64 {
     (ch as u32 as u64) << 32

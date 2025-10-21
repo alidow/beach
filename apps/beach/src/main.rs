@@ -1,9 +1,9 @@
 #![recursion_limit = "1024"]
 
-use beach::telemetry::logging as logctl;
-use beach::terminal::app;
-use beach::terminal::cli;
-use beach::terminal::error::CliError;
+use beach_client_core::telemetry::logging as logctl;
+use beach_client_core::terminal::app;
+use beach_client_core::terminal::cli;
+use beach_client_core::terminal::error::CliError;
 use tracing::debug;
 
 #[tokio::main]

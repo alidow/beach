@@ -232,7 +232,13 @@ export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUr
                 </div>
               </div>
               <div className="relative flex min-h-0 flex-1 bg-neutral-900">
-                <SessionTerminalPreview sessionId={s.session_id} managerUrl={managerUrl} token={token} className="w-full" />
+                <SessionTerminalPreview
+                  sessionId={s.session_id}
+                  privateBeachId={s.private_beach_id}
+                  managerUrl={managerUrl}
+                  token={token}
+                  className="w-full"
+                />
               </div>
               <div className="border-t border-border px-3 py-2">
                 <div className="flex items-center justify-between">
@@ -289,7 +295,14 @@ export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUr
             </div>
           </div>
           <div className="flex-1 overflow-hidden">
-            <SessionTerminalPreview sessionId={expanded.session_id} managerUrl={managerUrl} token={token} variant="full" className="h-full w-full" />
+            <SessionTerminalPreview
+              sessionId={expanded.session_id}
+              privateBeachId={expanded.private_beach_id}
+              managerUrl={managerUrl}
+              token={token}
+              variant="full"
+              className="h-full w-full"
+            />
           </div>
         </div>
       )}

@@ -43,11 +43,6 @@ use crate::transport::terminal::negotiation::{
     TransportSupervisor, negotiate_transport,
 };
 use crate::transport::{Payload, Transport, TransportError, TransportKind};
-use beach_buggy::{
-    CursorPosition, HarnessConfig, HarnessType, HttpTransport, SessionHarness, StaticTokenProvider,
-    TerminalFrame,
-};
-use serde_json::json;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Read, Write};
@@ -57,17 +52,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tokio::sync::{
-    Notify, RwLock,
     mpsc::{self, UnboundedSender},
     oneshot,
 };
 use tokio::task::JoinHandle;
-use tokio::time::{interval, sleep, timeout};
+use tokio::time::{sleep, timeout};
 use tracing::field::display;
 use tracing::{Level, debug, error, info, trace, warn};
-use transport_mod::webrtc::{
-    ManagerBridgeHint, OffererAcceptedTransport, OffererSupervisor, SignalingClient,
-};
+use transport_mod::webrtc::{OffererAcceptedTransport, OffererSupervisor};
 
 pub(crate) const MCP_CHANNEL_LABEL: &str = "mcp-jsonrpc";
 pub(crate) const MCP_CHANNEL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -240,18 +232,15 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let emulator_handle = runtime.emulator_handle();
 
     let (forwarder_updates_tx, forwarder_updates_rx) = mpsc::unbounded_channel();
-    let dirty_flag = Arc::new(AtomicBool::new(true));
     let cursor_tracker: Arc<Mutex<Option<CursorState>>> = Arc::new(Mutex::new(None));
     let updates_forward_task = {
         let mut updates = updates;
-        let dirty_flag = dirty_flag.clone();
         let cursor_tracker = Arc::clone(&cursor_tracker);
         tokio::spawn(async move {
             while let Some(update) = updates.recv().await {
                 if let CacheUpdate::Cursor(cursor) = &update {
                     *cursor_tracker.lock().unwrap() = Some(*cursor);
                 }
-                dirty_flag.store(true, Ordering::Relaxed);
                 if forwarder_updates_tx.send(update).is_err() {
                     break;
                 }
@@ -262,26 +251,6 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let mut mcp_task: Option<JoinHandle<()>> = None;
     let mut mcp_handle: Option<McpServerHandle> = None;
     let mcp_bridges: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
-    let (manager_hint_tx, manager_hint_rx) = mpsc::unbounded_channel::<ManagerBridgeHint>();
-    let harness_slot: Arc<RwLock<Option<Arc<SessionHarness<HttpTransport<StaticTokenProvider>>>>>> =
-        Arc::new(RwLock::new(None));
-    let manager_notify = Arc::new(Notify::new());
-    let signaling_attached = Arc::new(AtomicBool::new(false));
-    let manager_update_task = tokio::spawn(run_manager_update_pump(
-        session_id.clone(),
-        grid.clone(),
-        Arc::clone(&cursor_tracker),
-        Arc::clone(&harness_slot),
-        dirty_flag.clone(),
-        manager_notify.clone(),
-    ));
-    let manager_hint_task = tokio::spawn(handle_manager_hints(
-        session_id.clone(),
-        manager_hint_rx,
-        Arc::clone(&harness_slot),
-        manager_notify.clone(),
-        dirty_flag.clone(),
-    ));
     let _mcp_guard: Option<McpRegistryGuard> = if args.mcp {
         let session = McpTerminalSession::new(
             session_id.clone(),
@@ -416,8 +385,6 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         Arc::clone(&authorizer),
         mcp_handle.clone(),
         Arc::clone(&mcp_bridges),
-        manager_hint_tx.clone(),
-        Arc::clone(&signaling_attached),
         first_ready_tx,
     );
 
@@ -474,12 +441,6 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
 
     updates_forward_task.abort();
     let _ = updates_forward_task.await;
-
-    manager_hint_task.abort();
-    let _ = manager_hint_task.await;
-
-    manager_update_task.abort();
-    let _ = manager_update_task.await;
 
     if let Err(err) = updates_task.await {
         warn!(
@@ -971,8 +932,6 @@ fn spawn_webrtc_acceptor(
     authorizer: Arc<JoinAuthorizer>,
     mcp_handle: Option<McpServerHandle>,
     mcp_bridges: Arc<Mutex<Vec<JoinHandle<()>>>>,
-    manager_hint_tx: mpsc::UnboundedSender<ManagerBridgeHint>,
-    signaling_attached: Arc<AtomicBool>,
     ready_tx: Option<oneshot::Sender<()>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -983,22 +942,8 @@ fn spawn_webrtc_acceptor(
                 Ok(NegotiatedTransport::Single(NegotiatedSingle {
                     transport,
                     webrtc_channels,
-                    signaling_client,
+                    signaling_client: _,
                 })) => {
-                    if let Some(signaling) = signaling_client {
-                        spawn_manager_hint_listener(
-                            &session_id,
-                            Arc::clone(&signaling_attached),
-                            signaling,
-                            manager_hint_tx.clone(),
-                        );
-                    } else if !signaling_attached.load(Ordering::SeqCst) {
-                        debug!(
-                            session_id = %session_id,
-                            transport = ?transport.kind(),
-                            "manager bridge hint listener unavailable for single transport"
-                        );
-                    }
                     let selected_kind = transport.kind();
                     info!(session_id = %session_id, transport = ?selected_kind, "transport negotiated");
                     let metadata = JoinAuthorizationMetadata::from_parts(
@@ -1136,12 +1081,6 @@ fn spawn_webrtc_acceptor(
                     handshake_id,
                     metadata: extra_metadata,
                 }) => {
-                    spawn_manager_hint_listener(
-                        &session_id,
-                        Arc::clone(&signaling_attached),
-                        supervisor.signaling_client(),
-                        manager_hint_tx.clone(),
-                    );
                     let transport = connection.transport();
                     let channels = connection.channels();
                     info!(
@@ -1442,183 +1381,6 @@ fn spawn_viewer_accept_loop(
             );
         }
     });
-}
-
-fn spawn_manager_hint_listener(
-    session_id: &str,
-    attached_flag: Arc<AtomicBool>,
-    signaling: Arc<SignalingClient>,
-    tx: mpsc::UnboundedSender<ManagerBridgeHint>,
-) {
-    if attached_flag.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    let mut_tx = tx.clone();
-    info!(session_id = %session_id, "subscribing to manager bridge hints");
-    tokio::spawn(async move {
-        match signaling.manager_hints().await {
-            Ok(mut rx) => {
-                while let Some(hint) = rx.recv().await {
-                    if mut_tx.send(hint).is_err() {
-                        break;
-                    }
-                }
-            }
-            Err(err) => {
-                warn!(
-                    target = "webrtc",
-                    error = %err,
-                    "manager hint stream unavailable"
-                );
-            }
-        }
-    });
-}
-
-async fn handle_manager_hints(
-    session_id: String,
-    mut rx: mpsc::UnboundedReceiver<ManagerBridgeHint>,
-    harness_slot: Arc<RwLock<Option<Arc<SessionHarness<HttpTransport<StaticTokenProvider>>>>>>,
-    notify: Arc<Notify>,
-    dirty_flag: Arc<AtomicBool>,
-) {
-    while let Some(hint) = rx.recv().await {
-        info!(
-            target = "private_beach",
-            session_id = %session_id,
-            private_beach_id = %hint.private_beach_id,
-            manager_url = %hint.manager_url,
-            "received manager bridge hint"
-        );
-
-        let provider = StaticTokenProvider::new(hint.bridge_token.clone());
-        let transport = match HttpTransport::new(&hint.manager_url, provider) {
-            Ok(transport) => transport,
-            Err(err) => {
-                warn!(
-                    target = "private_beach",
-                    session_id = %session_id,
-                    error = %err,
-                    "failed to construct manager transport"
-                );
-                continue;
-            }
-        };
-
-        let version = option_env!("BEACH_BUILD_VERSION")
-            .unwrap_or(env!("CARGO_PKG_VERSION"))
-            .to_string();
-        let harness = Arc::new(SessionHarness::new(
-            HarnessConfig {
-                session_id: session_id.clone(),
-                private_beach_id: hint.private_beach_id.clone(),
-                harness_type: HarnessType::TerminalShim,
-                capabilities: vec!["terminal_diff_v1".into()],
-                location_hint: Some("terminal_host".into()),
-                version,
-            },
-            transport,
-        ));
-
-        let metadata = json!({
-            "host": "beach-cli",
-            "platform": std::env::consts::OS,
-        });
-
-        if let Err(err) = harness.register(Some(metadata)).await {
-            warn!(
-                target = "private_beach",
-                session_id = %session_id,
-                error = %err,
-                "manager registration failed"
-            );
-            continue;
-        }
-
-        {
-            let mut guard = harness_slot.write().await;
-            *guard = Some(harness);
-        }
-
-        dirty_flag.store(true, Ordering::Relaxed);
-        notify.notify_waiters();
-        info!(
-            target = "private_beach",
-            session_id = %session_id,
-            private_beach_id = %hint.private_beach_id,
-            "manager registration completed"
-        );
-    }
-}
-
-async fn run_manager_update_pump(
-    session_id: String,
-    grid: Arc<TerminalGrid>,
-    cursor_tracker: Arc<Mutex<Option<CursorState>>>,
-    harness_slot: Arc<RwLock<Option<Arc<SessionHarness<HttpTransport<StaticTokenProvider>>>>>>,
-    dirty_flag: Arc<AtomicBool>,
-    notify: Arc<Notify>,
-) {
-    let mut ticker = interval(Duration::from_millis(250));
-    loop {
-        tokio::select! {
-            _ = ticker.tick() => {},
-            _ = notify.notified() => {},
-        }
-
-        if !dirty_flag.swap(false, Ordering::Relaxed) {
-            continue;
-        }
-
-        let harness = {
-            let guard = harness_slot.read().await;
-            guard.clone()
-        };
-
-        if let Some(harness) = harness {
-            let cursor = { *cursor_tracker.lock().unwrap() };
-            let frame = capture_terminal_frame(&grid, cursor);
-            if let Err(err) = harness.push_terminal_frame(frame).await {
-                warn!(
-                    target = "private_beach",
-                    session_id = %session_id,
-                    error = %err,
-                    "failed to push terminal frame to manager"
-                );
-                dirty_flag.store(true, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
-fn capture_terminal_frame(grid: &TerminalGrid, cursor: Option<CursorState>) -> TerminalFrame {
-    let (viewport_rows, viewport_cols) = grid.viewport_size();
-    let total_rows = grid.rows();
-    let rows = viewport_rows.min(total_rows);
-    let style_table = grid.style_table.clone();
-    let mut lines = Vec::with_capacity(rows);
-
-    for row in 0..rows {
-        let mut line = String::with_capacity(viewport_cols);
-        for col in 0..viewport_cols {
-            let ch = grid
-                .get_cell_relaxed(row, col)
-                .map(|snapshot| snapshot.unpack(style_table.as_ref()).char)
-                .unwrap_or(' ');
-            line.push(ch);
-        }
-        while line.ends_with(' ') {
-            line.pop();
-        }
-        lines.push(line);
-    }
-
-    let cursor = cursor.map(|cursor| CursorPosition {
-        row: cursor.row,
-        col: cursor.col,
-    });
-
-    TerminalFrame { lines, cursor }
 }
 
 fn spawn_local_stdin_forwarder(

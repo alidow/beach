@@ -50,6 +50,7 @@ async fn postgres_sqlx_e2e() {
         location_hint: Some("us-test-1".into()),
         metadata: Some(serde_json::json!({ "tag": "pg-e2e" })),
         version: "0.1.0".into(),
+        viewer_passcode: Some("PGPASS".into()),
     };
     let register_resp = state
         .register_session(register)

@@ -57,8 +57,8 @@ pub fn build_router(state: AppState) -> Router {
             post(attach_owned),
         )
         .route(
-            "/private-beaches/:private_beach_id/harness-bridge-token",
-            post(mint_harness_bridge_token),
+            "/private-beaches/:private_beach_id/sessions/:session_id/viewer-credential",
+            get(get_viewer_credential),
         )
         .route("/sessions/:session_id/emergency-stop", post(emergency_stop))
         .route("/agents/onboard", post(onboard_agent))

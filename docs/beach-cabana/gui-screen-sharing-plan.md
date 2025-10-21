@@ -103,3 +103,29 @@ Future (Post-MVP)
 - Remote control/input and multi-user collaborative controls.
 - Recording/archiving pipelines with consent workflows.
 - Enterprise policy controls (allowed window lists, compliance logging).
+
+## Prioritized Next Steps (2025-10-21 Update)
+
+1. **Picker parity sprint (Phase 4 polish)** *(macOS picker now renders tile grid with window titles + application labels; Windows/Linux adapters still pending)*  
+   - Surface window titles, owning application bundle, and display identifiers inside both the native picker list and the preview tiles.  
+   - Replace the single-preview layout with a Zoom-style grid that renders all windows/displays at once, adds live refresh, and highlights the currently focused option.  
+   - Keep the relay contract unchanged so the CLI picker continues to receive selections with no additional wiring.
+
+2. **Embed the host engine in the desktop app** *(desktop picker now boots Cabana host/WebRTC end-to-end with in-app session controls and verification prompts)*  
+   - Link `beach_cabana_host` directly into `native-apps/desktop`, letting the native picker trigger capture, codec selection, and WebRTC bootstrapping without the CLI helper.  
+   - Maintain a thin CLI front-end that calls the same host APIs, preserving scriptability while proving that the GUI path can stand alone.  
+   - Audit permissions and lifecycle so ScreenCaptureKit (macOS), Noise verification, and signaling prompts surface in-window.
+
+3. **Native-to-web viewing path**  
+   - Use the embedded host to originate a full Cabana WebRTC session, then validate that Beach Surfer can attach and render the stream in real time from the fragmented-MP4 pipeline.  
+   - Add automated smoke flows that launch the desktop host, start a session, and drive a headless Surfer instance to confirm end-to-end playback.
+
+4. **Beach Surfer component architecture**  
+   - Introduce a `BeachSessionView` React component that selects between `TerminalViewer` and the new `CabanaViewer` based on session kind, sharing data-fetching hooks and zero-trust validation.  
+   - Keep the terminal renderer untouched while building the Cabana viewer on top of the existing `MediaVideo/MediaCanvas` work, exposing a clean props surface for metrics, controls, and verification state.  
+   - Document usage and ensure the component API is ergonomic enough to embed in future shells.
+
+5. **Stretch goal: remote input preview**  
+   - Prototype a secure input channel (mouse/keyboard) tunneled through the existing Noise transport, gated behind an explicit host opt-in.  
+   - Start with basic pointer move/click events and keyboard strokes, replayed locally on macOS via Accessibility APIs.  
+   - Treat this as experimental until hardened telemetry and permission UX are in place.

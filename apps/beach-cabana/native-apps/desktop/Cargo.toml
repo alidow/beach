@@ -5,8 +5,10 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-beach-cabana-host = { path = "../../host" }
+beach-cabana-host = { path = "../../host", features = ["webrtc"] }
+crossbeam-channel = "0.5"
 eframe = { version = "0.27", default-features = false, features = ["wgpu"] }
 egui_extras = { version = "0.27", features = ["image"] }
 image = { version = "0.24", default-features = false, features = ["png"] }
 open = "5"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"] }

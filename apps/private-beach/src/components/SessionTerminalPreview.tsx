@@ -3,6 +3,7 @@ import { useSessionTerminal } from '../hooks/useSessionTerminal';
 
 type Props = {
   sessionId: string;
+  privateBeachId: string;
   managerUrl: string;
   token: string | null;
   className?: string;
@@ -17,7 +18,7 @@ function formatLines(lines: string[]): string[] {
   return trimmed.map((line) => (line.endsWith('\r') ? line.slice(0, -1) : line));
 }
 
-function SessionTerminalPreviewInner({ sessionId, managerUrl, token, className, variant = 'preview' }: Props) {
+function SessionTerminalPreviewInner({ sessionId, privateBeachId, managerUrl, token, className, variant = 'preview' }: Props) {
   if (!token || token.trim().length === 0) {
     return (
       <div
@@ -32,7 +33,7 @@ function SessionTerminalPreviewInner({ sessionId, managerUrl, token, className, 
     );
   }
 
-  const preview = useSessionTerminal(sessionId, managerUrl, token);
+  const preview = useSessionTerminal(sessionId, privateBeachId, managerUrl, token);
   const lines = useMemo(() => formatLines(preview.lines), [preview.lines]);
 
   const containerClass =

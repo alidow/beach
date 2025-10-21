@@ -5,7 +5,7 @@
 //! layers. Typical usage looks like:
 //!
 //! ```
-//! # use beach::cache::{GridCache, CellSnapshot, WriteOutcome};
+//! # use beach_client_core::cache::{GridCache, CellSnapshot, WriteOutcome};
 //! # fn demo(grid: &dyn GridCache) {
 //! let payload = 42u64;
 //! let seq = 10;

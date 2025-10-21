@@ -77,11 +77,6 @@ pub struct AttachOwnedRequest {
     pub origin_session_ids: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct HarnessBridgeTokenRequest {
-    pub origin_session_id: String,
-}
-
 #[derive(Debug, serde::Serialize)]
 pub struct AttachByCodeResponse {
     pub ok: bool,
@@ -95,12 +90,6 @@ pub struct AttachOwnedResponse {
     pub duplicates: usize,
 }
 
-#[derive(Debug, serde::Serialize)]
-pub struct HarnessBridgeTokenResponse {
-    pub token: String,
-    pub expires_at_ms: i64,
-    pub audience: String,
-}
 
 pub async fn register_session(
     State(state): State<AppState>,
@@ -372,28 +361,6 @@ pub async fn attach_owned(
     Ok(Json(AttachOwnedResponse {
         attached,
         duplicates,
-    }))
-}
-
-pub async fn mint_harness_bridge_token(
-    State(state): State<AppState>,
-    token: AuthToken,
-    Path(private_beach_id): Path<String>,
-    Json(body): Json<HarnessBridgeTokenRequest>,
-) -> ApiResult<HarnessBridgeTokenResponse> {
-    ensure_scope(&token, "pb:sessions.write")?;
-    let (token_str, expires_at_ms, audience) = state
-        .mint_bridge_token(
-            &private_beach_id,
-            &body.origin_session_id,
-            token.account_uuid(),
-        )
-        .await
-        .map_err(map_state_err)?;
-    Ok(Json(HarnessBridgeTokenResponse {
-        token: token_str,
-        expires_at_ms,
-        audience,
     }))
 }
 

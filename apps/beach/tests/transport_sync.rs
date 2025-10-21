@@ -4,16 +4,18 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use beach::cache::terminal::{PackedCell, Style, StyleId, TerminalGrid};
-use beach::cache::{GridCache, Seq, WriteOutcome};
-use beach::model::terminal::diff::{CacheUpdate, CellWrite, RectFill};
-use beach::protocol::{
+use beach_client_core::cache::terminal::{PackedCell, Style, StyleId, TerminalGrid};
+use beach_client_core::cache::{GridCache, Seq, WriteOutcome};
+use beach_client_core::model::terminal::diff::{CacheUpdate, CellWrite, RectFill};
+use beach_client_core::protocol::{
     self, CursorFrame, HostFrame, Lane as WireLane, LaneBudgetFrame as WireLaneBudget,
     SyncConfigFrame as WireSyncConfig, Update as WireUpdate,
 };
-use beach::sync::terminal::sync::{TerminalDeltaStream, TerminalSync};
-use beach::sync::{LaneBudget, PriorityLane, ServerSynchronizer, SubscriptionId, SyncConfig};
-use beach::transport::{
+use beach_client_core::sync::terminal::sync::{TerminalDeltaStream, TerminalSync};
+use beach_client_core::sync::{
+    LaneBudget, PriorityLane, ServerSynchronizer, SubscriptionId, SyncConfig,
+};
+use beach_client_core::transport::{
     IpcBuilder, Payload, Transport, TransportBuilder, TransportKind, TransportMessage,
     WebRtcBuilder, WebSocketBuilder,
 };

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { SessionSummary, eventsSseUrl, stateSseUrl } from '../lib/api';
+import { SessionSummary, eventsSseUrl } from '../lib/api';
 import { Sheet } from './ui/sheet';
 
 type Props = {
@@ -12,7 +12,6 @@ type Props = {
 
 export default function SessionDrawer({ open, onOpenChange, session, managerUrl, token }: Props) {
   const evRef = useRef<EventSource | null>(null);
-  const stRef = useRef<EventSource | null>(null);
   const [events, setEvents] = useState<string[]>([]);
   const effectiveToken = useMemo(() => (token && token.trim().length > 0 ? token.trim() : null), [token]);
   const redactToken = (value: string | null) => {
@@ -23,16 +22,13 @@ export default function SessionDrawer({ open, onOpenChange, session, managerUrl,
 
   useEffect(() => {
     evRef.current?.close();
-    stRef.current?.close();
     setEvents([]);
     if (!open || !session || !effectiveToken) return;
     const eventsUrl = eventsSseUrl(session.session_id, managerUrl, effectiveToken);
-    const stateUrl = stateSseUrl(session.session_id, managerUrl, effectiveToken);
     console.info('[drawer] opening SSE streams', {
       sessionId: session.session_id,
       managerUrl,
       eventsUrl,
-      stateUrl,
       token: redactToken(effectiveToken),
     });
     const ev = new EventSource(eventsUrl);
@@ -46,26 +42,13 @@ export default function SessionDrawer({ open, onOpenChange, session, managerUrl,
         error: err,
       });
     };
-    const st = new EventSource(stateUrl);
-    st.addEventListener('state', (msg: MessageEvent) => setEvents((p) => [msg.data, ...p].slice(0, 200)));
-    st.onerror = (err) => {
-      console.error('[drawer] state stream error', {
-        sessionId: session.session_id,
-        managerUrl,
-        stateUrl,
-        token: redactToken(effectiveToken),
-        error: err,
-      });
-    };
     evRef.current = ev;
-    stRef.current = st;
     return () => {
       console.debug('[drawer] closing SSE streams', {
         sessionId: session.session_id,
         managerUrl,
       });
       ev.close();
-      st.close();
     };
   }, [open, session, managerUrl, effectiveToken]);
 

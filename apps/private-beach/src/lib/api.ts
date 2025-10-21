@@ -25,6 +25,14 @@ export type ControllerLeaseResponse = {
   expires_at_ms: number;
 };
 
+export type ViewerCredential = {
+  credential_type: string;
+  credential: string;
+  session_id: string;
+  private_beach_id: string;
+  issued_at_ms?: number | null;
+};
+
 function base(baseUrl?: string) {
   if (baseUrl) return baseUrl;
   return process.env.NEXT_PUBLIC_MANAGER_URL || 'http://localhost:8080';
@@ -76,20 +84,33 @@ export async function emergencyStop(sessionId: string, token: string | null, bas
   if (!res.ok) throw new Error(`emergencyStop failed ${res.status}`);
 }
 
-export function stateSseUrl(sessionId: string, baseUrl?: string, accessToken?: string): string {
-  if (!accessToken || accessToken.trim().length === 0) {
-    throw new Error('missing manager auth token');
-  }
-  const t = `?access_token=${encodeURIComponent(accessToken.trim())}`;
-  return `${base(baseUrl)}/sessions/${sessionId}/state/stream${t}`;
-}
-
 export function eventsSseUrl(sessionId: string, baseUrl?: string, accessToken?: string): string {
   if (!accessToken || accessToken.trim().length === 0) {
     throw new Error('missing manager auth token');
   }
   const t = `?access_token=${encodeURIComponent(accessToken.trim())}`;
   return `${base(baseUrl)}/sessions/${sessionId}/events/stream${t}`;
+}
+
+export async function fetchViewerCredential(
+  privateBeachId: string,
+  sessionId: string,
+  token: string | null,
+  baseUrl?: string,
+): Promise<ViewerCredential> {
+  const res = await fetch(
+    `${base(baseUrl)}/private-beaches/${privateBeachId}/sessions/${sessionId}/viewer-credential`,
+    {
+      headers: authHeaders(token),
+    },
+  );
+  if (res.status === 404) {
+    throw new Error('viewer credential unavailable');
+  }
+  if (!res.ok) {
+    throw new Error(`fetchViewerCredential failed ${res.status}`);
+  }
+  return res.json();
 }
 
 export async function attachByCode(privateBeachId: string, sessionId: string, code: string, token: string | null, baseUrl?: string) {

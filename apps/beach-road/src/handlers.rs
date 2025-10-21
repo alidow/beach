@@ -2,7 +2,6 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
-    Extension,
 };
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
@@ -16,7 +15,7 @@ use serde_json::json;
 use std::env;
 use std::sync::Arc;
 use time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use metrics::counter;
@@ -27,7 +26,6 @@ use crate::{
     session::{hash_passphrase, verify_passphrase},
     signaling::WebRtcSdpPayload,
     storage::{SessionInfo, Storage},
-    websocket::SignalingState,
 };
 
 pub type SharedStorage = Arc<Storage>;
@@ -800,49 +798,6 @@ pub async fn list_my_sessions(
         })
         .collect();
     Ok(Json(list))
-}
-
-// New: accept a manager join hint (no-op for now)
-#[derive(Deserialize)]
-pub struct JoinManagerRequest {
-    pub manager_url: String,
-    pub bridge_token: String,
-    pub private_beach_id: String,
-}
-
-#[derive(Serialize)]
-pub struct JoinManagerResponse {
-    pub ok: bool,
-}
-
-pub async fn join_manager(
-    State(_storage): State<SharedStorage>,
-    Extension(signaling): Extension<SignalingState>,
-    Path(session_id): Path<String>,
-    Json(body): Json<JoinManagerRequest>,
-) -> Result<Json<JoinManagerResponse>, StatusCode> {
-    let preview = body.bridge_token.get(..8).unwrap_or(&body.bridge_token);
-    info!(
-        private_beach_id = %body.private_beach_id,
-        origin_session_id = %session_id,
-        manager_url = %body.manager_url,
-        bridge_token_preview = %preview,
-        "join-manager request received; dispatching bridge hint",
-    );
-    let delivered = signaling.notify_join_manager(
-        &session_id,
-        body.manager_url.clone(),
-        body.bridge_token.clone(),
-        body.private_beach_id.clone(),
-    );
-    if delivered == 0 {
-        warn!(
-            private_beach_id = %body.private_beach_id,
-            origin_session_id = %session_id,
-            "join-manager hint delivered to 0 peers"
-        );
-    }
-    Ok(Json(JoinManagerResponse { ok: true }))
 }
 
 /// GET /health - Health check endpoint

@@ -3,6 +3,13 @@ import { stateSseUrl } from '../lib/api';
 
 type Cursor = { row: number; col: number } | null;
 
+function redactToken(token: string | null | undefined): string {
+  if (!token) return '(none)';
+  const trimmed = token.trim();
+  if (trimmed.length <= 8) return `${trimmed}`;
+  return `${trimmed.slice(0, 4)}…${trimmed.slice(-4)}`;
+}
+
 export type TerminalPreview = {
   lines: string[];
   cursor: Cursor;
@@ -63,6 +70,14 @@ export function useSessionTerminal(sessionId: string | null | undefined, manager
   useEffect(() => {
     sourceRef.current?.close();
     if (!sessionId || !token || token.trim().length === 0) {
+      if (!sessionId) {
+        console.debug('[terminal] no session id provided, clearing state');
+      } else {
+        console.debug('[terminal] missing manager token, clearing state', {
+          sessionId,
+          token: redactToken(token),
+        });
+      }
       setState((prev) => {
         if (!prev.connecting && prev.lines.length === 0 && prev.error == null) {
           return prev;
@@ -74,6 +89,12 @@ export function useSessionTerminal(sessionId: string | null | undefined, manager
     setState((prev) => ({ ...prev, connecting: true, error: null }));
     const trimmedToken = token.trim();
     const url = stateSseUrl(sessionId, managerUrl, trimmedToken);
+    console.info('[terminal] opening SSE stream', {
+      sessionId,
+      managerUrl,
+      url,
+      token: redactToken(trimmedToken),
+    });
     const es = new EventSource(url);
     sourceRef.current = es;
 
@@ -85,6 +106,11 @@ export function useSessionTerminal(sessionId: string | null | undefined, manager
           setState((prev) => ({ ...prev, connecting: false }));
           return;
         }
+        console.debug('[terminal] received diff', {
+          sessionId,
+          sequence: diff.sequence,
+          lines: snapshot.lines.length,
+        });
         setState((prev) => ({
           lines: snapshot.lines,
           cursor: snapshot.cursor ?? null,
@@ -94,12 +120,26 @@ export function useSessionTerminal(sessionId: string | null | undefined, manager
           error: null,
         }));
       } catch (error) {
+        console.error('[terminal] failed to parse state diff', {
+          sessionId,
+          managerUrl,
+          url,
+          token: redactToken(trimmedToken),
+          raw: msg.data,
+          error,
+        });
         setState((prev) => ({ ...prev, error: error instanceof Error ? error.message : String(error), connecting: false }));
       }
     };
 
     es.addEventListener('state', handleState);
     es.onerror = () => {
+      console.error('[terminal] SSE stream error', {
+        sessionId,
+        managerUrl,
+        url,
+        token: redactToken(trimmedToken),
+      });
       setState((prev) => ({
         ...prev,
         error: prev.error ?? 'Stream unavailable (check token and manager reachability)',
@@ -110,6 +150,12 @@ export function useSessionTerminal(sessionId: string | null | undefined, manager
     return () => {
       es.removeEventListener('state', handleState);
       es.close();
+      console.debug('[terminal] SSE stream closed', {
+        sessionId,
+        managerUrl,
+        url,
+        token: redactToken(trimmedToken),
+      });
     };
   }, [sessionId, managerUrl, token]);
 

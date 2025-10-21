@@ -39,12 +39,24 @@ export default function AddSessionModal({ open, onOpenChange, privateBeachId, ma
         setError('Sign in to load your active sessions.');
         return;
       }
+      console.info('[add-session] loading owned sessions', {
+        managerToken: hasToken ? 'present' : 'missing',
+        roadUrl,
+      });
       listMySessions(token, roadUrl)
         .then((sessions) => {
+          console.info('[add-session] loaded owned sessions', {
+            count: sessions.length,
+          });
           setMine(sessions);
           setError(null);
         })
-        .catch((e) => setError(e.message || 'Failed to load sessions'));
+        .catch((e) => {
+          console.error('[add-session] failed to load owned sessions', {
+            error: e,
+          });
+          setError(e.message || 'Failed to load sessions');
+        });
     }
   }, [open, tab, token, roadUrl, hasToken]);
 
@@ -55,10 +67,23 @@ export default function AddSessionModal({ open, onOpenChange, privateBeachId, ma
     }
     setLoading(true); setError(null);
     try {
+      console.info('[add-session] attaching by code', {
+        privateBeachId,
+        sessionId: sessionId.trim(),
+        managerUrl,
+      });
       const resp = await attachByCode(privateBeachId, sessionId.trim(), code.trim(), token, managerUrl);
+      console.info('[add-session] attach by code response', {
+        session: resp?.session?.session_id,
+      });
       onAttached?.([resp.session.session_id]);
       onOpenChange(false);
     } catch (e: any) {
+      console.error('[add-session] attach by code failed', {
+        privateBeachId,
+        sessionId: sessionId.trim(),
+        error: e,
+      });
       setError(e.message || 'Attach failed');
     } finally { setLoading(false); }
   }
@@ -72,10 +97,20 @@ export default function AddSessionModal({ open, onOpenChange, privateBeachId, ma
     setLoading(true); setError(null);
     try {
       const ids = Array.from(selected);
+      console.info('[add-session] attaching owned sessions', {
+        privateBeachId,
+        ids,
+        managerUrl,
+      });
       await attachOwned(privateBeachId, ids, token, managerUrl);
       onAttached?.(ids);
       onOpenChange(false);
     } catch (e: any) {
+      console.error('[add-session] attach owned failed', {
+        privateBeachId,
+        ids: Array.from(selected),
+        error: e,
+      });
       setError(e.message || 'Attach failed');
     } finally { setLoading(false); }
   }

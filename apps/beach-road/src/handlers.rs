@@ -1,15 +1,15 @@
 use axum::{
     extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
-use base64::engine::general_purpose::STANDARD_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD_NO_PAD;
 use beach_lifeguard_core::{
-    guardrail::SoftGuardrailState, is_telemetry_enabled, CohortId, FallbackTokenClaims,
-    TelemetryPreference,
+    CohortId, FallbackTokenClaims, TelemetryPreference, guardrail::SoftGuardrailState,
+    is_telemetry_enabled,
 };
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{Rng, distributions::Alphanumeric};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
@@ -420,16 +420,19 @@ pub async fn register_session(
     let join_code_plain = supplied_passphrase.unwrap_or_else(generate_join_code);
     let passphrase_hash = hash_passphrase(&join_code_plain);
 
-    let session_server_env = std::env::var("BEACH_SESSION_SERVER")
+    let internal_session_server = std::env::var("BEACH_SESSION_SERVER")
         .unwrap_or_else(|_| "https://api.beach.sh".to_string());
-    let base_http = normalize_base_url(&session_server_env);
+    let public_session_server = std::env::var("BEACH_PUBLIC_SESSION_SERVER")
+        .unwrap_or_else(|_| internal_session_server.clone());
+    let internal_base = normalize_base_url(&internal_session_server);
+    let public_base = normalize_base_url(&public_session_server);
 
     let mut session = SessionInfo::new(
         payload.session_id.clone(),
         passphrase_hash,
         join_code_plain.clone(),
     );
-    session.server_address = Some(base_http.clone());
+    session.server_address = Some(internal_base.clone());
     // Infer ownership from header for dev flows
     if let Some(val) = headers.get("x-account-id").and_then(|v| v.to_str().ok()) {
         session.owner_account_id = Some(val.to_string());
@@ -443,11 +446,11 @@ pub async fn register_session(
 
             let session_url = format!(
                 "{}/sessions/{}",
-                base_http.trim_end_matches('/'),
+                public_base.trim_end_matches('/'),
                 payload.session_id
             );
-            let websocket_url = websocket_url(&base_http, &payload.session_id);
-            let signal_url = signaling_url(&base_http, &payload.session_id);
+            let websocket_url = websocket_url(&public_base, &payload.session_id);
+            let signal_url = signaling_url(&public_base, &payload.session_id);
             let transports = vec![
                 AdvertisedTransport::webrtc(json!({
                     "signaling_url": signal_url,
@@ -516,11 +519,15 @@ pub async fn join_session(
 
             debug!("Client successfully joined session: {}", session_id);
 
-            let base_http = session.server_address.clone().unwrap_or_else(|| {
-                let env = std::env::var("BEACH_SESSION_SERVER")
-                    .unwrap_or_else(|_| "https://api.beach.sh".to_string());
-                normalize_base_url(&env)
-            });
+            let base_http = std::env::var("BEACH_PUBLIC_SESSION_SERVER")
+                .map(|url| normalize_base_url(&url))
+                .unwrap_or_else(|_| {
+                    session.server_address.clone().unwrap_or_else(|| {
+                        let internal = std::env::var("BEACH_SESSION_SERVER")
+                            .unwrap_or_else(|_| "https://api.beach.sh".to_string());
+                        normalize_base_url(&internal)
+                    })
+                });
 
             let session_url = format!(
                 "{}/sessions/{}",

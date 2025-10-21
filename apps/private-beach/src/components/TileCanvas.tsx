@@ -145,6 +145,7 @@ export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUr
   };
 
   const handleAcquire = async (sessionId: string) => {
+    console.info('[tile] acquire controller', { sessionId, managerUrl, tokenPresent: Boolean(token && token.trim().length > 0) });
     if (!token || token.trim().length === 0) return;
     await acquireController(sessionId, 30000, token, managerUrl).catch(() => {});
     await refresh();
@@ -152,6 +153,7 @@ export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUr
 
   const handleRelease = async (sessionId: string, controllerToken: string | null | undefined) => {
     if (!controllerToken) return;
+    console.info('[tile] release controller', { sessionId, managerUrl, controllerToken: controllerToken.slice(0, 4) + '…' });
     if (!token || token.trim().length === 0) return;
     await releaseController(sessionId, controllerToken, token, managerUrl).catch(() => {});
     await refresh();
@@ -159,6 +161,7 @@ export default function TileCanvas({ tiles, onRemove, onSelect, token, managerUr
 
   const handleStop = async (sessionId: string) => {
     if (!confirm('Emergency stop?')) return;
+    console.warn('[tile] emergency stop', { sessionId, managerUrl });
     if (!token || token.trim().length === 0) return;
     await emergencyStop(sessionId, token, managerUrl).catch(() => {});
     await refresh();

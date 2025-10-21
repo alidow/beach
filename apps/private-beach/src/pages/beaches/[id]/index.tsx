@@ -140,11 +140,28 @@ export default function BeachDashboard() {
         if (!token) {
           setSessions([]);
           setError('Missing manager auth token');
+          console.error('[dashboard] refresh aborted: missing manager token', {
+            privateBeachId: id,
+            managerUrl: effectiveManagerUrl,
+          });
           return;
         }
+        console.info('[dashboard] refreshing sessions', {
+          privateBeachId: id,
+          managerUrl: effectiveManagerUrl,
+          token: token.slice(0, 4) + '…',
+        });
         const data = await listSessions(id, token, effectiveManagerUrl);
+        console.debug('[dashboard] sessions loaded', {
+          count: data.length,
+        });
         setSessions(data);
       } catch (e: any) {
+        console.error('[dashboard] listSessions failed', {
+          privateBeachId: id,
+          managerUrl: effectiveManagerUrl,
+          error: e,
+        });
         setError(e.message || 'Failed to load sessions');
       } finally {
         setLoading(false);

@@ -22,6 +22,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{types::Json, FromRow, PgPool, Row};
 use tokio::sync::{broadcast, RwLock};
+use tracing::info;
 use uuid::Uuid;
 
 const DEFAULT_LEASE_TTL_MS: u64 = 30_000;
@@ -297,13 +298,25 @@ impl AppState {
             .entry(session_id.to_string())
             .or_insert_with(|| broadcast::channel(128).0)
             .clone();
+        info!(session_id = %session_id, "session stream subscribed");
         tx.subscribe()
     }
 
     async fn publish(&self, session_id: &str, event: StreamEvent) {
         let tx_opt = { self.events.read().await.get(session_id).cloned() };
         if let Some(tx) = tx_opt {
-            let _ = tx.send(event);
+            let event_kind = match &event {
+                StreamEvent::ControllerEvent(_) => "controller_event",
+                StreamEvent::State(_) => "state",
+                StreamEvent::Health(_) => "health",
+            };
+            if tx.send(event).is_err() {
+                info!(
+                    session_id = %session_id,
+                    event_kind,
+                    "no subscribers to receive stream event"
+                );
+            }
         }
     }
 
@@ -362,6 +375,12 @@ impl AppState {
             Backend::Postgres(pool) => {
                 let beach_uuid = parse_uuid(private_beach_id, "private_beach_id")?;
                 let origin_uuid = parse_uuid(origin_session_id, "session_id")?;
+                info!(
+                    private_beach_id = %beach_uuid,
+                    origin_session_id = %origin_uuid,
+                    requester = ?requester,
+                    "attaching session via code"
+                );
                 let mut tx = pool.begin().await?;
                 self.set_rls_context_tx(&mut tx, &beach_uuid).await?;
                 // Ensure the target private beach exists to avoid FK violations
@@ -412,6 +431,12 @@ impl AppState {
                     .mint_bridge_token(private_beach_id, origin_session_id, requester)
                     .await
                 {
+                    let token_preview = token.get(..8).unwrap_or(&token);
+                    info!(
+                        origin_session_id = %origin_uuid,
+                        bridge_token_preview = %token_preview,
+                        "minted bridge token and nudging harness"
+                    );
                     let _ = self.nudge_join_manager(origin_session_id, &token).await;
                 }
 
@@ -470,17 +495,17 @@ impl AppState {
                 for id in origin_ids {
                     if let Ok(origin_uuid) = Uuid::parse_str(&id) {
                         let result = sqlx::query(
-                            r#"
-                            INSERT INTO session (private_beach_id, origin_session_id, kind, created_by_account_id, attach_method)
-                            VALUES ($1, $2, 'terminal', $3, 'owned')
-                            ON CONFLICT (private_beach_id, origin_session_id) DO NOTHING
-                            "#,
-                        )
-                        .bind(beach_uuid)
-                        .bind(origin_uuid)
-                        .bind(requester)
-                        .execute(tx.as_mut())
-                        .await?;
+                    r#"
+                    INSERT INTO session (private_beach_id, origin_session_id, kind, created_by_account_id, attach_method)
+                    VALUES ($1, $2, 'terminal', $3, 'owned')
+                    ON CONFLICT (private_beach_id, origin_session_id) DO NOTHING
+                    "#,
+                )
+                .bind(beach_uuid)
+                .bind(origin_uuid)
+                .bind(requester)
+                .execute(tx.as_mut())
+                .await?;
                         if result.rows_affected() == 0 {
                             duplicates += 1;
                         } else {
@@ -496,6 +521,12 @@ impl AppState {
                         .mint_bridge_token(private_beach_id, &sid, requester)
                         .await
                     {
+                        let token_preview = token.get(..8).unwrap_or(&token);
+                        info!(
+                            origin_session_id = %sid,
+                            bridge_token_preview = %token_preview,
+                            "minted bridge token for owned session and nudging harness"
+                        );
                         let _ = self.nudge_join_manager(&sid, &token).await;
                     }
                 }
@@ -1204,6 +1235,12 @@ impl AppState {
             Backend::Postgres(pool) => {
                 let session_uuid = parse_uuid(session_id, "session_id")?;
                 let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
+                info!(
+                    session_id = %session_id,
+                    private_beach_id = %identifiers.private_beach_id,
+                    sequence = diff.sequence,
+                    "recording state diff"
+                );
                 self.store_state_redis(
                     &identifiers.private_beach_id.to_string(),
                     &session_uuid.to_string(),
@@ -1237,7 +1274,12 @@ impl AppState {
                 .await?;
                 tx.commit().await?;
 
-                self.fallback.store_state(session_id, diff).await;
+                let diff_clone = diff.clone();
+                self.fallback
+                    .store_state(session_id, diff_clone.clone())
+                    .await;
+                self.publish(session_id, StreamEvent::State(diff_clone))
+                    .await;
 
                 let label0 = identifiers.private_beach_id.to_string();
                 let label1 = session_uuid.to_string();
@@ -1931,6 +1973,13 @@ impl AppState {
             )
             .await;
 
+        info!(
+            session_id = %req.session_id,
+            private_beach_id = %req.private_beach_id,
+            harness_id = %harness_id,
+            "session registered with manager"
+        );
+
         Ok(RegisterSessionResponse {
             harness_id: harness_id.to_string(),
             controller_token: Some(controller_token.to_string()),
@@ -2539,7 +2588,7 @@ impl AppState {
             Backend::Memory => {
                 return Err(StateError::Database(sqlx::Error::Protocol(
                     "requires postgres backend".into(),
-                )))
+                )));
             }
         };
 

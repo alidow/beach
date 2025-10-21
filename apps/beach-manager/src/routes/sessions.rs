@@ -9,7 +9,7 @@ use beach_buggy::{
     StateDiff,
 };
 use serde::Deserialize;
-use tracing::error;
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::state::{
@@ -108,6 +108,12 @@ pub async fn register_session(
     Json(request): Json<RegisterSessionRequest>,
 ) -> ApiResult<RegisterSessionResponse> {
     ensure_scope(&token, "pb:sessions.register")?;
+    info!(
+        session_id = %request.session_id,
+        private_beach_id = %request.private_beach_id,
+        harness_type = ?request.harness_type,
+        "register_session invoked"
+    );
     let response = state
         .register_session(request)
         .await
@@ -247,6 +253,13 @@ pub async fn push_state(
     Json(body): Json<StateDiff>,
 ) -> ApiResult<serde_json::Value> {
     ensure_scope(&token, "pb:harness.publish")?;
+    let token_preview = token.as_str().chars().take(8).collect::<String>();
+    info!(
+        session_id = %session_id,
+        sequence = body.sequence,
+        token_preview = token_preview,
+        "push_state received"
+    );
     state
         .record_state(&session_id, body)
         .await

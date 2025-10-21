@@ -52,7 +52,7 @@ const STATUS_BADGES: Record<
     indicator: 'bg-amber-300',
   },
   connected: {
-    label: 'Streaming',
+    label: 'Connected',
     className: 'bg-emerald-500/10 text-emerald-100 ring-1 ring-emerald-400/40',
     indicator: 'bg-emerald-300',
   },

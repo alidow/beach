@@ -76,7 +76,7 @@ const STATUS_META: Record<
     tone: 'bg-emerald-500/10 text-emerald-200',
     ring: 'ring-1 ring-emerald-400/40',
     accent: 'text-emerald-300',
-    helper: 'Streaming terminal output in real-time.',
+    helper: 'Secure session established.',
     icon: Plug,
   },
   error: {

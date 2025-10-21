@@ -136,6 +136,21 @@ export function useSessionTerminal(
 
         const transportTarget = connection.transport;
 
+        const openHandler = () => {
+          if (cancelled) {
+            return;
+          }
+          console.info('[terminal] data channel open', {
+            sessionId,
+            privateBeachId,
+            remotePeerId: connection.remotePeerId ?? null,
+          });
+        };
+        transportTarget.addEventListener('open', openHandler as EventListener);
+        cleanupListeners.push(() =>
+          transportTarget.removeEventListener('open', openHandler as EventListener),
+        );
+
         const closeHandler = () => {
           if (cancelled) {
             return;
@@ -201,6 +216,21 @@ export function useSessionTerminal(
             signalingCloseHandler as EventListener,
           ),
         );
+        const signalingErrorHandler = (event: Event) => {
+          const detail = (event as ErrorEvent).message ?? 'unknown';
+          console.error('[terminal] signaling error', {
+            sessionId,
+            privateBeachId,
+            message: detail,
+          });
+        };
+        connection.signaling.addEventListener('error', signalingErrorHandler as EventListener);
+        cleanupListeners.push(() =>
+          connection.signaling.removeEventListener(
+            'error',
+            signalingErrorHandler as EventListener,
+          ),
+        );
       } catch (err) {
         if (cancelled) {
           return;
@@ -240,4 +270,3 @@ export function useSessionTerminal(
     error,
   };
 }
-

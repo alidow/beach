@@ -51,7 +51,7 @@ core-media = { version = "0.5", features = ["objc"], optional = true }
 core-video = { version = "0.4", features = ["objc"], optional = true }
 dispatch2 = { version = "0.1", optional = true }
 objc2 = { version = "0.5", features = ["std"], optional = true }
-objc2-foundation = { version = "0.2", features = ["NSArray", "NSDictionary", "NSError", "NSGeometry", "NSString"], optional = true }
+objc2-foundation = { version = "0.2", features = ["NSArray", "NSData", "NSDictionary", "NSError", "NSGeometry", "NSKeyedArchiver", "NSString"], optional = true }
 
 [lib]
 name = "beach_cabana_host"

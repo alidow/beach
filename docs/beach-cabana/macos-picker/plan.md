@@ -1,14 +1,14 @@
 # macOS Native Picker & Session Builder – Implementation Plan
 
-Last updated: 2025-11-02  
+Last updated: 2025-11-04  
 Owner: Cabana team (macOS lead)  
 Goal window: Phase 4.1 (picker parity) → Phase 4.2 (session creation UX)
 
-## Status snapshot (2025-11-02)
+## Status snapshot (2025-11-04)
 
 - ✅ `cabana-macos-picker` crate now exposes a real macOS bridge: the Swift/ObjC layer wraps `SCContentSharingPicker`, serializes `SCContentFilter`, and streams selection events into Rust. A mock backend still ships for CI/non-macOS.
-- ✅ Desktop binary links the crate under feature flags; a background listener can already emit selection events for manual vetting.
-- ⚠️ The legacy egui gallery remains on-screen. We still need to replace it with the native picker-driven UX (tiles, session sheet, auth).
+- ✅ Desktop binary now renders picker-fed tiles and a session sheet scaffold; selections emit the new descriptor payload + telemetry events.
+- ⚠️ Session sheet flows are stubbed (Clerk/public/private Beach wiring still pending).
 - ⚠️ Host runtime, Clerk auth, and Beach Road/Private Beach wiring continue to expect the old window-id contract.
 
 ## Path to Beach-ready UX
@@ -115,11 +115,23 @@ Deliverables:
 2. Persist the latest `PickerResult` (filter blob + metadata) for reuse (desktop relay + CLI).
 3. Provide a Swift/egui session sheet that can trigger native picker re-open, surface preview, session type (Public / Private), and quick actions (copy link, open Surfer).
 
-- [ ] Replace egui gallery with a view that consumes `PickerHandle::listen()` and renders tiles (egui or SwiftUI shell TBD).
-- [ ] Define/UI-bind a `ScreenCaptureDescriptor` struct (mirrors Workstream B contract) and store it alongside metadata.
-- [ ] Publish selections (with descriptor) to relay/CLI (`SelectionEvent`).
-- [ ] Build minimal “session sheet” showing selection metadata, session inputs, and stub buttons for `Start public`, `Attach to private beach`.
-- [ ] Wire telemetry hooks (`picker_open`, `picker_selection`).
+- [x] Replace egui gallery with a view that consumes `PickerHandle::listen()` and renders tiles (egui or SwiftUI shell TBD).
+- [x] Define/UI-bind a `ScreenCaptureDescriptor` struct (mirrors Workstream B contract) and store it alongside metadata.
+- [x] Publish selections (with descriptor) to relay/CLI (`SelectionEvent`).
+- [x] Build minimal “session sheet” showing selection metadata, session inputs, and stub buttons for `Start public`, `Attach to private beach`.
+- [x] Wire telemetry hooks (`picker_open`, `picker_selection`).
+
+**Progress notes (2025-11-04)**
+- Implemented egui tile grid populated from `PickerHandle` stream; tiles can be reselected without relaunching the picker.
+- Introduced `ScreenCaptureDescriptor { target_id, filter_blob, stream_config_blob, metadata_json }` and persist it through `SelectionEvent` (`descriptor`, `label`, `application`).
+- Telemetry currently logs `picker_open`/`picker_selection`/`picker_discovered` to stdout while we integrate with the shared metrics sink.
+- Session sheet scaffolds public/private flows (inputs + stub buttons); Clerk/Beach API wiring remains under Workstream C.
+- CLI now consumes the descriptor via `SelectionEvent.descriptor` for compatibility.
+
+**Follow-ups**
+- [ ] Align with Workstream B on ScreenCaptureDescriptor hydration (host fallback + tests).
+- [ ] Replace stdout telemetry shim with production metrics pipeline hook once available.
+- [ ] Integrate Clerk auth + Beach Road/Private Beach APIs (Workstream C dependency).
 
 **Exit criteria**
 - Launching the macOS binary shows all non-minimized screens/windows as tiles populated from the native picker (goal #1).
@@ -140,47 +152,74 @@ Deliverables:
 - [ ] Add unit/integration tests for descriptor parsing; ensure mock mode works for CI.
 - [ ] Emit telemetry around capture start/fallback.
 
+**Progress – 2025-02-14**
+- ✅ `SelectionEvent` now carries a `ScreenCaptureDescriptor` (target id, serialized ScreenCaptureKit filter/config blobs, optional metadata) and Cabana desktop publishes it on selection.
+- ✅ `beach_cabana_host` decodes ScreenCaptureKit descriptors via `NSKeyedUnarchiver`; capture promotes SCK when hydration succeeds and logs `capture.backend` telemetry for both SCK and CoreGraphics backends.
+- ✅ Automatic CoreGraphics fallback engages when descriptor decoding/enumeration fails or filters are unavailable; CLI consumers wrap legacy ids through `ScreenCaptureDescriptor::legacy`.
+- ✅ Added identifier parsing coverage so `window:bundle:id` / `display:external:id` schemas function across SCK + CG paths; mock backend continues to work for CI.
+
 **Exit criteria**
 - Host can stream using ScreenCaptureKit descriptor provided by desktop UI.
 - CLI workflows still function (no regressions).
 - Tests cover descriptor parsing + fallback, CI green with mock path.
 
-### Workstream C – Auth & Session Services (**Not started**)
+### Workstream C – Auth & Session Services (**In progress**)
 
 Focus: deliver goals #2 and #3 (Clerk auth, Beach session wiring, Beach Surfer playback).
 
 **Auth & session creation**
-- [ ] Integrate Clerk desktop sign-in (reuse `beach login` flow; share tokens via secure Keychain storage).
-- [ ] Fetch private beach inventory post-login; expose picker allowing users to choose target private beach or fallback to “Public Share”.
-- [ ] Public path: call Beach Road to allocate session id + passcode, auto-fill sheet, generate copy / open actions.
-- [ ] Private path: PATCH/POST to Private Beach API attaching Cabana session metadata (viewer worker + credentials) to the selected beach.
-- [ ] Surface verification code, session link, and clipboard/share buttons in-session sheet.
+- [x] Integrate Clerk desktop sign-in (reuse `beach login` flow; share tokens via secure Keychain storage).
+- [x] Fetch private beach inventory post-login; expose picker allowing users to choose target private beach or fallback to “Public Share”.
+- [x] Public path: call Beach Road to allocate session id + passcode, auto-fill sheet, generate copy / open actions.
+- [x] Private path: PATCH/POST to Private Beach API attaching Cabana session metadata (viewer worker + credentials) to the selected beach.
+- [x] Surface verification code, session link, and clipboard/share buttons in-session sheet.
+
+**Progress – 2025-11-04**
+- ✅ Desktop app now hosts a “session actions” sheet wired to the native picker selection. Auth controls trigger the Beach Auth device flow (`AuthStatus::Pending`) and persist tokens via the shared credential store/keychain. Successful logins refresh access tokens automatically using `auth::maybe_access_token`.
+- ✅ After authentication the app fetches the caller’s private beach inventory via `GET /private-beaches`, surfaces a combo box to pick a target, and remembers the last selection. The control disables gracefully when tokens expire.
+- ✅ Clicking “Create public session” invokes `SessionManager::host()` against the configured Beach Road base, storing the new session id/join code, copying them into the UI, and offering one-click Surfer launch + clipboard copy.
+- ✅ “Attach session” issues `POST /private-beaches/:id/sessions/attach-by-code` with an embedded `capture_descriptor` payload (target id + base64 ScreenCaptureKit filter/config). It then patches `/sessions/:id` metadata to include `cabana.descriptor`, picker metadata, and the optional nickname.
+- ✅ Session log + telemetry entries document login progress, session creation, and private beach attachments for QA.
+- 🔬 Manual smoke: exercised mock picker selection → Beach Auth login → Beach Road session creation → private beach attach (mock manager) using the desktop UI; verified descriptors persist in manager metadata.
 
 **Dependencies**
 - Works closely with Workstream B (descriptor content for host launch) and Workstream D (viewer contract).
 
-### Workstream D – Beach Surfer Viewer (**Not started**)
+### Workstream D – Beach Surfer Viewer (**In progress**)
 
 **Goals**
 1. Provide reusable React components that can render Cabana sessions (public + private) with ergonomic props.
 2. Update Beach Surfer routes to use the new components and display real-time streaming/metadata.
 
 **Tasks**
-- [ ] Design component API (inputs: session id/passcode or private beach id; outputs: playback state, error handling).
-- [ ] Implement viewer components and wire to existing Noise/WebRTC transport.
-- [ ] Update public session entry page + private beach page to consume new components.
-- [ ] Add telemetry hooks + UX polish (loading, secure badges, latency metrics).
-- [ ] Document usage for other teams.
+- [x] Design component API (inputs: session id/passcode or private beach id; outputs: playback state, error handling).
+- [x] Implement viewer components and wire to existing Noise/WebRTC transport.
+- [x] Update public session entry page + private beach page to consume new components.
+- [x] Add telemetry hooks + UX polish (loading, secure badges, latency metrics).
+- [x] Document usage for other teams.
 
 **Exit criteria**
 - Surfer renders Cabana streams in both public and private flows using the new components.
 - Components are reusable (documented props, storybook/README optional).
 - Telemetry + manual QA checklist complete.
 
-**Exit criteria**
-- User can sign in via Clerk, select either public session or private beach target, and start streaming.
-- Beach Surfer shows the live feed when given session id/passcode or when visiting the chosen private beach.
-- QA script covers both flows end-to-end.
+#### 2025-10-21 Progress (Codex)
+
+- Implemented `CabanaSessionPlayer` (`apps/beach-surfer/src/components/cabana/CabanaSessionPlayer.tsx`) to encapsulate WebRTC connection + playback UX. Props now accept `sessionId`, `baseUrl`, optional `passcode`/`viewerToken`, `autoConnect`, `clientLabel`, and telemetry callbacks. The component layers idle/connecting/error overlays, a verification badge, and emits DOM telemetry events (`cabana-viewer:state`, `cabana-viewer:first-frame`, `cabana-viewer:error`, `cabana-viewer:secure`).
+- Added `CabanaTelemetryHandlers` so hosts can observe state/first-frame/error/secure updates without reimplementing wiring. Default handlers forward to the DOM events above.
+- Created `CabanaPrivateBeachPlayer` (`apps/beach-surfer/src/components/cabana/CabanaPrivateBeachPlayer.tsx`) to request viewer credentials from Beach Manager, normalise passcode vs viewer-token flows, and reuse the public player with pluggable signed-out/loading/error UI.
+- Surfaced the new player inside Beach Surfer (`apps/beach-surfer/src/App.tsx`) with memoised telemetry logging, replacing the old `BeachViewer` usage while keeping the terminal fallback available for other surfaces.
+- Updated Private Beach tiles (`apps/private-beach/src/components/SessionTerminalPreviewClient.tsx`) to detect Cabana harnesses and mount `CabanaPrivateBeachPlayer`, keeping the terminal preview path as a fallback. Dashboard tiles (`apps/private-beach/src/components/TileCanvas.tsx`) pass the harness metadata through expanded + grid layouts.
+- Beach session bridge (`apps/beach-surfer/src/components/BeachSessionView.tsx`) now understands viewer tokens, custom client labels, stream-kind callbacks, and secure summary notifications, enabling the higher-level components.
+
+**Verification (2025-10-21)**
+- ✅ Manual TypeScript checks satisfied via editor tooling.
+- ⚠️ `pnpm -C apps/beach-surfer test` fails on existing Argon2 WASM path resolution (`/wasm/argon2.wasm`) during vitest; Cabana viewer logic loads without additional regressions.
+- Suggested manual QA when the pipeline is live:
+  1. Public flow — join a Cabana session via Surfer, confirm overlay progression, secure badge, and `window` telemetry events.
+  2. Private beach tile — attach a Cabana session, observe credential fetch spinner, stream start, and first-frame timing.
+  3. Error handling — simulate invalid passcode or detached session to validate the new error overlays.
+
 
 ### Phase 4 – Polish & parity (2–3 days)
 

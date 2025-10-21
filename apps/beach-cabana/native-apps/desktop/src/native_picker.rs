@@ -1,5 +1,5 @@
-use cabana_macos_picker::{PickerEvent, PickerHandle, PickerResult, PickerError};
-use crossbeam_channel::{unbounded, Receiver};
+use cabana_macos_picker::{PickerError, PickerEvent, PickerHandle, PickerResult};
+use crossbeam_channel::{Receiver, unbounded};
 use futures_util::StreamExt;
 use std::{sync::Arc, thread};
 use tokio::{runtime::Runtime, sync::oneshot};
@@ -26,8 +26,7 @@ impl NativePickerClient {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         let listener = thread::spawn(move || {
-            let runtime = Runtime::new()
-                .expect("failed to build tokio runtime for native picker");
+            let runtime = Runtime::new().expect("failed to build tokio runtime for native picker");
             runtime.block_on(async move {
                 let mut events = listener_handle.listen();
                 futures_util::pin_mut!(events);

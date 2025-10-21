@@ -23,13 +23,13 @@
 - **Documentation-first.** Each legacy doc mentioning HTTP/SSE/bridge harness flows must flag them as deprecated so future work does not regress.
 
 ## Current Progress & Handoff Summary (June 2025)
-- **Shared client crate** — `apps/beach` now builds as `beach-client-core`; the CLI links it as a bin target. Negotiation helpers, terminal cache, and protocol types are exported for reuse. All existing unit tests were adjusted to import from `beach_client_core::…`.
+- **Shared client crate** — `apps/beach` exports the `beach_client_core` library while the package/bin remain `beach`. Negotiation helpers, terminal cache, and protocol types are reusable, and all existing unit tests import from `beach_client_core::…`.
 - **TURN entitlement check** — WebRTC negotiation fails fast if the caller lacks `pb:transport.turn`; we no longer hit HTTP/SSE fallbacks silently. STUN-only paths still operate for non-entitled users.
-- **Manager viewer worker (authoritative)** — `AppState::spawn_viewer_worker` now negotiates WebRTC, decodes frames, and persists them to both Redis and `session_runtime` while emitting `StreamEvent::State`. Metrics (`manager_viewer_connected`, `manager_viewer_latency_ms`, `manager_viewer_reconnects_total`) track health, and the worker auto-reconnects until shut down.
+- **Manager viewer worker (authoritative)** — `AppState::spawn_viewer_worker` now negotiates WebRTC, decodes frames, and persists them to both Redis and `session_runtime` while emitting `StreamEvent::State`. Metrics (`manager_viewer_connected`, `manager_viewer_latency_ms`, `manager_viewer_reconnects_total`) track health, the worker auto-reconnects until shut down, and a periodic `__keepalive__` ping avoids silent ICE idling while logging when hosts stop sending frames.
 - **Credential plumbing & API** — `RegisterSessionRequest` carries an optional `viewer_passcode` (migrated into `session_runtime.viewer_passcode`). Managers and dashboards retrieve a short-lived Gate-signed viewer token (plus legacy passcode for the handshake) via `GET /private-beaches/:bid/sessions/:sid/viewer-credential`. Beach Road verifies the token before honoring joins.
 - **Legacy harness removed** — Manager no longer exposes the HTTP pump (`handle_manager_hints`). The viewer worker now publishes directly to Redis and `session_runtime`, enabling HTTP bridge code to be deleted from the host.
 - **CLI host cleanup** — `apps/beach` no longer listens for manager bridge hints or pushes HTTP diffs; the WebRTC path is the only authority. Bridge-token mint/nudge endpoints were deleted from Beach Road and Manager.
-- **Dashboard preview migrated** — Private Beach tiles now fetch viewer credentials and render via the shared Beach Surfer WebRTC transport (Next.js `externalDir` enabled). Session drawers still read SSE for history/events and need parity work.
+- **Dashboard viewer parity** — Private Beach tiles fetch viewer credentials and render via the shared Beach Surfer `BeachTerminal`, so style tables and cursor UX now match Surfer. Cabana sessions continue to flow through `CabanaPrivateBeachPlayer`, and session drawers now poll `GET /sessions/:id/controller-events` (no SSE) while we finish the history/event UX polish.
 - **Docs plan status** — Phase 0 tasks are partially complete (crate extraction ✅, entitlement audit ✅, credential design 🟡). Earlier sections now note status for quick scan.
 - **Open risks / follow-ups**
   1. Observer diff pipeline — ✅ viewer worker now emits `StreamEvent::State` and writes to Redis/`session_runtime`. Follow-up: add a smoke test that runs `spawn_viewer_worker` against a mocked session to guard regressions.
@@ -67,7 +67,7 @@
 
 ### Phase 0 – Preparation (Now)
 1. **Crate extraction**
-   - Status: ✅ crate renamed to `beach-client-core` with shared negotiation/viewer APIs exported for reuse.
+   - Status: ✅ crate exports shared negotiation/viewer APIs via the `beach_client_core` library while retaining the `beach` package for CLI compatibility.
    - Add `apps/beach/src/lib.rs` that exposes:
      - Session negotiation (`negotiate_transport`, `SignalingClient`, TURN helpers).
      - Terminal diff reader (`TerminalGrid`, `terminal::viewer`).
@@ -87,7 +87,7 @@
 ### Phase 1 – Manager as WebRTC Client
 - Status: ✅ manager viewer worker is authoritative (records diffs/metrics, emits `StreamEvent::State`); legacy HTTP harness removed.
 Deliverables:
-- `manager-client` module consuming the new `beach-client-core`.
+- `manager-client` module consuming the shared `beach_client_core` library.
 - Manager service spawns a lightweight “viewer worker” per attached session:
   - Joins via Beach Road signaling using stored credential.
   - Streams diffs into the existing cache (`session_runtime` row + Redis).
@@ -142,7 +142,7 @@ Deliverables:
 ## Immediate To-Do (next sprint)
 1. ✅ Add an automated smoke test for `spawn_viewer_worker` (mock session, assert Redis + state stream).
 2. ✅ Define and implement the signed viewer credential contract (Gate + Beach Road validation).
-3. Finish dashboard parity: migrate drawer/event panes off SSE, surface latency/secure badges, and write UX docs.
+3. Continue dashboard parity polish: surface latency/secure badges (the terminal already shows full styling), finish history/event UX docs, and remove the legacy SSE route once watchers are migrated.
 4. Document operational guidance (TURN quotas, viewer metrics dashboards) now that WebRTC is the sole transport.
 5. Unblock `npx tsc --noEmit` by adding module declarations for `argon2-browser`/`noise-c.wasm` and bumping the TS target to ES2020 (or shim BigInt usage).
 
@@ -150,7 +150,7 @@ Deliverables:
 - **Manager load increases** (now running N viewer clients): isolate viewer workers, cap concurrency, and rely on TURN quotas. Mitigate via autoscaling and instrumentation before rollout.
 - **Credential exposure**: ensure viewer tokens are scoped and short-lived; never return raw passcodes to browsers unless absolutely needed (prefer viewer JWT).
 - **Hosts without refactored binaries**: require an updated CLI that advertises WebRTC viewer support; publish upgrade guidance and verify older harness builds fail fast with a helpful error.
-- **Downstream tooling expecting SSE**: audit consumers (CLI tests, scripts) and provide migration. Mark SSE endpoints as deprecated with removal date.
+- **Downstream tooling expecting SSE**: audit consumers (CLI tests, scripts) and provide migration. Mark SSE endpoints as deprecated with removal date, now that tiles run entirely on WebRTC.
 
 ## How to Onboard the Next Engineer/Instance
 1. **Read this plan** plus:

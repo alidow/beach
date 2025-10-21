@@ -1,4 +1,5 @@
 use crate::capture::{Frame, PixelFormat};
+use crate::desktop::ScreenCaptureDescriptor;
 use crate::platform::WindowApiError;
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::number::CFNumber;
@@ -17,7 +18,10 @@ use objc2::{
     runtime::ProtocolObject,
     ClassType, DeclaredClass,
 };
-use objc2_foundation::{CGPoint, CGRect, CGSize, NSArray, NSError, NSObject, NSObjectProtocol};
+use objc2_foundation::{
+    CGPoint, CGRect, CGSize, NSArray, NSData, NSError, NSObject, NSObjectProtocol,
+    NSKeyedUnarchiver, NSUInteger,
+};
 use screen_capture_kit::{
     shareable_content::{SCDisplay, SCShareableContent, SCWindow},
     stream::{
@@ -29,6 +33,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::ffi::c_void;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::sync::Once;
@@ -169,9 +174,30 @@ impl SckStream {
 
         let content = fetch_shareable_content()?;
         let selection = select_target(&content, target)?;
+        Self::from_selection(selection)
+    }
 
+    pub fn from_descriptor(descriptor: &ScreenCaptureDescriptor) -> Result<Self, WindowApiError> {
+        ensure_appkit_initialized();
+
+        let filter = decode_filter(&descriptor.filter_blob)?;
+        let configuration = match decode_stream_configuration(descriptor.stream_config_blob.as_ref())? {
+            Some(cfg) => cfg,
+            None => {
+                let content = fetch_shareable_content()?;
+                let selection = select_target(&content, &descriptor.target_id)?;
+                selection.configuration
+            }
+        };
+
+        let selection = TargetSelection { filter, configuration };
+        Self::from_selection(selection)
+    }
+
+    fn from_selection(selection: TargetSelection) -> Result<Self, WindowApiError> {
         let (tx, rx) = unbounded::<StreamEvent>();
-        let delegate = StreamDelegate::alloc().set_ivars(StreamDelegateIvars { sender: tx.clone() });
+        let delegate =
+            StreamDelegate::alloc().set_ivars(StreamDelegateIvars { sender: tx.clone() });
         let queue = Queue::create("beach.cabana.sck", QueueAttribute::Serial);
 
         let stream = SCStream::new_with_filter_configuration_and_delegate_queue(
@@ -180,12 +206,24 @@ impl SckStream {
             Some(&*delegate),
             Some(&queue),
         )
-        .map_err(|err| WindowApiError::CaptureFailed(format!("failed to create SCStream: {:?}", err)))?;
+        .map_err(|err| {
+            WindowApiError::CaptureFailed(format!("failed to create SCStream: {:?}", err))
+        })?;
 
         let output: ProtocolObject<dyn SCStreamOutput> = ProtocolObject::from_ref(&*delegate);
         stream
-            .add_stream_output_type_sample_handler_queue(&output, SCStreamOutputType::Screen, None, &queue)
-            .map_err(|err| WindowApiError::CaptureFailed(format!("failed to add SCStreamOutput: {:?}", err)))?;
+            .add_stream_output_type_sample_handler_queue(
+                &output,
+                SCStreamOutputType::Screen,
+                None,
+                &queue,
+            )
+            .map_err(|err| {
+                WindowApiError::CaptureFailed(format!(
+                    "failed to add SCStreamOutput: {:?}",
+                    err
+                ))
+            })?;
 
         Ok(Self {
             stream,
@@ -250,6 +288,127 @@ struct TargetSelection {
     configuration: Id<SCStreamConfiguration>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParsedTarget {
+    Display(u32),
+    Window(u32),
+}
+
+fn parse_target_identifier(raw: &str) -> Result<ParsedTarget, WindowApiError> {
+    if let Some(rest) = raw.strip_prefix("display:") {
+        let id_str = rest.rsplit(':').next().unwrap_or(rest);
+        let id = id_str
+            .parse::<u32>()
+            .map_err(|_| WindowApiError::InvalidIdentifier(raw.to_string()))?;
+        return Ok(ParsedTarget::Display(id));
+    }
+    if let Some(rest) = raw.strip_prefix("window:") {
+        let id_str = rest.rsplit(':').next().unwrap_or(rest);
+        let id = id_str
+            .parse::<u32>()
+            .map_err(|_| WindowApiError::InvalidIdentifier(raw.to_string()))?;
+        return Ok(ParsedTarget::Window(id));
+    }
+    if let Some(rest) = raw.strip_prefix("application:") {
+        return Err(WindowApiError::CaptureFailed(format!(
+            "application target '{}' is not yet supported",
+            rest
+        )));
+    }
+    if let Ok(id) = raw.parse::<u32>() {
+        return Ok(ParsedTarget::Window(id));
+    }
+    Err(WindowApiError::InvalidIdentifier(raw.to_string()))
+}
+
+fn decode_filter(bytes: &[u8]) -> Result<Id<SCContentFilter>, WindowApiError> {
+    if bytes.is_empty() {
+        return Err(WindowApiError::CaptureFailed(
+            "ScreenCaptureKit descriptor missing filter data".into(),
+        ));
+    }
+    unsafe {
+        let data =
+            NSData::dataWithBytes_length(bytes.as_ptr() as *mut c_void, bytes.len() as NSUInteger);
+        NSKeyedUnarchiver::unarchivedObjectOfClass_fromData_error(
+            SCContentFilter::class(),
+            &data,
+        )
+        .map(|object| object.cast::<SCContentFilter>())
+        .map_err(|err| {
+            WindowApiError::CaptureFailed(format!(
+                "failed to decode ScreenCaptureKit filter: {:?}",
+                err
+            ))
+        })
+    }
+}
+
+fn decode_stream_configuration(
+    bytes: Option<&Vec<u8>>,
+) -> Result<Option<Id<SCStreamConfiguration>>, WindowApiError> {
+    let Some(blob) = bytes else {
+        return Ok(None);
+    };
+    if blob.is_empty() {
+        return Ok(None);
+    }
+    unsafe {
+        let data =
+            NSData::dataWithBytes_length(blob.as_ptr() as *mut c_void, blob.len() as NSUInteger);
+        NSKeyedUnarchiver::unarchivedObjectOfClass_fromData_error(
+            SCStreamConfiguration::class(),
+            &data,
+        )
+        .map(|object| Some(object.cast::<SCStreamConfiguration>()))
+        .map_err(|err| {
+            WindowApiError::CaptureFailed(format!(
+                "failed to decode ScreenCaptureKit stream configuration: {:?}",
+                err
+            ))
+        })
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_display_identifiers() {
+        assert_eq!(
+            parse_target_identifier("display:123").unwrap(),
+            ParsedTarget::Display(123)
+        );
+        assert_eq!(
+            parse_target_identifier("display:external:456").unwrap(),
+            ParsedTarget::Display(456)
+        );
+    }
+
+    #[test]
+    fn parse_window_identifiers() {
+        assert_eq!(
+            parse_target_identifier("window:42").unwrap(),
+            ParsedTarget::Window(42)
+        );
+        assert_eq!(
+            parse_target_identifier("window:com.apple.TextEdit:987").unwrap(),
+            ParsedTarget::Window(987)
+        );
+        assert_eq!(
+            parse_target_identifier("987").unwrap(),
+            ParsedTarget::Window(987)
+        );
+    }
+
+    #[test]
+    fn reject_invalid_targets() {
+        assert!(parse_target_identifier("display:abc").is_err());
+        assert!(parse_target_identifier("foo").is_err());
+    }
+}
+
 fn fetch_shareable_content() -> Result<Id<SCShareableContent>, WindowApiError> {
     let (tx, rx) = bounded::<Result<Id<SCShareableContent>, String>>(1);
     SCShareableContent::get_shareable_content_with_completion_closure(move |content, error| {
@@ -269,30 +428,36 @@ fn fetch_shareable_content() -> Result<Id<SCShareableContent>, WindowApiError> {
 }
 
 fn select_target(content: &SCShareableContent, target: &str) -> Result<TargetSelection, WindowApiError> {
-    if let Some(display_str) = target.strip_prefix("display:") {
-        let id: u32 = display_str.parse().map_err(|_| WindowApiError::InvalidIdentifier(target.to_string()))?;
-        let displays = content.displays();
-        for index in 0..displays.len() {
-            if let Some(display) = displays.get(index) {
-                if display.display_id() == id {
-                    return Ok(build_display_selection(display));
+    match parse_target_identifier(target)? {
+        ParsedTarget::Display(id) => {
+            let displays = content.displays();
+            for index in 0..displays.len() {
+                if let Some(display) = displays.get(index) {
+                    if display.display_id() == id {
+                        return Ok(build_display_selection(display));
+                    }
                 }
             }
+            Err(WindowApiError::InvalidIdentifier(format!(
+                "display identifier {} not found",
+                target
+            )))
         }
-        return Err(WindowApiError::InvalidIdentifier(format!("display identifier {} not found", target)));
-    }
-
-    let window_id: u32 = target.parse().map_err(|_| WindowApiError::InvalidIdentifier(target.to_string()))?;
-    let windows = content.windows();
-    for index in 0..windows.len() {
-        if let Some(window) = windows.get(index) {
-            if window.window_id() == window_id {
-                return Ok(build_window_selection(content, window));
+        ParsedTarget::Window(id) => {
+            let windows = content.windows();
+            for index in 0..windows.len() {
+                if let Some(window) = windows.get(index) {
+                    if window.window_id() == id {
+                        return Ok(build_window_selection(content, window));
+                    }
+                }
             }
+            Err(WindowApiError::InvalidIdentifier(format!(
+                "window identifier {} not found",
+                target
+            )))
         }
     }
-
-    Err(WindowApiError::InvalidIdentifier(format!("window identifier {} not found", target)))
 }
 
 fn build_window_selection(content: &SCShareableContent, window: &SCWindow) -> TargetSelection {
@@ -434,4 +599,3 @@ fn write_frame_png(frame: &Frame, path: &Path) -> Result<(), String> {
     };
     buf.save(path).map_err(|e| e.to_string())
 }
-

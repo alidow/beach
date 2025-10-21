@@ -127,6 +127,32 @@ pub static MANAGER_VIEWER_LATENCY_MS: Lazy<HistogramVec> = Lazy::new(|| {
     h
 });
 
+pub static MANAGER_VIEWER_KEEPALIVE_FAILURES: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "manager_viewer_keepalive_failures_total",
+            "Failed attempts to send keepalive pings from manager viewer",
+        ),
+        &["private_beach_id", "session_id"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+pub static MANAGER_VIEWER_IDLE_WARNINGS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "manager_viewer_idle_warnings_total",
+            "Count of idle intervals detected with no host frames",
+        ),
+        &["private_beach_id", "session_id"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
 pub static ACTION_LATENCY_MS: Lazy<HistogramVec> = Lazy::new(|| {
     let h = HistogramVec::new(
         HistogramOpts::new(

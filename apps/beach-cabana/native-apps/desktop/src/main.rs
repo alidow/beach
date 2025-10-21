@@ -1,23 +1,43 @@
 use anyhow::Result;
-use beach_cabana_host::{self as cabana, desktop::{publish_selection, SelectionEvent}};
-use crossbeam_channel::{self, Receiver, Sender};
-use eframe::{
-    egui::{self, Align, Color32, Layout, RichText, ScrollArea, TextEdit, Vec2, ViewportBuilder},
-    NativeOptions,
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use beach_cabana_host::desktop::{ScreenCaptureDescriptor, SelectionEvent, publish_selection};
+use beach_client_core::{
+    auth::{self, AuthError, access_token_is_valid, credentials::StoredProfile},
+    session::{SessionConfig, SessionError, SessionManager},
 };
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use eframe::{
+    NativeOptions,
+    egui::{self, Align, Color32, ComboBox, Layout, RichText, ScrollArea, Vec2, ViewportBuilder},
+};
+use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value as JsonValue, json};
 use std::{
     collections::VecDeque,
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    env,
+    fmt::Write as FmtWrite,
     thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::Runtime;
 
 #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
 mod native_picker;
+
+#[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+use cabana_macos_picker::{PickerItemKind, PickerResult};
+#[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+use native_picker::{NativePickerClient, NativePickerMessage};
+
+#[cfg(not(any(feature = "picker-mock", feature = "picker-native")))]
+#[derive(Copy, Clone)]
+enum PickerItemKind {
+    Window,
+    Display,
+    Application,
+    Unknown,
+}
 
 fn main() -> Result<()> {
     let options = NativeOptions {
@@ -36,886 +56,1342 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum CodecChoice {
-    Gif,
-    H264,
+#[derive(Debug, Clone, Deserialize)]
+struct PrivateBeachSummary {
+    id: String,
+    name: String,
+    slug: String,
+    #[serde(default)]
+    created_at: i64,
 }
 
-impl CodecChoice {
-    fn label(self) -> &'static str {
-        match self {
-            CodecChoice::Gif => "PNG transport (debug)",
-            CodecChoice::H264 => "H.264 (fragmented MP4)",
-        }
-    }
-
-    fn to_host(self) -> cabana::webrtc::EncodeCodec {
-        match self {
-            CodecChoice::Gif => cabana::webrtc::EncodeCodec::Gif,
-            CodecChoice::H264 => cabana::webrtc::EncodeCodec::H264,
-        }
-    }
-}
-
-struct ShareForm {
+#[derive(Debug, Clone)]
+struct PublicSessionInfo {
     session_id: String,
-    passcode: String,
-    road_url: String,
-    fixture_url: String,
-    fixture_dir: String,
-    from_peer: String,
-    to_peer: String,
-    max_width: String,
-    interval_ms: String,
-    chunk_frames: String,
-    codec: CodecChoice,
+    join_code: String,
+    session_url: String,
 }
 
-impl Default for ShareForm {
-    fn default() -> Self {
-        Self {
-            session_id: String::new(),
-            passcode: String::new(),
-            road_url: "http://127.0.0.1:8080".to_string(),
-            fixture_url: String::new(),
-            fixture_dir: String::new(),
-            from_peer: "host".to_string(),
-            to_peer: "viewer".to_string(),
-            max_width: "1280".to_string(),
-            interval_ms: "33".to_string(),
-            chunk_frames: "120".to_string(),
-            codec: CodecChoice::H264,
-        }
-    }
+#[derive(Debug, Clone)]
+struct AuthPrompt {
+    profile: String,
+    user_code: String,
+    verification_uri: String,
+    verification_uri_complete: String,
+    expires_at: SystemTime,
 }
 
-#[derive(Clone)]
-struct ShareConfig {
-    session_id: String,
-    passcode: String,
-    road_url: Option<String>,
-    fixture_url: Option<String>,
-    fixture_dir: Option<PathBuf>,
-    from_peer: String,
-    to_peer: String,
-    target_id: String,
-    codec: cabana::webrtc::EncodeCodec,
-    interval_ms: u64,
-    max_width: Option<u32>,
-    chunk_frames: u32,
-}
-
-enum ShareEvent {
-    Status(String),
-    Verification(String),
-    Started,
-    Finished,
+#[derive(Debug, Clone)]
+enum AuthStatus {
+    LoggedOut,
+    Starting,
+    Pending(AuthPrompt),
+    LoggedIn {
+        profile: String,
+        email: Option<String>,
+        tier: Option<String>,
+    },
     Error(String),
 }
 
-struct ShareWorker {
-    handle: Option<thread::JoinHandle<()>>,
-    events: Receiver<ShareEvent>,
-    stop: Arc<AtomicBool>,
+#[derive(Debug)]
+enum AppMessage {
+    AuthPrompt(AuthPrompt),
+    AuthSuccess {
+        profile: String,
+        email: Option<String>,
+        tier: Option<String>,
+    },
+    AuthError {
+        message: String,
+    },
+    AccessToken {
+        profile: String,
+        token: String,
+        expires_at: Option<SystemTime>,
+    },
+    BeachesLoaded(Vec<PrivateBeachSummary>),
+    BeachesError(String),
+    PublicSessionCreated(PublicSessionInfo),
+    PublicSessionError(String),
+    PrivateAttachOk {
+        beach_id: String,
+        beach_name: String,
+        session_id: String,
+    },
+    PrivateAttachError(String),
 }
-
-impl ShareWorker {
-    fn request_stop(&self) {
-        self.stop.store(true, Ordering::SeqCst);
-    }
-
-    fn join(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum SharingState {
-    Idle,
-    Starting,
-    Streaming,
-    Stopping,
-}
-
-#[cfg(any(feature = "picker-mock", feature = "picker-native"))]
-use cabana_macos_picker::PickerResult;
-#[cfg(any(feature = "picker-mock", feature = "picker-native"))]
-use native_picker::{NativePickerClient, NativePickerMessage};
 
 struct PickerApp {
     #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
     picker: Option<NativePickerClient>,
-    #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
-    picker_error: Option<String>,
-    #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
-    selection: Option<PickerResult>,
+    tiles: Vec<PickerTile>,
+    selected_id: Option<String>,
     status_message: Option<String>,
-    share_form: ShareForm,
-    share_state: SharingState,
-    share_worker: Option<ShareWorker>,
-    share_status_log: VecDeque<String>,
-    share_error: Option<String>,
-    share_verification: Option<String>,
+    telemetry_log: VecDeque<String>,
+    session_sheet: SessionSheetState,
+    #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+    picker_bootstrapped: bool,
+    event_tx: Sender<AppMessage>,
+    event_rx: Receiver<AppMessage>,
+    auth_status: AuthStatus,
+    auth_profile: Option<String>,
+    access_token: Option<String>,
+    access_token_expiry: Option<SystemTime>,
+    manager_base: String,
+    road_base: String,
+    beaches: Vec<PrivateBeachSummary>,
+    selected_beach_id: Option<String>,
+    session_updates: VecDeque<String>,
+    public_session: Option<PublicSessionInfo>,
+    auth_inflight: bool,
+    fetching_beaches: bool,
+    creating_public_session: bool,
+    attaching_private_beach: bool,
 }
 
 impl PickerApp {
     fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
-        let (picker, picker_error) = match NativePickerClient::new() {
-            Ok(client) => (Some(client), None),
-            Err(err) => (None, Some(format!("Native picker unavailable: {}", err))),
+        let picker = match NativePickerClient::new() {
+            Ok(client) => Some(client),
+            Err(err) => {
+                eprintln!("Native picker unavailable: {err}");
+                None
+            }
+        };
+
+        #[cfg(not(any(feature = "picker-mock", feature = "picker-native")))]
+        let picker: Option<NativePickerClient> = None;
+
+        let (event_tx, event_rx) = unbounded();
+
+        let mut app = Self {
+            #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+            picker,
+            tiles: Vec::new(),
+            selected_id: None,
+            status_message: None,
+            telemetry_log: VecDeque::new(),
+            session_sheet: SessionSheetState::new(),
+            #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+            picker_bootstrapped: false,
+            event_tx,
+            event_rx,
+            auth_status: AuthStatus::LoggedOut,
+            auth_profile: None,
+            access_token: None,
+            access_token_expiry: None,
+            manager_base: default_manager_base(),
+            road_base: default_road_base(),
+            beaches: Vec::new(),
+            selected_beach_id: None,
+            session_updates: VecDeque::new(),
+            public_session: None,
+            auth_inflight: false,
+            fetching_beaches: false,
+            creating_public_session: false,
+            attaching_private_beach: false,
         };
 
         #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
-        let initial_status = picker_error.clone();
+        app.bootstrap_picker();
+        app.refresh_auth_state();
 
-        #[cfg(not(any(feature = "picker-mock", feature = "picker-native")))]
-        let initial_status: Option<String> = None;
-
-        #[cfg(not(any(feature = "picker-mock", feature = "picker-native")))]
-        let picker_error: Option<String> = None;
-
-        Self {
-            #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
-            picker,
-            #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
-            picker_error,
-            #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
-            selection: None,
-            status_message: initial_status,
-            share_form: ShareForm::default(),
-            share_state: SharingState::Idle,
-            share_worker: None,
-            share_status_log: VecDeque::new(),
-            share_error: None,
-            share_verification: None,
-        }
+        app
     }
 
-    fn append_share_status(&mut self, message: impl Into<String>) {
-        const MAX_LOG: usize = 10;
-        self.share_status_log.push_back(message.into());
-        while self.share_status_log.len() > MAX_LOG {
-            self.share_status_log.pop_front();
+    #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+    fn bootstrap_picker(&mut self) {
+        if self.picker_bootstrapped {
+            return;
         }
-    }
-
-    fn poll_share_events(&mut self) {
-        let mut should_cleanup = false;
-        let mut encountered_error = false;
-        let mut events = Vec::new();
-        if let Some(worker) = self.share_worker.as_ref() {
-            while let Ok(event) = worker.events.try_recv() {
-                events.push(event);
-            }
-        }
-        for event in events {
-            match event {
-                ShareEvent::Status(msg) => self.append_share_status(msg),
-                ShareEvent::Verification(code) => {
-                    self.share_verification = Some(code.clone());
-                    self.append_share_status(format!("Verification code: {}", code));
+        if let Some(picker) = &self.picker {
+            match picker.launch() {
+                Ok(()) => {
+                    self.status_message = Some("Native picker ready.".to_string());
+                    self.record_telemetry("picker_open", "auto");
+                    self.picker_bootstrapped = true;
                 }
-                ShareEvent::Started => {
-                    self.share_state = SharingState::Streaming;
-                    self.append_share_status("Streaming started.");
-                }
-                ShareEvent::Finished => {
-                    should_cleanup = true;
-                }
-                ShareEvent::Error(err) => {
-                    self.share_error = Some(err.clone());
-                    self.append_share_status(format!("Error: {}", err));
-                    encountered_error = true;
-                    should_cleanup = true;
+                Err(err) => {
+                    self.status_message = Some(format!("Failed to launch native picker: {err}"));
+                    self.picker_bootstrapped = true;
                 }
             }
-        }
-        if should_cleanup {
-            if let Some(mut worker) = self.share_worker.take() {
-                worker.request_stop();
-                worker.join();
-            }
-            if !encountered_error {
-                self.append_share_status("Streaming stopped.");
-            }
-            self.share_state = SharingState::Idle;
-        }
-    }
-
-    fn optional_trimmed(value: &str) -> Option<String> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
         } else {
-            Some(trimmed.to_string())
+            self.status_message =
+                Some("Native picker is not available on this platform.".to_string());
+            self.picker_bootstrapped = true;
         }
     }
 
-    fn build_share_config(&self) -> Result<ShareConfig, String> {
-        let session_id = self.share_form.session_id.trim();
-        if session_id.is_empty() {
-            return Err("Enter a session ID.".to_string());
-        }
-        let passcode = self.share_form.passcode.trim();
-        if passcode.is_empty() {
-            return Err("Enter the session passcode.".to_string());
-        }
+    fn refresh_auth_state(&mut self) {
+        match auth::load_store() {
+            Ok(store) => {
+                let profile_name = store
+                    .current_profile
+                    .clone()
+                    .or_else(|| store.profile_names().into_iter().next());
 
-        let interval_ms = self
-            .share_form
-            .interval_ms
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| "Interval must be a positive integer (ms).".to_string())?
-            .max(1);
-        let chunk_frames = self
-            .share_form
-            .chunk_frames
-            .trim()
-            .parse::<u32>()
-            .map_err(|_| "Chunk size must be a positive integer (frames).".to_string())?
-            .max(1);
-
-        let max_width = {
-            let trimmed = self.share_form.max_width.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(
-                    trimmed
-                        .parse::<u32>()
-                        .map_err(|_| "Max width must be a positive integer.".to_string())?,
-                )
+                if let Some(name) = profile_name {
+                    if let Some(profile) = store.profile(&name) {
+                        self.auth_profile = Some(name.clone());
+                        self.auth_status = AuthStatus::LoggedIn {
+                            profile: name.clone(),
+                            email: profile.email.clone(),
+                            tier: profile.tier.clone(),
+                        };
+                        if let Some(cache) = profile
+                            .access_token
+                            .as_ref()
+                            .filter(|entry| access_token_is_valid(entry))
+                        {
+                            self.access_token = Some(cache.token.clone());
+                            self.access_token_expiry = Some(cache.expires_at.into());
+                        }
+                    } else {
+                        self.auth_status = AuthStatus::LoggedOut;
+                        self.auth_profile = None;
+                        self.access_token = None;
+                        self.access_token_expiry = None;
+                    }
+                } else {
+                    self.auth_status = AuthStatus::LoggedOut;
+                    self.auth_profile = None;
+                    self.access_token = None;
+                    self.access_token_expiry = None;
+                }
             }
-        };
-
-        let fixture_dir =
-            Self::optional_trimmed(&self.share_form.fixture_dir).map(PathBuf::from);
-
-        let target_id = self
-            .current_target_id()
-            .ok_or_else(|| "Select a window or display using the native picker.".to_string())?;
-
-        Ok(ShareConfig {
-            session_id: session_id.to_string(),
-            passcode: passcode.to_string(),
-            road_url: Self::optional_trimmed(&self.share_form.road_url),
-            fixture_url: Self::optional_trimmed(&self.share_form.fixture_url),
-            fixture_dir,
-            from_peer: self.share_form.from_peer.trim().to_string(),
-            to_peer: self.share_form.to_peer.trim().to_string(),
-            target_id,
-            codec: self.share_form.codec.to_host(),
-            interval_ms,
-            max_width,
-            chunk_frames,
-        })
-    }
-
-    fn can_start_sharing(&self) -> bool {
-        matches!(self.share_state, SharingState::Idle)
-            && self.current_target_id().is_some()
-            && !self.share_form.session_id.trim().is_empty()
-            && !self.share_form.passcode.trim().is_empty()
-    }
-
-    fn start_sharing(&mut self) {
-        if !self.can_start_sharing() {
-            return;
-        }
-        if let Some(worker) = self.share_worker.as_ref() {
-            worker.request_stop();
-        }
-        if let Some(mut worker) = self.share_worker.take() {
-            worker.join();
-        }
-        if self.current_target_id().is_none() {
-            self.share_error = Some("Pick a window or display before starting.".to_string());
-            return;
-        }
-        let config = match self.build_share_config() {
-            Ok(cfg) => cfg,
             Err(err) => {
-                self.share_error = Some(err.clone());
-                self.append_share_status(format!("Cannot start: {}", err));
+                self.auth_status = AuthStatus::Error(err.to_string());
+                self.auth_profile = None;
+                self.access_token = None;
+                self.access_token_expiry = None;
+            }
+        }
+    }
+
+    #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+    fn reopen_picker(&mut self) {
+        if let Some(picker) = &self.picker {
+            match picker.launch() {
+                Ok(()) => {
+                    self.status_message = Some("Picker relaunched.".to_string());
+                    self.record_telemetry("picker_open", "manual");
+                }
+                Err(err) => {
+                    self.status_message = Some(format!("Failed to relaunch picker: {err}"));
+                }
+            }
+        } else {
+            self.status_message =
+                Some("Cannot relaunch picker without native support.".to_string());
+        }
+    }
+
+    #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+    fn poll_picker_events(&mut self) {
+        if let Some(picker) = &self.picker {
+            for message in picker.poll() {
+                match message {
+                    NativePickerMessage::Selection(result) => {
+                        self.apply_selection(result, SelectionSource::Stream);
+                    }
+                    NativePickerMessage::Cancelled => {
+                        self.status_message = Some("Picker closed without selection.".to_string());
+                    }
+                    NativePickerMessage::Error(message) => {
+                        self.status_message = Some(format!("Picker error: {message}"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(any(feature = "picker-mock", feature = "picker-native")))]
+    fn poll_picker_events(&mut self) {}
+
+    fn poll_app_events(&mut self) {
+        while let Ok(message) = self.event_rx.try_recv() {
+            match message {
+                AppMessage::AuthPrompt(prompt) => {
+                    self.auth_status = AuthStatus::Pending(prompt.clone());
+                    self.auth_inflight = true;
+                    self.push_session_update(format!("Enter Beach Auth code {}", prompt.user_code));
+                }
+                AppMessage::AuthSuccess {
+                    profile,
+                    email,
+                    tier,
+                } => {
+                    self.auth_status = AuthStatus::LoggedIn {
+                        profile: profile.clone(),
+                        email,
+                        tier,
+                    };
+                    self.auth_profile = Some(profile.clone());
+                    self.auth_inflight = false;
+                    self.push_session_update(format!("Signed in as {profile}."));
+                    self.request_access_token();
+                }
+                AppMessage::AuthError { message } => {
+                    self.auth_status = AuthStatus::Error(message.clone());
+                    self.auth_inflight = false;
+                    self.push_session_update(format!("Auth error: {message}"));
+                }
+                AppMessage::AccessToken {
+                    profile,
+                    token,
+                    expires_at,
+                } => {
+                    self.access_token = Some(token);
+                    self.access_token_expiry = expires_at;
+                    self.auth_profile = Some(profile);
+                    self.auth_inflight = false;
+                    self.push_session_update("Fetched Beach Auth token.");
+                }
+                AppMessage::BeachesLoaded(list) => {
+                    self.fetching_beaches = false;
+                    self.beaches = list;
+                    if let Some(selected) = &self.selected_beach_id {
+                        if !self.beaches.iter().any(|b| &b.id == selected) {
+                            self.selected_beach_id = self.beaches.first().map(|b| b.id.clone());
+                        }
+                    } else {
+                        self.selected_beach_id = self.beaches.first().map(|b| b.id.clone());
+                    }
+                    if self.beaches.is_empty() {
+                        self.push_session_update("No private beaches registered.");
+                    } else {
+                        self.push_session_update(format!(
+                            "Loaded {} private beach{}.",
+                            self.beaches.len(),
+                            if self.beaches.len() == 1 { "" } else { "es" }
+                        ));
+                    }
+                }
+                AppMessage::BeachesError(error) => {
+                    self.fetching_beaches = false;
+                    self.push_session_update(format!("Failed to load beaches: {error}"));
+                }
+                AppMessage::PublicSessionCreated(info) => {
+                    self.creating_public_session = false;
+                    self.public_session = Some(info.clone());
+                    self.push_session_update(format!("Created session {}.", info.session_id));
+                }
+                AppMessage::PublicSessionError(error) => {
+                    self.creating_public_session = false;
+                    self.push_session_update(format!("Session creation failed: {error}"));
+                }
+                AppMessage::PrivateAttachOk {
+                    beach_name,
+                    session_id,
+                    ..
+                } => {
+                    self.attaching_private_beach = false;
+                    self.push_session_update(format!(
+                        "Attached session {} to {}.",
+                        session_id, beach_name
+                    ));
+                }
+                AppMessage::PrivateAttachError(error) => {
+                    self.attaching_private_beach = false;
+                    self.push_session_update(format!("Attach failed: {error}"));
+                }
+            }
+        }
+    }
+
+    #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+    fn apply_selection(&mut self, result: PickerResult, source: SelectionSource) {
+        let is_new_tile = self.upsert_tile(result.clone());
+
+        if is_new_tile {
+            self.record_telemetry("picker_discovered", &result.id);
+            if matches!(source, SelectionSource::Stream) && self.selected_id.is_some() {
+                self.status_message = Some(format!("Discovered {}", result.label));
                 return;
             }
-        };
-        #[cfg(target_os = "macos")]
+        }
+
+        if matches!(source, SelectionSource::Stream)
+            && self.selected_id.is_some()
+            && self.selected_id.as_deref() != Some(result.id.as_str())
         {
-            Self::ensure_screen_recording_permission();
+            return;
         }
 
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let handle = spawn_share_worker(config, tx, stop_flag.clone());
-        self.share_worker = Some(ShareWorker {
-            handle: Some(handle),
-            events: rx,
-            stop: stop_flag,
-        });
-        self.share_state = SharingState::Starting;
-        self.share_status_log.clear();
-        self.share_error = None;
-        self.share_verification = None;
-        self.append_share_status("Launching Cabana host…");
-    }
+        self.selected_id = Some(result.id.clone());
 
-    fn stop_sharing(&mut self) {
-        if let Some(worker) = self.share_worker.as_ref() {
-            worker.request_stop();
-            if !matches!(self.share_state, SharingState::Stopping) {
-                self.append_share_status("Stop requested…");
-            }
-            self.share_state = SharingState::Stopping;
-        }
-    }
+        let descriptor = ScreenCaptureDescriptor::new(
+            result.id.clone(),
+            result.filter_blob.clone(),
+            result.stream_config_blob.clone(),
+            result.metadata_json.clone(),
+        );
 
-    fn force_stop_sharing(&mut self) {
-        if let Some(worker) = self.share_worker.as_ref() {
-            worker.request_stop();
-        }
-        if let Some(mut worker) = self.share_worker.take() {
-            worker.join();
-        }
-        self.share_state = SharingState::Idle;
-    }
+        let metadata = decode_metadata(&result.metadata_json);
+        self.session_sheet.update_selection(
+            descriptor.clone(),
+            result.label.clone(),
+            result.application.clone(),
+            result.kind,
+            metadata,
+        );
 
-    #[cfg(target_os = "macos")]
-    fn ensure_screen_recording_permission() {
-        use beach_cabana_host::platform::macos::permissions::{
-            request_access, status, ScreenRecordingStatus,
-        };
-        if status() != ScreenRecordingStatus::Granted {
-            let _ = request_access();
-        }
-    }
+        publish_selection(SelectionEvent::new(
+            descriptor,
+            result.label.clone(),
+            result.application.clone(),
+            None,
+        ));
 
-    fn render_share_controls(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("WebRTC session").strong());
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.label("Session ID");
-            ui.add(
-                TextEdit::singleline(&mut self.share_form.session_id)
-                    .desired_width(160.0)
-                    .hint_text("road session id"),
-            );
-            ui.label("Passcode");
-            ui.add(
-                TextEdit::singleline(&mut self.share_form.passcode)
-                    .desired_width(140.0)
-                    .password(true)
-                    .hint_text("shared secret"),
-            );
-            ui.label("Road URL");
-            ui.add(
-                TextEdit::singleline(&mut self.share_form.road_url)
-                    .desired_width(220.0)
-                    .hint_text("http://127.0.0.1:8080"),
-            );
-        });
-        ui.horizontal(|ui| {
-            ui.label("Fixture URL");
-            ui.add(
-                TextEdit::singleline(&mut self.share_form.fixture_url)
-                    .desired_width(220.0)
-                    .hint_text("optional"),
-            );
-            ui.label("Fixture dir");
-            ui.add(
-                TextEdit::singleline(&mut self.share_form.fixture_dir)
-                    .desired_width(200.0)
-                    .hint_text("optional"),
-            );
-            ui.label("From/To");
-            ui.add(
-                TextEdit::singleline(&mut self.share_form.from_peer)
-                    .desired_width(80.0)
-                    .hint_text("host id"),
-            );
-            ui.add(
-                TextEdit::singleline(&mut self.share_form.to_peer)
-                    .desired_width(80.0)
-                    .hint_text("viewer id"),
-            );
-        });
-        ui.horizontal(|ui| {
-            ui.label("Codec");
-            ui.selectable_value(
-                &mut self.share_form.codec,
-                CodecChoice::H264,
-                CodecChoice::H264.label(),
-            );
-            ui.selectable_value(
-                &mut self.share_form.codec,
-                CodecChoice::Gif,
-                CodecChoice::Gif.label(),
-            );
-            ui.separator();
-            ui.label("Max width");
-            ui.add(
-                TextEdit::singleline(&mut self.share_form.max_width)
-                    .desired_width(70.0)
-                    .hint_text("1280"),
-            );
-            ui.label("Interval ms");
-            ui.add(
-                TextEdit::singleline(&mut self.share_form.interval_ms)
-                    .desired_width(60.0)
-                    .hint_text("33"),
-            );
-            ui.label("Chunk frames");
-            ui.add(
-                TextEdit::singleline(&mut self.share_form.chunk_frames)
-                    .desired_width(70.0)
-                    .hint_text("120"),
-            );
-        });
-        ui.horizontal(|ui| {
-            let start_label = match self.share_state {
-                SharingState::Idle => "Start sharing",
-                SharingState::Starting => "Starting…",
-                SharingState::Streaming => "Streaming…",
-                SharingState::Stopping => "Stopping…",
-            };
-            if ui
-                .add_enabled(self.can_start_sharing(), egui::Button::new(start_label))
-                .clicked()
-            {
-                self.start_sharing();
-            }
-            if ui
-                .add_enabled(
-                    matches!(
-                        self.share_state,
-                        SharingState::Starting | SharingState::Streaming | SharingState::Stopping
-                    ),
-                    egui::Button::new("Stop sharing"),
-                )
-                .clicked()
-            {
-                self.stop_sharing();
-            }
-            if let Some(code) = &self.share_verification {
-                ui.label(RichText::new(format!("Verification: {}", code)).strong());
-            }
-            if let Some(err) = &self.share_error {
-                ui.colored_label(Color32::from_rgb(220, 95, 78), err);
-            }
-        });
-        if !self.share_status_log.is_empty() {
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(8.0, 4.0);
-                for entry in &self.share_status_log {
-                    ui.label(RichText::new(entry).color(Color32::from_gray(170)));
+        let detail = match source {
+            SelectionSource::Stream => {
+                if is_new_tile {
+                    "stream-initial"
+                } else {
+                    "stream-refresh"
                 }
-            });
-        }
+            }
+            SelectionSource::Tile => "tile",
+        };
+        self.record_telemetry("picker_selection", &format!("{} ({})", result.id, detail));
+        self.status_message = Some(format!("Selected {}", result.label));
     }
 
-}
+    #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+    fn upsert_tile(&mut self, result: PickerResult) -> bool {
+        let metadata = decode_metadata(&result.metadata_json);
 
-impl eframe::App for PickerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_share_events();
+        if let Some(tile) = self
+            .tiles
+            .iter_mut()
+            .find(|tile| tile.result.id == result.id)
+        {
+            tile.result = result;
+            tile.metadata = metadata;
+            return false;
+        }
 
-        egui::TopBottomPanel::top("cabana-top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Beach Cabana — select a window or display to share");
-            });
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.selectable_value(
-                    &mut self.tab,
-                    PickerTab::Displays,
-                    PickerTab::Displays.label(),
-                );
-                ui.selectable_value(
-                    &mut self.tab,
-                    PickerTab::Windows,
-                    PickerTab::Windows.label(),
-                );
-                ui.separator();
-                let filter_changed = ui
-                    .add(
-                        TextEdit::singleline(&mut self.filter)
-                            .hint_text("Filter by name or application"),
-                    )
-                    .changed();
-                if filter_changed {
-                    if let Some(selected) = self.selected_item() {
-                        if !self.tab.matches(selected)
-                            || !selected.matches_filter(&self.filter.to_lowercase())
-                        {
-                            self.selected_id = None;
+        self.tiles.push(PickerTile { result, metadata });
+        self.tiles.sort_by(|a, b| {
+            a.result
+                .label
+                .to_lowercase()
+                .cmp(&b.result.label.to_lowercase())
+        });
+        true
+    }
+
+    fn record_telemetry(&mut self, event: &str, detail: &str) {
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|dur| dur.as_millis())
+            .unwrap_or_default();
+        let mut entry = String::new();
+        let _ = write!(&mut entry, "[{}] {} {}", timestamp_ms, event, detail);
+        self.telemetry_log.push_back(entry.clone());
+        while self.telemetry_log.len() > 16 {
+            self.telemetry_log.pop_front();
+        }
+        println!("[telemetry] {entry}");
+    }
+
+    fn begin_auth_login(&mut self) {
+        if self.auth_inflight {
+            return;
+        }
+        self.auth_inflight = true;
+        self.auth_status = AuthStatus::Starting;
+        let profile = self
+            .auth_profile
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let sender = self.event_tx.clone();
+        thread::spawn(move || {
+            let runtime = Runtime::new().expect("failed to create tokio runtime for auth login");
+            let result: Result<(), AuthError> = runtime.block_on(async {
+                let config = auth::BeachAuthConfig::from_env()?;
+                let (start, client) = auth::perform_device_login(&profile, config.clone()).await?;
+                let prompt = AuthPrompt {
+                    profile: profile.clone(),
+                    user_code: start.user_code.clone(),
+                    verification_uri: start.verification_uri.clone(),
+                    verification_uri_complete: start.verification_uri_complete.clone(),
+                    expires_at: SystemTime::now() + Duration::from_secs(start.expires_in.max(60)),
+                };
+                let _ = sender.send(AppMessage::AuthPrompt(prompt));
+
+                loop {
+                    tokio::time::sleep(Duration::from_secs(start.interval.max(3))).await;
+                    match auth::complete_device_login(&profile, &client, &start.device_code).await {
+                        Ok(tokens) => {
+                            let _ = auth::set_current_profile(Some(profile.clone()));
+                            let _ = sender.send(AppMessage::AuthSuccess {
+                                profile: profile.clone(),
+                                email: tokens.email.clone(),
+                                tier: tokens.tier.clone(),
+                            });
+
+                            if let Ok(Some(token)) =
+                                auth::maybe_access_token(Some(&profile), true).await
+                            {
+                                let expiry = auth::load_store()
+                                    .ok()
+                                    .and_then(|store| profile_expiry(&store, &profile));
+                                let _ = sender.send(AppMessage::AccessToken {
+                                    profile: profile.clone(),
+                                    token,
+                                    expires_at: expiry,
+                                });
+                            }
+                            break;
+                        }
+                        Err(AuthError::AuthorizationPending) => continue,
+                        Err(AuthError::AuthorizationDenied) => {
+                            let _ = sender.send(AppMessage::AuthError {
+                                message: "Authorization denied".to_string(),
+                            });
+                            break;
+                        }
+                        Err(err) => {
+                            let _ = sender.send(AppMessage::AuthError {
+                                message: err.to_string(),
+                            });
+                            break;
                         }
                     }
                 }
-                if ui.button("Refresh").clicked() {
-                    self.refresh_items();
+                Ok(())
+            });
+
+            if let Err(err) = result {
+                let _ = sender.send(AppMessage::AuthError {
+                    message: err.to_string(),
+                });
+            }
+        });
+    }
+
+    fn request_access_token(&mut self) {
+        if self.auth_inflight {
+            return;
+        }
+        let profile = match self.auth_profile.clone() {
+            Some(name) => name,
+            None => {
+                self.push_session_update("Sign in to request a Beach Auth token.");
+                return;
+            }
+        };
+        self.auth_inflight = true;
+        let sender = self.event_tx.clone();
+        thread::spawn(move || {
+            let runtime = Runtime::new().expect("failed to create tokio runtime for access token");
+            let result = runtime.block_on(async {
+                match auth::maybe_access_token(Some(&profile), true).await {
+                    Ok(Some(token)) => {
+                        let expiry = auth::load_store()
+                            .ok()
+                            .and_then(|store| profile_expiry(&store, &profile));
+                        sender
+                            .send(AppMessage::AccessToken {
+                                profile: profile.clone(),
+                                token,
+                                expires_at: expiry,
+                            })
+                            .ok();
+                        Ok(())
+                    }
+                    Ok(None) => Err(AuthError::ProfileNotFound(profile.clone())),
+                    Err(err) => Err(err),
                 }
             });
-            show_permission_banner(ui);
-            if let Some(msg) = &self.status_message {
-                ui.colored_label(Color32::from_rgb(220, 95, 78), msg);
+            if let Err(err) = result {
+                sender
+                    .send(AppMessage::AuthError {
+                        message: err.to_string(),
+                    })
+                    .ok();
             }
         });
+    }
 
-        let filtered = self.filtered_items();
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if filtered.is_empty() {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(48.0);
-                    ui.label(
-                        RichText::new("No windows or displays match your filter.")
-                            .color(Color32::from_gray(160)),
-                    );
-                });
+    fn fetch_private_beaches(&mut self) {
+        if self.fetching_beaches {
+            return;
+        }
+        let token = match self.access_token.clone() {
+            Some(token) => token,
+            None => {
+                self.push_session_update("Sign in to list private beaches.");
                 return;
             }
-
-        ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(18.0, 18.0);
-                        for item in filtered {
-                            let selected = self.selected_id.as_deref() == Some(&item.id);
-                            let preview_entry = if selected {
-                                Some(self.ensure_preview(ctx, &item.id).clone())
-                            } else {
-                                self.preview_cache.get(&item.id).cloned()
-                            };
-                            let texture = preview_entry
-                                .as_ref()
-                                .and_then(|entry| entry.texture.clone());
-                            let error = preview_entry
-                                .as_ref()
-                                .and_then(|entry| entry.error.clone());
-                            let selected = self.selected_id.as_deref() == Some(&item.id);
-
-                            let frame = egui::Frame::group(ui.style())
-                                .fill(if selected {
-                                    Color32::from_rgb(34, 52, 80)
-                                } else {
-                                    Color32::from_rgb(26, 28, 33)
-                                })
-                                .stroke(egui::Stroke::new(
-                                    if selected { 2.0 } else { 1.0 },
-                                    if selected {
-                                        Color32::from_rgb(68, 120, 196)
-                                    } else {
-                                        Color32::from_rgb(58, 62, 70)
-                                    },
-                                ))
-                                .inner_margin(Margin {
-                                    left: 12.0,
-                                    right: 12.0,
-                                    top: 12.0,
-                                    bottom: 12.0,
-                                })
-                                .rounding(egui::Rounding::same(10.0));
-
-                            let response = frame
-                                .show(ui, |ui| {
-                                    ui.set_min_width(260.0);
-                                    ui.set_max_width(260.0);
-                                    ui.set_min_height(220.0);
-                                    ui.vertical(|ui| {
-                                        let preview_size = Vec2::new(
-                                            ui.available_width(),
-                                            150.0,
-                                        );
-                                        if let Some(texture) = texture {
-                                            let texture_size = texture.size_vec2();
-                                            let scale = (preview_size.x / texture_size.x)
-                                                .min(preview_size.y / texture_size.y)
-                                                .clamp(0.0, 1.0);
-                                            let render_size = if scale > 0.0 {
-                                                texture_size * scale
-                                            } else {
-                                                texture_size
-                                            };
-                                            ui.add(
-                                                Image::new(&texture)
-                                                    .max_size(preview_size)
-                                                    .fit_to_exact_size(render_size),
-                                            );
-                                        } else if let Some(err) = error.clone() {
-                                            ui.vertical_centered(|ui| {
-                                                ui.label(
-                                                    RichText::new("Preview unavailable")
-                                                        .color(Color32::from_rgb(220, 95, 78))
-                                                        .strong(),
-                                                );
-                                                ui.label(
-                                                    RichText::new(err)
-                                                        .color(Color32::from_gray(160)),
-                                                );
-                                            });
-                                        } else {
-                                            ui.vertical_centered(|ui| {
-                                                ui.add_space(32.0);
-                                                ui.label(
-                                                    RichText::new(if selected {
-                                                        "Preparing preview…"
-                                                    } else {
-                                                        "Select to generate preview"
-                                                    })
-                                                    .color(Color32::from_gray(160)),
-                                                );
-                                            });
-                                        }
-                                        ui.add_space(12.0);
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "{}{}",
-                                                item.prefix(),
-                                                item.title
-                                            ))
-                                            .strong()
-                                            .color(Color32::from_rgb(224, 234, 255)),
-                                        );
-                                        if !item.application.is_empty() {
-                                            ui.vertical_centered(|ui| {
-                                                ui.label(
-                                                    RichText::new(&item.application)
-                                                        .color(Color32::from_rgb(170, 184, 210)),
-                                                );
-                                            });
-                                        }
-                                        if item.is_display {
-                                            ui.vertical_centered(|ui| {
-                                                ui.label(
-                                                    RichText::new("Display")
-                                                        .color(Color32::from_gray(150)),
-                                                );
-                                            });
-                                        }
-                                    });
-                                })
-                                .response
-                                .interact(egui::Sense::click());
-
-                            if response.clicked() {
-                                self.select_id(&item.id);
-                            }
-                        }
-                    });
-                });
-        });
-
-        egui::TopBottomPanel::bottom("cabana-actions").show(ctx, |ui| {
-            ui.separator();
-            ui.vertical(|ui| {
-                self.render_share_controls(ui);
-                ui.separator();
-                self.render_selection_controls(ui, ctx);
+        };
+        self.fetching_beaches = true;
+        let base = self.manager_base.clone();
+        let sender = self.event_tx.clone();
+        thread::spawn(move || {
+            let runtime = Runtime::new().expect("failed to create tokio runtime for beaches");
+            let result = runtime.block_on(async move {
+                let client = reqwest::Client::new();
+                let url = format!("{}/private-beaches", base.trim_end_matches('/'));
+                let response = client
+                    .get(url)
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                    .map_err(|err| err.to_string())?;
+                if !response.status().is_success() {
+                    return Err(format!("HTTP {}", response.status()));
+                }
+                response
+                    .json::<Vec<PrivateBeachSummary>>()
+                    .await
+                    .map_err(|err| err.to_string())
             });
+            match result {
+                Ok(list) => {
+                    sender.send(AppMessage::BeachesLoaded(list)).ok();
+                }
+                Err(err) => {
+                    sender.send(AppMessage::BeachesError(err)).ok();
+                }
+            }
         });
     }
-}
 
-impl Drop for PickerApp {
-    fn drop(&mut self) {
-        self.force_stop_sharing();
-        self.reset_preview_cache();
+    fn begin_create_public_session(&mut self) {
+        if self.creating_public_session {
+            return;
+        }
+        if self.session_sheet.descriptor().is_none() {
+            self.push_session_update("Select a target before creating a session.");
+            return;
+        }
+        self.creating_public_session = true;
+        let road = self.road_base.clone();
+        let sender = self.event_tx.clone();
+        thread::spawn(move || {
+            let runtime =
+                Runtime::new().expect("failed to create tokio runtime for session creation");
+            let result = runtime.block_on(async move {
+                let config = SessionConfig::new(&road).map_err(|err| err.to_string())?;
+                let manager = SessionManager::new(config).map_err(|err| err.to_string())?;
+                let host_session = manager.host().await.map_err(|err| match err {
+                    SessionError::HttpStatus(status) => {
+                        format!("Beach Road returned {}", status)
+                    }
+                    other => other.to_string(),
+                })?;
+                Ok(PublicSessionInfo {
+                    session_id: host_session.session_id().to_string(),
+                    join_code: host_session.join_code().to_string(),
+                    session_url: host_session.handle().session_url().to_string(),
+                })
+            });
+            match result {
+                Ok(info) => {
+                    sender.send(AppMessage::PublicSessionCreated(info)).ok();
+                }
+                Err(err) => {
+                    sender.send(AppMessage::PublicSessionError(err)).ok();
+                }
+            }
+        });
     }
-}
 
-fn spawn_share_worker(
-    config: ShareConfig,
-    sender: Sender<ShareEvent>,
-    stop_flag: Arc<AtomicBool>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        sender
-            .send(ShareEvent::Status(
-                "Bootstrapping Cabana host…".to_string(),
-            ))
-            .ok();
-        let runtime = match Runtime::new() {
-            Ok(rt) => rt,
-            Err(err) => {
-                sender
-                    .send(ShareEvent::Error(format!(
-                        "Runtime init failed: {}",
-                        err
-                    )))
-                    .ok();
-                sender.send(ShareEvent::Finished).ok();
+    fn begin_attach_private_beach(&mut self) {
+        if self.attaching_private_beach {
+            return;
+        }
+        let token = match self.access_token.clone() {
+            Some(token) => token,
+            None => {
+                self.push_session_update("Sign in to attach sessions to a private beach.");
                 return;
             }
         };
-
-        let bootstrap_result = runtime.block_on(cabana::webrtc::host_bootstrap(
-            config.session_id.clone(),
-            config.passcode.clone(),
-            config.road_url.clone(),
-            config.fixture_url.clone(),
-            config.fixture_dir.clone(),
-            Vec::new(),
-            config.from_peer.clone(),
-            config.to_peer.clone(),
-        ));
-
-        let (transport, verification) = match bootstrap_result {
-            Ok(pair) => pair,
-            Err(err) => {
-                sender
-                    .send(ShareEvent::Error(format!(
-                        "Bootstrap failed: {}",
-                        err
-                    )))
-                    .ok();
-                sender.send(ShareEvent::Finished).ok();
+        let descriptor = match self.session_sheet.descriptor().cloned() {
+            Some(descriptor) => descriptor,
+            None => {
+                self.push_session_update("Select a capture target before attaching.");
                 return;
             }
         };
-
-        sender
-            .send(ShareEvent::Verification(verification))
-            .ok();
-        sender
-            .send(ShareEvent::Status(
-                "Handshake complete. Confirm verification with the viewer."
-                    .to_string(),
-            ))
-            .ok();
-        sender.send(ShareEvent::Started).ok();
-
-        while !stop_flag.load(Ordering::SeqCst) {
-            let chunk_result = runtime.block_on(cabana::webrtc::host_stream(
-                &transport,
-                config.codec,
-                &config.window_id,
-                config.chunk_frames,
-                config.interval_ms,
-                config.max_width,
-            ));
-            match chunk_result {
+        let public = match self.public_session.clone() {
+            Some(info) => info,
+            None => {
+                self.push_session_update("Create a public session before attaching.");
+                return;
+            }
+        };
+        let beach_id = match self.selected_beach_id.clone() {
+            Some(id) => id,
+            None => {
+                self.push_session_update("Choose a private beach to attach to.");
+                return;
+            }
+        };
+        let beach_name = self
+            .beaches
+            .iter()
+            .find(|beach| beach.id == beach_id)
+            .map(|b| b.name.clone())
+            .unwrap_or_else(|| "selected private beach".to_string());
+        self.attaching_private_beach = true;
+        let manager = self.manager_base.clone();
+        let session_label = self.session_sheet.session_name().to_string();
+        let picker_label = self.session_sheet.label().map(|s| s.to_string());
+        let application = self.session_sheet.application().map(|s| s.to_string());
+        let kind = self.session_sheet.kind();
+        let picker_metadata = self.session_sheet.metadata().cloned();
+        let sender = self.event_tx.clone();
+        thread::spawn(move || {
+            let runtime =
+                Runtime::new().expect("failed to create tokio runtime for private attach");
+            let result = runtime.block_on(async move {
+                attach_private_beach(
+                    &manager,
+                    &token,
+                    &beach_id,
+                    &beach_name,
+                    &public,
+                    &descriptor,
+                    picker_label,
+                    application,
+                    kind,
+                    picker_metadata,
+                    session_label,
+                )
+                .await
+            });
+            match result {
                 Ok(_) => {
                     sender
-                        .send(ShareEvent::Status(format!(
-                            "Sent {} frames.",
-                            config.chunk_frames
-                        )))
+                        .send(AppMessage::PrivateAttachOk {
+                            beach_id,
+                            beach_name,
+                            session_id: public.session_id,
+                        })
                         .ok();
                 }
                 Err(err) => {
-                    sender
-                        .send(ShareEvent::Error(format!(
-                            "Streaming failed: {}",
-                            err
-                        )))
-                        .ok();
-                    break;
+                    sender.send(AppMessage::PrivateAttachError(err)).ok();
+                }
+            }
+        });
+    }
+
+    fn push_session_update(&mut self, message: impl Into<String>) {
+        const MAX: usize = 12;
+        self.session_updates.push_back(message.into());
+        while self.session_updates.len() > MAX {
+            self.session_updates.pop_front();
+        }
+    }
+
+    fn render_session_actions(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.label(RichText::new("Beach Auth").strong());
+            ui.add_space(4.0);
+            match &self.auth_status {
+                AuthStatus::LoggedOut => {
+                    ui.label("Not signed in.");
+                }
+                AuthStatus::Starting => {
+                    ui.label("Starting login flow…");
+                }
+                AuthStatus::Pending(prompt) => {
+                    ui.label("Complete login in your browser:");
+                    ui.monospace(format!("Code: {}", prompt.user_code));
+                    ui.hyperlink(&prompt.verification_uri_complete);
+                    if let Ok(remaining) = prompt.expires_at.duration_since(SystemTime::now()) {
+                        ui.small(format!("Expires in {} seconds.", remaining.as_secs()));
+                    }
+                }
+                AuthStatus::LoggedIn {
+                    profile,
+                    email,
+                    tier,
+                } => {
+                    ui.label(format!("Profile: {}", profile));
+                    if let Some(email) = email {
+                        ui.label(format!("Email: {}", email));
+                    }
+                    if let Some(tier) = tier {
+                        ui.label(format!("Tier: {}", tier));
+                    }
+                    if let Some(expiry) = self.access_token_expiry {
+                        if let Ok(remaining) = expiry.duration_since(SystemTime::now()) {
+                            ui.small(format!(
+                                "Access token expires in ~{} minute(s).",
+                                (remaining.as_secs() / 60).max(1)
+                            ));
+                        }
+                    }
+                }
+                AuthStatus::Error(message) => {
+                    ui.colored_label(Color32::from_rgb(220, 70, 70), message);
+                }
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !self.auth_inflight,
+                        egui::Button::new("Sign in with Beach Auth"),
+                    )
+                    .clicked()
+                {
+                    self.begin_auth_login();
+                }
+                if ui
+                    .add_enabled(
+                        !self.auth_inflight
+                            && matches!(self.auth_status, AuthStatus::LoggedIn { .. }),
+                        egui::Button::new("Refresh token"),
+                    )
+                    .clicked()
+                {
+                    self.request_access_token();
+                }
+            });
+        });
+
+        ui.add_space(12.0);
+        ui.group(|ui| {
+            ui.label(RichText::new("Public session").strong());
+            ui.add_space(4.0);
+            ui.small(format!("Beach Road: {}", self.road_base));
+            let can_create =
+                self.session_sheet.descriptor().is_some() && !self.creating_public_session;
+            if ui
+                .add_enabled(can_create, egui::Button::new("Create public session"))
+                .clicked()
+            {
+                self.begin_create_public_session();
+            }
+            if self.creating_public_session {
+                ui.label("Creating session…");
+            }
+            if let Some(session) = &self.public_session {
+                ui.add_space(6.0);
+                ui.label(format!("Session ID: {}", session.session_id));
+                ui.horizontal(|ui| {
+                    ui.label("Join code:");
+                    ui.monospace(&session.join_code);
+                    if ui.button("Copy").clicked() {
+                        ui.output_mut(|o| o.copied_text = session.join_code.clone());
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Session URL:");
+                    ui.hyperlink(&session.session_url);
+                    if ui.button("Open").clicked() {
+                        if let Err(err) = open::that(&session.session_url) {
+                            self.push_session_update(format!("Failed to open URL: {err}"));
+                        }
+                    }
+                });
+            } else {
+                ui.add_space(4.0);
+                ui.small("No session created yet.");
+            }
+        });
+
+        ui.add_space(12.0);
+        ui.group(|ui| {
+            ui.label(RichText::new("Private beach").strong());
+            ui.add_space(4.0);
+            ui.small(format!("Manager: {}", self.manager_base));
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !self.fetching_beaches
+                            && self.access_token.is_some()
+                            && matches!(self.auth_status, AuthStatus::LoggedIn { .. }),
+                        egui::Button::new("Refresh beaches"),
+                    )
+                    .clicked()
+                {
+                    self.fetch_private_beaches();
+                }
+                if self.fetching_beaches {
+                    ui.label("Loading…");
+                }
+            });
+            if self.beaches.is_empty() {
+                ui.label("No beaches loaded.");
+            } else {
+                let selected_name = self
+                    .selected_beach_id
+                    .as_ref()
+                    .and_then(|id| {
+                        self.beaches
+                            .iter()
+                            .find(|b| &b.id == id)
+                            .map(|b| format!("{} ({})", b.name, b.slug))
+                    })
+                    .unwrap_or_else(|| "Select private beach".to_string());
+                ComboBox::from_label("Private beach")
+                    .selected_text(selected_name)
+                    .show_ui(ui, |cb| {
+                        for beach in &self.beaches {
+                            cb.selectable_value(
+                                &mut self.selected_beach_id,
+                                Some(beach.id.clone()),
+                                format!("{} ({})", beach.name, beach.slug),
+                            );
+                        }
+                    });
+            }
+            let can_attach = self.access_token.is_some()
+                && self.public_session.is_some()
+                && self.session_sheet.descriptor().is_some()
+                && self.selected_beach_id.is_some()
+                && !self.attaching_private_beach;
+            if ui
+                .add_enabled(can_attach, egui::Button::new("Attach session"))
+                .clicked()
+            {
+                self.begin_attach_private_beach();
+            }
+            if self.attaching_private_beach {
+                ui.label("Attaching session…");
+            }
+        });
+
+        ui.add_space(12.0);
+        ui.group(|ui| {
+            ui.label(RichText::new("Session log").strong());
+            if self.session_updates.is_empty() {
+                ui.label("No host session events yet.");
+            } else {
+                for entry in self.session_updates.iter().rev() {
+                    ui.label(entry);
+                }
+            }
+        });
+    }
+
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.request_repaint_after(Duration::from_millis(100));
+
+        self.poll_app_events();
+        self.poll_picker_events();
+
+        egui::TopBottomPanel::top("cabana-top").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Cabana macOS Picker");
+                ui.add_space(12.0);
+                #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+                {
+                    if ui.button("Reopen picker").clicked() {
+                        self.reopen_picker();
+                    }
+                }
+                if let Some(status) = &self.status_message {
+                    ui.add_space(16.0);
+                    ui.label(status.clone());
+                }
+            });
+        });
+
+        #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+        {
+            egui::SidePanel::left("cabana-tile-panel")
+                .min_width(320.0)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.heading("Capture targets");
+                    ui.add_space(6.0);
+                    ScrollArea::vertical().show(ui, |ui| {
+                        if self.tiles.is_empty() {
+                            ui.label("Waiting for picker events…");
+                        } else {
+                            ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+                            ui.horizontal_wrapped(|ui| {
+                                for tile in &self.tiles {
+                                    let is_selected = self
+                                        .selected_id
+                                        .as_deref()
+                                        .map(|id| id == tile.result.id)
+                                        .unwrap_or(false);
+                                    let response = render_tile(ui, tile, is_selected);
+                                    if response.clicked() {
+                                        self.apply_selection(
+                                            tile.result.clone(),
+                                            SelectionSource::Tile,
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                    });
+                });
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
+                ui.heading("Session sheet");
+                ui.add_space(6.0);
+                self.session_sheet.render(ui);
+                ui.add_space(12.0);
+                self.render_session_actions(ui);
+            });
+        });
+
+        egui::TopBottomPanel::bottom("cabana-telemetry")
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.heading("Telemetry");
+                ui.add_space(4.0);
+                if self.telemetry_log.is_empty() {
+                    ui.label("No telemetry events recorded yet.");
+                } else {
+                    for entry in self.telemetry_log.iter().rev() {
+                        ui.label(entry);
+                    }
+                }
+            });
+    }
+}
+
+struct SessionSheetState {
+    session_name: String,
+    descriptor: Option<ScreenCaptureDescriptor>,
+    label: Option<String>,
+    application: Option<String>,
+    kind: Option<PickerItemKind>,
+    metadata: Option<JsonValue>,
+    confirmed_at: Option<SystemTime>,
+}
+
+impl SessionSheetState {
+    fn new() -> Self {
+        Self {
+            session_name: String::new(),
+            descriptor: None,
+            label: None,
+            application: None,
+            kind: None,
+            metadata: None,
+            confirmed_at: None,
+        }
+    }
+
+    fn update_selection(
+        &mut self,
+        descriptor: ScreenCaptureDescriptor,
+        label: String,
+        application: Option<String>,
+        kind: PickerItemKind,
+        metadata: Option<JsonValue>,
+    ) {
+        self.descriptor = Some(descriptor);
+        self.label = Some(label);
+        self.application = application;
+        self.kind = Some(kind);
+        self.metadata = metadata;
+        self.confirmed_at = Some(SystemTime::now());
+    }
+
+    fn render(&mut self, ui: &mut egui::Ui) {
+        if self.descriptor.is_none() {
+            ui.label("Pick a window or display to configure a session.");
+            return;
+        }
+
+        if let Some(label) = &self.label {
+            ui.label(RichText::new(label).strong());
+        }
+        if let Some(app) = &self.application {
+            ui.label(app.clone());
+        }
+        if let Some(kind) = self.kind {
+            ui.label(format!("Capture kind: {}", kind_label(kind)));
+        }
+        if let Some(descriptor) = &self.descriptor {
+            ui.add_space(4.0);
+            ui.label(format!("Target identifier: {}", descriptor.target_id));
+            if let Some(ts) = self.confirmed_at {
+                if let Ok(ms) = ts.duration_since(UNIX_EPOCH) {
+                    ui.label(format!("Selected at: {} ms", ms.as_millis()));
                 }
             }
         }
 
-        sender.send(ShareEvent::Finished).ok();
-    })
-}
+        ui.add_space(6.0);
+        ui.label("Session nickname (optional)");
+        ui.text_edit_singleline(&mut self.session_name)
+            .hint_text("Displayed to viewers and in Private Beach");
 
-fn load_texture_from_path(ctx: &egui::Context, path: &Path) -> Result<TextureHandle, String> {
-    let bytes = fs::read(path).map_err(|err| err.to_string())?;
-    let mut image = image::load_from_memory(&bytes)
-        .map_err(|err| err.to_string())?
-        .to_rgba8();
-    let mut width = image.width();
-    let mut height = image.height();
-    if width > 1400 {
-        let scale = 1400.0 / width as f32;
-        let new_width = 1400;
-        let new_height = (height as f32 * scale).round().max(1.0) as u32;
-        let resized =
-            image::imageops::resize(&image, new_width, new_height, FilterType::Triangle);
-        image = resized;
-        width = new_width;
-        height = new_height;
+        if let Some(metadata) = &self.metadata {
+            ui.add_space(6.0);
+            ui.label("Picker metadata");
+            for (key, value) in metadata_entries(metadata).into_iter().take(6) {
+                ui.label(format!("• {}: {}", key, value));
+            }
+        }
+
+        ui.add_space(8.0);
+        ui.small("Use the actions below to create a session or attach to a private beach.");
     }
-    let pixels = image.into_raw();
-    let color_image =
-        egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &pixels);
-    Ok(ctx.load_texture(
-        format!("preview-{}", path.display()),
-        color_image,
-        TextureOptions::LINEAR,
-    ))
+
+    fn descriptor(&self) -> Option<&ScreenCaptureDescriptor> {
+        self.descriptor.as_ref()
+    }
+
+    fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    fn application(&self) -> Option<&str> {
+        self.application.as_deref()
+    }
+
+    fn kind(&self) -> Option<PickerItemKind> {
+        self.kind
+    }
+
+    fn metadata(&self) -> Option<&JsonValue> {
+        self.metadata.as_ref()
+    }
+
+    fn session_name(&self) -> &str {
+        self.session_name.trim()
+    }
 }
 
-#[cfg(target_os = "macos")]
-fn show_permission_banner(ui: &mut egui::Ui) {
-    use beach_cabana_host::platform::macos::permissions::{
-        request_access, status, ScreenRecordingStatus,
+#[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+struct PickerTile {
+    result: PickerResult,
+    metadata: Option<JsonValue>,
+}
+
+#[cfg(not(any(feature = "picker-mock", feature = "picker-native")))]
+type PickerTile = ();
+
+enum SelectionSource {
+    Stream,
+    Tile,
+}
+
+#[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+fn render_tile(ui: &mut egui::Ui, tile: &PickerTile, selected: bool) -> egui::Response {
+    let stroke_color = if selected {
+        Color32::from_rgb(64, 145, 255)
+    } else {
+        Color32::from_rgb(90, 90, 90)
+    };
+    let fill_color = if selected {
+        Color32::from_rgb(30, 40, 70)
+    } else {
+        Color32::from_rgb(24, 24, 24)
     };
 
-    if status() != ScreenRecordingStatus::Granted {
-        egui::Frame::group(ui.style())
-            .fill(Color32::from_rgb(255, 248, 235))
-            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(247, 192, 120)))
-            .show(ui, |ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("Screen Recording permission required")
-                            .color(Color32::from_rgb(161, 92, 16))
-                            .strong(),
-                    );
-                    ui.label(
-                        "Grant access in System Settings → Privacy & Security → Screen Recording.",
-                    );
-                    if ui.button("Request access").clicked() {
-                        let _ = request_access();
+    let frame = egui::Frame::group(ui.style())
+        .fill(fill_color)
+        .stroke(egui::Stroke::new(
+            if selected { 2.0 } else { 1.0 },
+            stroke_color,
+        ))
+        .rounding(egui::Rounding::same(10.0));
+
+    frame
+        .show(ui, |ui| {
+            ui.set_width(220.0);
+            ui.set_min_height(140.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new(tile.result.label.clone()).strong());
+                if let Some(app) = &tile.result.application {
+                    ui.label(app.clone());
+                }
+                ui.label(kind_label(tile.result.kind));
+                if let Some(meta) = &tile.metadata {
+                    for (key, value) in metadata_entries(meta).into_iter().take(2) {
+                        ui.small(format!("{}: {}", key, value));
                     }
-                });
+                }
             });
+        })
+        .response
+}
+
+#[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+fn kind_label(kind: PickerItemKind) -> &'static str {
+    match kind {
+        PickerItemKind::Window => "Window",
+        PickerItemKind::Display => "Display",
+        PickerItemKind::Application => "Application",
+        PickerItemKind::Unknown => "Unknown",
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn show_permission_banner(ui: &mut egui::Ui) {
-    #[cfg(target_os = "windows")]
-    {
-        egui::Frame::group(ui.style())
-            .fill(Color32::from_rgb(240, 247, 255))
-            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(111, 176, 255)))
-            .show(ui, |ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("Windows screen capture access")
-                            .color(Color32::from_rgb(16, 87, 158))
-                            .strong(),
-                    );
-                    ui.label(
-                        "Windows shows a \"Screen capture\" toast the first time Cabana shares a window. Approve it, or enable access via Settings → Privacy & security → Screen capture.",
-                    );
-                });
+#[cfg(not(any(feature = "picker-mock", feature = "picker-native")))]
+fn kind_label(_kind: PickerItemKind) -> &'static str {
+    "Unknown"
+}
+
+fn decode_metadata(raw: &Option<String>) -> Option<JsonValue> {
+    raw.as_ref()
+        .and_then(|json| serde_json::from_str::<JsonValue>(json).ok())
+}
+
+fn metadata_entries(metadata: &JsonValue) -> Vec<(String, String)> {
+    match metadata {
+        JsonValue::Object(map) => map
+            .iter()
+            .map(|(k, v)| (k.clone(), summarize_json_value(v)))
+            .collect(),
+        other => vec![("value".to_string(), summarize_json_value(other))],
+    }
+}
+
+fn summarize_json_value(value: &JsonValue) -> String {
+    match value {
+        JsonValue::String(s) => s.clone(),
+        JsonValue::Number(num) => num.to_string(),
+        JsonValue::Bool(flag) => flag.to_string(),
+        JsonValue::Null => "null".to_string(),
+        JsonValue::Array(items) => {
+            if items.is_empty() {
+                "[]".to_string()
+            } else {
+                format!("{} item(s)", items.len())
+            }
+        }
+        JsonValue::Object(_) => "object".to_string(),
+    }
+}
+
+fn default_road_base() -> String {
+    env::var("CABANA_ROAD_URL")
+        .or_else(|_| env::var("BEACH_SESSION_SERVER"))
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string())
+}
+
+fn default_manager_base() -> String {
+    env::var("CABANA_MANAGER_URL")
+        .or_else(|_| env::var("NEXT_PUBLIC_MANAGER_URL"))
+        .unwrap_or_else(|_| "http://localhost:8080".to_string())
+}
+
+fn profile_expiry(store: &auth::credentials::CredentialsStore, name: &str) -> Option<SystemTime> {
+    store
+        .profile(name)
+        .and_then(|profile: &StoredProfile| profile.access_token.as_ref())
+        .map(|cache| cache.expires_at.into())
+}
+
+async fn attach_private_beach(
+    manager_base: &str,
+    token: &str,
+    beach_id: &str,
+    beach_name: &str,
+    session: &PublicSessionInfo,
+    descriptor: &ScreenCaptureDescriptor,
+    picker_label: Option<String>,
+    application: Option<String>,
+    kind: Option<PickerItemKind>,
+    picker_metadata: Option<JsonValue>,
+    session_name: String,
+) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct AttachBody<'a> {
+        session_id: &'a str,
+        code: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        capture_descriptor: Option<JsonValue>,
+    }
+
+    #[derive(Serialize)]
+    struct SessionUpdate<'a> {
+        metadata: Option<JsonValue>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        location_hint: Option<&'a str>,
+    }
+
+    let descriptor_json = json!({
+        "target_id": descriptor.target_id,
+        "filter_base64": BASE64_STANDARD.encode(&descriptor.filter_blob),
+        "stream_config_base64": descriptor
+            .stream_config_blob
+            .as_ref()
+            .map(|blob| BASE64_STANDARD.encode(blob)),
+    });
+
+    let mut session_metadata = json!({
+        "cabana": {
+            "label": picker_label,
+            "application": application,
+            "kind": kind.map(kind_label),
+            "descriptor": descriptor_json,
+            "picker_metadata": picker_metadata,
+        }
+    });
+
+    if !session_name.trim().is_empty() {
+        session_metadata
+            .as_object_mut()
+            .and_then(|obj| obj.get_mut("cabana"))
+            .and_then(JsonValue::as_object_mut)
+            .map(|cabana| {
+                cabana.insert("session_name".to_string(), JsonValue::String(session_name));
             });
     }
 
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    {
-        egui::Frame::group(ui.style())
-            .fill(Color32::from_rgb(242, 255, 244))
-            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(120, 201, 138)))
-            .show(ui, |ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("Portal/compositor permission expected")
-                            .color(Color32::from_rgb(17, 99, 45))
-                            .strong(),
-                    );
-                    ui.label(
-                        "Your desktop environment will prompt for screen sharing via PipeWire or X11. Accept the prompt when it appears to continue.",
-                    );
-                });
-            });
+    let client = reqwest::Client::new();
+    let base = manager_base.trim_end_matches('/');
+
+    let attach_url = format!(
+        "{}/private-beaches/{}/sessions/attach-by-code",
+        base, beach_id
+    );
+    let attach_body = AttachBody {
+        session_id: &session.session_id,
+        code: &session.join_code,
+        capture_descriptor: Some(descriptor_json.clone()),
+    };
+
+    let response = client
+        .post(&attach_url)
+        .bearer_auth(token)
+        .json(&attach_body)
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Attach failed ({} {}): {}",
+            response.status(),
+            beach_name,
+            response.text().await.unwrap_or_default()
+        ));
     }
+
+    let update_url = format!("{}/sessions/{}", base, session.session_id);
+    let update_body = SessionUpdate {
+        metadata: Some(session_metadata),
+        location_hint: None,
+    };
+
+    let response = client
+        .patch(&update_url)
+        .bearer_auth(token)
+        .json(&update_body)
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    if !response.status().is_success() && response.status() != StatusCode::NO_CONTENT {
+        return Err(format!(
+            "Metadata update failed ({}): {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        ));
+    }
+
+    Ok(())
 }

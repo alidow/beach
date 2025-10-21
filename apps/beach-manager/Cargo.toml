@@ -4,7 +4,7 @@ version = "0.0.1"
 edition = "2021"
 
 [dependencies]
-beach-client-core = { path = "../beach" }
+beach_client_core = { package = "beach", path = "../beach" }
 axum = "0.7"
 tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "signal"] }
 tower = "0.4"

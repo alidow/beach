@@ -45,6 +45,8 @@ const REDIS_TTL_SECONDS: usize = 120;
 const REDIS_ACTION_GROUP: &str = "controllers";
 const REDIS_ACTION_CONSUMER_PREFIX: &str = "poller";
 const VIEWER_KEEPALIVE_INTERVAL: StdDuration = StdDuration::from_secs(20);
+const VIEWER_KEEPALIVE_PAYLOAD: &str = "__keepalive__";
+const VIEWER_IDLE_LOG_AFTER: StdDuration = StdDuration::from_secs(45);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -3530,11 +3532,16 @@ async fn viewer_connect_once(
 
     let mut viewer_state = ManagerViewerState::new();
     let mut next_keepalive = Instant::now() + VIEWER_KEEPALIVE_INTERVAL;
+    let mut last_frame_at = Instant::now();
+    let mut idle_warned = false;
 
     loop {
         let now = Instant::now();
         if now >= next_keepalive {
-            if let Err(err) = transport.send_text("__ready__") {
+            if let Err(err) = transport.send_text(VIEWER_KEEPALIVE_PAYLOAD) {
+                metrics::MANAGER_VIEWER_KEEPALIVE_FAILURES
+                    .with_label_values(&[private_beach_id, session_id])
+                    .inc();
                 debug!(
                     target = "private_beach",
                     session_id = %session_id,
@@ -3545,82 +3552,106 @@ async fn viewer_connect_once(
             next_keepalive = now + VIEWER_KEEPALIVE_INTERVAL;
         }
         match transport.recv(StdDuration::from_millis(500)) {
-            Ok(message) => match message.payload {
-                Payload::Binary(bytes) => match decode_host_frame_binary(&bytes) {
-                    Ok(frame) => {
-                        let frame_type = match &frame {
-                            WireHostFrame::Hello { .. } => "hello",
-                            WireHostFrame::Grid { .. } => "grid",
-                            WireHostFrame::Snapshot { .. } => "snapshot",
-                            WireHostFrame::SnapshotComplete { .. } => "snapshot_complete",
-                            WireHostFrame::Delta { .. } => "delta",
-                            WireHostFrame::HistoryBackfill { .. } => "history_backfill",
-                            WireHostFrame::InputAck { .. } => "input_ack",
-                            WireHostFrame::Cursor { .. } => "cursor",
-                            WireHostFrame::Heartbeat { .. } => "heartbeat",
-                            WireHostFrame::Shutdown => "shutdown",
-                        };
-                        debug!(
-                            target = "private_beach",
-                            session_id = %session_id,
-                            frame = frame_type,
-                            "manager viewer received host frame"
-                        );
-                        if let WireHostFrame::Heartbeat { timestamp_ms, .. } = &frame {
-                            let now_ms = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as u64;
-                            if now_ms >= *timestamp_ms {
-                                let latency_ms = now_ms - *timestamp_ms;
-                                latency_hist.observe(latency_ms as f64);
+            Ok(message) => {
+                last_frame_at = Instant::now();
+                idle_warned = false;
+                match message.payload {
+                    Payload::Binary(bytes) => match decode_host_frame_binary(&bytes) {
+                        Ok(frame) => {
+                            let frame_type = match &frame {
+                                WireHostFrame::Hello { .. } => "hello",
+                                WireHostFrame::Grid { .. } => "grid",
+                                WireHostFrame::Snapshot { .. } => "snapshot",
+                                WireHostFrame::SnapshotComplete { .. } => "snapshot_complete",
+                                WireHostFrame::Delta { .. } => "delta",
+                                WireHostFrame::HistoryBackfill { .. } => "history_backfill",
+                                WireHostFrame::InputAck { .. } => "input_ack",
+                                WireHostFrame::Cursor { .. } => "cursor",
+                                WireHostFrame::Heartbeat { .. } => "heartbeat",
+                                WireHostFrame::Shutdown => "shutdown",
+                            };
+                            debug!(
+                                target = "private_beach",
+                                session_id = %session_id,
+                                frame = frame_type,
+                                "manager viewer received host frame"
+                            );
+                            if let WireHostFrame::Heartbeat { timestamp_ms, .. } = &frame {
+                                let now_ms = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis()
+                                    as u64;
+                                if now_ms >= *timestamp_ms {
+                                    let latency_ms = now_ms - *timestamp_ms;
+                                    latency_hist.observe(latency_ms as f64);
+                                }
                             }
-                        }
-                        if let Some(diff) = viewer_state.handle_host_frame(&frame) {
-                            let sequence = diff.sequence;
-                            if let Err(err) = state.record_state(session_id, diff).await {
-                                warn!(
+                            if let Some(diff) = viewer_state.handle_host_frame(&frame) {
+                                let sequence = diff.sequence;
+                                if let Err(err) = state.record_state(session_id, diff).await {
+                                    warn!(
+                                        target = "private_beach",
+                                        session_id = %session_id,
+                                        private_beach_id = %private_beach_id,
+                                        error = %err,
+                                        sequence,
+                                        "manager viewer failed to persist diff"
+                                    );
+                                }
+                            }
+                            if matches!(frame, WireHostFrame::Shutdown) {
+                                info!(
                                     target = "private_beach",
                                     session_id = %session_id,
                                     private_beach_id = %private_beach_id,
-                                    error = %err,
-                                    sequence,
-                                    "manager viewer failed to persist diff"
+                                    "manager viewer received shutdown frame"
                                 );
+                                return Ok(());
                             }
                         }
-                        if matches!(frame, WireHostFrame::Shutdown) {
-                            info!(
+                        Err(err) => {
+                            warn!(
                                 target = "private_beach",
                                 session_id = %session_id,
                                 private_beach_id = %private_beach_id,
-                                "manager viewer received shutdown frame"
+                                error = %err,
+                                "manager viewer failed to decode host frame"
                             );
-                            return Ok(());
+                        }
+                    },
+                    Payload::Text(text) => {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            debug!(
+                                target = "private_beach",
+                                session_id = %session_id,
+                                payload = %trimmed,
+                                "manager viewer received text payload"
+                            );
                         }
                     }
-                    Err(err) => {
+                }
+            }
+            Err(TransportError::Timeout) => {
+                if !idle_warned {
+                    let idle_duration = Instant::now().duration_since(last_frame_at);
+                    if idle_duration >= VIEWER_IDLE_LOG_AFTER {
+                        metrics::MANAGER_VIEWER_IDLE_WARNINGS
+                            .with_label_values(&[private_beach_id, session_id])
+                            .inc();
+                        idle_warned = true;
                         warn!(
                             target = "private_beach",
                             session_id = %session_id,
-                            error = %err,
-                            "manager viewer failed to decode host frame"
-                        );
-                    }
-                },
-                Payload::Text(text) => {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        debug!(
-                            target = "private_beach",
-                            session_id = %session_id,
-                            payload = %trimmed,
-                            "manager viewer received text payload"
+                            private_beach_id = %private_beach_id,
+                            idle_ms = idle_duration.as_millis(),
+                            "manager viewer has been idle without frames"
                         );
                     }
                 }
-            },
-            Err(TransportError::Timeout) => continue,
+                continue;
+            }
             Err(TransportError::ChannelClosed) => {
                 info!(
                     target = "private_beach",

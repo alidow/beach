@@ -23,5 +23,4 @@ pub type BoxedProducer = Box<dyn FrameProducer>;
 pub mod macos;
 
 #[cfg(target_os = "macos")]
-pub use macos::create_producer;
-
+pub use macos::{create_producer, create_producer_from_descriptor};

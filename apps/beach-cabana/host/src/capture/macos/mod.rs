@@ -1,9 +1,10 @@
 use crate::capture::{BoxedProducer, Frame, FrameProducer, PixelFormat};
+use crate::desktop::ScreenCaptureDescriptor;
 use crate::platform::WindowApiError;
 use std::time::{Duration, SystemTime};
 
 #[cfg(feature = "cabana_sck")]
-use tracing::warn;
+use tracing::{info, warn};
 
 #[cfg(feature = "cabana_sck")]
 use crate::platform::macos::sck;
@@ -98,6 +99,11 @@ impl AdaptiveProducer {
 
     fn promote_core(&mut self) -> anyhow::Result<()> {
         self.core.start()?;
+        info!(
+            capture.target = %self.target,
+            capture.backend = "coregraphics",
+            "capture backend activated"
+        );
         self.active = ActiveBackend::CoreGraphics;
         Ok(())
     }
@@ -126,6 +132,11 @@ impl FrameProducer for AdaptiveProducer {
                     Ok(()) => {
                         self.attempted_sck = true;
                         self.active = ActiveBackend::ScreenCaptureKit;
+                        info!(
+                            capture.target = %self.target,
+                            capture.backend = "screencapturekit",
+                            "capture backend activated"
+                        );
                         return Ok(());
                     }
                     Err(err) => {
@@ -143,6 +154,12 @@ impl FrameProducer for AdaptiveProducer {
                             target = %self.target,
                             error = %message,
                             "ScreenCaptureKit start failed; using CoreGraphics fallback"
+                        );
+                        info!(
+                            capture.target = %self.target,
+                            capture.backend = "coregraphics",
+                            capture.reason = %message,
+                            "falling back to CoreGraphics capture"
                         );
                         self.handle_sck_failure();
                     }
@@ -179,6 +196,12 @@ impl FrameProducer for AdaptiveProducer {
                                 error = %message,
                                 "ScreenCaptureKit frame failed; switching to CoreGraphics fallback"
                             );
+                            info!(
+                                capture.target = %self.target,
+                                capture.backend = "coregraphics",
+                                capture.reason = %message,
+                                "falling back to CoreGraphics capture"
+                            );
                             self.handle_sck_failure();
                         }
                     }
@@ -212,15 +235,20 @@ impl FrameProducer for AdaptiveProducer {
 
 #[cfg(feature = "cabana_sck")]
 pub struct ScreenCaptureKitProducer {
-    target: String,
+    descriptor: ScreenCaptureDescriptor,
     stream: Option<sck::SckStream>,
 }
 
 #[cfg(feature = "cabana_sck")]
 impl ScreenCaptureKitProducer {
-    pub fn new(target: impl Into<String>) -> Result<Self, WindowApiError> {
+    pub fn new(descriptor: ScreenCaptureDescriptor) -> Result<Self, WindowApiError> {
+        if !descriptor.has_filter() {
+            return Err(WindowApiError::CaptureFailed(
+                "ScreenCaptureKit descriptor missing serialized filter".into(),
+            ));
+        }
         Ok(Self {
-            target: target.into(),
+            descriptor,
             stream: None,
         })
     }
@@ -230,7 +258,8 @@ impl ScreenCaptureKitProducer {
 impl FrameProducer for ScreenCaptureKitProducer {
     fn start(&mut self) -> anyhow::Result<()> {
         if self.stream.is_none() {
-            let stream = sck::SckStream::new(&self.target)?;
+            let mut stream = sck::SckStream::from_descriptor(&self.descriptor)?;
+            stream.start()?;
             self.stream = Some(stream);
         }
         Ok(())
@@ -258,7 +287,7 @@ pub struct ScreenCaptureKitProducer;
 #[cfg(not(feature = "cabana_sck"))]
 #[allow(dead_code)]
 impl ScreenCaptureKitProducer {
-    pub fn new(_target: impl Into<String>) -> Result<Self, WindowApiError> {
+    pub fn new(_descriptor: ScreenCaptureDescriptor) -> Result<Self, WindowApiError> {
         Err(WindowApiError::CaptureFailed(
             "ScreenCaptureKit producer not implemented".into(),
         ))
@@ -283,24 +312,43 @@ impl FrameProducer for ScreenCaptureKitProducer {
 }
 
 #[cfg(all(target_os = "macos", feature = "cabana_sck"))]
-pub fn create_producer(target: impl Into<String>) -> Result<BoxedProducer, WindowApiError> {
-    let target = target.into();
-    let sck = match ScreenCaptureKitProducer::new(target.clone()) {
-        Ok(producer) => Some(producer),
-        Err(err) => {
-            warn!(
-                target = %target,
-                error = %err,
-                "ScreenCaptureKit producer unavailable; defaulting to CoreGraphics"
-            );
-            None
+pub fn create_producer_from_descriptor(
+    descriptor: &ScreenCaptureDescriptor,
+) -> Result<BoxedProducer, WindowApiError> {
+    let descriptor_clone = descriptor.clone();
+    let target = descriptor_clone.target_id.clone();
+    let mut sck = None;
+    if descriptor_clone.has_filter() {
+        match ScreenCaptureKitProducer::new(descriptor_clone.clone()) {
+            Ok(producer) => {
+                sck = Some(producer);
+            }
+            Err(err) => {
+                warn!(
+                    target = %descriptor_clone.target_id,
+                    error = %err,
+                    "ScreenCaptureKit descriptor rejected; defaulting to CoreGraphics"
+                );
+            }
         }
-    };
+    }
     Ok(Box::new(AdaptiveProducer::new(target, sck)))
+}
+
+#[cfg(all(target_os = "macos", feature = "cabana_sck"))]
+pub fn create_producer(target: impl Into<String>) -> Result<BoxedProducer, WindowApiError> {
+    let descriptor = ScreenCaptureDescriptor::legacy(target.into());
+    create_producer_from_descriptor(&descriptor)
+}
+
+#[cfg(all(target_os = "macos", not(feature = "cabana_sck")))]
+pub fn create_producer_from_descriptor(
+    descriptor: &ScreenCaptureDescriptor,
+) -> Result<BoxedProducer, WindowApiError> {
+    Ok(Box::new(CoreGraphicsProducer::new(descriptor.target_id.clone())))
 }
 
 #[cfg(all(target_os = "macos", not(feature = "cabana_sck")))]
 pub fn create_producer(target: impl Into<String>) -> Result<BoxedProducer, WindowApiError> {
     Ok(Box::new(CoreGraphicsProducer::new(target.into())))
 }
-

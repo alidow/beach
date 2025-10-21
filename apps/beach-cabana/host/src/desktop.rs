@@ -1,4 +1,4 @@
-use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use once_cell::sync::Lazy;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -27,6 +27,20 @@ impl ScreenCaptureDescriptor {
             stream_config_blob,
             metadata_json,
         }
+    }
+
+    /// Construct a descriptor for legacy callers that only know the target id.
+    pub fn legacy(target_id: impl Into<String>) -> Self {
+        Self {
+            target_id: target_id.into(),
+            filter_blob: Vec::new(),
+            stream_config_blob: None,
+            metadata_json: None,
+        }
+    }
+
+    pub fn has_filter(&self) -> bool {
+        !self.filter_blob.is_empty()
     }
 }
 
@@ -83,10 +97,8 @@ impl SelectionEvent {
     }
 }
 
-static SUBSCRIBERS: Lazy<Mutex<Vec<Sender<SelectionEvent>>>> =
-    Lazy::new(|| Mutex::new(Vec::new()));
-static LAST_SELECTION: Lazy<Mutex<Option<SelectionEvent>>> =
-    Lazy::new(|| Mutex::new(None));
+static SUBSCRIBERS: Lazy<Mutex<Vec<Sender<SelectionEvent>>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static LAST_SELECTION: Lazy<Mutex<Option<SelectionEvent>>> = Lazy::new(|| Mutex::new(None));
 
 /// Subscribe to future desktop picker selections.
 ///
@@ -124,14 +136,12 @@ pub fn publish_selection(event: SelectionEvent) -> usize {
         .lock()
         .expect("selection subscribers mutex poisoned");
     let mut delivered = 0usize;
-    guard.retain(|sender| {
-        match sender.send(event.clone()) {
-            Ok(()) => {
-                delivered += 1;
-                true
-            }
-            Err(_) => false,
+    guard.retain(|sender| match sender.send(event.clone()) {
+        Ok(()) => {
+            delivered += 1;
+            true
         }
+        Err(_) => false,
     });
     delivered
 }

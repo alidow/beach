@@ -5,6 +5,7 @@ import {
   type ReactNode,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from 'react';
@@ -20,7 +21,6 @@ import {
   ShieldAlert,
 } from 'lucide-react';
 import type { TerminalStatus } from './components/BeachTerminal';
-import { BeachViewer } from './components/BeachViewer';
 import { Button } from './components/ui/button';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from './components/ui/collapsible';
 import {
@@ -36,6 +36,7 @@ import { Switch } from './components/ui/switch';
 import { useConnectionController } from './hooks/useConnectionController';
 import { useDocumentTitle } from './hooks/useDocumentTitle';
 import { cn } from './lib/utils';
+import { CabanaSessionPlayer, type CabanaTelemetryHandlers } from './components/cabana/CabanaSessionPlayer';
 
 // Host surfaces can override --beach-shell-height to fit custom containers.
 const SHELL_STYLE: CSSProperties = {
@@ -139,6 +140,32 @@ export default function App(): JSX.Element {
     setFallbackTelemetryOptIn,
   } = useConnectionController();
   useDocumentTitle({ sessionId: trimmedSessionId });
+  const cabanaTelemetry = useMemo<CabanaTelemetryHandlers>(
+    () => ({
+      onStateChange: ({ status, mode }) => {
+        console.info('[beach-surfer] cabana viewer state', { status, mode });
+      },
+      onFirstFrame: ({ elapsedMs, mode, codec }) => {
+        console.info('[beach-surfer] cabana first frame', {
+          elapsedMs: Math.round(elapsedMs),
+          mode,
+          codec,
+        });
+      },
+      onError: ({ message }) => {
+        console.warn('[beach-surfer] cabana viewer error', { message });
+      },
+      onSecureSummary: (summary) => {
+        if (summary?.verificationCode) {
+          console.info('[beach-surfer] cabana secure transport', {
+            mode: summary.mode,
+            verificationCode: summary.verificationCode,
+          });
+        }
+      },
+    }),
+    [],
+  );
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [infoExpanded, setInfoExpanded] = useState(false);
   const [infoVisible, setInfoVisible] = useState(true);
@@ -456,15 +483,15 @@ export default function App(): JSX.Element {
 
       <div className="flex flex-1 min-h-0 flex-col">
         <div className="relative flex flex-1 min-h-0">
-          <BeachViewer
+          <CabanaSessionPlayer
             sessionId={trimmedSessionId || undefined}
             baseUrl={trimmedServer || undefined}
             passcode={passcode || undefined}
             autoConnect={connectRequested}
             onStatusChange={onStatusChange}
             className="flex-1"
-            showStatusBar={false}
-            showTopBar={false}
+            clientLabel="beach-surfer"
+            telemetry={cabanaTelemetry}
           />
         </div>
       </div>

@@ -1,29 +1,23 @@
 ## Private Beach Viewer Follow-Ups (Oct 2025)
 
-### 1. Intermittent viewer reconnects
-**Symptom**: Dashboard tiles periodically log a new WebRTC handshake (every few minutes).
+### ✅ Completed
+- **Keepalive + idle telemetry**
+  - `run_viewer_worker` now sends a dedicated `__keepalive__` ping every 20 s and raises a warning if no host frames arrive for 45 s. This surfaced reconnect loops without relying on ad‑hoc log tailing.
+- **Viewer style fidelity**
+  - `ManagerViewerState::apply_update` persists `WireUpdate::Style`, so cached diffs retain the host’s style table.
+  - Private Beach dashboard tiles render through the shared `BeachTerminal` component, restoring Surfer parity and eliminating the monochrome “terminal green” regression.
+- **Client-side diagnostics**
+  - `useSessionTerminal` logs data-channel open/close events and signaling errors, making reconnect root-cause analysis possible from browser logs.
+  - Cabana sessions short‑circuit to `CabanaPrivateBeachPlayer`, keeping media‑specific UX intact while terminals reuse Beach Surfer.
+- **Reconnect metrics**
+  - Prometheus counters `manager_viewer_keepalive_failures_total` and `manager_viewer_idle_warnings_total` expose failed pings and idle intervals per session, unlocking Grafana/Honeycomb alerting.
+- **Dashboard drawer parity**
+  - Session drawers now poll `GET /sessions/:id/controller-events` with bearer auth (no SSE), reuse trimmed tokens, and render structured controller events alongside the terminal.
 
-**Likely causes**
-- Manager’s viewer worker restarts (panic, Redis failure, diff persist error).
-- ICE connection idles out (no keepalive on the data channel).
-
-**Proposed fixes**
-- Tail `beach-manager` logs around reconnects to identify errors.
-- Add a keepalive in `run_viewer_worker` (e.g., send `__ready__` on a `tokio::interval`).
-- Enhance client logging (e.g., in `useSessionTerminal`) to capture RTC close events and reasons.
-
-### 2. Terminal styling missing
-**Symptom**: Tiles render single-color “terminal green”.
-
-**Root cause**
-- `ManagerViewerState::apply_update` ignores `WireUpdate::Style`, so the diff payload never includes the color/style table.
-- Result: JSON payload lacks data the React viewer needs to render styles.
-
-**Options**
-- Re-apply style handling in `ManagerViewerState`.
-- **Preferred**: Reuse Beach Surfer’s React terminal components (they already process style tables). This aligns with the longer-term plan for dashboard parity.
-
-### 3. Path forward
-1. Investigate `beach-manager` logs (possibly add structured logging) to find reconnect cause.
-2. Implement a viewer keepalive (or reuse the existing heartbeat publisher).
-3. Swap dashboard tiles to reuse the shared Surfer terminal component (colors, styling, reconnect behavior already tested there).
+### 🔄 In Progress / Follow-Ups
+1. **UX polish**
+   - Surface transport health (secure/plaintext badge, latency) in the tile chrome.
+   - Add a reconnection banner when the viewer falls back to reconnect loops.
+2. **Hardening**
+   - Add an integration test that asserts `WireUpdate::Style` survives the viewer pipeline.
+   - Simulate TURN-only environments to ensure the keepalive cadence doesn’t trigger quota alarms.

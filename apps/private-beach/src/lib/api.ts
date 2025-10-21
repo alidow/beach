@@ -25,6 +25,16 @@ export type ControllerLeaseResponse = {
   expires_at_ms: number;
 };
 
+export type ControllerEvent = {
+  id: string;
+  event_type: string;
+  controller_token?: string | null;
+  timestamp_ms: number;
+  reason?: string | null;
+  controller_account_id?: string | null;
+  issued_by_account_id?: string | null;
+};
+
 export type ViewerCredential = {
   credential_type: string;
   credential: string;
@@ -86,14 +96,6 @@ export async function emergencyStop(sessionId: string, token: string | null, bas
   if (!res.ok) throw new Error(`emergencyStop failed ${res.status}`);
 }
 
-export function eventsSseUrl(sessionId: string, baseUrl?: string, accessToken?: string): string {
-  if (!accessToken || accessToken.trim().length === 0) {
-    throw new Error('missing manager auth token');
-  }
-  const t = `?access_token=${encodeURIComponent(accessToken.trim())}`;
-  return `${base(baseUrl)}/sessions/${sessionId}/events/stream${t}`;
-}
-
 export async function fetchViewerCredential(
   privateBeachId: string,
   sessionId: string,
@@ -132,6 +134,31 @@ export async function attachOwned(privateBeachId: string, ids: string[], token: 
     body: JSON.stringify({ origin_session_ids: ids }),
   });
   if (!res.ok) throw new Error(`attachOwned failed ${res.status}`);
+  return res.json();
+}
+
+export async function fetchControllerEvents(
+  sessionId: string,
+  token: string | null,
+  baseUrl?: string,
+  params?: { event_type?: string; since_ms?: number; limit?: number },
+): Promise<ControllerEvent[]> {
+  const search = new URLSearchParams();
+  if (params?.event_type) {
+    search.set('event_type', params.event_type);
+  }
+  if (typeof params?.since_ms === 'number') {
+    search.set('since_ms', String(params.since_ms));
+  }
+  if (typeof params?.limit === 'number') {
+    search.set('limit', String(params.limit));
+  }
+  const qs = search.toString();
+  const url = `${base(baseUrl)}/sessions/${sessionId}/controller-events${qs ? `?${qs}` : ''}`;
+  const res = await fetch(url, {
+    headers: authHeaders(token),
+  });
+  if (!res.ok) throw new Error(`fetchControllerEvents failed ${res.status}`);
   return res.json();
 }
 

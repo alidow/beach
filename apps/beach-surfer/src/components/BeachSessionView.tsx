@@ -16,14 +16,18 @@ export interface BeachSessionViewProps {
   sessionId?: string;
   baseUrl?: string;
   passcode?: string;
+  viewerToken?: string;
+  clientLabel?: string;
   autoConnect?: boolean;
   onStatusChange?: (status: TerminalStatus) => void;
+  onStreamKindChange?: (mode: ViewerMode) => void;
+  onSecureSummary?: (summary: SecureTransportSummary | null) => void;
   className?: string;
   showStatusBar?: boolean;
   showTopBar?: boolean;
 }
 
-type ViewerMode = 'unknown' | 'terminal' | 'media_png' | 'media_h264';
+export type ViewerMode = 'unknown' | 'terminal' | 'media_png' | 'media_h264';
 
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 
@@ -40,8 +44,12 @@ export function BeachSessionView(props: BeachSessionViewProps): JSX.Element {
     sessionId,
     baseUrl,
     passcode,
+    viewerToken,
+    clientLabel,
     autoConnect = false,
     onStatusChange,
+    onStreamKindChange,
+    onSecureSummary,
     className,
     showStatusBar = false,
     showTopBar = false,
@@ -65,6 +73,8 @@ export function BeachSessionView(props: BeachSessionViewProps): JSX.Element {
     if (!autoConnect) return;
     const sid = sessionId?.trim();
     const base = baseUrl?.trim();
+    const token = viewerToken?.trim();
+    const label = clientLabel?.trim() || 'beach-surfer';
     if (!sid || !base) return;
     if (connectionRef.current) return;
 
@@ -76,7 +86,8 @@ export function BeachSessionView(props: BeachSessionViewProps): JSX.Element {
           sessionId: sid,
           baseUrl: base,
           passcode: passcode?.trim() || undefined,
-          clientLabel: 'beach-surfer',
+          viewerToken: token || undefined,
+          clientLabel: label,
         });
         if (cancelled) {
           unified.close();
@@ -96,6 +107,7 @@ export function BeachSessionView(props: BeachSessionViewProps): JSX.Element {
             decodeHostFrameBinary(detail.payload.data);
             sniffedRef.current = true;
             setMode('terminal');
+            onStreamKindChange?.('terminal');
             terminalTransportRef.current = new DataChannelTerminalTransport(transport, {
               replayBinaryFirst: detail.payload.data,
             });
@@ -105,17 +117,20 @@ export function BeachSessionView(props: BeachSessionViewProps): JSX.Element {
             if (isPng(bytes)) {
               sniffedRef.current = true;
               setMode('media_png');
+              onStreamKindChange?.('media_png');
               mediaTransportRef.current = new DataChannelMediaTransport(transport);
               notify('connected');
             } else if (looksLikeFmp4(bytes)) {
               sniffedRef.current = true;
               setMode('media_h264');
+              onStreamKindChange?.('media_h264');
               mediaTransportRef.current = new DataChannelMediaTransport(transport);
               notify('connected');
             } else {
               // Unknown stream type; default to media handling so future codecs can extend.
               sniffedRef.current = true;
               setMode('media_png');
+              onStreamKindChange?.('media_png');
               mediaTransportRef.current = new DataChannelMediaTransport(transport);
               notify('connected');
             }
@@ -142,6 +157,7 @@ export function BeachSessionView(props: BeachSessionViewProps): JSX.Element {
         const onSecure = (event: Event) => {
           const detail = (event as CustomEvent<SecureTransportSummary>).detail;
           setSecureSummary(detail);
+          onSecureSummary?.(detail);
         };
         transport.addEventListener('message', onMessage as any);
         transport.addEventListener('secure', onSecure as any);
@@ -160,7 +176,9 @@ export function BeachSessionView(props: BeachSessionViewProps): JSX.Element {
       connectionRef.current = null;
       sniffedRef.current = false;
       setMode('unknown');
+      onStreamKindChange?.('unknown');
       setSecureSummary(null);
+      onSecureSummary?.(null);
       mediaTransportRef.current = null;
       terminalTransportRef.current = null;
       notify('idle');
@@ -169,7 +187,7 @@ export function BeachSessionView(props: BeachSessionViewProps): JSX.Element {
       } catch {}
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoConnect, sessionId, baseUrl, passcode]);
+  }, [autoConnect, sessionId, baseUrl, passcode, viewerToken, clientLabel]);
 
   const content = useMemo(() => {
     if (mode === 'terminal' && terminalTransportRef.current) {

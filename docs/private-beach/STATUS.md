@@ -4,7 +4,7 @@ This document captures what’s built, how to run it locally, what’s left, and
 
 ## TL;DR
 - Manager (Rust) persists sessions, leases, and controller events in Postgres; commands/health/state use Redis Streams + TTL caches; SSE endpoints provide live updates (legacy, pending removal in favour of WebRTC); RLS is enforced via GUC.
-- Surfer (Next.js) is Clerk-gated, streams live terminal previews/events, and issues Manager requests with Clerk JWTs (no more dev token fallback).
+- Surfer (Next.js) is Clerk-gated, streams live terminal previews/events, and issues Manager requests with Clerk JWTs (no more dev token fallback). Private Beach tiles reuse the shared Beach Surfer `BeachTerminal`, so styling/cursor UX matches Surfer while Cabana sessions still flow through the media player; session drawers now poll `controller-events` over REST instead of SSE (legacy endpoint pending removal).
 - Fast‑path (WebRTC) is scaffolded in the manager with answerer endpoints and routing to send actions over data channels when available. Harness‑side fast‑path client is next.
 - WebRTC refactor plan captured in `docs/private-beach/webrtc-refactor/plan.md`; the current HTTP frame pump is slated for removal in favor of Manager joining sessions as a standard Beach client.
 

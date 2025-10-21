@@ -340,6 +340,7 @@ export default function TileCanvas({
                   privateBeachId={s.private_beach_id}
                   managerUrl={managerUrl}
                   token={token}
+                  harnessType={s.harness_type}
                   className="w-full"
                 />
               </div>
@@ -404,6 +405,7 @@ export default function TileCanvas({
               managerUrl={managerUrl}
               token={token}
               variant="full"
+              harnessType={expanded.harness_type}
               className="h-full w-full"
             />
           </div>

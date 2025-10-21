@@ -25,8 +25,9 @@ impl SessionConfig {
                 "session server base url cannot be empty".into(),
             ));
         }
-        if !base.starts_with("http://") && !base.starts_with("https://") {
-            base = format!("http://{base}");
+        if !base.contains("://") {
+            let inferred_scheme = infer_scheme(&base);
+            base = format!("{inferred_scheme}{base}");
         }
         let parsed = Url::parse(&base).map_err(|err| {
             SessionError::InvalidConfig(format!("invalid session server url: {err}"))
@@ -213,6 +214,35 @@ impl SessionManager {
                     "unable to construct session url for {session_id}: {err}"
                 ))
             })
+    }
+}
+
+fn infer_scheme(base: &str) -> &'static str {
+    let host_part = base
+        .split('/')
+        .next()
+        .unwrap_or(base)
+        .trim_start_matches('[')
+        .split(']')
+        .next()
+        .unwrap_or(base);
+    let host_lower = host_part.to_ascii_lowercase();
+    if host_lower == "localhost"
+        || host_lower == "0.0.0.0"
+        || host_lower.starts_with("127.")
+        || host_lower == "::1"
+        || host_lower.starts_with("10.")
+        || host_lower.starts_with("192.168.")
+        || host_lower
+            .strip_prefix("172.")
+            .and_then(|rest| rest.split('.').next())
+            .and_then(|octet| octet.parse::<u8>().ok())
+            .map(|octet| (16..32).contains(&octet))
+            .unwrap_or(false)
+    {
+        "http://"
+    } else {
+        "https://"
     }
 }
 

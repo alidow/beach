@@ -8,13 +8,14 @@ use beach_buggy::{
     ActionAck, ActionCommand, HealthHeartbeat, RegisterSessionRequest, RegisterSessionResponse,
     StateDiff,
 };
+use reqwest::StatusCode;
 use serde::Deserialize;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::state::{
-    AgentOnboardResponse, AppState, ControllerEvent, ControllerLeaseResponse, SessionSummary,
-    StateError,
+    AgentOnboardResponse, AppState, ControllerEvent, ControllerLeaseResponse,
+    JoinSessionResponsePayload, SessionSummary, StateError,
 };
 
 use super::{ApiError, ApiResult, AuthToken};
@@ -77,6 +78,13 @@ pub struct AttachOwnedRequest {
     pub origin_session_ids: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct JoinSessionRequestBody {
+    pub passphrase: Option<String>,
+    #[serde(default)]
+    pub mcp: bool,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct AttachByCodeResponse {
     pub ok: bool,
@@ -89,7 +97,6 @@ pub struct AttachOwnedResponse {
     pub attached: usize,
     pub duplicates: usize,
 }
-
 
 pub async fn register_session(
     State(state): State<AppState>,
@@ -362,6 +369,41 @@ pub async fn attach_owned(
         attached,
         duplicates,
     }))
+}
+
+pub async fn join_session(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(session_id): Path<String>,
+    Json(body): Json<JoinSessionRequestBody>,
+) -> ApiResult<JoinSessionResponsePayload> {
+    ensure_scope(&token, "pb:sessions.read")?;
+    let (status, payload) = state
+        .join_session_via_road(&session_id, body.passphrase.clone(), body.mcp)
+        .await
+        .map_err(|err| {
+            warn!(
+                target = "private_beach",
+                session_id = %session_id,
+                error = %err,
+                "failed to forward join request"
+            );
+            ApiError::Conflict("join proxy failed")
+        })?;
+
+    if status == StatusCode::NOT_FOUND {
+        return Err(ApiError::NotFound("session not found"));
+    }
+
+    if !status.is_success() {
+        let message = payload
+            .message
+            .clone()
+            .unwrap_or_else(|| format!("join failed with status {}", status));
+        return Err(ApiError::BadRequest(message));
+    }
+
+    Ok(Json(payload))
 }
 
 fn map_state_err(err: StateError) -> ApiError {

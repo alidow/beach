@@ -21,6 +21,9 @@ use std::{
 };
 use tokio::runtime::Runtime;
 
+#[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+mod native_picker;
+
 fn main() -> Result<()> {
     let options = NativeOptions {
         viewport: ViewportBuilder::default()
@@ -28,6 +31,9 @@ fn main() -> Result<()> {
             .with_min_inner_size(Vec2::new(820.0, 560.0)),
         ..Default::default()
     };
+
+    #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
+    native_picker::bootstrap();
 
     eframe::run_native(
         "Beach Cabana Picker",
@@ -103,6 +109,7 @@ impl PickerTab {
     }
 }
 
+#[derive(Clone)]
 struct PreviewCacheEntry {
     texture: Option<TextureHandle>,
     path: Option<PathBuf>,
@@ -824,9 +831,18 @@ impl eframe::App for PickerApp {
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(18.0, 18.0);
                         for item in filtered {
-                            let preview = self.ensure_preview(ctx, &item.id);
-                            let texture = preview.texture.clone();
-                            let error = preview.error.clone();
+                            let selected = self.selected_id.as_deref() == Some(&item.id);
+                            let preview_entry = if selected {
+                                Some(self.ensure_preview(ctx, &item.id).clone())
+                            } else {
+                                self.preview_cache.get(&item.id).cloned()
+                            };
+                            let texture = preview_entry
+                                .as_ref()
+                                .and_then(|entry| entry.texture.clone());
+                            let error = preview_entry
+                                .as_ref()
+                                .and_then(|entry| entry.error.clone());
                             let selected = self.selected_id.as_deref() == Some(&item.id);
 
                             let frame = egui::Frame::group(ui.style())
@@ -890,35 +906,42 @@ impl eframe::App for PickerApp {
                                             });
                                         } else {
                                             ui.vertical_centered(|ui| {
-                                                ui.add_space(24.0);
-                                                ui.spinner();
-                                                ui.add_space(6.0);
+                                                ui.add_space(32.0);
                                                 ui.label(
-                                                    RichText::new("Capturing preview…")
-                                                        .color(Color32::from_gray(160)),
+                                                    RichText::new(if selected {
+                                                        "Preparing preview…"
+                                                    } else {
+                                                        "Select to generate preview"
+                                                    })
+                                                    .color(Color32::from_gray(160)),
                                                 );
                                             });
                                         }
-                                        ui.add_space(10.0);
+                                        ui.add_space(12.0);
                                         ui.label(
                                             RichText::new(format!(
                                                 "{}{}",
                                                 item.prefix(),
                                                 item.title
                                             ))
-                                            .strong(),
+                                            .strong()
+                                            .color(Color32::from_rgb(224, 234, 255)),
                                         );
                                         if !item.application.is_empty() {
-                                            ui.label(
-                                                RichText::new(&item.application)
-                                                    .color(Color32::from_gray(180)),
-                                            );
+                                            ui.vertical_centered(|ui| {
+                                                ui.label(
+                                                    RichText::new(&item.application)
+                                                        .color(Color32::from_rgb(170, 184, 210)),
+                                                );
+                                            });
                                         }
                                         if item.is_display {
-                                            ui.label(
-                                                RichText::new("Display")
-                                                    .color(Color32::from_gray(150)),
-                                            );
+                                            ui.vertical_centered(|ui| {
+                                                ui.label(
+                                                    RichText::new("Display")
+                                                        .color(Color32::from_gray(150)),
+                                                );
+                                            });
                                         }
                                     });
                                 })

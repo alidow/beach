@@ -1,0 +1,40 @@
+[package]
+name = "cabana-macos-picker"
+version = "0.1.0"
+edition = "2021"
+description = "Native macOS picker bridge and safe wrapper for Beach Cabana"
+license = "Proprietary"
+build = "build.rs"
+
+[package.metadata]
+msrv = "1.75"
+
+[features]
+default = ["mock"]
+mock = ["dep:serde_json"]
+native = ["dep:serde_json"]
+
+[dependencies]
+async-channel = "1"
+async-stream = "0.3"
+base64 = "0.22"
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+once_cell = "1"
+serde = { version = "1", features = ["derive"] }
+
+# Optional dependencies for mock support.
+serde_json = { version = "1", optional = true }
+thiserror = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
+dispatch = "0.2"
+
+[dev-dependencies]
+futures-util = "0.3"
+test-timeout = { path = "../../../../crates/test-timeout" }
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+
+[build-dependencies]
+cc = "1"

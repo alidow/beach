@@ -26,6 +26,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/metrics", get(sse::prometheus_metrics))
         .route("/sessions/register", post(register_session))
         .route("/sessions/:session_id", patch(update_session))
+        .route("/sessions/:session_id/join", post(join_session))
         .route("/sessions/:session_id/state", post(push_state))
         .route("/sessions/:session_id/state/stream", get(sse::stream_state))
         .route("/sessions/:session_id/actions", post(queue_actions))
@@ -106,6 +107,7 @@ pub enum ApiError {
     NotFound(&'static str),
     Conflict(&'static str),
     BadRequest(String),
+    Upstream(&'static str),
 }
 
 #[derive(Debug, Serialize)]
@@ -154,6 +156,14 @@ impl IntoResponse for ApiError {
                 Json(ApiErrorBody {
                     error: "bad_request",
                     message: Some(msg),
+                }),
+            )
+                .into_response(),
+            ApiError::Upstream(msg) => (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(ApiErrorBody {
+                    error: "upstream_error",
+                    message: Some(msg.to_string()),
                 }),
             )
                 .into_response(),

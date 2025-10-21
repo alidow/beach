@@ -1,3 +1,5 @@
+'use client';
+
 import { useEffect, useRef, useState } from 'react';
 import { fetchViewerCredential } from '../lib/api';
 import { connectBrowserTransport, type BrowserTransportConnection } from '../../../beach-surfer/src/terminal/connect';
@@ -177,6 +179,7 @@ export function useSessionTerminal(
           baseUrl: managerUrl,
           passcode: credential.credential,
           clientLabel: 'manager-viewer',
+          authorizationToken: trimmedToken,
         });
         if (canceled) {
           connection.close();

@@ -23,6 +23,13 @@ interface VerifyBody {
   token?: string;
 }
 
+interface ViewerCredentialBody {
+  sessionId?: string;
+  joinCode?: string;
+  privateBeachId?: string;
+  ttlSeconds?: number;
+}
+
 interface ServerDependencies {
   config: BeachGateConfig;
   clerk?: ClerkClient;
@@ -214,6 +221,46 @@ export async function buildServer(deps: ServerDependencies): Promise<FastifyInst
       return reply.status(401).send({ error: 'invalid_token', detail: (error as Error).message });
     }
   });
+
+  if (config.viewerToken) {
+    fastify.post('/viewer/credentials', async (request, reply) => {
+      const bearer = extractBearerToken(request);
+      if (!bearer || !config.viewerToken!.serviceTokens.includes(bearer)) {
+        return reply.status(401).send({ error: 'unauthorized', detail: 'Invalid or missing bearer token.' });
+      }
+
+      const body = request.body as ViewerCredentialBody | undefined;
+      const sessionId = body?.sessionId?.trim();
+      const joinCode = body?.joinCode?.trim();
+
+      if (!sessionId || !joinCode) {
+        return reply
+          .status(400)
+          .send({ error: 'invalid_request', detail: 'sessionId and joinCode are required.' });
+      }
+
+      try {
+        const issued = await tokens.issueViewerToken({
+          sessionId,
+          joinCode,
+          privateBeachId: body?.privateBeachId?.trim(),
+          ttlSeconds: body?.ttlSeconds,
+        });
+        return reply.status(201).send({
+          token: issued.token,
+          expires_at: issued.expiresAt,
+          expires_in: issued.expiresIn,
+        });
+      } catch (error) {
+        request.log.error(error, 'viewer.credentials_issue_failed');
+        return reply.status(500).send({ error: 'viewer_token_failed', detail: (error as Error).message });
+      }
+    });
+  } else {
+    fastify.post('/viewer/credentials', async (_request, reply) => {
+      return reply.status(503).send({ error: 'viewer_tokens_unavailable' });
+    });
+  }
 
   return fastify;
 }

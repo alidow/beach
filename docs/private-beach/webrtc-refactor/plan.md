@@ -36,12 +36,14 @@
   2. Viewer credential story — We currently return the stored passcode (`GET /private-beaches/:id/sessions/:sid/viewer-credential`). Once Gate policy lands, migrate to a short-lived signed viewer token.
   3. Frontend parity — Dashboard tiles stream via WebRTC, but the drawer/event views still rely on SSE payloads. Align those components with the shared surfer viewer and expose latency/secure-state badges.
   4. Harness transforms — After transport parity, re-scope Beach Buggy to opt-in transforms with dedicated data channels; HTTP endpoints remain removed.
-- **Quick verification** — `cargo check -p beach-manager` passes (warnings remain due to unused fastpath imports). Whole-workspace `cargo check` currently fails because beach-road / lifeguard expect the old fallback token schema; untouched by this refactor.
+  5. TypeScript parity — Shared Beach Surfer imports require type stubs for `argon2-browser`/`noise-c.wasm` and raising the TS target to ES2020 so BigInt is legal.
+- **Quick verification** — `cargo check -p beach-manager` and `cargo check -p beach-road` pass (noise-only warnings). Whole-workspace `cargo check` still fails for the pre-existing lifeguard fallback token drift. `npx tsc --noEmit` in `apps/private-beach` now reaches cross-repo imports; it fails until we add type stubs for `argon2-browser`/`noise-c.wasm` and bump the TS target to ES2020 (BigInt usage).
 - **Incoming engineer gameplan**
   - Add an automated smoke test that exercises `spawn_viewer_worker` against a mocked session to verify Redis + `StreamEvent::State` publishing.
   - Design the follow-on viewer credential format (likely a signed token) and coordinate validation changes with Beach Road / host binaries.
   - Finish dashboard parity: reuse the shared surfer viewer for the session drawer/events view, surface latency + secure state, and tidy the UI.
   - Document the new WebRTC-first flow for ops/infra, including guidance on TURN quotas and viewer monitoring.
+  - Add TypeScript module declarations / target updates so the Private Beach app builds cleanly with the shared Beach Surfer code.
 
 ## Architecture Overview After Refactor
 ```
@@ -142,6 +144,7 @@ Deliverables:
 2. Define and implement the signed viewer credential contract (Gate + Beach Road validation).
 3. Finish dashboard parity: migrate drawer/event panes off SSE, surface latency/secure badges, and write UX docs.
 4. Document operational guidance (TURN quotas, viewer metrics dashboards) now that WebRTC is the sole transport.
+5. Unblock `npx tsc --noEmit` by adding module declarations for `argon2-browser`/`noise-c.wasm` and bumping the TS target to ES2020 (or shim BigInt usage).
 
 ## Risks & Mitigations
 - **Manager load increases** (now running N viewer clients): isolate viewer workers, cap concurrency, and rely on TURN quotas. Mitigate via autoscaling and instrumentation before rollout.

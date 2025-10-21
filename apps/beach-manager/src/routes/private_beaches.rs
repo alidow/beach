@@ -6,7 +6,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::state::{AppState, StateError};
+use crate::state::{AppState, StateError, ViewerTokenError};
 
 use super::{sessions::ensure_scope, ApiError, ApiResult, AuthToken};
 
@@ -65,6 +65,10 @@ pub struct ViewerCredentialResponse {
     pub private_beach_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issued_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passcode: Option<String>,
 }
 
 pub async fn create_private_beach(
@@ -166,14 +170,44 @@ pub async fn get_viewer_credential(
         .await
         .map_err(map_state_err)?
         .ok_or(ApiError::NotFound("viewer credential not available"))?;
+    let issued_at = Some(Utc::now().timestamp_millis());
 
-    let response = ViewerCredentialResponse {
-        credential_type: "passcode".to_string(),
-        credential: passcode,
-        session_id,
-        private_beach_id,
-        issued_at_ms: Some(Utc::now().timestamp_millis()),
+    let token_result = state
+        .viewer_token(&session_id, &private_beach_id, &passcode)
+        .await;
+
+    let response = match token_result {
+        Ok(issued) => ViewerCredentialResponse {
+            credential_type: "viewer_token".to_string(),
+            credential: issued.token,
+            session_id,
+            private_beach_id,
+            issued_at_ms: issued_at,
+            expires_at_ms: issued.expires_at_ms,
+            passcode: Some(passcode),
+        },
+        Err(ViewerTokenError::Unavailable) => ViewerCredentialResponse {
+            credential_type: "passcode".to_string(),
+            credential: passcode,
+            session_id,
+            private_beach_id,
+            issued_at_ms: issued_at,
+            expires_at_ms: None,
+            passcode: None,
+        },
+        Err(ViewerTokenError::Unauthorized) => {
+            return Err(ApiError::Upstream("viewer credential request rejected"));
+        }
+        Err(ViewerTokenError::Http(err)) => {
+            warn!(error = %err, "viewer token http error");
+            return Err(ApiError::Upstream("viewer credential service failure"));
+        }
+        Err(ViewerTokenError::Upstream(msg)) => {
+            warn!(message = %msg, "viewer token upstream error");
+            return Err(ApiError::Upstream("viewer credential service failure"));
+        }
     };
+
     Ok(Json(response))
 }
 
@@ -194,6 +228,10 @@ fn map_state_err(err: StateError) -> ApiError {
         StateError::Serde(e) => {
             warn!(error = %e, "serialization failure");
             ApiError::BadRequest("serialization error".into())
+        }
+        StateError::External(msg) => {
+            warn!(message = %msg, "external dependency failure");
+            ApiError::Upstream("external service failure")
         }
     }
 }

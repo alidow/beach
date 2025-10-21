@@ -21,6 +21,13 @@ export interface TurnConfig {
   requiredEntitlements: string[];
 }
 
+export interface ViewerTokenConfig {
+  ttlSeconds: number;
+  audience: string;
+  macSecret: Buffer;
+  serviceTokens: string[];
+}
+
 export interface BeachGateConfig {
   port: number;
   host: string;
@@ -39,6 +46,7 @@ export interface BeachGateConfig {
   entitlementOverrides: Record<string, EntitlementSeed>;
   defaultProfile: string;
   turn?: TurnConfig;
+  viewerToken?: ViewerTokenConfig;
 }
 
 function readSigningKey(path?: string): SigningKeyMaterial {
@@ -107,6 +115,35 @@ function loadTurnConfig(env: NodeJS.ProcessEnv): TurnConfig | undefined {
   };
 }
 
+function loadViewerTokenConfig(env: NodeJS.ProcessEnv): ViewerTokenConfig | undefined {
+  const secret = env.BEACH_GATE_VIEWER_TOKEN_SECRET;
+  const serviceTokens = parseList(env.BEACH_GATE_VIEWER_SERVICE_TOKENS);
+
+  if (!secret || serviceTokens.length === 0) {
+    return undefined;
+  }
+
+  let macSecret: Buffer;
+  try {
+    macSecret = Buffer.from(secret, 'base64');
+    if (macSecret.length === 0) {
+      throw new Error('empty base64 secret');
+    }
+  } catch {
+    macSecret = Buffer.from(secret, 'utf8');
+  }
+
+  const ttlSeconds = Number.parseInt(env.BEACH_GATE_VIEWER_TOKEN_TTL ?? '120', 10);
+  const audience = env.BEACH_GATE_VIEWER_TOKEN_AUDIENCE ?? 'beach-road';
+
+  return {
+    ttlSeconds,
+    audience,
+    macSecret,
+    serviceTokens,
+  };
+}
+
 export function loadConfig(env = process.env): BeachGateConfig {
   const port = Number.parseInt(env.BEACH_GATE_PORT ?? '4133', 10);
   const host = env.BEACH_GATE_HOST ?? '0.0.0.0';
@@ -137,6 +174,7 @@ export function loadConfig(env = process.env): BeachGateConfig {
     entitlementOverrides: parseEntitlementOverrides(env.BEACH_GATE_ENTITLEMENTS),
     defaultProfile: env.BEACH_GATE_DEFAULT_PROFILE ?? 'default',
     turn: loadTurnConfig(env),
+    viewerToken: loadViewerTokenConfig(env),
   };
 
   return config;

@@ -107,9 +107,11 @@ Future (Post-MVP)
 ## Prioritized Next Steps (2025-10-21 Update)
 
 1. **Picker parity sprint (Phase 4 polish)** *(macOS picker now renders tile grid with window titles + application labels; Windows/Linux adapters still pending)*  
+   - Ship OS-native pickers wherever the platform provides them (macOS `SCContentSharingPicker`, Windows Graphics Capture UI, Wayland portal) and fall back to our custom gallery only when no native shell exists (see `docs/beach-cabana/macos-picker/plan.md`).  
    - Surface window titles, owning application bundle, and display identifiers inside both the native picker list and the preview tiles.  
    - Replace the single-preview layout with a Zoom-style grid that renders all windows/displays at once, adds live refresh, and highlights the currently focused option.  
-   - Keep the relay contract unchanged so the CLI picker continues to receive selections with no additional wiring.
+   - Keep the relay contract unchanged so the CLI picker continues to receive selections with no additional wiring.  
+   - Follow-up: hide the picker window when capturing display previews, move preview capture off the UI thread, and return occluded/background windows so macOS parity matches Zoom-like pickers. Track Zoom behaviour as the baseline UX whenever we design custom flows.
 
 2. **Embed the host engine in the desktop app** *(desktop picker now boots Cabana host/WebRTC end-to-end with in-app session controls and verification prompts)*  
    - Link `beach_cabana_host` directly into `native-apps/desktop`, letting the native picker trigger capture, codec selection, and WebRTC bootstrapping without the CLI helper.  

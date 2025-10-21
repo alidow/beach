@@ -119,6 +119,55 @@ describe('Beach Gate server', () => {
     });
   });
 
+  describe('viewer credential endpoint', () => {
+    it('issues signed viewer tokens when configured', async () => {
+      const viewerEnv = {
+        ...baseEnv,
+        BEACH_GATE_DEFAULT_ENTITLEMENTS: 'rescue:fallback',
+        BEACH_GATE_VIEWER_TOKEN_SECRET: Buffer.from('viewer-secret').toString('base64'),
+        BEACH_GATE_VIEWER_SERVICE_TOKENS: 'manager-token',
+        BEACH_GATE_VIEWER_TOKEN_TTL: '30',
+      };
+      const localConfig = loadConfig(viewerEnv);
+      const localServer = await buildServer({ config: localConfig, logger: false });
+      try {
+        // missing auth
+        const unauth = await localServer.inject({
+          method: 'POST',
+          url: '/viewer/credentials',
+        });
+        expect(unauth.statusCode).toBe(401);
+
+        const badBody = await localServer.inject({
+          method: 'POST',
+          url: '/viewer/credentials',
+          headers: { authorization: 'Bearer manager-token' },
+          payload: { sessionId: 'abc' },
+        });
+        expect(badBody.statusCode).toBe(400);
+
+        const response = await localServer.inject({
+          method: 'POST',
+          url: '/viewer/credentials',
+          headers: { authorization: 'Bearer manager-token' },
+          payload: {
+            sessionId: 'session-123',
+            joinCode: 'ABC123',
+            privateBeachId: 'pb-456',
+          },
+        });
+
+        expect(response.statusCode).toBe(201);
+        const body = response.json() as Record<string, unknown>;
+        expect(typeof body.token).toBe('string');
+        expect(typeof body.expires_at).toBe('number');
+        expect(typeof body.expires_in).toBe('number');
+      } finally {
+        await localServer.close();
+      }
+    });
+  });
+
   afterEach(async () => {
     await server.close();
   });

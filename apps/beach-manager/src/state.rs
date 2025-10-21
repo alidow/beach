@@ -21,15 +21,17 @@ use beach_buggy::{
     AckStatus, ActionAck, ActionCommand, CursorPosition, HarnessType, HealthHeartbeat,
     RegisterSessionRequest, RegisterSessionResponse, StateDiff, TerminalFrame,
 };
+use beach_client_core::protocol::{CursorFrame, Update as WireUpdate};
 use beach_client_core::{
     decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
     ClientFrame as WireClientFrame, HostFrame as WireHostFrame, NegotiatedSingle,
     NegotiatedTransport, PackedCell, Payload, SessionConfig, SessionError, SessionManager,
     TerminalGrid, TransportError,
 };
-use beach_client_core::protocol::{CursorFrame, Update as WireUpdate};
 use chrono::{DateTime, Duration, Utc};
+use reqwest::StatusCode;
 use prometheus::IntGauge;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sqlx::{types::Json, FromRow, PgPool, Row};
 use tokio::sync::{broadcast, RwLock};
@@ -53,6 +55,7 @@ pub struct AppState {
     events: Arc<RwLock<HashMap<String, broadcast::Sender<StreamEvent>>>>,
     fast_paths: FastPathRegistry,
     viewer_workers: Arc<RwLock<HashMap<String, ViewerWorker>>>,
+    viewer_tokens: Option<ViewerTokenClient>,
     http: reqwest::Client,
     road_base_url: String,
     public_manager_url: String,
@@ -91,6 +94,90 @@ struct SessionRecord {
 
 struct ViewerWorker {
     handle: JoinHandle<()>,
+}
+
+#[derive(Clone)]
+struct ViewerTokenClient {
+    base_url: Arc<String>,
+    bearer: Arc<String>,
+}
+
+impl ViewerTokenClient {
+    fn new(base_url: String, bearer: String) -> Self {
+        let trimmed = base_url.trim_end_matches('/').to_string();
+        Self {
+            base_url: Arc::new(trimmed),
+            bearer: Arc::new(bearer),
+        }
+    }
+
+    async fn issue(
+        &self,
+        http: &reqwest::Client,
+        session_id: &str,
+        private_beach_id: &str,
+        join_code: &str,
+    ) -> Result<ViewerTokenIssued, ViewerTokenError> {
+        let url = format!("{}/viewer/credentials", self.base_url);
+        let response = http
+            .post(url)
+            .bearer_auth(self.bearer.as_ref())
+            .json(&serde_json::json!({
+                "sessionId": session_id,
+                "joinCode": join_code,
+                "privateBeachId": private_beach_id,
+            }))
+            .send()
+            .await
+            .map_err(ViewerTokenError::Http)?;
+
+        if response.status() == StatusCode::UNAUTHORIZED {
+            return Err(ViewerTokenError::Unauthorized);
+        }
+        if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+            return Err(ViewerTokenError::Unavailable);
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = response.text().await.unwrap_or_default();
+            return Err(ViewerTokenError::Upstream(format!(
+                "viewer token request failed: status {} body {}",
+                status, detail
+            )));
+        }
+
+        let payload: ViewerTokenGatewayResponse = response
+            .json()
+            .await
+            .map_err(ViewerTokenError::Http)?;
+
+        Ok(ViewerTokenIssued {
+            token: payload.token,
+            expires_at_ms: payload.expires_at,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct ViewerTokenGatewayResponse {
+    token: String,
+    #[serde(default)]
+    expires_at: Option<i64>,
+    #[serde(default)]
+    expires_in: Option<u64>,
+}
+
+struct ViewerTokenIssued {
+    token: String,
+    expires_at_ms: Option<i64>,
+}
+
+#[derive(Debug)]
+pub enum ViewerTokenError {
+    Unauthorized,
+    Unavailable,
+    Http(reqwest::Error),
+    Upstream(String),
 }
 #[derive(Clone, Copy, Debug)]
 struct ViewerCursor {
@@ -330,6 +417,8 @@ pub enum StateError {
     Redis(#[from] redis::RedisError),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("external service error: {0}")]
+    External(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -460,6 +549,7 @@ impl AppState {
             events: Arc::new(RwLock::new(HashMap::new())),
             fast_paths: FastPathRegistry::new(),
             viewer_workers: Arc::new(RwLock::new(HashMap::new())),
+            viewer_tokens: None,
             http: reqwest::Client::new(),
             road_base_url: std::env::var("BEACH_ROAD_URL")
                 .unwrap_or_else(|_| "https://api.beach.sh".into()),
@@ -481,6 +571,7 @@ impl AppState {
             events: Arc::new(RwLock::new(HashMap::new())),
             fast_paths: FastPathRegistry::new(),
             viewer_workers: Arc::new(RwLock::new(HashMap::new())),
+            viewer_tokens: None,
             http: reqwest::Client::new(),
             road_base_url: std::env::var("BEACH_ROAD_URL")
                 .unwrap_or_else(|_| "https://api.beach.sh".into()),
@@ -511,6 +602,31 @@ impl AppState {
             self.public_manager_url = url;
         }
         self
+    }
+
+    pub fn with_viewer_tokens(
+        mut self,
+        gate_url: Option<String>,
+        service_token: Option<String>,
+    ) -> Self {
+        if let (Some(url), Some(token)) = (gate_url, service_token) {
+            self.viewer_tokens = Some(ViewerTokenClient::new(url, token));
+        }
+        self
+    }
+
+    pub async fn viewer_token(
+        &self,
+        session_id: &str,
+        private_beach_id: &str,
+        join_code: &str,
+    ) -> Result<ViewerTokenIssued, ViewerTokenError> {
+        match &self.viewer_tokens {
+            Some(client) => client
+                .issue(&self.http, session_id, private_beach_id, join_code)
+                .await,
+            None => Err(ViewerTokenError::Unavailable),
+        }
     }
 
     #[allow(dead_code)]
@@ -601,10 +717,19 @@ impl AppState {
                             &HarnessType::Custom,
                         )
                     });
+                rec.viewer_passcode = Some(code.to_string());
                 rec.append_event(
                     ControllerEventType::Registered,
                     Some("attach_by_code".into()),
                 );
+                if let Err(err) = self.spawn_viewer_worker(origin_session_id).await {
+                    warn!(
+                        target = "private_beach",
+                        session_id = %origin_session_id,
+                        error = %err,
+                        "failed to start viewer worker after attach_by_code (memory backend)"
+                    );
+                }
                 Ok(SessionSummary::from_record(rec))
             }
             Backend::Postgres(pool) => {
@@ -660,7 +785,42 @@ impl AppState {
                     Some("attach_by_code".into()),
                 )
                 .await?;
+                sqlx::query(
+                    r#"
+                    INSERT INTO session_runtime (session_id, viewer_passcode)
+                    VALUES ($1, $2)
+                    ON CONFLICT (session_id)
+                    DO UPDATE SET viewer_passcode = EXCLUDED.viewer_passcode
+                    "#,
+                )
+                .bind(ids.session_id)
+                .bind(code)
+                .execute(tx.as_mut())
+                .await?;
                 tx.commit().await?;
+
+                {
+                    let mut sessions = self.fallback.sessions.write().await;
+                    let rec = sessions
+                        .entry(origin_session_id.to_string())
+                        .or_insert_with(|| {
+                            SessionRecord::new(
+                                origin_session_id,
+                                private_beach_id,
+                                &HarnessType::Custom,
+                            )
+                        });
+                    rec.viewer_passcode = Some(code.to_string());
+                }
+
+                if let Err(err) = self.spawn_viewer_worker(origin_session_id).await {
+                    warn!(
+                        target = "private_beach",
+                        session_id = %origin_session_id,
+                        error = %err,
+                        "failed to start viewer worker after attach_by_code"
+                    );
+                }
 
                 // Return summary (best-effort from DB fields)
                 let mut list = self.list_sessions(private_beach_id).await?;
@@ -761,6 +921,28 @@ impl AppState {
         }
         let v: serde_json::Value = resp.json().await.map_err(|_| ())?;
         Ok(v.get("verified").and_then(|b| b.as_bool()).unwrap_or(false))
+    }
+
+    pub async fn join_session_via_road(
+        &self,
+        session_id: &str,
+        passphrase: Option<String>,
+        mcp: bool,
+    ) -> Result<(StatusCode, JoinSessionResponsePayload), JoinForwardError> {
+        let url = format!(
+            "{}/sessions/{}/join",
+            self.road_base_url.trim_end_matches('/'),
+            session_id
+        );
+        let body = serde_json::json!({
+            "passphrase": passphrase,
+            "mcp": mcp,
+        });
+        let response = self.http.post(url).json(&body).send().await?;
+        let status = response.status();
+        let text = response.text().await?;
+        let payload: JoinSessionResponsePayload = serde_json::from_str(&text)?;
+        Ok((status, payload))
     }
 
     pub async fn update_session_metadata(
@@ -1478,9 +1660,7 @@ impl AppState {
             Backend::Postgres(pool) => {
                 let session_uuid = parse_uuid(session_id, "session_id")?;
                 let beach_uuid = parse_uuid(private_beach_id, "private_beach_id")?;
-                let identifiers = self
-                    .fetch_session_identifiers(pool, &session_uuid)
-                    .await?;
+                let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
                 if identifiers.private_beach_id != beach_uuid {
                     return Err(StateError::PrivateBeachNotFound);
                 }
@@ -2091,6 +2271,16 @@ impl AppState {
 
         entry.append_event(ControllerEventType::Registered, None);
 
+        let response = RegisterSessionResponse {
+            harness_id: entry.harness_id.clone(),
+            controller_token: entry.controller_token.clone(),
+            lease_ttl_ms: entry.lease_ttl_ms,
+            state_cache_url: entry.state_cache_url.clone(),
+            transport_hints: entry.transport_hints.clone(),
+        };
+
+        drop(sessions);
+
         if let Err(err) = self.spawn_viewer_worker(&req.session_id).await {
             warn!(
                 target = "private_beach",
@@ -2100,13 +2290,7 @@ impl AppState {
             );
         }
 
-        Ok(RegisterSessionResponse {
-            harness_id: entry.harness_id.clone(),
-            controller_token: entry.controller_token.clone(),
-            lease_ttl_ms: entry.lease_ttl_ms,
-            state_cache_url: entry.state_cache_url.clone(),
-            transport_hints: entry.transport_hints.clone(),
-        })
+        Ok(response)
     }
 
     async fn register_session_postgres(
@@ -2404,13 +2588,13 @@ impl AppState {
         let record = sessions
             .get_mut(session_id)
             .ok_or(StateError::SessionNotFound)?;
+        let diff_clone = diff.clone();
+        self.store_state_redis(&record.private_beach_id, session_id, &diff_clone)
+            .await?;
         record.last_state = Some(diff);
         record.append_event(ControllerEventType::StateUpdated, None);
-        self.publish(
-            session_id,
-            StreamEvent::State(record.last_state.clone().unwrap()),
-        )
-        .await;
+        self.publish(session_id, StreamEvent::State(diff_clone))
+            .await;
         Ok(())
     }
 
@@ -2764,6 +2948,8 @@ impl AppState {
         session_id: &str,
         diff: &StateDiff,
     ) -> Result<(), StateError> {
+        #[cfg(test)]
+        test_support::record_redis_state_write(private_beach_id, session_id, diff);
         if let Some(client) = &self.redis {
             let mut conn = client.get_async_connection().await?;
             let key = redis_state_key(private_beach_id, session_id);
@@ -3212,6 +3398,11 @@ async fn run_viewer_worker(
     passcode: String,
     road_base_url: String,
 ) {
+    #[cfg(test)]
+    if let Some(override_fn) = test_support::viewer_worker_override() {
+        override_fn(state, session_id, private_beach_id, passcode, road_base_url).await;
+        return;
+    }
     let _ = &state;
     let label = "beach-manager";
     let label_private = private_beach_id.clone();
@@ -3270,16 +3461,12 @@ async fn viewer_connect_once(
     road_base_url: &str,
     label: &str,
 ) -> Result<(), ViewerError> {
-    let gauge = metrics::MANAGER_VIEWER_CONNECTED.with_label_values(&[
-        private_beach_id,
-        session_id,
-    ]);
+    let gauge =
+        metrics::MANAGER_VIEWER_CONNECTED.with_label_values(&[private_beach_id, session_id]);
     gauge.set(0);
     let gauge_guard = ViewerGaugeGuard::new(gauge.clone());
-    let latency_hist = metrics::MANAGER_VIEWER_LATENCY_MS.with_label_values(&[
-        private_beach_id,
-        session_id,
-    ]);
+    let latency_hist =
+        metrics::MANAGER_VIEWER_LATENCY_MS.with_label_values(&[private_beach_id, session_id]);
 
     let config = SessionConfig::new(road_base_url).map_err(ViewerError::Join)?;
     let manager = SessionManager::new(config).map_err(ViewerError::Join)?;
@@ -3455,6 +3642,46 @@ enum ViewerError {
     UnsupportedTransport(&'static str),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum JoinForwardError {
+    #[error("http error: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("decode error: {0}")]
+    Decode(#[from] serde_json::Error),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdvertisedTransportKind {
+    WebRtc,
+    WebSocket,
+    Ipc,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvertisedTransport {
+    pub kind: AdvertisedTransportKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinSessionResponsePayload {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webrtc_offer: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_url: Option<String>,
+    #[serde(default)]
+    pub transports: Vec<AdvertisedTransport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub websocket_url: Option<String>,
+}
+
 fn slugify(name: &str) -> String {
     let mut s = name.to_lowercase();
     s = s
@@ -3476,4 +3703,198 @@ fn slugify(name: &str) -> String {
         }
     }
     out.trim_matches('-').to_string()
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use once_cell::sync::Lazy;
+    use std::{
+        future::Future,
+        mem,
+        pin::Pin,
+        sync::{Arc, RwLock},
+    };
+
+    type ViewerOverride = Arc<
+        dyn Fn(AppState, String, String, String, String) -> Pin<Box<dyn Future<Output = ()> + Send>>
+            + Send
+            + Sync,
+    >;
+
+    static VIEWER_WORKER_OVERRIDE: Lazy<RwLock<Option<ViewerOverride>>> =
+        Lazy::new(|| RwLock::new(None));
+
+    pub fn set_viewer_worker_override<F, Fut>(f: Option<F>)
+    where
+        F: Fn(AppState, String, String, String, String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut guard = VIEWER_WORKER_OVERRIDE.write().unwrap();
+        *guard = f.map(|func| {
+            Arc::new(
+                move |state, session_id, private_beach_id, passcode, base_url| {
+                    Box::pin(func(
+                        state,
+                        session_id,
+                        private_beach_id,
+                        passcode,
+                        base_url,
+                    )) as Pin<Box<dyn Future<Output = ()> + Send>>
+                },
+            ) as ViewerOverride
+        });
+    }
+
+    pub fn viewer_worker_override() -> Option<ViewerOverride> {
+        VIEWER_WORKER_OVERRIDE
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(Arc::clone)
+    }
+
+    pub fn clear_viewer_worker_override() {
+        let mut guard = VIEWER_WORKER_OVERRIDE.write().unwrap();
+        *guard = None;
+    }
+
+    static REDIS_STATE_WRITES: Lazy<RwLock<Vec<(String, String, StateDiff)>>> =
+        Lazy::new(|| RwLock::new(Vec::new()));
+
+    pub fn record_redis_state_write(private_beach_id: &str, session_id: &str, diff: &StateDiff) {
+        let mut guard = REDIS_STATE_WRITES.write().unwrap();
+        guard.push((
+            private_beach_id.to_string(),
+            session_id.to_string(),
+            diff.clone(),
+        ));
+    }
+
+    pub fn take_redis_state_writes() -> Vec<(String, String, StateDiff)> {
+        let mut guard = REDIS_STATE_WRITES.write().unwrap();
+        let mut out = Vec::new();
+        mem::swap(&mut *guard, &mut out);
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::test_support;
+    use beach_buggy::{HarnessType, RegisterSessionRequest};
+    use serde_json::json;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::SystemTime;
+    use tokio::time::{sleep, timeout, Duration};
+
+    #[test_timeout::tokio_timeout_test(10)]
+    async fn spawn_viewer_worker_smoke_test_records_state_and_stream() {
+        // clear any prior captured redis writes
+        let _ = test_support::take_redis_state_writes();
+        test_support::clear_viewer_worker_override();
+        let _guard = OverrideGuard;
+
+        let invocation_count = Arc::new(AtomicUsize::new(0));
+        test_support::set_viewer_worker_override(Some({
+            let invocation_count = invocation_count.clone();
+            move |state: AppState,
+                  session_id: String,
+                  private_beach_id: String,
+                  passcode: String,
+                  _base_url: String| {
+                let invocation_count = invocation_count.clone();
+                async move {
+                    assert_eq!(session_id, "sess-view");
+                    assert_eq!(private_beach_id, "pb-view");
+                    assert_eq!(passcode, "secret");
+                    let diff = beach_buggy::StateDiff {
+                        sequence: 1,
+                        emitted_at: SystemTime::now(),
+                        payload: json!({ "hello": "world" }),
+                    };
+                    state.record_state(&session_id, diff).await.unwrap();
+                    invocation_count.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }));
+
+        let state = AppState::new();
+        let register = RegisterSessionRequest {
+            session_id: "sess-view".into(),
+            private_beach_id: "pb-view".into(),
+            harness_type: HarnessType::TerminalShim,
+            capabilities: vec![],
+            location_hint: None,
+            metadata: None,
+            version: "1.0.0".into(),
+            viewer_passcode: Some("secret".into()),
+        };
+        state.register_session(register).await.unwrap();
+
+        timeout(Duration::from_secs(2), {
+            let invocation_count = invocation_count.clone();
+            async move {
+                while invocation_count.load(Ordering::SeqCst) < 1 {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            }
+        })
+        .await
+        .expect("initial viewer worker invocation");
+
+        let mut receiver = state.subscribe_session("sess-view").await;
+
+        state.spawn_viewer_worker("sess-view").await.unwrap();
+
+        timeout(Duration::from_secs(2), {
+            let invocation_count = invocation_count.clone();
+            async move {
+                while invocation_count.load(Ordering::SeqCst) < 2 {
+                    sleep(Duration::from_millis(10)).await;
+                }
+            }
+        })
+        .await
+        .expect("second viewer worker invocation");
+
+        let event = timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("viewer worker should emit")
+            .expect("stream closed unexpectedly");
+        match event {
+            StreamEvent::State(diff) => {
+                assert_eq!(diff.sequence, 1);
+                assert_eq!(diff.payload, json!({ "hello": "world" }));
+            }
+            other => panic!("expected state event, got {:?}", other),
+        }
+
+        let writes = test_support::take_redis_state_writes();
+        let matching: Vec<_> = writes
+            .into_iter()
+            .filter(|(pb, sess, diff)| {
+                pb == "pb-view"
+                    && sess == "sess-view"
+                    && diff.sequence == 1
+                    && diff.payload == json!({ "hello": "world" })
+            })
+            .collect();
+        assert!(
+            !matching.is_empty(),
+            "expected redis capture for viewer diff"
+        );
+    }
+
+    struct OverrideGuard;
+
+    impl Drop for OverrideGuard {
+        fn drop(&mut self) {
+            test_support::clear_viewer_worker_override();
+        }
+    }
 }

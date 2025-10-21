@@ -1,5 +1,9 @@
 import createNoiseModule from 'noise-c.wasm';
-import noiseWasmUrl from 'noise-c.wasm/src/noise-c.wasm?url';
+const DEFAULT_NOISE_WASM_PATH = '/wasm/noise-c.wasm';
+const noiseWasmUrl =
+  typeof window !== 'undefined' && typeof document !== 'undefined'
+    ? DEFAULT_NOISE_WASM_PATH
+    : undefined;
 
 import { derivePreSharedKey, hkdfExpand, toHex } from './sharedKey';
 
@@ -807,7 +811,10 @@ async function loadNoise(): Promise<NoiseModule> {
       return await new Promise<NoiseModule>((resolve, reject) => {
         try {
           const options: { locateFile: (path: string) => string; wasmBinary?: Uint8Array } = {
-            locateFile: (path: string) => (path.endsWith('.wasm') ? noiseWasmUrl : path),
+            locateFile: (path: string) =>
+              path.endsWith('.wasm')
+                ? noiseWasmUrl ?? DEFAULT_NOISE_WASM_PATH
+                : path,
           };
           if (wasmBinary) {
             options.wasmBinary = wasmBinary;
@@ -845,19 +852,11 @@ async function resolveWasmBinary(): Promise<Uint8Array | undefined> {
     return undefined;
   }
   try {
-    const [{ readFileSync }, { fileURLToPath }] = await Promise.all([
-      import('node:fs'),
-      import('node:url'),
+    const [{ readFileSync }, { resolve }] = await Promise.all([
+      import('fs'),
+      import('path'),
     ]);
-    const resolvedUrl =
-      typeof (import.meta as any).resolve === 'function'
-        ? await (import.meta as any).resolve('noise-c.wasm/src/noise-c.wasm')
-        : new URL(
-            '../../../../../node_modules/noise-c.wasm/src/noise-c.wasm',
-            import.meta.url,
-          ).toString();
-    const fileUrl = new URL(resolvedUrl);
-    const filePath = fileURLToPath(fileUrl);
+    const filePath = resolve(process.cwd(), 'public', 'wasm', 'noise-c.wasm');
     console.debug('[beach-surfer][noise] resolved wasm file path', { filePath });
     const buffer = readFileSync(filePath);
     return new Uint8Array(

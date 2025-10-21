@@ -1,3 +1,4 @@
+import { createHmac, randomUUID } from 'node:crypto';
 import { SignJWT, jwtVerify, JWTPayload } from 'jose';
 import { BeachGateConfig } from './config.js';
 
@@ -10,6 +11,19 @@ export interface AccessTokenContext {
 }
 
 export interface IssuedAccessToken {
+  token: string;
+  expiresAt: number;
+  expiresIn: number;
+}
+
+export interface ViewerTokenContext {
+  sessionId: string;
+  joinCode: string;
+  privateBeachId?: string | null;
+  ttlSeconds?: number;
+}
+
+export interface IssuedViewerToken {
   token: string;
   expiresAt: number;
   expiresIn: number;
@@ -77,5 +91,48 @@ export class TokenService {
     }
 
     return payload;
+  }
+
+  async issueViewerToken(context: ViewerTokenContext): Promise<IssuedViewerToken> {
+    const viewer = this.config.viewerToken;
+    if (!viewer) {
+      throw new Error('viewer token issuance not configured');
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const ttlSeconds = Math.max(
+      1,
+      Math.min(context.ttlSeconds ?? viewer.ttlSeconds, viewer.ttlSeconds),
+    );
+    const expiresAtSeconds = now + ttlSeconds;
+
+    const mac = createHmac('sha256', viewer.macSecret)
+      .update(`${context.sessionId}:${context.joinCode}`)
+      .digest('base64url');
+
+    const payload: JWTPayload = {
+      token_type: 'viewer',
+      viewer: true,
+      mac,
+    };
+    if (context.privateBeachId) {
+      payload.pb = context.privateBeachId;
+    }
+
+    const token = await new SignJWT(payload)
+      .setAudience(viewer.audience)
+      .setIssuer(this.config.issuer)
+      .setSubject(context.sessionId)
+      .setProtectedHeader({ alg: 'ES256', kid: this.config.signingKey.kid })
+      .setIssuedAt(now)
+      .setExpirationTime(expiresAtSeconds)
+      .setJti(randomUUID())
+      .sign(this.config.signingKey.privateKey);
+
+    return {
+      token,
+      expiresAt: expiresAtSeconds * 1000,
+      expiresIn: ttlSeconds,
+    };
   }
 }

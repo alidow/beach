@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
     }
     state = state.with_auth(AuthContext::new(auth_config));
     state = state.with_integrations(cfg.beach_road_url.clone(), cfg.public_manager_url.clone());
+    state = state.with_viewer_tokens(cfg.beach_gate_url.clone(), cfg.beach_gate_viewer_token.clone());
 
     if let Some(redis_url) = &cfg.redis_url {
         match redis::Client::open(redis_url.clone()) {

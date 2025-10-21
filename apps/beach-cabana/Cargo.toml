@@ -2,5 +2,6 @@
 members = [
   "host",
   "cli",
-  "native-apps/desktop"
+  "native-apps/desktop",
+  "crates/cabana-macos-picker"
 ]

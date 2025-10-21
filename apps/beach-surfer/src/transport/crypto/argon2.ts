@@ -63,22 +63,19 @@ async function loadWasmBytes(): Promise<Uint8Array> {
   }
   const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
   trace('module_load:start');
-  const wasmUrl = new URL('../../assets/argon2.wasm', import.meta.url);
-  const isNodeEnvironment = typeof process !== 'undefined' && !!process.versions?.node;
+  const browserWasmPath = '/wasm/argon2.wasm';
+  const isBrowserEnvironment = typeof window !== 'undefined' && typeof document !== 'undefined';
+  const isNodeEnvironment = !isBrowserEnvironment && typeof process !== 'undefined' && !!process.versions?.node;
   if (isNodeEnvironment) {
-    const [{ readFile }, { fileURLToPath }, { resolve }] = await Promise.all([
-      import('node:fs/promises'),
-      import('node:url'),
-      import('node:path'),
+    const [{ readFile }, { resolve }] = await Promise.all([
+      import('fs/promises'),
+      import('path'),
     ]);
-    const filePath =
-      wasmUrl.protocol === 'file:'
-        ? fileURLToPath(wasmUrl)
-        : resolve(process.cwd(), 'src/assets/argon2.wasm');
+    const filePath = resolve(process.cwd(), 'public', 'wasm', 'argon2.wasm');
     const buffer = await readFile(filePath);
     wasmBytesCache = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
   } else {
-    const response = await fetch(wasmUrl.toString());
+    const response = await fetch(browserWasmPath);
     if (!response.ok) {
       throw new Error(`failed to load argon2 wasm: ${response.status} ${response.statusText}`);
     }

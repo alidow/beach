@@ -33,6 +33,7 @@ export interface ConnectBrowserTransportOptions {
   clientLabel?: string;
   fallbackOverrides?: FallbackOverrides;
   trace?: ConnectionTrace | null;
+  authorizationToken?: string;
 }
 
 export async function connectBrowserTransport(
@@ -128,11 +129,15 @@ async function fetchJoinMetadata(options: ConnectBrowserTransportOptions): Promi
   trace?.mark('join_metadata:request', { url });
   let response: Response;
   try {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (options.authorizationToken && options.authorizationToken.trim().length > 0) {
+      headers['Authorization'] = `Bearer ${options.authorizationToken.trim()}`;
+    }
     response = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers,
       body: JSON.stringify({ passphrase: options.passcode ?? null }),
     });
   } catch (error) {

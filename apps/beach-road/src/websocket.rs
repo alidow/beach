@@ -126,7 +126,6 @@ impl SignalingState {
             .entry(session_id.clone())
             .or_insert_with(|| DashMap::new());
         peers.insert(peer.peer_id.clone(), peer);
-
     }
 
     /// Remove a peer from a session
@@ -233,7 +232,6 @@ impl SignalingState {
         }
         Ok(())
     }
-
 }
 
 fn build_metadata(

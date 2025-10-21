@@ -1,4 +1,6 @@
-# Private Beach Session Bridge Fix
+# Private Beach Session Bridge Fix *(Legacy Harness Workflow)*
+
+> **Note:** This document captures the interim HTTP-based bridge that we are retiring. For current direction (manager joins as a WebRTC viewer; harness optional), see `docs/private-beach/webrtc-refactor/plan.md`. Do not reintroduce the HTTP frame pump described below.
 
 ## Problem Statement
 - Private Beach tiles stayed in “Connecting…” after attaching a public session.

@@ -17,10 +17,11 @@
    - Export a light-weight `TerminalPreview` wrapper that accepts a `TerminalTransport` or `TerminalSnapshot` and renders a scaled terminal grid without the Surfer toolbar chrome.
 
 2. **Bridge Manager state to terminal transports**
-   - For terminals already using WebRTC fast-path: reuse the `WebRtcTransport` handshake from Surfer (fast-path endpoints already exist in Manager). Tiles can connect via read-only credentials, mirroring the full viewer.
-   - Until fast-path is available, fall back to SSE/HTTP state snapshots:
-     - Implement a `ManagerTerminalFeed` that watches `GET /sessions/:id/state/stream` events, rehydrates the terminal grid state (the payload already contains diff frames), and pushes updates into the shared terminal store (`applyTerminalFrame` helper from Surfer).
+- For terminals already using WebRTC fast-path: reuse the `WebRtcTransport` handshake from Surfer (fast-path endpoints already exist in Manager). Tiles can connect via read-only credentials, mirroring the full viewer.
+- **Legacy fallback (to be removed):** Until the WebRTC refactor lands, we temporarily fall back to SSE/HTTP state snapshots:
+     - Implement a `ManagerTerminalFeed` that watches `GET /sessions/:id/state/stream` events, rehydrates the terminal grid state (payload already contains diff frames), and pushes updates into the shared terminal store (`applyTerminalFrame` helper from Surfer).
      - The bridge satisfies the `TerminalTransport` interface by emitting decoded host frames and ignoring outbound `send` requests (tiles are read-only). This keeps the preview compatible with the shared terminal component.
+     - **Do not extend this fallback further; replace with WebRTC subscriptions as described in `webrtc-refactor/plan.md`.**
 
 3. **SessionTile composition**
    - Build a `SessionTileTerminal` component in `apps/private-beach` that:

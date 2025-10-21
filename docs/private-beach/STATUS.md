@@ -3,9 +3,10 @@
 This document captures what’s built, how to run it locally, what’s left, and how to resume implementation quickly.
 
 ## TL;DR
-- Manager (Rust) persists sessions, leases, and controller events in Postgres; commands/health/state use Redis Streams + TTL caches; SSE endpoints provide live updates; RLS is enforced via GUC.
+- Manager (Rust) persists sessions, leases, and controller events in Postgres; commands/health/state use Redis Streams + TTL caches; SSE endpoints provide live updates (legacy, pending removal in favour of WebRTC); RLS is enforced via GUC.
 - Surfer (Next.js) is Clerk-gated, streams live terminal previews/events, and issues Manager requests with Clerk JWTs (no more dev token fallback).
 - Fast‑path (WebRTC) is scaffolded in the manager with answerer endpoints and routing to send actions over data channels when available. Harness‑side fast‑path client is next.
+- WebRTC refactor plan captured in `docs/private-beach/webrtc-refactor/plan.md`; the current HTTP frame pump is slated for removal in favor of Manager joining sessions as a standard Beach client.
 
 ## New: Session Onboarding (Attach) — Current Status
 - Manager endpoints implemented:
@@ -76,7 +77,7 @@ Against api.beach.sh:
 ## What’s Built (Manager)
 - SQLx-backed schema + migrations: `session`, `controller_lease`, `session_runtime`, `controller_event` (+ indexes, enums). RLS policies applied; per-request GUC `beach.private_beach_id` is set in transactions.
 - Redis Streams for action queues with consumer groups; TTL caches for health/state; transparent fallback to in-memory for tests.
-- SSE endpoints:
+- SSE endpoints (legacy, slated for removal once WebRTC subscriptions land):
   - `GET /sessions/:id/state/stream` emits `state` events
   - `GET /sessions/:id/events/stream` emits `controller_event`/`state`/`health`
 - REST + MCP (JSON-RPC) covering session registration, listing, controller lease, queue/ack, health/state. MCP subscribe methods return `sse_url` helpers.

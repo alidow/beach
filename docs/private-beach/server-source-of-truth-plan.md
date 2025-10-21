@@ -1,4 +1,5 @@
 # Private Beach — Server Source of Truth (Critical Cleanup)
+> **Legacy transport note:** This plan references SSE/HTTP state feeds. Treat them as transitional; follow `docs/private-beach/webrtc-refactor/plan.md` for the WebRTC-first direction and avoid adding new SSE functionality.
 
 Status: NEXT ON DECK (blocking testing)
 

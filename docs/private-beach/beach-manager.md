@@ -93,17 +93,17 @@ APIs (Beach Road additions)
   - `POST /fastpath/sessions/:session_id/webrtc/offer` → returns SDP answer
   - `POST /fastpath/sessions/:session_id/webrtc/ice` → add remote ICE
   - `GET /fastpath/sessions/:session_id/webrtc/ice` → list local ICE candidates
-- Data channel labels: `mgr-actions` (ordered, reliable), `mgr-acks` (ordered, reliable), `mgr-state` (unordered).
-- Routing: `queue_actions` prefers fast‑path; falls back to Redis if unavailable. Metrics/events are recorded identically.
-- Next steps: manager listeners for `mgr-acks` → `ack_actions`, and `mgr-state` → `record_state`; feature‑flag and add per‑lane counters.
+- Data channel labels: `mgr-actions` (ordered, reliable), `mgr-acks` (ordered, reliable), `mgr-state` (unordered). Derived transform channels (`mgr-semantic-state`, etc.) live alongside these when requested.
+- Routing: WebRTC becomes the default; Redis/HTTP action queues are retained only for legacy hosts and authenticated fallback paths.
+- Next steps: manager listeners for `mgr-acks` → `ack_actions`, `mgr-state` → `record_state`, and transform channels → cache enrichment; feature-flagged rollout with per-lane counters.
 
 ## Fast-Path Transport (WebRTC Data Channel)
-- Goal: low-latency manager↔harness path for actions/state alongside Redis/HTTP.
+- Goal: keep manager ↔ host communication on the same WebRTC session used by normal Beach clients; Redis/HTTP remain emergency fallback only.
 - Approach: reuse Beach’s existing WebRTC stack and signaling model instead of embedding a separate WebRTC engine into the manager.
   - The harness will provision additional RTCDataChannels labelled `mgr-actions` (ordered, reliable) and `mgr-state` (unordered, low-latency) when a “manager peer” joins.
   - The manager participates as a viewer-level peer via Beach Road signaling (same offer/answer/ICE envelope), authenticated with a scoped token and gated by the controller lease.
   - Frames over `mgr-actions` map to the same `ActionCommand`/`ActionAck` envelopes used today; `mgr-state` carries `StateDiff`.
-- Fallbacks: if signaling/ICE fails, the system automatically uses Redis Streams + HTTP POSTs; both paths are first-class.
+- Fallbacks: if signaling/ICE fails and no entitled TURN/WSS route is available, manager surfaces degraded status; Redis/HTTP is now treated as opt-in legacy mode under a feature flag.
 - Phasing:
   1. Add signaling primitives and channel labels across host/harness (no UI impact).
   2. Teach `AppState` to multiplex action routes (Redis vs. WebRTC) and record per-lane metrics.
@@ -212,7 +212,7 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
 - **Dependency:** Requires JWT claims/scopes to map templates to entitlements; coordinate with Beach Gate integration above.
 
 ## Current Implementation Status (2025‑10‑24)
-- REST API routes remain the primary surface; a JSON-RPC `/mcp` endpoint mirrors the primary control-plane methods for harnesses/agents. Streaming is provided via SSE endpoints, and MCP returns `sse_url` helpers.
+- REST API routes remain the primary surface; a JSON-RPC `/mcp` endpoint mirrors the primary control-plane methods for harnesses/agents. Streaming is currently provided via SSE endpoints (legacy), and MCP returns `sse_url` helpers. **Do not introduce new SSE surfaces—replace with WebRTC subscriptions per `webrtc-refactor/plan.md`.**
 - `AppState` now persists sessions, controller leases, and controller events in Postgres via SQLx while preserving an in-memory fallback for tests/offline runs. SQLx `FromRow` models wrap the Postgres queries so downstream clients can reuse the same schema metadata without duplicating SQL.
 - New migration `20250102000000_controller_leases_runtime.sql` adds `controller_lease`, `session_runtime`, and `session.harness_type`, keeping the schema aligned with `docs/private-beach/data-model.md`.
 - Redis integration powers action queues (Streams) plus TTL’d health/state caches; when Redis is unavailable the manager transparently falls back to in-memory queues.

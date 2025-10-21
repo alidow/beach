@@ -49,7 +49,7 @@
 ```
 - **Front-end:** Next.js + Tailwind + shadcn component library; multi-viewport layout manager; live WebRTC/WebSocket feeds.
 - **Beach Manager Control Plane:** Rust service that validates entitlements, manages the session registry, issues controller leases, bootstraps automation agents (prompt templates, MCP bridge config), enforces zero-trust policy, and persists audit events.
-- **Beach Buggy Harness Layer:** Rust crate powering terminal/Cabana harnesses with diff codecs, OCR/semantic extraction, and action execution under tight latency budgets.
+- **Beach Buggy Harness Layer:** Optional Rust crate that listens to the host’s diff stream and emits derived views (semantic text, motion vectors, etc.) on demand. Baseline connectivity and contention handling stay inside the core `apps/beach` runtime. See `docs/private-beach/webrtc-refactor/plan.md`.
 - **Data Layer:** Postgres for relational state (organizations, beaches, memberships, automation policies); Redis for ephemeral state, KV, and pub/sub triggers; optional S3-compatible object store for file persistence.
 - **Integration Points:** `beach-surfer`, `apps/beach`, `beach-cabana`, `apps/private-beach`, Beach Gate, and third-party MCP agents.
 
@@ -58,7 +58,7 @@
 - **Policy Engine:** enforces org-level rules, rate limits, role-based access, and zero-trust assumptions; rejects actions outside declared scopes.
 - **Automation Onboarding:** verifies agent entitlements, generates task-specific prompt packs, wires MCP bridges or HTTP adapters, and rotates credentials.
 - **Telemetry & Audit:** captures controller events, state access logs, and automation outcomes; emits signals to billing, alerting, and analytics.
-- **Transport Coordination:** brokers WebRTC offers when direct P2P is possible, falls back to relays when necessary, and negotiates protocol upgrades with harnesses.
+- **Transport Coordination:** keeps WebRTC as the golden path, only invoking TURN/WSS when an authenticated, entitled account requires it, and negotiates extra data channels (e.g., harness transforms) without altering the base protocol.
 
 ## Implementation Roadmap (High-Level)
 1. **Foundations**

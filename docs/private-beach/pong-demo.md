@@ -25,11 +25,11 @@
 - **Left Paddle (TUI)**
   - Runs inside `apps/beach` terminal client with no Private Beach awareness.
   - Accepts paddle commands as byte sequences (`W`/`S` or arrow equivalents) and ball state updates via MCP.
-  - Harness captures terminal diffs and derives paddle/ball cues for the manager.
+  - Optional harness can derive semantic cues (ball x/y, paddle velocity) for observers.
 - **Right Paddle (GUI)**
   - Windows application streamed via Beach Cabana with zero knowledge of Beach orchestration.
   - Receives pointer and keyboard events; displays rich visualization to emphasize GUI control.
-  - Cabana harness publishes compacted frame metadata (paddle position, contact events, rendering FPS).
+  - Cabana harness (when requested) emits motion vectors or bounding boxes so agents can react without full frames.
 - **Scoreboard (TUI)**
   - Minimal terminal app showing current score, rally count, and match time.
   - Accepts atomic updates from manager to avoid desync; harness mirrors state for spectators.
@@ -40,12 +40,13 @@
 
 ## Functional Requirements
 - **State Synchronization**
-  - Harnesses stream render diffs to the Private Beach cache at sub-100ms intervals.
-  - Manager subscribes to both streams and derives ball position; paddles remain unaware of Private Beach mechanics.
+  - Manager joins each session as a standard Beach client over WebRTC (TURN/WSS only when entitled).
+  - Optional harness transforms supply higher-level signals (ball trajectory, paddle bounds) when agents subscribe.
+  - Paddles remain unaware of Private Beach mechanics; they simply honour the core Beach protocol.
 - **Action Dispatch**
-  - Manager issues prioritized commands with acknowledgement; target harnesses must process within 50ms budget.
+  - Manager issues prioritized commands using the standard Beach client stack; acknowledgements flow through the host’s existing contention logic.
   - Conflict resolution policy grants the manager “primary” control, with manual override button in UI.
-  - Optional direct WebRTC data channels eliminate message-bus latency; harness buffers commands locally when offline.
+  - Harnesses only annotate applied inputs (for auditing/analytics); they do not own the command queue.
 - **Shared Storage (Optional)**
   - Not required for core gameplay; manager can write match summaries post-game if we want persistence or replay.
 - **Observability**

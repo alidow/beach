@@ -26,16 +26,16 @@
 - ✅ Redis Streams + TTL caches power the action/health/state plane with graceful fallback when Redis is offline.
 - ✅ Beach Gate JWT verification integrated with JWKS caching; scope checks enforced.
 - ✅ JSON-RPC `/mcp` endpoint serves the core `private_beach.*` methods with scope checks.
-- ✅ Streaming: SSE endpoints for state and controller events are live; MCP subscription methods return `sse_url` helpers.
+- ✅ Streaming: SSE endpoints for state and controller events are live; MCP subscription methods return `sse_url` helpers. **Legacy path – these will be removed once the WebRTC refactor ships. Do not extend SSE further.**
 - ✅ Metrics: Prometheus counters/gauges at `/metrics` (queue depth, actions enqueued/delivered, health/state counts); Redis reachability gauge.
 - ✅ RLS policies applied via migrations; app sets per-request GUC; Postgres RLS tests added (ignored by default) with a limited role.
 - Next: publish schema metadata (drizzle-friendly SQL snapshots, enum maps) from `apps/beach-manager/migrations/` so `apps/private-beach` stays in lockstep.
 - Next: CI hardening (dockerized Postgres/Redis tests, `sqlx migrate run --check`), and OTEL tracing stubs.
-- Next: refine transport hints to include SSE endpoints and stream identifiers.
+- Next: refine transport hints to include viewer credentials for WebRTC (skip new SSE features; follow `webrtc-refactor/plan.md`).
 
 ## Phase 3 – Workspace Shell (Private Beach Surfer)
 - ✅ Next.js dashboard scaffolded (`apps/private-beach`) with a sessions view backed by Beach Manager.
-- ✅ Live updates via SSE to `/sessions/:id/state/stream` and `/sessions/:id/events/stream`.
+- ✅ Live updates via SSE to `/sessions/:id/state/stream` and `/sessions/:id/events/stream` (scheduled for deprecation in favour of direct WebRTC subscriptions).
 - ✅ Controller actions: acquire/release lease wired to REST endpoints.
 - ✅ Dev-friendly config: `NEXT_PUBLIC_MANAGER_URL` and localStorage overrides; manager CORS enabled; SSE supports `?access_token=` query for browser auth.
 - ✅ Surfer persistence: stand up a Postgres connection for `apps/private-beach` with Drizzle ORM so layout/tile state and other UX-specific data live in the database instead of browser storage.

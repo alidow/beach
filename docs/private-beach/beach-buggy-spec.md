@@ -1,107 +1,65 @@
-# Beach Buggy Harness Specification
+# Beach Buggy Harness Specification (Refocused)
 
 ## Intent
-- Wrap any Beach session (terminal, GUI, future media types) with a `beach-buggy` sidecar that provides Private Beach awareness without modifying the hosted application.
-- Standardise state streaming, command intake, and telemetry so managers and agents interact with sessions through consistent MCP primitives.
-- Enable flexible transport choices (brokered vs. peer-to-peer) while enforcing security boundaries and audit trails.
+- Make the harness an **optional enrichment layer** that plugs into any Beach session without touching the host binary or primary transport.
+- Let authorised clients ask for **derived views** of the session (semantic text, motion vectors, high-level events) when raw terminal/GUI diffs are too heavy or low-level.
+- Keep the core `apps/beach` runtime responsible for connectivity, contention management, and canonical diff streaming; the harness only listens and transforms.
 
-## Core Responsibilities
-1. **Attachment & Identity**
-   - Launch alongside a session when Beach establishes a connection (terminal attach, Cabana GUI stream, etc).
-   - Authenticate with the Private Beach manager using scoped tokens derived from Beach Gate/OIDC identity plus session metadata.
-   - Register capabilities (`terminal_diff_v1`, `gui_frame_meta_v1`, `keyboard_input`, `pointer_input`, etc) and receive a harness ID.
-2. **State Capture**
-   - Terminal harness: tail the PTY buffer, compute VT-grid diffs, normalise into compact MCP payloads, and push at configurable cadence (default ≤100 ms).
-   - GUI harness (Cabana): tap existing capture pipeline, extract lossy-compressed frame metadata (bounding boxes, frame hashes) + low-FPS preview frames when requested.
-   - All harnesses emit heartbeat + optional semantic hints (cursor pos, focused pane) without interpreting application-specific meaning.
-3. **Command Execution**
-   - Maintain local FIFO queue for incoming actions with priorities and expirations.
-   - Apply validated commands to the underlying session (write bytes to PTY, synthesize pointer/keyboard events).
-   - Send acknowledgements containing execution timestamp, status (`ok`, `rejected`, `expired`), and optional diagnostic info.
-4. **Transport Management**
-   - Default path: subscribe to Private Beach broker (Redis Streams/NATS) scoped to the private beach and session.
-   - Optional fast path: negotiate WebRTC data channels with authorised managers/agents; fall back to broker if peer link fails.
-   - Provide flow-control signals (queue depth, stall warnings) upstream so managers can adapt pacing.
+## What the Harness *Does*
+1. **Attachment on Demand**
+   - Spins up only when a consumer (Manager, controller, analytics job) requests a declared capability.
+   - Authenticates with scoped tokens, advertises optional modules (`terminal_semantic_v1`, `gui_motion_vectors_v1`, `cursor_intent_v1`), and receives a harness ID for telemetry.
+2. **Derived State Transforms**
+   - Subscribes to the existing WebRTC/TURN/WSS data channel that the host provides.
+   - Produces alternate representations: VT grid → text/layout blocks, Cabana frames → object detections, “interesting deltas only” streams, etc.
+   - Supports per-subscriber cadence/back-pressure so expensive transforms can be throttled or paused.
+3. **Contextual Input Metadata (Optional)**
+   - Observes acknowledgements emitted by the core host and replays metadata (which controller acted, how long it took, conflict reason) as structured events.
+   - **Does not** arbitrate or queue inputs; if two controllers clash, the host’s built-in contention rules still apply.
+4. **Transport Alignment**
+   - Reuses the host’s peer connection and simply adds new RTCDataChannels (e.g., `mgr-semantic-state`, `mgr-vision-events`, `mgr-input-meta`).
+   - If the host falls back to TURN/WSS, the harness rides along; if peer transport is unavailable and no entitlement exists, transforms are suspended.
 5. **Security & Isolation**
-   - Enforce per-command capability checks; reject actions beyond declared scope and require controller token tied to current lease.
-   - Run harness under an unprivileged user/namespace; only PTY/GUI device handles are exposed. Optional seccomp/Mac sandbox profiles restrict filesystem and network access.
-   - Config and signing keys pulled from Beach Gate–issued secrets manager; harness never persists credentials locally.
-   - Log every state emission and command execution to Private Beach audit stream (with redactable payloads); sensitive data can be hashed before logging.
-   - Escape hatch hooks (e.g., uploading files, clipboard access) require explicit opt-in capabilities and human confirmation.
-6. **Lifecycle & Recovery**
-   - Persist transient state (last diff hash, command cursor) so reconnects resume cleanly.
-   - Advertise readiness states (`initialising`, `active`, `degraded`, `offline`) to the manager.
-   - Surface local health metrics (CPU, latency) for observability.
+   - Runs under an unprivileged context with read-only access to host diffs.
+   - Enforces capability-level authorisation; unentitled consumers are rejected.
+   - Emits lightweight audit logs (consumer ID, transform type, latency) without duplicating raw payloads.
+6. **Lifecycle**
+   - Maintains small checkpoints to resume transforms after reconnects.
+   - Publishes availability (`inactive`, `warming`, `active`, `degraded`) so clients can adjust expectations.
+
+## What the Harness *Does Not* Do
+- It does **not** replace the host for base diff streaming—`apps/beach` remains authoritative.
+- It does **not** broker controller contention or maintain its own command queue.
+- It does **not** fall back to Redis/HTTP streaming; peer-to-peer is the golden path, with TURN/WSS only when the host already authorised it.
 
 ## Protocol Surface (MCP Extensions)
-- `session.register_capabilities`: invoked on attach; returns harness ID, broker topics, optional WebRTC offer parameters.
-- `session.push_state`: harness → manager streaming channel, batched diffs tagged with sequence numbers.
-- `session.pull_actions`: harness-initiated long-poll or streaming subscription; returns ordered actions.
-- `session.ack_action`: harness reports result for each action ID.
-- `session.signal_health`: periodic heartbeat with latency histogram, queue depth, custom warnings.
-- Harness registration payload includes `harness_type` (e.g., `terminal_shim`, `cabana_adapter`) so the manager can map to the `session.harness_type` column.
+- `session.register_capabilities` – harness advertises optional transforms; manager returns harness ID and approved modules.
+- `session.request_transform` – client asks the harness to start/stop a transform with parameters (bounding boxes only, cadence, filters).
+- `session.push_transform` – harness → client payloads with sequence numbers and provenance.
+- `session.describe_input` – optional metadata stream summarising host-acknowledged actions (purely informative).
+- `session.signal_health` – heartbeat covering transform latency, backlog, and resource usage.
 
-### Quick Interface Summary
-- **Attach:** Call `private_beach.register_session` (MCP) or `POST /sessions/register` with session + harness metadata → receive `harness_id`, `controller_token`, state/transport hints.
-- **State Push:** Stream diffs via `session.push_state` (MCP) or designated Redis/WebRTC channel; include sequence numbers for replay.
-- **Command Intake:** Listen on broker/WebRTC channel defined by manager; execute actions; respond with `session.ack_action` statuses (`ok`, `rejected`, `expired`, `preempted`).
-- **Health:** Send `session.signal_health` heartbeat containing queue depth, CPU load, degraded flags; absence signals trigger manager intervention.
-- **Controller Updates:** React to lease change notifications; discard queued actions when controller token changes to maintain policy compliance.
+### RTC Channel Examples
+| Label               | Direction        | Reliability | Payload                                     |
+|---------------------|------------------|-------------|---------------------------------------------|
+| `mgr-semantic-state`| Harness → client | Unordered   | JSON layout/semantic summaries              |
+| `mgr-vision-events` | Harness → client | Unordered   | Motion vectors, detected objects            |
+| `mgr-input-meta`    | Harness → client | Ordered     | Metadata about actions the host applied     |
 
-### Fast‑Path Channels (WebRTC)
-- When fast‑path is enabled, the harness opens the following RTCDataChannels with the manager:
-  - `mgr-actions` (ordered, reliable): manager → harness `ActionCommand` envelopes (JSON lines).
-  - `mgr-acks` (ordered, reliable): harness → manager `ActionAck` envelopes (JSON lines).
-  - `mgr-state` (unordered): harness → manager `StateDiff` envelopes (JSON lines).
-- The manager provides an answerer-only handshake API:
-  - `POST /fastpath/sessions/:session_id/webrtc/offer` (returns SDP answer)
-  - `POST /fastpath/sessions/:session_id/webrtc/ice` / `GET .../ice` for ICE exchange.
-- All Private Beach policy (controller lease gating, rate limits) still applies; frames missing a valid lease token are ignored.
-- Harness should continue to support Redis/HTTP fallback and mirror critical telemetry even when fast‑path is active.
+ICE/SDP reuse the host’s negotiation; no extra HTTP handshake is needed.
 
 ## Implementation Outline
-- **Runtime:** `crates/beach-buggy` (Rust) for terminal harness + structured GUI adapters, with TypeScript/Node bridge in Cabana where needed; unified protocol module shared across clients.
-- **Configuration:** JSON manifest per private beach defining harness policies (state cadence, allowed transports, encryption keys).
-- **Extensibility:** Capability registry so new media types (screen share, audio) publish their own diff format without changing manager core.
-- **Testing:** Harness simulator feeding synthetic terminal/GUI streams; chaos suite introducing latency spikes, command floods, and reconnect scenarios.
+- **Core crate:** `crates/beach-buggy` exposes transform primitives, capability registry, and channel wiring helpers.
+- **Adapters:** thin modules per media type (terminal, Cabana GUI, future audio/video) that plug into the core crate.
+- **Manager integration:** manager requests transforms only when a viewer/controller subscribes, keeping idle sessions lightweight.
+- **Testing:** synthetic streams feed the harness to ensure transforms are accurate, rate limited, and resume after reconnects.
 
-## Failure Handling
-- Broker outage: harness buffers commands locally, switches to peer-to-peer if configured, and raises degradation signal.
-- Peer congestion: harness back-pressures managers via `queue_depth` metric; manager must slow command rate.
-- Session crash: harness emits `offline` event; manager redistributes control or pauses automation; upon restart, harness performs state resync handshake.
+## Usage Examples
+- **Beach Cabana analytics:** publish bounding boxes for the ball/paddle so an agent reacts without downloading full frames.
+- **Terminal summarisation:** emit rolling text paragraphs or structured JSON from VT diffs for LLM agents.
+- **Audit overlay:** stream input metadata so auditors know which controller triggered each action without inspecting raw bytes.
 
-## Controller Handshake Flow
-- On startup, harness has no active controller. Managers or humans call `acquire_controller`; harness validates token with Beach Gate, caches lease metadata, and emits `controller_changed` event.
-- Incoming commands must carry the lease-bound `controller_token`; mismatches are rejected with `controller_conflict`.
-- When lease expires or a new controller is granted, harness flushes pending actions, marks them `preempted`, and transitions to the new token.
-- Harness exposes API to pause command execution (`controller.suspend`) used during human takeover countdowns; resumed via `controller.resume`.
-
-## Repository Layout Proposal
-```
-apps/
-├─ beach/                # core terminal + CLI client
-├─ beach-cabana/         # GUI streaming surface (with harness module)
-├─ private-beach/        # New Next.js frontend + API for Private Beach manager UI
-└─ beach-manager/        # Manager/control-plane service (Rust or TypeScript)
-
-crates/ or packages/
-├─ beach-buggy/          # Shared harness runtime (Rust core)
-├─ harness-proto/        # MCP schema + generated bindings
-├─ cabana-harness/       # JS/TS wrapper around Cabana capture
-└─ manager-sdk/          # Client library for managers/agents to consume harness APIs
-
-docs/
-└─ private-beach/
-   ├─ vision.md
-   ├─ intra-beach-orchestration.md
-   ├─ pong-demo.md
-   ├─ beach-manager.md
-   └─ beach-buggy-spec.md   # this document
-
-infrastructure/
-├─ terraform/             # environment provisioning
-└─ k8s/                   # manifests for manager + broker + redis
-```
-- `apps/private-beach` houses the premium web experience (Next.js, Tailwind, shadcn).  
-- `apps/beach-manager` exposes APIs, orchestrates harness communication, and manages broker/WebRTC negotiation.  
-- Harness code lives in shared crates/packages so both Beach core and Private Beach can reuse the same sidecar logic.
+## Open Questions
+- Do we need persistent transform caches for replay/export, or is on-demand enough?
+- How do we price/entitle expensive transforms (OCR, vision) across public vs. private sessions?
+- Should transforms be daisy-chained (e.g., harness A feeds harness B), or do we keep a single sidecar per session?

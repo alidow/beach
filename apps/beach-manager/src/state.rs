@@ -172,11 +172,15 @@ pub(crate) struct ViewerTokenIssued {
     pub expires_at_ms: Option<i64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ViewerTokenError {
+    #[error("viewer token unauthorized")]
     Unauthorized,
+    #[error("viewer token service unavailable")]
     Unavailable,
+    #[error("viewer token http error: {0}")]
     Http(reqwest::Error),
+    #[error("viewer token upstream error: {0}")]
     Upstream(String),
 }
 #[derive(Clone, Copy, Debug)]
@@ -942,6 +946,7 @@ impl AppState {
         &self,
         session_id: &str,
         passphrase: Option<String>,
+        viewer_token: Option<String>,
         mcp: bool,
     ) -> Result<(StatusCode, JoinSessionResponsePayload), JoinForwardError> {
         let url = format!(
@@ -951,6 +956,7 @@ impl AppState {
         );
         let body = serde_json::json!({
             "passphrase": passphrase,
+            "viewer_token": viewer_token,
             "mcp": mcp,
         });
         let response = self.http.post(url).json(&body).send().await?;
@@ -3508,10 +3514,9 @@ async fn viewer_connect_once(
         )
         .await
         .map_err(ViewerError::Join)?;
-    let negotiated =
-        negotiate_transport(joined.handle(), Some(join_code), Some(label), false)
-            .await
-            .map_err(ViewerError::Negotiation)?;
+    let negotiated = negotiate_transport(joined.handle(), Some(join_code), Some(label), false)
+        .await
+        .map_err(ViewerError::Negotiation)?;
     let transport = match negotiated {
         NegotiatedTransport::Single(NegotiatedSingle { transport, .. }) => transport,
         NegotiatedTransport::WebRtcOfferer { .. } => {

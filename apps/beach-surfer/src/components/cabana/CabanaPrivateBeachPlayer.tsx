@@ -15,8 +15,8 @@ interface ViewerCredentialPayload {
 }
 
 interface NormalisedCredential {
-  passcode: string;
-  viewerToken?: string;
+  passcode?: string;
+  viewerToken: string;
 }
 
 type CredentialStatus = 'idle' | 'loading' | 'ready' | 'error';
@@ -62,16 +62,13 @@ function normaliseCredential(payload: ViewerCredentialPayload): NormalisedCreden
   const passcode = payload.passcode?.toString().trim() ?? '';
 
   if (type === 'viewer_token') {
-    if (!credential || !passcode) {
+    if (!credential) {
       throw new Error('viewer token credential is incomplete');
     }
-    return { passcode, viewerToken: credential };
+    return { passcode: passcode || undefined, viewerToken: credential };
   }
 
-  if (!credential) {
-    throw new Error('viewer passcode is empty');
-  }
-  return { passcode: credential };
+  throw new Error(`unsupported viewer credential type: ${payload.credential_type ?? 'unknown'}`);
 }
 
 function buildCredentialUrl(baseUrl: string, privateBeachId: string, sessionId: string): string {

@@ -486,11 +486,15 @@ async fn handle_client_message(
                 .map(|value| value.trim())
                 .filter(|value| !value.is_empty());
 
+            let mut viewer_authenticated = false;
+
             if let Some(token_value) = viewer_token_str {
                 match verify_viewer_token(state.viewer_tokens.as_ref(), Some(token_value), &session)
                     .await
                 {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        viewer_authenticated = true;
+                    }
                     Err(ViewerAuthError::TokensDisabled) => {
                         warn!(session_id = %session_id, "viewer token provided but verifier disabled");
                         let _ = tx.send(ServerMessage::JoinError {
@@ -514,7 +518,7 @@ async fn handle_client_message(
                 }
             }
 
-            if !session.passphrase_hash.is_empty() {
+            if !session.passphrase_hash.is_empty() && !viewer_authenticated {
                 let passphrase_trimmed = passphrase
                     .as_ref()
                     .map(|value| value.trim())

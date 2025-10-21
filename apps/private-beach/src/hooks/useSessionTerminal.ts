@@ -108,19 +108,18 @@ export function useSessionTerminal(
         if (cancelled) {
           return;
         }
-        const viewerToken =
-          credential.credential_type === 'viewer_token' ? credential.credential : undefined;
-        const effectivePasscode =
-          credential.credential_type === 'viewer_token'
-            ? credential.passcode ?? null
-            : credential.credential;
-        if (!effectivePasscode || effectivePasscode.trim().length === 0) {
-          throw new Error('viewer passcode unavailable');
+        if (credential.credential_type?.toLowerCase() !== 'viewer_token') {
+          throw new Error(`unsupported viewer credential type: ${credential.credential_type ?? 'unknown'}`);
         }
+        const viewerToken = credential.credential?.trim() ?? '';
+        if (!viewerToken) {
+          throw new Error('viewer token unavailable');
+        }
+        const effectivePasscode = credential.passcode?.toString().trim();
         const connection = await connectBrowserTransport({
           sessionId,
           baseUrl: managerUrl,
-          passcode: effectivePasscode,
+          passcode: effectivePasscode && effectivePasscode.length > 0 ? effectivePasscode : undefined,
           viewerToken,
           clientLabel: 'private-beach-dashboard',
           authorizationToken: trimmedToken,

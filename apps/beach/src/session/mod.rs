@@ -152,7 +152,7 @@ impl SessionManager {
         let cleaned_passphrase = passphrase
             .map(|code| {
                 validate_join_code(code)?;
-                Ok(code.trim().to_string())
+                Ok::<String, SessionError>(code.trim().to_string())
             })
             .transpose()?;
 
@@ -755,13 +755,28 @@ mod tests {
         ) -> Result<JoinSessionResponse, SessionError> {
             let sessions = self.sessions.lock().await;
             match sessions.get(session_id) {
-                Some(expected)
-                    if request
+                Some(expected) => {
+                    let passphrase_valid = request
                         .passphrase
                         .as_ref()
                         .map(|value| value == expected)
-                        .unwrap_or(false) =>
-                {
+                        .unwrap_or(false);
+                    let viewer_token_valid = request
+                        .viewer_token
+                        .as_ref()
+                        .map(|value| !value.trim().is_empty())
+                        .unwrap_or(false);
+                    if !(passphrase_valid || viewer_token_valid) {
+                        return Ok(JoinSessionResponse {
+                            success: false,
+                            message: Some("invalid code".into()),
+                            session_url: None,
+                            transports: Vec::new(),
+                            webrtc_offer: None,
+                            websocket_url: None,
+                        });
+                    }
+
                     {
                         let mut slot = self.last_token.lock().await;
                         *slot = auth_token.map(|token| token.to_string());
@@ -786,14 +801,6 @@ mod tests {
                         websocket_url: None,
                     })
                 }
-                Some(_) => Ok(JoinSessionResponse {
-                    success: false,
-                    message: Some("invalid code".into()),
-                    session_url: None,
-                    transports: Vec::new(),
-                    webrtc_offer: None,
-                    websocket_url: None,
-                }),
                 None => Ok(JoinSessionResponse {
                     success: false,
                     message: Some("session not found".into()),
@@ -872,17 +879,43 @@ mod tests {
 
         let hosted = manager.host().await.unwrap();
         let err = manager
-            .join(
-                hosted.session_id(),
-                Some("000000"),
-                None,
-                None,
-                false,
-            )
+            .join(hosted.session_id(), Some("000000"), None, None, false)
             .await
             .unwrap_err();
 
         assert!(matches!(err, SessionError::AuthenticationFailed(_)));
+    }
+
+    #[test_timeout::tokio_timeout_test]
+    async fn join_session_with_viewer_token_requires_no_passphrase() {
+        let backend = Arc::new(MockSessionBackend::new());
+        let config = SessionConfig::new("http://mock.server").unwrap();
+        let manager = SessionManager::with_backend(config, backend);
+
+        let hosted = manager.host().await.unwrap();
+        let joiner = manager
+            .join(hosted.session_id(), None, Some("viewer-token"), None, false)
+            .await
+            .unwrap();
+
+        assert!(joiner
+            .offers()
+            .iter()
+            .any(|offer| matches!(offer, TransportOffer::WebRtc { .. })));
+    }
+
+    #[test_timeout::tokio_timeout_test]
+    async fn join_session_rejects_missing_credentials() {
+        let backend = Arc::new(MockSessionBackend::new());
+        let config = SessionConfig::new("http://mock.server").unwrap();
+        let manager = SessionManager::with_backend(config, backend);
+
+        let err = manager
+            .join("session-123", None, None, None, false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, SessionError::InvalidConfig(_)));
     }
 
     #[test_timeout::tokio_timeout_test]

@@ -3,10 +3,10 @@
 This document captures what’s built, how to run it locally, what’s left, and how to resume implementation quickly.
 
 ## TL;DR
-- Manager (Rust) persists sessions, leases, and controller events in Postgres; commands/health/state use Redis Streams + TTL caches; SSE endpoints provide live updates (legacy, pending removal in favour of WebRTC); RLS is enforced via GUC.
-- Surfer (Next.js) is Clerk-gated, streams live terminal previews/events, and issues Manager requests with Clerk JWTs (no more dev token fallback). Private Beach tiles reuse the shared Beach Surfer `BeachTerminal`, so styling/cursor UX matches Surfer while Cabana sessions still flow through the media player; session drawers now poll `controller-events` over REST instead of SSE (legacy endpoint pending removal).
+- Manager (Rust) persists sessions, leases, and controller events in Postgres; commands/health/state use Redis Streams + TTL caches; the manager viewer worker (WebRTC) is authoritative and `/sessions/:id/events/stream` has been removed (only the state SSE remains as legacy fallback). RLS is enforced via GUC.
+- Surfer/Private Beach (Next.js) are Clerk-gated, stream live previews through the shared `BeachTerminal`, and now surface security/latency badges plus reconnect messaging. Cabana sessions still use the media player, drawers poll `controller-events` over REST, and browsers fetch Gate-signed viewer tokens from Manager instead of passcodes.
 - Fast‑path (WebRTC) is scaffolded in the manager with answerer endpoints and routing to send actions over data channels when available. Harness‑side fast‑path client is next.
-- WebRTC refactor plan captured in `docs/private-beach/webrtc-refactor/plan.md`; the current HTTP frame pump is slated for removal in favor of Manager joining sessions as a standard Beach client.
+- WebRTC refactor plan captured in `docs/private-beach/webrtc-refactor/plan.md`; the HTTP frame pump has been retired in favor of Manager joining sessions as a standard Beach client.
 
 ## New: Session Onboarding (Attach) — Current Status
 - Manager endpoints implemented:
@@ -31,7 +31,7 @@ This document captures what’s built, how to run it locally, what’s left, and
   - `REDIS_URL=redis://localhost:6379`
   - Clerk auth (Manager): `BEACH_GATE_JWKS_URL=<clerk-jwks>`, `BEACH_GATE_ISSUER=<clerk-issuer>`, `BEACH_GATE_AUDIENCE=<audience>`; set `AUTH_BYPASS=1` only for dev overrides.
   - Clerk auth (Surfer): `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, optionally `NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE`.
-  - CLI auth: `CLERK_MOCK=1 beach login` (or `cargo run -p beach login`) seeds a local profile for private beaches; `BEACH_MANAGER_REQUIRE_AUTH=1` forces bearer tokens when working against custom hosts like `localhost`.
+ - CLI auth: `CLERK_MOCK=1 beach login` (or `cargo run -p beach login`) seeds a local profile for private beaches; `BEACH_MANAGER_REQUIRE_AUTH=1` forces bearer tokens when working against custom hosts like `localhost`.
 
 2) Manager
 - `cargo run -p beach-manager`
@@ -56,7 +56,11 @@ This document captures what’s built, how to run it locally, what’s left, and
 6) Surfer (Next.js)
 - `cd apps/private-beach && npm install && npm run dev -- -p 3001`
 - Open `http://localhost:3001`, sign in with Clerk, and select a private beach. Manager URL defaults to `http://localhost:8080` and can be overridden in Settings.
-- Live controls: Acquire/Release controller, Emergency Stop; see events/state via SSE and live terminal tiles (requires valid Clerk session token).
+- Live controls: Acquire/Release controller, Emergency Stop; live terminal tiles stream over WebRTC and drawers poll REST for controller events (Clerk session required).
+
+## Ops & Monitoring
+- **Viewer metrics** — Monitor `manager_viewer_connected`, `manager_viewer_latency_ms`, `manager_viewer_reconnects_total`, `manager_viewer_keepalive_sent_total`, `manager_viewer_keepalive_failures_total`, `manager_viewer_idle_warnings_total`, and `manager_viewer_idle_recoveries_total`. Wire alerts for sustained reconnect loops or keepalive failures.
+- **TURN-only verification** — Set `BEACH_WEBRTC_DISABLE_STUN=1` on both Manager and hosts to force TURN. Confirm the viewer connects, keepalive metrics stay flat, and latency badge reflects the expected TURN hop. Use this before capacity tests.
 
 ## End‑to‑End: Onboarding (Attach) — How to Test
 
@@ -77,9 +81,8 @@ Against api.beach.sh:
 ## What’s Built (Manager)
 - SQLx-backed schema + migrations: `session`, `controller_lease`, `session_runtime`, `controller_event` (+ indexes, enums). RLS policies applied; per-request GUC `beach.private_beach_id` is set in transactions.
 - Redis Streams for action queues with consumer groups; TTL caches for health/state; transparent fallback to in-memory for tests.
-- SSE endpoints (legacy, slated for removal once WebRTC subscriptions land):
-  - `GET /sessions/:id/state/stream` emits `state` events
-  - `GET /sessions/:id/events/stream` emits `controller_event`/`state`/`health`
+- SSE endpoint (legacy, retained for now): `GET /sessions/:id/state/stream` emits `state` events. The controller-event SSE was removed; drawers poll REST instead.
+- Viewer credentials: `GET /private-beaches/:id/sessions/:sid/viewer-credential` issues a Gate-signed viewer token; browsers no longer receive passcode fallbacks.
 - REST + MCP (JSON-RPC) covering session registration, listing, controller lease, queue/ack, health/state. MCP subscribe methods return `sse_url` helpers.
 - Metrics: queue depth (`actions_queue_depth`), lag (`actions_queue_pending`), `action_latency_ms` histogram, Redis availability.
 - Event audit enriched with principals (controller/issuer IDs) and filters in `GET /sessions/:id/controller-events?event_type=&since_ms=&limit=`.
@@ -98,19 +101,19 @@ Against api.beach.sh:
 - Status: send path is live; receive paths (reading `mgr-acks` and `mgr-state`) are planned (see TODOs).
 
 ## What’s Built (Surfer)
-- Sessions view listing session metadata + health with live SSE feed.
+- Sessions view listing session metadata + health with live WebRTC previews (shared `BeachTerminal`).
 - Queue column shows `depth / lag` from Prometheus-backed state.
 - Per‑session controls: Acquire/Release + Emergency Stop, gated by Clerk-issued Manager tokens.
 - Lease countdown shown when controller is active.
-- Settings allows overriding Manager/Road URLs; Clerk user tokens are fetched transparently for all Manager requests/SSE streams.
+- Settings allows overriding Manager/Road URLs; Clerk user tokens are fetched transparently for Manager REST requests and viewer credential fetches.
 - Add Session modal:
   - Tabs: By Code (verifies with Road via Manager), My Sessions (lists from Road, bulk attach), Launch New (copyable CLI).
 
 ## Handoff TODOs (Ordered)
-1. Surfer session tiles (live terminal preview):
-   - Replace the TileCanvas placeholder with the existing terminal renderer streaming real PTY diffs so attached sessions show activity immediately.
-   - Add drag-resize handles and persist a simple per-beach layout (local state for now, Manager layout API later) so tiles can be rearranged.
-   - Provide a maximize button to pop the tile into the full terminal view while keeping the minimized live preview.
+1. Surfer session tiles (next UX pass):
+   - Persist drag-resize layout per beach (local storage for now, Manager layout API once it lands).
+   - Provide a maximize/pop-out view that keeps the mini preview alive.
+   - Add quick filters/search once the layout stabilises.
 2. Harness fast‑path client (beach-buggy):
    - Dial manager endpoints (offer/answer/ICE) and open `mgr-actions`, `mgr-acks`, `mgr-state`.
    - Map ActionCommand/ActionAck/StateDiff over channels; enforce controller token.

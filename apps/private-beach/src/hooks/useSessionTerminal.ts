@@ -128,14 +128,20 @@ export function useSessionTerminal(
         if (cancelled) {
           return;
         }
-        if (credential.credential_type?.toLowerCase() !== 'viewer_token') {
-          throw new Error(`unsupported viewer credential type: ${credential.credential_type ?? 'unknown'}`);
+        const credentialType = credential.credential_type?.toLowerCase();
+        let viewerToken: string | undefined;
+        let effectivePasscode: string | undefined;
+        if (credentialType === 'viewer_token') {
+          viewerToken = credential.credential?.trim() || undefined;
+          if (credential.passcode != null) {
+            effectivePasscode = String(credential.passcode).trim();
+          }
+        } else if (credential.credential != null) {
+          effectivePasscode = String(credential.credential).trim();
         }
-        const viewerToken = credential.credential?.trim() ?? '';
-        if (!viewerToken) {
-          throw new Error('viewer token unavailable');
+        if (!viewerToken && (!effectivePasscode || effectivePasscode.length === 0)) {
+          throw new Error('viewer passcode unavailable');
         }
-        const effectivePasscode = credential.passcode?.toString().trim();
         const connection = await connectBrowserTransport({
           sessionId,
           baseUrl: managerUrl,
@@ -322,6 +328,10 @@ export function useSessionTerminal(
       if (reconnectTimer !== null) {
         window.clearTimeout(reconnectTimer);
       }
+      setStatus('idle');
+      setSecureSummary(null);
+      setLatencyMs(null);
+      lastHeartbeatRef.current = null;
     };
   }, [sessionId, privateBeachId, managerUrl, token, store, reconnectTick]);
 
@@ -330,5 +340,8 @@ export function useSessionTerminal(
     transport,
     connecting,
     error,
+    status,
+    secureSummary,
+    latencyMs,
   };
 }

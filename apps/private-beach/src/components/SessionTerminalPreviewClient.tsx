@@ -139,56 +139,90 @@ function SessionTerminalPreviewClientInner({
   const viewer = useSessionTerminal(sessionId, privateBeachId, managerUrl, trimmedToken);
 
   const placeholderMessage = useMemo(() => {
-    if (viewer.error) {
-      return viewer.error;
+    if (viewer.status === 'error') {
+      return viewer.error ?? 'Unable to connect to this session.';
     }
-    if (viewer.connecting) {
-      return viewer.transport ? 'Syncing…' : 'Connecting…';
+    if (viewer.status === 'connecting') {
+      return 'Connecting…';
     }
-    if (!viewer.transport) {
+    if (viewer.status === 'reconnecting') {
       return 'Reconnecting…';
     }
+    if (!viewer.transport) {
+      return 'Viewer unavailable';
+    }
     return null;
-  }, [viewer.connecting, viewer.error, viewer.transport]);
+  }, [viewer.error, viewer.status, viewer.transport]);
 
   const placeholderClass =
     variant === 'preview'
       ? 'flex h-full items-center justify-center bg-neutral-950/90 text-xs text-muted-foreground'
       : 'flex h-full items-center justify-center bg-neutral-950 text-sm text-muted-foreground';
 
-  if (placeholderMessage) {
+  if (placeholderMessage || !viewer.store || !viewer.transport) {
     const merged = className ? `${placeholderClass} ${className}` : placeholderClass;
     return (
       <div className={merged}>
-        <span>{placeholderMessage}</span>
+        <span>{placeholderMessage ?? 'Viewer unavailable'}</span>
       </div>
     );
   }
 
-  if (!viewer.store || !viewer.transport) {
-    const merged = className ? `${placeholderClass} ${className}` : placeholderClass;
-    return (
-      <div className={merged}>
-        <span>Viewer unavailable</span>
-      </div>
-    );
-  }
-
-  const terminalClass =
+  const containerClass =
     variant === 'preview'
-      ? ['h-full w-full overflow-hidden bg-neutral-950/90', className].filter(Boolean).join(' ')
-      : ['h-full w-full bg-neutral-950', className].filter(Boolean).join(' ');
+      ? ['relative h-full w-full overflow-hidden bg-neutral-950/90', className]
+          .filter(Boolean)
+          .join(' ')
+      : ['relative h-full w-full bg-neutral-950', className].filter(Boolean).join(' ');
+
+  const secureMode = viewer.secureSummary?.mode === 'secure';
+  const secureLabel = secureMode ? 'Secure' : 'Plaintext';
+  const secureClass = secureMode
+    ? 'border border-emerald-500/40 bg-emerald-500/15 text-emerald-100'
+    : 'border border-amber-500/40 bg-amber-500/15 text-amber-100';
+
+  let latencyLabel = 'Latency —';
+  let latencyClass = 'border border-slate-600/40 bg-slate-900/70 text-slate-200';
+  if (viewer.latencyMs != null) {
+    if (viewer.latencyMs >= 1000) {
+      latencyLabel = `Latency ${(viewer.latencyMs / 1000).toFixed(1)}s`;
+    } else {
+      latencyLabel = `Latency ${Math.round(viewer.latencyMs)}ms`;
+    }
+    if (viewer.latencyMs < 150) {
+      latencyClass = 'border border-emerald-500/30 bg-emerald-500/10 text-emerald-100';
+    } else if (viewer.latencyMs < 400) {
+      latencyClass = 'border border-amber-500/30 bg-amber-500/10 text-amber-100';
+    } else {
+      latencyClass = 'border border-rose-500/40 bg-rose-500/15 text-rose-100';
+    }
+  }
+
+  const overlayTextClass = variant === 'full' ? 'text-[11px]' : 'text-[10px]';
 
   return (
-    <BeachTerminal
-      store={viewer.store}
-      transport={viewer.transport}
-      autoConnect={false}
-      className={terminalClass}
-      fontSize={variant === 'full' ? 14 : 12}
-      showTopBar={variant === 'full'}
-      showStatusBar={variant === 'full'}
-    />
+    <div className={containerClass}>
+      <div className="pointer-events-none absolute left-2 top-2 flex flex-wrap items-center gap-2 font-semibold uppercase tracking-[0.2em]">
+        <span className={`${overlayTextClass} rounded-full px-3 py-1 ${secureClass}`}>{secureLabel}</span>
+        <span className={`${overlayTextClass} rounded-full px-3 py-1 ${latencyClass}`}>{latencyLabel}</span>
+      </div>
+      <BeachTerminal
+        store={viewer.store}
+        transport={viewer.transport}
+        autoConnect={false}
+        className="h-full w-full"
+        fontSize={variant === 'full' ? 14 : 12}
+        showTopBar={variant === 'full'}
+        showStatusBar={variant === 'full'}
+      />
+      {viewer.status === 'reconnecting' && (
+        <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center">
+          <span className="rounded-full border border-amber-500/40 bg-amber-500/15 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.24em] text-amber-100">
+            Reconnecting…
+          </span>
+        </div>
+      )}
+    </div>
   );
 }
 

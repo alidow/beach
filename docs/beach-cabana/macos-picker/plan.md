@@ -1,15 +1,16 @@
 # macOS Native Picker & Session Builder – Implementation Plan
 
-Last updated: 2025-11-04  
+Last updated: 2025-11-05  
 Owner: Cabana team (macOS lead)  
 Goal window: Phase 4.1 (picker parity) → Phase 4.2 (session creation UX)
 
-## Status snapshot (2025-11-04)
+## Status snapshot (2025-11-05)
 
-- ✅ `cabana-macos-picker` crate now exposes a real macOS bridge: the Swift/ObjC layer wraps `SCContentSharingPicker`, serializes `SCContentFilter`, and streams selection events into Rust. A mock backend still ships for CI/non-macOS.
-- ✅ Desktop binary now renders picker-fed tiles and a session sheet scaffold; selections emit the new descriptor payload + telemetry events.
-- ⚠️ Session sheet flows are stubbed (Clerk/public/private Beach wiring still pending).
-- ⚠️ Host runtime, Clerk auth, and Beach Road/Private Beach wiring continue to expect the old window-id contract.
+- ✅ `cabana-macos-picker` crate wraps the native picker and streams serialized `SCContentFilter` blobs into Rust; mock mode remains available for CI/non-macOS builds.
+- ✅ Desktop binary renders picker-fed tiles, persists `ScreenCaptureDescriptor`s, and now drives a continuous ScreenCaptureKit streaming worker (verification code + start/stop controls included).
+- ✅ Host runtime, CLI relay, Clerk auth, Beach Road session creation, and Private Beach attach flows all run end-to-end on the new descriptor contract.
+- ✅ Beach Surfer ships reusable Cabana viewer components for public/private playback.
+- ⚠️ Remaining polish: swap the stdout telemetry shim for the shared metrics sink, finish the QA checklist, and document manual verification steps.
 
 ## Path to Beach-ready UX
 
@@ -108,35 +109,22 @@ Deliverables:
 **Remaining acceptance items**
 - [ ] Harden error reporting/telemetry for picker availability (wire into desktop logger once UI lands).
 
-### Workstream A – Desktop Picker UX (**In progress**)
+### Workstream A – Desktop Picker UX (**Complete**)  
 
 **Goals**
 1. Display picker-provided tiles (including hidden/minimized windows and displays) in the Cabana shell.
 2. Persist the latest `PickerResult` (filter blob + metadata) for reuse (desktop relay + CLI).
-3. Provide a Swift/egui session sheet that can trigger native picker re-open, surface preview, session type (Public / Private), and quick actions (copy link, open Surfer).
+3. Provide a session sheet that can reopen the picker, surface preview metadata, drive public/private actions, and manage streaming state.
 
-- [x] Replace egui gallery with a view that consumes `PickerHandle::listen()` and renders tiles (egui or SwiftUI shell TBD).
-- [x] Define/UI-bind a `ScreenCaptureDescriptor` struct (mirrors Workstream B contract) and store it alongside metadata.
-- [x] Publish selections (with descriptor) to relay/CLI (`SelectionEvent`).
-- [x] Build minimal “session sheet” showing selection metadata, session inputs, and stub buttons for `Start public`, `Attach to private beach`.
-- [x] Wire telemetry hooks (`picker_open`, `picker_selection`).
-
-**Progress notes (2025-11-04)**
-- Implemented egui tile grid populated from `PickerHandle` stream; tiles can be reselected without relaunching the picker.
-- Introduced `ScreenCaptureDescriptor { target_id, filter_blob, stream_config_blob, metadata_json }` and persist it through `SelectionEvent` (`descriptor`, `label`, `application`).
-- Telemetry currently logs `picker_open`/`picker_selection`/`picker_discovered` to stdout while we integrate with the shared metrics sink.
-- Session sheet scaffolds public/private flows (inputs + stub buttons); Clerk/Beach API wiring remains under Workstream C.
-- CLI now consumes the descriptor via `SelectionEvent.descriptor` for compatibility.
+**Status**
+- ✅ egui tile grid consumes the native picker stream and keeps the session sheet in sync without relaunching the picker.
+- ✅ `ScreenCaptureDescriptor { target_id, filter_blob, stream_config_blob, metadata_json }` is stored on `SelectionEvent` and relayed to CLI/host.
+- ✅ Session sheet now hosts public/private workflow buttons, streaming controls, verification-code display, and basic telemetry (`picker_open`, `picker_selection`, `picker_discovered`).
+- ✅ Streaming worker (ScreenCaptureKit + CoreGraphics fallback) runs continuously with start/stop controls and session log updates.
 
 **Follow-ups**
-- [ ] Align with Workstream B on ScreenCaptureDescriptor consumption: confirm field contract, expose a `create_producer_from_descriptor` entry-point with CoreGraphics fallback, and wire descriptor passthrough for CLI relay + telemetry.
-- [ ] Replace stdout telemetry shim with production metrics pipeline hook once available.
-- [ ] Integrate Clerk auth + Beach Road/Private Beach APIs (Workstream C dependency).
-
-**Exit criteria**
-- Launching the macOS binary shows all non-minimized screens/windows as tiles populated from the native picker (goal #1).
-- Selecting a tile updates desktop state + publishes to the relay (e.g., CLI sees the same descriptor).
-- Manual smoke test logs streamed picker events in the new UI.
+- [ ] Replace stdout telemetry shim with the shared metrics pipeline once `beach-telemetry` lands.
+- [ ] Add the streaming worker to the production QA checklist (alongside permission prompts and error handling).
 
 ### Workstream B – Host Runtime & Relay (**Not started**)
 
@@ -149,8 +137,8 @@ Deliverables:
 - [ ] Extend `SelectionEvent` to include serialized descriptor + metadata (agreement with Workstream A).
 - [ ] Update `host_bootstrap` / `host_stream` to accept descriptors; branch to ScreenCaptureKit capture when available.
 - [ ] Preserve legacy window-id path for older builds (feature toggle or env-based fallback).
-- [ ] Add unit/integration tests for descriptor parsing; ensure mock mode works for CI.
-- [ ] Emit telemetry around capture start/fallback.
+- [x] Add unit/integration tests for descriptor parsing; ensure mock mode works for CI.
+- [x] Emit telemetry around capture start/fallback.
 
 **Progress – 2025-11-04 (Workstream B sync)**
 - ✅ `create_producer_from_descriptor(&ScreenCaptureDescriptor)` is available; it hydrates ScreenCaptureKit when `filter_blob` is present and automatically falls back to CoreGraphics on empty blobs or hydration failure. Legacy `create_producer(target_id)` remains for older callers.
@@ -164,7 +152,7 @@ Deliverables:
 - CLI workflows still function (no regressions).
 - Tests cover descriptor parsing + fallback, CI green with mock path.
 
-### Workstream C – Auth & Session Services (**In progress**)
+### Workstream C – Auth & Session Services (**Complete**)
 
 Focus: deliver goals #2 and #3 (Clerk auth, Beach session wiring, Beach Surfer playback).
 
@@ -241,11 +229,10 @@ Focus: deliver goals #2 and #3 (Clerk auth, Beach session wiring, Beach Surfer p
 
 #### TODO / follow-ups
 
-- [ ] Surface verification code + secure badge in the session sheet after `stream_started` (Workstream A dependency).
 - [ ] Handle `attach-by-code` duplicate responses with a dedicated user-facing message.
 - [ ] Schedule end-to-end QA with production Beach Road / Manager once the telemetry helper crate lands.
 
-### Workstream D – Beach Surfer Viewer (**In progress**)
+### Workstream D – Beach Surfer Viewer (**Complete**)
 
 **Goals**
 1. Provide reusable React components that can render Cabana sessions (public + private) with ergonomic props.
@@ -310,8 +297,8 @@ Deliverables:
 
 - **Clerk integration:** confirm desktop app already has a sign-in flow; if not, add one (webview or native). Tokens must be reusable by CLI (`beach login`).
 - **Distribution:** Swift bridge needs to compile for both Intel & Apple Silicon; ensure `swiftc` invocation produces universal binary.
-- **Testing on CI:** we may need to stub the picker by running tests in headless mode (no GUI). Provide environment variable `CABANA_NATIVE_PICKER=mock` to bypass UI during CI.
-- **Private beach APIs:** verify attach/update endpoints support ScreenCaptureKit descriptors and multi-session state before wiring the UI.
+- **Testing on CI:** continue to run with `CABANA_NATIVE_PICKER=mock` on non-macOS builders; ScreenCaptureKit path remains feature-gated behind `picker-native`.
+- **Private beach APIs:** attach/update flows validated via device login; keep an eye on scope changes for `pb:sessions.write`.
 
 ## Risks & mitigations
 
@@ -321,10 +308,10 @@ Deliverables:
 
 ## Handoff checklist
 
-- [ ] Swift bridge module committed with documentation.  
-- [ ] Rust wrapper crate exposing typed API + tests.  
-- [ ] Desktop app updated to use native picker with session sheet.  
-- [ ] Host runtime updated to accept SCK descriptors.  
-- [ ] Clerk integration implemented and documented.  
+- [x] Swift bridge module committed with documentation.  
+- [x] Rust wrapper crate exposing typed API + tests.  
+- [x] Desktop app updated to use native picker with session sheet.  
+- [x] Host runtime updated to accept SCK descriptors.  
+- [x] Clerk integration implemented and documented.  
 - [ ] Manual test instructions for QA.  
 - [ ] Telemetry events defined and wired.

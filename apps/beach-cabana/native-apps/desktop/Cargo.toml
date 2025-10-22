@@ -4,9 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["picker-mock"]
+default = ["picker-native"]
 picker-mock = ["dep:cabana-macos-picker", "cabana-macos-picker/mock"]
-picker-native = ["dep:cabana-macos-picker", "cabana-macos-picker/native"]
+picker-native = [
+    "dep:cabana-macos-picker",
+    "cabana-macos-picker/native"
+]
 
 [dependencies]
 anyhow = "1"
@@ -20,3 +23,5 @@ image = { version = "0.24", default-features = false, features = ["png"] }
 open = "5"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time"] }
 serde_json = "1"
+base64 = "0.22"
+beach_client_core = { package = "beach", path = "../../../beach" }

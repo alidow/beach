@@ -171,35 +171,39 @@ pub async fn get_viewer_credential(
         .map_err(map_state_err)?
         .ok_or(ApiError::NotFound("viewer credential not available"))?;
     let issued_at = Some(Utc::now().timestamp_millis());
-    let issued = state
+    match state
         .viewer_token(&session_id, &private_beach_id, &passcode)
         .await
-        .map_err(|err| match err {
-            ViewerTokenError::Unavailable => {
-                ApiError::Upstream("viewer credential service unavailable")
-            }
-            ViewerTokenError::Unauthorized => {
-                ApiError::Upstream("viewer credential request rejected")
-            }
-            ViewerTokenError::Http(http_err) => {
-                warn!(error = %http_err, "viewer token http error");
-                ApiError::Upstream("viewer credential service failure")
-            }
-            ViewerTokenError::Upstream(msg) => {
-                warn!(message = %msg, "viewer token upstream error");
-                ApiError::Upstream("viewer credential service failure")
-            }
-        })?;
-
-    Ok(Json(ViewerCredentialResponse {
-        credential_type: "viewer_token",
-        credential: issued.token,
-        session_id,
-        private_beach_id,
-        issued_at_ms: issued_at,
-        expires_at_ms: issued.expires_at_ms,
-        passcode: Some(passcode),
-    }))
+    {
+        Ok(issued) => Ok(Json(ViewerCredentialResponse {
+            credential_type: "viewer_token",
+            credential: issued.token,
+            session_id,
+            private_beach_id,
+            issued_at_ms: issued_at,
+            expires_at_ms: issued.expires_at_ms,
+            passcode: Some(passcode),
+        })),
+        Err(ViewerTokenError::Unavailable | ViewerTokenError::Unauthorized) => {
+            Ok(Json(ViewerCredentialResponse {
+                credential_type: "viewer_passcode",
+                credential: passcode.clone(),
+                session_id,
+                private_beach_id,
+                issued_at_ms: issued_at,
+                expires_at_ms: None,
+                passcode: None,
+            }))
+        }
+        Err(ViewerTokenError::Http(http_err)) => {
+            warn!(error = %http_err, "viewer token http error");
+            Err(ApiError::Upstream("viewer credential service failure"))
+        }
+        Err(ViewerTokenError::Upstream(msg)) => {
+            warn!(message = %msg, "viewer token upstream error");
+            Err(ApiError::Upstream("viewer credential service failure"))
+        }
+    }
 }
 
 fn map_state_err(err: StateError) -> ApiError {

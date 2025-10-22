@@ -42,3 +42,7 @@
 - [ ] Patch the CLI to respect a configurable remote log level (default info) and stop hard-coding trace.
 - [ ] Add a regression test that ensures the bootstrap stdout is a single JSON line even when remote trace logging is enabled.
 - [ ] Consider writing remote logs to stderr to avoid corrupting stdout in future debugging sessions.
+
+## Validation
+- Patched `remote_bootstrap_args` to accept `--remote-log-level` / `--remote-log-file` (defaulting to `info`) and reran `beach ssh … --keep-ssh --headless`.
+- With `/tmp` space restored (see `2025-10-21-tmp-disk-full.md`), the CLI now prints the session ID/passcode immediately and proceeds to headless validation, confirming the bootstrap JSON is delivered without clogging stdout.

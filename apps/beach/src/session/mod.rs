@@ -898,10 +898,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(joiner
-            .offers()
-            .iter()
-            .any(|offer| matches!(offer, TransportOffer::WebRtc { .. })));
+        assert!(
+            joiner
+                .offers()
+                .iter()
+                .any(|offer| matches!(offer, TransportOffer::WebRtc { .. }))
+        );
     }
 
     #[test_timeout::tokio_timeout_test]

@@ -1,8 +1,6 @@
 use cabana_macos_picker::{PickerError, PickerEvent, PickerHandle, PickerResult};
-use crossbeam_channel::{Receiver, unbounded};
-use futures_util::StreamExt;
-use std::{sync::Arc, thread};
-use tokio::{runtime::Runtime, sync::oneshot};
+use futures_util::{FutureExt, StreamExt};
+use std::pin::Pin;
 
 #[derive(Debug, Clone)]
 pub enum NativePickerMessage {
@@ -13,60 +11,36 @@ pub enum NativePickerMessage {
 
 pub struct NativePickerClient {
     handle: PickerHandle,
-    rx: Receiver<NativePickerMessage>,
-    shutdown: Option<oneshot::Sender<()>>,
-    listener: Option<thread::JoinHandle<()>>,
+    stream: Pin<Box<dyn futures_core::Stream<Item = PickerEvent>>>,
 }
 
 impl NativePickerClient {
     pub fn new() -> Result<Self, PickerError> {
         let handle = PickerHandle::new()?;
-        let (tx, rx) = unbounded();
-        let listener_handle = handle.clone();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-
-        let listener = thread::spawn(move || {
-            let runtime = Runtime::new().expect("failed to build tokio runtime for native picker");
-            runtime.block_on(async move {
-                let mut events = listener_handle.listen();
-                futures_util::pin_mut!(events);
-                let mut shutdown_rx = shutdown_rx;
-                loop {
-                    tokio::select! {
-                        _ = &mut shutdown_rx => {
-                            break;
-                        }
-                        maybe_event = events.next() => {
-                            match maybe_event {
-                                Some(PickerEvent::Selection(result)) => {
-                                    let _ = tx.send(NativePickerMessage::Selection(result));
-                                }
-                                Some(PickerEvent::Cancelled) => {
-                                    let _ = tx.send(NativePickerMessage::Cancelled);
-                                }
-                                Some(PickerEvent::Error { message }) => {
-                                    let _ = tx.send(NativePickerMessage::Error(message));
-                                }
-                                None => break,
-                            }
-                        }
-                    }
-                }
-            });
-        });
-
+        let stream = handle.listen();
         Ok(Self {
             handle,
-            rx,
-            shutdown: Some(shutdown_tx),
-            listener: Some(listener),
+            stream: Box::pin(stream),
         })
     }
 
-    pub fn poll(&self) -> Vec<NativePickerMessage> {
+    pub fn poll(&mut self) -> Vec<NativePickerMessage> {
         let mut events = Vec::new();
-        while let Ok(event) = self.rx.try_recv() {
-            events.push(event);
+        loop {
+            let next = self.stream.as_mut().next().now_or_never();
+            match next {
+                Some(Some(PickerEvent::Selection(result))) => {
+                    events.push(NativePickerMessage::Selection(result));
+                }
+                Some(Some(PickerEvent::Cancelled)) => {
+                    events.push(NativePickerMessage::Cancelled);
+                }
+                Some(Some(PickerEvent::Error { message })) => {
+                    events.push(NativePickerMessage::Error(message));
+                }
+                Some(None) => break,
+                None => break,
+            }
         }
         events
     }
@@ -83,12 +57,6 @@ impl NativePickerClient {
 impl Drop for NativePickerClient {
     fn drop(&mut self) {
         let _ = self.handle.stop();
-        if let Some(tx) = self.shutdown.take() {
-            let _ = tx.send(());
-        }
-        if let Some(listener) = self.listener.take() {
-            let _ = listener.join();
-        }
     }
 }
 

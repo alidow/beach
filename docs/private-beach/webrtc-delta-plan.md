@@ -13,14 +13,15 @@
   - Prometheus counters `manager_viewer_keepalive_sent_total`, `manager_viewer_keepalive_failures_total`, `manager_viewer_idle_warnings_total`, and `manager_viewer_idle_recoveries_total` expose ping cadence, failures, idle intervals, and recoveries per session, unlocking Grafana/Honeycomb alerting.
 - **Dashboard drawer parity**
   - Session drawers now poll `GET /sessions/:id/controller-events` with bearer auth (no SSE), reuse trimmed tokens, and render structured controller events alongside the terminal.
+- **Credential hardening & legacy removal**
+  - Manager now issues Gate-signed viewer tokens by default; passcode fallback is gone and Beach Road validates the signature before honoring joins.
+  - `/sessions/:id/events/stream` was removed after the dashboard migrated fully to WebRTC + REST polling.
+- **Dashboard polish**
+  - Private Beach tiles surface transport security/latency badges and show reconnect messaging when negotiations restart; the expanded viewer keeps parity with Beach Surfer.
+- **Viewer pipeline regression tests**
+  - Added `manager_viewer_style_updates_survive_pipeline` to guard `WireUpdate::Style` handling.
+  - TypeScript target bumped to ES2020 with module stubs so `npx tsc --noEmit` succeeds alongside the shared Surfer code.
 
 ### 🔄 In Progress / Follow-Ups
-1. **UX polish**
-   - Surface transport health (secure/plaintext badge, latency) in the tile chrome.
-   - Add a reconnection banner when the viewer falls back to reconnect loops.
-2. **Credential hardening & legacy removal**
-   - Land Gate/Beach Road support for signed viewer tokens, update the manager API to prefer them, and remove the fallback once hosts understand the new credential.
-   - Migrate any remaining consumers off `/sessions/:id/events/stream`, then delete the SSE endpoint.
-3. **Hardening**
-   - Add an integration test that asserts `WireUpdate::Style` survives the viewer pipeline.
-   - Simulate TURN-only environments to ensure the keepalive cadence doesn’t trigger quota alarms.
+1. **TURN-only soak**
+   - Manual recipe documented (`BEACH_WEBRTC_DISABLE_STUN=1`), but we still owe a sustained TURN-only load test to baseline quota impact and confirm keepalive cadence.

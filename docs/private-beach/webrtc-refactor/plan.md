@@ -26,24 +26,20 @@
 - **Shared client crate** — `apps/beach` exports the `beach_client_core` library while the package/bin remain `beach`. Negotiation helpers, terminal cache, and protocol types are reusable, and all existing unit tests import from `beach_client_core::…`.
 - **TURN entitlement check** — WebRTC negotiation fails fast if the caller lacks `pb:transport.turn`; we no longer hit HTTP/SSE fallbacks silently. STUN-only paths still operate for non-entitled users.
 - **Manager viewer worker (authoritative)** — `AppState::spawn_viewer_worker` now negotiates WebRTC, decodes frames, and persists them to both Redis and `session_runtime` while emitting `StreamEvent::State`. Metrics (`manager_viewer_connected`, `manager_viewer_latency_ms`, `manager_viewer_reconnects_total`, `manager_viewer_keepalive_sent_total`, `manager_viewer_keepalive_failures_total`, `manager_viewer_idle_warnings_total`, `manager_viewer_idle_recoveries_total`) track health, the worker auto-reconnects until shut down, and a periodic `__keepalive__` ping avoids silent ICE idling while logging when hosts stop sending frames.
-- **Credential plumbing & API** — `RegisterSessionRequest` carries an optional `viewer_passcode` (migrated into `session_runtime.viewer_passcode`). Managers and dashboards retrieve a short-lived Gate-signed viewer token (plus legacy passcode for the handshake) via `GET /private-beaches/:bid/sessions/:sid/viewer-credential`. Beach Road verifies the token before honoring joins.
+- **Credential plumbing & API** — `RegisterSessionRequest` still persists an optional `viewer_passcode` for handshake compatibility, but `GET /private-beaches/:bid/sessions/:sid/viewer-credential` now always returns a short-lived Gate-signed viewer token. Browsers consume the token directly, and Beach Road verifies it before completing the join (no more passcode fallback).
 - **Legacy harness removed** — Manager no longer exposes the HTTP pump (`handle_manager_hints`). The viewer worker now publishes directly to Redis and `session_runtime`, enabling HTTP bridge code to be deleted from the host.
 - **CLI host cleanup** — `apps/beach` no longer listens for manager bridge hints or pushes HTTP diffs; the WebRTC path is the only authority. Bridge-token mint/nudge endpoints were deleted from Beach Road and Manager.
-- **Dashboard viewer parity** — Private Beach tiles fetch viewer credentials and render via the shared Beach Surfer `BeachTerminal`, so style tables and cursor UX now match Surfer. Cabana sessions continue to flow through `CabanaPrivateBeachPlayer`, and session drawers now poll `GET /sessions/:id/controller-events` (no SSE) while we finish the history/event UX polish.
-- **Docs plan status** — Phase 0 tasks are partially complete (crate extraction ✅, entitlement audit ✅, credential design 🟡). Earlier sections now note status for quick scan.
+- **Dashboard viewer parity** — Private Beach tiles render via the shared Beach Surfer `BeachTerminal` with security/latency badges and reconnect messaging surfaced inline. Cabana sessions continue to flow through `CabanaPrivateBeachPlayer`, drawers pull from `GET /sessions/:id/controller-events`, and the legacy `/sessions/:id/events/stream` SSE endpoint has been removed.
+- **Docs plan status** — Phase 0 tasks are complete (crate extraction ✅, entitlement audit ✅, credential design ✅). Earlier sections note status for quick scan.
 - **Open risks / follow-ups**
-  1. Observer diff pipeline — ✅ viewer worker now emits `StreamEvent::State` and writes to Redis/`session_runtime`. Follow-up: add a smoke test that runs `spawn_viewer_worker` against a mocked session to guard regressions.
-  2. Viewer credential story — We currently return the stored passcode (`GET /private-beaches/:id/sessions/:sid/viewer-credential`). Once Gate policy lands, migrate to a short-lived signed viewer token and remove the fallback once hosts validate the new credential.
-  3. Frontend parity — Tiles and drawers run on WebRTC/REST, but we still need to surface latency + secure badges, add reconnect messaging, and remove the legacy `/sessions/:id/events/stream` SSE endpoint once no clients depend on it.
-  4. Harness transforms — After transport parity, re-scope Beach Buggy to opt-in transforms with dedicated data channels; HTTP endpoints remain removed.
-  5. TypeScript parity — Shared Beach Surfer imports require type stubs for `argon2-browser`/`noise-c.wasm` and raising the TS target to ES2020 so BigInt is legal.
-- **Quick verification** — `cargo check -p beach-manager` and `cargo check -p beach-road` pass (noise-only warnings). Whole-workspace `cargo check` still fails for the pre-existing lifeguard fallback token drift. `npx tsc --noEmit` in `apps/private-beach` now reaches cross-repo imports; it fails until we add type stubs for `argon2-browser`/`noise-c.wasm` and bump the TS target to ES2020 (BigInt usage).
+  1. Observer diff pipeline — ✅ style updates now survive the viewer pipeline (new integration test). We can still add a multi-session Redis smoke test if we want additional coverage.
+  2. TURN-only validation — Manual testing documented (`BEACH_WEBRTC_DISABLE_STUN=1`); schedule a sustained TURN soak test to baseline quota impact before GA.
+  3. Harness transforms — After transport parity, re-scope Beach Buggy to opt-in transforms with dedicated data channels; HTTP endpoints remain removed.
+- **Quick verification** — `cargo check -p beach-manager` still fails because of the pre-existing lifeguard fallback token drift (unchanged). `npx tsc --noEmit` in `apps/private-beach` now succeeds after raising the TS target to ES2020 and adding module stubs. Running `npm run lint` currently prompts for the Next.js ESLint scaffold; set `CI=1` if we decide to wire their preset in CI.
 - **Incoming engineer gameplan**
-  - Add an automated smoke test that exercises `spawn_viewer_worker` against a mocked session to verify Redis + `StreamEvent::State` publishing.
-  - Design the follow-on viewer credential format (likely a signed token) and coordinate validation changes with Beach Road / host binaries.
-  - Finish dashboard parity: reuse the shared surfer viewer for the session drawer/events view, surface latency + secure state, and tidy the UI.
-  - Document the new WebRTC-first flow for ops/infra, including guidance on TURN quotas and viewer monitoring.
-  - Add TypeScript module declarations / target updates so the Private Beach app builds cleanly with the shared Beach Surfer code.
+  - Layer a Redis-backed viewer worker smoke test if we decide the current unit coverage is insufficient.
+  - Run the TURN-only soak outlined above and feed results into transport budgeting.
+  - Keep the harness transforms item alive once transport polish winds down.
 
 ## Architecture Overview After Refactor
 ```
@@ -74,11 +70,8 @@
      - Transport interfaces used by Beach Surfer.
    - Keep `main.rs` as the CLI entry point; binary links the shared lib.
 2. **Credential story**
-   - Status: 🟡 viewer passcodes now flow through `RegisterSessionRequest` and persist in Manager; viewer token contract still to author.
-   - Decide how Manager authorises itself to join a session.
-     - Option A: Manager stores the passcode (already true for public sessions).
-     - Option B: Manager mints a short-lived viewer token signed by Beach Gate; host validates token as equivalent to passcode.
-   - Document API contract so Surfer can request a viewer credential from Manager (for humans) without exposing passcodes.
+   - Status: ✅ Manager mints Gate-signed viewer tokens and the Private Beach UI consumes them directly; passcode fallback to browsers was removed (passcodes are only stored server-side for handshake/backfill).
+   - API summary: `GET /private-beaches/:id/sessions/:sid/viewer-credential` issues a short-lived viewer token; Beach Road verifies it before completing the join.
 3. **Entitlement audit**
    - Status: ✅ TURN fallback now errors when `pb:transport.turn` missing and only STUN fallback continues.
    - Ensure TURN/WSS fallback path checks entitlements. If a user lacks `pb:transport.turn`, we reject rather than silently downgrade.
@@ -135,6 +128,9 @@ Deliverables:
   - WebRTC join success/failure.
   - TURN minutes consumed, fallback counts.
   - Manager cache lag vs. host diff timestamp.
+- Ops notes (documented in STATUS):
+  - Force TURN-only verification locally via `BEACH_WEBRTC_DISABLE_STUN=1` on Manager + hosts; confirm the keepalive metrics stay quiet while negotiating over TURN.
+  - Monitor the new viewer metrics (`manager_viewer_connected`, `manager_viewer_latency_ms`, `manager_viewer_reconnects_total`, `manager_viewer_keepalive_*`, `manager_viewer_idle_*`) and wire dashboards/alerts accordingly.
 - Rollout plan:
   - Feature flag to keep legacy HTTP path for emergency rollback only.
   - Migration script to disable HTTP path across environments once WebRTC viewer stable.
@@ -142,9 +138,9 @@ Deliverables:
 ## Immediate To-Do (next sprint)
 1. ✅ Add an automated smoke test for `spawn_viewer_worker` (mock session, assert Redis + state stream).
 2. ✅ Define and implement the signed viewer credential contract (Gate + Beach Road validation).
-3. Continue dashboard parity polish: surface latency/secure badges (the terminal already shows full styling), finish history/event UX docs, and remove the legacy SSE route once watchers are migrated.
-4. Document operational guidance (TURN quotas, viewer metrics dashboards) now that WebRTC is the sole transport.
-5. Unblock `npx tsc --noEmit` by adding module declarations for `argon2-browser`/`noise-c.wasm` and bumping the TS target to ES2020 (or shim BigInt usage).
+3. ✅ Dashboard parity polish landed: tiles show latency/security badges, reconnect messaging, and the session drawer uses the REST feed; `/sessions/:id/events/stream` was removed.
+4. ✅ Ops guidance captured (TURN-only test recipe + viewer metrics to monitor).
+5. ✅ `npx tsc --noEmit` passes after adding module stubs and bumping the TS target to ES2020.
 
 ## Risks & Mitigations
 - **Manager load increases** (now running N viewer clients): isolate viewer workers, cap concurrency, and rely on TURN quotas. Mitigate via autoscaling and instrumentation before rollout.

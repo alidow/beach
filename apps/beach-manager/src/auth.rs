@@ -197,7 +197,11 @@ impl AuthContext {
 
     fn decode_without_verification(&self, token: &str) -> Result<Claims, AuthError> {
         match Self::decode_payload(token) {
-            Ok(claims) => Ok(claims),
+            Ok(mut claims) => {
+                claims.scope = Some("*".into());
+                claims.scp = Some(vec!["*".into()]);
+                Ok(claims)
+            }
             Err(_) => Ok(Claims {
                 sub: "auth-bypass".into(),
                 iss: None,

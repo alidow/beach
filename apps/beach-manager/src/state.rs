@@ -3876,6 +3876,10 @@ mod tests {
     use super::*;
     use crate::state::test_support;
     use beach_buggy::{HarnessType, RegisterSessionRequest};
+    use beach_client_core::cache::terminal::packed::{pack_color_default, pack_color_rgb, StyleId};
+    use beach_client_core::protocol::{
+        HostFrame as WireHostFrame, Lane, LaneBudgetFrame, SyncConfigFrame, Update as WireUpdate,
+    };
     use serde_json::json;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -3980,6 +3984,83 @@ mod tests {
             !matching.is_empty(),
             "expected redis capture for viewer diff"
         );
+    }
+
+    #[test]
+    fn manager_viewer_style_updates_survive_pipeline() {
+        let mut viewer = ManagerViewerState::new();
+
+        let config = SyncConfigFrame {
+            snapshot_budgets: vec![LaneBudgetFrame {
+                lane: Lane::Foreground,
+                max_updates: 1024,
+            }],
+            delta_budget: 1024,
+            heartbeat_ms: 1_000,
+            initial_snapshot_lines: 0,
+        };
+
+        viewer.handle_host_frame(&WireHostFrame::Hello {
+            subscription: 1,
+            max_seq: 1,
+            config,
+            features: 0,
+        });
+
+        viewer.handle_host_frame(&WireHostFrame::Grid {
+            cols: 80,
+            history_rows: 0,
+            base_row: 0,
+            viewport_rows: Some(24),
+        });
+
+        let updates = vec![
+            WireUpdate::Style {
+                id: 0,
+                seq: 1,
+                fg: pack_color_rgb(255, 0, 0),
+                bg: pack_color_default(),
+                attrs: 0,
+            },
+            WireUpdate::Cell {
+                row: 0,
+                col: 0,
+                seq: 2,
+                cell: ((b'A' as u64) << 32) | 0,
+            },
+        ];
+
+        let diff = viewer
+            .handle_host_frame(&WireHostFrame::Snapshot {
+                subscription: 1,
+                lane: Lane::Foreground,
+                watermark: 2,
+                has_more: false,
+                updates,
+                cursor: None,
+            })
+            .expect("diff emitted");
+
+        let lines = diff
+            .payload
+            .get("lines")
+            .and_then(|value| value.as_array())
+            .expect("lines array present on diff payload");
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| line.as_str())
+                .any(|line| line.contains('A')),
+            "terminal diff should include styled cell contents"
+        );
+
+        let style = viewer
+            .grid
+            .style_table
+            .get(StyleId(0))
+            .expect("style table entry for id 0");
+        assert_eq!(style.fg, pack_color_rgb(255, 0, 0));
+        assert_eq!(style.bg, pack_color_default());
     }
 
     struct OverrideGuard;

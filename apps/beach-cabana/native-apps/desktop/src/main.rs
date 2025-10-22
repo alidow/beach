@@ -1,6 +1,9 @@
 use anyhow::Result;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use beach_cabana_host::desktop::{ScreenCaptureDescriptor, SelectionEvent, publish_selection};
+use beach_cabana_host::{
+    desktop::{ScreenCaptureDescriptor, SelectionEvent, publish_selection},
+    webrtc::{self, EncodeCodec},
+};
 use beach_client_core::{
     auth::{self, AuthError, access_token_is_valid, credentials::StoredProfile},
     session::{SessionConfig, SessionError, SessionManager},
@@ -21,9 +24,27 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::Runtime;
+use tokio::sync::oneshot;
+
+const STREAM_INTERVAL_MS: u64 = 33;
+const STREAM_MAX_WIDTH: Option<u32> = Some(1920);
+const STREAM_FRAME_LIMIT: u32 = u32::MAX;
 
 #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
 mod native_picker;
+
+#[cfg(target_os = "macos")]
+fn ensure_screen_recording_permission() {
+    use beach_cabana_host::platform::macos::permissions::{
+        ScreenRecordingStatus, request_access, status,
+    };
+    if status() != ScreenRecordingStatus::Granted {
+        let _ = request_access();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ensure_screen_recording_permission() {}
 
 #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
 use cabana_macos_picker::{PickerItemKind, PickerResult};
@@ -120,6 +141,10 @@ enum AppMessage {
         session_id: String,
     },
     PrivateAttachError(String),
+    StreamVerification(String),
+    StreamStarted,
+    StreamStopped,
+    StreamError(String),
 }
 
 struct PickerApp {
@@ -144,6 +169,9 @@ struct PickerApp {
     selected_beach_id: Option<String>,
     session_updates: VecDeque<String>,
     public_session: Option<PublicSessionInfo>,
+    stream_worker: Option<StreamWorker>,
+    stream_status: StreamStatus,
+    stream_verification: Option<String>,
     auth_inflight: bool,
     fetching_beaches: bool,
     creating_public_session: bool,
@@ -188,6 +216,9 @@ impl PickerApp {
             selected_beach_id: None,
             session_updates: VecDeque::new(),
             public_session: None,
+            stream_worker: None,
+            stream_status: StreamStatus::Idle,
+            stream_verification: None,
             auth_inflight: false,
             fetching_beaches: false,
             creating_public_session: false,
@@ -397,6 +428,26 @@ impl PickerApp {
                 AppMessage::PrivateAttachError(error) => {
                     self.attaching_private_beach = false;
                     self.push_session_update(format!("Attach failed: {error}"));
+                }
+                AppMessage::StreamVerification(code) => {
+                    self.stream_verification = Some(code.clone());
+                    self.push_session_update(format!("Verification code: {code}"));
+                }
+                AppMessage::StreamStarted => {
+                    self.stream_status = StreamStatus::Streaming;
+                    self.push_session_update("Streaming started.");
+                }
+                AppMessage::StreamStopped => {
+                    self.stream_status = StreamStatus::Idle;
+                    self.push_session_update("Streaming stopped.");
+                    self.cleanup_stream_worker();
+                    self.stream_verification = None;
+                }
+                AppMessage::StreamError(message) => {
+                    self.stream_status = StreamStatus::Error(message.clone());
+                    self.push_session_update(format!("Streaming error: {message}"));
+                    self.cleanup_stream_worker();
+                    self.stream_verification = None;
                 }
             }
         }
@@ -666,6 +717,9 @@ impl PickerApp {
         if self.creating_public_session {
             return;
         }
+        if self.stream_worker.is_some() {
+            self.stop_streaming();
+        }
         if self.session_sheet.descriptor().is_none() {
             self.push_session_update("Select a target before creating a session.");
             return;
@@ -751,6 +805,9 @@ impl PickerApp {
         thread::spawn(move || {
             let runtime =
                 Runtime::new().expect("failed to create tokio runtime for private attach");
+            let beach_id_for_result = beach_id.clone();
+            let beach_name_for_result = beach_name.clone();
+            let public_for_result = public.clone();
             let result = runtime.block_on(async move {
                 attach_private_beach(
                     &manager,
@@ -771,9 +828,9 @@ impl PickerApp {
                 Ok(_) => {
                     sender
                         .send(AppMessage::PrivateAttachOk {
-                            beach_id,
-                            beach_name,
-                            session_id: public.session_id,
+                            beach_id: beach_id_for_result,
+                            beach_name: beach_name_for_result,
+                            session_id: public_for_result.session_id,
                         })
                         .ok();
                 }
@@ -789,6 +846,133 @@ impl PickerApp {
         self.session_updates.push_back(message.into());
         while self.session_updates.len() > MAX {
             self.session_updates.pop_front();
+        }
+    }
+
+    fn begin_start_stream(&mut self) {
+        if self.stream_worker.is_some() {
+            self.push_session_update("Stop the current stream before starting another.");
+            return;
+        }
+        if !matches!(
+            self.stream_status,
+            StreamStatus::Idle | StreamStatus::Error(_)
+        ) {
+            self.push_session_update("Streaming is already in progress.");
+            return;
+        }
+        let descriptor = match self.session_sheet.descriptor().cloned() {
+            Some(descriptor) => descriptor,
+            None => {
+                self.push_session_update("Select a capture target first.");
+                return;
+            }
+        };
+        let public = match self.public_session.clone() {
+            Some(info) => info,
+            None => {
+                self.push_session_update("Create a public session before streaming.");
+                return;
+            }
+        };
+
+        ensure_screen_recording_permission();
+
+        let road_base = self.road_base.clone();
+        let event_sender = self.event_tx.clone();
+        let (stop_tx, stop_rx) = oneshot::channel();
+
+        self.stream_status = StreamStatus::Starting;
+        self.stream_verification = None;
+        self.push_session_update("Starting stream…");
+
+        let handle = thread::spawn(move || {
+            let runtime = match Runtime::new() {
+                Ok(rt) => rt,
+                Err(err) => {
+                    event_sender
+                        .send(AppMessage::StreamError(format!(
+                            "Failed to start runtime: {}",
+                            err
+                        )))
+                        .ok();
+                    return;
+                }
+            };
+
+            let thread_sender = event_sender.clone();
+            let descriptor_clone = descriptor.clone();
+            let result = runtime.block_on({
+                let async_sender = thread_sender.clone();
+                async move {
+                    let (transport, verification) = webrtc::host_bootstrap(
+                        public.session_id.clone(),
+                        public.join_code.clone(),
+                        Some(road_base.clone()),
+                        None,
+                    None,
+                    Vec::new(),
+                    "host".to_string(),
+                    "viewer".to_string(),
+                )
+                .await?;
+
+                    async_sender
+                        .send(AppMessage::StreamVerification(verification.clone()))
+                        .ok();
+
+                    let codec = if cfg!(all(target_os = "macos", feature = "cabana_sck")) {
+                        EncodeCodec::H264
+                    } else {
+                        EncodeCodec::Gif
+                    };
+
+                    async_sender.send(AppMessage::StreamStarted).ok();
+
+                    tokio::select! {
+                        result = webrtc::host_stream(
+                            &transport,
+                            codec,
+                        &descriptor_clone,
+                        STREAM_FRAME_LIMIT,
+                        STREAM_INTERVAL_MS,
+                        STREAM_MAX_WIDTH,
+                    ) => result,
+                    _ = async {
+                        let _ = stop_rx.await;
+                    } => Ok(()),
+                }
+            });
+
+            match result {
+                Ok(()) => {
+                    thread_sender.send(AppMessage::StreamStopped).ok();
+                }
+                Err(err) => {
+                    thread_sender
+                        .send(AppMessage::StreamError(err.to_string()))
+                        .ok();
+                }
+            }
+        });
+
+        self.stream_worker = Some(StreamWorker {
+            handle: Some(handle),
+            stop_sender: Some(stop_tx),
+        });
+    }
+
+    fn stop_streaming(&mut self) {
+        if let Some(worker) = self.stream_worker.as_mut() {
+            worker.stop();
+            self.stream_status = StreamStatus::Stopping;
+            self.push_session_update("Stopping stream…");
+        }
+    }
+
+    fn cleanup_stream_worker(&mut self) {
+        if let Some(mut worker) = self.stream_worker.take() {
+            worker.join();
         }
     }
 
@@ -877,20 +1061,24 @@ impl PickerApp {
                 ui.label("Creating session…");
             }
             if let Some(session) = &self.public_session {
+                let session_id = session.session_id.clone();
+                let join_code = session.join_code.clone();
+                let session_url = session.session_url.clone();
+                drop(session);
                 ui.add_space(6.0);
-                ui.label(format!("Session ID: {}", session.session_id));
+                ui.label(format!("Session ID: {}", session_id));
                 ui.horizontal(|ui| {
                     ui.label("Join code:");
-                    ui.monospace(&session.join_code);
+                    ui.monospace(&join_code);
                     if ui.button("Copy").clicked() {
-                        ui.output_mut(|o| o.copied_text = session.join_code.clone());
+                        ui.output_mut(|o| o.copied_text = join_code.clone());
                     }
                 });
                 ui.horizontal(|ui| {
                     ui.label("Session URL:");
-                    ui.hyperlink(&session.session_url);
+                    ui.hyperlink(&session_url);
                     if ui.button("Open").clicked() {
-                        if let Err(err) = open::that(&session.session_url) {
+                        if let Err(err) = open::that(&session_url) {
                             self.push_session_update(format!("Failed to open URL: {err}"));
                         }
                     }
@@ -964,6 +1152,9 @@ impl PickerApp {
         });
 
         ui.add_space(12.0);
+        self.render_stream_controls(ui);
+
+        ui.add_space(12.0);
         ui.group(|ui| {
             ui.label(RichText::new("Session log").strong());
             if self.session_updates.is_empty() {
@@ -976,6 +1167,73 @@ impl PickerApp {
         });
     }
 
+    fn render_stream_controls(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.label(RichText::new("Streaming").strong());
+            ui.add_space(4.0);
+
+            match &self.stream_status {
+                StreamStatus::Idle => {
+                    ui.label("Not streaming.");
+                }
+                StreamStatus::Starting => {
+                    ui.label("Negotiating session…");
+                }
+                StreamStatus::Streaming => {
+                    ui.label("Streaming to Beach Road.");
+                }
+                StreamStatus::Stopping => {
+                    ui.label("Stopping stream…");
+                }
+                StreamStatus::Error(message) => {
+                    ui.colored_label(
+                        Color32::from_rgb(220, 95, 78),
+                        format!("Streaming error: {message}"),
+                    );
+                }
+            }
+
+            if let Some(code) = &self.stream_verification {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Verification code:");
+                    ui.monospace(code);
+                    if ui.button("Copy").clicked() {
+                        ui.output_mut(|out| out.copied_text = code.clone());
+                    }
+                });
+            }
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let can_start = matches!(
+                    self.stream_status,
+                    StreamStatus::Idle | StreamStatus::Error(_)
+                ) && self.public_session.is_some()
+                    && self.session_sheet.descriptor().is_some();
+                if ui
+                    .add_enabled(can_start, egui::Button::new("Start streaming"))
+                    .clicked()
+                {
+                    self.begin_start_stream();
+                }
+
+                let can_stop = matches!(
+                    self.stream_status,
+                    StreamStatus::Starting | StreamStatus::Streaming | StreamStatus::Stopping
+                ) && self.stream_worker.is_some();
+                if ui
+                    .add_enabled(can_stop, egui::Button::new("Stop streaming"))
+                    .clicked()
+                {
+                    self.stop_streaming();
+                }
+            });
+        });
+    }
+}
+
+impl eframe::App for PickerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(100));
 
@@ -1013,6 +1271,7 @@ impl PickerApp {
                         } else {
                             ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
                             ui.horizontal_wrapped(|ui| {
+                                let mut selected: Option<PickerResult> = None;
                                 for tile in &self.tiles {
                                     let is_selected = self
                                         .selected_id
@@ -1021,11 +1280,11 @@ impl PickerApp {
                                         .unwrap_or(false);
                                     let response = render_tile(ui, tile, is_selected);
                                     if response.clicked() {
-                                        self.apply_selection(
-                                            tile.result.clone(),
-                                            SelectionSource::Tile,
-                                        );
+                                        selected = Some(tile.result.clone());
                                     }
+                                }
+                                if let Some(result) = selected {
+                                    self.apply_selection(result, SelectionSource::Tile);
                                 }
                             });
                         }
@@ -1067,6 +1326,15 @@ struct SessionSheetState {
     kind: Option<PickerItemKind>,
     metadata: Option<JsonValue>,
     confirmed_at: Option<SystemTime>,
+}
+
+impl Drop for PickerApp {
+    fn drop(&mut self) {
+        if let Some(worker) = self.stream_worker.as_mut() {
+            worker.stop();
+        }
+        self.cleanup_stream_worker();
+    }
 }
 
 impl SessionSheetState {
@@ -1125,8 +1393,10 @@ impl SessionSheetState {
 
         ui.add_space(6.0);
         ui.label("Session nickname (optional)");
-        ui.text_edit_singleline(&mut self.session_name)
-            .hint_text("Displayed to viewers and in Private Beach");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.session_name)
+                .hint_text("Displayed to viewers and in Private Beach"),
+        );
 
         if let Some(metadata) = &self.metadata {
             ui.add_space(6.0);
@@ -1177,6 +1447,34 @@ type PickerTile = ();
 enum SelectionSource {
     Stream,
     Tile,
+}
+
+struct StreamWorker {
+    handle: Option<thread::JoinHandle<()>>,
+    stop_sender: Option<oneshot::Sender<()>>,
+}
+
+impl StreamWorker {
+    fn stop(&mut self) {
+        if let Some(sender) = self.stop_sender.take() {
+            let _ = sender.send(());
+        }
+    }
+
+    fn join(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum StreamStatus {
+    Idle,
+    Starting,
+    Streaming,
+    Stopping,
+    Error(String),
 }
 
 #[cfg(any(feature = "picker-mock", feature = "picker-native"))]

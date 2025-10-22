@@ -40,10 +40,6 @@ pub fn build_router(state: AppState) -> Router {
             "/sessions/:session_id/controller-events",
             get(list_controller_events),
         )
-        .route(
-            "/sessions/:session_id/events/stream",
-            get(sse::stream_events),
-        )
         .route("/sessions/:session_id/health", post(signal_health))
         .route(
             "/private-beaches/:private_beach_id/sessions",

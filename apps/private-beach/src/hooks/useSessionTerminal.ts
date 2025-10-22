@@ -29,7 +29,10 @@ export function useSessionTerminal(
   managerUrl: string,
   token: string | null,
 ): TerminalViewerState {
-  const store = useMemo(() => new TerminalGridStore(80), [sessionId]);
+  const store = useMemo(() => {
+    void sessionId;
+    return new TerminalGridStore(80);
+  }, [sessionId]);
   const [transport, setTransport] = useState<TerminalTransport | null>(null);
   const [connecting, setConnecting] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);

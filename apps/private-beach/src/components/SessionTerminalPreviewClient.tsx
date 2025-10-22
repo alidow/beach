@@ -106,6 +106,30 @@ function SessionTerminalPreviewClientInner({
     [variant, className],
   );
 
+  const shouldConnect = !isCabana && trimmedToken.length > 0;
+  const viewer = useSessionTerminal(
+    sessionId,
+    privateBeachId,
+    managerUrl,
+    shouldConnect ? trimmedToken : null,
+  );
+
+  const placeholderMessage = useMemo(() => {
+    if (viewer.status === 'error') {
+      return viewer.error ?? 'Unable to connect to this session.';
+    }
+    if (viewer.status === 'connecting') {
+      return 'Connecting…';
+    }
+    if (viewer.status === 'reconnecting') {
+      return 'Reconnecting…';
+    }
+    if (!viewer.transport) {
+      return 'Viewer unavailable';
+    }
+    return null;
+  }, [viewer.error, viewer.status, viewer.transport]);
+
   if (isCabana) {
     return (
       <CabanaPrivateBeachPlayer
@@ -135,24 +159,6 @@ function SessionTerminalPreviewClientInner({
       </div>
     );
   }
-
-  const viewer = useSessionTerminal(sessionId, privateBeachId, managerUrl, trimmedToken);
-
-  const placeholderMessage = useMemo(() => {
-    if (viewer.status === 'error') {
-      return viewer.error ?? 'Unable to connect to this session.';
-    }
-    if (viewer.status === 'connecting') {
-      return 'Connecting…';
-    }
-    if (viewer.status === 'reconnecting') {
-      return 'Reconnecting…';
-    }
-    if (!viewer.transport) {
-      return 'Viewer unavailable';
-    }
-    return null;
-  }, [viewer.error, viewer.status, viewer.transport]);
 
   const placeholderClass =
     variant === 'preview'

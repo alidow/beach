@@ -1,3 +1,4 @@
+/* eslint-disable react/no-find-dom-node */
 import { DraggableCore } from 'react-draggable';
 import { findDOMNode } from 'react-dom';
 

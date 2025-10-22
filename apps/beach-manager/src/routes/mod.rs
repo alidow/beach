@@ -7,7 +7,7 @@ mod sse;
 
 use axum::{
     response::{IntoResponse, Response},
-    routing::{get, patch, post, put},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use serde::Serialize;
@@ -39,6 +39,18 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/sessions/:session_id/controller-events",
             get(list_controller_events),
+        )
+        .route(
+            "/sessions/:controller_id/controllers",
+            get(list_controller_pairings_route).post(create_controller_pairing),
+        )
+        .route(
+            "/sessions/:controller_id/controllers/stream",
+            get(sse::stream_controller_pairings),
+        )
+        .route(
+            "/sessions/:controller_id/controllers/:child_session_id",
+            delete(delete_controller_pairing),
         )
         .route("/sessions/:session_id/health", post(signal_health))
         .route(
@@ -302,6 +314,137 @@ mod tests {
         let summaries: Vec<SessionSummary> = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].session_id, "sess-test");
+    }
+
+    #[tokio::test]
+    async fn controller_pairing_crud() {
+        let state = AppState::new();
+        let app = build_router(state.clone());
+
+        let controller_register = json!({
+            "session_id": "controller-1",
+            "private_beach_id": "pb-ctrl",
+            "harness_type": HarnessType::TerminalShim,
+            "capabilities": ["terminal_diff_v1"],
+            "version": "0.1.0"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/register")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(controller_register.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let child_register = json!({
+            "session_id": "child-1",
+            "private_beach_id": "pb-ctrl",
+            "harness_type": HarnessType::TerminalShim,
+            "capabilities": ["terminal_diff_v1"],
+            "version": "0.1.0"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/register")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(child_register.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let pairing_body = json!({
+            "child_session_id": "child-1",
+            "prompt_template": "Focus on shell commands",
+            "update_cadence": "fast"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/controller-1/controllers")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(pairing_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let pairing_resp: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(pairing_resp["child_session_id"], "child-1");
+        assert_eq!(pairing_resp["update_cadence"], "fast");
+        assert_eq!(pairing_resp["transport_status"]["transport"], "pending");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/sessions/controller-1/controllers")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let pairings: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(pairings.len(), 1);
+        assert_eq!(pairings[0]["child_session_id"], "child-1");
+        assert_eq!(pairings[0]["transport_status"]["transport"], "pending");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/sessions/controller-1/controllers/child-1")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/sessions/controller-1/controllers")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let pairings: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert!(pairings.is_empty());
     }
 
     #[tokio::test]

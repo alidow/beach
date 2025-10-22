@@ -1,21 +1,21 @@
 use std::{collections::HashMap, sync::Arc};
 
 use beach_buggy::{ActionAck, ActionCommand, StateDiff};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use serde::{Deserialize, Serialize};
+use tokio::{
+    sync::{Mutex, RwLock},
+    time::{sleep, Duration},
+};
 use tracing::{info, warn};
-use uuid::Uuid;
 
-use webrtc::data_channel::RTCDataChannel;
+use webrtc::data_channel::{data_channel_message::DataChannelMessage, RTCDataChannel};
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::Error as WebRtcError;
 
-use crate::state::AppState;
+use crate::{metrics, state::AppState};
 
 #[derive(Clone)]
 pub struct FastPathSession {
@@ -99,6 +99,41 @@ impl FastPathSession {
     pub async fn add_remote_ice(&self, cand: RTCIceCandidateInit) -> Result<(), WebRtcError> {
         self.pc.add_ice_candidate(cand).await
     }
+
+    pub fn spawn_receivers(self: &Arc<Self>, state: AppState) {
+        let ack_session = Arc::clone(self);
+        let ack_state = state.clone();
+        tokio::spawn(async move {
+            if let Some(dc) = wait_for_channel(ack_session.clone(), ChannelKind::Acks).await {
+                install_ack_handler(dc, ack_session.clone(), ack_state.clone());
+            } else {
+                warn!(
+                    session_id = %ack_session.session_id,
+                    "fast-path ack channel not established; continuing with HTTP fallback"
+                );
+            }
+        });
+
+        let state_session = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Some(dc) = wait_for_channel(state_session.clone(), ChannelKind::State).await {
+                install_state_handler(dc, state_session.clone(), state.clone());
+            } else {
+                warn!(
+                    session_id = %state_session.session_id,
+                    "fast-path state channel not established; continuing with HTTP fallback"
+                );
+            }
+        });
+    }
+
+    async fn clear_ack_channel(&self) {
+        *self.acks_rx.lock().await = None;
+    }
+
+    async fn clear_state_channel(&self) {
+        *self.state_rx.lock().await = None;
+    }
 }
 
 #[derive(Clone, Default)]
@@ -139,4 +174,274 @@ pub async fn send_actions_over_fast_path(
         }
     }
     Ok(false)
+}
+
+async fn wait_for_channel(
+    session: Arc<FastPathSession>,
+    kind: ChannelKind,
+) -> Option<Arc<RTCDataChannel>> {
+    const MAX_ATTEMPTS: usize = 40;
+    const INTERVAL: Duration = Duration::from_millis(50);
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let maybe = match kind {
+            ChannelKind::Acks => session.acks_rx.lock().await.clone(),
+            ChannelKind::State => session.state_rx.lock().await.clone(),
+        };
+        if let Some(dc) = maybe {
+            info!(
+                session_id = %session.session_id,
+                channel = %dc.label(),
+                attempt,
+                "fast-path data channel ready"
+            );
+            return Some(dc);
+        }
+        sleep(INTERVAL).await;
+    }
+    None
+}
+
+fn install_ack_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>, state: AppState) {
+    let session_id = session.session_id.clone();
+    let state_clone = state.clone();
+    let state_for_close = state.clone();
+    let state_for_error = state.clone();
+    dc.on_message(Box::new(move |msg: DataChannelMessage| {
+        let state = state_clone.clone();
+        let session_id = session_id.clone();
+        Box::pin(async move {
+            match parse_action_ack(&msg) {
+                Ok(ack) => {
+                    if let Err(err) = state.ack_actions(&session_id, vec![ack], None, true).await {
+                        warn!(
+                            target = "fast_path",
+                            session_id = %session_id,
+                            error = %err,
+                            "failed to persist ack from fast-path"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        target = "fast_path",
+                        session_id = %session_id,
+                        error = %err,
+                        "failed to parse ack message from fast-path channel"
+                    );
+                    if let Some((pb, sess)) = state.session_metrics_labels(&session_id).await {
+                        metrics::FASTPATH_CHANNEL_ERRORS
+                            .with_label_values(&[pb.as_str(), sess.as_str(), "mgr-acks"])
+                            .inc();
+                    }
+                }
+            }
+        })
+    }));
+
+    let session_close = session.clone();
+    dc.on_close(Box::new(move || {
+        let session = session_close.clone();
+        let state = state_for_close.clone();
+        Box::pin(async move {
+            session.clear_ack_channel().await;
+            info!(
+                session_id = %session.session_id,
+                "fast-path ack channel closed"
+            );
+            if let Some((pb, sess)) = state.session_metrics_labels(&session.session_id).await {
+                metrics::FASTPATH_CHANNEL_CLOSED
+                    .with_label_values(&[pb.as_str(), sess.as_str(), "mgr-acks"])
+                    .inc();
+            }
+        })
+    }));
+
+    let session_error = session.clone();
+    dc.on_error(Box::new(move |err| {
+        let session = session_error.clone();
+        let state = state_for_error.clone();
+        Box::pin(async move {
+            warn!(
+                target = "fast_path",
+                session_id = %session.session_id,
+                error = %err,
+                "fast-path ack channel error"
+            );
+            if let Some((pb, sess)) = state.session_metrics_labels(&session.session_id).await {
+                metrics::FASTPATH_CHANNEL_ERRORS
+                    .with_label_values(&[pb.as_str(), sess.as_str(), "mgr-acks"])
+                    .inc();
+            }
+        })
+    }));
+}
+
+fn install_state_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>, state: AppState) {
+    let session_id = session.session_id.clone();
+    let state_clone = state.clone();
+    let state_for_close = state.clone();
+    let state_for_error = state.clone();
+    dc.on_message(Box::new(move |msg: DataChannelMessage| {
+        let state = state_clone.clone();
+        let session_id = session_id.clone();
+        Box::pin(async move {
+            match parse_state_diff(&msg) {
+                Ok(diff) => {
+                    if let Err(err) = state.record_state(&session_id, diff, true).await {
+                        warn!(
+                            target = "fast_path",
+                            session_id = %session_id,
+                            error = %err,
+                            "failed to persist state diff from fast-path"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        target = "fast_path",
+                        session_id = %session_id,
+                        error = %err,
+                        "failed to parse state message from fast-path channel"
+                    );
+                    if let Some((pb, sess)) = state.session_metrics_labels(&session_id).await {
+                        metrics::FASTPATH_CHANNEL_ERRORS
+                            .with_label_values(&[pb.as_str(), sess.as_str(), "mgr-state"])
+                            .inc();
+                    }
+                }
+            }
+        })
+    }));
+
+    let session_close = session.clone();
+    dc.on_close(Box::new(move || {
+        let session = session_close.clone();
+        let state = state_for_close.clone();
+        Box::pin(async move {
+            session.clear_state_channel().await;
+            info!(
+                session_id = %session.session_id,
+                "fast-path state channel closed"
+            );
+            if let Some((pb, sess)) = state.session_metrics_labels(&session.session_id).await {
+                metrics::FASTPATH_CHANNEL_CLOSED
+                    .with_label_values(&[pb.as_str(), sess.as_str(), "mgr-state"])
+                    .inc();
+            }
+        })
+    }));
+
+    let session_error = session.clone();
+    dc.on_error(Box::new(move |err| {
+        let session = session_error.clone();
+        let state = state_for_error.clone();
+        Box::pin(async move {
+            warn!(
+                target = "fast_path",
+                session_id = %session.session_id,
+                error = %err,
+                "fast-path state channel error"
+            );
+            if let Some((pb, sess)) = state.session_metrics_labels(&session.session_id).await {
+                metrics::FASTPATH_CHANNEL_ERRORS
+                    .with_label_values(&[pb.as_str(), sess.as_str(), "mgr-state"])
+                    .inc();
+            }
+        })
+    }));
+}
+
+fn parse_action_ack(msg: &DataChannelMessage) -> anyhow::Result<ActionAck> {
+    if !msg.is_string {
+        anyhow::bail!("expected text ack payload");
+    }
+    let text = String::from_utf8(msg.data.to_vec())?;
+    let envelope: AckEnvelope = serde_json::from_str(&text)?;
+    if envelope.kind != "ack" {
+        anyhow::bail!("unexpected message type {}", envelope.kind);
+    }
+    Ok(envelope.payload)
+}
+
+fn parse_state_diff(msg: &DataChannelMessage) -> anyhow::Result<StateDiff> {
+    if !msg.is_string {
+        anyhow::bail!("expected text state payload");
+    }
+    let text = String::from_utf8(msg.data.to_vec())?;
+    let envelope: StateEnvelope = serde_json::from_str(&text)?;
+    if envelope.kind != "state" {
+        anyhow::bail!("unexpected message type {}", envelope.kind);
+    }
+    Ok(envelope.payload)
+}
+
+#[derive(Deserialize, Serialize)]
+struct AckEnvelope {
+    #[serde(rename = "type")]
+    kind: String,
+    payload: ActionAck,
+}
+
+#[derive(Deserialize, Serialize)]
+struct StateEnvelope {
+    #[serde(rename = "type")]
+    kind: String,
+    payload: StateDiff,
+}
+
+enum ChannelKind {
+    Acks,
+    State,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[test]
+    fn parses_ack_envelope() {
+        let base_ack = ActionAck {
+            id: "a1".into(),
+            status: beach_buggy::AckStatus::Ok,
+            applied_at: std::time::SystemTime::now(),
+            latency_ms: Some(5),
+            error_code: None,
+            error_message: None,
+        };
+        let msg = DataChannelMessage {
+            is_string: true,
+            data: Bytes::from(
+                serde_json::to_string(&AckEnvelope {
+                    kind: "ack".into(),
+                    payload: base_ack.clone(),
+                })
+                .unwrap(),
+            ),
+        };
+        let ack = parse_action_ack(&msg).expect("parsed ack");
+        assert_eq!(ack.id, "a1");
+    }
+
+    #[test]
+    fn parses_state_envelope() {
+        let base_diff = StateDiff {
+            sequence: 7,
+            emitted_at: std::time::SystemTime::now(),
+            payload: serde_json::json!({"ops": []}),
+        };
+        let msg = DataChannelMessage {
+            is_string: true,
+            data: Bytes::from(
+                serde_json::to_string(&StateEnvelope {
+                    kind: "state".into(),
+                    payload: base_diff.clone(),
+                })
+                .unwrap(),
+            ),
+        };
+        let diff = parse_state_diff(&msg).expect("parsed state");
+        assert_eq!(diff.sequence, 7);
+    }
 }

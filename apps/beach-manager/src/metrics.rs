@@ -179,6 +179,32 @@ pub static MANAGER_VIEWER_IDLE_RECOVERIES: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+pub static CONTROLLER_PAIRINGS_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let g = IntGaugeVec::new(
+        Opts::new(
+            "controller_pairings_active",
+            "Active controller pairings per controller session",
+        ),
+        &["private_beach_id", "controller_session_id"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(g.clone())).ok();
+    g
+});
+
+pub static CONTROLLER_PAIRINGS_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "controller_pairings_events_total",
+            "Total controller pairing add/remove events",
+        ),
+        &["private_beach_id", "controller_session_id", "action"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
 pub static ACTION_LATENCY_MS: Lazy<HistogramVec> = Lazy::new(|| {
     let h = HistogramVec::new(
         HistogramOpts::new(
@@ -193,6 +219,84 @@ pub static ACTION_LATENCY_MS: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap();
     REGISTRY.register(Box::new(h.clone())).ok();
     h
+});
+
+pub static FASTPATH_ACTIONS_SENT: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "fastpath_actions_sent_total",
+            "Actions delivered over fast-path data channels",
+        ),
+        &["private_beach_id", "session_id"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+pub static FASTPATH_ACTIONS_FALLBACK: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "fastpath_actions_fallback_total",
+            "Actions that attempted fast-path but fell back to brokered delivery",
+        ),
+        &["private_beach_id", "session_id"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+pub static FASTPATH_ACKS_RECEIVED: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "fastpath_acks_received_total",
+            "Action acknowledgements received via fast-path",
+        ),
+        &["private_beach_id", "session_id"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+pub static FASTPATH_STATE_RECEIVED: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "fastpath_state_received_total",
+            "State diffs received via fast-path",
+        ),
+        &["private_beach_id", "session_id"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+pub static FASTPATH_CHANNEL_CLOSED: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "fastpath_channel_closed_total",
+            "Fast-path data channel closures observed by the manager",
+        ),
+        &["private_beach_id", "session_id", "channel"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+pub static FASTPATH_CHANNEL_ERRORS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "fastpath_channel_errors_total",
+            "Fast-path data channel errors / parse failures observed by the manager",
+        ),
+        &["private_beach_id", "session_id", "channel"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
 });
 
 pub fn export_prometheus() -> String {

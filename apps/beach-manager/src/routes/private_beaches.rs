@@ -210,6 +210,11 @@ fn map_state_err(err: StateError) -> ApiError {
     match err {
         StateError::SessionNotFound => ApiError::NotFound("session not found"),
         StateError::ControllerMismatch => ApiError::Conflict("controller mismatch"),
+        StateError::ControllerLeaseRequired => ApiError::Forbidden("controller lease required"),
+        StateError::ControllerPairingNotFound => ApiError::NotFound("controller pairing not found"),
+        StateError::CrossBeachPairing => {
+            ApiError::BadRequest("sessions must belong to the same private beach".into())
+        }
         StateError::PrivateBeachNotFound => ApiError::NotFound("private beach not found"),
         StateError::InvalidIdentifier(msg) => ApiError::BadRequest(msg),
         StateError::Database(e) => {

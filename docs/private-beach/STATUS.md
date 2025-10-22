@@ -5,6 +5,8 @@ This document captures what’s built, how to run it locally, what’s left, and
 ## TL;DR
 - Manager (Rust) persists sessions, leases, and controller events in Postgres; commands/health/state use Redis Streams + TTL caches; the manager viewer worker (WebRTC) is authoritative and `/sessions/:id/events/stream` has been removed (only the state SSE remains as legacy fallback). RLS is enforced via GUC.
 - Surfer/Private Beach (Next.js) are Clerk-gated, stream live previews through the shared `BeachTerminal`, and now surface security/latency badges plus reconnect messaging. Cabana sessions still use the media player, drawers poll `controller-events` over REST, and browsers fetch Gate-signed viewer tokens from Manager instead of passcodes.
+- Controller pairing UX uses the live `/sessions/:controller_id/controllers` APIs end-to-end: drag/drop overlays announce the target (“Drop controller here” → “Release to pair”), the accessible Pair button launches the same modal, and badges/modal fields update instantly as SSE payloads arrive (including transport status/prompts).
+- Front-end coverage exercises the SSE flow via mocked `EventSource` streams (Vitest + Playwright), ensuring badges, summaries, and the modal stay in sync with backend events.
 - Fast‑path (WebRTC) is scaffolded in the manager with answerer endpoints and routing to send actions over data channels when available. Harness‑side fast‑path client is next.
 - WebRTC refactor plan captured in `docs/private-beach/webrtc-refactor/plan.md`; the HTTP frame pump has been retired in favor of Manager joining sessions as a standard Beach client.
 
@@ -110,6 +112,11 @@ Against api.beach.sh:
   - Tabs: By Code (verifies with Road via Manager), My Sessions (lists from Road, bulk attach), Launch New (copyable CLI).
 
 ## Handoff TODOs (Ordered)
+0. Controller drag & drop MVP (priority demo track):
+   - Backend: add controller pairing schema and `POST/DELETE/GET /sessions/:id/controllers` (+ MCP equivalents) with basic prompt/cadence config.
+   - Harness: subscribe to pairings, auto-manage leases, watch child over fast-path, honour prompt/update cadence, log fallback to HTTP.
+   - Surfer: drag tile onto tile to assign control, modal for config, tile badges + pairing drawer, edit/remove actions.
+   - Validation: extend fast-path smoke script with pairing steps, capture metrics/events for Grafana.
 1. Surfer session tiles (next UX pass):
    - Persist drag-resize layout per beach (local storage for now, Manager layout API once it lands).
    - Provide a maximize/pop-out view that keeps the mini preview alive.
@@ -120,10 +127,13 @@ Against api.beach.sh:
    - Back-pressure + batching; fallback to Redis/HTTP if channel drops.
    - Kickoff June 19: manager transport hints now expose fast-path endpoints/channel labels; harness crate includes parsing scaffold (`crates/beach-buggy/src/fast_path.rs`).
    - June 19 update: `FastPathClient::connect` now performs SDP/ICE negotiation and surfaces an action broadcast + ack/state send helpers (integration with main harness loop still pending).
+   - June 19 update: harness transport prefers fast-path channels for actions/acks/state with automatic HTTP fallback (`crates/beach-buggy/src/lib.rs`).
 3. Manager fast‑path receive loops:
    - Listen on `mgr-acks` and call `ack_actions` with parsed acks (feed histograms/metrics as done for REST path).
    - Listen on `mgr-state` and call `record_state` (mirror to Redis + session_runtime).
    - Make both optional (feature flag) and observable (counters).
+   - June 19 update: receive loops now run inside `FastPathSession::spawn_receivers`; acks/state payloads land in Redis/Postgres while HTTP remains fallback.
+   - June 19 update: fast-path telemetry counters (`fastpath_actions_sent_total`, `fastpath_actions_fallback_total`, `fastpath_acks_received_total`, `fastpath_state_received_total`, `fastpath_channel_{closed,errors}_total`) now publish at `/metrics` for Grafana dashboards/alerts.
 4. Surfer UX phase (see roadmap Phase 4):
    - Design system + components, IA, search/filtering, accessibility, performance budgets, polished session detail.
    - Auth via Beach Gate (OIDC); remove `access_token` query fallback.

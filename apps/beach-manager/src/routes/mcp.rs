@@ -5,7 +5,7 @@ use serde_json::Value;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::state::{AppState, StateError};
+use crate::state::{AppState, ControllerUpdateCadence, StateError};
 
 use super::AuthToken;
 
@@ -82,6 +82,25 @@ struct AckActionsParams {
 #[derive(Debug, Deserialize)]
 struct SubscribeParams {
     session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListPairingsParams {
+    controller_session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreatePairingParams {
+    controller_session_id: String,
+    child_session_id: String,
+    prompt_template: Option<String>,
+    update_cadence: Option<ControllerUpdateCadence>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeletePairingParams {
+    controller_session_id: String,
+    child_session_id: String,
 }
 
 pub async fn handle_mcp(
@@ -162,6 +181,61 @@ pub async fn handle_mcp(
                 Err(err) => invalid_params(id, err),
             }
         }
+        "private_beach.controller_pairings.list" => {
+            if let Some(resp) = require_scope(&token, &id, "pb:control.write") {
+                return Json(resp);
+            }
+            match decode_params::<ListPairingsParams>(request.params) {
+                Ok(params) => match state
+                    .list_controller_pairings(&params.controller_session_id)
+                    .await
+                {
+                    Ok(rows) => success(id, rows),
+                    Err(err) => state_error(id, err),
+                },
+                Err(err) => invalid_params(id, err),
+            }
+        }
+        "private_beach.controller_pairings.create" => {
+            if let Some(resp) = require_scope(&token, &id, "pb:control.write") {
+                return Json(resp);
+            }
+            match decode_params::<CreatePairingParams>(request.params) {
+                Ok(params) => match state
+                    .upsert_controller_pairing(
+                        &params.controller_session_id,
+                        &params.child_session_id,
+                        params.prompt_template.clone(),
+                        params.update_cadence,
+                        token.account_uuid(),
+                    )
+                    .await
+                {
+                    Ok(pairing) => success(id, pairing),
+                    Err(err) => state_error(id, err),
+                },
+                Err(err) => invalid_params(id, err),
+            }
+        }
+        "private_beach.controller_pairings.delete" => {
+            if let Some(resp) = require_scope(&token, &id, "pb:control.write") {
+                return Json(resp);
+            }
+            match decode_params::<DeletePairingParams>(request.params) {
+                Ok(params) => match state
+                    .delete_controller_pairing(
+                        &params.controller_session_id,
+                        &params.child_session_id,
+                        token.account_uuid(),
+                    )
+                    .await
+                {
+                    Ok(_) => success(id, serde_json::json!({ "deleted": true })),
+                    Err(err) => state_error(id, err),
+                },
+                Err(err) => invalid_params(id, err),
+            }
+        }
         "private_beach.queue_action" => {
             if let Some(resp) = require_scope(&token, &id, "pb:control.write") {
                 resp
@@ -189,7 +263,7 @@ pub async fn handle_mcp(
             } else {
                 match decode_params::<AckActionsParams>(request.params) {
                     Ok(params) => match state
-                        .ack_actions(&params.session_id, params.acks, token.account_uuid())
+                        .ack_actions(&params.session_id, params.acks, token.account_uuid(), false)
                         .await
                     {
                         Ok(_) => success(id, serde_json::json!({ "acknowledged": true })),
@@ -266,6 +340,12 @@ fn state_error(id: Option<Value>, err: StateError) -> JsonRpcResponse {
     let (code, message) = match &err {
         StateError::SessionNotFound => (-32004, "session not found".into()),
         StateError::ControllerMismatch => (-32005, "controller mismatch".into()),
+        StateError::ControllerLeaseRequired => (-32007, "controller lease required".into()),
+        StateError::ControllerPairingNotFound => (-32008, "controller pairing not found".into()),
+        StateError::CrossBeachPairing => (
+            -32602,
+            "sessions must belong to the same private beach".into(),
+        ),
         StateError::PrivateBeachNotFound => (-32006, "private beach not found".into()),
         StateError::InvalidIdentifier(reason) => (-32602, reason.clone()),
         StateError::Database(db_err) => {

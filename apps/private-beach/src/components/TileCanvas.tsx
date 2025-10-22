@@ -1,7 +1,15 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type DragEvent as ReactDragEvent } from 'react';
 import dynamic from 'next/dynamic';
 import type { Layout } from 'react-grid-layout';
-import { SessionSummary, acquireController, emergencyStop, releaseController, type BeachLayoutItem } from '../lib/api';
+import {
+  SessionSummary,
+  acquireController,
+  emergencyStop,
+  releaseController,
+  type BeachLayoutItem,
+  type ControllerPairing,
+} from '../lib/api';
+import { formatCadenceLabel, pairingStatusDisplay } from '../lib/pairings';
 import { debugLog } from '../lib/debug';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
@@ -18,6 +26,9 @@ type Props = {
   preset?: 'grid2x2' | 'onePlusThree' | 'focus';
   savedLayout?: BeachLayoutItem[];
   onLayoutPersist?: (layout: BeachLayoutItem[]) => void;
+  pairings: ControllerPairing[];
+  onBeginPairing: (controllerSessionId: string | null, childSessionId: string | null) => void;
+  onEditPairing: (pairing: ControllerPairing) => void;
 };
 
 const AutoGrid = dynamic(() => import('./AutoGrid'), {
@@ -172,10 +183,15 @@ export default function TileCanvas({
   preset = 'grid2x2',
   savedLayout,
   onLayoutPersist,
+  pairings,
+  onBeginPairing,
+  onEditPairing,
 }: Props) {
   const [cache, setCache] = useState<LayoutCache>({});
   const [expanded, setExpanded] = useState<SessionSummary | null>(null);
   const [isClient, setIsClient] = useState(false);
+  const [draggingControllerId, setDraggingControllerId] = useState<string | null>(null);
+  const [dropTargetId, setDropTargetId] = useState<string | null>(null);
 
   const renderNow = Date.now();
 
@@ -272,6 +288,87 @@ export default function TileCanvas({
     [handleLayoutCommit],
   );
 
+  const pairingIndex = useMemo(() => {
+    const byController = new Map<string, ControllerPairing[]>();
+    const byChild = new Map<string, ControllerPairing>();
+    const byKey = new Map<string, ControllerPairing>();
+    pairings.forEach((pairing) => {
+      if (!byController.has(pairing.controller_session_id)) {
+        byController.set(pairing.controller_session_id, []);
+      }
+      byController.get(pairing.controller_session_id)!.push(pairing);
+      if (!byChild.has(pairing.child_session_id)) {
+        byChild.set(pairing.child_session_id, pairing);
+      }
+      byKey.set(`${pairing.controller_session_id}|${pairing.child_session_id}`, pairing);
+    });
+    return { byController, byChild, byKey };
+  }, [pairings]);
+
+  const handleControllerDragStart = useCallback(
+    (event: ReactDragEvent<HTMLElement>, controllerId: string) => {
+      if (!event.dataTransfer) return;
+      event.dataTransfer.effectAllowed = 'copy';
+      event.dataTransfer.setData('application/x-private-beach-controller', controllerId);
+      event.dataTransfer.setData('text/plain', controllerId);
+      setDraggingControllerId(controllerId);
+      setDropTargetId(null);
+    },
+    [],
+  );
+
+  const resetControllerDrag = useCallback(() => {
+    setDraggingControllerId(null);
+    setDropTargetId(null);
+  }, []);
+
+  const handleTileDragOver = useCallback(
+    (event: ReactDragEvent<HTMLDivElement>, targetId: string) => {
+      const controllerId =
+        draggingControllerId || event.dataTransfer?.getData('application/x-private-beach-controller');
+      if (!controllerId || controllerId === targetId) {
+        return;
+      }
+      event.preventDefault();
+      if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = 'copy';
+      }
+      setDropTargetId(targetId);
+    },
+    [draggingControllerId],
+  );
+
+  const handleTileDragLeave = useCallback(
+    (event: ReactDragEvent<HTMLDivElement>, targetId: string) => {
+      if (dropTargetId !== targetId) return;
+      const nextTarget = event.relatedTarget as Node | null;
+      if (nextTarget && event.currentTarget.contains(nextTarget)) {
+        return;
+      }
+      setDropTargetId(null);
+    },
+    [dropTargetId],
+  );
+
+  const handleTileDrop = useCallback(
+    (event: ReactDragEvent<HTMLDivElement>, targetId: string) => {
+      event.preventDefault();
+      const controllerId =
+        event.dataTransfer?.getData('application/x-private-beach-controller') || draggingControllerId;
+      resetControllerDrag();
+      if (!controllerId || controllerId === targetId) {
+        return;
+      }
+      const existing = pairingIndex.byKey.get(`${controllerId}|${targetId}`);
+      if (existing) {
+        onEditPairing(existing);
+        return;
+      }
+      onBeginPairing(controllerId, targetId);
+    },
+    [draggingControllerId, resetControllerDrag, pairingIndex.byKey, onBeginPairing, onEditPairing],
+  );
+
   const handleAcquire = async (sessionId: string) => {
     const tokenPresent = Boolean(managerToken && managerToken.trim().length > 0);
     debugLog('tile-session', 'acquire requested', { sessionId, tokenPresent });
@@ -345,8 +442,22 @@ export default function TileCanvas({
           const expires = s.controller_expires_at_ms || 0;
           const remain = Math.max(0, expires - now);
           const countdown = s.controller_token ? `${Math.floor(remain / 1000)}s` : '';
+          const isDropTarget = dropTargetId === s.session_id;
+          const showDropOverlay = Boolean(draggingControllerId && draggingControllerId !== s.session_id);
+          const controllerPairings = pairingIndex.byController.get(s.session_id) ?? [];
+          const controlledBy = pairingIndex.byChild.get(s.session_id);
           return (
-            <div key={s.session_id} className="flex h-full flex-col overflow-hidden rounded-xl border border-border bg-card text-card-foreground shadow-sm">
+            <div
+              key={s.session_id}
+              className={`flex h-full flex-col overflow-hidden rounded-xl border bg-card text-card-foreground shadow-sm transition-shadow ${
+                isDropTarget ? 'border-primary shadow-[0_0_0_2px_rgba(59,130,246,0.35)]' : 'border-border'
+              }`}
+              data-session-id={s.session_id}
+              onDragOver={(e) => handleTileDragOver(e, s.session_id)}
+              onDragEnter={(e) => handleTileDragOver(e, s.session_id)}
+              onDragLeave={(e) => handleTileDragLeave(e, s.session_id)}
+              onDrop={(e) => handleTileDrop(e, s.session_id)}
+            >
               <div className="flex items-center justify-between border-b border-border bg-muted/60 px-3 py-2 backdrop-blur dark:bg-muted/30">
                 <div className="session-tile-drag-grip flex cursor-grab items-center gap-2 text-xs text-muted-foreground active:cursor-grabbing" role="button" tabIndex={0}>
                   <span className="rounded border border-border/60 bg-background/80 px-1 font-mono text-[11px] tracking-tight">{s.session_id.slice(0, 8)}</span>
@@ -354,11 +465,26 @@ export default function TileCanvas({
                   <Badge variant={s.last_health?.degraded ? 'warning' : 'success'}>{s.last_health?.degraded ? 'degraded' : 'healthy'}</Badge>
                   <Badge variant="muted">{s.pending_actions}/{s.pending_unacked}</Badge>
                   {s.controller_token && <Badge variant="muted">{countdown}</Badge>}
+                  {controllerPairings.length > 0 && (
+                    <Badge variant="muted">{controllerPairings.length} controlling</Badge>
+                  )}
+                  {controlledBy && <Badge variant="muted">child</Badge>}
                 </div>
                 <div className="session-tile-actions flex items-center gap-2">
                   <Button size="sm" variant="ghost" onClick={() => onSelect(s)}>Details</Button>
                   <Button size="sm" variant="ghost" onClick={() => setExpanded(s)}>Expand ⤢</Button>
                   <Button size="sm" variant="ghost" onClick={() => onRemove(s.session_id)}>Remove</Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    draggable
+                    onDragStart={(event) => handleControllerDragStart(event, s.session_id)}
+                    onDragEnd={resetControllerDrag}
+                    onClick={() => onBeginPairing(s.session_id, null)}
+                    aria-label={`Pair controller ${s.session_id.slice(0, 8)}`}
+                  >
+                    Pair
+                  </Button>
                 </div>
               </div>
               <div className="relative flex min-h-0 flex-1 bg-neutral-900">
@@ -370,6 +496,23 @@ export default function TileCanvas({
                   harnessType={s.harness_type}
                   className="w-full"
                 />
+                <div
+                  className={`absolute inset-0 rounded-b-xl transition-all ${
+                    showDropOverlay ? 'pointer-events-auto' : 'pointer-events-none'
+                  } ${isDropTarget ? 'border-2 border-primary/60 bg-primary/10' : 'border-2 border-transparent'}`}
+                  onDragOver={(e) => handleTileDragOver(e, s.session_id)}
+                  onDragEnter={(e) => handleTileDragOver(e, s.session_id)}
+                  onDragLeave={(e) => handleTileDragLeave(e, s.session_id)}
+                  onDrop={(e) => handleTileDrop(e, s.session_id)}
+                  aria-hidden={!showDropOverlay}
+                  data-testid={`pairing-drop-overlay-${s.session_id}`}
+                >
+                  {showDropOverlay && (
+                    <div className="flex h-full w-full items-center justify-center text-xs font-medium text-primary">
+                      {isDropTarget ? 'Release to pair' : 'Drop controller here'}
+                    </div>
+                  )}
+                </div>
               </div>
               <div className="border-t border-border px-3 py-2">
                 <div className="flex items-center justify-between">
@@ -384,6 +527,37 @@ export default function TileCanvas({
                   </div>
                   <div className="text-[11px] text-muted-foreground">{s.location_hint || '—'}</div>
                 </div>
+                {(controllerPairings.length > 0 || controlledBy) && (
+                  <div className="mt-2 space-y-1 text-[11px]">
+                    {controllerPairings.map((pairing) => {
+                      const childShort = pairing.child_session_id.slice(0, 8);
+                      const status = pairingStatusDisplay(pairing);
+                      const cadence = formatCadenceLabel(pairing.update_cadence);
+                      return (
+                        <div
+                          key={pairing.pairing_id ?? `${pairing.controller_session_id}|${pairing.child_session_id}`}
+                          className="flex flex-wrap items-center gap-2 text-muted-foreground"
+                        >
+                          <Badge variant="muted">→ {childShort}</Badge>
+                          <Badge variant={status.variant}>{status.label}</Badge>
+                          <Badge variant="muted">{cadence}</Badge>
+                        </div>
+                      );
+                    })}
+                    {controlledBy && (() => {
+                      const status = pairingStatusDisplay(controlledBy);
+                      const cadence = formatCadenceLabel(controlledBy.update_cadence);
+                      const controllerShort = controlledBy.controller_session_id.slice(0, 8);
+                      return (
+                        <div className="flex flex-wrap items-center gap-2 text-muted-foreground">
+                          <Badge variant="muted">← {controllerShort}</Badge>
+                          <Badge variant={status.variant}>{status.label}</Badge>
+                          <Badge variant="muted">{cadence}</Badge>
+                        </div>
+                      );
+                    })()}
+                  </div>
+                )}
               </div>
             </div>
           );

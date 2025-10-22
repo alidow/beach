@@ -44,6 +44,38 @@ Each milestone rises on the previous one; we only start M4 after the fast-path/U
   - *Risk:* RLS regressions. *Mitigation:* Add integration tests + manual QA script.
   - *Risk:* Layout migration churn. *Mitigation:* Maintain migration helpers and fallback seed data.
 
+## Priority Track — Controller Drag & Drop MVP (June 2025)
+- **Goal**: Deliver an end-to-end demo-quality workflow where a Private Beach operator can drag one tile onto another in the web app, configure a lightweight control relationship, and have the harness drive the child session over the fast-path transport.
+- **Why now**: Enables internal dogfooding and the Pong showcase without waiting for the full GA scope. Builds directly on the fast-path work just landed.
+- **Scope (Phase split for parallel teams)**
+  - **Track A — Backend & Harness**
+    1. Add controller relationship schema (`controller_pairing`) with minimal config (prompt template, update cadence).
+    2. REST/MCP endpoints:
+       - `POST /sessions/:controller_id/controllers` → validate lease + beach membership, persist pairing, emit events.
+       - `DELETE /sessions/:controller_id/controllers/:child_id`.
+       - `GET /sessions/:controller_id/controllers`.
+    3. Extend harness runtime (CLI + Cabana adapters) to:
+       - Subscribe to pairing updates (reuse MCP or add `/controllers/stream` SSE).
+       - Auto-renew controller lease and watch child over fast-path.
+       - Respect prompt/cadence config (log-friendly prototype).
+    4. Emit pairing events/metrics (controller assignment count, fast-path status) and update `fast-path-validation.md` smoke script.
+  - **Track B — Web App UX**
+    1. ✅ Implement drag-and-drop on the tile canvas (fallback button for accessibility) — shipped via `TileCanvas` DnD handle + Pair button (Codex, 2025-06-24).
+    2. ✅ Modal to configure pairing (prompt text, update cadence radio/select) — new `ControllerPairingModal` with accessible selects + API wiring.
+    3. ✅ Tile indicators (“controlling X”, “controlled by Y”), quick actions to edit/remove relationships — badges now surface pairings on tiles with configure/remove hooks.
+    4. ✅ Drawer section summarising active pairings + status (fast-path vs fallback) using new metrics/events — delivered as controller pairing summary panel with transport badges.
+    5. ✅ React Testing Library coverage: drag controller → child, confirm badges + pairing list.
+        - NOTE: Frontend now surfaces a `controller pairing API not enabled` warning when Track A endpoints are absent so local devs aren’t blocked; upgrade manager once backend lands.
+- **Exit Criteria**
+  - Drag/drop controller assignment works locally (Docker + TURN disabled).
+  - Harness applies controller actions over fast-path within 1s of child diff; fallback path remains intact.
+  - Basic events/metrics land in `/metrics` and `docs/private-beach.log`.
+  - Runbook (`docs/private-beach/fast-path-validation.md`) updated with pairing steps.
+- **Risks/Mitigations**
+  - Schema churn → keep config minimal JSON, mark as experiment.
+  - Harness update lag → release CLI/Cabana dev builds alongside feature branch.
+  - UX complexity → favour simple modal copy; document future enhancements separately.
+
 ## M1 — Surfer UX Foundations (Phase 4)
 - **Goals**
   - Establish the dedicated Private Beach design system, IA, and accessibility/performance baseline.
@@ -72,15 +104,16 @@ Each milestone rises on the previous one; we only start M4 after the fast-path/U
   - Deliver low-latency command path and visibility into action queues and harness freshness.
 - **Key Tasks**
   0. ✅ Emit actionable transport hints: manager registration now surfaces fast-path offer/ICE endpoints + channel labels.
-  0. ✅ Add harness-side fast-path parsing/scaffold (`crates/beach-buggy/src/fast_path.rs`) for WebRTC negotiation metadata.
-  0. ✅ Establish fast-path handshake: harness client negotiates SDP/ICE, provides action stream + ack/state helpers (still pending integration with harness main loop).
+ 0. ✅ Add harness-side fast-path parsing/scaffold (`crates/beach-buggy/src/fast_path.rs`) for WebRTC negotiation metadata.
+ 0. ✅ Establish fast-path handshake: harness client negotiates SDP/ICE, provides action stream + ack/state helpers (still pending integration with harness main loop).
   1. **Fast-path transport**
-     - Harness-side WebRTC client establishes `mgr-actions`, `mgr-acks`, `mgr-state`.
+     - ✅ Harness runtime now prefers `mgr-actions`/`mgr-acks`/`mgr-state` data channels with automatic HTTP fallback (`crates/beach-buggy/src/lib.rs`).
      - Manager receive loops parse `mgr-acks` → `ack_actions`, `mgr-state` → `record_state`.
      - Feature flag + telemetry counters (`fastpath_actions_sent_total`, etc.).
   2. **Latency & freshness instrumentation**
      - Action ack histograms, harness freshness badges, queue depth surface in Surfer.
      - Prometheus alerts for pending depth, ack timeout, and freshness thresholds.
+     - ✅ Fast-path counters for send/fallback/acks/state + channel closure/error rates exposed in `/metrics`.
   3. **Controller UX**
      - Countdown overlays, manual takeover confirmations, emergency stop validation.
   4. **Session onboarding hardening**
@@ -89,6 +122,8 @@ Each milestone rises on the previous one; we only start M4 after the fast-path/U
   5. **Schema artifact + CI follow-through**
      - Drizzle/enum artifacts automated.
      - Docker-backed integration tests for Postgres/Redis, fast-path mock test.
+  6. **Validation & ops guides**
+      - ✅ Document automated + manual validation plan, including TURN/STUN knobs (`docs/private-beach/fast-path-validation.md`).
 - **Dependencies**
   - Rust manager state (`AppState`), `beach-buggy` harness crate.
   - Surfer telemetry surfaces from M1.

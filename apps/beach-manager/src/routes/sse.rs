@@ -36,6 +36,25 @@ pub async fn stream_state(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
+pub async fn stream_controller_pairings(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(controller_session_id): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    ensure_scope(&token, "pb:control.write")?;
+    let rx = state.subscribe_session(&controller_session_id).await;
+    let stream = BroadcastStream::new(rx)
+        .filter_map(|msg| match msg {
+            Ok(crate::state::StreamEvent::ControllerPairing(event)) => Some(event),
+            _ => None,
+        })
+        .map(|event| {
+            let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
+            Ok(Event::default().event("controller_pairing").data(data))
+        });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
 fn ensure_scope(token: &AuthToken, scope: &'static str) -> Result<(), ApiError> {
     if token.has_scope(scope) {
         Ok(())

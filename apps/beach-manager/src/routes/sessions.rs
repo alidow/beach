@@ -14,8 +14,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::state::{
-    AgentOnboardResponse, AppState, ControllerEvent, ControllerLeaseResponse,
-    JoinSessionResponsePayload, SessionSummary, StateError,
+    AgentOnboardResponse, AppState, ControllerEvent, ControllerLeaseResponse, ControllerPairing,
+    ControllerUpdateCadence, JoinSessionResponsePayload, SessionSummary, StateError,
 };
 
 use super::{ApiError, ApiResult, AuthToken};
@@ -76,6 +76,13 @@ pub struct AttachByCodeRequest {
 #[derive(Debug, Deserialize)]
 pub struct AttachOwnedRequest {
     pub origin_session_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateControllerPairingRequest {
+    pub child_session_id: String,
+    pub prompt_template: Option<String>,
+    pub update_cadence: Option<ControllerUpdateCadence>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,6 +186,56 @@ pub async fn release_controller(
     Ok(Json(serde_json::json!({ "released": true })))
 }
 
+pub async fn list_controller_pairings_route(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(controller_session_id): Path<String>,
+) -> ApiResult<Vec<ControllerPairing>> {
+    ensure_scope(&token, "pb:control.write")?;
+    let pairings = state
+        .list_controller_pairings(&controller_session_id)
+        .await
+        .map_err(map_state_err)?;
+    Ok(Json(pairings))
+}
+
+pub async fn create_controller_pairing(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(controller_session_id): Path<String>,
+    Json(body): Json<CreateControllerPairingRequest>,
+) -> ApiResult<ControllerPairing> {
+    ensure_scope(&token, "pb:control.write")?;
+    let pairing = state
+        .upsert_controller_pairing(
+            &controller_session_id,
+            &body.child_session_id,
+            body.prompt_template.clone(),
+            body.update_cadence,
+            token.account_uuid(),
+        )
+        .await
+        .map_err(map_state_err)?;
+    Ok(Json(pairing))
+}
+
+pub async fn delete_controller_pairing(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path((controller_session_id, child_session_id)): Path<(String, String)>,
+) -> ApiResult<serde_json::Value> {
+    ensure_scope(&token, "pb:control.write")?;
+    state
+        .delete_controller_pairing(
+            &controller_session_id,
+            &child_session_id,
+            token.account_uuid(),
+        )
+        .await
+        .map_err(map_state_err)?;
+    Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
 pub async fn queue_actions(
     State(state): State<AppState>,
     token: AuthToken,
@@ -224,7 +281,7 @@ pub async fn ack_actions(
 ) -> ApiResult<serde_json::Value> {
     ensure_scope(&token, "pb:control.consume")?;
     state
-        .ack_actions(&session_id, body, token.account_uuid())
+        .ack_actions(&session_id, body, token.account_uuid(), false)
         .await
         .map_err(map_state_err)?;
     Ok(Json(serde_json::json!({ "acknowledged": true })))
@@ -259,7 +316,7 @@ pub async fn push_state(
         "push_state received"
     );
     state
-        .record_state(&session_id, body)
+        .record_state(&session_id, body, false)
         .await
         .map_err(map_state_err)?;
     Ok(Json(serde_json::json!({ "stored": true })))
@@ -417,6 +474,11 @@ fn map_state_err(err: StateError) -> ApiError {
     match err {
         StateError::SessionNotFound => ApiError::NotFound("session not found"),
         StateError::ControllerMismatch => ApiError::Conflict("controller mismatch"),
+        StateError::ControllerLeaseRequired => ApiError::Forbidden("controller lease required"),
+        StateError::ControllerPairingNotFound => ApiError::NotFound("controller pairing not found"),
+        StateError::CrossBeachPairing => {
+            ApiError::BadRequest("sessions must belong to the same private beach".into())
+        }
         StateError::PrivateBeachNotFound => ApiError::NotFound("private beach not found"),
         StateError::InvalidIdentifier(msg) => ApiError::BadRequest(msg),
         StateError::Database(e) => {

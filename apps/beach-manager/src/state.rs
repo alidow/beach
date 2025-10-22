@@ -71,6 +71,7 @@ enum Backend {
 
 struct InnerState {
     sessions: RwLock<HashMap<String, SessionRecord>>,
+    pairings: RwLock<HashMap<String, Vec<ControllerPairing>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -424,6 +425,12 @@ pub enum StateError {
     SessionNotFound,
     #[error("controller token mismatch")]
     ControllerMismatch,
+    #[error("controller lease required")]
+    ControllerLeaseRequired,
+    #[error("controller pairing not found")]
+    ControllerPairingNotFound,
+    #[error("sessions must belong to the same private beach")]
+    CrossBeachPairing,
     #[error("private beach not found")]
     PrivateBeachNotFound,
     #[error("invalid identifier: {0}")]
@@ -476,6 +483,111 @@ pub enum ControllerEventType {
     ActionsAcked,
     HealthReported,
     StateUpdated,
+    PairingAdded,
+    PairingRemoved,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "controller_update_cadence", rename_all = "snake_case")]
+pub enum ControllerUpdateCadence {
+    Fast,
+    Balanced,
+    Slow,
+}
+
+impl Default for ControllerUpdateCadence {
+    fn default() -> Self {
+        ControllerUpdateCadence::Balanced
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingTransportKind {
+    FastPath,
+    HttpFallback,
+    Pending,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PairingTransportStatus {
+    pub transport: PairingTransportKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl PairingTransportStatus {
+    pub fn pending() -> Self {
+        Self {
+            transport: PairingTransportKind::Pending,
+            last_event_ms: None,
+            latency_ms: None,
+            last_error: None,
+        }
+    }
+
+    pub fn fast_path(now_ms: i64) -> Self {
+        Self {
+            transport: PairingTransportKind::FastPath,
+            last_event_ms: Some(now_ms),
+            latency_ms: None,
+            last_error: None,
+        }
+    }
+
+    pub fn http_fallback(now_ms: i64, last_error: Option<String>) -> Self {
+        Self {
+            transport: PairingTransportKind::HttpFallback,
+            last_event_ms: Some(now_ms),
+            latency_ms: None,
+            last_error,
+        }
+    }
+
+    pub fn with_latency(mut self, latency_ms: Option<u64>) -> Self {
+        self.latency_ms = latency_ms;
+        self
+    }
+
+    pub fn with_error(mut self, last_error: Option<String>) -> Self {
+        self.last_error = last_error;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControllerPairing {
+    pub pairing_id: String,
+    pub private_beach_id: String,
+    pub controller_session_id: String,
+    pub child_session_id: String,
+    pub prompt_template: Option<String>,
+    pub update_cadence: ControllerUpdateCadence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_status: Option<PairingTransportStatus>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerPairingAction {
+    Added,
+    Updated,
+    Removed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ControllerPairingEvent {
+    pub controller_session_id: String,
+    pub child_session_id: String,
+    pub action: ControllerPairingAction,
+    pub pairing: Option<ControllerPairing>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -484,6 +596,7 @@ pub enum StreamEvent {
     ControllerEvent(ControllerEvent),
     State(StateDiff),
     Health(HealthHeartbeat),
+    ControllerPairing(ControllerPairingEvent),
 }
 
 impl StreamEvent {
@@ -494,6 +607,9 @@ impl StreamEvent {
             }
             StreamEvent::State(diff) => ("state", serde_json::to_string(diff).ok()),
             StreamEvent::Health(hb) => ("health", serde_json::to_string(hb).ok()),
+            StreamEvent::ControllerPairing(event) => {
+                ("controller_pairing", serde_json::to_string(event).ok())
+            }
         }
     }
 }
@@ -550,6 +666,37 @@ struct ControllerEventRow {
     occurred_at: DateTime<Utc>,
     controller_account_id: Option<Uuid>,
     issued_by_account_id: Option<Uuid>,
+}
+
+#[derive(Debug, FromRow)]
+struct ControllerPairingRow {
+    controller_session_id: Uuid,
+    child_session_id: Uuid,
+    controller_origin_session_id: Uuid,
+    child_origin_session_id: Uuid,
+    prompt_template: Option<String>,
+    update_cadence: ControllerUpdateCadence,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl ControllerPairingRow {
+    fn into_pairing(self, private_beach_id: &Uuid) -> ControllerPairing {
+        ControllerPairing {
+            pairing_id: format!(
+                "{}:{}",
+                self.controller_origin_session_id, self.child_origin_session_id
+            ),
+            private_beach_id: private_beach_id.to_string(),
+            controller_session_id: self.controller_origin_session_id.to_string(),
+            child_session_id: self.child_origin_session_id.to_string(),
+            prompt_template: self.prompt_template,
+            update_cadence: self.update_cadence,
+            transport_status: None,
+            created_at_ms: self.created_at.timestamp_millis(),
+            updated_at_ms: self.updated_at.timestamp_millis(),
+        }
+    }
 }
 
 impl AppState {
@@ -662,11 +809,38 @@ impl AppState {
 
     pub async fn attach_fast_path(&self, session_id: String, fps: FastPathSession) {
         let arc = Arc::new(fps);
+        arc.spawn_receivers(self.clone());
         self.fast_paths.insert(session_id, arc).await;
     }
 
     pub async fn fast_path_for(&self, session_id: &str) -> Option<Arc<FastPathSession>> {
         self.fast_paths.get(session_id).await
+    }
+
+    pub async fn session_metrics_labels(&self, session_id: &str) -> Option<(String, String)> {
+        {
+            let sessions = self.fallback.sessions.read().await;
+            if let Some(record) = sessions.get(session_id) {
+                return Some((record.private_beach_id.clone(), session_id.to_string()));
+            }
+        }
+
+        match &self.backend {
+            Backend::Postgres(pool) => {
+                if let Ok(session_uuid) = Uuid::parse_str(session_id) {
+                    if let Ok(identifiers) =
+                        self.fetch_session_identifiers(pool, &session_uuid).await
+                    {
+                        return Some((
+                            identifiers.private_beach_id.to_string(),
+                            session_uuid.to_string(),
+                        ));
+                    }
+                }
+            }
+            Backend::Memory => {}
+        }
+        None
     }
 
     pub async fn subscribe_session(&self, session_id: &str) -> broadcast::Receiver<StreamEvent> {
@@ -686,6 +860,7 @@ impl AppState {
                 StreamEvent::ControllerEvent(_) => "controller_event",
                 StreamEvent::State(_) => "state",
                 StreamEvent::Health(_) => "health",
+                StreamEvent::ControllerPairing(_) => "controller_pairing",
             };
             if tx.send(event).is_err() {
                 info!(
@@ -693,6 +868,59 @@ impl AppState {
                     event_kind,
                     "no subscribers to receive stream event"
                 );
+            }
+        }
+    }
+
+    async fn publish_pairing_event(
+        &self,
+        controller_session_id: &str,
+        child_session_id: &str,
+        action: ControllerPairingAction,
+        pairing: Option<ControllerPairing>,
+    ) {
+        self.publish(
+            controller_session_id,
+            StreamEvent::ControllerPairing(ControllerPairingEvent {
+                controller_session_id: controller_session_id.to_string(),
+                child_session_id: child_session_id.to_string(),
+                action,
+                pairing,
+            }),
+        )
+        .await;
+    }
+
+    async fn update_pairing_transport_status(
+        &self,
+        child_session_id: &str,
+        status: PairingTransportStatus,
+    ) {
+        let controllers = self.fallback.controllers_for_child(child_session_id).await;
+        if controllers.is_empty() {
+            return;
+        }
+
+        for controller_session_id in controllers {
+            if let Some(updated) = self
+                .fallback
+                .update_pairing_status(&controller_session_id, child_session_id, status.clone())
+                .await
+            {
+                metrics::CONTROLLER_PAIRINGS_EVENTS
+                    .with_label_values(&[
+                        updated.private_beach_id.as_str(),
+                        controller_session_id.as_str(),
+                        pairing_action_label(&ControllerPairingAction::Updated),
+                    ])
+                    .inc();
+                self.publish_pairing_event(
+                    &controller_session_id,
+                    child_session_id,
+                    ControllerPairingAction::Updated,
+                    Some(updated),
+                )
+                .await;
             }
         }
     }
@@ -1123,6 +1351,463 @@ impl AppState {
         }
     }
 
+    pub async fn list_controller_pairings(
+        &self,
+        controller_session_id: &str,
+    ) -> Result<Vec<ControllerPairing>, StateError> {
+        match &self.backend {
+            Backend::Memory => {
+                let record = {
+                    let sessions = self.fallback.sessions.read().await;
+                    sessions.get(controller_session_id).cloned()
+                }
+                .ok_or(StateError::SessionNotFound)?;
+
+                if record.controller_token.is_none() {
+                    return Err(StateError::ControllerLeaseRequired);
+                }
+
+                let pairings = self.fallback.list_pairings(controller_session_id).await;
+                let label0 = record.private_beach_id.clone();
+                metrics::CONTROLLER_PAIRINGS_ACTIVE
+                    .with_label_values(&[label0.as_str(), controller_session_id])
+                    .set(pairings.len() as i64);
+                Ok(pairings)
+            }
+            Backend::Postgres(pool) => {
+                let controller_uuid = parse_uuid(controller_session_id, "controller_session_id")?;
+                let identifiers = self
+                    .fetch_session_identifiers(pool, &controller_uuid)
+                    .await?;
+                let lease = match self.fetch_active_lease(pool, identifiers.session_id).await {
+                    Ok(row) => row,
+                    Err(StateError::ControllerMismatch) => {
+                        return Err(StateError::ControllerLeaseRequired)
+                    }
+                    Err(err) => return Err(err),
+                };
+                if !is_active_lease(lease.expires_at, lease.revoked_at) {
+                    return Err(StateError::ControllerLeaseRequired);
+                }
+
+                let mut tx = pool.begin().await?;
+                self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
+                    .await?;
+                let rows: Vec<ControllerPairingRow> = sqlx::query_as(
+                    r#"
+                    SELECT
+                        cp.controller_session_id,
+                        cp.child_session_id,
+                        controller.origin_session_id AS controller_origin_session_id,
+                        child.origin_session_id AS child_origin_session_id,
+                        cp.prompt_template,
+                        cp.update_cadence,
+                        cp.created_at,
+                        cp.updated_at
+                    FROM controller_pairing cp
+                    INNER JOIN session controller ON controller.id = cp.controller_session_id
+                    INNER JOIN session child ON child.id = cp.child_session_id
+                    WHERE cp.controller_session_id = $1
+                    ORDER BY cp.created_at ASC
+                    "#,
+                )
+                .bind(identifiers.session_id)
+                .fetch_all(tx.as_mut())
+                .await?;
+                tx.commit().await?;
+
+                let private_beach_id = identifiers.private_beach_id;
+                let label0 = private_beach_id.to_string();
+                let pairings: Vec<ControllerPairing> = rows
+                    .into_iter()
+                    .map(|row| row.into_pairing(&private_beach_id))
+                    .collect();
+                let pairings = self
+                    .fallback
+                    .set_pairings(controller_session_id, pairings)
+                    .await;
+                metrics::CONTROLLER_PAIRINGS_ACTIVE
+                    .with_label_values(&[label0.as_str(), controller_session_id])
+                    .set(pairings.len() as i64);
+                Ok(pairings)
+            }
+        }
+    }
+
+    pub async fn upsert_controller_pairing(
+        &self,
+        controller_session_id: &str,
+        child_session_id: &str,
+        prompt_template: Option<String>,
+        update_cadence: Option<ControllerUpdateCadence>,
+        actor_account_id: Option<Uuid>,
+    ) -> Result<ControllerPairing, StateError> {
+        match &self.backend {
+            Backend::Memory => {
+                let (controller, child) = {
+                    let sessions = self.fallback.sessions.read().await;
+                    let Some(controller) = sessions.get(controller_session_id).cloned() else {
+                        return Err(StateError::SessionNotFound);
+                    };
+                    let Some(child) = sessions.get(child_session_id).cloned() else {
+                        return Err(StateError::SessionNotFound);
+                    };
+                    (controller, child)
+                };
+
+                if controller.controller_token.is_none() {
+                    return Err(StateError::ControllerLeaseRequired);
+                }
+                if controller.private_beach_id != child.private_beach_id {
+                    return Err(StateError::CrossBeachPairing);
+                }
+
+                let existing = self.fallback.list_pairings(controller_session_id).await;
+                let action = if existing
+                    .iter()
+                    .any(|p| p.child_session_id == child_session_id)
+                {
+                    ControllerPairingAction::Updated
+                } else {
+                    ControllerPairingAction::Added
+                };
+
+                let now = now_ms();
+                let pairing = ControllerPairing {
+                    pairing_id: format!("{controller_session_id}:{child_session_id}"),
+                    private_beach_id: controller.private_beach_id.clone(),
+                    controller_session_id: controller_session_id.to_string(),
+                    child_session_id: child_session_id.to_string(),
+                    prompt_template: prompt_template.clone(),
+                    update_cadence: update_cadence.unwrap_or_default(),
+                    transport_status: None,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                };
+
+                let pairing = self.fallback.upsert_pairing(pairing).await;
+                {
+                    let mut sessions = self.fallback.sessions.write().await;
+                    if let Some(record) = sessions.get_mut(controller_session_id) {
+                        record.append_event(ControllerEventType::PairingAdded, prompt_template);
+                    }
+                }
+
+                let count = self.fallback.pairing_count(controller_session_id).await as i64;
+                metrics::CONTROLLER_PAIRINGS_ACTIVE
+                    .with_label_values(&[
+                        controller.private_beach_id.as_str(),
+                        controller_session_id,
+                    ])
+                    .set(count);
+                metrics::CONTROLLER_PAIRINGS_EVENTS
+                    .with_label_values(&[
+                        controller.private_beach_id.as_str(),
+                        controller_session_id,
+                        pairing_action_label(&action),
+                    ])
+                    .inc();
+
+                self.publish_pairing_event(
+                    controller_session_id,
+                    child_session_id,
+                    action,
+                    Some(pairing.clone()),
+                )
+                .await;
+
+                Ok(pairing)
+            }
+            Backend::Postgres(pool) => {
+                let controller_uuid = parse_uuid(controller_session_id, "controller_session_id")?;
+                let child_uuid = parse_uuid(child_session_id, "child_session_id")?;
+                let controller_identifiers = self
+                    .fetch_session_identifiers(pool, &controller_uuid)
+                    .await?;
+                let child_identifiers = self.fetch_session_identifiers(pool, &child_uuid).await?;
+
+                if controller_identifiers.private_beach_id != child_identifiers.private_beach_id {
+                    return Err(StateError::CrossBeachPairing);
+                }
+
+                let lease = match self
+                    .fetch_active_lease(pool, controller_identifiers.session_id)
+                    .await
+                {
+                    Ok(row) => row,
+                    Err(StateError::ControllerMismatch) => {
+                        return Err(StateError::ControllerLeaseRequired)
+                    }
+                    Err(err) => return Err(err),
+                };
+                if !is_active_lease(lease.expires_at, lease.revoked_at) {
+                    return Err(StateError::ControllerLeaseRequired);
+                }
+
+                let cadence = update_cadence.unwrap_or_default();
+                let mut tx = pool.begin().await?;
+                self.set_rls_context_tx(&mut tx, &controller_identifiers.private_beach_id)
+                    .await?;
+                self.set_account_context_tx(&mut tx, actor_account_id.as_ref())
+                    .await?;
+
+                let prompt_clone = prompt_template.clone();
+                let row: ControllerPairingRow = sqlx::query_as(
+                    r#"
+                    INSERT INTO controller_pairing (
+                        controller_session_id,
+                        child_session_id,
+                        prompt_template,
+                        update_cadence
+                    )
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (controller_session_id, child_session_id)
+                    DO UPDATE SET
+                        prompt_template = EXCLUDED.prompt_template,
+                        update_cadence = EXCLUDED.update_cadence,
+                        updated_at = NOW()
+                    RETURNING
+                        controller_session_id,
+                        child_session_id,
+                        (SELECT origin_session_id FROM session WHERE id = controller_pairing.controller_session_id),
+                        (SELECT origin_session_id FROM session WHERE id = controller_pairing.child_session_id),
+                        prompt_template,
+                        update_cadence,
+                        created_at,
+                        updated_at
+                    "#,
+                )
+                .bind(controller_identifiers.session_id)
+                .bind(child_identifiers.session_id)
+                .bind(prompt_template)
+                .bind(cadence)
+                .fetch_one(tx.as_mut())
+                .await?;
+
+                let action = if row.created_at == row.updated_at {
+                    ControllerPairingAction::Added
+                } else {
+                    ControllerPairingAction::Updated
+                };
+
+                self.insert_controller_event(
+                    &mut tx,
+                    controller_identifiers.session_id,
+                    "pairing_added",
+                    Some(lease.id),
+                    lease.controller_account_id,
+                    actor_account_id,
+                    prompt_clone,
+                )
+                .await?;
+
+                let count: i64 = sqlx::query_scalar(
+                    r#"
+                    SELECT COUNT(*)::bigint
+                    FROM controller_pairing
+                    WHERE controller_session_id = $1
+                    "#,
+                )
+                .bind(controller_identifiers.session_id)
+                .fetch_one(tx.as_mut())
+                .await?;
+
+                tx.commit().await?;
+
+                let private_beach = controller_identifiers.private_beach_id.to_string();
+                metrics::CONTROLLER_PAIRINGS_ACTIVE
+                    .with_label_values(&[private_beach.as_str(), controller_session_id])
+                    .set(count);
+                metrics::CONTROLLER_PAIRINGS_EVENTS
+                    .with_label_values(&[
+                        private_beach.as_str(),
+                        controller_session_id,
+                        pairing_action_label(&action),
+                    ])
+                    .inc();
+
+                let pairing = row.into_pairing(&controller_identifiers.private_beach_id);
+                let pairing = self.fallback.upsert_pairing(pairing).await;
+                self.publish_pairing_event(
+                    controller_session_id,
+                    child_session_id,
+                    action,
+                    Some(pairing.clone()),
+                )
+                .await;
+                Ok(pairing)
+            }
+        }
+    }
+
+    pub async fn delete_controller_pairing(
+        &self,
+        controller_session_id: &str,
+        child_session_id: &str,
+        actor_account_id: Option<Uuid>,
+    ) -> Result<(), StateError> {
+        match &self.backend {
+            Backend::Memory => {
+                let controller = {
+                    let sessions = self.fallback.sessions.read().await;
+                    sessions.get(controller_session_id).cloned()
+                }
+                .ok_or(StateError::SessionNotFound)?;
+
+                if controller.controller_token.is_none() {
+                    return Err(StateError::ControllerLeaseRequired);
+                }
+
+                let removed = self
+                    .fallback
+                    .remove_pairing(controller_session_id, child_session_id)
+                    .await;
+                if !removed {
+                    return Err(StateError::ControllerPairingNotFound);
+                }
+
+                {
+                    let mut sessions = self.fallback.sessions.write().await;
+                    if let Some(record) = sessions.get_mut(controller_session_id) {
+                        record.append_event(ControllerEventType::PairingRemoved, None);
+                    }
+                }
+
+                let count = self.fallback.pairing_count(controller_session_id).await as i64;
+                metrics::CONTROLLER_PAIRINGS_ACTIVE
+                    .with_label_values(&[
+                        controller.private_beach_id.as_str(),
+                        controller_session_id,
+                    ])
+                    .set(count);
+                metrics::CONTROLLER_PAIRINGS_EVENTS
+                    .with_label_values(&[
+                        controller.private_beach_id.as_str(),
+                        controller_session_id,
+                        pairing_action_label(&ControllerPairingAction::Removed),
+                    ])
+                    .inc();
+
+                self.publish_pairing_event(
+                    controller_session_id,
+                    child_session_id,
+                    ControllerPairingAction::Removed,
+                    None,
+                )
+                .await;
+                Ok(())
+            }
+            Backend::Postgres(pool) => {
+                let controller_uuid = parse_uuid(controller_session_id, "controller_session_id")?;
+                let child_uuid = parse_uuid(child_session_id, "child_session_id")?;
+                let controller_identifiers = self
+                    .fetch_session_identifiers(pool, &controller_uuid)
+                    .await?;
+                let child_identifiers = self.fetch_session_identifiers(pool, &child_uuid).await?;
+
+                if controller_identifiers.private_beach_id != child_identifiers.private_beach_id {
+                    return Err(StateError::CrossBeachPairing);
+                }
+
+                let lease = match self
+                    .fetch_active_lease(pool, controller_identifiers.session_id)
+                    .await
+                {
+                    Ok(row) => row,
+                    Err(StateError::ControllerMismatch) => {
+                        return Err(StateError::ControllerLeaseRequired)
+                    }
+                    Err(err) => return Err(err),
+                };
+                if !is_active_lease(lease.expires_at, lease.revoked_at) {
+                    return Err(StateError::ControllerLeaseRequired);
+                }
+
+                let mut tx = pool.begin().await?;
+                self.set_rls_context_tx(&mut tx, &controller_identifiers.private_beach_id)
+                    .await?;
+                self.set_account_context_tx(&mut tx, actor_account_id.as_ref())
+                    .await?;
+
+                let row: Option<ControllerPairingRow> = sqlx::query_as(
+                    r#"
+                    DELETE FROM controller_pairing
+                    WHERE controller_session_id = $1
+                      AND child_session_id = $2
+                    RETURNING
+                        controller_session_id,
+                        child_session_id,
+                        (SELECT origin_session_id FROM session WHERE id = controller_pairing.controller_session_id),
+                        (SELECT origin_session_id FROM session WHERE id = controller_pairing.child_session_id),
+                        prompt_template,
+                        update_cadence,
+                        created_at,
+                        updated_at
+                    "#,
+                )
+                .bind(controller_identifiers.session_id)
+                .bind(child_identifiers.session_id)
+                .fetch_optional(tx.as_mut())
+                .await?;
+
+                let Some(row) = row else {
+                    tx.rollback().await.ok();
+                    return Err(StateError::ControllerPairingNotFound);
+                };
+
+                self.insert_controller_event(
+                    &mut tx,
+                    controller_identifiers.session_id,
+                    "pairing_removed",
+                    Some(lease.id),
+                    lease.controller_account_id,
+                    actor_account_id,
+                    None,
+                )
+                .await?;
+
+                let count: i64 = sqlx::query_scalar(
+                    r#"
+                    SELECT COUNT(*)::bigint
+                    FROM controller_pairing
+                    WHERE controller_session_id = $1
+                    "#,
+                )
+                .bind(controller_identifiers.session_id)
+                .fetch_one(tx.as_mut())
+                .await?;
+
+                tx.commit().await?;
+
+                let pairing = row.into_pairing(&controller_identifiers.private_beach_id);
+                let private_beach = controller_identifiers.private_beach_id.to_string();
+                metrics::CONTROLLER_PAIRINGS_ACTIVE
+                    .with_label_values(&[private_beach.as_str(), controller_session_id])
+                    .set(count);
+                metrics::CONTROLLER_PAIRINGS_EVENTS
+                    .with_label_values(&[
+                        private_beach.as_str(),
+                        controller_session_id,
+                        pairing_action_label(&ControllerPairingAction::Removed),
+                    ])
+                    .inc();
+
+                self.fallback
+                    .remove_pairing(controller_session_id, child_session_id)
+                    .await;
+
+                self.publish_pairing_event(
+                    controller_session_id,
+                    child_session_id,
+                    ControllerPairingAction::Removed,
+                    Some(pairing),
+                )
+                .await;
+                Ok(())
+            }
+        }
+    }
+
     pub async fn acquire_controller(
         &self,
         session_id: &str,
@@ -1316,58 +2001,92 @@ impl AppState {
                     return Err(StateError::ControllerMismatch);
                 }
 
-                // Try fast-path first
-                if send_actions_over_fast_path(
-                    &self.fast_paths,
-                    &session_uuid.to_string(),
-                    &actions,
-                )
-                .await
-                .unwrap_or(false)
+                let session_uuid_str = session_uuid.to_string();
+                let mut fast_path_error: Option<String> = None;
+                match send_actions_over_fast_path(&self.fast_paths, &session_uuid_str, &actions)
+                    .await
                 {
-                    let mut tx = pool.begin().await?;
-                    self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
-                        .await?;
-                    self.insert_controller_event(
-                        &mut tx,
-                        identifiers.session_id,
-                        "actions_queued",
-                        Some(lease.id),
-                        lease.controller_account_id,
-                        actor_account_id,
-                        None,
-                    )
-                    .await?;
-                    tx.commit().await?;
+                    Ok(true) => {
+                        let now = now_ms();
+                        self.update_pairing_transport_status(
+                            &session_uuid_str,
+                            PairingTransportStatus::fast_path(now),
+                        )
+                        .await;
 
-                    self.publish(
-                        session_id,
-                        StreamEvent::ControllerEvent(ControllerEvent {
-                            id: Uuid::new_v4().to_string(),
-                            event_type: ControllerEventType::ActionsQueued,
-                            controller_token: Some(token_uuid.to_string()),
-                            timestamp_ms: now_ms(),
-                            reason: None,
-                            controller_account_id: lease
-                                .controller_account_id
-                                .map(|u| u.to_string()),
-                            issued_by_account_id: actor_account_id.map(|u| u.to_string()),
-                        }),
-                    )
-                    .await;
-                    return Ok(());
+                        let label0 = identifiers.private_beach_id.to_string();
+                        let label1 = session_uuid_str.clone();
+                        metrics::FASTPATH_ACTIONS_SENT
+                            .with_label_values(&[label0.as_str(), label1.as_str()])
+                            .inc_by(actions.len() as u64);
+
+                        let mut tx = pool.begin().await?;
+                        self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
+                            .await?;
+                        self.insert_controller_event(
+                            &mut tx,
+                            identifiers.session_id,
+                            "actions_queued",
+                            Some(lease.id),
+                            lease.controller_account_id,
+                            actor_account_id,
+                            None,
+                        )
+                        .await?;
+                        tx.commit().await?;
+
+                        self.publish(
+                            session_id,
+                            StreamEvent::ControllerEvent(ControllerEvent {
+                                id: Uuid::new_v4().to_string(),
+                                event_type: ControllerEventType::ActionsQueued,
+                                controller_token: Some(token_uuid.to_string()),
+                                timestamp_ms: now,
+                                reason: None,
+                                controller_account_id: lease
+                                    .controller_account_id
+                                    .map(|u| u.to_string()),
+                                issued_by_account_id: actor_account_id.map(|u| u.to_string()),
+                            }),
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                    Ok(false) => {
+                        let now = now_ms();
+                        self.update_pairing_transport_status(
+                            &session_uuid_str,
+                            PairingTransportStatus::http_fallback(now, None),
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        warn!(
+                            target = "fast_path",
+                            session_id = %session_uuid,
+                            error = %err,
+                            "fast-path send failed; falling back to HTTP transport"
+                        );
+                        fast_path_error = Some(err.to_string());
+                        let now = now_ms();
+                        self.update_pairing_transport_status(
+                            &session_uuid_str,
+                            PairingTransportStatus::http_fallback(now, Some(err.to_string())),
+                        )
+                        .await;
+                    }
                 }
 
                 self.enqueue_actions_redis(
                     &identifiers.private_beach_id.to_string(),
-                    &session_uuid.to_string(),
+                    &session_uuid_str,
                     actions.clone(),
                 )
                 .await?;
 
                 // Metrics: enqueue count and queue depth gauge
                 let label0 = identifiers.private_beach_id.to_string();
-                let label1 = session_uuid.to_string();
+                let label1 = session_uuid_str.clone();
                 let labels = [label0.as_str(), label1.as_str()];
                 metrics::ACTIONS_ENQUEUED
                     .with_label_values(&labels)
@@ -1375,7 +2094,7 @@ impl AppState {
                 let depth = self
                     .pending_actions_count(
                         &identifiers.private_beach_id.to_string(),
-                        &session_uuid.to_string(),
+                        &session_uuid_str,
                     )
                     .await
                     .unwrap_or(0);
@@ -1386,13 +2105,16 @@ impl AppState {
                 let pending = self
                     .pending_actions_pending_count(
                         &identifiers.private_beach_id.to_string(),
-                        &session_uuid.to_string(),
+                        &session_uuid_str,
                     )
                     .await
                     .unwrap_or(0);
                 metrics::QUEUE_LAG
                     .with_label_values(&labels)
                     .set(pending as i64);
+                metrics::FASTPATH_ACTIONS_FALLBACK
+                    .with_label_values(&labels)
+                    .inc_by(actions.len() as u64);
 
                 let mut tx = pool.begin().await?;
                 self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
@@ -1410,6 +2132,15 @@ impl AppState {
                 tx.commit().await?;
 
                 self.fallback.enqueue_actions(session_id, actions).await;
+
+                if let Some(error) = fast_path_error {
+                    debug!(
+                        target = "controller_pairing",
+                        session_id = %session_uuid,
+                        error = %error,
+                        "fast-path unavailable; actions queued via fallback"
+                    );
+                }
 
                 self.publish(
                     session_id,
@@ -1502,24 +2233,50 @@ impl AppState {
         session_id: &str,
         acks: Vec<ActionAck>,
         _actor_account_id: Option<Uuid>,
+        via_fast_path: bool,
     ) -> Result<(), StateError> {
         match &self.backend {
             Backend::Memory => {
                 self.fallback.remove_actions(session_id, &acks).await;
+                if !acks.is_empty() {
+                    let event_time = now_ms();
+                    let latency = acks
+                        .iter()
+                        .find_map(|ack| ack.latency_ms)
+                        .map(|ms| ms as u64);
+                    let error_message = acks
+                        .iter()
+                        .find(|ack| !matches!(ack.status, AckStatus::Ok))
+                        .and_then(|ack| {
+                            ack.error_message.clone().or_else(|| ack.error_code.clone())
+                        });
+                    let mut status = if via_fast_path {
+                        PairingTransportStatus::fast_path(event_time)
+                    } else {
+                        PairingTransportStatus::http_fallback(event_time, None)
+                    };
+                    status = status.with_latency(latency);
+                    if let Some(err) = error_message {
+                        status = status.with_error(Some(err));
+                    }
+                    self.update_pairing_transport_status(session_id, status)
+                        .await;
+                }
                 Ok(())
             }
             Backend::Postgres(pool) => {
                 let session_uuid = parse_uuid(session_id, "session_id")?;
+                let session_uuid_str = session_uuid.to_string();
                 let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
                 self.ack_actions_redis(
                     &identifiers.private_beach_id.to_string(),
-                    &session_uuid.to_string(),
+                    &session_uuid_str,
                     &acks,
                 )
                 .await?;
                 // Metrics: record latencies for successful acks
                 let label0 = identifiers.private_beach_id.to_string();
-                let label1 = session_uuid.to_string();
+                let label1 = session_uuid_str.clone();
                 for ack in &acks {
                     if matches!(ack.status, AckStatus::Ok) {
                         if let Some(ms) = ack.latency_ms {
@@ -1531,15 +2288,44 @@ impl AppState {
                 }
                 // Update pending gauge after acks
                 let label0 = identifiers.private_beach_id.to_string();
-                let label1 = session_uuid.to_string();
+                let label1 = session_uuid_str.clone();
                 let pending = self
-                    .pending_actions_pending_count(&label0, &label1)
+                    .pending_actions_pending_count(&label0, &session_uuid_str)
                     .await
                     .unwrap_or(0);
                 metrics::QUEUE_LAG
                     .with_label_values(&[label0.as_str(), label1.as_str()])
                     .set(pending as i64);
+                if via_fast_path {
+                    metrics::FASTPATH_ACKS_RECEIVED
+                        .with_label_values(&[label0.as_str(), label1.as_str()])
+                        .inc_by(acks.len() as u64);
+                }
                 self.fallback.remove_actions(session_id, &acks).await;
+                if !acks.is_empty() {
+                    let event_time = now_ms();
+                    let latency = acks
+                        .iter()
+                        .find_map(|ack| ack.latency_ms)
+                        .map(|ms| ms as u64);
+                    let error_message = acks
+                        .iter()
+                        .find(|ack| !matches!(ack.status, AckStatus::Ok))
+                        .and_then(|ack| {
+                            ack.error_message.clone().or_else(|| ack.error_code.clone())
+                        });
+                    let mut status = if via_fast_path {
+                        PairingTransportStatus::fast_path(event_time)
+                    } else {
+                        PairingTransportStatus::http_fallback(event_time, None)
+                    };
+                    status = status.with_latency(latency);
+                    if let Some(err) = error_message {
+                        status = status.with_error(Some(err));
+                    }
+                    self.update_pairing_transport_status(&session_uuid_str, status)
+                        .await;
+                }
                 Ok(())
             }
         }
@@ -1600,7 +2386,12 @@ impl AppState {
         }
     }
 
-    pub async fn record_state(&self, session_id: &str, diff: StateDiff) -> Result<(), StateError> {
+    pub async fn record_state(
+        &self,
+        session_id: &str,
+        diff: StateDiff,
+        via_fast_path: bool,
+    ) -> Result<(), StateError> {
         match &self.backend {
             Backend::Memory => self.record_state_memory(session_id, diff).await,
             Backend::Postgres(pool) => {
@@ -1657,6 +2448,11 @@ impl AppState {
                 metrics::STATE_REPORTS
                     .with_label_values(&[label0.as_str(), label1.as_str()])
                     .inc();
+                if via_fast_path {
+                    metrics::FASTPATH_STATE_RECEIVED
+                        .with_label_values(&[label0.as_str(), label1.as_str()])
+                        .inc();
+                }
                 Ok(())
             }
         }
@@ -1994,6 +2790,7 @@ impl InnerState {
     fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            pairings: RwLock::new(HashMap::new()),
         }
     }
 
@@ -2077,6 +2874,147 @@ impl InnerState {
         if let Some(record) = sessions.get_mut(session_id) {
             record.last_state = Some(diff);
         }
+    }
+
+    async fn upsert_pairing(&self, mut pairing: ControllerPairing) -> ControllerPairing {
+        let mut pairings = self.pairings.write().await;
+        let entry = pairings
+            .entry(pairing.controller_session_id.clone())
+            .or_default();
+        if let Some(existing) = entry
+            .iter_mut()
+            .find(|p| p.child_session_id == pairing.child_session_id)
+        {
+            if pairing.transport_status.is_none() {
+                pairing.transport_status = existing.transport_status.clone();
+            }
+            *existing = pairing.clone();
+            pairing
+        } else {
+            if pairing.transport_status.is_none() {
+                pairing.transport_status = Some(PairingTransportStatus::pending());
+            }
+            entry.push(pairing.clone());
+            pairing
+        }
+    }
+
+    async fn remove_pairing(&self, controller_session_id: &str, child_session_id: &str) -> bool {
+        let mut pairings = self.pairings.write().await;
+        let mut remove_entry = false;
+        let mut removed = false;
+        if let Some(list) = pairings.get_mut(controller_session_id) {
+            let before = list.len();
+            list.retain(|pairing| pairing.child_session_id != child_session_id);
+            removed = before != list.len();
+            if list.is_empty() {
+                remove_entry = true;
+            }
+        }
+        if remove_entry {
+            pairings.remove(controller_session_id);
+        }
+        removed
+    }
+
+    async fn list_pairings(&self, controller_session_id: &str) -> Vec<ControllerPairing> {
+        self.pairings
+            .read()
+            .await
+            .get(controller_session_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    async fn pairing_count(&self, controller_session_id: &str) -> usize {
+        self.pairings
+            .read()
+            .await
+            .get(controller_session_id)
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+
+    async fn set_pairings(
+        &self,
+        controller_session_id: &str,
+        mut pairings: Vec<ControllerPairing>,
+    ) -> Vec<ControllerPairing> {
+        let mut guard = self.pairings.write().await;
+        if pairings.is_empty() {
+            guard.remove(controller_session_id);
+            return pairings;
+        }
+
+        if let Some(existing) = guard.get(controller_session_id) {
+            let mut statuses = HashMap::new();
+            for pairing in existing {
+                statuses.insert(
+                    pairing.child_session_id.clone(),
+                    pairing.transport_status.clone(),
+                );
+            }
+            for pairing in pairings.iter_mut() {
+                if pairing.transport_status.is_none() {
+                    if let Some(status) = statuses
+                        .get(&pairing.child_session_id)
+                        .and_then(|value| value.clone())
+                    {
+                        pairing.transport_status = Some(status);
+                    } else {
+                        pairing.transport_status = Some(PairingTransportStatus::pending());
+                    }
+                }
+            }
+        } else {
+            for pairing in pairings.iter_mut() {
+                if pairing.transport_status.is_none() {
+                    pairing.transport_status = Some(PairingTransportStatus::pending());
+                }
+            }
+        }
+
+        guard.insert(controller_session_id.to_string(), pairings.clone());
+        pairings
+    }
+
+    async fn controllers_for_child(&self, child_session_id: &str) -> Vec<String> {
+        let guard = self.pairings.read().await;
+        guard
+            .iter()
+            .filter_map(|(controller, list)| {
+                if list
+                    .iter()
+                    .any(|pairing| pairing.child_session_id == child_session_id)
+                {
+                    Some(controller.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    async fn update_pairing_status(
+        &self,
+        controller_session_id: &str,
+        child_session_id: &str,
+        status: PairingTransportStatus,
+    ) -> Option<ControllerPairing> {
+        let mut guard = self.pairings.write().await;
+        if let Some(list) = guard.get_mut(controller_session_id) {
+            if let Some(pairing) = list
+                .iter_mut()
+                .find(|p| p.child_session_id == child_session_id)
+            {
+                if pairing.transport_status.as_ref() == Some(&status) {
+                    return None;
+                }
+                pairing.transport_status = Some(status);
+                return Some(pairing.clone());
+            }
+        }
+        None
     }
 }
 
@@ -2238,6 +3176,8 @@ fn controller_event_from_str(value: &str) -> ControllerEventType {
         "actions_acked" => ControllerEventType::ActionsAcked,
         "health_reported" => ControllerEventType::HealthReported,
         "state_updated" => ControllerEventType::StateUpdated,
+        "pairing_added" => ControllerEventType::PairingAdded,
+        "pairing_removed" => ControllerEventType::PairingRemoved,
         _ => ControllerEventType::Registered,
     }
 }
@@ -2257,6 +3197,14 @@ fn json_array_to_strings(value: &serde_json::Value) -> Vec<String> {
 fn is_active_lease(expires_at: Option<DateTime<Utc>>, revoked_at: Option<DateTime<Utc>>) -> bool {
     let now = Utc::now();
     revoked_at.is_none() && expires_at.map(|exp| exp > now).unwrap_or(false)
+}
+
+fn pairing_action_label(action: &ControllerPairingAction) -> &'static str {
+    match action {
+        ControllerPairingAction::Added => "added",
+        ControllerPairingAction::Updated => "updated",
+        ControllerPairingAction::Removed => "removed",
+    }
 }
 
 fn redis_actions_key(private_beach_id: &str, session_id: &str) -> String {
@@ -2547,19 +3495,26 @@ impl AppState {
             record.pending_actions.push_back(action);
         }
         record.append_event(ControllerEventType::ActionsQueued, None);
-        self.publish(
+        let controller_token = record.controller_token.clone();
+        let event_time = now_ms();
+        let event = StreamEvent::ControllerEvent(ControllerEvent {
+            id: Uuid::new_v4().to_string(),
+            event_type: ControllerEventType::ActionsQueued,
+            controller_token,
+            timestamp_ms: event_time,
+            reason: None,
+            controller_account_id: None,
+            issued_by_account_id: None,
+        });
+        drop(sessions);
+
+        self.update_pairing_transport_status(
             session_id,
-            StreamEvent::ControllerEvent(ControllerEvent {
-                id: Uuid::new_v4().to_string(),
-                event_type: ControllerEventType::ActionsQueued,
-                controller_token: record.controller_token.clone(),
-                timestamp_ms: now_ms(),
-                reason: None,
-                controller_account_id: None,
-                issued_by_account_id: None,
-            }),
+            PairingTransportStatus::http_fallback(event_time, None),
         )
         .await;
+
+        self.publish(session_id, event).await;
         Ok(())
     }
 
@@ -3628,7 +4583,8 @@ async fn viewer_connect_once(
                             }
                             if let Some(diff) = viewer_state.handle_host_frame(&frame) {
                                 let sequence = diff.sequence;
-                                if let Err(err) = state.record_state(session_id, diff).await {
+                                if let Err(err) = state.record_state(session_id, diff, false).await
+                                {
                                     warn!(
                                         target = "private_beach",
                                         session_id = %session_id,
@@ -3919,7 +4875,7 @@ mod tests {
                         emitted_at: SystemTime::now(),
                         payload: json!({ "hello": "world" }),
                     };
-                    state.record_state(&session_id, diff).await.unwrap();
+                    state.record_state(&session_id, diff, false).await.unwrap();
                     invocation_count.fetch_add(1, Ordering::SeqCst);
                 }
             }

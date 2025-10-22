@@ -103,7 +103,7 @@ async fn postgres_sqlx_e2e() {
         error_message: None,
     };
     state
-        .ack_actions(&session_id, vec![ack], None)
+        .ack_actions(&session_id, vec![ack], None, false)
         .await
         .expect("ack actions");
 
@@ -125,7 +125,7 @@ async fn postgres_sqlx_e2e() {
         payload: serde_json::json!({"ops": []}),
     };
     state
-        .record_state(&session_id, diff)
+        .record_state(&session_id, diff, false)
         .await
         .expect("record state");
 

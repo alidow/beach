@@ -292,6 +292,7 @@ impl FastPathClient {
     }
 }
 
+#[derive(Clone)]
 pub struct FastPathConnection {
     pub peer: Arc<RTCPeerConnection>,
     channels: FastPathChannels,

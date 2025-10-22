@@ -20,6 +20,27 @@ export type SessionSummary = {
   } | null;
 };
 
+export const CONTROLLER_UPDATE_CADENCE_OPTIONS = ['fast', 'balanced', 'slow'] as const;
+export type ControllerUpdateCadence = (typeof CONTROLLER_UPDATE_CADENCE_OPTIONS)[number];
+
+export type PairingTransportStatus = {
+  transport: 'fast_path' | 'http_fallback' | 'pending';
+  last_event_ms?: number | null;
+  last_error?: string | null;
+  latency_ms?: number | null;
+};
+
+export type ControllerPairing = {
+  pairing_id: string;
+  controller_session_id: string;
+  child_session_id: string;
+  prompt_template?: string | null;
+  update_cadence: ControllerUpdateCadence;
+  transport_status?: PairingTransportStatus | null;
+  created_at_ms?: number | null;
+  updated_at_ms?: number | null;
+};
+
 export type ControllerLeaseResponse = {
   controller_token: string;
   expires_at_ms: number;
@@ -197,6 +218,200 @@ export async function listBeaches(token: string | null, baseUrl?: string): Promi
   const res = await fetch(`${base(baseUrl)}/private-beaches`, { headers: authHeaders(token) });
   if (!res.ok) throw new Error(`listBeaches failed ${res.status}`);
   return res.json();
+}
+
+function normalizeTransportStatus(raw: any): PairingTransportStatus | null {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const transport = typeof raw.transport === 'string' ? raw.transport : null;
+  if (transport !== 'fast_path' && transport !== 'http_fallback' && transport !== 'pending') {
+    return null;
+  }
+  const lastEventMs = Number((raw as any).last_event_ms);
+  const latencyMs = Number((raw as any).latency_ms);
+  const status: PairingTransportStatus = {
+    transport,
+  };
+  if (Number.isFinite(lastEventMs)) {
+    status.last_event_ms = lastEventMs;
+  }
+  if (Number.isFinite(latencyMs)) {
+    status.latency_ms = latencyMs;
+  }
+  if (typeof (raw as any).last_error === 'string' && (raw as any).last_error.trim().length > 0) {
+    status.last_error = (raw as any).last_error;
+  }
+  return status;
+}
+
+export function normalizeControllerPairing(raw: any): ControllerPairing {
+  if (!raw || typeof raw !== 'object') {
+    throw new Error('invalid controller pairing payload');
+  }
+  const controllerId = typeof raw.controller_session_id === 'string' ? raw.controller_session_id : '';
+  const childId = typeof raw.child_session_id === 'string' ? raw.child_session_id : '';
+  if (!controllerId || !childId) {
+    throw new Error('controller pairing missing session identifiers');
+  }
+  const pairingId =
+    typeof raw.pairing_id === 'string' && raw.pairing_id.trim().length > 0
+      ? raw.pairing_id
+      : `${controllerId}|${childId}`;
+  const cadenceRaw = typeof raw.update_cadence === 'string' ? raw.update_cadence : '';
+  const cadence = CONTROLLER_UPDATE_CADENCE_OPTIONS.includes(cadenceRaw as ControllerUpdateCadence)
+    ? (cadenceRaw as ControllerUpdateCadence)
+    : 'balanced';
+  const createdAt = Number(raw.created_at_ms);
+  const updatedAt = Number(raw.updated_at_ms);
+  const promptTemplate =
+    typeof raw.prompt_template === 'string'
+      ? raw.prompt_template
+      : raw.prompt_template === null
+        ? null
+        : undefined;
+  const pairing: ControllerPairing = {
+    pairing_id: pairingId,
+    controller_session_id: controllerId,
+    child_session_id: childId,
+    update_cadence: cadence,
+  };
+  if (promptTemplate !== undefined) {
+    pairing.prompt_template =
+      typeof promptTemplate === 'string' && promptTemplate.trim().length > 0 ? promptTemplate : null;
+  }
+  const status = normalizeTransportStatus((raw as any).transport_status);
+  if (status) {
+    pairing.transport_status = status;
+  }
+  if (Number.isFinite(createdAt)) {
+    pairing.created_at_ms = createdAt;
+  }
+  if (Number.isFinite(updatedAt)) {
+    pairing.updated_at_ms = updatedAt;
+  }
+  return pairing;
+}
+
+export function sortControllerPairings(list: ControllerPairing[]): ControllerPairing[] {
+  return list
+    .slice()
+    .sort((a, b) => {
+      const controllerOrder = a.controller_session_id.localeCompare(b.controller_session_id);
+      if (controllerOrder !== 0) return controllerOrder;
+      const childOrder = a.child_session_id.localeCompare(b.child_session_id);
+      if (childOrder !== 0) return childOrder;
+      return a.pairing_id.localeCompare(b.pairing_id);
+    });
+}
+
+export function normalizeControllerPairingList(raw: unknown): ControllerPairing[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const map = new Map<string, ControllerPairing>();
+  for (const entry of raw) {
+    try {
+      const pairing = normalizeControllerPairing(entry);
+      map.set(`${pairing.controller_session_id}|${pairing.child_session_id}`, pairing);
+    } catch (err) {
+      console.warn('[api] skipping invalid controller pairing payload', err);
+    }
+  }
+  return sortControllerPairings(Array.from(map.values()));
+}
+
+type ControllerPairingRequestBody = {
+  child_session_id: string;
+  prompt_template?: string | null;
+  update_cadence: ControllerUpdateCadence;
+};
+
+export async function createControllerPairing(
+  controllerSessionId: string,
+  body: ControllerPairingRequestBody,
+  token: string | null,
+  baseUrl?: string,
+): Promise<ControllerPairing> {
+  const res = await fetch(`${base(baseUrl)}/sessions/${controllerSessionId}/controllers`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify(body),
+  });
+  if (res.status === 404) {
+    throw new Error('controller_pairing_api_unavailable');
+  }
+  if (!res.ok) {
+    throw new Error(`createControllerPairing failed ${res.status}`);
+  }
+  const payload = await res.json();
+  return normalizeControllerPairing(payload);
+}
+
+export async function listControllerPairingsForController(
+  controllerSessionId: string,
+  token: string | null,
+  baseUrl?: string,
+): Promise<ControllerPairing[]> {
+  const res = await fetch(`${base(baseUrl)}/sessions/${controllerSessionId}/controllers`, {
+    headers: authHeaders(token),
+  });
+  if (res.status === 404) {
+    return [];
+  }
+  if (!res.ok) {
+    throw new Error(`listControllerPairingsForController failed ${res.status}`);
+  }
+  const payload = await res.json();
+  return normalizeControllerPairingList(payload);
+}
+
+export async function listControllerPairingsForControllers(
+  controllerSessionIds: string[],
+  token: string | null,
+  baseUrl?: string,
+): Promise<ControllerPairing[]> {
+  if (controllerSessionIds.length === 0) {
+    return [];
+  }
+  const results = await Promise.all(
+    controllerSessionIds.map(async (sessionId) => {
+      try {
+        return await listControllerPairingsForController(sessionId, token, baseUrl);
+      } catch (err) {
+        console.error('[api] listControllerPairingsForController failed', {
+          sessionId,
+          error: err,
+        });
+        return [] as ControllerPairing[];
+      }
+    }),
+  );
+  const map = new Map<string, ControllerPairing>();
+  for (const batch of results) {
+    for (const pairing of batch) {
+      map.set(pairing.pairing_id, pairing);
+    }
+  }
+  return sortControllerPairings(Array.from(map.values()));
+}
+
+export async function deleteControllerPairing(
+  controllerSessionId: string,
+  childSessionId: string,
+  token: string | null,
+  baseUrl?: string,
+): Promise<void> {
+  const res = await fetch(`${base(baseUrl)}/sessions/${controllerSessionId}/controllers/${childSessionId}`, {
+    method: 'DELETE',
+    headers: authHeaders(token),
+  });
+  if (res.status === 404) {
+    throw new Error('controller_pairing_api_unavailable');
+  }
+  if (!res.ok) {
+    throw new Error(`deleteControllerPairing failed ${res.status}`);
+  }
 }
 
 export async function createBeach(name: string, slug: string | undefined, token: string | null, baseUrl?: string): Promise<BeachSummary> {

@@ -11,19 +11,28 @@
 //! `beach-cabana` (GUI) can embed while keeping their platform specifics thin.
 
 use async_trait::async_trait;
+use futures::stream::Stream;
+use futures::{stream, StreamExt};
 use reqwest::Url;
+use reqwest_eventsource::{Event, EventSource};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::SystemTime,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::sync::Mutex;
-use tracing::{trace, warn};
+use tokio::{
+    sync::{broadcast, Mutex},
+    time::{sleep, timeout},
+};
+use tracing::{debug, error, info, trace, warn};
+
+use crate::fast_path::{parse_fast_path_endpoints, FastPathClient, FastPathConnection};
 
 pub mod fast_path;
 
@@ -141,6 +150,82 @@ pub struct ControllerNotification {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerUpdateCadence {
+    Fast,
+    #[default]
+    Balanced,
+    Slow,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingTransportKind {
+    FastPath,
+    HttpFallback,
+    Pending,
+}
+
+impl Default for PairingTransportKind {
+    fn default() -> Self {
+        PairingTransportKind::Pending
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PairingTransportStatus {
+    pub transport: PairingTransportKind,
+    #[serde(default)]
+    pub last_event_ms: Option<i64>,
+    #[serde(default)]
+    pub latency_ms: Option<u64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ControllerPairing {
+    pub pairing_id: String,
+    pub controller_session_id: String,
+    pub child_session_id: String,
+    #[serde(default)]
+    pub prompt_template: Option<String>,
+    pub update_cadence: ControllerUpdateCadence,
+    #[serde(default)]
+    pub transport_status: Option<PairingTransportStatus>,
+    #[serde(default)]
+    pub created_at_ms: Option<i64>,
+    #[serde(default)]
+    pub updated_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerPairingAction {
+    Added,
+    Updated,
+    Removed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ControllerPairingEvent {
+    pub controller_session_id: String,
+    pub child_session_id: String,
+    pub action: ControllerPairingAction,
+    #[serde(default)]
+    pub pairing: Option<ControllerPairing>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControllerLeaseRenewal {
+    pub controller_token: String,
+    pub expires_at_ms: i64,
+}
+
+pub type ControllerPairingStream =
+    Pin<Box<dyn Stream<Item = HarnessResult<ControllerPairingEvent>> + Send>>;
+
 /// Representation of a terminal frame we can diff.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerminalFrame {
@@ -197,6 +282,25 @@ pub trait ManagerTransport: Send + Sync + 'static {
         session_id: &str,
         heartbeat: HealthHeartbeat,
     ) -> HarnessResult<()>;
+}
+
+#[async_trait]
+pub trait ControllerTransport: Send + Sync + 'static {
+    async fn list_controller_pairings(
+        &self,
+        controller_session_id: &str,
+    ) -> HarnessResult<Vec<ControllerPairing>>;
+
+    async fn stream_controller_pairings(
+        &self,
+        controller_session_id: &str,
+    ) -> HarnessResult<ControllerPairingStream>;
+
+    async fn renew_controller_lease(
+        &self,
+        session_id: &str,
+        ttl_ms: Option<u64>,
+    ) -> HarnessResult<ControllerLeaseRenewal>;
 }
 
 /// Configuration for instantiating a harness.
@@ -397,6 +501,11 @@ impl<T: ManagerTransport> SessionHarness<T> {
             .await
     }
 
+    /// Returns the current controller token if one is held.
+    pub async fn controller_token(&self) -> Option<String> {
+        self.state.lock().await.controller_token.clone()
+    }
+
     /// Called when manager revokes controller lease or hands it to another entity.
     pub async fn handle_controller_notification(
         &self,
@@ -449,12 +558,424 @@ impl<T: ManagerTransport> SessionHarness<T> {
     }
 }
 
+impl<T> SessionHarness<T>
+where
+    T: ManagerTransport + ControllerTransport + Send + Sync + 'static,
+{
+    /// Spawns background tasks that keep the controller lease fresh and
+    /// react to pairing updates emitted by the manager.
+    pub fn spawn_controller_runtime(
+        &self,
+        initial_lease_ttl_ms: u64,
+    ) -> tokio::task::JoinHandle<()> {
+        let transport = self.transport.clone();
+        let state = self.state.clone();
+        let config = self.config.clone();
+        tokio::spawn(async move {
+            controller_runtime::run(transport, state, config, initial_lease_ttl_ms).await;
+        })
+    }
+}
+
 fn build_terminal_payload(frame: &TerminalFrame) -> serde_json::Value {
     serde_json::json!({
         "type": "terminal_full",
         "lines": frame.lines,
         "cursor": frame.cursor.map(|c| serde_json::json!({"row": c.row, "col": c.col}))
     })
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+mod controller_runtime {
+    use super::*;
+    use std::collections::HashMap;
+
+    const MIN_RENEW_WINDOW_MS: u64 = 1_000;
+    const RENEW_FRACTION: f32 = 0.5;
+    const STREAM_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+    pub async fn run<T>(
+        transport: Arc<T>,
+        state: Arc<Mutex<HarnessState>>,
+        config: Arc<HarnessConfig>,
+        initial_lease_ttl_ms: u64,
+    ) where
+        T: ControllerTransport + Send + Sync + 'static,
+    {
+        let lease_transport = transport.clone();
+        let lease_state = state.clone();
+        let session_id = config.session_id.clone();
+        let private_beach_id = config.private_beach_id.clone();
+
+        let lease_task = tokio::spawn(async move {
+            lease_loop(
+                lease_transport,
+                lease_state,
+                session_id,
+                initial_lease_ttl_ms,
+            )
+            .await;
+        });
+
+        let pairing_task = tokio::spawn(async move {
+            pairing_loop(transport, config, private_beach_id).await;
+        });
+
+        let _ = tokio::join!(lease_task, pairing_task);
+    }
+
+    async fn lease_loop<T>(
+        transport: Arc<T>,
+        state: Arc<Mutex<HarnessState>>,
+        session_id: String,
+        mut ttl_ms: u64,
+    ) where
+        T: ControllerTransport + Send + Sync + 'static,
+    {
+        if ttl_ms == 0 {
+            ttl_ms = 30_000;
+        }
+
+        loop {
+            let window = ((ttl_ms as f32) * RENEW_FRACTION).max(MIN_RENEW_WINDOW_MS as f32) as u64;
+            sleep(Duration::from_millis(window)).await;
+
+            match transport
+                .renew_controller_lease(&session_id, Some(ttl_ms))
+                .await
+            {
+                Ok(lease) => {
+                    {
+                        let mut guard = state.lock().await;
+                        guard.controller_token = Some(lease.controller_token.clone());
+                    }
+
+                    let expires_in = lease
+                        .expires_at_ms
+                        .saturating_sub(now_millis())
+                        .max(MIN_RENEW_WINDOW_MS as i64)
+                        as u64;
+                    ttl_ms = expires_in;
+                    debug!(
+                        target = "controller_pairing",
+                        session_id = %session_id,
+                        expires_in_ms = expires_in,
+                        "controller lease renewed"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        target = "controller_pairing",
+                        session_id = %session_id,
+                        error = %err,
+                        "controller lease renewal failed; retrying"
+                    );
+                    sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
+
+    async fn pairing_loop<T>(
+        transport: Arc<T>,
+        config: Arc<HarnessConfig>,
+        private_beach_id: String,
+    ) where
+        T: ControllerTransport + Send + Sync + 'static,
+    {
+        let controller_session_id = config.session_id.clone();
+        let mut known: HashMap<String, ControllerPairing> = HashMap::new();
+
+        if let Ok(snapshot) = transport
+            .list_controller_pairings(&controller_session_id)
+            .await
+        {
+            apply_snapshot(
+                &controller_session_id,
+                &private_beach_id,
+                &mut known,
+                snapshot,
+            );
+        }
+
+        loop {
+            match transport
+                .stream_controller_pairings(&controller_session_id)
+                .await
+            {
+                Ok(mut stream) => {
+                    info!(
+                        target = "controller_pairing",
+                        controller_session_id = %controller_session_id,
+                        "controller pairing stream connected"
+                    );
+                    while let Some(event) = stream.next().await {
+                        match event {
+                            Ok(ev) => {
+                                handle_event(
+                                    &transport,
+                                    &controller_session_id,
+                                    &private_beach_id,
+                                    &mut known,
+                                    ev,
+                                )
+                                .await;
+                            }
+                            Err(err) => {
+                                warn!(
+                                    target = "controller_pairing",
+                                    controller_session_id = %controller_session_id,
+                                    error = %err,
+                                    "controller pairing stream error"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        target = "controller_pairing",
+                        controller_session_id = %controller_session_id,
+                        error = %err,
+                        "controller pairing stream unavailable"
+                    );
+                }
+            }
+
+            if let Ok(snapshot) = transport
+                .list_controller_pairings(&controller_session_id)
+                .await
+            {
+                apply_snapshot(
+                    &controller_session_id,
+                    &private_beach_id,
+                    &mut known,
+                    snapshot,
+                );
+            }
+
+            sleep(STREAM_RETRY_DELAY).await;
+        }
+    }
+
+    async fn handle_event<T>(
+        transport: &Arc<T>,
+        controller_session_id: &str,
+        private_beach_id: &str,
+        known: &mut HashMap<String, ControllerPairing>,
+        event: ControllerPairingEvent,
+    ) where
+        T: ControllerTransport + Send + Sync + 'static,
+    {
+        match event.action {
+            action @ ControllerPairingAction::Added | action @ ControllerPairingAction::Updated => {
+                if let Some(pairing) = event.pairing {
+                    upsert_pairing(
+                        controller_session_id,
+                        private_beach_id,
+                        known,
+                        pairing,
+                        action,
+                    );
+                } else if let Ok(snapshot) = transport
+                    .list_controller_pairings(controller_session_id)
+                    .await
+                {
+                    apply_snapshot(controller_session_id, private_beach_id, known, snapshot);
+                }
+            }
+            ControllerPairingAction::Removed => {
+                known.remove(&event.child_session_id);
+                info!(
+                    target = "controller_pairing",
+                    controller_session_id,
+                    private_beach_id,
+                    child_session_id = %event.child_session_id,
+                    "controller pairing removed"
+                );
+            }
+        }
+    }
+
+    fn upsert_pairing(
+        controller_session_id: &str,
+        private_beach_id: &str,
+        known: &mut HashMap<String, ControllerPairing>,
+        pairing: ControllerPairing,
+        action: ControllerPairingAction,
+    ) {
+        let child = pairing.child_session_id.clone();
+        let entry = known.insert(child.clone(), pairing.clone());
+        let log_action = if entry.is_some() {
+            ControllerPairingAction::Updated
+        } else {
+            action
+        };
+        log_pairing(
+            controller_session_id,
+            private_beach_id,
+            &pairing,
+            log_action,
+        );
+    }
+
+    fn apply_snapshot(
+        controller_session_id: &str,
+        private_beach_id: &str,
+        known: &mut HashMap<String, ControllerPairing>,
+        snapshot: Vec<ControllerPairing>,
+    ) {
+        let mut next = HashMap::new();
+        for pairing in snapshot {
+            let child = pairing.child_session_id.clone();
+            if let Some(existing) = known.get(&child) {
+                if existing != &pairing {
+                    log_pairing(
+                        controller_session_id,
+                        private_beach_id,
+                        &pairing,
+                        ControllerPairingAction::Updated,
+                    );
+                }
+            } else {
+                log_pairing(
+                    controller_session_id,
+                    private_beach_id,
+                    &pairing,
+                    ControllerPairingAction::Added,
+                );
+            }
+            next.insert(child, pairing);
+        }
+
+        for removed in known
+            .keys()
+            .filter(|child| !next.contains_key(*child))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            info!(
+                target = "controller_pairing",
+                controller_session_id,
+                private_beach_id,
+                child_session_id = %removed,
+                "controller pairing removed"
+            );
+        }
+
+        *known = next;
+    }
+
+    fn log_pairing(
+        controller_session_id: &str,
+        private_beach_id: &str,
+        pairing: &ControllerPairing,
+        action: ControllerPairingAction,
+    ) {
+        let transport = pairing
+            .transport_status
+            .as_ref()
+            .map(|status| status.transport)
+            .unwrap_or_default();
+        let transport_latency = pairing
+            .transport_status
+            .as_ref()
+            .and_then(|status| status.latency_ms);
+        let transport_error = pairing
+            .transport_status
+            .as_ref()
+            .and_then(|status| status.last_error.as_deref());
+        info!(
+            target = "controller_pairing",
+            controller_session_id,
+            private_beach_id,
+            child_session_id = %pairing.child_session_id,
+            update_cadence = ?pairing.update_cadence,
+            prompt_template = ?pairing.prompt_template,
+            transport = ?transport,
+            transport_latency = ?transport_latency,
+            transport_error = ?transport_error,
+            action = ?action,
+            "controller pairing update"
+        );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::HashMap;
+
+        fn sample_pairing(
+            controller: &str,
+            child: &str,
+            status: Option<PairingTransportStatus>,
+        ) -> ControllerPairing {
+            ControllerPairing {
+                pairing_id: format!("{controller}:{child}"),
+                controller_session_id: controller.into(),
+                child_session_id: child.into(),
+                prompt_template: Some("example prompt".into()),
+                update_cadence: ControllerUpdateCadence::Balanced,
+                transport_status: status,
+                created_at_ms: Some(1),
+                updated_at_ms: Some(1),
+            }
+        }
+
+        #[test]
+        fn apply_snapshot_persists_transport_status() {
+            let mut known = HashMap::new();
+            let status = PairingTransportStatus {
+                transport: PairingTransportKind::FastPath,
+                last_event_ms: Some(42),
+                latency_ms: Some(7),
+                last_error: None,
+            };
+            let pairing = sample_pairing("controller-1", "child-1", Some(status.clone()));
+
+            apply_snapshot("controller-1", "pb-test", &mut known, vec![pairing]);
+
+            let stored = known
+                .get("child-1")
+                .expect("pairing should be stored after snapshot");
+            assert_eq!(stored.transport_status, Some(status));
+        }
+
+        #[test]
+        fn upsert_pairing_updates_existing_status() {
+            let mut known = HashMap::new();
+            let initial = sample_pairing("controller-1", "child-1", None);
+            apply_snapshot("controller-1", "pb-test", &mut known, vec![initial]);
+
+            let updated_status = PairingTransportStatus {
+                transport: PairingTransportKind::HttpFallback,
+                last_event_ms: Some(99),
+                latency_ms: Some(15),
+                last_error: Some("fast_path_unavailable".into()),
+            };
+            let updated = sample_pairing("controller-1", "child-1", Some(updated_status.clone()));
+
+            upsert_pairing(
+                "controller-1",
+                "pb-test",
+                &mut known,
+                updated,
+                ControllerPairingAction::Updated,
+            );
+
+            let stored = known
+                .get("child-1")
+                .expect("pairing should remain after update");
+            assert_eq!(stored.transport_status, Some(updated_status));
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------- //
@@ -493,6 +1014,20 @@ pub struct HttpTransport<P: TokenProvider> {
     client: reqwest::Client,
     base_url: Url,
     token_provider: P,
+    fast_path: Arc<Mutex<FastPathState>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControllerLeaseResponse {
+    controller_token: String,
+    expires_at_ms: i64,
+}
+
+#[derive(Default)]
+struct FastPathState {
+    client: Option<FastPathClient>,
+    connection: Option<FastPathConnection>,
+    actions_rx: Option<broadcast::Receiver<ActionCommand>>,
 }
 
 impl<P: TokenProvider> HttpTransport<P> {
@@ -506,7 +1041,131 @@ impl<P: TokenProvider> HttpTransport<P> {
             client: reqwest::Client::new(),
             base_url: base,
             token_provider,
+            fast_path: Arc::new(Mutex::new(FastPathState::default())),
         })
+    }
+
+    async fn configure_fast_path(&self, hints: &HashMap<String, serde_json::Value>) {
+        match parse_fast_path_endpoints(self.base_url(), hints) {
+            Ok(Some(endpoints)) => {
+                let client = FastPathClient::new(endpoints.clone());
+                {
+                    let mut state = self.fast_path.lock().await;
+                    state.client = Some(client.clone());
+                }
+                if let Err(err) = self.establish_fast_path(client).await {
+                    warn!(
+                        target = "fast_path",
+                        error = %err,
+                        "failed to establish fast-path connection; continuing with HTTP transport"
+                    );
+                }
+            }
+            Ok(None) => {
+                self.clear_fast_path().await;
+            }
+            Err(err) => {
+                warn!(
+                    target = "fast_path",
+                    error = %err,
+                    "invalid fast-path hint returned by manager; ignoring"
+                );
+            }
+        }
+    }
+
+    async fn establish_fast_path(
+        &self,
+        client: FastPathClient,
+    ) -> HarnessResult<FastPathConnection> {
+        let token = self.token_provider.token().await?;
+        let connection = client.connect(&token).await?;
+        let receiver = connection.subscribe_actions();
+        {
+            let mut state = self.fast_path.lock().await;
+            state.connection = Some(connection.clone());
+            state.actions_rx = Some(receiver);
+            state.client = Some(client);
+        }
+        info!(target = "fast_path", "fast-path connection established");
+        Ok(connection)
+    }
+
+    async fn ensure_fast_path_connection(&self) -> Option<FastPathConnection> {
+        let client = {
+            let state = self.fast_path.lock().await;
+            if let Some(conn) = &state.connection {
+                return Some(conn.clone());
+            }
+            state.client.clone()
+        };
+
+        if let Some(client) = client {
+            match self.establish_fast_path(client.clone()).await {
+                Ok(conn) => Some(conn),
+                Err(err) => {
+                    warn!(
+                        target = "fast_path",
+                        error = %err,
+                        "failed to connect fast-path; falling back to HTTP"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    }
+
+    async fn drop_fast_path_connection(&self) {
+        let connection = {
+            let mut state = self.fast_path.lock().await;
+            state.actions_rx = None;
+            state.connection.take()
+        };
+        if let Some(conn) = connection {
+            if let Err(err) = conn.peer.close().await {
+                warn!(
+                    target = "fast_path",
+                    error = %err,
+                    "failed to close fast-path peer connection"
+                );
+            }
+        }
+    }
+
+    async fn clear_fast_path(&self) {
+        let connection = {
+            let mut state = self.fast_path.lock().await;
+            state.client = None;
+            state.actions_rx = None;
+            state.connection.take()
+        };
+        if let Some(conn) = connection {
+            if let Err(err) = conn.peer.close().await {
+                warn!(
+                    target = "fast_path",
+                    error = %err,
+                    "failed to close fast-path peer connection"
+                );
+            }
+        }
+    }
+
+    async fn take_actions_receiver(&self) -> Option<broadcast::Receiver<ActionCommand>> {
+        let mut state = self.fast_path.lock().await;
+        if state.connection.is_some() {
+            state.actions_rx.take()
+        } else {
+            None
+        }
+    }
+
+    async fn store_actions_receiver(&self, rx: broadcast::Receiver<ActionCommand>) {
+        let mut state = self.fast_path.lock().await;
+        if state.connection.is_some() {
+            state.actions_rx = Some(rx);
+        }
     }
 
     pub fn base_url(&self) -> &Url {
@@ -555,12 +1214,31 @@ impl<P: TokenProvider> ManagerTransport for HttpTransport<P> {
         let resp = self
             .request_with_token(self.client.post(url).json(&request))
             .await?;
-        resp.json::<RegisterSessionResponse>()
+        let register_response = resp
+            .json::<RegisterSessionResponse>()
             .await
-            .map_err(|e| HarnessError::Transport(format!("decode register response: {e}")))
+            .map_err(|e| HarnessError::Transport(format!("decode register response: {e}")))?;
+
+        self.configure_fast_path(&register_response.transport_hints)
+            .await;
+
+        Ok(register_response)
     }
 
     async fn send_state(&self, session_id: &str, diff: StateDiff) -> HarnessResult<()> {
+        if let Some(conn) = self.ensure_fast_path_connection().await {
+            if let Err(err) = conn.send_state(&diff).await {
+                warn!(
+                    target = "fast_path",
+                    error = %err,
+                    "fast-path state send failed; reverting to HTTP"
+                );
+                self.drop_fast_path_connection().await;
+            } else {
+                return Ok(());
+            }
+        }
+
         let url = self.url(&format!("sessions/{session_id}/state"))?;
         self.request_with_token(self.client.post(url).json(&diff))
             .await?;
@@ -568,6 +1246,70 @@ impl<P: TokenProvider> ManagerTransport for HttpTransport<P> {
     }
 
     async fn receive_actions(&self, session_id: &str) -> HarnessResult<Vec<ActionCommand>> {
+        if self.ensure_fast_path_connection().await.is_some() {
+            if let Some(mut rx) = self.take_actions_receiver().await {
+                let mut commands = Vec::new();
+                let mut keep_receiver = true;
+
+                loop {
+                    use tokio::sync::broadcast::error::TryRecvError;
+                    match rx.try_recv() {
+                        Ok(cmd) => commands.push(cmd),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Lagged(skipped)) => {
+                            warn!(
+                                target = "fast_path",
+                                skipped, "fast-path action channel lagged; dropping connection"
+                            );
+                            keep_receiver = false;
+                            self.drop_fast_path_connection().await;
+                            break;
+                        }
+                        Err(TryRecvError::Closed) => {
+                            keep_receiver = false;
+                            self.drop_fast_path_connection().await;
+                            break;
+                        }
+                    }
+                }
+
+                if commands.is_empty() && keep_receiver {
+                    use tokio::sync::broadcast::error::RecvError;
+                    match timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                        Ok(Ok(cmd)) => {
+                            commands.push(cmd);
+                            while let Ok(cmd2) = rx.try_recv() {
+                                commands.push(cmd2);
+                            }
+                        }
+                        Ok(Err(RecvError::Lagged(skipped))) => {
+                            warn!(
+                                target = "fast_path",
+                                skipped, "fast-path action channel lagged; dropping connection"
+                            );
+                            keep_receiver = false;
+                            self.drop_fast_path_connection().await;
+                        }
+                        Ok(Err(RecvError::Closed)) => {
+                            keep_receiver = false;
+                            self.drop_fast_path_connection().await;
+                        }
+                        Err(_) => {
+                            // timeout waiting for actions; fall back to HTTP below
+                        }
+                    }
+                }
+
+                if keep_receiver {
+                    self.store_actions_receiver(rx).await;
+                }
+
+                if !commands.is_empty() {
+                    return Ok(commands);
+                }
+            }
+        }
+
         let url = self.url(&format!("sessions/{session_id}/actions/poll"))?;
         let resp = self.request_with_token(self.client.get(url)).await?;
         resp.json::<Vec<ActionCommand>>()
@@ -576,6 +1318,19 @@ impl<P: TokenProvider> ManagerTransport for HttpTransport<P> {
     }
 
     async fn ack_actions(&self, session_id: &str, acks: Vec<ActionAck>) -> HarnessResult<()> {
+        if let Some(conn) = self.ensure_fast_path_connection().await {
+            if let Err(err) = conn.send_acks(&acks).await {
+                warn!(
+                    target = "fast_path",
+                    error = %err,
+                    "fast-path ack send failed; reverting to HTTP"
+                );
+                self.drop_fast_path_connection().await;
+            } else {
+                return Ok(());
+            }
+        }
+
         let url = self.url(&format!("sessions/{session_id}/actions/ack"))?;
         self.request_with_token(self.client.post(url).json(&acks))
             .await?;
@@ -591,6 +1346,86 @@ impl<P: TokenProvider> ManagerTransport for HttpTransport<P> {
         self.request_with_token(self.client.post(url).json(&heartbeat))
             .await?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl<P: TokenProvider> ControllerTransport for HttpTransport<P> {
+    async fn list_controller_pairings(
+        &self,
+        controller_session_id: &str,
+    ) -> HarnessResult<Vec<ControllerPairing>> {
+        let url = self.url(&format!("sessions/{controller_session_id}/controllers"))?;
+        let resp = self.request_with_token(self.client.get(url)).await?;
+        resp.json::<Vec<ControllerPairing>>()
+            .await
+            .map_err(|e| HarnessError::Transport(format!("decode controller pairings: {e}")))
+    }
+
+    async fn stream_controller_pairings(
+        &self,
+        controller_session_id: &str,
+    ) -> HarnessResult<ControllerPairingStream> {
+        let url = self.url(&format!(
+            "sessions/{controller_session_id}/controllers/stream"
+        ))?;
+        let token = self.token_provider.token().await?;
+        let request = self.client.get(url).bearer_auth(token);
+        let source = EventSource::new(request).map_err(|e| {
+            HarnessError::Transport(format!("connect controller pairing stream failed: {e}"))
+        })?;
+
+        let stream = source.filter_map(|event| async move {
+            match event {
+                Ok(Event::Open) => {
+                    trace!(target = "controller_pairing", "pairing stream opened");
+                    None
+                }
+                Ok(Event::Message(msg)) => {
+                    if msg.event == "controller_pairing" {
+                        Some(
+                            serde_json::from_str::<ControllerPairingEvent>(&msg.data).map_err(
+                                |err| {
+                                    HarnessError::Transport(format!(
+                                        "decode controller pairing event: {err}"
+                                    ))
+                                },
+                            ),
+                        )
+                    } else {
+                        None
+                    }
+                }
+                Err(err) => Some(Err(HarnessError::Transport(format!(
+                    "controller pairing stream error: {err}"
+                )))),
+            }
+        });
+
+        Ok(Box::pin(stream))
+    }
+
+    async fn renew_controller_lease(
+        &self,
+        session_id: &str,
+        ttl_ms: Option<u64>,
+    ) -> HarnessResult<ControllerLeaseRenewal> {
+        let url = self.url(&format!("sessions/{session_id}/controller/lease"))?;
+        let mut body = serde_json::Map::new();
+        if let Some(ttl) = ttl_ms {
+            body.insert("ttl_ms".into(), serde_json::Value::from(ttl));
+        }
+        let resp = self
+            .request_with_token(self.client.post(url).json(&body))
+            .await?;
+        let lease = resp
+            .json::<ControllerLeaseResponse>()
+            .await
+            .map_err(|e| HarnessError::Transport(format!("decode controller lease: {e}")))?;
+        Ok(ControllerLeaseRenewal {
+            controller_token: lease.controller_token,
+            expires_at_ms: lease.expires_at_ms,
+        })
     }
 }
 
@@ -611,6 +1446,7 @@ struct InMemoryState {
     actions: Vec<Vec<ActionCommand>>,
     acks: Vec<Vec<ActionAck>>,
     health: Vec<HealthHeartbeat>,
+    controller_pairings: Vec<ControllerPairing>,
 }
 
 impl InMemoryTransport {
@@ -638,6 +1474,10 @@ impl InMemoryTransport {
 
     pub async fn health(&self) -> Vec<HealthHeartbeat> {
         self.inner.lock().await.health.clone()
+    }
+
+    pub async fn set_pairings(&self, pairings: Vec<ControllerPairing>) {
+        self.inner.lock().await.controller_pairings = pairings;
     }
 }
 
@@ -684,6 +1524,37 @@ impl ManagerTransport for InMemoryTransport {
     }
 }
 
+#[async_trait]
+impl ControllerTransport for InMemoryTransport {
+    async fn list_controller_pairings(
+        &self,
+        _controller_session_id: &str,
+    ) -> HarnessResult<Vec<ControllerPairing>> {
+        Ok(self.inner.lock().await.controller_pairings.clone())
+    }
+
+    async fn stream_controller_pairings(
+        &self,
+        _controller_session_id: &str,
+    ) -> HarnessResult<ControllerPairingStream> {
+        Ok(Box::pin(stream::empty()))
+    }
+
+    async fn renew_controller_lease(
+        &self,
+        _session_id: &str,
+        _ttl_ms: Option<u64>,
+    ) -> HarnessResult<ControllerLeaseRenewal> {
+        let mut state = self.inner.lock().await;
+        let token = format!("renewed-{}", now_millis());
+        state.register_response.controller_token = Some(token.clone());
+        Ok(ControllerLeaseRenewal {
+            controller_token: token,
+            expires_at_ms: now_millis() + 1_000,
+        })
+    }
+}
+
 // ----------------------------------------------------------------------------- //
 // Tests
 // ----------------------------------------------------------------------------- //
@@ -697,6 +1568,8 @@ mod tests {
         routing::{get, post},
         Json, Router,
     };
+    use std::time::Duration;
+    use tokio::time::sleep;
 
     fn sample_register_response() -> RegisterSessionResponse {
         RegisterSessionResponse {
@@ -881,6 +1754,50 @@ mod tests {
         assert_eq!(diff.sequence, 1);
         assert_eq!(diff.payload["type"], "cabana_frame");
         assert_eq!(diff.payload["windows"][0]["title"], "Editor");
+    }
+
+    #[tokio::test]
+    async fn controller_runtime_renews_and_updates_token() {
+        let transport = InMemoryTransport::with_response(sample_register_response());
+        transport
+            .set_pairings(vec![ControllerPairing {
+                pairing_id: "controller-1:child-1".into(),
+                controller_session_id: "controller-1".into(),
+                child_session_id: "child-1".into(),
+                prompt_template: Some("Prioritise shell".into()),
+                update_cadence: ControllerUpdateCadence::Fast,
+                transport_status: None,
+                created_at_ms: None,
+                updated_at_ms: None,
+            }])
+            .await;
+
+        let harness = SessionHarness::new(
+            HarnessConfig {
+                session_id: "controller-1".into(),
+                private_beach_id: "pb-ctrl".into(),
+                harness_type: HarnessType::TerminalShim,
+                capabilities: vec!["terminal_diff_v1".into()],
+                location_hint: None,
+                version: "0.1.0".into(),
+                viewer_passcode: None,
+            },
+            transport.clone(),
+        );
+
+        let register = harness.register(None).await.unwrap();
+        assert_eq!(register.controller_token.as_deref(), Some("controller-1"));
+
+        let handle = harness.spawn_controller_runtime(1_500);
+
+        sleep(Duration::from_millis(1_600)).await;
+
+        let token = harness.controller_token().await;
+        let token = token.expect("controller token present");
+        assert!(token.starts_with("renewed-"));
+
+        handle.abort();
+        let _ = handle.await;
     }
 
     #[derive(Default)]

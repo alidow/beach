@@ -47,6 +47,20 @@ declare global {
   }
 }
 
+function isDevEnvironment(): boolean {
+  const meta = typeof import.meta !== 'undefined' ? (import.meta as Record<string, any>) : undefined;
+  if (meta?.env && typeof meta.env.DEV === 'boolean') {
+    return Boolean(meta.env.DEV);
+  }
+  const nodeEnv = (globalThis as Record<string, any>).process?.env?.NODE_ENV;
+  if (typeof nodeEnv === 'string') {
+    return nodeEnv !== 'production';
+  }
+  return false;
+}
+
+const IS_DEV = isDevEnvironment();
+
 let versionLogged = false;
 
 function trace(...args: unknown[]): void {
@@ -295,7 +309,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   } = props;
 
   const store = useMemo(() => providedStore ?? createTerminalStore(), [providedStore]);
-  if (import.meta.env.DEV) {
+  if (IS_DEV && typeof window !== 'undefined') {
     (window as any).beachStore = store;
   }
   const snapshot = useTerminalSnapshot(store);
@@ -553,7 +567,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     }
   }, [status, onStatusChange]);
   const lines = useMemo(() => buildLines(snapshot, 600, effectiveOverlay), [snapshot, effectiveOverlay]);
-  if (import.meta.env.DEV && typeof window !== 'undefined' && window.__BEACH_TRACE) {
+  if (IS_DEV && typeof window !== 'undefined' && window.__BEACH_TRACE) {
     const sample = lines.slice(-5).map((line) => ({
       absolute: line.absolute,
       kind: line.kind,
@@ -568,7 +582,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     }
     return 'New Session';
   }, [sessionId]);
-  if (import.meta.env.DEV) {
+  if (IS_DEV && typeof window !== 'undefined') {
     (window as any).beachLines = lines;
   }
   const lineHeight = computeLineHeight(fontSize);
@@ -917,7 +931,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       } else {
         desired = 0;
       }
-      if (import.meta.env.DEV && typeof window !== 'undefined' && window.__BEACH_TRACE) {
+      if (IS_DEV && typeof window !== 'undefined' && window.__BEACH_TRACE) {
         console.debug('[beach-trace][terminal] autoscroll', {
           before: element.scrollTop,
           target,
@@ -934,7 +948,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       // Only adjust upward if we're nudging by about a row; avoid yanking the user to the top.
       if (desired >= currentTop || upwardsDelta <= maxAutoRewind) {
         element.scrollTop = desired;
-      } else if (import.meta.env.DEV && typeof window !== 'undefined' && window.__BEACH_TRACE) {
+      } else if (IS_DEV && typeof window !== 'undefined' && window.__BEACH_TRACE) {
         console.debug('[beach-trace][terminal] autoscroll skipped rewind', {
           before: currentTop,
           desired,

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import dynamic from 'next/dynamic';
 import type { Layout } from 'react-grid-layout';
 import { SessionSummary, acquireController, emergencyStop, releaseController, type BeachLayoutItem } from '../lib/api';
+import { debugLog } from '../lib/debug';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
 import { SessionTerminalPreview } from './SessionTerminalPreview';
@@ -10,9 +11,10 @@ type Props = {
   tiles: SessionSummary[];
   onRemove: (sessionId: string) => void;
   onSelect: (s: SessionSummary) => void;
-  token: string | null;
+  managerToken: string | null;
+  viewerToken: string | null;
   managerUrl: string;
-  refresh: () => Promise<void>;
+  refresh: (metadata?: Record<string, unknown>) => Promise<void>;
   preset?: 'grid2x2' | 'onePlusThree' | 'focus';
   savedLayout?: BeachLayoutItem[];
   onLayoutPersist?: (layout: BeachLayoutItem[]) => void;
@@ -163,7 +165,8 @@ export default function TileCanvas({
   tiles,
   onRemove,
   onSelect,
-  token,
+  managerToken,
+  viewerToken,
   managerUrl,
   refresh,
   preset = 'grid2x2',
@@ -200,6 +203,10 @@ export default function TileCanvas({
   );
 
   const handleLayoutChange = (next: Layout[]) => {
+    debugLog('tile-layout', 'layout change', {
+      tileCount: next.length,
+      layout: next.map(({ i, x, y, w, h }) => ({ i, x, y, w, h })),
+    });
     const nextCache: LayoutCache = { ...cache };
     next.forEach((item) => {
       nextCache[item.i] = {
@@ -234,9 +241,18 @@ export default function TileCanvas({
   );
 
   const handleLayoutCommit = useCallback(
-    (next: Layout[]) => {
+    (next: Layout[], reason: 'drag-stop' | 'resize-stop') => {
+      debugLog('tile-layout', 'layout commit', {
+        reason,
+        tileCount: next.length,
+        layout: next.map(({ i, x, y, w, h }) => ({ i, x, y, w, h })),
+      });
       if (!onLayoutPersist) return;
       const snapshot = snapshotLayout(next);
+      debugLog('tile-layout', 'persist snapshot', {
+        reason,
+        snapshot,
+      });
       onLayoutPersist(snapshot);
     },
     [onLayoutPersist, snapshotLayout],
@@ -244,39 +260,50 @@ export default function TileCanvas({
 
   const handleDragStop = useCallback(
     (next: Layout[]) => {
-      handleLayoutCommit(next);
+      handleLayoutCommit(next, 'drag-stop');
     },
     [handleLayoutCommit],
   );
 
   const handleResizeStop = useCallback(
     (next: Layout[]) => {
-      handleLayoutCommit(next);
+      handleLayoutCommit(next, 'resize-stop');
     },
     [handleLayoutCommit],
   );
 
   const handleAcquire = async (sessionId: string) => {
-    console.info('[tile] acquire controller', { sessionId, managerUrl, tokenPresent: Boolean(token && token.trim().length > 0) });
-    if (!token || token.trim().length === 0) return;
-    await acquireController(sessionId, 30000, token, managerUrl).catch(() => {});
-    await refresh();
+    const tokenPresent = Boolean(managerToken && managerToken.trim().length > 0);
+    debugLog('tile-session', 'acquire requested', { sessionId, tokenPresent });
+    console.info('[tile] acquire controller', { sessionId, managerUrl, tokenPresent });
+    if (!managerToken || managerToken.trim().length === 0) return;
+    await acquireController(sessionId, 30000, managerToken, managerUrl).catch(() => {});
+    await refresh({ source: 'tile-session', action: 'acquire', sessionId });
   };
 
   const handleRelease = async (sessionId: string, controllerToken: string | null | undefined) => {
     if (!controllerToken) return;
+    debugLog('tile-session', 'release requested', {
+      sessionId,
+      tokenPresent: Boolean(managerToken && managerToken.trim().length > 0),
+      controllerTokenPresent: Boolean(controllerToken),
+    });
     console.info('[tile] release controller', { sessionId, managerUrl, controllerToken: controllerToken.slice(0, 4) + '…' });
-    if (!token || token.trim().length === 0) return;
-    await releaseController(sessionId, controllerToken, token, managerUrl).catch(() => {});
-    await refresh();
+    if (!managerToken || managerToken.trim().length === 0) return;
+    await releaseController(sessionId, controllerToken, managerToken, managerUrl).catch(() => {});
+    await refresh({ source: 'tile-session', action: 'release', sessionId });
   };
 
   const handleStop = async (sessionId: string) => {
     if (!confirm('Emergency stop?')) return;
+    debugLog('tile-session', 'emergency stop confirmed', {
+      sessionId,
+      tokenPresent: Boolean(managerToken && managerToken.trim().length > 0),
+    });
     console.warn('[tile] emergency stop', { sessionId, managerUrl });
-    if (!token || token.trim().length === 0) return;
-    await emergencyStop(sessionId, token, managerUrl).catch(() => {});
-    await refresh();
+    if (!managerToken || managerToken.trim().length === 0) return;
+    await emergencyStop(sessionId, managerToken, managerUrl).catch(() => {});
+    await refresh({ source: 'tile-session', action: 'stop', sessionId });
   };
 
   const renderResizeHandle = useCallback((axis: string) => {
@@ -339,7 +366,7 @@ export default function TileCanvas({
                   sessionId={s.session_id}
                   privateBeachId={s.private_beach_id}
                   managerUrl={managerUrl}
-                  token={token}
+                  token={viewerToken}
                   harnessType={s.harness_type}
                   className="w-full"
                 />
@@ -347,11 +374,11 @@ export default function TileCanvas({
               <div className="border-t border-border px-3 py-2">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <Button size="sm" onClick={() => handleAcquire(s.session_id)} disabled={!token || token.trim().length === 0}>Acquire</Button>
-                    <Button size="sm" variant="outline" onClick={() => handleRelease(s.session_id, s.controller_token)} disabled={!token || token.trim().length === 0}>
+                    <Button size="sm" onClick={() => handleAcquire(s.session_id)} disabled={!managerToken || managerToken.trim().length === 0}>Acquire</Button>
+                    <Button size="sm" variant="outline" onClick={() => handleRelease(s.session_id, s.controller_token)} disabled={!managerToken || managerToken.trim().length === 0}>
                       Release
                     </Button>
-                    <Button size="sm" variant="danger" onClick={() => handleStop(s.session_id)} disabled={!token || token.trim().length === 0}>
+                    <Button size="sm" variant="danger" onClick={() => handleStop(s.session_id)} disabled={!managerToken || managerToken.trim().length === 0}>
                       Stop
                     </Button>
                   </div>
@@ -381,18 +408,18 @@ export default function TileCanvas({
               )}
             </div>
             <div className="flex items-center gap-2">
-              <Button size="sm" variant="outline" onClick={() => handleAcquire(expanded.session_id)} disabled={!token || token.trim().length === 0}>
+              <Button size="sm" variant="outline" onClick={() => handleAcquire(expanded.session_id)} disabled={!managerToken || managerToken.trim().length === 0}>
                 Acquire
               </Button>
               <Button
                 size="sm"
                 variant="outline"
                 onClick={() => handleRelease(expanded.session_id, expanded.controller_token)}
-                disabled={!token || token.trim().length === 0}
+                disabled={!managerToken || managerToken.trim().length === 0}
               >
                 Release
               </Button>
-              <Button size="sm" variant="danger" onClick={() => handleStop(expanded.session_id)} disabled={!token || token.trim().length === 0}>
+              <Button size="sm" variant="danger" onClick={() => handleStop(expanded.session_id)} disabled={!managerToken || managerToken.trim().length === 0}>
                 Stop
               </Button>
               <Button size="sm" variant="ghost" onClick={() => setExpanded(null)}>Close</Button>
@@ -403,7 +430,7 @@ export default function TileCanvas({
               sessionId={expanded.session_id}
               privateBeachId={expanded.private_beach_id}
               managerUrl={managerUrl}
-              token={token}
+              token={viewerToken}
               variant="full"
               harnessType={expanded.harness_type}
               className="h-full w-full"

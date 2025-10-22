@@ -25,6 +25,8 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{trace, warn};
 
+pub mod fast_path;
+
 /// Convenient result alias used throughout the harness.
 pub type HarnessResult<T> = Result<T, HarnessError>;
 
@@ -505,6 +507,10 @@ impl<P: TokenProvider> HttpTransport<P> {
             base_url: base,
             token_provider,
         })
+    }
+
+    pub fn base_url(&self) -> &Url {
+        &self.base_url
     }
 
     fn url(&self, path: &str) -> HarnessResult<Url> {

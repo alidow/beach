@@ -2214,12 +2214,18 @@ fn default_transport_hints(session_id: &str) -> HashMap<String, serde_json::Valu
         "health_post".into(),
         serde_json::json!({ "path": format!("/sessions/{session_id}/health") }),
     );
-    // Fast-path (WebRTC) placeholder: surfaced to harness/clients so they can
-    // discover the experimental lane. Negotiation details documented in
-    // docs/private-beach/beach-manager.md and secure-webrtc plans.
     hints.insert(
         "fast_path_webrtc".into(),
-        serde_json::json!({ "status": "planned" }),
+        serde_json::json!({
+            "offer_path": format!("/fastpath/sessions/{session_id}/webrtc/offer"),
+            "ice_path": format!("/fastpath/sessions/{session_id}/webrtc/ice"),
+            "channels": {
+                "actions": "mgr-actions",
+                "acks": "mgr-acks",
+                "state": "mgr-state"
+            },
+            "status": "experimental"
+        }),
     );
     hints
 }

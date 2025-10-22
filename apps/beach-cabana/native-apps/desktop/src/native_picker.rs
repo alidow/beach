@@ -1,5 +1,5 @@
 use cabana_macos_picker::{PickerError, PickerEvent, PickerHandle, PickerResult};
-use futures_util::{FutureExt, StreamExt};
+use futures_util::{FutureExt, Stream, StreamExt};
 use std::pin::Pin;
 
 #[derive(Debug, Clone)]
@@ -11,7 +11,7 @@ pub enum NativePickerMessage {
 
 pub struct NativePickerClient {
     handle: PickerHandle,
-    stream: Pin<Box<dyn futures_core::Stream<Item = PickerEvent>>>,
+    stream: Pin<Box<dyn Stream<Item = PickerEvent>>>,
 }
 
 impl NativePickerClient {
@@ -49,17 +49,10 @@ impl NativePickerClient {
         self.handle.launch()
     }
 
-    pub fn stop(&self) -> Result<(), PickerError> {
-        self.handle.stop()
-    }
 }
 
 impl Drop for NativePickerClient {
     fn drop(&mut self) {
         let _ = self.handle.stop();
     }
-}
-
-pub fn available() -> bool {
-    PickerHandle::new().is_ok()
 }

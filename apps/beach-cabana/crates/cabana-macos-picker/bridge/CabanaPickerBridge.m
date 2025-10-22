@@ -353,93 +353,34 @@ static NSDictionary *CabanaCreateSelectionPayload(SCContentFilter *filter, SCStr
     NSString *label = nil;
     NSString *application = nil;
 
-    NSArray<SCDisplay *> *displays = nil;
-    if (@available(macOS 15.2, *)) {
-        displays = filter.includedDisplays;
+    SCShareableContentStyle style = SCShareableContentStyleNone;
+    if ([filter respondsToSelector:@selector(style)]) {
+        style = filter.style;
     }
-    if (displays.count > 0) {
-        SCDisplay *display = displays.firstObject;
-        identifier = [NSString stringWithFormat:@"display:%u", display.displayID];
-        label = CabanaDisplayNameForDisplay(display);
-        kind = @"display";
-        metadata[@"display_id"] = @(display.displayID);
-        CGRect frame = display.frame;
-        metadata[@"width"] = @(CGRectGetWidth(frame));
-        metadata[@"height"] = @(CGRectGetHeight(frame));
-    } else {
-        NSArray<SCWindow *> *windows = nil;
-        if (@available(macOS 15.2, *)) {
-            windows = filter.includedWindows;
-        }
-        if (windows.count > 0) {
-            SCWindow *window = windows.firstObject;
-            identifier = [NSString stringWithFormat:@"window:%u", window.windowID];
-            label = window.title ?: @"Untitled Window";
+    switch (style) {
+        case SCShareableContentStyleDisplay:
+            kind = @"display";
+            label = @"Selected Display";
+            break;
+        case SCShareableContentStyleWindow:
             kind = @"window";
-            metadata[@"window_id"] = @(window.windowID);
-            metadata[@"layer"] = @(window.windowLayer);
-            metadata[@"is_on_screen"] = @(window.isOnScreen);
-            CGRect frame = window.frame;
-            metadata[@"width"] = @(CGRectGetWidth(frame));
-            metadata[@"height"] = @(CGRectGetHeight(frame));
-
-            SCRunningApplication *app = window.owningApplication;
-            if (app) {
-                application = app.applicationName;
-                metadata[@"bundle_id"] = app.bundleIdentifier ?: @"";
-                metadata[@"process_id"] = @(app.processID);
-            }
-        } else {
-            NSArray<SCRunningApplication *> *applications = nil;
-            if (@available(macOS 15.2, *)) {
-                applications = filter.includedApplications;
-            }
-            if (applications.count > 0) {
-                SCRunningApplication *app = applications.firstObject;
-                identifier = [NSString stringWithFormat:@"application:%@", app.bundleIdentifier ?: @"unknown"];
-                application = app.applicationName;
-                label = app.applicationName;
-                kind = @"application";
-                metadata[@"bundle_id"] = app.bundleIdentifier ?: @"";
-                metadata[@"process_id"] = @(app.processID);
-            } else {
-                SCShareableContentStyle style = SCShareableContentStyleNone;
-                if (@available(macOS 14.0, *)) {
-                    style = filter.style;
-                }
-                switch (style) {
-                    case SCShareableContentStyleDisplay:
-                        kind = @"display";
-                        label = @"Selected Display";
-                        break;
-                    case SCShareableContentStyleWindow:
-                        kind = @"window";
-                        label = @"Selected Window";
-                        break;
-                    case SCShareableContentStyleApplication:
-                        kind = @"application";
-                        label = @"Selected Application";
-                        break;
-                    default:
-                        kind = @"unknown";
-                        label = @"Selected Content";
-                        break;
-                }
-            }
-        }
+            label = @"Selected Window";
+            break;
+        case SCShareableContentStyleApplication:
+            kind = @"application";
+            label = @"Selected Application";
+            break;
+        default:
+            kind = @"unknown";
+            label = @"Selected Content";
+            break;
     }
 
-    if (@available(macOS 14.0, *)) {
-        SCShareableContentInfo *info = [SCShareableContent infoForFilter:filter];
-        if (info) {
-            CGRect rect = info.contentRect;
-            if (!metadata[@"width"]) {
-                metadata[@"width"] = @(CGRectGetWidth(rect));
-            }
-            if (!metadata[@"height"]) {
-                metadata[@"height"] = @(CGRectGetHeight(rect));
-            }
-        }
+    SCShareableContentInfo *info = [SCShareableContent infoForFilter:filter];
+    if (info) {
+        CGRect rect = info.contentRect;
+        metadata[@"width"] = @(CGRectGetWidth(rect));
+        metadata[@"height"] = @(CGRectGetHeight(rect));
     }
 
     if (!label) {

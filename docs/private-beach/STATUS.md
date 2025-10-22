@@ -118,6 +118,8 @@ Against api.beach.sh:
    - Dial manager endpoints (offer/answer/ICE) and open `mgr-actions`, `mgr-acks`, `mgr-state`.
    - Map ActionCommand/ActionAck/StateDiff over channels; enforce controller token.
    - Back-pressure + batching; fallback to Redis/HTTP if channel drops.
+   - Kickoff June 19: manager transport hints now expose fast-path endpoints/channel labels; harness crate includes parsing scaffold (`crates/beach-buggy/src/fast_path.rs`).
+   - June 19 update: `FastPathClient::connect` now performs SDP/ICE negotiation and surfaces an action broadcast + ack/state send helpers (integration with main harness loop still pending).
 3. Manager fast‑path receive loops:
    - Listen on `mgr-acks` and call `ack_actions` with parsed acks (feed histograms/metrics as done for REST path).
    - Listen on `mgr-state` and call `record_state` (mirror to Redis + session_runtime).
@@ -125,6 +127,7 @@ Against api.beach.sh:
 4. Surfer UX phase (see roadmap Phase 4):
    - Design system + components, IA, search/filtering, accessibility, performance budgets, polished session detail.
    - Auth via Beach Gate (OIDC); remove `access_token` query fallback.
+   - Kickoff June 19: UX foundations brief captured in `docs/private-beach/ux-foundation-brief.md`.
 5. Session onboarding hardening:
    - Replace dev bridge token with Beach Gate–minted scoped JWT; gate by beach/session.
    - Enforce ownership check against Beach Road for `attach` (currently trusting dev owner header).

@@ -15,6 +15,8 @@ fn main() {
 
     // Require macOS 14 for SCContentSharingPicker APIs.
     env::set_var("MACOSX_DEPLOYMENT_TARGET", "14.0");
+    println!("cargo:rustc-env=MACOSX_DEPLOYMENT_TARGET=14.0");
+    println!("cargo:rustc-link-arg=-mmacosx-version-min=14.0");
 
     let mut build = cc::Build::new();
     build.file("bridge/CabanaPickerBridge.m");

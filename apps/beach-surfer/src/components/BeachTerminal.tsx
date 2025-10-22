@@ -48,9 +48,11 @@ declare global {
 }
 
 function isDevEnvironment(): boolean {
-  const meta = typeof import.meta !== 'undefined' ? (import.meta as Record<string, any>) : undefined;
-  if (meta?.env && typeof meta.env.DEV === 'boolean') {
-    return Boolean(meta.env.DEV);
+  if (typeof import.meta !== 'undefined') {
+    const metaEnv = (import.meta as Record<string, any>).env;
+    if (metaEnv && typeof metaEnv.DEV === 'boolean') {
+      return Boolean(metaEnv.DEV);
+    }
   }
   const nodeEnv = (globalThis as Record<string, any>).process?.env?.NODE_ENV;
   if (typeof nodeEnv === 'string') {

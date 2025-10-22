@@ -1,12 +1,12 @@
 use anyhow::Result;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use beach_client_core::{
+    auth::{self, credentials::StoredProfile, credentials::access_token_is_valid, error::AuthError},
+    session::{SessionConfig, SessionError, SessionManager},
+};
 use beach_cabana_host::{
     desktop::{ScreenCaptureDescriptor, SelectionEvent, publish_selection},
     webrtc::{self, EncodeCodec},
-};
-use beach_client_core::{
-    auth::{self, AuthError, access_token_is_valid, credentials::StoredProfile},
-    session::{SessionConfig, SessionError, SessionManager},
 };
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::{
@@ -322,7 +322,7 @@ impl PickerApp {
 
     #[cfg(any(feature = "picker-mock", feature = "picker-native"))]
     fn poll_picker_events(&mut self) {
-        if let Some(picker) = &self.picker {
+        if let Some(picker) = self.picker.as_mut() {
             for message in picker.poll() {
                 match message {
                     NativePickerMessage::Selection(result) => {
@@ -910,22 +910,18 @@ impl PickerApp {
                         public.join_code.clone(),
                         Some(road_base.clone()),
                         None,
-                    None,
-                    Vec::new(),
-                    "host".to_string(),
-                    "viewer".to_string(),
-                )
-                .await?;
+                        None,
+                        Vec::new(),
+                        "host".to_string(),
+                        "viewer".to_string(),
+                    )
+                    .await?;
 
                     async_sender
                         .send(AppMessage::StreamVerification(verification.clone()))
                         .ok();
 
-                    let codec = if cfg!(all(target_os = "macos", feature = "cabana_sck")) {
-                        EncodeCodec::H264
-                    } else {
-                        EncodeCodec::Gif
-                    };
+                    let codec = EncodeCodec::Gif;
 
                     async_sender.send(AppMessage::StreamStarted).ok();
 
@@ -933,14 +929,15 @@ impl PickerApp {
                         result = webrtc::host_stream(
                             &transport,
                             codec,
-                        &descriptor_clone,
-                        STREAM_FRAME_LIMIT,
-                        STREAM_INTERVAL_MS,
-                        STREAM_MAX_WIDTH,
-                    ) => result,
-                    _ = async {
-                        let _ = stop_rx.await;
-                    } => Ok(()),
+                            &descriptor_clone,
+                            STREAM_FRAME_LIMIT,
+                            STREAM_INTERVAL_MS,
+                            STREAM_MAX_WIDTH,
+                        ) => result,
+                        _ = async {
+                            let _ = stop_rx.await;
+                        } => Ok(()),
+                    }
                 }
             });
 
@@ -1064,7 +1061,7 @@ impl PickerApp {
                 let session_id = session.session_id.clone();
                 let join_code = session.join_code.clone();
                 let session_url = session.session_url.clone();
-                drop(session);
+                let _ = session;
                 ui.add_space(6.0);
                 ui.label(format!("Session ID: {}", session_id));
                 ui.horizontal(|ui| {

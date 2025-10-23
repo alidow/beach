@@ -5,8 +5,8 @@ This document captures what’s built, how to run it locally, what’s left, and
 ## TL;DR
 - Manager (Rust) persists sessions, leases, and controller events in Postgres; commands/health/state use Redis Streams + TTL caches; the manager viewer worker (WebRTC) is authoritative and `/sessions/:id/events/stream` has been removed (only the state SSE remains as legacy fallback). RLS is enforced via GUC.
 - Surfer/Private Beach (Next.js) are Clerk-gated, stream live previews through the shared `BeachTerminal`, and now surface security/latency badges plus reconnect messaging. Cabana sessions still use the media player, drawers poll `controller-events` over REST, and browsers fetch Gate-signed viewer tokens from Manager instead of passcodes.
-- Controller pairing UX uses the live `/sessions/:controller_id/controllers` APIs end-to-end: drag/drop overlays announce the target (“Drop controller here” → “Release to pair”), the accessible Pair button launches the same modal, and badges/modal fields update instantly as SSE payloads arrive (including transport status/prompts).
-- Front-end coverage exercises the SSE flow via mocked `EventSource` streams (Vitest + Playwright), ensuring badges, summaries, and the modal stay in sync with backend events.
+- Controller assignments now use the agent ↔ application explorer: sessions declare their role (toggleable), applications can be dragged onto agents or assigned via the sidebar, and the right-hand pane replaces the old modal for editing prompts/cadence/transport state.
+- Front-end coverage exercises the SSE flow via mocked `EventSource` streams (Vitest + Playwright), ensuring the explorer tree, tile assignment bars, and the detail pane stay in sync with backend events.
 - Fast‑path (WebRTC) is scaffolded in the manager with answerer endpoints and routing to send actions over data channels when available. Harness‑side fast‑path client is next.
 - WebRTC refactor plan captured in `docs/private-beach/webrtc-refactor/plan.md`; the HTTP frame pump has been retired in favor of Manager joining sessions as a standard Beach client.
 

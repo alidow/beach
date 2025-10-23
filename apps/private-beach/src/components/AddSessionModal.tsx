@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { attachByCode, attachOwned } from '../lib/api';
+import { attachByCode, attachOwned, updateSessionRoleById, type SessionRole } from '../lib/api';
 import { listMySessions, RoadMySession } from '../lib/road';
 import { Dialog } from './ui/dialog';
 import { Input } from './ui/input';
@@ -23,7 +23,18 @@ export default function AddSessionModal({ open, onOpenChange, privateBeachId, ma
   const [error, setError] = useState<string | null>(null);
   const [mine, setMine] = useState<RoadMySession[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [attachRole, setAttachRole] = useState<SessionRole>('application');
   const hasToken = token && token.trim().length > 0;
+
+  useEffect(() => {
+    if (!open) {
+      setAttachRole('application');
+      setSelected(new Set());
+      setSessionId('');
+      setCode('');
+      setError(null);
+    }
+  }, [open]);
 
   useEffect(() => {
     if (tab !== 'mine') {
@@ -67,17 +78,33 @@ export default function AddSessionModal({ open, onOpenChange, privateBeachId, ma
     }
     setLoading(true); setError(null);
     try {
-      console.info('[add-session] attaching by code', {
-        privateBeachId,
-        sessionId: sessionId.trim(),
+    console.info('[add-session] attaching by code', {
+      privateBeachId,
+      sessionId: sessionId.trim(),
+      managerUrl,
+    });
+    const resp = await attachByCode(privateBeachId, sessionId.trim(), code.trim(), token, managerUrl);
+    console.info('[add-session] attach by code response', {
+      session: resp?.session?.session_id,
+    });
+    try {
+      await updateSessionRoleById(
+        resp.session.session_id,
+        attachRole,
+        token,
         managerUrl,
+        resp.session.metadata,
+        resp.session.location_hint ?? null,
+      );
+    } catch (roleErr: any) {
+      console.error('[add-session] failed to set session role', {
+        sessionId: resp.session.session_id,
+        error: roleErr,
       });
-      const resp = await attachByCode(privateBeachId, sessionId.trim(), code.trim(), token, managerUrl);
-      console.info('[add-session] attach by code response', {
-        session: resp?.session?.session_id,
-      });
-      onAttached?.([resp.session.session_id]);
-      onOpenChange(false);
+      setError('Attached session, but failed to set its type. Update it from the dashboard.');
+    }
+    onAttached?.([resp.session.session_id]);
+    onOpenChange(false);
     } catch (e: any) {
       console.error('[add-session] attach by code failed', {
         privateBeachId,
@@ -103,6 +130,19 @@ export default function AddSessionModal({ open, onOpenChange, privateBeachId, ma
         managerUrl,
       });
       await attachOwned(privateBeachId, ids, token, managerUrl);
+      await Promise.all(
+        ids.map(async (session) => {
+          try {
+            await updateSessionRoleById(session, attachRole, token, managerUrl);
+          } catch (roleErr: any) {
+            console.error('[add-session] failed to set role for session', {
+              session,
+              error: roleErr,
+            });
+            setError('Some sessions were attached, but updating their type failed. Adjust from the dashboard.');
+          }
+        }),
+      );
       onAttached?.(ids);
       onOpenChange(false);
     } catch (e: any) {
@@ -127,6 +167,30 @@ export default function AddSessionModal({ open, onOpenChange, privateBeachId, ma
           <button className={`py-2 transition-colors ${tab === 'new' ? 'font-semibold text-foreground' : 'text-muted-foreground hover:text-foreground'}`} onClick={() => setTab('new')}>Launch New</button>
         </div>
         <div className="p-3">
+          <div className="mb-4 space-y-2">
+            <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Session type</p>
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                variant={attachRole === 'application' ? 'default' : 'outline'}
+                onClick={() => setAttachRole('application')}
+                size="sm"
+              >
+                Application
+              </Button>
+              <Button
+                type="button"
+                variant={attachRole === 'agent' ? 'default' : 'outline'}
+                onClick={() => setAttachRole('agent')}
+                size="sm"
+              >
+                Agent
+              </Button>
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              Agents can control other sessions; applications are controlled by agents. You can change this later from the dashboard.
+            </p>
+          </div>
           {tab==='code' && (
             <div className="space-y-2">
               <div className="text-sm text-muted-foreground">Attach a public Beach session by its ID + code.</div>

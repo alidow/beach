@@ -20,6 +20,9 @@ export type SessionSummary = {
   } | null;
 };
 
+export const SESSION_ROLE_OPTIONS = ['agent', 'application'] as const;
+export type SessionRole = (typeof SESSION_ROLE_OPTIONS)[number];
+
 export const CONTROLLER_UPDATE_CADENCE_OPTIONS = ['fast', 'balanced', 'slow'] as const;
 export type ControllerUpdateCadence = (typeof CONTROLLER_UPDATE_CADENCE_OPTIONS)[number];
 
@@ -412,6 +415,101 @@ export async function deleteControllerPairing(
   if (!res.ok) {
     throw new Error(`deleteControllerPairing failed ${res.status}`);
   }
+}
+
+function cloneMetadata(metadata: unknown): Record<string, any> {
+  if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) {
+    return { ...(metadata as Record<string, any>) };
+  }
+  return {};
+}
+
+export function sessionRoleFromMetadata(metadata: unknown): SessionRole | null {
+  if (!metadata || typeof metadata !== 'object') {
+    return null;
+  }
+  const value = (metadata as any).role;
+  if (value === 'agent' || value === 'application') {
+    return value;
+  }
+  return null;
+}
+
+export function deriveSessionRole(
+  session: SessionSummary,
+  assignments?: ControllerPairing[],
+): SessionRole {
+  const metaRole = sessionRoleFromMetadata(session.metadata);
+  if (metaRole) {
+    return metaRole;
+  }
+  if (assignments?.some((pairing) => pairing.controller_session_id === session.session_id)) {
+    return 'agent';
+  }
+  return 'application';
+}
+
+export function buildMetadataWithRole(metadata: unknown, role: SessionRole): Record<string, any> {
+  const base = cloneMetadata(metadata);
+  base.role = role;
+  return base;
+}
+
+export async function updateSessionMetadata(
+  sessionId: string,
+  body: { metadata?: any; location_hint?: string | null },
+  token: string | null,
+  baseUrl?: string,
+): Promise<void> {
+  const res = await fetch(`${base(baseUrl)}/sessions/${sessionId}`, {
+    method: 'PATCH',
+    headers: authHeaders(token),
+    body: JSON.stringify({
+      metadata: body.metadata ?? null,
+      location_hint: body.location_hint ?? null,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`updateSessionMetadata failed ${res.status}`);
+  }
+}
+
+export async function updateSessionRole(
+  session: SessionSummary,
+  role: SessionRole,
+  token: string | null,
+  baseUrl?: string,
+): Promise<void> {
+  const metadata = buildMetadataWithRole(session.metadata, role);
+  await updateSessionMetadata(
+    session.session_id,
+    {
+      metadata,
+      location_hint: session.location_hint ?? null,
+    },
+    token,
+    baseUrl,
+  );
+}
+
+export async function updateSessionRoleById(
+  sessionId: string,
+  role: SessionRole,
+  token: string | null,
+  baseUrl?: string,
+  metadata?: unknown,
+  locationHint?: string | null,
+): Promise<void> {
+  const payload = buildMetadataWithRole(metadata, role);
+  await updateSessionMetadata(
+    sessionId,
+    {
+      metadata: payload,
+      location_hint: locationHint ?? null,
+    },
+    token,
+    baseUrl,
+  );
 }
 
 export async function createBeach(name: string, slug: string | undefined, token: string | null, baseUrl?: string): Promise<BeachSummary> {

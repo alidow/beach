@@ -74,3 +74,14 @@
 - [x] Drafted `docs/private-beach/controller-agent-ux-plan.md` capturing the new agent/application terminology, tile redesign, explorer-based assignment workflow, and mobile considerations.
 - [x] Replaced modal-first editing with a right-hand assignment pane in the plan, ensuring future engineers have a concrete roadmap.
 - [x] Logged accessibility, data-model, and responsive design requirements so follow-on implementation can proceed without additional discovery.
+
+## 2025-07-05 — Agent Explorer Implementation (Codex)
+
+### Frontend
+- [x] Replaced the legacy pair modal/summary with the agent/application explorer sidebar, assignment detail pane, and assignment bars on tiles (desktop/mobile responsive).
+- [x] Added session role toggles on tiles + attach flow, updated TileCanvas to surface controller badges, and wired the SSE hook through the new assignment model.
+- [x] Removed legacy pairing UI components, refreshed tests to cover explorer interactions, and documented the workflow updates in STATUS + fast-path-validation guides.
+
+### APIs & Hooks
+- [x] Added metadata helpers (`updateSessionRoleById`, role derivation) and assignment normalisers so the explorer and tiles stay in sync with SSE updates.
+- [x] Extended `useControllerPairingStreams` reducer to drop directly into the new assignment store.

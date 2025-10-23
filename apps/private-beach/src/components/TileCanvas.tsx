@@ -1,35 +1,13 @@
-import { useCallback, useEffect, useMemo, useState, type DragEvent as ReactDragEvent } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import dynamic from 'next/dynamic';
 import type { Layout } from 'react-grid-layout';
-import {
-  SessionSummary,
-  acquireController,
-  emergencyStop,
-  releaseController,
-  type BeachLayoutItem,
-  type ControllerPairing,
-} from '../lib/api';
-import { formatCadenceLabel, pairingStatusDisplay } from '../lib/pairings';
+import type { SessionSummary, BeachLayoutItem, SessionRole, ControllerPairing } from '../lib/api';
+import type { AssignmentEdge } from '../lib/assignments';
+import { pairingStatusDisplay, formatCadenceLabel } from '../lib/pairings';
 import { debugLog } from '../lib/debug';
+import { SessionTerminalPreview } from './SessionTerminalPreview';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
-import { SessionTerminalPreview } from './SessionTerminalPreview';
-
-type Props = {
-  tiles: SessionSummary[];
-  onRemove: (sessionId: string) => void;
-  onSelect: (s: SessionSummary) => void;
-  managerToken: string | null;
-  viewerToken: string | null;
-  managerUrl: string;
-  refresh: (metadata?: Record<string, unknown>) => Promise<void>;
-  preset?: 'grid2x2' | 'onePlusThree' | 'focus';
-  savedLayout?: BeachLayoutItem[];
-  onLayoutPersist?: (layout: BeachLayoutItem[]) => void;
-  pairings: ControllerPairing[];
-  onBeginPairing: (controllerSessionId: string | null, childSessionId: string | null) => void;
-  onEditPairing: (pairing: ControllerPairing) => void;
-};
 
 const AutoGrid = dynamic(() => import('./AutoGrid'), {
   ssr: false,
@@ -39,6 +17,7 @@ const AutoGrid = dynamic(() => import('./AutoGrid'), {
 const COLS = 12;
 const DEFAULT_W = 4;
 const DEFAULT_H = 6;
+
 type LayoutCache = Record<string, Layout>;
 type ResizeHandleAxis = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
 type LayoutSnapshot = BeachLayoutItem;
@@ -52,6 +31,70 @@ const RESIZE_HANDLE_LABELS: Record<ResizeHandleAxis, string> = {
   se: 'Resize bottom-right corner',
   sw: 'Resize bottom-left corner',
 };
+
+type Props = {
+  tiles: SessionSummary[];
+  onRemove: (sessionId: string) => void;
+  onSelect: (s: SessionSummary) => void;
+  viewerToken: string | null;
+  managerUrl: string;
+  preset?: 'grid2x2' | 'onePlusThree' | 'focus';
+  savedLayout?: BeachLayoutItem[];
+  onLayoutPersist?: (layout: BeachLayoutItem[]) => void;
+  roles: Map<string, SessionRole>;
+  assignmentsByAgent: Map<string, AssignmentEdge[]>;
+  assignmentsByApplication: Map<string, ControllerPairing[]>;
+  onRequestRoleChange: (session: SessionSummary, role: SessionRole) => void;
+  onOpenAssignment: (pairing: ControllerPairing) => void;
+};
+
+function presetPositions(preset: Props['preset'], count: number) {
+  if (preset === 'focus') {
+    return Array.from({ length: count }).map((_, idx) => ({
+      x: 0,
+      y: idx * DEFAULT_H,
+      w: COLS,
+      h: DEFAULT_H,
+    }));
+  }
+  if (preset === 'onePlusThree') {
+    const positions: Array<{ x: number; y: number; w: number; h: number }> = [];
+    positions.push({ x: 0, y: 0, w: COLS, h: DEFAULT_H });
+    let row = DEFAULT_H;
+    for (let i = 1; i < count; i += 1) {
+      const colIndex = (i - 1) % 3;
+      const x = colIndex * 4;
+      positions.push({
+        x,
+        y: row,
+        w: 4,
+        h: DEFAULT_H,
+      });
+      if (colIndex === 2) {
+        row += DEFAULT_H;
+      }
+    }
+    return positions;
+  }
+  const positions: Array<{ x: number; y: number; w: number; h: number }> = [];
+  let y = 0;
+  for (let i = 0; i < count; i += 1) {
+    const x = (i % 3) * DEFAULT_W;
+    positions.push({ x, y, w: DEFAULT_W, h: DEFAULT_H });
+    if ((i + 1) % 3 === 0) {
+      y += DEFAULT_H;
+    }
+  }
+  return positions;
+}
+
+function nextPosition(existing: Layout[]) {
+  if (existing.length === 0) {
+    return { x: 0, y: 0, w: DEFAULT_W, h: DEFAULT_H };
+  }
+  const maxY = existing.reduce((acc, item) => Math.max(acc, item.y + item.h), 0);
+  return { x: 0, y: maxY, w: DEFAULT_W, h: DEFAULT_H };
+}
 
 function ensureLayout(
   cache: LayoutCache,
@@ -105,7 +148,7 @@ function ensureLayout(
       return;
     }
     const base = basePositions[index] ?? nextPosition(items);
-    const layout: Layout = {
+    items.push({
       i: id,
       x: base.x,
       y: base.y,
@@ -113,87 +156,32 @@ function ensureLayout(
       h: base.h,
       minW: 3,
       minH: 4,
-    };
-    items.push(layout);
+    });
     taken.add(id);
   });
 
   return items;
 }
 
-type Position = { x: number; y: number; w: number; h: number };
-
-function presetPositions(preset: Props['preset'], count: number): Position[] {
-  if (preset === 'focus') {
-    return Array.from({ length: count }).map((_, idx) => ({
-      x: 0,
-      y: idx * DEFAULT_H,
-      w: COLS,
-      h: DEFAULT_H,
-    }));
-  }
-  if (preset === 'onePlusThree') {
-    const positions: Position[] = [];
-    positions.push({ x: 0, y: 0, w: COLS, h: DEFAULT_H });
-    let row = DEFAULT_H;
-    for (let i = 1; i < count; i += 1) {
-      const colIndex = (i - 1) % 3;
-      const x = colIndex * 4;
-      positions.push({
-        x,
-        y: row,
-        w: 4,
-        h: DEFAULT_H,
-      });
-      if (colIndex === 2) {
-        row += DEFAULT_H;
-      }
-    }
-    return positions;
-  }
-  // default grid2x2
-  const positions: Position[] = [];
-  let y = 0;
-  for (let i = 0; i < count; i += 1) {
-    const x = (i % 3) * DEFAULT_W;
-    positions.push({ x, y, w: DEFAULT_W, h: DEFAULT_H });
-    if ((i + 1) % 3 === 0) {
-      y += DEFAULT_H;
-    }
-  }
-  return positions;
-}
-
-function nextPosition(existing: Layout[]): Position {
-  if (existing.length === 0) {
-    return { x: 0, y: 0, w: DEFAULT_W, h: DEFAULT_H };
-  }
-  const maxY = existing.reduce((acc, item) => Math.max(acc, item.y + item.h), 0);
-  return { x: 0, y: maxY, w: DEFAULT_W, h: DEFAULT_H };
-}
-
 export default function TileCanvas({
   tiles,
   onRemove,
   onSelect,
-  managerToken,
   viewerToken,
   managerUrl,
-  refresh,
   preset = 'grid2x2',
   savedLayout,
   onLayoutPersist,
-  pairings,
-  onBeginPairing,
-  onEditPairing,
+  roles,
+  assignmentsByAgent,
+  assignmentsByApplication,
+  onRequestRoleChange,
+  onOpenAssignment,
 }: Props) {
   const [cache, setCache] = useState<LayoutCache>({});
   const [expanded, setExpanded] = useState<SessionSummary | null>(null);
   const [isClient, setIsClient] = useState(false);
-  const [draggingControllerId, setDraggingControllerId] = useState<string | null>(null);
-  const [dropTargetId, setDropTargetId] = useState<string | null>(null);
-
-  const renderNow = Date.now();
+  const [collapsedAssignments, setCollapsedAssignments] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     setIsClient(true);
@@ -218,21 +206,24 @@ export default function TileCanvas({
     [cache, savedLayout, tiles, preset],
   );
 
-  const handleLayoutChange = (next: Layout[]) => {
-    debugLog('tile-layout', 'layout change', {
-      tileCount: next.length,
-      layout: next.map(({ i, x, y, w, h }) => ({ i, x, y, w, h })),
-    });
-    const nextCache: LayoutCache = { ...cache };
-    next.forEach((item) => {
-      nextCache[item.i] = {
-        ...item,
-        minW: item.minW ?? 3,
-        minH: item.minH ?? 4,
-      };
-    });
-    setCache(nextCache);
-  };
+  const handleLayoutChange = useCallback(
+    (next: Layout[]) => {
+      debugLog('tile-layout', 'layout change', {
+        tileCount: next.length,
+        layout: next.map(({ i, x, y, w, h }) => ({ i, x, y, w, h })),
+      });
+      const nextCache: LayoutCache = { ...cache };
+      next.forEach((item) => {
+        nextCache[item.i] = {
+          ...item,
+          minW: item.minW ?? 3,
+          minH: item.minH ?? 4,
+        };
+      });
+      setCache(nextCache);
+    },
+    [cache],
+  );
 
   const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
 
@@ -288,121 +279,6 @@ export default function TileCanvas({
     [handleLayoutCommit],
   );
 
-  const pairingIndex = useMemo(() => {
-    const byController = new Map<string, ControllerPairing[]>();
-    const byChild = new Map<string, ControllerPairing>();
-    const byKey = new Map<string, ControllerPairing>();
-    pairings.forEach((pairing) => {
-      if (!byController.has(pairing.controller_session_id)) {
-        byController.set(pairing.controller_session_id, []);
-      }
-      byController.get(pairing.controller_session_id)!.push(pairing);
-      if (!byChild.has(pairing.child_session_id)) {
-        byChild.set(pairing.child_session_id, pairing);
-      }
-      byKey.set(`${pairing.controller_session_id}|${pairing.child_session_id}`, pairing);
-    });
-    return { byController, byChild, byKey };
-  }, [pairings]);
-
-  const handleControllerDragStart = useCallback(
-    (event: ReactDragEvent<HTMLElement>, controllerId: string) => {
-      if (!event.dataTransfer) return;
-      event.dataTransfer.effectAllowed = 'copy';
-      event.dataTransfer.setData('application/x-private-beach-controller', controllerId);
-      event.dataTransfer.setData('text/plain', controllerId);
-      setDraggingControllerId(controllerId);
-      setDropTargetId(null);
-    },
-    [],
-  );
-
-  const resetControllerDrag = useCallback(() => {
-    setDraggingControllerId(null);
-    setDropTargetId(null);
-  }, []);
-
-  const handleTileDragOver = useCallback(
-    (event: ReactDragEvent<HTMLDivElement>, targetId: string) => {
-      const controllerId =
-        draggingControllerId || event.dataTransfer?.getData('application/x-private-beach-controller');
-      if (!controllerId || controllerId === targetId) {
-        return;
-      }
-      event.preventDefault();
-      if (event.dataTransfer) {
-        event.dataTransfer.dropEffect = 'copy';
-      }
-      setDropTargetId(targetId);
-    },
-    [draggingControllerId],
-  );
-
-  const handleTileDragLeave = useCallback(
-    (event: ReactDragEvent<HTMLDivElement>, targetId: string) => {
-      if (dropTargetId !== targetId) return;
-      const nextTarget = event.relatedTarget as Node | null;
-      if (nextTarget && event.currentTarget.contains(nextTarget)) {
-        return;
-      }
-      setDropTargetId(null);
-    },
-    [dropTargetId],
-  );
-
-  const handleTileDrop = useCallback(
-    (event: ReactDragEvent<HTMLDivElement>, targetId: string) => {
-      event.preventDefault();
-      const controllerId =
-        event.dataTransfer?.getData('application/x-private-beach-controller') || draggingControllerId;
-      resetControllerDrag();
-      if (!controllerId || controllerId === targetId) {
-        return;
-      }
-      const existing = pairingIndex.byKey.get(`${controllerId}|${targetId}`);
-      if (existing) {
-        onEditPairing(existing);
-        return;
-      }
-      onBeginPairing(controllerId, targetId);
-    },
-    [draggingControllerId, resetControllerDrag, pairingIndex.byKey, onBeginPairing, onEditPairing],
-  );
-
-  const handleAcquire = async (sessionId: string) => {
-    const tokenPresent = Boolean(managerToken && managerToken.trim().length > 0);
-    debugLog('tile-session', 'acquire requested', { sessionId, tokenPresent });
-    console.info('[tile] acquire controller', { sessionId, managerUrl, tokenPresent });
-    if (!managerToken || managerToken.trim().length === 0) return;
-    await acquireController(sessionId, 30000, managerToken, managerUrl).catch(() => {});
-    await refresh({ source: 'tile-session', action: 'acquire', sessionId });
-  };
-
-  const handleRelease = async (sessionId: string, controllerToken: string | null | undefined) => {
-    if (!controllerToken) return;
-    debugLog('tile-session', 'release requested', {
-      sessionId,
-      tokenPresent: Boolean(managerToken && managerToken.trim().length > 0),
-      controllerTokenPresent: Boolean(controllerToken),
-    });
-    console.info('[tile] release controller', { sessionId, managerUrl, controllerToken: controllerToken.slice(0, 4) + '…' });
-    if (!managerToken || managerToken.trim().length === 0) return;
-    await releaseController(sessionId, controllerToken, managerToken, managerUrl).catch(() => {});
-    await refresh({ source: 'tile-session', action: 'release', sessionId });
-  };
-
-  const handleStop = async (sessionId: string) => {
-    if (!confirm('Emergency stop?')) return;
-    debugLog('tile-session', 'emergency stop confirmed', {
-      sessionId,
-      tokenPresent: Boolean(managerToken && managerToken.trim().length > 0),
-    });
-    console.warn('[tile] emergency stop', { sessionId, managerUrl });
-    if (!managerToken || managerToken.trim().length === 0) return;
-    await emergencyStop(sessionId, managerToken, managerUrl).catch(() => {});
-    await refresh({ source: 'tile-session', action: 'stop', sessionId });
-  };
-
   const renderResizeHandle = useCallback((axis: string) => {
     const key = axis as ResizeHandleAxis;
     const label = RESIZE_HANDLE_LABELS[key] ?? 'Resize';
@@ -413,6 +289,15 @@ export default function TileCanvas({
         data-axis={axis}
       />
     );
+  }, []);
+
+  const toggleAssignments = useCallback((sessionId: string) => {
+    setCollapsedAssignments((prev) => {
+      const next = { ...prev };
+      const current = prev[sessionId] ?? true;
+      next[sessionId] = !current;
+      return next;
+    });
   }, []);
 
   if (!isClient) {
@@ -437,125 +322,137 @@ export default function TileCanvas({
         onResizeStop={handleResizeStop}
         onLayoutChange={handleLayoutChange}
       >
-        {tiles.map((s) => {
-          const now = renderNow;
-          const expires = s.controller_expires_at_ms || 0;
-          const remain = Math.max(0, expires - now);
-          const countdown = s.controller_token ? `${Math.floor(remain / 1000)}s` : '';
-          const isDropTarget = dropTargetId === s.session_id;
-          const showDropOverlay = Boolean(draggingControllerId && draggingControllerId !== s.session_id);
-          const controllerPairings = pairingIndex.byController.get(s.session_id) ?? [];
-          const controlledBy = pairingIndex.byChild.get(s.session_id);
+        {tiles.map((session) => {
+          const role = roles.get(session.session_id) ?? 'application';
+          const isAgent = role === 'agent';
+          const agentAssignments = assignmentsByAgent.get(session.session_id) ?? [];
+          const controllers = assignmentsByApplication.get(session.session_id) ?? [];
+          const collapsed = collapsedAssignments[session.session_id] ?? true;
+
           return (
             <div
-              key={s.session_id}
+              key={session.session_id}
               className={`flex h-full flex-col overflow-hidden rounded-xl border bg-card text-card-foreground shadow-sm transition-shadow ${
-                isDropTarget ? 'border-primary shadow-[0_0_0_2px_rgba(59,130,246,0.35)]' : 'border-border'
+                isAgent && agentAssignments.length > 0 ? 'border-primary/60' : 'border-border'
               }`}
-              data-session-id={s.session_id}
-              onDragOver={(e) => handleTileDragOver(e, s.session_id)}
-              onDragEnter={(e) => handleTileDragOver(e, s.session_id)}
-              onDragLeave={(e) => handleTileDragLeave(e, s.session_id)}
-              onDrop={(e) => handleTileDrop(e, s.session_id)}
+              data-session-id={session.session_id}
             >
               <div className="flex items-center justify-between border-b border-border bg-muted/60 px-3 py-2 backdrop-blur dark:bg-muted/30">
-                <div className="session-tile-drag-grip flex cursor-grab items-center gap-2 text-xs text-muted-foreground active:cursor-grabbing" role="button" tabIndex={0}>
-                  <span className="rounded border border-border/60 bg-background/80 px-1 font-mono text-[11px] tracking-tight">{s.session_id.slice(0, 8)}</span>
-                  <Badge variant="muted">{s.harness_type}</Badge>
-                  <Badge variant={s.last_health?.degraded ? 'warning' : 'success'}>{s.last_health?.degraded ? 'degraded' : 'healthy'}</Badge>
-                  <Badge variant="muted">{s.pending_actions}/{s.pending_unacked}</Badge>
-                  {s.controller_token && <Badge variant="muted">{countdown}</Badge>}
-                  {controllerPairings.length > 0 && (
-                    <Badge variant="muted">{controllerPairings.length} controlling</Badge>
-                  )}
-                  {controlledBy && <Badge variant="muted">child</Badge>}
+                <div
+                  className="session-tile-drag-grip flex cursor-grab items-center gap-2 text-xs text-muted-foreground active:cursor-grabbing"
+                  role="button"
+                  tabIndex={0}
+                >
+                  <span className="rounded border border-border/60 bg-background/80 px-1 font-mono text-[11px] tracking-tight">
+                    {session.session_id.slice(0, 8)}
+                  </span>
+                  <Badge variant="muted">{session.harness_type}</Badge>
+                  <Badge variant={session.last_health?.degraded ? 'warning' : 'success'}>
+                    {session.last_health?.degraded ? 'degraded' : 'healthy'}
+                  </Badge>
+                  <Badge variant="muted">{session.pending_actions}/{session.pending_unacked}</Badge>
+                  <Badge variant={isAgent ? 'default' : 'outline'}>
+                    {role === 'agent' ? 'Agent' : 'Application'}
+                  </Badge>
                 </div>
                 <div className="session-tile-actions flex items-center gap-2">
-                  <Button size="sm" variant="ghost" onClick={() => onSelect(s)}>Details</Button>
-                  <Button size="sm" variant="ghost" onClick={() => setExpanded(s)}>Expand ⤢</Button>
-                  <Button size="sm" variant="ghost" onClick={() => onRemove(s.session_id)}>Remove</Button>
+                  <Button size="sm" variant="ghost" onClick={() => onSelect(session)}>
+                    Details
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => setExpanded(session)}>
+                    Expand ⤢
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => onRemove(session.session_id)}>
+                    Remove
+                  </Button>
                   <Button
                     size="sm"
                     variant="outline"
-                    draggable
-                    onDragStart={(event) => handleControllerDragStart(event, s.session_id)}
-                    onDragEnd={resetControllerDrag}
-                    onClick={() => onBeginPairing(s.session_id, null)}
-                    aria-label={`Pair controller ${s.session_id.slice(0, 8)}`}
+                    onClick={() => onRequestRoleChange(session, role === 'agent' ? 'application' : 'agent')}
                   >
-                    Pair
+                    {role === 'agent' ? 'Set as Application' : 'Set as Agent'}
                   </Button>
                 </div>
               </div>
               <div className="relative flex min-h-0 flex-1 bg-neutral-900">
                 <SessionTerminalPreview
-                  sessionId={s.session_id}
-                  privateBeachId={s.private_beach_id}
+                  sessionId={session.session_id}
+                  privateBeachId={session.private_beach_id}
                   managerUrl={managerUrl}
                   token={viewerToken}
-                  harnessType={s.harness_type}
+                  harnessType={session.harness_type}
                   className="w-full"
                 />
-                <div
-                  className={`absolute inset-0 rounded-b-xl transition-all ${
-                    showDropOverlay ? 'pointer-events-auto' : 'pointer-events-none'
-                  } ${isDropTarget ? 'border-2 border-primary/60 bg-primary/10' : 'border-2 border-transparent'}`}
-                  onDragOver={(e) => handleTileDragOver(e, s.session_id)}
-                  onDragEnter={(e) => handleTileDragOver(e, s.session_id)}
-                  onDragLeave={(e) => handleTileDragLeave(e, s.session_id)}
-                  onDrop={(e) => handleTileDrop(e, s.session_id)}
-                  aria-hidden={!showDropOverlay}
-                  data-testid={`pairing-drop-overlay-${s.session_id}`}
-                >
-                  {showDropOverlay && (
-                    <div className="flex h-full w-full items-center justify-center text-xs font-medium text-primary">
-                      {isDropTarget ? 'Release to pair' : 'Drop controller here'}
+              </div>
+              <div className="space-y-2 border-t border-border px-3 py-2">
+                <div className="flex items-center justify-between">
+                  <div className="text-[11px] text-muted-foreground">{session.location_hint || '—'}</div>
+                  {controllers.length > 0 && (
+                    <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
+                      {controllers.map((pairing) => (
+                        <Badge
+                          key={`${pairing.controller_session_id}|${pairing.child_session_id}`}
+                          variant="muted"
+                        >
+                          {pairing.controller_session_id.slice(0, 6)}
+                        </Badge>
+                      ))}
                     </div>
                   )}
                 </div>
-              </div>
-              <div className="border-t border-border px-3 py-2">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <Button size="sm" onClick={() => handleAcquire(s.session_id)} disabled={!managerToken || managerToken.trim().length === 0}>Acquire</Button>
-                    <Button size="sm" variant="outline" onClick={() => handleRelease(s.session_id, s.controller_token)} disabled={!managerToken || managerToken.trim().length === 0}>
-                      Release
-                    </Button>
-                    <Button size="sm" variant="danger" onClick={() => handleStop(s.session_id)} disabled={!managerToken || managerToken.trim().length === 0}>
-                      Stop
-                    </Button>
+                {isAgent && (
+                  <div>
+                    <button
+                      type="button"
+                      className="flex w-full items-center justify-between rounded border border-border/70 bg-muted/40 px-2 py-1 text-[11px] text-muted-foreground transition hover:bg-muted"
+                      onClick={() => toggleAssignments(session.session_id)}
+                    >
+                      <span>
+                        {agentAssignments.length === 0
+                          ? 'No applications assigned'
+                          : `${agentAssignments.length} assignment${agentAssignments.length === 1 ? '' : 's'}`}
+                      </span>
+                      <span>{collapsed ? 'Show ▾' : 'Hide ▴'}</span>
+                    </button>
+                    {!collapsed && (
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {agentAssignments.length === 0 ? (
+                          <div className="text-[11px] text-muted-foreground">
+                            Assign applications from the explorer.
+                          </div>
+                        ) : (
+                          agentAssignments.map((edge) => {
+                            const status = pairingStatusDisplay(edge.pairing);
+                            const cadence = formatCadenceLabel(edge.pairing.update_cadence);
+                            const label = edge.application
+                              ? edge.application.session_id.slice(0, 8)
+                              : edge.pairing.child_session_id.slice(0, 8);
+                            return (
+                              <button
+                                type="button"
+                                key={
+                                  edge.pairing.pairing_id ??
+                                  `${edge.pairing.controller_session_id}|${edge.pairing.child_session_id}`
+                                }
+                                className="flex min-w-[140px] flex-col gap-1 rounded border border-border/60 bg-background/80 px-2 py-2 text-left text-[11px] shadow-sm hover:border-primary"
+                                onClick={() => onOpenAssignment(edge.pairing)}
+                              >
+                                <span className="font-mono text-xs text-foreground">{label}</span>
+                                <div className="flex flex-wrap gap-1">
+                                  <Badge variant={status.variant}>{status.label}</Badge>
+                                  <Badge variant="muted">{cadence}</Badge>
+                                </div>
+                              </button>
+                            );
+                          })
+                        )}
+                      </div>
+                    )}
                   </div>
-                  <div className="text-[11px] text-muted-foreground">{s.location_hint || '—'}</div>
-                </div>
-                {(controllerPairings.length > 0 || controlledBy) && (
-                  <div className="mt-2 space-y-1 text-[11px]">
-                    {controllerPairings.map((pairing) => {
-                      const childShort = pairing.child_session_id.slice(0, 8);
-                      const status = pairingStatusDisplay(pairing);
-                      const cadence = formatCadenceLabel(pairing.update_cadence);
-                      return (
-                        <div
-                          key={pairing.pairing_id ?? `${pairing.controller_session_id}|${pairing.child_session_id}`}
-                          className="flex flex-wrap items-center gap-2 text-muted-foreground"
-                        >
-                          <Badge variant="muted">→ {childShort}</Badge>
-                          <Badge variant={status.variant}>{status.label}</Badge>
-                          <Badge variant="muted">{cadence}</Badge>
-                        </div>
-                      );
-                    })}
-                    {controlledBy && (() => {
-                      const status = pairingStatusDisplay(controlledBy);
-                      const cadence = formatCadenceLabel(controlledBy.update_cadence);
-                      const controllerShort = controlledBy.controller_session_id.slice(0, 8);
-                      return (
-                        <div className="flex flex-wrap items-center gap-2 text-muted-foreground">
-                          <Badge variant="muted">← {controllerShort}</Badge>
-                          <Badge variant={status.variant}>{status.label}</Badge>
-                          <Badge variant="muted">{cadence}</Badge>
-                        </div>
-                      );
-                    })()}
+                )}
+                {!isAgent && controllers.length === 0 && (
+                  <div className="text-[11px] text-muted-foreground">
+                    Unassigned application — drag it onto an agent in the explorer to connect.
                   </div>
                 )}
               </div>
@@ -565,38 +462,40 @@ export default function TileCanvas({
       </AutoGrid>
       {tiles.length === 0 && (
         <div className="flex h-80 items-center justify-center rounded-xl border border-dashed border-border/70 text-sm text-muted-foreground">
-          Add sessions from the sidebar to build your dashboard.
+          Add sessions from the explorer to build your dashboard.
         </div>
       )}
       {expanded && (
         <div className="fixed inset-0 z-50 flex flex-col bg-background/95 text-foreground backdrop-blur dark:bg-black/80">
           <div className="flex items-center justify-between border-b border-border/40 px-6 py-4">
             <div className="flex flex-wrap items-center gap-3">
-              <span className="rounded border border-border/50 bg-card/80 px-2 py-1 font-mono text-sm text-card-foreground">{expanded.session_id}</span>
-              <span className="text-xs uppercase tracking-wide text-muted-foreground">{expanded.harness_type}</span>
+              <span className="rounded border border-border/50 bg-card/80 px-2 py-1 font-mono text-sm text-card-foreground">
+                {expanded.session_id}
+              </span>
+              <span className="text-xs uppercase tracking-wide text-muted-foreground">
+                {expanded.harness_type}
+              </span>
               <span className="text-xs text-muted-foreground">{expanded.location_hint || '—'}</span>
-              {expanded.controller_token && (
-                <span className="rounded-full bg-emerald-500/20 px-3 py-1 text-xs text-emerald-900 dark:text-emerald-100">
-                  Lease active
-                </span>
-              )}
+              <Badge variant={roles.get(expanded.session_id) === 'agent' ? 'default' : 'outline'}>
+                {roles.get(expanded.session_id) === 'agent' ? 'Agent' : 'Application'}
+              </Badge>
             </div>
             <div className="flex items-center gap-2">
-              <Button size="sm" variant="outline" onClick={() => handleAcquire(expanded.session_id)} disabled={!managerToken || managerToken.trim().length === 0}>
-                Acquire
-              </Button>
               <Button
                 size="sm"
                 variant="outline"
-                onClick={() => handleRelease(expanded.session_id, expanded.controller_token)}
-                disabled={!managerToken || managerToken.trim().length === 0}
+                onClick={() =>
+                  onRequestRoleChange(
+                    expanded,
+                    roles.get(expanded.session_id) === 'agent' ? 'application' : 'agent',
+                  )
+                }
               >
-                Release
+                {roles.get(expanded.session_id) === 'agent' ? 'Set as Application' : 'Set as Agent'}
               </Button>
-              <Button size="sm" variant="danger" onClick={() => handleStop(expanded.session_id)} disabled={!managerToken || managerToken.trim().length === 0}>
-                Stop
+              <Button size="sm" variant="ghost" onClick={() => setExpanded(null)}>
+                Close
               </Button>
-              <Button size="sm" variant="ghost" onClick={() => setExpanded(null)}>Close</Button>
             </div>
           </div>
           <div className="flex-1 overflow-hidden">

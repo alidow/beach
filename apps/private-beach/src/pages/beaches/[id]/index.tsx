@@ -2,7 +2,6 @@ import { useRouter } from 'next/router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAuth } from '@clerk/nextjs';
 import TopNav from '../../../components/TopNav';
-import SessionListPanel from '../../../components/SessionListPanel';
 import TileCanvas from '../../../components/TileCanvas';
 import SessionDrawer from '../../../components/SessionDrawer';
 import { Button } from '../../../components/ui/button';
@@ -18,16 +17,19 @@ import {
   listControllerPairingsForControllers,
   createControllerPairing,
   deleteControllerPairing,
-  sortControllerPairings,
+  updateSessionRole,
+  buildMetadataWithRole,
+  type SessionRole,
   type ControllerPairing,
 } from '../../../lib/api';
 import type { BeachLayout, ControllerUpdateCadence } from '../../../lib/api';
 import { BeachSettingsProvider, ManagerSettings } from '../../../components/settings/BeachSettingsContext';
 import { BeachSettingsButton } from '../../../components/settings/SettingsButton';
-import ControllerPairingModal from '../../../components/ControllerPairingModal';
-import ControllerPairingSummary from '../../../components/ControllerPairingSummary';
+import { AgentExplorer } from '../../../components/AgentExplorer';
+import { AssignmentDetailPane } from '../../../components/AssignmentDetailPane';
 import { debugLog, debugStack } from '../../../lib/debug';
 import { useControllerPairingStreams } from '../../../hooks/useControllerPairingStreams';
+import { buildAssignmentModel } from '../../../lib/assignments';
 
 export default function BeachDashboard() {
   const router = useRouter();
@@ -52,16 +54,14 @@ export default function BeachDashboard() {
   const tokenTemplate = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
   const [managerToken, setManagerToken] = useState<string | null>(null);
   const [viewerToken, setViewerToken] = useState<string | null>(null);
-  const [pairings, setPairings] = useState<ControllerPairing[]>([]);
-  const [pairingDialog, setPairingDialog] = useState<{
-    mode: 'create' | 'edit';
-    controllerId: string | null;
-    childId: string | null;
-    pairing?: ControllerPairing | null;
-  } | null>(null);
-  const [pairingSubmitting, setPairingSubmitting] = useState(false);
-  const [pairingError, setPairingError] = useState<string | null>(null);
-  const formatPairingError = useCallback((message: string) => {
+  const [assignments, setAssignments] = useState<ControllerPairing[]>([]);
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const [selectedApplicationId, setSelectedApplicationId] = useState<string | null>(null);
+  const [activeAssignment, setActiveAssignment] = useState<ControllerPairing | null>(null);
+  const [assignmentPaneOpen, setAssignmentPaneOpen] = useState(false);
+  const [assignmentSaving, setAssignmentSaving] = useState(false);
+  const [assignmentError, setAssignmentError] = useState<string | null>(null);
+  const formatAssignmentError = useCallback((message: string) => {
     if (message === 'controller_pairing_api_unavailable') {
       return 'Controller pairing API is not enabled on this manager build yet. Coordinate with Track A or update your backend stubs.';
     }
@@ -252,7 +252,7 @@ export default function BeachDashboard() {
   useEffect(() => {
     hasLoadedSessionsRef.current = false;
     knownSessionIds.current = new Set();
-    setPairings([]);
+    setAssignments([]);
   }, [id]);
 
   const addTiles = useCallback(
@@ -367,24 +367,22 @@ export default function BeachDashboard() {
         setSessions(data);
         try {
           const controllerIds = data.map((session) => session.session_id);
-          const pairingData = await listControllerPairingsForControllers(controllerIds, token, effectiveManagerUrl);
-          const unique = new Map(pairingData.map((entry) => [entry.pairing_id, entry]));
-          const flattened = sortControllerPairings(Array.from(unique.values()));
-          setPairings(flattened);
+          const assignmentData = await listControllerPairingsForControllers(controllerIds, token, effectiveManagerUrl);
+          setAssignments(assignmentData);
           debugLog(
             'dashboard',
-            'pairings refresh succeeded',
+            'assignments refresh succeeded',
             {
               ...metadata,
               privateBeachId: id,
               managerUrl: effectiveManagerUrl,
-              pairings: flattened.length,
+              assignments: assignmentData.length,
             },
           );
         } catch (pairingErr: any) {
           debugLog(
             'dashboard',
-            'pairings refresh failed',
+            'assignments refresh failed',
             {
               ...metadata,
               privateBeachId: id,
@@ -638,20 +636,42 @@ export default function BeachDashboard() {
   }, [sessions, layout.tiles]);
 
   const sessionById = useMemo(() => new Map(sessions.map((s) => [s.session_id, s])), [sessions]);
-  const controllerSessionIds = useMemo(() => {
-    const ids = new Set<string>();
-    sessions.forEach((session) => {
-      ids.add(session.session_id);
-    });
-    return Array.from(ids).sort();
-  }, [sessions]);
+  const assignmentModel = useMemo(
+    () => buildAssignmentModel(sessions, assignments),
+    [sessions, assignments],
+  );
+  const agentSessions = assignmentModel.agents;
+  const applicationSessions = assignmentModel.applications;
+  const assignmentsByAgent = assignmentModel.assignmentsByAgent;
+  const assignmentsByApplication = assignmentModel.assignmentsByApplication;
+  const sessionRoles = assignmentModel.roles;
+
+  const controllerSessionIds = useMemo(
+    () => agentSessions.map((agent) => agent.session_id),
+    [agentSessions],
+  );
 
   useControllerPairingStreams({
     managerUrl,
     managerToken,
     controllerSessionIds,
-    setPairings,
+    setAssignments,
   });
+
+  useEffect(() => {
+    if (selectedAgentId && !agentSessions.some((agent) => agent.session_id === selectedAgentId)) {
+      setSelectedAgentId(null);
+    }
+  }, [agentSessions, selectedAgentId]);
+
+  useEffect(() => {
+    if (
+      selectedApplicationId &&
+      !applicationSessions.some((app) => app.session_id === selectedApplicationId)
+    ) {
+      setSelectedApplicationId(null);
+    }
+  }, [applicationSessions, selectedApplicationId]);
 
   function onSelect(s: SessionSummary) {
     setSelected(s);
@@ -667,73 +687,115 @@ export default function BeachDashboard() {
     [managerSettings, updateManagerSettings, savingSettings],
   );
 
-  const closePairingDialog = useCallback(() => {
-    setPairingDialog(null);
-    setPairingError(null);
-  }, []);
-
-  const beginPairing = useCallback(
-    (controllerId: string, childId: string | null) => {
-      setPairingError(null);
-      const existing =
-        childId &&
-        pairings.find(
-          (entry) => entry.controller_session_id === controllerId && entry.child_session_id === childId,
+  const handleRoleChange = useCallback(
+    async (session: SessionSummary, targetRole: SessionRole) => {
+      if (!managerToken || managerToken.trim().length === 0) {
+        setError('Missing manager auth token.');
+        return;
+      }
+      setAssignmentError(null);
+      try {
+        if (targetRole === 'application') {
+          const existing = assignmentsByAgent.get(session.session_id) ?? [];
+          for (const edge of existing) {
+            await deleteControllerPairing(
+              session.session_id,
+              edge.pairing.child_session_id,
+              managerToken,
+              managerUrl,
+            );
+          }
+          setAssignments((prev) =>
+            prev.filter(
+              (entry) => entry.controller_session_id !== session.session_id,
+            ),
+          );
+        }
+        await updateSessionRole(session, targetRole, managerToken, managerUrl);
+        setSessions((prev) =>
+          prev.map((existing) =>
+            existing.session_id === session.session_id
+              ? { ...existing, metadata: buildMetadataWithRole(existing.metadata, targetRole) }
+              : existing,
+          ),
         );
-      setPairingDialog({
-        mode: existing ? 'edit' : 'create',
-        controllerId,
-        childId,
-        pairing: existing ?? null,
-      });
+        void refresh(undefined, {
+          source: 'role-change',
+          sessionId: session.session_id,
+          role: targetRole,
+        }).catch(() => {});
+      } catch (err: any) {
+        setError(err?.message ?? 'Failed to update session role');
+      }
     },
-    [pairings],
+    [managerToken, managerUrl, assignmentsByAgent, refresh],
   );
 
-  const editPairing = useCallback((pairing: ControllerPairing) => {
-    setPairingError(null);
-    setPairingDialog({
-      mode: 'edit',
-      controllerId: pairing.controller_session_id,
-      childId: pairing.child_session_id,
-      pairing,
-    });
-  }, []);
+  const handleCreateAssignment = useCallback(
+    async (agentId: string, applicationId: string) => {
+      if (!managerToken || managerToken.trim().length === 0) {
+        setAssignmentError('Missing manager auth token.');
+        return;
+      }
+      setAssignmentSaving(true);
+      setAssignmentError(null);
+      try {
+        const created = await createControllerPairing(
+          agentId,
+          {
+            child_session_id: applicationId,
+            prompt_template: null,
+            update_cadence: 'balanced',
+          },
+          managerToken,
+          managerUrl,
+        );
+        setAssignments((prev) => {
+          const map = new Map(
+            prev.map((entry) => [`${entry.controller_session_id}|${entry.child_session_id}`, entry]),
+          );
+          map.set(`${created.controller_session_id}|${created.child_session_id}`, created);
+          return Array.from(map.values());
+        });
+        setSelectedAgentId(agentId);
+        setSelectedApplicationId(applicationId);
+        setActiveAssignment(created);
+        setAssignmentPaneOpen(true);
+        void refresh(undefined, {
+          source: 'assignment',
+          reason: 'created',
+          controllerId: agentId,
+          childId: applicationId,
+        }).catch(() => {});
+      } catch (err: any) {
+        setAssignmentError(formatAssignmentError(err?.message ?? String(err)));
+      } finally {
+        setAssignmentSaving(false);
+      }
+    },
+    [managerToken, managerUrl, refresh, formatAssignmentError],
+  );
 
-  const handlePairingSubmit = useCallback(
+  const handleSaveAssignment = useCallback(
     async ({
       controllerId,
       childId,
       promptTemplate,
       updateCadence,
-      pairingId,
     }: {
       controllerId: string;
       childId: string;
       promptTemplate: string;
       updateCadence: ControllerUpdateCadence;
-      pairingId?: string | null;
     }) => {
-      if (!id) return;
       if (!managerToken || managerToken.trim().length === 0) {
-        setPairingError('Missing manager auth token.');
+        setAssignmentError('Missing manager auth token.');
         return;
       }
-      const conflictingPairing = pairings.find(
-        (entry) =>
-          entry.child_session_id === childId &&
-          entry.controller_session_id !== controllerId &&
-          entry.pairing_id !== pairingId,
-      );
-      if (conflictingPairing) {
-        const controllerLabel = conflictingPairing.controller_session_id.slice(0, 8);
-        setPairingError(`Child session is already controlled by ${controllerLabel}. Remove that pairing first.`);
-        return;
-      }
-      setPairingSubmitting(true);
-      setPairingError(null);
+      setAssignmentSaving(true);
+      setAssignmentError(null);
       try {
-        await createControllerPairing(
+        const updated = await createControllerPairing(
           controllerId,
           {
             child_session_id: childId,
@@ -743,114 +805,79 @@ export default function BeachDashboard() {
           managerToken,
           managerUrl,
         );
-        closePairingDialog();
-        await refresh(
-          { managerUrl },
-          {
-            source: 'pairing',
-            reason: 'pairing-upsert',
-            controllerId,
-            childId,
-          },
+        setAssignments((prev) =>
+          prev.map((entry) =>
+            entry.controller_session_id === controllerId && entry.child_session_id === childId
+              ? updated
+              : entry,
+          ),
         );
+        setActiveAssignment(updated);
+        void refresh(undefined, {
+          source: 'assignment',
+          reason: 'updated',
+          controllerId,
+          childId,
+        }).catch(() => {});
       } catch (err: any) {
-        const message = err?.message ?? String(err);
-        setPairingError(formatPairingError(message));
+        setAssignmentError(formatAssignmentError(err?.message ?? String(err)));
       } finally {
-        setPairingSubmitting(false);
+        setAssignmentSaving(false);
       }
     },
-    [id, managerToken, managerUrl, closePairingDialog, refresh, pairings, formatPairingError],
+    [managerToken, managerUrl, refresh, formatAssignmentError],
   );
 
-  const handlePairingRemove = useCallback(
-    async (pairing: ControllerPairing) => {
-      if (!id) return;
+  const handleRemoveAssignment = useCallback(
+    async ({ controllerId, childId }: { controllerId: string; childId: string }) => {
       if (!managerToken || managerToken.trim().length === 0) {
-        setPairingError('Missing manager auth token.');
+        setAssignmentError('Missing manager auth token.');
         return;
       }
-      if (!confirm('Remove this controller pairing?')) {
-        return;
-      }
-      setPairingSubmitting(true);
-      setPairingError(null);
+      setAssignmentSaving(true);
+      setAssignmentError(null);
       try {
-        await deleteControllerPairing(
-          pairing.controller_session_id,
-          pairing.child_session_id,
-          managerToken,
-          managerUrl,
+        await deleteControllerPairing(controllerId, childId, managerToken, managerUrl);
+        setAssignments((prev) =>
+          prev.filter(
+            (entry) =>
+              !(entry.controller_session_id === controllerId && entry.child_session_id === childId),
+          ),
         );
-        closePairingDialog();
-        await refresh(
-          { managerUrl },
-          {
-            source: 'pairing',
-            reason: 'pairing-deleted',
-            controllerId: pairing.controller_session_id,
-            childId: pairing.child_session_id,
-          },
-        );
+        setAssignmentPaneOpen(false);
+        setActiveAssignment(null);
+        void refresh(undefined, {
+          source: 'assignment',
+          reason: 'deleted',
+          controllerId,
+          childId,
+        }).catch(() => {});
       } catch (err: any) {
-        const message = err?.message ?? String(err);
-        setPairingError(formatPairingError(message));
+        setAssignmentError(formatAssignmentError(err?.message ?? String(err)));
       } finally {
-        setPairingSubmitting(false);
+        setAssignmentSaving(false);
       }
     },
-    [id, managerToken, managerUrl, closePairingDialog, refresh, formatPairingError],
+    [managerToken, managerUrl, refresh, formatAssignmentError],
   );
 
-  const pairingDialogController = pairingDialog?.controllerId
-    ? sessionById.get(pairingDialog.controllerId) ?? null
-    : null;
-  const pairingDialogChild = pairingDialog?.childId ? sessionById.get(pairingDialog.childId) ?? null : null;
-  const pairingDialogPairing = pairingDialog?.pairing ?? null;
+  const handleOpenAssignment = useCallback((pairing: ControllerPairing) => {
+    setActiveAssignment(pairing);
+    setAssignmentPaneOpen(true);
+    setSelectedAgentId(pairing.controller_session_id);
+    setSelectedApplicationId(pairing.child_session_id);
+    setAssignmentError(null);
+  }, []);
 
-  useEffect(() => {
-    if (!pairingDialog || !pairingDialog.controllerId || !pairingDialog.childId) {
-      return;
-    }
-    const latest = pairings.find(
-      (entry) =>
-        entry.controller_session_id === pairingDialog.controllerId &&
-        entry.child_session_id === pairingDialog.childId,
-    );
-    if (pairingDialog.mode === 'edit' && !latest) {
-      setPairingError((prev) => prev ?? 'Pairing was removed by another source.');
-      setPairingDialog(null);
-      return;
-    }
-    if (!latest) {
-      return;
-    }
-    setPairingDialog((prev) => {
-      if (!prev) {
-        return prev;
-      }
-      if (prev.controllerId !== pairingDialog.controllerId || prev.childId !== pairingDialog.childId) {
-        return prev;
-      }
-      const current = prev.pairing;
-      if (
-        !current ||
-        current.updated_at_ms !== latest.updated_at_ms ||
-        current.prompt_template !== latest.prompt_template ||
-        current.update_cadence !== latest.update_cadence ||
-        current.transport_status?.transport !== latest.transport_status?.transport ||
-        current.transport_status?.last_event_ms !== latest.transport_status?.last_event_ms ||
-        current.transport_status?.latency_ms !== latest.transport_status?.latency_ms ||
-        current.transport_status?.last_error !== latest.transport_status?.last_error
-      ) {
-        return {
-          ...prev,
-          pairing: latest,
-        };
-      }
-      return prev;
-    });
-  }, [pairingDialog, pairings]);
+  const activeAssignmentController = useMemo(() => {
+    if (!activeAssignment) return null;
+    return sessionById.get(activeAssignment.controller_session_id) ?? null;
+  }, [activeAssignment, sessionById]);
+
+  const activeAssignmentChild = useMemo(() => {
+    if (!activeAssignment) return null;
+    return sessionById.get(activeAssignment.child_session_id) ?? null;
+  }, [activeAssignment, sessionById]);
 
   return (
     <BeachSettingsProvider value={settingsContextValue}>
@@ -865,7 +892,7 @@ export default function BeachDashboard() {
                 onClick={() => setSidebarOpen((prev) => !prev)}
                 aria-pressed={sidebarOpen}
               >
-                {sidebarOpen ? 'Hide Sessions' : 'Sessions'}
+                {sidebarOpen ? 'Hide Explorer' : 'Show Explorer'}
               </Button>
               <Select
                 value={layout.preset}
@@ -892,34 +919,45 @@ export default function BeachDashboard() {
         <div className="grid grid-cols-12 gap-3 p-3">
           {sidebarOpen && (
             <div className="col-span-12 md:col-span-3">
-              <div className="h-[calc(100vh-4rem)] rounded-lg border border-border bg-card text-card-foreground shadow-sm">
-                <SessionListPanel sessions={sessions} onAdd={addTile} />
-              </div>
+              <AgentExplorer
+                agents={agentSessions}
+                applications={applicationSessions}
+                assignmentsByAgent={assignmentsByAgent}
+                assignmentsByApplication={assignmentsByApplication}
+                onCreateAssignment={handleCreateAssignment}
+                onRemoveAssignment={(agentId, applicationId) =>
+                  handleRemoveAssignment({ controllerId: agentId, childId: applicationId })
+                }
+                onOpenAssignment={handleOpenAssignment}
+                selectedAgentId={selectedAgentId}
+                onSelectAgent={setSelectedAgentId}
+                selectedApplicationId={selectedApplicationId}
+                onSelectApplication={setSelectedApplicationId}
+                onAddToLayout={addTile}
+              />
             </div>
           )}
           <div className={`col-span-12 ${sidebarOpen ? 'md:col-span-9' : 'md:col-span-12'}`}>
             {error && <div className="mb-2 rounded-md border border-red-500/40 bg-red-500/10 p-2 text-sm text-red-600 dark:text-red-400">{error}</div>}
+            {assignmentError && !assignmentPaneOpen && (
+              <div className="mb-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-sm text-amber-700 dark:text-amber-300">
+                {assignmentError}
+              </div>
+            )}
             <TileCanvas
               tiles={tileSessions}
               onRemove={removeTile}
               onSelect={onSelect}
-              managerToken={managerToken}
               viewerToken={viewerToken}
               managerUrl={managerUrl}
-              refresh={(metadata) => refresh(undefined, { source: 'tile-canvas', ...(metadata ?? {}) })}
               preset={layout.preset}
               savedLayout={layout.layout}
               onLayoutPersist={persistLayoutSnapshot}
-              pairings={pairings}
-              onBeginPairing={beginPairing}
-              onEditPairing={editPairing}
-            />
-            <ControllerPairingSummary
-              pairings={pairings}
-              sessions={sessionById}
-              onCreate={() => beginPairing(null, null)}
-              onEdit={editPairing}
-              onRemove={handlePairingRemove}
+              roles={sessionRoles}
+              assignmentsByAgent={assignmentsByAgent}
+              assignmentsByApplication={assignmentsByApplication}
+              onRequestRoleChange={handleRoleChange}
+              onOpenAssignment={handleOpenAssignment}
             />
           </div>
         </div>
@@ -944,21 +982,19 @@ export default function BeachDashboard() {
             }
           />
         )}
-        <ControllerPairingModal
-          open={Boolean(pairingDialog)}
-          onOpenChange={(open) => {
-            if (!open) closePairingDialog();
+        <AssignmentDetailPane
+          open={assignmentPaneOpen && Boolean(activeAssignment && activeAssignmentController && activeAssignmentChild)}
+          pairing={assignmentPaneOpen ? activeAssignment : null}
+          controller={activeAssignmentController}
+          child={activeAssignmentChild}
+          onClose={() => {
+            setAssignmentPaneOpen(false);
+            setAssignmentError(null);
           }}
-          mode={pairingDialog?.mode ?? 'create'}
-          controller={pairingDialogController}
-          child={pairingDialogChild}
-          pairing={pairingDialogPairing}
-          sessions={sessions}
-          existingPairings={pairings}
-          onSubmit={handlePairingSubmit}
-          onRemove={handlePairingRemove}
-          submitting={pairingSubmitting}
-          error={pairingError}
+          onSave={handleSaveAssignment}
+          onRemove={handleRemoveAssignment}
+          saving={assignmentSaving}
+          error={assignmentError}
         />
       </div>
     </BeachSettingsProvider>

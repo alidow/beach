@@ -1,8 +1,9 @@
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import React from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import TileCanvas from '../TileCanvas';
-import type { ControllerPairing, SessionSummary } from '../../lib/api';
+import type { ControllerPairing, SessionRole, SessionSummary } from '../../lib/api';
+import type { AssignmentEdge } from '../../lib/assignments';
 
 vi.mock('../AutoGrid', () => ({
   __esModule: true,
@@ -49,122 +50,99 @@ function makePairing(overrides: Partial<ControllerPairing>): ControllerPairing {
   };
 }
 
-function createDataTransfer(): DataTransfer {
-  const store: Record<string, string> = {};
-  return {
-    dropEffect: 'copy',
-    effectAllowed: 'all',
-    files: [],
-    items: [],
-    types: [],
-    setData: (type: string, value: string) => {
-      store[type] = value;
-    },
-    getData: (type: string) => store[type] ?? '',
-    clearData: () => {
-      Object.keys(store).forEach((key) => delete store[key]);
-    },
-    setDragImage: () => {},
-  } as unknown as DataTransfer;
-}
-
 describe('TileCanvas', () => {
-  const controller = makeSession({ session_id: 'controller-1', harness_type: 'controller' });
-  const child = makeSession({ session_id: 'child-1', harness_type: 'worker' });
+  const agent = makeSession({ session_id: 'agent-1', harness_type: 'controller' });
+  const application = makeSession({ session_id: 'app-1', harness_type: 'worker' });
+  const assignment = makePairing({ controller_session_id: 'agent-1', child_session_id: 'app-1' });
 
-  it('calls onBeginPairing when a controller is dropped onto a child tile', async () => {
-    const onBeginPairing = vi.fn();
-    const onEditPairing = vi.fn();
-    const pairLabel = new RegExp(`Pair controller ${controller.session_id.slice(0, 8)}`, 'i');
+  const roles = new Map<string, SessionRole>([
+    ['agent-1', 'agent'],
+    ['app-1', 'application'],
+  ]);
 
+  const assignmentsByAgent = new Map<string, AssignmentEdge[]>([
+    ['agent-1', [{ pairing: assignment, application }]],
+  ]);
+
+  const assignmentsByApplication = new Map<string, ControllerPairing[]>([
+    ['app-1', [assignment]],
+  ]);
+
+  it('shows assignment bar for agents and opens detail on click', async () => {
+    const onOpenAssignment = vi.fn();
     render(
       <TileCanvas
-        tiles={[controller, child]}
+        tiles={[agent]}
         onRemove={() => {}}
         onSelect={() => {}}
-        managerToken="token"
         viewerToken="viewer"
         managerUrl="http://localhost:8080"
-        refresh={async () => {}}
-        pairings={[]}
-        onBeginPairing={onBeginPairing}
-        onEditPairing={onEditPairing}
+        preset="grid2x2"
+        savedLayout={[]}
+        onLayoutPersist={() => {}}
+        roles={roles}
+        assignmentsByAgent={assignmentsByAgent}
+        assignmentsByApplication={assignmentsByApplication}
+        onRequestRoleChange={() => {}}
+        onOpenAssignment={onOpenAssignment}
       />,
     );
 
-    const pairButton = await screen.findByLabelText(pairLabel);
-    const dataTransfer = createDataTransfer();
-
-    fireEvent.dragStart(pairButton, { dataTransfer });
-    const overlay = await screen.findByTestId('pairing-drop-overlay-child-1');
-    expect(overlay).toHaveTextContent(/drop controller here/i);
-    fireEvent.dragEnter(overlay, { dataTransfer });
-    expect(overlay).toHaveTextContent(/release to pair/i);
-    fireEvent.dragOver(overlay, { dataTransfer });
-    fireEvent.drop(overlay, { dataTransfer });
-    fireEvent.dragEnd(pairButton, { dataTransfer });
-
-    expect(onBeginPairing).toHaveBeenCalledWith('controller-1', 'child-1');
-    expect(onEditPairing).not.toHaveBeenCalled();
+    await screen.findByTestId('auto-grid');
+    expect(screen.getByText('1 assignment')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Show ▾'));
+    await waitFor(() => expect(screen.getByText(/Hide/)).toBeInTheDocument());
+    const assignmentButton = screen.getByText(application.session_id.slice(0, 8)).closest('button');
+    expect(assignmentButton).not.toBeNull();
+    fireEvent.click(assignmentButton!);
+    expect(onOpenAssignment).toHaveBeenCalledWith(assignment);
   });
 
-  it('routes drop events to onEditPairing when a pairing already exists', async () => {
-    const onBeginPairing = vi.fn();
-    const onEditPairing = vi.fn();
-    const pairLabel = new RegExp(`Pair controller ${controller.session_id.slice(0, 8)}`, 'i');
-
+  it('displays controllers on application tiles', async () => {
     render(
       <TileCanvas
-        tiles={[controller, child]}
+        tiles={[application]}
         onRemove={() => {}}
         onSelect={() => {}}
-        managerToken="token"
         viewerToken="viewer"
         managerUrl="http://localhost:8080"
-        refresh={async () => {}}
-        pairings={[makePairing({ pairing_id: 'pair-existing' })]}
-        onBeginPairing={onBeginPairing}
-        onEditPairing={onEditPairing}
+        preset="grid2x2"
+        savedLayout={[]}
+        onLayoutPersist={() => {}}
+        roles={roles}
+        assignmentsByAgent={assignmentsByAgent}
+        assignmentsByApplication={assignmentsByApplication}
+        onRequestRoleChange={() => {}}
+        onOpenAssignment={() => {}}
       />,
     );
 
-    const pairButton = await screen.findByLabelText(pairLabel);
-    const dataTransfer = createDataTransfer();
-
-    fireEvent.dragStart(pairButton, { dataTransfer });
-    const overlay = await screen.findByTestId('pairing-drop-overlay-child-1');
-    fireEvent.dragEnter(overlay, { dataTransfer });
-    fireEvent.dragOver(overlay, { dataTransfer });
-    fireEvent.drop(overlay, { dataTransfer });
-    fireEvent.dragEnd(pairButton, { dataTransfer });
-
-    expect(onBeginPairing).not.toHaveBeenCalled();
-    expect(onEditPairing).toHaveBeenCalledWith(
-      expect.objectContaining({ controller_session_id: 'controller-1', child_session_id: 'child-1' }),
-    );
+    await screen.findByTestId('auto-grid');
+    expect(screen.getByText('agent-')).toBeInTheDocument();
   });
 
-  it('renders status badges for controller and child tiles', async () => {
+  it('invokes onRequestRoleChange when toggling role', async () => {
+    const onRequestRoleChange = vi.fn();
     render(
       <TileCanvas
-        tiles={[controller, child]}
+        tiles={[application]}
         onRemove={() => {}}
         onSelect={() => {}}
-        managerToken="token"
         viewerToken="viewer"
         managerUrl="http://localhost:8080"
-        refresh={async () => {}}
-        pairings={[makePairing({ update_cadence: 'balanced', transport_status: { transport: 'fast_path' } })]}
-        onBeginPairing={() => {}}
-        onEditPairing={() => {}}
+        preset="grid2x2"
+        savedLayout={[]}
+        onLayoutPersist={() => {}}
+        roles={roles}
+        assignmentsByAgent={assignmentsByAgent}
+        assignmentsByApplication={assignmentsByApplication}
+        onRequestRoleChange={onRequestRoleChange}
+        onOpenAssignment={() => {}}
       />,
     );
 
-    const fastPathBadges = await screen.findAllByText('Fast-path');
-    expect(fastPathBadges).toHaveLength(2);
-    const cadenceBadges = await screen.findAllByText('Balanced');
-    expect(cadenceBadges.length).toBeGreaterThan(0);
-    expect(await screen.findByText('→ child-1')).toBeInTheDocument();
-    expect(await screen.findByText(/← controll/i)).toBeInTheDocument();
+    await screen.findByTestId('auto-grid');
+    fireEvent.click(screen.getByText('Set as Agent'));
+    expect(onRequestRoleChange).toHaveBeenCalledWith(application, 'agent');
   });
 });

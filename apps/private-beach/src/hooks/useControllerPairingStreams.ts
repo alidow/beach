@@ -13,7 +13,7 @@ type Params = {
   managerUrl: string | null;
   managerToken: string | null;
   controllerSessionIds: string[];
-  setPairings: React.Dispatch<React.SetStateAction<ControllerPairing[]>>;
+  setAssignments: React.Dispatch<React.SetStateAction<ControllerPairing[]>>;
 };
 
 type ControllerPairingStreamEvent = {
@@ -72,7 +72,7 @@ export function useControllerPairingStreams({
   managerUrl,
   managerToken,
   controllerSessionIds,
-  setPairings,
+  setAssignments,
 }: Params) {
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -215,7 +215,7 @@ export function useControllerPairingStreams({
             childSessionId: child,
             action,
           });
-          setPairings((prev) =>
+          setAssignments((prev) =>
             applyControllerPairingEvent(prev, {
               controllerId: controller,
               childId: child,
@@ -282,5 +282,5 @@ export function useControllerPairingStreams({
       retryTimers.clear();
       retryCounts.clear();
     };
-  }, [controllerSessionIds, managerToken, managerUrl, setPairings]);
+  }, [controllerSessionIds, managerToken, managerUrl, setAssignments]);
 }

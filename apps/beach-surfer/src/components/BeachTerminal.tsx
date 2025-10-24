@@ -69,7 +69,9 @@ function trace(...args: unknown[]): void {
   if (typeof window !== 'undefined' && window.__BEACH_TRACE) {
     if (!versionLogged) {
       versionLogged = true;
-      console.info('[beach-surfer] version', __APP_VERSION__);
+      const version =
+        typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : 'unknown';
+      console.info('[beach-surfer] version', version);
     }
     console.debug('[beach-trace][terminal]', ...args);
   }
@@ -347,6 +349,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     visible: false,
     underline: false,
   });
+  const [ptyViewportRows, setPtyViewportRows] = useState<number | null>(null);
+  const ptyViewportRowsRef = useRef<number | null>(null);
+  const [ptyCols, setPtyCols] = useState<number | null>(null);
+  const ptyColsRef = useRef<number | null>(null);
   const effectiveOverlay = useMemo(() => {
     if (predictionOverlay.visible || !snapshot.hasPredictions) {
       return predictionOverlay;
@@ -691,6 +697,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   useEffect(() => {
     transportRef.current = providedTransport ?? null;
     setSecureSummary(null);
+    ptyViewportRowsRef.current = null;
+    setPtyViewportRows((prev) => (prev === null ? prev : null));
+    ptyColsRef.current = null;
+    setPtyCols((prev) => (prev === null ? prev : null));
     if (providedTransport) {
       bindTransport(providedTransport);
       setStatus('connected');
@@ -1136,15 +1146,25 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   }, [isFullscreen]);
 
   const wrapperClasses = cn(
-    'relative flex h-full min-h-0 flex-col overflow-hidden',
+    'relative flex h-full min-h-0 flex-col',
     'rounded-[22px] border border-[#0f131a] bg-[#090d14]/95 shadow-[0_45px_120px_-70px_rgba(10,26,55,0.85)]',
     isFullscreen && 'z-50 rounded-none',
     className,
+  );
+  const headerClasses = cn(
+    'relative z-10 flex items-center justify-between gap-4 bg-[#111925]/95 px-6 py-3 text-[11px] font-medium uppercase tracking-[0.36em] text-[#9aa4bc]',
+    !isFullscreen && 'rounded-t-[22px]',
   );
   const containerClasses = cn(
     'beach-terminal relative flex-1 min-h-0 overflow-y-auto overflow-x-auto whitespace-pre font-mono text-[13px] leading-[1.42] text-[#d5d9e0]',
     'bg-[hsl(var(--terminal-screen))] px-6 py-5 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04),inset_0_22px_45px_-25px_rgba(8,10,20,0.82)]',
     'outline-none focus:outline-none',
+    !isFullscreen && !showTopBar && 'rounded-t-[22px]',
+    !isFullscreen && !showStatusBar && 'rounded-b-[22px]',
+  );
+  const statusBarClasses = cn(
+    'flex items-center gap-2 px-6 pb-3 text-xs text-[hsl(var(--muted-foreground))]',
+    !isFullscreen && 'rounded-b-[22px]',
   );
 
   const containerStyle: CSSProperties & { '--beach-terminal-line-height': string } = {
@@ -1159,6 +1179,32 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     '--beach-terminal-line-height': `${lineHeight}px`,
   };
 
+  const handleMatchPtyViewport = useCallback(() => {
+    const transport = transportRef.current;
+    const targetRowsFromRef = ptyViewportRowsRef.current;
+    const subscription = subscriptionRef.current;
+    if (!transport || subscription === null || targetRowsFromRef == null || targetRowsFromRef <= 0) {
+      return;
+    }
+    const clampedRows = Math.max(1, Math.min(targetRowsFromRef, MAX_VIEWPORT_ROWS));
+    const snapshotNow = store.getSnapshot();
+    const fallbackCols = snapshotNow.cols > 0 ? snapshotNow.cols : 80;
+    const targetCols = Math.max(1, ptyColsRef.current ?? fallbackCols);
+    suppressNextResizeRef.current = true;
+    lastSentViewportRows.current = clampedRows;
+    log('match_host_viewport', {
+      targetRows: clampedRows,
+      targetCols,
+      subscription,
+    });
+    try {
+      transport.send({ type: 'resize', cols: targetCols, rows: clampedRows });
+    } catch (err) {
+      if (IS_DEV) {
+        console.warn('[beach-surfer] match_host_viewport send failed', err);
+      }
+    }
+  }, [log, store]);
   const statusColor = useMemo(() => {
     switch (status) {
       case 'connected':
@@ -1173,18 +1219,41 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         return '#64748b';
     }
   }, [status]);
+  const hasPtyResizeTarget = ptyViewportRows != null;
+  const fallbackColsForLabel = Math.max(1, ptyCols ?? (snapshot.cols > 0 ? snapshot.cols : 80));
+  const matchButtonDisabled = !hasPtyResizeTarget || status !== 'connected';
+  const matchButtonTitle = hasPtyResizeTarget
+    ? `Match PTY size ${fallbackColsForLabel}×${ptyViewportRows}`
+    : 'Host PTY size unavailable yet';
+  const matchButtonAriaLabel = hasPtyResizeTarget
+    ? `Resize to host PTY size ${fallbackColsForLabel} by ${ptyViewportRows}`
+    : 'Resize to host PTY size (unavailable)';
+  const matchButtonClass = cn(
+    'inline-flex h-3.5 w-3.5 items-center justify-center rounded-full transition focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40',
+    matchButtonDisabled
+      ? 'cursor-not-allowed border border-[#1b2638] bg-[#101724] text-[#4c5d7f] opacity-60'
+      : 'border border-[#254f8c] bg-[#2d60aa] text-[#d7e4ff] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.18)] hover:bg-[#346bc0]',
+  );
 
   return (
     <div ref={wrapperRef} className={wrapperClasses}>
-      <div className="pointer-events-none absolute inset-0">
+      <div
+        className={cn(
+          'pointer-events-none absolute inset-0',
+          !isFullscreen && 'overflow-hidden rounded-[22px]',
+        )}
+      >
         <div className="absolute inset-x-0 top-0 h-28 bg-gradient-to-b from-white/12 via-white/0 to-transparent opacity-20" aria-hidden />
-        <div className="absolute inset-0 rounded-[22px] ring-1 ring-[#1f2736]/60" aria-hidden />
+        <div
+          className={cn('absolute inset-0 ring-1 ring-[#1f2736]/60', !isFullscreen && 'rounded-[22px]')}
+          aria-hidden
+        />
       </div>
-      <JoinStatusOverlay state={joinState} message={joinMessage} />
+      <JoinStatusOverlay state={joinState} message={joinMessage} isFullscreen={isFullscreen} />
       {showTopBar ? (
         <header
           ref={headerRef}
-          className="relative z-10 flex items-center justify-between gap-4 bg-[#111925]/95 px-6 py-3 text-[11px] font-medium uppercase tracking-[0.36em] text-[#9aa4bc]"
+          className={headerClasses}
         >
           <div className="flex items-center gap-3">
             <button
@@ -1215,6 +1284,24 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
                     </g>
                   </>
                 )}
+              </svg>
+            </button>
+            <button
+              type="button"
+              onClick={handleMatchPtyViewport}
+              className={matchButtonClass}
+              aria-label={matchButtonAriaLabel}
+              title={matchButtonTitle}
+              disabled={matchButtonDisabled}
+            >
+              <svg viewBox="0 0 12 12" className="h-2.5 w-2.5" fill="none" aria-hidden>
+                <rect x="2.3" y="2.3" width="7.4" height="7.4" rx="1.6" stroke="currentColor" strokeWidth="0.9" />
+                <path d="M3.8 6h4.4" stroke="currentColor" strokeWidth="0.9" strokeLinecap="round" />
+                <path d="M6 3.6v4.8" stroke="currentColor" strokeWidth="0.9" strokeLinecap="round" />
+                <path d="M6 3.6L7.1 4.7" stroke="currentColor" strokeWidth="0.85" strokeLinecap="round" strokeLinejoin="round" />
+                <path d="M6 3.6L4.9 4.7" stroke="currentColor" strokeWidth="0.85" strokeLinecap="round" strokeLinejoin="round" />
+                <path d="M6 8.4L7.1 7.3" stroke="currentColor" strokeWidth="0.85" strokeLinecap="round" strokeLinejoin="round" />
+                <path d="M6 8.4L4.9 7.3" stroke="currentColor" strokeWidth="0.85" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
             </button>
             <span className="text-[10px] font-semibold uppercase tracking-[0.5em] text-[#c0cada]">{sessionTitle}</span>
@@ -1250,7 +1337,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         <div style={{ height: bottomPadding }} aria-hidden="true" />
       </div>
       {showStatusBar ? (
-        <footer className="flex items-center gap-2 px-6 pb-3 text-xs text-[hsl(var(--muted-foreground))]">
+        <footer className={statusBarClasses}>
           {renderStatus()}
         </footer>
       ) : null}
@@ -1282,7 +1369,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     });
 
     const remainingPixels = Math.max(0, element.scrollHeight - (element.scrollTop + element.clientHeight));
-    const atBottom = shouldReenableFollowTail(remainingPixels);
+    const atBottom = shouldReenableFollowTail(remainingPixels, pixelsPerRow);
     const nearBottom = remainingPixels <= pixelsPerRow * 2;
     const previousFollowTail = snapshot.followTail;
     store.setFollowTail(atBottom);
@@ -1425,6 +1512,14 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     switch (frame.type) {
       case 'hello':
         trace('frame hello', frame);
+        if (ptyViewportRowsRef.current !== null) {
+          ptyViewportRowsRef.current = null;
+          setPtyViewportRows((prev) => (prev === null ? prev : null));
+        }
+        if (ptyColsRef.current !== null) {
+          ptyColsRef.current = null;
+          setPtyCols((prev) => (prev === null ? prev : null));
+        }
         store.reset();
         subscriptionRef.current = frame.subscription;
         inputSeqRef.current = 0;
@@ -1448,6 +1543,16 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         break;
       case 'grid':
         trace('frame grid', frame);
+        {
+          const nextCols = Math.max(1, frame.cols);
+          ptyColsRef.current = nextCols;
+          setPtyCols((prev) => (prev === nextCols ? prev : nextCols));
+        }
+        if (typeof frame.viewportRows === 'number' && frame.viewportRows > 0) {
+          const clampedRows = Math.max(1, Math.min(frame.viewportRows, MAX_VIEWPORT_ROWS));
+          ptyViewportRowsRef.current = clampedRows;
+          setPtyViewportRows((prev) => (prev === clampedRows ? prev : clampedRows));
+        }
         store.setBaseRow(frame.baseRow);
         store.setGridSize(frame.historyRows, frame.cols);
         {
@@ -1527,6 +1632,14 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         break;
       case 'shutdown':
         trace('frame shutdown');
+        if (ptyViewportRowsRef.current !== null) {
+          ptyViewportRowsRef.current = null;
+          setPtyViewportRows((prev) => (prev === null ? prev : null));
+        }
+        if (ptyColsRef.current !== null) {
+          ptyColsRef.current = null;
+          setPtyCols((prev) => (prev === null ? prev : null));
+        }
         setStatus('closed');
         break;
       default:
@@ -1805,10 +1918,60 @@ export function buildLines(
     lines.push({ absolute: row.absolute, kind: row.kind, cells });
   }
 
+  trace('buildLines result', {
+    limit,
+    followTail: snapshot.followTail,
+    viewportTop: snapshot.viewportTop,
+    viewportHeight: snapshot.viewportHeight,
+    baseRow: snapshot.baseRow,
+    rowKinds: rows.map((row) => row.kind),
+    absolutes: rows.map((row) => row.absolute),
+    lineKinds: lines.map((line) => line.kind),
+    lineAbsolutes: lines.map((line) => line.absolute),
+  });
+  if (typeof console !== 'undefined') {
+    console.info('[beach-trace][terminal][buildLines result]', {
+      limit,
+      followTail: snapshot.followTail,
+      viewportTop: snapshot.viewportTop,
+      viewportHeight: snapshot.viewportHeight,
+      baseRow: snapshot.baseRow,
+      rowKinds: rows.map((row) => row.kind),
+      absolutes: rows.map((row) => row.absolute),
+      lineKinds: lines.map((line) => line.kind),
+      lineAbsolutes: lines.map((line) => line.absolute),
+    });
+  }
+  if (typeof window !== 'undefined' && Array.isArray((window as typeof window & { __BEACH_TRACE_HISTORY?: unknown[] }).__BEACH_TRACE_HISTORY)) {
+    (window as typeof window & { __BEACH_TRACE_HISTORY: unknown[] }).__BEACH_TRACE_HISTORY.push({
+      scope: 'terminal',
+      event: 'buildLines result',
+      payload: {
+        limit,
+        followTail: snapshot.followTail,
+        viewportTop: snapshot.viewportTop,
+        viewportHeight: snapshot.viewportHeight,
+        baseRow: snapshot.baseRow,
+        rowKinds: rows.map((row) => row.kind),
+        absolutes: rows.map((row) => row.absolute),
+        lineKinds: lines.map((line) => line.kind),
+        lineAbsolutes: lines.map((line) => line.absolute),
+      },
+    });
+  }
+
   return lines;
 }
 
-function JoinStatusOverlay({ state, message }: { state: JoinOverlayState; message: string | null }): JSX.Element | null {
+function JoinStatusOverlay({
+  state,
+  message,
+  isFullscreen,
+}: {
+  state: JoinOverlayState;
+  message: string | null;
+  isFullscreen: boolean;
+}): JSX.Element | null {
   if (state === 'idle') {
     return null;
   }
@@ -1817,7 +1980,12 @@ function JoinStatusOverlay({ state, message }: { state: JoinOverlayState; messag
   const badgeText = state === 'approved' ? 'OK' : state === 'denied' ? 'NO' : 'OFF';
 
   return (
-    <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-[#05070b]/80 backdrop-blur-sm">
+    <div
+      className={cn(
+        'pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-[#05070b]/80 backdrop-blur-sm',
+        !isFullscreen && 'rounded-[22px]',
+      )}
+    >
       <div className="pointer-events-auto flex w-[min(420px,90%)] flex-col items-center gap-3 rounded-lg border border-white/10 bg-[#111827]/95 px-6 py-5 text-center text-sm text-slate-200 shadow-2xl">
         {showSpinner ? (
           <div className="h-8 w-8 animate-spin rounded-full border-2 border-white/40 border-t-transparent" />
@@ -1899,8 +2067,9 @@ function computeLineHeight(fontSize: number): number {
   return Math.round(fontSize * 1.4);
 }
 
-export function shouldReenableFollowTail(remainingPixels: number): boolean {
-  return remainingPixels <= 1;
+export function shouldReenableFollowTail(remainingPixels: number, lineHeightPx: number): boolean {
+  const tolerance = Math.max(1, Math.ceil(lineHeightPx * 2));
+  return remainingPixels <= tolerance;
 }
 
 const DEFAULT_FOREGROUND = '#e2e8f0';

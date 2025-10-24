@@ -318,6 +318,120 @@ describe('TerminalGridCache cursor hints', () => {
   });
 });
 
+describe('TerminalGridCache visibleRows', () => {
+  it('pads missing rows when viewport height exceeds loaded content while following tail', () => {
+    const cache = new TerminalGridCache({ initialCols: 4 });
+    cache.setBaseRow(100);
+    cache.setGridSize(3, 4);
+
+    cache.applyUpdates(
+      [
+        { type: 'row', row: 100, seq: 1, cells: packString('r0') },
+        { type: 'row', row: 101, seq: 2, cells: packString('r1') },
+        { type: 'row', row: 102, seq: 3, cells: packString('r2') },
+      ],
+      { authoritative: true },
+    );
+
+    cache.setViewport(0, 5);
+
+    const rows = cache.visibleRows();
+    expect(rows).toHaveLength(5);
+    expect(rows[0]?.kind).toBe('missing');
+    expect(rows[1]?.kind).toBe('missing');
+    const loaded = rows.filter((row) => row.kind === 'loaded');
+    expect(loaded.map((row) => row.absolute)).toEqual([100, 101, 102]);
+  });
+
+  it('retains trailing blank rows before padding to viewport height', () => {
+    const cache = new TerminalGridCache({ initialCols: 4 });
+    cache.setBaseRow(200);
+    cache.setGridSize(5, 4);
+
+    cache.applyUpdates(
+      [
+        { type: 'row', row: 200, seq: 1, cells: packString('line0') },
+        { type: 'row', row: 201, seq: 2, cells: packString('line1') },
+        { type: 'row', row: 202, seq: 3, cells: packString('line2') },
+        { type: 'row', row: 203, seq: 4, cells: packString('    ') },
+        { type: 'row', row: 204, seq: 5, cells: packString('    ') },
+      ],
+      { authoritative: true },
+    );
+
+    cache.setViewport(0, 7);
+
+    const rows = cache.visibleRows();
+    expect(rows).toHaveLength(7);
+    expect(rows.slice(-2).map((row) => ({ kind: row?.kind, absolute: row?.absolute }))).toEqual([
+      { kind: 'loaded', absolute: 203 },
+      { kind: 'loaded', absolute: 204 },
+    ]);
+  });
+
+  it('pads newly exposed tail rows with missing slots until refreshed', () => {
+    const cache = new TerminalGridCache({ initialCols: 4 });
+    cache.setGridSize(6, 4);
+
+    cache.applyUpdates(
+      [
+        { type: 'row', row: 0, seq: 1, cells: packString('r0  ') },
+        { type: 'row', row: 1, seq: 2, cells: packString('r1  ') },
+        { type: 'row', row: 2, seq: 3, cells: packString('r2  ') },
+        { type: 'row', row: 3, seq: 4, cells: packString('r3  ') },
+        { type: 'row', row: 4, seq: 5, cells: packString('r4  ') },
+        { type: 'row', row: 5, seq: 6, cells: packString('r5  ') },
+      ],
+      { authoritative: true },
+    );
+
+    cache.setViewport(4, 2);
+    let rows = cache.visibleRows();
+    expect(rows.map((row) => row.kind)).toEqual(['loaded', 'loaded']);
+
+    cache.setViewport(2, 4);
+    rows = cache.visibleRows();
+    expect(rows.map((row) => row.kind)).toEqual(['missing', 'missing', 'loaded', 'loaded']);
+
+    cache.applyUpdates([{ type: 'row', row: 2, seq: 7, cells: packString('    ') }], { authoritative: true });
+    cache.applyUpdates([{ type: 'row', row: 3, seq: 8, cells: packString('    ') }], { authoritative: true });
+
+    rows = cache.visibleRows();
+    expect(rows.map((row) => row.kind)).toEqual(['loaded', 'loaded', 'loaded', 'loaded']);
+  });
+
+  it('keeps padding active after followTail is disabled', () => {
+    const cache = new TerminalGridCache({ initialCols: 4 });
+    cache.setGridSize(6, 4);
+
+    cache.applyUpdates(
+      [
+        { type: 'row', row: 0, seq: 1, cells: packString('r0  ') },
+        { type: 'row', row: 1, seq: 2, cells: packString('r1  ') },
+        { type: 'row', row: 2, seq: 3, cells: packString('r2  ') },
+        { type: 'row', row: 3, seq: 4, cells: packString('r3  ') },
+        { type: 'row', row: 4, seq: 5, cells: packString('r4  ') },
+        { type: 'row', row: 5, seq: 6, cells: packString('r5  ') },
+      ],
+      { authoritative: true },
+    );
+
+    cache.setViewport(4, 2);
+    cache.visibleRows();
+
+    cache.setViewport(2, 4);
+    cache.setFollowTail(false);
+    let rows = cache.visibleRows();
+    expect(rows.map((row) => row.kind)).toEqual(['missing', 'missing', 'loaded', 'loaded']);
+
+    cache.applyUpdates([{ type: 'row', row: 2, seq: 7, cells: packString('    ') }], { authoritative: true });
+    cache.applyUpdates([{ type: 'row', row: 3, seq: 8, cells: packString('    ') }], { authoritative: true });
+
+    rows = cache.visibleRows();
+    expect(rows.map((row) => row.kind)).toEqual(['loaded', 'loaded', 'loaded', 'loaded']);
+  });
+});
+
 function packString(text: string, styleId = DEFAULT_STYLE): number[] {
   return Array.from(text).map((char) => packCell(char, styleId));
 }

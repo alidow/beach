@@ -21,7 +21,7 @@ import curses
 import sys
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Set
 
 
 DEFAULT_FPS = 30.0
@@ -60,6 +60,7 @@ class PongView:
         self.command_buffer = bytearray()
         self.status_message = "Ready."
         self.last_frame_time = time.monotonic()
+        self._last_hud_rows: Set[int] = set()
 
     def log_status(self, message: str) -> None:
         self.status_message = message
@@ -216,16 +217,24 @@ class PongView:
     def _draw(self) -> None:
         self.stdscr.erase()
 
+        # Guard against zero-sized terminals (common before a viewer attaches).
+        if self.height < INSTRUCTION_LINES + 2 or self.width < 3:
+            self._addstr_safe(0, 0, "Waiting for viewer…")
+            self.stdscr.refresh()
+            return
+
         play_height = min(self._play_area_height(), self.height)
+        for row in range(play_height, self.height):
+            self._clear_line(row)
         if self.width >= 2:
             for row in range(play_height):
                 if row >= self.height:
                     break
-                self.stdscr.addch(row, 0, "|")
-                self.stdscr.addch(row, self.width - 1, "|")
+                self._addch_safe(row, 0, "|")
+                self._addch_safe(row, self.width - 1, "|")
         if play_height < self.height:
             for col in range(self.width):
-                self.stdscr.addch(play_height, col, "-")
+                self._addch_safe(play_height, col, "-")
 
         # Center divider for visual alignment
         if self.width >= 2:
@@ -233,25 +242,38 @@ class PongView:
                 if row % 2 == 0 and 0 <= row < self.height:
                     mid_x = self.width // 2
                     if 0 <= mid_x < self.width:
-                        self.stdscr.addch(row, mid_x, "|")
+                        self._addch_safe(row, mid_x, "|")
 
         # Paddle
         top = int(round(self.paddle.y - PADDLE_HEIGHT / 2))
         bottom = int(round(self.paddle.y + PADDLE_HEIGHT / 2))
         for row in range(top, bottom + 1):
             if 1 <= row < play_height and 0 <= self.paddle.x < self.width:
-                self.stdscr.addch(row, self.paddle.x, "#")
+                self._addch_safe(row, self.paddle.x, "#")
 
         # Ball
         if self.ball:
             bx = int(round(self.ball.x))
             by = int(round(self.ball.y))
             if 1 <= by < play_height and 1 <= bx < self.width - 1:
-                self.stdscr.addch(by, bx, "o")
+                self._addch_safe(by, bx, "o")
 
         # HUD
         instruction_y = self.height - INSTRUCTION_LINES
+        status_y = instruction_y - 1
+
+        new_hud_rows: Set[int] = set()
+        if status_y >= 0:
+            new_hud_rows.add(status_y)
         if instruction_y >= 0:
+            new_hud_rows.update({instruction_y, instruction_y + 1, instruction_y + 2})
+
+        for row in self._last_hud_rows:
+            if row not in new_hud_rows:
+                self._clear_line(row)
+
+        if instruction_y >= 0:
+            self._clear_line(instruction_y)
             controls = "Commands: m <delta> | b <y> <dx> <dy> | quit"
             self._addstr_safe(
                 instruction_y,
@@ -262,8 +284,10 @@ class PongView:
                 f"Mode: {self.mode.upper()} — Paddle X={self.paddle.x}"
                 " (positive delta moves up)"
             )
+            self._clear_line(instruction_y + 1)
             self._addstr_safe(instruction_y + 1, 1, mode_hint)
             buffer_display = self.command_buffer.decode("ascii", errors="ignore")
+            self._clear_line(instruction_y + 2)
             self._addstr_safe(
                 instruction_y + 2,
                 1,
@@ -271,9 +295,11 @@ class PongView:
             )
 
         # Status message just above instruction area if space allows
-        status_y = instruction_y - 1
         if status_y >= 0:
+            self._clear_line(status_y)
             self._addstr_safe(status_y, 1, self.status_message)
+
+        self._last_hud_rows = new_hud_rows
 
         self.stdscr.refresh()
 
@@ -284,7 +310,29 @@ class PongView:
         if max_len <= 0:
             return
         trimmed = text[:max_len]
-        self.stdscr.addstr(y, x, trimmed)
+        if not trimmed:
+            return
+        try:
+            self.stdscr.addstr(y, x, trimmed)
+        except curses.error:
+            pass
+
+    def _addch_safe(self, y: int, x: int, ch: str) -> None:
+        if y < 0 or y >= self.height or x < 0 or x >= self.width:
+            return
+        try:
+            self.stdscr.addch(y, x, ch)
+        except curses.error:
+            pass
+
+    def _clear_line(self, y: int) -> None:
+        if y < 0 or y >= self.height:
+            return
+        try:
+            self.stdscr.move(y, 0)
+            self.stdscr.clrtoeol()
+        except curses.error:
+            pass
 
     def run(self) -> None:
         curses.curs_set(0)

@@ -170,6 +170,10 @@ export class TerminalGridCache {
   private readonly traceStartMs = traceNow();
   private pendingPredictions = new Map<number, PendingPredictionEntry>();
   private debugContext: DebugUpdateContext | null = null;
+  private latestAppliedSeq = 0;
+  private tailPadSeqThreshold: number | null = null;
+  private tailPadRange: { start: number; end: number } | null = null;
+  private tailPadPendingHeightIncrease: number | null = null;
 
   constructor(options: TerminalGridCacheOptions = {}) {
     this.maxHistory = options.maxHistory ?? DEFAULT_HISTORY_LIMIT;
@@ -338,6 +342,10 @@ export class TerminalGridCache {
     this.pendingInitialCursor = null;
     this.predictions.clear();
     this.pendingPredictions.clear();
+    this.latestAppliedSeq = 0;
+    this.tailPadSeqThreshold = null;
+    this.tailPadRange = null;
+    this.tailPadPendingHeightIncrease = null;
   }
 
   setGridSize(totalRows: number, cols: number): boolean {
@@ -359,11 +367,61 @@ export class TerminalGridCache {
   setViewport(top: number, height: number): boolean {
     const clampedTop = Math.max(0, top);
     const clampedHeight = Math.max(0, height);
-    if (clampedTop === this.viewportTop && clampedHeight === this.viewportHeight) {
+    const previousTop = this.viewportTop;
+    const previousHeight = this.viewportHeight;
+    if (clampedTop === previousTop && clampedHeight === previousHeight) {
       return false;
     }
+    trace('setViewport', {
+      previousTop,
+      previousHeight,
+      nextTop: clampedTop,
+      nextHeight: clampedHeight,
+    });
     this.viewportTop = clampedTop;
     this.viewportHeight = clampedHeight;
+    const viewportBottom = clampedTop + clampedHeight;
+    const tailBottom = this.baseRow + this.rows.length;
+
+    const heightIncreased = clampedHeight > previousHeight;
+    const bottomAtTail = viewportBottom >= tailBottom;
+
+    if (previousHeight > 0 && heightIncreased && bottomAtTail && this.latestAppliedSeq > 0) {
+      this.tailPadSeqThreshold = this.latestAppliedSeq;
+      this.tailPadPendingHeightIncrease = clampedHeight - previousHeight;
+      this.tailPadRange = null;
+      trace('setViewport tail_pad_threshold', {
+        threshold: this.tailPadSeqThreshold,
+        latestSeq: this.latestAppliedSeq,
+        followTail: this.followTail,
+        viewportTop: clampedTop,
+        viewportBottom,
+        tailBottom,
+        pendingHeightIncrease: this.tailPadPendingHeightIncrease,
+      });
+    }
+
+    const movedOffTail = !bottomAtTail;
+    const reducedHeight = clampedHeight < previousHeight;
+    const scrolledAwayFromTail = clampedTop > previousTop;
+    if (movedOffTail || reducedHeight || scrolledAwayFromTail) {
+      if (this.tailPadSeqThreshold !== null || this.tailPadRange !== null || this.tailPadPendingHeightIncrease !== null) {
+        trace('setViewport clear_tail_pad_threshold', {
+          reason: movedOffTail
+            ? 'viewport_not_at_tail'
+            : reducedHeight
+              ? 'viewport_reduced'
+              : 'viewport_scrolled_away_from_tail',
+          viewportTop: clampedTop,
+          viewportBottom,
+          tailBottom,
+        });
+      }
+      this.tailPadSeqThreshold = null;
+      this.tailPadRange = null;
+      this.tailPadPendingHeightIncrease = null;
+    }
+
     return true;
   }
 
@@ -371,6 +429,7 @@ export class TerminalGridCache {
     if (this.followTail === enabled) {
       return false;
     }
+    trace('setFollowTail', { previous: this.followTail, next: enabled });
     this.followTail = enabled;
     return true;
   }
@@ -584,37 +643,164 @@ export class TerminalGridCache {
   }
 
   visibleRows(limit = this.viewportHeight || this.rows.length): RowSlot[] {
-    if (this.rows.length === 0) {
-      return [];
-    }
-    const fallbackHeight = Math.min(limit, Math.max(1, this.rows.length));
+    const normalizedLimit = Math.max(1, limit);
+    const fallbackHeight = Math.min(normalizedLimit, Math.max(1, this.rows.length || 1));
     const requestedHeight = this.viewportHeight > 0 ? this.viewportHeight : fallbackHeight;
-    const height = Math.max(1, Math.min(limit, requestedHeight));
-
-    const highestLoaded = this.findHighestLoadedRow();
-    let startAbsolute: number;
-    if (this.followTail && highestLoaded !== null) {
-      const tailHeadroom = Math.max(0, height - 1);
-      const oldestTracked = highestLoaded - tailHeadroom;
-      startAbsolute = Math.max(this.baseRow, oldestTracked);
-    } else if (this.followTail) {
-      startAbsolute = this.baseRow;
-    } else {
-      startAbsolute = clamp(
-        this.viewportTop,
-        this.baseRow,
-        Math.max(this.baseRow, this.baseRow + this.rows.length - height),
-      );
-    }
+    const height = Math.max(1, Math.min(normalizedLimit, requestedHeight));
 
     const rows: RowSlot[] = [];
+    let tailPaddingApplied = false;
+
+    const ensureTailPadRange = (startAbsolute: number): void => {
+      if (
+        this.tailPadSeqThreshold !== null &&
+        this.tailPadRange === null &&
+        this.tailPadPendingHeightIncrease !== null &&
+        this.tailPadPendingHeightIncrease > 0
+      ) {
+        const pending = Math.min(this.tailPadPendingHeightIncrease, height);
+        this.tailPadRange = { start: startAbsolute, end: startAbsolute + pending };
+        this.tailPadPendingHeightIncrease = null;
+      }
+    };
+
+    const materializeRow = (absolute: number): RowSlot => {
+      const slot = this.getRow(absolute);
+      if (
+        this.tailPadRange !== null &&
+        this.tailPadSeqThreshold !== null &&
+        absolute >= this.tailPadRange.start &&
+        absolute < this.tailPadRange.end
+      ) {
+        const latestSeq = slot && slot.kind === 'loaded' ? slot.latestSeq : null;
+        if (latestSeq === null || latestSeq <= this.tailPadSeqThreshold) {
+          tailPaddingApplied = true;
+          return createMissingRow(absolute);
+        }
+      }
+      return slot ?? createMissingRow(absolute);
+    };
+
+    if (this.followTail) {
+      const highestLoaded = this.findHighestLoadedRow();
+      const lastTracked = this.rows.length > 0 ? this.baseRow + this.rows.length - 1 : this.baseRow;
+      const anchor = Math.max(lastTracked, highestLoaded ?? Number.NEGATIVE_INFINITY);
+      const startAbsolute = anchor - (height - 1);
+      ensureTailPadRange(startAbsolute);
+      for (let offset = 0; offset < height; offset += 1) {
+        const absolute = startAbsolute + offset;
+        rows.push(materializeRow(absolute));
+      }
+      if (this.tailPadRange !== null && this.tailPadSeqThreshold !== null && !tailPaddingApplied) {
+        this.tailPadSeqThreshold = null;
+        this.tailPadRange = null;
+      }
+      trace('visibleRows tail', {
+        limit: normalizedLimit,
+        requestedHeight: height,
+        viewportHeight: this.viewportHeight,
+        baseRow: this.baseRow,
+        highestLoaded,
+        lastTracked,
+        anchor,
+        startAbsolute,
+        followTail: this.followTail,
+        tailPadSeqThreshold: this.tailPadSeqThreshold,
+        tailPadRange: this.tailPadRange,
+        rowKinds: rows.map((row) => row.kind),
+        absolutes: rows.map((row) => row.absolute),
+      });
+      if (typeof console !== 'undefined') {
+        console.info('[beach-trace][cache][visibleRows tail]', {
+          limit: normalizedLimit,
+          requestedHeight: height,
+          viewportHeight: this.viewportHeight,
+          baseRow: this.baseRow,
+          highestLoaded,
+          lastTracked,
+          anchor,
+          startAbsolute,
+          followTail: this.followTail,
+          tailPadSeqThreshold: this.tailPadSeqThreshold,
+          tailPadRange: this.tailPadRange,
+          rowKinds: rows.map((row) => row.kind),
+          absolutes: rows.map((row) => row.absolute),
+        });
+      }
+      if (tailPaddingApplied && typeof window !== 'undefined' && Array.isArray((window as typeof window & { __BEACH_TRACE_HISTORY?: unknown[] }).__BEACH_TRACE_HISTORY)) {
+        (window as typeof window & { __BEACH_TRACE_HISTORY: unknown[] }).__BEACH_TRACE_HISTORY.push({
+          scope: 'cache',
+          event: 'visibleRows tail (padded)',
+          payload: {
+            limit: normalizedLimit,
+            requestedHeight: height,
+            viewportHeight: this.viewportHeight,
+            baseRow: this.baseRow,
+            highestLoaded,
+            lastTracked,
+            anchor,
+            startAbsolute,
+            followTail: this.followTail,
+            tailPadSeqThreshold: this.tailPadSeqThreshold,
+            tailPadRange: this.tailPadRange,
+            rowKinds: rows.map((row) => row.kind),
+            absolutes: rows.map((row) => row.absolute),
+          },
+        });
+      }
+      return rows;
+    }
+    const maxStart = Math.max(this.baseRow, this.baseRow + this.rows.length - height);
+    const startAbsolute = clamp(this.viewportTop, this.baseRow, maxStart);
+    ensureTailPadRange(startAbsolute);
     for (let offset = 0; offset < height; offset += 1) {
       const absolute = startAbsolute + offset;
-      const slot = this.getRow(absolute) ?? createMissingRow(absolute);
-      rows.push(slot);
-      if (rows.length >= limit) {
-        break;
-      }
+      rows.push(materializeRow(absolute));
+    }
+    if (this.tailPadRange !== null && this.tailPadSeqThreshold !== null && !tailPaddingApplied) {
+      this.tailPadSeqThreshold = null;
+      this.tailPadRange = null;
+    }
+    trace('visibleRows window', {
+      limit: normalizedLimit,
+      requestedHeight: height,
+      viewportHeight: this.viewportHeight,
+      baseRow: this.baseRow,
+      startAbsolute,
+      maxStart,
+      followTail: this.followTail,
+      rowKinds: rows.map((row) => row.kind),
+      absolutes: rows.map((row) => row.absolute),
+    });
+    if (typeof console !== 'undefined') {
+      console.info('[beach-trace][cache][visibleRows window]', {
+        limit: normalizedLimit,
+        requestedHeight: height,
+        viewportHeight: this.viewportHeight,
+        baseRow: this.baseRow,
+        startAbsolute,
+        maxStart,
+        followTail: this.followTail,
+        rowKinds: rows.map((row) => row.kind),
+        absolutes: rows.map((row) => row.absolute),
+      });
+    }
+    if (typeof window !== 'undefined' && Array.isArray((window as typeof window & { __BEACH_TRACE_HISTORY?: unknown[] }).__BEACH_TRACE_HISTORY)) {
+      (window as typeof window & { __BEACH_TRACE_HISTORY: unknown[] }).__BEACH_TRACE_HISTORY.push({
+        scope: 'cache',
+        event: 'visibleRows window',
+        payload: {
+          limit: normalizedLimit,
+          requestedHeight: height,
+          viewportHeight: this.viewportHeight,
+          baseRow: this.baseRow,
+          startAbsolute,
+          maxStart,
+          followTail: this.followTail,
+          rowKinds: rows.map((row) => row.kind),
+          absolutes: rows.map((row) => row.absolute),
+        },
+      });
     }
     return rows;
   }
@@ -645,7 +831,23 @@ export class TerminalGridCache {
     };
   }
 
+  private recordSeq(seq: number | null | undefined): void {
+    if (seq === null || seq === undefined) {
+      return;
+    }
+    const numeric = Number(seq);
+    if (!Number.isFinite(numeric)) {
+      return;
+    }
+    if (numeric > this.latestAppliedSeq) {
+      this.latestAppliedSeq = numeric;
+    }
+  }
+
   private applyGridUpdate(update: Update): boolean {
+    if ('seq' in update) {
+      this.recordSeq((update as UpdateWithSeq).seq ?? null);
+    }
     switch (update.type) {
       case 'cell':
         return this.applyCell(update.row, update.col, update.seq, update.cell);

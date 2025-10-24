@@ -58,3 +58,7 @@ dump.rdb
 playwright-report/
 test-results/
 .nyc_output/
+
+# Python bytecode (Pong demo helpers)
+apps/private-beach/demo/**/__pycache__/
+apps/private-beach/demo/**/*.py[cod]

@@ -292,6 +292,17 @@ export interface BeachTerminalProps {
   onToggleFullscreen?: (next: boolean) => void;
   showTopBar?: boolean;
   fallbackOverrides?: FallbackOverrides;
+  autoResizeHostOnViewportChange?: boolean;
+  onViewportStateChange?: (state: TerminalViewportState) => void;
+}
+
+export interface TerminalViewportState {
+  viewportRows: number;
+  viewportCols: number;
+  hostViewportRows: number | null;
+  hostCols: number | null;
+  canSendResize: boolean;
+  sendHostResize: () => void;
 }
 
 export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
@@ -312,6 +323,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     isFullscreen = false,
     onToggleFullscreen,
     showTopBar = true,
+    autoResizeHostOnViewportChange = true,
+    onViewportStateChange,
   } = props;
 
   const store = useMemo(() => providedStore ?? createTerminalStore(), [providedStore]);
@@ -334,6 +347,14 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const lastSentViewportRows = useRef<number>(0);
   const lastMeasuredViewportRows = useRef<number>(24);
   const suppressNextResizeRef = useRef<boolean>(false);
+  const sendHostResizeRef = useRef<() => void>(() => {});
+  const lastViewportReportRef = useRef<{
+    viewportRows: number;
+    viewportCols: number;
+    hostViewportRows: number | null;
+    hostCols: number | null;
+    canSendResize: boolean;
+  } | null>(null);
   const [status, setStatus] = useState<TerminalStatus>(
     providedTransport ? 'connected' : 'idle',
   );
@@ -450,6 +471,71 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       console.info(`${prefix} ${message}`);
     }
   }, []);
+
+  const sendHostResize = useCallback(() => {
+    const transport = transportRef.current;
+    if (!transport) {
+      return;
+    }
+    const measuredRows = Math.max(1, Math.min(lastMeasuredViewportRows.current, MAX_VIEWPORT_ROWS));
+    const snapshotNow = store.getSnapshot();
+    const fallbackCols = snapshotNow.cols > 0 ? snapshotNow.cols : 80;
+    const targetCols = Math.max(1, ptyColsRef.current ?? fallbackCols);
+    suppressNextResizeRef.current = true;
+    lastSentViewportRows.current = measuredRows;
+    log('send_host_resize', {
+      targetCols,
+      targetRows: measuredRows,
+    });
+    try {
+      transport.send({ type: 'resize', cols: targetCols, rows: measuredRows });
+    } catch (err) {
+      if (IS_DEV) {
+        console.warn('[beach-surfer] send_host_resize failed', err);
+      }
+    }
+  }, [MAX_VIEWPORT_ROWS, log, store]);
+  sendHostResizeRef.current = sendHostResize;
+
+  const emitViewportState = useCallback(() => {
+    if (!onViewportStateChange) {
+      return;
+    }
+    const snapshotNow = store.getSnapshot();
+    const viewportRows = Math.max(1, Math.min(lastMeasuredViewportRows.current, MAX_VIEWPORT_ROWS));
+    const viewportCols = snapshotNow.cols;
+    const hostViewportRows = ptyViewportRowsRef.current;
+    const hostCols = ptyColsRef.current;
+    const canSendResize = Boolean(transportRef.current);
+    const nextReport = {
+      viewportRows,
+      viewportCols,
+      hostViewportRows,
+      hostCols,
+      canSendResize,
+    };
+    const previous = lastViewportReportRef.current;
+    if (
+      previous &&
+      previous.viewportRows === nextReport.viewportRows &&
+      previous.viewportCols === nextReport.viewportCols &&
+      previous.hostViewportRows === nextReport.hostViewportRows &&
+      previous.hostCols === nextReport.hostCols &&
+      previous.canSendResize === nextReport.canSendResize
+    ) {
+      return;
+    }
+    lastViewportReportRef.current = nextReport;
+    onViewportStateChange({
+      ...nextReport,
+      sendHostResize: sendHostResizeRef.current,
+    });
+  }, [MAX_VIEWPORT_ROWS, onViewportStateChange, store]);
+
+  useEffect(() => {
+    lastViewportReportRef.current = null;
+    emitViewportState();
+  }, [emitViewportState]);
 
   const enterWaitingState = useCallback(
     (message?: string) => {
@@ -716,6 +802,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       setJoinState('idle');
       setJoinMessage(null);
     }
+    emitViewportState();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [providedTransport]);
 
@@ -777,6 +864,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         setRemotePeerId(connection.remotePeerId ?? null);
         bindTransport(connection.transport);
         setStatus('connected');
+        emitViewportState();
         markConnectionTrace('beach_terminal:status_connected');
       } catch (err) {
         if (cancelled) {
@@ -817,6 +905,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       clearJoinTimers();
       setJoinState('idle');
       setJoinMessage(null);
+      emitViewportState();
       finishConnectionTrace('cancelled', { reason: 'cleanup' });
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -861,12 +950,18 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         followTail: current.followTail,
       });
       store.setViewport(current.viewportTop, viewportRows);
+      emitViewportState();
       if (suppressNextResizeRef.current) {
         suppressNextResizeRef.current = false;
         return;
       }
       // Only send resize if the viewport size actually changed
-      if (subscriptionRef.current !== null && transportRef.current && viewportRows !== lastSentViewportRows.current) {
+      if (
+        autoResizeHostOnViewportChange &&
+        subscriptionRef.current !== null &&
+        transportRef.current &&
+        viewportRows !== lastSentViewportRows.current
+      ) {
         transportRef.current.send({ type: 'resize', cols: current.cols, rows: viewportRows });
         lastSentViewportRows.current = viewportRows;
       }
@@ -874,7 +969,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     // Observe the wrapper, not the scroll container
     observer.observe(wrapper);
     return () => observer.disconnect();
-  }, [effectiveLineHeight, lineHeight, store]);
+  }, [autoResizeHostOnViewportChange, effectiveLineHeight, emitViewportState, lineHeight, store]);
 
   useEffect(() => {
     const connection = activeConnection;
@@ -1604,6 +1699,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           remotePeerId: remotePeerId ?? connectionRef.current?.remotePeerId ?? null,
           subscription: frame.subscription,
         });
+        emitViewportState();
         break;
       case 'grid':
         trace('frame grid', frame);
@@ -1648,6 +1744,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
             setPredictionOverlay(overlayReset);
           }
         }
+        emitViewportState();
         break;
       case 'snapshot':
       case 'delta':
@@ -1704,6 +1801,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           setPtyCols((prev) => (prev === null ? prev : null));
         }
         setStatus('closed');
+        emitViewportState();
         break;
       default:
         break;

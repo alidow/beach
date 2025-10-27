@@ -318,7 +318,47 @@ describe('TerminalGridCache cursor hints', () => {
   });
 });
 
+describe('TerminalGridCache authoritative snapshots', () => {
+  it('overwrites stale rows when snapshots replay lower sequence numbers', () => {
+    const cache = new TerminalGridCache({ initialCols: 8 });
+    cache.setGridSize(1, 8);
+
+    cache.applyUpdates(
+      [{ type: 'row', row: 0, seq: 400, cells: packString('OLD ') }],
+      { authoritative: true },
+    );
+    expect(cache.getRowText(0)).toBe('OLD');
+
+    cache.applyUpdates(
+      [{ type: 'row', row: 0, seq: 10, cells: packString('NEW ') }],
+      { authoritative: true },
+    );
+
+    const snapshot = cache.snapshot();
+    const row = snapshot.rows[0];
+    expect(row?.kind).toBe('loaded');
+    if (row?.kind === 'loaded') {
+      const text = row.cells.map((cell) => cell.char).join('').trimEnd();
+      expect(text).toBe('NEW');
+    }
+  });
+});
+
 describe('TerminalGridCache visibleRows', () => {
+  it('anchors the initial viewport to the base row when the server origin is unknown', () => {
+    const cache = new TerminalGridCache({ initialCols: 4 });
+    cache.setGridSize(4, 4);
+
+    cache.setViewport(20, 10);
+
+    const snapshot = cache.snapshot();
+    expect(snapshot.followTail).toBe(false);
+    expect(snapshot.viewportTop).toBe(0);
+    expect(snapshot.viewportHeight).toBe(4);
+    const rows = cache.visibleRows(2);
+    expect(rows[0]?.absolute).toBe(0);
+  });
+
   it('pads missing rows when viewport height exceeds loaded content while following tail', () => {
     const cache = new TerminalGridCache({ initialCols: 4 });
     cache.setBaseRow(100);
@@ -344,6 +384,35 @@ describe('TerminalGridCache visibleRows', () => {
     expect(loaded.map((row) => row.absolute)).toEqual([100, 101, 102]);
   });
 
+  it('does not reuse older history rows when viewport exceeds PTY height in follow-tail mode', () => {
+    const cache = new TerminalGridCache({ initialCols: 4 });
+    cache.setBaseRow(80);
+    cache.setGridSize(8, 4);
+
+    for (let index = 0; index < 8; index += 1) {
+      cache.applyUpdates(
+        [{ type: 'row', row: 80 + index, seq: 10 + index, cells: packString(`t${index.toString().padEnd(3, ' ')}`) }],
+        { authoritative: true },
+      );
+    }
+
+    cache.setBaseRow(60);
+    for (let index = 0; index < 20; index += 1) {
+      cache.applyUpdates(
+        [{ type: 'row', row: 60 + index, seq: 100 + index, cells: packString(`h${index.toString().padEnd(3, ' ')}`) }],
+        { authoritative: true },
+      );
+    }
+
+    cache.setFollowTail(true);
+    cache.setViewport(0, 12);
+
+    const rows = cache.visibleRows();
+    expect(rows).toHaveLength(12);
+    expect(rows.slice(0, 4).map((row) => row.kind)).toEqual(['missing', 'missing', 'missing', 'missing']);
+    expect(rows.slice(4).map((row) => row.absolute)).toEqual([80, 81, 82, 83, 84, 85, 86, 87]);
+  });
+
   it('retains trailing blank rows even when viewport height exceeds grid size', () => {
     const cache = new TerminalGridCache({ initialCols: 4 });
     cache.setBaseRow(200);
@@ -363,8 +432,12 @@ describe('TerminalGridCache visibleRows', () => {
     cache.setViewport(0, 7);
 
     const rows = cache.visibleRows();
-    expect(rows).toHaveLength(5);
-    expect(rows.slice(-2).map((row) => ({ kind: row?.kind, absolute: row?.absolute }))).toEqual([
+    expect(rows).toHaveLength(7);
+    const loadedTail = rows.filter((row) => row.kind === 'loaded').slice(-2).map((row) => ({
+      kind: row?.kind,
+      absolute: row?.absolute,
+    }));
+    expect(loadedTail).toEqual([
       { kind: 'loaded', absolute: 203 },
       { kind: 'loaded', absolute: 204 },
     ]);
@@ -453,6 +526,7 @@ describe('TerminalGridCache visibleRows', () => {
       );
     });
 
+    cache.setFollowTail(true);
     cache.setViewport(0, 4);
     cache.visibleRows();
 
@@ -504,6 +578,7 @@ describe('TerminalGridCache visibleRows', () => {
       );
     });
 
+    cache.setFollowTail(true);
     cache.setViewport(0, 4);
     cache.visibleRows();
 

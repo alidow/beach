@@ -18,13 +18,19 @@ describe('TerminalGridStore', () => {
     expect(text).toBe('AB');
   });
 
-  it('prefills pending rows when grid size is set', () => {
+  it('prefills blank loaded rows when grid size is set', () => {
     const store = new TerminalGridStore();
     store.setGridSize(3, 80);
 
     const snapshot = store.getSnapshot();
     expect(snapshot.rows).toHaveLength(3);
-    expect(snapshot.rows.every((row) => row.kind === 'pending')).toBe(true);
+    expect(snapshot.rows.every((row) => row.kind === 'loaded')).toBe(true);
+    snapshot.rows.forEach((row) => {
+      if (row.kind === 'loaded') {
+        const text = row.cells.map((cell) => cell.char).join('').trim();
+        expect(text).toBe('');
+      }
+    });
   });
 
   it('applies individual cell updates respecting sequence numbers', () => {
@@ -86,8 +92,19 @@ describe('TerminalGridStore', () => {
     store.setGridSize(24, 80);
     store.applyUpdates([{ type: 'row', row: 0, seq: 2, cells: packString('new session') }], { authoritative: true });
 
-    const loadedRows = store.getSnapshot().rows.filter((row) => row.kind === 'loaded');
-    expect(loadedRows).toHaveLength(1);
+    const snapshot = store.getSnapshot();
+    expect(snapshot.rows.length).toBe(24);
+    snapshot.rows.forEach((row, index) => {
+      expect(row.kind).toBe('loaded');
+      if (row.kind === 'loaded') {
+        const text = row.cells.map((cell) => cell.char).join('').trim();
+        if (index === 0) {
+          expect(text).toBe('new session');
+        } else {
+          expect(text).toBe('');
+        }
+      }
+    });
     expect(store.getRowText(0)).toBe('new session');
   });
 
@@ -101,7 +118,7 @@ describe('TerminalGridStore', () => {
     expect(store.getSnapshot().baseRow).toBe(8);
   });
 
-  it('returns visible rows following the tail by default', () => {
+  it('starts top-anchored and follows the tail once enabled', () => {
     const store = new TerminalGridStore();
     store.setGridSize(5, 80);
     store.applyUpdates(
@@ -116,8 +133,15 @@ describe('TerminalGridStore', () => {
     );
     store.setViewport(0, 3);
 
-    const snapshot = store.getSnapshot();
-    const visible = snapshot.visibleRows(10);
+    let snapshot = store.getSnapshot();
+    expect(snapshot.followTail).toBe(false);
+    let visible = snapshot.visibleRows(10);
+    expect(visible.map((row) => row.absolute)).toEqual([0, 1, 2]);
+
+    store.setFollowTail(true);
+    snapshot = store.getSnapshot();
+    expect(snapshot.followTail).toBe(true);
+    visible = snapshot.visibleRows(10);
     expect(visible.map((row) => row.absolute)).toEqual([2, 3, 4]);
   });
 

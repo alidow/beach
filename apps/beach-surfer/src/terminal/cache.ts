@@ -206,6 +206,7 @@ export class TerminalGridCache {
   private latestAppliedSeq = 0;
   private tailPadSeqThreshold: number | null = null;
   private tailPadRanges: RowRange[] = [];
+  private gridHeight = 0;
 
   constructor(options: TerminalGridCacheOptions = {}) {
     this.maxHistory = options.maxHistory ?? DEFAULT_HISTORY_LIMIT;
@@ -378,6 +379,7 @@ export class TerminalGridCache {
     this.latestAppliedSeq = 0;
     this.tailPadSeqThreshold = null;
     this.tailPadRanges = [];
+    this.gridHeight = 0;
   }
 
   setGridSize(totalRows: number, cols: number): boolean {
@@ -385,8 +387,10 @@ export class TerminalGridCache {
     if (this.ensureCols(cols)) {
       mutated = true;
     }
+    const clampedRows = Math.max(0, Math.floor(totalRows));
+    this.gridHeight = clampedRows;
     const start = this.baseRow;
-    const end = start + totalRows;
+    const end = start + clampedRows;
 
     // When grid grows at the tail (PTY resize taller), create blank loaded rows
     // instead of pending rows to avoid triggering bogus backfill requests.
@@ -439,12 +443,12 @@ export class TerminalGridCache {
     if (!this.initialViewportApplied) {
       if (this.knownBaseRow === null) {
         clampedTop = this.baseRow;
+        const gridHeight = this.rows.length;
+        if (gridHeight > 0 && clampedHeight > gridHeight) {
+          clampedHeight = gridHeight;
+        }
       } else {
         clampedTop = Math.max(this.baseRow, clampedTop);
-      }
-      const gridHeight = this.rows.length;
-      if (gridHeight > 0 && clampedHeight > gridHeight) {
-        clampedHeight = gridHeight;
       }
     } else {
       clampedTop = Math.max(this.baseRow, clampedTop);
@@ -764,11 +768,41 @@ export class TerminalGridCache {
       const highestLoaded = this.findHighestLoadedRow();
       const lastTracked = this.rows.length > 0 ? this.baseRow + this.rows.length - 1 : this.baseRow;
       const anchor = Math.max(lastTracked, highestLoaded ?? Number.NEGATIVE_INFINITY);
-      const startAbsolute = anchor - (height - 1);
-      for (let offset = 0; offset < height; offset += 1) {
-        const absolute = startAbsolute + offset;
-        rows.push(materializeRow(absolute));
+      const effectiveGridHeight = this.gridHeight > 0 ? this.gridHeight : 0;
+      const actualRowsToShow = effectiveGridHeight > 0 ? Math.min(height, effectiveGridHeight) : 0;
+      const padCount = height - actualRowsToShow;
+      let actualStartAbsolute: number | null = null;
+      let padStartAbsolute: number | null = null;
+
+      if (actualRowsToShow === 0) {
+        const padStart = anchor - (height - 1);
+        padStartAbsolute = padStart;
+        for (let offset = 0; offset < height; offset += 1) {
+          const absolute = padStart + offset;
+          rows.push(createMissingRow(absolute));
+        }
+        if (padCount > 0) {
+          tailPaddingApplied = true;
+        }
+      } else {
+        const tailFloor = anchor - (effectiveGridHeight - 1);
+        const actualStart = Math.max(anchor - (actualRowsToShow - 1), tailFloor);
+        actualStartAbsolute = actualStart;
+        if (padCount > 0) {
+          const padStart = actualStart - padCount;
+          padStartAbsolute = padStart;
+          for (let offset = 0; offset < padCount; offset += 1) {
+            const absolute = padStart + offset;
+            rows.push(createMissingRow(absolute));
+          }
+          tailPaddingApplied = true;
+        }
+        for (let offset = 0; offset < actualRowsToShow; offset += 1) {
+          const absolute = actualStart + offset;
+          rows.push(materializeRow(absolute));
+        }
       }
+
       trace('visibleRows tail', {
         limit: normalizedLimit,
         requestedHeight: height,
@@ -777,7 +811,11 @@ export class TerminalGridCache {
         highestLoaded,
         lastTracked,
         anchor,
-        startAbsolute,
+        gridHeight: this.gridHeight,
+        padCount,
+        actualRowsToShow,
+        padStartAbsolute,
+        actualStartAbsolute,
         followTail: this.followTail,
         tailPadSeqThreshold: this.tailPadSeqThreshold,
         tailPadRanges: this.tailPadRanges.map((range) => ({ ...range })),
@@ -793,7 +831,11 @@ export class TerminalGridCache {
           highestLoaded,
           lastTracked,
           anchor,
-          startAbsolute,
+          gridHeight: this.gridHeight,
+          padCount,
+          actualRowsToShow,
+          padStartAbsolute,
+          actualStartAbsolute,
           followTail: this.followTail,
           tailPadSeqThreshold: this.tailPadSeqThreshold,
           tailPadRanges: this.tailPadRanges.map((range) => ({ ...range })),
@@ -813,7 +855,11 @@ export class TerminalGridCache {
             highestLoaded,
             lastTracked,
             anchor,
-            startAbsolute,
+            gridHeight: this.gridHeight,
+            padCount,
+            actualRowsToShow,
+            padStartAbsolute,
+            actualStartAbsolute,
             followTail: this.followTail,
             tailPadSeqThreshold: this.tailPadSeqThreshold,
             tailPadRanges: this.tailPadRanges.map((range) => ({ ...range })),

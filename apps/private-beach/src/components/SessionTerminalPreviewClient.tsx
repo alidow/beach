@@ -1,10 +1,20 @@
 'use client';
 
-import { memo, useCallback, useMemo } from 'react';
+import { memo, useCallback, useEffect, useMemo, useState } from 'react';
 import { useSessionTerminal } from '../hooks/useSessionTerminal';
-import { BeachTerminal } from '../../../beach-surfer/src/components/BeachTerminal';
+import { BeachTerminal, type TerminalViewportState } from '../../../beach-surfer/src/components/BeachTerminal';
 import { CabanaPrivateBeachPlayer } from '../../../beach-surfer/src/components/cabana/CabanaPrivateBeachPlayer';
 import type { CabanaTelemetryHandlers } from '../../../beach-surfer/src/components/cabana/CabanaSessionPlayer';
+
+export type HostResizeControlState = {
+  needsResize: boolean;
+  canResize: boolean;
+  trigger: () => void;
+  viewportRows: number;
+  hostViewportRows: number | null;
+  viewportCols: number;
+  hostCols: number | null;
+};
 
 type Props = {
   sessionId: string;
@@ -14,6 +24,7 @@ type Props = {
   className?: string;
   variant?: 'preview' | 'full';
   harnessType?: string | null;
+  onHostResizeStateChange?: (sessionId: string, state: HostResizeControlState | null) => void;
 };
 
 function SessionTerminalPreviewClientInner({
@@ -24,9 +35,15 @@ function SessionTerminalPreviewClientInner({
   className,
   variant = 'preview',
   harnessType,
+  onHostResizeStateChange,
 }: Props) {
   const trimmedToken = token?.trim() ?? '';
   const isCabana = harnessType ? harnessType.toLowerCase().includes('cabana') : false;
+  const [viewportState, setViewportState] = useState<TerminalViewportState | null>(null);
+
+  const handleViewportStateChange = useCallback((state: TerminalViewportState) => {
+    setViewportState(state);
+  }, []);
 
   const cabanaTelemetry = useMemo<CabanaTelemetryHandlers>(
     () => ({
@@ -112,6 +129,42 @@ function SessionTerminalPreviewClientInner({
     privateBeachId,
     managerUrl,
     shouldConnect ? trimmedToken : null,
+  );
+
+  useEffect(() => {
+    if (viewer.store && viewer.transport) {
+      return;
+    }
+    setViewportState(null);
+  }, [viewer.store, viewer.transport]);
+
+  useEffect(() => {
+    if (!onHostResizeStateChange) {
+      return;
+    }
+    if (!viewportState) {
+      onHostResizeStateChange(sessionId, null);
+      return;
+    }
+    const needsResize =
+      viewportState.hostViewportRows != null && viewportState.viewportRows !== viewportState.hostViewportRows;
+    const canResize = viewportState.canSendResize && needsResize;
+    onHostResizeStateChange(sessionId, {
+      needsResize,
+      canResize,
+      trigger: viewportState.sendHostResize,
+      viewportRows: viewportState.viewportRows,
+      hostViewportRows: viewportState.hostViewportRows,
+      viewportCols: viewportState.viewportCols,
+      hostCols: viewportState.hostCols,
+    });
+  }, [onHostResizeStateChange, sessionId, viewportState]);
+
+  useEffect(
+    () => () => {
+      onHostResizeStateChange?.(sessionId, null);
+    },
+    [onHostResizeStateChange, sessionId],
   );
 
   const placeholderMessage = useMemo(() => {
@@ -220,6 +273,8 @@ function SessionTerminalPreviewClientInner({
         fontSize={variant === 'full' ? 14 : 12}
         showTopBar={variant === 'full'}
         showStatusBar={variant === 'full'}
+        autoResizeHostOnViewportChange={false}
+        onViewportStateChange={handleViewportStateChange}
       />
       {viewer.status === 'reconnecting' && (
         <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center">

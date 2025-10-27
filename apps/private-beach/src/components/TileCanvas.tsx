@@ -6,6 +6,7 @@ import type { AssignmentEdge } from '../lib/assignments';
 import { pairingStatusDisplay, formatCadenceLabel } from '../lib/pairings';
 import { debugLog } from '../lib/debug';
 import { SessionTerminalPreview } from './SessionTerminalPreview';
+import type { HostResizeControlState } from './SessionTerminalPreviewClient';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
 
@@ -182,6 +183,7 @@ export default function TileCanvas({
   const [expanded, setExpanded] = useState<SessionSummary | null>(null);
   const [isClient, setIsClient] = useState(false);
   const [collapsedAssignments, setCollapsedAssignments] = useState<Record<string, boolean>>({});
+  const [resizeControls, setResizeControls] = useState<Record<string, HostResizeControlState>>({});
 
   useEffect(() => {
     setIsClient(true);
@@ -200,6 +202,23 @@ export default function TileCanvas({
       setExpanded(match);
     }
   }, [tiles, expanded]);
+
+  const handleHostResizeStateChange = useCallback(
+    (sessionId: string, state: HostResizeControlState | null) => {
+      setResizeControls((prev) => {
+        if (!state) {
+          if (!(sessionId in prev)) {
+            return prev;
+          }
+          const next = { ...prev };
+          delete next[sessionId];
+          return next;
+        }
+        return { ...prev, [sessionId]: state };
+      });
+    },
+    [],
+  );
 
   const layout = useMemo(
     () => ensureLayout(cache, savedLayout, tiles, preset),
@@ -328,6 +347,14 @@ export default function TileCanvas({
           const agentAssignments = assignmentsByAgent.get(session.session_id) ?? [];
           const controllers = assignmentsByApplication.get(session.session_id) ?? [];
           const collapsed = collapsedAssignments[session.session_id] ?? true;
+          const resizeControl = resizeControls[session.session_id];
+          const resizeColsLabel =
+            resizeControl && resizeControl.viewportCols > 0
+              ? String(resizeControl.viewportCols)
+              : 'auto';
+          const resizeButtonTitle = resizeControl
+            ? `Resize host terminal to ${resizeColsLabel}×${resizeControl.viewportRows}`
+            : 'Resize host terminal';
 
           return (
             <div
@@ -362,6 +389,28 @@ export default function TileCanvas({
                   <Button size="sm" variant="ghost" onClick={() => setExpanded(session)}>
                     Expand ⤢
                   </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={!resizeControl?.canResize}
+                    onClick={() => {
+                      if (!resizeControl?.canResize) {
+                        return;
+                      }
+                      resizeControl.trigger();
+                    }}
+                    title={resizeButtonTitle}
+                    aria-disabled={!resizeControl?.canResize}
+                  >
+                    <span className="mr-1 inline-flex h-3 w-3 items-center justify-center">
+                      <svg viewBox="0 0 12 12" className="h-3 w-3" fill="none" aria-hidden>
+                        <rect x="2.1" y="2.1" width="7.8" height="7.8" rx="1.5" stroke="currentColor" strokeWidth="1" />
+                        <path d="M3.6 6h4.8" stroke="currentColor" strokeWidth="1" strokeLinecap="round" />
+                        <path d="M6 3.6v4.8" stroke="currentColor" strokeWidth="1" strokeLinecap="round" />
+                      </svg>
+                    </span>
+                    Resize host terminal
+                  </Button>
                   <Button size="sm" variant="ghost" onClick={() => onRemove(session.session_id)}>
                     Remove
                   </Button>
@@ -382,6 +431,7 @@ export default function TileCanvas({
                   token={viewerToken}
                   harnessType={session.harness_type}
                   className="w-full"
+                  onHostResizeStateChange={handleHostResizeStateChange}
                 />
               </div>
               <div className="space-y-2 border-t border-border px-3 py-2">

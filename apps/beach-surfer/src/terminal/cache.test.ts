@@ -333,6 +333,7 @@ describe('TerminalGridCache visibleRows', () => {
       { authoritative: true },
     );
 
+    cache.setFollowTail(true);
     cache.setViewport(0, 5);
 
     const rows = cache.visibleRows();
@@ -343,7 +344,7 @@ describe('TerminalGridCache visibleRows', () => {
     expect(loaded.map((row) => row.absolute)).toEqual([100, 101, 102]);
   });
 
-  it('retains trailing blank rows before padding to viewport height', () => {
+  it('retains trailing blank rows even when viewport height exceeds grid size', () => {
     const cache = new TerminalGridCache({ initialCols: 4 });
     cache.setBaseRow(200);
     cache.setGridSize(5, 4);
@@ -362,7 +363,7 @@ describe('TerminalGridCache visibleRows', () => {
     cache.setViewport(0, 7);
 
     const rows = cache.visibleRows();
-    expect(rows).toHaveLength(7);
+    expect(rows).toHaveLength(5);
     expect(rows.slice(-2).map((row) => ({ kind: row?.kind, absolute: row?.absolute }))).toEqual([
       { kind: 'loaded', absolute: 203 },
       { kind: 'loaded', absolute: 204 },
@@ -385,6 +386,7 @@ describe('TerminalGridCache visibleRows', () => {
       { authoritative: true },
     );
 
+    cache.setFollowTail(true);
     cache.setViewport(4, 2);
     let rows = cache.visibleRows();
     expect(rows.map((row) => row.kind)).toEqual(['loaded', 'loaded']);
@@ -416,6 +418,7 @@ describe('TerminalGridCache visibleRows', () => {
       { authoritative: true },
     );
 
+    cache.setFollowTail(true);
     cache.setViewport(4, 2);
     cache.visibleRows();
 
@@ -429,6 +432,311 @@ describe('TerminalGridCache visibleRows', () => {
 
     rows = cache.visibleRows();
     expect(rows.map((row) => row.kind)).toEqual(['loaded', 'loaded', 'loaded', 'loaded']);
+  });
+
+  it('keeps tail padding when authoritative backfill replays existing rows', () => {
+    const cache = new TerminalGridCache({ initialCols: 16 });
+    cache.setGridSize(8, 16);
+
+    const hudLines = ['Unknown command', 'Commands', 'Mode', '> '];
+    hudLines.forEach((line, index) => {
+      cache.applyUpdates(
+        [
+          {
+            type: 'row',
+            row: index,
+            seq: index + 1,
+            cells: packString(line.padEnd(16, ' ')),
+          },
+        ],
+        { authoritative: true },
+      );
+    });
+
+    cache.setViewport(0, 4);
+    cache.visibleRows();
+
+    cache.setViewport(0, 8);
+    let rows = cache.visibleRows();
+    // After PTY resize fix: rows 4-7 were created as blank loaded rows by setGridSize
+    // They should be 'loaded', not 'missing', since they're part of the grid
+    expect(rows.slice(4, 8).map((row) => row.kind)).toEqual([
+      'loaded',
+      'loaded',
+      'loaded',
+      'loaded',
+    ]);
+
+    const replayUpdates = hudLines.map((line, index) => ({
+      type: 'row' as const,
+      row: index,
+      seq: 100 + index,
+      cells: packString(line.padEnd(16, ' ')),
+    }));
+    cache.applyUpdates(replayUpdates, { authoritative: true, origin: 'history_backfill' });
+
+    rows = cache.visibleRows();
+    // After backfill replay, rows 4-7 remain as loaded (blank)
+    expect(rows.slice(4, 8).map((row) => row.kind)).toEqual([
+      'loaded',
+      'loaded',
+      'loaded',
+      'loaded',
+    ]);
+  });
+
+  it('keeps tail padding when delta replays identical rows', () => {
+    const cache = new TerminalGridCache({ initialCols: 16 });
+    cache.setGridSize(8, 16);
+
+    const hudLines = ['Unknown command', 'Commands', 'Mode', '> '];
+    hudLines.forEach((line, index) => {
+      cache.applyUpdates(
+        [
+          {
+            type: 'row',
+            row: index,
+            seq: index + 1,
+            cells: packString(line.padEnd(16, ' ')),
+          },
+        ],
+        { authoritative: true },
+      );
+    });
+
+    cache.setViewport(0, 4);
+    cache.visibleRows();
+
+    cache.setViewport(0, 8);
+    let rows = cache.visibleRows();
+    // After PTY resize fix: rows 4-7 were created as blank loaded rows by setGridSize
+    expect(rows.slice(4, 8).map((row) => row.kind)).toEqual([
+      'loaded',
+      'loaded',
+      'loaded',
+      'loaded',
+    ]);
+
+    const deltaUpdates = hudLines.map((line, index) => ({
+      type: 'row' as const,
+      row: index,
+      seq: 500 + index,
+      cells: packString(line.padEnd(16, ' ')),
+    }));
+    cache.applyUpdates(deltaUpdates, { authoritative: false, origin: 'delta' });
+
+    rows = cache.visibleRows();
+    // After delta replay, rows 4-7 remain as loaded (blank)
+    expect(rows.slice(4, 8).map((row) => row.kind)).toEqual([
+      'loaded',
+      'loaded',
+      'loaded',
+      'loaded',
+    ]);
+  });
+
+  it('keeps tail padding when history replays reuse original sequence numbers', () => {
+    const cache = new TerminalGridCache({ initialCols: 16 });
+    cache.setGridSize(8, 16);
+
+    const hudLines = ['Unknown command', 'Commands', 'Mode', '> '];
+    hudLines.forEach((line, index) => {
+      cache.applyUpdates(
+        [
+          {
+            type: 'row',
+            row: index,
+            seq: index + 1,
+            cells: packString(line.padEnd(16, ' ')),
+          },
+        ],
+        { authoritative: true },
+      );
+    });
+
+    cache.setViewport(0, 4);
+    cache.visibleRows();
+
+    cache.setViewport(0, 8);
+    let rows = cache.visibleRows();
+    // After PTY resize fix: rows 4-7 were created as blank loaded rows by setGridSize
+    expect(rows.slice(4, 8).map((row) => row.kind)).toEqual([
+      'loaded',
+      'loaded',
+      'loaded',
+      'loaded',
+    ]);
+
+    const staleUpdates = hudLines.map((line, index) => ({
+      type: 'row' as const,
+      row: index,
+      seq: index + 1,
+      cells: packString(line.padEnd(16, ' ')),
+    }));
+    cache.applyUpdates(staleUpdates, { authoritative: true, origin: 'history_backfill' });
+
+    rows = cache.visibleRows();
+    // After history replay, rows 4-7 remain as loaded (blank)
+    expect(rows.slice(4, 8).map((row) => row.kind)).toEqual([
+      'loaded',
+      'loaded',
+      'loaded',
+      'loaded',
+    ]);
+  });
+
+  it('PTY resize creates blank loaded rows not pending rows', () => {
+    const cache = new TerminalGridCache({ initialCols: 80 });
+
+    // Initial grid with 24 rows (simulating initial PTY size)
+    cache.setGridSize(24, 80);
+
+    // Verify all rows are loaded (not pending)
+    const initialSnapshot = cache.snapshot();
+    expect(initialSnapshot.rows.length).toBe(24);
+    expect(initialSnapshot.rows.every((row) => row.kind === 'loaded')).toBe(true);
+
+    // Add some content to the first few rows
+    for (let i = 0; i < 4; i++) {
+      cache.applyUpdates(
+        [
+          {
+            type: 'row',
+            row: i,
+            seq: i + 1,
+            cells: packString(`Line ${i}`.padEnd(80, ' ')),
+          },
+        ],
+        { authoritative: true },
+      );
+    }
+
+    // Simulate PTY resize from 24 rows to 36 rows
+    cache.setGridSize(36, 80);
+
+    // Verify new rows (24-35) are loaded with blank content, not pending
+    const afterResize = cache.snapshot();
+    expect(afterResize.rows.length).toBe(36);
+
+    // Check that rows 24-35 are loaded (not pending)
+    for (let i = 24; i < 36; i++) {
+      const row = afterResize.rows[i];
+      expect(row).toBeDefined();
+      expect(row.kind).toBe('loaded');
+      if (row.kind === 'loaded') {
+        // Verify they're blank (all spaces)
+        const text = row.cells.map((cell) => cell.char).join('');
+        expect(text.trim()).toBe('');
+        // Verify they have a non-zero latestSeq to prevent backfill
+        expect(row.latestSeq).toBeGreaterThan(0);
+      }
+    }
+
+    // Verify original content rows (0-3) are unchanged
+    for (let i = 0; i < 4; i++) {
+      const row = afterResize.rows[i];
+      expect(row.kind).toBe('loaded');
+      if (row.kind === 'loaded') {
+        const text = row.cells.map((cell) => cell.char).join('').trim();
+        expect(text).toBe(`Line ${i}`);
+      }
+    }
+
+    // Most importantly: rows 4-23 should be loaded (blank), not pending
+    for (let i = 4; i < 24; i++) {
+      const row = afterResize.rows[i];
+      expect(row.kind).toBe('loaded');
+      if (row.kind === 'loaded') {
+        // These rows should also have non-zero latestSeq
+        expect(row.latestSeq).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('PTY resize does not trigger backfill - newly created rows have non-zero latestSeq', () => {
+    const cache = new TerminalGridCache({ initialCols: 80 });
+
+    // Apply some initial content to establish a sequence number
+    cache.applyUpdates([{
+      type: 'row',
+      row: 0,
+      seq: 1,
+      cells: packString('Initial content'.padEnd(80, ' ')),
+    }], { authoritative: true });
+
+    // Simulate PTY with 24 rows
+    cache.setBaseRow(0);
+    cache.setGridSize(24, 80);
+
+    let snapshot = cache.snapshot();
+    expect(snapshot.rows.length).toBe(24);
+    expect(snapshot.baseRow).toBe(0);
+
+    // Verify all 24 rows are loaded with non-zero latestSeq
+    for (let i = 0; i < 24; i++) {
+      const row = snapshot.rows[i];
+      expect(row?.kind).toBe('loaded');
+      if (row?.kind === 'loaded') {
+        expect(row.latestSeq).toBeGreaterThan(0);
+      }
+    }
+
+    // Now resize from 24 to 36 rows (simulate PTY resize taller)
+    cache.setGridSize(36, 80);
+
+    snapshot = cache.snapshot();
+    expect(snapshot.rows.length).toBe(36);
+
+    // **CRITICAL TEST**: Newly created rows (24-35) must have non-zero latestSeq
+    // to prevent backfill controller from treating them as gaps
+    for (let i = 24; i < 36; i++) {
+      const row = snapshot.rows[i];
+      expect(row?.kind).toBe('loaded');
+      if (row?.kind === 'loaded') {
+        // This is the key fix: latestSeq > 0 prevents findTailGap from requesting backfill
+        expect(row.latestSeq).toBeGreaterThan(0);
+        // Verify they're blank
+        const text = row.cells.map((cell) => cell.char).join('').trim();
+        expect(text).toBe('');
+      }
+    }
+
+    // SIMULATE findTailGap logic (from backfillController.ts line 238-266)
+    const maxLoadedRowIndex = snapshot.rows.findLastIndex(r => r.kind === 'loaded');
+    expect(maxLoadedRowIndex).toBeGreaterThanOrEqual(35);
+
+    if (maxLoadedRowIndex >= 0) {
+      const maxLoadedRow = snapshot.rows[maxLoadedRowIndex];
+      if (maxLoadedRow?.kind === 'loaded') {
+        const BACKFILL_LOOKAHEAD_ROWS = 64;
+        const scanStart = Math.max(snapshot.baseRow, maxLoadedRow.absolute - BACKFILL_LOOKAHEAD_ROWS);
+
+        // Scan for gaps like findTailGap does
+        let gapFound = false;
+        for (let absolute = scanStart; absolute <= maxLoadedRow.absolute; absolute += 1) {
+          const index = absolute - snapshot.baseRow;
+          if (index < 0 || index >= snapshot.rows.length) {
+            continue;
+          }
+          const slot = snapshot.rows[index];
+
+          // backfillController.ts line 257-261: check if row is a gap
+          if (!slot || slot.kind !== 'loaded') {
+            gapFound = true;
+            break;
+          }
+          // backfillController.ts line 263-266: THIS WAS THE BUG!
+          // Rows with latestSeq === 0 are treated as gaps
+          if (slot.latestSeq === 0) {
+            gapFound = true;
+            break;
+          }
+        }
+
+        // With the fix, no gaps should be found
+        expect(gapFound).toBe(false);
+      }
+    }
   });
 });
 

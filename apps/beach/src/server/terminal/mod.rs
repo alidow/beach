@@ -174,7 +174,7 @@ async fn read_loop(
                     emulator.handle_output(&chunk, &grid)
                 };
                 for update in updates {
-                    log_update_sample(&update);
+                    log_update_sample(grid.as_ref(), &update);
                     apply_update(&grid, &update);
                     let _ = tx.send(update);
                 }
@@ -189,7 +189,7 @@ async fn read_loop(
                     emulator.flush(&grid)
                 };
                 for update in flushes {
-                    log_update_sample(&update);
+                    log_update_sample(grid.as_ref(), &update);
                     apply_update(&grid, &update);
                     let _ = tx.send(update);
                 }
@@ -206,7 +206,7 @@ async fn read_loop(
     }
 }
 
-fn log_update_sample(update: &CacheUpdate) {
+fn log_update_sample(grid: &TerminalGrid, update: &CacheUpdate) {
     if !tracing::enabled!(Level::TRACE) {
         return;
     }
@@ -214,14 +214,57 @@ fn log_update_sample(update: &CacheUpdate) {
         CacheUpdate::Row(row) => {
             let text: String = row.cells.iter().map(|cell| unpack_cell(*cell).0).collect();
             let trimmed = text.trim_end();
-            if !trimmed.is_empty() {
-                trace!(target = "server::grid", row = row.row, seq = row.seq, sample = %trimmed);
+            if trimmed.is_empty() {
+                return;
             }
+            let (viewport_rows, viewport_cols) = grid.viewport_size();
+            let row_offset = grid.row_offset();
+            let tail_bottom = row_offset.saturating_add(grid.rows() as u64);
+            let absolute = row.row as u64;
+            let distance = tail_bottom.saturating_sub(absolute.saturating_add(1));
+            let trailing_spaces = text.len().saturating_sub(trimmed.len());
+            let near_tail = distance <= (viewport_rows as u64).saturating_add(16);
+            trace!(
+                target = "server::grid",
+                row = row.row,
+                absolute,
+                seq = row.seq,
+                viewport_rows,
+                viewport_cols,
+                row_offset,
+                tail_bottom,
+                tail_distance = distance,
+                trailing_spaces,
+                near_tail,
+                sample = %trimmed,
+                raw = %text,
+                marker = "emit_row"
+            );
         }
         CacheUpdate::Cell(cell) => {
             let (ch, _) = unpack_cell(cell.cell);
-            if ch != ' ' {
-                trace!(target = "server::grid", row = cell.row, col = cell.col, seq = cell.seq, ch = %ch);
+            let (viewport_rows, viewport_cols) = grid.viewport_size();
+            let row_offset = grid.row_offset();
+            let tail_bottom = row_offset.saturating_add(grid.rows() as u64);
+            let absolute = cell.row as u64;
+            let distance = tail_bottom.saturating_sub(absolute.saturating_add(1));
+            let near_tail = distance <= (viewport_rows as u64).saturating_add(16);
+            if near_tail || ch != ' ' {
+                trace!(
+                    target = "server::grid",
+                    row = cell.row,
+                    absolute,
+                    col = cell.col,
+                    seq = cell.seq,
+                    viewport_rows,
+                    viewport_cols,
+                    row_offset,
+                    tail_bottom,
+                    tail_distance = distance,
+                    near_tail,
+                    ch = %ch,
+                    marker = "emit_cell"
+                );
             }
         }
         _ => {}

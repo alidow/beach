@@ -44,6 +44,8 @@ const FALLBACK_SIGNUP_MESSAGE =
 declare global {
   interface Window {
     __BEACH_TRACE?: boolean;
+    __BEACH_TRACE_DUMP_ROWS?: (limit?: number) => void;
+    __BEACH_TRACE_LAST_ROWS?: unknown;
   }
 }
 
@@ -1080,6 +1082,68 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   };
 
   useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    const dumpRows = (limit?: number) => {
+      const snapshot = store.getSnapshot();
+      const fallbackHeight = snapshot.viewportHeight || snapshot.rows.length || 1;
+      const normalized = typeof limit === 'number' && Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : fallbackHeight;
+      const visible = store.visibleRows(normalized);
+      const entries = visible.map((row) => {
+        if (!row) {
+          return null;
+        }
+        if (row.kind === 'loaded') {
+          const text = store.getRowText(row.absolute) ?? '';
+          return {
+            kind: row.kind,
+            absolute: row.absolute,
+            seq: row.latestSeq,
+            logicalWidth: row.logicalWidth,
+            text,
+          };
+        }
+        return {
+          kind: row.kind,
+          absolute: row.absolute,
+          seq: null,
+          logicalWidth: null,
+          text: '',
+        };
+      });
+      const payload = {
+        viewportTop: snapshot.viewportTop,
+        viewportHeight: snapshot.viewportHeight,
+        followTail: snapshot.followTail,
+        baseRow: snapshot.baseRow,
+        rowCount: snapshot.rows.length,
+        requestedHeight: normalized,
+        tailPadSeqThreshold: snapshot.tailPadSeqThreshold,
+        tailPadRanges: snapshot.tailPadRanges,
+        rows: entries,
+      };
+      const serialized = JSON.stringify(payload, null, 2);
+      console.info('[beach-trace][terminal] dump visible rows\n', serialized);
+      window.__BEACH_TRACE_LAST_ROWS = payload;
+      const history = (window as typeof window & { __BEACH_TRACE_HISTORY?: unknown[] }).__BEACH_TRACE_HISTORY;
+      if (Array.isArray(history)) {
+        history.push({
+          scope: 'terminal',
+          event: 'visibleRows dump',
+          payload,
+        });
+      }
+    };
+    window.__BEACH_TRACE_DUMP_ROWS = dumpRows;
+    return () => {
+      if (window.__BEACH_TRACE_DUMP_ROWS === dumpRows) {
+        delete window.__BEACH_TRACE_DUMP_ROWS;
+      }
+    };
+  }, [store]);
+
+  useEffect(() => {
     if (!wrapperRef.current) return;
 
     if (isFullscreen) {
@@ -1555,13 +1619,14 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         }
         store.setBaseRow(frame.baseRow);
         store.setGridSize(frame.historyRows, frame.cols);
+        store.setFollowTail(false);
         {
           const historyEnd = frame.baseRow + frame.historyRows;
           const deviceViewport = Math.max(
             1,
             Math.min(lastMeasuredViewportRows.current, MAX_VIEWPORT_ROWS),
           );
-          const viewportTop = Math.max(historyEnd - deviceViewport, frame.baseRow);
+          const viewportTop = frame.baseRow;
           store.setViewport(viewportTop, deviceViewport);
           if (lastSentViewportRows.current === 0) {
             lastSentViewportRows.current = deviceViewport;
@@ -1574,6 +1639,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
             serverViewport: frame.viewportRows ?? null,
             deviceViewport,
             viewportTop,
+            historyEnd,
           });
         }
         {
@@ -1603,9 +1669,6 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           backfillController.finalizeHistoryBackfill(frame);
         }
         summarizeSnapshot(store);
-        if (frame.type === 'snapshot' && !frame.hasMore) {
-          store.setFollowTail(true);
-        }
         const current = store.getSnapshot();
         backfillController.maybeRequest(current, current.followTail);
         break;

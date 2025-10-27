@@ -140,6 +140,47 @@ export default function App(): JSX.Element {
     setFallbackTelemetryOptIn,
   } = useConnectionController();
   useDocumentTitle({ sessionId: trimmedSessionId });
+
+  // Expose test API for E2E automation (DEV mode only)
+  useEffect(() => {
+    if (import.meta.env.DEV && typeof window !== 'undefined') {
+      (window as any).__beachTestAPI = {
+        connect: (id: string, pass: string, server?: string) => {
+          setSessionId(id);
+          setPasscode(pass);
+          if (server) {
+            setSessionServer(server);
+          }
+          // Wait for state updates, then trigger connect
+          setTimeout(() => requestConnect(), 50);
+        },
+        getState: () => ({
+          sessionId,
+          passcode,
+          sessionServer,
+          status,
+          connectDisabled,
+          connectRequested,
+        }),
+      };
+
+      return () => {
+        delete (window as any).__beachTestAPI;
+      };
+    }
+  }, [
+    sessionId,
+    passcode,
+    sessionServer,
+    status,
+    connectDisabled,
+    connectRequested,
+    setSessionId,
+    setPasscode,
+    setSessionServer,
+    requestConnect,
+  ]);
+
   const cabanaTelemetry = useMemo<CabanaTelemetryHandlers>(
     () => ({
       onStateChange: ({ status, mode }) => {

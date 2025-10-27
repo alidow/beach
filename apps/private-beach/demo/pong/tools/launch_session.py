@@ -128,9 +128,11 @@ def build_host_command(args: argparse.Namespace, metadata_tag: str) -> List[str]
     else:
         base = ["cargo", "run", "-p", "beach", "--"]
 
+    session_server_url = args.session_server_url or args.manager_url
+
     command = base + [
         "--session-server",
-        args.manager_url,
+        session_server_url,
         "host",
         "--bootstrap-output",
         "json",
@@ -142,7 +144,7 @@ def build_host_command(args: argparse.Namespace, metadata_tag: str) -> List[str]
         command.append("--wait")
     if args.extra_host_arg:
         command.extend(args.extra_host_arg)
-    command.append("--command")
+    command.append("--")
     command.extend(args.command)
 
     env = os.environ.copy()
@@ -159,6 +161,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--manager-url",
         required=True,
         help="Beach Manager base URL (e.g. https://manager.private-beach.test/api).",
+    )
+    parser.add_argument(
+        "--session-server-url",
+        help="Session server URL for registering the host (defaults to manager URL).",
     )
     parser.add_argument(
         "--private-beach-id",

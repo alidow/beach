@@ -297,13 +297,25 @@ impl AlacrittyEmulator {
 
     fn ensure_session_origin(&mut self, base_row: u64, viewport_top: usize) -> u64 {
         let candidate = base_row.saturating_add(viewport_top as u64);
-        match self.session_origin {
+        let previous = self.session_origin;
+        let origin = match previous {
             Some(origin) if candidate <= origin => origin,
             _ => {
                 self.session_origin = Some(candidate);
                 candidate
             }
-        }
+        };
+        trace!(
+            target = "server::emulator",
+            base_row,
+            viewport_top,
+            candidate,
+            origin,
+            prev_origin = previous.unwrap_or(origin),
+            updated = previous != Some(origin),
+            "ensure_session_origin"
+        );
+        origin
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -358,6 +370,20 @@ impl AlacrittyEmulator {
         let viewport_top = history_size.saturating_sub(display_offset);
         let base_row = grid.row_offset();
         let origin = self.ensure_session_origin(base_row, viewport_top);
+        trace!(
+            target = "server::emulator",
+            cols,
+            total_lines,
+            screen_lines,
+            display_offset,
+            top_line,
+            bottom_line,
+            history_size,
+            viewport_top,
+            base_row,
+            origin,
+            "capture_full_grid window"
+        );
 
         let style_table = grid.style_table.clone();
         let mut style_updates = Vec::new();
@@ -371,7 +397,15 @@ impl AlacrittyEmulator {
             } else {
                 match origin.checked_sub((-line_idx) as u64) {
                     Some(value) => value,
-                    None => continue,
+                    None => {
+                        trace!(
+                            target = "server::emulator",
+                            origin,
+                            line_idx,
+                            "capture_full_grid skipped_negative_line"
+                        );
+                        continue;
+                    }
                 }
             };
 

@@ -54,9 +54,10 @@ impl Config {
 
         Self {
             port: env::var("BEACH_ROAD_PORT")
+                .or_else(|_| env::var("PORT"))
                 .ok()
                 .and_then(|p| p.parse().ok())
-                .unwrap_or(8080),
+                .unwrap_or(4132),
             redis_url: env::var("REDIS_URL")
                 .unwrap_or_else(|_| "redis://localhost:6379".to_string()),
             session_ttl_seconds: env::var("SESSION_TTL")
@@ -82,7 +83,7 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            port: 8080,
+            port: 4132,
             redis_url: "redis://localhost:6379".to_string(),
             session_ttl_seconds: 2_592_000,
             fallback_guardrail_threshold: 0.005,

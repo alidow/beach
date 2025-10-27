@@ -98,9 +98,24 @@ export function useConnectionController(options: ConnectionOptions = {}): Connec
     () => options.defaultServer ?? import.meta.env.VITE_SESSION_SERVER_URL ?? 'https://api.beach.sh',
     [options.defaultServer],
   );
-  const [sessionId, setSessionId] = useState('');
-  const [sessionServer, setSessionServer] = useState(defaultServer);
-  const [passcode, setPasscode] = useState('');
+
+  // Parse URL parameters for test automation and deep linking
+  const urlParams = useMemo(() => {
+    if (typeof window === 'undefined') {
+      return null;
+    }
+    const params = new URLSearchParams(window.location.search);
+    return {
+      session: params.get('session') || '',
+      passcode: params.get('passcode') || '',
+      sessionServer: params.get('sessionServer') || '',
+      autoConnect: params.get('autoConnect') === 'true',
+    };
+  }, []);
+
+  const [sessionId, setSessionId] = useState(urlParams?.session || '');
+  const [sessionServer, setSessionServer] = useState(urlParams?.sessionServer || defaultServer);
+  const [passcode, setPasscode] = useState(urlParams?.passcode || '');
   const [status, setStatus] = useState<TerminalStatus>('idle');
   const [connectRequested, setConnectRequested] = useState(false);
   const [fallbackCohort, setFallbackCohortState] = useState(() => readStringSetting(FALLBACK_COHORT_KEY));
@@ -163,6 +178,19 @@ export function useConnectionController(options: ConnectionOptions = {}): Connec
     }
     return 'Connect';
   }, [isConnecting, status]);
+
+  // Auto-connect when URL parameters specify autoConnect=true
+  useEffect(() => {
+    if (urlParams?.autoConnect && urlParams.session && !connectRequested && status === 'idle') {
+      // Small delay to ensure form validation completes
+      const timer = setTimeout(() => {
+        if (!connectDisabled) {
+          requestConnect();
+        }
+      }, 100);
+      return () => clearTimeout(timer);
+    }
+  }, [urlParams, connectRequested, status, connectDisabled, requestConnect]);
 
   return {
     sessionId,

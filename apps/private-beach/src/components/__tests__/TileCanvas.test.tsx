@@ -99,11 +99,11 @@ describe('TileCanvas', () => {
   });
 
   it('displays controllers on application tiles', async () => {
-    render(
-      <TileCanvas
-        tiles={[application]}
-        onRemove={() => {}}
-        onSelect={() => {}}
+  render(
+    <TileCanvas
+      tiles={[application]}
+      onRemove={() => {}}
+      onSelect={() => {}}
         viewerToken="viewer"
         managerUrl="http://localhost:8080"
         preset="grid2x2"
@@ -115,10 +115,10 @@ describe('TileCanvas', () => {
         onRequestRoleChange={() => {}}
         onOpenAssignment={() => {}}
       />,
-    );
+  );
 
-    await screen.findByTestId('auto-grid');
-    expect(screen.getByText('agent-')).toBeInTheDocument();
+  await screen.findByTestId('auto-grid');
+  expect(screen.getByText(assignment.controller_session_id.slice(0, 6))).toBeInTheDocument();
   });
 
   it('invokes onRequestRoleChange when toggling role', async () => {
@@ -144,5 +144,43 @@ describe('TileCanvas', () => {
     await screen.findByTestId('auto-grid');
     fireEvent.click(screen.getByText('Set as Agent'));
     expect(onRequestRoleChange).toHaveBeenCalledWith(application, 'agent');
+  });
+
+  it('normalizes oversized saved layouts and persists the corrected width', async () => {
+    const onLayoutPersist = vi.fn();
+    render(
+      <TileCanvas
+        tiles={[application]}
+        onRemove={() => {}}
+        onSelect={() => {}}
+        viewerToken="viewer"
+        managerUrl="http://localhost:8080"
+        preset="grid2x2"
+        savedLayout={[
+          {
+            id: application.session_id,
+            x: 0,
+            y: 0,
+            w: 12,
+            h: 3,
+            widthPx: 1200,
+            zoom: 1,
+            locked: false,
+          },
+        ]}
+        onLayoutPersist={onLayoutPersist}
+        roles={roles}
+        assignmentsByAgent={assignmentsByAgent}
+        assignmentsByApplication={assignmentsByApplication}
+        onRequestRoleChange={() => {}}
+        onOpenAssignment={() => {}}
+      />,
+    );
+
+    await waitFor(() => expect(onLayoutPersist).toHaveBeenCalled());
+    const snapshot = onLayoutPersist.mock.calls[0]?.[0];
+    expect(Array.isArray(snapshot)).toBe(true);
+    expect(snapshot[0]?.w).toBe(3);
+    expect(snapshot[0]?.zoom).toBeLessThan(1);
   });
 });

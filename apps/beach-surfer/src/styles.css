@@ -90,12 +90,15 @@
   .xterm-row {
     min-height: var(--beach-terminal-line-height, 1.4rem);
     line-height: var(--beach-terminal-line-height, 1.4rem);
-    letter-spacing: 0.01em;
+    letter-spacing: 0;
+    font-kerning: none;
+    word-spacing: 0;
   }
 
   .xterm-row span {
     display: inline-block;
-    min-width: 0.62ch;
+    min-width: var(--beach-terminal-cell-width, 0.6em);
+    width: var(--beach-terminal-cell-width, 0.6em);
   }
 
   .xterm-row span[data-predicted='true'] {

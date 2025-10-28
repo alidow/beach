@@ -190,7 +190,18 @@ export async function fetchControllerEvents(
 
 export type BeachSummary = { id: string; name: string; slug: string; created_at: number };
 export type BeachMeta = BeachSummary & { settings: any };
-export type BeachLayoutItem = { id: string; x: number; y: number; w: number; h: number };
+export type BeachLayoutItem = {
+  id: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  widthPx?: number;
+  heightPx?: number;
+  zoom?: number;
+  locked?: boolean;
+  toolbarPinned?: boolean;
+};
 export type BeachLayout = {
   preset: 'grid2x2' | 'onePlusThree' | 'focus';
   tiles: string[];
@@ -210,7 +221,18 @@ function normalizeLayoutItems(input: unknown): BeachLayoutItem[] {
     const w = Number.isFinite((raw as any).w) ? Math.max(1, Math.floor((raw as any).w)) : null;
     const h = Number.isFinite((raw as any).h) ? Math.max(1, Math.floor((raw as any).h)) : null;
     if (x === null || y === null || w === null || h === null) continue;
-    clean.push({ id, x, y, w, h });
+    const item: BeachLayoutItem = { id, x, y, w, h };
+    const widthPx = Number.isFinite((raw as any).widthPx) ? Math.max(0, Math.round((raw as any).widthPx)) : null;
+    const heightPx = Number.isFinite((raw as any).heightPx) ? Math.max(0, Math.round((raw as any).heightPx)) : null;
+    const zoom = Number.isFinite((raw as any).zoom) ? Math.max(0.05, Math.min(4, Number((raw as any).zoom))) : null;
+    const locked = typeof (raw as any).locked === 'boolean' ? (raw as any).locked : null;
+    const toolbarPinned = typeof (raw as any).toolbarPinned === 'boolean' ? (raw as any).toolbarPinned : null;
+    if (widthPx !== null) item.widthPx = widthPx;
+    if (heightPx !== null) item.heightPx = heightPx;
+    if (zoom !== null) item.zoom = zoom;
+    if (locked !== null) item.locked = locked;
+    if (toolbarPinned !== null) item.toolbarPinned = toolbarPinned;
+    clean.push(item);
     seen.add(id);
     if (clean.length >= 12) break;
   }

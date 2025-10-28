@@ -92,3 +92,22 @@
   left: -4px;
   cursor: nesw-resize;
 }
+
+.session-grid {
+  position: relative;
+  width: 100%;
+}
+
+.session-grid .react-grid-layout {
+  transition: width 160ms ease;
+}
+
+.session-grid-item {
+  display: flex;
+  height: 100%;
+}
+
+.session-grid-item > * {
+  flex: 1 1 auto;
+  min-width: 0;
+}

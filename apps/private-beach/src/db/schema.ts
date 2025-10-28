@@ -9,6 +9,11 @@ export type TileLayoutCoordinates = {
   y: number;
   w: number;
   h: number;
+  widthPx?: number | null;
+  heightPx?: number | null;
+  zoom?: number | null;
+  locked?: boolean | null;
+  toolbarPinned?: boolean | null;
 };
 
 export const tileLayouts = pgTable('surfer_tile_layout', {

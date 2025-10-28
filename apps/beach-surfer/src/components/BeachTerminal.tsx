@@ -1326,16 +1326,31 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     !isFullscreen && 'rounded-b-[22px]',
   );
 
-  const containerStyle: CSSProperties & { '--beach-terminal-line-height': string } = {
+  const devicePixelRatioValue =
+    typeof window !== 'undefined' && typeof window.devicePixelRatio === 'number'
+      ? window.devicePixelRatio || 1
+      : 1;
+  const baseCellWidth = (fontSize / BASE_TERMINAL_FONT_SIZE) * BASE_TERMINAL_CELL_WIDTH;
+  const dpr = Math.max(1, devicePixelRatioValue);
+  const roundedCellWidth = Math.max(1, Math.round(baseCellWidth * dpr) / dpr);
+  const cellWidthPx = Number(roundedCellWidth.toFixed(3));
+
+  const containerStyle: CSSProperties & {
+    '--beach-terminal-line-height': string;
+    '--beach-terminal-cell-width': string;
+  } = {
     fontFamily,
     fontSize,
-    lineHeight: `${lineHeight}px`,
-    letterSpacing: '0.01em',
+    lineHeight: `${effectiveLineHeight}px`,
+    letterSpacing: '0',
+    fontKerning: 'none',
+    wordSpacing: '0',
     fontVariantLigatures: 'none',
     // Prevent Chrome scroll anchoring from fighting spacer adjustments during
     // zoom/resize, which can cause off-screen rows to jump into view.
     overflowAnchor: 'none',
-    '--beach-terminal-line-height': `${lineHeight}px`,
+    '--beach-terminal-line-height': `${effectiveLineHeight}px`,
+    '--beach-terminal-cell-width': `${cellWidthPx}px`,
   };
 
   const handleMatchPtyViewport = useCallback(() => {
@@ -2236,6 +2251,8 @@ export function shouldReenableFollowTail(remainingPixels: number, lineHeightPx: 
 const DEFAULT_FOREGROUND = '#e2e8f0';
 const DEFAULT_BACKGROUND = 'hsl(var(--terminal-screen))';
 const NBSP = '\u00A0';
+const BASE_TERMINAL_FONT_SIZE = 14;
+const BASE_TERMINAL_CELL_WIDTH = 8;
 
 function styleFromDefinition(def: StyleDefinition, highlightCursor = false): CSSProperties {
   const style: CSSProperties = {};

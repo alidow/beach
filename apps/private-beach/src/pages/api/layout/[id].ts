@@ -34,6 +34,10 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
 }
 
+function isBoolean(value: unknown): value is boolean {
+  return typeof value === 'boolean';
+}
+
 function normalizeLayout(input: unknown): TileLayoutCoordinates[] {
   if (!Array.isArray(input)) return [];
   const seen = new Set<string>();
@@ -47,7 +51,18 @@ function normalizeLayout(input: unknown): TileLayoutCoordinates[] {
     const w = isFiniteNumber((raw as any).w) ? Math.max(1, Math.floor((raw as any).w)) : null;
     const h = isFiniteNumber((raw as any).h) ? Math.max(1, Math.floor((raw as any).h)) : null;
     if (x === null || y === null || w === null || h === null) continue;
-    clean.push({ id, x, y, w, h });
+    const widthPx = isFiniteNumber((raw as any).widthPx) ? Math.max(0, Math.round((raw as any).widthPx)) : undefined;
+    const heightPx = isFiniteNumber((raw as any).heightPx) ? Math.max(0, Math.round((raw as any).heightPx)) : undefined;
+    const zoom = isFiniteNumber((raw as any).zoom) ? Math.max(0.05, Math.min(4, Number((raw as any).zoom))) : undefined;
+    const locked = isBoolean((raw as any).locked) ? (raw as any).locked : undefined;
+    const toolbarPinned = isBoolean((raw as any).toolbarPinned) ? (raw as any).toolbarPinned : undefined;
+    const item: TileLayoutCoordinates = { id, x, y, w, h };
+    if (widthPx !== undefined) item.widthPx = widthPx;
+    if (heightPx !== undefined) item.heightPx = heightPx;
+    if (zoom !== undefined) item.zoom = zoom;
+    if (locked !== undefined) item.locked = locked;
+    if (toolbarPinned !== undefined) item.toolbarPinned = toolbarPinned;
+    clean.push(item);
     seen.add(id);
     if (clean.length >= 12) break;
   }

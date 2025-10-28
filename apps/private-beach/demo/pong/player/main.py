@@ -29,6 +29,30 @@ PADDLE_HEIGHT = 5
 PADDLE_MARGIN_X = 3
 INSTRUCTION_LINES = 3  # Lines reserved at bottom
 
+MIN_PLAYFIELD_WIDTH = 20
+MIN_PLAYFIELD_HEIGHT = PADDLE_HEIGHT + 4
+
+FRAME_TOP_LEFT = "╭"
+FRAME_TOP_RIGHT = "╮"
+FRAME_BOTTOM_LEFT = "╰"
+FRAME_BOTTOM_RIGHT = "╯"
+FRAME_HORIZONTAL = "─"
+FRAME_VERTICAL = "│"
+
+CENTER_NET_PATTERN = ("┊", "┆")
+BALL_GLYPH = "●"
+
+TITLE_TEMPLATE = " PRIVATE BEACH PONG · {mode} "
+STATUS_ICON = "●"
+COMMAND_ICON = "⌨"
+PROMPT_ICON = "›"
+DIVIDER_DOT = "·"
+
+PADDLE_GLYPHS = {
+    "lhs": {"cap_top": "▛", "body": "▌", "cap_bottom": "▙", "accent": "▏"},
+    "rhs": {"cap_top": "▜", "body": "▐", "cap_bottom": "▟", "accent": "▕"},
+}
+
 
 @dataclass
 class Ball:
@@ -61,6 +85,18 @@ class PongView:
         self.status_message = "Ready."
         self.last_frame_time = time.monotonic()
         self._last_hud_rows: Set[int] = set()
+        self.frame_time = 0.0
+
+        self._colors_initialized = False
+        self.color_border = curses.A_BOLD
+        self.color_centerline = curses.A_DIM
+        self.color_paddle = curses.A_BOLD
+        self.color_paddle_cap = curses.A_BOLD
+        self.color_ball = curses.A_BOLD
+        self.color_status = curses.A_BOLD
+        self.color_commands = curses.A_NORMAL
+        self.color_prompt = curses.A_BOLD
+        self.color_title = curses.A_BOLD
 
     def log_status(self, message: str) -> None:
         self.status_message = message
@@ -87,7 +123,11 @@ class PongView:
         return PADDLE_HEIGHT / 2 + 1
 
     def _paddle_max_y(self) -> float:
-        return self._play_area_height() - (PADDLE_HEIGHT / 2)
+        max_value = self._play_area_height() - (PADDLE_HEIGHT / 2) - 2
+        min_value = self._paddle_min_y()
+        if max_value < min_value:
+            return min_value
+        return max_value
 
     def move_paddle(self, delta: float) -> None:
         new_y = self.paddle.y - delta  # negative delta moves down
@@ -99,12 +139,21 @@ class PongView:
             return
 
         play_top = 1
-        play_bottom = self._play_area_height() - 1
+        play_bottom = self._play_area_height() - 2
 
-        clamped_y = self._clamp(y, play_top + 1, play_bottom - 1)
+        if play_bottom <= play_top:
+            self.log_status("Cannot spawn ball: play area too small.")
+            return
+
+        lower_limit = play_top + 1
+        upper_limit = play_bottom - 1
+        if upper_limit <= lower_limit:
+            clamped_y = (lower_limit + upper_limit) / 2
+        else:
+            clamped_y = self._clamp(y, lower_limit, upper_limit)
         abs_vx = abs(vx) if vx != 0 else 1.0
         if self.mode == "lhs":
-            x = float(self.width - PADDLE_MARGIN_X - 1)
+            x = float(self.width - PADDLE_MARGIN_X - 2)
             vx_final = -abs_vx
         else:
             x = float(PADDLE_MARGIN_X + 1)
@@ -178,6 +227,47 @@ class PongView:
             return (minimum + maximum) / 2
         return max(minimum, min(value, maximum))
 
+    def _init_colors(self) -> None:
+        if self._colors_initialized:
+            return
+        self._colors_initialized = True
+
+        if not curses.has_colors():
+            # Fall back to attribute-only styling.
+            self.color_border = curses.A_BOLD
+            self.color_centerline = curses.A_DIM
+            self.color_paddle = curses.A_BOLD
+            self.color_paddle_cap = curses.A_BOLD
+            self.color_ball = curses.A_BOLD
+            self.color_status = curses.A_BOLD
+            self.color_commands = curses.A_NORMAL
+            self.color_prompt = curses.A_BOLD
+            self.color_title = curses.A_BOLD
+            return
+
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+        except curses.error:
+            # Some terminals do not support default color merging; ignore.
+            pass
+
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+        curses.init_pair(2, curses.COLOR_MAGENTA, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_WHITE, -1)
+        curses.init_pair(5, curses.COLOR_GREEN, -1)
+
+        self.color_border = curses.color_pair(1) | curses.A_BOLD
+        self.color_centerline = curses.color_pair(1) | curses.A_DIM
+        self.color_paddle = curses.color_pair(2) | curses.A_BOLD
+        self.color_paddle_cap = curses.color_pair(2) | curses.A_BOLD
+        self.color_ball = curses.color_pair(3) | curses.A_BOLD
+        self.color_status = curses.color_pair(4) | curses.A_BOLD
+        self.color_commands = curses.color_pair(4)
+        self.color_prompt = curses.color_pair(5) | curses.A_BOLD
+        self.color_title = curses.color_pair(1) | curses.A_BOLD
+
     def _update_ball(self, dt: float) -> None:
         if not self.ball:
             return
@@ -187,7 +277,7 @@ class PongView:
         ball.y += ball.vy * dt
 
         top_limit = 1
-        bottom_limit = self._play_area_height() - 1
+        bottom_limit = self._play_area_height() - 2
 
         if ball.y <= top_limit:
             ball.y = top_limit + (top_limit - ball.y)
@@ -217,111 +307,230 @@ class PongView:
     def _draw(self) -> None:
         self.stdscr.erase()
 
-        # Guard against zero-sized terminals (common before a viewer attaches).
+        play_height = self._play_area_height()
+
         if self.height < INSTRUCTION_LINES + 2 or self.width < 3:
-            self._addstr_safe(0, 0, "Waiting for viewer…")
+            self._render_resize_hint("Waiting for viewer…")
             self.stdscr.refresh()
             return
 
-        play_height = min(self._play_area_height(), self.height)
+        if play_height < MIN_PLAYFIELD_HEIGHT or self.width < MIN_PLAYFIELD_WIDTH:
+            self._render_resize_hint("Resize for the full Pong experience.")
+            self.stdscr.refresh()
+            return
+
+        play_top = 0
+        play_bottom = play_height - 1
+        inner_top = play_top + 1
+        inner_bottom = play_bottom - 1
+        inner_left = 1
+        inner_right = self.width - 2
+
         for row in range(play_height, self.height):
             self._clear_line(row)
-        if self.width >= 2:
-            for row in range(play_height):
-                if row >= self.height:
-                    break
-                self._addch_safe(row, 0, "|")
-                self._addch_safe(row, self.width - 1, "|")
-        if play_height < self.height:
-            for col in range(self.width):
-                self._addch_safe(play_height, col, "-")
 
-        # Center divider for visual alignment
-        if self.width >= 2:
-            for row in range(1, play_height):
-                if row % 2 == 0 and 0 <= row < self.height:
-                    mid_x = self.width // 2
-                    if 0 <= mid_x < self.width:
-                        self._addch_safe(row, mid_x, "|")
-
-        # Paddle
-        top = int(round(self.paddle.y - PADDLE_HEIGHT / 2))
-        bottom = int(round(self.paddle.y + PADDLE_HEIGHT / 2))
-        for row in range(top, bottom + 1):
-            if 1 <= row < play_height and 0 <= self.paddle.x < self.width:
-                self._addch_safe(row, self.paddle.x, "#")
-
-        # Ball
-        if self.ball:
-            bx = int(round(self.ball.x))
-            by = int(round(self.ball.y))
-            if 1 <= by < play_height and 1 <= bx < self.width - 1:
-                self._addch_safe(by, bx, "o")
-
-        # HUD
-        instruction_y = self.height - INSTRUCTION_LINES
-        status_y = instruction_y - 1
-
-        new_hud_rows: Set[int] = set()
-        if status_y >= 0:
-            new_hud_rows.add(status_y)
-        if instruction_y >= 0:
-            new_hud_rows.update({instruction_y, instruction_y + 1, instruction_y + 2})
-
-        for row in self._last_hud_rows:
-            if row not in new_hud_rows:
-                self._clear_line(row)
-
-        if instruction_y >= 0:
-            self._clear_line(instruction_y)
-            controls = "Commands: m <delta> | b <y> <dx> <dy> | quit"
-            self._addstr_safe(
-                instruction_y,
-                1,
-                controls,
-            )
-            mode_hint = (
-                f"Mode: {self.mode.upper()} — Paddle X={self.paddle.x}"
-                " (positive delta moves up)"
-            )
-            self._clear_line(instruction_y + 1)
-            self._addstr_safe(instruction_y + 1, 1, mode_hint)
-            buffer_display = self.command_buffer.decode("ascii", errors="ignore")
-            self._clear_line(instruction_y + 2)
-            self._addstr_safe(
-                instruction_y + 2,
-                1,
-                f"> {buffer_display}",
-            )
-
-        # Status message just above instruction area if space allows
-        if status_y >= 0:
-            self._clear_line(status_y)
-            self._addstr_safe(status_y, 1, self.status_message)
-
-        self._last_hud_rows = new_hud_rows
+        self._draw_frame(play_top, play_bottom)
+        self._draw_centerline(inner_top, inner_bottom)
+        self._draw_paddle(inner_top, inner_bottom, inner_left, inner_right)
+        self._draw_ball(inner_top, inner_bottom, inner_left, inner_right)
+        self._draw_hud(play_bottom)
 
         self.stdscr.refresh()
 
-    def _addstr_safe(self, y: int, x: int, text: str) -> None:
+    def _render_resize_hint(self, message: str) -> None:
+        for row in self._last_hud_rows:
+            self._clear_line(row)
+        self._last_hud_rows.clear()
+
+        hint_y = max(self.height // 2, 0)
+        intro = message
+        detail = "Expand the terminal to enjoy Private Beach Pong."
+
+        intro_x = max((self.width - len(intro)) // 2, 0)
+        detail_x = max((self.width - len(detail)) // 2, 0)
+
+        self._addstr_safe(hint_y, intro_x, intro, self.color_status)
+        if hint_y + 2 < self.height:
+            self._addstr_safe(hint_y + 2, detail_x, detail, self.color_commands)
+
+    def _draw_frame(self, top: int, bottom: int) -> None:
+        if self.width < 2 or bottom <= top:
+            return
+
+        horizontal_width = max(self.width - 2, 0)
+        top_line = (
+            FRAME_TOP_LEFT
+            + (FRAME_HORIZONTAL * horizontal_width)
+            + FRAME_TOP_RIGHT
+        )
+        bottom_line = (
+            FRAME_BOTTOM_LEFT
+            + (FRAME_HORIZONTAL * horizontal_width)
+            + FRAME_BOTTOM_RIGHT
+        )
+
+        self._addstr_safe(top, 0, top_line, self.color_border)
+        self._addstr_safe(bottom, 0, bottom_line, self.color_border)
+
+        for row in range(top + 1, bottom):
+            self._addch_safe(row, 0, FRAME_VERTICAL, self.color_border)
+            self._addch_safe(row, self.width - 1, FRAME_VERTICAL, self.color_border)
+
+        self._draw_frame_title(top)
+
+    def _draw_frame_title(self, y: int) -> None:
+        max_len = self.width - 2
+        if max_len <= 2:
+            return
+
+        title = TITLE_TEMPLATE.format(mode=self.mode.upper())
+        if len(title) > max_len:
+            if max_len <= 1:
+                return
+            title = title[: max_len - 1] + "…"
+
+        start_x = max((self.width - len(title)) // 2, 1)
+        if start_x + len(title) >= self.width:
+            start_x = self.width - len(title) - 1
+            if start_x < 1:
+                return
+
+        self._addstr_safe(y, start_x, title, self.color_title)
+
+    def _draw_centerline(self, inner_top: int, inner_bottom: int) -> None:
+        if inner_top > inner_bottom or self.width < 3:
+            return
+        mid_x = self.width // 2
+        pattern_length = len(CENTER_NET_PATTERN)
+        if pattern_length == 0:
+            return
+        for offset, row in enumerate(range(inner_top, inner_bottom + 1)):
+            glyph = CENTER_NET_PATTERN[offset % pattern_length]
+            self._addch_safe(row, mid_x, glyph, self.color_centerline)
+
+    def _draw_paddle(
+        self,
+        inner_top: int,
+        inner_bottom: int,
+        inner_left: int,
+        inner_right: int,
+    ) -> None:
+        glyph_set = PADDLE_GLYPHS["lhs" if self.mode == "lhs" else "rhs"]
+        half_height = PADDLE_HEIGHT / 2
+        top_row = int(round(self.paddle.y - half_height))
+        bottom_row = int(round(self.paddle.y + half_height))
+
+        rows = [
+            row
+            for row in range(top_row, bottom_row + 1)
+            if inner_top <= row <= inner_bottom
+        ]
+        if not rows:
+            return
+
+        for index, row in enumerate(rows):
+            if len(rows) > 1 and index == 0:
+                glyph = glyph_set["cap_top"]
+                attr = self.color_paddle_cap
+            elif len(rows) > 1 and index == len(rows) - 1:
+                glyph = glyph_set["cap_bottom"]
+                attr = self.color_paddle_cap
+            else:
+                glyph = glyph_set["body"]
+                attr = self.color_paddle
+
+            self._addch_safe(row, self.paddle.x, glyph, attr)
+
+            accent_x = self.paddle.x + (1 if self.mode == "lhs" else -1)
+            if inner_left <= accent_x <= inner_right:
+                self._addch_safe(
+                    row,
+                    accent_x,
+                    glyph_set["accent"],
+                    self.color_paddle | curses.A_DIM,
+                )
+
+    def _draw_ball(
+        self,
+        inner_top: int,
+        inner_bottom: int,
+        inner_left: int,
+        inner_right: int,
+    ) -> None:
+        if not self.ball:
+            return
+
+        bx = int(round(self.ball.x))
+        by = int(round(self.ball.y))
+        if inner_left <= bx <= inner_right and inner_top <= by <= inner_bottom:
+            self._addch_safe(by, bx, BALL_GLYPH, self.color_ball)
+
+    def _draw_hud(self, play_bottom: int) -> None:
+        status_y = play_bottom + 1
+        commands_y = status_y + 1
+        prompt_y = commands_y + 1
+
+        hud_rows = {row for row in (status_y, commands_y, prompt_y) if 0 <= row < self.height}
+
+        for row in self._last_hud_rows:
+            if row not in hud_rows:
+                self._clear_line(row)
+
+        fps_display = 0.0
+        if self.frame_time > 0:
+            fps_display = min(1.0 / self.frame_time, 999.9)
+
+        status_parts = [
+            f"{STATUS_ICON} {self.status_message}",
+            f"Mode {self.mode.upper()} @ X{self.paddle.x}",
+        ]
+        if fps_display:
+            status_parts.append(f"{fps_display:5.1f} FPS")
+        if self.ball:
+            status_parts.append(
+                f"Ball {int(round(self.ball.x))},{int(round(self.ball.y))}"
+            )
+        status_line = f" {DIVIDER_DOT} ".join(status_parts)
+
+        if status_y in hud_rows:
+            self._clear_line(status_y)
+            self._addstr_safe(status_y, 1, status_line, self.color_status)
+
+        if commands_y in hud_rows:
+            commands_line = (
+                f"{COMMAND_ICON} Commands  m <Δ>   {DIVIDER_DOT}   b <y> <dx> <dy>   "
+                f"{DIVIDER_DOT}   quit"
+            )
+            self._clear_line(commands_y)
+            self._addstr_safe(commands_y, 1, commands_line, self.color_commands)
+
+        if prompt_y in hud_rows:
+            buffer_display = self.command_buffer.decode("ascii", errors="ignore")
+            prompt_line = f"{PROMPT_ICON} {buffer_display}"
+            self._clear_line(prompt_y)
+            self._addstr_safe(prompt_y, 1, prompt_line, self.color_prompt)
+
+        self._last_hud_rows = hud_rows
+
+    def _addstr_safe(self, y: int, x: int, text: str, attr: int = 0) -> None:
         if y < 0 or y >= self.height:
             return
-        max_len = max(self.width - x - 1, 0)
+        max_len = max(self.width - x, 0)
         if max_len <= 0:
             return
         trimmed = text[:max_len]
         if not trimmed:
             return
         try:
-            self.stdscr.addstr(y, x, trimmed)
+            self.stdscr.addstr(y, x, trimmed, attr)
         except curses.error:
             pass
 
-    def _addch_safe(self, y: int, x: int, ch: str) -> None:
+    def _addch_safe(self, y: int, x: int, ch: str, attr: int = 0) -> None:
         if y < 0 or y >= self.height or x < 0 or x >= self.width:
             return
         try:
-            self.stdscr.addch(y, x, ch)
+            self.stdscr.addch(y, x, ch, attr)
         except curses.error:
             pass
 
@@ -337,6 +546,7 @@ class PongView:
     def run(self) -> None:
         curses.curs_set(0)
         self.stdscr.nodelay(True)
+        self._init_colors()
         frame_delay = 1.0 / self.fps if self.fps > 0 else 0.033
 
         while self.running:
@@ -346,6 +556,7 @@ class PongView:
             if dt <= 0:
                 dt = frame_delay
             self.last_frame_time = now
+            self.frame_time = dt
 
             self._read_input()
             self._update_ball(dt)

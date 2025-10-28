@@ -916,9 +916,9 @@ export default function BeachDashboard() {
             </div>
           }
         />
-        <div className="grid grid-cols-12 gap-3 p-3">
+        <div className="flex flex-col gap-3 p-3 md:flex-row">
           {sidebarOpen && (
-            <div className="col-span-12 md:col-span-3">
+            <div className="w-full md:w-[320px] md:flex-none">
               <AgentExplorer
                 agents={agentSessions}
                 applications={applicationSessions}
@@ -937,7 +937,7 @@ export default function BeachDashboard() {
               />
             </div>
           )}
-          <div className={`col-span-12 ${sidebarOpen ? 'md:col-span-9' : 'md:col-span-12'}`}>
+          <div className="flex-1 min-w-0">
             {error && <div className="mb-2 rounded-md border border-red-500/40 bg-red-500/10 p-2 text-sm text-red-600 dark:text-red-400">{error}</div>}
             {assignmentError && !assignmentPaneOpen && (
               <div className="mb-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-sm text-amber-700 dark:text-amber-300">

@@ -25,6 +25,18 @@ type Props = {
   variant?: 'preview' | 'full';
   harnessType?: string | null;
   onHostResizeStateChange?: (sessionId: string, state: HostResizeControlState | null) => void;
+  fontSize?: number;
+  locked?: boolean;
+  cropped?: boolean;
+  onViewportDimensions?: (
+    sessionId: string,
+    dims: {
+      viewportRows: number;
+      viewportCols: number;
+      hostRows: number | null;
+      hostCols: number | null;
+    },
+  ) => void;
 };
 
 function SessionTerminalPreviewClientInner({
@@ -36,10 +48,27 @@ function SessionTerminalPreviewClientInner({
   variant = 'preview',
   harnessType,
   onHostResizeStateChange,
+  fontSize,
+  locked = false,
+  cropped = false,
+  onViewportDimensions,
 }: Props) {
   const trimmedToken = token?.trim() ?? '';
   const isCabana = harnessType ? harnessType.toLowerCase().includes('cabana') : false;
   const [viewportState, setViewportState] = useState<TerminalViewportState | null>(null);
+
+  const baseFontSize = variant === 'full' ? 14 : 12;
+  const effectiveFontSize = useMemo(() => {
+    const candidate =
+      typeof fontSize === 'number' && Number.isFinite(fontSize) ? fontSize : baseFontSize;
+    const clamped = Math.max(8, Math.min(candidate, 28));
+    const dpr = typeof window !== 'undefined' && typeof window.devicePixelRatio === 'number'
+      ? window.devicePixelRatio || 1
+      : 1;
+    const step = 1 / Math.max(1, Math.round(dpr * 2));
+    const normalized = Math.round(clamped / step) * step;
+    return Number(normalized.toFixed(3));
+  }, [fontSize, baseFontSize]);
 
   const handleViewportStateChange = useCallback((state: TerminalViewportState) => {
     setViewportState(state);
@@ -147,7 +176,8 @@ function SessionTerminalPreviewClientInner({
       return;
     }
     const needsResize =
-      viewportState.hostViewportRows != null && viewportState.viewportRows !== viewportState.hostViewportRows;
+      viewportState.hostViewportRows != null &&
+      viewportState.viewportRows !== viewportState.hostViewportRows;
     const canResize = viewportState.canSendResize && needsResize;
     onHostResizeStateChange(sessionId, {
       needsResize,
@@ -159,6 +189,18 @@ function SessionTerminalPreviewClientInner({
       hostCols: viewportState.hostCols,
     });
   }, [onHostResizeStateChange, sessionId, viewportState]);
+
+  useEffect(() => {
+    if (!onViewportDimensions || !viewportState) {
+      return;
+    }
+    onViewportDimensions(sessionId, {
+      viewportRows: viewportState.viewportRows,
+      viewportCols: viewportState.viewportCols,
+      hostRows: viewportState.hostViewportRows,
+      hostCols: viewportState.hostCols,
+    });
+  }, [onViewportDimensions, sessionId, viewportState]);
 
   useEffect(
     () => () => {
@@ -270,10 +312,10 @@ function SessionTerminalPreviewClientInner({
         transport={viewer.transport}
         autoConnect={false}
         className="h-full w-full"
-        fontSize={variant === 'full' ? 14 : 12}
+        fontSize={effectiveFontSize}
         showTopBar={variant === 'full'}
         showStatusBar={variant === 'full'}
-        autoResizeHostOnViewportChange={false}
+        autoResizeHostOnViewportChange={locked}
         onViewportStateChange={handleViewportStateChange}
       />
       {viewer.status === 'reconnecting' && (
@@ -281,6 +323,11 @@ function SessionTerminalPreviewClientInner({
           <span className="rounded-full border border-amber-500/40 bg-amber-500/15 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.24em] text-amber-100">
             Reconnecting…
           </span>
+        </div>
+      )}
+      {cropped && (
+        <div className="pointer-events-none absolute right-2 bottom-2 rounded-full border border-amber-400/40 bg-amber-500/15 px-2 py-[2px] text-[10px] uppercase tracking-[0.24em] text-amber-100">
+          Cropped
         </div>
       )}
     </div>

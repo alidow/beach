@@ -1,7 +1,7 @@
 'use client';
 
 import { memo, useCallback, useEffect, useMemo, useState } from 'react';
-import { useSessionTerminal } from '../hooks/useSessionTerminal';
+import { useSessionTerminal, type TerminalViewerState } from '../hooks/useSessionTerminal';
 import { BeachTerminal, type TerminalViewportState } from '../../../beach-surfer/src/components/BeachTerminal';
 import { CabanaPrivateBeachPlayer } from '../../../beach-surfer/src/components/cabana/CabanaPrivateBeachPlayer';
 import type { CabanaTelemetryHandlers } from '../../../beach-surfer/src/components/cabana/CabanaSessionPlayer';
@@ -37,24 +37,31 @@ type Props = {
       hostCols: number | null;
     },
   ) => void;
+  viewerOverride?: TerminalViewerState | null;
 };
 
-function SessionTerminalPreviewClientInner({
+type ViewProps = Omit<Props, 'token' | 'viewerOverride'> & {
+  viewer: TerminalViewerState;
+  trimmedToken: string;
+  isCabana: boolean;
+};
+
+function SessionTerminalPreviewView({
   sessionId,
   privateBeachId,
   managerUrl,
-  token,
   className,
   variant = 'preview',
-  harnessType,
+  harnessType: _harnessType,
   onHostResizeStateChange,
   fontSize,
   locked = false,
   cropped = false,
   onViewportDimensions,
-}: Props) {
-  const trimmedToken = token?.trim() ?? '';
-  const isCabana = harnessType ? harnessType.toLowerCase().includes('cabana') : false;
+  viewer,
+  trimmedToken,
+  isCabana,
+}: ViewProps) {
   const [viewportState, setViewportState] = useState<TerminalViewportState | null>(null);
 
   const baseFontSize = variant === 'full' ? 14 : 12;
@@ -62,9 +69,10 @@ function SessionTerminalPreviewClientInner({
     const candidate =
       typeof fontSize === 'number' && Number.isFinite(fontSize) ? fontSize : baseFontSize;
     const clamped = Math.max(8, Math.min(candidate, 28));
-    const dpr = typeof window !== 'undefined' && typeof window.devicePixelRatio === 'number'
-      ? window.devicePixelRatio || 1
-      : 1;
+    const dpr =
+      typeof window !== 'undefined' && typeof window.devicePixelRatio === 'number'
+        ? window.devicePixelRatio || 1
+        : 1;
     const step = 1 / Math.max(1, Math.round(dpr * 2));
     const normalized = Math.round(clamped / step) * step;
     return Number(normalized.toFixed(3));
@@ -150,14 +158,6 @@ function SessionTerminalPreviewClientInner({
         .filter(Boolean)
         .join(' '),
     [variant, className],
-  );
-
-  const shouldConnect = !isCabana && trimmedToken.length > 0;
-  const viewer = useSessionTerminal(
-    sessionId,
-    privateBeachId,
-    managerUrl,
-    shouldConnect ? trimmedToken : null,
   );
 
   useEffect(() => {
@@ -331,6 +331,54 @@ function SessionTerminalPreviewClientInner({
         </div>
       )}
     </div>
+  );
+}
+
+function SessionTerminalPreviewManaged({
+  trimmedToken,
+  isCabana,
+  token: _token,
+  viewerOverride: _viewerOverride,
+  ...rest
+}: Props & { trimmedToken: string; isCabana: boolean }) {
+  const viewer = useSessionTerminal(
+    rest.sessionId,
+    rest.privateBeachId,
+    rest.managerUrl,
+    !isCabana && trimmedToken.length > 0 ? trimmedToken : null,
+  );
+  return (
+    <SessionTerminalPreviewView
+      {...rest}
+      trimmedToken={trimmedToken}
+      isCabana={isCabana}
+      viewer={viewer}
+    />
+  );
+}
+
+function SessionTerminalPreviewClientInner(props: Props) {
+  const trimmedToken = props.token?.trim() ?? '';
+  const isCabana = props.harnessType ? props.harnessType.toLowerCase().includes('cabana') : false;
+
+  if (props.viewerOverride) {
+    const { token: _token, viewerOverride, ...rest } = props;
+    return (
+      <SessionTerminalPreviewView
+        {...rest}
+        trimmedToken={trimmedToken}
+        isCabana={isCabana}
+        viewer={viewerOverride}
+      />
+    );
+  }
+
+  return (
+    <SessionTerminalPreviewManaged
+      {...props}
+      trimmedToken={trimmedToken}
+      isCabana={isCabana}
+    />
   );
 }
 

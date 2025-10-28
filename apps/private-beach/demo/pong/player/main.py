@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Set
 
 
-DEFAULT_FPS = 30.0
+FRAME_DELAY_SECONDS = 1.0 / 30.0
 PADDLE_HEIGHT = 5
 PADDLE_MARGIN_X = 3
 INSTRUCTION_LINES = 3  # Lines reserved at bottom
@@ -69,10 +69,9 @@ class Paddle:
 
 
 class PongView:
-    def __init__(self, stdscr: "curses._CursesWindow", mode: str, fps: float) -> None:
+    def __init__(self, stdscr: "curses._CursesWindow", mode: str) -> None:
         self.stdscr = stdscr
         self.mode = mode
-        self.fps = fps
         self.running = True
 
         self.height = 0
@@ -85,7 +84,6 @@ class PongView:
         self.status_message = "Ready."
         self.last_frame_time = time.monotonic()
         self._last_hud_rows: Set[int] = set()
-        self.frame_time = 0.0
 
         self._colors_initialized = False
         self.color_border = curses.A_BOLD
@@ -476,16 +474,10 @@ class PongView:
             if row not in hud_rows:
                 self._clear_line(row)
 
-        fps_display = 0.0
-        if self.frame_time > 0:
-            fps_display = min(1.0 / self.frame_time, 999.9)
-
         status_parts = [
             f"{STATUS_ICON} {self.status_message}",
             f"Mode {self.mode.upper()} @ X{self.paddle.x}",
         ]
-        if fps_display:
-            status_parts.append(f"{fps_display:5.1f} FPS")
         if self.ball:
             status_parts.append(
                 f"Ball {int(round(self.ball.x))},{int(round(self.ball.y))}"
@@ -547,7 +539,7 @@ class PongView:
         curses.curs_set(0)
         self.stdscr.nodelay(True)
         self._init_colors()
-        frame_delay = 1.0 / self.fps if self.fps > 0 else 0.033
+        frame_delay = FRAME_DELAY_SECONDS
 
         while self.running:
             self.update_dimensions()
@@ -556,7 +548,6 @@ class PongView:
             if dt <= 0:
                 dt = frame_delay
             self.last_frame_time = now
-            self.frame_time = dt
 
             self._read_input()
             self._update_ball(dt)
@@ -574,17 +565,11 @@ def parse_args(argv: Tuple[str, ...]) -> argparse.Namespace:
         default="lhs",
         help="Which side to render. Run two instances for both paddles.",
     )
-    parser.add_argument(
-        "--fps",
-        type=float,
-        default=DEFAULT_FPS,
-        help="Target frame rate for rendering/physics.",
-    )
     return parser.parse_args(argv)
 
 
 def curses_main(stdscr: "curses._CursesWindow", args: argparse.Namespace) -> None:
-    view = PongView(stdscr, mode=args.mode, fps=args.fps)
+    view = PongView(stdscr, mode=args.mode)
     view.run()
 
 

@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+} from 'react';
 import dynamic from 'next/dynamic';
 import type { Layout } from 'react-grid-layout';
 import type { SessionSummary, BeachLayoutItem, SessionRole, ControllerPairing } from '../lib/api';
@@ -9,6 +18,7 @@ import { SessionTerminalPreview } from './SessionTerminalPreview';
 import type { HostResizeControlState } from './SessionTerminalPreviewClient';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
+import { useSessionTerminal, type TerminalViewerState } from '../hooks/useSessionTerminal';
 
 const AutoGrid = dynamic(() => import('./AutoGrid'), {
   ssr: false,
@@ -20,6 +30,7 @@ const DEFAULT_W = 3;
 const DEFAULT_H = 3;
 const MIN_W = 2;
 const MIN_H = 2;
+const ROW_HEIGHT = 110;
 const UNLOCKED_MAX_W = 3;
 const UNLOCKED_MAX_H = 3;
 const TARGET_TILE_WIDTH = 360;
@@ -424,6 +435,7 @@ type TileCardProps = {
   resizeControl: HostResizeControlState | undefined;
   managerUrl: string;
   viewerToken: string | null;
+  viewer: TerminalViewerState;
   view: TileViewState;
   onMeasure: (measurement: TileMeasurements) => void;
   onViewport: (dims: {
@@ -433,6 +445,7 @@ type TileCardProps = {
     hostCols: number | null;
   }) => void;
   onHostResizeStateChange: (sessionId: string, state: HostResizeControlState | null) => void;
+  isExpanded: boolean;
 };
 
 function TileCard({
@@ -454,10 +467,12 @@ function TileCard({
   resizeControl,
   managerUrl,
   viewerToken,
+  viewer,
   view,
   onMeasure,
   onViewport,
   onHostResizeStateChange,
+  isExpanded,
 }: TileCardProps) {
   const contentRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -489,7 +504,7 @@ function TileCard({
 
   return (
     <div
-      className={`group relative flex h-full w-full flex-col overflow-hidden rounded-xl border bg-card text-card-foreground shadow-sm transition-shadow ${
+      className={`group relative flex h-full flex-col overflow-hidden rounded-xl border bg-card text-card-foreground shadow-sm transition-shadow ${
         isAgent && assignments.length > 0 ? 'border-primary/60' : 'border-border'
       }`}
       data-session-id={session.session_id}
@@ -535,10 +550,11 @@ function TileCard({
         </div>
       </div>
       <div className="flex-1 space-y-3 pt-9">
-        <div
-          ref={contentRef}
-          className="relative flex min-h-0 flex-1 overflow-hidden rounded-lg border border-border/60 bg-neutral-900"
-        >
+      <div
+        ref={contentRef}
+        className="relative flex min-h-0 flex-1 overflow-hidden rounded-lg border border-border/60 bg-neutral-900"
+      >
+        {!isExpanded ? (
           <SessionTerminalPreview
             sessionId={session.session_id}
             privateBeachId={session.private_beach_id}
@@ -551,8 +567,14 @@ function TileCard({
             fontSize={fontSize}
             locked={view.locked}
             cropped={cropped}
+            viewerOverride={viewer}
           />
-        </div>
+        ) : (
+          <div className="flex h-full w-full items-center justify-center bg-neutral-950/90 text-xs text-muted-foreground">
+            <span>Expanded view active…</span>
+          </div>
+        )}
+      </div>
         <div className="space-y-2 border-t border-border px-3 pb-3 pt-2">
           <div className="flex items-center justify-between">
             <div className="text-[11px] text-muted-foreground">{session.location_hint || '—'}</div>
@@ -648,6 +670,152 @@ function TileCard({
   );
 }
 
+type SessionTileProps = {
+  session: SessionSummary;
+  role: SessionRole;
+  isAgent: boolean;
+  assignments: AssignmentEdge[];
+  controllers: ControllerPairing[];
+  collapsed: boolean;
+  onToggleAssignments: () => void;
+  onOpenAssignment: (pairing: ControllerPairing) => void;
+  onSelect: () => void;
+  onRemove: () => void;
+  onToggleRole: () => void;
+  onExpand: () => void;
+  onSnap: () => void;
+  onToggleLock: () => void;
+  onToolbarToggle: () => void;
+  resizeControl: HostResizeControlState | undefined;
+  managerUrl: string;
+  viewerToken: string | null;
+  view: TileViewState;
+  onMeasure: (measurement: TileMeasurements) => void;
+  onViewport: (dims: {
+    viewportRows: number;
+    viewportCols: number;
+    hostRows: number | null;
+    hostCols: number | null;
+  }) => void;
+  onHostResizeStateChange: (sessionId: string, state: HostResizeControlState | null) => void;
+  onViewerStateChange: (sessionId: string, viewer: TerminalViewerState | null) => void;
+  isExpanded: boolean;
+  className?: string;
+  style?: CSSProperties;
+};
+
+const SessionTile = forwardRef<HTMLDivElement, SessionTileProps>(
+  (
+    {
+      session,
+      role,
+      isAgent,
+      assignments,
+      controllers,
+      collapsed,
+      onToggleAssignments,
+      onOpenAssignment,
+      onSelect,
+      onRemove,
+      onToggleRole,
+      onExpand,
+      onSnap,
+      onToggleLock,
+      onToolbarToggle,
+      resizeControl,
+      managerUrl,
+      viewerToken,
+      view,
+      onMeasure,
+      onViewport,
+      onHostResizeStateChange,
+      onViewerStateChange,
+      isExpanded,
+      className,
+      style,
+    },
+    ref,
+  ) => {
+  const trimmedToken = viewerToken?.trim() ?? '';
+  const viewer = useSessionTerminal(
+    session.session_id,
+    session.private_beach_id,
+    managerUrl,
+    trimmedToken.length > 0 ? trimmedToken : null,
+  );
+
+  const viewerSnapshot = useMemo<TerminalViewerState>(() => {
+    return {
+      store: viewer.store,
+      transport: viewer.transport,
+      connecting: viewer.connecting,
+      error: viewer.error,
+      status: viewer.status,
+      secureSummary: viewer.secureSummary,
+      latencyMs: viewer.latencyMs,
+    };
+  }, [
+    viewer.store,
+    viewer.transport,
+    viewer.connecting,
+    viewer.error,
+    viewer.status,
+    viewer.secureSummary,
+    viewer.latencyMs,
+  ]);
+
+  useEffect(() => {
+    onViewerStateChange(session.session_id, viewerSnapshot);
+    return () => {
+      onViewerStateChange(session.session_id, null);
+    };
+  }, [
+    onViewerStateChange,
+    session.session_id,
+    viewerSnapshot,
+  ]);
+
+    const combinedClassName = className ? `session-grid-item ${className}` : 'session-grid-item';
+
+    return (
+      <div
+        ref={ref}
+        className={combinedClassName}
+        style={style}
+        data-grid-session={session.session_id}
+      >
+      <TileCard
+        session={session}
+        role={role}
+        isAgent={isAgent}
+        assignments={assignments}
+        controllers={controllers}
+        collapsed={collapsed}
+        onToggleAssignments={onToggleAssignments}
+        onOpenAssignment={onOpenAssignment}
+        onSelect={onSelect}
+        onRemove={onRemove}
+        onToggleRole={onToggleRole}
+        onExpand={onExpand}
+        onSnap={onSnap}
+        onToggleLock={onToggleLock}
+        onToolbarToggle={onToolbarToggle}
+        resizeControl={resizeControl}
+        managerUrl={managerUrl}
+        viewerToken={viewerToken}
+        viewer={viewer}
+        view={view}
+        onMeasure={onMeasure}
+        onViewport={onViewport}
+        onHostResizeStateChange={onHostResizeStateChange}
+        isExpanded={isExpanded}
+      />
+      </div>
+    );
+  },
+);
+SessionTile.displayName = 'SessionTile';
+
 type Props = {
   tiles: SessionSummary[];
   onRemove: (sessionId: string) => void;
@@ -684,8 +852,10 @@ export default function TileCanvas({
   const [isClient, setIsClient] = useState(false);
   const [collapsedAssignments, setCollapsedAssignments] = useState<Record<string, boolean>>({});
   const [resizeControls, setResizeControls] = useState<Record<string, HostResizeControlState>>({});
+  const [viewerStates, setViewerStates] = useState<Record<string, TerminalViewerState>>({});
   const [cols, setCols] = useState(DEFAULT_COLS);
   const [gridWidth, setGridWidth] = useState<number | null>(null);
+  const [gridElementNode, setGridElementNode] = useState<HTMLElement | null>(null);
   const [tileState, setTileState] = useState<TileStateMap>(() => {
     const initial: TileStateMap = {};
     savedLayout?.forEach((item) => {
@@ -723,6 +893,39 @@ export default function TileCanvas({
   useEffect(() => {
     setIsClient(true);
   }, []);
+
+  const handleViewerStateChange = useCallback(
+    (sessionId: string, viewer: TerminalViewerState | null) => {
+      setViewerStates((prev) => {
+        const existing = prev[sessionId];
+        if (!viewer) {
+          if (existing === undefined) {
+            return prev;
+          }
+          const next = { ...prev };
+          delete next[sessionId];
+          return next;
+        }
+        if (
+          existing &&
+          existing.store === viewer.store &&
+          existing.transport === viewer.transport &&
+          existing.status === viewer.status &&
+          existing.error === viewer.error &&
+          existing.secureSummary === viewer.secureSummary &&
+          existing.latencyMs === viewer.latencyMs &&
+          existing.connecting === viewer.connecting
+        ) {
+          return prev;
+        }
+        return {
+          ...prev,
+          [sessionId]: viewer,
+        };
+      });
+    },
+    [],
+  );
 
   useEffect(() => {
     if (!isClient) {
@@ -826,12 +1029,9 @@ export default function TileCanvas({
 
   const layout = useMemo(() => {
     const adjusted = ensureLayout(cache, savedLayout, tiles, preset, tileState, cols).map((item) => {
-      const state = tileState[item.i];
-      return {
-        ...item,
-        maxW: state?.locked ? cols : cols,
-        maxH: state?.locked ? cols : cols,
-      };
+      const next: Layout = { ...item, maxW: cols };
+      delete next.maxH; // allow taller tiles so snap-to-host can match large hosts
+      return next;
     });
     if (typeof window !== 'undefined') {
       console.info(
@@ -848,6 +1048,27 @@ export default function TileCanvas({
     });
     return adjusted;
   }, [cache, savedLayout, tiles, preset, tileState, cols]);
+  const layoutSignature = useMemo(() => {
+    return JSON.stringify(layout.map(({ i, x, y, w, h }) => ({ i, x, y, w, h })));
+  }, [layout]);
+
+  const layoutForRender = useMemo(
+    () =>
+      layout.map((item) => ({
+        ...item,
+        data: {
+          x: item.x,
+          y: item.y,
+          w: item.w,
+          h: item.h,
+          minW: item.minW,
+          maxW: item.maxW,
+          minH: item.minH,
+          maxH: item.maxH,
+        },
+      })),
+    [layout],
+  );
 
 const layoutMap = useMemo(() => {
   const map = new Map<string, Layout>();
@@ -862,7 +1083,8 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
       const stateMap = tileStateRef.current;
       return layouts.map((item) => {
         const state = stateMap[item.i];
-        const { w, h } = clampGridSize(item.w, item.h, state, effectiveCols);
+        const restrict = !state?.lastLayout;
+        const { w, h } = clampGridSize(item.w, item.h, state, effectiveCols, restrict);
         const x = Math.max(0, Math.min(item.x, effectiveCols - w));
         return {
           ...item,
@@ -941,7 +1163,19 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
 
   const handleLayoutChange = useCallback(
     (nextLayouts: Layout[]) => {
+      if (typeof window !== 'undefined') {
+        console.info(
+          '[tile-layout] onLayoutChange',
+          JSON.stringify(nextLayouts.map(({ i, x, y, w, h }) => ({ i, x, y, w, h }))),
+        );
+      }
       const normalized = clampLayoutItems(nextLayouts, cols);
+      if (typeof window !== 'undefined') {
+        console.info(
+          '[tile-layout] onLayoutChange normalized',
+          JSON.stringify(normalized.map(({ i, x, y, w, h }) => ({ i, x, y, w, h }))),
+        );
+      }
       debugLog('tile-layout', 'layout change', {
         tileCount: normalized.length,
         layout: normalized.map(({ i, x, y, w, h }) => ({ i, x, y, w, h })),
@@ -962,7 +1196,7 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
         const nextState: TileStateMap = { ...prev };
         normalized.forEach((item) => {
           const current = nextState[item.i] ?? buildTileState();
-        const dims = { w: item.w, h: item.h };
+          const dims = clampGridSize(item.w, item.h, current, cols, true);
           if (!isSameLayoutDimensions(current.lastLayout, dims)) {
             nextState[item.i] = { ...current, lastLayout: dims };
             changed = true;
@@ -1004,11 +1238,26 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
       setTileState((prev) => {
         const current = prev[sessionId] ?? buildTileState();
         let next = producer(current);
-        const computedZoom = computeZoomForSize(next.measurements, next.hostCols, next.hostRows);
-        if (next.locked) {
-          next = { ...next, zoom: MAX_UNLOCKED_ZOOM };
-        } else {
-          const selected = Number.isFinite(next.zoom) ? Number(next.zoom) : computedZoom;
+       const computedZoom = computeZoomForSize(next.measurements, next.hostCols, next.hostRows);
+       if (next.locked) {
+         next = { ...next, zoom: MAX_UNLOCKED_ZOOM };
+       } else {
+          const measurementChanged = !isSameMeasurement(current.measurements, next.measurements);
+          let selected = Number.isFinite(next.zoom) ? Number(next.zoom) : computedZoom;
+          if (measurementChanged) {
+            const previousTarget = computeZoomForSize(
+              current.measurements,
+              current.hostCols,
+              current.hostRows,
+            );
+            const wasDefault =
+              current.measurements === null ||
+              Math.abs(current.zoom - previousTarget) < 0.05 ||
+              Math.abs(current.zoom - DEFAULT_ZOOM) < 0.05;
+            if (wasDefault) {
+              selected = computedZoom;
+            }
+          }
           next = { ...next, zoom: clampZoom(selected) };
         }
         if (
@@ -1132,14 +1381,23 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
   const handleMeasure = useCallback(
     (sessionId: string, measurement: TileMeasurements) => {
       const layoutItem = layoutMap.get(sessionId);
-      const widthFromLayout =
-        layoutItem && gridWidth != null && cols > 0
-          ? (gridWidth / cols) * layoutItem.w
-          : null;
+      if (!layoutItem || gridWidth == null || gridWidth <= 0 || cols <= 0 || layoutItem.w <= 0) {
+        return;
+      }
+      const columnWidth = gridWidth / cols;
+      const layoutWidth = columnWidth * layoutItem.w;
+      const layoutHeight = Math.max(ROW_HEIGHT * layoutItem.h, 1);
+      if (!Number.isFinite(layoutWidth) || layoutWidth <= 0) {
+        return;
+      }
       const normalized: TileMeasurements = {
-        width: widthFromLayout && Number.isFinite(widthFromLayout) ? widthFromLayout : measurement.width,
-        height: measurement.height,
+        width: layoutWidth,
+        height: layoutHeight,
       };
+      const existing = tileStateRef.current[sessionId]?.measurements;
+      if (existing && isSameMeasurement(existing, normalized)) {
+        return;
+      }
       updateTileState(sessionId, (state) => ({
         ...state,
         measurements: normalized,
@@ -1147,11 +1405,21 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
       if (typeof window !== 'undefined') {
         console.info(
           '[tile-layout] measure',
-          JSON.stringify({
-            sessionId,
-            width: normalized.width,
-            height: normalized.height,
-          }),
+          JSON.stringify(
+            {
+              sessionId,
+              width: normalized.width,
+              height: normalized.height,
+              rawWidth: measurement.width,
+              rawHeight: measurement.height,
+              gridWidth,
+              cols,
+              layoutItem,
+              columnWidth,
+              layoutHeight,
+            },
+            (_key, value) => (value instanceof Map ? undefined : value),
+          ),
         );
       }
     },
@@ -1203,13 +1471,16 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
         layoutItem.h > 0 ? Math.max(1, measurement.height / layoutItem.h) : Math.max(1, measurement.height);
       const targetWUnits = Math.max(MIN_W, Math.round(hostSize.width / unitWidth));
       const targetHUnits = Math.max(MIN_H, Math.round(hostSize.height / unitHeight));
+      const currentWidthUnits = Math.max(MIN_W, Math.min(layoutItem.w, cols));
+      const clampedWidth = Math.min(targetWUnits, cols);
+      const nextWidth = Math.min(clampedWidth, currentWidthUnits);
       const nextLayouts = clampLayoutItems(
         layout.map((item) =>
           item.i === sessionId
             ? {
                 ...item,
-                w: Math.min(targetWUnits, cols),
-                h: Math.min(targetHUnits, cols),
+                w: nextWidth,
+                h: targetHUnits,
               }
             : item,
         ),
@@ -1217,14 +1488,12 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
       );
       handleLayoutChange(nextLayouts);
       handleLayoutCommit(nextLayouts, 'state-change');
+      const applied = nextLayouts.find((item) => item.i === sessionId);
+      const spansFullWidth = Boolean(applied && applied.w >= cols);
       updateTileState(sessionId, (current) => ({
         ...current,
         locked: false,
-        zoom: clampZoom(
-          Math.min(targetWUnits, cols) >= cols || Math.min(targetHUnits, cols) >= cols
-            ? MAX_UNLOCKED_ZOOM
-            : DEFAULT_ZOOM,
-        ),
+        zoom: clampZoom(spansFullWidth ? MAX_UNLOCKED_ZOOM : DEFAULT_ZOOM),
       }));
     },
     [clampLayoutItems, cols, gridWidth, handleLayoutChange, handleLayoutCommit, layout, layoutMap, updateTileState],
@@ -1353,10 +1622,13 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
 
   const gridContent = isClient ? (
     <div className="session-grid">
+      {typeof window !== 'undefined' &&
+        console.info('[tile-layout] layout-signature', layoutSignature)}
       <AutoGrid
-        layout={layout}
+        key={layoutSignature}
+        layout={layoutForRender}
         cols={cols}
-        rowHeight={110}
+        rowHeight={ROW_HEIGHT}
         margin={[16, 16]}
         containerPadding={[8, 8]}
         compactType={null}
@@ -1367,6 +1639,7 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
         resizeHandles={['e', 's', 'se']}
         onDragStop={handleDragStop}
         onResizeStop={handleResizeStop}
+        innerRef={setGridElementNode}
         onLayoutChange={handleLayoutChange}
       >
         {tiles.map((session) => {
@@ -1377,36 +1650,39 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
           const collapsed = collapsedAssignments[session.session_id] ?? true;
           const view = tileState[session.session_id] ?? buildTileState();
           const resizeControl = resizeControls[session.session_id];
+          const isExpanded = expanded?.session_id === session.session_id;
 
           return (
-            <div key={session.session_id} className="session-grid-item" data-grid-session={session.session_id}>
-              <TileCard
-                session={session}
-                role={role}
-                isAgent={isAgent}
-                assignments={agentAssignments}
-                controllers={controllers}
-                collapsed={collapsed}
-                onToggleAssignments={() => toggleAssignments(session.session_id)}
-                onOpenAssignment={onOpenAssignment}
-                onSelect={() => onSelect(session)}
-                onRemove={() => onRemove(session.session_id)}
-                onToggleRole={() =>
-                  onRequestRoleChange(session, role === 'agent' ? 'application' : 'agent')
-                }
-                onExpand={() => setExpanded(session)}
-                onSnap={() => handleSnap(session.session_id)}
-                onToggleLock={() => handleToggleLock(session.session_id)}
-                onToolbarToggle={() => handleToolbarToggle(session.session_id)}
-                resizeControl={resizeControl}
-                managerUrl={managerUrl}
-                viewerToken={viewerToken}
-                view={view}
-                onMeasure={(measurement) => handleMeasure(session.session_id, measurement)}
-                onViewport={(dims) => handleViewportDimensions(session.session_id, dims)}
-                onHostResizeStateChange={handleHostResizeStateChange}
-              />
-            </div>
+            <SessionTile
+              key={session.session_id}
+              session={session}
+              role={role}
+              isAgent={isAgent}
+              assignments={agentAssignments}
+              controllers={controllers}
+              collapsed={collapsed}
+              onToggleAssignments={() => toggleAssignments(session.session_id)}
+              onOpenAssignment={onOpenAssignment}
+              onSelect={() => onSelect(session)}
+              onRemove={() => onRemove(session.session_id)}
+              onToggleRole={() =>
+                onRequestRoleChange(session, role === 'agent' ? 'application' : 'agent')
+              }
+              onExpand={() => setExpanded(session)}
+              onSnap={() => handleSnap(session.session_id)}
+              onToggleLock={() => handleToggleLock(session.session_id)}
+              onToolbarToggle={() => handleToolbarToggle(session.session_id)}
+              resizeControl={resizeControl}
+              managerUrl={managerUrl}
+              viewerToken={viewerToken}
+              view={view}
+              onMeasure={(measurement) => handleMeasure(session.session_id, measurement)}
+              onViewport={(dims) => handleViewportDimensions(session.session_id, dims)}
+              onHostResizeStateChange={handleHostResizeStateChange}
+              onViewerStateChange={handleViewerStateChange}
+              isExpanded={isExpanded}
+              className="session-grid-item opacity-0 transition-opacity"
+            />
           );
         })}
       </AutoGrid>
@@ -1414,6 +1690,100 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
   ) : (
     <div className="h-[520px] rounded-xl border border-border bg-card shadow-sm" />
   );
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    console.info('[tile-layout] instrumentation', { component: 'TileCanvas', version: 'v1' });
+  }, []);
+
+  useEffect(() => {
+    if (!isClient) return;
+    const wrapper = gridWrapperRef.current;
+    if (!wrapper) return;
+    const target =
+      gridElementNode ??
+      wrapper.querySelector<HTMLElement>('.react-grid-layout') ??
+      wrapper.parentElement?.querySelector<HTMLElement>('.react-grid-layout') ??
+      wrapper;
+    if (!target) {
+      console.info('[tile-layout] dom-log skipped', { version: 'v1', layoutSignature });
+      return;
+    }
+    console.info('[tile-layout] dom-log start', {
+      version: 'v1',
+      layoutSignature,
+      hasGrid: Boolean(gridElementNode),
+      targetClass: target.className,
+    });
+    const logItems = (phase: 'initial' | 'mutation'): boolean => {
+      const items = target.querySelectorAll<HTMLElement>('.react-grid-item');
+      if (items.length === 0) {
+        const childSummaries = Array.from(target.children)
+          .slice(0, 3)
+          .map((el) => ({ tag: el.tagName, className: el.className, dataAttrs: { ...el.dataset } }));
+        console.info(
+          '[tile-layout] dom-item pending',
+          JSON.stringify({
+            version: 'v1',
+            phase,
+            layoutSignature,
+            count: items.length,
+            childSummaries,
+            htmlSample: target.innerHTML.slice(0, 200),
+          }),
+        );
+        return false;
+      }
+      items.forEach((item) => {
+        const sessionId = item.dataset.sessionId ?? item.getAttribute('data-grid-session') ?? 'unknown';
+        const rect = item.getBoundingClientRect();
+        console.info(
+          '[tile-layout] dom-item',
+          JSON.stringify({
+            version: 'v1',
+            sessionId,
+            width: Math.round(rect.width * 100) / 100,
+            height: Math.round(rect.height * 100) / 100,
+          }),
+        );
+      });
+      return true;
+    };
+    if (logItems('initial')) {
+      return;
+    }
+    const observer = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        mutation.addedNodes.forEach((node) => {
+          if (node instanceof HTMLElement && node.classList.contains('react-grid-item')) {
+            console.info('[tile-layout] dom-mutation', {
+              version: 'v1',
+              tag: node.tagName,
+              className: node.className,
+              dataset: { ...node.dataset },
+              style: node.getAttribute('style'),
+            });
+          }
+        });
+      }
+      if (logItems('mutation')) {
+        observer.disconnect();
+      }
+    });
+    observer.observe(target, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [gridElementNode, isClient, layoutSignature]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (gridElementNode) {
+      const items = gridElementNode.querySelectorAll<HTMLElement>('.session-grid-item');
+      items.forEach((item) => {
+        item.classList.remove('opacity-0');
+        item.classList.add('opacity-100');
+      });
+    }
+  }, [gridElementNode, layoutSignature]);
 
   useEffect(() => {
     if (!isClient) return;
@@ -1430,6 +1800,8 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
       console.info('[tile-layout] item-width', 'missing react-grid-item');
     }
   }, [isClient, layout]);
+
+  const expandedViewer = expanded ? viewerStates[expanded.session_id] ?? null : null;
 
   return (
     <div ref={gridWrapperRef} className="relative">
@@ -1473,20 +1845,27 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
             </div>
           </div>
           <div className="flex-1 overflow-hidden">
-            <SessionTerminalPreview
-              sessionId={expanded.session_id}
-              privateBeachId={expanded.private_beach_id}
-              managerUrl={managerUrl}
-              token={viewerToken}
-              variant="full"
-              harnessType={expanded.harness_type}
-              className="h-full w-full"
-              fontSize={BASE_FONT_SIZE}
-              locked={false}
-              cropped={false}
-              onHostResizeStateChange={handleHostResizeStateChange}
-              onViewportDimensions={(dims) => handleViewportDimensions(expanded.session_id, dims)}
-            />
+            {expandedViewer ? (
+              <SessionTerminalPreview
+                sessionId={expanded.session_id}
+                privateBeachId={expanded.private_beach_id}
+                managerUrl={managerUrl}
+                token={viewerToken}
+                variant="full"
+                harnessType={expanded.harness_type}
+                className="h-full w-full"
+                fontSize={BASE_FONT_SIZE}
+                locked={false}
+                cropped={false}
+                onHostResizeStateChange={handleHostResizeStateChange}
+                onViewportDimensions={(dims) => handleViewportDimensions(expanded.session_id, dims)}
+                viewerOverride={expandedViewer}
+              />
+            ) : (
+              <div className="flex h-full items-center justify-center bg-neutral-950 text-sm text-muted-foreground">
+                <span>Preparing viewer…</span>
+              </div>
+            )}
           </div>
         </div>
       )}

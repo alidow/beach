@@ -17,6 +17,21 @@ vi.mock('../SessionTerminalPreview', () => ({
   ),
 }));
 
+const mockViewer = {
+  store: { kind: 'store' },
+  transport: { kind: 'transport' },
+  connecting: false,
+  error: null,
+  status: 'connected' as const,
+  secureSummary: null,
+  latencyMs: null,
+};
+
+vi.mock('../hooks/useSessionTerminal', () => ({
+  __esModule: true,
+  useSessionTerminal: vi.fn(() => mockViewer),
+}));
+
 function makeSession(overrides: Partial<SessionSummary>): SessionSummary {
   return {
     session_id: 'session-0',

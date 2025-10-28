@@ -683,6 +683,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   }
   const lineHeight = computeLineHeight(fontSize);
   const [measuredLineHeight, setMeasuredLineHeight] = useState<number>(lineHeight);
+  const [measuredCellWidth, setMeasuredCellWidth] = useState<number | null>(null);
   const effectiveLineHeight = measuredLineHeight > 0 ? measuredLineHeight : lineHeight;
   const totalRows = snapshot.rows.length;
   const firstAbsolute = lines.length > 0 ? lines[0]!.absolute : snapshot.baseRow;
@@ -761,26 +762,66 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     if (!container) {
       return;
     }
-    let raf = -1;
-    const measure = () => {
-      const row = container.querySelector<HTMLDivElement>('.xterm-row');
-      if (!row) {
-        return;
+    let frame = -1;
+    const scheduleMeasure = () => {
+      if (frame !== -1) {
+        window.cancelAnimationFrame(frame);
       }
-      const rect = row.getBoundingClientRect();
-      const next = rect.height;
-      if (!Number.isFinite(next) || next <= 0) {
-        return;
-      }
-      setMeasuredLineHeight((prev) => (Math.abs(prev - next) > 0.1 ? next : prev));
+      frame = window.requestAnimationFrame(() => {
+        const row = container.querySelector<HTMLDivElement>('.xterm-row');
+        if (!row) {
+          return;
+        }
+        const rect = row.getBoundingClientRect();
+        if (Number.isFinite(rect.height) && rect.height > 0) {
+          setMeasuredLineHeight((prev) => (Math.abs(prev - rect.height) > 0.1 ? rect.height : prev));
+        }
+        let nextCellWidth: number | null = null;
+        const spans = Array.from(row.querySelectorAll<HTMLSpanElement>('span'));
+        const glyphSpan = spans.find((span) => {
+          const text = span.textContent?.replace(/\u00A0/g, ' ').trim() ?? '';
+          return text.length > 0;
+        }) ?? spans[0] ?? null;
+        if (glyphSpan) {
+          const glyphRect = glyphSpan.getBoundingClientRect();
+          if (Number.isFinite(glyphRect.width) && glyphRect.width > 0) {
+            nextCellWidth = glyphRect.width;
+          }
+        }
+        if ((!nextCellWidth || nextCellWidth <= 0) && Number.isFinite(rect.width) && rect.width > 0) {
+          const renderedCells = spans.length;
+          const fallbackCols = snapshot.cols > 0 ? snapshot.cols : DEFAULT_TERMINAL_COLS;
+          const colsCount = renderedCells > 0 ? renderedCells : fallbackCols;
+          const widthPerCell = rect.width / Math.max(1, colsCount);
+          if (Number.isFinite(widthPerCell) && widthPerCell > 0) {
+            nextCellWidth = widthPerCell;
+          }
+        }
+        if (nextCellWidth && nextCellWidth > 0) {
+          setMeasuredCellWidth((prev) =>
+            prev === null || Math.abs(prev - nextCellWidth) > 0.1 ? nextCellWidth : prev,
+          );
+        }
+      });
     };
-    raf = window.requestAnimationFrame(measure);
+
+    scheduleMeasure();
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      observer = new ResizeObserver(() => scheduleMeasure());
+      observer.observe(container);
+    }
+    window.addEventListener('resize', scheduleMeasure);
     return () => {
-      if (raf !== -1) {
-        window.cancelAnimationFrame(raf);
+      if (frame !== -1) {
+        window.cancelAnimationFrame(frame);
       }
+      if (observer) {
+        observer.disconnect();
+      }
+      window.removeEventListener('resize', scheduleMeasure);
     };
-  }, [lines.length, fontFamily, fontSize]);
+  }, [snapshot.cols, fontFamily, fontSize, lines.length]);
 
   useEffect(() => {
     transportRef.current = providedTransport ?? null;
@@ -1335,6 +1376,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const roundedCellWidth = Math.max(1, Math.round(baseCellWidth * dpr) / dpr);
   const cellWidthPx = Number(roundedCellWidth.toFixed(3));
 
+  const effectiveCellWidth = measuredCellWidth && measuredCellWidth > 0 ? measuredCellWidth : cellWidthPx;
+
   const containerStyle: CSSProperties & {
     '--beach-terminal-line-height': string;
     '--beach-terminal-cell-width': string;
@@ -1350,7 +1393,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     // zoom/resize, which can cause off-screen rows to jump into view.
     overflowAnchor: 'none',
     '--beach-terminal-line-height': `${effectiveLineHeight}px`,
-    '--beach-terminal-cell-width': `${cellWidthPx}px`,
+    '--beach-terminal-cell-width': `${effectiveCellWidth.toFixed(3)}px`,
   };
 
   const handleMatchPtyViewport = useCallback(() => {
@@ -2251,6 +2294,7 @@ export function shouldReenableFollowTail(remainingPixels: number, lineHeightPx: 
 const DEFAULT_FOREGROUND = '#e2e8f0';
 const DEFAULT_BACKGROUND = 'hsl(var(--terminal-screen))';
 const NBSP = '\u00A0';
+const DEFAULT_TERMINAL_COLS = 80;
 const BASE_TERMINAL_FONT_SIZE = 14;
 const BASE_TERMINAL_CELL_WIDTH = 8;
 

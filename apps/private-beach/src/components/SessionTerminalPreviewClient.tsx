@@ -93,6 +93,44 @@ function SessionTerminalPreviewView({
     cols: null,
   });
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      console.info('[terminal][diag] mount', {
+        sessionId,
+        variant,
+        isCabana,
+      });
+    } catch {
+      // ignore logging issues
+    }
+    return () => {
+      if (typeof window === 'undefined') return;
+      try {
+        console.info('[terminal][diag] unmount', { sessionId });
+      } catch {
+        // ignore logging issues
+      }
+    };
+  }, [isCabana, sessionId, variant]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      console.info('[terminal][diag] viewer-change', {
+        sessionId,
+        store: viewer.store,
+        transport: viewer.transport,
+        status: viewer.status,
+        connecting: viewer.connecting,
+        latencyMs: viewer.latencyMs,
+        hasToken: Boolean(trimmedToken),
+      });
+    } catch {
+      // ignore logging issues
+    }
+  }, [sessionId, trimmedToken, viewer.connecting, viewer.latencyMs, viewer.status, viewer.store, viewer.transport]);
+
   const baseFontSize = variant === 'full' ? 14 : 12;
   const effectiveFontSize = useMemo(() => {
     const candidate =
@@ -153,6 +191,21 @@ function SessionTerminalPreviewView({
       return { rows, cols };
     });
   }, [viewportState]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      console.info('[terminal][diag] host-dimensions', {
+        sessionId,
+        rows: hostDimensions.rows,
+        cols: hostDimensions.cols,
+        viewportRows: viewportState?.viewportRows ?? null,
+        viewportCols: viewportState?.viewportCols ?? null,
+      });
+    } catch {
+      // ignore logging issues
+    }
+  }, [hostDimensions.cols, hostDimensions.rows, sessionId, viewportState?.viewportCols, viewportState?.viewportRows]);
 
   const cabanaTelemetry = useMemo<CabanaTelemetryHandlers>(
     () => ({
@@ -233,12 +286,19 @@ function SessionTerminalPreviewView({
   );
 
   useEffect(() => {
-    if (viewer.store && viewer.transport) {
+    if (viewer.store) {
       return;
     }
     setViewportState(null);
     setHostDimensions({ rows: null, cols: null });
-  }, [viewer.store, viewer.transport]);
+    if (typeof window !== 'undefined') {
+      try {
+        console.info('[terminal][diag] reset-dimensions', { sessionId });
+      } catch {
+        // ignore logging issues
+      }
+    }
+  }, [sessionId, viewer.store]);
 
   useEffect(() => {
     if (!onHostResizeStateChange) {
@@ -313,6 +373,25 @@ function SessionTerminalPreviewView({
     return estimateHostPixelSize(hostCols, hostRows, effectiveFontSize);
   }, [hostCols, hostRows, effectiveFontSize]);
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      console.info('[terminal][diag] scale-state', {
+        sessionId,
+        incomingScale: scale,
+        resolvedScale: scaleValue,
+        locked,
+        cropped,
+        targetSize,
+        hostCols,
+        hostRows,
+        fontSize: effectiveFontSize,
+      });
+    } catch {
+      // ignore logging issues
+    }
+  }, [cropped, effectiveFontSize, hostCols, hostRows, locked, scale, scaleValue, sessionId, targetSize]);
+
   const scaledWrapperStyle = useMemo(() => {
     if (!scaleValue) {
       return undefined;
@@ -345,7 +424,7 @@ function SessionTerminalPreviewView({
       height: baseHeight ? `${baseHeight}px` : undefined,
     };
     return style;
-  }, [scaleValue, hostPixelSize, targetSize]);
+  }, [hostPixelSize, scaleValue, sessionId, targetSize]);
 
   useEffect(() => {
     if (

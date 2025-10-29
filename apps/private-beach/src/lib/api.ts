@@ -201,6 +201,9 @@ export type BeachLayoutItem = {
   zoom?: number;
   locked?: boolean;
   toolbarPinned?: boolean;
+  gridCols?: number;
+  rowHeightPx?: number;
+  layoutVersion?: number;
 };
 export type BeachLayout = {
   preset: 'grid2x2' | 'onePlusThree' | 'focus';
@@ -227,11 +230,23 @@ function normalizeLayoutItems(input: unknown): BeachLayoutItem[] {
     const zoom = Number.isFinite((raw as any).zoom) ? Math.max(0.05, Math.min(4, Number((raw as any).zoom))) : null;
     const locked = typeof (raw as any).locked === 'boolean' ? (raw as any).locked : null;
     const toolbarPinned = typeof (raw as any).toolbarPinned === 'boolean' ? (raw as any).toolbarPinned : null;
+    const gridCols = Number.isFinite((raw as any).gridCols)
+      ? Math.max(1, Math.floor((raw as any).gridCols))
+      : null;
+    const rowHeightPx = Number.isFinite((raw as any).rowHeightPx)
+      ? Math.max(1, Math.round((raw as any).rowHeightPx))
+      : null;
+    const layoutVersion = Number.isFinite((raw as any).layoutVersion)
+      ? Math.max(0, Math.floor((raw as any).layoutVersion))
+      : null;
     if (widthPx !== null) item.widthPx = widthPx;
     if (heightPx !== null) item.heightPx = heightPx;
     if (zoom !== null) item.zoom = zoom;
     if (locked !== null) item.locked = locked;
     if (toolbarPinned !== null) item.toolbarPinned = toolbarPinned;
+    if (gridCols !== null) item.gridCols = gridCols;
+    if (rowHeightPx !== null) item.rowHeightPx = rowHeightPx;
+    if (layoutVersion !== null) item.layoutVersion = layoutVersion;
     clean.push(item);
     seen.add(id);
     if (clean.length >= 12) break;

@@ -74,6 +74,7 @@ Full console history is preserved in `temp/private-beach.log`.
 - `SessionTerminalPreviewClient` caches the first authoritative PTY dimensions it sees (from either host metadata or the initial viewport measurement) and reuses them for scaling and the `viewport-dims` callback. This prevents jitter and guarantees `TileCanvas` always receives consistent `hostRows`/`hostCols`.
 - `TileCanvas` simplifies its host-dimension handling: once a host size is known it is treated as authoritative, and all of the previous monotonic viewport heuristics are removed.
 - `BeachTerminal` learned to opt out of ResizeObserver measurements when instructed (preview mode), which stops the transform-induced feedback loop and preserves the ~17 px base line height.  
+- `TileCanvas` now bumps freshly-added terminal tiles to a host-aware footprint (still compact, but tall enough for 60+ rows) the moment real PTY dimensions arrive, so zoom stays consistent without the huge right-side gutter.
 - With the new data flow and measurement guard, the terminal preview renders the full ~62 host rows at a stable zoom (~0.25) instead of collapsing to a single row after viewport jitter.
 - Instrumentation remains in place; expect `[terminal] viewport-dims dispatch` to show `hostRows` ≈ `62` and `[tile-layout] tile-zoom` to log `hostRows` consistently for the Pong demo tile.
 

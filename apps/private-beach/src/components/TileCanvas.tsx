@@ -33,9 +33,9 @@ const MIN_H = 2;
 const ROW_HEIGHT = 110;
 const UNLOCKED_MAX_W = 3;
 const UNLOCKED_MAX_H = 3;
-const TARGET_TILE_WIDTH = 360;
+const TARGET_TILE_WIDTH = 480;
 const MAX_UNLOCKED_ZOOM = 1;
-const MIN_ZOOM = 0.2;
+const MIN_ZOOM = 0.05;
 const DEFAULT_ZOOM = 0.45;
 const DEFAULT_HOST_COLS = 80;
 const DEFAULT_HOST_ROWS = 24;
@@ -79,11 +79,16 @@ const RESIZE_HANDLE_LABELS: Record<ResizeHandleAxis, string> = {
   sw: 'Resize bottom-left corner',
 };
 
-function clampZoom(value: number | undefined): number {
+function clampZoom(value: number | undefined, measurement?: TileMeasurements | null): number {
   if (!Number.isFinite(value ?? Number.NaN)) {
     return DEFAULT_ZOOM;
   }
-  return Math.min(MAX_UNLOCKED_ZOOM, Math.max(MIN_ZOOM, Number(value)));
+  let min = MIN_ZOOM;
+  if (measurement) {
+    const minWidthZoom = TARGET_TILE_WIDTH / measurement.width;
+    min = Math.min(min, Math.max(MIN_ZOOM, minWidthZoom));
+  }
+  return Math.min(MAX_UNLOCKED_ZOOM, Math.max(min, Number(value)));
 }
 
 function estimateHostSize(cols: number | null, rows: number | null) {
@@ -154,9 +159,11 @@ function buildTileState(saved?: BeachLayoutItem): TileViewState {
     !locked && savedMeasurement && savedMeasurement.width > UNLOCKED_MEASUREMENT_LIMIT
       ? null
       : savedMeasurement;
-  const baselineZoom = locked ? MAX_UNLOCKED_ZOOM : clampZoom(saved?.zoom);
-  const zoom =
-    !locked && baselineZoom >= MAX_UNLOCKED_ZOOM - ZOOM_EPSILON ? DEFAULT_ZOOM : baselineZoom;
+  const estimatedZoom = measurement ? computeZoomForSize(measurement, saved?.hostCols ?? null, saved?.hostRows ?? null) : DEFAULT_ZOOM;
+  const baselineZoom = locked
+    ? MAX_UNLOCKED_ZOOM
+    : clampZoom(saved?.zoom ?? estimatedZoom, measurement);
+  const zoom = baselineZoom;
   const baseline: TileViewState = {
     zoom,
     locked,
@@ -178,7 +185,7 @@ function buildTileState(saved?: BeachLayoutItem): TileViewState {
 function isTileCropped(hostCols: number | null, hostRows: number | null): boolean {
   const c = hostCols && hostCols > 0 ? hostCols : DEFAULT_HOST_COLS;
   const r = hostRows && hostRows > 0 ? hostRows : DEFAULT_HOST_ROWS;
-  return c > 80 || r > 80;
+  return c > DEFAULT_HOST_COLS || r > DEFAULT_HOST_ROWS;
 }
 
 function isTileStateEqual(a: TileViewState, b: TileViewState): boolean {
@@ -438,12 +445,15 @@ type TileCardProps = {
   viewer: TerminalViewerState;
   view: TileViewState;
   onMeasure: (measurement: TileMeasurements) => void;
-  onViewport: (dims: {
-    viewportRows: number;
-    viewportCols: number;
-    hostRows: number | null;
-    hostCols: number | null;
-  }) => void;
+  onViewport: (
+    sessionId: string,
+    dims: {
+      viewportRows: number;
+      viewportCols: number;
+      hostRows: number | null;
+      hostCols: number | null;
+    },
+  ) => void;
   onHostResizeStateChange: (sessionId: string, state: HostResizeControlState | null) => void;
   isExpanded: boolean;
 };
@@ -493,14 +503,62 @@ function TileCard({
   }, [onMeasure]);
 
   const toolbarVisibleClass = view.toolbarPinned ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100';
-  const zoomDisplay = view.locked ? MAX_UNLOCKED_ZOOM : clampZoom(view.zoom);
-  const fontSize = Math.round(zoomDisplay * BASE_FONT_SIZE * 100) / 100;
+  const zoomDisplay = view.locked ? MAX_UNLOCKED_ZOOM : clampZoom(view.zoom, view.measurements);
+  if (typeof window !== 'undefined') {
+    try {
+      console.info(
+        '[tile-layout] tile-zoom',
+        JSON.stringify({
+          version: 'v1',
+          sessionId: session.session_id,
+          zoom: zoomDisplay,
+          measurements: view.measurements,
+          hostCols: view.hostCols,
+          hostRows: view.hostRows,
+          viewportCols: view.viewportCols,
+          viewportRows: view.viewportRows,
+        }),
+      );
+    } catch (err) {
+      console.info('[tile-layout] tile-zoom', {
+        version: 'v1',
+        sessionId: session.session_id,
+        zoom: zoomDisplay,
+        measurements: view.measurements,
+        hostCols: view.hostCols,
+        hostRows: view.hostRows,
+        viewportCols: view.viewportCols,
+        viewportRows: view.viewportRows,
+      });
+    }
+  }
+  const fontSize = BASE_FONT_SIZE;
   const zoomLabel = `${Math.round(zoomDisplay * 100)}%`;
   const cropped = isTileCropped(view.hostCols, view.hostRows);
   const resizeHint =
     resizeControl && resizeControl.canResize
       ? `Resize host to ${resizeControl.viewportCols}×${resizeControl.viewportRows}`
       : 'Host resize unavailable';
+
+  const handlePreviewViewportDimensions = useCallback(
+    (
+      _sessionId: string,
+      dims:
+        | {
+            viewportRows: number;
+            viewportCols: number;
+            hostRows: number | null;
+            hostCols: number | null;
+          }
+        | undefined,
+    ) => {
+      if (!dims || typeof dims.viewportRows !== 'number' || typeof dims.viewportCols !== 'number') {
+        return;
+      }
+      onViewport(session.session_id, dims);
+    },
+    [onViewport, session.session_id],
+  );
 
   return (
     <div
@@ -563,10 +621,12 @@ function TileCard({
             harnessType={session.harness_type}
             className="h-full w-full"
             onHostResizeStateChange={onHostResizeStateChange}
-            onViewportDimensions={onViewport}
+            onViewportDimensions={handlePreviewViewportDimensions}
             fontSize={fontSize}
+            scale={zoomDisplay}
             locked={view.locked}
             cropped={cropped}
+            targetSize={view.measurements}
             viewerOverride={viewer}
           />
         ) : (
@@ -691,12 +751,15 @@ type SessionTileProps = {
   viewerToken: string | null;
   view: TileViewState;
   onMeasure: (measurement: TileMeasurements) => void;
-  onViewport: (dims: {
-    viewportRows: number;
-    viewportCols: number;
-    hostRows: number | null;
-    hostCols: number | null;
-  }) => void;
+  onViewport: (
+    sessionId: string,
+    dims: {
+      viewportRows: number;
+      viewportCols: number;
+      hostRows: number | null;
+      hostCols: number | null;
+    },
+  ) => void;
   onHostResizeStateChange: (sessionId: string, state: HostResizeControlState | null) => void;
   onViewerStateChange: (sessionId: string, viewer: TerminalViewerState | null) => void;
   isExpanded: boolean;
@@ -775,11 +838,29 @@ const SessionTile = forwardRef<HTMLDivElement, SessionTileProps>(
     viewerSnapshot,
   ]);
 
-    const combinedClassName = className ? `session-grid-item ${className}` : 'session-grid-item';
+  const handlePreviewViewportDimensions = useCallback(
+    (
+      _sessionId: string,
+      dims: {
+        viewportRows: number;
+        viewportCols: number;
+        hostRows: number | null;
+        hostCols: number | null;
+      } | undefined,
+    ) => {
+      if (!dims || typeof dims.viewportRows !== 'number' || typeof dims.viewportCols !== 'number') {
+        return;
+      }
+      onViewport(session.session_id, dims);
+    },
+    [onViewport, session.session_id],
+  );
 
-    return (
-      <div
-        ref={ref}
+  const combinedClassName = className ? `session-grid-item ${className}` : 'session-grid-item';
+
+  return (
+    <div
+      ref={ref}
         className={combinedClassName}
         style={style}
         data-grid-session={session.session_id}
@@ -806,12 +887,12 @@ const SessionTile = forwardRef<HTMLDivElement, SessionTileProps>(
         viewer={viewer}
         view={view}
         onMeasure={onMeasure}
-        onViewport={onViewport}
+        onViewport={handlePreviewViewportDimensions}
         onHostResizeStateChange={onHostResizeStateChange}
         isExpanded={isExpanded}
       />
-      </div>
-    );
+    </div>
+  );
   },
 );
 SessionTile.displayName = 'SessionTile';
@@ -1238,11 +1319,14 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
       setTileState((prev) => {
         const current = prev[sessionId] ?? buildTileState();
         let next = producer(current);
-       const computedZoom = computeZoomForSize(next.measurements, next.hostCols, next.hostRows);
-       if (next.locked) {
-         next = { ...next, zoom: MAX_UNLOCKED_ZOOM };
-       } else {
+        const computedZoom = computeZoomForSize(next.measurements, next.hostCols, next.hostRows);
+        if (next.locked) {
+          next = { ...next, zoom: MAX_UNLOCKED_ZOOM };
+        } else {
           const measurementChanged = !isSameMeasurement(current.measurements, next.measurements);
+          const hostChanged =
+            (current.hostCols ?? null) !== (next.hostCols ?? null) ||
+            (current.hostRows ?? null) !== (next.hostRows ?? null);
           let selected = Number.isFinite(next.zoom) ? Number(next.zoom) : computedZoom;
           if (measurementChanged) {
             const previousTarget = computeZoomForSize(
@@ -1252,6 +1336,20 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
             );
             const wasDefault =
               current.measurements === null ||
+              Math.abs(current.zoom - previousTarget) < 0.05 ||
+              Math.abs(current.zoom - DEFAULT_ZOOM) < 0.05;
+            if (wasDefault) {
+              selected = computedZoom;
+            }
+          } else if (hostChanged) {
+            const previousTarget = computeZoomForSize(
+              current.measurements,
+              current.hostCols,
+              current.hostRows,
+            );
+            const wasDefault =
+              current.measurements === null ||
+              !Number.isFinite(current.zoom) ||
               Math.abs(current.zoom - previousTarget) < 0.05 ||
               Math.abs(current.zoom - DEFAULT_ZOOM) < 0.05;
             if (wasDefault) {
@@ -1436,13 +1534,70 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
         hostCols: number | null;
       },
     ) => {
-      updateTileState(sessionId, (state) => ({
-        ...state,
-        viewportRows: dims.viewportRows,
-        viewportCols: dims.viewportCols,
-        hostRows: typeof dims.hostRows === 'number' && dims.hostRows > 0 ? dims.hostRows : state.hostRows,
-        hostCols: typeof dims.hostCols === 'number' && dims.hostCols > 0 ? dims.hostCols : state.hostCols,
-      }));
+      if (typeof window !== 'undefined') {
+        try {
+          console.info('[tile-layout] viewport-payload', {
+            version: 'v2',
+            sessionId,
+            viewportRows: dims?.viewportRows ?? null,
+            viewportCols: dims?.viewportCols ?? null,
+            hostRows: dims?.hostRows ?? null,
+            hostCols: dims?.hostCols ?? null,
+          });
+        } catch {
+          // ignore logging errors
+        }
+      }
+      if (
+        !dims ||
+        typeof dims.viewportRows !== 'number' ||
+        typeof dims.viewportCols !== 'number' ||
+        dims.viewportRows <= 0 ||
+        dims.viewportCols <= 0
+      ) {
+        if (typeof window !== 'undefined') {
+          console.warn('[tile-layout] viewport-dims skipped', { sessionId, dims });
+        }
+        return;
+      }
+      if (typeof window !== 'undefined') {
+        console.info('[tile-layout] viewport-dims raw', JSON.stringify(dims));
+        console.info('[tile-layout] viewport-dims', {
+          version: 'v1',
+          sessionId,
+          viewportRows: dims.viewportRows,
+          viewportCols: dims.viewportCols,
+          hostRows: dims.hostRows,
+          hostCols: dims.hostCols,
+        });
+      }
+      updateTileState(sessionId, (state) => {
+        const nextViewportRows =
+          dims.viewportRows > 0 ? dims.viewportRows : state.viewportRows ?? DEFAULT_HOST_ROWS;
+        const nextViewportCols =
+          dims.viewportCols > 0 ? dims.viewportCols : state.viewportCols ?? DEFAULT_HOST_COLS;
+        const resolvedHostRows =
+          typeof dims.hostRows === 'number' && dims.hostRows > 0
+            ? dims.hostRows
+            : state.hostRows && state.hostRows > 0
+              ? state.hostRows
+              : nextViewportRows;
+        const resolvedHostCols =
+          typeof dims.hostCols === 'number' && dims.hostCols > 0
+            ? dims.hostCols
+            : state.hostCols && state.hostCols > 0
+              ? state.hostCols
+              : nextViewportCols;
+        const nextHostRows = Math.max(DEFAULT_HOST_ROWS, resolvedHostRows);
+        const nextHostCols = Math.max(DEFAULT_HOST_COLS, resolvedHostCols);
+        return {
+          ...state,
+          viewportRows: nextViewportRows,
+          viewportCols: nextViewportCols,
+          hostRows: nextHostRows,
+          hostCols: nextHostCols,
+        };
+      });
     },
     [updateTileState],
   );
@@ -1677,11 +1832,11 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
               viewerToken={viewerToken}
               view={view}
               onMeasure={(measurement) => handleMeasure(session.session_id, measurement)}
-              onViewport={(dims) => handleViewportDimensions(session.session_id, dims)}
+              onViewport={handleViewportDimensions}
               onHostResizeStateChange={handleHostResizeStateChange}
               onViewerStateChange={handleViewerStateChange}
               isExpanded={isExpanded}
-              className="session-grid-item opacity-0 transition-opacity"
+              className="session-grid-item"
             />
           );
         })}
@@ -1775,17 +1930,6 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
   }, [gridElementNode, isClient, layoutSignature]);
 
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    if (gridElementNode) {
-      const items = gridElementNode.querySelectorAll<HTMLElement>('.session-grid-item');
-      items.forEach((item) => {
-        item.classList.remove('opacity-0');
-        item.classList.add('opacity-100');
-      });
-    }
-  }, [gridElementNode, layoutSignature]);
-
-  useEffect(() => {
     if (!isClient) return;
     const wrapper = gridWrapperRef.current;
     if (!wrapper) return;
@@ -1858,7 +2002,12 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
                 locked={false}
                 cropped={false}
                 onHostResizeStateChange={handleHostResizeStateChange}
-                onViewportDimensions={(dims) => handleViewportDimensions(expanded.session_id, dims)}
+                onViewportDimensions={(sessionIdArg, dims) => {
+                  if (!dims) {
+                    return;
+                  }
+                  handleViewportDimensions(sessionIdArg ?? expanded.session_id, dims);
+                }}
                 viewerOverride={expandedViewer}
               />
             ) : (

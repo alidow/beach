@@ -294,6 +294,8 @@ export interface BeachTerminalProps {
   fallbackOverrides?: FallbackOverrides;
   autoResizeHostOnViewportChange?: boolean;
   onViewportStateChange?: (state: TerminalViewportState) => void;
+  disableViewportMeasurements?: boolean;
+  forcedViewportRows?: number | null;
 }
 
 export interface TerminalViewportState {
@@ -325,6 +327,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     showTopBar = true,
     autoResizeHostOnViewportChange = true,
     onViewportStateChange,
+    disableViewportMeasurements = false,
+    forcedViewportRows = null,
   } = props;
 
   const store = useMemo(() => providedStore ?? createTerminalStore(), [providedStore]);
@@ -758,6 +762,11 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     if (typeof window === 'undefined') {
       return;
     }
+    if (disableViewportMeasurements) {
+      setMeasuredLineHeight(lineHeight);
+      setMeasuredCellWidth(null);
+      return;
+    }
     const container = containerRef.current;
     if (!container) {
       return;
@@ -821,7 +830,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       }
       window.removeEventListener('resize', scheduleMeasure);
     };
-  }, [snapshot.cols, fontFamily, fontSize, lines.length]);
+  }, [disableViewportMeasurements, snapshot.cols, fontFamily, fontSize, lines.length, lineHeight]);
 
   useEffect(() => {
     transportRef.current = providedTransport ?? null;
@@ -953,11 +962,32 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   }, [autoConnect, sessionId, baseUrl, passcode, queryLabel]);
 
   useEffect(() => {
-    if (!wrapperRef.current || !containerRef.current) {
-      return;
-    }
     const wrapper = wrapperRef.current;
     const container = containerRef.current;
+    if (!wrapper || !container) {
+      return;
+    }
+    if (disableViewportMeasurements) {
+      const desiredRows = (() => {
+        if (typeof forcedViewportRows === 'number' && forcedViewportRows > 0) {
+          return forcedViewportRows;
+        }
+        if (ptyViewportRowsRef.current && ptyViewportRowsRef.current > 0) {
+          return ptyViewportRowsRef.current;
+        }
+        return 24;
+      })();
+      const fallbackRows = Math.max(1, Math.min(desiredRows, MAX_VIEWPORT_ROWS));
+      const snapshotNow = store.getSnapshot();
+      const viewportTop = snapshotNow.viewportTop;
+      store.setViewport(viewportTop, fallbackRows);
+      lastMeasuredViewportRows.current = fallbackRows;
+      lastSentViewportRows.current = fallbackRows;
+      container.style.removeProperty('maxHeight');
+      container.style.removeProperty('--beach-terminal-max-height');
+      emitViewportState();
+      return;
+    }
     const observer = new ResizeObserver(() => {
       // Measure the container's actual viewport size
       // This is the fixed available space, not affected by internal padding
@@ -1010,7 +1040,15 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     // Observe the wrapper, not the scroll container
     observer.observe(wrapper);
     return () => observer.disconnect();
-  }, [autoResizeHostOnViewportChange, effectiveLineHeight, emitViewportState, lineHeight, store]);
+  }, [
+    autoResizeHostOnViewportChange,
+    disableViewportMeasurements,
+    effectiveLineHeight,
+    emitViewportState,
+    forcedViewportRows,
+    lineHeight,
+    store,
+  ]);
 
   useEffect(() => {
     const connection = activeConnection;
@@ -1766,8 +1804,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           ptyColsRef.current = nextCols;
           setPtyCols((prev) => (prev === nextCols ? prev : nextCols));
         }
-        if (typeof frame.viewportRows === 'number' && frame.viewportRows > 0) {
-          const clampedRows = Math.max(1, Math.min(frame.viewportRows, MAX_VIEWPORT_ROWS));
+        const rawViewportRows =
+          typeof frame.viewportRows === 'number' && frame.viewportRows > 0
+            ? frame.viewportRows
+            : frame.historyRows;
+        if (rawViewportRows > 0) {
+          const clampedRows = Math.max(1, Math.min(rawViewportRows, MAX_VIEWPORT_ROWS));
           ptyViewportRowsRef.current = clampedRows;
           setPtyViewportRows((prev) => (prev === clampedRows ? prev : clampedRows));
         }

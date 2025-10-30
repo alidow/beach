@@ -1,0 +1,23 @@
+LOG_DIR="$HOME/beach-debug"
+mkdir -p "$LOG_DIR"
+
+~/development/beach/target/debug/beach \
+  --log-level trace \
+  --log-file /tmp/beach-host.log \
+  --session-server http://localhost:4132/ \
+  host \
+  --bootstrap-output json \
+  --wait \
+  -- /usr/bin/env python3 ~/development/beach/apps/private-beach/demo/pong/player/main.py --mode lhs \
+| tee "$LOG_DIR/bootstrap.json"
+
+
+
+
+
+-------
+
+
+
+
+head -n 1 "$LOG_DIR/bootstrap.json"

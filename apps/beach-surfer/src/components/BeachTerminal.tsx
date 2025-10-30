@@ -296,6 +296,7 @@ export interface BeachTerminalProps {
   onViewportStateChange?: (state: TerminalViewportState) => void;
   disableViewportMeasurements?: boolean;
   forcedViewportRows?: number | null;
+  hideIdlePlaceholder?: boolean;
 }
 
 export interface TerminalViewportState {
@@ -329,6 +330,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     onViewportStateChange,
     disableViewportMeasurements = false,
     forcedViewportRows = null,
+  hideIdlePlaceholder = false,
   } = props;
 
   const store = useMemo(() => providedStore ?? createTerminalStore(), [providedStore]);
@@ -364,7 +366,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   );
   const [error, setError] = useState<Error | null>(null);
   const [secureSummary, setSecureSummary] = useState<SecureTransportSummary | null>(null);
-  const [showIdlePlaceholder, setShowIdlePlaceholder] = useState(true);
+  const [showIdlePlaceholder, setShowIdlePlaceholder] = useState(!hideIdlePlaceholder);
   const [, setHeaderHeight] = useState<number>(0);
   const [activeConnection, setActiveConnection] = useState<BrowserTransportConnection | null>(null);
   const [peerId, setPeerId] = useState<string | null>(null);
@@ -530,6 +532,20 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       return;
     }
     lastViewportReportRef.current = nextReport;
+    if (typeof window !== 'undefined') {
+      try {
+        console.info('[terminal][trace] emit-viewport-state', {
+          sessionId,
+          viewportRows: nextReport.viewportRows,
+          viewportCols: nextReport.viewportCols,
+          hostViewportRows: nextReport.hostViewportRows,
+          hostCols: nextReport.hostCols,
+          canSendResize,
+        });
+      } catch {
+        // ignore logging issues
+      }
+    }
     onViewportStateChange({
       ...nextReport,
       sendHostResize: sendHostResizeRef.current,
@@ -655,6 +671,11 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     [enterApprovedState, enterDeniedState, enterWaitingState],
   );
   useEffect(() => {
+    if (hideIdlePlaceholder) {
+      setShowIdlePlaceholder(false);
+      onStatusChange?.(status);
+      return;
+    }
     onStatusChange?.(status);
     if (status === 'connected') {
       setShowIdlePlaceholder(false);
@@ -665,7 +686,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     } else if (status === 'idle') {
       setShowIdlePlaceholder(true);
     }
-  }, [status, onStatusChange]);
+  }, [hideIdlePlaceholder, status, onStatusChange]);
   const lines = useMemo(() => buildLines(snapshot, 600, effectiveOverlay), [snapshot, effectiveOverlay]);
   if (IS_DEV && typeof window !== 'undefined' && window.__BEACH_TRACE) {
     const sample = lines.slice(-5).map((line) => ({
@@ -985,6 +1006,21 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       lastSentViewportRows.current = fallbackRows;
       container.style.removeProperty('maxHeight');
       container.style.removeProperty('--beach-terminal-max-height');
+      if (typeof window !== 'undefined') {
+        try {
+          console.info('[terminal][trace] disable-measurements viewport-set', {
+            sessionId,
+            forcedViewportRows,
+            desiredRows,
+            appliedRows: fallbackRows,
+            viewportTop,
+            snapshotViewportHeight: snapshotNow.viewportHeight,
+            snapshotFollowTail: snapshotNow.followTail,
+          });
+        } catch {
+          // ignore logging issues
+        }
+      }
       emitViewportState();
       return;
     }

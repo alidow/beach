@@ -1,6 +1,6 @@
 'use client';
 
-import { memo, useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { useSessionTerminal, type TerminalViewerState } from '../hooks/useSessionTerminal';
 import { BeachTerminal, type TerminalViewportState } from '../../../beach-surfer/src/components/BeachTerminal';
 import { CabanaPrivateBeachPlayer } from '../../../beach-surfer/src/components/cabana/CabanaPrivateBeachPlayer';
@@ -13,6 +13,8 @@ const TERMINAL_PADDING_Y = 56;
 const BASE_TERMINAL_FONT_SIZE = 14;
 const BASE_TERMINAL_CELL_WIDTH = 8;
 const MINIMUM_SCALE = 0.05;
+const MAX_PREVIEW_WIDTH = 450;
+const MAX_PREVIEW_HEIGHT = 450;
 
 function estimateHostPixelSize(cols: number, rows: number, fontSize: number) {
   const devicePixelRatio =
@@ -37,6 +39,16 @@ export type HostResizeControlState = {
   hostCols: number | null;
 };
 
+type PreviewStatus = 'connecting' | 'initializing' | 'ready' | 'error';
+
+type PreviewMeasurements = {
+  scale: number;
+  targetWidth: number;
+  targetHeight: number;
+  rawWidth: number;
+  rawHeight: number;
+};
+
 type Props = {
   sessionId: string;
   privateBeachId: string;
@@ -50,7 +62,6 @@ type Props = {
   scale?: number;
   locked?: boolean;
   cropped?: boolean;
-  targetSize?: { width: number; height: number } | null;
   onViewportDimensions?: (
     sessionId: string,
     dims: {
@@ -60,6 +71,8 @@ type Props = {
       hostCols: number | null;
     },
   ) => void;
+  onPreviewStatusChange?: (status: PreviewStatus) => void;
+  onPreviewMeasurementsChange?: (sessionId: string, measurements: PreviewMeasurements | null) => void;
   viewerOverride?: TerminalViewerState | null;
 };
 
@@ -82,16 +95,34 @@ function SessionTerminalPreviewView({
   locked = false,
   cropped = false,
   onViewportDimensions,
+  onPreviewStatusChange,
+  onPreviewMeasurementsChange,
   viewer,
   trimmedToken,
   isCabana,
-  targetSize,
 }: ViewProps) {
   const [viewportState, setViewportState] = useState<TerminalViewportState | null>(null);
   const [hostDimensions, setHostDimensions] = useState<{ rows: number | null; cols: number | null }>({
     rows: null,
     cols: null,
   });
+  const cloneWrapperRef = useRef<HTMLDivElement | null>(null);
+  const cloneInnerRef = useRef<HTMLDivElement | null>(null);
+  const previewStatusRef = useRef<PreviewStatus>('connecting');
+  const [previewStatus, setPreviewStatusState] = useState<PreviewStatus>('connecting');
+  const measurementsRef = useRef<PreviewMeasurements | null>(null);
+
+  const updatePreviewStatus = useCallback(
+    (next: PreviewStatus) => {
+      if (previewStatusRef.current === next) {
+        return;
+      }
+      previewStatusRef.current = next;
+      setPreviewStatusState(next);
+      onPreviewStatusChange?.(next);
+    },
+    [onPreviewStatusChange],
+  );
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -145,19 +176,22 @@ function SessionTerminalPreviewView({
     return Number(normalized.toFixed(3));
   }, [fontSize, baseFontSize]);
 
-  const handleViewportStateChange = useCallback((state: TerminalViewportState) => {
-    if (typeof window !== 'undefined') {
-      console.info('[terminal] viewport-state', {
-        version: 'v1',
-        sessionId,
-        viewportRows: state.viewportRows,
-        viewportCols: state.viewportCols,
-        hostViewportRows: state.hostViewportRows,
-        hostCols: state.hostCols,
-      });
-    }
-    setViewportState(state);
-  }, [sessionId]);
+  const handleViewportStateChange = useCallback(
+    (state: TerminalViewportState) => {
+      if (typeof window !== 'undefined') {
+        console.info('[terminal] viewport-state', {
+          version: 'v2',
+          sessionId,
+          viewportRows: state.viewportRows,
+          viewportCols: state.viewportCols,
+          hostViewportRows: state.hostViewportRows,
+          hostCols: state.hostCols,
+        });
+      }
+      setViewportState(state);
+    },
+    [sessionId],
+  );
 
   useEffect(() => {
     if (!viewportState) {
@@ -167,30 +201,53 @@ function SessionTerminalPreviewView({
       let rows = current.rows;
       let cols = current.cols;
       let changed = false;
-      if (typeof viewportState.hostViewportRows === 'number' && viewportState.hostViewportRows > 0) {
-        if (rows !== viewportState.hostViewportRows) {
-          rows = viewportState.hostViewportRows;
-          changed = true;
-        }
-      } else if (rows == null && viewportState.viewportRows > 0) {
-        rows = viewportState.viewportRows;
+      const hostViewportRows =
+        typeof viewportState.hostViewportRows === 'number' && viewportState.hostViewportRows > 0
+          ? viewportState.hostViewportRows
+          : null;
+      const measuredViewportRows = viewportState.viewportRows > 0 ? viewportState.viewportRows : null;
+      const hostViewportCols =
+        typeof viewportState.hostCols === 'number' && viewportState.hostCols > 0
+          ? viewportState.hostCols
+          : null;
+      const measuredViewportCols = viewportState.viewportCols > 0 ? viewportState.viewportCols : null;
+      if (hostViewportRows != null && rows !== hostViewportRows) {
+        rows = hostViewportRows;
+        changed = true;
+      } else if (rows == null && measuredViewportRows != null) {
+        rows = measuredViewportRows;
         changed = true;
       }
-      if (typeof viewportState.hostCols === 'number' && viewportState.hostCols > 0) {
-        if (cols !== viewportState.hostCols) {
-          cols = viewportState.hostCols;
-          changed = true;
-        }
-      } else if (cols == null && viewportState.viewportCols > 0) {
-        cols = viewportState.viewportCols;
+      if (hostViewportCols != null && cols !== hostViewportCols) {
+        cols = hostViewportCols;
+        changed = true;
+      } else if (cols == null && measuredViewportCols != null) {
+        cols = measuredViewportCols;
         changed = true;
       }
       if (!changed) {
         return current;
       }
+      if (typeof window !== 'undefined') {
+        try {
+          console.info('[terminal][trace] host-dimension-update', {
+            sessionId,
+            prevRows: current.rows,
+            nextRows: rows,
+            prevCols: current.cols,
+            nextCols: cols,
+            hostViewportRows,
+            measuredViewportRows,
+            hostViewportCols,
+            measuredViewportCols,
+          });
+        } catch {
+          // ignore logging failures
+        }
+      }
       return { rows, cols };
     });
-  }, [viewportState]);
+  }, [sessionId, viewportState]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -327,22 +384,34 @@ function SessionTerminalPreviewView({
     if (!onViewportDimensions || !viewportState) {
       return;
     }
+    const viewportRowsValue = viewportState.viewportRows > 0 ? viewportState.viewportRows : 0;
+    const viewportColsValue = viewportState.viewportCols > 0 ? viewportState.viewportCols : 0;
+    const limitedViewportRows =
+      hostDimensions.rows != null && viewportRowsValue > 0
+        ? Math.min(hostDimensions.rows, viewportRowsValue)
+        : viewportRowsValue;
+    const limitedViewportCols =
+      hostDimensions.cols != null && viewportColsValue > 0
+        ? Math.min(hostDimensions.cols, viewportColsValue)
+        : viewportColsValue;
     if (typeof window !== 'undefined') {
-      console.info(
-        '[terminal] viewport-dims dispatch',
-        JSON.stringify({
-          version: 'v1',
+      try {
+        console.info('[terminal][trace] viewport-dims limited', {
           sessionId,
-          viewportRows: viewportState.viewportRows,
-          viewportCols: viewportState.viewportCols,
+          limitedViewportRows,
+          limitedViewportCols,
+          rawViewportRows: viewportState.viewportRows,
+          rawViewportCols: viewportState.viewportCols,
           hostRows: hostDimensions.rows,
           hostCols: hostDimensions.cols,
-        }),
-      );
+        });
+      } catch {
+        // ignore logging issues
+      }
     }
     onViewportDimensions(sessionId, {
-      viewportRows: viewportState.viewportRows,
-      viewportCols: viewportState.viewportCols,
+      viewportRows: limitedViewportRows,
+      viewportCols: limitedViewportCols,
       hostRows: hostDimensions.rows,
       hostCols: hostDimensions.cols,
     });
@@ -355,23 +424,155 @@ function SessionTerminalPreviewView({
     [onHostResizeStateChange, sessionId],
   );
 
-  const scaleValue =
-    typeof scale === 'number' && Number.isFinite(scale) ? Math.max(scale, MINIMUM_SCALE) : null;
-  const hostCols =
-    hostDimensions.cols && hostDimensions.cols > 0
-      ? hostDimensions.cols
-      : viewportState?.viewportCols && viewportState.viewportCols > 0
-        ? viewportState.viewportCols
-        : DEFAULT_HOST_COLS;
-  const hostRows =
-    hostDimensions.rows && hostDimensions.rows > 0
-      ? hostDimensions.rows
-      : viewportState?.viewportRows && viewportState.viewportRows > 0
-        ? viewportState.viewportRows
-        : DEFAULT_HOST_ROWS;
+  const zoomMultiplier =
+    typeof scale === 'number' && Number.isFinite(scale) ? Math.max(scale, MINIMUM_SCALE) : 1;
+
+  const hostViewportRows =
+    viewportState?.hostViewportRows && viewportState.hostViewportRows > 0
+      ? viewportState.hostViewportRows
+      : null;
+  const measuredViewportRows =
+    viewportState?.viewportRows && viewportState.viewportRows > 0
+      ? viewportState.viewportRows
+      : null;
+  const hostViewportCols =
+    viewportState?.hostCols && viewportState.hostCols > 0 ? viewportState.hostCols : null;
+  const measuredViewportCols =
+    viewportState?.viewportCols && viewportState.viewportCols > 0
+      ? viewportState.viewportCols
+      : null;
+
+  const resolvedHostRows =
+    hostDimensions.rows && hostDimensions.rows > 0 ? hostDimensions.rows : hostViewportRows;
+  const resolvedHostCols =
+    hostDimensions.cols && hostDimensions.cols > 0 ? hostDimensions.cols : hostViewportCols;
+
+  const fallbackHostRows = resolvedHostRows ?? measuredViewportRows ?? DEFAULT_HOST_ROWS;
+  const fallbackHostCols = resolvedHostCols ?? measuredViewportCols ?? DEFAULT_HOST_COLS;
+
   const hostPixelSize = useMemo(() => {
-    return estimateHostPixelSize(hostCols, hostRows, effectiveFontSize);
-  }, [hostCols, hostRows, effectiveFontSize]);
+    return estimateHostPixelSize(fallbackHostCols, fallbackHostRows, effectiveFontSize);
+  }, [fallbackHostCols, fallbackHostRows, effectiveFontSize]);
+
+  const previewMeasurements = useMemo<PreviewMeasurements | null>(() => {
+    if (
+      resolvedHostCols == null ||
+      resolvedHostRows == null ||
+      resolvedHostCols <= 0 ||
+      resolvedHostRows <= 0
+    ) {
+      return null;
+    }
+    const rawWidth = hostPixelSize.width;
+    const rawHeight = hostPixelSize.height;
+    if (!Number.isFinite(rawWidth) || rawWidth <= 0 || !Number.isFinite(rawHeight) || rawHeight <= 0) {
+      return null;
+    }
+    const widthScale = rawWidth > 0 ? MAX_PREVIEW_WIDTH / rawWidth : 1;
+    const heightScale = rawHeight > 0 ? MAX_PREVIEW_HEIGHT / rawHeight : 1;
+    const limitedScale = Math.min(1, widthScale, heightScale);
+    const normalizedScale =
+      Number.isFinite(limitedScale) && limitedScale > 0 ? Number(limitedScale.toFixed(6)) : 1;
+    const targetWidth = Math.max(1, Math.round(rawWidth * normalizedScale));
+    const targetHeight = Math.max(1, Math.round(rawHeight * normalizedScale));
+    return {
+      scale: normalizedScale,
+      targetWidth,
+      targetHeight,
+      rawWidth: Math.round(rawWidth),
+      rawHeight: Math.round(rawHeight),
+    };
+  }, [hostPixelSize.height, hostPixelSize.width, resolvedHostCols, resolvedHostRows]);
+
+  const effectiveScale = useMemo(() => {
+    if (!previewMeasurements) {
+      return zoomMultiplier;
+    }
+    return previewMeasurements.scale * zoomMultiplier;
+  }, [previewMeasurements, zoomMultiplier]);
+
+  useEffect(() => {
+    const previous = measurementsRef.current;
+    const next = previewMeasurements;
+    const changed =
+      previous?.targetWidth !== next?.targetWidth ||
+      previous?.targetHeight !== next?.targetHeight ||
+      previous?.scale !== next?.scale ||
+      previous?.rawWidth !== next?.rawWidth ||
+      previous?.rawHeight !== next?.rawHeight;
+    if (!changed) {
+      return;
+    }
+    measurementsRef.current = next ?? null;
+    if (typeof window !== 'undefined') {
+      try {
+        console.info('[terminal][trace] preview-measurements', {
+          sessionId,
+          measurement: next,
+        });
+      } catch {
+        // ignore logging errors
+      }
+    }
+    onPreviewMeasurementsChange?.(sessionId, next ?? null);
+  }, [onPreviewMeasurementsChange, previewMeasurements, sessionId]);
+
+  useEffect(() => {
+    if (viewer.status === 'error') {
+      updatePreviewStatus('error');
+      return;
+    }
+    if (viewer.status === 'connecting' || viewer.status === 'reconnecting' || viewer.status === 'idle') {
+      updatePreviewStatus('connecting');
+      return;
+    }
+    if (viewer.status === 'connected') {
+      if (previewMeasurements) {
+        updatePreviewStatus('ready');
+      } else {
+        updatePreviewStatus('initializing');
+      }
+    }
+  }, [previewMeasurements, updatePreviewStatus, viewer.status]);
+
+  useEffect(() => {
+    if (!viewer.store) {
+      return;
+    }
+    const ensurePinnedViewport = () => {
+      const snapshot = viewer.store!.getSnapshot();
+      const desiredTop = snapshot.baseRow;
+      const hostRowCount = resolvedHostRows ?? hostViewportRows ?? DEFAULT_HOST_ROWS;
+      const desiredHeight = Math.max(1, hostRowCount);
+      let changed = false;
+      if (snapshot.followTail) {
+        viewer.store!.setFollowTail(false);
+        changed = true;
+      }
+      if (snapshot.viewportTop !== desiredTop || snapshot.viewportHeight !== desiredHeight) {
+        viewer.store!.setViewport(desiredTop, desiredHeight);
+        changed = true;
+      }
+      if (changed && typeof window !== 'undefined') {
+        try {
+          console.info('[terminal][trace] viewport-clamped', {
+            sessionId,
+            desiredTop,
+            desiredHeight,
+            snapshotTop: snapshot.viewportTop,
+            snapshotHeight: snapshot.viewportHeight,
+          });
+        } catch {
+          // ignore logging issues
+        }
+      }
+    };
+    ensurePinnedViewport();
+    const unsubscribe = viewer.store.subscribe(() => {
+      ensurePinnedViewport();
+    });
+    return unsubscribe;
+  }, [hostViewportRows, resolvedHostRows, sessionId, viewer.store]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -379,101 +580,151 @@ function SessionTerminalPreviewView({
       console.info('[terminal][diag] scale-state', {
         sessionId,
         incomingScale: scale,
-        resolvedScale: scaleValue,
+        zoomMultiplier,
+        effectiveScale,
         locked,
         cropped,
-        targetSize,
-        hostCols,
-        hostRows,
+        previewScale: previewMeasurements?.scale ?? null,
+        targetWidth: previewMeasurements?.targetWidth ?? null,
+        targetHeight: previewMeasurements?.targetHeight ?? null,
+        resolvedHostCols,
+        resolvedHostRows,
+        fallbackHostCols,
+        fallbackHostRows,
         fontSize: effectiveFontSize,
       });
     } catch {
       // ignore logging issues
     }
-  }, [cropped, effectiveFontSize, hostCols, hostRows, locked, scale, scaleValue, sessionId, targetSize]);
+  }, [
+    cropped,
+    effectiveFontSize,
+    effectiveScale,
+    fallbackHostCols,
+    fallbackHostRows,
+    locked,
+    previewMeasurements,
+    resolvedHostCols,
+    resolvedHostRows,
+    scale,
+    sessionId,
+    zoomMultiplier,
+  ]);
 
-  const scaledWrapperStyle = useMemo(() => {
-    if (!scaleValue) {
-      return undefined;
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const node = cloneWrapperRef.current;
+    if (!node || !previewMeasurements) {
+      return;
     }
-    if (typeof window !== 'undefined') {
-      try {
-        console.info('[terminal] target-size', {
-          version: 'v1',
-          sessionId,
-          targetWidth: targetSize?.width ?? null,
-          targetHeight: targetSize?.height ?? null,
-          scale: scaleValue,
-        });
-      } catch {
-        // ignore logging errors
-      }
-    }
-    const baseWidth =
-      targetSize && targetSize.width > 0
-        ? targetSize.width / scaleValue
-        : hostPixelSize?.width ?? undefined;
-    const baseHeight =
-      targetSize && targetSize.height > 0
-        ? targetSize.height / scaleValue
-        : hostPixelSize?.height ?? undefined;
-    const style: CSSProperties = {
-      transform: `scale(${scaleValue})`,
-      transformOrigin: 'top left',
-      width: baseWidth ? `${baseWidth}px` : undefined,
-      height: baseHeight ? `${baseHeight}px` : undefined,
+    const logDimensions = () => {
+      const rect = node.getBoundingClientRect();
+      const child =
+        cloneInnerRef.current instanceof HTMLElement ? cloneInnerRef.current.getBoundingClientRect() : null;
+      console.info('[terminal][trace] dom-dimensions', {
+        sessionId,
+        effectiveScale,
+        targetWidth: previewMeasurements.targetWidth,
+        targetHeight: previewMeasurements.targetHeight,
+        wrapperWidth: Math.round(rect.width),
+        wrapperHeight: Math.round(rect.height),
+        childWidth: child ? Math.round(child.width) : null,
+        childHeight: child ? Math.round(child.height) : null,
+      });
     };
-    return style;
-  }, [hostPixelSize, scaleValue, sessionId, targetSize]);
+    const handle = window.requestAnimationFrame(logDimensions);
+    return () => window.cancelAnimationFrame(handle);
+  }, [effectiveScale, previewMeasurements, sessionId]);
 
   useEffect(() => {
     if (
-      !scaleValue ||
-      !hostPixelSize ||
+      !previewMeasurements ||
       typeof window === 'undefined' ||
       isCabana ||
       !trimmedToken ||
-      !viewer.store ||
-      !viewer.transport
+      !viewer.store
     ) {
       return;
     }
-    console.info('[terminal] zoom-wrapper', {
-      version: 'v1',
-      sessionId,
-      scale: scaleValue,
-      hostCols,
-      hostRows,
-      widthPx: Math.round(hostPixelSize.width),
-      heightPx: Math.round(hostPixelSize.height),
-    });
+    try {
+      console.info('[terminal] zoom-wrapper', {
+        version: 'v2',
+        sessionId,
+        zoomMultiplier,
+        effectiveScale,
+        previewScale: previewMeasurements.scale,
+        hostCols: resolvedHostCols ?? fallbackHostCols,
+        hostRows: resolvedHostRows ?? fallbackHostRows,
+        rawWidth: previewMeasurements.rawWidth,
+        rawHeight: previewMeasurements.rawHeight,
+        targetWidth: previewMeasurements.targetWidth,
+        targetHeight: previewMeasurements.targetHeight,
+      });
+    } catch {
+      // ignore logging issues
+    }
   }, [
-    scaleValue,
-    hostPixelSize,
-    hostCols,
-    hostRows,
-    sessionId,
+    effectiveScale,
+    fallbackHostCols,
+    fallbackHostRows,
     isCabana,
+    previewMeasurements,
+    resolvedHostCols,
+    resolvedHostRows,
+    sessionId,
     trimmedToken,
     viewer.store,
-    viewer.transport,
+    zoomMultiplier,
   ]);
 
+  const driverWrapperStyle = useMemo<CSSProperties>(
+    () => ({
+      position: 'absolute',
+      width: 0,
+      height: 0,
+      overflow: 'hidden',
+      opacity: 0,
+      pointerEvents: 'none',
+    }),
+    [],
+  );
+
+  const cloneWrapperStyle = useMemo<CSSProperties | undefined>(() => {
+    if (!previewMeasurements) {
+      return undefined;
+    }
+    const width = previewMeasurements.rawWidth * effectiveScale;
+    const height = previewMeasurements.rawHeight * effectiveScale;
+    return {
+      width: `${Math.max(1, Math.round(width))}px`,
+      height: `${Math.max(1, Math.round(height))}px`,
+    };
+  }, [effectiveScale, previewMeasurements]);
+
+  const cloneInnerStyle = useMemo<CSSProperties | undefined>(() => {
+    if (!previewMeasurements) {
+      return undefined;
+    }
+    return {
+      width: `${previewMeasurements.rawWidth}px`,
+      height: `${previewMeasurements.rawHeight}px`,
+      transform: `scale(${effectiveScale})`,
+      transformOrigin: 'top left',
+    };
+  }, [effectiveScale, previewMeasurements]);
+
   const placeholderMessage = useMemo(() => {
-    if (viewer.status === 'error') {
-      return viewer.error ?? 'Unable to connect to this session.';
+    switch (previewStatus) {
+      case 'connecting':
+        return 'Connecting to session…';
+      case 'initializing':
+        return 'Preparing terminal preview…';
+      case 'error':
+        return viewer.error ?? 'Unable to load this session.';
+      default:
+        return null;
     }
-    if (viewer.status === 'connecting') {
-      return 'Connecting…';
-    }
-    if (viewer.status === 'reconnecting') {
-      return 'Reconnecting…';
-    }
-    if (!viewer.transport) {
-      return 'Viewer unavailable';
-    }
-    return null;
-  }, [viewer.error, viewer.status, viewer.transport]);
+  }, [previewStatus, viewer.error]);
 
   if (isCabana) {
     return (
@@ -501,20 +752,6 @@ function SessionTerminalPreviewView({
         }
       >
         <span>Sign in to stream this session.</span>
-      </div>
-    );
-  }
-
-  const placeholderClass =
-    variant === 'preview'
-      ? 'flex h-full items-center justify-center bg-neutral-950/90 text-xs text-muted-foreground'
-      : 'flex h-full items-center justify-center bg-neutral-950 text-sm text-muted-foreground';
-
-  if (placeholderMessage || !viewer.store || !viewer.transport) {
-    const merged = className ? `${placeholderClass} ${className}` : placeholderClass;
-    return (
-      <div className={merged}>
-        <span>{placeholderMessage ?? 'Viewer unavailable'}</span>
       </div>
     );
   }
@@ -550,6 +787,11 @@ function SessionTerminalPreviewView({
   }
 
   const overlayTextClass = variant === 'full' ? 'text-[11px]' : 'text-[10px]';
+  const showPlaceholder = previewStatus !== 'ready';
+  const overlayClass =
+    variant === 'preview'
+      ? 'absolute inset-0 flex items-center justify-center bg-neutral-950/90 text-xs text-muted-foreground'
+      : 'absolute inset-0 flex items-center justify-center bg-neutral-950 text-sm text-muted-foreground';
 
   return (
     <div className={containerClass}>
@@ -557,21 +799,46 @@ function SessionTerminalPreviewView({
         <span className={`${overlayTextClass} rounded-full px-3 py-1 ${secureClass}`}>{secureLabel}</span>
         <span className={`${overlayTextClass} rounded-full px-3 py-1 ${latencyClass}`}>{latencyLabel}</span>
       </div>
-      <div className="flex h-full w-full items-start justify-start overflow-hidden">
-        <div className="origin-top-left" style={scaledWrapperStyle}>
+      <div className="relative flex w-full items-start justify-start overflow-hidden">
+        <div style={driverWrapperStyle} aria-hidden>
           <BeachTerminal
-            store={viewer.store}
-            transport={viewer.transport}
+            store={viewer.store ?? undefined}
+            transport={viewer.transport ?? undefined}
             autoConnect={false}
-            className="h-full w-full"
+            className="w-full"
             fontSize={effectiveFontSize}
-            showTopBar={variant === 'full'}
-            showStatusBar={variant === 'full'}
-            autoResizeHostOnViewportChange={locked}
+            showTopBar={false}
+            showStatusBar={false}
+            autoResizeHostOnViewportChange={false}
             onViewportStateChange={handleViewportStateChange}
-            disableViewportMeasurements={Boolean(scaleValue)}
-            forcedViewportRows={hostRows}
+            disableViewportMeasurements={false}
+            hideIdlePlaceholder
           />
+        </div>
+        <div
+          ref={cloneWrapperRef}
+          className="relative flex items-start justify-start overflow-hidden"
+          style={cloneWrapperStyle}
+        >
+          <div ref={cloneInnerRef} className="origin-top-left" style={cloneInnerStyle}>
+            <BeachTerminal
+              store={viewer.store ?? undefined}
+              transport={undefined}
+              autoConnect={false}
+              className="w-full"
+              fontSize={effectiveFontSize}
+              showTopBar={variant === 'full'}
+              showStatusBar={variant === 'full'}
+              autoResizeHostOnViewportChange={locked}
+              disableViewportMeasurements
+              hideIdlePlaceholder
+            />
+          </div>
+          {showPlaceholder && (
+            <div className={overlayClass}>
+              <span>{placeholderMessage ?? 'Preparing terminal preview…'}</span>
+            </div>
+          )}
         </div>
       </div>
       {viewer.status === 'reconnecting' && (

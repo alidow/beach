@@ -28,7 +28,7 @@ services:
     networks:
       - beach-network
   beach-manager:
-    image: rustlang/rust:nightly
+    image: rust:1.82-slim-bullseye
     container_name: beach-manager
     working_dir: /app
     command: ["cargo", "run", "-p", "beach-manager"]
@@ -42,8 +42,8 @@ services:
       RUST_LOG: info
     volumes:
       - .:/app
-      - cargo-manager-target:/app/target
-      - cargo-manager-registry:/usr/local/cargo/registry
+      - cargo-target:/app/target
+      - cargo-registry:/usr/local/cargo/registry
     depends_on:
       postgres:
         condition: service_healthy
@@ -54,7 +54,7 @@ services:
     networks:
       - beach-network
   beach-road:
-    image: rustlang/rust:nightly
+    image: rust:1.82-slim-bullseye
     container_name: beach-road
     working_dir: /app
     command: ["cargo", "run", "-p", "beach-road"]
@@ -66,8 +66,8 @@ services:
       RUST_LOG: info
     volumes:
       - .:/app
-      - cargo-road-target:/app/target
-      - cargo-road-registry:/usr/local/cargo/registry
+      - cargo-target:/app/target
+      - cargo-registry:/usr/local/cargo/registry
     depends_on:
       redis:
         condition: service_started
@@ -191,7 +191,7 @@ services:
     networks:
       - beach-network
   beach-lifeguard:
-    image: rustlang/rust:nightly
+    image: rust:1.82-slim-bullseye
     container_name: beach-lifeguard
     profiles: ["lifeguard"]
     working_dir: /app
@@ -202,8 +202,8 @@ services:
       RUST_LOG: info
     volumes:
       - .:/app
-      - cargo-lifeguard-target:/app/target
-      - cargo-lifeguard-registry:/usr/local/cargo/registry
+      - cargo-target:/app/target
+      - cargo-registry:/usr/local/cargo/registry
     depends_on:
       - redis
     networks:
@@ -212,12 +212,8 @@ services:
 volumes:
   postgres-data:
   redis-data:
-  cargo-manager-target:
-  cargo-manager-registry:
-  cargo-lifeguard-target:
-  cargo-lifeguard-registry:
-  cargo-road-target:
-  cargo-road-registry:
+  cargo-target:
+  cargo-registry:
 
 networks:
   beach-network:

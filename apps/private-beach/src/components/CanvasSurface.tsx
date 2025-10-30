@@ -46,7 +46,7 @@ import {
 } from '../canvas/state';
 import type { CanvasLayout as ApiCanvasLayout } from '../lib/api';
 import { emitTelemetry } from '../lib/telemetry';
-import { buildViewerStateFromTerminalDiff, extractTerminalStateDiff } from '../lib/terminalHydrator';
+import { extractTerminalStateDiff, type TerminalStateDiff } from '../lib/terminalHydrator';
 
 const SessionTerminalPreview = dynamic(
   () => import('./SessionTerminalPreview').then((mod) => mod.SessionTerminalPreview),
@@ -93,6 +93,7 @@ type TileNodeData = {
   viewerOverride?: TerminalViewerState | null;
   privateBeachId: string | null;
   onMeasurements: (sessionId: string, measurements: MeasurementPayload | null) => void;
+  cachedDiff?: TerminalStateDiff | null;
 };
 
 type AgentNodeData = {
@@ -409,41 +410,6 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
 
   const sessionMap = useMemo(() => new Map(tiles.map((session) => [session.session_id, session] as const)), [tiles]);
   const agentMap = useMemo(() => new Map(agents.map((session) => [session.session_id, session] as const)), [agents]);
-
-  const autoViewerStateOverrides = useMemo<Record<string, TerminalViewerState>>(() => {
-    if (!tiles || tiles.length === 0) {
-      return {};
-    }
-    const overrides: Record<string, TerminalViewerState> = {};
-    for (const session of tiles) {
-      try {
-        const diff = extractTerminalStateDiff(session.metadata);
-        if (!diff) {
-          continue;
-        }
-        const viewerState = buildViewerStateFromTerminalDiff(diff);
-        if (viewerState) {
-          overrides[session.session_id] = viewerState;
-        }
-      } catch (err) {
-        console.warn('[canvas-surface] terminal preview hydration failed', {
-          sessionId: session.session_id,
-          error: err instanceof Error ? err.message : err,
-        });
-      }
-    }
-    return overrides;
-  }, [tiles]);
-
-  const effectiveViewerStateOverrides = useMemo<Record<string, TerminalViewerState | null | undefined>>(() => {
-    if (!viewerStateOverridesProp || Object.keys(viewerStateOverridesProp).length === 0) {
-      return autoViewerStateOverrides;
-    }
-    return {
-      ...autoViewerStateOverrides,
-      ...viewerStateOverridesProp,
-    };
-  }, [autoViewerStateOverrides, viewerStateOverridesProp]);
 
   const syncStore = useCallback(
     (next: SharedCanvasLayout) => {

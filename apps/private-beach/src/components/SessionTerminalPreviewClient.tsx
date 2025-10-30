@@ -52,6 +52,7 @@ type PreviewMeasurements = {
   targetHeight: number;
   rawWidth: number;
   rawHeight: number;
+  rawHeightColsAdjusted: number;
   hostRows: number | null;
   hostCols: number | null;
   measurementVersion: number;
@@ -545,7 +546,8 @@ function SessionTerminalPreviewView({
       previous?.targetHeight !== next?.targetHeight ||
       previous?.scale !== next?.scale ||
       previous?.rawWidth !== next?.rawWidth ||
-      previous?.rawHeight !== next?.rawHeight;
+      previous?.rawHeight !== next?.rawHeight ||
+      previous?.measurementVersion !== next?.measurementVersion;
     if (!changed) {
       return;
     }

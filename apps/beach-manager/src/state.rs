@@ -19,8 +19,10 @@ use crate::fastpath::{send_actions_over_fast_path, FastPathRegistry, FastPathSes
 use crate::metrics;
 use beach_buggy::{
     AckStatus, ActionAck, ActionCommand, CursorPosition, HarnessType, HealthHeartbeat,
-    RegisterSessionRequest, RegisterSessionResponse, StateDiff, TerminalFrame,
+    RegisterSessionRequest, RegisterSessionResponse, StateDiff, StyleDefinition, StyledCell,
+    TerminalFrame,
 };
+use beach_client_core::cache::terminal::packed::unpack_cell;
 use beach_client_core::protocol::{CursorFrame, Update as WireUpdate};
 use beach_client_core::{
     decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
@@ -385,20 +387,31 @@ fn capture_terminal_frame_simple(
     let rows = viewport_rows.min(total_rows);
     let style_table = grid.style_table.clone();
     let mut lines = Vec::with_capacity(rows);
+    let mut styled_lines = Vec::with_capacity(rows);
 
     for row in 0..rows {
-        let mut line = String::with_capacity(viewport_cols);
+        let mut cells = Vec::with_capacity(viewport_cols);
         for col in 0..viewport_cols {
-            let ch = grid
+            let (raw_char, style_id) = grid
                 .get_cell_relaxed(row, col)
-                .map(|snapshot| snapshot.unpack(style_table.as_ref()).char)
-                .unwrap_or(' ');
-            line.push(ch);
+                .map(|snapshot| unpack_cell(snapshot.cell))
+                .unwrap_or((' ', StyleId::DEFAULT));
+            let ch = if raw_char == '\0' { ' ' } else { raw_char };
+            cells.push(StyledCell {
+                ch,
+                style: style_id.0,
+            });
         }
-        while line.ends_with(' ') {
-            line.pop();
+        while let Some(last) = cells.last() {
+            if last.ch == ' ' && last.style == StyleId::DEFAULT.0 {
+                cells.pop();
+            } else {
+                break;
+            }
         }
+        let line: String = cells.iter().map(|cell| cell.ch).collect();
         lines.push(line);
+        styled_lines.push(cells);
     }
 
     let cursor = cursor.map(|cursor| CursorPosition {
@@ -406,18 +419,65 @@ fn capture_terminal_frame_simple(
         col: cursor.col,
     });
 
-    TerminalFrame { lines, cursor }
+    let styles = style_table
+        .entries()
+        .into_iter()
+        .map(|(id, style)| StyleDefinition {
+            id: id.0,
+            fg: style.fg,
+            bg: style.bg,
+            attrs: style.attrs as u32,
+        })
+        .collect();
+
+    TerminalFrame {
+        lines,
+        styled_lines: Some(styled_lines),
+        styles: Some(styles),
+        cols: Some(viewport_cols),
+        rows: Some(rows),
+        cursor,
+    }
 }
 
 fn build_terminal_payload(frame: &TerminalFrame) -> serde_json::Value {
-    serde_json::json!({
-        "type": "terminal_full",
-        "lines": frame.lines,
-        "cursor": frame.cursor.map(|cursor| serde_json::json!({
-            "row": cursor.row,
-            "col": cursor.col,
-        })),
-    })
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "type".into(),
+        serde_json::Value::String("terminal_full".into()),
+    );
+    payload.insert(
+        "lines".into(),
+        serde_json::to_value(&frame.lines).expect("serialize terminal lines"),
+    );
+    if let Some(cursor) = frame.cursor {
+        payload.insert(
+            "cursor".into(),
+            serde_json::json!({
+                "row": cursor.row,
+                "col": cursor.col,
+            }),
+        );
+    }
+    if let Some(styled_lines) = &frame.styled_lines {
+        payload.insert(
+            "styled_lines".into(),
+            serde_json::to_value(styled_lines).expect("serialize styled lines"),
+        );
+    }
+    if let Some(styles) = &frame.styles {
+        payload.insert(
+            "styles".into(),
+            serde_json::to_value(styles).expect("serialize style definitions"),
+        );
+    }
+    if let Some(cols) = frame.cols {
+        payload.insert("cols".into(), serde_json::json!(cols));
+    }
+    if let Some(rows) = frame.rows {
+        payload.insert("rows".into(), serde_json::json!(rows));
+    }
+    serde_json::Value::Object(payload)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -5150,6 +5210,49 @@ mod tests {
                 .flat_map(|line| line.as_str())
                 .any(|line| line.contains('A')),
             "terminal diff should include styled cell contents"
+        );
+
+        let styles = diff
+            .payload
+            .get("styles")
+            .and_then(|value| value.as_array())
+            .expect("styles array present on diff payload");
+        assert!(
+            styles.iter().any(|entry| {
+                let id = entry.get("id").and_then(|v| v.as_u64());
+                let fg = entry.get("fg").and_then(|v| v.as_u64());
+                id == Some(0) && fg == Some(pack_color_rgb(255, 0, 0) as u64)
+            }),
+            "styles array should include foreground definition for id 0"
+        );
+
+        let styled_lines = diff
+            .payload
+            .get("styled_lines")
+            .and_then(|value| value.as_array())
+            .expect("styled_lines array present on diff payload");
+        let first_row = styled_lines
+            .first()
+            .and_then(|row| row.as_array())
+            .expect("first styled row array");
+        let first_cell = first_row
+            .first()
+            .and_then(|cell| cell.as_object())
+            .expect("styled cell shape");
+        assert_eq!(
+            first_cell.get("ch").and_then(|v| v.as_str()),
+            Some("A"),
+            "styled cell should capture character"
+        );
+        assert_eq!(
+            first_cell.get("style").and_then(|v| v.as_u64()),
+            Some(0),
+            "styled cell should reference style id 0"
+        );
+        assert_eq!(
+            diff.payload.get("cols").and_then(|v| v.as_u64()),
+            Some(80),
+            "payload should report column count"
         );
 
         let style = viewer

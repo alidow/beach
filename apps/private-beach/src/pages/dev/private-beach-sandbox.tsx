@@ -13,7 +13,9 @@ import {
   type SessionSummary,
   type SessionRole,
 } from '../../lib/api';
-import type { SessionCredentialOverride } from '../../hooks/useSessionTerminal';
+import type { SessionCredentialOverride, TerminalViewerState } from '../../hooks/useSessionTerminal';
+import { createStaticTerminalViewer } from '../../sandbox/staticTerminal';
+import { resolveTerminalFixture } from '../../sandbox/fixtures';
 
 const SANDBOX_ENABLED =
   process.env.NEXT_PUBLIC_ENABLE_PRIVATE_BEACH_SANDBOX === 'true' || process.env.NODE_ENV !== 'production';
@@ -42,6 +44,8 @@ type SandboxConfig = {
   passcodeMap: Map<string, string>;
   titleEntries: Array<[string, string]>;
   titleMap: Map<string, string>;
+  terminalFixtureEntries: Array<[string, string]>;
+  terminalFixtureMap: Map<string, string>;
   shouldFetchFromApi: boolean;
   skipApi: boolean;
   signature: string;
@@ -175,6 +179,9 @@ function parseSandboxConfig(query: ReturnType<typeof useRouter>['query'], isRead
   const skipApi = Boolean(skipApiRaw && ['1', 'true', 'yes'].includes(skipApiRaw.toLowerCase()));
   const passcodeMap = parseKeyValueList(query.passcodes ?? query.passcode);
   const titleMap = parseKeyValueList(query.titles ?? query.title);
+  const fixtureMap = parseKeyValueList(
+    query.terminalFixtures ?? query.terminalFixture ?? query.mockTerminals ?? query.fixtures,
+  );
   const specById = new Map<string, SessionSpec>();
 
   const upsert = (spec: SessionSpec) => {
@@ -191,6 +198,11 @@ function parseSandboxConfig(query: ReturnType<typeof useRouter>['query'], isRead
   }
   parseSessionEntries(query.applications ?? query.apps, 'application').forEach(upsert);
   parseSessionEntries(query.agents, 'agent').forEach(upsert);
+  for (const sessionId of fixtureMap.keys()) {
+    if (!specById.has(sessionId)) {
+      upsert({ id: sessionId, role: 'application' });
+    }
+  }
 
   const sessionSpecs = Array.from(specById.values());
   const shouldFetchFromApi = Boolean(privateBeachId && managerToken && !skipApi);
@@ -205,6 +217,7 @@ function parseSandboxConfig(query: ReturnType<typeof useRouter>['query'], isRead
     specs: sessionSpecs.map((spec) => [spec.id, spec.role, spec.title ?? '', spec.passcode ?? '']),
     passcodes: Array.from(passcodeMap.entries()),
     titles: Array.from(titleMap.entries()),
+    fixtures: Array.from(fixtureMap.entries()),
   });
 
   return {
@@ -219,6 +232,8 @@ function parseSandboxConfig(query: ReturnType<typeof useRouter>['query'], isRead
     passcodeMap,
     titleEntries: Array.from(titleMap.entries()),
     titleMap,
+    terminalFixtureEntries: Array.from(fixtureMap.entries()),
+    terminalFixtureMap: fixtureMap,
     shouldFetchFromApi,
     skipApi,
     signature,
@@ -448,6 +463,23 @@ function PrivateBeachSandboxPage() {
     () => buildViewerOverrides(config.passcodeEntries, config.sessionSpecs, config.managerToken),
     [config.passcodeEntries, config.sessionSpecs, config.managerToken],
   );
+  const viewerStateOverrides = useMemo(() => {
+    const overrides: Record<string, TerminalViewerState> = {};
+    for (const [sessionId, fixtureKey] of config.terminalFixtureEntries) {
+      const lines = resolveTerminalFixture(fixtureKey);
+      if (!lines) {
+        console.warn('[sandbox-debug] missing terminal fixture', { sessionId, fixtureKey });
+        continue;
+      }
+      console.info('[sandbox-debug] apply terminal fixture', {
+        sessionId,
+        fixtureKey,
+        lineCount: lines.length,
+      });
+      overrides[sessionId] = createStaticTerminalViewer(Array.from(lines), { viewportRows: 24 });
+    }
+    return overrides;
+  }, [config.terminalFixtureEntries]);
 
   const partitionedSessions = useMemo(() => {
     const agents: SessionSummary[] = [];
@@ -654,6 +686,7 @@ function PrivateBeachSandboxPage() {
               managerUrl={config.managerUrl}
               viewerToken={viewerToken}
               viewerOverrides={viewerOverrides}
+              viewerStateOverrides={viewerStateOverrides}
             />
           </section>
         </main>
@@ -670,4 +703,3 @@ function PrivateBeachSandboxPage() {
 }
 
 export default PrivateBeachSandboxPage;
-

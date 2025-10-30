@@ -372,6 +372,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     managerUrl,
     viewerToken,
     viewerOverrides,
+    viewerStateOverrides,
   } = props;
   const reactFlow = useReactFlow();
   const { load, setNodes, setViewport, setSelection } = useCanvasActions();
@@ -750,7 +751,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     }
 
     return nodes;
-  }, [activeDragNodeId, agentMap, handleTileMeasurements, hoverTarget, layout.agents, layout.groups, layout.tiles, managerUrl, onRemove, onSelect, privateBeachId, selectionSet, sessionMap, viewerOverrides, viewerToken]);
+  }, [activeDragNodeId, agentMap, handleTileMeasurements, hoverTarget, layout.agents, layout.groups, layout.tiles, managerUrl, onRemove, onSelect, privateBeachId, selectionSet, sessionMap, viewerOverrides, viewerStateOverrides, viewerToken]);
 
   const edges = useMemo<RFEdge[]>(() => [], []);
 

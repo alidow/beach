@@ -150,6 +150,16 @@ impl StyleTable {
         (id, true)
     }
 
+    pub fn entries(&self) -> Vec<(StyleId, Style)> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .vec
+            .iter()
+            .enumerate()
+            .map(|(idx, style)| (StyleId(idx as u32), *style))
+            .collect()
+    }
+
     pub fn get(&self, id: StyleId) -> Option<Style> {
         self.inner.read().unwrap().vec.get(id.idx()).copied()
     }

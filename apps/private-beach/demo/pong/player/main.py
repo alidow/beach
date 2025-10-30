@@ -41,6 +41,7 @@ FRAME_VERTICAL = "│"
 
 CENTER_NET_PATTERN = ("┊", "┆")
 BALL_GLYPH = "●"
+PADDLE_KEYSTEP = 1.0
 
 TITLE_TEMPLATE = " PRIVATE BEACH PONG · {mode} "
 STATUS_ICON = "●"
@@ -207,6 +208,14 @@ class PongView:
             if ch in (3, 4):  # Ctrl+C / Ctrl+D
                 self.running = False
                 return
+            if ch == curses.KEY_UP:
+                self.move_paddle(PADDLE_KEYSTEP)
+                self.log_status("Paddle moved up.")
+                continue
+            if ch == curses.KEY_DOWN:
+                self.move_paddle(-PADDLE_KEYSTEP)
+                self.log_status("Paddle moved down.")
+                continue
             if ch in (10, 13):  # Enter
                 command = self.command_buffer.decode("ascii", errors="ignore").strip()
                 self.command_buffer.clear()

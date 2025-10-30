@@ -30,6 +30,12 @@ export type SessionCredentialOverride = {
   skipCredentialFetch?: boolean;
 };
 
+type ConnectionListenerBundle = {
+  connection: BrowserTransportConnection;
+  connectionId: string;
+  detachAll: () => void;
+};
+
 export function useSessionTerminal(
   sessionId: string | null | undefined,
   privateBeachId: string | null | undefined,
@@ -51,13 +57,17 @@ export function useSessionTerminal(
   const lastHeartbeatRef = useRef<number | null>(null);
   const wasConnectedRef = useRef<boolean>(false);
   const [reconnectTick, setReconnectTick] = useState(0);
+  const depsSignatureRef = useRef<string | null>(null);
+  const reconnectTickSignatureRef = useRef<number>(0);
   const connectionSeqRef = useRef(0);
+  const connectionListenersRef = useRef<ConnectionListenerBundle | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     let reconnectTimer: number | null = null;
-    const cleanupListeners: Array<() => void> = [];
-    const connectionId = `${connectionSeqRef.current++}`;
+    const existingBundle = connectionListenersRef.current;
+    const connectionId =
+      existingBundle?.connectionId ?? `${connectionSeqRef.current++}`;
     const logEvent = (event: string, extra: Record<string, unknown> = {}) => {
       if (typeof window === 'undefined') return;
       console.info('[terminal-conn]', {
@@ -72,13 +82,35 @@ export function useSessionTerminal(
       });
     };
 
-    const closeCurrentConnection = () => {
-      const current = connectionRef.current;
-      if (!current) {
-        logEvent('close-current', { hasConnection: false });
+    const detachTransportListeners = (
+      reason: string,
+      bundleOverride?: ConnectionListenerBundle | null,
+    ) => {
+      const bundle = bundleOverride ?? connectionListenersRef.current;
+      if (!bundle) {
+        if (!bundleOverride && reason !== 'before-attach') {
+          logEvent('detach-listeners:skip', { reason });
+        }
         return;
       }
-      logEvent('close-current', { hasConnection: true });
+      if (connectionListenersRef.current === bundle) {
+        connectionListenersRef.current = null;
+      }
+      try {
+        bundle.detachAll();
+      } catch (err) {
+        console.warn('[terminal] detach listeners error', err);
+      }
+      logEvent('detach-listeners', { reason });
+    };
+
+    const closeCurrentConnection = (reason: string) => {
+      const current = connectionRef.current;
+      if (!current) {
+        logEvent('close-current', { hasConnection: false, reason });
+        return;
+      }
+      logEvent('close-current', { hasConnection: true, reason });
       try {
         current.close();
       } catch (err) {
@@ -87,34 +119,37 @@ export function useSessionTerminal(
       connectionRef.current = null;
     };
 
-    const performCleanup = (reason: string) => {
+    const performCleanup = (
+      reason: string,
+      options?: { closeConnection?: boolean; detachListeners?: boolean },
+    ) => {
+      const {
+        closeConnection: shouldCloseConnection = true,
+        detachListeners = shouldCloseConnection,
+      } = options ?? {};
       cancelled = true;
-      for (const fn of cleanupListeners) {
-        try {
-          fn();
-        } catch (err) {
-          console.warn('[terminal] cleanup error', err);
-        }
+      if (detachListeners) {
+        detachTransportListeners(reason);
       }
-      cleanupListeners.length = 0;
-      closeCurrentConnection();
+      if (shouldCloseConnection) {
+        closeCurrentConnection(reason);
+      }
       if (reconnectTimer !== null) {
         window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
       }
-      setStatus('idle');
-      setSecureSummary(null);
-      setLatencyMs(null);
-      lastHeartbeatRef.current = null;
-      logEvent('effect-cleanup', { reason });
+      if (shouldCloseConnection) {
+        setStatus('idle');
+        setSecureSummary(null);
+        setLatencyMs(null);
+        lastHeartbeatRef.current = null;
+      }
+      logEvent('effect-cleanup', {
+        reason,
+        closeConnection: shouldCloseConnection,
+        detachListeners,
+      });
     };
-
-    closeCurrentConnection();
-    setTransport(null);
-    store.reset();
-    store.setFollowTail(true);
-    setSecureSummary(null);
-    setLatencyMs(null);
-    lastHeartbeatRef.current = null;
 
     const normalizedOverride = {
       passcode: override?.passcode?.trim() ?? null,
@@ -132,6 +167,25 @@ export function useSessionTerminal(
         : trimmedManagerToken;
     const needsCredentialFetch = !normalizedOverride.skipCredentialFetch && !hasOverrideCredentials;
     const trimmedManagerUrl = managerUrl.trim();
+    const depsSignature = JSON.stringify({
+      sessionId: sessionId ?? null,
+      privateBeachId: privateBeachId ?? null,
+      managerUrl: trimmedManagerUrl,
+      authToken: effectiveAuthToken,
+      passcode: normalizedOverride.passcode,
+      viewerTokenOverride: normalizedOverride.viewerToken,
+      skipCredentialFetch: normalizedOverride.skipCredentialFetch,
+    });
+    const previousSignature = depsSignatureRef.current;
+    const previousReconnectTick = reconnectTickSignatureRef.current;
+    const hasExistingConnection = connectionRef.current !== null;
+    const shouldReuseConnection =
+      hasExistingConnection &&
+      previousSignature === depsSignature &&
+      previousReconnectTick === reconnectTick;
+
+    depsSignatureRef.current = depsSignature;
+    reconnectTickSignatureRef.current = reconnectTick;
 
     if (!sessionId || trimmedManagerUrl.length === 0) {
       setConnecting(false);
@@ -168,17 +222,6 @@ export function useSessionTerminal(
       return () => performCleanup('missing-override-credentials');
     }
 
-    setConnecting(true);
-    setError(null);
-    setStatus(wasConnectedRef.current ? 'reconnecting' : 'connecting');
-    setSecureSummary(null);
-    setLatencyMs(null);
-    logEvent('effect-start', {
-      wasConnected: wasConnectedRef.current,
-      needsCredentialFetch,
-      hasOverrideCredentials,
-    });
-
     const scheduleReconnect = (source: string) => {
       if (cancelled) {
         return;
@@ -200,6 +243,238 @@ export function useSessionTerminal(
         setReconnectTick((tick) => tick + 1);
       }, 1_500);
     };
+
+    const attachTransportListeners = (connection: BrowserTransportConnection) => {
+      detachTransportListeners('before-attach');
+      const transportTarget = connection.transport;
+      const detachFns: Array<() => void> = [];
+      const bundle: ConnectionListenerBundle = {
+        connection,
+        connectionId,
+        detachAll: () => {
+          const removers = detachFns.splice(0);
+          for (const fn of removers) {
+            try {
+              fn();
+            } catch (err) {
+              console.warn('[terminal] listener detach error', err);
+            }
+          }
+        },
+      };
+      connectionListenersRef.current = bundle;
+
+      const isCurrentConnection = () =>
+        connectionListenersRef.current?.connection === connection &&
+        connectionRef.current === connection;
+
+      const openHandler = () => {
+        if (!isCurrentConnection()) {
+          return;
+        }
+        console.info('[terminal] data channel open', {
+          sessionId,
+          privateBeachId,
+          remotePeerId: connection.remotePeerId ?? null,
+        });
+        logEvent('transport-open', {
+          remotePeerId: connection.remotePeerId ?? null,
+        });
+      };
+      transportTarget.addEventListener('open', openHandler as EventListener);
+      detachFns.push(() =>
+        transportTarget.removeEventListener('open', openHandler as EventListener),
+      );
+
+      const secureHandler = (event: Event) => {
+        if (!isCurrentConnection()) {
+          return;
+        }
+        const detail = (event as CustomEvent<SecureTransportSummary>).detail;
+        setSecureSummary(detail);
+      };
+      transportTarget.addEventListener('secure', secureHandler as EventListener);
+      detachFns.push(() =>
+        transportTarget.removeEventListener('secure', secureHandler as EventListener),
+      );
+
+      const frameHandler = (event: Event) => {
+        if (!isCurrentConnection()) {
+          return;
+        }
+        const detail = (event as CustomEvent<HostFrame>).detail;
+        if (detail?.type === 'heartbeat' && typeof detail.timestampMs === 'number') {
+          lastHeartbeatRef.current = detail.timestampMs;
+          const now = Date.now();
+          const latency = Math.max(0, now - detail.timestampMs);
+          setLatencyMs(latency);
+        }
+      };
+      transportTarget.addEventListener('frame', frameHandler as EventListener);
+      detachFns.push(() =>
+        transportTarget.removeEventListener('frame', frameHandler as EventListener),
+      );
+
+      const closeHandler = () => {
+        if (!isCurrentConnection()) {
+          return;
+        }
+        console.warn('[terminal] data channel closed', {
+          sessionId,
+          privateBeachId,
+          remotePeerId: connection.remotePeerId ?? null,
+        });
+        logEvent('transport-close', {
+          remotePeerId: connection.remotePeerId ?? null,
+        });
+        if (connectionRef.current === connection) {
+          connectionRef.current = null;
+        }
+        detachTransportListeners('transport-close', bundle);
+        setTransport(null);
+        setConnecting(true);
+        setError(null);
+        setStatus('reconnecting');
+        setSecureSummary(null);
+        setLatencyMs(null);
+        scheduleReconnect('transport-close');
+      };
+      transportTarget.addEventListener('close', closeHandler as EventListener);
+      detachFns.push(() =>
+        transportTarget.removeEventListener('close', closeHandler as EventListener),
+      );
+
+      const errorHandler = (event: Event) => {
+        if (!isCurrentConnection()) {
+          return;
+        }
+        const err = (event as any).error;
+        const message = err instanceof Error ? err.message : String(err ?? 'transport error');
+        console.error('[terminal] data channel error', {
+          sessionId,
+          privateBeachId,
+          message,
+        });
+        logEvent('transport-error', { message });
+        setError(message);
+        setStatus('error');
+        setSecureSummary(null);
+        setLatencyMs(null);
+      };
+      transportTarget.addEventListener('error', errorHandler as EventListener);
+      detachFns.push(() =>
+        transportTarget.removeEventListener('error', errorHandler as EventListener),
+      );
+
+      const statusHandler = (event: Event) => {
+        if (!isCurrentConnection()) {
+          return;
+        }
+        const detail = (event as CustomEvent<string>).detail;
+        if (detail?.startsWith('beach:status:')) {
+          console.debug('[terminal] status signal', { sessionId, detail });
+        }
+      };
+      transportTarget.addEventListener('status', statusHandler as EventListener);
+      detachFns.push(() =>
+        transportTarget.removeEventListener('status', statusHandler as EventListener),
+      );
+
+      const signalingCloseHandler = (event: Event) => {
+        if (!isCurrentConnection()) {
+          return;
+        }
+        const detail = (event as CustomEvent<CloseEvent>).detail;
+        console.warn('[terminal] signaling closed', {
+          sessionId,
+          privateBeachId,
+          code: detail?.code ?? null,
+          reason: detail?.reason ?? '',
+          wasClean: detail?.wasClean ?? null,
+        });
+        logEvent('signaling-close', {
+          code: detail?.code ?? null,
+          reason: detail?.reason ?? '',
+          wasClean: detail?.wasClean ?? null,
+        });
+      };
+      connection.signaling.addEventListener('close', signalingCloseHandler as EventListener);
+      detachFns.push(() =>
+        connection.signaling.removeEventListener('close', signalingCloseHandler as EventListener),
+      );
+
+      const signalingErrorHandler = (event: Event) => {
+        if (!isCurrentConnection()) {
+          return;
+        }
+        const detail = (event as ErrorEvent).message ?? 'unknown';
+        console.error('[terminal] signaling error', {
+          sessionId,
+          privateBeachId,
+          message: detail,
+        });
+        logEvent('signaling-error', { message: detail });
+      };
+      connection.signaling.addEventListener('error', signalingErrorHandler as EventListener);
+      detachFns.push(() =>
+        connection.signaling.removeEventListener(
+          'error',
+          signalingErrorHandler as EventListener,
+        ),
+      );
+
+      logEvent('attach-listeners', {
+        remotePeerId: connection.remotePeerId ?? null,
+      });
+    };
+
+    if (shouldReuseConnection) {
+      logEvent('effect-start', {
+        reused: true,
+        wasConnected: wasConnectedRef.current,
+        needsCredentialFetch,
+        hasOverrideCredentials,
+      });
+      setConnecting(false);
+      setError(null);
+      if (status !== 'connected') {
+        setStatus('connected');
+      }
+      const activeConnection = connectionRef.current;
+      if (
+        activeConnection &&
+        (!connectionListenersRef.current ||
+          connectionListenersRef.current.connection !== activeConnection)
+      ) {
+        attachTransportListeners(activeConnection);
+        logEvent('reuse-attach-listeners', {});
+      }
+      if (activeConnection) {
+        setTransport(activeConnection.transport);
+      }
+      return () =>
+        performCleanup('reuse', { closeConnection: false, detachListeners: false });
+    }
+
+    detachTransportListeners('refresh-before-connect');
+    closeCurrentConnection('refresh-before-connect');
+    setTransport(null);
+    store.reset();
+    store.setFollowTail(true);
+    setSecureSummary(null);
+    setLatencyMs(null);
+    lastHeartbeatRef.current = null;
+
+    setConnecting(true);
+    setError(null);
+    setStatus(wasConnectedRef.current ? 'reconnecting' : 'connecting');
+    setSecureSummary(null);
+    setLatencyMs(null);
+    logEvent('effect-start', {
+      wasConnected: wasConnectedRef.current,
+      needsCredentialFetch,
+      hasOverrideCredentials,
+    });
 
     (async () => {
       try {
@@ -272,151 +547,7 @@ export function useSessionTerminal(
           secureMode: connection.secure?.mode ?? 'plaintext',
         });
 
-        const transportTarget = connection.transport;
-
-        const openHandler = () => {
-          if (cancelled) {
-            return;
-          }
-          console.info('[terminal] data channel open', {
-            sessionId,
-            privateBeachId,
-            remotePeerId: connection.remotePeerId ?? null,
-          });
-          logEvent('transport-open', {
-            remotePeerId: connection.remotePeerId ?? null,
-          });
-        };
-        transportTarget.addEventListener('open', openHandler as EventListener);
-        cleanupListeners.push(() =>
-          transportTarget.removeEventListener('open', openHandler as EventListener),
-        );
-
-        const secureHandler = (event: Event) => {
-          if (cancelled) {
-            return;
-          }
-          const detail = (event as CustomEvent<SecureTransportSummary>).detail;
-          setSecureSummary(detail);
-        };
-        transportTarget.addEventListener('secure', secureHandler as EventListener);
-        cleanupListeners.push(() =>
-          transportTarget.removeEventListener('secure', secureHandler as EventListener),
-        );
-
-        const frameHandler = (event: Event) => {
-          if (cancelled) {
-            return;
-          }
-          const detail = (event as CustomEvent<HostFrame>).detail;
-          if (detail?.type === 'heartbeat' && typeof detail.timestampMs === 'number') {
-            lastHeartbeatRef.current = detail.timestampMs;
-            const now = Date.now();
-            const latency = Math.max(0, now - detail.timestampMs);
-            setLatencyMs(latency);
-          }
-        };
-        transportTarget.addEventListener('frame', frameHandler as EventListener);
-        cleanupListeners.push(() =>
-          transportTarget.removeEventListener('frame', frameHandler as EventListener),
-        );
-
-        const closeHandler = () => {
-          if (cancelled) {
-            return;
-          }
-          console.warn('[terminal] data channel closed', {
-            sessionId,
-            privateBeachId,
-            remotePeerId: connection.remotePeerId ?? null,
-          });
-          logEvent('transport-close', {
-            remotePeerId: connection.remotePeerId ?? null,
-          });
-          setTransport(null);
-          setConnecting(true);
-          setError(null);
-          setStatus('reconnecting');
-          setSecureSummary(null);
-          setLatencyMs(null);
-          scheduleReconnect('transport-close');
-        };
-        transportTarget.addEventListener('close', closeHandler as EventListener);
-        cleanupListeners.push(() =>
-          transportTarget.removeEventListener('close', closeHandler as EventListener),
-        );
-
-        const errorHandler = (event: Event) => {
-          if (cancelled) {
-            return;
-          }
-          const err = (event as any).error;
-          const message = err instanceof Error ? err.message : String(err ?? 'transport error');
-          console.error('[terminal] data channel error', {
-            sessionId,
-            privateBeachId,
-            message,
-          });
-          logEvent('transport-error', { message });
-          setError(message);
-          setStatus('error');
-          setSecureSummary(null);
-          setLatencyMs(null);
-        };
-        transportTarget.addEventListener('error', errorHandler as EventListener);
-        cleanupListeners.push(() =>
-          transportTarget.removeEventListener('error', errorHandler as EventListener),
-        );
-
-        const statusHandler = (event: Event) => {
-          const detail = (event as CustomEvent<string>).detail;
-          if (detail?.startsWith('beach:status:')) {
-            console.debug('[terminal] status signal', { sessionId, detail });
-          }
-        };
-        transportTarget.addEventListener('status', statusHandler as EventListener);
-        cleanupListeners.push(() =>
-          transportTarget.removeEventListener('status', statusHandler as EventListener),
-        );
-
-        const signalingCloseHandler = (event: Event) => {
-          const detail = (event as CustomEvent<CloseEvent>).detail;
-          console.warn('[terminal] signaling closed', {
-            sessionId,
-            privateBeachId,
-            code: detail?.code ?? null,
-            reason: detail?.reason ?? '',
-            wasClean: detail?.wasClean ?? null,
-          });
-          logEvent('signaling-close', {
-            code: detail?.code ?? null,
-            reason: detail?.reason ?? '',
-            wasClean: detail?.wasClean ?? null,
-          });
-        };
-        connection.signaling.addEventListener('close', signalingCloseHandler as EventListener);
-        cleanupListeners.push(() =>
-          connection.signaling.removeEventListener(
-            'close',
-            signalingCloseHandler as EventListener,
-          ),
-        );
-        const signalingErrorHandler = (event: Event) => {
-          const detail = (event as ErrorEvent).message ?? 'unknown';
-          console.error('[terminal] signaling error', {
-            sessionId,
-            privateBeachId,
-            message: detail,
-          });
-          logEvent('signaling-error', { message: detail });
-        };
-        connection.signaling.addEventListener('error', signalingErrorHandler as EventListener);
-        cleanupListeners.push(() =>
-          connection.signaling.removeEventListener(
-            'error',
-            signalingErrorHandler as EventListener,
-          ),
-        );
+        attachTransportListeners(connection);
       } catch (err) {
         if (cancelled) {
           return;

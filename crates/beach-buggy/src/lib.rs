@@ -227,13 +227,37 @@ pub type ControllerPairingStream =
     Pin<Box<dyn Stream<Item = HarnessResult<ControllerPairingEvent>> + Send>>;
 
 /// Representation of a terminal frame we can diff.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StyledCell {
+    pub ch: char,
+    pub style: u32,
+}
+
+/// Serialized style definition for terminal snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StyleDefinition {
+    pub id: u32,
+    pub fg: u32,
+    pub bg: u32,
+    pub attrs: u32,
+}
+
+/// Representation of a terminal frame we can diff.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TerminalFrame {
     pub lines: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub styled_lines: Option<Vec<Vec<StyledCell>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub styles: Option<Vec<StyleDefinition>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<usize>,
     pub cursor: Option<CursorPosition>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct CursorPosition {
     pub row: usize,
     pub col: usize,
@@ -578,11 +602,40 @@ where
 }
 
 fn build_terminal_payload(frame: &TerminalFrame) -> serde_json::Value {
-    serde_json::json!({
-        "type": "terminal_full",
-        "lines": frame.lines,
-        "cursor": frame.cursor.map(|c| serde_json::json!({"row": c.row, "col": c.col}))
-    })
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "type".into(),
+        serde_json::Value::String("terminal_full".into()),
+    );
+    payload.insert(
+        "lines".into(),
+        serde_json::to_value(&frame.lines).expect("serialize terminal lines"),
+    );
+    if let Some(cursor) = frame.cursor {
+        payload.insert(
+            "cursor".into(),
+            serde_json::json!({ "row": cursor.row, "col": cursor.col }),
+        );
+    }
+    if let Some(styled_lines) = &frame.styled_lines {
+        payload.insert(
+            "styled_lines".into(),
+            serde_json::to_value(styled_lines).expect("serialize styled lines"),
+        );
+    }
+    if let Some(styles) = &frame.styles {
+        payload.insert(
+            "styles".into(),
+            serde_json::to_value(styles).expect("serialize style definitions"),
+        );
+    }
+    if let Some(cols) = frame.cols {
+        payload.insert("cols".into(), serde_json::json!(cols));
+    }
+    if let Some(rows) = frame.rows {
+        payload.insert("rows".into(), serde_json::json!(rows));
+    }
+    serde_json::Value::Object(payload)
 }
 
 fn now_millis() -> i64 {
@@ -1584,6 +1637,10 @@ mod tests {
     fn make_terminal_frame(line: &str) -> TerminalFrame {
         TerminalFrame {
             lines: vec![line.into()],
+            styled_lines: None,
+            styles: None,
+            cols: None,
+            rows: None,
             cursor: Some(CursorPosition {
                 row: 0,
                 col: line.len(),

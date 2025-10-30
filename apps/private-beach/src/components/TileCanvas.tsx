@@ -19,6 +19,7 @@ import type { HostResizeControlState } from './SessionTerminalPreviewClient';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
 import { useSessionTerminal, type TerminalViewerState } from '../hooks/useSessionTerminal';
+import { emitTelemetry } from '../lib/telemetry';
 
 const AutoGrid = dynamic(() => import('./AutoGrid'), {
   ssr: false,
@@ -70,6 +71,9 @@ type PreviewMetrics = {
   targetHeight: number;
   rawWidth: number;
   rawHeight: number;
+  hostRows: number | null;
+  hostCols: number | null;
+  measurementVersion: number;
 };
 
 type TileViewState = {
@@ -104,7 +108,7 @@ const RESIZE_HANDLE_LABELS: Record<ResizeHandleAxis, string> = {
   sw: 'Resize bottom-left corner',
 };
 
-function clampZoom(value: number | undefined, measurement?: TileMeasurements | null): number {
+export function clampZoom(value: number | undefined, measurement?: TileMeasurements | null): number {
   if (!Number.isFinite(value ?? Number.NaN)) {
     return DEFAULT_ZOOM;
   }
@@ -116,7 +120,7 @@ function clampZoom(value: number | undefined, measurement?: TileMeasurements | n
   return Math.min(MAX_UNLOCKED_ZOOM, Math.max(min, Number(value)));
 }
 
-function getColumnWidth(gridWidth: number | null, cols: number): number | null {
+export function getColumnWidth(gridWidth: number | null, cols: number): number | null {
   if (gridWidth == null || gridWidth <= 0 || cols <= 0) {
     return null;
   }
@@ -130,7 +134,7 @@ function getColumnWidth(gridWidth: number | null, cols: number): number | null {
   return Number.isFinite(fallbackWidth) && fallbackWidth > 0 ? fallbackWidth : null;
 }
 
-function estimateHostSize(cols: number | null, rows: number | null) {
+export function estimateHostSize(cols: number | null, rows: number | null) {
   const c = cols && cols > 0 ? cols : DEFAULT_HOST_COLS;
   const r = rows && rows > 0 ? rows : DEFAULT_HOST_ROWS;
   const width = c * BASE_CELL_WIDTH + TERMINAL_PADDING_X;
@@ -138,7 +142,7 @@ function estimateHostSize(cols: number | null, rows: number | null) {
   return { width, height };
 }
 
-function computeZoomForSize(
+export function computeZoomForSize(
   measurements: TileMeasurements | null,
   hostCols: number | null,
   hostRows: number | null,
@@ -714,6 +718,9 @@ function TileCard({
             targetHeight: number;
             rawWidth: number;
             rawHeight: number;
+            hostRows: number | null;
+            hostCols: number | null;
+            measurementVersion: number;
           }
         | null,
     ) => {
@@ -729,6 +736,9 @@ function TileCard({
               targetHeight: measurement.targetHeight,
               rawWidth: measurement.rawWidth,
               rawHeight: measurement.rawHeight,
+              hostRows: measurement.hostRows,
+              hostCols: measurement.hostCols,
+              measurementVersion: measurement.measurementVersion,
             }
           : null,
       );
@@ -1848,6 +1858,9 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
       if (!onLayoutPersist) return;
       const snapshot = snapshotLayout(normalized, cols);
       onLayoutPersist(snapshot);
+      try {
+        emitTelemetry('canvas.layout.persist', { reason, tiles: normalized.length });
+      } catch {}
     },
     [clampLayoutItems, cols, onLayoutPersist, snapshotLayout],
   );
@@ -1937,12 +1950,42 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
     }
     const control = resizeControlRef.current[sessionId];
     if (!control?.canResize) return;
-    window.setTimeout(() => {
-      const current = resizeControlRef.current[sessionId];
-      if (current?.canResize) {
-        current.trigger();
+    const state = tileStateRef.current[sessionId];
+    const measurement = state?.measurements;
+    const computeTarget = () => {
+      const widthPx = Math.max(1, Math.round((measurement?.width ?? 0)));
+      const heightPx = Math.max(1, Math.round((measurement?.height ?? 0)));
+      // Derive rows/cols from visible tile size
+      const innerWidth = Math.max(1, widthPx - TERMINAL_PADDING_X);
+      const innerHeight = Math.max(1, heightPx - TERMINAL_PADDING_Y);
+      const cols = Math.max(2, Math.floor(innerWidth / BASE_CELL_WIDTH));
+      const rows = Math.max(2, Math.floor(innerHeight / BASE_LINE_HEIGHT));
+      return { rows, cols };
+    };
+    const request = () => {
+      const { rows, cols } = computeTarget();
+      if (typeof window !== 'undefined') {
+        try {
+          console.info('[terminal][resize] request', {
+            sessionId,
+            rows,
+            cols,
+            reason: 'tile_locked_or_snap',
+          });
+        } catch {
+          // ignore
+        }
       }
-    }, 120);
+      if (control.request) {
+        control.request({ rows, cols });
+      } else {
+        control.trigger();
+      }
+    };
+    // debounce to avoid bursts
+    window.clearTimeout((scheduleHostResize as any)._t?.[sessionId]);
+    (scheduleHostResize as any)._t = (scheduleHostResize as any)._t || {};
+    (scheduleHostResize as any)._t[sessionId] = window.setTimeout(request, 180);
   }, []);
 
   useEffect(() => {
@@ -2109,6 +2152,20 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
             measurements: state.manualLayout ? state.measurements : null,
           };
         }
+        // Ignore stale measurements from an earlier version
+        const prevVersion = state.preview?.measurementVersion ?? 0;
+        if (measurement.measurementVersion < prevVersion) {
+          if (typeof window !== 'undefined') {
+            try {
+              console.info('[tile-layout] preview-skip-stale', {
+                sessionId,
+                prevVersion,
+                nextVersion: measurement.measurementVersion,
+              });
+            } catch {}
+          }
+          return state;
+        }
         const zoomFactor = state.locked ? MAX_UNLOCKED_ZOOM : state.zoom;
         return {
           ...state,
@@ -2141,8 +2198,33 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
     [],
   );
 
+  const dragStartTimeRef = useRef<Map<string, number>>(new Map());
+
+  const handleDragStart = useCallback(
+    (
+      _next: Layout[],
+      _oldItem: Layout,
+      newItem: Layout,
+      _placeholder: Layout,
+      _event: MouseEvent,
+      _element?: HTMLElement,
+    ) => {
+      try {
+        dragStartTimeRef.current.set(newItem.i, typeof performance !== 'undefined' ? performance.now() : Date.now());
+        emitTelemetry('canvas.drag.start', { id: newItem.i, x: newItem.x, y: newItem.y });
+      } catch {}
+    },
+    [],
+  );
+
   const handleDragStop = useCallback(
-    (next: Layout[]) => {
+    (next: Layout[], _oldItem: Layout, newItem: Layout) => {
+      try {
+        const start = dragStartTimeRef.current.get(newItem.i) ?? null;
+        const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        const latency = start != null ? Math.max(0, now - start) : undefined;
+        emitTelemetry('canvas.drag.stop', { id: newItem.i, x: newItem.x, y: newItem.y, latency });
+      } catch {}
       handleLayoutCommit(next, 'drag-stop');
     },
     [handleLayoutCommit],
@@ -2220,6 +2302,17 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
       }
 
       const normalized = clampLayoutItems(adjustedLayouts, cols);
+      try {
+        emitTelemetry('canvas.resize.stop', {
+          id: newItem.i,
+          w: newItem.w,
+          h: newItem.h,
+          widthPx,
+          heightPx,
+          hostWidth: boundedHostWidth,
+          hostHeight: boundedHostHeight,
+        });
+      } catch {}
       handleLayoutChange(normalized);
       handleLayoutCommit(normalized, 'resize-stop');
       updateTileState(newItem.i, (current) => ({
@@ -2696,6 +2789,7 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
         preventCollision={false}
         draggableHandle=".session-tile-drag-grip"
         draggableCancel=".session-tile-actions"
+        onDragStart={handleDragStart}
         resizeHandle={renderResizeHandle}
         resizeHandles={['e', 's', 'se']}
         onDragStop={handleDragStop}
@@ -2927,6 +3021,9 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
                           targetHeight: measurement.targetHeight,
                           rawWidth: measurement.rawWidth,
                           rawHeight: measurement.rawHeight,
+                          hostRows: measurement.hostRows,
+                          hostCols: measurement.hostCols,
+                          measurementVersion: measurement.measurementVersion,
                         }
                       : null,
                   );

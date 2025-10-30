@@ -93,6 +93,10 @@ pub fn build_router(state: AppState) -> Router {
             "/private-beaches/:id/layout",
             get(get_private_beach_layout).put(put_private_beach_layout),
         )
+        .route(
+            "/private-beaches/:id/controller-assignments/batch",
+            post(batch_controller_assignments),
+        )
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -445,6 +449,101 @@ mod tests {
             .unwrap();
         let pairings: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
         assert!(pairings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_controller_assignments_endpoint() {
+        let state = AppState::new();
+        let app = build_router(state.clone());
+
+        let controller_register = json!({
+            "session_id": "controller-batch",
+            "private_beach_id": "pb-batch",
+            "harness_type": HarnessType::TerminalShim,
+            "capabilities": ["terminal_diff_v1"],
+            "version": "0.1.0"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/register")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(controller_register.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let lease_request = json!({ "reason": "batch-test" });
+        let lease_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/controller-batch/controller/lease")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(lease_request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(lease_resp.status(), StatusCode::OK);
+
+        let child_register = json!({
+            "session_id": "child-batch",
+            "private_beach_id": "pb-batch",
+            "harness_type": HarnessType::TerminalShim,
+            "capabilities": ["terminal_diff_v1"],
+            "version": "0.1.0"
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/register")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(child_register.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let batch_body = json!({
+            "assignments": [
+                { "controller_session_id": "controller-batch", "child_session_id": "child-batch" },
+                { "controller_session_id": "controller-batch", "child_session_id": "missing-child" }
+            ]
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/private-beaches/pb-batch/controller-assignments/batch")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(batch_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let results: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let array = results["results"].as_array().unwrap();
+        assert_eq!(array.len(), 2);
+        assert!(array[0]["ok"].as_bool().unwrap());
+        assert!(!array[1]["ok"].as_bool().unwrap());
     }
 
     #[tokio::test]

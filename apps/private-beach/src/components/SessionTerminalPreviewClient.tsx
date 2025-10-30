@@ -33,6 +33,7 @@ export type HostResizeControlState = {
   needsResize: boolean;
   canResize: boolean;
   trigger: () => void;
+  request?: (opts: { rows: number; cols?: number }) => void;
   viewportRows: number;
   hostViewportRows: number | null;
   viewportCols: number;
@@ -47,6 +48,9 @@ type PreviewMeasurements = {
   targetHeight: number;
   rawWidth: number;
   rawHeight: number;
+  hostRows: number | null;
+  hostCols: number | null;
+  measurementVersion: number;
 };
 
 type Props = {
@@ -111,6 +115,8 @@ function SessionTerminalPreviewView({
   const previewStatusRef = useRef<PreviewStatus>('connecting');
   const [previewStatus, setPreviewStatusState] = useState<PreviewStatus>('connecting');
   const measurementsRef = useRef<PreviewMeasurements | null>(null);
+  const measurementVersionRef = useRef<number>(1);
+  const [isCloneVisible, setIsCloneVisible] = useState<boolean>(true);
 
   const updatePreviewStatus = useCallback(
     (next: PreviewStatus) => {
@@ -144,6 +150,23 @@ function SessionTerminalPreviewView({
       }
     };
   }, [isCabana, sessionId, variant]);
+
+  // Observe clone visibility to throttle rendering when off-screen
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const target = cloneWrapperRef.current;
+    if (!target || typeof IntersectionObserver === 'undefined') {
+      setIsCloneVisible(true);
+      return;
+    }
+    const observer = new IntersectionObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      setIsCloneVisible(entry.isIntersecting && entry.intersectionRatio > 0.01);
+    }, { threshold: [0, 0.01, 0.1] });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -228,6 +251,8 @@ function SessionTerminalPreviewView({
       if (!changed) {
         return current;
       }
+      // bump measurement version when host metadata changes
+      measurementVersionRef.current = (measurementVersionRef.current % 1_000_000) + 1;
       if (typeof window !== 'undefined') {
         try {
           console.info('[terminal][trace] host-dimension-update', {
@@ -240,6 +265,7 @@ function SessionTerminalPreviewView({
             measuredViewportRows,
             hostViewportCols,
             measuredViewportCols,
+            measurementVersion: measurementVersionRef.current,
           });
         } catch {
           // ignore logging failures
@@ -373,6 +399,7 @@ function SessionTerminalPreviewView({
       needsResize,
       canResize,
       trigger: viewportState.sendHostResize,
+      request: viewportState.requestHostResize,
       viewportRows: viewportState.viewportRows,
       hostViewportRows: viewportState.hostViewportRows,
       viewportCols: viewportState.viewportCols,
@@ -481,6 +508,9 @@ function SessionTerminalPreviewView({
       targetHeight,
       rawWidth: Math.round(rawWidth),
       rawHeight: Math.round(rawHeight),
+      hostRows: resolvedHostRows,
+      hostCols: resolvedHostCols,
+      measurementVersion: measurementVersionRef.current,
     };
   }, [hostPixelSize.height, hostPixelSize.width, resolvedHostCols, resolvedHostRows]);
 
@@ -685,6 +715,7 @@ function SessionTerminalPreviewView({
       overflow: 'hidden',
       opacity: 0,
       pointerEvents: 'none',
+      contain: 'size',
     }),
     [],
   );
@@ -811,7 +842,8 @@ function SessionTerminalPreviewView({
             showStatusBar={false}
             autoResizeHostOnViewportChange={false}
             onViewportStateChange={handleViewportStateChange}
-            disableViewportMeasurements={false}
+            disableViewportMeasurements
+            maxRenderFps={20}
             hideIdlePlaceholder
           />
         </div>
@@ -831,6 +863,7 @@ function SessionTerminalPreviewView({
               showStatusBar={variant === 'full'}
               autoResizeHostOnViewportChange={locked}
               disableViewportMeasurements
+              maxRenderFps={isCloneVisible ? undefined : 12}
               hideIdlePlaceholder
             />
           </div>

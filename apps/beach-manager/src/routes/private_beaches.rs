@@ -4,6 +4,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tracing::warn;
 
 use crate::state::{AppState, StateError, ViewerTokenError};
@@ -44,17 +45,162 @@ pub struct BeachMeta {
     pub created_at: i64,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct LayoutUpsert {
-    pub preset: Option<String>,
-    #[serde(default)]
-    pub tiles: Option<Vec<String>>,
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CanvasPoint {
+    pub x: f64,
+    pub y: f64,
 }
 
-#[derive(Debug, Serialize)]
-pub struct BeachLayout {
-    pub preset: String,
-    pub tiles: Vec<String>,
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CanvasSize {
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanvasViewport {
+    pub zoom: f64,
+    pub pan: CanvasPoint,
+}
+
+impl Default for CanvasViewport {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            pan: CanvasPoint::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CanvasTileNode {
+    pub id: String,
+    pub position: CanvasPoint,
+    pub size: CanvasSize,
+    pub z_index: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zoom: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolbar_pinned: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CanvasAgentNode {
+    pub id: String,
+    pub position: CanvasPoint,
+    pub size: CanvasSize,
+    pub z_index: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CanvasGroupNode {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub member_ids: Vec<String>,
+    pub position: CanvasPoint,
+    pub size: CanvasSize,
+    pub z_index: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collapsed: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CanvasAssignment {
+    pub controller_id: String,
+    pub target_type: String,
+    pub target_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanvasMetadata {
+    pub created_at: i64,
+    pub updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migrated_from: Option<i64>,
+}
+
+impl Default for CanvasMetadata {
+    fn default() -> Self {
+        Self {
+            created_at: 0,
+            updated_at: 0,
+            migrated_from: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanvasLayout {
+    #[serde(default = "CanvasLayout::default_version")]
+    pub version: u8,
+    #[serde(default)]
+    pub viewport: CanvasViewport,
+    #[serde(default)]
+    pub tiles: HashMap<String, CanvasTileNode>,
+    #[serde(default)]
+    pub agents: HashMap<String, CanvasAgentNode>,
+    #[serde(default)]
+    pub groups: HashMap<String, CanvasGroupNode>,
+    #[serde(default)]
+    pub control_assignments: HashMap<String, CanvasAssignment>,
+    #[serde(default)]
+    pub metadata: CanvasMetadata,
+}
+
+impl CanvasLayout {
+    const fn default_version() -> u8 {
+        3
+    }
+
+    pub fn empty(now_ms: i64) -> Self {
+        Self {
+            version: 3,
+            viewport: CanvasViewport::default(),
+            tiles: HashMap::new(),
+            agents: HashMap::new(),
+            groups: HashMap::new(),
+            control_assignments: HashMap::new(),
+            metadata: CanvasMetadata {
+                created_at: now_ms,
+                updated_at: now_ms,
+                migrated_from: None,
+            },
+        }
+    }
+
+    pub fn ensure_version(self) -> Result<Self, String> {
+        if self.version != 3 {
+            return Err("layout version must be 3".into());
+        }
+        Ok(self)
+    }
+
+    pub fn with_updated_timestamp(mut self, now_ms: i64) -> Self {
+        if self.metadata.created_at == 0 {
+            self.metadata.created_at = now_ms;
+        }
+        self.metadata.updated_at = now_ms;
+        self
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +215,79 @@ pub struct ViewerCredentialResponse {
     pub expires_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub passcode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BatchAssignmentItem {
+    pub controller_session_id: String,
+    pub child_session_id: String,
+    #[serde(default)]
+    pub prompt_template: Option<String>,
+    #[serde(default)]
+    pub update_cadence: Option<crate::state::ControllerUpdateCadence>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchAssignmentResultItem {
+    pub controller_session_id: String,
+    pub child_session_id: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pairing: Option<crate::state::ControllerPairing>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BatchAssignmentsRequest {
+    pub assignments: Vec<BatchAssignmentItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchAssignmentsResponse {
+    pub results: Vec<BatchAssignmentResultItem>,
+}
+
+pub async fn batch_controller_assignments(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(_id): Path<String>,
+    Json(body): Json<BatchAssignmentsRequest>,
+) -> ApiResult<BatchAssignmentsResponse> {
+    ensure_scope(&token, "pb:control.write")?;
+    if body.assignments.is_empty() {
+        return Err(ApiError::BadRequest("assignments array required".into()));
+    }
+    let mut results = Vec::with_capacity(body.assignments.len());
+    for item in body.assignments.into_iter() {
+        let res = match state
+            .upsert_controller_pairing(
+                &item.controller_session_id,
+                &item.child_session_id,
+                item.prompt_template.clone(),
+                item.update_cadence,
+                token.account_uuid(),
+            )
+            .await
+        {
+            Ok(pairing) => BatchAssignmentResultItem {
+                controller_session_id: item.controller_session_id,
+                child_session_id: item.child_session_id,
+                ok: true,
+                error: None,
+                pairing: Some(pairing),
+            },
+            Err(e) => BatchAssignmentResultItem {
+                controller_session_id: item.controller_session_id,
+                child_session_id: item.child_session_id,
+                ok: false,
+                error: Some(format!("{}", e)),
+                pairing: None,
+            },
+        };
+        results.push(res);
+    }
+    Ok(Json(BatchAssignmentsResponse { results }))
 }
 
 pub async fn create_private_beach(
@@ -134,7 +353,7 @@ pub async fn get_private_beach_layout(
     State(state): State<AppState>,
     token: AuthToken,
     Path(id): Path<String>,
-) -> ApiResult<BeachLayout> {
+) -> ApiResult<CanvasLayout> {
     ensure_scope(&token, "pb:beaches.read")?;
     let layout = state
         .get_private_beach_layout(&id, token.account_uuid())
@@ -147,16 +366,14 @@ pub async fn put_private_beach_layout(
     State(state): State<AppState>,
     token: AuthToken,
     Path(id): Path<String>,
-    Json(body): Json<LayoutUpsert>,
-) -> ApiResult<serde_json::Value> {
+    Json(body): Json<CanvasLayout>,
+) -> ApiResult<CanvasLayout> {
     ensure_scope(&token, "pb:beaches.write")?;
-    let preset = body.preset.unwrap_or_else(|| "grid2x2".to_string());
-    let tiles = body.tiles.unwrap_or_default();
-    state
-        .put_private_beach_layout(&id, preset, tiles, token.account_uuid())
+    let layout = state
+        .put_private_beach_layout(&id, body, token.account_uuid())
         .await
         .map_err(map_state_err)?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(layout))
 }
 
 pub async fn get_viewer_credential(
@@ -217,6 +434,7 @@ fn map_state_err(err: StateError) -> ApiError {
         }
         StateError::PrivateBeachNotFound => ApiError::NotFound("private beach not found"),
         StateError::InvalidIdentifier(msg) => ApiError::BadRequest(msg),
+        StateError::InvalidLayout(msg) => ApiError::BadRequest(msg),
         StateError::Database(e) => {
             warn!(error = %e, "database error");
             ApiError::Conflict("database error")

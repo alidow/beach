@@ -15,6 +15,13 @@
       "when": 1738790400000,
       "tag": "0001_tile_layout_positions",
       "breakpoints": false
+    },
+    {
+      "idx": 2,
+      "version": "0002",
+      "when": 1738886400000,
+      "tag": "0002_canvas_layouts",
+      "breakpoints": false
     }
   ]
 }

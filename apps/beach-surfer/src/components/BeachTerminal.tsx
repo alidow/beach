@@ -297,6 +297,8 @@ export interface BeachTerminalProps {
   disableViewportMeasurements?: boolean;
   forcedViewportRows?: number | null;
   hideIdlePlaceholder?: boolean;
+  // Maximum render FPS for internal rAF-based updates; undefined or <=0 disables throttling
+  maxRenderFps?: number;
 }
 
 export interface TerminalViewportState {
@@ -306,6 +308,7 @@ export interface TerminalViewportState {
   hostCols: number | null;
   canSendResize: boolean;
   sendHostResize: () => void;
+  requestHostResize: (opts: { rows: number; cols?: number }) => void;
 }
 
 export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
@@ -331,6 +334,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     disableViewportMeasurements = false,
     forcedViewportRows = null,
   hideIdlePlaceholder = false,
+  maxRenderFps,
   } = props;
 
   const store = useMemo(() => providedStore ?? createTerminalStore(), [providedStore]);
@@ -449,12 +453,21 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       return;
     }
     let raf = 0;
+    const intervalMs = (() => {
+      if (typeof maxRenderFps !== 'number' || maxRenderFps <= 0) return 0;
+      const ms = 1000 / Math.max(1, Math.min(120, Math.floor(maxRenderFps)));
+      return ms;
+    })();
+    let lastTick = 0;
     const step = () => {
       const timestamp = now();
-      store.pruneAckedPredictions(timestamp, PREDICTION_ACK_GRACE_MS);
-      const update = predictionUxRef.current.tick(timestamp);
-      if (update) {
-        setPredictionOverlay(update);
+      if (!intervalMs || timestamp - lastTick >= intervalMs) {
+        lastTick = timestamp;
+        store.pruneAckedPredictions(timestamp, PREDICTION_ACK_GRACE_MS);
+        const update = predictionUxRef.current.tick(timestamp);
+        if (update) {
+          setPredictionOverlay(update);
+        }
       }
       raf = window.requestAnimationFrame(step);
     };
@@ -464,7 +477,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         window.cancelAnimationFrame(raf);
       }
     };
-  }, [store]);
+  }, [store, maxRenderFps]);
   const log = useCallback((message: string, detail?: Record<string, unknown>) => {
     if (typeof window === 'undefined' || !window.__BEACH_TRACE) {
       return;
@@ -483,7 +496,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     if (!transport) {
       return;
     }
-    const measuredRows = Math.max(1, Math.min(lastMeasuredViewportRows.current, MAX_VIEWPORT_ROWS));
+    const measuredRows = Math.max(2, Math.min(lastMeasuredViewportRows.current, MAX_VIEWPORT_ROWS));
     const snapshotNow = store.getSnapshot();
     const fallbackCols = snapshotNow.cols > 0 ? snapshotNow.cols : 80;
     const targetCols = Math.max(1, ptyColsRef.current ?? fallbackCols);
@@ -502,6 +515,31 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     }
   }, [MAX_VIEWPORT_ROWS, log, store]);
   sendHostResizeRef.current = sendHostResize;
+
+  // Explicit host resize API that bypasses lastMeasuredViewportRows and uses inputs.
+  const requestHostResize = useCallback(
+    (opts: { rows: number; cols?: number }) => {
+      const transport = transportRef.current;
+      if (!transport) {
+        return;
+      }
+      const rows = Math.max(2, Math.min(Math.floor(opts.rows), MAX_VIEWPORT_ROWS));
+      const snapshotNow = store.getSnapshot();
+      const fallbackCols = snapshotNow.cols > 0 ? snapshotNow.cols : 80;
+      const cols = Math.max(1, Math.floor(opts.cols ?? ptyColsRef.current ?? fallbackCols));
+      suppressNextResizeRef.current = true;
+      lastSentViewportRows.current = rows;
+      log('request_host_resize', { targetCols: cols, targetRows: rows, reason: 'explicit' });
+      try {
+        transport.send({ type: 'resize', cols, rows });
+      } catch (err) {
+        if (IS_DEV) {
+          console.warn('[beach-surfer] request_host_resize failed', err);
+        }
+      }
+    },
+    [MAX_VIEWPORT_ROWS, log, store],
+  );
 
   const emitViewportState = useCallback(() => {
     if (!onViewportStateChange) {
@@ -549,6 +587,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     onViewportStateChange({
       ...nextReport,
       sendHostResize: sendHostResizeRef.current,
+      requestHostResize,
     });
   }, [MAX_VIEWPORT_ROWS, onViewportStateChange, store]);
 

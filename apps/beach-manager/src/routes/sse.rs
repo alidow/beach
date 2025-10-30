@@ -41,7 +41,9 @@ pub async fn stream_controller_pairings(
     token: AuthToken,
     Path(controller_session_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    ensure_scope(&token, "pb:control.write")?;
+    if !(token.has_scope("pb:control.read") || token.has_scope("pb:sessions.read")) {
+        return Err(ApiError::Forbidden("pb:control.read"));
+    }
     let rx = state.subscribe_session(&controller_session_id).await;
     let stream = BroadcastStream::new(rx)
         .filter_map(|msg| match msg {

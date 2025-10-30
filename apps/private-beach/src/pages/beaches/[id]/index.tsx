@@ -2,17 +2,20 @@ import { useRouter } from 'next/router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAuth } from '@clerk/nextjs';
 import TopNav from '../../../components/TopNav';
-import TileCanvas from '../../../components/TileCanvas';
+import dynamic from 'next/dynamic';
+const CanvasSurface = dynamic(() => import('../../../components/CanvasSurface'), {
+  ssr: false,
+  loading: () => <div className="h-[520px] rounded-xl border border-border bg-card shadow-sm" />,
+});
 import SessionDrawer from '../../../components/SessionDrawer';
 import { Button } from '../../../components/ui/button';
 import AddSessionModal from '../../../components/AddSessionModal';
-import { Select } from '../../../components/ui/select';
 import {
   SessionSummary,
   listSessions,
   getBeachMeta,
-  getBeachLayout,
-  putBeachLayout,
+  getCanvasLayout,
+  putCanvasLayout,
   updateBeach,
   listControllerPairingsForControllers,
   createControllerPairing,
@@ -22,7 +25,8 @@ import {
   type SessionRole,
   type ControllerPairing,
 } from '../../../lib/api';
-import type { BeachLayout, ControllerUpdateCadence } from '../../../lib/api';
+import type { CanvasLayout, ControllerUpdateCadence } from '../../../lib/api';
+import type { BatchAssignmentResponse } from '../../../canvas';
 import { BeachSettingsProvider, ManagerSettings } from '../../../components/settings/BeachSettingsContext';
 import { BeachSettingsButton } from '../../../components/settings/SettingsButton';
 import { AgentExplorer } from '../../../components/AgentExplorer';
@@ -31,6 +35,79 @@ import { debugLog, debugStack } from '../../../lib/debug';
 import { useControllerPairingStreams } from '../../../hooks/useControllerPairingStreams';
 import { buildAssignmentModel } from '../../../lib/assignments';
 
+const DEFAULT_CANVAS_TILE_WIDTH = 448;
+const DEFAULT_CANVAS_TILE_HEIGHT = 448;
+const DEFAULT_CANVAS_TILE_GAP = 32;
+const AUTO_LAYOUT_COLUMNS = 4;
+
+function emptyCanvasLayout(): CanvasLayout {
+  const now = Date.now();
+  return {
+    version: 3,
+    viewport: { zoom: 1, pan: { x: 0, y: 0 } },
+    tiles: {},
+    agents: {},
+    groups: {},
+    controlAssignments: {},
+    metadata: { createdAt: now, updatedAt: now },
+  };
+}
+
+function ensureLayoutMetadata(layout: CanvasLayout | null): CanvasLayout {
+  if (!layout) {
+    return emptyCanvasLayout();
+  }
+  const createdAt = layout.metadata?.createdAt ?? Date.now();
+  const updatedAt = layout.metadata?.updatedAt ?? createdAt;
+  const normalizedTiles: CanvasLayout['tiles'] = {};
+  for (const [tileId, tile] of Object.entries(layout.tiles ?? {})) {
+    normalizedTiles[tileId] = {
+      kind: tile.kind ?? 'application',
+      id: tile.id ?? tileId,
+      position: tile.position ?? { x: 0, y: 0 },
+      size: tile.size ?? { width: DEFAULT_CANVAS_TILE_WIDTH, height: DEFAULT_CANVAS_TILE_HEIGHT },
+      zIndex: tile.zIndex ?? 1,
+      groupId: tile.groupId,
+      zoom: tile.zoom,
+      locked: tile.locked,
+      toolbarPinned: tile.toolbarPinned,
+    };
+  }
+  return {
+    version: 3,
+    viewport: layout.viewport ?? { zoom: 1, pan: { x: 0, y: 0 } },
+    tiles: normalizedTiles,
+    agents: layout.agents ?? {},
+    groups: layout.groups ?? {},
+    controlAssignments: layout.controlAssignments ?? {},
+    metadata: {
+      createdAt,
+      updatedAt,
+      migratedFrom: layout.metadata?.migratedFrom,
+    },
+  };
+}
+
+function withUpdatedTimestamp(layout: CanvasLayout): CanvasLayout {
+  const base = ensureLayoutMetadata(layout);
+  return {
+    ...base,
+    metadata: {
+      ...base.metadata,
+      updatedAt: Date.now(),
+    },
+  };
+}
+
+function computeAutoPosition(index: number) {
+  const column = index % AUTO_LAYOUT_COLUMNS;
+  const row = Math.floor(index / AUTO_LAYOUT_COLUMNS);
+  return {
+    x: column * (DEFAULT_CANVAS_TILE_WIDTH + DEFAULT_CANVAS_TILE_GAP),
+    y: row * (DEFAULT_CANVAS_TILE_HEIGHT + DEFAULT_CANVAS_TILE_GAP),
+  };
+}
+
 export default function BeachDashboard() {
   const router = useRouter();
   const { id } = router.query as { id?: string };
@@ -38,7 +115,7 @@ export default function BeachDashboard() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [layout, setLayout] = useState<BeachLayout>({ tiles: [], preset: 'grid2x2', layout: [] });
+  const [canvasLayout, setCanvasLayout] = useState<CanvasLayout | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [selected, setSelected] = useState<SessionSummary | null>(null);
   const [addOpen, setAddOpen] = useState(false);
@@ -61,6 +138,7 @@ export default function BeachDashboard() {
   const [assignmentPaneOpen, setAssignmentPaneOpen] = useState(false);
   const [assignmentSaving, setAssignmentSaving] = useState(false);
   const [assignmentError, setAssignmentError] = useState<string | null>(null);
+  const canvasLayoutRef = useRef<CanvasLayout | null>(null);
   const formatAssignmentError = useCallback((message: string) => {
     if (message === 'controller_pairing_api_unavailable') {
       return 'Controller pairing API is not enabled on this manager build yet. Coordinate with Track A or update your backend stubs.';
@@ -84,6 +162,10 @@ export default function BeachDashboard() {
 
   const managerUrl = managerSettings.managerUrl;
   const roadUrl = managerSettings.roadUrl;
+
+  useEffect(() => {
+    canvasLayoutRef.current = canvasLayout;
+  }, [canvasLayout]);
 
   const refreshManagerToken = useCallback(async () => {
     if (!isLoaded || !isSignedIn) {
@@ -202,6 +284,7 @@ export default function BeachDashboard() {
             'warn',
           );
           setError('Not authorized to load beach.');
+          setCanvasLayout(emptyCanvasLayout());
           return;
         }
         debugLog(
@@ -211,10 +294,27 @@ export default function BeachDashboard() {
             privateBeachId: id,
           },
         );
-        const meta = await getBeachMeta(id, token);
+        const meta = await getBeachMeta(id, token, managerSettings.managerUrl);
         if (!active) return;
         setBeachName(meta.name);
         setSettingsJson(meta.settings || {});
+        try {
+          const layoutResponse = await getCanvasLayout(id, token, managerSettings.managerUrl);
+          if (!active) return;
+          setCanvasLayout(ensureLayoutMetadata(layoutResponse));
+          setError(null);
+        } catch (layoutErr: any) {
+          debugLog(
+            'dashboard',
+            'canvas layout fetch failed',
+            {
+              privateBeachId: id,
+              error: layoutErr?.message ?? String(layoutErr),
+            },
+            'warn',
+          );
+          setCanvasLayout(emptyCanvasLayout());
+        }
       } catch (e: any) {
         if (!active) return;
         const message = e?.message ?? String(e);
@@ -230,18 +330,13 @@ export default function BeachDashboard() {
         if (message === 'not_found') setError('Beach not found');
         else if (message.includes('401')) setError('Not authorized to load beach.');
         else setError('Failed to load beach');
-      }
-      try {
-        const l = await getBeachLayout(id, managerToken);
-        if (active) setLayout(l);
-      } catch {
-        // ignore, keep default
+        setCanvasLayout(emptyCanvasLayout());
       }
     })();
     return () => {
       active = false;
     };
-  }, [id, isLoaded, isSignedIn, ensureManagerToken, managerToken]);
+  }, [id, isLoaded, isSignedIn, ensureManagerToken, managerSettings.managerUrl]);
 
   type RefreshOverride = { managerUrl?: string };
   type RefreshMetadata = Record<string, unknown>;
@@ -255,6 +350,53 @@ export default function BeachDashboard() {
     setAssignments([]);
   }, [id]);
 
+  const handleCanvasLayoutChange = useCallback((next: CanvasLayout) => {
+    const normalized = ensureLayoutMetadata(next);
+    canvasLayoutRef.current = normalized;
+    setCanvasLayout(normalized);
+  }, []);
+
+  const handleCanvasAssignmentError = useCallback(
+    (message: string | null) => {
+      setAssignmentError(message ? formatAssignmentError(message) : null);
+    },
+    [formatAssignmentError],
+  );
+
+  const persistCanvasLayout = useCallback(
+    async (next: CanvasLayout) => {
+      if (!id) return;
+      const normalized = ensureLayoutMetadata(next);
+      const previous = canvasLayoutRef.current;
+      canvasLayoutRef.current = normalized;
+      setCanvasLayout(normalized);
+      if (!managerToken) {
+        return;
+      }
+      try {
+        const saved = await putCanvasLayout(id, normalized, managerToken, managerSettings.managerUrl);
+        const ensured = ensureLayoutMetadata(saved);
+        canvasLayoutRef.current = ensured;
+        setCanvasLayout(ensured);
+      } catch (err) {
+        canvasLayoutRef.current = previous ?? normalized;
+        if (previous) {
+          setCanvasLayout(previous);
+        }
+        debugLog(
+          'layout',
+          'putCanvasLayout failed',
+          {
+            privateBeachId: id,
+            error: err instanceof Error ? err.message : String(err),
+          },
+          'warn',
+        );
+      }
+    },
+    [id, managerToken, managerSettings.managerUrl],
+  );
+
   const addTiles = useCallback(
     (sessionIds: string[]) => {
       if (!id) return;
@@ -262,26 +404,50 @@ export default function BeachDashboard() {
       if (filteredIds.length === 0) {
         return;
       }
-      let nextLayout: BeachLayout | null = null;
-      setLayout((prev) => {
-        const tiles = Array.from(new Set([...filteredIds, ...prev.tiles])).slice(0, 6);
-        const unchanged = tiles.length === prev.tiles.length && tiles.every((tile, index) => tile === prev.tiles[index]);
-        if (unchanged) {
-          return prev;
+      const sessionsById = new Map(sessions.map((session) => [session.session_id, session] as const));
+      let nextLayout: CanvasLayout | null = null;
+      setCanvasLayout((prev) => {
+        const base = ensureLayoutMetadata(prev);
+        const tiles = { ...base.tiles };
+        let changed = false;
+        let index = Object.keys(tiles).length;
+        for (const sessionId of filteredIds) {
+          if (tiles[sessionId]) {
+            continue;
+          }
+          const position = computeAutoPosition(index);
+          index += 1;
+          const session = sessionsById.get(sessionId);
+          tiles[sessionId] = {
+            id: sessionId,
+            kind: 'application',
+            position,
+            size: { width: DEFAULT_CANVAS_TILE_WIDTH, height: DEFAULT_CANVAS_TILE_HEIGHT },
+            zIndex: index,
+            zoom: 1,
+            locked: false,
+            toolbarPinned: false,
+          };
+          changed = true;
         }
-        const allowed = new Set(tiles);
-        const next = { ...prev, tiles, layout: prev.layout.filter((entry) => allowed.has(entry.id)) };
+        if (!changed) {
+          return prev ?? base;
+        }
+        const next = withUpdatedTimestamp({
+          ...base,
+          tiles,
+        });
         nextLayout = next;
         return next;
       });
-      if (nextLayout && managerToken) {
-        void putBeachLayout(id, nextLayout, managerToken).catch(() => {});
+      if (nextLayout) {
+        void persistCanvasLayout(nextLayout);
       }
       for (const sessionId of filteredIds) {
         knownSessionIds.current.add(sessionId);
       }
     },
-    [id, managerToken],
+    [id, managerToken, managerSettings.managerUrl, sessions, persistCanvasLayout],
   );
 
   const refresh = useCallback(
@@ -476,6 +642,38 @@ export default function BeachDashboard() {
     [id, settingsJson, managerSettings, defaultManagerUrl, refresh, ensureManagerToken],
   );
 
+  const handleCanvasAssignmentsUpdated = useCallback(
+    ({ agentId, targetIds, response }: { agentId: string; targetIds: string[]; response: BatchAssignmentResponse }) => {
+      const successes = response.results.filter((result) => result.ok);
+      if (successes.length === 0) {
+        return;
+      }
+      const pairings = response.results
+        .map((result) => result.pairing)
+        .filter((pairing): pairing is ControllerPairing => Boolean(pairing));
+      if (pairings.length > 0) {
+        setAssignments((prev) => {
+          const map = new Map(
+            prev.map((entry) => [`${entry.controller_session_id}|${entry.child_session_id}`, entry] as const),
+          );
+          for (const pairing of pairings) {
+            map.set(`${pairing.controller_session_id}|${pairing.child_session_id}`, pairing);
+          }
+          return Array.from(map.values());
+        });
+        return;
+      }
+      void refresh(undefined, {
+        source: 'canvas-surface',
+        reason: 'assignment-drop',
+        controllerId: agentId,
+        count: successes.length,
+        targetIds,
+      }).catch(() => {});
+    },
+    [refresh],
+  );
+
   const refreshRef = useRef(refresh);
   useEffect(() => {
     refreshRef.current = refresh;
@@ -544,54 +742,6 @@ export default function BeachDashboard() {
       .catch(() => {});
   }, [id, viewerToken, isLoaded, isSignedIn]);
 
-  const persistLayoutSnapshot = useCallback(
-    (items: BeachLayout['layout']) => {
-      if (!id) return;
-      setLayout((prev) => {
-        const stack = debugStack(1);
-        debugLog('layout', 'persist invoked', {
-          privateBeachId: id,
-          incomingCount: items.length,
-          stack,
-        });
-        const allowed = new Set(prev.tiles);
-        const filtered = items.filter((entry) => allowed.has(entry.id));
-        const unchanged =
-          filtered.length === prev.layout.length &&
-          filtered.every((entry, index) => {
-            const existing = prev.layout[index];
-            return (
-              !!existing &&
-              existing.id === entry.id &&
-              existing.x === entry.x &&
-              existing.y === entry.y &&
-              existing.w === entry.w &&
-              existing.h === entry.h
-            );
-          });
-        if (unchanged) {
-          debugLog('layout', 'persist skipped (unchanged)', {
-            privateBeachId: id,
-            tilesTracked: prev.tiles.length,
-            stack,
-          });
-          return prev;
-        }
-        const next = { ...prev, layout: filtered };
-        debugLog('layout', 'persist scheduled', {
-          privateBeachId: id,
-          tilesTracked: prev.tiles.length,
-          persistedCount: filtered.length,
-          layout: filtered.map(({ id: layoutId, x, y, w, h }) => ({ id: layoutId, x, y, w, h })),
-          stack,
-        });
-        void putBeachLayout(id, next, managerToken).catch(() => {});
-        return next;
-      });
-    },
-    [id, managerToken],
-  );
-
   const addTile = useCallback(
     (sessionId: string) => {
       addTiles([sessionId]);
@@ -602,38 +752,26 @@ export default function BeachDashboard() {
   const removeTile = useCallback(
     (sessionId: string) => {
       if (!id) return;
-      let nextLayout: BeachLayout | null = null;
-      setLayout((prev) => {
-        if (!prev.tiles.includes(sessionId)) {
-          return prev;
+      let nextLayout: CanvasLayout | null = null;
+      setCanvasLayout((prev) => {
+        const base = ensureLayoutMetadata(prev);
+        if (!base.tiles[sessionId]) {
+          return prev ?? base;
         }
-        const tiles = prev.tiles.filter((t) => t !== sessionId);
-        const allowed = new Set(tiles);
-        const next = { ...prev, tiles, layout: prev.layout.filter((entry) => allowed.has(entry.id)) };
+        const { [sessionId]: _omit, ...rest } = base.tiles;
+        const next = withUpdatedTimestamp({
+          ...base,
+          tiles: rest,
+        });
         nextLayout = next;
         return next;
       });
-      if (nextLayout && managerToken) {
-        void putBeachLayout(id, nextLayout, managerToken).catch(() => {});
+      if (nextLayout) {
+        void persistCanvasLayout(nextLayout);
       }
     },
-    [id, managerToken],
+    [id, persistCanvasLayout, managerToken],
   );
-
-  const changePreset = useCallback(
-    (preset: BeachLayout['preset']) => {
-      if (!id) return;
-      const next = { ...layout, preset, layout: [] };
-      setLayout(next);
-      putBeachLayout(id, next, managerToken).catch(() => {});
-    },
-    [id, layout, managerToken],
-  );
-
-  const tileSessions = useMemo(() => {
-    const byId = new Map(sessions.map((s) => [s.session_id, s] as const));
-    return layout.tiles.map((id) => byId.get(id)).filter(Boolean) as SessionSummary[];
-  }, [sessions, layout.tiles]);
 
   const sessionById = useMemo(() => new Map(sessions.map((s) => [s.session_id, s])), [sessions]);
   const assignmentModel = useMemo(
@@ -645,6 +783,15 @@ export default function BeachDashboard() {
   const assignmentsByAgent = assignmentModel.assignmentsByAgent;
   const assignmentsByApplication = assignmentModel.assignmentsByApplication;
   const sessionRoles = assignmentModel.roles;
+
+  const tileSessions = useMemo(() => {
+    if (!canvasLayout) return [] as SessionSummary[];
+    const order = Object.keys(canvasLayout.tiles);
+    const map = new Map(sessions.map((session) => [session.session_id, session] as const));
+    return order
+      .map((sessionId) => map.get(sessionId))
+      .filter((entry): entry is SessionSummary => Boolean(entry));
+  }, [canvasLayout, sessions]);
 
   const controllerSessionIds = useMemo(
     () => agentSessions.map((agent) => agent.session_id),
@@ -881,7 +1028,7 @@ export default function BeachDashboard() {
 
   return (
     <BeachSettingsProvider value={settingsContextValue}>
-      <div className="min-h-screen">
+      <div className="flex min-h-screen flex-col">
         <TopNav
           currentId={id}
           onSwitch={(v) => router.push(`/beaches/${v}`)}
@@ -894,15 +1041,6 @@ export default function BeachDashboard() {
               >
                 {sidebarOpen ? 'Hide Explorer' : 'Show Explorer'}
               </Button>
-              <Select
-                value={layout.preset}
-                onChange={(v) => changePreset(v as any)}
-                options={[
-                  { value: 'grid2x2', label: 'Layout: Grid' },
-                  { value: 'onePlusThree', label: 'Layout: 1+3' },
-                  { value: 'focus', label: 'Layout: Focus' },
-                ]}
-              />
               <Button variant="outline" onClick={() => setAddOpen(true)}>Add</Button>
               <Button
                 onClick={() => {
@@ -916,7 +1054,7 @@ export default function BeachDashboard() {
             </div>
           }
         />
-        <div className="flex flex-col gap-3 p-3 md:flex-row">
+        <div className="flex flex-1 min-h-0 flex-col md:flex-row">
           {sidebarOpen && (
             <div className="w-full md:w-[320px] md:flex-none">
               <AgentExplorer
@@ -937,28 +1075,32 @@ export default function BeachDashboard() {
               />
             </div>
           )}
-          <div className="flex-1 min-w-0">
+          <div className="flex-1 min-w-0 flex flex-col min-h-0">
             {error && <div className="mb-2 rounded-md border border-red-500/40 bg-red-500/10 p-2 text-sm text-red-600 dark:text-red-400">{error}</div>}
             {assignmentError && !assignmentPaneOpen && (
               <div className="mb-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-sm text-amber-700 dark:text-amber-300">
                 {assignmentError}
               </div>
             )}
-            <TileCanvas
-              tiles={tileSessions}
-              onRemove={removeTile}
-              onSelect={onSelect}
-              viewerToken={viewerToken}
-              managerUrl={managerUrl}
-              preset={layout.preset}
-              savedLayout={layout.layout}
-              onLayoutPersist={persistLayoutSnapshot}
-              roles={sessionRoles}
-              assignmentsByAgent={assignmentsByAgent}
-              assignmentsByApplication={assignmentsByApplication}
-              onRequestRoleChange={handleRoleChange}
-              onOpenAssignment={handleOpenAssignment}
-            />
+            <div className="flex-1 min-h-0">
+              <CanvasSurface
+                tiles={tileSessions}
+                agents={agentSessions}
+                layout={canvasLayout}
+                onLayoutChange={handleCanvasLayoutChange}
+                onPersistLayout={persistCanvasLayout}
+                onRemove={removeTile}
+                onSelect={onSelect}
+                privateBeachId={id ?? null}
+                managerToken={managerToken}
+                managerUrl={managerUrl}
+                viewerToken={viewerToken}
+                handlers={{
+                  onAssignAgent: handleCanvasAssignmentsUpdated,
+                  onAssignmentError: handleCanvasAssignmentError,
+                }}
+              />
+            </div>
           </div>
         </div>
         <SessionDrawer open={drawerOpen} onOpenChange={setDrawerOpen} session={selected} managerUrl={managerUrl} token={managerToken} />

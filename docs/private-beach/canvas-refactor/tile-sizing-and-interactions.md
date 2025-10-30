@@ -1,6 +1,6 @@
 # Private Beach Canvas — Tile Sizing, Drag/Drop, and Grouping Research
 
-_Last reviewed: 2025-06-09 (Codex). See appended log at end of file for future updates._
+_Last reviewed: 2025-06-09 (Codex, post-review). See appended log at end of file for future updates._
 
 ## 1. Purpose
 - Consolidate the long-running tile sizing issues (see `docs/private-beach/tile-sizing-issues/`) and translate them into requirements for the free-form canvas effort.
@@ -26,7 +26,7 @@ _Last reviewed: 2025-06-09 (Codex). See appended log at end of file for future u
 ## 4. Tile Sizing Strategy (Free-Form Canvas)
 
 ### 4.1 Measurement Pipeline
-1. **Driver mount (off-screen):** When a tile mounts, spin up the live preview inside an off-screen container (`position:absolute; pointer-events:none; opacity:0; width:0; height:0`). This instance negotiates WebRTC, receives PTY frames, and exposes accurate `hostCols/hostRows`.
+1. **Driver mount (off-screen):** When a tile mounts, spin up the live preview inside an off-screen container (`position:absolute; pointer-events:none; opacity:0; width:0; height:0`). This instance negotiates WebRTC, receives PTY frames, and exposes accurate `hostCols/hostRows`. Set `disableViewportMeasurements` and apply `contain: size` so driver DOM never contributes to layout observers.
 2. **Snapshot metrics:** Once metadata arrives, compute the unscaled host pixel dimensions using the existing helper (`estimateHostSize` equivalent) but store the raw values for reference.
 3. **Scale calculation:**
    ```ts
@@ -43,12 +43,13 @@ _Last reviewed: 2025-06-09 (Codex). See appended log at end of file for future u
    - Allow an override for tiles that are manually resized or locked; in that case, use the explicit size instead of the max bounds.
 4. **Visible preview:** Render a visible clone inside a wrapper with fixed dimensions (`width: targetWidth; height: targetHeight`). Apply `transform: scale(scale)` to the live preview content. Because the wrapper owns the scaled dimensions, React Flow’s node bounding box equals `targetWidth/Height`.
 5. **State propagation:** Emit a `previewReady` event carrying `{ targetWidth, targetHeight, scale, hostCols, hostRows, measuredAt }`. The canvas state stores this as `tile.preview.measurements`.
-6. **Persistence:** Persist `widthPx/heightPx` in the new `CanvasLayout` schema using the `targetWidth/Height`. Include `contentScale` (for future debugging) but treat it as derived.
+6. **Persistence:** Persist `widthPx/heightPx` in the new `CanvasLayout` schema using the `targetWidth/Height`. Include `contentScale` (for diagnostics) but treat it as derived.
+7. **Host resize API:** When a tile is locked or a user requests host fit, call `requestHostResize({ rows, cols })` with values derived from `targetWidth/Height` and host metadata. Debounce to avoid bursts while the host is already resizing.
 
 ### 4.2 Runtime Adjustments
-- **Host resizing:** If the host announces new PTY dimensions, recompute the scale. Smoothly animate size changes (CSS transition ~120 ms) to avoid abrupt jumps.
+- **Host resizing:** If the host announces new PTY dimensions, recompute the scale, bump a `measurementVersion`, and smooth the transition (CSS ~120 ms).
 - **Manual resize:** When a user resizes a tile (future feature), update an explicit `manualSize` override. Downscale content proportionally unless locked.
-- **Locked tiles:** Keep the last persisted `targetWidth/Height`; on host changes, do not auto-resize unless `autoResize === true`.
+- **Locked tiles:** Keep the last persisted `targetWidth/Height`; on host changes, issue `requestHostResize` with locked dimensions instead of recomputing scale.
 - **Viewport zoom:** Canvas-level zoom multiplies all node positions/sizes visually but does not mutate `targetWidth/Height`. Persist zoom separately (`viewport.zoom`).
 
 ### 4.3 Accessibility & Performance
@@ -141,16 +142,16 @@ _Last reviewed: 2025-06-09 (Codex). See appended log at end of file for future u
 - Maintain high-contrast outlines for selected nodes; ensure border thickness scales with zoom (via CSS transform compensation).
 
 ## 10. Open Questions
-1. **Group assignment batching:** Do we need a backend endpoint to assign an agent to an entire group atomically? Current API requires per-session calls.
-2. **Viewport persistence vs. user preference:** Should we store distinct zoom levels per user or per beach? Need product decision.
-3. **Tile resize handles:** Are manual resize controls in scope for v1 of the canvas? Impacts sizing persistence and UX complexity.
-4. **Real-time collaboration:** If two users edit simultaneously, how do we reconcile tile positions? Out of scope now but influences data model (etag vs. CRDT).
-5. **Snap-to-grid option:** Do power users still want optional snapping? Could provide toggle without reintroducing RGL constraints.
+1. **Viewport persistence vs. user preference:** Should we store distinct zoom levels per user or per beach? Need product decision.
+2. **Tile resize handles:** Are manual resize controls in scope for v1 of the canvas? Impacts sizing persistence and UX complexity.
+3. **Real-time collaboration:** If two users edit simultaneously, how do we reconcile tile positions? Out of scope now but influences data model (etag vs. CRDT).
+4. **Snap-to-grid option:** Do power users still want optional snapping? Could provide toggle without reintroducing RGL constraints.
+5. **Preview throttling thresholds:** Finalize FPS budgets (for example, 15fps for background tiles) and confirm UX impact.
 
 ## 11. Recommended Next Steps
-1. Prototype the off-screen driver + scaled preview pipeline within the existing grid to validate measurement math before migrating to React Flow.
-2. Begin defining React Flow node types with size/position props influenced by the measurement state described above.
-3. Work with backend to confirm layout v3 schema additions (size, scale, group padding) and controller pairing batching requirements.
+1. Implement the refactored SessionTerminal preview (driver + clone + `requestHostResize`) directly in the new canvas codepath.
+2. Define React Flow node types with size/position props influenced by the measurement state described above.
+3. Work with backend to finalize layout v3 schema additions (size, scale, group padding) and the batch controller assignment endpoint.
 4. Align with design on grouping visuals, drop affordances, and keyboard interaction patterns.
 
 ---
@@ -158,3 +159,4 @@ _Last reviewed: 2025-06-09 (Codex). See appended log at end of file for future u
 ### Appendix A — Research Log
 
 - **2025-06-09 (Codex):** Consolidated legacy tile sizing issues, proposed off-screen measurement strategy for canvas, defined drag/drop/grouping behaviours, and highlighted open backend questions.
+- **2025-06-09 (Codex):** Incorporated critical review feedback—locked in explicit `requestHostResize`, added measurement versioning, preview throttling, and aligned sizing plan with aggressive greenfield canvas rollout.

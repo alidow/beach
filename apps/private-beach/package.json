@@ -15,6 +15,7 @@
     "test:e2e:resize": "playwright test tests/e2e/tile-resize-hud",
     "test:e2e:ui": "playwright test --ui",
     "test:e2e:headed": "playwright test --headed",
+    "test:perf": "tsx tests/scripts/canvas-perf.ts",
     "postinstall": "node scripts/copy-wasm.js",
     "db:generate": "drizzle-kit generate --config drizzle.config.ts",
     "db:migrate": "drizzle-kit push --config drizzle.config.ts"
@@ -30,7 +31,8 @@
     "react": "18.3.1",
     "react-dom": "18.3.1",
     "react-grid-layout": "^1.4.4",
-    "react-resizable": "^3.0.5"
+    "react-resizable": "^3.0.5",
+    "reactflow": "^11.10.4"
   },
   "devDependencies": {
     "@clerk/clerk-sdk-node": "^4.13.23",

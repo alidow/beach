@@ -4,14 +4,14 @@
 - Replace the current `react-grid-layout` dashboard with a free-form canvas that supports zoom/pan, arbitrary tile placement, grouping, and agent assignment via drag-and-drop.
 - Adopt **React Flow** as the core canvas engine after a structured evaluation against `react-konva` and `pixi-react`, leveraging its mature ecosystem, built-in interaction primitives, and TypeScript support.
 - Introduce a unified scene graph that models tiles, agents, and groups as nodes with composable behaviours, backed by a new persistence schema that captures absolute positioning, z-order, and membership.
-- Ship incrementally behind a feature flag: first deliver rendering parity, then layering interactions (drag, zoom, grouping, agent control), conclude with polish, migration tooling, and documentation.
-- Maintain backwards compatibility through layout versioning and data migration scripts, plus extensive automated and manual validation before general release.
+- Build the canvas as the new default experience (greenfield replacement of the grid), decommissioning legacy layout codepaths as part of the initial release.
+- Stand up a dedicated persistence/API surface for the canvas graph (layout version 3) including group metadata, z-order, assignments, and viewport state.
 
 ## Goals
 - Provide a fluid canvas where tiles occupy arbitrary coordinates, support smooth zoom/pan, and maintain consistent rendering of existing tile content.
 - Enable drag-and-drop workflows: assign agents as controllers when a tile/group is dropped on them; build application groups by dropping applications onto each other.
 - Deliver ergonomic group affordances (visual border, stacked cards, group metadata) and treat groups as first-class draggable entities.
-- Persist the new layout state (positions, scale, group membership, controller bindings) while remaining compatible with legacy layouts during rollout.
+- Persist the new layout state (positions, scale, group membership, controller bindings) via the canvas graph and retire legacy grid schemas.
 - Preserve or improve on current performance, accessibility, keyboard support, and error handling.
 
 ## Non-Goals
@@ -45,8 +45,8 @@
   - Support both pointer and keyboard accessibility, including focus management and ARIA roles.
   - Integrate with Clerk auth token refresh flow and existing data fetching routines with minimal disruption.
 - **Persistence & Sync**
-  - Introduce layout version `3` capturing absolute pixel coordinates (`xPx`, `yPx`), zoom scale, and group definitions.
-  - Support reversible migration path from grid-based layout (v1/v2) to canvas-based layout (v3).
+  - Define layout version `3` as the authoritative canvas graph: absolute coordinates (`xPx`, `yPx`), z-order, grouping, node sizing metadata, and viewport state.
+  - Remove hard-coded caps (current 12-tile limit) and support 50+ nodes per beach.
   - Save operations must remain idempotent and atomic; server should validate schemas and reject invalid graphs.
 - **Observability**
   - Emit analytics for key interactions (zoom, drag, drop, group create/destroy, assignment).
@@ -59,12 +59,7 @@
   - Provides parent/child nodes (nested nodes) that we can leverage for groups without re-implementing hit-testing.
   - Lightweight DOM/SVG rendering keeps accessibility manageable versus pure canvas APIs.
   - Compatible with Next.js via dynamic import; SSR guard patterns documented by maintainers.
-- **Evaluation criteria:** accessibility, performance, feature fit (zoom, grouping), API ergonomics, licensing, community adoption, and maintenance cadence.
-- **Structured prototype plan:**
-  1. **Spike A (React Flow):** Render sample tile (terminal preview) inside custom node; implement pan/zoom, drop-to-group interactions using parent nodes; confirm nested drag events and custom controls integrate cleanly with existing state.
-  2. **Spike B (React Konva):** Rebuild the same scenario with `react-konva`, assess text/DOM embedding challenges, keyboard accessibility, and interop cost of replicating controls/menus.
-  3. **Spike C (PixiJS via `@pixi/react`):** Validate render quality and performance, note the overhead of rebuilding UI primitives (buttons/toolbars) in WebGL.
-  4. Score each spike against criteria; document trade-offs and finalize decision (default expectation: React Flow unless critical gaps surface).
+- **Evaluation outcome:** React Flow outranked alternatives on accessibility, grouping support, and ecosystem health; we treat that decision as final for the first release.
 
 | Criterion | React Flow | React Konva | Pixi React |
 | --- | --- | --- | --- |
@@ -128,8 +123,8 @@
   - Provide context menu or command palette entry to ungroup/remove.
 - **Agent Assignment**
   - Drag tile/group onto agent; highlight valid drop target.
-  - On drop, call `createControllerPairing` with the appropriate session IDs; update `controlAssignments` state optimistically.
-  - If group dropped, create pairings for each member tile (batch request) or update backend design to accept group-level assignment.
+  - On drop, invoke the batch controller assignment endpoint with the tile or group payload; update `controlAssignments` state optimistically from the response.
+  - Batch responses must expose per-session status so the UI can surface partial failures.
   - Show assignment status (loading, success, error) via inline UI (badge, toast).
 - **Selection & Keyboard**
   - Click selects node; `Esc` clears selection; arrow keys nudge by configurable step (e.g., 10px).
@@ -137,18 +132,30 @@
 - **Undo/Redo (Stretch)**
   - Capture interaction history for undo/redo to ease user mistakes; consider local-only history to start.
 
+## Terminal Integration & Host Resize
+- **Dual-instance strategy refined**
+  - Keep the off-screen driver for transport + telemetry, but disable its viewport measurements (`disableViewportMeasurements` + `contain: size` wrappers) so device height never collapses to 0/1 rows.
+  - Visible clone remains the only element contributing DOM dimensions; clone wrapper owns the scaled size (`targetWidth/Height`) and exposes those measurements to the canvas.
+- **Deterministic host resize**
+  - Introduce a `requestHostResize({ rows, cols })` API on `BeachTerminal` so callers pass explicit targets derived from the visible clone rather than reusing the driver’s last measurement.
+  - Session tiles compute target rows/cols using host metadata + zoom overrides; when a tile is locked or snapped, we invoke the API with those explicit values.
+  - Debounce resize requests and version them with the latest host metadata to avoid race conditions when the PTY changes mid-measurement.
+- **Measurement stability**
+  - Track a `measurementVersion` and discard stale measurements if host dimensions change before persistence completes.
+  - When host metadata updates, recompute scale and propagate new `targetWidth/Height`; animate transitions to avoid flicker.
+- **Performance guardrails**
+  - Suspend rendering work for off-screen tiles via `IntersectionObserver` (driver stays connected but clone throttles re-renders).
+  - Downsample preview frame rate for unfocused tiles (e.g., requestAnimationFrame throttled to 15fps) to keep CPU/GPU within budget for 50+ sessions.
+
 ## Persistence & API Changes
 - **Backend Schema**
-  - Extend `BeachLayoutItem` to include optional `canvas` payload or introduce separate `CanvasLayout` JSON column.
-  - Persist groups and agent assignments server-side; ensure APIs validate membership constraints.
-  - Versioning: `layoutVersion: 3` indicates canvas layout. Fallback to grid layout when version < 3.
-- **Migration Strategy**
-  - Implement server-side migration utility: convert grid coordinates into pixel positions using previous column width/row height calculations.
-  - Default group assignments to none; maintain existing controller pairings.
-  - Allow users to opt into new canvas via feature flag; maintain ability to revert to grid (avoid destructive migrations until GA).
+  - Introduce a dedicated `canvas_layouts` table/column storing the full graph (`CanvasLayout` JSON) keyed by beach.
+  - Persist groups, tiles, agents, assignments, z-order, and viewport state directly in this schema; treat legacy `layout` arrays as deprecated.
+  - Versioning: enforce `layoutVersion: 3`. Reject older versions at write time and provide a one-time conversion script if legacy data must be brought forward.
 - **API Contracts**
-  - Update `getBeachLayout` / `putBeachLayout` to accept and return new schema; maintain compatibility by including both `layout` array (legacy) and `canvasLayout` object during transition.
-  - Document new endpoints or payloads in `docs/private-beach/data-model.md`.
+  - Replace `getBeachLayout` / `putBeachLayout` payloads with the canvas graph (no mixed-mode responses).
+  - Add batch controller pairing endpoint to accept group assignments atomically.
+  - Document schema and validation rules in `docs/private-beach/data-model.md`; update client `lib/api.ts` types accordingly.
 
 ## Grouping & Agent Control Flow
 - **Group Lifecycle**
@@ -159,47 +166,23 @@
 - **Agent Binding**
   - On drop: evaluate target type (agent vs. tile/group).
   - API calls:
-    - Tile target: existing `createControllerPairing(sessionId, agentId)`.
-    - Group target: call for each member (batched) or extend backend to accept group assignment (investigate).
+    - Tile target: call the batch controller assignment endpoint with a single-member list.
+    - Group target: send the full member list in one request; handle per-session success/failure results.
   - Update agent node to show controlling tile(s); allow quick jump to tile.
   - Handle failure states gracefully (rollback UI, toast message).
 - **Concurrency**
   - Lock layout during save to prevent conflicting updates (client-level flag); consider backend conflict detection (etag).
 
-## Implementation Phases & Milestones
-- **Phase 0 — Discovery & Spikes**
-  - Catalog current tile types, data dependencies, and external interactions.
-  - Execute library spikes (React Flow, Konva, Pixi), document findings, finalise stack decision.
-  - Define UX prototypes (Figma or similar) for grouping visuals and control assignments.
-  - Exit criteria: documented evaluation, approved UX mocks, signed-off architecture.
-- **Phase 1 — Infrastructure & Data Layer**
-  - Add layout version 3 schema to backend and API clients.
-  - Implement migration utilities and feature flag gating.
-  - Create `CanvasSurface` scaffold with React Flow integrated, rendering static tiles without interactions.
-  - Exit criteria: canvas renders existing layout (converted) read-only behind flag.
-- **Phase 2 — Core Interactions**
-  - Implement pan/zoom controls, basic drag-and-drop with free positioning.
-  - Persist positions via new schema; ensure optimistic updates and revert on errors.
-  - Add selection handling, keyboard navigation, and focus management.
-  - Exit criteria: parity with existing grid (single-tile positioning, zoom) under flag.
-- **Phase 3 — Grouping & Agent Drops**
-  - Implement grouping logic, visuals, drag behaviour, and persistence.
-  - Wire drag-to-agent assignment flow, API integration, and UI feedback.
-  - Add z-order controls and drop target affordances.
-  - Exit criteria: full feature set functioning for internal testers.
-- **Phase 4 — Polish & Hardening**
-  - Add undo/redo (if in scope), context menus, tooltips, onboarding messaging.
-  - Boost telemetry, error handling, loading states, and offline protection.
-  - Expand automated tests, integration tests (Playwright), and performance profiling.
-  - Exit criteria: QA sign-off, performance budgets met, documentation updated.
-- **Phase 5 — Rollout**
-  - Enable beta for select beaches; monitor telemetry and error rates.
-  - Provide migration fallback path and guard rails (toggle flag in manager settings).
-  - Graduate to GA after stability window; retire old grid code once all tenants migrated.
+## Execution Approach
+- **Immediately retire the grid**: remove `react-grid-layout` dependencies and replace `TileCanvas` entry point with the React Flow-powered `CanvasSurface`.
+- **Deliver full canvas baseline**: implement node rendering, free-form positioning, viewport pan/zoom, and persistence wiring before layering additional UX flourishes.
+- **Integrate advanced behaviours as first-class features**: grouping, agent assignment, undo/redo, and keyboard interaction built into the initial release instead of incremental toggles.
+- **Back the build with automated validation**: add Jest/RTL unit suites for reducers/utilities, Playwright flows for DnD/grouping, and load/perf harnesses targeting 50+ tiles.
+- **Cut legacy code and feature flags**: delete v1/v2 layout handling, SSE/grid-specific branches, and deprecated UI controls once canvas functionality is merged.
 
 ## Testing & Quality Strategy
 - **Unit Tests**
-  - Scene graph reducers (Zustand selectors), migration utilities, grouping algorithms, collision detection.
+  - Scene graph reducers (Zustand selectors), sizing/measurement utilities, grouping algorithms, collision detection.
 - **Integration Tests**
   - React Testing Library for drag/drop flows (use `@testing-library/user-event` + mocked React Flow hooks).
   - Playwright E2E verifying pan/zoom, grouping, agent assignment, persistence.
@@ -213,22 +196,20 @@
 - **Observability**
   - Instrument events (`canvas.drag.start`, `canvas.group.create`, `canvas.assignment.success`, etc.) with Beach analytics.
 
-## Rollout Strategy
-- Feature flag in app settings (e.g., `canvasLayoutEnabled`).
-- Beta cohort (internal teams) to validate workflows; collect feedback.
-- Gradually migrate beaches by default while allowing manual rollback for defined window.
-- Monitor telemetry dashboards (error rates, layout save failures, assignment latency).
-- Sunset plan: once stable, delete grid layout components, mark API fields deprecated, and run cleanup migration.
+## Deployment Strategy
+- Canvas becomes the default dashboard immediately after merge; legacy grid routes/components are deleted in the same change set.
+- Run one-time data conversion (if needed) during deployment to translate any existing layouts into the new canvas graph, with automated validation.
+- Monitor telemetry dashboards (error rates, layout save failures, assignment latency) and gate rollout behind automated smoke checks in CI/CD.
 
 ## Risks & Mitigations
-- **Library limitations:** React Flow may have constraints around nested draggable nodes. Mitigation: confirm via spike, contribute upstream or implement custom drag handlers if needed.
+- **Library limitations:** React Flow may have constraints around nested draggable nodes. Mitigation: validate with automated integration tests early and contribute upstream or implement custom drag handlers if gaps surface.
 - **Performance degradation:** Free-form layout could cause overdraw. Mitigation: virtualization, memoization, throttle updates, offload heavy rendering (terminal preview remains canvas-based but optimize re-render).
-- **Migration data loss:** Improper conversion could misplace tiles. Mitigation: snapshot backups, idempotent migration scripts, allow manual adjustments before GA.
 - **Complexity creep:** Group and assignment logic may balloon. Mitigation: maintain clear separation of concerns, unit-test algorithms, document flows.
 - **Accessibility regressions:** Canvas interactions risk excluding keyboard users. Mitigation: design keyboard-first navigation, follow WAI-ARIA guidelines, test early.
 - **Backend bottlenecks:** Increased layout payload size may strain APIs. Mitigation: compress JSON if needed, enforce payload limits, optimize serialization.
 
 ## Open Questions
+- How do we want to expose a deterministic host-resize API so locked tiles resize hosts using visible clone measurements (not zero-sized driver metrics)?
 - Should group assignment to agents imply atomic backend operation (single request) or remain multiple pairings? Need backend input.
 - What are the desired UX affordances for creating agents directly on canvas (if future requirement)?
 - Do we require persistent z-order controls (send to back/front) or auto-manage based on interaction history?
@@ -236,9 +217,10 @@
 - Are there analytics or audit constraints requiring server-side logging of drag events beyond layout saves?
 
 ## Next Steps
-- Validate this plan with stakeholders (design, backend, product) and confirm scope.
-- Kick off Phase 0 tasks: schedule spikes, gather UX mocks, and draft migration RFC for backend.
-- Establish tracking issues/epics in project management tooling reflecting phase milestones.
+- Lock architecture with design/backend leads; confirm React Flow + canvas schema decision.
+- Spec and implement the new backend contracts (canvas graph storage, batch controller pairing) alongside client scaffolding.
+- Replace `TileCanvas` with the React Flow `CanvasSurface`, wiring measurement/host-resize plumbing per the sizing plan.
+- Stand up automated test suites (unit + Playwright) and perf harnesses before declaring feature complete.
 
 ## References
 - Current grid implementation: `apps/private-beach/src/components/TileCanvas.tsx`.

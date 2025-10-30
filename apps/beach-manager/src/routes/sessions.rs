@@ -191,7 +191,9 @@ pub async fn list_controller_pairings_route(
     token: AuthToken,
     Path(controller_session_id): Path<String>,
 ) -> ApiResult<Vec<ControllerPairing>> {
-    ensure_scope(&token, "pb:control.write")?;
+    if !(token.has_scope("pb:control.read") || token.has_scope("pb:sessions.read")) {
+        return Err(ApiError::Forbidden("pb:control.read"));
+    }
     let pairings = state
         .list_controller_pairings(&controller_session_id)
         .await
@@ -481,6 +483,7 @@ fn map_state_err(err: StateError) -> ApiError {
         }
         StateError::PrivateBeachNotFound => ApiError::NotFound("private beach not found"),
         StateError::InvalidIdentifier(msg) => ApiError::BadRequest(msg),
+        StateError::InvalidLayout(msg) => ApiError::BadRequest(msg),
         StateError::Database(e) => {
             error!(error = %e, "database operation failed");
             ApiError::Conflict("database error")

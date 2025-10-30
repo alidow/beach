@@ -249,7 +249,6 @@ function normalizeLayoutItems(input: unknown): BeachLayoutItem[] {
     if (layoutVersion !== null) item.layoutVersion = layoutVersion;
     clean.push(item);
     seen.add(id);
-    if (clean.length >= 12) break;
   }
   return clean;
 }
@@ -566,28 +565,163 @@ export async function getBeachMeta(id: string, token: string | null, baseUrl?: s
   return res.json();
 }
 
-export async function getBeachLayout(id: string, _token: string | null): Promise<BeachLayout> {
-  const res = await fetch(`/api/layout/${encodeURIComponent(id)}`);
-  if (!res.ok) throw new Error(`getBeachLayout failed ${res.status}`);
-  const data = await res.json();
+// ---- Canvas Layout (v3) API ----
+
+export type CanvasLayout = {
+  version: 3;
+  viewport: { zoom: number; pan: { x: number; y: number } };
+  tiles: Record<
+    string,
+    {
+      id: string;
+      kind: 'application';
+      position: { x: number; y: number };
+      size: { width: number; height: number };
+      zIndex: number;
+      groupId?: string;
+      zoom?: number;
+      locked?: boolean;
+      toolbarPinned?: boolean;
+    }
+  >;
+  agents: Record<
+    string,
+    {
+      id: string;
+      position: { x: number; y: number };
+      size: { width: number; height: number };
+      zIndex: number;
+      icon?: string;
+      status?: 'idle' | 'controlling';
+    }
+  >;
+  groups: Record<
+    string,
+    {
+      id: string;
+      name?: string;
+      memberIds: string[];
+      position: { x: number; y: number };
+      size: { width: number; height: number };
+      zIndex: number;
+      collapsed?: boolean;
+      padding?: number;
+    }
+  >;
+  controlAssignments: Record<string, { controllerId: string; targetType: 'tile' | 'group'; targetId: string }>;
+  metadata: { createdAt: number; updatedAt: number; migratedFrom?: number };
+};
+
+export async function getCanvasLayout(id: string, token: string | null, baseUrl?: string): Promise<CanvasLayout> {
+  const res = await fetch(`${base(baseUrl)}/private-beaches/${id}/layout`, {
+    headers: authHeaders(token),
+  });
+  if (!res.ok) throw new Error(`getCanvasLayout failed ${res.status}`);
+  const data = (await res.json()) as Partial<CanvasLayout>;
+  if (data.version !== 3) {
+    throw new Error('invalid canvas layout: version');
+  }
+  const tiles: CanvasLayout['tiles'] = {};
+  for (const [tileId, raw] of Object.entries(data.tiles ?? {})) {
+    tiles[tileId] = {
+      kind: 'application',
+      id: raw?.id ?? tileId,
+      position: raw?.position ?? { x: 0, y: 0 },
+      size: raw?.size ?? { width: 0, height: 0 },
+      zIndex: raw?.zIndex ?? 1,
+      groupId: raw?.groupId,
+      zoom: raw?.zoom,
+      locked: raw?.locked,
+      toolbarPinned: raw?.toolbarPinned,
+    };
+  }
+  const groups: CanvasLayout['groups'] = {};
+  for (const [groupId, raw] of Object.entries(data.groups ?? {})) {
+    groups[groupId] = {
+      id: raw?.id ?? groupId,
+      name: raw?.name,
+      memberIds: Array.isArray(raw?.memberIds) ? raw.memberIds : [],
+      position: raw?.position ?? { x: 0, y: 0 },
+      size: raw?.size ?? { width: 0, height: 0 },
+      zIndex: raw?.zIndex ?? 1,
+      collapsed: raw?.collapsed,
+      padding: typeof raw?.padding === 'number' ? raw.padding : 16,
+    };
+  }
   return {
-    preset: (data.preset || 'grid2x2') as BeachLayout['preset'],
-    tiles: Array.isArray(data.tiles) ? data.tiles : [],
-    layout: normalizeLayoutItems(data.layout),
+    version: 3,
+    viewport: data.viewport ?? { zoom: 1, pan: { x: 0, y: 0 } },
+    tiles,
+    agents: data.agents ?? {},
+    groups,
+    controlAssignments: data.controlAssignments ?? {},
+    metadata: data.metadata ?? { createdAt: Date.now(), updatedAt: Date.now() },
   };
 }
 
-export async function putBeachLayout(id: string, layout: BeachLayout, _token: string | null): Promise<void> {
-  const res = await fetch(`/api/layout/${encodeURIComponent(id)}`, {
+export async function putCanvasLayout(
+  id: string,
+  layout: CanvasLayout,
+  token: string | null,
+  baseUrl?: string,
+): Promise<CanvasLayout> {
+  const res = await fetch(`${base(baseUrl)}/private-beaches/${id}/layout`, {
     method: 'PUT',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      preset: layout.preset,
-      tiles: layout.tiles,
-      layout: normalizeLayoutItems(layout.layout),
-    }),
+    headers: authHeaders(token),
+    body: JSON.stringify(layout),
   });
-  if (!res.ok) throw new Error(`putBeachLayout failed ${res.status}`);
+  if (!res.ok) throw new Error(`putCanvasLayout failed ${res.status}`);
+  const data = (await res.json()) as CanvasLayout;
+  if (data.version !== 3) {
+    throw new Error('invalid canvas layout: version');
+  }
+  const groups: CanvasLayout['groups'] = {};
+  for (const [groupId, raw] of Object.entries(data.groups ?? {})) {
+    groups[groupId] = {
+      ...raw,
+      id: raw?.id ?? groupId,
+      memberIds: Array.isArray(raw?.memberIds) ? raw.memberIds : [],
+      padding: typeof raw?.padding === 'number' ? raw.padding : 16,
+    };
+  }
+  return { ...data, groups };
+}
+
+// ---- Batch Controller Assignment (manager) ----
+
+export type ControllerAssignment = {
+  controller_session_id: string;
+  child_session_id: string;
+  prompt_template?: string | null;
+  update_cadence?: ControllerUpdateCadence;
+};
+
+export type ControllerAssignmentResult = {
+  controller_session_id: string;
+  child_session_id: string;
+  ok: boolean;
+  error?: string;
+  pairing?: ControllerPairing;
+};
+
+export async function batchControllerAssignments(
+  privateBeachId: string,
+  assignments: ControllerAssignment[],
+  token: string | null,
+  baseUrl?: string,
+): Promise<ControllerAssignmentResult[]> {
+  if (!Array.isArray(assignments) || assignments.length === 0) {
+    throw new Error('assignments array required');
+  }
+  const res = await fetch(`${base(baseUrl)}/private-beaches/${privateBeachId}/controller-assignments/batch`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify({ assignments }),
+  });
+  if (!res.ok) throw new Error(`batchControllerAssignments failed ${res.status}`);
+  const data = await res.json();
+  const results = Array.isArray(data?.results) ? data.results : [];
+  return results as ControllerAssignmentResult[];
 }
 
 export async function updateBeach(id: string, patch: { name?: string; slug?: string; settings?: any }, token: string | null, baseUrl?: string): Promise<BeachMeta> {

@@ -72,6 +72,7 @@ enum Backend {
 struct InnerState {
     sessions: RwLock<HashMap<String, SessionRecord>>,
     pairings: RwLock<HashMap<String, Vec<ControllerPairing>>>,
+    canvas_layouts: RwLock<HashMap<String, crate::routes::CanvasLayout>>,
 }
 
 #[derive(Debug, Clone)]
@@ -435,6 +436,8 @@ pub enum StateError {
     PrivateBeachNotFound,
     #[error("invalid identifier: {0}")]
     InvalidIdentifier(String),
+    #[error("invalid layout: {0}")]
+    InvalidLayout(String),
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("redis error: {0}")]
@@ -1355,6 +1358,8 @@ impl AppState {
         &self,
         controller_session_id: &str,
     ) -> Result<Vec<ControllerPairing>, StateError> {
+        // Reads are allowed even when no controller lease is active so that viewer dashboards
+        // can inspect pairing assignments without being connected as a controller.
         match &self.backend {
             Backend::Memory => {
                 let record = {
@@ -1362,10 +1367,6 @@ impl AppState {
                     sessions.get(controller_session_id).cloned()
                 }
                 .ok_or(StateError::SessionNotFound)?;
-
-                if record.controller_token.is_none() {
-                    return Err(StateError::ControllerLeaseRequired);
-                }
 
                 let pairings = self.fallback.list_pairings(controller_session_id).await;
                 let label0 = record.private_beach_id.clone();
@@ -1379,16 +1380,6 @@ impl AppState {
                 let identifiers = self
                     .fetch_session_identifiers(pool, &controller_uuid)
                     .await?;
-                let lease = match self.fetch_active_lease(pool, identifiers.session_id).await {
-                    Ok(row) => row,
-                    Err(StateError::ControllerMismatch) => {
-                        return Err(StateError::ControllerLeaseRequired)
-                    }
-                    Err(err) => return Err(err),
-                };
-                if !is_active_lease(lease.expires_at, lease.revoked_at) {
-                    return Err(StateError::ControllerLeaseRequired);
-                }
 
                 let mut tx = pool.begin().await?;
                 self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
@@ -2786,12 +2777,107 @@ impl AppState {
     }
 }
 
+fn legacy_layout_to_canvas(
+    layout_value: Option<&serde_json::Value>,
+    now_ms: i64,
+) -> crate::routes::CanvasLayout {
+    let mut tiles = HashMap::new();
+    if let Some(items) = layout_value
+        .and_then(|value| value.get("layout"))
+        .and_then(|value| value.as_array())
+    {
+        for item in items {
+            let id = item
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let Some(id) = id else { continue; };
+            let grid_x = item.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
+            let grid_y = item.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
+            let grid_w = item.get("w").and_then(|v| v.as_f64()).unwrap_or(2.0).max(1.0);
+            let grid_h = item.get("h").and_then(|v| v.as_f64()).unwrap_or(2.0).max(1.0);
+            let width_px = item
+                .get("widthPx")
+                .and_then(|v| v.as_f64())
+                .map(|v| v.max(50.0))
+                .unwrap_or_else(|| grid_w * 320.0);
+            let height_px = item
+                .get("heightPx")
+                .and_then(|v| v.as_f64())
+                .map(|v| v.max(50.0))
+                .unwrap_or_else(|| grid_h * 240.0);
+            let zoom = item.get("zoom").and_then(|v| v.as_f64());
+            let locked = item.get("locked").and_then(|v| v.as_bool());
+            let toolbar_pinned = item.get("toolbarPinned").and_then(|v| v.as_bool());
+
+            tiles.insert(
+                id.clone(),
+                crate::routes::CanvasTileNode {
+                    id,
+                    position: crate::routes::CanvasPoint {
+                        x: (grid_x * 320.0).round(),
+                        y: (grid_y * 240.0).round(),
+                    },
+                    size: crate::routes::CanvasSize {
+                        width: width_px.round(),
+                        height: height_px.round(),
+                    },
+                    z_index: 1,
+                    group_id: None,
+                    zoom,
+                    locked,
+                    toolbar_pinned,
+                },
+            );
+        }
+    }
+
+    crate::routes::CanvasLayout {
+        version: 3,
+        viewport: crate::routes::CanvasViewport::default(),
+        tiles,
+        agents: HashMap::new(),
+        groups: HashMap::new(),
+        control_assignments: HashMap::new(),
+        metadata: crate::routes::CanvasMetadata {
+            created_at: now_ms,
+            updated_at: now_ms,
+            migrated_from: Some(2),
+        },
+    }
+        .ensure_version()
+        .unwrap_or_else(|_| crate::routes::CanvasLayout::empty(now_ms))
+}
+
 impl InnerState {
     fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
             pairings: RwLock::new(HashMap::new()),
+            canvas_layouts: RwLock::new(HashMap::new()),
         }
+    }
+
+    async fn get_canvas_layout(
+        &self,
+        beach_id: &str,
+        now_ms: i64,
+    ) -> crate::routes::CanvasLayout {
+        let layouts = self.canvas_layouts.read().await;
+        layouts
+            .get(beach_id)
+            .cloned()
+            .unwrap_or_else(|| crate::routes::CanvasLayout::empty(now_ms))
+    }
+
+    async fn set_canvas_layout(
+        &self,
+        beach_id: impl Into<String>,
+        layout: crate::routes::CanvasLayout,
+    ) {
+        let mut layouts = self.canvas_layouts.write().await;
+        layouts.insert(beach_id.into(), layout);
     }
 
     async fn ensure_session(
@@ -4279,40 +4365,80 @@ impl AppState {
         &self,
         id_str: &str,
         account: Option<Uuid>,
-    ) -> Result<crate::routes::BeachLayout, StateError> {
-        let meta = self.get_private_beach(id_str, account).await?;
-        let layout = meta
-            .settings
-            .get("layout")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({ "preset": "grid2x2", "tiles": [] }));
-        let preset = layout
-            .get("preset")
-            .and_then(|v| v.as_str())
-            .unwrap_or("grid2x2")
-            .to_string();
-        let tiles = layout
-            .get("tiles")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|t| t.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_else(|| Vec::new());
-        Ok(crate::routes::BeachLayout { preset, tiles })
+    ) -> Result<crate::routes::CanvasLayout, StateError> {
+        let now_ms = Utc::now().timestamp_millis();
+        match &self.backend {
+            Backend::Memory => Ok(self.fallback.get_canvas_layout(id_str, now_ms).await),
+            Backend::Postgres(pool) => {
+                let meta = self.get_private_beach(id_str, account).await?;
+                let id = parse_uuid(id_str, "id")?;
+                let mut tx = pool.begin().await?;
+                if let Some(a) = account {
+                    self.set_account_context_tx(&mut tx, Some(&a)).await?;
+                } else {
+                    self.set_account_context_tx(&mut tx, None).await?;
+                }
+                self.set_rls_context_tx(&mut tx, &id).await?;
+                let row: Option<Json<serde_json::Value>> = sqlx::query_scalar(
+                    r#"
+                    SELECT layout
+                    FROM surfer_canvas_layout
+                    WHERE private_beach_id = $1
+                    "#,
+                )
+                .bind(id)
+                .fetch_optional(tx.as_mut())
+                .await?;
+
+                let layout = if let Some(Json(value)) = row {
+                    let layout: crate::routes::CanvasLayout = serde_json::from_value(value)?;
+                    layout
+                        .ensure_version()
+                        .map_err(StateError::InvalidLayout)?
+                } else {
+                    let migrated = legacy_layout_to_canvas(meta.settings.get("layout"), now_ms);
+                    let payload = serde_json::to_value(&migrated)?;
+                    sqlx::query(
+                        r#"
+                        INSERT INTO surfer_canvas_layout (private_beach_id, layout, updated_at)
+                        VALUES ($1, $2, NOW())
+                        ON CONFLICT (private_beach_id)
+                        DO UPDATE SET layout = EXCLUDED.layout, updated_at = NOW()
+                        "#,
+                    )
+                    .bind(id)
+                    .bind(Json(payload))
+                    .execute(tx.as_mut())
+                    .await?;
+                    migrated
+                };
+
+                tx.commit().await?;
+                Ok(layout)
+            }
+        }
     }
 
     pub async fn put_private_beach_layout(
         &self,
         id_str: &str,
-        preset: String,
-        tiles: Vec<String>,
+        layout: crate::routes::CanvasLayout,
         account: Option<Uuid>,
-    ) -> Result<(), StateError> {
+    ) -> Result<crate::routes::CanvasLayout, StateError> {
+        let now_ms = Utc::now().timestamp_millis();
+        let layout = layout
+            .ensure_version()
+            .map_err(StateError::InvalidLayout)?
+            .with_updated_timestamp(now_ms);
+
         let pool = match &self.backend {
             Backend::Postgres(p) => p,
-            Backend::Memory => return Ok(()),
+            Backend::Memory => {
+                self.fallback
+                    .set_canvas_layout(id_str.to_string(), layout.clone())
+                    .await;
+                return Ok(layout);
+            }
         };
         let id = parse_uuid(id_str, "id")?;
         let mut tx = pool.begin().await?;
@@ -4345,22 +4471,21 @@ impl AppState {
             }
         }
 
-        // Upsert settings->'layout'
-        let layout = serde_json::json!({ "preset": preset, "tiles": tiles });
+        let payload = serde_json::to_value(&layout)?;
         sqlx::query(
             r#"
-            UPDATE private_beach
-            SET settings = jsonb_set(COALESCE(settings, '{}'::jsonb), '{layout}', $2::jsonb, true),
-                updated_at = NOW()
-            WHERE id = $1
+            INSERT INTO surfer_canvas_layout (private_beach_id, layout, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (private_beach_id)
+            DO UPDATE SET layout = EXCLUDED.layout, updated_at = NOW()
             "#,
         )
         .bind(id)
-        .bind(Json(layout).0)
+        .bind(Json(payload))
         .execute(tx.as_mut())
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(layout)
     }
 }
 

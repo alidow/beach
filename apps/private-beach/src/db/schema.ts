@@ -36,3 +36,59 @@ export const tileLayouts = pgTable('surfer_tile_layout', {
 
 export type TileLayout = typeof tileLayouts.$inferSelect;
 export type NewTileLayout = typeof tileLayouts.$inferInsert;
+
+// Canvas layout (v3) persisted as a JSON graph per beach.
+export type CanvasLayoutJson = {
+  version: 3;
+  viewport: { zoom: number; pan: { x: number; y: number } };
+  tiles: Record<
+    string,
+    {
+      id: string;
+      kind: 'application';
+      position: { x: number; y: number };
+      size: { width: number; height: number };
+      zIndex: number;
+      groupId?: string;
+      zoom?: number;
+      locked?: boolean;
+      toolbarPinned?: boolean;
+    }
+  >;
+  agents: Record<
+    string,
+    {
+      id: string;
+      position: { x: number; y: number };
+      size: { width: number; height: number };
+      zIndex: number;
+      icon?: string;
+      status?: 'idle' | 'controlling';
+    }
+  >;
+  groups: Record<
+    string,
+    {
+      id: string;
+      name?: string;
+      memberIds: string[];
+      position: { x: number; y: number };
+      size: { width: number; height: number };
+      zIndex: number;
+      collapsed?: boolean;
+    }
+  >;
+  controlAssignments: Record<string, { controllerId: string; targetType: 'tile' | 'group'; targetId: string }>;
+  metadata: { createdAt: number; updatedAt: number; migratedFrom?: number };
+};
+
+export const canvasLayouts = pgTable('surfer_canvas_layout', {
+  privateBeachId: text('private_beach_id').primaryKey(),
+  layout: jsonb('layout').$type<CanvasLayoutJson>().notNull().default(sql`'{}'::jsonb`),
+  updatedAt: timestamp('updated_at', { withTimezone: true })
+    .notNull()
+    .default(sql`now()`),
+});
+
+export type CanvasLayoutRow = typeof canvasLayouts.$inferSelect;
+export type NewCanvasLayoutRow = typeof canvasLayouts.$inferInsert;

@@ -28,7 +28,7 @@ services:
     networks:
       - beach-network
   beach-manager:
-    image: rust:1.82-slim-bullseye
+    image: rustlang/rust:nightly@sha256:5766e2ac4aec7297945133b9cebb031acea6964b204b175868279a9a87ab5a95
     container_name: beach-manager
     working_dir: /app
     command: ["cargo", "run", "-p", "beach-manager"]
@@ -54,7 +54,7 @@ services:
     networks:
       - beach-network
   beach-road:
-    image: rust:1.82-slim-bullseye
+    image: rustlang/rust:nightly@sha256:5766e2ac4aec7297945133b9cebb031acea6964b204b175868279a9a87ab5a95
     container_name: beach-road
     working_dir: /app
     command: ["cargo", "run", "-p", "beach-road"]
@@ -191,7 +191,7 @@ services:
     networks:
       - beach-network
   beach-lifeguard:
-    image: rust:1.82-slim-bullseye
+    image: rustlang/rust:nightly@sha256:5766e2ac4aec7297945133b9cebb031acea6964b204b175868279a9a87ab5a95
     container_name: beach-lifeguard
     profiles: ["lifeguard"]
     working_dir: /app

@@ -466,17 +466,16 @@ function PrivateBeachSandboxPage() {
   const viewerStateOverrides = useMemo(() => {
     const overrides: Record<string, TerminalViewerState> = {};
     for (const [sessionId, fixtureKey] of config.terminalFixtureEntries) {
-      const lines = resolveTerminalFixture(fixtureKey);
-      if (!lines) {
+      const fixture = resolveTerminalFixture(fixtureKey);
+      if (!fixture) {
         console.warn('[sandbox-debug] missing terminal fixture', { sessionId, fixtureKey });
         continue;
       }
       console.info('[sandbox-debug] apply terminal fixture', {
         sessionId,
         fixtureKey,
-        lineCount: lines.length,
       });
-      overrides[sessionId] = createStaticTerminalViewer(Array.from(lines), { viewportRows: 24 });
+      overrides[sessionId] = createStaticTerminalViewer(fixture, { viewportRows: 24 });
     }
     return overrides;
   }, [config.terminalFixtureEntries]);

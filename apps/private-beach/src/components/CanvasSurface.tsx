@@ -46,6 +46,7 @@ import {
 } from '../canvas/state';
 import type { CanvasLayout as ApiCanvasLayout } from '../lib/api';
 import { emitTelemetry } from '../lib/telemetry';
+import { buildViewerStateFromTerminalDiff, extractTerminalStateDiff } from '../lib/terminalHydrator';
 
 const SessionTerminalPreview = dynamic(
   () => import('./SessionTerminalPreview').then((mod) => mod.SessionTerminalPreview),
@@ -372,7 +373,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     managerUrl,
     viewerToken,
     viewerOverrides,
-    viewerStateOverrides,
+    viewerStateOverrides: viewerStateOverridesProp,
   } = props;
   const reactFlow = useReactFlow();
   const { load, setNodes, setViewport, setSelection } = useCanvasActions();
@@ -408,6 +409,41 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
 
   const sessionMap = useMemo(() => new Map(tiles.map((session) => [session.session_id, session] as const)), [tiles]);
   const agentMap = useMemo(() => new Map(agents.map((session) => [session.session_id, session] as const)), [agents]);
+
+  const autoViewerStateOverrides = useMemo<Record<string, TerminalViewerState>>(() => {
+    if (!tiles || tiles.length === 0) {
+      return {};
+    }
+    const overrides: Record<string, TerminalViewerState> = {};
+    for (const session of tiles) {
+      try {
+        const diff = extractTerminalStateDiff(session.metadata);
+        if (!diff) {
+          continue;
+        }
+        const viewerState = buildViewerStateFromTerminalDiff(diff);
+        if (viewerState) {
+          overrides[session.session_id] = viewerState;
+        }
+      } catch (err) {
+        console.warn('[canvas-surface] terminal preview hydration failed', {
+          sessionId: session.session_id,
+          error: err instanceof Error ? err.message : err,
+        });
+      }
+    }
+    return overrides;
+  }, [tiles]);
+
+  const effectiveViewerStateOverrides = useMemo<Record<string, TerminalViewerState | null | undefined>>(() => {
+    if (!viewerStateOverridesProp || Object.keys(viewerStateOverridesProp).length === 0) {
+      return autoViewerStateOverrides;
+    }
+    return {
+      ...autoViewerStateOverrides,
+      ...viewerStateOverridesProp,
+    };
+  }, [autoViewerStateOverrides, viewerStateOverridesProp]);
 
   const syncStore = useCallback(
     (next: SharedCanvasLayout) => {
@@ -678,7 +714,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
           managerUrl,
           viewerToken,
           credentialOverride: viewerOverrides?.[tile.id] ?? null,
-          viewerOverride: viewerStateOverrides?.[tile.id] ?? null,
+          viewerOverride: effectiveViewerStateOverrides[tile.id] ?? null,
           privateBeachId,
           onMeasurements: handleTileMeasurements,
         } satisfies TileNodeData,
@@ -751,7 +787,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     }
 
     return nodes;
-  }, [activeDragNodeId, agentMap, handleTileMeasurements, hoverTarget, layout.agents, layout.groups, layout.tiles, managerUrl, onRemove, onSelect, privateBeachId, selectionSet, sessionMap, viewerOverrides, viewerStateOverrides, viewerToken]);
+  }, [activeDragNodeId, agentMap, handleTileMeasurements, hoverTarget, layout.agents, layout.groups, layout.tiles, managerUrl, onRemove, onSelect, privateBeachId, selectionSet, sessionMap, viewerOverrides, effectiveViewerStateOverrides, viewerToken]);
 
   const edges = useMemo<RFEdge[]>(() => [], []);
 

@@ -21,6 +21,7 @@ import { Button } from './ui/button';
 import { useSessionTerminal, type TerminalViewerState } from '../hooks/useSessionTerminal';
 import { emitTelemetry } from '../lib/telemetry';
 import { extractSessionTitle } from '../lib/sessionMetadata';
+import { buildViewerStateFromTerminalDiff, extractTerminalStateDiff } from '../lib/terminalHydrator';
 
 const AutoGrid = dynamic(() => import('./AutoGrid'), {
   ssr: false,
@@ -1336,6 +1337,41 @@ export default function TileCanvas({
     });
     return initial;
   });
+
+  const autoViewerOverrides = useMemo<Record<string, TerminalViewerState>>(() => {
+    if (!tiles || tiles.length === 0) {
+      return {};
+    }
+    const overrides: Record<string, TerminalViewerState> = {};
+    for (const session of tiles) {
+      try {
+        const diff = extractTerminalStateDiff(session.metadata);
+        if (!diff) {
+          continue;
+        }
+        const viewerState = buildViewerStateFromTerminalDiff(diff);
+        if (viewerState) {
+          overrides[session.session_id] = viewerState;
+        }
+      } catch (err) {
+        console.warn('[tile-canvas] terminal preview hydration failed', {
+          sessionId: session.session_id,
+          error: err instanceof Error ? err.message : err,
+        });
+      }
+    }
+    return overrides;
+  }, [tiles]);
+
+  const effectiveViewerOverrides = useMemo<Record<string, TerminalViewerState | null | undefined>>(() => {
+    if (!viewerOverrides || Object.keys(viewerOverrides).length === 0) {
+      return autoViewerOverrides;
+    }
+    return {
+      ...autoViewerOverrides,
+      ...viewerOverrides,
+    };
+  }, [autoViewerOverrides, viewerOverrides]);
 
   const tileStateRef = useRef<TileStateMap>(tileState);
   const prevTileStateRef = useRef<TileStateMap>({});
@@ -2945,7 +2981,7 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
               onViewerStateChange={handleViewerStateChange}
               isExpanded={isExpanded}
               className="session-grid-item"
-              viewerOverride={viewerOverrides?.[session.session_id] ?? null}
+              viewerOverride={effectiveViewerOverrides[session.session_id] ?? null}
             />
           );
         })}

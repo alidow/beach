@@ -42,7 +42,8 @@ _Last updated: 2025-03-31_
 | D | Short-circuited `handleTileMeasurements` when measurement unchanged. | Loop persisted because parent layout still cloned. |
 | E | Added guard in `updateLayout` to skip no-op clones. | Eliminated measurement-driven remounts. |
 | F | Introduced reuse logic in `useSessionTerminal` to keep existing WebRTC connection if deps unchanged. | **Regression:** Hook cleanup removed event listeners before reuse path exited, leaving transport open but inert. |
-| G | Added decision logging + strict-mode guard + in-memory connection cache to survive remounts. | **Current:** Dev/prod still remount the tree; cached transport is reused but listeners/store never rebind → blank preview. |
+| G | Added decision logging + strict-mode guard + in-memory connection cache to survive remounts. | Partial – cache keeps channel open but listeners/store still lost on remount (blank preview). |
+| H | Replaced `useSessionTerminal` with shared connection manager + per-key terminal store. Added sandbox Playwright spec. | Sandbox fixture renders reliably and survives interactions; need to validate against live manager sessions. |
 
 Key log snippets (from `temp/private-beach.log`):
 
@@ -59,13 +60,11 @@ Key log snippets (from `temp/private-beach.log`):
 1. `SessionTerminalPreviewClient` unmounts repeatedly:
    - React Strict Mode in dev intentionally mounts → unmounts → remounts.
    - Canvas layout tweaks (resize, drag, viewport measurement) also trigger unmount/remount cycles.
-2. The hook now consults an in-memory connection cache. When the component remounts it finds the
-   cached transport and returns early, but the listener bundle (and grid store viewport) are not
-   reattached, so we never process `frame` events.
-3. Result: WebRTC connection is stable (no reconnect spam), yet terminal content stays blank and
-   the placeholder never clears.
-4. Sandbox page (`/dev/private-beach-sandbox`) with `skipApi=1` and a static terminal fixture shows
-   the same behaviour, providing a fast repro without manager services.
+2. Connection manager now owns the WebRTC transport + `TerminalGridStore` per key. React mounts just
+   subscribe/unsubscribe; the transport stays alive across remounts. Sandbox fixture (Playwright) verifies
+   the placeholder clears and content persists on click.
+3. Still outstanding: confirm live manager sessions stream frames with the new manager, and sniff logs for
+   any missed listener detaches.
 
 ---
 
@@ -80,24 +79,15 @@ Zero restarts and live terminal feed even when layout updates happen. New connec
 
 ### Plan (rev 2)
 
-1. **Extract a connection manager module** shared across mounts.
-   - Keyed by `{sessionId, managerUrl, token, overrides}`.
-   - Owns the live `BrowserTransportConnection`, refcount, keep-alive timeout, and listener bundles.
-   - Provides `acquire()` / `release()` so React components only bind/unbind listeners.
-2. **Rebind listeners + store on every mount.**
-   - Even when reusing a cached connection, always attach `frame`, `open`, `close`, etc. handlers and
-     resynchronise the `TerminalGridStore` viewport.
-   - Ensure Strict Mode cleanup simply calls `release()` without tearing down the shared transport.
-3. **Stabilise viewport + measurements.**
-   - When remounting, immediately resend the last known viewport to avoid the preview entering an
-     empty state before frames resume.
-4. **Automated repro:**
-   - Finish Playwright spec (`apps/private-beach/tests/e2e/private-beach-sandbox.spec.ts`) that loads
-     the sandbox fixture and asserts the banner text renders before any interactions.
-   - Extend spec to drag/resize the tile and confirm the content persists (no reconnect placeholder).
-
-Once this architecture is in place we can remove most of the ad-hoc logging and rely on the spec +
-tile telemetry for regressions.
+1. ✅ **Connection manager**: implemented in `sessionTerminalManager.ts`. React components now subscribe
+   to a per-key entry that owns the transport, listeners, reconnection loop, and terminal store. Strict Mode
+   cleanup simply decrements a refcount; keep-alive timers close idle transports after 15s.
+2. ✅ **Listener/store reuse**: every subscriber receives the same `TerminalGridStore`, and listeners are
+   attached exactly once per connection. Heartbeat latency updates continue to flow to hooks.
+3. ✅ **Automated repro**: sandbox Playwright spec (`private-beach-sandbox.spec.ts`) loads a static fixture,
+   waits for the placeholder to disappear, and verifies the banner text survives a tile click.
+4. ⏳ **Live session validation**: still need to exercise the dashboard against real manager + surfer,
+   confirm frame streaming, and ensure placeholders disappear under resize/drag.
 
 ---
 
@@ -125,14 +115,10 @@ tile telemetry for regressions.
 
 ## 7. Next Actions for New Engineer
 
-1. Build the shared connection manager (see §5 rev 2) and migrate `useSessionTerminal` to it.
-2. Verify in sandbox:
-   - Load `/dev/private-beach-sandbox?skipApi=1&sessions=sandbox-session|application|Sandbox Fixture&terminalFixtures=sandbox-session:pong-lhs`.
-   - Confirm placeholder clears and fixture banner renders.
-   - Drag/resize the tile; ensure no reconnect placeholder and log shows reuse path.
-3. Run Playwright spec `private-beach-sandbox.spec.ts` (with the dev server running on port 3000).
-4. Re-test production dashboard against real manager to confirm live frames flow.
-5. Update this log again once the fix is validated (expect to remove the placeholder warning).
+1. ✅ Connection manager deployed; hook now delegates lifecycle to it (`sessionTerminalManager.ts`).
+2. ✅ Sandbox validation passes via Playwright spec.
+3. ⏳ Exercise real manager sessions to confirm frames stream and latencies update after drag/resize.
+4. ⏳ Iterate on additional Playwright coverage (e.g., drag/resize once transporter fix confirmed).
 
 ### Reproduction Commands
 

@@ -1,0 +1,42 @@
+{
+  "sequence": 7,
+  "payload": {
+    "type": "terminal_full",
+    "rows": 4,
+    "cols": 4,
+    "lines": ["+--+", "|  |", "|[]|", "+--+"],
+    "styles": [
+      { "id": 0, "fg": 0, "bg": 0, "attrs": 0 },
+      { "id": 1, "fg": 37788927, "bg": 0, "attrs": 0 },
+      { "id": 2, "fg": 48820479, "bg": 0, "attrs": 0 },
+      { "id": 3, "fg": 50312770, "bg": 0, "attrs": 0 }
+    ],
+    "styled_lines": [
+      [
+        { "ch": "+", "style": { "id": 1 } },
+        { "ch": "-", "style": { "id": 1 } },
+        { "ch": "-", "style": { "id": 1 } },
+        { "ch": "+", "style": { "id": 1 } }
+      ],
+      [
+        { "ch": "|", "style": { "id": 1 } },
+        { "ch": " ", "style": { "id": 2 } },
+        { "ch": " ", "style": { "id": 2 } },
+        { "ch": "|", "style": { "id": 1 } }
+      ],
+      [
+        { "ch": "|", "style": { "id": 1 } },
+        { "ch": "[", "style": { "id": 3 } },
+        { "ch": "]", "style": { "id": 3 } },
+        { "ch": "|", "style": { "id": 1 } }
+      ],
+      [
+        { "ch": "+", "style": { "id": 1 } },
+        { "ch": "-", "style": { "id": 1 } },
+        { "ch": "-", "style": { "id": 1 } },
+        { "ch": "+", "style": { "id": 1 } }
+      ]
+    ],
+    "cursor": null
+  }
+}

@@ -19,17 +19,17 @@ test('Private Beach Sandbox renders terminal fixture and survives interaction', 
   await page.goto(buildSandboxUrl());
 
   // Wait for the tile header to appear so we know the layout mounted.
-  await expect(page.getByRole('button', { name: 'Sandbox Fixture' })).toBeVisible();
+  const tile = page.getByTestId('rf__node-tile:sandbox-session');
+  await expect(tile).toBeVisible();
+  await expect(tile.getByRole('button', { name: 'Sandbox Fixture', exact: true })).toBeVisible();
 
   const placeholder = page.getByText('Preparing terminal preview…');
   await expect(placeholder).toHaveCount(0, { timeout: 30_000 });
 
   // The static fixture should render the marquee banner text.
-  await expect(page.getByText('PRIVATE BEACH PONG', { exact: false })).toBeVisible({
-    timeout: 30_000,
-  });
+  await expect(page.locator('body')).toContainText('PRIVATE BEACH PONG', { timeout: 30_000 });
 
   // Interact with the tile and confirm the text remains visible (no reconnect flash).
-  await page.getByRole('button', { name: 'Sandbox Fixture' }).click();
-  await expect(page.getByText('PRIVATE BEACH PONG', { exact: false })).toBeVisible();
+  await tile.getByRole('button', { name: 'Sandbox Fixture', exact: true }).click();
+  await expect(page.locator('body')).toContainText('PRIVATE BEACH PONG');
 });

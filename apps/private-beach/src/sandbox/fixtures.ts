@@ -1,5 +1,5 @@
-import pongLhsFixture from '../tests/fixtures/pong-lhs-terminal.json';
-import pongLhsStyledFixture from '../tests/fixtures/pong-lhs-terminal-styled.json';
+import pongLhsFixture from './fixtures-data/pong-lhs-terminal.json';
+import pongLhsStyledFixture from './fixtures-data/pong-lhs-terminal-styled.json';
 import type { TerminalStateDiff, TerminalFramePayload } from '../lib/terminalHydrator';
 
 type TerminalFixture = readonly string[] | TerminalStateDiff | TerminalFramePayload;

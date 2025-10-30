@@ -662,6 +662,12 @@ function TileCard({
     ? { width: view.preview.targetWidth, height: view.preview.targetHeight }
     : view.measurements;
   const zoomDisplay = view.locked ? MAX_UNLOCKED_ZOOM : clampZoom(view.zoom, clampMeasurement);
+  const sessionName = useMemo(() => extractSessionTitle(session.metadata), [session.metadata]);
+  const shortSessionId = useMemo(() => session.session_id.slice(0, 8), [session.session_id]);
+  const dragGripClass = sessionName
+    ? 'pointer-events-auto session-tile-drag-grip flex min-w-0 flex-col items-start gap-1 text-left text-muted-foreground'
+    : 'pointer-events-auto session-tile-drag-grip flex items-center gap-2 text-[10px] uppercase tracking-[0.36em] text-muted-foreground';
+
   if (typeof window !== 'undefined') {
     try {
       console.info(
@@ -787,6 +793,38 @@ function TileCard({
     [onPreviewStatusChange, session.session_id],
   );
 
+  const [copyState, setCopyState] = useState<'idle' | 'copied'>('idle');
+
+  const handleCopySessionId = useCallback(() => {
+    if (typeof navigator === 'undefined' || !navigator.clipboard) {
+      console.warn('[tile] clipboard API unavailable');
+      return;
+    }
+    navigator.clipboard
+      .writeText(session.session_id)
+      .then(() => {
+        setCopyState('copied');
+      })
+      .catch((error) => {
+        console.error('[tile] failed to copy session id', {
+          sessionId: session.session_id,
+          error,
+        });
+      });
+  }, [session.session_id]);
+
+  useEffect(() => {
+    if (copyState !== 'copied') {
+      return;
+    }
+    const timeout = window.setTimeout(() => {
+      setCopyState('idle');
+    }, 1500);
+    return () => {
+      window.clearTimeout(timeout);
+    };
+  }, [copyState]);
+
   if (typeof window !== 'undefined') {
     try {
       console.info('[tile-layout] render-state', {
@@ -884,8 +922,8 @@ function TileCard({
               harnessType={session.harness_type}
               className="w-full"
               onHostResizeStateChange={onHostResizeStateChange}
-              onViewportDimensions={handlePreviewViewportDimensions}
-              onPreviewStatusChange={handlePreviewStatusChange}
+          onViewportDimensions={handlePreviewViewportDimensions}
+          onPreviewStatusChange={handlePreviewStatusChange}
           onPreviewMeasurementsChange={handlePreviewMeasurements}
           fontSize={fontSize}
           scale={zoomDisplay}
@@ -1068,7 +1106,7 @@ const SessionTile = forwardRef<HTMLDivElement, SessionTileProps>(
       className,
       style,
       viewerOverride,
-      cachedDiff,
+      cachedDiff = null,
     },
     ref,
   ) => {
@@ -1097,44 +1135,6 @@ const SessionTile = forwardRef<HTMLDivElement, SessionTileProps>(
   );
 
   const effectiveViewer = effectiveOverride ?? viewer;
-
-  const sessionName = useMemo(() => extractSessionTitle(session.metadata), [session.metadata]);
-  const shortSessionId = useMemo(() => session.session_id.slice(0, 8), [session.session_id]);
-  const dragGripClass = sessionName
-    ? 'pointer-events-auto session-tile-drag-grip flex min-w-0 flex-col items-start gap-1 text-left text-muted-foreground'
-    : 'pointer-events-auto session-tile-drag-grip flex items-center gap-2 text-[10px] uppercase tracking-[0.36em] text-muted-foreground';
-
-  const [copyState, setCopyState] = useState<'idle' | 'copied'>('idle');
-
-  const handleCopySessionId = useCallback(() => {
-    if (typeof navigator === 'undefined' || !navigator.clipboard) {
-      console.warn('[tile] clipboard API unavailable');
-      return;
-    }
-    navigator.clipboard
-      .writeText(session.session_id)
-      .then(() => {
-        setCopyState('copied');
-      })
-      .catch((error) => {
-        console.error('[tile] failed to copy session id', {
-          sessionId: session.session_id,
-          error,
-        });
-      });
-  }, [session.session_id]);
-
-  useEffect(() => {
-    if (copyState !== 'copied') {
-      return;
-    }
-    const timeout = window.setTimeout(() => {
-      setCopyState('idle');
-    }, 1500);
-    return () => {
-      window.clearTimeout(timeout);
-    };
-  }, [copyState]);
 
   const viewerSnapshot = useMemo<TerminalViewerState>(() => {
     return {

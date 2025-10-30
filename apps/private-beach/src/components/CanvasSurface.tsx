@@ -680,7 +680,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
           managerUrl,
           viewerToken,
           credentialOverride: viewerOverrides?.[tile.id] ?? null,
-          viewerOverride: effectiveViewerStateOverrides[tile.id] ?? null,
+          viewerOverride: viewerStateOverridesProp?.[tile.id] ?? null,
           privateBeachId,
           onMeasurements: handleTileMeasurements,
         } satisfies TileNodeData,

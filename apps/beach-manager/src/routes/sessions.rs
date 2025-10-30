@@ -439,6 +439,22 @@ pub async fn join_session(
     Json(body): Json<JoinSessionRequestBody>,
 ) -> ApiResult<JoinSessionResponsePayload> {
     ensure_scope(&token, "pb:sessions.read")?;
+    info!(
+        target = "private_beach",
+        session_id = %session_id,
+        passphrase_provided = body
+            .passphrase
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
+        viewer_token_provided = body
+            .viewer_token
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
+        mcp = body.mcp,
+        "join_session proxy request"
+    );
     let (status, payload) = state
         .join_session_via_road(
             &session_id,
@@ -469,6 +485,13 @@ pub async fn join_session(
         return Err(ApiError::BadRequest(message));
     }
 
+    info!(
+        target = "private_beach",
+        session_id = %session_id,
+        status = %status,
+        transports = ?payload.transports,
+        "join_session proxy success"
+    );
     Ok(Json(payload))
 }
 

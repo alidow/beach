@@ -400,8 +400,15 @@ async fn handle_socket(
                     );
                 }
             }
-            Message::Close(_) => {
-                debug!("Received Close frame from peer {}", peer_id);
+            Message::Close(frame) => {
+                let (code, reason) = frame
+                    .as_ref()
+                    .map(|f| (Some::<u16>(f.code.into()), Some(f.reason.clone())))
+                    .unwrap_or((None, None));
+                info!(
+                    "Received Close frame from peer {} (code: {:?}, reason: {:?})",
+                    peer_id, code, reason
+                );
                 break;
             }
             _ => {
@@ -461,6 +468,20 @@ async fn handle_client_message(
             info!(
                 "📥 RECEIVED Join message from peer {} (client_peer_id: {:?}) for session {}",
                 peer_id, client_peer_id, session_id
+            );
+            let passphrase_present = passphrase
+                .as_ref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false);
+            let viewer_token_present = viewer_token
+                .as_ref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false);
+            info!(
+                "  → Join credentials summary passphrase_present={} viewer_token_present={} label={:?}",
+                passphrase_present,
+                viewer_token_present,
+                label
             );
 
             let session = match state.storage.get_session(session_id).await {

@@ -38,6 +38,7 @@ services:
       AUTH_BYPASS: "1"
       BEACH_ROAD_URL: http://beach-road:4132
       PUBLIC_MANAGER_URL: http://127.0.0.1:8080
+      BEACH_GATE_URL: ${BEACH_GATE_URL:-http://beach-gate:4133}
       BEACH_SESSION_SERVER: http://beach-road:4132
       RUST_LOG: info
     volumes:

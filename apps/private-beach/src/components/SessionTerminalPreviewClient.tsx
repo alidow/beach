@@ -1,7 +1,11 @@
 'use client';
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
-import { useSessionTerminal, type TerminalViewerState } from '../hooks/useSessionTerminal';
+import {
+  useSessionTerminal,
+  type SessionCredentialOverride,
+  type TerminalViewerState,
+} from '../hooks/useSessionTerminal';
 import { BeachTerminal, type TerminalViewportState } from '../../../beach-surfer/src/components/BeachTerminal';
 import { CabanaPrivateBeachPlayer } from '../../../beach-surfer/src/components/cabana/CabanaPrivateBeachPlayer';
 import type { CabanaTelemetryHandlers } from '../../../beach-surfer/src/components/cabana/CabanaSessionPlayer';
@@ -77,6 +81,7 @@ type Props = {
   ) => void;
   onPreviewStatusChange?: (status: PreviewStatus) => void;
   onPreviewMeasurementsChange?: (sessionId: string, measurements: PreviewMeasurements | null) => void;
+  credentialOverride?: SessionCredentialOverride | null;
   viewerOverride?: TerminalViewerState | null;
 };
 
@@ -98,6 +103,7 @@ function SessionTerminalPreviewView({
   scale,
   locked = false,
   cropped = false,
+  credentialOverride,
   onViewportDimensions,
   onPreviewStatusChange,
   onPreviewMeasurementsChange,
@@ -757,6 +763,21 @@ function SessionTerminalPreviewView({
     }
   }, [previewStatus, viewer.error]);
 
+  const hasDirectCredential = useMemo(() => {
+    if (!credentialOverride) {
+      return false;
+    }
+    const pass = credentialOverride.passcode?.trim();
+    if (pass && pass.length > 0) {
+      return true;
+    }
+    const directViewerToken = credentialOverride.viewerToken?.trim();
+    if (directViewerToken && directViewerToken.length > 0) {
+      return true;
+    }
+    return false;
+  }, [credentialOverride]);
+
   if (isCabana) {
     return (
       <CabanaPrivateBeachPlayer
@@ -773,7 +794,7 @@ function SessionTerminalPreviewView({
     );
   }
 
-  if (!trimmedToken) {
+  if (!trimmedToken && !hasDirectCredential) {
     return (
       <div
         className={
@@ -893,6 +914,7 @@ function SessionTerminalPreviewView({
 function SessionTerminalPreviewManaged({
   trimmedToken,
   isCabana,
+  credentialOverride,
   token: _token,
   viewerOverride: _viewerOverride,
   ...rest
@@ -902,10 +924,12 @@ function SessionTerminalPreviewManaged({
     rest.privateBeachId,
     rest.managerUrl,
     !isCabana && trimmedToken.length > 0 ? trimmedToken : null,
+    isCabana ? undefined : credentialOverride ?? undefined,
   );
   return (
     <SessionTerminalPreviewView
       {...rest}
+      credentialOverride={credentialOverride}
       trimmedToken={trimmedToken}
       isCabana={isCabana}
       viewer={viewer}

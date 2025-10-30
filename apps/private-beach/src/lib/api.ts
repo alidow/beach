@@ -126,12 +126,27 @@ export async function fetchViewerCredential(
   token: string | null,
   baseUrl?: string,
 ): Promise<ViewerCredential> {
+  if (typeof window !== 'undefined') {
+    console.info('[api] fetchViewerCredential request', {
+      privateBeachId,
+      sessionId,
+      baseUrl: baseUrl ?? base(baseUrl),
+      hasToken: Boolean(token && token.trim().length > 0),
+    });
+  }
   const res = await fetch(
     `${base(baseUrl)}/private-beaches/${privateBeachId}/sessions/${sessionId}/viewer-credential`,
     {
       headers: authHeaders(token),
     },
   );
+  if (typeof window !== 'undefined') {
+    console.info('[api] fetchViewerCredential response', {
+      privateBeachId,
+      sessionId,
+      status: res.status,
+    });
+  }
   if (res.status === 404) {
     throw new Error('viewer credential unavailable');
   }
@@ -582,6 +597,7 @@ export type CanvasLayout = {
       zoom?: number;
       locked?: boolean;
       toolbarPinned?: boolean;
+      metadata?: Record<string, any>;
     }
   >;
   agents: Record<
@@ -633,6 +649,10 @@ export async function getCanvasLayout(id: string, token: string | null, baseUrl?
       zoom: raw?.zoom,
       locked: raw?.locked,
       toolbarPinned: raw?.toolbarPinned,
+      metadata:
+        raw && typeof raw === 'object' && 'metadata' in raw && raw?.metadata && typeof raw.metadata === 'object'
+          ? { ...(raw.metadata as Record<string, any>) }
+          : undefined,
     };
   }
   const groups: CanvasLayout['groups'] = {};

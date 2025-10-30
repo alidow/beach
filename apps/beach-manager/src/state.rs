@@ -4582,11 +4582,22 @@ async fn viewer_connect_once(
     let latency_hist =
         metrics::MANAGER_VIEWER_LATENCY_MS.with_label_values(&[private_beach_id, session_id]);
 
-    let issued_token = state
+    let viewer_token = match state
         .viewer_token(session_id, private_beach_id, join_code)
         .await
-        .map_err(ViewerError::Credential)?;
-    let viewer_token = issued_token.token;
+    {
+        Ok(issued) => Some(issued.token),
+        Err(ViewerTokenError::Unavailable) => {
+            debug!(
+                target = "private_beach",
+                session_id = %session_id,
+                private_beach_id = %private_beach_id,
+                "viewer token service unavailable; falling back to passcode only"
+            );
+            None
+        }
+        Err(err) => return Err(ViewerError::Credential(err)),
+    };
 
     let config = SessionConfig::new(road_base_url).map_err(ViewerError::Join)?;
     let manager = SessionManager::new(config).map_err(ViewerError::Join)?;
@@ -4594,7 +4605,7 @@ async fn viewer_connect_once(
         .join(
             session_id,
             Some(join_code),
-            Some(viewer_token.as_str()),
+            viewer_token.as_deref(),
             Some(label),
             false,
         )

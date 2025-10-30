@@ -19,6 +19,7 @@ import ReactFlow, {
 import 'reactflow/dist/style.css';
 
 import type { SessionSummary } from '../lib/api';
+import type { SessionCredentialOverride, TerminalViewerState } from '../hooks/useSessionTerminal';
 import {
   GroupNode,
   applyAssignmentResults,
@@ -74,6 +75,8 @@ type CanvasSurfaceProps = {
   managerToken: string | null;
   managerUrl: string;
   viewerToken: string | null;
+  viewerOverrides?: Record<string, SessionCredentialOverride | null | undefined>;
+  viewerStateOverrides?: Record<string, TerminalViewerState | null | undefined>;
   handlers?: HandlersConfig;
 };
 
@@ -82,8 +85,11 @@ type TileNodeData = {
   onRemove: (sessionId: string) => void;
   onSelect: (session: SessionSummary) => void;
   isDropTarget: boolean;
+  isDragging?: boolean;
   managerUrl: string;
   viewerToken: string | null;
+  credentialOverride?: SessionCredentialOverride | null;
+  viewerOverride?: TerminalViewerState | null;
   privateBeachId: string | null;
   onMeasurements: (sessionId: string, measurements: MeasurementPayload | null) => void;
 };
@@ -235,13 +241,42 @@ function buildCanvasNodes(layout: SharedCanvasLayout, sessionMap: Map<string, Se
   return nodes;
 }
 
+export function getTileBorderClass({
+  selected,
+  isDropTarget,
+  isDragging = false,
+}: {
+  selected: boolean;
+  isDropTarget: boolean;
+  isDragging?: boolean;
+}) {
+  if (isDragging) {
+    return 'border-sky-400/70 shadow-[0_0_0_1px_rgba(56,189,248,0.3)]';
+  }
+  if (isDropTarget) {
+    return 'border-sky-500/60 shadow-[0_0_0_1px_rgba(14,165,233,0.25)]';
+  }
+  if (selected) {
+    return 'border-sky-400/60';
+  }
+  return 'border-border/80';
+}
+
 function TileNodeComponent({ data, selected }: NodeProps<TileNodeData>) {
-  const { session, onRemove, onSelect, isDropTarget, managerUrl, viewerToken, privateBeachId, onMeasurements } = data;
-  const borderClass = selected
-    ? 'border-primary/70 ring-2 ring-primary/30'
-    : isDropTarget
-      ? 'border-sky-500 ring-2 ring-sky-400/30'
-      : 'border-border';
+  const {
+    session,
+    onRemove,
+    onSelect,
+    isDropTarget,
+    isDragging,
+    managerUrl,
+    viewerToken,
+    credentialOverride,
+    viewerOverride,
+    privateBeachId,
+    onMeasurements,
+  } = data;
+  const borderClass = getTileBorderClass({ selected, isDropTarget, isDragging: !!isDragging });
 
   if (!session) {
     return (
@@ -275,6 +310,8 @@ function TileNodeComponent({ data, selected }: NodeProps<TileNodeData>) {
           privateBeachId={privateBeachId ?? session.private_beach_id}
           managerUrl={managerUrl}
           token={viewerToken}
+          credentialOverride={credentialOverride ?? undefined}
+          viewerOverride={viewerOverride ?? undefined}
           variant="preview"
           onPreviewMeasurementsChange={(id, measurements) => onMeasurements(id, measurements as MeasurementPayload | null)}
         />
@@ -334,13 +371,16 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     managerToken,
     managerUrl,
     viewerToken,
+    viewerOverrides,
   } = props;
   const reactFlow = useReactFlow();
   const { load, setNodes, setViewport, setSelection } = useCanvasActions();
   const { selection } = useCanvasState();
   const { onDropNode, onCreateGroup, onAssignAgent, onAssignmentError } = useCanvasHandlers();
   const [layout, setLayout] = useState<SharedCanvasLayout>(() => ensureLayout(layoutProp));
+  const [miniMapVisible, setMiniMapVisible] = useState(true);
   const [hoverTarget, setHoverTarget] = useState<DropTarget | null>(null);
+  const [activeDragNodeId, setActiveDragNodeId] = useState<string | null>(null);
   const persistTimer = useRef<NodeJS.Timeout | null>(null);
   const didLoadRef = useRef(false);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
@@ -350,6 +390,8 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     origin: { x: number; y: number };
     entityId: string;
   } | null>(null);
+  const lastSyncNodeIdsRef = useRef<Set<string>>(new Set());
+  const lastLayoutSignatureRef = useRef<string | null>(null);
 
   useEffect(() => {
     setLayout(ensureLayout(layoutProp));
@@ -370,6 +412,38 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     (next: SharedCanvasLayout) => {
       const nodes = buildCanvasNodes(next, sessionMap, agentMap);
       const viewport = layoutViewport(next);
+      if (typeof window !== 'undefined') {
+        const prevIds = lastSyncNodeIdsRef.current;
+        const nextIds = new Set(nodes.map((node) => node.id));
+        const added: string[] = [];
+        const removed: string[] = [];
+        nextIds.forEach((id) => {
+          if (!prevIds.has(id)) {
+            added.push(id);
+          }
+        });
+        prevIds.forEach((id) => {
+          if (!nextIds.has(id)) {
+            removed.push(id);
+          }
+        });
+        lastSyncNodeIdsRef.current = nextIds;
+        const layoutSignature = JSON.stringify({
+          tiles: Object.keys(next.tiles),
+          agents: Object.keys(next.agents),
+          groups: Object.keys(next.groups),
+        });
+        const previousSignature = lastLayoutSignatureRef.current;
+        lastLayoutSignatureRef.current = layoutSignature;
+        console.info('[canvas-sync] apply', {
+          added,
+          removed,
+          nodeCount: nodes.length,
+          viewport,
+          previousSignature,
+          nextSignature: layoutSignature,
+        });
+      }
       if (!didLoadRef.current) {
         load({ version: 3, nodes, edges: next.edges ?? [], viewport });
         didLoadRef.current = true;
@@ -405,10 +479,44 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
   );
 
   const updateLayout = useCallback(
-    (produce: (current: SharedCanvasLayout) => SharedCanvasLayout) => {
+    (reason: string, produce: (current: SharedCanvasLayout) => SharedCanvasLayout) => {
       setLayout((prev) => {
         const base = ensureLayout(prev);
-        const next = ensureLayout(produce(base));
+        const baseSignature = JSON.stringify({
+          tiles: Object.keys(base.tiles),
+          agents: Object.keys(base.agents),
+          groups: Object.keys(base.groups),
+        });
+        const produced = produce(base);
+        if (Object.is(produced, base)) {
+          if (typeof window !== 'undefined') {
+            console.info('[canvas-update] layout-change', {
+              reason,
+              baseSignature,
+              nextSignature: baseSignature,
+              tileCountBefore: Object.keys(base.tiles).length,
+              tileCountAfter: Object.keys(base.tiles).length,
+              skipped: true,
+            });
+          }
+          return prev ?? base;
+        }
+        const next = ensureLayout(produced);
+        const nextSignature = JSON.stringify({
+          tiles: Object.keys(next.tiles),
+          agents: Object.keys(next.agents),
+          groups: Object.keys(next.groups),
+        });
+        if (typeof window !== 'undefined') {
+          console.info('[canvas-update] layout-change', {
+            reason,
+            baseSignature,
+            nextSignature,
+            tileCountBefore: Object.keys(base.tiles).length,
+            tileCountAfter: Object.keys(next.tiles).length,
+            skipped: false,
+          });
+        }
         onLayoutChange?.(next as ApiCanvasLayout);
         schedulePersist(next);
         return next;
@@ -422,17 +530,65 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
       if (!measurements) {
         return;
       }
-      updateLayout((current) => {
+      updateLayout('measurement', (current) => {
         const tile = current.tiles[sessionId];
         if (!tile) {
+          if (typeof window !== 'undefined') {
+            console.info('[canvas-measure] skip', {
+              sessionId,
+              reason: 'missing-tile',
+            });
+          }
           return current;
         }
         const currentVersion = typeof tile.metadata?.measurementVersion === 'number' ? (tile.metadata as any).measurementVersion : 0;
         if (measurements.measurementVersion <= currentVersion) {
+          if (typeof window !== 'undefined') {
+            console.info('[canvas-measure] skip', {
+              sessionId,
+              reason: 'stale-version',
+              measurementVersion: measurements.measurementVersion,
+              currentVersion,
+            });
+          }
           return current;
         }
         const width = Math.max(1, Math.round(measurements.targetWidth));
         const height = Math.max(1, Math.round(measurements.targetHeight));
+        const existingWidth = Math.round(tile.size?.width ?? 0);
+        const existingHeight = Math.round(tile.size?.height ?? 0);
+        const existingRawWidth = tile.metadata?.rawWidth ?? null;
+        const existingRawHeight = tile.metadata?.rawHeight ?? null;
+        const existingScale = tile.metadata?.scale ?? null;
+        const existingHostRows = tile.metadata?.hostRows ?? null;
+        const existingHostCols = tile.metadata?.hostCols ?? null;
+        const decisionPayload = {
+          sessionId,
+          measurementVersion: measurements.measurementVersion,
+          previousVersion: currentVersion,
+          width,
+          height,
+          rawWidth: measurements.rawWidth,
+          rawHeight: measurements.rawHeight,
+          scale: measurements.scale,
+        };
+        if (
+          existingWidth === width &&
+          existingHeight === height &&
+          existingRawWidth === measurements.rawWidth &&
+          existingRawHeight === measurements.rawHeight &&
+          existingScale === measurements.scale &&
+          existingHostRows === measurements.hostRows &&
+          existingHostCols === measurements.hostCols
+        ) {
+          if (typeof window !== 'undefined') {
+            console.info('[canvas-measure] metadata-only', {
+              ...decisionPayload,
+              decision: 'metadata-only',
+            });
+          }
+          return current;
+        }
         const metadata = {
           ...(tile.metadata ?? {}),
           measurementVersion: measurements.measurementVersion,
@@ -453,6 +609,16 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
             },
           },
         });
+        if (typeof window !== 'undefined') {
+          console.info('[canvas-measure] apply', {
+            ...decisionPayload,
+            decision: 'size-update',
+            previousSize: {
+              width: existingWidth,
+              height: existingHeight,
+            },
+          });
+        }
 
         emitTelemetry('canvas.measurement', {
           beachId: privateBeachId ?? undefined,
@@ -497,6 +663,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     for (const tile of Object.values(layout.tiles)) {
       const nodeId = encodeNodeId('tile', tile.id);
       const session = sessionMap.get(tile.id) ?? null;
+      const isActiveDrag = activeDragNodeId === nodeId;
       nodes.push({
         id: nodeId,
         type: 'tile',
@@ -506,8 +673,11 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
           onRemove,
           onSelect,
           isDropTarget: hoverTarget?.type === 'tile' && hoverTarget.id === tile.id,
+          isDragging: isActiveDrag,
           managerUrl,
           viewerToken,
+          credentialOverride: viewerOverrides?.[tile.id] ?? null,
+          viewerOverride: viewerStateOverrides?.[tile.id] ?? null,
           privateBeachId,
           onMeasurements: handleTileMeasurements,
         } satisfies TileNodeData,
@@ -580,7 +750,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     }
 
     return nodes;
-  }, [agentMap, handleTileMeasurements, hoverTarget, layout.agents, layout.groups, layout.tiles, managerUrl, onRemove, onSelect, privateBeachId, selectionSet, sessionMap, viewerToken]);
+  }, [activeDragNodeId, agentMap, handleTileMeasurements, hoverTarget, layout.agents, layout.groups, layout.tiles, managerUrl, onRemove, onSelect, privateBeachId, selectionSet, sessionMap, viewerOverrides, viewerToken]);
 
   const edges = useMemo<RFEdge[]>(() => [], []);
 
@@ -588,7 +758,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     (changes: NodeChange[]) => {
       setNodes((prev) => applyNodeChanges(changes, prev));
     },
-    [],
+    [setNodes],
   );
 
   const handleSelectionChange = useCallback(
@@ -596,6 +766,15 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
       setSelection(nodes.map((node) => node.id));
     },
     [setSelection],
+  );
+
+  const handleNodeDragStart = useCallback(
+    (_event: React.MouseEvent, node: RFNode) => {
+      if (node && typeof node.id === 'string') {
+        setActiveDragNodeId(node.id);
+      }
+    },
+    [],
   );
 
   const handleNodeDrag = useCallback(
@@ -610,16 +789,27 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
         return;
       }
 
-      setNodes((prev) =>
-        prev.map((existing) =>
-          existing.id === node.id
-            ? {
-                ...existing,
-                position: { x: node.position.x, y: node.position.y },
-              }
-            : existing,
-        ),
-      );
+      setLayout((prev) => {
+        const base = ensureLayout(prev);
+        const tile = base.tiles[parsed.id];
+        if (!tile) {
+          return prev;
+        }
+        const nextPosition = { x: node.position.x, y: node.position.y };
+        if (tile.position.x === nextPosition.x && tile.position.y === nextPosition.y) {
+          return prev;
+        }
+        return {
+          ...base,
+          tiles: {
+            ...base.tiles,
+            [parsed.id]: {
+              ...tile,
+              position: nextPosition,
+            },
+          },
+        };
+      });
 
       if (!dragStateRef.current || dragStateRef.current.nodeId !== node.id) {
         let origin = { x: node.position.x, y: node.position.y };
@@ -675,7 +865,9 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
         return;
       }
       if (!managerToken || managerToken.trim().length === 0) {
-        updateLayout((current) => removeOptimisticAssignment(current, pending.controllerId, pending.target));
+        updateLayout('assignment-rollback-no-token', (current) =>
+          removeOptimisticAssignment(current, pending.controllerId, pending.target),
+        );
         onAssignmentError?.('Missing manager auth token.');
         return;
       }
@@ -684,7 +876,9 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
           const response = await fulfillPendingAssignment(snapshot, pending, managerToken, managerUrl, {
             privateBeachId: privateBeachId ?? undefined,
           });
-          updateLayout((current) => applyAssignmentResults(current, pending, response));
+          updateLayout('assignment-apply-results', (current) =>
+            applyAssignmentResults(current, pending, response),
+          );
           const successIds = response.results.filter((result) => result.ok).map((result) => result.childId);
           if (successIds.length > 0) {
             onAssignAgent?.({ agentId: pending.controllerId, targetIds: successIds, response });
@@ -693,7 +887,9 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
           onAssignmentError?.(failureMessage ?? null);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          updateLayout((current) => removeOptimisticAssignment(current, pending.controllerId, pending.target));
+          updateLayout('assignment-rollback-error', (current) =>
+            removeOptimisticAssignment(current, pending.controllerId, pending.target),
+          );
           onAssignmentError?.(`Assignment failed: ${message}`);
         }
       })();
@@ -704,6 +900,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
   const handleNodeDragStop = useCallback(
     (event: React.MouseEvent, node: RFNode) => {
       setHoverTarget(null);
+      setActiveDragNodeId(null);
       if (!node || typeof node.id !== 'string') {
         dragStateRef.current = null;
         return;
@@ -716,7 +913,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
       if (parsed.kind === 'tile') {
         let pending: PendingAssignment | undefined;
         let snapshot: SharedCanvasLayout | null = null;
-        updateLayout((current) => {
+        updateLayout('drag-stop-tile', (current) => {
           const tile = current.tiles[parsed.id];
           if (!tile) return current;
           let next: SharedCanvasLayout = {
@@ -751,7 +948,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
           processPendingAssignment(pending, snapshot);
         }
       } else if (parsed.kind === 'agent') {
-        updateLayout((current) => {
+        updateLayout('drag-stop-agent', (current) => {
           const agent = current.agents[parsed.id];
           if (!agent) return current;
           return withUpdatedTimestamp({
@@ -768,7 +965,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
       } else if (parsed.kind === 'group') {
         let pending: PendingAssignment | undefined;
         let snapshot: SharedCanvasLayout | null = null;
-        updateLayout((current) => {
+        updateLayout('drag-stop-group', (current) => {
           const group = current.groups[parsed.id];
           if (!group) return current;
           const dx = node.position.x - group.position.x;
@@ -846,7 +1043,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
 
   const handleMoveEnd = useCallback(() => {
     const viewport = reactFlow.getViewport();
-    updateLayout((current) =>
+    updateLayout('viewport-move', (current) =>
       withUpdatedTimestamp({
         ...current,
         viewport: {
@@ -867,7 +1064,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
         .map((entry) => entry.id);
       if (tileSelection.length === 0) return;
       event.preventDefault();
-      updateLayout((current) => {
+      updateLayout('keyboard-group-toggle', (current) => {
         const next = event.shiftKey ? ungroupSelection(current, tileSelection) : groupSelection(current, tileSelection);
         if (!event.shiftKey && next !== current) {
           const newGroup = Object.keys(next.groups).find((id) => !current.groups[id]);
@@ -883,25 +1080,59 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
   }, [onCreateGroup, selection, updateLayout]);
 
   return (
-    <div ref={wrapperRef} className="h-full w-full">
+    <div ref={wrapperRef} className="relative h-full w-full">
       <ReactFlow
         nodeTypes={nodeTypes}
         nodes={rfNodes}
         edges={edges}
         onNodesChange={handleNodesChange}
         onSelectionChange={handleSelectionChange}
+        onNodeDragStart={handleNodeDragStart}
         onNodeDrag={handleNodeDrag}
         onNodeDragStop={handleNodeDragStop}
         onMoveEnd={handleMoveEnd}
+        panOnDrag={false}
         minZoom={0.1}
         maxZoom={2}
         proOptions={{ hideAttribution: true }}
         style={{ width: '100%', height: '100%' }}
       >
         <Background />
-        <MiniMap pannable zoomable />
         <Controls />
+        {miniMapVisible ? (
+          <MiniMap
+            pannable
+            zoomable
+            className="rounded-md border border-slate-800 bg-slate-950/95 text-xs shadow shadow-black/40"
+            maskColor="rgba(15, 23, 42, 0.7)"
+            nodeColor={(node) => {
+              if (node.type === 'agent') return '#0f766e';
+              if (node.type === 'group') return '#5b21b6';
+              return '#1d4ed8';
+            }}
+            nodeStrokeColor={(node) => (node.selected ? '#f97316' : '#020617')}
+          />
+        ) : null}
       </ReactFlow>
+      <button
+        type="button"
+        onClick={() => setMiniMapVisible((prev) => !prev)}
+        className="absolute bottom-3 right-3 z-10 flex h-8 w-8 items-center justify-center rounded-full border border-slate-800 bg-slate-950/90 text-slate-300 shadow shadow-black/40 transition hover:bg-slate-900/70 hover:text-white"
+        aria-label={miniMapVisible ? 'Hide mini map' : 'Show mini map'}
+      >
+        {miniMapVisible ? (
+          <svg aria-hidden="true" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M2.458 12C3.732 7.943 7.522 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.478 0-8.268-2.943-9.542-7Z" />
+            <path d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+            <line x1="3" y1="3" x2="21" y2="21" />
+          </svg>
+        ) : (
+          <svg aria-hidden="true" className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M2.458 12C3.732 7.943 7.522 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.478 0-8.268-2.943-9.542-7Z" />
+            <path d="M12 15c1.657 0 3-1.343 3-3s-1.343-3-3-3-3 1.343-3 3 1.343 3 3 3Z" />
+          </svg>
+        )}
+      </button>
     </div>
   );
 }

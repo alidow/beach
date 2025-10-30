@@ -23,11 +23,19 @@ export type TerminalViewerState = {
   latencyMs: number | null;
 };
 
+export type SessionCredentialOverride = {
+  passcode?: string | null;
+  viewerToken?: string | null;
+  authorizationToken?: string | null;
+  skipCredentialFetch?: boolean;
+};
+
 export function useSessionTerminal(
   sessionId: string | null | undefined,
   privateBeachId: string | null | undefined,
   managerUrl: string,
   token: string | null,
+  override?: SessionCredentialOverride,
 ): TerminalViewerState {
   const store = useMemo(() => {
     void sessionId;
@@ -43,23 +51,61 @@ export function useSessionTerminal(
   const lastHeartbeatRef = useRef<number | null>(null);
   const wasConnectedRef = useRef<boolean>(false);
   const [reconnectTick, setReconnectTick] = useState(0);
+  const connectionSeqRef = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
     let reconnectTimer: number | null = null;
     const cleanupListeners: Array<() => void> = [];
+    const connectionId = `${connectionSeqRef.current++}`;
+    const logEvent = (event: string, extra: Record<string, unknown> = {}) => {
+      if (typeof window === 'undefined') return;
+      console.info('[terminal-conn]', {
+        event,
+        connectionId,
+        sessionId,
+        privateBeachId,
+        managerUrl,
+        tokenPresent: Boolean(token && token.trim().length > 0),
+        reconnectTick,
+        ...extra,
+      });
+    };
 
     const closeCurrentConnection = () => {
       const current = connectionRef.current;
       if (!current) {
+        logEvent('close-current', { hasConnection: false });
         return;
       }
+      logEvent('close-current', { hasConnection: true });
       try {
         current.close();
       } catch (err) {
         console.warn('[terminal] error closing previous connection', err);
       }
       connectionRef.current = null;
+    };
+
+    const performCleanup = (reason: string) => {
+      cancelled = true;
+      for (const fn of cleanupListeners) {
+        try {
+          fn();
+        } catch (err) {
+          console.warn('[terminal] cleanup error', err);
+        }
+      }
+      cleanupListeners.length = 0;
+      closeCurrentConnection();
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+      }
+      setStatus('idle');
+      setSecureSummary(null);
+      setLatencyMs(null);
+      lastHeartbeatRef.current = null;
+      logEvent('effect-cleanup', { reason });
     };
 
     closeCurrentConnection();
@@ -70,27 +116,56 @@ export function useSessionTerminal(
     setLatencyMs(null);
     lastHeartbeatRef.current = null;
 
-    const trimmedToken = token?.trim();
-    if (!sessionId || !privateBeachId || !trimmedToken) {
+    const normalizedOverride = {
+      passcode: override?.passcode?.trim() ?? null,
+      viewerToken: override?.viewerToken?.trim() ?? null,
+      authorizationToken: override?.authorizationToken?.trim() ?? null,
+      skipCredentialFetch: override?.skipCredentialFetch ?? false,
+    };
+    const hasOverrideCredentials =
+      Boolean(normalizedOverride.passcode && normalizedOverride.passcode.length > 0) ||
+      Boolean(normalizedOverride.viewerToken && normalizedOverride.viewerToken.length > 0);
+    const trimmedManagerToken = token?.trim() ?? '';
+    const effectiveAuthToken =
+      normalizedOverride.authorizationToken && normalizedOverride.authorizationToken.length > 0
+        ? normalizedOverride.authorizationToken
+        : trimmedManagerToken;
+    const needsCredentialFetch = !normalizedOverride.skipCredentialFetch && !hasOverrideCredentials;
+    const trimmedManagerUrl = managerUrl.trim();
+
+    if (!sessionId || trimmedManagerUrl.length === 0) {
       setConnecting(false);
-      if (!trimmedToken) {
-        setError(null);
-      }
+      setError(null);
       setStatus('idle');
       wasConnectedRef.current = false;
-      return () => {
-        cancelled = true;
-        for (const fn of cleanupListeners) {
-          try {
-            fn();
-          } catch (err) {
-            console.warn('[terminal] cleanup error', err);
-          }
+      logEvent('idle-no-session-or-url', {
+        hasSessionId: Boolean(sessionId),
+        hasManagerUrl: trimmedManagerUrl.length > 0,
+      });
+      return () => performCleanup('no-session-or-url');
+    }
+
+    if (needsCredentialFetch) {
+      if (!privateBeachId || effectiveAuthToken.length === 0) {
+        setConnecting(false);
+        if (effectiveAuthToken.length === 0) {
+          setError(null);
         }
-        if (reconnectTimer !== null) {
-          window.clearTimeout(reconnectTimer);
-        }
-      };
+        setStatus('idle');
+        wasConnectedRef.current = false;
+        logEvent('idle-missing-credentials', {
+          hasPrivateBeachId: Boolean(privateBeachId),
+          hasAuthToken: effectiveAuthToken.length > 0,
+        });
+        return () => performCleanup('missing-credentials');
+      }
+    } else if (!hasOverrideCredentials) {
+      setConnecting(false);
+      setError('Missing session credentials');
+      setStatus('idle');
+      wasConnectedRef.current = false;
+      logEvent('idle-missing-override-credentials', {});
+      return () => performCleanup('missing-override-credentials');
     }
 
     setConnecting(true);
@@ -98,6 +173,11 @@ export function useSessionTerminal(
     setStatus(wasConnectedRef.current ? 'reconnecting' : 'connecting');
     setSecureSummary(null);
     setLatencyMs(null);
+    logEvent('effect-start', {
+      wasConnected: wasConnectedRef.current,
+      needsCredentialFetch,
+      hasOverrideCredentials,
+    });
 
     const scheduleReconnect = (source: string) => {
       if (cancelled) {
@@ -116,42 +196,63 @@ export function useSessionTerminal(
           privateBeachId,
           source,
         });
+        logEvent('schedule-reconnect', { source });
         setReconnectTick((tick) => tick + 1);
       }, 1_500);
     };
 
     (async () => {
       try {
-        const credential = await fetchViewerCredential(
-          privateBeachId,
-          sessionId,
-          trimmedToken,
-          managerUrl,
-        );
-        if (cancelled) {
-          return;
-        }
-        const credentialType = credential.credential_type?.toLowerCase();
-        let viewerToken: string | undefined;
         let effectivePasscode: string | undefined;
-        if (credentialType === 'viewer_token') {
-          viewerToken = credential.credential?.trim() || undefined;
-          if (credential.passcode != null) {
-            effectivePasscode = String(credential.passcode).trim();
+        let viewerTokenForTransport: string | undefined;
+
+        if (hasOverrideCredentials) {
+          if (normalizedOverride.passcode && normalizedOverride.passcode.length > 0) {
+            effectivePasscode = normalizedOverride.passcode;
           }
-        } else if (credential.credential != null) {
-          effectivePasscode = String(credential.credential).trim();
+          if (normalizedOverride.viewerToken && normalizedOverride.viewerToken.length > 0) {
+            viewerTokenForTransport = normalizedOverride.viewerToken;
+          }
+        } else {
+          logEvent('fetch-viewer-credential:start');
+          const credential = await fetchViewerCredential(
+            privateBeachId!,
+            sessionId,
+            effectiveAuthToken,
+            trimmedManagerUrl,
+          );
+          if (cancelled) {
+            return;
+          }
+          const credentialType = credential.credential_type?.toLowerCase();
+          logEvent('fetch-viewer-credential:success', {
+            credentialType: credentialType ?? 'unknown',
+          });
+          if (credentialType === 'viewer_token') {
+            viewerTokenForTransport = credential.credential?.trim() || undefined;
+            if (credential.passcode != null) {
+              const candidate = String(credential.passcode).trim();
+              if (candidate.length > 0) {
+                effectivePasscode = candidate;
+              }
+            }
+          } else if (credential.credential != null) {
+            const candidate = String(credential.credential).trim();
+            if (candidate.length > 0) {
+              effectivePasscode = candidate;
+            }
+          }
         }
-        if (!viewerToken && (!effectivePasscode || effectivePasscode.length === 0)) {
+        if (!viewerTokenForTransport && (!effectivePasscode || effectivePasscode.length === 0)) {
           throw new Error('viewer passcode unavailable');
         }
         const connection = await connectBrowserTransport({
           sessionId,
-          baseUrl: managerUrl,
+          baseUrl: trimmedManagerUrl,
           passcode: effectivePasscode && effectivePasscode.length > 0 ? effectivePasscode : undefined,
-          viewerToken,
+          viewerToken: viewerTokenForTransport,
           clientLabel: 'private-beach-dashboard',
-          authorizationToken: trimmedToken,
+          authorizationToken: effectiveAuthToken.length > 0 ? effectiveAuthToken : undefined,
         });
         if (cancelled) {
           connection.close();
@@ -166,6 +267,10 @@ export function useSessionTerminal(
         setSecureSummary(connection.secure ?? null);
         setLatencyMs(null);
         lastHeartbeatRef.current = null;
+        logEvent('connect-browser-transport:success', {
+          remotePeerId: connection.remotePeerId ?? null,
+          secureMode: connection.secure?.mode ?? 'plaintext',
+        });
 
         const transportTarget = connection.transport;
 
@@ -176,6 +281,9 @@ export function useSessionTerminal(
           console.info('[terminal] data channel open', {
             sessionId,
             privateBeachId,
+            remotePeerId: connection.remotePeerId ?? null,
+          });
+          logEvent('transport-open', {
             remotePeerId: connection.remotePeerId ?? null,
           });
         };
@@ -222,6 +330,9 @@ export function useSessionTerminal(
             privateBeachId,
             remotePeerId: connection.remotePeerId ?? null,
           });
+          logEvent('transport-close', {
+            remotePeerId: connection.remotePeerId ?? null,
+          });
           setTransport(null);
           setConnecting(true);
           setError(null);
@@ -246,6 +357,7 @@ export function useSessionTerminal(
             privateBeachId,
             message,
           });
+          logEvent('transport-error', { message });
           setError(message);
           setStatus('error');
           setSecureSummary(null);
@@ -276,6 +388,11 @@ export function useSessionTerminal(
             reason: detail?.reason ?? '',
             wasClean: detail?.wasClean ?? null,
           });
+          logEvent('signaling-close', {
+            code: detail?.code ?? null,
+            reason: detail?.reason ?? '',
+            wasClean: detail?.wasClean ?? null,
+          });
         };
         connection.signaling.addEventListener('close', signalingCloseHandler as EventListener);
         cleanupListeners.push(() =>
@@ -291,6 +408,7 @@ export function useSessionTerminal(
             privateBeachId,
             message: detail,
           });
+          logEvent('signaling-error', { message: detail });
         };
         connection.signaling.addEventListener('error', signalingErrorHandler as EventListener);
         cleanupListeners.push(() =>
@@ -309,6 +427,7 @@ export function useSessionTerminal(
           managerUrl,
           error: message,
         });
+        logEvent('connect-browser-transport:error', { message });
         setError(message);
         setConnecting(false);
         setStatus('error');
@@ -317,26 +436,19 @@ export function useSessionTerminal(
       }
     })();
 
-    return () => {
-      cancelled = true;
-      for (const fn of cleanupListeners) {
-        try {
-          fn();
-        } catch (err) {
-          console.warn('[terminal] cleanup error', err);
-        }
-      }
-      cleanupListeners.length = 0;
-      closeCurrentConnection();
-      if (reconnectTimer !== null) {
-        window.clearTimeout(reconnectTimer);
-      }
-      setStatus('idle');
-      setSecureSummary(null);
-      setLatencyMs(null);
-      lastHeartbeatRef.current = null;
-    };
-  }, [sessionId, privateBeachId, managerUrl, token, store, reconnectTick]);
+    return () => performCleanup('dependency-change');
+  }, [
+    sessionId,
+    privateBeachId,
+    managerUrl,
+    token,
+    override?.passcode,
+    override?.viewerToken,
+    override?.authorizationToken,
+    override?.skipCredentialFetch,
+    store,
+    reconnectTick,
+  ]);
 
   return {
     store,

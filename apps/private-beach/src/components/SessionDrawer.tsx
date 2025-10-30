@@ -1,7 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ControllerEvent, SessionSummary, fetchControllerEvents } from '../lib/api';
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
+import { ControllerEvent, SessionSummary, fetchControllerEvents, updateSessionMetadata } from '../lib/api';
 import { Sheet } from './ui/sheet';
 import { Badge } from './ui/badge';
+import { Input } from './ui/input';
+import { Button } from './ui/button';
+import { extractSessionTitle, metadataWithSessionTitle } from '../lib/sessionMetadata';
 
 type Props = {
   open: boolean;
@@ -9,13 +12,25 @@ type Props = {
   session: SessionSummary | null;
   managerUrl: string;
   token: string | null;
+  onSessionMetadataUpdate?: (sessionId: string, metadata: Record<string, unknown>) => void;
 };
 
-export default function SessionDrawer({ open, onOpenChange, session, managerUrl, token }: Props) {
+export default function SessionDrawer({
+  open,
+  onOpenChange,
+  session,
+  managerUrl,
+  token,
+  onSessionMetadataUpdate,
+}: Props) {
   const pollRef = useRef<number | null>(null);
   const seenIdsRef = useRef<Set<string>>(new Set());
   const latestTimestampRef = useRef<number>(0);
   const [events, setEvents] = useState<ControllerEvent[]>([]);
+  const [nameInput, setNameInput] = useState('');
+  const [nameSaving, setNameSaving] = useState(false);
+  const [nameError, setNameError] = useState<string | null>(null);
+  const [nameSavedAt, setNameSavedAt] = useState<number | null>(null);
   const effectiveToken = useMemo(() => (token && token.trim().length > 0 ? token.trim() : null), [token]);
   const redactToken = (value: string | null) => {
     if (!value) return '(none)';
@@ -58,6 +73,92 @@ export default function SessionDrawer({ open, onOpenChange, session, managerUrl,
     latestTimestampRef.current = 0;
     setEvents([]);
   }, []);
+
+  const sessionTitle = useMemo(() => (session ? extractSessionTitle(session.metadata) : null), [session]);
+  const trimmedSessionTitle = sessionTitle ? sessionTitle.trim() : '';
+  const trimmedInput = nameInput.trim();
+  const nameDirty = trimmedInput !== trimmedSessionTitle;
+  const canEditName = Boolean(session) && Boolean(effectiveToken);
+  const canSubmitName = canEditName && nameDirty && !nameSaving;
+
+  useEffect(() => {
+    if (!session) {
+      setNameInput('');
+      setNameError(null);
+      setNameSavedAt(null);
+      return;
+    }
+    const title = extractSessionTitle(session.metadata);
+    setNameInput(title ?? '');
+    setNameError(null);
+    setNameSavedAt(null);
+  }, [session]);
+
+  useEffect(() => {
+    if (nameSavedAt === null) {
+      return;
+    }
+    const timeout = window.setTimeout(() => {
+      setNameSavedAt(null);
+    }, 2000);
+    return () => {
+      window.clearTimeout(timeout);
+    };
+  }, [nameSavedAt]);
+
+  const handleNameChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    setNameInput(event.target.value);
+    setNameError(null);
+    setNameSavedAt(null);
+  }, []);
+
+  const handleNameSubmit = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      if (!session) {
+        return;
+      }
+      if (!effectiveToken) {
+        setNameError('Missing manager auth token. Sign in to edit session metadata.');
+        return;
+      }
+      if (!nameDirty && !nameSaving) {
+        setNameError(null);
+        return;
+      }
+      setNameSaving(true);
+      setNameError(null);
+      try {
+        const nextMetadata = metadataWithSessionTitle(session.metadata, trimmedInput);
+        await updateSessionMetadata(
+          session.session_id,
+          {
+            metadata: nextMetadata,
+            location_hint: session.location_hint ?? null,
+          },
+          effectiveToken,
+          managerUrl,
+        );
+        setNameInput(trimmedInput);
+        setNameSavedAt(Date.now());
+        onSessionMetadataUpdate?.(session.session_id, nextMetadata);
+      } catch (error: any) {
+        const message = error?.message ?? 'Failed to save session name';
+        setNameError(message);
+      } finally {
+        setNameSaving(false);
+      }
+    },
+    [
+      session,
+      effectiveToken,
+      nameDirty,
+      nameSaving,
+      trimmedInput,
+      managerUrl,
+      onSessionMetadataUpdate,
+    ],
+  );
 
   useEffect(() => {
     resetState();
@@ -189,7 +290,10 @@ export default function SessionDrawer({ open, onOpenChange, session, managerUrl,
       <div className="flex h-full flex-col">
         <div className="border-b border-border px-4 py-3">
           <div className="flex flex-col gap-2">
-            <div className="text-sm font-semibold">Session Detail</div>
+            <div className="flex flex-col gap-1">
+              <div className="text-sm font-semibold">{sessionTitle ?? 'Session Detail'}</div>
+              {sessionTitle && <div className="text-xs text-muted-foreground">Session Detail</div>}
+            </div>
             {session && (
               <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                 <span className="rounded border border-border/60 bg-background/80 px-2 py-1 font-mono text-[11px] text-foreground">
@@ -211,6 +315,32 @@ export default function SessionDrawer({ open, onOpenChange, session, managerUrl,
                   Location {session.location_hint ?? '—'}
                 </span>
               </div>
+            )}
+            {session && (
+              <form className="flex flex-col gap-2 pt-1" onSubmit={handleNameSubmit}>
+                <label className="text-[10px] font-medium uppercase tracking-[0.28em] text-muted-foreground">
+                  Session Name
+                </label>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Input
+                    value={nameInput}
+                    onChange={handleNameChange}
+                    placeholder="Add a friendly name"
+                    className="h-8 min-w-[200px] flex-1"
+                    disabled={!canEditName || nameSaving}
+                  />
+                  <Button type="submit" size="sm" disabled={!canSubmitName}>
+                    {nameSaving ? 'Saving…' : 'Save'}
+                  </Button>
+                </div>
+                {nameError && <div className="text-xs text-destructive">{nameError}</div>}
+                {!nameError && nameSavedAt !== null && (
+                  <div className="text-xs text-muted-foreground">Saved</div>
+                )}
+                {!effectiveToken && (
+                  <div className="text-xs text-muted-foreground">Sign in to edit session metadata.</div>
+                )}
+              </form>
             )}
           </div>
         </div>

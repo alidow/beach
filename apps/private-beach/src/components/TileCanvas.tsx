@@ -20,6 +20,7 @@ import { Badge } from './ui/badge';
 import { Button } from './ui/button';
 import { useSessionTerminal, type TerminalViewerState } from '../hooks/useSessionTerminal';
 import { emitTelemetry } from '../lib/telemetry';
+import { extractSessionTitle } from '../lib/sessionMetadata';
 
 const AutoGrid = dynamic(() => import('./AutoGrid'), {
   ssr: false,
@@ -492,6 +493,23 @@ function IconButton({ title, onClick, disabled, pressed, ariaLabel, children }: 
   );
 }
 
+function CopyIcon() {
+  return (
+    <svg viewBox="0 0 16 16" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.2">
+      <rect x="5.5" y="4.5" width="8" height="8" rx="1.6" />
+      <path d="M4 11V5.5a2 2 0 0 1 2-2H11" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg viewBox="0 0 16 16" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.4">
+      <path d="M4 8.5 7 11l5-6" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 function SnapIcon() {
   return (
     <svg viewBox="0 0 16 16" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.2">
@@ -798,16 +816,32 @@ function TileCard({
       <div
         className={`pointer-events-none absolute inset-x-2 top-2 z-20 flex items-center justify-between rounded-full bg-background/80 px-3 py-1 text-[11px] font-medium text-muted-foreground shadow-sm backdrop-blur transition-opacity ${toolbarVisibleClass}`}
       >
-        <button
-          type="button"
-          className="pointer-events-auto session-tile-drag-grip flex items-center gap-2 text-[10px] uppercase tracking-[0.36em] text-muted-foreground"
-          onDoubleClick={onToolbarToggle}
-        >
-          <span className="rounded border border-border/60 bg-background/70 px-2 py-0.5 font-mono text-[10px] tracking-tight">
-            {session.session_id.slice(0, 8)}
-          </span>
+        <button type="button" className={dragGripClass} onDoubleClick={onToolbarToggle}>
+          {sessionName ? (
+            <>
+              <span className="max-w-[240px] truncate text-sm font-semibold text-foreground">
+                {sessionName}
+              </span>
+              <div className="flex items-center gap-1 text-[10px] uppercase tracking-[0.28em] text-muted-foreground">
+                <span className="rounded border border-border/60 bg-background/70 px-2 py-0.5 font-mono uppercase text-[10px] tracking-tight">
+                  {shortSessionId}
+                </span>
+              </div>
+            </>
+          ) : (
+            <span className="rounded border border-border/60 bg-background/70 px-2 py-0.5 font-mono uppercase text-[10px] tracking-tight">
+              {shortSessionId}
+            </span>
+          )}
         </button>
         <div className="pointer-events-auto flex items-center gap-2">
+          <IconButton
+            title={copyState === 'copied' ? 'Copied session ID' : 'Copy session ID'}
+            ariaLabel={copyState === 'copied' ? 'Session ID copied' : 'Copy session ID'}
+            onClick={handleCopySessionId}
+          >
+            {copyState === 'copied' ? <CheckIcon /> : <CopyIcon />}
+          </IconButton>
           <IconButton title="Snap to host size" ariaLabel="Snap to host size" onClick={onSnap} disabled={view.locked}>
             <SnapIcon />
           </IconButton>
@@ -1060,6 +1094,44 @@ const SessionTile = forwardRef<HTMLDivElement, SessionTileProps>(
 
   const effectiveViewer = effectiveOverride ?? viewer;
 
+  const sessionName = useMemo(() => extractSessionTitle(session.metadata), [session.metadata]);
+  const shortSessionId = useMemo(() => session.session_id.slice(0, 8), [session.session_id]);
+  const dragGripClass = sessionName
+    ? 'pointer-events-auto session-tile-drag-grip flex min-w-0 flex-col items-start gap-1 text-left text-muted-foreground'
+    : 'pointer-events-auto session-tile-drag-grip flex items-center gap-2 text-[10px] uppercase tracking-[0.36em] text-muted-foreground';
+
+  const [copyState, setCopyState] = useState<'idle' | 'copied'>('idle');
+
+  const handleCopySessionId = useCallback(() => {
+    if (typeof navigator === 'undefined' || !navigator.clipboard) {
+      console.warn('[tile] clipboard API unavailable');
+      return;
+    }
+    navigator.clipboard
+      .writeText(session.session_id)
+      .then(() => {
+        setCopyState('copied');
+      })
+      .catch((error) => {
+        console.error('[tile] failed to copy session id', {
+          sessionId: session.session_id,
+          error,
+        });
+      });
+  }, [session.session_id]);
+
+  useEffect(() => {
+    if (copyState !== 'copied') {
+      return;
+    }
+    const timeout = window.setTimeout(() => {
+      setCopyState('idle');
+    }, 1500);
+    return () => {
+      window.clearTimeout(timeout);
+    };
+  }, [copyState]);
+
   const viewerSnapshot = useMemo<TerminalViewerState>(() => {
     return {
       store: effectiveViewer.store,
@@ -1079,10 +1151,44 @@ const SessionTile = forwardRef<HTMLDivElement, SessionTileProps>(
     effectiveViewer.secureSummary,
     effectiveViewer.latencyMs,
   ]);
+  const viewerConfigSummaryRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const payload = {
+      sessionId: session.session_id,
+      shouldUseLiveViewer,
+      hasOverride: Boolean(effectiveOverride),
+      manualLayout: view.manualLayout,
+      locked: view.locked,
+    };
+    const signature = JSON.stringify(payload);
+    if (viewerConfigSummaryRef.current !== signature) {
+      viewerConfigSummaryRef.current = signature;
+      console.info('[tile-viewer] config', payload);
+    }
+  }, [effectiveOverride, session.session_id, shouldUseLiveViewer, view.locked, view.manualLayout]);
 
   useEffect(() => {
+    const transportType =
+      viewerSnapshot.transport?.constructor?.name ??
+      (viewerSnapshot.transport ? 'custom' : null);
+    if (typeof window !== 'undefined') {
+      console.info('[tile-viewer] snapshot', {
+        sessionId: session.session_id,
+        status: viewerSnapshot.status,
+        connecting: viewerSnapshot.connecting,
+        latencyMs: viewerSnapshot.latencyMs,
+        transportType,
+        hasStore: Boolean(viewerSnapshot.store),
+      });
+    }
     onViewerStateChange(session.session_id, viewerSnapshot);
     return () => {
+      if (typeof window !== 'undefined') {
+        console.info('[tile-viewer] snapshot-dispose', {
+          sessionId: session.session_id,
+        });
+      }
       onViewerStateChange(session.session_id, null);
     };
   }, [

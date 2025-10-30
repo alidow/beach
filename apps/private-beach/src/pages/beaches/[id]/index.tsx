@@ -61,6 +61,10 @@ function ensureLayoutMetadata(layout: CanvasLayout | null): CanvasLayout {
   const updatedAt = layout.metadata?.updatedAt ?? createdAt;
   const normalizedTiles: CanvasLayout['tiles'] = {};
   for (const [tileId, tile] of Object.entries(layout.tiles ?? {})) {
+    const normalizedMetadata =
+      tile && typeof tile === 'object' && 'metadata' in tile && tile.metadata && typeof tile.metadata === 'object'
+        ? { ...(tile.metadata as Record<string, any>) }
+        : undefined;
     normalizedTiles[tileId] = {
       kind: tile.kind ?? 'application',
       id: tile.id ?? tileId,
@@ -71,6 +75,7 @@ function ensureLayoutMetadata(layout: CanvasLayout | null): CanvasLayout {
       zoom: tile.zoom,
       locked: tile.locked,
       toolbarPinned: tile.toolbarPinned,
+      metadata: normalizedMetadata,
     };
   }
   return {
@@ -179,6 +184,12 @@ export default function BeachDashboard() {
       );
       setManagerToken(null);
       setViewerToken(null);
+      if (typeof window !== 'undefined') {
+        console.info('[auth] manager-token-state', {
+          source: 'refresh-skip',
+          reason: 'auth-not-ready',
+        });
+      }
       return null;
     }
     try {
@@ -193,15 +204,34 @@ export default function BeachDashboard() {
         },
       );
       setManagerToken(token ?? null);
+      if (typeof window !== 'undefined') {
+        console.info('[auth] manager-token-state', {
+          source: 'refresh-success',
+          hasToken: Boolean(token && token.trim().length > 0),
+        });
+      }
       if (token && token.trim().length > 0) {
         setViewerToken((prev) => {
-          if (prev && prev.trim().length > 0) {
+          const reuseExisting = Boolean(prev && prev.trim().length > 0);
+          if (typeof window !== 'undefined') {
+            console.info('[auth] viewer-token-state', {
+              source: 'refresh-success',
+              reusedPrevious: reuseExisting,
+            });
+          }
+          if (reuseExisting) {
             return prev;
           }
           return token;
         });
       } else {
         setViewerToken(null);
+        if (typeof window !== 'undefined') {
+          console.info('[auth] viewer-token-state', {
+            source: 'refresh-success',
+            cleared: true,
+          });
+        }
       }
       return token ?? null;
     } catch (err: any) {
@@ -216,6 +246,12 @@ export default function BeachDashboard() {
       );
       setManagerToken(null);
       setViewerToken(null);
+      if (typeof window !== 'undefined') {
+        console.info('[auth] manager-token-state', {
+          source: 'refresh-failure',
+          error: message,
+        });
+      }
       return null;
     }
   }, [isLoaded, isSignedIn, getToken, tokenTemplate]);
@@ -792,6 +828,19 @@ export default function BeachDashboard() {
       .map((sessionId) => map.get(sessionId))
       .filter((entry): entry is SessionSummary => Boolean(entry));
   }, [canvasLayout, sessions]);
+  const lastTileOrderRef = useRef<string | null>(null);
+  useEffect(() => {
+    const order = tileSessions.map((session) => session.session_id);
+    const signature = order.join(',');
+    if (typeof window !== 'undefined' && lastTileOrderRef.current !== signature) {
+      console.info('[dashboard] tile-order', {
+        order,
+        count: order.length,
+        previous: lastTileOrderRef.current,
+      });
+    }
+    lastTileOrderRef.current = signature;
+  }, [tileSessions]);
 
   const controllerSessionIds = useMemo(
     () => agentSessions.map((agent) => agent.session_id),
@@ -824,6 +873,20 @@ export default function BeachDashboard() {
     setSelected(s);
     setDrawerOpen(true);
   }
+
+  const handleSessionMetadataUpdate = useCallback(
+    (sessionId: string, metadata: Record<string, unknown>) => {
+      setSessions((prev) =>
+        prev.map((existing) =>
+          existing.session_id === sessionId ? { ...existing, metadata } : existing,
+        ),
+      );
+      setSelected((prev) =>
+        prev && prev.session_id === sessionId ? { ...prev, metadata } : prev,
+      );
+    },
+    [setSessions, setSelected],
+  );
 
   const settingsContextValue = useMemo(
     () => ({
@@ -1103,7 +1166,14 @@ export default function BeachDashboard() {
             </div>
           </div>
         </div>
-        <SessionDrawer open={drawerOpen} onOpenChange={setDrawerOpen} session={selected} managerUrl={managerUrl} token={managerToken} />
+        <SessionDrawer
+          open={drawerOpen}
+          onOpenChange={setDrawerOpen}
+          session={selected}
+          managerUrl={managerUrl}
+          token={managerToken}
+          onSessionMetadataUpdate={handleSessionMetadataUpdate}
+        />
         {id && (
           <AddSessionModal
             open={addOpen}

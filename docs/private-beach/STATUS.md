@@ -64,6 +64,9 @@ This document captures what’s built, how to run it locally, what’s left, and
 - **Viewer metrics** — Monitor `manager_viewer_connected`, `manager_viewer_latency_ms`, `manager_viewer_reconnects_total`, `manager_viewer_keepalive_sent_total`, `manager_viewer_keepalive_failures_total`, `manager_viewer_idle_warnings_total`, and `manager_viewer_idle_recoveries_total`. Wire alerts for sustained reconnect loops or keepalive failures.
 - **TURN-only verification** — Set `BEACH_WEBRTC_DISABLE_STUN=1` on both Manager and hosts to force TURN. Confirm the viewer connects, keepalive metrics stay flat, and latency badge reflects the expected TURN hop. Use this before capacity tests.
 
+## Configuration Notes
+- Manager reads `BEACH_GATE_URL`; docker-compose now defaults it to `http://beach-gate:4133` for local networking. Override with your production Gate hostname and provide `BEACH_GATE_VIEWER_TOKEN` (plus the matching Gate/Road secrets) to enable viewer tokens end-to-end.
+
 ## End‑to‑End: Onboarding (Attach) — How to Test
 
 Local (docker compose):
@@ -84,7 +87,7 @@ Against api.beach.sh:
 - SQLx-backed schema + migrations: `session`, `controller_lease`, `session_runtime`, `controller_event` (+ indexes, enums). RLS policies applied; per-request GUC `beach.private_beach_id` is set in transactions.
 - Redis Streams for action queues with consumer groups; TTL caches for health/state; transparent fallback to in-memory for tests.
 - SSE endpoint (legacy, retained for now): `GET /sessions/:id/state/stream` emits `state` events. The controller-event SSE was removed; drawers poll REST instead.
-- Viewer credentials: `GET /private-beaches/:id/sessions/:sid/viewer-credential` issues a Gate-signed viewer token; browsers no longer receive passcode fallbacks.
+- Viewer credentials: `GET /private-beaches/:id/sessions/:sid/viewer-credential` prefers Gate-signed viewer tokens, but falls back to passcodes when the viewer token service is disabled (common in local dev).
 - REST + MCP (JSON-RPC) covering session registration, listing, controller lease, queue/ack, health/state. MCP subscribe methods return `sse_url` helpers.
 - Metrics: queue depth (`actions_queue_depth`), lag (`actions_queue_pending`), `action_latency_ms` histogram, Redis availability.
 - Event audit enriched with principals (controller/issuer IDs) and filters in `GET /sessions/:id/controller-events?event_type=&since_ms=&limit=`.

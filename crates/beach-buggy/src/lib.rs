@@ -230,12 +230,20 @@ pub type ControllerPairingStream =
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StyledCell {
     pub ch: char,
-    pub style: u32,
+    pub style: CellStylePayload,
 }
 
 /// Serialized style definition for terminal snapshots.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StyleDefinition {
+    pub id: u32,
+    pub fg: u32,
+    pub bg: u32,
+    pub attrs: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CellStylePayload {
     pub id: u32,
     pub fg: u32,
     pub bg: u32,

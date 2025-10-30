@@ -18,9 +18,9 @@ use crate::auth::{AuthConfig, AuthContext};
 use crate::fastpath::{send_actions_over_fast_path, FastPathRegistry, FastPathSession};
 use crate::metrics;
 use beach_buggy::{
-    AckStatus, ActionAck, ActionCommand, CursorPosition, HarnessType, HealthHeartbeat,
-    RegisterSessionRequest, RegisterSessionResponse, StateDiff, StyleDefinition, StyledCell,
-    TerminalFrame,
+    AckStatus, ActionAck, ActionCommand, CellStylePayload, CursorPosition, HarnessType,
+    HealthHeartbeat, RegisterSessionRequest, RegisterSessionResponse, StateDiff, StyleDefinition,
+    StyledCell, TerminalFrame,
 };
 use beach_client_core::cache::terminal::packed::unpack_cell;
 use beach_client_core::protocol::{CursorFrame, Update as WireUpdate};
@@ -386,6 +386,11 @@ fn capture_terminal_frame_simple(
     let total_rows = grid.rows();
     let rows = viewport_rows.min(total_rows);
     let style_table = grid.style_table.clone();
+    let style_entries = style_table.entries();
+    let mut style_lookup = HashMap::with_capacity(style_entries.len());
+    for (id, style) in &style_entries {
+        style_lookup.insert(id.0, *style);
+    }
     let mut lines = Vec::with_capacity(rows);
     let mut styled_lines = Vec::with_capacity(rows);
 
@@ -397,13 +402,22 @@ fn capture_terminal_frame_simple(
                 .map(|snapshot| unpack_cell(snapshot.cell))
                 .unwrap_or((' ', StyleId::DEFAULT));
             let ch = if raw_char == '\0' { ' ' } else { raw_char };
+            let style = style_lookup
+                .get(&style_id.0)
+                .copied()
+                .unwrap_or_default();
             cells.push(StyledCell {
                 ch,
-                style: style_id.0,
+                style: CellStylePayload {
+                    id: style_id.0,
+                    fg: style.fg,
+                    bg: style.bg,
+                    attrs: style.attrs as u32,
+                },
             });
         }
         while let Some(last) = cells.last() {
-            if last.ch == ' ' && last.style == StyleId::DEFAULT.0 {
+            if last.ch == ' ' && last.style.id == StyleId::DEFAULT.0 {
                 cells.pop();
             } else {
                 break;
@@ -419,8 +433,7 @@ fn capture_terminal_frame_simple(
         col: cursor.col,
     });
 
-    let styles = style_table
-        .entries()
+    let styles = style_entries
         .into_iter()
         .map(|(id, style)| StyleDefinition {
             id: id.0,
@@ -5244,10 +5257,19 @@ mod tests {
             Some("A"),
             "styled cell should capture character"
         );
+        let style_payload = first_cell
+            .get("style")
+            .and_then(|v| v.as_object())
+            .expect("styled cell should include style payload");
         assert_eq!(
-            first_cell.get("style").and_then(|v| v.as_u64()),
+            style_payload.get("id").and_then(|v| v.as_u64()),
             Some(0),
-            "styled cell should reference style id 0"
+            "styled cell should include style id 0"
+        );
+        assert_eq!(
+            style_payload.get("fg").and_then(|v| v.as_u64()),
+            Some(pack_color_rgb(255, 0, 0) as u64),
+            "styled cell should embed resolved foreground color"
         );
         assert_eq!(
             diff.payload.get("cols").and_then(|v| v.as_u64()),

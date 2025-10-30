@@ -606,8 +606,8 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
           }
           return current;
         }
-        const width = Math.max(1, Math.round(measurements.targetWidth));
-        const height = Math.max(1, Math.round(measurements.targetHeight));
+        const width = Math.max(1, Math.round(measurements.rawWidth));
+        const height = Math.max(1, Math.round(measurements.rawHeight));
         const existingWidth = Math.round(tile.size?.width ?? 0);
         const existingHeight = Math.round(tile.size?.height ?? 0);
         const existingRawWidth = tile.metadata?.rawWidth ?? null;

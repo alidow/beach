@@ -166,6 +166,12 @@ function SessionTerminalPreviewView({
     };
   }, [isCabana, sessionId, variant]);
 
+  useEffect(() => {
+    measurementVersionRef.current = 1;
+    domRawSizeRef.current = null;
+    setDomRawVersion((version) => (version + 1) % 1_000_000);
+  }, [sessionId]);
+
   // Observe clone visibility to throttle rendering when off-screen
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -259,24 +265,27 @@ function SessionTerminalPreviewView({
           ? viewportState.hostCols
           : null;
       const measuredViewportCols = viewportState.viewportCols > 0 ? viewportState.viewportCols : null;
-      if (hostViewportRows != null && rows !== hostViewportRows) {
+
+      if (hostViewportRows != null && hostViewportRows !== rows) {
         rows = hostViewportRows;
         changed = true;
-      } else if (rows == null && measuredViewportRows != null) {
+      } else if ((rows == null || rows <= 0) && measuredViewportRows != null) {
         rows = measuredViewportRows;
         changed = true;
       }
-      if (hostViewportCols != null && cols !== hostViewportCols) {
+
+      if (hostViewportCols != null && hostViewportCols !== cols) {
         cols = hostViewportCols;
         changed = true;
-      } else if (cols == null && measuredViewportCols != null) {
+      } else if ((cols == null || cols <= 0) && measuredViewportCols != null) {
         cols = measuredViewportCols;
         changed = true;
       }
+
       if (!changed) {
         return current;
       }
-      // bump measurement version when host metadata changes
+
       measurementVersionRef.current = (measurementVersionRef.current % 1_000_000) + 1;
       if (typeof window !== 'undefined') {
         try {
@@ -548,9 +557,9 @@ function SessionTerminalPreviewView({
     ) {
       return null;
     }
-    const domRaw = domRawSizeRef.current;
     let rawWidth = hostPixelSize.width;
     let rawHeight = hostPixelSize.height;
+    const domRaw = domRawSizeRef.current;
     if (
       domRaw &&
       Number.isFinite(domRaw.width) &&
@@ -564,11 +573,12 @@ function SessionTerminalPreviewView({
     if (!Number.isFinite(rawWidth) || rawWidth <= 0 || !Number.isFinite(rawHeight) || rawHeight <= 0) {
       return null;
     }
-    const widthScale = rawWidth > 0 ? MAX_PREVIEW_WIDTH / rawWidth : 1;
-    const heightScale = rawHeight > 0 ? MAX_PREVIEW_HEIGHT / rawHeight : 1;
+    const maxWidth = MAX_PREVIEW_WIDTH;
+    const maxHeight = MAX_PREVIEW_HEIGHT;
+    const widthScale = rawWidth > 0 ? maxWidth / rawWidth : 1;
+    const heightScale = rawHeight > 0 ? maxHeight / rawHeight : 1;
     const limitedScale = Math.min(1, widthScale, heightScale);
-    const normalizedScale =
-      Number.isFinite(limitedScale) && limitedScale > 0 ? Number(limitedScale.toFixed(6)) : 1;
+    const normalizedScale = 1;
     const targetWidth = Math.max(1, Math.round(rawWidth * normalizedScale));
     const targetHeight = Math.max(1, Math.round(rawHeight * normalizedScale));
     return {
@@ -583,12 +593,7 @@ function SessionTerminalPreviewView({
     };
   }, [domRawVersion, hostPixelSize.height, hostPixelSize.width, resolvedHostCols, resolvedHostRows]);
 
-  const effectiveScale = useMemo(() => {
-    if (!previewMeasurements) {
-      return zoomMultiplier;
-    }
-    return previewMeasurements.scale * zoomMultiplier;
-  }, [previewMeasurements, zoomMultiplier]);
+  const effectiveScale = 1;
 
   useEffect(() => {
     const previous = measurementsRef.current;
@@ -733,7 +738,7 @@ function SessionTerminalPreviewView({
       });
       const measuredWidth = child ? child.width : rect.width;
       const measuredHeight = child ? child.height : rect.height;
-      if (effectiveScale > 0 && Number.isFinite(measuredWidth) && Number.isFinite(measuredHeight)) {
+      if (Number.isFinite(measuredWidth) && Number.isFinite(measuredHeight)) {
         const rawWidthFromDom = measuredWidth / effectiveScale;
         const rawHeightFromDom = measuredHeight / effectiveScale;
         const prev = domRawSizeRef.current;
@@ -745,6 +750,28 @@ function SessionTerminalPreviewView({
             height: rawHeightFromDom,
           };
           setDomRawVersion((version) => (version + 1) % 1_000_000);
+          measurementVersionRef.current = (measurementVersionRef.current % 1_000_000) + 1;
+        }
+        const cellWidth = Math.max(
+          1,
+          Math.round(((effectiveFontSize / BASE_TERMINAL_FONT_SIZE) * BASE_TERMINAL_CELL_WIDTH) * (typeof window !== 'undefined' && typeof window.devicePixelRatio === 'number' ? window.devicePixelRatio || 1 : 1)) /
+            (typeof window !== 'undefined' && typeof window.devicePixelRatio === 'number' ? window.devicePixelRatio || 1 : 1),
+        );
+        const lineHeightPx = Math.max(1, Math.round(effectiveFontSize * 1.4));
+        const inferredRows = Math.max(1, Math.round((rawHeightFromDom - TERMINAL_PADDING_Y) / lineHeightPx));
+        const inferredCols = Math.max(1, Math.round((rawWidthFromDom - TERMINAL_PADDING_X) / cellWidth));
+        if (Number.isFinite(inferredRows) || Number.isFinite(inferredCols)) {
+          setHostDimensions((current) => {
+            const nextRows = Number.isFinite(inferredRows) ? inferredRows : current.rows;
+            const nextCols = Number.isFinite(inferredCols) ? inferredCols : current.cols;
+            if (current.rows === nextRows && current.cols === nextCols) {
+              return current;
+            }
+            return {
+              rows: nextRows,
+              cols: nextCols,
+            };
+          });
         }
       }
     };
@@ -810,8 +837,8 @@ function SessionTerminalPreviewView({
     if (!previewMeasurements) {
       return undefined;
     }
-    const width = previewMeasurements.rawWidth * effectiveScale;
-    const height = previewMeasurements.rawHeight * effectiveScale;
+    const width = previewMeasurements.rawWidth;
+    const height = previewMeasurements.rawHeight;
     return {
       width: `${Math.max(1, Math.round(width))}px`,
       height: `${Math.max(1, Math.round(height))}px`,
@@ -825,8 +852,8 @@ function SessionTerminalPreviewView({
     return {
       width: `${previewMeasurements.rawWidth}px`,
       height: `${previewMeasurements.rawHeight}px`,
-      transform: `scale(${effectiveScale})`,
-      transformOrigin: 'top left',
+      transform: undefined,
+      transformOrigin: undefined,
     };
   }, [effectiveScale, previewMeasurements]);
 

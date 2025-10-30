@@ -277,6 +277,7 @@ function TileNodeComponent({ data, selected }: NodeProps<TileNodeData>) {
     viewerOverride,
     privateBeachId,
     onMeasurements,
+    cachedDiff,
   } = data;
   const borderClass = getTileBorderClass({ selected, isDropTarget, isDragging: !!isDragging });
 
@@ -315,6 +316,7 @@ function TileNodeComponent({ data, selected }: NodeProps<TileNodeData>) {
           credentialOverride={credentialOverride ?? undefined}
           viewerOverride={viewerOverride ?? undefined}
           variant="preview"
+          cachedStateDiff={cachedDiff ?? undefined}
           onPreviewMeasurementsChange={(id, measurements) => onMeasurements(id, measurements as MeasurementPayload | null)}
         />
       </div>
@@ -410,6 +412,54 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
 
   const sessionMap = useMemo(() => new Map(tiles.map((session) => [session.session_id, session] as const)), [tiles]);
   const agentMap = useMemo(() => new Map(agents.map((session) => [session.session_id, session] as const)), [agents]);
+
+  const cachedTerminalDiffs = useMemo<Record<string, TerminalStateDiff>>(() => {
+    const map: Record<string, TerminalStateDiff> = {};
+    const seen = new Set<string>();
+    for (const session of tiles) {
+      const diff = extractTerminalStateDiff(session.metadata);
+      if (diff) {
+        map[session.session_id] = diff;
+        seen.add(session.session_id);
+        if (typeof window !== 'undefined') {
+          console.info('[terminal-hydrate][canvas][session]', {
+            sessionId: session.session_id,
+            sequence: diff.sequence ?? null,
+          });
+        }
+      } else if (typeof window !== 'undefined') {
+        console.info('[terminal-hydrate][canvas][session-miss]', {
+          sessionId: session.session_id,
+        });
+      }
+    }
+    const layoutTiles = layout?.tiles ?? {};
+    for (const [tileId, tile] of Object.entries(layoutTiles)) {
+      if (seen.has(tileId)) {
+        continue;
+      }
+      const diff = extractTerminalStateDiff(tile?.metadata ?? null);
+      if (diff) {
+        map[tileId] = diff;
+        if (typeof window !== 'undefined') {
+          console.info('[terminal-hydrate][canvas][layout]', {
+            sessionId: tileId,
+            sequence: diff.sequence ?? null,
+          });
+        }
+      }
+    }
+    return map;
+  }, [layout?.tiles, tiles]);
+
+  const viewerStateOverridesResolved = useMemo(() => {
+    if (!viewerStateOverridesProp) {
+      return {} as Record<string, TerminalViewerState | null | undefined>;
+    }
+    return { ...viewerStateOverridesProp } as Record<string, TerminalViewerState | null | undefined>;
+  }, [viewerStateOverridesProp]);
+
+  const effectiveViewerStateOverrides = viewerStateOverridesResolved;
 
   const syncStore = useCallback(
     (next: SharedCanvasLayout) => {
@@ -680,9 +730,10 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
           managerUrl,
           viewerToken,
           credentialOverride: viewerOverrides?.[tile.id] ?? null,
-          viewerOverride: viewerStateOverridesProp?.[tile.id] ?? null,
+          viewerOverride: viewerStateOverridesResolved[tile.id] ?? null,
           privateBeachId,
           onMeasurements: handleTileMeasurements,
+          cachedDiff: cachedTerminalDiffs[tile.id] ?? null,
         } satisfies TileNodeData,
         draggable: true,
         selectable: true,

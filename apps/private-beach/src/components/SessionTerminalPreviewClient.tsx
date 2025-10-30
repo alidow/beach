@@ -254,6 +254,24 @@ function SessionTerminalPreviewView({
     if (!viewportState) {
       return;
     }
+    const storeSnapshot = viewer.store?.getSnapshot();
+    const storeRows = storeSnapshot?.rows ? storeSnapshot.rows.length : null;
+    const storeCols = storeSnapshot?.cols ?? null;
+    const fallbackRowsCandidate = (() => {
+      const measured = measuredViewportRows ?? null;
+      const storeValue = storeRows != null && storeRows > 0 ? storeRows : null;
+      if (measured == null) return storeValue;
+      if (storeValue == null) return measured;
+      return Math.max(measured, storeValue);
+    })();
+    const fallbackColsCandidate = (() => {
+      const measured = measuredViewportCols ?? null;
+      const storeValue = storeCols != null && storeCols > 0 ? storeCols : null;
+      if (measured == null) return storeValue;
+      if (storeValue == null) return measured;
+      return Math.max(measured, storeValue);
+    })();
+
     setHostDimensions((current) => {
       const hostViewportRows =
         typeof viewportState.hostViewportRows === 'number' && viewportState.hostViewportRows > 0
@@ -269,13 +287,13 @@ function SessionTerminalPreviewView({
       const nextRowResult = computeDimensionUpdate(
         current.rows,
         hostViewportRows,
-        measuredViewportRows,
+        fallbackRowsCandidate,
         hostRowSourceRef.current,
       );
       const nextColResult = computeDimensionUpdate(
         current.cols,
         hostViewportCols,
-        measuredViewportCols,
+        fallbackColsCandidate,
         hostColSourceRef.current,
       );
 
@@ -310,7 +328,80 @@ function SessionTerminalPreviewView({
       }
       return { rows: nextRowResult.value, cols: nextColResult.value };
     });
-  }, [sessionId, viewportState]);
+  }, [sessionId, viewportState, viewer.store]);
+
+  useEffect(() => {
+    if (!viewer.store) {
+      return;
+    }
+    const store = viewer.store;
+    const updateFromStore = () => {
+      const snapshot = store.getSnapshot();
+      const totalRowsFromArray = snapshot.rows.length > 0 ? snapshot.rows.length : null;
+      const lastRow = snapshot.rows.length > 0 ? snapshot.rows[snapshot.rows.length - 1] : null;
+      const totalRowsFromAbsolute =
+        lastRow && typeof (lastRow as { absolute?: number }).absolute === 'number'
+          ? (lastRow as { absolute: number }).absolute - snapshot.baseRow + 1
+          : null;
+      const estimatedRows = Math.max(
+        totalRowsFromArray ?? 0,
+        totalRowsFromAbsolute ?? 0,
+        snapshot.viewportHeight > 0 ? snapshot.viewportHeight : 0,
+      );
+      const estimatedCols = snapshot.cols > 0 ? snapshot.cols : null;
+
+      if (estimatedRows <= 0 && (estimatedCols == null || estimatedCols <= 0)) {
+        return;
+      }
+
+      setHostDimensions((current) => {
+        const nextRowResult = computeDimensionUpdate(
+          current.rows,
+          null,
+          estimatedRows > 0 ? estimatedRows : null,
+          hostRowSourceRef.current,
+        );
+        const nextColResult = computeDimensionUpdate(
+          current.cols,
+          null,
+          estimatedCols,
+          hostColSourceRef.current,
+        );
+
+        const changed = nextRowResult.changed || nextColResult.changed;
+        hostRowSourceRef.current = nextRowResult.source;
+        hostColSourceRef.current = nextColResult.source;
+
+        if (!changed) {
+          return current;
+        }
+
+        measurementVersionRef.current = (measurementVersionRef.current % 1_000_000) + 1;
+        if (typeof window !== 'undefined') {
+          try {
+            console.info('[terminal][trace] host-dimension-update', {
+              sessionId,
+              prevRows: current.rows,
+              nextRows: nextRowResult.value,
+              prevCols: current.cols,
+              nextCols: nextColResult.value,
+              sourceRows: nextRowResult.source,
+              sourceCols: nextColResult.source,
+              reason: 'store-snapshot',
+              measurementVersion: measurementVersionRef.current,
+            });
+          } catch {
+            // ignore logging failures
+          }
+        }
+        return { rows: nextRowResult.value, cols: nextColResult.value };
+      });
+    };
+
+    updateFromStore();
+    const unsubscribe = store.subscribe(updateFromStore);
+    return unsubscribe;
+  }, [sessionId, viewer.store]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;

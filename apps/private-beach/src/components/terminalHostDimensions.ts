@@ -21,8 +21,12 @@ export function computeDimensionUpdate(
   }
 
   if (normalizedFallback != null) {
-    const changed = currentSource !== 'fallback' || currentValue !== normalizedFallback;
-    return { value: normalizedFallback, source: 'fallback', changed };
+    const nextValue =
+      currentSource === 'fallback' && currentValue != null
+        ? Math.max(currentValue, normalizedFallback)
+        : normalizedFallback;
+    const changed = currentSource !== 'fallback' || currentValue !== nextValue;
+    return { value: nextValue, source: 'fallback', changed };
   }
 
   if (currentSource === 'fallback') {

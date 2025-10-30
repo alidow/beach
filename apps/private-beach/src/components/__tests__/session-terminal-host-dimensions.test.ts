@@ -19,6 +19,16 @@ describe('computeDimensionUpdate', () => {
     expect(hostUpdate.changed).toBe(true);
   });
 
+  it('allows fallback to grow but not shrink when host data is missing', () => {
+    const first = computeDimensionUpdate(null, null, 24, 'unknown');
+    expect(first.value).toBe(24);
+    const grow = computeDimensionUpdate(first.value, null, 40, first.source);
+    expect(grow.value).toBe(40);
+    const shrink = computeDimensionUpdate(grow.value, null, 30, grow.source);
+    expect(shrink.value).toBe(40);
+    expect(shrink.changed).toBe(false);
+  });
+
   it('preserves PTY dimensions once established even if fallback data changes', () => {
     const afterHost = { value: 62, source: 'pty' as const };
 

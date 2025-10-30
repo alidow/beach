@@ -268,6 +268,7 @@ export function buildViewerStateFromTerminalDiff(
   return {
     store,
     transport: null,
+    transportVersion: 0,
     connecting: false,
     error: null,
     status: 'connected',

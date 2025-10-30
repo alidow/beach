@@ -15,23 +15,21 @@ function buildSandboxUrl(): string {
   return `/dev/private-beach-sandbox?${params.toString()}`;
 }
 
-test.describe('Private Beach Sandbox', () => {
-  test('renders terminal preview from static fixture', async ({ page }) => {
-    await page.goto(buildSandboxUrl());
+test('Private Beach Sandbox renders terminal fixture and survives interaction', async ({ page }) => {
+  await page.goto(buildSandboxUrl());
 
-    // Wait for the tile header to appear so we know the layout mounted.
-    await expect(page.getByRole('button', { name: 'Sandbox Fixture' })).toBeVisible();
+  // Wait for the tile header to appear so we know the layout mounted.
+  await expect(page.getByRole('button', { name: 'Sandbox Fixture' })).toBeVisible();
 
-    const placeholder = page.getByText('Preparing terminal preview…');
-    await expect(placeholder).toHaveCount(0, { timeout: 30_000 });
+  const placeholder = page.getByText('Preparing terminal preview…');
+  await expect(placeholder).toHaveCount(0, { timeout: 30_000 });
 
-    // The static fixture should render the marquee banner text.
-    await expect(page.getByText('PRIVATE BEACH PONG', { exact: false })).toBeVisible({
-      timeout: 30_000,
-    });
-
-    // Interact with the tile and confirm the text remains visible (no reconnect flash).
-    await page.getByRole('button', { name: 'Sandbox Fixture' }).click();
-    await expect(page.getByText('PRIVATE BEACH PONG', { exact: false })).toBeVisible();
+  // The static fixture should render the marquee banner text.
+  await expect(page.getByText('PRIVATE BEACH PONG', { exact: false })).toBeVisible({
+    timeout: 30_000,
   });
+
+  // Interact with the tile and confirm the text remains visible (no reconnect flash).
+  await page.getByRole('button', { name: 'Sandbox Fixture' }).click();
+  await expect(page.getByText('PRIVATE BEACH PONG', { exact: false })).toBeVisible();
 });

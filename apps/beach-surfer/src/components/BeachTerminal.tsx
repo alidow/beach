@@ -284,6 +284,7 @@ export interface BeachTerminalProps {
   onStatusChange?: (status: TerminalStatus) => void;
   store?: TerminalGridStore;
   transport?: TerminalTransport;
+  transportVersion?: number;
   className?: string;
   fontFamily?: string;
   fontSize?: number;
@@ -320,6 +321,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     autoConnect = false,
     onStatusChange,
     transport: providedTransport,
+    transportVersion = 0,
     store: providedStore,
     fallbackOverrides,
     className,
@@ -914,7 +916,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     }
     emitViewportState();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [providedTransport]);
+  }, [providedTransport, transportVersion]);
 
   useEffect(() => {
     if (!autoConnect || transportRef.current || !sessionId || !baseUrl) {

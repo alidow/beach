@@ -108,8 +108,18 @@ export function removeTileFromGroup(layout: CanvasLayout, tileId: string, groupI
   const group = layout.groups[groupId];
   if (!tile || !group) return layout;
   const memberIds = group.memberIds.filter((id) => id !== tileId);
-  const tiles = { ...layout.tiles, [tileId]: { ...tile, groupId: undefined } };
+  const tiles: CanvasLayout['tiles'] = {
+    ...layout.tiles,
+    [tileId]: { ...tile, groupId: undefined },
+  };
   if (memberIds.length <= 1) {
+    for (const memberId of group.memberIds) {
+      if (memberId === tileId) continue;
+      const member = layout.tiles[memberId];
+      if (member && member.groupId === groupId) {
+        tiles[memberId] = { ...member, groupId: undefined };
+      }
+    }
     // dissolve group
     const { [groupId]: _omit, ...rest } = layout.groups;
     const next: CanvasLayout = { ...layout, groups: rest, tiles };
@@ -163,6 +173,9 @@ export function hitTest(layout: CanvasLayout, point: CanvasPoint): DropTarget {
 
 export function dropTileOnTarget(layout: CanvasLayout, tileId: string, target: DropTarget): CanvasLayout {
   if (target.type === 'tile') {
+    if (target.id === tileId) {
+      return layout;
+    }
     // Create a new group containing both tiles (or merge if target is already grouped)
     const dst = layout.tiles[target.id];
     if (!dst) return layout;

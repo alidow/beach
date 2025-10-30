@@ -181,6 +181,7 @@ function SessionTerminalPreviewView({
         sessionId,
         store: viewer.store,
         transport: viewer.transport,
+        transportVersion: viewer.transportVersion,
         status: viewer.status,
         connecting: viewer.connecting,
         latencyMs: viewer.latencyMs,
@@ -189,7 +190,16 @@ function SessionTerminalPreviewView({
     } catch {
       // ignore logging issues
     }
-  }, [sessionId, trimmedToken, viewer.connecting, viewer.latencyMs, viewer.status, viewer.store, viewer.transport]);
+  }, [
+    sessionId,
+    trimmedToken,
+    viewer.connecting,
+    viewer.latencyMs,
+    viewer.status,
+    viewer.store,
+    viewer.transport,
+    viewer.transportVersion,
+  ]);
 
   const baseFontSize = variant === 'full' ? 14 : 12;
   const effectiveFontSize = useMemo(() => {
@@ -856,6 +866,7 @@ function SessionTerminalPreviewView({
           <BeachTerminal
             store={viewer.store ?? undefined}
             transport={viewer.transport ?? undefined}
+            transportVersion={viewer.transportVersion}
             autoConnect={false}
             className="w-full"
             fontSize={effectiveFontSize}

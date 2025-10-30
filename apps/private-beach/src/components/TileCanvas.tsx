@@ -1137,6 +1137,7 @@ const SessionTile = forwardRef<HTMLDivElement, SessionTileProps>(
     return {
       store: effectiveViewer.store,
       transport: effectiveViewer.transport,
+      transportVersion: effectiveViewer.transportVersion,
       connecting: effectiveViewer.connecting,
       error: effectiveViewer.error,
       status: effectiveViewer.status,
@@ -1146,6 +1147,7 @@ const SessionTile = forwardRef<HTMLDivElement, SessionTileProps>(
   }, [
     effectiveViewer.store,
     effectiveViewer.transport,
+    effectiveViewer.transportVersion,
     effectiveViewer.connecting,
     effectiveViewer.error,
     effectiveViewer.status,
@@ -1180,6 +1182,7 @@ const SessionTile = forwardRef<HTMLDivElement, SessionTileProps>(
         connecting: viewerSnapshot.connecting,
         latencyMs: viewerSnapshot.latencyMs,
         transportType,
+        transportVersion: viewerSnapshot.transportVersion,
         hasStore: Boolean(viewerSnapshot.store),
       });
     }

@@ -20,6 +20,7 @@ vi.mock('../SessionTerminalPreview', () => ({
 const mockViewer = {
   store: { kind: 'store' },
   transport: { kind: 'transport' },
+  transportVersion: 0,
   connecting: false,
   error: null,
   status: 'connected' as const,

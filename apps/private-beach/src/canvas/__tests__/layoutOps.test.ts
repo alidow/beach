@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   addTileToGroup,
   createGroupWithTiles,
+  dropTileOnTarget,
   removeTileFromGroup,
 } from '../layoutOps';
 import type { CanvasLayout } from '../types';
@@ -72,5 +73,11 @@ describe('layoutOps grouping', () => {
     expect(dissolved.tiles.a.groupId).toBeUndefined();
     expect(dissolved.tiles.b.groupId).toBeUndefined();
   });
-});
 
+  it('ignores self-drop attempts that would otherwise create a group', () => {
+    const base = makeBaseLayout();
+    const result = dropTileOnTarget(base, 'a', { type: 'tile', id: 'a' });
+    expect(result).toBe(base);
+    expect(Object.keys(result.groups)).toHaveLength(0);
+  });
+});

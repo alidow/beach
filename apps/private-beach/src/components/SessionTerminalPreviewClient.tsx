@@ -13,6 +13,7 @@ import {
   hydrateTerminalStoreFromDiff,
   type TerminalStateDiff,
 } from '../lib/terminalHydrator';
+import { computeDimensionUpdate, type HostDimensionSource } from './terminalHostDimensions';
 
 const DEFAULT_HOST_COLS = 80;
 const DEFAULT_HOST_ROWS = 24;
@@ -122,6 +123,8 @@ function SessionTerminalPreviewView({
     rows: null,
     cols: null,
   });
+  const hostRowSourceRef = useRef<HostDimensionSource>('unknown');
+  const hostColSourceRef = useRef<HostDimensionSource>('unknown');
   const cloneWrapperRef = useRef<HTMLDivElement | null>(null);
   const cloneInnerRef = useRef<HTMLDivElement | null>(null);
   const previewStatusRef = useRef<PreviewStatus>('connecting');
@@ -252,9 +255,6 @@ function SessionTerminalPreviewView({
       return;
     }
     setHostDimensions((current) => {
-      let rows = current.rows;
-      let cols = current.cols;
-      let changed = false;
       const hostViewportRows =
         typeof viewportState.hostViewportRows === 'number' && viewportState.hostViewportRows > 0
           ? viewportState.hostViewportRows
@@ -266,21 +266,22 @@ function SessionTerminalPreviewView({
           : null;
       const measuredViewportCols = viewportState.viewportCols > 0 ? viewportState.viewportCols : null;
 
-      if (hostViewportRows != null && hostViewportRows !== rows) {
-        rows = hostViewportRows;
-        changed = true;
-      } else if ((rows == null || rows <= 0) && measuredViewportRows != null) {
-        rows = measuredViewportRows;
-        changed = true;
-      }
+      const nextRowResult = computeDimensionUpdate(
+        current.rows,
+        hostViewportRows,
+        measuredViewportRows,
+        hostRowSourceRef.current,
+      );
+      const nextColResult = computeDimensionUpdate(
+        current.cols,
+        hostViewportCols,
+        measuredViewportCols,
+        hostColSourceRef.current,
+      );
 
-      if (hostViewportCols != null && hostViewportCols !== cols) {
-        cols = hostViewportCols;
-        changed = true;
-      } else if ((cols == null || cols <= 0) && measuredViewportCols != null) {
-        cols = measuredViewportCols;
-        changed = true;
-      }
+      const changed = nextRowResult.changed || nextColResult.changed;
+      hostRowSourceRef.current = nextRowResult.source;
+      hostColSourceRef.current = nextColResult.source;
 
       if (!changed) {
         return current;
@@ -292,20 +293,22 @@ function SessionTerminalPreviewView({
           console.info('[terminal][trace] host-dimension-update', {
             sessionId,
             prevRows: current.rows,
-            nextRows: rows,
+            nextRows: nextRowResult.value,
             prevCols: current.cols,
-            nextCols: cols,
+            nextCols: nextColResult.value,
             hostViewportRows,
             measuredViewportRows,
             hostViewportCols,
             measuredViewportCols,
+            rowSource: nextRowResult.source,
+            colSource: nextColResult.source,
             measurementVersion: measurementVersionRef.current,
           });
         } catch {
           // ignore logging failures
         }
       }
-      return { rows, cols };
+      return { rows: nextRowResult.value, cols: nextColResult.value };
     });
   }, [sessionId, viewportState]);
 
@@ -408,6 +411,8 @@ function SessionTerminalPreviewView({
     }
     setViewportState(null);
     setHostDimensions({ rows: null, cols: null });
+    hostRowSourceRef.current = 'unknown';
+    hostColSourceRef.current = 'unknown';
     if (typeof window !== 'undefined') {
       try {
         console.info('[terminal][diag] reset-dimensions', { sessionId });
@@ -416,6 +421,12 @@ function SessionTerminalPreviewView({
       }
     }
   }, [sessionId, viewer.store]);
+
+  useEffect(() => {
+    hostRowSourceRef.current = 'unknown';
+    hostColSourceRef.current = 'unknown';
+    setHostDimensions({ rows: null, cols: null });
+  }, [sessionId]);
 
   useEffect(() => {
     prehydratedSeqRef.current = null;
@@ -762,14 +773,29 @@ function SessionTerminalPreviewView({
         const inferredCols = Math.max(1, Math.round((rawWidthFromDom - TERMINAL_PADDING_X) / cellWidth));
         if (Number.isFinite(inferredRows) || Number.isFinite(inferredCols)) {
           setHostDimensions((current) => {
-            const nextRows = Number.isFinite(inferredRows) ? inferredRows : current.rows;
-            const nextCols = Number.isFinite(inferredCols) ? inferredCols : current.cols;
-            if (current.rows === nextRows && current.cols === nextCols) {
+            const fallbackRows = Number.isFinite(inferredRows) ? inferredRows : null;
+            const fallbackCols = Number.isFinite(inferredCols) ? inferredCols : null;
+            const nextRowResult = computeDimensionUpdate(
+              current.rows,
+              null,
+              fallbackRows,
+              hostRowSourceRef.current,
+            );
+            const nextColResult = computeDimensionUpdate(
+              current.cols,
+              null,
+              fallbackCols,
+              hostColSourceRef.current,
+            );
+            const changed = nextRowResult.changed || nextColResult.changed;
+            hostRowSourceRef.current = nextRowResult.source;
+            hostColSourceRef.current = nextColResult.source;
+            if (!changed) {
               return current;
             }
             return {
-              rows: nextRows,
-              cols: nextCols,
+              rows: nextRowResult.value,
+              cols: nextColResult.value,
             };
           });
         }
@@ -823,12 +849,11 @@ function SessionTerminalPreviewView({
   const driverWrapperStyle = useMemo<CSSProperties>(
     () => ({
       position: 'absolute',
-      width: 0,
-      height: 0,
-      overflow: 'hidden',
+      top: -10_000,
+      left: -10_000,
       opacity: 0,
       pointerEvents: 'none',
-      contain: 'size',
+      visibility: 'hidden',
     }),
     [],
   );
@@ -971,7 +996,7 @@ function SessionTerminalPreviewView({
             showStatusBar={false}
             autoResizeHostOnViewportChange={false}
             onViewportStateChange={handleViewportStateChange}
-            disableViewportMeasurements
+            disableViewportMeasurements={false}
             maxRenderFps={20}
             hideIdlePlaceholder
           />

@@ -9,6 +9,10 @@ import {
 import { BeachTerminal, type TerminalViewportState } from '../../../beach-surfer/src/components/BeachTerminal';
 import { CabanaPrivateBeachPlayer } from '../../../beach-surfer/src/components/cabana/CabanaPrivateBeachPlayer';
 import type { CabanaTelemetryHandlers } from '../../../beach-surfer/src/components/cabana/CabanaSessionPlayer';
+import {
+  hydrateTerminalStoreFromDiff,
+  type TerminalStateDiff,
+} from '../lib/terminalHydrator';
 
 const DEFAULT_HOST_COLS = 80;
 const DEFAULT_HOST_ROWS = 24;
@@ -52,7 +56,6 @@ type PreviewMeasurements = {
   targetHeight: number;
   rawWidth: number;
   rawHeight: number;
-  rawHeightColsAdjusted: number;
   hostRows: number | null;
   hostCols: number | null;
   measurementVersion: number;
@@ -84,6 +87,7 @@ type Props = {
   onPreviewMeasurementsChange?: (sessionId: string, measurements: PreviewMeasurements | null) => void;
   credentialOverride?: SessionCredentialOverride | null;
   viewerOverride?: TerminalViewerState | null;
+  cachedStateDiff?: TerminalStateDiff | undefined;
 };
 
 type ViewProps = Omit<Props, 'token' | 'viewerOverride'> & {
@@ -111,6 +115,7 @@ function SessionTerminalPreviewView({
   viewer,
   trimmedToken,
   isCabana,
+  cachedStateDiff,
 }: ViewProps) {
   const [viewportState, setViewportState] = useState<TerminalViewportState | null>(null);
   const [hostDimensions, setHostDimensions] = useState<{ rows: number | null; cols: number | null }>({
@@ -123,7 +128,10 @@ function SessionTerminalPreviewView({
   const [previewStatus, setPreviewStatusState] = useState<PreviewStatus>('connecting');
   const measurementsRef = useRef<PreviewMeasurements | null>(null);
   const measurementVersionRef = useRef<number>(1);
+  const domRawSizeRef = useRef<{ width: number; height: number } | null>(null);
+  const [domRawVersion, setDomRawVersion] = useState(0);
   const [isCloneVisible, setIsCloneVisible] = useState<boolean>(true);
+  const prehydratedSeqRef = useRef<number | null>(null);
 
   const updatePreviewStatus = useCallback(
     (next: PreviewStatus) => {
@@ -401,6 +409,39 @@ function SessionTerminalPreviewView({
   }, [sessionId, viewer.store]);
 
   useEffect(() => {
+    prehydratedSeqRef.current = null;
+  }, [viewer.store]);
+
+  useEffect(() => {
+    if (!viewer.store || !cachedStateDiff) {
+      return;
+    }
+    const seq = cachedStateDiff.sequence ?? 0;
+    if (prehydratedSeqRef.current === seq) {
+      return;
+    }
+    const hydrated = hydrateTerminalStoreFromDiff(viewer.store, cachedStateDiff, {
+      viewportRows: hostDimensions.rows ?? undefined,
+    });
+    if (hydrated) {
+      prehydratedSeqRef.current = seq;
+      if (typeof window !== 'undefined') {
+        console.info('[terminal][hydrate] applied cached diff', {
+          sessionId,
+          sequence: seq,
+          rows: cachedStateDiff.payload?.rows ?? null,
+          cols: cachedStateDiff.payload?.cols ?? null,
+        });
+      }
+    } else if (typeof window !== 'undefined') {
+      console.warn('[terminal][hydrate] failed to apply cached diff', {
+        sessionId,
+        sequence: seq,
+      });
+    }
+  }, [cachedStateDiff, hostDimensions.rows, sessionId, viewer.store]);
+
+  useEffect(() => {
     if (!onHostResizeStateChange) {
       return;
     }
@@ -507,8 +548,19 @@ function SessionTerminalPreviewView({
     ) {
       return null;
     }
-    const rawWidth = hostPixelSize.width;
-    const rawHeight = hostPixelSize.height;
+    const domRaw = domRawSizeRef.current;
+    let rawWidth = hostPixelSize.width;
+    let rawHeight = hostPixelSize.height;
+    if (
+      domRaw &&
+      Number.isFinite(domRaw.width) &&
+      Number.isFinite(domRaw.height) &&
+      domRaw.width > 0 &&
+      domRaw.height > 0
+    ) {
+      rawWidth = domRaw.width;
+      rawHeight = domRaw.height;
+    }
     if (!Number.isFinite(rawWidth) || rawWidth <= 0 || !Number.isFinite(rawHeight) || rawHeight <= 0) {
       return null;
     }
@@ -529,7 +581,7 @@ function SessionTerminalPreviewView({
       hostCols: resolvedHostCols,
       measurementVersion: measurementVersionRef.current,
     };
-  }, [hostPixelSize.height, hostPixelSize.width, resolvedHostCols, resolvedHostRows]);
+  }, [domRawVersion, hostPixelSize.height, hostPixelSize.width, resolvedHostCols, resolvedHostRows]);
 
   const effectiveScale = useMemo(() => {
     if (!previewMeasurements) {
@@ -679,6 +731,22 @@ function SessionTerminalPreviewView({
         childWidth: child ? Math.round(child.width) : null,
         childHeight: child ? Math.round(child.height) : null,
       });
+      const measuredWidth = child ? child.width : rect.width;
+      const measuredHeight = child ? child.height : rect.height;
+      if (effectiveScale > 0 && Number.isFinite(measuredWidth) && Number.isFinite(measuredHeight)) {
+        const rawWidthFromDom = measuredWidth / effectiveScale;
+        const rawHeightFromDom = measuredHeight / effectiveScale;
+        const prev = domRawSizeRef.current;
+        const widthDelta = !prev ? Number.POSITIVE_INFINITY : Math.abs(prev.width - rawWidthFromDom);
+        const heightDelta = !prev ? Number.POSITIVE_INFINITY : Math.abs(prev.height - rawHeightFromDom);
+        if (!prev || widthDelta > 1 || heightDelta > 1) {
+          domRawSizeRef.current = {
+            width: rawWidthFromDom,
+            height: rawHeightFromDom,
+          };
+          setDomRawVersion((version) => (version + 1) % 1_000_000);
+        }
+      }
     };
     const handle = window.requestAnimationFrame(logDimensions);
     return () => window.cancelAnimationFrame(handle);

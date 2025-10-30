@@ -21,7 +21,7 @@ import { Button } from './ui/button';
 import { useSessionTerminal, type TerminalViewerState } from '../hooks/useSessionTerminal';
 import { emitTelemetry } from '../lib/telemetry';
 import { extractSessionTitle } from '../lib/sessionMetadata';
-import { buildViewerStateFromTerminalDiff, extractTerminalStateDiff } from '../lib/terminalHydrator';
+import { extractTerminalStateDiff, type TerminalStateDiff } from '../lib/terminalHydrator';
 
 const AutoGrid = dynamic(() => import('./AutoGrid'), {
   ssr: false,
@@ -886,13 +886,14 @@ function TileCard({
               onHostResizeStateChange={onHostResizeStateChange}
               onViewportDimensions={handlePreviewViewportDimensions}
               onPreviewStatusChange={handlePreviewStatusChange}
-              onPreviewMeasurementsChange={handlePreviewMeasurements}
-              fontSize={fontSize}
-              scale={zoomDisplay}
-              locked={view.locked}
-              cropped={cropped}
-              viewerOverride={viewer}
-            />
+          onPreviewMeasurementsChange={handlePreviewMeasurements}
+          fontSize={fontSize}
+          scale={zoomDisplay}
+          locked={view.locked}
+          cropped={cropped}
+          viewerOverride={viewer}
+          cachedStateDiff={cachedDiff ?? undefined}
+        />
           ) : (
             <div className="flex h-full w-full items-center justify-center bg-neutral-950/90 text-xs text-muted-foreground">
               <span>Expanded view active…</span>
@@ -1032,6 +1033,7 @@ type SessionTileProps = {
   className?: string;
   style?: CSSProperties;
   viewerOverride?: TerminalViewerState | null;
+  cachedDiff?: TerminalStateDiff | null;
 };
 
 const SessionTile = forwardRef<HTMLDivElement, SessionTileProps>(
@@ -1066,6 +1068,7 @@ const SessionTile = forwardRef<HTMLDivElement, SessionTileProps>(
       className,
       style,
       viewerOverride,
+      cachedDiff,
     },
     ref,
   ) => {
@@ -1341,40 +1344,26 @@ export default function TileCanvas({
     return initial;
   });
 
-  const autoViewerOverrides = useMemo<Record<string, TerminalViewerState>>(() => {
-    if (!tiles || tiles.length === 0) {
-      return {};
-    }
-    const overrides: Record<string, TerminalViewerState> = {};
+  const cachedTerminalDiffs = useMemo<Record<string, TerminalStateDiff>>(() => {
+    const map: Record<string, TerminalStateDiff> = {};
     for (const session of tiles) {
-      try {
-        const diff = extractTerminalStateDiff(session.metadata);
-        if (!diff) {
-          continue;
+      const diff = extractTerminalStateDiff(session.metadata);
+      if (diff) {
+        map[session.session_id] = diff;
+        if (typeof window !== 'undefined') {
+          console.info('[terminal-hydrate][tile-canvas]', {
+            sessionId: session.session_id,
+            sequence: diff.sequence ?? null,
+          });
         }
-        const viewerState = buildViewerStateFromTerminalDiff(diff);
-        if (viewerState) {
-          overrides[session.session_id] = viewerState;
-        }
-      } catch (err) {
-        console.warn('[tile-canvas] terminal preview hydration failed', {
-          sessionId: session.session_id,
-          error: err instanceof Error ? err.message : err,
-        });
       }
     }
-    return overrides;
+    return map;
   }, [tiles]);
 
   const effectiveViewerOverrides = useMemo<Record<string, TerminalViewerState | null | undefined>>(() => {
-    if (!viewerOverrides || Object.keys(viewerOverrides).length === 0) {
-      return autoViewerOverrides;
-    }
-    return {
-      ...autoViewerOverrides,
-      ...viewerOverrides,
-    };
-  }, [autoViewerOverrides, viewerOverrides]);
+    return viewerOverrides ?? {};
+  }, [viewerOverrides]);
 
   const tileStateRef = useRef<TileStateMap>(tileState);
   const prevTileStateRef = useRef<TileStateMap>({});
@@ -2985,6 +2974,7 @@ const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
               isExpanded={isExpanded}
               className="session-grid-item"
               viewerOverride={effectiveViewerOverrides[session.session_id] ?? null}
+              cachedDiff={cachedTerminalDiffs[session.session_id] ?? null}
             />
           );
         })}

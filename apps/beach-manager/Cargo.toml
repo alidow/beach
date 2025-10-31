@@ -32,6 +32,7 @@ futures-util = "0.3"
 tower-http = { version = "0.5", features = ["cors"] }
 percent-encoding = "2.3"
 webrtc = "0.14"
+url = "2"
 
 [dev-dependencies]
 tokio = { version = "1.35", features = ["rt", "macros"] }

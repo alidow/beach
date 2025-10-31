@@ -56,11 +56,14 @@ type ManagerEntry = {
   reconnectTimer: number | null;
   listenerBundle: ListenerBundle | null;
   disposed: boolean;
+  reconnectAttempts: number;
+  lastCloseReason: string | null;
 };
 
 const entries = new Map<string, ManagerEntry>();
 const KEEP_ALIVE_MS = 15_000;
 const RECONNECT_DELAY_MS = 1_500;
+const MAX_RECONNECT_DELAY_MS = 15_000;
 
 export function acquireTerminalConnection(
   key: string,
@@ -114,6 +117,8 @@ function getOrCreateEntry(key: string, params: PreparedConnectionParams): Manage
     reconnectTimer: null,
     listenerBundle: null,
     disposed: false,
+    reconnectAttempts: 0,
+    lastCloseReason: null,
   };
   entries.set(key, entry);
   return entry;
@@ -237,6 +242,8 @@ function ensureEntryConnection(entry: ManagerEntry) {
       entry.latencyMs = null;
       entry.lastHeartbeat = null;
       entry.listenerBundle = attachListeners(entry, connection);
+      entry.reconnectAttempts = 0;
+      entry.lastCloseReason = null;
       notifySubscribers(entry);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -246,6 +253,9 @@ function ensureEntryConnection(entry: ManagerEntry) {
       entry.transport = null;
       entry.connection = null;
       notifySubscribers(entry);
+      entry.reconnectAttempts = Math.min(entry.reconnectAttempts + 1, 8);
+      entry.lastCloseReason = message;
+      scheduleReconnect(entry, { immediate: false });
     } finally {
       entry.connectPromise = null;
     }
@@ -324,14 +334,22 @@ function attachListeners(entry: ManagerEntry, connection: BrowserTransportConnec
   transport.addEventListener('frame', frameHandler as EventListener);
   detachFns.push(() => transport.removeEventListener('frame', frameHandler as EventListener));
 
-  const closeHandler = () => {
+  const closeHandler = (event: Event) => {
+    const eventReason =
+      typeof (event as any)?.reason === 'string'
+        ? String((event as any).reason)
+        : typeof (event as any)?.detail?.reason === 'string'
+          ? String((event as any).detail.reason)
+          : null;
     detachListeners(entry);
     entry.connection = null;
     entry.transport = null;
     entry.connecting = true;
     entry.status = 'reconnecting';
+    entry.reconnectAttempts = Math.min(entry.reconnectAttempts + 1, 8);
+    entry.lastCloseReason = eventReason ?? 'transport-close';
     notifySubscribers(entry);
-    scheduleReconnect(entry);
+    scheduleReconnect(entry, { reason: entry.lastCloseReason ?? undefined });
   };
   transport.addEventListener('close', closeHandler as EventListener);
   detachFns.push(() => transport.removeEventListener('close', closeHandler as EventListener));
@@ -411,7 +429,7 @@ function closeConnection(entry: ManagerEntry, reason: string) {
   entry.transport = null;
 }
 
-function scheduleReconnect(entry: ManagerEntry) {
+function scheduleReconnect(entry: ManagerEntry, options?: { reason?: string; immediate?: boolean }) {
   if (entry.disposed || entry.refCount === 0) {
     return;
   }
@@ -422,8 +440,26 @@ function scheduleReconnect(entry: ManagerEntry) {
   if (entry.reconnectTimer != null) {
     return;
   }
+  const attempt = Math.max(0, entry.reconnectAttempts - 1);
+  const computedDelay = Math.min(
+    RECONNECT_DELAY_MS * (attempt > 0 ? 2 ** attempt : 1),
+    MAX_RECONNECT_DELAY_MS,
+  );
+  const delay = options?.immediate ? 0 : computedDelay;
+  if (typeof window !== 'undefined') {
+    try {
+      console.info('[terminal-manager] schedule-reconnect', {
+        sessionId: entry.params.sessionId,
+        attempt: entry.reconnectAttempts,
+        delay,
+        reason: options?.reason ?? entry.lastCloseReason ?? null,
+      });
+    } catch {
+      // ignore logging issues
+    }
+  }
   entry.reconnectTimer = window.setTimeout(() => {
     entry.reconnectTimer = null;
     ensureEntryConnection(entry);
-  }, RECONNECT_DELAY_MS);
+  }, delay);
 }

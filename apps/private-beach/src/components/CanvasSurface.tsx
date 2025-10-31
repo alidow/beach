@@ -14,7 +14,9 @@ import ReactFlow, {
   type NodeChange,
   type NodeTypes,
   type OnSelectionChangeParams,
+  type Viewport,
   applyNodeChanges,
+  useOnViewportChange,
 } from 'reactflow';
 import 'reactflow/dist/style.css';
 
@@ -61,6 +63,8 @@ const DEFAULT_TILE_WIDTH = 448;
 const DEFAULT_TILE_HEIGHT = 448;
 const DEFAULT_AGENT_WIDTH = 240;
 const DEFAULT_AGENT_HEIGHT = 140;
+const VIEWPORT_PAN_EPSILON = 0.5;
+const VIEWPORT_ZOOM_EPSILON = 0.001;
 
 type HandlersConfig = Parameters<typeof useRegisterCanvasHandlers>[0];
 
@@ -397,6 +401,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
   } | null>(null);
   const lastSyncNodeIdsRef = useRef<Set<string>>(new Set());
   const lastLayoutSignatureRef = useRef<string | null>(null);
+  const lastSyncedViewportRef = useRef<{ x: number; y: number; zoom: number } | null>(null);
 
   useEffect(() => {
     setLayout(ensureLayout(layoutProp));
@@ -417,7 +422,8 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     const map: Record<string, TerminalStateDiff> = {};
     const seen = new Set<string>();
     for (const session of tiles) {
-      const diff = extractTerminalStateDiff(session.metadata);
+      const diff =
+        extractTerminalStateDiff(session.last_state) ?? extractTerminalStateDiff(session.metadata);
       if (diff) {
         map[session.session_id] = diff;
         seen.add(session.session_id);
@@ -500,9 +506,19 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
       if (!didLoadRef.current) {
         load({ version: 3, nodes, edges: next.edges ?? [], viewport });
         didLoadRef.current = true;
+        lastSyncedViewportRef.current = viewport;
       } else {
         setNodes(nodes);
-        setViewport(viewport);
+        const prevViewport = lastSyncedViewportRef.current;
+        const shouldSyncViewport =
+          !prevViewport ||
+          Math.abs(prevViewport.x - viewport.x) > 0.5 ||
+          Math.abs(prevViewport.y - viewport.y) > 0.5 ||
+          Math.abs(prevViewport.zoom - viewport.zoom) > 0.001;
+        if (shouldSyncViewport) {
+          setViewport(viewport);
+        }
+        lastSyncedViewportRef.current = viewport;
       }
     },
     [agentMap, load, sessionMap, setNodes, setViewport],
@@ -1107,6 +1123,46 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
       }),
     );
   }, [reactFlow, updateLayout]);
+
+  const handleViewportChange = useCallback((viewport: Viewport) => {
+    lastSyncedViewportRef.current = viewport;
+  }, []);
+
+  const handleViewportEnd = useCallback(
+    (viewport: Viewport) => {
+      lastSyncedViewportRef.current = viewport;
+      if (!didLoadRef.current) {
+        return;
+      }
+      updateLayout('viewport-sync', (current) => {
+        const existingPan = current.viewport?.pan ?? { x: 0, y: 0 };
+        const existingZoom = current.viewport?.zoom ?? 1;
+        const panDeltaX = Math.abs(existingPan.x - viewport.x);
+        const panDeltaY = Math.abs(existingPan.y - viewport.y);
+        const zoomDelta = Math.abs(existingZoom - viewport.zoom);
+        if (
+          panDeltaX < VIEWPORT_PAN_EPSILON &&
+          panDeltaY < VIEWPORT_PAN_EPSILON &&
+          zoomDelta < VIEWPORT_ZOOM_EPSILON
+        ) {
+          return current;
+        }
+        return withUpdatedTimestamp({
+          ...current,
+          viewport: {
+            zoom: viewport.zoom,
+            pan: { x: viewport.x, y: viewport.y },
+          },
+        });
+      });
+    },
+    [updateLayout],
+  );
+
+  useOnViewportChange({
+    onChange: handleViewportChange,
+    onEnd: handleViewportEnd,
+  });
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {

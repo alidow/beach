@@ -7,6 +7,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    net::IpAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -27,8 +28,8 @@ use beach_client_core::protocol::{CursorFrame, Update as WireUpdate};
 use beach_client_core::{
     decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
     ClientFrame as WireClientFrame, HostFrame as WireHostFrame, NegotiatedSingle,
-    NegotiatedTransport, PackedCell, Payload, SessionConfig, SessionError, SessionManager, Style,
-    StyleId, TerminalGrid, TransportError,
+    NegotiatedTransport, PackedCell, Payload, SessionConfig, SessionError, SessionHandle,
+    SessionManager, Style, StyleId, TerminalGrid, TransportError, TransportOffer,
 };
 use chrono::{DateTime, Duration, Utc};
 use prometheus::IntGauge;
@@ -39,6 +40,7 @@ use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
+use url::Url;
 use uuid::Uuid;
 
 const DEFAULT_LEASE_TTL_MS: u64 = 30_000;
@@ -402,10 +404,7 @@ fn capture_terminal_frame_simple(
                 .map(|snapshot| unpack_cell(snapshot.cell))
                 .unwrap_or((' ', StyleId::DEFAULT));
             let ch = if raw_char == '\0' { ' ' } else { raw_char };
-            let style = style_lookup
-                .get(&style_id.0)
-                .copied()
-                .unwrap_or_default();
+            let style = style_lookup.get(&style_id.0).copied().unwrap_or_default();
             cells.push(StyledCell {
                 ch,
                 style: CellStylePayload {
@@ -529,6 +528,7 @@ pub struct SessionSummary {
     pub capabilities: Vec<String>,
     pub location_hint: Option<String>,
     pub metadata: Option<serde_json::Value>,
+    pub last_state: Option<StateDiff>,
     pub version: String,
     pub harness_id: String,
     pub controller_token: Option<String>,
@@ -727,6 +727,7 @@ struct SessionRow {
     capabilities: Option<Json<serde_json::Value>>,
     metadata: Option<Json<serde_json::Value>>,
     location_hint: Option<String>,
+    last_state: Option<Json<serde_json::Value>>,
     last_health: Option<Json<serde_json::Value>>,
     controller_token: Option<Uuid>,
     expires_at: Option<DateTime<Utc>>,
@@ -1353,6 +1354,7 @@ impl AppState {
                         s.capabilities,
                         s.metadata,
                         s.location_hint,
+                        sr.last_state,
                         sr.last_health,
                         cl.id AS controller_token,
                         cl.expires_at,
@@ -1379,6 +1381,9 @@ impl AppState {
                         .map(|Json(value)| json_array_to_strings(&value))
                         .unwrap_or_default();
                     let metadata = row.metadata.map(|Json(value)| value);
+                    let last_state = row
+                        .last_state
+                        .and_then(|Json(value)| serde_json::from_value(value).ok());
                     let controller_token = row
                         .controller_token
                         .filter(|_| is_active_lease(row.expires_at, row.revoked_at))
@@ -1412,6 +1417,7 @@ impl AppState {
                         capabilities,
                         location_hint: row.location_hint.clone(),
                         metadata,
+                        last_state,
                         version: "unknown".into(),
                         harness_id: row.harness_id.unwrap_or_else(Uuid::new_v4).to_string(),
                         controller_token,
@@ -2865,11 +2871,29 @@ fn legacy_layout_to_canvas(
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
-            let Some(id) = id else { continue; };
-            let grid_x = item.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
-            let grid_y = item.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
-            let grid_w = item.get("w").and_then(|v| v.as_f64()).unwrap_or(2.0).max(1.0);
-            let grid_h = item.get("h").and_then(|v| v.as_f64()).unwrap_or(2.0).max(1.0);
+            let Some(id) = id else {
+                continue;
+            };
+            let grid_x = item
+                .get("x")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                .max(0.0);
+            let grid_y = item
+                .get("y")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                .max(0.0);
+            let grid_w = item
+                .get("w")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(2.0)
+                .max(1.0);
+            let grid_h = item
+                .get("h")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(2.0)
+                .max(1.0);
             let width_px = item
                 .get("widthPx")
                 .and_then(|v| v.as_f64())
@@ -2919,8 +2943,8 @@ fn legacy_layout_to_canvas(
             migrated_from: Some(2),
         },
     }
-        .ensure_version()
-        .unwrap_or_else(|_| crate::routes::CanvasLayout::empty(now_ms))
+    .ensure_version()
+    .unwrap_or_else(|_| crate::routes::CanvasLayout::empty(now_ms))
 }
 
 impl InnerState {
@@ -2932,11 +2956,7 @@ impl InnerState {
         }
     }
 
-    async fn get_canvas_layout(
-        &self,
-        beach_id: &str,
-        now_ms: i64,
-    ) -> crate::routes::CanvasLayout {
+    async fn get_canvas_layout(&self, beach_id: &str, now_ms: i64) -> crate::routes::CanvasLayout {
         let layouts = self.canvas_layouts.read().await;
         layouts
             .get(beach_id)
@@ -3224,6 +3244,7 @@ impl SessionSummary {
             capabilities: record.capabilities.clone(),
             location_hint: record.location_hint.clone(),
             metadata: record.metadata.clone(),
+            last_state: record.last_state.clone(),
             version: record.version.clone(),
             harness_id: record.harness_id.clone(),
             controller_token: record.controller_token.clone(),
@@ -4465,9 +4486,7 @@ impl AppState {
 
                 let layout = if let Some(Json(value)) = row {
                     let layout: crate::routes::CanvasLayout = serde_json::from_value(value)?;
-                    layout
-                        .ensure_version()
-                        .map_err(StateError::InvalidLayout)?
+                    layout.ensure_version().map_err(StateError::InvalidLayout)?
                 } else {
                     let migrated = legacy_layout_to_canvas(meta.settings.get("layout"), now_ms);
                     let payload = serde_json::to_value(&migrated)?;
@@ -4673,6 +4692,7 @@ async fn viewer_connect_once(
     };
 
     let config = SessionConfig::new(road_base_url).map_err(ViewerError::Join)?;
+    let fallback_base = config.base_url().clone();
     let manager = SessionManager::new(config).map_err(ViewerError::Join)?;
     let joined = manager
         .join(
@@ -4684,7 +4704,9 @@ async fn viewer_connect_once(
         )
         .await
         .map_err(ViewerError::Join)?;
-    let negotiated = negotiate_transport(joined.handle(), Some(join_code), Some(label), false)
+    let mut handle = joined.into_handle();
+    rewrite_loopback_transports(&mut handle, &fallback_base)?;
+    let negotiated = negotiate_transport(&handle, Some(join_code), Some(label), false)
         .await
         .map_err(ViewerError::Negotiation)?;
     let transport = match negotiated {
@@ -4869,6 +4891,123 @@ async fn viewer_connect_once(
             }
         }
     }
+}
+
+fn rewrite_loopback_transports(
+    handle: &mut SessionHandle,
+    fallback_base: &Url,
+) -> Result<(), ViewerError> {
+    if fallback_base.host_str().is_none() {
+        return Err(viewer_config_error(
+            "BEACH_ROAD_URL must include a host component",
+        ));
+    }
+
+    if handle
+        .session_url
+        .host_str()
+        .map_or(false, is_loopback_host)
+    {
+        let mut updated = handle.session_url.clone();
+        rewrite_url_host_port(&mut updated, fallback_base)?;
+        handle.session_url = updated;
+    }
+
+    for offer in &mut handle.offers {
+        match offer {
+            TransportOffer::WebSocket { url } | TransportOffer::WebSocketFallback { url } => {
+                if let Ok(mut parsed) = Url::parse(url) {
+                    if parsed.host_str().map_or(false, is_loopback_host) {
+                        rewrite_url_host_port(&mut parsed, fallback_base)?;
+                        *url = parsed.to_string();
+                    }
+                }
+            }
+            TransportOffer::WebRtc { offer } => {
+                rewrite_webrtc_offer(offer, fallback_base)?;
+            }
+            TransportOffer::Ipc => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn rewrite_webrtc_offer(
+    value: &mut serde_json::Value,
+    fallback_base: &Url,
+) -> Result<(), ViewerError> {
+    let Some(object) = value.as_object_mut() else {
+        return Ok(());
+    };
+
+    if let Some(signaling_value) = object.get_mut("signaling_url") {
+        if let Some(rewritten) = rewrite_string_url(signaling_value, fallback_base)? {
+            *signaling_value = serde_json::Value::String(rewritten);
+        }
+    }
+
+    if let Some(url_value) = object.get_mut("url") {
+        if let Some(rewritten) = rewrite_string_url(url_value, fallback_base)? {
+            *url_value = serde_json::Value::String(rewritten);
+        }
+    }
+
+    Ok(())
+}
+
+fn rewrite_string_url(
+    value: &serde_json::Value,
+    fallback_base: &Url,
+) -> Result<Option<String>, ViewerError> {
+    let Some(raw) = value.as_str() else {
+        return Ok(None);
+    };
+
+    let Ok(mut parsed) = Url::parse(raw) else {
+        return Ok(None);
+    };
+
+    if !parsed.host_str().map_or(false, is_loopback_host) {
+        return Ok(None);
+    }
+
+    rewrite_url_host_port(&mut parsed, fallback_base)?;
+    Ok(Some(parsed.to_string()))
+}
+
+fn rewrite_url_host_port(url: &mut Url, fallback_base: &Url) -> Result<(), ViewerError> {
+    let host = fallback_base
+        .host_str()
+        .ok_or_else(|| viewer_config_error("BEACH_ROAD_URL must include a host component"))?;
+
+    url.set_host(Some(host))
+        .map_err(|_| viewer_config_error("failed to rewrite transport host"))?;
+
+    match fallback_base.port() {
+        Some(port) => url
+            .set_port(Some(port))
+            .map_err(|_| viewer_config_error("failed to rewrite transport port"))?,
+        None => url
+            .set_port(None)
+            .map_err(|_| viewer_config_error("failed to clear transport port"))?,
+    }
+
+    Ok(())
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    host.parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+fn viewer_config_error(message: impl Into<String>) -> ViewerError {
+    ViewerError::Join(SessionError::InvalidConfig(message.into()))
 }
 
 struct ViewerGaugeGuard {

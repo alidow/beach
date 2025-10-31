@@ -1347,7 +1347,8 @@ export default function TileCanvas({
   const cachedTerminalDiffs = useMemo<Record<string, TerminalStateDiff>>(() => {
     const map: Record<string, TerminalStateDiff> = {};
     for (const session of tiles) {
-      const diff = extractTerminalStateDiff(session.metadata);
+      const diff =
+        extractTerminalStateDiff(session.last_state) ?? extractTerminalStateDiff(session.metadata);
       if (diff) {
         map[session.session_id] = diff;
         if (typeof window !== 'undefined') {

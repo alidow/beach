@@ -25,6 +25,16 @@ const MINIMUM_SCALE = 0.05;
 const MAX_PREVIEW_WIDTH = 450;
 const MAX_PREVIEW_HEIGHT = 450;
 
+type HostDimensionCacheEntry = {
+  rows: number | null;
+  cols: number | null;
+  rowSource: HostDimensionSource;
+  colSource: HostDimensionSource;
+  timestamp: number;
+};
+
+const hostDimensionCache = new Map<string, HostDimensionCacheEntry>();
+
 function estimateHostPixelSize(cols: number, rows: number, fontSize: number) {
   const devicePixelRatio =
     typeof window !== 'undefined' && typeof window.devicePixelRatio === 'number'
@@ -119,12 +129,13 @@ function SessionTerminalPreviewView({
   cachedStateDiff,
 }: ViewProps) {
   const [viewportState, setViewportState] = useState<TerminalViewportState | null>(null);
-  const [hostDimensions, setHostDimensions] = useState<{ rows: number | null; cols: number | null }>({
-    rows: null,
-    cols: null,
-  });
-  const hostRowSourceRef = useRef<HostDimensionSource>('unknown');
-  const hostColSourceRef = useRef<HostDimensionSource>('unknown');
+  const cachedEntry = hostDimensionCache.get(sessionId) ?? null;
+  const [hostDimensions, setHostDimensions] = useState<{ rows: number | null; cols: number | null }>(() => ({
+    rows: cachedEntry?.rows ?? null,
+    cols: cachedEntry?.cols ?? null,
+  }));
+  const hostRowSourceRef = useRef<HostDimensionSource>(cachedEntry?.rowSource ?? 'unknown');
+  const hostColSourceRef = useRef<HostDimensionSource>(cachedEntry?.colSource ?? 'unknown');
   const cloneWrapperRef = useRef<HTMLDivElement | null>(null);
   const cloneInnerRef = useRef<HTMLDivElement | null>(null);
   const previewStatusRef = useRef<PreviewStatus>('connecting');
@@ -301,6 +312,15 @@ function SessionTerminalPreviewView({
       hostRowSourceRef.current = nextRowResult.source;
       hostColSourceRef.current = nextColResult.source;
 
+      const cacheEntry: HostDimensionCacheEntry = {
+        rows: changed ? nextRowResult.value : current.rows,
+        cols: changed ? nextColResult.value : current.cols,
+        rowSource: nextRowResult.source,
+        colSource: nextColResult.source,
+        timestamp: Date.now(),
+      };
+      hostDimensionCache.set(sessionId, cacheEntry);
+
       if (!changed) {
         return current;
       }
@@ -371,6 +391,15 @@ function SessionTerminalPreviewView({
         const changed = nextRowResult.changed || nextColResult.changed;
         hostRowSourceRef.current = nextRowResult.source;
         hostColSourceRef.current = nextColResult.source;
+
+        const cacheEntry: HostDimensionCacheEntry = {
+          rows: changed ? nextRowResult.value : current.rows,
+          cols: changed ? nextColResult.value : current.cols,
+          rowSource: nextRowResult.source,
+          colSource: nextColResult.source,
+          timestamp: Date.now(),
+        };
+        hostDimensionCache.set(sessionId, cacheEntry);
 
         if (!changed) {
           return current;
@@ -501,22 +530,44 @@ function SessionTerminalPreviewView({
       return;
     }
     setViewportState(null);
-    setHostDimensions({ rows: null, cols: null });
-    hostRowSourceRef.current = 'unknown';
-    hostColSourceRef.current = 'unknown';
-    if (typeof window !== 'undefined') {
-      try {
-        console.info('[terminal][diag] reset-dimensions', { sessionId });
-      } catch {
-        // ignore logging issues
+    if (!hostDimensionCache.has(sessionId)) {
+      hostRowSourceRef.current = 'unknown';
+      hostColSourceRef.current = 'unknown';
+      setHostDimensions({ rows: null, cols: null });
+      if (typeof window !== 'undefined') {
+        try {
+          console.info('[terminal][diag] reset-dimensions', { sessionId });
+        } catch {
+          // ignore logging issues
+        }
       }
     }
   }, [sessionId, viewer.store]);
 
   useEffect(() => {
-    hostRowSourceRef.current = 'unknown';
-    hostColSourceRef.current = 'unknown';
-    setHostDimensions({ rows: null, cols: null });
+    const cached = hostDimensionCache.get(sessionId) ?? null;
+    if (cached) {
+      hostRowSourceRef.current = cached.rowSource;
+      hostColSourceRef.current = cached.colSource;
+      measurementVersionRef.current = (measurementVersionRef.current % 1_000_000) + 1;
+      setHostDimensions((current) => {
+        if (current.rows === cached.rows && current.cols === cached.cols) {
+          return current;
+        }
+        return { rows: cached.rows, cols: cached.cols };
+      });
+    } else {
+      hostRowSourceRef.current = 'unknown';
+      hostColSourceRef.current = 'unknown';
+      hostDimensionCache.delete(sessionId);
+      measurementVersionRef.current = 1;
+      setHostDimensions((current) => {
+        if (current.rows == null && current.cols == null) {
+          return current;
+        }
+        return { rows: null, cols: null };
+      });
+    }
   }, [sessionId]);
 
   useEffect(() => {
@@ -881,6 +932,14 @@ function SessionTerminalPreviewView({
             const changed = nextRowResult.changed || nextColResult.changed;
             hostRowSourceRef.current = nextRowResult.source;
             hostColSourceRef.current = nextColResult.source;
+            const cacheEntry: HostDimensionCacheEntry = {
+              rows: changed ? nextRowResult.value : current.rows,
+              cols: changed ? nextColResult.value : current.cols,
+              rowSource: nextRowResult.source,
+              colSource: nextColResult.source,
+              timestamp: Date.now(),
+            };
+            hostDimensionCache.set(sessionId, cacheEntry);
             if (!changed) {
               return current;
             }

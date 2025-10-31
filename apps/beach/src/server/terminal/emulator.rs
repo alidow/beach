@@ -400,9 +400,7 @@ impl AlacrittyEmulator {
                     None => {
                         trace!(
                             target = "server::emulator",
-                            origin,
-                            line_idx,
-                            "capture_full_grid skipped_negative_line"
+                            origin, line_idx, "capture_full_grid skipped_negative_line"
                         );
                         continue;
                     }

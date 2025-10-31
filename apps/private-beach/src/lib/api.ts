@@ -5,6 +5,7 @@ export type SessionSummary = {
   capabilities: string[];
   location_hint?: string | null;
   metadata?: any;
+  last_state?: unknown;
   version: string;
   harness_id: string;
   controller_token?: string | null;

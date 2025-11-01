@@ -256,6 +256,21 @@ function SessionTerminalPreviewView({
     [sessionId],
   );
 
+  const hostViewportRows =
+    viewportState?.hostViewportRows && viewportState.hostViewportRows > 0
+      ? viewportState.hostViewportRows
+      : null;
+  const measuredViewportRows =
+    viewportState?.viewportRows && viewportState.viewportRows > 0
+      ? viewportState.viewportRows
+      : null;
+  const hostViewportCols =
+    viewportState?.hostCols && viewportState.hostCols > 0 ? viewportState.hostCols : null;
+  const measuredViewportCols =
+    viewportState?.viewportCols && viewportState.viewportCols > 0
+      ? viewportState.viewportCols
+      : null;
+
   useEffect(() => {
     if (!viewportState) {
       return;
@@ -676,21 +691,6 @@ function SessionTerminalPreviewView({
 
   const zoomMultiplier =
     typeof scale === 'number' && Number.isFinite(scale) ? Math.max(scale, MINIMUM_SCALE) : 1;
-
-  const hostViewportRows =
-    viewportState?.hostViewportRows && viewportState.hostViewportRows > 0
-      ? viewportState.hostViewportRows
-      : null;
-  const measuredViewportRows =
-    viewportState?.viewportRows && viewportState.viewportRows > 0
-      ? viewportState.viewportRows
-      : null;
-  const hostViewportCols =
-    viewportState?.hostCols && viewportState.hostCols > 0 ? viewportState.hostCols : null;
-  const measuredViewportCols =
-    viewportState?.viewportCols && viewportState.viewportCols > 0
-      ? viewportState.viewportCols
-      : null;
 
   const resolvedHostRows =
     hostDimensions.rows && hostDimensions.rows > 0 ? hostDimensions.rows : hostViewportRows;

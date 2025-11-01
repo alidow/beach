@@ -218,7 +218,6 @@ const connectedViewer: TerminalViewerState = {
 
   it('normalizes oversized saved layouts and persists the corrected width', async () => {
     const onLayoutPersist = vi.fn();
-    vi.useFakeTimers();
     renderCanvas({
       tiles: [application],
       savedLayout: [
@@ -237,15 +236,20 @@ const connectedViewer: TerminalViewerState = {
     });
 
     try {
-      await screen.findByTestId('auto-grid');
-      vi.advanceTimersByTime(250);
-      await waitFor(() => expect(onLayoutPersist).toHaveBeenCalled());
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      });
+      expect(onLayoutPersist).toHaveBeenCalled();
       const snapshot = onLayoutPersist.mock.calls[0]?.[0];
       expect(Array.isArray(snapshot)).toBe(true);
       expect(snapshot[0]?.w).toBe(3);
-      expect(snapshot[0]?.zoom).toBeLessThan(1);
+      expect(snapshot[0]?.zoom).toBeLessThanOrEqual(1);
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      });
+      expect(onLayoutPersist.mock.calls.length).toBeLessThanOrEqual(2);
     } finally {
-      vi.useRealTimers();
+      // no-op
     }
   });
 

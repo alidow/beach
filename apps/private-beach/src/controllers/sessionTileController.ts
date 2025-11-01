@@ -209,6 +209,8 @@ class SessionTileController {
 
     if (input.onPersistLayout) {
       this.persistCallback = input.onPersistLayout;
+    } else {
+      this.persistCallback = null;
     }
     this.layoutChangeCallback = input.onLayoutChange ?? null;
 
@@ -354,23 +356,34 @@ class SessionTileController {
     });
   }
 
+  requestPersist() {
+    this.schedulePersist();
+  }
+
   updateTileGridMetadata(
     tileId: string,
     reason: string,
     updater: TileGridMetadataUpdate | ((current: GridDashboardMetadata) => TileGridMetadataUpdate | null | undefined),
   ) {
     this.updateLayout(reason, (layout) => {
-      const tile = layout.tiles[tileId];
-      if (!tile) {
-        return layout;
-      }
-      const currentMeta = extractGridDashboardMetadata(tile);
+      const existingTile = layout.tiles[tileId];
+      const baseTile =
+        existingTile ??
+        ({
+          id: tileId,
+          kind: 'application',
+          position: { x: 0, y: 0 },
+          size: { width: DEFAULT_TILE_WIDTH, height: DEFAULT_TILE_HEIGHT },
+          zIndex: 1,
+          metadata: {},
+        } as CanvasTileNode);
+      const currentMeta = extractGridDashboardMetadata(baseTile);
       const update = typeof updater === 'function' ? updater(currentMeta) : updater;
       if (!update) {
         return layout;
       }
-      const nextTile = withTileGridMetadata(tile, update);
-      if (nextTile === tile) {
+      const nextTile = withTileGridMetadata(baseTile, update);
+      if (nextTile === existingTile) {
         return layout;
       }
       return {
@@ -384,7 +397,6 @@ class SessionTileController {
   }
 
   updateTileViewState(tileId: string, reason: string, updater: TileViewStateUpdate) {
-    console.log('[debug] updateTileViewState call', tileId, reason);
     this.updateTileGridMetadata(tileId, reason, (current) => {
       const base = current.viewState ?? defaultTileViewState();
       const patch = typeof updater === 'function' ? updater(base) : updater;
@@ -516,7 +528,10 @@ class SessionTileController {
     viewerConnectionService.resetMetrics();
   }
 
-  private replaceLayout(nextLayout: SharedCanvasLayout, options?: { reason?: string; suppressPersist?: boolean }) {
+  private replaceLayout(
+    nextLayout: SharedCanvasLayout,
+    options?: { reason?: string; suppressPersist?: boolean; skipLayoutChange?: boolean; preserveUpdatedAt?: boolean },
+  ) {
     const prevTiles = new Set(Object.keys(this.layout.tiles));
     const nextTiles = new Set(Object.keys(nextLayout.tiles));
     const removed = [...prevTiles].filter((id) => !nextTiles.has(id));
@@ -536,12 +551,13 @@ class SessionTileController {
 
     this.layout = nextLayout;
     this.controllerVersion += 1;
+    const snapshotUpdatedAt = options?.preserveUpdatedAt ? this.snapshot.updatedAt : Date.now();
     this.snapshot = {
       layout: this.layout,
       version: this.controllerVersion,
-      updatedAt: Date.now(),
+      updatedAt: snapshotUpdatedAt,
     };
-    if (options?.reason !== 'hydrate') {
+    if (!options?.skipLayoutChange && options?.reason !== 'hydrate') {
       this.layoutChangeCallback?.(nextLayout as ApiCanvasLayout);
     }
 
@@ -683,7 +699,12 @@ class SessionTileController {
     }
 
     if (didMutate) {
-      this.replaceLayout(withUpdatedTimestamp(layout), { reason: 'measurement' });
+      this.replaceLayout(layout, {
+        reason: 'measurement',
+        suppressPersist: true,
+        skipLayoutChange: true,
+        preserveUpdatedAt: true,
+      });
     }
   }
 

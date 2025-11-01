@@ -2,6 +2,7 @@ import {
   forwardRef,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -76,10 +77,58 @@ const MAX_TILE_WIDTH_PX = 450;
 const MAX_TILE_HEIGHT_PX = 450;
 const GRID_LAYOUT_VERSION = 2;
 const CROPPED_EPSILON = 0.02;
+const MAX_NORMALIZE_ATTEMPTS = 3;
+const LEGACY_GRID_COLS = 12;
+const LEGACY_ROW_HEIGHT_PX = 110;
+const LEGACY_MIN_W = 3;
+const LEGACY_MIN_H = 3;
 
 type TileViewStateMap = Record<string, TileViewState>;
 
 const TILE_DEBUG_ENABLED = process.env.NEXT_PUBLIC_TILE_DEBUG === 'true';
+
+function areLayoutsEquivalent(a: Layout[], b: Layout[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  const previous = new Map(a.map((item) => [item.i, item]));
+  for (const next of b) {
+    const match = previous.get(next.i);
+    if (!match) {
+      return false;
+    }
+    if (match.x !== next.x || match.y !== next.y || match.w !== next.w || match.h !== next.h) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function serializeBeachLayoutItems(items: BeachLayoutItem[]): string {
+  return items
+    .slice()
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .map((item) => {
+      const width = item.widthPx != null ? Math.round(item.widthPx) : '';
+      const height = item.heightPx != null ? Math.round(item.heightPx) : '';
+      const zoom = item.zoom != null ? item.zoom.toFixed(3) : '';
+      const locked = item.locked ? '1' : '0';
+      const toolbarPinned = item.toolbarPinned ? '1' : '0';
+      return [
+        item.id,
+        item.x,
+        item.y,
+        item.w,
+        item.h,
+        width,
+        height,
+        zoom,
+        locked,
+        toolbarPinned,
+      ].join(':');
+    })
+    .join('|');
+}
 
 function tileDebugLog(...args: Parameters<typeof console.info>) {
   if (TILE_DEBUG_ENABLED) {
@@ -656,7 +705,6 @@ function TileCard({
           )}
         </button>
         <div className="pointer-events-auto flex items-center gap-2">
-          {typeof console !== 'undefined' && console.log('[debug] view.locked', view.locked)}
           <IconButton
             title={copyState === 'copied' ? 'Copied session ID' : 'Copy session ID'}
             ariaLabel={copyState === 'copied' ? 'Session ID copied' : 'Copy session ID'}
@@ -1230,48 +1278,38 @@ export default function TileCanvas({
         return;
       }
       const items = sessionTileController.exportGridLayoutAsBeachItems();
+      if (items.length === 0) {
+        return;
+      }
       onLayoutPersist(items);
     },
     [onLayoutPersist],
   );
 
-  const viewStateMapRef = useRef<TileViewStateMap>({});
   const previousViewStateRef = useRef<TileViewStateMap>({});
-  const resizeControlRef = useRef<Record<string, HostResizeControlState>>(resizeControls);
   const gridWrapperRef = useRef<HTMLDivElement | null>(null);
-  const lastPersistSignatureRef = useRef<string | null>(null);
-  const autoSizingRef = useRef<Set<string>>(new Set());
-  const autoSizeSnapshotSignatureRef = useRef<string | null>(null);
+  const controllerHydratedRef = useRef(false);
 
-  useEffect(() => {
-    if (hydrateKeyRef.current === hydrateKey) {
-      return;
-    }
-    hydrateKeyRef.current = hydrateKey;
-    sessionTileController.hydrate({
-      layout: null,
-      gridLayoutItems: savedLayout ?? [],
-      sessions: tiles,
-      agents: [],
-      privateBeachId: null,
-      managerUrl,
-      managerToken,
-      viewerToken,
-      viewerStateOverrides: effectiveViewerOverrides,
-      onPersistLayout: onLayoutPersist ? handlePersistLayout : undefined,
-    });
-  }, [
-    effectiveViewerOverrides,
-    handlePersistLayout,
-    hydrateKey,
-    managerToken,
-    managerUrl,
-    onLayoutPersist,
-    savedLayout,
-    savedLayoutSignature,
-    tiles,
-    viewerToken,
-  ]);
+  const clampLayoutItems = useCallback(
+    (layouts: Layout[], colsValue: number): Layout[] => {
+      const effectiveCols = Math.max(DEFAULT_W, colsValue || DEFAULT_COLS);
+      return layouts.map((item) => {
+        const state = viewStateMap[item.i];
+        const restrict = !state?.lastLayout;
+        const { w, h } = clampGridSize(item.w, item.h, state, effectiveCols, restrict);
+        const x = Math.max(0, Math.min(item.x, effectiveCols - w));
+        return {
+          ...item,
+          x,
+          w,
+          h,
+          minW: MIN_W,
+          minH: MIN_H,
+        };
+      });
+    },
+    [viewStateMap],
+  );
 
   useEffect(() => {
     for (const [sessionId, diff] of Object.entries(cachedTerminalDiffs)) {
@@ -1279,13 +1317,7 @@ export default function TileCanvas({
     }
   }, [cachedTerminalDiffs]);
 
-  useEffect(() => {
-    viewStateMapRef.current = viewStateMap;
-  }, [viewStateMap]);
 
-  useEffect(() => {
-    resizeControlRef.current = resizeControls;
-  }, [resizeControls]);
 
   useEffect(() => {
     setIsClient(true);
@@ -1393,29 +1425,6 @@ const layoutMap = useMemo(() => {
   return map;
 }, [layout]);
 
-
-  const clampLayoutItems = useCallback(
-    (layouts: Layout[], colsValue: number): Layout[] => {
-      const effectiveCols = Math.max(DEFAULT_W, colsValue || DEFAULT_COLS);
-      const stateMap = viewStateMapRef.current;
-      return layouts.map((item) => {
-        const state = stateMap[item.i];
-        const restrict = !state?.lastLayout;
-        const { w, h } = clampGridSize(item.w, item.h, state, effectiveCols, restrict);
-        const x = Math.max(0, Math.min(item.x, effectiveCols - w));
-        return {
-          ...item,
-          x,
-          w,
-          h,
-          minW: MIN_W,
-          minH: MIN_H,
-        };
-      });
-    },
-    [],
-  );
-
   const gridCommandContext = useMemo(
     () => ({
       cols,
@@ -1450,15 +1459,75 @@ const layoutMap = useMemo(() => {
     [gridCommandContext],
   );
 
+  const normalizeSavedLayout = useCallback(() => {
+    if (!controllerHydratedRef.current || !isClient || layout.length === 0) {
+      return;
+    }
+    const normalized = clampLayoutItems(layout, cols);
+    if (normalized.length === 0) {
+      return;
+    }
+    if (!areLayoutsEquivalent(layout, normalized)) {
+      applyReactGridMutation('autosize', normalized, 'grid-normalize', true);
+      return;
+    }
+    if (!savedLayout || savedLayout.length === 0) {
+      return;
+    }
+    const exported = sessionTileController.exportGridLayoutAsBeachItems();
+    const savedSignature = serializeBeachLayoutItems(savedLayout);
+    const exportedSignature = serializeBeachLayoutItems(exported);
+    if (savedSignature !== exportedSignature) {
+      sessionTileController.requestPersist();
+    }
+  }, [applyReactGridMutation, clampLayoutItems, cols, isClient, layout, savedLayout]);
+
+  useLayoutEffect(() => {
+    if (hydrateKeyRef.current === hydrateKey) {
+      controllerHydratedRef.current = true;
+      return;
+    }
+    hydrateKeyRef.current = hydrateKey;
+    controllerHydratedRef.current = false;
+    sessionTileController.hydrate({
+      layout: null,
+      gridLayoutItems: savedLayout ?? [],
+      sessions: tiles,
+      agents: [],
+      privateBeachId: null,
+      managerUrl,
+      managerToken,
+      viewerToken,
+      viewerStateOverrides: effectiveViewerOverrides,
+      onPersistLayout: onLayoutPersist ? handlePersistLayout : undefined,
+    });
+    controllerHydratedRef.current = true;
+    normalizeSavedLayout();
+  }, [
+    effectiveViewerOverrides,
+    handlePersistLayout,
+    hydrateKey,
+    managerToken,
+    managerUrl,
+    normalizeSavedLayout,
+    onLayoutPersist,
+    savedLayout,
+    savedLayoutSignature,
+    tiles,
+    viewerToken,
+  ]);
+
+  useLayoutEffect(() => {
+    normalizeSavedLayout();
+  }, [normalizeSavedLayout]);
+
 
   useEffect(() => {
     if (!isClient || !gridWidth || gridWidth <= 0 || cols <= 0) {
-      autoSizeSnapshotSignatureRef.current = null;
       return;
     }
     const columnWidth = getColumnWidth(gridWidth, cols);
     if (columnWidth == null) {
-      autoSizeSnapshotSignatureRef.current = null;
       return;
     }
     tileDebugLog('[tile-diag] autosize-start', {
@@ -1612,30 +1681,7 @@ const layoutMap = useMemo(() => {
       adjustments,
       initializedTiles,
     });
-    const snapshotSignature = JSON.stringify({
-      adjustments: adjustments.map(({ id, w, h, widthPx, heightPx, hostCols, hostRows }) => ({
-        id,
-        w,
-        h,
-        widthPx,
-        heightPx,
-        hostCols,
-        hostRows,
-      })),
-      initialized: initializedTiles.map(({ id, hostCols, hostRows, widthPx, heightPx }) => ({
-        id,
-        hostCols,
-        hostRows,
-        widthPx,
-        heightPx,
-      })),
-    });
-    if (autoSizeSnapshotSignatureRef.current === snapshotSignature) {
-      return;
-    }
-    autoSizeSnapshotSignatureRef.current = snapshotSignature;
     if (adjustments.length === 0) {
-      autoSizingRef.current.clear();
       if (initializedTiles.length > 0) {
         initializedTiles.forEach(({ id, hostCols, hostRows, widthPx, heightPx }) => {
           const current = viewStateMap[id] ?? defaultTileViewState();
@@ -1686,7 +1732,6 @@ const layoutMap = useMemo(() => {
       }
       return;
     }
-    autoSizingRef.current = new Set(adjustments.map(({ id }) => id));
     const adjustedLayouts = layout.map((item) => {
       const match = adjustments.find(({ id }) => id === item.i);
       if (!match) {
@@ -1700,6 +1745,9 @@ const layoutMap = useMemo(() => {
       };
     });
     const normalizedLayouts = clampLayoutItems(adjustedLayouts, cols);
+    if (areLayoutsEquivalent(layout, normalizedLayouts)) {
+      return;
+    }
     applyReactGridMutation('autosize', normalizedLayouts, 'grid-autosize', false);
     adjustments.forEach(({ id, w, h, hostCols, hostRows, widthPx, heightPx }) => {
       const current = viewStateMap[id] ?? defaultTileViewState();
@@ -1781,18 +1829,11 @@ const layoutMap = useMemo(() => {
         JSON.stringify(nextLayouts.map(({ i, x, y, w, h }) => ({ i, x, y, w, h }))),
       );
       const normalized = clampLayoutItems(nextLayouts, cols);
-      const autoSizingIds = autoSizingRef.current;
-      const isAutosizingEvent =
-        normalized.length > 0 && normalized.every((item) => autoSizingIds.has(item.i));
-      if (isAutosizingEvent) {
+      if (areLayoutsEquivalent(layout, normalized)) {
         tileDebugLog(
-          '[tile-layout] onLayoutChange autosize-skip',
+          '[tile-layout] onLayoutChange skip-equal',
           JSON.stringify(normalized.map(({ i, x, y, w, h }) => ({ i, x, y, w, h }))),
         );
-        normalized.forEach(({ i }) => autoSizingIds.delete(i));
-        if (autoSizingIds.size === 0) {
-          autoSizingRef.current = new Set();
-        }
         return;
       }
       tileDebugLog(
@@ -1804,7 +1845,7 @@ const layoutMap = useMemo(() => {
         layout: normalized.map(({ i, x, y, w, h }) => ({ i, x, y, w, h })),
       });
       normalized.forEach((item) => {
-        const current = viewStateMapRef.current[item.i] ?? defaultTileViewState();
+        const current = viewStateMap[item.i] ?? defaultTileViewState();
         const dims = clampGridSize(item.w, item.h, current, cols, true);
         if (isSameLayoutDimensions(current.lastLayout, dims)) {
           return;
@@ -1829,20 +1870,20 @@ const layoutMap = useMemo(() => {
       });
       applyReactGridMutation('resize', normalized, 'grid-change', false);
     },
-    [applyReactGridMutation, clampLayoutItems, cols],
+    [applyReactGridMutation, clampLayoutItems, cols, layout, viewStateMap],
   );
 
   const scheduleHostResize = useCallback((sessionId: string) => {
     if (typeof window === 'undefined') {
       return;
     }
-    const control = resizeControlRef.current[sessionId];
+    const control = resizeControls[sessionId];
     if (!control?.canResize) return;
-    const state = viewStateMapRef.current[sessionId];
+    const state = viewStateMap[sessionId];
     const measurement = state?.measurements;
     const computeTarget = () => {
-      const widthPx = Math.max(1, Math.round((measurement?.width ?? 0)));
-      const heightPx = Math.max(1, Math.round((measurement?.height ?? 0)));
+      const widthPx = Math.max(1, Math.round(measurement?.width ?? 0));
+      const heightPx = Math.max(1, Math.round(measurement?.height ?? 0));
       // Derive rows/cols from visible tile size
       const innerWidth = Math.max(1, widthPx - TERMINAL_PADDING_X);
       const innerHeight = Math.max(1, heightPx - TERMINAL_PADDING_Y);
@@ -1874,7 +1915,7 @@ const layoutMap = useMemo(() => {
     window.clearTimeout((scheduleHostResize as any)._t?.[sessionId]);
     (scheduleHostResize as any)._t = (scheduleHostResize as any)._t || {};
     (scheduleHostResize as any)._t[sessionId] = window.setTimeout(request, 180);
-  }, []);
+  }, [resizeControls, viewStateMap]);
 
   useEffect(() => {
     const previous = previousViewStateRef.current;
@@ -1888,7 +1929,8 @@ const layoutMap = useMemo(() => {
   }, [viewStateMap, scheduleHostResize]);
 
   const handleTilePreviewMeasurementsChange = useCallback((sessionId: string, measurement: PreviewMetrics | null) => {
-    const currentState = viewStateMapRef.current[sessionId] ?? defaultTileViewState();
+    const snapshot = sessionTileController.getTileSnapshot(sessionId);
+    const currentState = selectTileViewState(snapshot.grid);
     if (!measurement) {
       sessionTileController.updateTileViewState(sessionId, 'view-state.preview.measurement', {
         preview: null,
@@ -1974,7 +2016,7 @@ const layoutMap = useMemo(() => {
       _event: MouseEvent,
       element: HTMLElement | undefined,
     ) => {
-      const state = viewStateMapRef.current[newItem.i] ?? defaultTileViewState();
+      const state = viewStateMap[newItem.i] ?? defaultTileViewState();
       const effectiveCols = (() => {
         const viewport = state.viewportCols && state.viewportCols > 0 ? state.viewportCols : null;
         const host = state.hostCols && state.hostCols > 0 ? state.hostCols : null;
@@ -2095,7 +2137,7 @@ const layoutMap = useMemo(() => {
         scheduleHostResize(newItem.i);
       }
     },
-    [clampLayoutItems, cols, gridWidth, handleLayoutChange, handleLayoutCommit, rowHeightPx, scheduleHostResize],
+    [clampLayoutItems, cols, gridWidth, handleLayoutChange, handleLayoutCommit, rowHeightPx, scheduleHostResize, viewStateMap],
   );
 
   const renderResizeHandle = useCallback((axis: string) => {
@@ -2115,8 +2157,8 @@ const layoutMap = useMemo(() => {
       if (!layoutItem || gridWidth == null || gridWidth <= 0 || cols <= 0 || layoutItem.w <= 0) {
         return;
       }
-      const state = viewStateMapRef.current[sessionId];
-      if (!state || !state.manualLayout || autoSizingRef.current.has(sessionId)) {
+      const state = viewStateMap[sessionId];
+      if (!state || !state.manualLayout) {
         return;
       }
       const columnWidth = getColumnWidth(gridWidth, cols);
@@ -2133,7 +2175,7 @@ const layoutMap = useMemo(() => {
         width: layoutWidth,
         height: layoutHeight,
       };
-      const existing = viewStateMapRef.current[sessionId]?.measurements;
+      const existing = viewStateMap[sessionId]?.measurements;
       if (existing && isSameMeasurement(existing, normalized)) {
         return;
       }
@@ -2159,7 +2201,7 @@ const layoutMap = useMemo(() => {
         ),
       );
     },
-    [cols, gridWidth, layoutMap, rowHeightPx],
+    [cols, gridWidth, layoutMap, rowHeightPx, viewStateMap],
   );
 
   const handlePreviewStatusChange = useCallback(
@@ -2206,7 +2248,7 @@ const layoutMap = useMemo(() => {
         hostRows: dims.hostRows,
         hostCols: dims.hostCols,
       });
-      const state = viewStateMapRef.current[sessionId] ?? defaultTileViewState();
+      const state = viewStateMap[sessionId] ?? defaultTileViewState();
       const viewportRows = dims.viewportRows > 0 ? dims.viewportRows : null;
       const viewportCols = dims.viewportCols > 0 ? dims.viewportCols : null;
       const hostRowsCandidate =
@@ -2286,13 +2328,13 @@ const layoutMap = useMemo(() => {
         sessionTileController.updateTileViewState(sessionId, 'view-state.viewport', patch);
       }
     },
-    [],
+    [viewStateMap],
   );
 
   const handleSnap = useCallback(
     (sessionId: string) => {
       const layoutItem = layoutMap.get(sessionId);
-      const state = viewStateMapRef.current[sessionId];
+      const state = viewStateMap[sessionId];
       const measurement = state?.measurements;
       if (!layoutItem || !state || !measurement) {
         sessionTileController.updateTileViewState(sessionId, 'view-state.snap', {
@@ -2365,12 +2407,13 @@ const layoutMap = useMemo(() => {
         sessionTileController.updateTileViewState(sessionId, 'view-state.snap', patch);
       }
     },
-    [clampLayoutItems, cols, gridWidth, handleLayoutChange, handleLayoutCommit, layout, layoutMap, rowHeightPx],
+    [clampLayoutItems, cols, gridWidth, handleLayoutChange, handleLayoutCommit, layout, layoutMap, rowHeightPx, viewStateMap],
   );
 
   const handleToggleLock = useCallback(
     (sessionId: string) => {
-      const current = viewStateMapRef.current[sessionId] ?? defaultTileViewState();
+      const snapshot = sessionTileController.getTileSnapshot(sessionId);
+      const current = selectTileViewState(snapshot.grid);
       const nextLocked = !current.locked;
       const nextZoom = nextLocked ? MAX_UNLOCKED_ZOOM : clampZoom(current.zoom);
       sessionTileController.updateTileViewState(sessionId, 'view-state.lock.toggle', {
@@ -2383,7 +2426,8 @@ const layoutMap = useMemo(() => {
 
   const handleToolbarToggle = useCallback(
     (sessionId: string) => {
-      const current = viewStateMapRef.current[sessionId] ?? defaultTileViewState();
+      const snapshot = sessionTileController.getTileSnapshot(sessionId);
+      const current = selectTileViewState(snapshot.grid);
       const nextPinned = !current.toolbarPinned;
       sessionTileController.setTileToolbarPinned(sessionId, nextPinned);
     },
@@ -2399,67 +2443,9 @@ const layoutMap = useMemo(() => {
     });
   }, []);
 
-  useEffect(() => {
-    if (!isClient || !savedLayout || savedLayout.length === 0 || layout.length === 0) {
-      return;
-    }
-    const normalized = clampLayoutItems(layout, cols);
-    if (normalized.length === 0) {
-      return;
-    }
-    const exported = sessionTileController.exportGridLayoutAsBeachItems();
-    const savedMap = new Map(savedLayout.map((item) => [item.id, item]));
-    let needsPersist = false;
-
-    for (const item of exported) {
-      const saved = savedMap.get(item.id);
-      if (!saved) {
-        needsPersist = true;
-        break;
-      }
-      if (saved.x !== item.x || saved.y !== item.y || saved.w !== item.w || saved.h !== item.h) {
-        needsPersist = true;
-        break;
-      }
-      if (
-        (item.widthPx ?? null) !== (saved.widthPx ?? null) ||
-        (item.heightPx ?? null) !== (saved.heightPx ?? null)
-      ) {
-        needsPersist = true;
-        break;
-      }
-      if (Boolean(saved.locked) !== Boolean(item.locked)) {
-        needsPersist = true;
-        break;
-      }
-      const savedZoom = saved.zoom ?? null;
-      const nextZoom = item.zoom ?? null;
-      if (savedZoom !== null && nextZoom !== null && Math.abs(savedZoom - nextZoom) > 0.005) {
-        needsPersist = true;
-        break;
-      }
-    }
-
-    if (!needsPersist) {
-      for (const saved of savedLayout) {
-        if (!exported.some((item) => item.id === saved.id)) {
-          needsPersist = true;
-          break;
-        }
-      }
-    }
-
-    if (!needsPersist) {
-      return;
-    }
-
-    const signature = JSON.stringify(exported);
-    if (lastPersistSignatureRef.current === signature) {
-      return;
-    }
-    lastPersistSignatureRef.current = signature;
-    applyReactGridMutation('autosize', normalized, 'grid-normalize', true);
-  }, [applyReactGridMutation, clampLayoutItems, cols, isClient, layout, savedLayout]);
+  useLayoutEffect(() => {
+    normalizeSavedLayout();
+  }, [normalizeSavedLayout]);
 
   const gridContent = isClient ? (
     <div className="session-grid">

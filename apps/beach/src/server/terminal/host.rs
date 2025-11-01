@@ -317,6 +317,8 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                 backfill_tx.clone(),
                 None,
                 None,
+                None,
+                None,
             );
             input_handles.lock().unwrap().push(handle);
         }
@@ -631,6 +633,8 @@ fn spawn_input_listener(
     grid: Arc<TerminalGrid>,
     backfill_tx: UnboundedSender<BackfillCommand>,
     forwarder_tx: Option<UnboundedSender<ForwarderCommand>>,
+    client_label: Option<String>,
+    client_peer_id: Option<String>,
     gate: Option<Arc<HostInputGate>>,
 ) -> thread::JoinHandle<()> {
     let transport_id = transport.id().0;
@@ -641,6 +645,8 @@ fn spawn_input_listener(
             target = "sync::incoming",
             transport_id,
             transport = ?transport_kind,
+            client_label = client_label.as_deref(),
+            client_peer_id = client_peer_id.as_deref(),
             "input listener started"
         );
         let mut channel_closed = false;
@@ -771,6 +777,8 @@ fn spawn_input_listener(
                                                 transport = ?transport_kind,
                                                 cols = clamped_cols,
                                                 rows = clamped_rows,
+                                                client_label = client_label.as_deref(),
+                                                client_peer_id = client_peer_id.as_deref(),
                                                 "processed resize request"
                                             );
                                         }
@@ -891,6 +899,8 @@ fn spawn_input_listener(
             target = "sync::incoming",
             transport_id,
             transport = ?transport_kind,
+            client_label = client_label.as_deref(),
+            client_peer_id = client_peer_id.as_deref(),
             "input listener stopped"
         );
         if channel_closed || fatal_error {
@@ -1054,6 +1064,8 @@ fn spawn_webrtc_acceptor(
                         grid.clone(),
                         backfill_tx.clone(),
                         Some(forwarder_tx.clone()),
+                        metadata.label.clone(),
+                        metadata.peer_id.clone(),
                         authorizer.gate(),
                     );
                     input_handles.lock().unwrap().push(listener);
@@ -1185,6 +1197,8 @@ fn spawn_webrtc_acceptor(
                         grid.clone(),
                         backfill_tx.clone(),
                         Some(forwarder_tx.clone()),
+                        metadata.label.clone(),
+                        metadata.peer_id.clone(),
                         authorizer.gate(),
                     );
                     input_handles.lock().unwrap().push(listener);
@@ -1359,6 +1373,8 @@ fn spawn_viewer_accept_loop(
                 grid.clone(),
                 backfill_tx.clone(),
                 Some(forwarder_tx.clone()),
+                auth_metadata.label.clone(),
+                auth_metadata.peer_id.clone(),
                 authorizer.gate(),
             );
             input_handles.lock().unwrap().push(listener);

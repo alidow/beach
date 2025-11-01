@@ -32,6 +32,7 @@ export interface CabanaSessionPlayerProps {
   onStatusChange?: (status: TerminalStatus) => void;
   telemetry?: CabanaTelemetryHandlers;
   showStatusBadges?: boolean;
+  viewOnly?: boolean;
 }
 
 const STATUS_BADGES: Record<
@@ -127,6 +128,7 @@ export function CabanaSessionPlayer(props: CabanaSessionPlayerProps): JSX.Elemen
     onStatusChange,
     telemetry,
     showStatusBadges = true,
+    viewOnly = false,
   } = props;
 
   const trimmedSessionId = sessionId?.trim() ?? '';
@@ -326,6 +328,7 @@ export function CabanaSessionPlayer(props: CabanaSessionPlayerProps): JSX.Elemen
         className="h-full w-full"
         showStatusBar={false}
         showTopBar={false}
+        viewOnly={viewOnly}
       />
 
       <div className="pointer-events-none absolute inset-0">

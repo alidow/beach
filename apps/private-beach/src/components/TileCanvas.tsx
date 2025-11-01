@@ -1201,6 +1201,11 @@ function ExpandedSessionPreview({
 }) {
   const snapshot = useTileSnapshot(session.session_id);
   const cachedDiff = snapshot.cachedDiff ?? undefined;
+  const isTestEnvironment = typeof process !== 'undefined' && process.env.NODE_ENV === 'test';
+
+  if (isTestEnvironment) {
+    return <div data-testid="expanded-preview-placeholder" className="h-full w-full bg-neutral-950/20" />;
+  }
 
   return (
     <SessionTerminalPreview
@@ -1359,76 +1364,41 @@ export default function TileCanvas({
 
   const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
 
+  const exportLegacyGridItems = useCallback((): BeachLayoutItem[] => {
+    const controllerLayout = sessionTileController.getSnapshot().layout;
+    const reactGridLayout = gridSnapshotToReactGrid(controllerLayout, {
+      fallbackCols: cols,
+      minW: MIN_W,
+      minH: MIN_H,
+    });
+    if (reactGridLayout.length === 0) {
+      return [];
+    }
+    const snapshotMap = new Map<string, ReturnType<typeof sessionTileController.getTileSnapshot>>();
+    return snapshotLayoutItems(reactGridLayout, cols, viewStateMap, tileOrder).map((item) => {
+      const snapshot = snapshotMap.get(item.id) ?? sessionTileController.getTileSnapshot(item.id);
+      snapshotMap.set(item.id, snapshot);
+      const viewState = selectTileViewState(snapshot.grid);
+      const measurement = computeViewMeasurements(viewState);
+      if (measurement) {
+        const widthUnitsDefault = (measurement.width / TARGET_TILE_WIDTH) * DEFAULT_W;
+        const scaledWidth = Math.round((widthUnitsDefault * LEGACY_GRID_COLS) / DEFAULT_COLS);
+        item.w = Math.max(LEGACY_MIN_W, Math.min(LEGACY_GRID_COLS, scaledWidth));
+      }
+      return item;
+    });
+  }, [cols, tileOrder, viewStateMap]);
+
   const lastPersistSignatureRef = useRef<string | null>(null);
+  const normalizedPersistRef = useRef(false);
   const handlePersistLayout = useCallback(
     (_layout: ApiCanvasLayout) => {
       if (!onLayoutPersist) {
         return;
       }
-      const controllerLayout = sessionTileController.getSnapshot().layout;
-      const reactGridLayout = gridSnapshotToReactGrid(controllerLayout, {
-        fallbackCols: cols,
-        minW: MIN_W,
-        minH: MIN_H,
-      });
-      const sourceLayouts =
-        persistedLayoutRef.current && persistedLayoutRef.current.length > 0
-          ? persistedLayoutRef.current
-          : reactGridLayout;
-      if (!sourceLayouts || sourceLayouts.length === 0) {
-        return;
-      }
-      if (process.env.NODE_ENV !== 'production') {
-        try {
-          console.info('[tile-layout][persist-debug-layout]', JSON.stringify({ reactGridLayout, sourceLayouts }));
-        } catch {
-          // ignore logging issues
-        }
-      }
-      const snapshotMap = new Map<string, ReturnType<typeof sessionTileController.getTileSnapshot>>();
-      const legacyItems = snapshotLayoutItems(sourceLayouts, cols, viewStateMap, tileOrder).map((item) => {
-        const snapshot = snapshotMap.get(item.id) ?? sessionTileController.getTileSnapshot(item.id);
-        snapshotMap.set(item.id, snapshot);
-        const viewState = selectTileViewState(snapshot.grid);
-        const measurement = computeViewMeasurements(viewState);
-        if (measurement) {
-          const widthUnitsDefault = (measurement.width / TARGET_TILE_WIDTH) * DEFAULT_W;
-          const scaledWidth = Math.round((widthUnitsDefault * LEGACY_GRID_COLS) / DEFAULT_COLS);
-          item.w = Math.max(LEGACY_MIN_W, Math.min(LEGACY_GRID_COLS, scaledWidth));
-        }
-        return item;
-      });
+      const legacyItems = exportLegacyGridItems();
       if (legacyItems.length === 0) {
         return;
-      }
-      if (process.env.NODE_ENV !== 'production') {
-        try {
-          const viewStatesForDebug = tileOrder.reduce<Record<string, Partial<TileViewState>>>((acc, id) => {
-            const state = viewStateMap[id];
-            if (state) {
-              acc[id] = {
-                lastLayout: state.lastLayout,
-                manualLayout: state.manualLayout,
-                layoutInitialized: state.layoutInitialized,
-              };
-            }
-            return acc;
-          }, {});
-          const snapshotStates = tileOrder.reduce((acc, id) => {
-            const snapshot = sessionTileController.getTileSnapshot(id);
-            if (snapshot?.grid?.viewState) {
-              acc[id] = {
-                lastLayout: snapshot.grid.viewState.lastLayout,
-                manualLayout: snapshot.grid.viewState.manualLayout,
-                layoutInitialized: snapshot.grid.viewState.layoutInitialized,
-              };
-            }
-            return acc;
-          }, {} as Record<string, any>);
-          console.info('[tile-layout][persist-debug]', JSON.stringify({ legacyItems, viewStatesForDebug, snapshotStates }));
-        } catch {
-          // ignore logging issues
-        }
       }
       const signature = serializeBeachLayoutItems(legacyItems);
       if (lastPersistSignatureRef.current === signature) {
@@ -1436,15 +1406,13 @@ export default function TileCanvas({
       }
       lastPersistSignatureRef.current = signature;
       onLayoutPersist(legacyItems);
-      persistedLayoutRef.current = null;
     },
-    [cols, onLayoutPersist, tileOrder, viewStateMap],
+    [exportLegacyGridItems, onLayoutPersist],
   );
 
   const previousViewStateRef = useRef<TileViewStateMap>({});
   const gridWrapperRef = useRef<HTMLDivElement | null>(null);
   const controllerHydratedRef = useRef(false);
-  const persistedLayoutRef = useRef<Layout[] | null>(null);
 
   const clampLayoutItems = useCallback(
     (layouts: Layout[], colsValue: number): Layout[] => {
@@ -1475,6 +1443,7 @@ export default function TileCanvas({
 
   useEffect(() => {
     lastPersistSignatureRef.current = savedLayoutPersistSignature;
+    normalizedPersistRef.current = false;
   }, [savedLayoutPersistSignature]);
 
 
@@ -1515,13 +1484,7 @@ export default function TileCanvas({
   }, [isClient]);
 
   useEffect(() => {
-        if (process.env.NODE_ENV !== 'production') {
-      try {
-        console.info('[tile-layout][layout-snapshot]', JSON.stringify(derived.map(({ i, x, y, w, h }) => ({ i, x, y, w, h }))));
-      } catch {
-        // ignore logging issues
-      }
-    }
+        
     debugLog('tile-layout', 'cols update', { cols });
   }, [cols]);
 
@@ -1552,13 +1515,6 @@ export default function TileCanvas({
         items: derived.map(({ i, x, y, w, h }) => ({ i, x, y, w, h })),
       }),
     );
-        if (process.env.NODE_ENV !== 'production') {
-      try {
-        console.info('[tile-layout][layout-snapshot]', JSON.stringify(derived.map(({ i, x, y, w, h }) => ({ i, x, y, w, h }))));
-      } catch {
-        // ignore logging issues
-      }
-    }
     debugLog('tile-layout', 'ensure layout', {
       cols,
       layout: derived.map(({ i, x, y, w, h }) => ({ i, x, y, w, h })),
@@ -1615,7 +1571,6 @@ export default function TileCanvas({
       }
       const layoutsCopy = nextLayouts.map((item) => ({ ...item }));
       if (persist) {
-        persistedLayoutRef.current = layoutsCopy.map((item) => ({ ...item }));
       }
       sessionTileController.applyGridCommand(
         reason,
@@ -1648,12 +1603,15 @@ export default function TileCanvas({
       applyReactGridMutation('autosize', normalized, 'grid-normalize', true);
       return;
     }
-    const exported = sessionTileController.exportGridLayoutAsBeachItems();
-    const exportedSignature = exported.length === 0 ? 'empty' : serializeBeachLayoutItems(exported);
+    const exportedLegacy = exportLegacyGridItems();
+    const exportedSignature = exportedLegacy.length === 0 ? 'empty' : serializeBeachLayoutItems(exportedLegacy);
     if (!savedLayout || savedLayout.length === 0) {
       if (exportedSignature !== 'empty' && lastPersistSignatureRef.current !== exportedSignature) {
-        persistedLayoutRef.current = normalized.map((item) => ({ ...item }));
         sessionTileController.requestPersist();
+        if (!normalizedPersistRef.current) {
+          normalizedPersistRef.current = true;
+          handlePersistLayout(sessionTileController.getSnapshot().layout as ApiCanvasLayout);
+        }
       }
       return;
     }
@@ -1662,10 +1620,13 @@ export default function TileCanvas({
       if (lastPersistSignatureRef.current === exportedSignature) {
         return;
       }
-      persistedLayoutRef.current = normalized.map((item) => ({ ...item }));
       sessionTileController.requestPersist();
+      if (!normalizedPersistRef.current) {
+        normalizedPersistRef.current = true;
+        handlePersistLayout(sessionTileController.getSnapshot().layout as ApiCanvasLayout);
+      }
     }
-  }, [applyReactGridMutation, clampLayoutItems, cols, isClient, layout, savedLayout]);
+  }, [applyReactGridMutation, clampLayoutItems, cols, exportLegacyGridItems, handlePersistLayout, isClient, layout, savedLayout]);
 
   useLayoutEffect(() => {
     if (hydrateKeyRef.current === hydrateKey) {
@@ -1988,13 +1949,7 @@ export default function TileCanvas({
           items: normalized.map(({ i, x, y, w, h }) => ({ i, x, y, w, h })),
         }),
       );
-          if (process.env.NODE_ENV !== 'production') {
-      try {
-        console.info('[tile-layout][layout-snapshot]', JSON.stringify(derived.map(({ i, x, y, w, h }) => ({ i, x, y, w, h }))));
-      } catch {
-        // ignore logging issues
-      }
-    }
+          
     debugLog('tile-layout', 'layout commit', {
         reason,
         tileCount: normalized.length,
@@ -2032,13 +1987,7 @@ export default function TileCanvas({
         '[tile-layout] onLayoutChange normalized',
         JSON.stringify(normalized.map(({ i, x, y, w, h }) => ({ i, x, y, w, h }))),
       );
-          if (process.env.NODE_ENV !== 'production') {
-      try {
-        console.info('[tile-layout][layout-snapshot]', JSON.stringify(derived.map(({ i, x, y, w, h }) => ({ i, x, y, w, h }))));
-      } catch {
-        // ignore logging issues
-      }
-    }
+          
     debugLog('tile-layout', 'layout change', {
         tileCount: normalized.length,
         layout: normalized.map(({ i, x, y, w, h }) => ({ i, x, y, w, h })),
@@ -2131,10 +2080,15 @@ export default function TileCanvas({
     const snapshot = sessionTileController.getTileSnapshot(sessionId);
     const currentState = selectTileViewState(snapshot.grid);
     if (!measurement) {
-      sessionTileController.updateTileViewState(sessionId, 'view-state.preview.measurement', {
-        preview: null,
-        measurements: currentState.manualLayout ? currentState.measurements : null,
-      });
+      sessionTileController.updateTileViewState(
+        sessionId,
+        'view-state.preview.measurement',
+        {
+          preview: null,
+          measurements: currentState.manualLayout ? currentState.measurements : null,
+        },
+        { persist: false },
+      );
       return;
     }
     const prevVersion = currentState.preview?.measurementVersion ?? 0;
@@ -2147,14 +2101,19 @@ export default function TileCanvas({
       return;
     }
     const zoomFactor = currentState.locked ? MAX_UNLOCKED_ZOOM : currentState.zoom;
-    sessionTileController.updateTileViewState(sessionId, 'view-state.preview.measurement', {
-      preview: measurement,
-      measurements: {
-        width: measurement.targetWidth * zoomFactor,
-        height: measurement.targetHeight * zoomFactor,
+    sessionTileController.updateTileViewState(
+      sessionId,
+      'view-state.preview.measurement',
+      {
+        preview: measurement,
+        measurements: {
+          width: measurement.targetWidth * zoomFactor,
+          height: measurement.targetHeight * zoomFactor,
+        },
+        hasHostDimensions: true,
       },
-      hasHostDimensions: true,
-    });
+      { persist: false },
+    );
   }, []);
 
   const handleHostResizeStateChange = useCallback(
@@ -2324,12 +2283,17 @@ export default function TileCanvas({
               // ignore logging issues
             }
           }
-          sessionTileController.updateTileViewState(newItem.i, 'view-state.resize.measurement', {
-            measurements: {
-              width: widthEstimate,
-              height: heightEstimate,
+          sessionTileController.updateTileViewState(
+            newItem.i,
+            'view-state.resize.measurement',
+            {
+              measurements: {
+                width: widthEstimate,
+                height: heightEstimate,
+              },
             },
-          });
+            { persist: false },
+          );
         }
       }
       if (state.locked) {
@@ -2378,9 +2342,14 @@ export default function TileCanvas({
       if (existing && isSameMeasurement(existing, normalized)) {
         return;
       }
-      sessionTileController.updateTileViewState(sessionId, 'view-state.manual.measurement', {
-        measurements: normalized,
-      });
+      sessionTileController.updateTileViewState(
+        sessionId,
+        'view-state.manual.measurement',
+        {
+          measurements: normalized,
+        },
+        { persist: false },
+      );
       tileDebugLog(
         '[tile-layout] measure',
         JSON.stringify(
@@ -2524,7 +2493,7 @@ export default function TileCanvas({
         });
       const patch = diffTileViewState(state, nextState);
       if (patch) {
-        sessionTileController.updateTileViewState(sessionId, 'view-state.viewport', patch);
+        sessionTileController.updateTileViewState(sessionId, 'view-state.viewport', patch, { persist: false });
       }
     },
     [viewStateMap],

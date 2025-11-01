@@ -214,6 +214,7 @@ export function CabanaPrivateBeachPlayer(props: CabanaPrivateBeachPlayerProps): 
       telemetry={telemetry}
       onStatusChange={onStatusChange}
       emptyState={signedOutState}
+      viewOnly
     />
   );
 }

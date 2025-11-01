@@ -83,7 +83,9 @@ describe('BeachTerminal requestHostResize', () => {
       expect(viewportState).not.toBeNull();
     });
 
-    viewportState!.requestHostResize({ rows: 1 });
+    expect(viewportState?.viewOnly).toBe(false);
+    expect(viewportState?.requestHostResize).toBeDefined();
+    viewportState?.requestHostResize?.({ rows: 1 });
     expect(transport.sent.pop()).toEqual({ type: 'resize', rows: 2, cols: 80 });
   });
 
@@ -106,7 +108,36 @@ describe('BeachTerminal requestHostResize', () => {
       expect(viewportState).not.toBeNull();
     });
 
-    viewportState!.requestHostResize({ rows: 999, cols: 12 });
+    expect(viewportState?.viewOnly).toBe(false);
+    expect(viewportState?.requestHostResize).toBeDefined();
+    viewportState?.requestHostResize?.({ rows: 999, cols: 12 });
     expect(transport.sent.pop()).toEqual({ type: 'resize', rows: 512, cols: 12 });
+  });
+
+  it('suppresses resize helpers and frames in view-only mode', async () => {
+    const transport = new MockTransport();
+    let viewportState: TerminalViewportState | null = null;
+    render(
+      <BeachTerminal
+        transport={transport as any}
+        autoConnect={false}
+        disableViewportMeasurements
+        hideIdlePlaceholder
+        viewOnly
+        onViewportStateChange={(state) => {
+          viewportState = state;
+        }}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(viewportState).not.toBeNull();
+    });
+
+    expect(viewportState?.viewOnly).toBe(true);
+    expect(viewportState?.canSendResize).toBe(false);
+    expect(viewportState?.sendHostResize).toBeUndefined();
+    expect(viewportState?.requestHostResize).toBeUndefined();
+    expect(transport.sent).toHaveLength(0);
   });
 });

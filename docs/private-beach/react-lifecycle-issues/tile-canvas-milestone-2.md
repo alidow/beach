@@ -84,3 +84,11 @@ Goals:
 
 Keep existing behaviour (autosize, expanded view, assignments) intact.
 ```
+
+---
+
+## Milestone 2 progress — 2025-01-13
+
+- rewired persistence flow: introduced `exportLegacyGridItems()` so controller snapshots are translated to legacy `BeachLayoutItem` records before invoking the host callback; legacy layout export now drives `onLayoutPersist` (including normalization).
+- removed the ad-hoc persist signatures/tile order refs from the old implementation and replaced them with controller-driven guards; local caches are avoided and the component relies on controller snapshots plus `normalizedPersistRef` to avoid redundant saves.
+- tests: `pnpm --filter @beach/private-beach lint` passes; the focused TileCanvas scenario (`pnpm --filter @beach/private-beach test -- --testNamePattern "normalizes oversized" src/components/__tests__/TileCanvas.test.tsx`) passes after refactor. Running the whole spec file (`pnpm --filter @beach/private-beach test -- TileCanvas.test.tsx`) currently exhausts the Vitest worker heap after several minutes—tracked for follow-up alongside controller throttling.

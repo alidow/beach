@@ -302,7 +302,11 @@ class SessionTileController {
     return snapshot;
   }
 
-  updateLayout(reason: string, mutate: (layout: SharedCanvasLayout) => SharedCanvasLayout | null | undefined) {
+  updateLayout(
+    reason: string,
+    mutate: (layout: SharedCanvasLayout) => SharedCanvasLayout | null | undefined,
+    options?: { suppressPersist?: boolean; skipLayoutChange?: boolean; preserveUpdatedAt?: boolean },
+  ) {
     const base = this.layout;
     const produced = mutate(base);
     if (!produced) {
@@ -312,22 +316,26 @@ class SessionTileController {
     if (Object.is(ensured, base)) {
       return;
     }
-    this.replaceLayout(withUpdatedTimestamp(ensured), { reason });
+    this.replaceLayout(withUpdatedTimestamp(ensured), { reason, ...options });
   }
 
   applyGridSnapshot(reason: string, snapshot: GridLayoutSnapshot | null | undefined, options?: { suppressPersist?: boolean }) {
     if (!snapshot) {
       return;
     }
+    const produced = this.applyGridSnapshotToLayout(this.layout, snapshot);
     if (options?.suppressPersist) {
-      const produced = this.applyGridSnapshotToLayout(this.layout, snapshot);
       if (Object.is(produced, this.layout)) {
         return;
       }
       this.replaceLayout(withUpdatedTimestamp(produced), { reason, suppressPersist: true });
       return;
     }
-    this.updateLayout(reason, (layout) => this.applyGridSnapshotToLayout(layout, snapshot));
+    if (Object.is(produced, this.layout)) {
+      this.schedulePersist();
+      return;
+    }
+    this.updateLayout(reason, () => produced);
   }
 
   applyGridCommand(
@@ -364,6 +372,7 @@ class SessionTileController {
     tileId: string,
     reason: string,
     updater: TileGridMetadataUpdate | ((current: GridDashboardMetadata) => TileGridMetadataUpdate | null | undefined),
+    options?: { suppressPersist?: boolean },
   ) {
     this.updateLayout(reason, (layout) => {
       const existingTile = layout.tiles[tileId];
@@ -393,10 +402,11 @@ class SessionTileController {
           [tileId]: nextTile,
         },
       };
-    });
+    }, options);
   }
 
-  updateTileViewState(tileId: string, reason: string, updater: TileViewStateUpdate) {
+  updateTileViewState(tileId: string, reason: string, updater: TileViewStateUpdate, options?: { persist?: boolean }) {
+    const persist = options?.persist ?? true;
     this.updateTileGridMetadata(tileId, reason, (current) => {
       const base = current.viewState ?? defaultTileViewState();
       const patch = typeof updater === 'function' ? updater(base) : updater;
@@ -406,7 +416,7 @@ class SessionTileController {
       return {
         viewState: patch,
       };
-    });
+    }, { suppressPersist: !persist });
   }
 
   setTileLocked(tileId: string, locked: boolean) {
@@ -420,11 +430,11 @@ class SessionTileController {
   }
 
   setTilePreviewStatus(tileId: string, status: TileViewState['previewStatus']) {
-    this.updateTileViewState(tileId, 'view-state.preview-status', { previewStatus: status });
+    this.updateTileViewState(tileId, 'view-state.preview-status', { previewStatus: status }, { persist: false });
   }
 
   setTilePreview(tileId: string, preview: TileViewState['preview']) {
-    this.updateTileViewState(tileId, 'view-state.preview', { preview });
+    this.updateTileViewState(tileId, 'view-state.preview', { preview }, { persist: false });
   }
 
   hydrateGridLayoutFromBeachItems(items: BeachLayoutItem[] | null | undefined) {

@@ -25,6 +25,7 @@ export interface BeachSessionViewProps {
   className?: string;
   showStatusBar?: boolean;
   showTopBar?: boolean;
+  viewOnly?: boolean;
 }
 
 export type ViewerMode = 'unknown' | 'terminal' | 'media_png' | 'media_h264';
@@ -53,6 +54,7 @@ export function BeachSessionView(props: BeachSessionViewProps): JSX.Element {
     className,
     showStatusBar = false,
     showTopBar = false,
+    viewOnly = false,
   } = props;
 
   const [_status, setStatus] = useState<TerminalStatus>('idle');
@@ -198,6 +200,7 @@ export function BeachSessionView(props: BeachSessionViewProps): JSX.Element {
           className="h-full w-full"
           showStatusBar={showStatusBar}
           showTopBar={showTopBar}
+          viewOnly={viewOnly}
         />
       );
     }
@@ -213,7 +216,7 @@ export function BeachSessionView(props: BeachSessionViewProps): JSX.Element {
     }
     return <div className="h-full w-full" />;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, onStatusChange, showStatusBar, showTopBar, secureSummary]);
+  }, [mode, onStatusChange, showStatusBar, showTopBar, secureSummary, viewOnly]);
 
   return (
     <div className={cn('relative h-full w-full', className)}>

@@ -300,6 +300,7 @@ export interface BeachTerminalProps {
   hideIdlePlaceholder?: boolean;
   // Maximum render FPS for internal rAF-based updates; undefined or <=0 disables throttling
   maxRenderFps?: number;
+  viewOnly?: boolean;
 }
 
 export interface TerminalViewportState {
@@ -308,8 +309,9 @@ export interface TerminalViewportState {
   hostViewportRows: number | null;
   hostCols: number | null;
   canSendResize: boolean;
-  sendHostResize: () => void;
-  requestHostResize: (opts: { rows: number; cols?: number }) => void;
+  viewOnly: boolean;
+  sendHostResize?: () => void;
+  requestHostResize?: (opts: { rows: number; cols?: number }) => void;
 }
 
 export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
@@ -335,11 +337,14 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     onViewportStateChange,
     disableViewportMeasurements = false,
     forcedViewportRows = null,
-  hideIdlePlaceholder = false,
-  maxRenderFps,
+    hideIdlePlaceholder = false,
+    maxRenderFps,
+    viewOnly = false,
   } = props;
 
   const store = useMemo(() => providedStore ?? createTerminalStore(), [providedStore]);
+  const autoResizeHostOnViewportChangeEffective =
+    !viewOnly && autoResizeHostOnViewportChange;
   if (IS_DEV && typeof window !== 'undefined') {
     (window as any).beachStore = store;
   }
@@ -366,6 +371,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     hostViewportRows: number | null;
     hostCols: number | null;
     canSendResize: boolean;
+    viewOnly: boolean;
   } | null>(null);
   const [status, setStatus] = useState<TerminalStatus>(
     providedTransport ? 'connected' : 'idle',
@@ -494,6 +500,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   }, []);
 
   const sendHostResize = useCallback(() => {
+    if (viewOnly) {
+      if (IS_DEV) {
+        console.warn('[beach-surfer] sendHostResize called while viewOnly=true; ignoring resize request');
+      }
+      return;
+    }
     const transport = transportRef.current;
     if (!transport) {
       return;
@@ -504,9 +516,14 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     const targetCols = Math.max(1, ptyColsRef.current ?? fallbackCols);
     suppressNextResizeRef.current = true;
     lastSentViewportRows.current = measuredRows;
+    const label = queryLabel ?? null;
+    const peerId = peerIdRef.current;
     log('send_host_resize', {
       targetCols,
       targetRows: measuredRows,
+      clientLabel: label ?? null,
+      peerId: peerId ?? null,
+      viewOnly: false,
     });
     try {
       transport.send({ type: 'resize', cols: targetCols, rows: measuredRows });
@@ -515,12 +532,18 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         console.warn('[beach-surfer] send_host_resize failed', err);
       }
     }
-  }, [MAX_VIEWPORT_ROWS, log, store]);
+  }, [MAX_VIEWPORT_ROWS, log, store, viewOnly, queryLabel]);
   sendHostResizeRef.current = sendHostResize;
 
   // Explicit host resize API that bypasses lastMeasuredViewportRows and uses inputs.
   const requestHostResize = useCallback(
     (opts: { rows: number; cols?: number }) => {
+      if (viewOnly) {
+        if (IS_DEV) {
+          console.warn('[beach-surfer] requestHostResize ignored because viewOnly=true');
+        }
+        return;
+      }
       const transport = transportRef.current;
       if (!transport) {
         return;
@@ -531,7 +554,16 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       const cols = Math.max(1, Math.floor(opts.cols ?? ptyColsRef.current ?? fallbackCols));
       suppressNextResizeRef.current = true;
       lastSentViewportRows.current = rows;
-      log('request_host_resize', { targetCols: cols, targetRows: rows, reason: 'explicit' });
+      const label = queryLabel ?? null;
+      const peerId = peerIdRef.current;
+      log('request_host_resize', {
+        targetCols: cols,
+        targetRows: rows,
+        reason: 'explicit',
+        clientLabel: label ?? null,
+        peerId: peerId ?? null,
+        viewOnly: false,
+      });
       try {
         transport.send({ type: 'resize', cols, rows });
       } catch (err) {
@@ -540,7 +572,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         }
       }
     },
-    [MAX_VIEWPORT_ROWS, log, store],
+    [MAX_VIEWPORT_ROWS, log, store, viewOnly, queryLabel],
   );
 
   const emitViewportState = useCallback(() => {
@@ -552,13 +584,14 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     const viewportCols = snapshotNow.cols;
     const hostViewportRows = ptyViewportRowsRef.current;
     const hostCols = ptyColsRef.current;
-    const canSendResize = Boolean(transportRef.current);
+    const canSendResize = Boolean(transportRef.current) && !viewOnly;
     const nextReport = {
       viewportRows,
       viewportCols,
       hostViewportRows,
       hostCols,
       canSendResize,
+      viewOnly,
     };
     const previous = lastViewportReportRef.current;
     if (
@@ -567,7 +600,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       previous.viewportCols === nextReport.viewportCols &&
       previous.hostViewportRows === nextReport.hostViewportRows &&
       previous.hostCols === nextReport.hostCols &&
-      previous.canSendResize === nextReport.canSendResize
+      previous.canSendResize === nextReport.canSendResize &&
+      previous.viewOnly === nextReport.viewOnly
     ) {
       return;
     }
@@ -581,17 +615,21 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           hostViewportRows: nextReport.hostViewportRows,
           hostCols: nextReport.hostCols,
           canSendResize,
+          viewOnly: nextReport.viewOnly,
         });
       } catch {
         // ignore logging issues
       }
     }
-    onViewportStateChange({
+    const payload: TerminalViewportState = {
       ...nextReport,
-      sendHostResize: sendHostResizeRef.current,
-      requestHostResize,
-    });
-  }, [MAX_VIEWPORT_ROWS, onViewportStateChange, store]);
+    };
+    if (!viewOnly) {
+      payload.sendHostResize = sendHostResizeRef.current;
+      payload.requestHostResize = requestHostResize;
+    }
+    onViewportStateChange(payload);
+  }, [MAX_VIEWPORT_ROWS, onViewportStateChange, requestHostResize, store, viewOnly]);
 
   useEffect(() => {
     lastViewportReportRef.current = null;
@@ -1105,11 +1143,20 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       }
       // Only send resize if the viewport size actually changed
       if (
-        autoResizeHostOnViewportChange &&
+        autoResizeHostOnViewportChangeEffective &&
         subscriptionRef.current !== null &&
         transportRef.current &&
         viewportRows !== lastSentViewportRows.current
       ) {
+        const label = queryLabel ?? null;
+        const peerId = peerIdRef.current;
+        log('auto_host_resize', {
+          targetCols: current.cols,
+          targetRows: viewportRows,
+          clientLabel: label ?? null,
+          peerId: peerId ?? null,
+          viewOnly,
+        });
         transportRef.current.send({ type: 'resize', cols: current.cols, rows: viewportRows });
         lastSentViewportRows.current = viewportRows;
       }
@@ -1118,13 +1165,16 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     observer.observe(wrapper);
     return () => observer.disconnect();
   }, [
-    autoResizeHostOnViewportChange,
+    autoResizeHostOnViewportChangeEffective,
     disableViewportMeasurements,
     effectiveLineHeight,
     emitViewportState,
     forcedViewportRows,
     lineHeight,
+    log,
+    queryLabel,
     store,
+    viewOnly,
   ]);
 
   useEffect(() => {
@@ -1512,6 +1562,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   };
 
   const handleMatchPtyViewport = useCallback(() => {
+    if (viewOnly) {
+      if (IS_DEV) {
+        console.warn('[beach-surfer] match host viewport blocked in view-only mode');
+      }
+      return;
+    }
     const transport = transportRef.current;
     const targetRowsFromRef = ptyViewportRowsRef.current;
     const subscription = subscriptionRef.current;
@@ -1524,10 +1580,15 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     const targetCols = Math.max(1, ptyColsRef.current ?? fallbackCols);
     suppressNextResizeRef.current = true;
     lastSentViewportRows.current = clampedRows;
+    const label = queryLabel ?? null;
+    const peerId = peerIdRef.current;
     log('match_host_viewport', {
       targetRows: clampedRows,
       targetCols,
       subscription,
+      clientLabel: label ?? null,
+      peerId: peerId ?? null,
+      viewOnly: false,
     });
     try {
       transport.send({ type: 'resize', cols: targetCols, rows: clampedRows });
@@ -1536,7 +1597,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         console.warn('[beach-surfer] match_host_viewport send failed', err);
       }
     }
-  }, [log, store]);
+  }, [log, queryLabel, store, viewOnly]);
   const statusColor = useMemo(() => {
     switch (status) {
       case 'connected':
@@ -1553,13 +1614,17 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   }, [status]);
   const hasPtyResizeTarget = ptyViewportRows != null;
   const fallbackColsForLabel = Math.max(1, ptyCols ?? (snapshot.cols > 0 ? snapshot.cols : 80));
-  const matchButtonDisabled = !hasPtyResizeTarget || status !== 'connected';
-  const matchButtonTitle = hasPtyResizeTarget
-    ? `Match PTY size ${fallbackColsForLabel}×${ptyViewportRows}`
-    : 'Host PTY size unavailable yet';
-  const matchButtonAriaLabel = hasPtyResizeTarget
-    ? `Resize to host PTY size ${fallbackColsForLabel} by ${ptyViewportRows}`
-    : 'Resize to host PTY size (unavailable)';
+  const matchButtonDisabled = viewOnly || !hasPtyResizeTarget || status !== 'connected';
+  const matchButtonTitle = viewOnly
+    ? 'Host resizing unavailable in view-only mode'
+    : hasPtyResizeTarget
+      ? `Match PTY size ${fallbackColsForLabel}×${ptyViewportRows}`
+      : 'Host PTY size unavailable yet';
+  const matchButtonAriaLabel = viewOnly
+    ? 'Host resizing disabled in view-only mode'
+    : hasPtyResizeTarget
+      ? `Resize to host PTY size ${fallbackColsForLabel} by ${ptyViewportRows}`
+      : 'Resize to host PTY size (unavailable)';
   const matchButtonClass = cn(
     'inline-flex h-3.5 w-3.5 items-center justify-center rounded-full transition focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40',
     matchButtonDisabled

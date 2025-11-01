@@ -47,12 +47,13 @@ function estimateHostPixelSize(cols: number, rows: number, fontSize: number) {
 export type HostResizeControlState = {
   needsResize: boolean;
   canResize: boolean;
-  trigger: () => void;
+  trigger?: () => void;
   request?: (opts: { rows: number; cols?: number }) => void;
   viewportRows: number;
   hostViewportRows: number | null;
   viewportCols: number;
   hostCols: number | null;
+  viewOnly: boolean;
 };
 
 type PreviewStatus = 'connecting' | 'initializing' | 'ready' | 'error';
@@ -249,6 +250,7 @@ function SessionTerminalPreviewView({
           viewportCols: state.viewportCols,
           hostViewportRows: state.hostViewportRows,
           hostCols: state.hostCols,
+          viewOnly: state.viewOnly,
         });
       }
       setViewportState(state);
@@ -632,7 +634,7 @@ function SessionTerminalPreviewView({
     const needsResize =
       viewportState.hostViewportRows != null &&
       viewportState.viewportRows !== viewportState.hostViewportRows;
-    const canResize = viewportState.canSendResize && needsResize;
+    const canResize = !viewportState.viewOnly && viewportState.canSendResize && needsResize;
     onHostResizeStateChange(sessionId, {
       needsResize,
       canResize,
@@ -642,6 +644,7 @@ function SessionTerminalPreviewView({
       hostViewportRows: viewportState.hostViewportRows,
       viewportCols: viewportState.viewportCols,
       hostCols: viewportState.hostCols,
+      viewOnly: viewportState.viewOnly,
     });
   }, [onHostResizeStateChange, sessionId, viewportState]);
 
@@ -998,6 +1001,10 @@ function SessionTerminalPreviewView({
     zoomMultiplier,
   ]);
 
+  const isPassiveTile = !locked;
+  const driverViewOnly = isPassiveTile;
+  const cloneViewOnly = isPassiveTile;
+
   const driverWrapperStyle = useMemo<CSSProperties>(
     () => ({
       position: 'absolute',
@@ -1151,6 +1158,7 @@ function SessionTerminalPreviewView({
             disableViewportMeasurements={false}
             maxRenderFps={20}
             hideIdlePlaceholder
+            viewOnly={driverViewOnly}
           />
         </div>
         <div
@@ -1171,6 +1179,7 @@ function SessionTerminalPreviewView({
               disableViewportMeasurements
               maxRenderFps={isCloneVisible ? undefined : 12}
               hideIdlePlaceholder
+              viewOnly={cloneViewOnly}
             />
           </div>
           {showPlaceholder && (

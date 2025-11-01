@@ -1272,18 +1272,84 @@ export default function TileCanvas({
     return [tileSignature, savedLayoutSignature, managerUrl, managerToken ?? '', viewerToken ?? '', viewerOverrideSignature].join('::');
   }, [managerToken, managerUrl, savedLayoutSignature, tileSignature, viewerOverrideSignature, viewerToken]);
 
+  const lastPersistSignatureRef = useRef<string | null>(null);
   const handlePersistLayout = useCallback(
     (_layout: ApiCanvasLayout) => {
       if (!onLayoutPersist) {
         return;
       }
-      const items = sessionTileController.exportGridLayoutAsBeachItems();
-      if (items.length === 0) {
+      const controllerItems = sessionTileController.exportGridLayoutAsBeachItems();
+      if (controllerItems.length === 0) {
         return;
       }
-      onLayoutPersist(items);
+      const allowedIds = new Set(tileOrder);
+      const fallbackCols = cols;
+      const fallbackRowHeight = rowHeightPx;
+      const byId = new Map<string, BeachLayoutItem>();
+      for (const item of controllerItems) {
+        if (!allowedIds.has(item.id)) {
+          continue;
+        }
+        const itemCols = item.gridCols && item.gridCols > 0 ? item.gridCols : fallbackCols;
+        const itemRowHeight = item.rowHeightPx && item.rowHeightPx > 0 ? item.rowHeightPx : fallbackRowHeight;
+        const scaledW = Math.max(
+          LEGACY_MIN_W,
+          Math.round((item.w * LEGACY_GRID_COLS) / Math.max(1, itemCols)),
+        );
+        const scaledH = Math.max(
+          LEGACY_MIN_H,
+          Math.round((item.h * LEGACY_ROW_HEIGHT_PX) / Math.max(1, itemRowHeight)),
+        );
+        const scaledX = Math.max(
+          0,
+          Math.round((item.x * LEGACY_GRID_COLS) / Math.max(1, itemCols)),
+        );
+        const scaledY = Math.max(
+          0,
+          Math.round((item.y * LEGACY_ROW_HEIGHT_PX) / Math.max(1, itemRowHeight)),
+        );
+        const clampedX = Math.max(0, Math.min(scaledX, Math.max(0, LEGACY_GRID_COLS - scaledW)));
+        const legacyItem: BeachLayoutItem = {
+          id: item.id,
+          x: clampedX,
+          y: scaledY,
+          w: scaledW,
+          h: scaledH,
+          gridCols: LEGACY_GRID_COLS,
+          rowHeightPx: LEGACY_ROW_HEIGHT_PX,
+          layoutVersion: GRID_LAYOUT_VERSION,
+        };
+        if (item.widthPx != null) {
+          legacyItem.widthPx = Math.round(item.widthPx);
+        }
+        if (item.heightPx != null) {
+          legacyItem.heightPx = Math.round(item.heightPx);
+        }
+        if (typeof item.zoom === 'number') {
+          legacyItem.zoom = Number.isFinite(item.zoom) ? Number(item.zoom.toFixed(3)) : item.zoom;
+        }
+        if (typeof item.locked === 'boolean') {
+          legacyItem.locked = item.locked;
+        }
+        if (typeof item.toolbarPinned === 'boolean') {
+          legacyItem.toolbarPinned = item.toolbarPinned;
+        }
+        byId.set(item.id, legacyItem);
+      }
+      const legacyItems = tileOrder
+        .map((id) => byId.get(id))
+        .filter((v): v is BeachLayoutItem => Boolean(v));
+      if (legacyItems.length === 0) {
+        return;
+      }
+      const signature = serializeBeachLayoutItems(legacyItems);
+      if (lastPersistSignatureRef.current === signature) {
+        return;
+      }
+      lastPersistSignatureRef.current = signature;
+      onLayoutPersist(legacyItems);
     },
-    [onLayoutPersist],
+    [cols, onLayoutPersist, rowHeightPx, tileOrder],
   );
 
   const previousViewStateRef = useRef<TileViewStateMap>({});
@@ -1316,6 +1382,14 @@ export default function TileCanvas({
       sessionTileController.setCachedDiff(sessionId, diff ?? null);
     }
   }, [cachedTerminalDiffs]);
+
+  useEffect(() => {
+    if (!savedLayout || savedLayout.length === 0) {
+      lastPersistSignatureRef.current = 'empty';
+      return;
+    }
+    lastPersistSignatureRef.current = serializeBeachLayoutItems(savedLayout);
+  }, [savedLayout]);
 
 
 
@@ -1471,13 +1545,19 @@ const layoutMap = useMemo(() => {
       applyReactGridMutation('autosize', normalized, 'grid-normalize', true);
       return;
     }
+    const exported = sessionTileController.exportGridLayoutAsBeachItems();
+    const exportedSignature = exported.length === 0 ? 'empty' : serializeBeachLayoutItems(exported);
     if (!savedLayout || savedLayout.length === 0) {
+      if (exportedSignature !== 'empty' && lastPersistSignatureRef.current !== exportedSignature) {
+        sessionTileController.requestPersist();
+      }
       return;
     }
-    const exported = sessionTileController.exportGridLayoutAsBeachItems();
     const savedSignature = serializeBeachLayoutItems(savedLayout);
-    const exportedSignature = serializeBeachLayoutItems(exported);
     if (savedSignature !== exportedSignature) {
+      if (lastPersistSignatureRef.current === exportedSignature) {
+        return;
+      }
       sessionTileController.requestPersist();
     }
   }, [applyReactGridMutation, clampLayoutItems, cols, isClient, layout, savedLayout]);

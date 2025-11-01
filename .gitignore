@@ -24,6 +24,7 @@ Thumbs.db
 # Environment
 .env
 .env.local
+.env.*
 
 # Logs
 *.log
@@ -34,12 +35,24 @@ sessions/
 # temp data
 tmp/
 temp/
+
+# Node / JS workspaces
+node_modules/
 apps/**/node_modules/
-apps/**/dist/
-apps/**/build/
+**/node_modules.bak/
+
+# Common build outputs
+dist/
+build/
+.turbo/
 apps/**/.turbo/
-apps/**/.tsbuildinfo
+.next/
 apps/**/.next/
+
+# TypeScript build info
+*.tsbuildinfo
+apps/**/.tsbuildinfo
+
 # Tauri targets (native apps)
 apps/**/src-tauri/target/
 
@@ -58,6 +71,11 @@ dump.rdb
 playwright-report/
 test-results/
 .nyc_output/
+
+# Backups and editor caches
+*.bak
+.eslintcache
+.vercel/
 
 # Python bytecode (Pong demo helpers)
 apps/private-beach/demo/**/__pycache__/

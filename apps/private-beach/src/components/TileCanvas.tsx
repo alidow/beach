@@ -87,6 +87,84 @@ type TileViewStateMap = Record<string, TileViewState>;
 
 const TILE_DEBUG_ENABLED = process.env.NEXT_PUBLIC_TILE_DEBUG === 'true';
 
+function computeViewMeasurements(view: TileViewState): TileMeasurements | null {
+  if (view.measurements) {
+    return view.measurements;
+  }
+  if (view.preview) {
+    const scale = view.locked ? MAX_UNLOCKED_ZOOM : view.zoom;
+    return {
+      width: view.preview.targetWidth * scale,
+      height: view.preview.targetHeight * scale,
+    };
+  }
+  return null;
+}
+
+function snapshotLayoutItems(
+  layouts: Layout[],
+  cols: number,
+  viewStates: TileViewStateMap,
+  tileOrder: string[],
+): BeachLayoutItem[] {
+  if (layouts.length === 0 || tileOrder.length === 0) {
+    return [];
+  }
+  const allowed = new Set(tileOrder);
+  const byId = new Map<string, BeachLayoutItem>();
+  const effectiveCols = Math.max(DEFAULT_W, cols || DEFAULT_COLS);
+  for (const item of layouts) {
+    if (!allowed.has(item.i)) {
+      continue;
+    }
+    const w = Math.min(effectiveCols, Math.max(MIN_W, Math.round(item.w)));
+    const h = Math.max(MIN_H, Math.round(item.h));
+    const x = Math.max(0, Math.min(Math.round(item.x), Math.max(0, effectiveCols - w)));
+    const y = Math.max(0, Math.round(item.y));
+    const view = viewStates[item.i] ?? defaultTileViewState();
+    const measurement = computeViewMeasurements(view);
+    const widthPx = measurement ? Math.round(measurement.width) : null;
+    const heightPx = measurement ? Math.round(measurement.height) : null;
+    const computedZoom = view.locked ? MAX_UNLOCKED_ZOOM : clampZoom(view.zoom, measurement);
+    const normalizedZoom = Number.isFinite(computedZoom) ? Number(computedZoom.toFixed(3)) : undefined;
+    const scaledW = Math.max(LEGACY_MIN_W, Math.round((w * LEGACY_GRID_COLS) / Math.max(1, effectiveCols)));
+    const scaledH = Math.max(LEGACY_MIN_H, Math.round((h * LEGACY_ROW_HEIGHT_PX) / ROW_HEIGHT));
+    const scaledX = Math.max(0, Math.round((x * LEGACY_GRID_COLS) / Math.max(1, effectiveCols)));
+    const scaledY = Math.max(0, Math.round((y * LEGACY_ROW_HEIGHT_PX) / ROW_HEIGHT));
+    const maxLegacyX = Math.max(0, LEGACY_GRID_COLS - scaledW);
+    const clampedLegacyX = Math.max(0, Math.min(scaledX, maxLegacyX));
+    const layoutItem: BeachLayoutItem = {
+      id: item.i,
+      x: clampedLegacyX,
+      y: scaledY,
+      w: scaledW,
+      h: scaledH,
+      gridCols: LEGACY_GRID_COLS,
+      rowHeightPx: LEGACY_ROW_HEIGHT_PX,
+      layoutVersion: GRID_LAYOUT_VERSION,
+    };
+    if (widthPx != null) {
+      layoutItem.widthPx = widthPx;
+    }
+    if (heightPx != null) {
+      layoutItem.heightPx = heightPx;
+    }
+    if (normalizedZoom != null) {
+      layoutItem.zoom = normalizedZoom;
+    }
+    if (typeof view.locked === 'boolean') {
+      layoutItem.locked = view.locked;
+    }
+    if (typeof view.toolbarPinned === 'boolean') {
+      layoutItem.toolbarPinned = view.toolbarPinned;
+    }
+    byId.set(item.i, layoutItem);
+  }
+  return tileOrder
+    .map((id) => byId.get(id))
+    .filter((entry): entry is BeachLayoutItem => Boolean(entry));
+}
+
 function areLayoutsEquivalent(a: Layout[], b: Layout[]): boolean {
   if (a.length !== b.length) {
     return false;
@@ -1261,6 +1339,13 @@ export default function TileCanvas({
       .join('|');
   }, [savedLayout]);
 
+  const savedLayoutPersistSignature = useMemo(() => {
+    if (!savedLayout || savedLayout.length === 0) {
+      return 'empty';
+    }
+    return serializeBeachLayoutItems(savedLayout);
+  }, [savedLayout]);
+
   const viewerOverrideSignature = useMemo(() => {
     return Object.entries(effectiveViewerOverrides)
       .map(([id, state]) => `${id}:${state?.status ?? 'null'}:${state?.connecting ? '1' : '0'}`)
@@ -1272,73 +1357,24 @@ export default function TileCanvas({
     return [tileSignature, savedLayoutSignature, managerUrl, managerToken ?? '', viewerToken ?? '', viewerOverrideSignature].join('::');
   }, [managerToken, managerUrl, savedLayoutSignature, tileSignature, viewerOverrideSignature, viewerToken]);
 
+  const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
+
   const lastPersistSignatureRef = useRef<string | null>(null);
   const handlePersistLayout = useCallback(
     (_layout: ApiCanvasLayout) => {
       if (!onLayoutPersist) {
         return;
       }
-      const controllerItems = sessionTileController.exportGridLayoutAsBeachItems();
-      if (controllerItems.length === 0) {
+      const controllerLayout = sessionTileController.getSnapshot().layout;
+      const reactGridLayout = gridSnapshotToReactGrid(controllerLayout, {
+        fallbackCols: cols,
+        minW: MIN_W,
+        minH: MIN_H,
+      });
+      if (reactGridLayout.length === 0) {
         return;
       }
-      const allowedIds = new Set(tileOrder);
-      const fallbackCols = cols;
-      const fallbackRowHeight = rowHeightPx;
-      const byId = new Map<string, BeachLayoutItem>();
-      for (const item of controllerItems) {
-        if (!allowedIds.has(item.id)) {
-          continue;
-        }
-        const itemCols = item.gridCols && item.gridCols > 0 ? item.gridCols : fallbackCols;
-        const itemRowHeight = item.rowHeightPx && item.rowHeightPx > 0 ? item.rowHeightPx : fallbackRowHeight;
-        const scaledW = Math.max(
-          LEGACY_MIN_W,
-          Math.round((item.w * LEGACY_GRID_COLS) / Math.max(1, itemCols)),
-        );
-        const scaledH = Math.max(
-          LEGACY_MIN_H,
-          Math.round((item.h * LEGACY_ROW_HEIGHT_PX) / Math.max(1, itemRowHeight)),
-        );
-        const scaledX = Math.max(
-          0,
-          Math.round((item.x * LEGACY_GRID_COLS) / Math.max(1, itemCols)),
-        );
-        const scaledY = Math.max(
-          0,
-          Math.round((item.y * LEGACY_ROW_HEIGHT_PX) / Math.max(1, itemRowHeight)),
-        );
-        const clampedX = Math.max(0, Math.min(scaledX, Math.max(0, LEGACY_GRID_COLS - scaledW)));
-        const legacyItem: BeachLayoutItem = {
-          id: item.id,
-          x: clampedX,
-          y: scaledY,
-          w: scaledW,
-          h: scaledH,
-          gridCols: LEGACY_GRID_COLS,
-          rowHeightPx: LEGACY_ROW_HEIGHT_PX,
-          layoutVersion: GRID_LAYOUT_VERSION,
-        };
-        if (item.widthPx != null) {
-          legacyItem.widthPx = Math.round(item.widthPx);
-        }
-        if (item.heightPx != null) {
-          legacyItem.heightPx = Math.round(item.heightPx);
-        }
-        if (typeof item.zoom === 'number') {
-          legacyItem.zoom = Number.isFinite(item.zoom) ? Number(item.zoom.toFixed(3)) : item.zoom;
-        }
-        if (typeof item.locked === 'boolean') {
-          legacyItem.locked = item.locked;
-        }
-        if (typeof item.toolbarPinned === 'boolean') {
-          legacyItem.toolbarPinned = item.toolbarPinned;
-        }
-        byId.set(item.id, legacyItem);
-      }
-      const legacyItems = tileOrder
-        .map((id) => byId.get(id))
-        .filter((v): v is BeachLayoutItem => Boolean(v));
+      const legacyItems = snapshotLayoutItems(reactGridLayout, cols, viewStateMap, tileOrder);
       if (legacyItems.length === 0) {
         return;
       }
@@ -1349,7 +1385,7 @@ export default function TileCanvas({
       lastPersistSignatureRef.current = signature;
       onLayoutPersist(legacyItems);
     },
-    [cols, onLayoutPersist, rowHeightPx, tileOrder],
+    [cols, onLayoutPersist, tileOrder, viewStateMap],
   );
 
   const previousViewStateRef = useRef<TileViewStateMap>({});
@@ -1384,12 +1420,8 @@ export default function TileCanvas({
   }, [cachedTerminalDiffs]);
 
   useEffect(() => {
-    if (!savedLayout || savedLayout.length === 0) {
-      lastPersistSignatureRef.current = 'empty';
-      return;
-    }
-    lastPersistSignatureRef.current = serializeBeachLayoutItems(savedLayout);
-  }, [savedLayout]);
+    lastPersistSignatureRef.current = savedLayoutPersistSignature;
+  }, [savedLayoutPersistSignature]);
 
 
 
@@ -1493,11 +1525,11 @@ export default function TileCanvas({
     [layout],
   );
 
-const layoutMap = useMemo(() => {
-  const map = new Map<string, Layout>();
-  layout.forEach((item) => map.set(item.i, item));
-  return map;
-}, [layout]);
+  const layoutMap = useMemo(() => {
+    const map = new Map<string, Layout>();
+    layout.forEach((item) => map.set(item.i, item));
+    return map;
+  }, [layout]);
 
   const gridCommandContext = useMemo(
     () => ({

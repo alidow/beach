@@ -50,7 +50,7 @@
      ```
    - Launch the sandbox with these parameters, ensure the tile renders the blue-bordered preview immediately after page load (without waiting for live frames), and capture console logs.
 4. **Manual verification checklist**
-   - Clear Manager cache / restart the worker to force reliance on `last_state`.
+   - Clear Manager cache / restart the worker to ensure the Redis-backed snapshot endpoint returns data immediately.
    - Reload the dashboard in production-like mode and confirm colors appear instantly.
    - Re-run `cargo test -p beach-manager` and the relevant `apps/private-beach` test suite once the hydrator changes land.
 
@@ -58,4 +58,3 @@
 - The enriched payload surfaced by Manager already ships; only the Private Beach client needs to consume it.
 - Look for TODOs or comments referencing “hydrate from styled_lines” once the client work begins.
 - Keep the existing telemetry (`[terminal][trace]` logs) – they will confirm when previews fall back to cached styled data vs. live viewer frames.
-

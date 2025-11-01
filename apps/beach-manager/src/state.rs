@@ -389,6 +389,23 @@ fn capture_terminal_frame_simple(
     let rows = viewport_rows.min(total_rows);
     let style_table = grid.style_table.clone();
     let style_entries = style_table.entries();
+    if let Some((first_id, first_style)) = style_entries.get(0) {
+        info!(
+            target = "private_beach",
+            styles = style_entries.len(),
+            sample_id = first_id.0,
+            sample_fg = first_style.fg,
+            sample_bg = first_style.bg,
+            sample_attrs = first_style.attrs,
+            "manager viewer style snapshot"
+        );
+    } else {
+        info!(
+            target = "private_beach",
+            styles = 0,
+            "manager viewer style snapshot"
+        );
+    }
     let mut style_lookup = HashMap::with_capacity(style_entries.len());
     for (id, style) in &style_entries {
         style_lookup.insert(id.0, *style);
@@ -528,7 +545,6 @@ pub struct SessionSummary {
     pub capabilities: Vec<String>,
     pub location_hint: Option<String>,
     pub metadata: Option<serde_json::Value>,
-    pub last_state: Option<StateDiff>,
     pub version: String,
     pub harness_id: String,
     pub controller_token: Option<String>,
@@ -727,7 +743,6 @@ struct SessionRow {
     capabilities: Option<Json<serde_json::Value>>,
     metadata: Option<Json<serde_json::Value>>,
     location_hint: Option<String>,
-    last_state: Option<Json<serde_json::Value>>,
     last_health: Option<Json<serde_json::Value>>,
     controller_token: Option<Uuid>,
     expires_at: Option<DateTime<Utc>>,
@@ -1354,7 +1369,6 @@ impl AppState {
                         s.capabilities,
                         s.metadata,
                         s.location_hint,
-                        sr.last_state,
                         sr.last_health,
                         cl.id AS controller_token,
                         cl.expires_at,
@@ -1381,9 +1395,6 @@ impl AppState {
                         .map(|Json(value)| json_array_to_strings(&value))
                         .unwrap_or_default();
                     let metadata = row.metadata.map(|Json(value)| value);
-                    let last_state = row
-                        .last_state
-                        .and_then(|Json(value)| serde_json::from_value(value).ok());
                     let controller_token = row
                         .controller_token
                         .filter(|_| is_active_lease(row.expires_at, row.revoked_at))
@@ -1417,7 +1428,6 @@ impl AppState {
                         capabilities,
                         location_hint: row.location_hint.clone(),
                         metadata,
-                        last_state,
                         version: "unknown".into(),
                         harness_id: row.harness_id.unwrap_or_else(Uuid::new_v4).to_string(),
                         controller_token,
@@ -2482,18 +2492,6 @@ impl AppState {
                 let mut tx = pool.begin().await?;
                 self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
                     .await?;
-                sqlx::query(
-                    r#"
-                    INSERT INTO session_runtime (session_id, last_state, last_state_at)
-                    VALUES ($1, $2, NOW())
-                    ON CONFLICT (session_id)
-                    DO UPDATE SET last_state = EXCLUDED.last_state, last_state_at = NOW()
-                    "#,
-                )
-                .bind(identifiers.session_id)
-                .bind(Json(serde_json::to_value(&diff)?))
-                .execute(tx.as_mut())
-                .await?;
                 self.insert_controller_event(
                     &mut tx,
                     identifiers.session_id,
@@ -2524,6 +2522,36 @@ impl AppState {
                         .inc();
                 }
                 Ok(())
+            }
+        }
+    }
+
+    pub async fn state_snapshot(&self, session_id: &str) -> Result<Option<StateDiff>, StateError> {
+        match &self.backend {
+            Backend::Memory => {
+                let sessions = self.fallback.sessions.read().await;
+                Ok(sessions
+                    .get(session_id)
+                    .and_then(|record| record.last_state.clone()))
+            }
+            Backend::Postgres(pool) => {
+                let session_uuid = parse_uuid(session_id, "session_id")?;
+                let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
+                let private_beach_id = identifiers.private_beach_id.to_string();
+                let session_uuid_str = session_uuid.to_string();
+                if let Some(snapshot) = self
+                    .load_state_redis(&private_beach_id, &session_uuid_str)
+                    .await?
+                {
+                    return Ok(Some(snapshot));
+                }
+                let fallback_state = {
+                    let sessions = self.fallback.sessions.read().await;
+                    sessions
+                        .get(&session_uuid_str)
+                        .and_then(|record| record.last_state.clone())
+                };
+                Ok(fallback_state)
             }
         }
     }
@@ -3244,7 +3272,6 @@ impl SessionSummary {
             capabilities: record.capabilities.clone(),
             location_hint: record.location_hint.clone(),
             metadata: record.metadata.clone(),
-            last_state: record.last_state.clone(),
             version: record.version.clone(),
             harness_id: record.harness_id.clone(),
             controller_token: record.controller_token.clone(),
@@ -4124,6 +4151,24 @@ impl AppState {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn load_state_redis(
+        &self,
+        private_beach_id: &str,
+        session_id: &str,
+    ) -> Result<Option<StateDiff>, StateError> {
+        if let Some(client) = &self.redis {
+            let mut conn = client.get_async_connection().await?;
+            let key = redis_state_key(private_beach_id, session_id);
+            let payload: Option<String> =
+                redis::cmd("GET").arg(&key).query_async(&mut conn).await?;
+            if let Some(raw) = payload {
+                let diff = serde_json::from_str(&raw)?;
+                return Ok(Some(diff));
+            }
+        }
+        Ok(None)
     }
 
     async fn ack_actions_redis(

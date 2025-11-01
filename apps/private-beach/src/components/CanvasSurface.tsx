@@ -21,7 +21,7 @@ import ReactFlow, {
 import 'reactflow/dist/style.css';
 
 import type { SessionSummary } from '../lib/api';
-import type { SessionCredentialOverride, TerminalViewerState } from '../hooks/useSessionTerminal';
+import type { SessionCredentialOverride, TerminalViewerState } from '../hooks/terminalViewerTypes';
 import {
   GroupNode,
   applyAssignmentResults,
@@ -49,6 +49,12 @@ import {
 import type { CanvasLayout as ApiCanvasLayout } from '../lib/api';
 import { emitTelemetry } from '../lib/telemetry';
 import { extractTerminalStateDiff, type TerminalStateDiff } from '../lib/terminalHydrator';
+import {
+  sessionTileController,
+  useCanvasSnapshot,
+  useTileSnapshot,
+  type TileMeasurementPayload,
+} from '../controllers/sessionTileController';
 
 const SessionTerminalPreview = dynamic(
   () => import('./SessionTerminalPreview').then((mod) => mod.SessionTerminalPreview),
@@ -58,7 +64,6 @@ const SessionTerminalPreview = dynamic(
 const TILE_PREFIX = 'tile:';
 const AGENT_PREFIX = 'agent:';
 const GROUP_PREFIX = 'group:';
-const PERSIST_DELAY_MS = 200;
 const DEFAULT_TILE_WIDTH = 448;
 const DEFAULT_TILE_HEIGHT = 448;
 const DEFAULT_AGENT_WIDTH = 240;
@@ -86,6 +91,7 @@ type CanvasSurfaceProps = {
 };
 
 type TileNodeData = {
+  tileId: string;
   session: SessionSummary | null;
   onRemove: (sessionId: string) => void;
   onSelect: (session: SessionSummary) => void;
@@ -96,7 +102,6 @@ type TileNodeData = {
   credentialOverride?: SessionCredentialOverride | null;
   viewerOverride?: TerminalViewerState | null;
   privateBeachId: string | null;
-  onMeasurements: (sessionId: string, measurements: MeasurementPayload | null) => void;
   cachedDiff?: TerminalStateDiff | null;
 };
 
@@ -113,59 +118,6 @@ type GroupNodeData = {
   members: { id: string; x: number; y: number; w: number; h: number }[];
   isDropTarget: boolean;
 };
-
-type MeasurementPayload = {
-  scale: number;
-  targetWidth: number;
-  targetHeight: number;
-  rawWidth: number;
-  rawHeight: number;
-  hostRows: number | null;
-  hostCols: number | null;
-  measurementVersion: number;
-};
-
-function ensureLayout(input: ApiCanvasLayout | SharedCanvasLayout | null): SharedCanvasLayout {
-  const now = Date.now();
-  if (!input) {
-    return {
-      version: 3,
-      viewport: { zoom: 1, pan: { x: 0, y: 0 } },
-      tiles: {},
-      groups: {},
-      agents: {},
-      controlAssignments: {},
-      metadata: { createdAt: now, updatedAt: now },
-    };
-  }
-  const rawTiles = input.tiles ?? {};
-  const tiles: SharedCanvasLayout['tiles'] = {};
-  for (const [tileId, tile] of Object.entries(rawTiles)) {
-    tiles[tileId] = {
-      ...tile,
-      id: tile.id ?? tileId,
-      kind: 'application',
-      position: tile.position ?? { x: 0, y: 0 },
-      size: tile.size ?? { width: DEFAULT_TILE_WIDTH, height: DEFAULT_TILE_HEIGHT },
-      zIndex: tile.zIndex ?? 1,
-      metadata: tile.metadata ?? {},
-    };
-  }
-
-  return {
-    version: 3,
-    viewport: input.viewport ?? { zoom: 1, pan: { x: 0, y: 0 } },
-    tiles,
-    groups: input.groups ?? {},
-    agents: input.agents ?? {},
-    controlAssignments: input.controlAssignments ?? {},
-    metadata: {
-      createdAt: input.metadata?.createdAt ?? now,
-      updatedAt: input.metadata?.updatedAt ?? now,
-      migratedFrom: input.metadata?.migratedFrom,
-    },
-  };
-}
 
 function encodeNodeId(kind: 'tile' | 'agent' | 'group', id: string): string {
   if (kind === 'tile') return `${TILE_PREFIX}${id}`;
@@ -270,6 +222,7 @@ export function getTileBorderClass({
 
 function TileNodeComponent({ data, selected }: NodeProps<TileNodeData>) {
   const {
+    tileId,
     session,
     onRemove,
     onSelect,
@@ -280,12 +233,26 @@ function TileNodeComponent({ data, selected }: NodeProps<TileNodeData>) {
     credentialOverride,
     viewerOverride,
     privateBeachId,
-    onMeasurements,
     cachedDiff,
   } = data;
+  const snapshot = useTileSnapshot(tileId);
+  const sessionSummary = session ?? snapshot.session;
   const borderClass = getTileBorderClass({ selected, isDropTarget, isDragging: !!isDragging });
 
-  if (!session) {
+  const effectiveViewer = viewerOverride ?? snapshot.viewer;
+  const effectiveCachedDiff = cachedDiff ?? snapshot.cachedDiff ?? null;
+
+  const handleMeasurements = useCallback(
+    (_sessionId: string, measurements: unknown) => {
+      if (!measurements) {
+        return;
+      }
+      sessionTileController.enqueueMeasurement(tileId, measurements as TileMeasurementPayload, 'dom');
+    },
+    [tileId],
+  );
+
+  if (!sessionSummary) {
     return (
       <div className={`flex h-full w-full items-center justify-center rounded-xl border ${borderClass} bg-muted/20 text-xs text-muted-foreground`}>
         Missing session
@@ -299,29 +266,29 @@ function TileNodeComponent({ data, selected }: NodeProps<TileNodeData>) {
         <button
           type="button"
           className="truncate text-left text-sm font-medium"
-          onClick={() => onSelect(session)}
+          onClick={() => onSelect(sessionSummary)}
         >
-          {session.metadata?.title || session.session_id}
+          {sessionSummary.metadata?.title || sessionSummary.session_id}
         </button>
         <button
           type="button"
           className="text-xs text-muted-foreground transition hover:text-destructive"
-          onClick={() => onRemove(session.session_id)}
+          onClick={() => onRemove(sessionSummary.session_id)}
         >
           Remove
         </button>
       </div>
       <div className="flex flex-1 min-h-0 flex-col">
         <SessionTerminalPreview
-          sessionId={session.session_id}
-          privateBeachId={privateBeachId ?? session.private_beach_id}
+          sessionId={sessionSummary.session_id}
+          privateBeachId={privateBeachId ?? sessionSummary.private_beach_id}
           managerUrl={managerUrl}
           token={viewerToken}
           credentialOverride={credentialOverride ?? undefined}
-          viewerOverride={viewerOverride ?? undefined}
+          viewer={effectiveViewer}
           variant="preview"
-          cachedStateDiff={cachedDiff ?? undefined}
-          onPreviewMeasurementsChange={(id, measurements) => onMeasurements(id, measurements as MeasurementPayload | null)}
+          cachedStateDiff={effectiveCachedDiff ?? undefined}
+          onPreviewMeasurementsChange={handleMeasurements}
         />
       </div>
     </div>
@@ -386,11 +353,10 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
   const { load, setNodes, setViewport, setSelection } = useCanvasActions();
   const { selection } = useCanvasState();
   const { onDropNode, onCreateGroup, onAssignAgent, onAssignmentError } = useCanvasHandlers();
-  const [layout, setLayout] = useState<SharedCanvasLayout>(() => ensureLayout(layoutProp));
+  const { layout } = useCanvasSnapshot();
   const [miniMapVisible, setMiniMapVisible] = useState(true);
   const [hoverTarget, setHoverTarget] = useState<DropTarget | null>(null);
   const [activeDragNodeId, setActiveDragNodeId] = useState<string | null>(null);
-  const persistTimer = useRef<NodeJS.Timeout | null>(null);
   const didLoadRef = useRef(false);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const dragStateRef = useRef<{
@@ -402,18 +368,70 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
   const lastSyncNodeIdsRef = useRef<Set<string>>(new Set());
   const lastLayoutSignatureRef = useRef<string | null>(null);
   const lastSyncedViewportRef = useRef<{ x: number; y: number; zoom: number } | null>(null);
+  const hydrateKeyRef = useRef<string | null>(null);
+  const persistCallbackRef = useRef<typeof onPersistLayout | undefined>(onPersistLayout);
+  const layoutChangeCallbackRef = useRef<typeof onLayoutChange | undefined>(onLayoutChange);
 
-  useEffect(() => {
-    setLayout(ensureLayout(layoutProp));
-  }, [layoutProp]);
+  const viewerOverrideSignature = useMemo(() => {
+    if (!viewerOverrides) {
+      return '';
+    }
+    return Object.entries(viewerOverrides)
+      .map(([id, override]) => {
+        if (!override) {
+          return `${id}:null`;
+        }
+        return [
+          id,
+          override.authorizationToken ?? '',
+          override.passcode ?? '',
+          override.viewerToken ?? '',
+          override.skipCredentialFetch ? '1' : '0',
+        ].join(':');
+      })
+      .sort()
+      .join('|');
+  }, [viewerOverrides]);
 
-  useEffect(() => {
-    return () => {
-      if (persistTimer.current) {
-        clearTimeout(persistTimer.current);
-      }
-    };
-  }, []);
+  const viewerStateSignature = useMemo(() => {
+    if (!viewerStateOverridesProp) {
+      return '';
+    }
+    return Object.entries(viewerStateOverridesProp)
+      .map(([id, state]) => `${id}:${state?.status ?? 'null'}:${state?.connecting ? '1' : '0'}`)
+      .sort()
+      .join('|');
+  }, [viewerStateOverridesProp]);
+
+  const hydrateKey = useMemo(() => {
+    const layoutUpdatedAt = layoutProp?.metadata?.updatedAt ?? 0;
+    const layoutVersion = layoutProp?.version ?? 0;
+    const tileIdsSignature = [...tiles].map((session) => session.session_id).sort().join(',');
+    const agentIdsSignature = [...agents].map((session) => session.session_id).sort().join(',');
+    return [
+      layoutVersion,
+      layoutUpdatedAt,
+      tileIdsSignature,
+      agentIdsSignature,
+      managerUrl,
+      managerToken ?? '',
+      viewerToken ?? '',
+      privateBeachId ?? '',
+      viewerOverrideSignature,
+      viewerStateSignature,
+    ].join('|');
+  }, [
+    agents,
+    layoutProp?.metadata?.updatedAt,
+    layoutProp?.version,
+    managerToken,
+    managerUrl,
+    privateBeachId,
+    tiles,
+    viewerOverrideSignature,
+    viewerStateSignature,
+    viewerToken,
+  ]);
 
   const sessionMap = useMemo(() => new Map(tiles.map((session) => [session.session_id, session] as const)), [tiles]);
   const agentMap = useMemo(() => new Map(agents.map((session) => [session.session_id, session] as const)), [agents]);
@@ -457,6 +475,53 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     }
     return map;
   }, [layout?.tiles, tiles]);
+
+  useEffect(() => {
+    for (const [sessionId, diff] of Object.entries(cachedTerminalDiffs)) {
+      sessionTileController.setCachedDiff(sessionId, diff ?? null);
+    }
+  }, [cachedTerminalDiffs]);
+
+  useEffect(() => {
+    const keyChanged = hydrateKeyRef.current !== hydrateKey;
+    const callbacksChanged =
+      persistCallbackRef.current !== onPersistLayout ||
+      layoutChangeCallbackRef.current !== onLayoutChange;
+    if (!keyChanged && !callbacksChanged) {
+      return;
+    }
+    hydrateKeyRef.current = hydrateKey;
+    persistCallbackRef.current = onPersistLayout;
+    layoutChangeCallbackRef.current = onLayoutChange;
+    sessionTileController.hydrate({
+      layout: layoutProp,
+      sessions: tiles,
+      agents,
+      privateBeachId,
+      managerUrl,
+      managerToken,
+      viewerToken,
+      viewerOverrides,
+      viewerStateOverrides: viewerStateOverridesProp,
+      cachedDiffs: cachedTerminalDiffs,
+      onPersistLayout,
+      onLayoutChange,
+    });
+  }, [
+    cachedTerminalDiffs,
+    agents,
+    hydrateKey,
+    layoutProp,
+    managerToken,
+    managerUrl,
+    onLayoutChange,
+    onPersistLayout,
+    privateBeachId,
+    tiles,
+    viewerOverrides,
+    viewerStateOverridesProp,
+    viewerToken,
+  ]);
 
   const viewerStateOverridesResolved = useMemo(() => {
     if (!viewerStateOverridesProp) {
@@ -528,189 +593,11 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     syncStore(layout);
   }, [layout, syncStore]);
 
-  const schedulePersist = useCallback(
-    (next: SharedCanvasLayout) => {
-      if (persistTimer.current) {
-        clearTimeout(persistTimer.current);
-      }
-      if (!onPersistLayout) return;
-      persistTimer.current = setTimeout(() => {
-        emitTelemetry('canvas.layout.persist', {
-          beachId: privateBeachId ?? undefined,
-          tileCount: Object.keys(next.tiles).length,
-          groupCount: Object.keys(next.groups).length,
-          agentCount: Object.keys(next.agents).length,
-        });
-        onPersistLayout(next as ApiCanvasLayout);
-      }, PERSIST_DELAY_MS);
-    },
-    [onPersistLayout, privateBeachId],
-  );
-
   const updateLayout = useCallback(
     (reason: string, produce: (current: SharedCanvasLayout) => SharedCanvasLayout) => {
-      setLayout((prev) => {
-        const base = ensureLayout(prev);
-        const baseSignature = JSON.stringify({
-          tiles: Object.keys(base.tiles),
-          agents: Object.keys(base.agents),
-          groups: Object.keys(base.groups),
-        });
-        const produced = produce(base);
-        if (Object.is(produced, base)) {
-          if (typeof window !== 'undefined') {
-            console.info('[canvas-update] layout-change', {
-              reason,
-              baseSignature,
-              nextSignature: baseSignature,
-              tileCountBefore: Object.keys(base.tiles).length,
-              tileCountAfter: Object.keys(base.tiles).length,
-              skipped: true,
-            });
-          }
-          return prev ?? base;
-        }
-        const next = ensureLayout(produced);
-        const nextSignature = JSON.stringify({
-          tiles: Object.keys(next.tiles),
-          agents: Object.keys(next.agents),
-          groups: Object.keys(next.groups),
-        });
-        if (typeof window !== 'undefined') {
-          console.info('[canvas-update] layout-change', {
-            reason,
-            baseSignature,
-            nextSignature,
-            tileCountBefore: Object.keys(base.tiles).length,
-            tileCountAfter: Object.keys(next.tiles).length,
-            skipped: false,
-          });
-        }
-        onLayoutChange?.(next as ApiCanvasLayout);
-        schedulePersist(next);
-        return next;
-      });
+      sessionTileController.updateLayout(reason, produce);
     },
-    [onLayoutChange, schedulePersist],
-  );
-
-  const handleTileMeasurements = useCallback(
-    (sessionId: string, measurements: MeasurementPayload | null) => {
-      if (!measurements) {
-        return;
-      }
-      updateLayout('measurement', (current) => {
-        const tile = current.tiles[sessionId];
-        if (!tile) {
-          if (typeof window !== 'undefined') {
-            console.info('[canvas-measure] skip', {
-              sessionId,
-              reason: 'missing-tile',
-            });
-          }
-          return current;
-        }
-        const currentVersion = typeof tile.metadata?.measurementVersion === 'number' ? (tile.metadata as any).measurementVersion : 0;
-        if (measurements.measurementVersion <= currentVersion) {
-          if (typeof window !== 'undefined') {
-            console.info('[canvas-measure] skip', {
-              sessionId,
-              reason: 'stale-version',
-              measurementVersion: measurements.measurementVersion,
-              currentVersion,
-            });
-          }
-          return current;
-        }
-        const width = Math.max(1, Math.round(measurements.rawWidth));
-        const height = Math.max(1, Math.round(measurements.rawHeight));
-        const existingWidth = Math.round(tile.size?.width ?? 0);
-        const existingHeight = Math.round(tile.size?.height ?? 0);
-        const existingRawWidth = tile.metadata?.rawWidth ?? null;
-        const existingRawHeight = tile.metadata?.rawHeight ?? null;
-        const existingScale = tile.metadata?.scale ?? null;
-        const existingHostRows = tile.metadata?.hostRows ?? null;
-        const existingHostCols = tile.metadata?.hostCols ?? null;
-        const decisionPayload = {
-          sessionId,
-          measurementVersion: measurements.measurementVersion,
-          previousVersion: currentVersion,
-          width,
-          height,
-          rawWidth: measurements.rawWidth,
-          rawHeight: measurements.rawHeight,
-          scale: measurements.scale,
-        };
-        if (
-          existingWidth === width &&
-          existingHeight === height &&
-          existingRawWidth === measurements.rawWidth &&
-          existingRawHeight === measurements.rawHeight &&
-          existingScale === measurements.scale &&
-          existingHostRows === measurements.hostRows &&
-          existingHostCols === measurements.hostCols
-        ) {
-          if (typeof window !== 'undefined') {
-            console.info('[canvas-measure] metadata-only', {
-              ...decisionPayload,
-              decision: 'metadata-only',
-            });
-          }
-          return current;
-        }
-        const metadata = {
-          ...(tile.metadata ?? {}),
-          measurementVersion: measurements.measurementVersion,
-          rawWidth: measurements.rawWidth,
-          rawHeight: measurements.rawHeight,
-          scale: measurements.scale,
-          hostRows: measurements.hostRows,
-          hostCols: measurements.hostCols,
-        };
-        const nextLayout = withUpdatedTimestamp({
-          ...current,
-          tiles: {
-            ...current.tiles,
-            [sessionId]: {
-              ...tile,
-              size: { width, height },
-              metadata,
-            },
-          },
-        });
-        if (typeof window !== 'undefined') {
-          console.info('[canvas-measure] apply', {
-            ...decisionPayload,
-            decision: 'size-update',
-            previousSize: {
-              width: existingWidth,
-              height: existingHeight,
-            },
-          });
-        }
-
-        emitTelemetry('canvas.measurement', {
-          beachId: privateBeachId ?? undefined,
-          sessionId,
-          targetWidth: measurements.targetWidth,
-          targetHeight: measurements.targetHeight,
-          rawWidth: measurements.rawWidth,
-          rawHeight: measurements.rawHeight,
-          scale: measurements.scale,
-          measurementVersion: measurements.measurementVersion,
-        });
-
-        emitTelemetry('canvas.resize.stop', {
-          beachId: privateBeachId ?? undefined,
-          sessionId,
-          width,
-          height,
-        });
-
-        return nextLayout;
-      });
-    },
-    [privateBeachId, updateLayout],
+    [],
   );
 
   const toCanvasPoint = useCallback(
@@ -738,6 +625,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
         type: 'tile',
         position: { x: tile.position?.x ?? 0, y: tile.position?.y ?? 0 },
         data: {
+          tileId: tile.id,
           session,
           onRemove,
           onSelect,
@@ -746,9 +634,8 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
           managerUrl,
           viewerToken,
           credentialOverride: viewerOverrides?.[tile.id] ?? null,
-          viewerOverride: viewerStateOverridesResolved[tile.id] ?? null,
+          viewerOverride: effectiveViewerStateOverrides[tile.id] ?? null,
           privateBeachId,
-          onMeasurements: handleTileMeasurements,
           cachedDiff: cachedTerminalDiffs[tile.id] ?? null,
         } satisfies TileNodeData,
         draggable: true,
@@ -820,7 +707,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     }
 
     return nodes;
-  }, [activeDragNodeId, agentMap, handleTileMeasurements, hoverTarget, layout.agents, layout.groups, layout.tiles, managerUrl, onRemove, onSelect, privateBeachId, selectionSet, sessionMap, viewerOverrides, effectiveViewerStateOverrides, viewerToken]);
+  }, [activeDragNodeId, agentMap, cachedTerminalDiffs, hoverTarget, layout.agents, layout.groups, layout.tiles, managerUrl, onRemove, onSelect, privateBeachId, selectionSet, sessionMap, viewerOverrides, effectiveViewerStateOverrides, viewerToken]);
 
   const edges = useMemo<RFEdge[]>(() => [], []);
 
@@ -859,27 +746,31 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
         return;
       }
 
-      setLayout((prev) => {
-        const base = ensureLayout(prev);
-        const tile = base.tiles[parsed.id];
+      let updatedLayout: SharedCanvasLayout | null = null;
+      sessionTileController.updateLayout('drag-preview-position', (current) => {
+        const tile = current.tiles[parsed.id];
         if (!tile) {
-          return prev;
+          return current;
         }
         const nextPosition = { x: node.position.x, y: node.position.y };
         if (tile.position.x === nextPosition.x && tile.position.y === nextPosition.y) {
-          return prev;
+          return current;
         }
-        return {
-          ...base,
+        const next: SharedCanvasLayout = {
+          ...current,
           tiles: {
-            ...base.tiles,
+            ...current.tiles,
             [parsed.id]: {
               ...tile,
               position: nextPosition,
             },
           },
         };
+        updatedLayout = next;
+        return next;
       });
+
+      const layoutForPreview = updatedLayout ?? layout;
 
       if (!dragStateRef.current || dragStateRef.current.nodeId !== node.id) {
         let origin = { x: node.position.x, y: node.position.y };
@@ -919,7 +810,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
         });
       }
 
-      const target = previewDropTarget(layout, adapter, event.clientX, event.clientY);
+      const target = previewDropTarget(layoutForPreview, adapter, event.clientX, event.clientY);
       if (parsed.kind === 'tile' && target.type === 'tile' && target.id === parsed.id) {
         setHoverTarget(null);
         return;

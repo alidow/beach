@@ -223,9 +223,7 @@
 | `transport_hints` | `jsonb` | Broker/WebRTC hinting returned in registration |
 | `last_health` | `jsonb` | Latest health heartbeat payload (optional) |
 | `last_health_at` | `timestamptz` | Timestamp of last heartbeat |
-| `last_state` | `jsonb` | Latest diff snapshot (for diagnostics) |
-| `last_state_at` | `timestamptz` | Timestamp of last diff |
-| Notes | | Supplements Redis cache so restarts can rebuild baseline metadata; contents mirrored from Redis on shutdown |
+| Notes | | Supplements Redis cache so restarts can rebuild baseline metadata; terminal state snapshots now live exclusively in Redis |
 
 ### file_record
 | Column | Type | Notes |

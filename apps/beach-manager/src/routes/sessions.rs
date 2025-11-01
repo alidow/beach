@@ -324,6 +324,19 @@ pub async fn push_state(
     Ok(Json(serde_json::json!({ "stored": true })))
 }
 
+pub async fn fetch_state_snapshot(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(session_id): Path<String>,
+) -> ApiResult<Option<StateDiff>> {
+    ensure_scope(&token, "pb:sessions.read")?;
+    let snapshot = state
+        .state_snapshot(&session_id)
+        .await
+        .map_err(map_state_err)?;
+    Ok(Json(snapshot))
+}
+
 pub async fn list_controller_events(
     State(state): State<AppState>,
     token: AuthToken,

@@ -1,3 +1,34 @@
+import { vi } from 'vitest';
+
+vi.mock('../../controllers/viewerConnectionService', () => {
+  const connectTile = vi.fn((_tileId: string, _input: unknown, subscriber: (snapshot: any) => void) => {
+    subscriber({
+      store: null,
+      transport: null,
+      connecting: false,
+      error: null,
+      status: 'connected',
+      secureSummary: null,
+      latencyMs: null,
+    });
+    return () => {};
+  });
+  return {
+    viewerConnectionService: {
+      connectTile,
+      disconnectTile: vi.fn(),
+      getTileMetrics: vi.fn(() => ({
+        started: 0,
+        completed: 0,
+        retries: 0,
+        failures: 0,
+        disposed: 0,
+      })),
+      resetMetrics: vi.fn(),
+    },
+  };
+});
+
 import { describe, it, expect } from 'vitest';
 import { clampZoom, computeZoomForSize, estimateHostSize, getColumnWidth } from '../TileCanvas';
 
@@ -26,4 +57,3 @@ describe('TileCanvas helpers', () => {
     expect(getColumnWidth(1200, 12)).toBeGreaterThan(0);
   });
 });
-

@@ -67,7 +67,7 @@ Toolbar presentation:
    - Track per-tile zoom/lock state with React state seeded from saved layout.
    - Provide callbacks for toolbar controls.
 
-3. Extend `SessionSummary` fetch or `useSessionTerminal` to expose host PTY cols/rows (if not already surfaced) for snap/lock decisions.
+3. Extend `SessionSummary` fetch or controller snapshots (`sessionTileController` / `viewerConnectionService`) to expose host PTY cols/rows (if not already surfaced) for snap/lock decisions.
 
 ### Phase 2 – UX Scaffolding
 1. Replace top-nav zoom select.

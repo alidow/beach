@@ -172,7 +172,7 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
 
 ### 2. Redis Cache & Command Queue
 - **Status:** Action queues now run on Redis Streams with consumer groups and explicit `ack_actions` handling; health/state payloads sit in TTL'd keys, and the service gracefully degrades when Redis is absent.
-- **Scope:** Externalize transient state (`pending_actions`, `last_state`, `last_health`) to Redis so multiple manager instances and harnesses share a consistent view.
+- **Scope:** Externalize transient state (`pending_actions`, terminal snapshots, `last_health`) to Redis so multiple manager instances and harnesses share a consistent view.
 - **Key Strategy:** Use namespaced keys `pb:{private_beach_id}:sess:{session_id}`. Store:
   - `actions` as a Redis Stream (XPUSH) to support fan-out and consumer groups for multiple harness workers; acknowledgements use XACK with `pending` semantics.
   - `state` snapshots as a Hash (`state:latest`) plus a capped list (`state:diffs`) for recent diffs (<=200 entries).
@@ -180,7 +180,7 @@ Schemas for these methods live in `crates/harness-proto` so bindings can be rege
 - **Implementation Steps:**
   1. ✅ `redis::Client` is optional; `AppState::with_redis` gates functionality and logs PING failures.
   2. ✅ `queue_actions`/`poll_actions` now use consumer groups; `ack_actions` issues `XACK`/`XDEL` and trims index mappings.
-  3. ✅ Health/state writes go through `SETEX` with TTLs; `session_runtime` mirrors the latest snapshot for warm restart diagnostics.
+  3. ✅ Health/state writes go through `SETEX` with TTLs; `session_runtime` now retains viewer metadata and transport hints while Redis remains the source of truth for terminal snapshots.
   4. ◻ Update harness transport hints to advertise stream identifiers; today only REST paths are returned.
   5. ✅ Instrument queue depth and basic counters; add lag metric and alerting next.
 - **Open Questions:** Idempotency tokens, multi-harness consumer group design, and eviction strategies for long-lived sessions.

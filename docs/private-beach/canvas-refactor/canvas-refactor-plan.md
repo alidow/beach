@@ -102,7 +102,7 @@
 - **Rendering & Integration**
   - Replace `AutoGrid` with `CanvasSurface` component (`dynamic` loaded, SSR disabled).
   - Wrap React Flow canvas with top-level overlays for controls (zoom controls, breadcrumbs, selection info).
-  - Ensure tile contents (terminal preview) continue to mount via existing hooks (`useSessionTerminal`) without regression.
+  - Ensure tile contents (terminal preview) continue to mount via controller selectors (`viewerConnectionService` / `sessionTileController`) without regression.
 
 ## Interaction Model
 - **Zoom & Pan**

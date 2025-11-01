@@ -13,7 +13,7 @@ import {
   type SessionSummary,
   type SessionRole,
 } from '../../lib/api';
-import type { SessionCredentialOverride, TerminalViewerState } from '../../hooks/useSessionTerminal';
+import type { SessionCredentialOverride, TerminalViewerState } from '../../hooks/terminalViewerTypes';
 import { createStaticTerminalViewer } from '../../sandbox/staticTerminal';
 import { resolveTerminalFixture } from '../../sandbox/fixtures';
 

@@ -11,6 +11,8 @@ _Last updated: 2025-03-31_
 > survives component unmounts, plus explicit listener reattachment and viewport sync on every
 > mount. Once that is stable we can use the sandbox Playwright spec to prevent regressions.
 
+_2025-11-02 note_: `useSessionTerminal` has been fully retired in favour of the controller-driven `viewerConnectionService`. Retain the historical context below, but defer to the controller lifecycle docs for current behaviour.
+
 ---
 
 ## 1. Background
@@ -144,7 +146,7 @@ Next.js production build to speed up startup.
 ## 8. Quick Reference
 
 - **Key files:**
-  - `apps/private-beach/src/hooks/useSessionTerminal.ts`
+  - `apps/private-beach/src/controllers/viewerConnectionService.ts`
   - `apps/private-beach/src/components/CanvasSurface.tsx`
   - `apps/private-beach/src/components/TileCanvas.tsx`
 - **Logs:** `temp/private-beach.log` (client), `temp/beach-surfer.log` (transport)

@@ -1,4 +1,4 @@
-import type { TerminalViewerState } from '../hooks/useSessionTerminal';
+import type { TerminalViewerState } from '../hooks/terminalViewerTypes';
 import {
   buildViewerStateFromTerminalDiff,
   extractTerminalStateDiff,

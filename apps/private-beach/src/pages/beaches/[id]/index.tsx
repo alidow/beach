@@ -483,7 +483,7 @@ export default function BeachDashboard() {
         knownSessionIds.current.add(sessionId);
       }
     },
-    [id, managerToken, managerSettings.managerUrl, sessions, persistCanvasLayout],
+    [id, sessions, persistCanvasLayout],
   );
 
   const refresh = useCallback(
@@ -806,7 +806,7 @@ export default function BeachDashboard() {
         void persistCanvasLayout(nextLayout);
       }
     },
-    [id, persistCanvasLayout, managerToken],
+    [id, persistCanvasLayout],
   );
 
   const sessionById = useMemo(() => new Map(sessions.map((s) => [s.session_id, s])), [sessions]);

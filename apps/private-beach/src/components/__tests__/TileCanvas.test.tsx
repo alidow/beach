@@ -1,37 +1,94 @@
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { vi } from 'vitest';
+
+vi.mock('../../controllers/viewerConnectionService', () => {
+  const connectTile = vi.fn((_tileId: string, _input: unknown, subscriber: (snapshot: any) => void) => {
+    subscriber({
+      store: null,
+      transport: null,
+      connecting: false,
+      error: null,
+      status: 'connected',
+      secureSummary: null,
+      latencyMs: null,
+    });
+    return () => {};
+  });
+  return {
+    viewerConnectionService: {
+      connectTile,
+      disconnectTile: vi.fn(),
+      getTileMetrics: vi.fn(() => ({
+        started: 0,
+        completed: 0,
+        retries: 0,
+        failures: 0,
+        disposed: 0,
+      })),
+      resetMetrics: vi.fn(),
+    },
+  };
+});
+
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import React from 'react';
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import TileCanvas from '../TileCanvas';
 import type { ControllerPairing, SessionRole, SessionSummary } from '../../lib/api';
 import type { AssignmentEdge } from '../../lib/assignments';
+import type { TerminalViewerState } from '../../hooks/terminalViewerTypes';
+import { sessionTileController } from '../../controllers/sessionTileController';
 
 vi.mock('../AutoGrid', () => ({
   __esModule: true,
   default: ({ children }: { children: React.ReactNode }) => <div data-testid="auto-grid">{children}</div>,
 }));
 
-vi.mock('../SessionTerminalPreview', () => ({
-  __esModule: true,
-  SessionTerminalPreview: ({ sessionId }: { sessionId: string }) => (
-    <div data-testid={`preview-${sessionId}`} />
-  ),
-}));
+vi.mock('../SessionTerminalPreview', () => {
+  const React = require('react');
+  const { useEffect } = React as typeof import('react');
+  return {
+    __esModule: true,
+    SessionTerminalPreview: (props: any) => {
+      const {
+        sessionId,
+        viewer,
+        onPreviewMeasurementsChange,
+        onPreviewStatusChange,
+      } = props;
 
-const mockViewer = {
-  store: { kind: 'store' },
-  transport: { kind: 'transport' },
-  transportVersion: 0,
-  connecting: false,
-  error: null,
-  status: 'connected' as const,
-  secureSummary: null,
-  latencyMs: null,
-};
-
-vi.mock('../hooks/useSessionTerminal', () => ({
-  __esModule: true,
-  useSessionTerminal: vi.fn(() => mockViewer),
-}));
+      useEffect(() => {
+        const status =
+          viewer.status === 'connected'
+            ? viewer.latencyMs != null
+              ? 'ready'
+              : 'initializing'
+            : viewer.status === 'error'
+              ? 'error'
+              : 'connecting';
+        onPreviewStatusChange?.(status);
+        if (viewer.latencyMs != null) {
+          onPreviewMeasurementsChange?.(sessionId, {
+            scale: 1,
+            targetWidth: 420,
+            targetHeight: 320,
+            rawWidth: 420,
+            rawHeight: 320,
+            hostRows: 24,
+            hostCols: 80,
+            measurementVersion: 1,
+          });
+        }
+      }, [sessionId, viewer.latencyMs, viewer.status, onPreviewMeasurementsChange, onPreviewStatusChange]);
+      return (
+        <div data-testid={`preview-${sessionId}`}>
+          <span data-testid={`status-${sessionId}`}>{viewer.status}</span>
+          <span data-testid={`latency-${sessionId}`}>{viewer.latencyMs ?? 'none'}</span>
+          <span data-testid={`error-${sessionId}`}>{viewer.error ?? 'none'}</span>
+        </div>
+      );
+    },
+  };
+});
 
 function makeSession(overrides: Partial<SessionSummary>): SessionSummary {
   return {
@@ -67,9 +124,19 @@ function makePairing(overrides: Partial<ControllerPairing>): ControllerPairing {
 }
 
 describe('TileCanvas', () => {
-  const agent = makeSession({ session_id: 'agent-1', harness_type: 'controller' });
-  const application = makeSession({ session_id: 'app-1', harness_type: 'worker' });
-  const assignment = makePairing({ controller_session_id: 'agent-1', child_session_id: 'app-1' });
+const agent = makeSession({ session_id: 'agent-1', harness_type: 'controller' });
+const application = makeSession({ session_id: 'app-1', harness_type: 'worker' });
+const assignment = makePairing({ controller_session_id: 'agent-1', child_session_id: 'app-1' });
+
+const connectedViewer: TerminalViewerState = {
+  store: null,
+  transport: null,
+  connecting: false,
+  error: null,
+  status: 'connected',
+  secureSummary: null,
+  latencyMs: 12,
+};
 
   const roles = new Map<string, SessionRole>([
     ['agent-1', 'agent'],
@@ -84,25 +151,44 @@ describe('TileCanvas', () => {
     ['app-1', [assignment]],
   ]);
 
+  beforeEach(() => {
+    sessionTileController.hydrate({
+      layout: null,
+      sessions: [],
+      agents: [],
+      privateBeachId: null,
+      managerUrl: '',
+      managerToken: null,
+    });
+  });
+
+  function renderCanvas(overrides: Partial<React.ComponentProps<typeof TileCanvas>> = {}) {
+    const baseProps: React.ComponentProps<typeof TileCanvas> = {
+      tiles: [application],
+      onRemove: () => {},
+      onSelect: () => {},
+      viewerToken: 'viewer',
+      managerUrl: 'http://localhost:8080',
+      preset: 'grid2x2',
+      savedLayout: [],
+      onLayoutPersist: () => {},
+      roles,
+      assignmentsByAgent,
+      assignmentsByApplication,
+      onRequestRoleChange: () => {},
+      onOpenAssignment: () => {},
+      ...overrides,
+    };
+    const tilesForOverride = overrides.tiles ?? baseProps.tiles;
+    const viewerOverrides = overrides.viewerOverrides ?? Object.fromEntries(
+      tilesForOverride.map((session) => [session.session_id, connectedViewer]),
+    );
+    return render(<TileCanvas {...baseProps} {...overrides} viewerOverrides={viewerOverrides} />);
+  }
+
   it('shows assignment bar for agents and opens detail on click', async () => {
     const onOpenAssignment = vi.fn();
-    render(
-      <TileCanvas
-        tiles={[agent]}
-        onRemove={() => {}}
-        onSelect={() => {}}
-        viewerToken="viewer"
-        managerUrl="http://localhost:8080"
-        preset="grid2x2"
-        savedLayout={[]}
-        onLayoutPersist={() => {}}
-        roles={roles}
-        assignmentsByAgent={assignmentsByAgent}
-        assignmentsByApplication={assignmentsByApplication}
-        onRequestRoleChange={() => {}}
-        onOpenAssignment={onOpenAssignment}
-      />,
-    );
+    renderCanvas({ tiles: [agent], onOpenAssignment });
 
     await screen.findByTestId('auto-grid');
     expect(screen.getByText('1 assignment')).toBeInTheDocument();
@@ -115,23 +201,7 @@ describe('TileCanvas', () => {
   });
 
   it('displays controllers on application tiles', async () => {
-  render(
-    <TileCanvas
-      tiles={[application]}
-      onRemove={() => {}}
-      onSelect={() => {}}
-        viewerToken="viewer"
-        managerUrl="http://localhost:8080"
-        preset="grid2x2"
-        savedLayout={[]}
-        onLayoutPersist={() => {}}
-        roles={roles}
-        assignmentsByAgent={assignmentsByAgent}
-        assignmentsByApplication={assignmentsByApplication}
-        onRequestRoleChange={() => {}}
-        onOpenAssignment={() => {}}
-      />,
-  );
+  renderCanvas({ tiles: [application] });
 
   await screen.findByTestId('auto-grid');
   expect(screen.getByText(assignment.controller_session_id.slice(0, 6))).toBeInTheDocument();
@@ -139,23 +209,7 @@ describe('TileCanvas', () => {
 
   it('invokes onRequestRoleChange when toggling role', async () => {
     const onRequestRoleChange = vi.fn();
-    render(
-      <TileCanvas
-        tiles={[application]}
-        onRemove={() => {}}
-        onSelect={() => {}}
-        viewerToken="viewer"
-        managerUrl="http://localhost:8080"
-        preset="grid2x2"
-        savedLayout={[]}
-        onLayoutPersist={() => {}}
-        roles={roles}
-        assignmentsByAgent={assignmentsByAgent}
-        assignmentsByApplication={assignmentsByApplication}
-        onRequestRoleChange={onRequestRoleChange}
-        onOpenAssignment={() => {}}
-      />,
-    );
+    renderCanvas({ tiles: [application], onRequestRoleChange });
 
     await screen.findByTestId('auto-grid');
     fireEvent.click(screen.getByText('Set as Agent'));
@@ -164,39 +218,173 @@ describe('TileCanvas', () => {
 
   it('normalizes oversized saved layouts and persists the corrected width', async () => {
     const onLayoutPersist = vi.fn();
-    render(
-      <TileCanvas
-        tiles={[application]}
-        onRemove={() => {}}
-        onSelect={() => {}}
-        viewerToken="viewer"
-        managerUrl="http://localhost:8080"
-        preset="grid2x2"
-        savedLayout={[
-          {
-            id: application.session_id,
-            x: 0,
-            y: 0,
-            w: 12,
-            h: 3,
-            widthPx: 1200,
-            zoom: 1,
-            locked: false,
-          },
-        ]}
-        onLayoutPersist={onLayoutPersist}
-        roles={roles}
-        assignmentsByAgent={assignmentsByAgent}
-        assignmentsByApplication={assignmentsByApplication}
-        onRequestRoleChange={() => {}}
-        onOpenAssignment={() => {}}
-      />,
+    vi.useFakeTimers();
+    renderCanvas({
+      tiles: [application],
+      savedLayout: [
+        {
+          id: application.session_id,
+          x: 0,
+          y: 0,
+          w: 12,
+          h: 3,
+          widthPx: 1200,
+          zoom: 1,
+          locked: false,
+        },
+      ],
+      onLayoutPersist,
+    });
+
+    try {
+      await screen.findByTestId('auto-grid');
+      vi.advanceTimersByTime(250);
+      await waitFor(() => expect(onLayoutPersist).toHaveBeenCalled());
+      const snapshot = onLayoutPersist.mock.calls[0]?.[0];
+      expect(Array.isArray(snapshot)).toBe(true);
+      expect(snapshot[0]?.w).toBe(3);
+      expect(snapshot[0]?.zoom).toBeLessThan(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('updates lock button state when controller view state changes', async () => {
+    renderCanvas();
+    await screen.findByTestId('auto-grid');
+
+    const lockButton = screen.getByTitle('Lock tile and resize host PTY');
+    expect(lockButton).toHaveAttribute('aria-pressed', 'false');
+
+    act(() => {
+      sessionTileController.updateTileViewState('app-1', 'test', {
+        locked: true,
+        zoom: 1,
+      });
+    });
+
+    await waitFor(() => {
+      expect(lockButton).toHaveAttribute('aria-pressed', 'true');
+      expect(lockButton).toHaveAttribute('title', 'Unlock tile (resize without touching host)');
+    });
+  });
+
+
+  it('keeps the toolbar visible when controller pins the tile toolbar', async () => {
+    renderCanvas();
+    await screen.findByTestId('auto-grid');
+
+    const nameLabel = screen.getByText(application.session_id.slice(0, 8));
+    const toolbar = nameLabel.closest('button')?.parentElement as HTMLElement;
+    expect(toolbar.className).toContain('opacity-0');
+
+    act(() => {
+      sessionTileController.setTileToolbarPinned('app-1', true);
+    });
+
+    await waitFor(() => {
+      expect(toolbar.className).toContain('opacity-100');
+    });
+  });
+
+  it('renders updated zoom label when controller view state changes', async () => {
+    renderCanvas();
+    await screen.findByTestId('auto-grid');
+
+    await waitFor(() => {
+      expect(screen.getByText(/Zoom/)).toBeInTheDocument();
+    });
+
+    act(() => {
+      sessionTileController.updateTileViewState('app-1', 'test', {
+        zoom: 0.5,
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('Zoom 50%')).toBeInTheDocument();
+    });
+  });
+
+  it('shows expanded overlay when Expand tile is pressed', async () => {
+    renderCanvas();
+    await screen.findByTestId('auto-grid');
+
+    const expandButton = screen.getByTitle('Expand tile');
+    fireEvent.click(expandButton);
+
+    await waitFor(() => {
+      expect(screen.getByText('Expanded view active…')).toBeInTheDocument();
+    });
+  });
+
+  it('throttles layout persistence when the controller applies snapshots', async () => {
+    vi.useFakeTimers();
+    const onLayoutPersist = vi.fn();
+    renderCanvas({ onLayoutPersist });
+    await screen.findByTestId('auto-grid');
+
+    const snapshot = {
+      tiles: {
+        'app-1': {
+          layout: { x: 0, y: 0, w: 32, h: 28 },
+        },
+      },
+      gridCols: 128,
+      rowHeightPx: 12,
+    };
+
+    act(() => {
+      sessionTileController.applyGridSnapshot('test-initial', snapshot);
+    });
+
+    expect(onLayoutPersist).not.toHaveBeenCalled();
+
+    act(() => {
+      vi.advanceTimersByTime(199);
+    });
+    expect(onLayoutPersist).not.toHaveBeenCalled();
+
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+
+    await waitFor(() => expect(onLayoutPersist).toHaveBeenCalledTimes(1));
+    const firstPersist = onLayoutPersist.mock.calls[0][0];
+    expect(firstPersist).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: 'app-1', x: 0, y: 0 })]),
     );
 
-    await waitFor(() => expect(onLayoutPersist).toHaveBeenCalled());
-    const snapshot = onLayoutPersist.mock.calls[0]?.[0];
-    expect(Array.isArray(snapshot)).toBe(true);
-    expect(snapshot[0]?.w).toBe(3);
-    expect(snapshot[0]?.zoom).toBeLessThan(1);
+    act(() => {
+      sessionTileController.applyGridSnapshot('test-second', {
+        tiles: {
+          'app-1': {
+            layout: { x: 16, y: 4, w: 32, h: 28 },
+          },
+        },
+        gridCols: 128,
+        rowHeightPx: 12,
+      });
+      sessionTileController.applyGridSnapshot('test-third', {
+        tiles: {
+          'app-1': {
+            layout: { x: 20, y: 6, w: 32, h: 28 },
+          },
+        },
+        gridCols: 128,
+        rowHeightPx: 12,
+      });
+    });
+
+    act(() => {
+      vi.advanceTimersByTime(200);
+    });
+
+    await waitFor(() => expect(onLayoutPersist).toHaveBeenCalledTimes(2));
+    const secondPersist = onLayoutPersist.mock.calls[1][0];
+    expect(secondPersist).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: 'app-1', x: 20, y: 6 })]),
+    );
+    vi.useRealTimers();
   });
 });

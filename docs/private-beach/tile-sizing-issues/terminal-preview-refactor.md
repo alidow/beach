@@ -7,7 +7,7 @@ _Last updated: 2025-10-30_
 - **Surface:** Private Beach dashboard (`apps/private-beach/src/pages/beaches/[id]/index.tsx`)
 - **Preview component:** `SessionTerminalPreviewClient`
 - **Transport:** Beach Surfer WebRTC client (`apps/beach-surfer`)
-- **Hook:** `useSessionTerminal`
+- **Hook (legacy):** `useSessionTerminal` (now replaced by controller-driven `viewerConnectionService` subscriptions)
 - **Current behaviour:** The visible terminal preview tile only shows ~24 rows (upper half). The underlying PTY is 62×104, but the preview never expands to the full height even after the connection stabilises.
 
 ### Key Observations

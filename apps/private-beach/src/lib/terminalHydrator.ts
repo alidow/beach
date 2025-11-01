@@ -2,7 +2,7 @@
 
 import { TerminalGridStore } from '../../../beach-surfer/src/terminal/gridStore';
 import type { Update, CursorFrame } from '../../../beach-surfer/src/protocol/types';
-import type { TerminalViewerState } from '../hooks/useSessionTerminal';
+import type { TerminalViewerState } from '../hooks/terminalViewerTypes';
 
 const WORD = 2 ** 32;
 const DEFAULT_STYLE_ID = 0;

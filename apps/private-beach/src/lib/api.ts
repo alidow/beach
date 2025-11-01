@@ -1,3 +1,5 @@
+import type { TerminalStateDiff } from './terminalHydrator';
+
 export type SessionSummary = {
   session_id: string;
   private_beach_id: string;
@@ -5,7 +7,6 @@ export type SessionSummary = {
   capabilities: string[];
   location_hint?: string | null;
   metadata?: any;
-  last_state?: unknown;
   version: string;
   harness_id: string;
   controller_token?: string | null;
@@ -175,6 +176,27 @@ export async function attachOwned(privateBeachId: string, ids: string[], token: 
   });
   if (!res.ok) throw new Error(`attachOwned failed ${res.status}`);
   return res.json();
+}
+
+export async function fetchSessionStateSnapshot(
+  sessionId: string,
+  token: string | null,
+  baseUrl?: string,
+): Promise<TerminalStateDiff | null> {
+  const res = await fetch(`${base(baseUrl)}/sessions/${sessionId}/state`, {
+    headers: authHeaders(token),
+  });
+  if (res.status === 404 || res.status === 204) {
+    return null;
+  }
+  if (!res.ok) {
+    throw new Error(`fetchSessionStateSnapshot failed ${res.status}`);
+  }
+  const payload = await res.json();
+  if (payload == null) {
+    return null;
+  }
+  return payload as TerminalStateDiff;
 }
 
 export async function fetchControllerEvents(

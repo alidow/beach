@@ -27,7 +27,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/sessions/register", post(register_session))
         .route("/sessions/:session_id", patch(update_session))
         .route("/sessions/:session_id/join", post(join_session))
-        .route("/sessions/:session_id/state", post(push_state))
+        .route(
+            "/sessions/:session_id/state",
+            get(fetch_state_snapshot).post(push_state),
+        )
         .route("/sessions/:session_id/state/stream", get(sse::stream_state))
         .route("/sessions/:session_id/actions", post(queue_actions))
         .route("/sessions/:session_id/actions/poll", get(poll_actions))

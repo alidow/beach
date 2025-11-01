@@ -1,11 +1,7 @@
 'use client';
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
-import {
-  useSessionTerminal,
-  type SessionCredentialOverride,
-  type TerminalViewerState,
-} from '../hooks/useSessionTerminal';
+import type { SessionCredentialOverride, TerminalViewerState } from '../hooks/terminalViewerTypes';
 import { BeachTerminal, type TerminalViewportState } from '../../../beach-surfer/src/components/BeachTerminal';
 import { CabanaPrivateBeachPlayer } from '../../../beach-surfer/src/components/cabana/CabanaPrivateBeachPlayer';
 import type { CabanaTelemetryHandlers } from '../../../beach-surfer/src/components/cabana/CabanaSessionPlayer';
@@ -97,12 +93,11 @@ type Props = {
   onPreviewStatusChange?: (status: PreviewStatus) => void;
   onPreviewMeasurementsChange?: (sessionId: string, measurements: PreviewMeasurements | null) => void;
   credentialOverride?: SessionCredentialOverride | null;
-  viewerOverride?: TerminalViewerState | null;
+  viewer: TerminalViewerState;
   cachedStateDiff?: TerminalStateDiff | undefined;
 };
 
-type ViewProps = Omit<Props, 'token' | 'viewerOverride'> & {
-  viewer: TerminalViewerState;
+type ViewProps = Omit<Props, 'token'> & {
   trimmedToken: string;
   isCabana: boolean;
 };
@@ -348,7 +343,15 @@ function SessionTerminalPreviewView({
       }
       return { rows: nextRowResult.value, cols: nextColResult.value };
     });
-  }, [sessionId, viewportState, viewer.store]);
+  }, [
+    sessionId,
+    viewportState,
+    viewer.store,
+    hostViewportCols,
+    hostViewportRows,
+    measuredViewportCols,
+    measuredViewportRows,
+  ]);
 
   useEffect(() => {
     if (!viewer.store) {
@@ -702,6 +705,7 @@ function SessionTerminalPreviewView({
   }, [fallbackHostCols, fallbackHostRows, effectiveFontSize]);
 
   const previewMeasurements = useMemo<PreviewMeasurements | null>(() => {
+    void domRawVersion;
     if (
       resolvedHostCols == null ||
       resolvedHostRows == null ||
@@ -857,7 +861,6 @@ function SessionTerminalPreviewView({
   }, [
     cropped,
     effectiveFontSize,
-    effectiveScale,
     fallbackHostCols,
     fallbackHostRows,
     locked,
@@ -953,7 +956,7 @@ function SessionTerminalPreviewView({
     };
     const handle = window.requestAnimationFrame(logDimensions);
     return () => window.cancelAnimationFrame(handle);
-  }, [effectiveScale, previewMeasurements, sessionId]);
+  }, [previewMeasurements, sessionId, effectiveFontSize]);
 
   useEffect(() => {
     if (
@@ -983,7 +986,6 @@ function SessionTerminalPreviewView({
       // ignore logging issues
     }
   }, [
-    effectiveScale,
     fallbackHostCols,
     fallbackHostRows,
     isCabana,
@@ -1018,7 +1020,7 @@ function SessionTerminalPreviewView({
       width: `${Math.max(1, Math.round(width))}px`,
       height: `${Math.max(1, Math.round(height))}px`,
     };
-  }, [effectiveScale, previewMeasurements]);
+  }, [previewMeasurements]);
 
   const cloneInnerStyle = useMemo<CSSProperties | undefined>(() => {
     if (!previewMeasurements) {
@@ -1030,7 +1032,7 @@ function SessionTerminalPreviewView({
       transform: undefined,
       transformOrigin: undefined,
     };
-  }, [effectiveScale, previewMeasurements]);
+  }, [previewMeasurements]);
 
   const placeholderMessage = useMemo(() => {
     switch (previewStatus) {
@@ -1194,51 +1196,14 @@ function SessionTerminalPreviewView({
   );
 }
 
-function SessionTerminalPreviewManaged({
-  trimmedToken,
-  isCabana,
-  credentialOverride,
-  token: _token,
-  viewerOverride: _viewerOverride,
-  ...rest
-}: Props & { trimmedToken: string; isCabana: boolean }) {
-  const viewer = useSessionTerminal(
-    rest.sessionId,
-    rest.privateBeachId,
-    rest.managerUrl,
-    !isCabana && trimmedToken.length > 0 ? trimmedToken : null,
-    isCabana ? undefined : credentialOverride ?? undefined,
-  );
+function SessionTerminalPreviewClientInner(props: Props) {
+  const { token, ...rest } = props;
+  const trimmedToken = token?.trim() ?? '';
+  const isCabana = props.harnessType ? props.harnessType.toLowerCase().includes('cabana') : false;
+
   return (
     <SessionTerminalPreviewView
       {...rest}
-      credentialOverride={credentialOverride}
-      trimmedToken={trimmedToken}
-      isCabana={isCabana}
-      viewer={viewer}
-    />
-  );
-}
-
-function SessionTerminalPreviewClientInner(props: Props) {
-  const trimmedToken = props.token?.trim() ?? '';
-  const isCabana = props.harnessType ? props.harnessType.toLowerCase().includes('cabana') : false;
-
-  if (props.viewerOverride) {
-    const { token: _token, viewerOverride, ...rest } = props;
-    return (
-      <SessionTerminalPreviewView
-        {...rest}
-        trimmedToken={trimmedToken}
-        isCabana={isCabana}
-        viewer={viewerOverride}
-      />
-    );
-  }
-
-  return (
-    <SessionTerminalPreviewManaged
-      {...props}
       trimmedToken={trimmedToken}
       isCabana={isCabana}
     />

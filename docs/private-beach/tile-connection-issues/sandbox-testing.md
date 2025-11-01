@@ -12,7 +12,7 @@ _Last updated: 2025-03-31_
 
 ## Current Context
 
-- Hook refactor: `useSessionTerminal` now delegates to `sessionTerminalManager.ts`, which keeps a per-key transport/store alive across remounts.
+- Viewer lifecycle: controller-driven selectors (`sessionTileController` + `viewerConnectionService`) now own the transport/store across remounts; the legacy `useSessionTerminal` hook has been removed.
 - Fixtures moved under `apps/private-beach/src/sandbox/fixtures-data/` so Next.js can resolve them.
 - Sandbox Playwright spec: `apps/private-beach/tests/e2e/private-beach-sandbox.spec.ts`
   - Loads `/dev/private-beach-sandbox?skipApi=1&privateBeachId=sandbox&sessions=sandbox-session|application|Sandbox Fixture&terminalFixtures=sandbox-session:pong-lhs&viewerToken=sandbox-token`.

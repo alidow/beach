@@ -14,6 +14,9 @@ import {
   extractGridDashboardMetadata,
   extractGridLayoutSnapshot,
   gridSnapshotToBeachItems,
+  DEFAULT_GRID_W_UNITS,
+  DEFAULT_GRID_H_UNITS,
+  sanitizeLayoutUnits,
   withLayoutDashboardMetadata,
   withTileGridMetadata,
   type GridDashboardMetadata,
@@ -194,6 +197,7 @@ class SessionTileController {
   private measurementSignatures = new Map<string, string>();
   private persistTimer: ReturnType<typeof setTimeout> | null = null;
   private persistCallback: ((layout: ApiCanvasLayout) => void) | null = null;
+  private pendingGridLayoutOverride = new Map<string, GridLayoutUnits>();
   private privateBeachId: string | null = null;
   private managerUrl = '';
   private managerToken: string | null = null;
@@ -320,10 +324,27 @@ class SessionTileController {
   }
 
   applyGridSnapshot(reason: string, snapshot: GridLayoutSnapshot | null | undefined, options?: { suppressPersist?: boolean }) {
+    console.warn('[controller] applyGridSnapshot called', reason, snapshot?.tiles?.['app-1']?.layout);
+    console.warn('[controller] snapshot payload tile', snapshot?.tiles?.['app-1']);
     if (!snapshot) {
       return;
     }
     const produced = this.applyGridSnapshotToLayout(this.layout, snapshot);
+    if (!options?.suppressPersist) {
+      for (const [tileId, metadata] of Object.entries(snapshot.tiles)) {
+        const layout = metadata.layout;
+        if (layout) {
+          const override: GridLayoutUnits = {
+            x: typeof layout.x === 'number' ? layout.x : 0,
+            y: typeof layout.y === 'number' ? layout.y : 0,
+            w: typeof layout.w === 'number' ? layout.w : DEFAULT_GRID_W_UNITS,
+            h: typeof layout.h === 'number' ? layout.h : DEFAULT_GRID_H_UNITS,
+          };
+          console.warn('[controller] override stored', tileId, override);
+          this.pendingGridLayoutOverride.set(tileId, override);
+        }
+      }
+    }
     if (options?.suppressPersist) {
       if (Object.is(produced, this.layout)) {
         return;
@@ -450,7 +471,24 @@ class SessionTileController {
   }
 
   exportGridLayoutAsBeachItems(): BeachLayoutItem[] {
-    return gridSnapshotToBeachItems(this.layout);
+    const items = gridSnapshotToBeachItems(this.layout);
+    if (this.pendingGridLayoutOverride.size === 0) {
+      return items;
+    }
+    console.log('[controller] overriding layout with pending overrides', Array.from(this.pendingGridLayoutOverride.entries()));
+    const overridden = items.map((item) => {
+      const override = this.pendingGridLayoutOverride.get(item.id);
+      if (!override) {
+        return item;
+      }
+      return {
+        ...item,
+        x: override.x,
+        y: override.y,
+      };
+    });
+    this.pendingGridLayoutOverride.clear();
+    return overridden;
   }
 
   enqueueMeasurement(tileId: string, payload: TileMeasurementPayload | null | undefined, source: MeasurementSource = 'dom') {
@@ -542,6 +580,7 @@ class SessionTileController {
     nextLayout: SharedCanvasLayout,
     options?: { reason?: string; suppressPersist?: boolean; skipLayoutChange?: boolean; preserveUpdatedAt?: boolean },
   ) {
+    console.log('[controller] replaceLayout', options?.reason, 'suppress?', options?.suppressPersist);
     const prevTiles = new Set(Object.keys(this.layout.tiles));
     const nextTiles = new Set(Object.keys(nextLayout.tiles));
     const removed = [...prevTiles].filter((id) => !nextTiles.has(id));
@@ -852,11 +891,52 @@ class SessionTileController {
 
   private applyGridSnapshotToLayout(base: SharedCanvasLayout, snapshot: GridLayoutSnapshot): SharedCanvasLayout {
     let next = withLayoutDashboardMetadata(base, snapshot);
-    if (Object.keys(snapshot.tiles).length === 0) {
+    const entries = Object.entries(snapshot.tiles);
+    if (entries.length === 0) {
       return next;
     }
-    next = applyGridMetadataToLayout(next, snapshot.tiles);
-    return next;
+    const tiles: SharedCanvasLayout['tiles'] = { ...next.tiles };
+    for (const [tileId, tile] of Object.entries(tiles)) {
+      if (!tile.position) {
+        tiles[tileId] = {
+          ...tile,
+          position: { x: 0, y: 0 },
+        } as CanvasTileNode;
+      }
+      if (!tile.size) {
+        tiles[tileId] = {
+          ...tiles[tileId],
+          size: { width: DEFAULT_TILE_WIDTH, height: DEFAULT_TILE_HEIGHT },
+        } as CanvasTileNode;
+      }
+    }
+    let mutated = false;
+    for (const [tileId, update] of entries) {
+      console.log('[controller] applying update', tileId, update.layout);
+      const existing =
+        tiles[tileId] ??
+        ({
+          id: tileId,
+          kind: 'application',
+          position: { x: 0, y: 0 },
+          size: { width: DEFAULT_TILE_WIDTH, height: DEFAULT_TILE_HEIGHT },
+          zIndex: 1,
+          metadata: {},
+        } as CanvasTileNode);
+      const updated = withTileGridMetadata(existing, update);
+      if (updated !== existing || !tiles[tileId]) {
+        mutated = true;
+        tiles[tileId] = updated;
+      }
+    }
+    console.log('[controller] applyGridSnapshotToLayout mutated', mutated, 'tiles', Object.keys(tiles));
+    if (!mutated) {
+      return next;
+    }
+    return {
+      ...next,
+      tiles,
+    };
   }
 }
 

@@ -1365,17 +1365,35 @@ export default function TileCanvas({
   const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
 
   const exportLegacyGridItems = useCallback((): BeachLayoutItem[] => {
-    const controllerLayout = sessionTileController.getSnapshot().layout;
-    const reactGridLayout = gridSnapshotToReactGrid(controllerLayout, {
-      fallbackCols: cols,
-      minW: MIN_W,
-      minH: MIN_H,
-    });
-    if (reactGridLayout.length === 0) {
+    const gridSnapshot = sessionTileController.getGridLayoutSnapshot();
+    const entries: Layout[] = [];
+    for (const id of tileOrder) {
+      const metadata = gridSnapshot.tiles[id];
+      if (!metadata) {
+        continue;
+      }
+      const layoutUnits = metadata.layout;
+      const clampedW = Math.min(Math.max(layoutUnits.w, MIN_W), cols);
+      const maxX = Math.max(0, cols - clampedW);
+      const x = Math.min(Math.max(layoutUnits.x, 0), maxX);
+      const y = Math.max(layoutUnits.y, 0);
+      const h = Math.max(layoutUnits.h, MIN_H);
+      entries.push({
+        i: id,
+        x,
+        y,
+        w: clampedW,
+        h,
+        minW: MIN_W,
+        minH: MIN_H,
+      });
+    }
+    if (entries.length === 0) {
       return [];
     }
+    console.log('[exportLegacy] entries', entries);
     const snapshotMap = new Map<string, ReturnType<typeof sessionTileController.getTileSnapshot>>();
-    return snapshotLayoutItems(reactGridLayout, cols, viewStateMap, tileOrder).map((item) => {
+    return snapshotLayoutItems(entries, cols, viewStateMap, tileOrder).map((item) => {
       const snapshot = snapshotMap.get(item.id) ?? sessionTileController.getTileSnapshot(item.id);
       snapshotMap.set(item.id, snapshot);
       const viewState = selectTileViewState(snapshot.grid);
@@ -1390,6 +1408,7 @@ export default function TileCanvas({
   }, [cols, tileOrder, viewStateMap]);
 
   const lastPersistSignatureRef = useRef<string | null>(null);
+  const pendingPersistSignatureRef = useRef<string | null>(null);
   const normalizedPersistRef = useRef(false);
   const handlePersistLayout = useCallback(
     (_layout: ApiCanvasLayout) => {
@@ -1397,10 +1416,12 @@ export default function TileCanvas({
         return;
       }
       const legacyItems = exportLegacyGridItems();
+      console.log('[persist] legacy items length', legacyItems.length);
       if (legacyItems.length === 0) {
         return;
       }
       const signature = serializeBeachLayoutItems(legacyItems);
+      pendingPersistSignatureRef.current = null;
       if (lastPersistSignatureRef.current === signature) {
         return;
       }
@@ -1444,6 +1465,7 @@ export default function TileCanvas({
   useEffect(() => {
     lastPersistSignatureRef.current = savedLayoutPersistSignature;
     normalizedPersistRef.current = false;
+    pendingPersistSignatureRef.current = null;
   }, [savedLayoutPersistSignature]);
 
 
@@ -1606,7 +1628,12 @@ export default function TileCanvas({
     const exportedLegacy = exportLegacyGridItems();
     const exportedSignature = exportedLegacy.length === 0 ? 'empty' : serializeBeachLayoutItems(exportedLegacy);
     if (!savedLayout || savedLayout.length === 0) {
-      if (exportedSignature !== 'empty' && lastPersistSignatureRef.current !== exportedSignature) {
+      if (
+        exportedSignature !== 'empty' &&
+        pendingPersistSignatureRef.current !== exportedSignature &&
+        lastPersistSignatureRef.current !== exportedSignature
+      ) {
+        pendingPersistSignatureRef.current = exportedSignature;
         sessionTileController.requestPersist();
         if (!normalizedPersistRef.current) {
           normalizedPersistRef.current = true;
@@ -1620,6 +1647,10 @@ export default function TileCanvas({
       if (lastPersistSignatureRef.current === exportedSignature) {
         return;
       }
+      if (pendingPersistSignatureRef.current === exportedSignature) {
+        return;
+      }
+      pendingPersistSignatureRef.current = exportedSignature;
       sessionTileController.requestPersist();
       if (!normalizedPersistRef.current) {
         normalizedPersistRef.current = true;

@@ -295,12 +295,17 @@ function previewEqual(a: PreviewMetrics | null, b: PreviewMetrics | null): boole
 }
 
 function layoutEqual(
-  a: { w: number; h: number } | null,
-  b: { w: number; h: number } | null,
+  a: Partial<GridLayoutUnits> | null,
+  b: Partial<GridLayoutUnits> | null,
 ): boolean {
   if (!a && !b) return true;
   if (!a || !b) return false;
-  return a.w === b.w && a.h === b.h;
+  return (
+    (a.x ?? 0) === (b.x ?? 0) &&
+    (a.y ?? 0) === (b.y ?? 0) &&
+    (a.w ?? 0) === (b.w ?? 0) &&
+    (a.h ?? 0) === (b.h ?? 0)
+  );
 }
 
 function clampInt(value: number, min: number, max?: number): number {
@@ -517,6 +522,7 @@ function metadataEquals(a: GridDashboardMetadata, b: GridDashboardMetadata): boo
 
 export function withTileGridMetadata(tile: CanvasTileNode, update: TileGridMetadataUpdate): CanvasTileNode {
   const current = extractGridDashboardMetadata(tile);
+  console.log('[withTileGridMetadata] current layout', current.layout, 'update layout', update.layout);
   const nextLayout = sanitizeLayoutUnits(update.layout, current.layout);
   const has = (key: keyof TileGridMetadataUpdate) => Object.prototype.hasOwnProperty.call(update, key);
   const baseViewState = current.viewState ?? defaultTileViewState();
@@ -584,8 +590,18 @@ export function withTileGridMetadata(tile: CanvasTileNode, update: TileGridMetad
     mergeIntoViewState({ previewStatus: update.previewStatus as TileViewState['previewStatus'] });
   }
 
+  const fallbackCols = update.gridCols ?? current.gridCols ?? DEFAULT_GRID_W_UNITS;
+  const maxX = Math.max(0, fallbackCols - nextLayout.w);
+  const layoutOverrideX =
+    typeof update.layout?.x === 'number' ? clampInt(update.layout.x, 0, maxX) : nextLayout.x;
+  const layoutOverrideY = typeof update.layout?.y === 'number' ? clampInt(update.layout.y, 0) : nextLayout.y;
+  const layoutWithOverride: GridLayoutUnits = {
+    ...nextLayout,
+    x: layoutOverrideX,
+    y: layoutOverrideY,
+  };
   const merged: GridDashboardMetadata = {
-    layout: nextLayout,
+    layout: layoutWithOverride,
     gridCols: has('gridCols') ? update.gridCols ?? current.gridCols : current.gridCols,
     rowHeightPx: has('rowHeightPx') ? update.rowHeightPx ?? current.rowHeightPx : current.rowHeightPx,
     layoutVersion: has('layoutVersion') ? update.layoutVersion ?? current.layoutVersion : current.layoutVersion,
@@ -685,7 +701,9 @@ export function withTileGridMetadata(tile: CanvasTileNode, update: TileGridMetad
           : current.previewStatus,
     viewState: viewStateChanged ? nextViewState : current.viewState,
   };
-  if (metadataEquals(current, merged)) {
+  const positionChanged =
+    tile.position?.x !== merged.layout.x || tile.position?.y !== merged.layout.y;
+  if (!positionChanged && metadataEquals(current, merged)) {
     return tile;
   }
   const metadata = { ...(tile.metadata ?? {}) };
@@ -715,7 +733,13 @@ export function withTileGridMetadata(tile: CanvasTileNode, update: TileGridMetad
     previewStatus: merged.previewStatus ?? 'connecting',
     viewState: merged.viewState ?? defaultTileViewState(),
   };
-  return cloneTile(tile, metadata);
+  return {
+    ...cloneTile(tile, metadata),
+    position: {
+      x: merged.layout.x,
+      y: merged.layout.y,
+    },
+  };
 }
 
 export function applyGridMetadataToLayout(

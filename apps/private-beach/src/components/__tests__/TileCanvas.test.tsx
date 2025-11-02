@@ -360,6 +360,9 @@ const connectedViewer: TerminalViewerState = {
     );
 
     act(() => {
+      console.log('snapshot second payload', {
+        layout: { x: 16, y: 4, w: 32, h: 28 },
+      });
       sessionTileController.applyGridSnapshot('test-second', {
         tiles: {
           'app-1': {
@@ -368,6 +371,9 @@ const connectedViewer: TerminalViewerState = {
         },
         gridCols: 128,
         rowHeightPx: 12,
+      });
+      console.log('snapshot third payload', {
+        layout: { x: 20, y: 6, w: 32, h: 28 },
       });
       sessionTileController.applyGridSnapshot('test-third', {
         tiles: {
@@ -379,6 +385,10 @@ const connectedViewer: TerminalViewerState = {
         rowHeightPx: 12,
       });
     });
+    const intermediateSnapshot = sessionTileController.getGridLayoutSnapshot();
+    console.log('intermediate snapshot layout', intermediateSnapshot.tiles['app-1']);
+    expect(intermediateSnapshot.tiles['app-1']?.layout.x).toBe(20);
+    expect(intermediateSnapshot.tiles['app-1']?.layout.y).toBe(6);
 
     act(() => {
       vi.advanceTimersByTime(200);

@@ -147,6 +147,49 @@ function layoutViewport(layout: SharedCanvasLayout) {
   };
 }
 
+function computeLayoutSignature(layout: SharedCanvasLayout | ApiCanvasLayout | null | undefined): string {
+  if (!layout) {
+    return 'layout:none';
+  }
+  const tileSignature = Object.values(layout.tiles ?? {})
+    .map((tile) => {
+      const id = tile?.id ?? '';
+      const pos = tile?.position ?? { x: 0, y: 0 };
+      const size = tile?.size ?? { width: 0, height: 0 };
+      const zIndex = tile?.zIndex ?? 0;
+      const groupId = (tile as { groupId?: string } | undefined)?.groupId ?? '';
+      return `${id}:${pos.x ?? 0}:${pos.y ?? 0}:${size.width ?? 0}:${size.height ?? 0}:${zIndex}:${groupId}`;
+    })
+    .sort()
+    .join('|');
+  const agentSignature = Object.values(layout.agents ?? {})
+    .map((agent) => {
+      const id = agent?.id ?? '';
+      const pos = agent?.position ?? { x: 0, y: 0 };
+      const size = agent?.size ?? { width: 0, height: 0 };
+      const zIndex = agent?.zIndex ?? 0;
+      return `${id}:${pos.x ?? 0}:${pos.y ?? 0}:${size.width ?? 0}:${size.height ?? 0}:${zIndex}`;
+    })
+    .sort()
+    .join('|');
+  const groupSignature = Object.values(layout.groups ?? {})
+    .map((group) => {
+      const id = group?.id ?? '';
+      const pos = group?.position ?? { x: 0, y: 0 };
+      const size = group?.size ?? { width: 0, height: 0 };
+      const zIndex = group?.zIndex ?? 0;
+      const members = [...(group?.memberIds ?? [])].sort().join(',');
+      return `${id}:${pos.x ?? 0}:${pos.y ?? 0}:${size.width ?? 0}:${size.height ?? 0}:${zIndex}:${members}`;
+    })
+    .sort()
+    .join('|');
+  const viewport = layout.viewport;
+  const viewportSignature = viewport
+    ? `${viewport.zoom ?? 1}:${viewport.pan?.x ?? 0}:${viewport.pan?.y ?? 0}`
+    : 'none';
+  return [tileSignature, agentSignature, groupSignature, viewportSignature].join(';');
+}
+
 function buildCanvasNodes(layout: SharedCanvasLayout, sessionMap: Map<string, SessionSummary>, agentMap: Map<string, SessionSummary>): CanvasNodeBase[] {
   const nodes: CanvasNodeBase[] = [];
   for (const tile of Object.values(layout.tiles)) {
@@ -376,6 +419,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
   const hydrateKeyRef = useRef<string | null>(null);
   const persistCallbackRef = useRef<typeof onPersistLayout | undefined>(onPersistLayout);
   const layoutChangeCallbackRef = useRef<typeof onLayoutChange | undefined>(onLayoutChange);
+  const lastNonLayoutKeyRef = useRef<string | null>(null);
 
   const viewerOverrideSignature = useMemo(() => {
     if (!viewerOverrides) {
@@ -408,63 +452,44 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
       .join('|');
   }, [viewerStateOverridesProp]);
 
-  const layoutSignature = useMemo(() => {
-    if (!layoutProp) {
-      return 'layout:none';
-    }
-    const tileSignature = Object.values(layoutProp.tiles ?? {})
-      .map((tile) => {
-        const pos = tile?.position ?? { x: 0, y: 0 };
-        const size = tile?.size ?? { width: 0, height: 0 };
-        const zIndex = tile?.zIndex ?? 0;
-        const groupId = (tile as { groupId?: string } | undefined)?.groupId ?? '';
-        return `${tile?.id ?? ''}:${pos.x ?? 0}:${pos.y ?? 0}:${size.width ?? 0}:${size.height ?? 0}:${zIndex}:${groupId}`;
-      })
-      .sort()
-      .join('|');
-    const agentSignature = Object.values(layoutProp.agents ?? {})
-      .map((agent) => {
-        const pos = agent?.position ?? { x: 0, y: 0 };
-        const size = agent?.size ?? { width: 0, height: 0 };
-        const zIndex = agent?.zIndex ?? 0;
-        return `${agent?.id ?? ''}:${pos.x ?? 0}:${pos.y ?? 0}:${size.width ?? 0}:${size.height ?? 0}:${zIndex}`;
-      })
-      .sort()
-      .join('|');
-    const groupSignature = Object.values(layoutProp.groups ?? {})
-      .map((group) => {
-        const pos = group?.position ?? { x: 0, y: 0 };
-        const size = group?.size ?? { width: 0, height: 0 };
-        const zIndex = group?.zIndex ?? 0;
-        const members = [...(group?.memberIds ?? [])].sort().join(',');
-        return `${group?.id ?? ''}:${pos.x ?? 0}:${pos.y ?? 0}:${size.width ?? 0}:${size.height ?? 0}:${zIndex}:${members}`;
-      })
-      .sort()
-      .join('|');
-    const viewport = layoutProp.viewport;
-    const viewportSignature = viewport
-      ? `${viewport.zoom ?? 1}:${viewport.pan?.x ?? 0}:${viewport.pan?.y ?? 0}`
-      : 'none';
-    return [tileSignature, agentSignature, groupSignature, viewportSignature].join(';');
-  }, [layoutProp]);
-
-  const hydrateKey = useMemo(() => {
-    const layoutVersion = layoutProp?.version ?? 0;
-    const tileIdsSignature = [...tiles].map((session) => session.session_id).sort().join(',');
-    const agentIdsSignature = [...agents].map((session) => session.session_id).sort().join(',');
-    return [
-      layoutVersion,
-      layoutSignature,
-      tileIdsSignature,
+  const layoutSignature = useMemo(() => computeLayoutSignature(layoutProp), [layoutProp]);
+  const controllerLayoutSignature = useMemo(() => computeLayoutSignature(layout), [layout]);
+  const tileIdsSignature = useMemo(
+    () => [...tiles].map((session) => session.session_id).sort().join(','),
+    [tiles],
+  );
+  const agentIdsSignature = useMemo(
+    () => [...agents].map((session) => session.session_id).sort().join(','),
+    [agents],
+  );
+  const nonLayoutHydrateKey = useMemo(
+    () =>
+      [
+        tileIdsSignature,
+        agentIdsSignature,
+        managerUrl,
+        managerToken ?? '',
+        viewerToken ?? '',
+        privateBeachId ?? '',
+        viewerOverrideSignature,
+        viewerStateSignature,
+      ].join('|'),
+    [
       agentIdsSignature,
+      managerToken,
       managerUrl,
-      managerToken ?? '',
-      viewerToken ?? '',
-      privateBeachId ?? '',
+      privateBeachId,
+      tileIdsSignature,
       viewerOverrideSignature,
       viewerStateSignature,
-    ].join('|');
-  }, [agents, layoutProp?.version, layoutSignature, managerToken, managerUrl, privateBeachId, tiles, viewerOverrideSignature, viewerStateSignature, viewerToken]);
+      viewerToken,
+    ],
+  );
+  const layoutVersion = layoutProp?.version ?? 0;
+  const hydrateKey = useMemo(
+    () => [layoutVersion, layoutSignature, nonLayoutHydrateKey].join('|'),
+    [layoutVersion, layoutSignature, nonLayoutHydrateKey],
+  );
 
   const sessionMap = useMemo(() => new Map(tiles.map((session) => [session.session_id, session] as const)), [tiles]);
   const agentMap = useMemo(() => new Map(agents.map((session) => [session.session_id, session] as const)), [agents]);
@@ -507,9 +532,16 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     if (!keyChanged && !callbacksChanged) {
       return;
     }
+    const layoutMatchesController = layoutSignature === controllerLayoutSignature;
+    const nonLayoutChanged = lastNonLayoutKeyRef.current !== nonLayoutHydrateKey;
     hydrateKeyRef.current = hydrateKey;
     persistCallbackRef.current = onPersistLayout;
     layoutChangeCallbackRef.current = onLayoutChange;
+    if (!callbacksChanged && layoutMatchesController && !nonLayoutChanged) {
+      lastNonLayoutKeyRef.current = nonLayoutHydrateKey;
+      return;
+    }
+    lastNonLayoutKeyRef.current = nonLayoutHydrateKey;
     sessionTileController.hydrate({
       layout: layoutProp,
       sessions: tiles,
@@ -527,10 +559,13 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
   }, [
     cachedTerminalDiffs,
     agents,
+    controllerLayoutSignature,
     hydrateKey,
     layoutProp,
+    layoutSignature,
     managerToken,
     managerUrl,
+    nonLayoutHydrateKey,
     onLayoutChange,
     onPersistLayout,
     privateBeachId,

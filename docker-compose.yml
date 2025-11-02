@@ -44,7 +44,7 @@ services:
     volumes:
       - .:/app
       - cargo-target:/app/target
-      - cargo-registry:/usr/local/cargo/registry
+      - cargo-registry-beach-manager:/usr/local/cargo/registry
     depends_on:
       postgres:
         condition: service_healthy
@@ -68,7 +68,7 @@ services:
     volumes:
       - .:/app
       - cargo-target:/app/target
-      - cargo-registry:/usr/local/cargo/registry
+      - cargo-registry-beach-road:/usr/local/cargo/registry
     depends_on:
       redis:
         condition: service_started
@@ -204,7 +204,7 @@ services:
     volumes:
       - .:/app
       - cargo-target:/app/target
-      - cargo-registry:/usr/local/cargo/registry
+      - cargo-registry-beach-lifeguard:/usr/local/cargo/registry
     depends_on:
       - redis
     networks:
@@ -214,7 +214,9 @@ volumes:
   postgres-data:
   redis-data:
   cargo-target:
-  cargo-registry:
+  cargo-registry-beach-manager:
+  cargo-registry-beach-road:
+  cargo-registry-beach-lifeguard:
 
 networks:
   beach-network:

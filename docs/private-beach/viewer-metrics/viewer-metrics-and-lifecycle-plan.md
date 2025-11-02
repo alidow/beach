@@ -75,6 +75,8 @@ _Workstream B notes (2025-11-02)_: `TileCanvas`/`CanvasSurface` now hydrate excl
 
 _Workstream B notes (2025-11-08)_: Removed the remaining `CanvasSurface` telemetry tied to the legacy terminal hooks, expanded `sessionTileController.lifecycle.test.ts` with multi-tile persistence + viewer metrics stress coverage, and added a Playwright sandbox resize storm that asserts controller throttling via the new persist-event probe.
 
+_Workstream B notes (2025-11-09)_: Exposed `sessionTileController` via `window.__PRIVATE_BEACH_TILE_CONTROLLER__` for dev/test harnesses and refactored the sandbox Playwright specs to drive resize storms/telemetry directly through the controller, eliminating flaky DOM drag interactions while preserving throttling & viewer-metric assertions.
+
 ## Parallelization Notes
 - Workstream A (Viewer Metrics) and Workstream B (Lifecycle cleanup) are largely independent; they can be run in parallel by separate contributors.
 - Within Workstream A:

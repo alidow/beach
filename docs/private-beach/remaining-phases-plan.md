@@ -6,11 +6,11 @@
 - Capture explicit exit criteria, dependencies, and instrumentation requirements so future contributors can resume quickly.
 
 ## Milestone Summary
-- **M0 – Server Source of Truth** *(in progress)*  
+- **M0 – Server Source of Truth** *(in progress, backend supporting work pending)*  
   Manager-backed CRUD, layout persistence, and auth-hardening that removes the last LocalStorage surfaces.
-- **M1 – Surfer UX Foundations (Phase 4)**  
+- **M1 – Surfer UX Foundations (Phase 4)** *(pending)*  
   Ship design system, navigation IA, layout management, and accessibility/performance baselines.
-- **M2 – Orchestration Mechanics (Phase 5)**  
+- **M2 – Orchestration Mechanics (Phase 5)** *(pending, some fast-path groundwork shipped)*  
   Fast-path transport closed loop, latency instrumentation, controller UX polish, and onboarding hardening.
 - **M3 – Shared State & Storage (Phase 6)**  
   Deliver the scoped KV/file surfaces and associated MCP hooks.

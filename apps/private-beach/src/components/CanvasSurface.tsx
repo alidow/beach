@@ -365,8 +365,6 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     origin: { x: number; y: number };
     entityId: string;
   } | null>(null);
-  const lastSyncNodeIdsRef = useRef<Set<string>>(new Set());
-  const lastLayoutSignatureRef = useRef<string | null>(null);
   const lastSyncedViewportRef = useRef<{ x: number; y: number; zoom: number } | null>(null);
   const hydrateKeyRef = useRef<string | null>(null);
   const persistCallbackRef = useRef<typeof onPersistLayout | undefined>(onPersistLayout);
@@ -445,16 +443,6 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
       if (diff) {
         map[session.session_id] = diff;
         seen.add(session.session_id);
-        if (typeof window !== 'undefined') {
-          console.info('[terminal-hydrate][canvas][session]', {
-            sessionId: session.session_id,
-            sequence: diff.sequence ?? null,
-          });
-        }
-      } else if (typeof window !== 'undefined') {
-        console.info('[terminal-hydrate][canvas][session-miss]', {
-          sessionId: session.session_id,
-        });
       }
     }
     const layoutTiles = layout?.tiles ?? {};
@@ -465,12 +453,6 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
       const diff = extractTerminalStateDiff(tile?.metadata ?? null);
       if (diff) {
         map[tileId] = diff;
-        if (typeof window !== 'undefined') {
-          console.info('[terminal-hydrate][canvas][layout]', {
-            sessionId: tileId,
-            sequence: diff.sequence ?? null,
-          });
-        }
       }
     }
     return map;
@@ -536,38 +518,6 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     (next: SharedCanvasLayout) => {
       const nodes = buildCanvasNodes(next, sessionMap, agentMap);
       const viewport = layoutViewport(next);
-      if (typeof window !== 'undefined') {
-        const prevIds = lastSyncNodeIdsRef.current;
-        const nextIds = new Set(nodes.map((node) => node.id));
-        const added: string[] = [];
-        const removed: string[] = [];
-        nextIds.forEach((id) => {
-          if (!prevIds.has(id)) {
-            added.push(id);
-          }
-        });
-        prevIds.forEach((id) => {
-          if (!nextIds.has(id)) {
-            removed.push(id);
-          }
-        });
-        lastSyncNodeIdsRef.current = nextIds;
-        const layoutSignature = JSON.stringify({
-          tiles: Object.keys(next.tiles),
-          agents: Object.keys(next.agents),
-          groups: Object.keys(next.groups),
-        });
-        const previousSignature = lastLayoutSignatureRef.current;
-        lastLayoutSignatureRef.current = layoutSignature;
-        console.info('[canvas-sync] apply', {
-          added,
-          removed,
-          nodeCount: nodes.length,
-          viewport,
-          previousSignature,
-          nextSignature: layoutSignature,
-        });
-      }
       if (!didLoadRef.current) {
         load({ version: 3, nodes, edges: next.edges ?? [], viewport });
         didLoadRef.current = true;

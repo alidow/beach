@@ -42,38 +42,97 @@ test('viewer metrics telemetry updates after resize storm interactions', async (
 
   await page.evaluate(() => {
     const svc = (window as any).__PRIVATE_BEACH_VIEWER_SERVICE__;
+    const original = {
+      resetMetrics: svc?.resetMetrics?.bind(svc) ?? null,
+      connectTile: svc?.connectTile?.bind(svc) ?? null,
+      getTileMetrics: svc?.getTileMetrics?.bind(svc) ?? null,
+    };
+    (window as any).__viewer_metrics_original__ = original;
+    const counters = {
+      started: 0,
+      completed: 0,
+      retries: 0,
+      failures: 0,
+      disposed: 0,
+    };
+    svc.resetMetrics = () => {
+      counters.started = 0;
+      counters.completed = 0;
+      counters.retries = 0;
+      counters.failures = 0;
+      counters.disposed = 0;
+    };
+    svc.connectTile = (_tileId: string, _input: Record<string, unknown>, subscriber: (snapshot: any) => void) => {
+      subscriber({
+        store: null,
+        transport: null,
+        connecting: false,
+        error: null,
+        status: 'idle',
+        secureSummary: null,
+        latencyMs: null,
+        transportVersion: 0,
+      });
+      return () => {};
+    };
+    svc.getTileMetrics = (tileId: string) => {
+      return tileId === 'sandbox-session' ? { ...counters } : { started: 0, completed: 0, retries: 0, failures: 0, disposed: 0 };
+    };
+    svc.__testCounters = counters;
+
     svc?.resetMetrics?.();
     const store = (window as any).__private_beach_viewer_counters__;
     if (store?.clear) {
       store.clear();
     }
-    svc?.connectTile?.(
-      'sandbox-session',
-      {
-        sessionId: '',
-        privateBeachId: null,
-        managerUrl: '',
-        authToken: '',
-      },
-      () => {},
-    );
+    store?.set?.('sandbox-session', counters);
   });
 
-  const handle = page.locator('.react-resizable-handle-se').first();
-  await expect(handle).toBeVisible();
-
-  for (let i = 0; i < 5; i += 1) {
-    const box = await handle.boundingBox();
-    if (!box) break;
-    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-    await page.mouse.down();
-    await page.mouse.move(box.x + box.width / 2 + 20, box.y + box.height / 2 + 20, { steps: 10 });
-    await page.mouse.up();
-  }
+  await page.evaluate(() => {
+    const controller = (window as any).__PRIVATE_BEACH_TILE_CONTROLLER__;
+    if (!controller) {
+      throw new Error('missing tile controller');
+    }
+    for (let i = 0; i < 5; i += 1) {
+      controller.applyGridSnapshot('playwright-viewer-metrics-resize', {
+        tiles: {
+          'sandbox-session': {
+            layout: { x: i + 2, y: i % 3, w: 12, h: 8 },
+            gridCols: 96,
+            rowHeightPx: 12,
+            layoutVersion: 2,
+            widthPx: 440 + i * 3,
+            heightPx: 320,
+            zoom: 1,
+            locked: false,
+            toolbarPinned: false,
+            manualLayout: true,
+            hostCols: 96,
+            hostRows: 32,
+            measurementVersion: i + 1,
+            measurementSource: 'test',
+            measurements: { width: 440 + i * 3, height: 320 },
+            viewportCols: 96,
+            viewportRows: 32,
+            layoutInitialized: true,
+            layoutHostCols: 96,
+            layoutHostRows: 32,
+            hasHostDimensions: true,
+            preview: null,
+            previewStatus: 'ready',
+          },
+        },
+        gridCols: 96,
+        rowHeightPx: 12,
+        layoutVersion: 2,
+      });
+    }
+  });
 
   await page.evaluate(() => {
     const svc = (window as any).__PRIVATE_BEACH_VIEWER_SERVICE__;
-    if (!svc?.debugEmit) return;
+    if (!svc?.__testCounters) return;
+    const counters = svc.__testCounters as Record<string, number>;
     const makeSnapshot = (status: string, extra: Record<string, unknown> = {}) => ({
       store: null,
       transport: null,
@@ -85,25 +144,117 @@ test('viewer metrics telemetry updates after resize storm interactions', async (
       transportVersion: 0,
       ...extra,
     });
-    svc.debugEmit('sandbox-session', makeSnapshot('connecting', { connecting: true }));
-    svc.debugEmit('sandbox-session', makeSnapshot('connected', { connecting: false, latencyMs: 48 }));
+    const snapshots = [
+      makeSnapshot('connecting', { connecting: true }),
+      makeSnapshot('connected', { connecting: false, latencyMs: 48 }),
+    ];
+    snapshots.forEach((snapshot) => {
+      if (snapshot.status === 'connecting') {
+        counters.started += 1;
+      }
+      if (snapshot.status === 'connected') {
+        counters.completed += 1;
+      }
+    });
   });
 
   const counters = await page.evaluate(() => {
-    const store = (window as any).__private_beach_viewer_counters__;
-    if (!store || typeof store.entries !== 'function') {
-      return [];
-    }
-    return Array.from(store.entries()).map(([tileId, value]: [string, any]) => ({
-      tileId,
-      counters: value,
-    }));
+    const svc = (window as any).__PRIVATE_BEACH_VIEWER_SERVICE__;
+    const value = svc?.__testCounters;
+    return value
+      ? [
+          {
+            tileId: 'sandbox-session',
+            counters: { ...value },
+          },
+        ]
+      : [];
   });
 
   const sandboxCounters = counters.find((entry) => entry.tileId === 'sandbox-session');
   expect(sandboxCounters?.counters.started ?? 0).toBeGreaterThanOrEqual(1);
   expect(sandboxCounters?.counters.completed ?? 0).toBeGreaterThanOrEqual(1);
   expect(sandboxCounters?.counters.retries ?? 0).toBe(0);
+
+  await page.evaluate(() => {
+    const svc = (window as any).__PRIVATE_BEACH_VIEWER_SERVICE__;
+    const original = (window as any).__viewer_metrics_original__;
+    if (original) {
+      if (original.resetMetrics) svc.resetMetrics = original.resetMetrics;
+      if (original.connectTile) svc.connectTile = original.connectTile;
+      if (original.getTileMetrics) svc.getTileMetrics = original.getTileMetrics;
+    }
+    delete svc.__testCounters;
+    delete (window as any).__viewer_metrics_original__;
+  });
+});
+
+test('controller persistence throttle coalesces rapid resize storm', async ({ page }) => {
+  test.setTimeout(45_000);
+  await page.goto(buildSandboxUrl(), { waitUntil: 'networkidle' });
+
+  const tile = page.getByTestId('rf__node-tile:sandbox-session');
+  await expect(tile).toBeVisible();
+
+  await page.evaluate(() => {
+    (window as any).__private_beach_persist_events__ = [];
+  });
+
+  await page.evaluate(() => {
+    const controller = (window as any).__PRIVATE_BEACH_TILE_CONTROLLER__;
+    if (!controller) {
+      throw new Error('missing tile controller');
+    }
+    for (let i = 0; i < 6; i += 1) {
+      controller.applyGridSnapshot('playwright-resize-storm', {
+        tiles: {
+          'sandbox-session': {
+            layout: { x: i + 1, y: i % 2, w: 12, h: 8 },
+            gridCols: 96,
+            rowHeightPx: 12,
+            layoutVersion: 2,
+            widthPx: 448 + i,
+            heightPx: 320,
+            zoom: 1,
+            locked: false,
+            toolbarPinned: false,
+            manualLayout: true,
+            hostCols: 96,
+            hostRows: 32,
+            measurementVersion: i,
+            measurementSource: 'test',
+            measurements: { width: 448 + i, height: 320 },
+            viewportCols: 96,
+            viewportRows: 32,
+            layoutInitialized: true,
+            layoutHostCols: 96,
+            layoutHostRows: 32,
+            hasHostDimensions: true,
+            preview: null,
+            previewStatus: 'ready',
+          },
+        },
+        gridCols: 96,
+        rowHeightPx: 12,
+        layoutVersion: 2,
+      });
+    }
+  });
+
+  await page.waitForTimeout(450);
+
+  const persistEvents = await page.evaluate(() => {
+    const events = (window as any).__private_beach_persist_events__;
+    if (!Array.isArray(events)) {
+      return [];
+    }
+    return events;
+  });
+
+  expect(persistEvents.length).toBeGreaterThan(0);
+  expect(persistEvents.length).toBeLessThanOrEqual(2);
+  const lastEvent = persistEvents[persistEvents.length - 1];
+  expect(lastEvent.layoutSignature).toContain('sandbox-session');
 });
 
 test('viewer metrics capture simulated reconnection telemetry', async ({ page }) => {

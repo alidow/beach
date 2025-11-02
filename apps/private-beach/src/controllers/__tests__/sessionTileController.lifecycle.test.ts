@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../hooks/sessionTerminalManager', () => ({
   acquireTerminalConnection: vi.fn(() => () => {}),
@@ -17,8 +17,50 @@ vi.mock('../hooks/sessionTerminalManager', () => ({
 
 import type { CanvasLayout } from '../../canvas';
 import type { SessionSummary } from '../../lib/api';
+import type { TerminalViewerState } from '../../hooks/terminalViewerTypes';
+
+let originalWindow: typeof window | undefined;
+
+if (typeof window !== 'undefined') {
+  originalWindow = window;
+  Reflect.deleteProperty(globalThis, 'window');
+}
+
+vi.stubGlobal(
+  'fetch',
+  vi.fn(async (input: RequestInfo | URL) => {
+    const url =
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.href
+          : typeof Request !== 'undefined' && input instanceof Request
+            ? input.url
+            : String(input);
+    if (url.includes('/sessions/') && url.endsWith('/state')) {
+      return new Response('{}', {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    if (url.includes('/viewer-credential')) {
+      return new Response(
+        JSON.stringify({
+          token: 'stub-viewer-token',
+          expiresAt: Date.now() + 60_000,
+        }),
+        {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        },
+      );
+    }
+    return new Response(new Uint8Array(), { status: 200 });
+  }),
+);
 
 const { sessionTileController } = await import('../sessionTileController');
+const { viewerConnectionService } = await import('../viewerConnectionService');
 
 const baseLayout: CanvasLayout = {
   version: 3,
@@ -57,9 +99,71 @@ function makeSession(id: string): SessionSummary {
   };
 }
 
+function makeViewerState(
+  status: TerminalViewerState['status'],
+  overrides: Partial<TerminalViewerState & { transportVersion?: number }> = {},
+): TerminalViewerState & { transportVersion?: number } {
+  return {
+    store: null,
+    transport: null,
+    connecting: status === 'connecting' || status === 'reconnecting',
+    error: null,
+    status,
+    secureSummary: null,
+    latencyMs: null,
+    transportVersion: 0,
+    ...overrides,
+  };
+}
+
+function makeGridTileSnapshot({
+  x,
+  y,
+  w,
+  h,
+  widthPx,
+  heightPx,
+  measurementVersion,
+}: {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  widthPx: number;
+  heightPx: number;
+  measurementVersion: number;
+}) {
+  return {
+    layout: { x, y, w, h },
+    gridCols: 96,
+    rowHeightPx: 12,
+    layoutVersion: 2,
+    widthPx,
+    heightPx,
+    zoom: 1,
+    locked: false,
+    toolbarPinned: false,
+    manualLayout: true,
+    hostCols: 80,
+    hostRows: 24,
+    measurementVersion,
+    measurementSource: 'dom' as const,
+    measurements: { width: widthPx, height: heightPx },
+    viewportCols: 80,
+    viewportRows: 24,
+    layoutInitialized: true,
+    layoutHostCols: 80,
+    layoutHostRows: 24,
+    hasHostDimensions: true,
+    preview: null,
+    previewStatus: 'ready' as const,
+  };
+}
+
 describe('SessionTileController lifecycle stress', () => {
   afterEach(() => {
     vi.useRealTimers();
+    sessionTileController.resetViewerMetrics();
     sessionTileController.hydrate({
       layout: baseLayout,
       sessions: [],
@@ -68,6 +172,15 @@ describe('SessionTileController lifecycle stress', () => {
       managerUrl: '',
       managerToken: null,
     });
+  });
+
+  afterAll(() => {
+    vi.unstubAllGlobals();
+    if (typeof originalWindow !== 'undefined') {
+      (globalThis as any).window = originalWindow;
+    } else {
+      Reflect.deleteProperty(globalThis, 'window');
+    }
   });
 
   it('debounces layout persistence under rapid updates', () => {
@@ -131,7 +244,7 @@ describe('SessionTileController lifecycle stress', () => {
     const persisted = onPersistLayout.mock.calls[0]?.[0];
     const layoutMetadata = persisted?.tiles?.['tile-1']?.metadata as any;
     expect(layoutMetadata?.dashboard?.layout?.x).toBe(4);
-    expect(persisted?.tiles?.['tile-1']?.size?.width).toBe(400 + 4);
+    expect(layoutMetadata?.dashboard?.widthPx).toBe(400 + 4);
   });
 
   it('applies the latest measurement when resize updates burst', () => {
@@ -172,8 +285,133 @@ describe('SessionTileController lifecycle stress', () => {
     expect(snapshot.layout?.metadata?.measurementVersion).toBe(5);
     expect(snapshot.layout?.metadata?.rawWidth).toBe(420 + 5 * 10);
     expect(snapshot.layout?.metadata?.rawHeight).toBe(300 + 5 * 8);
-
     vi.advanceTimersByTime(200);
+    expect(onPersistLayout).not.toHaveBeenCalled();
+  });
+
+  it('throttles persistence while tracking viewer metrics during connection churn', () => {
+    vi.useFakeTimers();
+    const onPersistLayout = vi.fn();
+    const sessions = [makeSession('tile-1'), makeSession('tile-2')];
+    const dualTileLayout: CanvasLayout = {
+      ...baseLayout,
+      tiles: {
+        ...baseLayout.tiles,
+        'tile-2': {
+          id: 'tile-2',
+          kind: 'application',
+          position: { x: 8, y: 4 },
+          size: { width: 300, height: 240 },
+          zIndex: 2,
+          metadata: {},
+        },
+      },
+    };
+
+    sessionTileController.resetViewerMetrics();
+    sessionTileController.hydrate({
+      layout: dualTileLayout,
+      sessions,
+      agents: [],
+      privateBeachId: 'pb-1',
+      managerUrl: 'http://localhost:8080',
+      managerToken: 'token',
+      viewerToken: 'viewer-token',
+      onPersistLayout,
+    });
+
+    viewerConnectionService.debugEmit('tile-1', makeViewerState('connecting', { connecting: true }));
+    viewerConnectionService.debugEmit('tile-1', makeViewerState('connected', { connecting: false }));
+    viewerConnectionService.debugEmit('tile-2', makeViewerState('connecting', { connecting: true }));
+    viewerConnectionService.debugEmit(
+      'tile-2',
+      makeViewerState('error', { connecting: false, error: 'keepalive timed out' }),
+    );
+    viewerConnectionService.debugEmit('tile-2', makeViewerState('reconnecting', { connecting: true }));
+    viewerConnectionService.debugEmit('tile-2', makeViewerState('connected', { connecting: false, latencyMs: 96 }));
+
+    for (let i = 0; i < 4; i += 1) {
+      sessionTileController.applyGridSnapshot('grid-storm', {
+        tiles: {
+          'tile-1': makeGridTileSnapshot({
+            x: i,
+            y: i % 2,
+            w: 12,
+            h: 8,
+            widthPx: 400 + i,
+            heightPx: 320,
+            measurementVersion: i,
+          }),
+          'tile-2': makeGridTileSnapshot({
+            x: i + 1,
+            y: (i + 1) % 2,
+            w: 10,
+            h: 6,
+            widthPx: 360 + i,
+            heightPx: 300,
+            measurementVersion: i,
+          }),
+        },
+        gridCols: 96,
+        rowHeightPx: 12,
+        layoutVersion: 2,
+      });
+    }
+
+    expect(onPersistLayout).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(199);
+    expect(onPersistLayout).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(2);
     expect(onPersistLayout).toHaveBeenCalledTimes(1);
+
+    const persisted = onPersistLayout.mock.calls[0]?.[0];
+    const tile1Layout = persisted?.tiles?.['tile-1']?.metadata as any;
+    const tile2Layout = persisted?.tiles?.['tile-2']?.metadata as any;
+    expect(tile1Layout?.dashboard?.layout?.x).toBe(3);
+    expect(tile2Layout?.dashboard?.layout?.x).toBe(4);
+    expect(tile1Layout?.dashboard?.widthPx).toBe(403);
+
+    sessionTileController.applyGridSnapshot('grid-storm', {
+      tiles: {
+        'tile-1': makeGridTileSnapshot({
+          x: 6,
+          y: 0,
+          w: 12,
+          h: 8,
+          widthPx: 412,
+          heightPx: 320,
+          measurementVersion: 9,
+        }),
+        'tile-2': makeGridTileSnapshot({
+          x: 7,
+          y: 1,
+          w: 10,
+          h: 6,
+          widthPx: 372,
+          heightPx: 300,
+          measurementVersion: 9,
+        }),
+      },
+      gridCols: 96,
+      rowHeightPx: 12,
+      layoutVersion: 2,
+    });
+
+    vi.advanceTimersByTime(199);
+    expect(onPersistLayout).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(2);
+    expect(onPersistLayout).toHaveBeenCalledTimes(2);
+
+    const tile1Metrics = sessionTileController.getTileMetrics('tile-1');
+    const tile2Metrics = sessionTileController.getTileMetrics('tile-2');
+
+    expect(tile1Metrics.started).toBeGreaterThan(0);
+    expect(tile1Metrics.completed).toBeGreaterThan(0);
+    expect(tile1Metrics.retries).toBe(0);
+
+    expect(tile2Metrics.started).toBeGreaterThan(0);
+    expect(tile2Metrics.retries).toBeGreaterThan(0);
+    expect(tile2Metrics.failures).toBeGreaterThan(0);
   });
 });

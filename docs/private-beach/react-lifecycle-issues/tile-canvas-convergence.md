@@ -57,6 +57,7 @@ Additionally, lint warnings remain in `SessionTerminalPreviewClient.tsx`, `useSe
 7. **Testing & logging**
    - Update `TileCanvas` unit tests to mock controller snapshots (e.g., fake `sessionTileController.getTileSnapshot` and confirm commands/persistence are triggered).
    - Ensure existing telemetry/logging is either retained or updated to use controller events.
+   - 2025-11-08 — Controller lifecycle stress now exercises multi-tile persistence + metrics (`sessionTileController.lifecycle.test.ts`), and the sandbox Playwright suite records persist signatures to verify throttle behaviour while trimming the last CanvasSurface legacy logs.
 
 ---
 

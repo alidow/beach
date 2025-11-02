@@ -38,42 +38,43 @@ vi.stubGlobal(
 );
 
 const { sessionTileController } = await import('../sessionTileController');
-import type { CanvasLayout } from '../../canvas';
 import type { GridLayoutSnapshot } from '../gridLayout';
 import { applyGridDragCommand } from '../gridLayoutCommands';
+import type { CanvasLayout } from '../../canvas';
 
-const baseLayout: CanvasLayout = {
-  version: 3,
-  viewport: { zoom: 1, pan: { x: 0, y: 0 } },
-  tiles: {
-    'tile-1': {
-      id: 'tile-1',
-      kind: 'application',
-      position: { x: 0, y: 0 },
-      size: { width: 320, height: 240 },
-      zIndex: 1,
-      metadata: {},
+function createBaseLayout(): CanvasLayout {
+  const timestamp = Date.now();
+  return {
+    version: 3,
+    viewport: { zoom: 1, pan: { x: 0, y: 0 } },
+    tiles: {
+      'tile-1': {
+        id: 'tile-1',
+        kind: 'application',
+        position: { x: 0, y: 0 },
+        size: { width: 320, height: 240 },
+        zIndex: 1,
+        metadata: {},
+      },
     },
-  },
-  groups: {},
-  agents: {},
-  controlAssignments: {},
-  metadata: { createdAt: Date.now(), updatedAt: Date.now() },
-};
+    groups: {},
+    agents: {},
+    controlAssignments: {},
+    metadata: { createdAt: timestamp, updatedAt: timestamp },
+  };
+}
 
 describe('SessionTileController grid helpers', () => {
-  beforeEach(() => {
+  it('applies grid snapshot metadata to tiles', () => {
     sessionTileController.hydrate({
-      layout: baseLayout,
+      layout: createBaseLayout(),
       sessions: [],
       agents: [],
       privateBeachId: null,
       managerUrl: '',
       managerToken: null,
     });
-  });
 
-  it('applies grid snapshot metadata to tiles', () => {
     const snapshot: GridLayoutSnapshot = {
       tiles: {
         'tile-1': {
@@ -107,7 +108,7 @@ describe('SessionTileController grid helpers', () => {
       layoutVersion: 2,
     };
 
-    sessionTileController.applyGridSnapshot('test-grid-update', snapshot);
+    sessionTileController.applyGridSnapshot('test-grid-update', snapshot, { suppressPersist: true });
 
     const tileSnapshot = sessionTileController.getTileSnapshot('tile-1');
     expect(tileSnapshot.grid.layout).toEqual({ x: 8, y: 4, w: 16, h: 12 });
@@ -118,6 +119,15 @@ describe('SessionTileController grid helpers', () => {
   });
 
   it('exports controller layout as BeachLayoutItems', () => {
+    sessionTileController.hydrate({
+      layout: createBaseLayout(),
+      sessions: [],
+      agents: [],
+      privateBeachId: null,
+      managerUrl: '',
+      managerToken: null,
+    });
+
     const snapshot: GridLayoutSnapshot = {
       tiles: {
         'tile-1': {
@@ -166,6 +176,9 @@ describe('SessionTileController grid helpers', () => {
         gridCols: 96,
         rowHeightPx: 16,
         layoutVersion: 2,
+        locked: false,
+        toolbarPinned: false,
+        zoom: 1,
       }),
     ]);
   });
@@ -175,7 +188,7 @@ describe('SessionTileController grid helpers', () => {
     try {
       const onPersistLayout = vi.fn();
       sessionTileController.hydrate({
-        layout: baseLayout,
+        layout: createBaseLayout(),
         sessions: [],
         agents: [],
         privateBeachId: null,
@@ -209,7 +222,7 @@ describe('SessionTileController grid helpers', () => {
     try {
       const onPersistLayout = vi.fn();
       sessionTileController.hydrate({
-        layout: baseLayout,
+        layout: createBaseLayout(),
         sessions: [],
         agents: [],
         privateBeachId: null,

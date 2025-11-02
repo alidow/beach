@@ -73,6 +73,8 @@
 
 _Workstream B notes (2025-11-02)_: `TileCanvas`/`CanvasSurface` now hydrate exclusively from `sessionTileController`, controller-managed snapshot fetching (`fetchSessionStateSnapshot`) replaced the terminal snapshot hook, and new vitest suites stress persistence/connection flows. Documentation across the lifecycle stack was updated to reflect the controller as the single source of truth.
 
+_Workstream B notes (2025-11-08)_: Removed the remaining `CanvasSurface` telemetry tied to the legacy terminal hooks, expanded `sessionTileController.lifecycle.test.ts` with multi-tile persistence + viewer metrics stress coverage, and added a Playwright sandbox resize storm that asserts controller throttling via the new persist-event probe.
+
 ## Parallelization Notes
 - Workstream A (Viewer Metrics) and Workstream B (Lifecycle cleanup) are largely independent; they can be run in parallel by separate contributors.
 - Within Workstream A:

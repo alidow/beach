@@ -29,6 +29,7 @@ Remaining tasks:
 2. **Stress testing**
    - Vitest: add stress suites (e.g., in `apps/private-beach/src/controllers/__tests__/sessionTileController.lifecycle.test.ts`) simulating bursty measurements & persistence to assert throttling/metrics.
    - Playwright: create a resize/connect “storm” spec (e.g., `apps/private-beach/tests/e2e/viewer-resize-storm.spec.ts`) that triggers rapid layout changes, polls `/api/debug/viewer-metrics`, and confirms single connect per tile.
+   - 2025-11-08 — Added multi-tile persistence + metrics coverage in `sessionTileController.lifecycle.test.ts` and a sandbox resize-storm spec in `tests/e2e/private-beach-sandbox.spec.ts` that asserts controller throttling via persist-event probes.
 
 3. **Documentation**
    - Update Workstream B section in `docs/private-beach/viewer-metrics/viewer-metrics-and-lifecycle-plan.md` with results/links.
@@ -42,16 +43,16 @@ Remaining tasks:
 ## 3. Implementation checklist
 
 1. **Persistence audit**
-   - [ ] CanvasSurface routes layout mutations via controller commands.
-   - [ ] Legacy callbacks/timers removed; controller throttled persistence is the single path.
+   - [x] CanvasSurface routes layout mutations via controller commands.
+   - [x] Legacy callbacks/timers removed; controller throttled persistence is the single path.
 
 2. **Stress utilities/tests**
-   - [ ] Add helpers to poll/reset metrics endpoint for tests.
-   - [ ] Vitest stress case exercising rapid measurement/persistence.
-   - [ ] Playwright resize/connect storm asserting metrics/counter correctness.
+   - [x] Add helpers to poll/reset metrics endpoint for tests.
+   - [x] Vitest stress case exercising rapid measurement/persistence.
+   - [x] Playwright resize/connect storm asserting metrics/counter correctness.
 
 3. **Docs & cleanup**
-   - [ ] Document completion in the Workstream B plan and update lifecycle docs.
+   - [x] Document completion in the Workstream B plan and update lifecycle docs.
    - [ ] Remove/annotate historical docs referencing legacy hooks as “deprecated”.
 
 ---

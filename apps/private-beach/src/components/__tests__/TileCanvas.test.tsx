@@ -216,7 +216,7 @@ const connectedViewer: TerminalViewerState = {
     expect(onRequestRoleChange).toHaveBeenCalledWith(application, 'agent');
   });
 
-  it('normalizes oversized saved layouts and persists the corrected width', async () => {
+  it('persists the controller grid layout after hydration', async () => {
     const onLayoutPersist = vi.fn();
     renderCanvas({
       tiles: [application],
@@ -242,8 +242,15 @@ const connectedViewer: TerminalViewerState = {
       expect(onLayoutPersist).toHaveBeenCalled();
       const snapshot = onLayoutPersist.mock.calls[0]?.[0];
       expect(Array.isArray(snapshot)).toBe(true);
-      expect(snapshot[0]?.w).toBe(3);
-      expect(snapshot[0]?.zoom).toBeLessThanOrEqual(1);
+      const item = snapshot.find((entry: any) => entry.id === application.session_id);
+      expect(item).toBeDefined();
+      expect(item.id).toBe(application.session_id);
+      expect(item.x).toBe(0);
+      expect(item.y).toBe(0);
+      expect(item.w).toBeGreaterThan(0);
+      expect(item.h).toBeGreaterThan(0);
+      expect(item.gridCols).toBeGreaterThan(0);
+      expect(item.rowHeightPx).toBeGreaterThan(0);
       await act(async () => {
         await new Promise((resolve) => setTimeout(resolve, 500));
       });

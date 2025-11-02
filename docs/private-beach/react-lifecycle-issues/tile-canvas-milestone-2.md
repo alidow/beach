@@ -98,3 +98,10 @@ Keep existing behaviour (autosize, expanded view, assignments) intact.
 - controller snapshots now retain `layout.x/y` when applying explicit grid payloads; `applyGridSnapshotToLayout` normalizes global `gridCols` metadata before delegating so overrides no longer clamp to zero. `TileCanvas` persistence has been rewired to consume `sessionTileController.exportGridLayoutAsBeachItems()`, eliminating the stale React Grid projection and ensuring throttled saves report the controller's coordinates.
 - flattened the throttle test to run with real timers (no fake timer flakiness) and adjusted the projection so layout persistence exports the controller units directly. Added coverage that a second snapshot produces a new persist payload with the expected coordinates.
 - Tests: `pnpm --filter @beach/private-beach test -- src/components/__tests__/TileCanvas.test.tsx --testNamePattern "throttles layout persistence when the controller applies snapshots"` and `pnpm --filter @beach/private-beach test -- TileCanvas.test.tsx`.
+
+## Milestone 2 completion — 2025-11-01
+
+- `TileCanvas` now hydrates the controller once per input signature and lets `sessionTileController` own persistence. We replaced the legacy signature guards with a lightweight `persistGridLayout` bridge that exports the controller snapshot via `exportGridLayoutAsBeachItems()` and hands the ordered payload to the host callback.
+- Normalisation of imported layouts runs through `sessionTileController.applyGridCommand('grid-normalize', …)` so every drag/resize/autosize path flows through `gridLayoutCommands`. No React-grid layout cache, timers, or manual `requestPersist` heuristics remain—only a single controller throttle scheduled after hydration.
+- Tests were updated to assert against controller-native payloads (grid units + metadata) instead of the deprecated 12-column projection.
+- Verification: `pnpm --filter @beach/private-beach lint` and `pnpm --filter @beach/private-beach test -- TileCanvas`.

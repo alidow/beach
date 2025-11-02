@@ -589,7 +589,35 @@ function PrivateBeachSandboxPage() {
   }, []);
 
   const handlePersistLayout = useCallback((next: CanvasLayout) => {
-    setLayout(ensureLayoutBase(next));
+    const normalized = ensureLayoutBase(next);
+    setLayout(normalized);
+    if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+      const globalWindow = window as typeof window & {
+        __private_beach_persist_events__?: Array<{
+          timestamp: number;
+          tileCount: number;
+          layoutSignature: string;
+        }>;
+      };
+      const layoutSignature = Object.entries(normalized.tiles ?? {})
+        .map(([tileId, tile]) => {
+          const pos = tile?.position ?? { x: 0, y: 0 };
+          const size = tile?.size ?? { width: 0, height: 0 };
+          return `${tileId}:${pos.x}:${pos.y}:${size.width}:${size.height}`;
+        })
+        .sort()
+        .join('|');
+      const events = globalWindow.__private_beach_persist_events__ ?? [];
+      const nextEvents = [
+        ...events,
+        {
+          timestamp: Date.now(),
+          tileCount: Object.keys(normalized.tiles ?? {}).length,
+          layoutSignature,
+        },
+      ];
+      globalWindow.__private_beach_persist_events__ = nextEvents;
+    }
   }, []);
 
   if (!SANDBOX_ENABLED) {

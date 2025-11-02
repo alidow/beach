@@ -576,7 +576,6 @@ class SessionTileController {
     nextLayout: SharedCanvasLayout,
     options?: { reason?: string; suppressPersist?: boolean; skipLayoutChange?: boolean; preserveUpdatedAt?: boolean },
   ) {
-    console.log('[controller] replaceLayout', options?.reason, 'suppress?', options?.suppressPersist);
     const prevTiles = new Set(Object.keys(this.layout.tiles));
     const nextTiles = new Set(Object.keys(nextLayout.tiles));
     const removed = [...prevTiles].filter((id) => !nextTiles.has(id));
@@ -964,6 +963,15 @@ function shallowViewerEqual(a: TerminalViewerState, b: TerminalViewerState) {
 }
 
 export const sessionTileController = new SessionTileController();
+
+if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+  const globalWindow = window as typeof window & {
+    __PRIVATE_BEACH_TILE_CONTROLLER__?: SessionTileController;
+  };
+  if (!globalWindow.__PRIVATE_BEACH_TILE_CONTROLLER__) {
+    globalWindow.__PRIVATE_BEACH_TILE_CONTROLLER__ = sessionTileController;
+  }
+}
 
 export function useCanvasSnapshot(): ControllerSnapshot {
   return useSyncExternalStore(

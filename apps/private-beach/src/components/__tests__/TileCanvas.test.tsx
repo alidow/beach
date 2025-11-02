@@ -216,6 +216,33 @@ const connectedViewer: TerminalViewerState = {
     expect(onRequestRoleChange).toHaveBeenCalledWith(application, 'agent');
   });
 
+  it('applies the preset layout when no saved layout is provided', async () => {
+    const otherApplication = makeSession({ session_id: 'app-2', harness_type: 'worker' });
+    renderCanvas({ tiles: [application, otherApplication], savedLayout: [] });
+
+    await screen.findByTestId('auto-grid');
+
+    await waitFor(() => {
+      const snapshot = sessionTileController.getGridLayoutSnapshot();
+      expect(snapshot.tiles['app-1']).toBeDefined();
+      expect(snapshot.tiles['app-2']).toBeDefined();
+    });
+
+    const presetSnapshot = sessionTileController.getGridLayoutSnapshot();
+    const firstLayout = presetSnapshot.tiles['app-1']?.layout ?? null;
+    const secondLayout = presetSnapshot.tiles['app-2']?.layout ?? null;
+
+    expect(firstLayout).not.toBeNull();
+    expect(firstLayout).toMatchObject({ x: 0, y: 0 });
+    expect(firstLayout?.w ?? 0).toBeGreaterThan(0);
+    expect(firstLayout?.h ?? 0).toBeGreaterThan(0);
+    expect(secondLayout).not.toBeNull();
+    expect(secondLayout).toMatchObject({ y: 0 });
+    expect((secondLayout?.x ?? 0) > (firstLayout?.x ?? 0)).toBe(true);
+    expect(secondLayout?.w ?? 0).toBeGreaterThan(0);
+    expect(secondLayout?.h ?? 0).toBeGreaterThan(0);
+  });
+
   it('persists the controller grid layout after hydration', async () => {
     const onLayoutPersist = vi.fn();
     renderCanvas({

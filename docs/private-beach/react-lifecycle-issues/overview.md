@@ -26,9 +26,11 @@
    - Handles reconnect backoff, error handling, and metrics independent of React renders.
 
 3. **Measurement & layout reconciliation pipeline**
-   - DOM resize observers enqueue measurement commands into the controller’s debounced queue keyed by tile id.
-   - The controller compares incoming measurements against canonical state (including sequence/version). Identical measurements are dropped synchronously; updated ones mutate state and emit a single snapshot.
-   - Host-reported dimensions (from viewer telemetry) feed into the same pipeline with priority over DOM measurements.
+- DOM resize observers enqueue measurement commands into the controller’s debounced queue keyed by tile id.
+- The controller compares incoming measurements against canonical state (including sequence/version). Identical measurements are dropped synchronously; updated ones mutate state and emit a single snapshot.
+- Host telemetry runs through the same queue but has precedence: measurement signatures encode the payload source, the active layout metadata records whether the last-applied update came from the host, and any DOM payload whose `measurementVersion` is <= the most recent host update is rejected before it reaches the queue. This guarantees that when a host packet and DOM observer share a version, the host dimensions remain authoritative for both layout metadata and downstream signatures.
+- Preview callbacks now invoke `controller.applyHostDimensions` from both TileCanvas and CanvasSurface, reusing the emitted measurement objects so host rows/cols reach the controller queue even if DOM observers haven’t reported yet, while preserving signature stability.
+- When host dimensions win, the resulting grid metadata, layout persistence, and telemetry exports all reflect the host-sourced measurement so downstream consumers never observe the transient DOM-only values.
 
 4. **React layer (pure presentation)**
    - Components subscribe to controller snapshots and render them via React Flow.

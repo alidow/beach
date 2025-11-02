@@ -103,5 +103,6 @@ Keep existing behaviour (autosize, expanded view, assignments) intact.
 
 - `TileCanvas` now hydrates the controller once per input signature and lets `sessionTileController` own persistence. We replaced the legacy signature guards with a lightweight `persistGridLayout` bridge that exports the controller snapshot via `exportGridLayoutAsBeachItems()` and hands the ordered payload to the host callback.
 - Normalisation of imported layouts runs through `sessionTileController.applyGridCommand('grid-normalize', …)` so every drag/resize/autosize path flows through `gridLayoutCommands`. No React-grid layout cache, timers, or manual `requestPersist` heuristics remain—only a single controller throttle scheduled after hydration.
+- Dashboard presets (`grid2x2`, `onePlusThree`, `focus`) now dispatch controller commands, so new beaches without saved layouts prime themselves via `applyGridPresetCommand` before any manual adjustments.
 - Tests were updated to assert against controller-native payloads (grid units + metadata) instead of the deprecated 12-column projection.
 - Verification: `pnpm --filter @beach/private-beach lint` and `pnpm --filter @beach/private-beach test -- TileCanvas`.

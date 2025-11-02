@@ -18,6 +18,7 @@ vi.mock('../hooks/sessionTerminalManager', () => ({
 import type { CanvasLayout } from '../../canvas';
 import type { SessionSummary } from '../../lib/api';
 import type { TerminalViewerState } from '../../hooks/terminalViewerTypes';
+import type { TileMeasurementPayload } from '../sessionTileController';
 
 let originalWindow: typeof window | undefined;
 
@@ -160,6 +161,20 @@ function makeGridTileSnapshot({
   };
 }
 
+function makeMeasurementPayload(overrides: Partial<TileMeasurementPayload> = {}): TileMeasurementPayload {
+  return {
+    scale: 1,
+    targetWidth: 420,
+    targetHeight: 300,
+    rawWidth: 420,
+    rawHeight: 300,
+    hostRows: 24,
+    hostCols: 80,
+    measurementVersion: 1,
+    ...overrides,
+  };
+}
+
 describe('SessionTileController lifecycle stress', () => {
   afterEach(() => {
     vi.useRealTimers();
@@ -287,6 +302,92 @@ describe('SessionTileController lifecycle stress', () => {
     expect(snapshot.layout?.metadata?.rawHeight).toBe(300 + 5 * 8);
     vi.advanceTimersByTime(200);
     expect(onPersistLayout).not.toHaveBeenCalled();
+  });
+
+  it('prefers host measurements over DOM payloads when the version matches', () => {
+    vi.useFakeTimers();
+    const session = makeSession('tile-1');
+
+    sessionTileController.hydrate({
+      layout: baseLayout,
+      sessions: [session],
+      agents: [],
+      privateBeachId: 'pb-1',
+      managerUrl: 'http://localhost:8080',
+      managerToken: null,
+    });
+
+    const domPayload = makeMeasurementPayload({
+      measurementVersion: 12,
+      rawWidth: 360,
+      rawHeight: 260,
+      targetWidth: 360,
+      targetHeight: 260,
+      scale: 0.87,
+      hostRows: 28,
+      hostCols: 70,
+    });
+    const hostPayload = makeMeasurementPayload({
+      measurementVersion: 12,
+      rawWidth: 408,
+      rawHeight: 288,
+      targetWidth: 408,
+      targetHeight: 288,
+      scale: 0.98,
+      hostRows: 32,
+      hostCols: 96,
+    });
+
+    sessionTileController.enqueueMeasurement('tile-1', domPayload, 'dom');
+    sessionTileController.applyHostDimensions('tile-1', hostPayload);
+
+    vi.advanceTimersByTime(40);
+
+    const snapshot = sessionTileController.getTileSnapshot('tile-1');
+    const metadata = snapshot.layout?.metadata as Record<string, unknown>;
+
+    expect(metadata?.measurementVersion).toBe(hostPayload.measurementVersion);
+    expect(metadata?.measurementSource).toBe('host');
+    expect(metadata?.rawWidth).toBe(hostPayload.rawWidth);
+    expect(metadata?.rawHeight).toBe(hostPayload.rawHeight);
+    expect(metadata?.scale).toBe(hostPayload.scale);
+    expect(metadata?.hostRows).toBe(hostPayload.hostRows);
+    expect(metadata?.hostCols).toBe(hostPayload.hostCols);
+    expect(Math.round(snapshot.layout?.size?.width ?? 0)).toBe(Math.round(hostPayload.rawWidth));
+    expect(Math.round(snapshot.layout?.size?.height ?? 0)).toBe(Math.round(hostPayload.rawHeight));
+
+    expect(snapshot.grid.measurementVersion).toBe(hostPayload.measurementVersion);
+    expect(snapshot.grid.measurementSource).toBe('host');
+    expect(snapshot.grid.widthPx).toBe(Math.round(hostPayload.rawWidth));
+    expect(snapshot.grid.heightPx).toBe(Math.round(hostPayload.rawHeight));
+    expect(snapshot.grid.hostRows).toBe(hostPayload.hostRows);
+    expect(snapshot.grid.hostCols).toBe(hostPayload.hostCols);
+
+    // Subsequent DOM payloads with the same version should be dropped in favour of cached host data.
+    sessionTileController.enqueueMeasurement(
+      'tile-1',
+      makeMeasurementPayload({
+        measurementVersion: hostPayload.measurementVersion,
+        rawWidth: 300,
+        rawHeight: 200,
+        targetWidth: 300,
+        targetHeight: 200,
+        scale: 0.7,
+        hostRows: 20,
+        hostCols: 60,
+      }),
+      'dom',
+    );
+
+    vi.advanceTimersByTime(40);
+
+    const persistedSnapshot = sessionTileController.getTileSnapshot('tile-1');
+    const persistedMetadata = persistedSnapshot.layout?.metadata as Record<string, unknown>;
+
+    expect(persistedMetadata?.measurementSource).toBe('host');
+    expect(persistedMetadata?.rawWidth).toBe(hostPayload.rawWidth);
+    expect(persistedSnapshot.grid.measurementSource).toBe('host');
+    expect(persistedSnapshot.grid.widthPx).toBe(Math.round(hostPayload.rawWidth));
   });
 
   it('throttles persistence while tracking viewer metrics during connection churn', () => {

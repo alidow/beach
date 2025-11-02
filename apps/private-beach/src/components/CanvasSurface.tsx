@@ -247,7 +247,14 @@ function TileNodeComponent({ data, selected }: NodeProps<TileNodeData>) {
       if (!measurements) {
         return;
       }
-      sessionTileController.enqueueMeasurement(tileId, measurements as TileMeasurementPayload, 'dom');
+      const payload = measurements as TileMeasurementPayload;
+      sessionTileController.enqueueMeasurement(tileId, payload, 'dom');
+      const hasHostTelemetry =
+        (typeof payload.hostRows === 'number' && payload.hostRows > 0) ||
+        (typeof payload.hostCols === 'number' && payload.hostCols > 0);
+      if (hasHostTelemetry) {
+        sessionTileController.applyHostDimensions(tileId, payload);
+      }
     },
     [tileId],
   );

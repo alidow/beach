@@ -34,6 +34,7 @@ import { extractGridLayoutSnapshot, gridSnapshotToReactGrid } from '../controlle
 import {
   applyGridAutosizeCommand,
   applyGridDragCommand,
+  applyGridPresetCommand,
   applyGridResizeCommand,
 } from '../controllers/gridLayoutCommands';
 import {
@@ -79,6 +80,9 @@ const GRID_LAYOUT_VERSION = 2;
 const CROPPED_EPSILON = 0.02;
 
 type TileViewStateMap = Record<string, TileViewState>;
+
+const PRESET_GRID_COLS = DEFAULT_COLS;
+const PRESET_ROW_HEIGHT_PX = ROW_HEIGHT;
 
 const TILE_DEBUG_ENABLED = process.env.NEXT_PUBLIC_TILE_DEBUG === 'true';
 
@@ -148,6 +152,103 @@ function tileDebugLog(...args: Parameters<typeof console.info>) {
 function tileDebugWarn(...args: Parameters<typeof console.warn>) {
   if (TILE_DEBUG_ENABLED) {
     console.warn(...args);
+  }
+}
+
+function createPresetItem(id: string, x: number, y: number, w: number, h: number): BeachLayoutItem {
+  const width = Math.max(MIN_W, Math.min(PRESET_GRID_COLS, Math.round(w)));
+  const height = Math.max(MIN_H, Math.round(h));
+  return {
+    id,
+    x: Math.max(0, Math.round(x)),
+    y: Math.max(0, Math.round(y)),
+    w: width,
+    h: height,
+    gridCols: PRESET_GRID_COLS,
+    rowHeightPx: PRESET_ROW_HEIGHT_PX,
+    layoutVersion: GRID_LAYOUT_VERSION,
+  };
+}
+
+function buildGrid2x2Preset(tileIds: string[]): BeachLayoutItem[] {
+  if (tileIds.length === 0) {
+    return [];
+  }
+  const columnWidth = Math.round(PRESET_GRID_COLS / 2);
+  const rowHeight = DEFAULT_H;
+  return tileIds.map((id, index) => {
+    const col = index % 2;
+    const row = Math.floor(index / 2);
+    return createPresetItem(id, col * columnWidth, row * rowHeight, columnWidth, rowHeight);
+  });
+}
+
+function buildFocusPreset(tileIds: string[]): BeachLayoutItem[] {
+  if (tileIds.length === 0) {
+    return [];
+  }
+  const items: BeachLayoutItem[] = [];
+  const primaryHeight = DEFAULT_H * 2;
+  items.push(createPresetItem(tileIds[0], 0, 0, PRESET_GRID_COLS, primaryHeight));
+  const secondaryWidth = Math.round(PRESET_GRID_COLS / 2);
+  const secondaryHeight = DEFAULT_H;
+  for (let index = 1; index < tileIds.length; index += 1) {
+    const adjustedIndex = index - 1;
+    const col = adjustedIndex % 2;
+    const row = Math.floor(adjustedIndex / 2);
+    const offsetY = primaryHeight + row * secondaryHeight;
+    items.push(
+      createPresetItem(tileIds[index], col * secondaryWidth, offsetY, secondaryWidth, secondaryHeight),
+    );
+  }
+  return items;
+}
+
+function buildOnePlusThreePreset(tileIds: string[]): BeachLayoutItem[] {
+  if (tileIds.length === 0) {
+    return [];
+  }
+  const items: BeachLayoutItem[] = [];
+  const mainWidth = Math.round(PRESET_GRID_COLS * 0.75);
+  const mainHeight = DEFAULT_H * 2;
+  items.push(createPresetItem(tileIds[0], 0, 0, mainWidth, mainHeight));
+
+  const sideWidth = PRESET_GRID_COLS - mainWidth;
+  const sideHeight = DEFAULT_H;
+  const sideCount = Math.min(3, Math.max(0, tileIds.length - 1));
+  for (let index = 0; index < sideCount; index += 1) {
+    const tileId = tileIds[index + 1];
+    items.push(createPresetItem(tileId, mainWidth, index * sideHeight, sideWidth, sideHeight));
+  }
+
+  const remaining = tileIds.slice(1 + sideCount);
+  if (remaining.length > 0) {
+    const offsetY = Math.max(mainHeight, sideCount * sideHeight);
+    const gridWidth = Math.round(PRESET_GRID_COLS / 2);
+    remaining.forEach((id, index) => {
+      const col = index % 2;
+      const row = Math.floor(index / 2);
+      const x = col * gridWidth;
+      const y = offsetY + row * sideHeight;
+      items.push(createPresetItem(id, x, y, gridWidth, sideHeight));
+    });
+  }
+
+  return items;
+}
+
+function buildPresetLayoutItems(
+  preset: 'grid2x2' | 'onePlusThree' | 'focus',
+  tileIds: string[],
+): BeachLayoutItem[] {
+  switch (preset) {
+    case 'focus':
+      return buildFocusPreset(tileIds);
+    case 'onePlusThree':
+      return buildOnePlusThreePreset(tileIds);
+    case 'grid2x2':
+    default:
+      return buildGrid2x2Preset(tileIds);
   }
 }
 
@@ -1291,6 +1392,7 @@ export default function TileCanvas({
   }, [managerToken, managerUrl, savedLayoutKey, tileSignature, viewerOverrideSignature, viewerToken]);
 
   const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
+  const hasSavedLayout = Boolean(savedLayout && savedLayout.length > 0);
 
   const buildPersistItems = useCallback((): BeachLayoutItem[] => {
     const exported = sessionTileController.exportGridLayoutAsBeachItems();
@@ -1326,6 +1428,7 @@ export default function TileCanvas({
 
   const previousViewStateRef = useRef<TileViewStateMap>({});
   const gridWrapperRef = useRef<HTMLDivElement | null>(null);
+  const presetAppliedRef = useRef<string | null>(null);
 
   const clampLayoutItems = useCallback(
     (layouts: Layout[], colsValue: number): Layout[] => {
@@ -1406,6 +1509,32 @@ export default function TileCanvas({
       setExpanded(match);
     }
   }, [tiles, expanded]);
+
+  useEffect(() => {
+    if (hasSavedLayout || !preset || tiles.length === 0) {
+      if (hasSavedLayout) {
+        presetAppliedRef.current = null;
+      }
+      return;
+    }
+    const presetKey = `${preset}:${tileSignature}`;
+    if (presetAppliedRef.current === presetKey) {
+      return;
+    }
+    const presetItems = buildPresetLayoutItems(preset, tileOrder);
+    if (presetItems.length === 0) {
+      return;
+    }
+    presetAppliedRef.current = presetKey;
+    sessionTileController.applyGridCommand('grid-preset', (layout) =>
+      applyGridPresetCommand(layout, presetItems, {
+        defaultCols: PRESET_GRID_COLS,
+        defaultRowHeightPx: PRESET_ROW_HEIGHT_PX,
+        rowHeightPx,
+        layoutVersion,
+      }),
+    );
+  }, [hasSavedLayout, layoutVersion, preset, rowHeightPx, tileOrder, tileSignature, tiles.length]);
 
   const layout = useMemo(() => {
     const derived = gridSnapshotToReactGrid(canvasSnapshot.layout, {
@@ -2294,6 +2423,18 @@ export default function TileCanvas({
       const hostColsCandidate =
         typeof dims.hostCols === 'number' && dims.hostCols > 0 ? dims.hostCols : null;
       const hostProvided = hostRowsCandidate != null || hostColsCandidate != null;
+      const previewMeasurement = state.preview ?? null;
+      if (hostProvided && previewMeasurement) {
+        const hasHostTelemetry =
+          (typeof previewMeasurement.hostRows === 'number' && previewMeasurement.hostRows > 0) ||
+          (typeof previewMeasurement.hostCols === 'number' && previewMeasurement.hostCols > 0);
+        if (hasHostTelemetry) {
+          sessionTileController.applyHostDimensions(
+            sessionId,
+            previewMeasurement as TileMeasurementPayload,
+          );
+        }
+      }
 
       const resolvedHostRows = (() => {
         if (hostRowsCandidate != null) {

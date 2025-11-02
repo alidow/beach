@@ -53,6 +53,14 @@
 - [x] Perform targeted manual smoke (rendering assignments, toggling lock/toolbar, autosize logs) if possible.
 - [x] Update this document with progress notes per step.
 
+## Progress — 2025-11-02
+- Summary: SessionTileController now lets host-sourced measurements win on equal `measurementVersion`, adds source-aware signatures so host replays dedupe, and drops stale DOM payloads before they enqueue while suppressing duplicate telemetry.
+- Coverage: Added lifecycle coverage ensuring host measurement payloads override DOM inputs when the version ties, introduced a shared helper to keep the new vitest scenario readable, and documented the host-first pipeline in the lifecycle overview.
+- Tests: `timeout 600 pnpm --filter @beach/private-beach test -- sessionTileController.lifecycle` (pass); `timeout 600 pnpm --filter @beach/private-beach lint` (pass).
+- TODOs: Watch for DOM measurement streams that advance beyond a host override; flag those flows during Milestone 3 validation if we see the queue oscillate.
+- Host telemetry: `SessionTerminalPreview` host dimension payloads now call `sessionTileController.applyHostDimensions` from both `TileCanvas.tsx` (viewport handler) and `CanvasSurface.tsx` (tile node wrapper), reusing preview measurement objects so host rows/cols propagate through the controller queue without new signatures. Confirm Cabana host resize emits compatible payloads once viewer instrumentation lands.
+- Follow-ups: Workstream A (viewer metrics) to confirm host telemetry continues emitting deduped measurement signatures for multi-transport sessions; Workstream B (CanvasSurface parity) should double-check that the host-precedence guard is wired through any remaining CanvasSurface enqueue paths—flagged for next sync.
+
 ## Progress — 2025-10-31
 - Step 1 complete: `GridDashboardMetadata`/`TileViewState` now normalize all view-state fields, `mergeTileViewState` handles null resets, and controller helpers (`updateTileViewState`, `setTileToolbarPinned`, etc.) are available with telemetry reasons.
 - Step 2 complete: introduced `useTileViewState` selector, `SessionTile` renders from `sessionTileController` snapshots, and TileCanvas now derives all view data from controller metadata (no local cache initialisation).

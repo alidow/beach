@@ -163,7 +163,7 @@ function withUpdatedTimestamp(layout: SharedCanvasLayout, timestamp = Date.now()
   };
 }
 
-function buildMeasurementSignature(payload: TileMeasurementPayload): string {
+function buildMeasurementSignature(payload: TileMeasurementPayload, source: MeasurementSource): string {
   return JSON.stringify([
     Math.round(payload.rawWidth * 100) / 100,
     Math.round(payload.rawHeight * 100) / 100,
@@ -171,6 +171,7 @@ function buildMeasurementSignature(payload: TileMeasurementPayload): string {
     payload.hostRows ?? null,
     payload.hostCols ?? null,
     payload.measurementVersion,
+    source,
   ]);
 }
 
@@ -491,7 +492,16 @@ class SessionTileController {
     if (!payload) {
       return;
     }
-    const signature = buildMeasurementSignature(payload);
+    const tile = this.layout.tiles[tileId];
+    if (source === 'dom' && tile) {
+      const tileVersion =
+        typeof tile.metadata?.measurementVersion === 'number' ? (tile.metadata?.measurementVersion as number) : 0;
+      const tileSource = (tile.metadata?.measurementSource as MeasurementSource | undefined) ?? 'dom';
+      if (tileSource === 'host' && tileVersion >= payload.measurementVersion) {
+        return;
+      }
+    }
+    const signature = buildMeasurementSignature(payload, source);
     const appliedSignature = this.measurementSignatures.get(tileId);
     if (appliedSignature === signature) {
       return;
@@ -661,7 +671,10 @@ class SessionTileController {
       }
       const currentVersion =
         typeof tile.metadata?.measurementVersion === 'number' ? (tile.metadata?.measurementVersion as number) : 0;
-      if (payload.measurementVersion <= currentVersion) {
+      if (payload.measurementVersion < currentVersion) {
+        continue;
+      }
+      if (payload.measurementVersion === currentVersion && source !== 'host') {
         continue;
       }
       const width = Math.max(1, Math.round(payload.rawWidth));
@@ -673,16 +686,18 @@ class SessionTileController {
       const existingScale = tile.metadata?.scale ?? null;
       const existingHostRows = tile.metadata?.hostRows ?? null;
       const existingHostCols = tile.metadata?.hostCols ?? null;
+      const existingSource = (tile.metadata?.measurementSource as MeasurementSource | undefined) ?? 'dom';
 
-      if (
+      const hasSameMetrics =
         existingWidth === width &&
         existingHeight === height &&
         existingRawWidth === payload.rawWidth &&
         existingRawHeight === payload.rawHeight &&
         existingScale === payload.scale &&
         existingHostRows === payload.hostRows &&
-        existingHostCols === payload.hostCols
-      ) {
+        existingHostCols === payload.hostCols;
+
+      if (hasSameMetrics && existingSource === source) {
         this.measurementSignatures.set(tileId, signature);
         continue;
       }
@@ -723,23 +738,31 @@ class SessionTileController {
       this.measurementSignatures.set(tileId, signature);
       didMutate = true;
 
-      emitTelemetry('canvas.measurement', {
-        beachId: this.privateBeachId ?? undefined,
-        sessionId: tileId,
-        targetWidth: payload.targetWidth,
-        targetHeight: payload.targetHeight,
-        rawWidth: payload.rawWidth,
-        rawHeight: payload.rawHeight,
-        scale: payload.scale,
-        measurementVersion: payload.measurementVersion,
-      });
+      const shouldEmitMeasurementTelemetry =
+        !hasSameMetrics || payload.measurementVersion > currentVersion;
+      const shouldEmitResizeTelemetry = existingWidth !== width || existingHeight !== height;
 
-      emitTelemetry('canvas.resize.stop', {
-        beachId: this.privateBeachId ?? undefined,
-        sessionId: tileId,
-        width,
-        height,
-      });
+      if (shouldEmitMeasurementTelemetry) {
+        emitTelemetry('canvas.measurement', {
+          beachId: this.privateBeachId ?? undefined,
+          sessionId: tileId,
+          targetWidth: payload.targetWidth,
+          targetHeight: payload.targetHeight,
+          rawWidth: payload.rawWidth,
+          rawHeight: payload.rawHeight,
+          scale: payload.scale,
+          measurementVersion: payload.measurementVersion,
+        });
+      }
+
+      if (shouldEmitResizeTelemetry) {
+        emitTelemetry('canvas.resize.stop', {
+          beachId: this.privateBeachId ?? undefined,
+          sessionId: tileId,
+          width,
+          height,
+        });
+      }
     }
 
     if (didMutate) {

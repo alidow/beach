@@ -522,7 +522,6 @@ function metadataEquals(a: GridDashboardMetadata, b: GridDashboardMetadata): boo
 
 export function withTileGridMetadata(tile: CanvasTileNode, update: TileGridMetadataUpdate): CanvasTileNode {
   const current = extractGridDashboardMetadata(tile);
-  console.log('[withTileGridMetadata] current layout', current.layout, 'update layout', update.layout);
   const nextLayout = sanitizeLayoutUnits(update.layout, current.layout);
   const has = (key: keyof TileGridMetadataUpdate) => Object.prototype.hasOwnProperty.call(update, key);
   const baseViewState = current.viewState ?? defaultTileViewState();

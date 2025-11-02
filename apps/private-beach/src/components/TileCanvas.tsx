@@ -1365,47 +1365,37 @@ export default function TileCanvas({
   const tileOrder = useMemo(() => tiles.map((t) => t.session_id), [tiles]);
 
   const exportLegacyGridItems = useCallback((): BeachLayoutItem[] => {
-    const gridSnapshot = sessionTileController.getGridLayoutSnapshot();
-    const entries: Layout[] = [];
-    for (const id of tileOrder) {
-      const metadata = gridSnapshot.tiles[id];
-      if (!metadata) {
-        continue;
-      }
-      const layoutUnits = metadata.layout;
-      const clampedW = Math.min(Math.max(layoutUnits.w, MIN_W), cols);
-      const maxX = Math.max(0, cols - clampedW);
-      const x = Math.min(Math.max(layoutUnits.x, 0), maxX);
-      const y = Math.max(layoutUnits.y, 0);
-      const h = Math.max(layoutUnits.h, MIN_H);
-      entries.push({
-        i: id,
-        x,
-        y,
-        w: clampedW,
-        h,
-        minW: MIN_W,
-        minH: MIN_H,
-      });
-    }
-    if (entries.length === 0) {
+    const exported = sessionTileController.exportGridLayoutAsBeachItems();
+    if (exported.length === 0) {
       return [];
     }
-    console.log('[exportLegacy] entries', entries);
-    const snapshotMap = new Map<string, ReturnType<typeof sessionTileController.getTileSnapshot>>();
-    return snapshotLayoutItems(entries, cols, viewStateMap, tileOrder).map((item) => {
-      const snapshot = snapshotMap.get(item.id) ?? sessionTileController.getTileSnapshot(item.id);
-      snapshotMap.set(item.id, snapshot);
-      const viewState = selectTileViewState(snapshot.grid);
+    if (tileOrder.length === 0) {
+      return exported;
+    }
+    const itemMap = new Map(exported.map((item) => [item.id, { ...item }] as const));
+    const snapshotCache = new Map<string, ReturnType<typeof sessionTileController.getTileSnapshot>>();
+    const ordered: BeachLayoutItem[] = [];
+    for (const id of tileOrder) {
+      const item = itemMap.get(id);
+      if (!item) {
+        continue;
+      }
+      const cached = snapshotCache.get(id) ?? sessionTileController.getTileSnapshot(id);
+      snapshotCache.set(id, cached);
+      const viewState = selectTileViewState(cached.grid);
       const measurement = computeViewMeasurements(viewState);
       if (measurement) {
         const widthUnitsDefault = (measurement.width / TARGET_TILE_WIDTH) * DEFAULT_W;
         const scaledWidth = Math.round((widthUnitsDefault * LEGACY_GRID_COLS) / DEFAULT_COLS);
         item.w = Math.max(LEGACY_MIN_W, Math.min(LEGACY_GRID_COLS, scaledWidth));
       }
-      return item;
-    });
-  }, [cols, tileOrder, viewStateMap]);
+      ordered.push(item);
+    }
+    if (ordered.length === tileOrder.length) {
+      return ordered;
+    }
+    return exported;
+  }, [tileOrder]);
 
   const lastPersistSignatureRef = useRef<string | null>(null);
   const pendingPersistSignatureRef = useRef<string | null>(null);
@@ -1416,7 +1406,6 @@ export default function TileCanvas({
         return;
       }
       const legacyItems = exportLegacyGridItems();
-      console.log('[persist] legacy items length', legacyItems.length);
       if (legacyItems.length === 0) {
         return;
       }

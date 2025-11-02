@@ -16,7 +16,6 @@ import {
   gridSnapshotToBeachItems,
   DEFAULT_GRID_W_UNITS,
   DEFAULT_GRID_H_UNITS,
-  sanitizeLayoutUnits,
   withLayoutDashboardMetadata,
   withTileGridMetadata,
   type GridDashboardMetadata,
@@ -324,8 +323,6 @@ class SessionTileController {
   }
 
   applyGridSnapshot(reason: string, snapshot: GridLayoutSnapshot | null | undefined, options?: { suppressPersist?: boolean }) {
-    console.warn('[controller] applyGridSnapshot called', reason, snapshot?.tiles?.['app-1']?.layout);
-    console.warn('[controller] snapshot payload tile', snapshot?.tiles?.['app-1']);
     if (!snapshot) {
       return;
     }
@@ -333,16 +330,16 @@ class SessionTileController {
     if (!options?.suppressPersist) {
       for (const [tileId, metadata] of Object.entries(snapshot.tiles)) {
         const layout = metadata.layout;
-        if (layout) {
-          const override: GridLayoutUnits = {
-            x: typeof layout.x === 'number' ? layout.x : 0,
-            y: typeof layout.y === 'number' ? layout.y : 0,
-            w: typeof layout.w === 'number' ? layout.w : DEFAULT_GRID_W_UNITS,
-            h: typeof layout.h === 'number' ? layout.h : DEFAULT_GRID_H_UNITS,
-          };
-          console.warn('[controller] override stored', tileId, override);
-          this.pendingGridLayoutOverride.set(tileId, override);
+        if (!layout) {
+          continue;
         }
+        const override: GridLayoutUnits = {
+          x: typeof layout.x === 'number' ? layout.x : 0,
+          y: typeof layout.y === 'number' ? layout.y : 0,
+          w: typeof layout.w === 'number' ? layout.w : DEFAULT_GRID_W_UNITS,
+          h: typeof layout.h === 'number' ? layout.h : DEFAULT_GRID_H_UNITS,
+        };
+        this.pendingGridLayoutOverride.set(tileId, override);
       }
     }
     if (options?.suppressPersist) {
@@ -475,7 +472,6 @@ class SessionTileController {
     if (this.pendingGridLayoutOverride.size === 0) {
       return items;
     }
-    console.log('[controller] overriding layout with pending overrides', Array.from(this.pendingGridLayoutOverride.entries()));
     const overridden = items.map((item) => {
       const override = this.pendingGridLayoutOverride.get(item.id);
       if (!override) {
@@ -895,6 +891,9 @@ class SessionTileController {
     if (entries.length === 0) {
       return next;
     }
+    const defaultGridCols = typeof snapshot.gridCols === 'number' ? snapshot.gridCols : undefined;
+    const defaultRowHeight = typeof snapshot.rowHeightPx === 'number' ? snapshot.rowHeightPx : undefined;
+    const defaultLayoutVersion = typeof snapshot.layoutVersion === 'number' ? snapshot.layoutVersion : undefined;
     const tiles: SharedCanvasLayout['tiles'] = { ...next.tiles };
     for (const [tileId, tile] of Object.entries(tiles)) {
       if (!tile.position) {
@@ -911,8 +910,7 @@ class SessionTileController {
       }
     }
     let mutated = false;
-    for (const [tileId, update] of entries) {
-      console.log('[controller] applying update', tileId, update.layout);
+    for (const [tileId, metadata] of entries) {
       const existing =
         tiles[tileId] ??
         ({
@@ -923,13 +921,25 @@ class SessionTileController {
           zIndex: 1,
           metadata: {},
         } as CanvasTileNode);
-      const updated = withTileGridMetadata(existing, update);
+      const normalized: TileGridMetadataUpdate = {
+        ...metadata,
+        layout: metadata.layout ? { ...metadata.layout } : metadata.layout,
+      };
+      if (normalized.gridCols === undefined && defaultGridCols !== undefined) {
+        normalized.gridCols = defaultGridCols;
+      }
+      if (normalized.rowHeightPx === undefined && defaultRowHeight !== undefined) {
+        normalized.rowHeightPx = defaultRowHeight;
+      }
+      if (normalized.layoutVersion === undefined && defaultLayoutVersion !== undefined) {
+        normalized.layoutVersion = defaultLayoutVersion;
+      }
+      const updated = withTileGridMetadata(existing, normalized);
       if (updated !== existing || !tiles[tileId]) {
         mutated = true;
         tiles[tileId] = updated;
       }
     }
-    console.log('[controller] applyGridSnapshotToLayout mutated', mutated, 'tiles', Object.keys(tiles));
     if (!mutated) {
       return next;
     }

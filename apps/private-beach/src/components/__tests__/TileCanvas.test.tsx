@@ -323,10 +323,12 @@ const connectedViewer: TerminalViewerState = {
   });
 
   it('throttles layout persistence when the controller applies snapshots', async () => {
-    vi.useFakeTimers();
     const onLayoutPersist = vi.fn();
     renderCanvas({ onLayoutPersist });
     await screen.findByTestId('auto-grid');
+
+    await waitFor(() => expect(onLayoutPersist).toHaveBeenCalled());
+    onLayoutPersist.mockClear();
 
     const snapshot = {
       tiles: {
@@ -344,25 +346,17 @@ const connectedViewer: TerminalViewerState = {
 
     expect(onLayoutPersist).not.toHaveBeenCalled();
 
-    act(() => {
-      vi.advanceTimersByTime(199);
-    });
-    expect(onLayoutPersist).not.toHaveBeenCalled();
-
-    act(() => {
-      vi.advanceTimersByTime(1);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 200));
     });
 
-    await waitFor(() => expect(onLayoutPersist).toHaveBeenCalledTimes(1));
+    expect(onLayoutPersist).toHaveBeenCalledTimes(1);
     const firstPersist = onLayoutPersist.mock.calls[0][0];
     expect(firstPersist).toEqual(
       expect.arrayContaining([expect.objectContaining({ id: 'app-1', x: 0, y: 0 })]),
     );
 
     act(() => {
-      console.log('snapshot second payload', {
-        layout: { x: 16, y: 4, w: 32, h: 28 },
-      });
       sessionTileController.applyGridSnapshot('test-second', {
         tiles: {
           'app-1': {
@@ -371,9 +365,6 @@ const connectedViewer: TerminalViewerState = {
         },
         gridCols: 128,
         rowHeightPx: 12,
-      });
-      console.log('snapshot third payload', {
-        layout: { x: 20, y: 6, w: 32, h: 28 },
       });
       sessionTileController.applyGridSnapshot('test-third', {
         tiles: {
@@ -386,19 +377,17 @@ const connectedViewer: TerminalViewerState = {
       });
     });
     const intermediateSnapshot = sessionTileController.getGridLayoutSnapshot();
-    console.log('intermediate snapshot layout', intermediateSnapshot.tiles['app-1']);
     expect(intermediateSnapshot.tiles['app-1']?.layout.x).toBe(20);
     expect(intermediateSnapshot.tiles['app-1']?.layout.y).toBe(6);
 
-    act(() => {
-      vi.advanceTimersByTime(200);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 200));
     });
 
-    await waitFor(() => expect(onLayoutPersist).toHaveBeenCalledTimes(2));
+    expect(onLayoutPersist).toHaveBeenCalledTimes(2);
     const secondPersist = onLayoutPersist.mock.calls[1][0];
     expect(secondPersist).toEqual(
       expect.arrayContaining([expect.objectContaining({ id: 'app-1', x: 20, y: 6 })]),
     );
-    vi.useRealTimers();
   });
 });

@@ -41,6 +41,8 @@ export type TileMeasurementPayload = {
   hostRows: number | null;
   hostCols: number | null;
   measurementVersion: number;
+  hostRowSource?: 'unknown' | 'pty' | 'fallback';
+  hostColSource?: 'unknown' | 'pty' | 'fallback';
 };
 
 type MeasurementSource = 'dom' | 'host';
@@ -795,6 +797,8 @@ class SessionTileController {
             scale: payload.scale,
             hostRows: payload.hostRows,
             hostCols: payload.hostCols,
+            hostRowSource: payload.hostRowSource ?? null,
+            hostColSource: payload.hostColSource ?? null,
             measurementVersion: payload.measurementVersion,
             existingWidth,
             existingHeight,

@@ -506,11 +506,19 @@ impl AlacrittyEmulator {
         let (captured_rows, mut style_updates) = self.capture_full_grid(grid);
         let mut updates = self.emit_deltas(captured_rows);
         if !style_updates.is_empty() {
-            debug!(
-                target = "server::emulator",
-                style_updates = style_updates.len(),
-                "emitting style updates for transport"
-            );
+            for update in &style_updates {
+                if let CacheUpdate::Style(style_def) = update {
+                    debug!(
+                        target = "server::emulator",
+                        style_id = style_def.id.0,
+                        seq = style_def.seq,
+                        fg = style_def.style.fg,
+                        bg = style_def.style.bg,
+                        attrs = style_def.style.attrs,
+                        "emitting style update"
+                    );
+                }
+            }
             style_updates.extend(updates);
             updates = style_updates;
         }

@@ -2425,10 +2425,10 @@ export default function TileCanvas({
       const hostProvided = hostRowsCandidate != null || hostColsCandidate != null;
       const previewMeasurement = state.preview ?? null;
       if (hostProvided && previewMeasurement) {
-        const hasHostTelemetry =
-          (typeof previewMeasurement.hostRows === 'number' && previewMeasurement.hostRows > 0) ||
-          (typeof previewMeasurement.hostCols === 'number' && previewMeasurement.hostCols > 0);
-        if (hasHostTelemetry) {
+        const hostSourceIsPty =
+          (previewMeasurement.hostRowSource ?? 'unknown') === 'pty' ||
+          (previewMeasurement.hostColSource ?? 'unknown') === 'pty';
+        if (hostSourceIsPty) {
           sessionTileController.applyHostDimensions(
             sessionId,
             previewMeasurement as TileMeasurementPayload,

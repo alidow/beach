@@ -14,6 +14,8 @@ export type PreviewMetrics = {
   hostRows: number | null;
   hostCols: number | null;
   measurementVersion: number;
+  hostRowSource?: 'unknown' | 'pty' | 'fallback';
+  hostColSource?: 'unknown' | 'pty' | 'fallback';
 };
 
 export type TileViewState = {

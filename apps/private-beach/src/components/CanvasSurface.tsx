@@ -292,10 +292,9 @@ function TileNodeComponent({ data, selected }: NodeProps<TileNodeData>) {
       }
       const payload = measurements as TileMeasurementPayload;
       sessionTileController.enqueueMeasurement(tileId, payload, 'dom');
-      const hasHostTelemetry =
-        (typeof payload.hostRows === 'number' && payload.hostRows > 0) ||
-        (typeof payload.hostCols === 'number' && payload.hostCols > 0);
-      if (hasHostTelemetry) {
+      const hostSourceIsPty =
+        (payload.hostRowSource ?? 'unknown') === 'pty' || (payload.hostColSource ?? 'unknown') === 'pty';
+      if (hostSourceIsPty) {
         sessionTileController.applyHostDimensions(tileId, payload);
       }
     },

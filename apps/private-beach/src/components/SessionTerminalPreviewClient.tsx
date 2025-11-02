@@ -411,6 +411,9 @@ function SessionTerminalPreviewView({
         snapshot.viewportHeight > 0 ? snapshot.viewportHeight : 0,
       );
       const estimatedCols = snapshot.cols > 0 ? snapshot.cols : null;
+      const hostViewportRowsFromSnapshot =
+        snapshot.viewportHeight && snapshot.viewportHeight > 1 ? snapshot.viewportHeight : null;
+      const hostViewportColsFromSnapshot = snapshot.cols && snapshot.cols > 1 ? snapshot.cols : null;
 
       if (estimatedRows <= 0 && (estimatedCols == null || estimatedCols <= 0)) {
         return;
@@ -419,13 +422,13 @@ function SessionTerminalPreviewView({
       setHostDimensions((current) => {
         const nextRowResult = computeDimensionUpdate(
           current.rows,
-          null,
+          hostViewportRowsFromSnapshot,
           estimatedRows > 0 ? estimatedRows : null,
           hostRowSourceRef.current,
         );
         const nextColResult = computeDimensionUpdate(
           current.cols,
-          null,
+          hostViewportColsFromSnapshot,
           estimatedCols,
           hostColSourceRef.current,
         );
@@ -782,6 +785,8 @@ function SessionTerminalPreviewView({
       hostRows: resolvedHostRows,
       hostCols: resolvedHostCols,
       measurementVersion: measurementVersionRef.current,
+      hostRowSource: hostRowSourceRef.current,
+      hostColSource: hostColSourceRef.current,
     };
   }, [domRawVersion, hostPixelSize.height, hostPixelSize.width, resolvedHostCols, resolvedHostRows, shouldSkipDomMeasurements]);
 

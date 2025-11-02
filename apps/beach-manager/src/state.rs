@@ -26,10 +26,9 @@ use beach_buggy::{
 use beach_client_core::cache::terminal::packed::unpack_cell;
 use beach_client_core::protocol::{CursorFrame, Update as WireUpdate};
 use beach_client_core::{
-    decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
-    ClientFrame as WireClientFrame, HostFrame as WireHostFrame, NegotiatedSingle,
-    NegotiatedTransport, PackedCell, Payload, SessionConfig, SessionError, SessionHandle,
-    SessionManager, Style, StyleId, TerminalGrid, TransportError, TransportOffer,
+    decode_host_frame_binary, negotiate_transport, CliError, HostFrame as WireHostFrame,
+    NegotiatedSingle, NegotiatedTransport, PackedCell, Payload, SessionConfig, SessionError,
+    SessionHandle, SessionManager, Style, StyleId, TerminalGrid, TransportError, TransportOffer,
 };
 use chrono::{DateTime, Duration, Utc};
 use prometheus::IntGauge;
@@ -4775,20 +4774,6 @@ async fn viewer_connect_once(
             session_id = %session_id,
             error = %err,
             "manager viewer failed to send ready sentinel"
-        );
-    }
-
-    let resize_frame = WireClientFrame::Resize {
-        cols: 120,
-        rows: 40,
-    };
-    let resize_bytes = encode_client_frame_binary(&resize_frame);
-    if let Err(err) = transport.send_bytes(&resize_bytes) {
-        debug!(
-            target = "private_beach",
-            session_id = %session_id,
-            error = %err,
-            "manager viewer failed to send resize frame"
         );
     }
 

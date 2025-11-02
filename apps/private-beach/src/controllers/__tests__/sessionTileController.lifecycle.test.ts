@@ -401,6 +401,126 @@ describe('SessionTileController lifecycle stress', () => {
     expect(persistedSnapshot.grid.widthPx).toBe(Math.round(hostPayload.rawWidth));
   });
 
+  it('emits host measurement telemetry once and records DOM skips for multi-transport ties', () => {
+    vi.useFakeTimers();
+    const session = makeSession('tile-1');
+
+    sessionTileController.hydrate({
+      layout: baseLayout,
+      sessions: [session],
+      agents: [],
+      privateBeachId: 'pb-1',
+      managerUrl: 'http://localhost:8080',
+      managerToken: null,
+    });
+
+    const domFirst = makeMeasurementPayload({
+      measurementVersion: 22,
+      rawWidth: 332,
+      rawHeight: 244,
+      targetWidth: 332,
+      targetHeight: 244,
+      scale: 0.86,
+      hostRows: 24,
+      hostCols: 80,
+    });
+    const hostPayload = makeMeasurementPayload({
+      measurementVersion: 22,
+      rawWidth: 384,
+      rawHeight: 288,
+      targetWidth: 384,
+      targetHeight: 288,
+      scale: 0.97,
+      hostRows: 30,
+      hostCols: 96,
+    });
+    const domSecond = makeMeasurementPayload({
+      measurementVersion: 22,
+      rawWidth: 342,
+      rawHeight: 252,
+      targetWidth: 342,
+      targetHeight: 252,
+      scale: 0.9,
+      hostRows: 26,
+      hostCols: 84,
+    });
+
+    sessionTileController.enqueueMeasurement('tile-1', domFirst, 'dom');
+    sessionTileController.applyHostDimensions('tile-1', hostPayload);
+
+    vi.advanceTimersByTime(40);
+
+    sessionTileController.enqueueMeasurement('tile-1', domSecond, 'dom');
+
+    vi.advanceTimersByTime(40);
+
+    const snapshot = sessionTileController.getTileSnapshot('tile-1');
+    expect(snapshot.layout?.metadata?.measurementVersion).toBe(hostPayload.measurementVersion);
+    expect(snapshot.layout?.metadata?.measurementSource).toBe('host');
+    expect(snapshot.layout?.metadata?.rawWidth).toBe(hostPayload.rawWidth);
+    expect(snapshot.layout?.metadata?.rawHeight).toBe(hostPayload.rawHeight);
+    expect(snapshot.grid.measurementSource).toBe('host');
+
+    const measurementEvents = telemetryEvents('canvas.measurement');
+    expect(measurementEvents).toHaveLength(1);
+    const [, measurementPayload] = measurementEvents[0] ?? [];
+    expect(measurementPayload?.measurementVersion).toBe(hostPayload.measurementVersion);
+
+    const skipEvents = telemetryEvents('canvas.measurement.dom-skipped-after-host');
+    expect(skipEvents).toHaveLength(2);
+    const skipStages = skipEvents.map(([, payload]) => payload?.stage).sort();
+    expect(skipStages).toEqual(['enqueue', 'queue-preempted']);
+
+    expect(telemetryEvents('canvas.measurement.dom-advanced-after-host')).toHaveLength(0);
+  });
+
+  it('drops identical host measurements without emitting duplicate telemetry', () => {
+    vi.useFakeTimers();
+    const session = makeSession('tile-1');
+
+    sessionTileController.hydrate({
+      layout: baseLayout,
+      sessions: [session],
+      agents: [],
+      privateBeachId: 'pb-1',
+      managerUrl: 'http://localhost:8080',
+      managerToken: null,
+    });
+
+    const hostPayload = makeMeasurementPayload({
+      measurementVersion: 31,
+      rawWidth: 412,
+      rawHeight: 308,
+      targetWidth: 412,
+      targetHeight: 308,
+      scale: 0.99,
+      hostRows: 34,
+      hostCols: 98,
+    });
+
+    sessionTileController.applyHostDimensions('tile-1', hostPayload);
+    vi.advanceTimersByTime(40);
+
+    const initialMeasurementEvents = telemetryEvents('canvas.measurement');
+    expect(initialMeasurementEvents).toHaveLength(1);
+    const [, initialMeasurementPayload] = initialMeasurementEvents[0] ?? [];
+    expect(initialMeasurementPayload?.measurementVersion).toBe(hostPayload.measurementVersion);
+
+    emitTelemetrySpy.mockClear();
+
+    sessionTileController.applyHostDimensions('tile-1', hostPayload);
+    vi.advanceTimersByTime(40);
+
+    expect(telemetryEvents('canvas.measurement')).toHaveLength(0);
+    expect(telemetryEvents('canvas.measurement.dom-skipped-after-host')).toHaveLength(0);
+    expect(telemetryEvents('canvas.measurement.dom-advanced-after-host')).toHaveLength(0);
+
+    const snapshot = sessionTileController.getTileSnapshot('tile-1');
+    expect(snapshot.layout?.metadata?.measurementVersion).toBe(hostPayload.measurementVersion);
+    expect(snapshot.layout?.metadata?.measurementSource).toBe('host');
+    expect(snapshot.grid.measurementVersion).toBe(hostPayload.measurementVersion);
+  });
+
   it('throttles persistence while tracking viewer metrics during connection churn', () => {
     vi.useFakeTimers();
     const onPersistLayout = vi.fn();

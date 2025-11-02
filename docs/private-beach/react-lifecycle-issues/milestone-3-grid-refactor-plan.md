@@ -56,11 +56,14 @@
 ## Progress — 2025-11-02
 - Summary: SessionTileController now lets host-sourced measurements win on equal `measurementVersion`, adds source-aware signatures so host replays dedupe, and drops stale DOM payloads before they enqueue while suppressing duplicate telemetry.
 - Coverage: Added lifecycle coverage ensuring host measurement payloads override DOM inputs when the version ties, introduced a shared helper to keep the new vitest scenario readable, and documented the host-first pipeline in the lifecycle overview.
+- Telemetry validation: Stubbing telemetry in the lifecycle suite verified that multi-transport DOM → host → DOM sequences emit `canvas.measurement` exactly once while surfacing `canvas.measurement.dom-skipped-after-host` for both queue-preempted and enqueue-stage drops, and that duplicate host signatures short-circuit without any telemetry repeats (no discrepancies observed in captured payloads).
 - Tests: `timeout 600 pnpm --filter @beach/private-beach test -- sessionTileController.lifecycle` (pass); `timeout 600 pnpm --filter @beach/private-beach lint` (pass).
 - TODOs: Watch for DOM measurement streams that advance beyond a host override; flag those flows during Milestone 3 validation if we see the queue oscillate.
 - Host telemetry: `SessionTerminalPreview` host dimension payloads now call `sessionTileController.applyHostDimensions` from both `TileCanvas.tsx` (viewport handler) and `CanvasSurface.tsx` (tile node wrapper), reusing preview measurement objects so host rows/cols propagate through the controller queue without new signatures. Confirm Cabana host resize emits compatible payloads once viewer instrumentation lands.
 - Instrumentation: Added `canvas.measurement.dom-skipped-after-host` (DOM dropped behind host) and `canvas.measurement.dom-advanced-after-host` (DOM leapfrogs host) counters to flush logs so ops can monitor oscillation; runbook hint: `pnpm --filter @beach/private-beach lint` verifies the wiring locally.
-- Follow-ups: Workstream A (viewer metrics) to confirm host telemetry continues emitting deduped measurement signatures for multi-transport sessions; Workstream B (CanvasSurface parity) should double-check that the host-precedence guard is wired through any remaining CanvasSurface enqueue paths—flagged for next sync.
+- CanvasSurface parity: Audited drag + preview helpers (no remaining call sites bypass `applyHostDimensions`) and added `apps/private-beach/src/components/__tests__/CanvasSurface.test.tsx` to assert host payloads stick when DOM sends the same version.
+- Tests: `pnpm --filter @beach/private-beach test -- CanvasSurface.test`
+- Follow-ups: Workstream A (viewer metrics) to confirm host telemetry continues emitting deduped measurement signatures for multi-transport sessions; CanvasSurface parity gap resolved, just keep an eye on QA logs for DOM streams that legitimately outrun host widths.
 
 ## Progress — 2025-10-31
 - Step 1 complete: `GridDashboardMetadata`/`TileViewState` now normalize all view-state fields, `mergeTileViewState` handles null resets, and controller helpers (`updateTileViewState`, `setTileToolbarPinned`, etc.) are available with telemetry reasons.

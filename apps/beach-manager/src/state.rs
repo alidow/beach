@@ -308,13 +308,25 @@ impl ManagerViewerState {
                     bg: *bg,
                     attrs: *attrs,
                 };
-                if !self.grid.style_table.set(StyleId(*id), style) {
-                    debug!(
-                        target = "private_beach",
-                        style_id = *id,
-                        "manager viewer received style update for missing style id"
-                    );
+                let style_id = StyleId(*id);
+                if !self.grid.style_table.set(style_id, style) {
+                    let (assigned, is_new) = self.grid.style_table.ensure_id_with_new(style);
+                    if assigned != style_id {
+                        debug!(
+                            target = "private_beach",
+                            expected = style_id.0,
+                            assigned = assigned.0,
+                            is_new,
+                            "manager viewer style id mismatch while inserting style"
+                        );
+                    }
                 }
+                debug!(
+                    target = "private_beach",
+                    style_id = *id,
+                    styles_registered = self.grid.style_table.len(),
+                    "manager viewer applied style update"
+                );
             }
         }
     }

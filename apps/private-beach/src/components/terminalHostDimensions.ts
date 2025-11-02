@@ -12,8 +12,12 @@ export function computeDimensionUpdate(
   const normalizedFallback = typeof fallbackValue === 'number' && fallbackValue > 0 ? fallbackValue : null;
 
   if (normalizedHost != null) {
-    const changed = currentSource !== 'pty' || currentValue !== normalizedHost;
-    return { value: normalizedHost, source: 'pty', changed };
+    const nextValue =
+      currentSource === 'pty' && typeof currentValue === 'number' && currentValue > 0
+        ? Math.max(currentValue, normalizedHost)
+        : normalizedHost;
+    const changed = currentSource !== 'pty' || currentValue !== nextValue;
+    return { value: nextValue, source: 'pty', changed };
   }
 
   if (currentSource === 'pty') {

@@ -68,6 +68,8 @@ type PreviewMeasurements = {
   hostRows: number | null;
   hostCols: number | null;
   measurementVersion: number;
+  hostRowSource: HostDimensionSource;
+  hostColSource: HostDimensionSource;
 };
 
 type Props = {
@@ -734,10 +736,9 @@ function SessionTerminalPreviewView({
     return estimateHostPixelSize(fallbackHostCols, fallbackHostRows, effectiveFontSize);
   }, [fallbackHostCols, fallbackHostRows, effectiveFontSize]);
 
-  const shouldSkipDomMeasurements =
-    disableDomMeasurements ||
-    hostRowSourceRef.current === 'host' ||
-    hostColSourceRef.current === 'host';
+  const hasRemoteHostDimensions =
+    hostRowSourceRef.current === 'pty' || hostColSourceRef.current === 'pty';
+  const shouldSkipDomMeasurements = disableDomMeasurements || hasRemoteHostDimensions;
 
   const previewMeasurements = useMemo<PreviewMeasurements | null>(() => {
     if (shouldSkipDomMeasurements) {
@@ -944,7 +945,9 @@ function SessionTerminalPreviewView({
         const prev = domRawSizeRef.current;
         const widthDelta = !prev ? Number.POSITIVE_INFINITY : Math.abs(prev.width - rawWidthFromDom);
         const heightDelta = !prev ? Number.POSITIVE_INFINITY : Math.abs(prev.height - rawHeightFromDom);
-        if (!prev || widthDelta > 1 || heightDelta > 1) {
+        const hostSourceIsRemote =
+          hostRowSourceRef.current === 'pty' || hostColSourceRef.current === 'pty';
+        if (!hostSourceIsRemote && (!prev || widthDelta > 1 || heightDelta > 1)) {
           domRawSizeRef.current = {
             width: rawWidthFromDom,
             height: rawHeightFromDom,
@@ -960,7 +963,7 @@ function SessionTerminalPreviewView({
         const lineHeightPx = Math.max(1, Math.round(effectiveFontSize * 1.4));
         const inferredRows = Math.max(1, Math.round((rawHeightFromDom - TERMINAL_PADDING_Y) / lineHeightPx));
         const inferredCols = Math.max(1, Math.round((rawWidthFromDom - TERMINAL_PADDING_X) / cellWidth));
-        if (Number.isFinite(inferredRows) || Number.isFinite(inferredCols)) {
+        if (!hostSourceIsRemote && (Number.isFinite(inferredRows) || Number.isFinite(inferredCols))) {
           setHostDimensions((current) => {
             const fallbackRows = Number.isFinite(inferredRows) ? inferredRows : null;
             const fallbackCols = Number.isFinite(inferredCols) ? inferredCols : null;

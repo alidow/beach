@@ -30,6 +30,7 @@
 - The controller compares incoming measurements against canonical state (including sequence/version). Identical measurements are dropped synchronously; updated ones mutate state and emit a single snapshot.
 - Host telemetry runs through the same queue but has precedence: measurement signatures encode the payload source, the active layout metadata records whether the last-applied update came from the host, and any DOM payload whose `measurementVersion` is <= the most recent host update is rejected before it reaches the queue. This guarantees that when a host packet and DOM observer share a version, the host dimensions remain authoritative for both layout metadata and downstream signatures.
 - Preview callbacks now invoke `controller.applyHostDimensions` from both TileCanvas and CanvasSurface, reusing the emitted measurement objects so host rows/cols reach the controller queue even if DOM observers haven’t reported yet, while preserving signature stability.
+- When a DOM payload arrives after a host override, we emit `canvas.measurement.dom-skipped-after-host` (for stale versions) and `canvas.measurement.dom-advanced-after-host` (when DOM advances past the host) so ops can detect oscillation in metrics.
 - When host dimensions win, the resulting grid metadata, layout persistence, and telemetry exports all reflect the host-sourced measurement so downstream consumers never observe the transient DOM-only values.
 
 4. **React layer (pure presentation)**

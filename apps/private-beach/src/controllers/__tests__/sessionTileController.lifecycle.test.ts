@@ -15,6 +15,12 @@ vi.mock('../hooks/sessionTerminalManager', () => ({
   }),
 }));
 
+const emitTelemetrySpy = vi.fn();
+
+vi.mock('../../lib/telemetry', () => ({
+  emitTelemetry: emitTelemetrySpy,
+}));
+
 import type { CanvasLayout } from '../../canvas';
 import type { SessionSummary } from '../../lib/api';
 import type { TerminalViewerState } from '../../hooks/terminalViewerTypes';
@@ -175,6 +181,10 @@ function makeMeasurementPayload(overrides: Partial<TileMeasurementPayload> = {})
   };
 }
 
+function telemetryEvents(event: string) {
+  return emitTelemetrySpy.mock.calls.filter(([name]) => name === event);
+}
+
 describe('SessionTileController lifecycle stress', () => {
   afterEach(() => {
     vi.useRealTimers();
@@ -187,6 +197,7 @@ describe('SessionTileController lifecycle stress', () => {
       managerUrl: '',
       managerToken: null,
     });
+    emitTelemetrySpy.mockClear();
   });
 
   afterAll(() => {

@@ -9,7 +9,9 @@ export type TelemetryEvent =
   | 'canvas.group.create'
   | 'canvas.assignment.success'
   | 'canvas.assignment.failure'
-  | 'canvas.measurement';
+  | 'canvas.measurement'
+  | 'canvas.measurement.dom-skipped-after-host'
+  | 'canvas.measurement.dom-advanced-after-host';
 
 type TelemetryPayload = Record<string, unknown> & { time?: number };
 

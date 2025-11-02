@@ -59,6 +59,7 @@
 - Tests: `timeout 600 pnpm --filter @beach/private-beach test -- sessionTileController.lifecycle` (pass); `timeout 600 pnpm --filter @beach/private-beach lint` (pass).
 - TODOs: Watch for DOM measurement streams that advance beyond a host override; flag those flows during Milestone 3 validation if we see the queue oscillate.
 - Host telemetry: `SessionTerminalPreview` host dimension payloads now call `sessionTileController.applyHostDimensions` from both `TileCanvas.tsx` (viewport handler) and `CanvasSurface.tsx` (tile node wrapper), reusing preview measurement objects so host rows/cols propagate through the controller queue without new signatures. Confirm Cabana host resize emits compatible payloads once viewer instrumentation lands.
+- Instrumentation: Added `canvas.measurement.dom-skipped-after-host` (DOM dropped behind host) and `canvas.measurement.dom-advanced-after-host` (DOM leapfrogs host) counters to flush logs so ops can monitor oscillation; runbook hint: `pnpm --filter @beach/private-beach lint` verifies the wiring locally.
 - Follow-ups: Workstream A (viewer metrics) to confirm host telemetry continues emitting deduped measurement signatures for multi-transport sessions; Workstream B (CanvasSurface parity) should double-check that the host-precedence guard is wired through any remaining CanvasSurface enqueue paths—flagged for next sync.
 
 ## Progress — 2025-10-31

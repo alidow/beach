@@ -498,6 +498,13 @@ class SessionTileController {
         typeof tile.metadata?.measurementVersion === 'number' ? (tile.metadata?.measurementVersion as number) : 0;
       const tileSource = (tile.metadata?.measurementSource as MeasurementSource | undefined) ?? 'dom';
       if (tileSource === 'host' && tileVersion >= payload.measurementVersion) {
+        emitTelemetry('canvas.measurement.dom-skipped-after-host', {
+          beachId: this.privateBeachId ?? undefined,
+          sessionId: tileId,
+          domVersion: payload.measurementVersion,
+          appliedVersion: tileVersion,
+          stage: 'enqueue',
+        });
         return;
       }
     }
@@ -512,7 +519,23 @@ class SessionTileController {
         return;
       }
       if (existing.source === 'host' && source === 'dom') {
+        emitTelemetry('canvas.measurement.dom-skipped-after-host', {
+          beachId: this.privateBeachId ?? undefined,
+          sessionId: tileId,
+          domVersion: payload.measurementVersion,
+          appliedVersion: existing.payload.measurementVersion,
+          stage: 'queue',
+        });
         return;
+      }
+      if (existing.source === 'dom' && source === 'host') {
+        emitTelemetry('canvas.measurement.dom-skipped-after-host', {
+          beachId: this.privateBeachId ?? undefined,
+          sessionId: tileId,
+          domVersion: existing.payload.measurementVersion,
+          appliedVersion: payload.measurementVersion,
+          stage: 'queue-preempted',
+        });
       }
     }
     this.measurementQueue.set(tileId, {
@@ -671,11 +694,39 @@ class SessionTileController {
       }
       const currentVersion =
         typeof tile.metadata?.measurementVersion === 'number' ? (tile.metadata?.measurementVersion as number) : 0;
+      const existingSource = (tile.metadata?.measurementSource as MeasurementSource | undefined) ?? 'dom';
       if (payload.measurementVersion < currentVersion) {
+        if (source === 'dom' && existingSource === 'host') {
+          emitTelemetry('canvas.measurement.dom-skipped-after-host', {
+            beachId: this.privateBeachId ?? undefined,
+            sessionId: tileId,
+            domVersion: payload.measurementVersion,
+            appliedVersion: currentVersion,
+            stage: 'flush',
+          });
+        }
         continue;
       }
       if (payload.measurementVersion === currentVersion && source !== 'host') {
+        if (source === 'dom' && existingSource === 'host') {
+          emitTelemetry('canvas.measurement.dom-skipped-after-host', {
+            beachId: this.privateBeachId ?? undefined,
+            sessionId: tileId,
+            domVersion: payload.measurementVersion,
+            appliedVersion: currentVersion,
+            stage: 'flush',
+          });
+        }
         continue;
+      }
+      if (source === 'dom' && existingSource === 'host' && payload.measurementVersion > currentVersion) {
+        emitTelemetry('canvas.measurement.dom-advanced-after-host', {
+          beachId: this.privateBeachId ?? undefined,
+          sessionId: tileId,
+          domVersion: payload.measurementVersion,
+          appliedVersion: currentVersion,
+          stage: 'flush',
+        });
       }
       const width = Math.max(1, Math.round(payload.rawWidth));
       const height = Math.max(1, Math.round(payload.rawHeight));
@@ -686,7 +737,6 @@ class SessionTileController {
       const existingScale = tile.metadata?.scale ?? null;
       const existingHostRows = tile.metadata?.hostRows ?? null;
       const existingHostCols = tile.metadata?.hostCols ?? null;
-      const existingSource = (tile.metadata?.measurementSource as MeasurementSource | undefined) ?? 'dom';
 
       const hasSameMetrics =
         existingWidth === width &&

@@ -408,14 +408,53 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
       .join('|');
   }, [viewerStateOverridesProp]);
 
+  const layoutSignature = useMemo(() => {
+    if (!layoutProp) {
+      return 'layout:none';
+    }
+    const tileSignature = Object.values(layoutProp.tiles ?? {})
+      .map((tile) => {
+        const pos = tile?.position ?? { x: 0, y: 0 };
+        const size = tile?.size ?? { width: 0, height: 0 };
+        const zIndex = tile?.zIndex ?? 0;
+        const groupId = (tile as { groupId?: string } | undefined)?.groupId ?? '';
+        return `${tile?.id ?? ''}:${pos.x ?? 0}:${pos.y ?? 0}:${size.width ?? 0}:${size.height ?? 0}:${zIndex}:${groupId}`;
+      })
+      .sort()
+      .join('|');
+    const agentSignature = Object.values(layoutProp.agents ?? {})
+      .map((agent) => {
+        const pos = agent?.position ?? { x: 0, y: 0 };
+        const size = agent?.size ?? { width: 0, height: 0 };
+        const zIndex = agent?.zIndex ?? 0;
+        return `${agent?.id ?? ''}:${pos.x ?? 0}:${pos.y ?? 0}:${size.width ?? 0}:${size.height ?? 0}:${zIndex}`;
+      })
+      .sort()
+      .join('|');
+    const groupSignature = Object.values(layoutProp.groups ?? {})
+      .map((group) => {
+        const pos = group?.position ?? { x: 0, y: 0 };
+        const size = group?.size ?? { width: 0, height: 0 };
+        const zIndex = group?.zIndex ?? 0;
+        const members = [...(group?.memberIds ?? [])].sort().join(',');
+        return `${group?.id ?? ''}:${pos.x ?? 0}:${pos.y ?? 0}:${size.width ?? 0}:${size.height ?? 0}:${zIndex}:${members}`;
+      })
+      .sort()
+      .join('|');
+    const viewport = layoutProp.viewport;
+    const viewportSignature = viewport
+      ? `${viewport.zoom ?? 1}:${viewport.pan?.x ?? 0}:${viewport.pan?.y ?? 0}`
+      : 'none';
+    return [tileSignature, agentSignature, groupSignature, viewportSignature].join(';');
+  }, [layoutProp]);
+
   const hydrateKey = useMemo(() => {
-    const layoutUpdatedAt = layoutProp?.metadata?.updatedAt ?? 0;
     const layoutVersion = layoutProp?.version ?? 0;
     const tileIdsSignature = [...tiles].map((session) => session.session_id).sort().join(',');
     const agentIdsSignature = [...agents].map((session) => session.session_id).sort().join(',');
     return [
       layoutVersion,
-      layoutUpdatedAt,
+      layoutSignature,
       tileIdsSignature,
       agentIdsSignature,
       managerUrl,
@@ -425,18 +464,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
       viewerOverrideSignature,
       viewerStateSignature,
     ].join('|');
-  }, [
-    agents,
-    layoutProp?.metadata?.updatedAt,
-    layoutProp?.version,
-    managerToken,
-    managerUrl,
-    privateBeachId,
-    tiles,
-    viewerOverrideSignature,
-    viewerStateSignature,
-    viewerToken,
-  ]);
+  }, [agents, layoutProp?.version, layoutSignature, managerToken, managerUrl, privateBeachId, tiles, viewerOverrideSignature, viewerStateSignature, viewerToken]);
 
   const sessionMap = useMemo(() => new Map(tiles.map((session) => [session.session_id, session] as const)), [tiles]);
   const agentMap = useMemo(() => new Map(agents.map((session) => [session.session_id, session] as const)), [agents]);
@@ -551,8 +579,12 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
   }, [layout, syncStore]);
 
   const updateLayout = useCallback(
-    (reason: string, produce: (current: SharedCanvasLayout) => SharedCanvasLayout) => {
-      sessionTileController.updateLayout(reason, produce);
+    (
+      reason: string,
+      produce: (current: SharedCanvasLayout) => SharedCanvasLayout,
+      options?: { suppressPersist?: boolean; skipLayoutChange?: boolean; preserveUpdatedAt?: boolean },
+    ) => {
+      sessionTileController.updateLayout(reason, produce, options);
     },
     [],
   );
@@ -704,28 +736,32 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
       }
 
       let updatedLayout: SharedCanvasLayout | null = null;
-      sessionTileController.updateLayout('drag-preview-position', (current) => {
-        const tile = current.tiles[parsed.id];
-        if (!tile) {
-          return current;
-        }
-        const nextPosition = { x: node.position.x, y: node.position.y };
-        if (tile.position.x === nextPosition.x && tile.position.y === nextPosition.y) {
-          return current;
-        }
-        const next: SharedCanvasLayout = {
-          ...current,
-          tiles: {
-            ...current.tiles,
-            [parsed.id]: {
-              ...tile,
-              position: nextPosition,
+      sessionTileController.updateLayout(
+        'drag-preview-position',
+        (current) => {
+          const tile = current.tiles[parsed.id];
+          if (!tile) {
+            return current;
+          }
+          const nextPosition = { x: node.position.x, y: node.position.y };
+          if (tile.position.x === nextPosition.x && tile.position.y === nextPosition.y) {
+            return current;
+          }
+          const next: SharedCanvasLayout = {
+            ...current,
+            tiles: {
+              ...current.tiles,
+              [parsed.id]: {
+                ...tile,
+                position: nextPosition,
+              },
             },
-          },
-        };
-        updatedLayout = next;
-        return next;
-      });
+          };
+          updatedLayout = next;
+          return next;
+        },
+        { suppressPersist: true, skipLayoutChange: true, preserveUpdatedAt: true },
+      );
 
       const layoutForPreview = updatedLayout ?? layout;
 

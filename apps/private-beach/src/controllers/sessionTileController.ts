@@ -320,7 +320,8 @@ class SessionTileController {
     if (Object.is(ensured, base)) {
       return;
     }
-    this.replaceLayout(withUpdatedTimestamp(ensured), { reason, ...options });
+    const nextLayout = options?.preserveUpdatedAt ? ensured : withUpdatedTimestamp(ensured);
+    this.replaceLayout(nextLayout, { reason, ...options });
   }
 
   applyGridSnapshot(reason: string, snapshot: GridLayoutSnapshot | null | undefined, options?: { suppressPersist?: boolean }) {
@@ -728,8 +729,8 @@ class SessionTileController {
           stage: 'flush',
         });
       }
-      const width = Math.max(1, Math.round(payload.rawWidth));
-      const height = Math.max(1, Math.round(payload.rawHeight));
+      const width = Math.max(1, Math.round(payload.targetWidth ?? payload.rawWidth));
+      const height = Math.max(1, Math.round(payload.targetHeight ?? payload.rawHeight));
       const existingWidth = Math.round(tile.size?.width ?? 0);
       const existingHeight = Math.round(tile.size?.height ?? 0);
       const existingRawWidth = tile.metadata?.rawWidth ?? null;

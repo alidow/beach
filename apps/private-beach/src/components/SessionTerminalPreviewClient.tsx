@@ -738,7 +738,7 @@ function SessionTerminalPreviewView({
     const widthScale = rawWidth > 0 ? maxWidth / rawWidth : 1;
     const heightScale = rawHeight > 0 ? maxHeight / rawHeight : 1;
     const limitedScale = Math.min(1, widthScale, heightScale);
-    const normalizedScale = 1;
+    const normalizedScale = Math.min(1, Math.max(MINIMUM_SCALE, limitedScale));
     const targetWidth = Math.max(1, Math.round(rawWidth * normalizedScale));
     const targetHeight = Math.max(1, Math.round(rawHeight * normalizedScale));
     return {
@@ -753,7 +753,7 @@ function SessionTerminalPreviewView({
     };
   }, [domRawVersion, hostPixelSize.height, hostPixelSize.width, resolvedHostCols, resolvedHostRows]);
 
-  const effectiveScale = 1;
+  const effectiveScale = previewMeasurements?.scale ?? 1;
 
   useEffect(() => {
     const previous = measurementsRef.current;
@@ -864,6 +864,7 @@ function SessionTerminalPreviewView({
   }, [
     cropped,
     effectiveFontSize,
+    effectiveScale,
     fallbackHostCols,
     fallbackHostRows,
     locked,
@@ -959,7 +960,7 @@ function SessionTerminalPreviewView({
     };
     const handle = window.requestAnimationFrame(logDimensions);
     return () => window.cancelAnimationFrame(handle);
-  }, [previewMeasurements, sessionId, effectiveFontSize]);
+  }, [effectiveFontSize, effectiveScale, previewMeasurements, sessionId]);
 
   useEffect(() => {
     if (
@@ -989,6 +990,7 @@ function SessionTerminalPreviewView({
       // ignore logging issues
     }
   }, [
+    effectiveScale,
     fallbackHostCols,
     fallbackHostRows,
     isCabana,
@@ -1021,8 +1023,8 @@ function SessionTerminalPreviewView({
     if (!previewMeasurements) {
       return undefined;
     }
-    const width = previewMeasurements.rawWidth;
-    const height = previewMeasurements.rawHeight;
+    const width = previewMeasurements.targetWidth;
+    const height = previewMeasurements.targetHeight;
     return {
       width: `${Math.max(1, Math.round(width))}px`,
       height: `${Math.max(1, Math.round(height))}px`,
@@ -1033,11 +1035,14 @@ function SessionTerminalPreviewView({
     if (!previewMeasurements) {
       return undefined;
     }
+    const scale = previewMeasurements.scale;
+    const transform =
+      typeof scale === 'number' && Number.isFinite(scale) && scale !== 1 ? `scale(${scale})` : undefined;
     return {
       width: `${previewMeasurements.rawWidth}px`,
       height: `${previewMeasurements.rawHeight}px`,
-      transform: undefined,
-      transformOrigin: undefined,
+      transform,
+      transformOrigin: 'top left',
     };
   }, [previewMeasurements]);
 

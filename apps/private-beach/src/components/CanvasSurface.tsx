@@ -97,6 +97,7 @@ type TileNodeData = {
   onSelect: (session: SessionSummary) => void;
   isDropTarget: boolean;
   isDragging?: boolean;
+  isSettling?: boolean;
   managerUrl: string;
   viewerToken: string | null;
   credentialOverride?: SessionCredentialOverride | null;
@@ -271,6 +272,7 @@ function TileNodeComponent({ data, selected }: NodeProps<TileNodeData>) {
     onSelect,
     isDropTarget,
     isDragging,
+    isSettling,
     managerUrl,
     viewerToken,
     credentialOverride,
@@ -280,14 +282,15 @@ function TileNodeComponent({ data, selected }: NodeProps<TileNodeData>) {
   } = data;
   const snapshot = useTileSnapshot(tileId);
   const sessionSummary = session ?? snapshot.session;
-  const borderClass = getTileBorderClass({ selected, isDropTarget, isDragging: !!isDragging });
+  const isActiveMotion = !!isDragging || !!isSettling;
+  const borderClass = getTileBorderClass({ selected, isDropTarget, isDragging: isActiveMotion });
 
   const effectiveViewer = viewerOverride ?? snapshot.viewer;
   const effectiveCachedDiff = cachedDiff ?? snapshot.cachedDiff ?? null;
 
   const handleMeasurements = useCallback(
     (_sessionId: string, measurements: unknown) => {
-      if (!measurements || isDragging) {
+      if (!measurements || isActiveMotion) {
         return;
       }
       const payload = measurements as TileMeasurementPayload;
@@ -298,7 +301,7 @@ function TileNodeComponent({ data, selected }: NodeProps<TileNodeData>) {
         sessionTileController.applyHostDimensions(tileId, payload);
       }
     },
-    [isDragging, tileId],
+    [isActiveMotion, tileId],
   );
 
   if (!sessionSummary) {
@@ -338,7 +341,7 @@ function TileNodeComponent({ data, selected }: NodeProps<TileNodeData>) {
           variant="preview"
           cachedStateDiff={effectiveCachedDiff ?? undefined}
           onPreviewMeasurementsChange={handleMeasurements}
-          disableDomMeasurements={!!isDragging}
+          disableDomMeasurements={isActiveMotion}
         />
       </div>
     </div>
@@ -407,6 +410,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
   const [miniMapVisible, setMiniMapVisible] = useState(true);
   const [hoverTarget, setHoverTarget] = useState<DropTarget | null>(null);
   const [activeDragNodeId, setActiveDragNodeId] = useState<string | null>(null);
+  const [settlingNodeId, setSettlingNodeId] = useState<string | null>(null);
   const didLoadRef = useRef(false);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const dragStateRef = useRef<{
@@ -420,6 +424,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
   const persistCallbackRef = useRef<typeof onPersistLayout | undefined>(onPersistLayout);
   const layoutChangeCallbackRef = useRef<typeof onLayoutChange | undefined>(onLayoutChange);
   const lastNonLayoutKeyRef = useRef<string | null>(null);
+  const settlingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const viewerOverrideSignature = useMemo(() => {
     if (!viewerOverrides) {
@@ -613,6 +618,15 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     syncStore(layout);
   }, [layout, syncStore]);
 
+  useEffect(() => {
+    return () => {
+      if (settlingTimerRef.current) {
+        clearTimeout(settlingTimerRef.current);
+        settlingTimerRef.current = null;
+      }
+    };
+  }, []);
+
   const updateLayout = useCallback(
     (
       reason: string,
@@ -644,6 +658,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
       const nodeId = encodeNodeId('tile', tile.id);
       const session = sessionMap.get(tile.id) ?? null;
       const isActiveDrag = activeDragNodeId === nodeId;
+      const isSettling = settlingNodeId === nodeId;
       nodes.push({
         id: nodeId,
         type: 'tile',
@@ -655,6 +670,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
           onSelect,
           isDropTarget: hoverTarget?.type === 'tile' && hoverTarget.id === tile.id,
           isDragging: isActiveDrag,
+          isSettling,
           managerUrl,
           viewerToken,
           credentialOverride: viewerOverrides?.[tile.id] ?? null,
@@ -731,7 +747,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     }
 
     return nodes;
-  }, [activeDragNodeId, agentMap, cachedTerminalDiffs, hoverTarget, layout.agents, layout.groups, layout.tiles, managerUrl, onRemove, onSelect, privateBeachId, selectionSet, sessionMap, viewerOverrides, effectiveViewerStateOverrides, viewerToken]);
+  }, [activeDragNodeId, agentMap, cachedTerminalDiffs, hoverTarget, layout.agents, layout.groups, layout.tiles, managerUrl, onRemove, onSelect, privateBeachId, selectionSet, sessionMap, viewerOverrides, effectiveViewerStateOverrides, viewerToken, settlingNodeId]);
 
   const edges = useMemo<RFEdge[]>(() => [], []);
 
@@ -753,6 +769,11 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     (_event: React.MouseEvent, node: RFNode) => {
       if (node && typeof node.id === 'string') {
         setActiveDragNodeId(node.id);
+        setSettlingNodeId(null);
+        if (settlingTimerRef.current) {
+          clearTimeout(settlingTimerRef.current);
+          settlingTimerRef.current = null;
+        }
       }
     },
     [],
@@ -936,6 +957,14 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
         if (pending && snapshot) {
           processPendingAssignment(pending, snapshot);
         }
+        setSettlingNodeId(node.id);
+        if (settlingTimerRef.current) {
+          clearTimeout(settlingTimerRef.current);
+        }
+        settlingTimerRef.current = setTimeout(() => {
+          setSettlingNodeId((current) => (current === node.id ? null : current));
+          settlingTimerRef.current = null;
+        }, 200);
       } else if (parsed.kind === 'agent') {
         updateLayout('drag-stop-agent', (current) => {
           const agent = current.agents[parsed.id];
@@ -1027,7 +1056,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
         dragStateRef.current = null;
       }
     },
-    [adapter, layout, onCreateGroup, onDropNode, processPendingAssignment, privateBeachId, updateLayout],
+    [adapter, layout, onCreateGroup, onDropNode, processPendingAssignment, privateBeachId, setSettlingNodeId, updateLayout],
   );
 
   const handleMoveEnd = useCallback(() => {

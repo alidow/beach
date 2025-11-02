@@ -309,18 +309,7 @@ impl ManagerViewerState {
                     attrs: *attrs,
                 };
                 let style_id = StyleId(*id);
-                if !self.grid.style_table.set(style_id, style) {
-                    let (assigned, is_new) = self.grid.style_table.ensure_id_with_new(style);
-                    if assigned != style_id {
-                        debug!(
-                            target = "private_beach",
-                            expected = style_id.0,
-                            assigned = assigned.0,
-                            is_new,
-                            "manager viewer style id mismatch while inserting style"
-                        );
-                    }
-                }
+                self.grid.style_table.insert_at(style_id, style);
                 debug!(
                     target = "private_beach",
                     style_id = *id,

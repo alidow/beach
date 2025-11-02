@@ -181,6 +181,25 @@ impl StyleTable {
     pub fn len(&self) -> usize {
         self.inner.read().unwrap().vec.len()
     }
+
+    /// Inserts or replaces the style at the provided id, expanding the table if needed.
+    pub fn insert_at(&self, id: StyleId, style: Style) {
+        let mut inner = self.inner.write().unwrap();
+        let idx = id.idx();
+        if idx >= inner.vec.len() {
+            inner.vec.resize(idx + 1, Style::default());
+        }
+        if let Some(old_style) = inner.vec.get(idx).copied() {
+            inner.map.remove(&old_style);
+        }
+        if let Some(previous_id) = inner.map.get(&style).copied() {
+            if previous_id.idx() != idx && previous_id.idx() < inner.vec.len() {
+                inner.vec[previous_id.idx()] = Style::default();
+            }
+        }
+        inner.vec[idx] = style;
+        inner.map.insert(style, id);
+    }
 }
 
 impl Default for StyleTable {

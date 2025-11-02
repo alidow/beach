@@ -1954,9 +1954,10 @@ mod tests {
                     base_row,
                     viewport_rows,
                 } => {
-                    assert!(
-                        viewport_rows.is_none(),
-                        "handshake should not advertise viewport rows"
+                    assert_eq!(
+                        viewport_rows,
+                        Some(rows as u32),
+                        "handshake should advertise viewport rows"
                     );
                     assert_eq!(grid_cols as usize, cols);
                     assert!(
@@ -2412,7 +2413,11 @@ mod tests {
         }
 
         let (rows, cols, total, base_row) = advertised.expect("grid frame missing from handshake");
-        assert!(rows.is_none(), "handshake should not include viewport rows");
+        assert_eq!(
+            rows,
+            Some(viewport_rows as u32),
+            "handshake should advertise viewport rows"
+        );
         assert_eq!(cols as usize, viewport_cols, "handshake cols mismatch");
         assert_eq!(total as usize, total_rows, "handshake history mismatch");
         assert_eq!(base_row, grid.row_offset(), "handshake base row mismatch");

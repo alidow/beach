@@ -741,9 +741,6 @@ function SessionTerminalPreviewView({
   const shouldSkipDomMeasurements = disableDomMeasurements || hasRemoteHostDimensions;
 
   const previewMeasurements = useMemo<PreviewMeasurements | null>(() => {
-    if (shouldSkipDomMeasurements) {
-      return measurementsRef.current;
-    }
     void domRawVersion;
     if (
       resolvedHostCols == null ||
@@ -755,16 +752,18 @@ function SessionTerminalPreviewView({
     }
     let rawWidth = hostPixelSize.width;
     let rawHeight = hostPixelSize.height;
-    const domRaw = domRawSizeRef.current;
-    if (
-      domRaw &&
-      Number.isFinite(domRaw.width) &&
-      Number.isFinite(domRaw.height) &&
-      domRaw.width > 0 &&
-      domRaw.height > 0
-    ) {
-      rawWidth = domRaw.width;
-      rawHeight = domRaw.height;
+    if (!shouldSkipDomMeasurements) {
+      const domRaw = domRawSizeRef.current;
+      if (
+        domRaw &&
+        Number.isFinite(domRaw.width) &&
+        Number.isFinite(domRaw.height) &&
+        domRaw.width > 0 &&
+        domRaw.height > 0
+      ) {
+        rawWidth = domRaw.width;
+        rawHeight = domRaw.height;
+      }
     }
     if (!Number.isFinite(rawWidth) || rawWidth <= 0 || !Number.isFinite(rawHeight) || rawHeight <= 0) {
       return null;

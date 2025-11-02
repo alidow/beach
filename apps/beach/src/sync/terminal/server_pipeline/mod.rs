@@ -1425,7 +1425,7 @@ pub(crate) fn initialize_transport_snapshot(
             cols: cols as u32,
             history_rows: history_rows as u32,
             base_row: terminal_sync.grid().row_offset(),
-            viewport_rows: None,
+            viewport_rows: Some(viewport_rows as u32),
         },
     )?;
     transmit_initial_snapshots(transport, &mut synchronizer, cache, subscription)?;

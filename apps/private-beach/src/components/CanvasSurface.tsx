@@ -287,7 +287,7 @@ function TileNodeComponent({ data, selected }: NodeProps<TileNodeData>) {
 
   const handleMeasurements = useCallback(
     (_sessionId: string, measurements: unknown) => {
-      if (!measurements) {
+      if (!measurements || isDragging) {
         return;
       }
       const payload = measurements as TileMeasurementPayload;
@@ -299,7 +299,7 @@ function TileNodeComponent({ data, selected }: NodeProps<TileNodeData>) {
         sessionTileController.applyHostDimensions(tileId, payload);
       }
     },
-    [tileId],
+    [isDragging, tileId],
   );
 
   if (!sessionSummary) {
@@ -339,6 +339,7 @@ function TileNodeComponent({ data, selected }: NodeProps<TileNodeData>) {
           variant="preview"
           cachedStateDiff={effectiveCachedDiff ?? undefined}
           onPreviewMeasurementsChange={handleMeasurements}
+          disableDomMeasurements={!!isDragging}
         />
       </div>
     </div>

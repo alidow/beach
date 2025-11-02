@@ -97,6 +97,7 @@ type Props = {
   credentialOverride?: SessionCredentialOverride | null;
   viewer: TerminalViewerState;
   cachedStateDiff?: TerminalStateDiff | undefined;
+  disableDomMeasurements?: boolean;
 };
 
 type ViewProps = Omit<Props, 'token'> & {
@@ -124,6 +125,7 @@ function SessionTerminalPreviewView({
   trimmedToken,
   isCabana,
   cachedStateDiff,
+  disableDomMeasurements = false,
 }: ViewProps) {
   const [viewportState, setViewportState] = useState<TerminalViewportState | null>(null);
   const cachedEntry = hostDimensionCache.get(sessionId) ?? null;
@@ -729,7 +731,15 @@ function SessionTerminalPreviewView({
     return estimateHostPixelSize(fallbackHostCols, fallbackHostRows, effectiveFontSize);
   }, [fallbackHostCols, fallbackHostRows, effectiveFontSize]);
 
+  const shouldSkipDomMeasurements =
+    disableDomMeasurements ||
+    hostRowSourceRef.current === 'host' ||
+    hostColSourceRef.current === 'host';
+
   const previewMeasurements = useMemo<PreviewMeasurements | null>(() => {
+    if (shouldSkipDomMeasurements) {
+      return measurementsRef.current;
+    }
     void domRawVersion;
     if (
       resolvedHostCols == null ||
@@ -773,7 +783,7 @@ function SessionTerminalPreviewView({
       hostCols: resolvedHostCols,
       measurementVersion: measurementVersionRef.current,
     };
-  }, [domRawVersion, hostPixelSize.height, hostPixelSize.width, resolvedHostCols, resolvedHostRows]);
+  }, [domRawVersion, hostPixelSize.height, hostPixelSize.width, resolvedHostCols, resolvedHostRows, shouldSkipDomMeasurements]);
 
   const effectiveScale = previewMeasurements?.scale ?? 1;
 
@@ -865,7 +875,7 @@ function SessionTerminalPreviewView({
   useEffect(() => {
     if (typeof window === 'undefined') return;
     try {
-      console.info('[terminal][diag] scale-state', {
+      const payload = {
         sessionId,
         incomingScale: scale,
         zoomMultiplier,
@@ -880,7 +890,8 @@ function SessionTerminalPreviewView({
         fallbackHostCols,
         fallbackHostRows,
         fontSize: effectiveFontSize,
-      });
+      };
+      console.info('[terminal][diag] scale-state', payload, JSON.stringify(payload));
     } catch {
       // ignore logging issues
     }
@@ -909,7 +920,7 @@ function SessionTerminalPreviewView({
       const rect = node.getBoundingClientRect();
       const child =
         cloneInnerRef.current instanceof HTMLElement ? cloneInnerRef.current.getBoundingClientRect() : null;
-      console.info('[terminal][trace] dom-dimensions', {
+      const domPayload = {
         sessionId,
         effectiveScale,
         targetWidth: previewMeasurements.targetWidth,
@@ -918,7 +929,8 @@ function SessionTerminalPreviewView({
         wrapperHeight: Math.round(rect.height),
         childWidth: child ? Math.round(child.width) : null,
         childHeight: child ? Math.round(child.height) : null,
-      });
+      };
+      console.info('[terminal][trace] dom-dimensions', domPayload, JSON.stringify(domPayload));
       const measuredWidth = child ? child.width : rect.width;
       const measuredHeight = child ? child.height : rect.height;
       if (Number.isFinite(measuredWidth) && Number.isFinite(measuredHeight)) {
@@ -996,7 +1008,7 @@ function SessionTerminalPreviewView({
       return;
     }
     try {
-      console.info('[terminal] zoom-wrapper', {
+      const payload = {
         version: 'v2',
         sessionId,
         zoomMultiplier,
@@ -1008,7 +1020,8 @@ function SessionTerminalPreviewView({
         rawHeight: previewMeasurements.rawHeight,
         targetWidth: previewMeasurements.targetWidth,
         targetHeight: previewMeasurements.targetHeight,
-      });
+      };
+      console.info('[terminal] zoom-wrapper', payload, JSON.stringify(payload));
     } catch {
       // ignore logging issues
     }

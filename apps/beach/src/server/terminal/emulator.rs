@@ -19,7 +19,7 @@ use alacritty_terminal::{
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::convert::TryFrom;
-use tracing::{Level, trace};
+use tracing::{Level, debug, trace};
 
 pub type EmulatorResult = Vec<CacheUpdate>;
 
@@ -526,6 +526,20 @@ impl AlacrittyEmulator {
         let heavy = convert_cell(cell);
         let style = style_from_heavy(&heavy);
         let (style_id, is_new) = style_table.ensure_id_with_new(style);
+        if is_new {
+            let styles_registered = style_table.entries().len();
+            debug!(
+                target = "server::emulator",
+                absolute_row = point.line.0,
+                column = point.column.0,
+                style_id = style_id.0,
+                styles_registered,
+                fg = style.fg,
+                bg = style.bg,
+                attrs = style.attrs,
+                "registered new style id"
+            );
+        }
         let packed = pack_cell(heavy.char, style_id);
         (packed, style_id, style, is_new)
     }

@@ -8,6 +8,7 @@ import type { CanvasLayout as SharedCanvasLayout, CanvasTileNode } from '../canv
 import type { SessionCredentialOverride, TerminalViewerState } from '../hooks/terminalViewerTypes';
 import type { TerminalStateDiff } from '../lib/terminalHydrator';
 import { emitTelemetry } from '../lib/telemetry';
+import { isPrivateBeachDebugEnabled } from '../lib/debug';
 import { viewerConnectionService } from './viewerConnectionService';
 import {
   applyGridMetadataToLayout,
@@ -780,6 +781,30 @@ class SessionTileController {
         measurementVersion: payload.measurementVersion,
         measurementSource: source,
       });
+      if (isPrivateBeachDebugEnabled()) {
+        try {
+          const debugPayload = {
+            tileId,
+            source,
+            width,
+            height,
+            rawWidth: payload.rawWidth,
+            rawHeight: payload.rawHeight,
+            targetWidth: payload.targetWidth ?? null,
+            targetHeight: payload.targetHeight ?? null,
+            scale: payload.scale,
+            hostRows: payload.hostRows,
+            hostCols: payload.hostCols,
+            measurementVersion: payload.measurementVersion,
+            existingWidth,
+            existingHeight,
+            existingSource,
+          };
+          console.debug('[tile-controller][measurement.apply]', JSON.stringify(debugPayload));
+        } catch {
+          // ignore debug logging failures
+        }
+      }
 
       layout = {
         ...layout,

@@ -594,6 +594,26 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       viewOnly,
     };
     const previous = lastViewportReportRef.current;
+    trace(
+      'viewport state candidate',
+      JSON.stringify({
+        viewportRows,
+        viewportCols,
+        hostViewportRows,
+        hostCols,
+        canSendResize,
+        viewOnly,
+        suppressed: Boolean(
+          previous &&
+            previous.viewportRows === nextReport.viewportRows &&
+            previous.viewportCols === nextReport.viewportCols &&
+            previous.hostViewportRows === nextReport.hostViewportRows &&
+            previous.hostCols === nextReport.hostCols &&
+            previous.canSendResize === nextReport.canSendResize &&
+            previous.viewOnly === nextReport.viewOnly,
+        ),
+      }),
+    );
     if (
       previous &&
       previous.viewportRows === nextReport.viewportRows &&
@@ -1910,10 +1930,23 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       case 'hello':
         trace('frame hello', frame);
         if (ptyViewportRowsRef.current !== null) {
+          trace(
+            'pty viewport reset on hello',
+            JSON.stringify({
+              previousRows: ptyViewportRowsRef.current,
+              previousCols: ptyColsRef.current,
+            }),
+          );
           ptyViewportRowsRef.current = null;
           setPtyViewportRows((prev) => (prev === null ? prev : null));
         }
         if (ptyColsRef.current !== null) {
+          trace(
+            'pty columns reset on hello',
+            JSON.stringify({
+              previousCols: ptyColsRef.current,
+            }),
+          );
           ptyColsRef.current = null;
           setPtyCols((prev) => (prev === null ? prev : null));
         }
@@ -1942,6 +1975,16 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       case 'grid':
         trace('frame grid', frame);
         {
+          trace(
+            'grid host metadata',
+            JSON.stringify({
+              frameViewportRows: frame.viewportRows ?? null,
+              frameHistoryRows: frame.historyRows,
+              frameCols: frame.cols,
+              previousPtyRows: ptyViewportRowsRef.current,
+              previousPtyCols: ptyColsRef.current,
+            }),
+          );
           const nextCols = Math.max(1, frame.cols);
           ptyColsRef.current = nextCols;
           setPtyCols((prev) => (prev === nextCols ? prev : nextCols));
@@ -1952,8 +1995,25 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
             : frame.historyRows;
         if (rawViewportRows > 0) {
           const clampedRows = Math.max(1, Math.min(rawViewportRows, MAX_VIEWPORT_ROWS));
+          trace(
+            'grid host viewport applied',
+            JSON.stringify({
+              rawViewportRows,
+              clampedRows,
+              previousPtyRows: ptyViewportRowsRef.current,
+            }),
+          );
           ptyViewportRowsRef.current = clampedRows;
           setPtyViewportRows((prev) => (prev === clampedRows ? prev : clampedRows));
+        } else {
+          trace(
+            'grid host viewport missing',
+            JSON.stringify({
+              rawViewportRows,
+              frameViewportRows: frame.viewportRows ?? null,
+              frameHistoryRows: frame.historyRows,
+            }),
+          );
         }
         store.setBaseRow(frame.baseRow);
         store.setGridSize(frame.historyRows, frame.cols);

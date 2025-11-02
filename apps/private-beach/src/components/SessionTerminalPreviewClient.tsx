@@ -10,6 +10,7 @@ import {
   type TerminalStateDiff,
 } from '../lib/terminalHydrator';
 import { computeDimensionUpdate, type HostDimensionSource } from './terminalHostDimensions';
+import { isPrivateBeachDebugEnabled } from '../lib/debug';
 
 const DEFAULT_HOST_COLS = 80;
 const DEFAULT_HOST_ROWS = 24;
@@ -242,6 +243,24 @@ function SessionTerminalPreviewView({
 
   const handleViewportStateChange = useCallback(
     (state: TerminalViewportState) => {
+      if (isPrivateBeachDebugEnabled()) {
+        try {
+          console.debug(
+            '[terminal][trace] viewport-state-raw',
+            JSON.stringify({
+              sessionId,
+              viewportRows: state.viewportRows,
+              viewportCols: state.viewportCols,
+              hostViewportRows: state.hostViewportRows,
+              hostCols: state.hostCols,
+              viewOnly: state.viewOnly,
+              canSendResize: state.canSendResize,
+            }),
+          );
+        } catch {
+          // ignore logging issues
+        }
+      }
       if (typeof window !== 'undefined') {
         console.info('[terminal] viewport-state', {
           version: 'v2',
@@ -340,7 +359,7 @@ function SessionTerminalPreviewView({
       measurementVersionRef.current = (measurementVersionRef.current % 1_000_000) + 1;
       if (typeof window !== 'undefined') {
         try {
-          console.info('[terminal][trace] host-dimension-update', {
+          const payload = {
             sessionId,
             prevRows: current.rows,
             nextRows: nextRowResult.value,
@@ -353,7 +372,8 @@ function SessionTerminalPreviewView({
             rowSource: nextRowResult.source,
             colSource: nextColResult.source,
             measurementVersion: measurementVersionRef.current,
-          });
+          };
+          console.info('[terminal][trace] host-dimension-update', payload, JSON.stringify(payload));
         } catch {
           // ignore logging failures
         }
@@ -428,7 +448,7 @@ function SessionTerminalPreviewView({
         measurementVersionRef.current = (measurementVersionRef.current % 1_000_000) + 1;
         if (typeof window !== 'undefined') {
           try {
-            console.info('[terminal][trace] host-dimension-update', {
+            const payload = {
               sessionId,
               prevRows: current.rows,
               nextRows: nextRowResult.value,
@@ -438,7 +458,8 @@ function SessionTerminalPreviewView({
               sourceCols: nextColResult.source,
               reason: 'store-snapshot',
               measurementVersion: measurementVersionRef.current,
-            });
+            };
+            console.info('[terminal][trace] host-dimension-update', payload, JSON.stringify(payload));
           } catch {
             // ignore logging failures
           }
@@ -455,13 +476,14 @@ function SessionTerminalPreviewView({
   useEffect(() => {
     if (typeof window === 'undefined') return;
     try {
-      console.info('[terminal][diag] host-dimensions', {
+      const payload = {
         sessionId,
         rows: hostDimensions.rows,
         cols: hostDimensions.cols,
         viewportRows: viewportState?.viewportRows ?? null,
         viewportCols: viewportState?.viewportCols ?? null,
-      });
+      };
+      console.info('[terminal][diag] host-dimensions', payload, JSON.stringify(payload));
     } catch {
       // ignore logging issues
     }
@@ -771,10 +793,11 @@ function SessionTerminalPreviewView({
     measurementsRef.current = next ?? null;
     if (typeof window !== 'undefined') {
       try {
-        console.info('[terminal][trace] preview-measurements', {
+        const payload = {
           sessionId,
           measurement: next,
-        });
+        };
+        console.info('[terminal][trace] preview-measurements', payload, JSON.stringify(payload));
       } catch {
         // ignore logging errors
       }

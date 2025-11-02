@@ -2,6 +2,7 @@
 
 import { useSyncExternalStore } from 'react';
 import { fetchSessionStateSnapshot, type SessionSummary, type BeachLayoutItem } from '../lib/api';
+import { normalizeOverride } from '../hooks/sessionTerminalManager';
 import type { CanvasLayout as ApiCanvasLayout } from '../lib/api';
 import type { CanvasLayout as SharedCanvasLayout, CanvasTileNode } from '../canvas';
 import type { SessionCredentialOverride, TerminalViewerState } from '../hooks/terminalViewerTypes';
@@ -203,6 +204,7 @@ class SessionTileController {
   private managerToken: string | null = null;
   private viewerToken: string | null = null;
   private connectionHandles = new Map<string, () => void>();
+  private connectionStates = new Map<string, { key: string | null; ready: boolean; reason: string | null }>();
   private layoutChangeCallback: ((layout: ApiCanvasLayout) => void) | null = null;
 
   hydrate(input: HydrateInput) {
@@ -620,6 +622,7 @@ class SessionTileController {
         handle();
         this.connectionHandles.delete(removedId);
       }
+      this.connectionStates.delete(removedId);
       this.tileSnapshots.delete(removedId);
       this.measurementSignatures.delete(removedId);
       viewerConnectionService.disconnectTile(removedId);
@@ -835,16 +838,29 @@ class SessionTileController {
           handle();
           this.connectionHandles.delete(tileId);
         }
+        this.connectionStates.delete(tileId);
         viewerConnectionService.disconnectTile(tileId);
         continue;
       }
       const session = snapshot.session ?? this.sessions.get(tileId) ?? null;
       if (!session) {
         viewerConnectionService.disconnectTile(tileId);
+        this.connectionStates.delete(tileId);
         continue;
       }
       if (!this.managerUrl || this.managerUrl.length === 0) {
         viewerConnectionService.disconnectTile(tileId);
+        this.connectionStates.delete(tileId);
+        continue;
+      }
+      const connectionState = this.prepareConnectionState(tileId, session.session_id, session.private_beach_id ?? this.privateBeachId);
+      const previousState = this.connectionStates.get(tileId);
+      if (
+        previousState &&
+        previousState.key === connectionState.key &&
+        previousState.ready === connectionState.ready &&
+        previousState.reason === connectionState.reason
+      ) {
         continue;
       }
       const authToken = this.viewerToken ?? this.managerToken;
@@ -861,7 +877,51 @@ class SessionTileController {
         (state) => this.handleViewerSnapshot(tileId, state),
       );
       this.connectionHandles.set(tileId, handle);
+      this.connectionStates.set(tileId, connectionState);
     }
+  }
+
+  private prepareConnectionState(
+    tileId: string,
+    sessionId: string | null | undefined,
+    fallbackPrivateBeachId: string | null | undefined,
+  ): { key: string | null; ready: boolean; reason: string | null } {
+    const normalizedSessionId = sessionId?.trim() ?? '';
+    const managerUrl = this.managerUrl?.trim() ?? '';
+    if (normalizedSessionId.length === 0 || managerUrl.length === 0) {
+      return { key: null, ready: false, reason: 'no-session-or-url' };
+    }
+    const overrideRaw = this.viewerOverrides.get(tileId) ?? undefined;
+    const override = normalizeOverride(overrideRaw ?? undefined);
+    const viewerToken = this.viewerToken?.trim() ?? '';
+    const managerToken = this.managerToken?.trim() ?? '';
+    const baseAuthToken = viewerToken.length > 0 ? viewerToken : managerToken;
+    const effectiveAuthToken =
+      override.authorizationToken && override.authorizationToken.length > 0
+        ? override.authorizationToken
+        : baseAuthToken;
+    const hasOverrideCredentials = Boolean(override.passcode) || Boolean(override.viewerToken);
+    const needsCredentialFetch = !override.skipCredentialFetch && !hasOverrideCredentials;
+    if (needsCredentialFetch) {
+      const privateBeachId = fallbackPrivateBeachId?.trim() ?? '';
+      const hasPrivateBeach = privateBeachId.length > 0;
+      const hasAuthToken = effectiveAuthToken.length > 0;
+      if (!hasPrivateBeach || !hasAuthToken) {
+        return { key: null, ready: false, reason: 'missing-credentials' };
+      }
+    } else if (!hasOverrideCredentials) {
+      return { key: null, ready: false, reason: 'missing-override-credentials' };
+    }
+    const key = JSON.stringify({
+      sessionId: normalizedSessionId,
+      privateBeachId: fallbackPrivateBeachId ?? null,
+      managerUrl,
+      authToken: effectiveAuthToken,
+      passcode: override.passcode,
+      viewerToken: override.viewerToken,
+      skipCredentialFetch: override.skipCredentialFetch,
+    });
+    return { key, ready: true, reason: null };
   }
 
   private scheduleSnapshotFetch(tileId: string, sessionId: string) {

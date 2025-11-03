@@ -2189,6 +2189,23 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
             }),
           );
         }
+        if (
+          typeof window !== 'undefined' &&
+          frame.historyRows !== rawViewportRows &&
+          frame.historyRows > 0
+        ) {
+          try {
+            console.info('[terminal][diag] history-rows-mismatch', {
+              sessionId,
+              frameViewportRows: frame.viewportRows ?? null,
+              rawViewportRows,
+              historyRows: frame.historyRows,
+              cols: frame.cols,
+            });
+          } catch {
+            // ignore logging issues
+          }
+        }
         store.setBaseRow(frame.baseRow);
         store.setGridSize(frame.historyRows, frame.cols);
         store.setFollowTail(false);

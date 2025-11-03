@@ -349,13 +349,30 @@ function SessionTerminalPreviewView({
     const storeSnapshot = viewer.store?.getSnapshot();
     const storeRows = storeSnapshot?.rows ? storeSnapshot.rows.length : null;
     const storeCols = storeSnapshot?.cols ?? null;
-    const fallbackRowsCandidate = (() => {
-      const measured = measuredViewportRows ?? null;
-      const storeValue = storeRows != null && storeRows > 0 ? storeRows : null;
-      if (measured == null) return storeValue;
-      if (storeValue == null) return measured;
-      return Math.max(measured, storeValue);
-    })();
+    const measuredRowsValue = measuredViewportRows ?? null;
+    const storeRowsValue = storeRows != null && storeRows > 0 ? storeRows : null;
+    const fallbackRowsCandidate = cloneViewOnly
+      ? measuredRowsValue
+      : measuredRowsValue != null && storeRowsValue != null
+        ? Math.max(measuredRowsValue, storeRowsValue)
+        : measuredRowsValue ?? storeRowsValue;
+    if (
+      cloneViewOnly &&
+      typeof window !== 'undefined' &&
+      storeRowsValue != null &&
+      fallbackRowsCandidate !== storeRowsValue
+    ) {
+      try {
+        console.info('[terminal][diag] view-only-fallback-rows', {
+          sessionId,
+          measured: measuredRowsValue,
+          storeRows: storeRowsValue,
+          appliedFallback: fallbackRowsCandidate,
+        });
+      } catch {
+        // ignore logging issues
+      }
+    }
     const fallbackColsCandidate = (() => {
       const measured = measuredViewportCols ?? null;
       const storeValue = storeCols != null && storeCols > 0 ? storeCols : null;
@@ -438,6 +455,7 @@ function SessionTerminalPreviewView({
     hostViewportRows,
     measuredViewportCols,
     measuredViewportRows,
+    cloneViewOnly,
   ]);
 
   useEffect(() => {
@@ -453,15 +471,32 @@ function SessionTerminalPreviewView({
         lastRow && typeof (lastRow as { absolute?: number }).absolute === 'number'
           ? (lastRow as { absolute: number }).absolute - snapshot.baseRow + 1
           : null;
-      const estimatedRows = Math.max(
-        totalRowsFromArray ?? 0,
-        totalRowsFromAbsolute ?? 0,
-        snapshot.viewportHeight > 0 ? snapshot.viewportHeight : 0,
-      );
+      const baseViewportHeight = snapshot.viewportHeight > 0 ? snapshot.viewportHeight : 0;
+      const estimatedRows = cloneViewOnly
+        ? baseViewportHeight
+        : Math.max(totalRowsFromArray ?? 0, totalRowsFromAbsolute ?? 0, baseViewportHeight);
       const estimatedCols = snapshot.cols > 0 ? snapshot.cols : null;
       const hostViewportRowsFromSnapshot =
         snapshot.viewportHeight && snapshot.viewportHeight > 1 ? snapshot.viewportHeight : null;
       const hostViewportColsFromSnapshot = snapshot.cols && snapshot.cols > 1 ? snapshot.cols : null;
+
+      if (typeof window !== 'undefined') {
+        try {
+          const payload = {
+            sessionId,
+            cloneViewOnly,
+            rowsFromArray: totalRowsFromArray,
+            rowsFromAbsolute: totalRowsFromAbsolute,
+            viewportHeight: snapshot.viewportHeight,
+            estimatedRows,
+            hostViewportRowsFromSnapshot,
+            cols: estimatedCols,
+          };
+          console.info('[terminal][diag] store-dimension-candidates', payload, JSON.stringify(payload));
+        } catch {
+          // ignore logging issues
+        }
+      }
 
       if (estimatedRows <= 0 && (estimatedCols == null || estimatedCols <= 0)) {
         return;
@@ -471,7 +506,7 @@ function SessionTerminalPreviewView({
         const nextRowResult = computeDimensionUpdate(
           current.rows,
           hostViewportRowsFromSnapshot,
-          estimatedRows > 0 ? estimatedRows : null,
+          cloneViewOnly ? null : estimatedRows > 0 ? estimatedRows : null,
           hostRowSourceRef.current,
         );
         const nextColResult = computeDimensionUpdate(
@@ -524,7 +559,7 @@ function SessionTerminalPreviewView({
     updateFromStore();
     const unsubscribe = store.subscribe(updateFromStore);
     return unsubscribe;
-  }, [sessionId, viewer.store]);
+  }, [cloneViewOnly, sessionId, viewer.store]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;

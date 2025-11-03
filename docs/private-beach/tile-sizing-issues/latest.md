@@ -942,3 +942,26 @@ SessionTerminalPreviewClient.tsx
 interesting as you were making your fixes and nextjs was hot reloading i was watching the existing tile we had. it got resized many times but something also caused the host pty to get resized (which should never happen unless extremely explicit by user that they "lock" the tile). the host pty got resized to exactly 24 rows! could you take a look at temp/private-beach.log to see what caused it to be resized? you can also look at host trace log /tmp/beach-host.log
 
 
+
+Latest findings – 2025-11-03 afternoon
+
+- Host still advertises ~62×106 (see /tmp/beach-host.log:6964937), but the preview keeps promoting `historyRows` (106) to the PTY height. Right before the tile goes skinny we log `host-dimensions {rows: 106, cols: 106}` and `scale-state … effectiveScale ≈ 0.39` in temp/private-beach-2.log:845-848.
+- The culprit is the `updateFromStore` path in apps/private-beach/src/components/SessionTerminalPreviewClient.tsx. When the hidden driver collapses to a 1-row measurement (temp/private-beach-2.log:883-884), `snapshot.viewportHeight` drops below our >1 guard, so the fallback switches to `snapshot.rows.length === historyRows === 106`. That fallback is then cached as the PTY size, so every subsequent clamp thinks the terminal is 106 rows tall.
+- Grid rendering confirms it: buildLines keeps emitting `viewportHeight: 106` (temp/private-beach-2.log:1225 et al.), so the clone renders a tall empty tail even though the DOM has the Pong board.
+- The unwanted host shrink to 24 rows comes from the same window. When the fallback rows dip to the default we emit `disable-measurements viewport-set … appliedRows: 24` (temp/private-beach-2.log:883-884); the host interprets that as a resize request.
+
+Fixes applied
+
+- View-only clones now ignore history rows when deriving fallbacks. In SessionTerminalPreviewClient.tsx we:
+  - Skip the store-array fallback when cloneViewOnly is true, so a momentary 1-row measurement no longer escalates to 106. The store-dimension update now passes `null` in that mode and logs the candidates via `[terminal][diag] store-dimension-candidates`.
+  - Add `[terminal][diag] view-only-fallback-rows` diagnostics so we can see when the history count was deliberately ignored.
+- On the host we added `[terminal][diag] history-rows-mismatch` in apps/beach-surfer/src/components/BeachTerminal.tsx. This fires whenever `historyRows` differs from the viewport we’re propagating, making it obvious if the server ever omits viewportRows.
+
+Plan to finish the sizing work
+
+1. Reload a dashboard and confirm the new diagnostics: `store-dimension-candidates` should show `estimatedRows` tracking the measured viewport (≈24 → 62), and `view-only-fallback-rows` should prove we no longer adopt 106 from history.
+2. Watch for `history-rows-mismatch`; if it spams, cache the server-reported `viewportRows` so we never regress to history before the viewer mounts.
+3. If cropping persists, instrument the DOM observer to dump child height whenever `viewportHeight === 1` so we can prove whether the wrapper is still collapsing.
+4. After the preview stabilises around the 60–64 row window, rerun the host resize test and make sure we never emit `disable-measurements viewport-set … appliedRows: 24` again.
+
+Evidence quick links: /tmp/beach-host.log:6964937-6964954, temp/private-beach-2.log:845-897, 1210-1217, 1225, 883-884.

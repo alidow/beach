@@ -455,6 +455,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const ptyViewportRowsRef = useRef<number | null>(null);
   const [ptyCols, setPtyCols] = useState<number | null>(null);
   const ptyColsRef = useRef<number | null>(null);
+  // Debounce DOM-driven viewport measurements to avoid transient oscillation
+  // from StrictMode remounts and layout thrash from rewriting the PTY size.
+  const domPendingViewportRowsRef = useRef<number | null>(null);
+  const domPendingTimestampRef = useRef<number | null>(null);
+  const DOM_VIEWPORT_DEBOUNCE_MS = 120;
+  const DOM_VIEWPORT_TOLERANCE = 1; // rows
   const effectiveOverlay = useMemo(() => {
     if (predictionOverlay.visible || !snapshot.hasPredictions) {
       return predictionOverlay;
@@ -1267,12 +1273,20 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         }
         return 24;
       })();
-      const fallbackRows = Math.max(1, Math.min(desiredRows, MAX_VIEWPORT_ROWS));
+      let viewportRows = Math.max(1, Math.min(desiredRows, MAX_VIEWPORT_ROWS));
+      const previousViewportRows = lastMeasuredViewportRows.current;
+      if (
+        previousViewportRows != null &&
+        previousViewportRows >= MIN_STABLE_VIEWPORT_ROWS &&
+        viewportRows < MIN_STABLE_VIEWPORT_ROWS
+      ) {
+        viewportRows = previousViewportRows;
+      }
       const snapshotNow = store.getSnapshot();
       const viewportTop = snapshotNow.viewportTop;
-      store.setViewport(viewportTop, fallbackRows);
-      lastMeasuredViewportRows.current = fallbackRows;
-      lastSentViewportRows.current = fallbackRows;
+      store.setViewport(viewportTop, viewportRows);
+      lastMeasuredViewportRows.current = viewportRows;
+      lastSentViewportRows.current = viewportRows;
       container.style.removeProperty('maxHeight');
       container.style.removeProperty('--beach-terminal-max-height');
       if (typeof window !== 'undefined') {
@@ -1281,7 +1295,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
             sessionId,
             forcedViewportRows,
             desiredRows,
-            appliedRows: fallbackRows,
+            appliedRows: viewportRows,
             viewportTop,
             snapshotViewportHeight: snapshotNow.viewportHeight,
             snapshotFollowTail: snapshotNow.followTail,
@@ -1308,55 +1322,106 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         : MAX_VIEWPORT_ROWS;
       const fallbackRows = Math.max(1, Math.min(windowRows, MAX_VIEWPORT_ROWS));
       const previousViewportRows = lastMeasuredViewportRows.current;
-      let viewportRows = Math.max(1, Math.min(measured, fallbackRows));
+      let candidateRows = Math.max(1, Math.min(measured, fallbackRows));
       if (
         previousViewportRows != null &&
         previousViewportRows >= MIN_STABLE_VIEWPORT_ROWS &&
-        viewportRows <= Math.max(1, Math.floor(MIN_STABLE_VIEWPORT_ROWS / 2))
+        candidateRows <= Math.max(1, Math.floor(MIN_STABLE_VIEWPORT_ROWS / 2))
       ) {
-        viewportRows = previousViewportRows;
+        candidateRows = previousViewportRows;
       }
-      lastMeasuredViewportRows.current = viewportRows;
-      const maxHeightPx = fallbackRows * rowHeight;
-      container.style.maxHeight = `${maxHeightPx}px`;
-      container.style.setProperty('--beach-terminal-max-height', `${maxHeightPx}px`);
-      const current = store.getSnapshot();
-      log('resize', {
-        containerHeight: containerRect.height,
-        viewportHeight,
-        lineHeight,
-        measuredRows: measured,
-        windowRows,
-        viewportRows,
-        lastSent: lastSentViewportRows.current,
-        baseRow: current.baseRow,
-        totalRows: current.rows.length,
-        followTail: current.followTail,
-      });
-      store.setViewport(current.viewportTop, viewportRows);
-      emitViewportState();
-      if (suppressNextResizeRef.current) {
-        suppressNextResizeRef.current = false;
+
+      const commitRows = (rows: number) => {
+        // Tie the container max height to the committed viewport rows, not
+        // the window-derived fallback. This prevents the terminal from being
+        // squeezed into a smaller box than the visible viewport allows.
+        const maxHeightPx = Math.max(1, Math.round(rows * rowHeight));
+        container.style.maxHeight = `${maxHeightPx}px`;
+        container.style.setProperty('--beach-terminal-max-height', `${maxHeightPx}px`);
+        const current = store.getSnapshot();
+        log('resize-commit', {
+          containerHeight: containerRect.height,
+          viewportHeight,
+          lineHeight,
+          measuredRows: measured,
+          windowRows,
+          committedRows: rows,
+          lastSent: lastSentViewportRows.current,
+          baseRow: current.baseRow,
+          totalRows: current.rows.length,
+          followTail: current.followTail,
+        });
+        store.setViewport(current.viewportTop, rows);
+        lastMeasuredViewportRows.current = rows;
+        emitViewportState();
+        if (suppressNextResizeRef.current) {
+          suppressNextResizeRef.current = false;
+          return;
+        }
+        // Only send resize if the viewport size actually changed
+        if (
+          autoResizeHostOnViewportChangeEffective &&
+          subscriptionRef.current !== null &&
+          transportRef.current &&
+          rows !== lastSentViewportRows.current
+        ) {
+          const label = queryLabel ?? null;
+          const peerId = peerIdRef.current;
+          log('auto_host_resize', {
+            targetCols: current.cols,
+            targetRows: rows,
+            clientLabel: label ?? null,
+            peerId: peerId ?? null,
+            viewOnly,
+          });
+          transportRef.current.send({ type: 'resize', cols: current.cols, rows });
+          lastSentViewportRows.current = rows;
+        }
+      };
+
+      const pending = domPendingViewportRowsRef.current;
+      const nowTs = now();
+      // If same as committed, clear any pending and skip
+      if (
+        previousViewportRows != null &&
+        Math.abs(previousViewportRows - candidateRows) <= DOM_VIEWPORT_TOLERANCE
+      ) {
+        domPendingViewportRowsRef.current = null;
+        domPendingTimestampRef.current = null;
         return;
       }
-      // Only send resize if the viewport size actually changed
+      // If same as pending and debounce window elapsed, commit
       if (
-        autoResizeHostOnViewportChangeEffective &&
-        subscriptionRef.current !== null &&
-        transportRef.current &&
-        viewportRows !== lastSentViewportRows.current
+        pending != null &&
+        Math.abs(pending - candidateRows) <= DOM_VIEWPORT_TOLERANCE &&
+        domPendingTimestampRef.current != null &&
+        nowTs - domPendingTimestampRef.current >= DOM_VIEWPORT_DEBOUNCE_MS
       ) {
-        const label = queryLabel ?? null;
-        const peerId = peerIdRef.current;
-        log('auto_host_resize', {
-          targetCols: current.cols,
-          targetRows: viewportRows,
-          clientLabel: label ?? null,
-          peerId: peerId ?? null,
-          viewOnly,
+        domPendingViewportRowsRef.current = null;
+        domPendingTimestampRef.current = null;
+        commitRows(candidateRows);
+        return;
+      }
+      // If differs from pending, update pending and log sample; allow stale pending to commit
+      const pendingAge =
+        domPendingTimestampRef.current != null ? nowTs - domPendingTimestampRef.current : null;
+      if (pending != null && pendingAge != null && pendingAge >= DOM_VIEWPORT_DEBOUNCE_MS * 2) {
+        // Commit stale pending sample to avoid starvation
+        const stale = pending;
+        domPendingViewportRowsRef.current = null;
+        domPendingTimestampRef.current = null;
+        commitRows(stale);
+        return;
+      }
+      if (pending == null || Math.abs(pending - candidateRows) > DOM_VIEWPORT_TOLERANCE) {
+        domPendingViewportRowsRef.current = candidateRows;
+        domPendingTimestampRef.current = nowTs;
+        log('resize-sample', {
+          measuredRows: measured,
+          candidateRows,
+          fallbackRows,
+          previousViewportRows,
         });
-        transportRef.current.send({ type: 'resize', cols: current.cols, rows: viewportRows });
-        lastSentViewportRows.current = viewportRows;
       }
     });
     // Observe the wrapper, not the scroll container
@@ -2172,10 +2237,13 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           ptyColsRef.current = nextCols;
           setPtyCols((prev) => (prev === nextCols ? prev : nextCols));
         }
+        const previousViewportRows = ptyViewportRowsRef.current;
         const rawViewportRows =
           typeof frame.viewportRows === 'number' && frame.viewportRows > 0
             ? frame.viewportRows
-            : null;
+            : previousViewportRows && previousViewportRows > 0
+              ? previousViewportRows
+              : null;
         if (rawViewportRows > 0) {
           const clampedRows = Math.max(1, Math.min(rawViewportRows, MAX_VIEWPORT_ROWS));
           trace(
@@ -2208,6 +2276,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
               sessionId,
               frameViewportRows: frame.viewportRows ?? null,
               appliedViewportRows: rawViewportRows,
+              previousViewportRows,
               historyRows: frame.historyRows,
               cols: frame.cols,
             });

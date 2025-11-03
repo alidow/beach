@@ -25,6 +25,8 @@ const MIN_STABLE_DOM_ROWS = 6;
 const DOM_SAMPLE_ROW_TOLERANCE = 1;
 const DOM_SAMPLE_COL_TOLERANCE = 2;
 const DOM_SAMPLE_MAX_AGE_MS = 150;
+const ENABLE_VISIBLE_PREVIEW_DRIVER =
+  typeof process !== 'undefined' && process.env.NEXT_PUBLIC_PRIVATE_BEACH_VISIBLE_DRIVER === 'true';
 
 type HostDimensionCacheEntry = {
   rows: number | null;
@@ -185,6 +187,7 @@ function SessionTerminalPreviewView({
         sessionId,
         variant,
         isCabana,
+        visibleDriver: ENABLE_VISIBLE_PREVIEW_DRIVER,
       });
     } catch {
       // ignore logging issues
@@ -192,7 +195,10 @@ function SessionTerminalPreviewView({
     return () => {
       if (typeof window === 'undefined') return;
       try {
-        console.info('[terminal][diag] unmount', { sessionId });
+        console.info('[terminal][diag] unmount', {
+          sessionId,
+          visibleDriver: ENABLE_VISIBLE_PREVIEW_DRIVER,
+        });
       } catch {
         // ignore logging issues
       }
@@ -364,34 +370,52 @@ function SessionTerminalPreviewView({
       return;
     }
     const storeSnapshot = viewer.store?.getSnapshot();
-    const storeRows = storeSnapshot?.rows ? storeSnapshot.rows.length : null;
     const storeCols = storeSnapshot?.cols ?? null;
-    const fallbackRowsCandidate = (() => {
-      const measured = measuredViewportRows ?? null;
-      const storeValue = storeRows != null && storeRows > 0 ? storeRows : null;
-      if (measured == null) return storeValue;
-      if (storeValue == null) return measured;
-      return Math.max(measured, storeValue);
-    })();
-    const fallbackColsCandidate = (() => {
-      const measured = measuredViewportCols ?? null;
-      const storeValue = storeCols != null && storeCols > 0 ? storeCols : null;
-      if (measured == null) return storeValue;
-      if (storeValue == null) return measured;
-      return Math.max(measured, storeValue);
-    })();
+    // Rows must remain PTY authoritative; do not fall back to DOM/store.
+    const fallbackRowsCandidate: number | null = null;
+    // Cols can fall back to store cols (host-provided via frames), not DOM.
+    const fallbackColsCandidate: number | null = storeCols != null && storeCols > 0 ? storeCols : null;
 
     setHostDimensions((current) => {
-      const hostViewportRows =
+      const rawHostRows =
         typeof viewportState.hostViewportRows === 'number' && viewportState.hostViewportRows > 0
           ? viewportState.hostViewportRows
           : null;
       const measuredViewportRows = viewportState.viewportRows > 0 ? viewportState.viewportRows : null;
-      const hostViewportCols =
+      const rawHostCols =
         typeof viewportState.hostCols === 'number' && viewportState.hostCols > 0
           ? viewportState.hostCols
           : null;
       const measuredViewportCols = viewportState.viewportCols > 0 ? viewportState.viewportCols : null;
+
+      let hostViewportRows = rawHostRows;
+      let hostViewportCols = rawHostCols;
+      // Heuristic correction: some sessions report swapped rows/cols (e.g. rows=106, cols=62).
+      if (
+        hostViewportRows != null &&
+        hostViewportCols != null &&
+        hostViewportRows > hostViewportCols &&
+        // prefer swap when rows are unusually large and cols unusually small
+        ((hostViewportRows >= 80 && hostViewportCols <= 80) || hostViewportRows / Math.max(1, hostViewportCols) >= 1.5)
+      ) {
+        const correctedRows = hostViewportCols;
+        const correctedCols = hostViewportRows;
+        if (typeof window !== 'undefined') {
+          try {
+            console.warn('[terminal][diag] host-dimensions-swap-corrected', {
+              sessionId,
+              previousRows: hostViewportRows,
+              previousCols: hostViewportCols,
+              correctedRows,
+              correctedCols,
+            });
+          } catch {
+            // ignore logging issues
+          }
+        }
+        hostViewportRows = correctedRows;
+        hostViewportCols = correctedCols;
+      }
 
       const nextRowResult = computeDimensionUpdate(
         current.rows,
@@ -470,14 +494,13 @@ function SessionTerminalPreviewView({
         lastRow && typeof (lastRow as { absolute?: number }).absolute === 'number'
           ? (lastRow as { absolute: number }).absolute - snapshot.baseRow + 1
           : null;
-      const estimatedRows = Math.max(
-        totalRowsFromArray ?? 0,
-        totalRowsFromAbsolute ?? 0,
-        snapshot.viewportHeight > 0 ? snapshot.viewportHeight : 0,
-      );
+      const estimatedRows = Math.max(totalRowsFromArray ?? 0, totalRowsFromAbsolute ?? 0);
       const estimatedCols = snapshot.cols > 0 ? snapshot.cols : null;
-      const hostViewportRowsFromSnapshot =
-        snapshot.viewportHeight && snapshot.viewportHeight > 1 ? snapshot.viewportHeight : null;
+      // Do NOT treat snapshot.viewportHeight as host-provided PTY rows.
+      // The store's viewportHeight reflects the local DOM viewport, which
+      // can oscillate during mount/resizes. Only cols from the store are
+      // authoritative from the host.
+      const hostViewportRowsFromSnapshot = null;
       const hostViewportColsFromSnapshot = snapshot.cols && snapshot.cols > 1 ? snapshot.cols : null;
 
       if (estimatedRows <= 0 && (estimatedCols == null || estimatedCols <= 0)) {
@@ -488,7 +511,7 @@ function SessionTerminalPreviewView({
         const nextRowResult = computeDimensionUpdate(
           current.rows,
           hostViewportRowsFromSnapshot,
-          estimatedRows > 0 ? estimatedRows : null,
+          null,
           hostRowSourceRef.current,
         );
         const nextColResult = computeDimensionUpdate(
@@ -794,19 +817,23 @@ function SessionTerminalPreviewView({
     return normalized.length > 0 ? Math.max(...normalized) : null;
   };
 
-  const resolvedHostRows = cloneViewOnly
-    ? pickMaxPositive(hostDimensions.rows, hostViewportRows, measuredViewportRows, DEFAULT_HOST_ROWS)
-    : hostDimensions.rows && hostDimensions.rows > 0
-      ? hostDimensions.rows
-      : hostViewportRows;
-  const resolvedHostCols = cloneViewOnly
-    ? pickMaxPositive(hostDimensions.cols, hostViewportCols, measuredViewportCols, DEFAULT_HOST_COLS)
-    : hostDimensions.cols && hostDimensions.cols > 0
-      ? hostDimensions.cols
-      : hostViewportCols;
+  // Keep PTY rows/cols from the host authoritative. DOM measurements should
+  // never inflate them. Only fall back to DOM/defaults if the host values are
+  // unavailable.
+  const authoritativeHostRows = hostDimensions.rows ?? hostViewportRows ?? null;
+  const authoritativeHostCols = hostDimensions.cols ?? hostViewportCols ?? null;
 
-  const fallbackHostRows = resolvedHostRows ?? pickMaxPositive(measuredViewportRows, DEFAULT_HOST_ROWS) ?? DEFAULT_HOST_ROWS;
-  const fallbackHostCols = resolvedHostCols ?? pickMaxPositive(measuredViewportCols, DEFAULT_HOST_COLS) ?? DEFAULT_HOST_COLS;
+  const resolvedHostRows =
+    authoritativeHostRows != null ? authoritativeHostRows : DEFAULT_HOST_ROWS;
+  const resolvedHostCols =
+    authoritativeHostCols != null
+      ? authoritativeHostCols
+      : (viewer.store?.getSnapshot()?.cols ?? DEFAULT_HOST_COLS) || DEFAULT_HOST_COLS;
+
+  const fallbackHostRows =
+    resolvedHostRows ?? pickMaxPositive(measuredViewportRows, DEFAULT_HOST_ROWS) ?? DEFAULT_HOST_ROWS;
+  const fallbackHostCols =
+    resolvedHostCols ?? pickMaxPositive(measuredViewportCols, DEFAULT_HOST_COLS) ?? DEFAULT_HOST_COLS;
 
   const hostPixelSize = useMemo(() => {
     return estimateHostPixelSize(fallbackHostCols, fallbackHostRows, effectiveFontSize);
@@ -930,43 +957,37 @@ function SessionTerminalPreviewView({
     }
     const ensurePinnedViewport = () => {
       const snapshot = viewer.store!.getSnapshot();
-      const desiredTop = cloneViewOnly ? 0 : snapshot.baseRow;
-      const candidateRows = cloneViewOnly
-        ? [
-            measuredViewportRows,
-            snapshot.viewportHeight,
-            hostViewportRows,
-            resolvedHostRows,
-            DEFAULT_HOST_ROWS,
-          ]
-        : [resolvedHostRows, hostViewportRows, DEFAULT_HOST_ROWS];
-      const normalizedRowOptions = candidateRows
-        .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0)
-        .map((value) => Math.floor(value));
-      const targetRows =
-        normalizedRowOptions.length > 0
-          ? Math.max(1, Math.max(...normalizedRowOptions))
-          : Math.max(1, DEFAULT_HOST_ROWS);
-      let changed = false;
-      if (snapshot.followTail) {
-        viewer.store!.setFollowTail(false);
-        changed = true;
+      // Only adjust height to what is actually visible; avoid forcing top.
+      // Prefer min(hostRows, measuredRows). If one is missing, use the other.
+      const measured = measuredViewportRows && measuredViewportRows > 0 ? Math.floor(measuredViewportRows) : null;
+      const hostRows = hostViewportRows && hostViewportRows > 0 ? Math.floor(hostViewportRows) : null;
+      let targetRows: number | null = null;
+      if (hostRows != null && measured != null) {
+        targetRows = Math.max(1, Math.min(hostRows, measured));
+      } else if (measured != null) {
+        targetRows = Math.max(1, measured);
+      } else if (hostRows != null) {
+        targetRows = Math.max(1, hostRows);
+      } else if (resolvedHostRows != null) {
+        targetRows = Math.max(1, resolvedHostRows);
+      } else {
+        targetRows = DEFAULT_HOST_ROWS;
       }
-      if (snapshot.viewportTop !== desiredTop || snapshot.viewportHeight !== targetRows) {
-        viewer.store!.setViewport(desiredTop, targetRows);
-        changed = true;
-      }
-      if (changed && typeof window !== 'undefined') {
-        try {
-          console.info('[terminal][trace] viewport-clamped', {
-            sessionId,
-            desiredTop,
-            desiredHeight: targetRows,
-            snapshotTop: snapshot.viewportTop,
-            snapshotHeight: snapshot.viewportHeight,
-          });
-        } catch {
-          // ignore logging issues
+
+      if (snapshot.viewportHeight !== targetRows) {
+        viewer.store!.setViewport(snapshot.viewportTop, targetRows);
+        if (typeof window !== 'undefined') {
+          try {
+            console.info('[terminal][trace] viewport-clamped', {
+              sessionId,
+              desiredTop: snapshot.viewportTop,
+              desiredHeight: targetRows,
+              snapshotTop: snapshot.viewportTop,
+              snapshotHeight: snapshot.viewportHeight,
+            });
+          } catch {
+            // ignore logging issues
+          }
         }
       }
     };
@@ -1221,6 +1242,9 @@ function SessionTerminalPreviewView({
   ]);
 
   const driverWrapperStyle = useMemo<CSSProperties>(() => {
+    if (ENABLE_VISIBLE_PREVIEW_DRIVER) {
+      return {};
+    }
     // Keep the hidden driver terminal in a stable layout box so its ResizeObserver
     // reports the real host row height instead of falling back to the 24-row default.
     const widthPx = Math.max(1, Math.round(driverHostPixelSize.width));
@@ -1366,27 +1390,29 @@ function SessionTerminalPreviewView({
         <span className={`${overlayTextClass} rounded-full px-3 py-1 ${latencyClass}`}>{latencyLabel}</span>
       </div>
       <div className="relative flex w-full items-start justify-start overflow-hidden">
-        <div style={driverWrapperStyle} aria-hidden>
-          {terminalReady ? (
-            <BeachTerminal
-              store={viewer.store ?? undefined}
-              transport={viewer.transport ?? undefined}
-              transportVersion={viewer.transportVersion}
-              autoConnect={false}
-              className="w-full"
-              fontSize={effectiveFontSize}
-              showTopBar={false}
-              showStatusBar={false}
-              autoResizeHostOnViewportChange={false}
-              onViewportStateChange={handleViewportStateChange}
-              disableViewportMeasurements={false}
-              maxRenderFps={20}
-              hideIdlePlaceholder
-              viewOnly={driverViewOnly}
-              sessionId={sessionId}
-            />
-          ) : null}
-        </div>
+        {!ENABLE_VISIBLE_PREVIEW_DRIVER && (
+          <div style={driverWrapperStyle} aria-hidden>
+            {terminalReady ? (
+              <BeachTerminal
+                store={viewer.store ?? undefined}
+                transport={viewer.transport ?? undefined}
+                transportVersion={viewer.transportVersion}
+                autoConnect={false}
+                className="w-full"
+                fontSize={effectiveFontSize}
+                showTopBar={false}
+                showStatusBar={false}
+                autoResizeHostOnViewportChange={false}
+                onViewportStateChange={handleViewportStateChange}
+                disableViewportMeasurements={false}
+                maxRenderFps={20}
+                hideIdlePlaceholder
+                viewOnly={driverViewOnly}
+                sessionId={sessionId}
+              />
+            ) : null}
+          </div>
+        )}
         <div
           ref={cloneWrapperRef}
           className="relative flex items-start justify-start overflow-hidden"
@@ -1394,21 +1420,45 @@ function SessionTerminalPreviewView({
         >
           <div ref={cloneInnerRef} className="origin-top-left" style={cloneInnerStyle}>
             {terminalReady ? (
-              <BeachTerminal
-                store={viewer.store ?? undefined}
-                transport={undefined}
-                autoConnect={false}
-                className="w-full"
-                fontSize={effectiveFontSize}
-                showTopBar={variant === 'full'}
-                showStatusBar={variant === 'full'}
-                autoResizeHostOnViewportChange={locked}
-                disableViewportMeasurements
-                maxRenderFps={isCloneVisible ? undefined : 12}
-                hideIdlePlaceholder
-                viewOnly={cloneViewOnly}
-                sessionId={sessionId}
-              />
+              ENABLE_VISIBLE_PREVIEW_DRIVER ? (
+                <BeachTerminal
+                  store={viewer.store ?? undefined}
+                  transport={viewer.transport ?? undefined}
+                  transportVersion={viewer.transportVersion}
+                  autoConnect={false}
+                  className="w-full"
+                  fontSize={effectiveFontSize}
+                  showTopBar={variant === 'full'}
+                  showStatusBar={variant === 'full'}
+                  autoResizeHostOnViewportChange={false}
+                  // In visible driver mode, keep terminal geometry fixed to
+                  // the host so the preview scaling matches. Avoid DOM-driven
+                  // height clamps that create a tiny render band.
+                  disableViewportMeasurements
+                  forcedViewportRows={resolvedHostRows ?? DEFAULT_HOST_ROWS}
+                  onViewportStateChange={handleViewportStateChange}
+                  maxRenderFps={20}
+                  hideIdlePlaceholder
+                  viewOnly={cloneViewOnly}
+                  sessionId={sessionId}
+                />
+              ) : (
+                <BeachTerminal
+                  store={viewer.store ?? undefined}
+                  transport={undefined}
+                  autoConnect={false}
+                  className="w-full"
+                  fontSize={effectiveFontSize}
+                  showTopBar={variant === 'full'}
+                  showStatusBar={variant === 'full'}
+                  autoResizeHostOnViewportChange={locked}
+                  disableViewportMeasurements
+                  maxRenderFps={isCloneVisible ? undefined : 12}
+                  hideIdlePlaceholder
+                  viewOnly={cloneViewOnly}
+                  sessionId={sessionId}
+                />
+              )
             ) : (
               <div className="h-full w-full" aria-hidden />
             )}

@@ -100,6 +100,7 @@ services:
     environment:
       NEXT_PUBLIC_MANAGER_URL: http://localhost:8080
       NEXT_PUBLIC_ROAD_URL: http://localhost:4132
+      NEXT_PUBLIC_PRIVATE_BEACH_VISIBLE_DRIVER: "true"
       PRIVATE_BEACH_DATABASE_URL: postgres://postgres:postgres@beach-postgres:5432/private_beach_surfer
       TAILWIND_MODE: watch
       CHOKIDAR_USEPOLLING: "true"

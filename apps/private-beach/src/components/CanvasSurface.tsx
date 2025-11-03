@@ -15,7 +15,6 @@ import ReactFlow, {
   type NodeTypes,
   type OnSelectionChangeParams,
   type Viewport,
-  applyNodeChanges,
   useOnViewportChange,
 } from 'reactflow';
 import 'reactflow/dist/style.css';
@@ -243,6 +242,117 @@ function buildCanvasNodes(layout: SharedCanvasLayout, sessionMap: Map<string, Se
   return nodes;
 }
 
+function shallowArrayEqual(a?: unknown[], b?: unknown[]) {
+  if (a === b) {
+    return true;
+  }
+  if (!a || !b) {
+    return !a && !b;
+  }
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function canvasNodeDataEqual(a?: Record<string, unknown>, b?: Record<string, unknown>) {
+  if (a === b) {
+    return true;
+  }
+  if (!a || !b) {
+    return !a && !b;
+  }
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) {
+    return false;
+  }
+  for (const key of aKeys) {
+    const av = a[key];
+    const bv = b[key];
+    if (Array.isArray(av) && Array.isArray(bv)) {
+      if (!shallowArrayEqual(av, bv)) {
+        return false;
+      }
+      continue;
+    }
+    if (av !== bv) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function layoutWithPreviewPosition(
+  layout: SharedCanvasLayout,
+  parsed: { kind: 'tile' | 'agent' | 'group'; id: string },
+  position: { x: number; y: number },
+): SharedCanvasLayout {
+  if (parsed.kind === 'tile') {
+    const tile = layout.tiles[parsed.id];
+    if (!tile) {
+      return layout;
+    }
+    if (tile.position.x === position.x && tile.position.y === position.y) {
+      return layout;
+    }
+    return {
+      ...layout,
+      tiles: {
+        ...layout.tiles,
+        [parsed.id]: {
+          ...tile,
+          position: { x: position.x, y: position.y },
+        },
+      },
+    };
+  }
+  if (parsed.kind === 'agent') {
+    const agent = layout.agents[parsed.id];
+    if (!agent) {
+      return layout;
+    }
+    if (agent.position.x === position.x && agent.position.y === position.y) {
+      return layout;
+    }
+    return {
+      ...layout,
+      agents: {
+        ...layout.agents,
+        [parsed.id]: {
+          ...agent,
+          position: { x: position.x, y: position.y },
+        },
+      },
+    };
+  }
+  if (parsed.kind === 'group') {
+    const group = layout.groups[parsed.id];
+    if (!group) {
+      return layout;
+    }
+    if (group.position.x === position.x && group.position.y === position.y) {
+      return layout;
+    }
+    return {
+      ...layout,
+      groups: {
+        ...layout.groups,
+        [parsed.id]: {
+          ...group,
+          position: { x: position.x, y: position.y },
+        },
+      },
+    };
+  }
+  return layout;
+}
+
 export function getTileBorderClass({
   selected,
   isDropTarget,
@@ -294,11 +404,14 @@ function TileNodeComponent({ data, selected }: NodeProps<TileNodeData>) {
         return;
       }
       const payload = measurements as TileMeasurementPayload;
-      sessionTileController.enqueueMeasurement(tileId, payload, 'dom');
-      const hostSourceIsPty =
-        (payload.hostRowSource ?? 'unknown') === 'pty' || (payload.hostColSource ?? 'unknown') === 'pty';
-      if (hostSourceIsPty) {
-        sessionTileController.applyHostDimensions(tileId, payload);
+      const hostSourceIsTrusted =
+        (payload.hostRowSource ?? 'unknown') === 'pty' ||
+        (payload.hostColSource ?? 'unknown') === 'pty' ||
+        (payload.hostRows != null && payload.hostCols != null);
+      if (hostSourceIsTrusted) {
+        sessionTileController.enqueueMeasurement(tileId, payload, 'host');
+      } else {
+        sessionTileController.enqueueMeasurement(tileId, payload, 'dom');
       }
     },
     [isActiveMotion, tileId],
@@ -403,8 +516,8 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     viewerStateOverrides: viewerStateOverridesProp,
   } = props;
   const reactFlow = useReactFlow();
-  const { load, setNodes, setViewport, setSelection } = useCanvasActions();
-  const { selection } = useCanvasState();
+  const { load, setNodes: setCanvasNodes, updateNode, setViewport, setSelection } = useCanvasActions();
+  const { selection, nodes: canvasNodes } = useCanvasState();
   const { onDropNode, onCreateGroup, onAssignAgent, onAssignmentError } = useCanvasHandlers();
   const { layout } = useCanvasSnapshot();
   const [miniMapVisible, setMiniMapVisible] = useState(true);
@@ -419,6 +532,8 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     origin: { x: number; y: number };
     entityId: string;
   } | null>(null);
+  const canvasNodesRef = useRef<CanvasNodeBase[]>([]);
+  const rfNodeCacheRef = useRef<Map<string, RFNode>>(new Map());
   const lastSyncedViewportRef = useRef<{ x: number; y: number; zoom: number } | null>(null);
   const hydrateKeyRef = useRef<string | null>(null);
   const persistCallbackRef = useRef<typeof onPersistLayout | undefined>(onPersistLayout);
@@ -588,6 +703,9 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
   }, [viewerStateOverridesProp]);
 
   const effectiveViewerStateOverrides = viewerStateOverridesResolved;
+  useEffect(() => {
+    canvasNodesRef.current = canvasNodes;
+  }, [canvasNodes]);
 
   const syncStore = useCallback(
     (next: SharedCanvasLayout) => {
@@ -597,8 +715,53 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
         load({ version: 3, nodes, edges: next.edges ?? [], viewport });
         didLoadRef.current = true;
         lastSyncedViewportRef.current = viewport;
+        canvasNodesRef.current = nodes;
       } else {
-        setNodes(nodes);
+        const prevNodes = canvasNodesRef.current;
+        const prevMap = new Map(prevNodes.map((node) => [node.id, node]));
+        let membershipChanged = prevNodes.length !== nodes.length;
+        if (!membershipChanged) {
+          for (const node of nodes) {
+            const prev = prevMap.get(node.id);
+            if (!prev || prev.type !== node.type) {
+              membershipChanged = true;
+              break;
+            }
+          }
+        }
+        if (membershipChanged) {
+          setCanvasNodes(nodes);
+          canvasNodesRef.current = nodes;
+        } else {
+          for (const node of nodes) {
+            const prev = prevMap.get(node.id);
+            if (!prev) {
+              continue;
+            }
+            const patch: Partial<CanvasNodeBase> = {};
+            if (prev.xPx !== node.xPx || prev.yPx !== node.yPx) {
+              patch.xPx = node.xPx;
+              patch.yPx = node.yPx;
+            }
+            if (prev.widthPx !== node.widthPx || prev.heightPx !== node.heightPx) {
+              patch.widthPx = node.widthPx;
+              patch.heightPx = node.heightPx;
+            }
+            if (prev.zIndex !== node.zIndex) {
+              patch.zIndex = node.zIndex;
+            }
+            if ((prev.parentId ?? null) !== (node.parentId ?? null)) {
+              patch.parentId = node.parentId;
+            }
+            if (!canvasNodeDataEqual(prev.data, node.data)) {
+              patch.data = node.data;
+            }
+            if (Object.keys(patch).length > 0) {
+              updateNode(node.id, patch);
+            }
+          }
+          canvasNodesRef.current = nodes;
+        }
         const prevViewport = lastSyncedViewportRef.current;
         const shouldSyncViewport =
           !prevViewport ||
@@ -611,7 +774,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
         lastSyncedViewportRef.current = viewport;
       }
     },
-    [agentMap, load, sessionMap, setNodes, setViewport],
+    [agentMap, load, sessionMap, setCanvasNodes, setViewport, updateNode],
   );
 
   useEffect(() => {
@@ -653,62 +816,111 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
   const selectionSet = useMemo(() => new Set(selection), [selection]);
 
   const rfNodes = useMemo(() => {
-    const nodes: RFNode[] = [];
+    const cache = rfNodeCacheRef.current;
+    const nextCache = new Map<string, RFNode>();
+    const nextNodes: RFNode[] = [];
+
     for (const tile of Object.values(layout.tiles)) {
       const nodeId = encodeNodeId('tile', tile.id);
       const session = sessionMap.get(tile.id) ?? null;
       const isActiveDrag = activeDragNodeId === nodeId;
       const isSettling = settlingNodeId === nodeId;
-      nodes.push({
-        id: nodeId,
-        type: 'tile',
-        position: { x: tile.position?.x ?? 0, y: tile.position?.y ?? 0 },
-        data: {
-          tileId: tile.id,
-          session,
-          onRemove,
-          onSelect,
-          isDropTarget: hoverTarget?.type === 'tile' && hoverTarget.id === tile.id,
-          isDragging: isActiveDrag,
-          isSettling,
-          managerUrl,
-          viewerToken,
-          credentialOverride: viewerOverrides?.[tile.id] ?? null,
-          viewerOverride: effectiveViewerStateOverrides[tile.id] ?? null,
-          privateBeachId,
-          cachedDiff: cachedTerminalDiffs[tile.id] ?? null,
-        } satisfies TileNodeData,
-        draggable: true,
-        selectable: true,
-        style: {
+      let node = cache.get(nodeId);
+      const nodeData: TileNodeData = {
+        tileId: tile.id,
+        session,
+        onRemove,
+        onSelect,
+        isDropTarget: hoverTarget?.type === 'tile' && hoverTarget.id === tile.id,
+        isDragging: isActiveDrag,
+        isSettling,
+        managerUrl,
+        viewerToken,
+        credentialOverride: viewerOverrides?.[tile.id] ?? null,
+        viewerOverride: effectiveViewerStateOverrides[tile.id] ?? null,
+        privateBeachId,
+        cachedDiff: cachedTerminalDiffs[tile.id] ?? null,
+      };
+      if (!node) {
+        node = {
+          id: nodeId,
+          type: 'tile',
+          position: { x: tile.position?.x ?? 0, y: tile.position?.y ?? 0 },
+          data: nodeData,
+          draggable: true,
+          selectable: true,
+          style: {
+            width: tile.size?.width ?? DEFAULT_TILE_WIDTH,
+            height: tile.size?.height ?? DEFAULT_TILE_HEIGHT,
+            zIndex: tile.zIndex ?? 1,
+          },
+          selected: selectionSet.has(nodeId),
+        };
+      } else {
+        node.type = 'tile';
+        if (!node.position) {
+          node.position = { x: tile.position?.x ?? 0, y: tile.position?.y ?? 0 };
+        } else {
+          node.position.x = tile.position?.x ?? 0;
+          node.position.y = tile.position?.y ?? 0;
+        }
+        node.data = nodeData;
+        node.draggable = true;
+        node.selectable = true;
+        node.style = {
           width: tile.size?.width ?? DEFAULT_TILE_WIDTH,
           height: tile.size?.height ?? DEFAULT_TILE_HEIGHT,
           zIndex: tile.zIndex ?? 1,
-        },
-        selected: selectionSet.has(nodeId),
-      });
+        };
+        node.selected = selectionSet.has(nodeId);
+      }
+      nextCache.set(nodeId, node);
+      nextNodes.push(node);
     }
 
     for (const agent of Object.values(layout.agents)) {
       const nodeId = encodeNodeId('agent', agent.id);
       const session = agentMap.get(agent.id) ?? null;
-      nodes.push({
-        id: nodeId,
-        type: 'agent',
-        position: { x: agent.position?.x ?? 0, y: agent.position?.y ?? 0 },
-        data: {
-          session,
-          isDropTarget: hoverTarget?.type === 'agent' && hoverTarget.id === agent.id,
-        } satisfies AgentNodeData,
-        draggable: true,
-        selectable: true,
-        style: {
+      const nodeData: AgentNodeData = {
+        session,
+        isDropTarget: hoverTarget?.type === 'agent' && hoverTarget.id === agent.id,
+      };
+      let node = cache.get(nodeId);
+      if (!node) {
+        node = {
+          id: nodeId,
+          type: 'agent',
+          position: { x: agent.position?.x ?? 0, y: agent.position?.y ?? 0 },
+          data: nodeData,
+          draggable: true,
+          selectable: true,
+          style: {
+            width: agent.size?.width ?? DEFAULT_AGENT_WIDTH,
+            height: agent.size?.height ?? DEFAULT_AGENT_HEIGHT,
+            zIndex: agent.zIndex ?? 1,
+          },
+          selected: selectionSet.has(nodeId),
+        };
+      } else {
+        node.type = 'agent';
+        if (!node.position) {
+          node.position = { x: agent.position?.x ?? 0, y: agent.position?.y ?? 0 };
+        } else {
+          node.position.x = agent.position?.x ?? 0;
+          node.position.y = agent.position?.y ?? 0;
+        }
+        node.data = nodeData;
+        node.draggable = true;
+        node.selectable = true;
+        node.style = {
           width: agent.size?.width ?? DEFAULT_AGENT_WIDTH,
           height: agent.size?.height ?? DEFAULT_AGENT_HEIGHT,
           zIndex: agent.zIndex ?? 1,
-        },
-        selected: selectionSet.has(nodeId),
-      });
+        };
+        node.selected = selectionSet.has(nodeId);
+      }
+      nextCache.set(nodeId, node);
+      nextNodes.push(node);
     }
 
     for (const group of Object.values(layout.groups)) {
@@ -723,40 +935,79 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
           w: tile!.size.width,
           h: tile!.size.height,
         }));
-      nodes.push({
-        id: nodeId,
-        type: 'group',
-        position: { x: group.position.x, y: group.position.y },
-        data: {
-          name: group.name,
-          width: group.size.width,
-          height: group.size.height,
-          padding: group.padding ?? 16,
-          members,
-          isDropTarget: hoverTarget?.type === 'group' && hoverTarget.id === group.id,
-        } satisfies GroupNodeData,
-        draggable: true,
-        selectable: true,
-        style: {
+      const nodeData: GroupNodeData = {
+        name: group.name,
+        width: group.size.width,
+        height: group.size.height,
+        padding: group.padding ?? 16,
+        members,
+        isDropTarget: hoverTarget?.type === 'group' && hoverTarget.id === group.id,
+      };
+      let node = cache.get(nodeId);
+      if (!node) {
+        node = {
+          id: nodeId,
+          type: 'group',
+          position: { x: group.position.x, y: group.position.y },
+          data: nodeData,
+          draggable: true,
+          selectable: true,
+          style: {
+            width: group.size.width,
+            height: group.size.height,
+            zIndex: group.zIndex ?? 1,
+          },
+          selected: selectionSet.has(nodeId),
+        };
+      } else {
+        node.type = 'group';
+        if (!node.position) {
+          node.position = { x: group.position.x, y: group.position.y };
+        } else {
+          node.position.x = group.position.x;
+          node.position.y = group.position.y;
+        }
+        node.data = nodeData;
+        node.draggable = true;
+        node.selectable = true;
+        node.style = {
           width: group.size.width,
           height: group.size.height,
           zIndex: group.zIndex ?? 1,
-        },
-        selected: selectionSet.has(nodeId),
-      });
+        };
+        node.selected = selectionSet.has(nodeId);
+      }
+      nextCache.set(nodeId, node);
+      nextNodes.push(node);
     }
 
-    return nodes;
-  }, [activeDragNodeId, agentMap, cachedTerminalDiffs, hoverTarget, layout.agents, layout.groups, layout.tiles, managerUrl, onRemove, onSelect, privateBeachId, selectionSet, sessionMap, viewerOverrides, effectiveViewerStateOverrides, viewerToken, settlingNodeId]);
+    rfNodeCacheRef.current = nextCache;
+    return nextNodes;
+  }, [
+    activeDragNodeId,
+    agentMap,
+    cachedTerminalDiffs,
+    effectiveViewerStateOverrides,
+    hoverTarget,
+    layout.agents,
+    layout.groups,
+    layout.tiles,
+    managerUrl,
+    onRemove,
+    onSelect,
+    privateBeachId,
+    selectionSet,
+    sessionMap,
+    viewerOverrides,
+    viewerToken,
+    settlingNodeId,
+  ]);
 
   const edges = useMemo<RFEdge[]>(() => [], []);
 
-  const handleNodesChange = useCallback(
-    (changes: NodeChange[]) => {
-      setNodes((prev) => applyNodeChanges(changes, prev));
-    },
-    [setNodes],
-  );
+  const handleNodesChange = useCallback((_changes: NodeChange[]) => {
+    // React Flow maintains transient drag state; layout updates commit on drop.
+  }, []);
 
   const handleSelectionChange = useCallback(
     ({ nodes }: OnSelectionChangeParams) => {
@@ -791,35 +1042,11 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
         return;
       }
 
-      let updatedLayout: SharedCanvasLayout | null = null;
-      sessionTileController.updateLayout(
-        'drag-preview-position',
-        (current) => {
-          const tile = current.tiles[parsed.id];
-          if (!tile) {
-            return current;
-          }
-          const nextPosition = { x: node.position.x, y: node.position.y };
-          if (tile.position.x === nextPosition.x && tile.position.y === nextPosition.y) {
-            return current;
-          }
-          const next: SharedCanvasLayout = {
-            ...current,
-            tiles: {
-              ...current.tiles,
-              [parsed.id]: {
-                ...tile,
-                position: nextPosition,
-              },
-            },
-          };
-          updatedLayout = next;
-          return next;
-        },
-        { suppressPersist: true, skipLayoutChange: true, preserveUpdatedAt: true },
-      );
-
-      const layoutForPreview = updatedLayout ?? layout;
+      const previewPosition = { x: node.position.x, y: node.position.y };
+      const layoutForPreview =
+        parsed.kind === 'tile' || parsed.kind === 'agent' || parsed.kind === 'group'
+          ? layoutWithPreviewPosition(layout, parsed, previewPosition)
+          : layout;
 
       if (!dragStateRef.current || dragStateRef.current.nodeId !== node.id) {
         let origin = { x: node.position.x, y: node.position.y };

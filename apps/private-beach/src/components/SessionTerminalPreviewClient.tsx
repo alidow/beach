@@ -245,20 +245,59 @@ function SessionTerminalPreviewView({
     return Number(normalized.toFixed(3));
   }, [fontSize, baseFontSize]);
 
+  const lastViewportRef = useRef<{ rows: number | null; cols: number | null }>({
+    rows: null,
+    cols: null,
+  });
+
   const handleViewportStateChange = useCallback(
     (state: TerminalViewportState) => {
+      const hostRows =
+        typeof state.hostViewportRows === 'number' && state.hostViewportRows > 0
+          ? state.hostViewportRows
+          : null;
+      const hostCols =
+        typeof state.hostCols === 'number' && state.hostCols > 0 ? state.hostCols : null;
+      const prevRows = lastViewportRef.current.rows;
+      const prevCols = lastViewportRef.current.cols;
+      let patchedRows =
+        typeof state.viewportRows === 'number' && state.viewportRows > 0 ? state.viewportRows : null;
+      let patchedCols =
+        typeof state.viewportCols === 'number' && state.viewportCols > 0 ? state.viewportCols : null;
+      if (hostRows && (!patchedRows || patchedRows < hostRows)) {
+        patchedRows = hostRows;
+      } else if (prevRows && (!patchedRows || patchedRows < prevRows)) {
+        patchedRows = prevRows;
+      }
+      if (hostCols && (!patchedCols || patchedCols < hostCols)) {
+        patchedCols = hostCols;
+      } else if (prevCols && (!patchedCols || patchedCols < prevCols)) {
+        patchedCols = prevCols;
+      }
+      const patchedState =
+        patchedRows !== state.viewportRows || patchedCols !== state.viewportCols
+          ? {
+              ...state,
+              viewportRows: patchedRows ?? state.viewportRows,
+              viewportCols: patchedCols ?? state.viewportCols,
+            }
+          : state;
+      lastViewportRef.current = {
+        rows: patchedRows ?? hostRows ?? prevRows ?? null,
+        cols: patchedCols ?? hostCols ?? prevCols ?? null,
+      };
       if (isPrivateBeachDebugEnabled()) {
         try {
           console.debug(
             '[terminal][trace] viewport-state-raw',
             JSON.stringify({
               sessionId,
-              viewportRows: state.viewportRows,
-              viewportCols: state.viewportCols,
-              hostViewportRows: state.hostViewportRows,
-              hostCols: state.hostCols,
-              viewOnly: state.viewOnly,
-              canSendResize: state.canSendResize,
+              viewportRows: patchedState.viewportRows,
+              viewportCols: patchedState.viewportCols,
+              hostViewportRows: patchedState.hostViewportRows,
+              hostCols: patchedState.hostCols,
+              viewOnly: patchedState.viewOnly,
+              canSendResize: patchedState.canSendResize,
             }),
           );
         } catch {
@@ -269,14 +308,14 @@ function SessionTerminalPreviewView({
         console.info('[terminal] viewport-state', {
           version: 'v2',
           sessionId,
-          viewportRows: state.viewportRows,
-          viewportCols: state.viewportCols,
-          hostViewportRows: state.hostViewportRows,
-          hostCols: state.hostCols,
-          viewOnly: state.viewOnly,
+          viewportRows: patchedState.viewportRows,
+          viewportCols: patchedState.viewportCols,
+          hostViewportRows: patchedState.hostViewportRows,
+          hostCols: patchedState.hostCols,
+          viewOnly: patchedState.viewOnly,
         });
       }
-      setViewportState(state);
+      setViewportState(patchedState);
     },
     [sessionId],
   );
@@ -790,7 +829,8 @@ function SessionTerminalPreviewView({
     };
   }, [domRawVersion, hostPixelSize.height, hostPixelSize.width, resolvedHostCols, resolvedHostRows, shouldSkipDomMeasurements]);
 
-  const effectiveScale = previewMeasurements?.scale ?? 1;
+  const effectiveScale =
+    typeof scale === 'number' && Number.isFinite(scale) && scale > 0 ? scale : previewMeasurements?.scale ?? 1;
 
   useEffect(() => {
     const previous = measurementsRef.current;

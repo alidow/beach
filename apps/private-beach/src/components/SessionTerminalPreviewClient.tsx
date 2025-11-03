@@ -21,6 +21,10 @@ const BASE_TERMINAL_CELL_WIDTH = 8;
 const MINIMUM_SCALE = 0.05;
 const MAX_PREVIEW_WIDTH = 720;
 const MAX_PREVIEW_HEIGHT = 720;
+const MIN_STABLE_DOM_ROWS = 6;
+const DOM_SAMPLE_ROW_TOLERANCE = 1;
+const DOM_SAMPLE_COL_TOLERANCE = 2;
+const DOM_SAMPLE_MAX_AGE_MS = 150;
 
 type HostDimensionCacheEntry = {
   rows: number | null;
@@ -70,6 +74,13 @@ type PreviewMeasurements = {
   measurementVersion: number;
   hostRowSource: HostDimensionSource;
   hostColSource: HostDimensionSource;
+};
+
+type DomMeasurementSample = {
+  rawWidth: number;
+  rawHeight: number;
+  rows: number;
+  cols: number;
 };
 
 type Props = {
@@ -144,6 +155,9 @@ function SessionTerminalPreviewView({
   const measurementsRef = useRef<PreviewMeasurements | null>(null);
   const measurementVersionRef = useRef<number>(1);
   const domRawSizeRef = useRef<{ width: number; height: number } | null>(null);
+  const domPendingSampleRef = useRef<DomMeasurementSample | null>(null);
+  const domPendingTimestampRef = useRef<number | null>(null);
+  const domCommittedSampleRef = useRef<DomMeasurementSample | null>(null);
   const [domRawVersion, setDomRawVersion] = useState(0);
   const [isCloneVisible, setIsCloneVisible] = useState<boolean>(true);
   const prehydratedSeqRef = useRef<number | null>(null);
@@ -189,6 +203,9 @@ function SessionTerminalPreviewView({
     measurementVersionRef.current = 1;
     domRawSizeRef.current = null;
     setDomRawVersion((version) => (version + 1) % 1_000_000);
+    domPendingSampleRef.current = null;
+    domPendingTimestampRef.current = null;
+    domCommittedSampleRef.current = null;
   }, [sessionId]);
   useEffect(() => {
     setTerminalReady(true);
@@ -349,30 +366,13 @@ function SessionTerminalPreviewView({
     const storeSnapshot = viewer.store?.getSnapshot();
     const storeRows = storeSnapshot?.rows ? storeSnapshot.rows.length : null;
     const storeCols = storeSnapshot?.cols ?? null;
-    const measuredRowsValue = measuredViewportRows ?? null;
-    const storeRowsValue = storeRows != null && storeRows > 0 ? storeRows : null;
-    const fallbackRowsCandidate = cloneViewOnly
-      ? measuredRowsValue
-      : measuredRowsValue != null && storeRowsValue != null
-        ? Math.max(measuredRowsValue, storeRowsValue)
-        : measuredRowsValue ?? storeRowsValue;
-    if (
-      cloneViewOnly &&
-      typeof window !== 'undefined' &&
-      storeRowsValue != null &&
-      fallbackRowsCandidate !== storeRowsValue
-    ) {
-      try {
-        console.info('[terminal][diag] view-only-fallback-rows', {
-          sessionId,
-          measured: measuredRowsValue,
-          storeRows: storeRowsValue,
-          appliedFallback: fallbackRowsCandidate,
-        });
-      } catch {
-        // ignore logging issues
-      }
-    }
+    const fallbackRowsCandidate = (() => {
+      const measured = measuredViewportRows ?? null;
+      const storeValue = storeRows != null && storeRows > 0 ? storeRows : null;
+      if (measured == null) return storeValue;
+      if (storeValue == null) return measured;
+      return Math.max(measured, storeValue);
+    })();
     const fallbackColsCandidate = (() => {
       const measured = measuredViewportCols ?? null;
       const storeValue = storeCols != null && storeCols > 0 ? storeCols : null;
@@ -455,7 +455,6 @@ function SessionTerminalPreviewView({
     hostViewportRows,
     measuredViewportCols,
     measuredViewportRows,
-    cloneViewOnly,
   ]);
 
   useEffect(() => {
@@ -471,32 +470,15 @@ function SessionTerminalPreviewView({
         lastRow && typeof (lastRow as { absolute?: number }).absolute === 'number'
           ? (lastRow as { absolute: number }).absolute - snapshot.baseRow + 1
           : null;
-      const baseViewportHeight = snapshot.viewportHeight > 0 ? snapshot.viewportHeight : 0;
-      const estimatedRows = cloneViewOnly
-        ? baseViewportHeight
-        : Math.max(totalRowsFromArray ?? 0, totalRowsFromAbsolute ?? 0, baseViewportHeight);
+      const estimatedRows = Math.max(
+        totalRowsFromArray ?? 0,
+        totalRowsFromAbsolute ?? 0,
+        snapshot.viewportHeight > 0 ? snapshot.viewportHeight : 0,
+      );
       const estimatedCols = snapshot.cols > 0 ? snapshot.cols : null;
       const hostViewportRowsFromSnapshot =
         snapshot.viewportHeight && snapshot.viewportHeight > 1 ? snapshot.viewportHeight : null;
       const hostViewportColsFromSnapshot = snapshot.cols && snapshot.cols > 1 ? snapshot.cols : null;
-
-      if (typeof window !== 'undefined') {
-        try {
-          const payload = {
-            sessionId,
-            cloneViewOnly,
-            rowsFromArray: totalRowsFromArray,
-            rowsFromAbsolute: totalRowsFromAbsolute,
-            viewportHeight: snapshot.viewportHeight,
-            estimatedRows,
-            hostViewportRowsFromSnapshot,
-            cols: estimatedCols,
-          };
-          console.info('[terminal][diag] store-dimension-candidates', payload, JSON.stringify(payload));
-        } catch {
-          // ignore logging issues
-        }
-      }
 
       if (estimatedRows <= 0 && (estimatedCols == null || estimatedCols <= 0)) {
         return;
@@ -506,7 +488,7 @@ function SessionTerminalPreviewView({
         const nextRowResult = computeDimensionUpdate(
           current.rows,
           hostViewportRowsFromSnapshot,
-          cloneViewOnly ? null : estimatedRows > 0 ? estimatedRows : null,
+          estimatedRows > 0 ? estimatedRows : null,
           hostRowSourceRef.current,
         );
         const nextColResult = computeDimensionUpdate(
@@ -559,7 +541,7 @@ function SessionTerminalPreviewView({
     updateFromStore();
     const unsubscribe = store.subscribe(updateFromStore);
     return unsubscribe;
-  }, [cloneViewOnly, sessionId, viewer.store]);
+  }, [sessionId, viewer.store]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -1059,19 +1041,13 @@ function SessionTerminalPreviewView({
       if (Number.isFinite(measuredWidth) && Number.isFinite(measuredHeight)) {
         const rawWidthFromDom = measuredWidth / effectiveScale;
         const rawHeightFromDom = measuredHeight / effectiveScale;
-        const prev = domRawSizeRef.current;
-        const widthDelta = !prev ? Number.POSITIVE_INFINITY : Math.abs(prev.width - rawWidthFromDom);
-        const heightDelta = !prev ? Number.POSITIVE_INFINITY : Math.abs(prev.height - rawHeightFromDom);
         const hostSourceIsRemote =
           hostRowSourceRef.current === 'pty' || hostColSourceRef.current === 'pty';
-        if (!hostSourceIsRemote && (!prev || widthDelta > 1 || heightDelta > 1)) {
-          domRawSizeRef.current = {
-            width: rawWidthFromDom,
-            height: rawHeightFromDom,
-          };
-          setDomRawVersion((version) => (version + 1) % 1_000_000);
-          measurementVersionRef.current = (measurementVersionRef.current % 1_000_000) + 1;
+
+        if (hostSourceIsRemote) {
+          return;
         }
+
         const cellWidth = Math.max(
           1,
           Math.round(((effectiveFontSize / BASE_TERMINAL_FONT_SIZE) * BASE_TERMINAL_CELL_WIDTH) * (typeof window !== 'undefined' && typeof window.devicePixelRatio === 'number' ? window.devicePixelRatio || 1 : 1)) /
@@ -1080,20 +1056,43 @@ function SessionTerminalPreviewView({
         const lineHeightPx = Math.max(1, Math.round(effectiveFontSize * 1.4));
         const inferredRows = Math.max(1, Math.round((rawHeightFromDom - TERMINAL_PADDING_Y) / lineHeightPx));
         const inferredCols = Math.max(1, Math.round((rawWidthFromDom - TERMINAL_PADDING_X) / cellWidth));
-        if (!hostSourceIsRemote && (Number.isFinite(inferredRows) || Number.isFinite(inferredCols))) {
+
+        if (!Number.isFinite(inferredRows) || inferredRows < MIN_STABLE_DOM_ROWS) {
+          domPendingSampleRef.current = null;
+          domPendingTimestampRef.current = null;
+          return;
+        }
+
+        const sample: DomMeasurementSample = {
+          rawWidth: rawWidthFromDom,
+          rawHeight: rawHeightFromDom,
+          rows: inferredRows,
+          cols: Number.isFinite(inferredCols) ? inferredCols : inferredRows,
+        };
+
+        const commitSample = (candidate: DomMeasurementSample) => {
+          const prev = domRawSizeRef.current;
+          const widthDelta = !prev ? Number.POSITIVE_INFINITY : Math.abs(prev.width - candidate.rawWidth);
+          const heightDelta = !prev ? Number.POSITIVE_INFINITY : Math.abs(prev.height - candidate.rawHeight);
+          if (!prev || widthDelta > 1 || heightDelta > 1) {
+            domRawSizeRef.current = {
+              width: candidate.rawWidth,
+              height: candidate.rawHeight,
+            };
+            setDomRawVersion((version) => (version + 1) % 1_000_000);
+            measurementVersionRef.current = (measurementVersionRef.current % 1_000_000) + 1;
+          }
           setHostDimensions((current) => {
-            const fallbackRows = Number.isFinite(inferredRows) ? inferredRows : null;
-            const fallbackCols = Number.isFinite(inferredCols) ? inferredCols : null;
             const nextRowResult = computeDimensionUpdate(
               current.rows,
               null,
-              fallbackRows,
+              candidate.rows,
               hostRowSourceRef.current,
             );
             const nextColResult = computeDimensionUpdate(
               current.cols,
               null,
-              fallbackCols,
+              candidate.cols,
               hostColSourceRef.current,
             );
             const changed = nextRowResult.changed || nextColResult.changed;
@@ -1110,11 +1109,68 @@ function SessionTerminalPreviewView({
             if (!changed) {
               return current;
             }
-            return {
-              rows: nextRowResult.value,
-              cols: nextColResult.value,
-            };
+            if (typeof window !== 'undefined') {
+              try {
+                const payload = {
+                  sessionId,
+                  prevRows: current.rows,
+                  nextRows: nextRowResult.value,
+                  prevCols: current.cols,
+                  nextCols: nextColResult.value,
+                  rowSource: nextRowResult.source,
+                  colSource: nextColResult.source,
+                  reason: 'dom-measurement',
+                  measurementVersion: measurementVersionRef.current,
+                };
+                console.info('[terminal][trace] host-dimension-update', payload, JSON.stringify(payload));
+              } catch {
+                // ignore logging issues
+              }
+            }
+            return { rows: nextRowResult.value, cols: nextColResult.value };
           });
+          domCommittedSampleRef.current = candidate;
+        };
+
+        const isClose = (a: number, b: number, tolerance: number) => Math.abs(a - b) <= tolerance;
+        const now = Date.now();
+        const committed = domCommittedSampleRef.current;
+
+        if (
+          committed &&
+          isClose(committed.rows, sample.rows, DOM_SAMPLE_ROW_TOLERANCE) &&
+          isClose(committed.cols, sample.cols, DOM_SAMPLE_COL_TOLERANCE)
+        ) {
+          domPendingSampleRef.current = null;
+          domPendingTimestampRef.current = null;
+          commitSample(sample);
+          return;
+        }
+
+        const pending = domPendingSampleRef.current;
+        if (
+          pending &&
+          isClose(pending.rows, sample.rows, DOM_SAMPLE_ROW_TOLERANCE) &&
+          isClose(pending.cols, sample.cols, DOM_SAMPLE_COL_TOLERANCE)
+        ) {
+          domPendingSampleRef.current = null;
+          domPendingTimestampRef.current = null;
+          commitSample(sample);
+          return;
+        }
+
+        domPendingSampleRef.current = sample;
+        domPendingTimestampRef.current = now;
+
+        if (
+          domPendingSampleRef.current &&
+          domPendingTimestampRef.current != null &&
+          now - domPendingTimestampRef.current >= DOM_SAMPLE_MAX_AGE_MS
+        ) {
+          const staleSample = domPendingSampleRef.current;
+          domPendingSampleRef.current = null;
+          domPendingTimestampRef.current = null;
+          commitSample(staleSample);
         }
       }
     };

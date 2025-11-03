@@ -375,6 +375,7 @@ export interface TerminalViewportState {
 
 export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const MAX_VIEWPORT_ROWS = 512;
+  const MIN_STABLE_VIEWPORT_ROWS = 6;
   const {
     sessionId,
     baseUrl,
@@ -1306,7 +1307,15 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         ? Math.max(1, Math.floor(window.innerHeight / rowHeight))
         : MAX_VIEWPORT_ROWS;
       const fallbackRows = Math.max(1, Math.min(windowRows, MAX_VIEWPORT_ROWS));
-      const viewportRows = Math.max(1, Math.min(measured, fallbackRows));
+      const previousViewportRows = lastMeasuredViewportRows.current;
+      let viewportRows = Math.max(1, Math.min(measured, fallbackRows));
+      if (
+        previousViewportRows != null &&
+        previousViewportRows >= MIN_STABLE_VIEWPORT_ROWS &&
+        viewportRows <= Math.max(1, Math.floor(MIN_STABLE_VIEWPORT_ROWS / 2))
+      ) {
+        viewportRows = previousViewportRows;
+      }
       lastMeasuredViewportRows.current = viewportRows;
       const maxHeightPx = fallbackRows * rowHeight;
       container.style.maxHeight = `${maxHeightPx}px`;
@@ -2166,7 +2175,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         const rawViewportRows =
           typeof frame.viewportRows === 'number' && frame.viewportRows > 0
             ? frame.viewportRows
-            : frame.historyRows;
+            : null;
         if (rawViewportRows > 0) {
           const clampedRows = Math.max(1, Math.min(rawViewportRows, MAX_VIEWPORT_ROWS));
           trace(
@@ -2191,14 +2200,14 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         }
         if (
           typeof window !== 'undefined' &&
-          frame.historyRows !== rawViewportRows &&
-          frame.historyRows > 0
+          frame.historyRows > 0 &&
+          typeof frame.viewportRows !== 'number'
         ) {
           try {
             console.info('[terminal][diag] history-rows-mismatch', {
               sessionId,
               frameViewportRows: frame.viewportRows ?? null,
-              rawViewportRows,
+              appliedViewportRows: rawViewportRows,
               historyRows: frame.historyRows,
               cols: frame.cols,
             });

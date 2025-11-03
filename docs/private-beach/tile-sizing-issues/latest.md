@@ -965,3 +965,12 @@ Plan to finish the sizing work
 4. After the preview stabilises around the 60–64 row window, rerun the host resize test and make sure we never emit `disable-measurements viewport-set … appliedRows: 24` again.
 
 Evidence quick links: /tmp/beach-host.log:6964937-6964954, temp/private-beach-2.log:845-897, 1210-1217, 1225, 883-884.
+
+2025-11-03 – Measurement debounce & glitch guard
+
+- Disabled the grid-frame fallback that copied historyRows into the PTY height (`apps/beach-surfer/src/components/BeachTerminal.tsx`). When the browser-side host can’t measure its viewport we now keep the previous PTY size and log `[terminal][diag] history-rows-mismatch` instead of inflating to the history length.
+- The hidden driver BeachTerminal lives in a fixed off-screen box and only publishes DOM measurements after two consistent ResizeObserver samples (with a 150 ms safety timeout). New refs in `SessionTerminalPreviewClient.tsx` (`domPendingSampleRef`, etc.) make sure transient 0/1-row readings never reach the store.
+- Added `[terminal][diag] view-only-host-dim-clamp` diagnostics so we know when we accept/skip a DOM-derived host size. Once a stable measurement lands we still update the fallback host dimensions, so view-only tiles scale to the real PTY height without trusting the brief StrictMode glitches.
+- BeachTerminal now ignores single-digit viewport drops when the previous measurement was healthy (≥6 rows), preventing the browser host from requesting 24-row resizes during remounts.
+
+Next verification pass: reload the dashboard and confirm the driver logs show two `dom-dimensions` samples before `[terminal][trace] host-dimension-update reason: dom-measurement`. After the debounce settles you should see the tile hold its full 60–65 row height while the historyRows fallback stays dormant.

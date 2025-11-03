@@ -850,6 +850,9 @@ function SessionTerminalPreviewView({
 
   const hasRemoteHostDimensions =
     hostRowSourceRef.current === 'pty' || hostColSourceRef.current === 'pty';
+  // For visible driver, we still want DOM pixels to drive preview scaling
+  // even when PTY dimensions are known. We only skip DOM for scaling when
+  // explicitly disabled.
   const shouldSkipDomMeasurements = disableDomMeasurements || hasRemoteHostDimensions;
 
   const previewMeasurements = useMemo<PreviewMeasurements | null>(() => {
@@ -951,8 +954,28 @@ function SessionTerminalPreviewView({
     }
   }, [previewMeasurements, updatePreviewStatus, viewer.status]);
 
+  // For visible-driver previews, once the terminal is ready, follow tail so
+  // the most recent content (bottom) is visible and we don't hide the last
+  // few rows due to partial height rounding.
+  useEffect(() => {
+    if (previewStatus !== 'ready' || !viewer.store) return;
+    try {
+      viewer.store.setFollowTail(true);
+      if (typeof window !== 'undefined') {
+        console.info('[terminal][trace] follow-tail:enabled', { sessionId });
+      }
+    } catch {
+      // ignore
+    }
+  }, [previewStatus, sessionId, viewer.store]);
+
   useEffect(() => {
     if (!viewer.store) {
+      return;
+    }
+    if (ENABLE_VISIBLE_PREVIEW_DRIVER) {
+      // In visible-driver mode, BeachTerminal controls viewport height via
+      // forcedViewportRows and we should not clamp it here.
       return;
     }
     const ensurePinnedViewport = () => {
@@ -1060,12 +1083,22 @@ function SessionTerminalPreviewView({
       const measuredWidth = child ? child.width : rect.width;
       const measuredHeight = child ? child.height : rect.height;
       if (Number.isFinite(measuredWidth) && Number.isFinite(measuredHeight)) {
-        const rawWidthFromDom = measuredWidth / effectiveScale;
-        const rawHeightFromDom = measuredHeight / effectiveScale;
+        const rawWidthFromDom = measuredWidth / Math.max(1e-6, effectiveScale);
+        const rawHeightFromDom = measuredHeight / Math.max(1e-6, effectiveScale);
         const hostSourceIsRemote =
           hostRowSourceRef.current === 'pty' || hostColSourceRef.current === 'pty';
 
-        if (hostSourceIsRemote) {
+        // In visible-driver mode, always capture DOM raw size for scaling,
+        // but avoid mutating host dimensions when PTY is authoritative.
+        if (hostSourceIsRemote && ENABLE_VISIBLE_PREVIEW_DRIVER) {
+          const prev = domRawSizeRef.current;
+          const widthDelta = !prev ? Number.POSITIVE_INFINITY : Math.abs(prev.width - rawWidthFromDom);
+          const heightDelta = !prev ? Number.POSITIVE_INFINITY : Math.abs(prev.height - rawHeightFromDom);
+          if (!prev || widthDelta > 1 || heightDelta > 1) {
+            domRawSizeRef.current = { width: rawWidthFromDom, height: rawHeightFromDom };
+            setDomRawVersion((version) => (version + 1) % 1_000_000);
+            measurementVersionRef.current = (measurementVersionRef.current % 1_000_000) + 1;
+          }
           return;
         }
 
@@ -1431,9 +1464,6 @@ function SessionTerminalPreviewView({
                   showTopBar={variant === 'full'}
                   showStatusBar={variant === 'full'}
                   autoResizeHostOnViewportChange={false}
-                  // In visible driver mode, keep terminal geometry fixed to
-                  // the host so the preview scaling matches. Avoid DOM-driven
-                  // height clamps that create a tiny render band.
                   disableViewportMeasurements
                   forcedViewportRows={resolvedHostRows ?? DEFAULT_HOST_ROWS}
                   onViewportStateChange={handleViewportStateChange}

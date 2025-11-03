@@ -1335,7 +1335,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         // Tie the container max height to the committed viewport rows, not
         // the window-derived fallback. This prevents the terminal from being
         // squeezed into a smaller box than the visible viewport allows.
-        const maxHeightPx = Math.max(1, Math.round(rows * rowHeight));
+        const maxHeightPx = Math.max(1, Math.ceil(rows * rowHeight));
         container.style.maxHeight = `${maxHeightPx}px`;
         container.style.setProperty('--beach-terminal-max-height', `${maxHeightPx}px`);
         const current = store.getSnapshot();

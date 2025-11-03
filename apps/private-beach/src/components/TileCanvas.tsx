@@ -2424,7 +2424,7 @@ export default function TileCanvas({
         typeof dims.hostCols === 'number' && dims.hostCols > 0 ? dims.hostCols : null;
       const hostProvided = hostRowsCandidate != null || hostColsCandidate != null;
       const previewMeasurement = state.preview ?? null;
-      if (hostProvided && previewMeasurement) {
+      if (hostProvided && previewMeasurement && state.locked) {
         const hostSourceIsPty =
           (previewMeasurement.hostRowSource ?? 'unknown') === 'pty' ||
           (previewMeasurement.hostColSource ?? 'unknown') === 'pty';
@@ -2436,28 +2436,40 @@ export default function TileCanvas({
         }
       }
 
-      const resolvedHostRows = (() => {
-        if (hostRowsCandidate != null) {
-          return hostRowsCandidate;
-        }
-        if (state.hostRows && state.hostRows > 0) {
-          return state.hostRows;
-        }
-        if (viewportRows && viewportRows > 0) {
-          return viewportRows;
+  const resolvedHostRows = (() => {
+    if (hostRowsCandidate != null) {
+      if (state.locked) {
+        return hostRowsCandidate;
+      }
+      if (viewportRows && viewportRows > 0) {
+        return viewportRows;
+      }
+      return hostRowsCandidate;
+    }
+    if (state.hostRows && state.hostRows > 0) {
+      return state.hostRows;
+    }
+    if (viewportRows && viewportRows > 0) {
+      return viewportRows;
         }
         return DEFAULT_HOST_ROWS;
       })();
 
-      const resolvedHostCols = (() => {
-        if (hostColsCandidate != null) {
-          return hostColsCandidate;
-        }
-        if (state.hostCols && state.hostCols > 0) {
-          return state.hostCols;
-        }
-        if (viewportCols && viewportCols > 0) {
-          return viewportCols;
+  const resolvedHostCols = (() => {
+    if (hostColsCandidate != null) {
+      if (state.locked) {
+        return hostColsCandidate;
+      }
+      if (viewportCols && viewportCols > 0) {
+        return viewportCols;
+      }
+      return hostColsCandidate;
+    }
+    if (state.hostCols && state.hostCols > 0) {
+      return state.hostCols;
+    }
+    if (viewportCols && viewportCols > 0) {
+      return viewportCols;
         }
         return DEFAULT_HOST_COLS;
       })();

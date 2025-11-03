@@ -33,6 +33,7 @@ export class DataChannelTerminalTransport extends EventTarget implements Termina
   private readonly logger?: (message: string) => void;
   private framesSeen = 0;
   private readyAnnounced = false;
+  private lastStatus: string | null = null;
 
   constructor(channel: WebRtcTransport, options: DataChannelTerminalTransportOptions = {}) {
     super();
@@ -63,6 +64,17 @@ export class DataChannelTerminalTransport extends EventTarget implements Termina
           return;
         }
         if (text.startsWith('beach:status:')) {
+          this.lastStatus = text;
+          if (typeof window !== 'undefined') {
+            try {
+              console.info('[terminal][diag] status-control', {
+                payload: text,
+                framesSeen: this.framesSeen,
+              });
+            } catch {
+              // ignore logging failures
+            }
+          }
           this.dispatchEvent(new CustomEvent<string>('status', { detail: text }));
           return;
         }
@@ -187,6 +199,10 @@ export class DataChannelTerminalTransport extends EventTarget implements Termina
       return;
     }
     this.logger(`[terminal transport] ${message}`);
+  }
+
+  getLastStatus(): string | null {
+    return this.lastStatus;
   }
 }
 

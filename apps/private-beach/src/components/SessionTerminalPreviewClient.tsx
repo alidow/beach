@@ -15,12 +15,12 @@ import { isPrivateBeachDebugEnabled } from '../lib/debug';
 const DEFAULT_HOST_COLS = 80;
 const DEFAULT_HOST_ROWS = 24;
 const TERMINAL_PADDING_X = 48;
-const TERMINAL_PADDING_Y = 56;
+const TERMINAL_PADDING_Y = 32;
 const BASE_TERMINAL_FONT_SIZE = 14;
 const BASE_TERMINAL_CELL_WIDTH = 8;
 const MINIMUM_SCALE = 0.05;
-const MAX_PREVIEW_WIDTH = 450;
-const MAX_PREVIEW_HEIGHT = 450;
+const MAX_PREVIEW_WIDTH = 720;
+const MAX_PREVIEW_HEIGHT = 720;
 
 type HostDimensionCacheEntry = {
   rows: number | null;
@@ -147,6 +147,10 @@ function SessionTerminalPreviewView({
   const [domRawVersion, setDomRawVersion] = useState(0);
   const [isCloneVisible, setIsCloneVisible] = useState<boolean>(true);
   const prehydratedSeqRef = useRef<number | null>(null);
+  const [terminalReady, setTerminalReady] = useState(false);
+  const isPassiveTile = !locked;
+  const driverViewOnly = isPassiveTile;
+  const cloneViewOnly = isPassiveTile;
 
   const updatePreviewStatus = useCallback(
     (next: PreviewStatus) => {
@@ -186,6 +190,9 @@ function SessionTerminalPreviewView({
     domRawSizeRef.current = null;
     setDomRawVersion((version) => (version + 1) % 1_000_000);
   }, [sessionId]);
+  useEffect(() => {
+    setTerminalReady(true);
+  }, []);
 
   // Observe clone visibility to throttle rendering when off-screen
   useEffect(() => {
@@ -264,12 +271,12 @@ function SessionTerminalPreviewView({
         typeof state.viewportRows === 'number' && state.viewportRows > 0 ? state.viewportRows : null;
       let patchedCols =
         typeof state.viewportCols === 'number' && state.viewportCols > 0 ? state.viewportCols : null;
-      if (hostRows && (!patchedRows || patchedRows < hostRows)) {
+      if (!state.viewOnly && hostRows && (!patchedRows || patchedRows < hostRows)) {
         patchedRows = hostRows;
       } else if (prevRows && (!patchedRows || patchedRows < prevRows)) {
         patchedRows = prevRows;
       }
-      if (hostCols && (!patchedCols || patchedCols < hostCols)) {
+      if (!state.viewOnly && hostCols && (!patchedCols || patchedCols < hostCols)) {
         patchedCols = hostCols;
       } else if (prevCols && (!patchedCols || patchedCols < prevCols)) {
         patchedCols = prevCols;
@@ -763,10 +770,16 @@ function SessionTerminalPreviewView({
   const zoomMultiplier =
     typeof scale === 'number' && Number.isFinite(scale) ? Math.max(scale, MINIMUM_SCALE) : 1;
 
-  const resolvedHostRows =
-    hostDimensions.rows && hostDimensions.rows > 0 ? hostDimensions.rows : hostViewportRows;
-  const resolvedHostCols =
-    hostDimensions.cols && hostDimensions.cols > 0 ? hostDimensions.cols : hostViewportCols;
+  const resolvedHostRows = cloneViewOnly
+    ? measuredViewportRows ?? hostViewportRows ?? hostDimensions.rows
+    : hostDimensions.rows && hostDimensions.rows > 0
+      ? hostDimensions.rows
+      : hostViewportRows;
+  const resolvedHostCols = cloneViewOnly
+    ? measuredViewportCols ?? hostViewportCols ?? hostDimensions.cols
+    : hostDimensions.cols && hostDimensions.cols > 0
+      ? hostDimensions.cols
+      : hostViewportCols;
 
   const fallbackHostRows = resolvedHostRows ?? measuredViewportRows ?? DEFAULT_HOST_ROWS;
   const fallbackHostCols = resolvedHostCols ?? measuredViewportCols ?? DEFAULT_HOST_COLS;
@@ -885,15 +898,24 @@ function SessionTerminalPreviewView({
     const ensurePinnedViewport = () => {
       const snapshot = viewer.store!.getSnapshot();
       const desiredTop = snapshot.baseRow;
-      const hostRowCount = resolvedHostRows ?? hostViewportRows ?? DEFAULT_HOST_ROWS;
-      const desiredHeight = Math.max(1, hostRowCount);
+      const targetRows =
+        cloneViewOnly
+          ? Math.max(
+              1,
+              measuredViewportRows ??
+                snapshot.viewportHeight ??
+                resolvedHostRows ??
+                hostViewportRows ??
+                DEFAULT_HOST_ROWS,
+            )
+          : Math.max(1, resolvedHostRows ?? hostViewportRows ?? DEFAULT_HOST_ROWS);
       let changed = false;
       if (snapshot.followTail) {
         viewer.store!.setFollowTail(false);
         changed = true;
       }
-      if (snapshot.viewportTop !== desiredTop || snapshot.viewportHeight !== desiredHeight) {
-        viewer.store!.setViewport(desiredTop, desiredHeight);
+      if (snapshot.viewportTop !== desiredTop || snapshot.viewportHeight !== targetRows) {
+        viewer.store!.setViewport(desiredTop, targetRows);
         changed = true;
       }
       if (changed && typeof window !== 'undefined') {
@@ -901,7 +923,7 @@ function SessionTerminalPreviewView({
           console.info('[terminal][trace] viewport-clamped', {
             sessionId,
             desiredTop,
-            desiredHeight,
+            desiredHeight: targetRows,
             snapshotTop: snapshot.viewportTop,
             snapshotHeight: snapshot.viewportHeight,
           });
@@ -915,7 +937,7 @@ function SessionTerminalPreviewView({
       ensurePinnedViewport();
     });
     return unsubscribe;
-  }, [hostViewportRows, resolvedHostRows, sessionId, viewer.store]);
+  }, [cloneViewOnly, hostViewportRows, measuredViewportRows, resolvedHostRows, sessionId, viewer.store]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -1086,10 +1108,6 @@ function SessionTerminalPreviewView({
     zoomMultiplier,
   ]);
 
-  const isPassiveTile = !locked;
-  const driverViewOnly = isPassiveTile;
-  const cloneViewOnly = isPassiveTile;
-
   const driverWrapperStyle = useMemo<CSSProperties>(
     () => ({
       position: 'absolute',
@@ -1218,7 +1236,7 @@ function SessionTerminalPreviewView({
   }
 
   const overlayTextClass = variant === 'full' ? 'text-[11px]' : 'text-[10px]';
-  const showPlaceholder = previewStatus !== 'ready';
+  const showPlaceholder = !terminalReady || previewStatus !== 'ready';
   const overlayClass =
     variant === 'preview'
       ? 'absolute inset-0 flex items-center justify-center bg-neutral-950/90 text-xs text-muted-foreground'
@@ -1232,22 +1250,25 @@ function SessionTerminalPreviewView({
       </div>
       <div className="relative flex w-full items-start justify-start overflow-hidden">
         <div style={driverWrapperStyle} aria-hidden>
-          <BeachTerminal
-            store={viewer.store ?? undefined}
-            transport={viewer.transport ?? undefined}
-            transportVersion={viewer.transportVersion}
-            autoConnect={false}
-            className="w-full"
-            fontSize={effectiveFontSize}
-            showTopBar={false}
-            showStatusBar={false}
-            autoResizeHostOnViewportChange={false}
-            onViewportStateChange={handleViewportStateChange}
-            disableViewportMeasurements={false}
-            maxRenderFps={20}
-            hideIdlePlaceholder
-            viewOnly={driverViewOnly}
-          />
+          {terminalReady ? (
+            <BeachTerminal
+              store={viewer.store ?? undefined}
+              transport={viewer.transport ?? undefined}
+              transportVersion={viewer.transportVersion}
+              autoConnect={false}
+              className="w-full"
+              fontSize={effectiveFontSize}
+              showTopBar={false}
+              showStatusBar={false}
+              autoResizeHostOnViewportChange={false}
+              onViewportStateChange={handleViewportStateChange}
+              disableViewportMeasurements={false}
+              maxRenderFps={20}
+              hideIdlePlaceholder
+              viewOnly={driverViewOnly}
+              sessionId={sessionId}
+            />
+          ) : null}
         </div>
         <div
           ref={cloneWrapperRef}
@@ -1255,20 +1276,25 @@ function SessionTerminalPreviewView({
           style={cloneWrapperStyle}
         >
           <div ref={cloneInnerRef} className="origin-top-left" style={cloneInnerStyle}>
-            <BeachTerminal
-              store={viewer.store ?? undefined}
-              transport={undefined}
-              autoConnect={false}
-              className="w-full"
-              fontSize={effectiveFontSize}
-              showTopBar={variant === 'full'}
-              showStatusBar={variant === 'full'}
-              autoResizeHostOnViewportChange={locked}
-              disableViewportMeasurements
-              maxRenderFps={isCloneVisible ? undefined : 12}
-              hideIdlePlaceholder
-              viewOnly={cloneViewOnly}
-            />
+            {terminalReady ? (
+              <BeachTerminal
+                store={viewer.store ?? undefined}
+                transport={undefined}
+                autoConnect={false}
+                className="w-full"
+                fontSize={effectiveFontSize}
+                showTopBar={variant === 'full'}
+                showStatusBar={variant === 'full'}
+                autoResizeHostOnViewportChange={locked}
+                disableViewportMeasurements
+                maxRenderFps={isCloneVisible ? undefined : 12}
+                hideIdlePlaceholder
+                viewOnly={cloneViewOnly}
+                sessionId={sessionId}
+              />
+            ) : (
+              <div className="h-full w-full" aria-hidden />
+            )}
           </div>
           {showPlaceholder && (
             <div className={overlayClass}>

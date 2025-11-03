@@ -6,12 +6,19 @@
 //! - Optionally export `REDIS_URL` if you want to exercise Redis paths
 //! - Run: `cargo test -p beach-manager -- --ignored postgres_sqlx_e2e`
 
-use axum::Router;
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+    Router,
+};
 use beach_buggy::{
     AckStatus, ActionAck, ActionCommand, HarnessType, HealthHeartbeat, RegisterSessionRequest,
     StateDiff,
 };
+use hyper::body::to_bytes;
+use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
+use tower::ServiceExt;
 use uuid::Uuid;
 
 use beach_manager::{routes::build_router, state::AppState};
@@ -132,4 +139,139 @@ async fn postgres_sqlx_e2e() {
     // Events should be present
     let events = state.controller_events(&session_id).await.expect("events");
     assert!(!events.is_empty());
+}
+
+#[ignore]
+#[tokio::test]
+async fn postgres_viewer_credentials_for_multi_beach_session() {
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for this test");
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .expect("connect to postgres");
+
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("apply migrations");
+
+    let state = AppState::with_db(pool.clone());
+    let app: Router = build_router(state.clone());
+
+    let origin_session_id = Uuid::new_v4().to_string();
+    let private_beach_a = Uuid::new_v4();
+    let private_beach_b = Uuid::new_v4();
+
+    let slug_a = format!("test-a-{}", private_beach_a);
+    let slug_b = format!("test-b-{}", private_beach_b);
+
+    for (id, name, slug) in [
+        (private_beach_a, "Test Beach A", slug_a),
+        (private_beach_b, "Test Beach B", slug_b),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO private_beach (id, name, slug)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (id) DO NOTHING
+            "#,
+        )
+        .bind(id)
+        .bind(name)
+        .bind(slug)
+        .execute(&pool)
+        .await
+        .expect("insert private beach");
+    }
+
+    let register_a = RegisterSessionRequest {
+        session_id: origin_session_id.clone(),
+        private_beach_id: private_beach_a.to_string(),
+        harness_type: HarnessType::TerminalShim,
+        capabilities: vec!["terminal_diff_v1".into()],
+        location_hint: None,
+        metadata: None,
+        version: "1.0.0".into(),
+        viewer_passcode: Some("PASS-A".into()),
+    };
+    state
+        .register_session(register_a)
+        .await
+        .expect("register session for beach A");
+
+    let register_b = RegisterSessionRequest {
+        session_id: origin_session_id.clone(),
+        private_beach_id: private_beach_b.to_string(),
+        harness_type: HarnessType::TerminalShim,
+        capabilities: vec!["terminal_diff_v1".into()],
+        location_hint: None,
+        metadata: None,
+        version: "1.0.0".into(),
+        viewer_passcode: Some("PASS-B".into()),
+    };
+    state
+        .register_session(register_b)
+        .await
+        .expect("register session for beach B");
+
+    let pass_a = state
+        .viewer_passcode(&private_beach_a.to_string(), &origin_session_id)
+        .await
+        .expect("viewer passcode lookup A")
+        .expect("passcode present for beach A");
+    assert_eq!(pass_a, "PASS-A");
+
+    let pass_b = state
+        .viewer_passcode(&private_beach_b.to_string(), &origin_session_id)
+        .await
+        .expect("viewer passcode lookup B")
+        .expect("passcode present for beach B");
+    assert_eq!(pass_b, "PASS-B");
+
+    let uri_a = format!(
+        "/private-beaches/{}/sessions/{}/viewer-credential",
+        private_beach_a, origin_session_id
+    );
+    let response_a = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri_a)
+                .header("Authorization", "Bearer test-token")
+                .body(Body::empty())
+                .expect("build request A"),
+        )
+        .await
+        .expect("send viewer credential request A");
+    assert_eq!(response_a.status(), StatusCode::OK);
+    let body_a = to_bytes(response_a.into_body()).await.expect("read body A");
+    let json_a: Value = serde_json::from_slice(&body_a).expect("parse body A");
+    assert_eq!(json_a["credential_type"], "viewer_passcode");
+    assert_eq!(json_a["credential"], "PASS-A");
+    assert_eq!(json_a["session_id"], origin_session_id);
+    assert_eq!(json_a["private_beach_id"], private_beach_a.to_string());
+
+    let uri_b = format!(
+        "/private-beaches/{}/sessions/{}/viewer-credential",
+        private_beach_b, origin_session_id
+    );
+    let response_b = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri_b)
+                .header("Authorization", "Bearer test-token")
+                .body(Body::empty())
+                .expect("build request B"),
+        )
+        .await
+        .expect("send viewer credential request B");
+    assert_eq!(response_b.status(), StatusCode::OK);
+    let body_b = to_bytes(response_b.into_body()).await.expect("read body B");
+    let json_b: Value = serde_json::from_slice(&body_b).expect("parse body B");
+    assert_eq!(json_b["credential_type"], "viewer_passcode");
+    assert_eq!(json_b["credential"], "PASS-B");
+    assert_eq!(json_b["session_id"], origin_session_id);
+    assert_eq!(json_b["private_beach_id"], private_beach_b.to_string());
 }

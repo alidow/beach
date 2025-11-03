@@ -2575,10 +2575,19 @@ impl AppState {
             Backend::Postgres(pool) => {
                 let session_uuid = parse_uuid(session_id, "session_id")?;
                 let beach_uuid = parse_uuid(private_beach_id, "private_beach_id")?;
-                let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
-                if identifiers.private_beach_id != beach_uuid {
-                    return Err(StateError::PrivateBeachNotFound);
-                }
+                let identifiers = match self
+                    .fetch_session_identifiers_for_private_beach(pool, &session_uuid, &beach_uuid)
+                    .await?
+                {
+                    Some(found) => found,
+                    None => match self.fetch_session_identifiers(pool, &session_uuid).await {
+                        Ok(_) => return Err(StateError::PrivateBeachNotFound),
+                        Err(StateError::SessionNotFound) => {
+                            return Err(StateError::SessionNotFound)
+                        }
+                        Err(other) => return Err(other),
+                    },
+                };
 
                 let mut tx = pool.begin().await?;
                 self.set_rls_context_tx(&mut tx, &beach_uuid).await?;
@@ -3855,6 +3864,28 @@ impl AppState {
         .await?;
 
         row.ok_or(StateError::SessionNotFound)
+    }
+
+    async fn fetch_session_identifiers_for_private_beach(
+        &self,
+        pool: &PgPool,
+        session_uuid: &Uuid,
+        private_beach_uuid: &Uuid,
+    ) -> Result<Option<DbSessionIdentifiers>, StateError> {
+        let row = sqlx::query_as::<_, DbSessionIdentifiers>(
+            r#"
+            SELECT id AS session_id, private_beach_id
+            FROM session
+            WHERE origin_session_id = $1
+              AND private_beach_id = $2
+            "#,
+        )
+        .bind(session_uuid)
+        .bind(private_beach_uuid)
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(row)
     }
 
     async fn fetch_active_lease(

@@ -143,6 +143,65 @@ const PREDICTION_GLITCH_FLAG_THRESHOLD_MS = 5000;
 const PREDICTION_SRTT_ALPHA = 0.125;
 const PREDICTION_ACK_GRACE_MS = 90;
 
+type JoinStateSnapshot = { state: JoinOverlayState; message: string | null };
+
+type JoinStateListener = {
+  id: string;
+  callback: (snapshot: JoinStateSnapshot) => void;
+};
+
+const LAST_JOIN_STATE = new Map<string, JoinStateSnapshot>();
+const JOIN_STATE_LISTENERS = new Map<string, Map<string, JoinStateListener>>();
+let joinStateSubscriberCounter = 0;
+
+function nextJoinStateSubscriberId(): string {
+  joinStateSubscriberCounter += 1;
+  return `terminal-${joinStateSubscriberCounter}`;
+}
+
+function subscribeJoinState(
+  sessionId: string,
+  listener: JoinStateListener,
+): () => void {
+  let listeners = JOIN_STATE_LISTENERS.get(sessionId);
+  if (!listeners) {
+    listeners = new Map();
+    JOIN_STATE_LISTENERS.set(sessionId, listeners);
+  }
+  listeners.set(listener.id, listener);
+  return () => {
+    const current = JOIN_STATE_LISTENERS.get(sessionId);
+    if (!current) return;
+    current.delete(listener.id);
+    if (current.size === 0) {
+      JOIN_STATE_LISTENERS.delete(sessionId);
+    }
+  };
+}
+
+function emitJoinState(
+  sessionId: string,
+  snapshot: JoinStateSnapshot,
+  skipListenerId?: string,
+): void {
+  const listeners = JOIN_STATE_LISTENERS.get(sessionId);
+  if (!listeners) {
+    return;
+  }
+  listeners.forEach(({ id, callback }) => {
+    if (skipListenerId && id === skipListenerId) {
+      return;
+    }
+    try {
+      callback(snapshot);
+    } catch (error) {
+      if (IS_DEV) {
+        console.warn('[beach-surfer] join state listener error', error);
+      }
+    }
+  });
+}
+
 function now(): number {
   if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
     return performance.now();
@@ -386,6 +445,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const [joinState, setJoinState] = useState<JoinOverlayState>('idle');
   const joinStateRef = useRef<JoinOverlayState>('idle');
   const [joinMessage, setJoinMessage] = useState<string | null>(null);
+  const joinMessageRef = useRef<string | null>(null);
   const [predictionOverlay, setPredictionOverlay] = useState<PredictionOverlayState>({
     visible: false,
     underline: false,
@@ -408,6 +468,36 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       connectionTraceRef.current?.mark(name, extra);
     },
     [],
+  );
+  const subscriberIdRef = useRef<string>('');
+  if (!subscriberIdRef.current) {
+    subscriberIdRef.current = nextJoinStateSubscriberId();
+  }
+
+  const updateJoinStateCache = useCallback(
+    (state: JoinOverlayState, message: string | null, skipEmitId?: string) => {
+      if (!sessionId) {
+        return;
+      }
+      const previous = LAST_JOIN_STATE.get(sessionId);
+      if (previous && previous.state === state && previous.message === message) {
+        return;
+      }
+      const snapshot = { state, message } as JoinStateSnapshot;
+      if (typeof window !== 'undefined') {
+        try {
+          console.info(
+            '[terminal][diag] join-state-cache',
+            JSON.stringify({ sessionId, state, message }),
+          );
+        } catch {
+          // ignore logging failures
+        }
+      }
+      LAST_JOIN_STATE.set(sessionId, snapshot);
+      emitJoinState(sessionId, snapshot, skipEmitId);
+    },
+    [sessionId],
   );
   const finishConnectionTrace = useCallback(
     (outcome: 'success' | 'error' | 'cancelled', extra: Record<string, unknown> = {}) => {
@@ -451,6 +541,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   useEffect(() => {
     joinStateRef.current = joinState;
   }, [joinState]);
+  useEffect(() => {
+    joinMessageRef.current = joinMessage;
+  }, [joinMessage]);
   useEffect(() => {
     return () => {
       clearJoinTimers();
@@ -663,6 +756,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       const effective = trimmed && trimmed.length > 0 ? trimmed : JOIN_WAIT_INITIAL;
       setJoinState('waiting');
       setJoinMessage(effective);
+      updateJoinStateCache('waiting', effective ?? null, subscriberIdRef.current);
       clearJoinTimers();
       if (!trimmed || trimmed.length === 0) {
         joinTimersRef.current.short = window.setTimeout(() => {
@@ -671,6 +765,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
               return current;
             }
             if (current === JOIN_WAIT_INITIAL || current === JOIN_WAIT_DEFAULT) {
+              updateJoinStateCache('waiting', JOIN_WAIT_HINT_ONE, subscriberIdRef.current);
               return JOIN_WAIT_HINT_ONE;
             }
             return current;
@@ -686,6 +781,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
               current === JOIN_WAIT_DEFAULT ||
               current === JOIN_WAIT_HINT_ONE
             ) {
+              updateJoinStateCache('waiting', JOIN_WAIT_HINT_TWO, subscriberIdRef.current);
               return JOIN_WAIT_HINT_TWO;
             }
             return current;
@@ -693,7 +789,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         }, 30_000);
       }
     },
-    [clearJoinTimers],
+    [clearJoinTimers, updateJoinStateCache],
   );
 
   const enterApprovedState = useCallback(
@@ -703,14 +799,16 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       const effective = trimmed && trimmed.length > 0 ? trimmed : JOIN_APPROVED_MESSAGE;
       setJoinState('approved');
       setJoinMessage(effective);
+      updateJoinStateCache('approved', effective ?? null, subscriberIdRef.current);
       clearJoinTimers();
       joinTimersRef.current.hide = window.setTimeout(() => {
         setJoinState('idle');
         setJoinMessage(null);
+        updateJoinStateCache('idle', null, subscriberIdRef.current);
         joinTimersRef.current.hide = undefined;
       }, JOIN_OVERLAY_HIDE_DELAY_MS);
     },
-    [clearJoinTimers],
+    [clearJoinTimers, updateJoinStateCache],
   );
 
   const enterDeniedState = useCallback(
@@ -720,27 +818,31 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       const effective = trimmed && trimmed.length > 0 ? trimmed : JOIN_DENIED_MESSAGE;
       setJoinState('denied');
       setJoinMessage(effective);
+      updateJoinStateCache('denied', effective ?? null, subscriberIdRef.current);
       clearJoinTimers();
       joinTimersRef.current.hide = window.setTimeout(() => {
         setJoinState('idle');
         setJoinMessage(null);
+        updateJoinStateCache('idle', null, subscriberIdRef.current);
         joinTimersRef.current.hide = undefined;
       }, JOIN_OVERLAY_HIDE_DELAY_MS);
     },
-    [clearJoinTimers],
+    [clearJoinTimers, updateJoinStateCache],
   );
 
   const enterDisconnectedState = useCallback(() => {
     handshakeReadyRef.current = false;
     setJoinState('disconnected');
     setJoinMessage(JOIN_DISCONNECTED_MESSAGE);
+    updateJoinStateCache('disconnected', JOIN_DISCONNECTED_MESSAGE, subscriberIdRef.current);
     clearJoinTimers();
     joinTimersRef.current.hide = window.setTimeout(() => {
       setJoinState('idle');
       setJoinMessage(null);
+      updateJoinStateCache('idle', null, subscriberIdRef.current);
       joinTimersRef.current.hide = undefined;
     }, JOIN_OVERLAY_HIDE_DELAY_MS);
-  }, [clearJoinTimers]);
+  }, [clearJoinTimers, updateJoinStateCache]);
 
   const handleStatusSignal = useCallback(
     (signal: string) => {
@@ -769,6 +871,71 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     },
     [enterApprovedState, enterDeniedState, enterWaitingState],
   );
+  useEffect(() => {
+    if (!sessionId) {
+      return;
+    }
+    const applySnapshot = (snapshot: JoinStateSnapshot) => {
+      const { state, message } = snapshot;
+      if (typeof window !== 'undefined') {
+        try {
+          console.info('[terminal][diag] join-state-apply', {
+            sessionId,
+            state,
+            message,
+            currentState: joinStateRef.current,
+            currentMessage: joinMessageRef.current,
+          });
+        } catch {
+          // ignore logging failures
+        }
+      }
+      if (state === joinStateRef.current && message === joinMessageRef.current) {
+        return;
+      }
+      switch (state) {
+        case 'waiting':
+          enterWaitingState(message ?? undefined);
+          break;
+        case 'approved':
+          enterApprovedState(message ?? undefined);
+          break;
+        case 'denied':
+          enterDeniedState(message ?? undefined);
+          break;
+        case 'disconnected':
+          enterDisconnectedState();
+          break;
+        case 'connecting':
+          setJoinState('connecting');
+          setJoinMessage(message ?? JOIN_CONNECTING_MESSAGE);
+          break;
+        case 'idle':
+          setJoinState('idle');
+          setJoinMessage(message ?? null);
+          break;
+        default:
+          break;
+      }
+    };
+    const cached = LAST_JOIN_STATE.get(sessionId);
+    if (cached) {
+      applySnapshot(cached);
+    }
+    return subscribeJoinState(sessionId, {
+      id: subscriberIdRef.current,
+      callback: applySnapshot,
+    });
+  }, [
+    enterApprovedState,
+    enterDeniedState,
+    enterDisconnectedState,
+    enterWaitingState,
+    joinMessage,
+    joinState,
+    sessionId,
+    updateJoinStateCache,
+  ]);
   useEffect(() => {
     if (hideIdlePlaceholder) {
       setShowIdlePlaceholder(false);
@@ -971,6 +1138,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       clearJoinTimers();
       setJoinState('idle');
       setJoinMessage(null);
+      updateJoinStateCache('idle', null, subscriberIdRef.current);
     }
     emitViewportState();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -990,6 +1158,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     setStatus('connecting');
     setJoinState('connecting');
     setJoinMessage(JOIN_CONNECTING_MESSAGE);
+    updateJoinStateCache('connecting', JOIN_CONNECTING_MESSAGE, subscriberIdRef.current);
     markConnectionTrace('beach_terminal:status_connecting');
     handshakeReadyRef.current = false;
     clearJoinTimers();
@@ -1919,6 +2088,11 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       setStatus('error');
     });
 
+    const replayStatus =
+      (transport as unknown as { getLastStatus?: () => string | null }).getLastStatus?.() ?? null;
+    if (replayStatus) {
+      handleStatusSignal(replayStatus);
+    }
     if (!handshakeReadyRef.current) {
       enterWaitingState();
     }

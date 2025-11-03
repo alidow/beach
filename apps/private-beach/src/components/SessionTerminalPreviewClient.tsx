@@ -770,23 +770,39 @@ function SessionTerminalPreviewView({
   const zoomMultiplier =
     typeof scale === 'number' && Number.isFinite(scale) ? Math.max(scale, MINIMUM_SCALE) : 1;
 
+  const pickMaxPositive = (...values: Array<number | null | undefined>) => {
+    const normalized = values
+      .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0)
+      .map((value) => Math.floor(value));
+    return normalized.length > 0 ? Math.max(...normalized) : null;
+  };
+
   const resolvedHostRows = cloneViewOnly
-    ? measuredViewportRows ?? hostViewportRows ?? hostDimensions.rows
+    ? pickMaxPositive(hostDimensions.rows, hostViewportRows, measuredViewportRows, DEFAULT_HOST_ROWS)
     : hostDimensions.rows && hostDimensions.rows > 0
       ? hostDimensions.rows
       : hostViewportRows;
   const resolvedHostCols = cloneViewOnly
-    ? measuredViewportCols ?? hostViewportCols ?? hostDimensions.cols
+    ? pickMaxPositive(hostDimensions.cols, hostViewportCols, measuredViewportCols, DEFAULT_HOST_COLS)
     : hostDimensions.cols && hostDimensions.cols > 0
       ? hostDimensions.cols
       : hostViewportCols;
 
-  const fallbackHostRows = resolvedHostRows ?? measuredViewportRows ?? DEFAULT_HOST_ROWS;
-  const fallbackHostCols = resolvedHostCols ?? measuredViewportCols ?? DEFAULT_HOST_COLS;
+  const fallbackHostRows = resolvedHostRows ?? pickMaxPositive(measuredViewportRows, DEFAULT_HOST_ROWS) ?? DEFAULT_HOST_ROWS;
+  const fallbackHostCols = resolvedHostCols ?? pickMaxPositive(measuredViewportCols, DEFAULT_HOST_COLS) ?? DEFAULT_HOST_COLS;
 
   const hostPixelSize = useMemo(() => {
     return estimateHostPixelSize(fallbackHostCols, fallbackHostRows, effectiveFontSize);
   }, [fallbackHostCols, fallbackHostRows, effectiveFontSize]);
+
+  const driverHostRows = hostDimensions.rows && hostDimensions.rows > 0 ? hostDimensions.rows : fallbackHostRows;
+  const driverHostCols = hostDimensions.cols && hostDimensions.cols > 0 ? hostDimensions.cols : fallbackHostCols;
+
+  const driverHostPixelSize = useMemo(() => {
+    const cols = driverHostCols && driverHostCols > 0 ? driverHostCols : DEFAULT_HOST_COLS;
+    const rows = driverHostRows && driverHostRows > 0 ? driverHostRows : DEFAULT_HOST_ROWS;
+    return estimateHostPixelSize(cols, rows, effectiveFontSize);
+  }, [driverHostCols, driverHostRows, effectiveFontSize]);
 
   const hasRemoteHostDimensions =
     hostRowSourceRef.current === 'pty' || hostColSourceRef.current === 'pty';
@@ -897,18 +913,23 @@ function SessionTerminalPreviewView({
     }
     const ensurePinnedViewport = () => {
       const snapshot = viewer.store!.getSnapshot();
-      const desiredTop = snapshot.baseRow;
+      const desiredTop = cloneViewOnly ? 0 : snapshot.baseRow;
+      const candidateRows = cloneViewOnly
+        ? [
+            measuredViewportRows,
+            snapshot.viewportHeight,
+            hostViewportRows,
+            resolvedHostRows,
+            DEFAULT_HOST_ROWS,
+          ]
+        : [resolvedHostRows, hostViewportRows, DEFAULT_HOST_ROWS];
+      const normalizedRowOptions = candidateRows
+        .filter((value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0)
+        .map((value) => Math.floor(value));
       const targetRows =
-        cloneViewOnly
-          ? Math.max(
-              1,
-              measuredViewportRows ??
-                snapshot.viewportHeight ??
-                resolvedHostRows ??
-                hostViewportRows ??
-                DEFAULT_HOST_ROWS,
-            )
-          : Math.max(1, resolvedHostRows ?? hostViewportRows ?? DEFAULT_HOST_ROWS);
+        normalizedRowOptions.length > 0
+          ? Math.max(1, Math.max(...normalizedRowOptions))
+          : Math.max(1, DEFAULT_HOST_ROWS);
       let changed = false;
       if (snapshot.followTail) {
         viewer.store!.setFollowTail(false);
@@ -1108,17 +1129,22 @@ function SessionTerminalPreviewView({
     zoomMultiplier,
   ]);
 
-  const driverWrapperStyle = useMemo<CSSProperties>(
-    () => ({
+  const driverWrapperStyle = useMemo<CSSProperties>(() => {
+    // Keep the hidden driver terminal in a stable layout box so its ResizeObserver
+    // reports the real host row height instead of falling back to the 24-row default.
+    const widthPx = Math.max(1, Math.round(driverHostPixelSize.width));
+    const heightPx = Math.max(1, Math.round(driverHostPixelSize.height));
+    return {
       position: 'absolute',
       top: -10_000,
       left: -10_000,
       opacity: 0,
       pointerEvents: 'none',
-      visibility: 'hidden',
-    }),
-    [],
-  );
+      width: `${widthPx}px`,
+      height: `${heightPx}px`,
+      overflow: 'hidden',
+    };
+  }, [driverHostPixelSize.height, driverHostPixelSize.width]);
 
   const cloneWrapperStyle = useMemo<CSSProperties | undefined>(() => {
     if (!previewMeasurements) {

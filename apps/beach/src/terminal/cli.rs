@@ -346,6 +346,13 @@ pub struct JoinArgs {
         help = "Maximum time to wait for headless mode to receive the initial snapshot"
     )]
     pub headless_timeout: u64,
+
+    #[arg(
+        long = "headless-resize",
+        value_name = "COLSxROWS",
+        help = "Request a specific terminal size when running headless validation (e.g. 80x24)"
+    )]
+    pub headless_resize: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -451,6 +458,13 @@ pub struct SshArgs {
         help = "Maximum time to wait for the headless validator to load the remote snapshot"
     )]
     pub headless_timeout: u64,
+
+    #[arg(
+        long = "headless-resize",
+        value_name = "COLSxROWS",
+        help = "Request a specific terminal size when headless validation runs (e.g. 80x24)"
+    )]
+    pub headless_resize: Option<String>,
 
     #[arg(
         long = "request-tty",

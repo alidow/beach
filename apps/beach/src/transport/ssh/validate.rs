@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 pub struct HeadlessOptions {
     pub timeout: Duration,
     pub require_snapshot: bool,
+    pub initial_resize: Option<(u16, u16)>,
 }
 
 impl Default for HeadlessOptions {
@@ -19,6 +20,7 @@ impl Default for HeadlessOptions {
         Self {
             timeout: Duration::from_secs(30),
             require_snapshot: true,
+            initial_resize: None,
         }
     }
 }
@@ -169,8 +171,9 @@ pub async fn run_headless_validation(
     let timeout = options.timeout;
     let require_snapshot = options.require_snapshot;
 
+    let initial_resize = options.initial_resize;
     let report = match tokio::task::spawn_blocking(move || {
-        execute_validation(transport_clone, timeout, require_snapshot)
+        execute_validation(transport_clone, timeout, require_snapshot, initial_resize)
     })
     .await
     .map_err(|err| CliError::Runtime(format!("validation task failed: {err}")))?
@@ -205,8 +208,9 @@ pub fn validate_existing_transport_blocking(
     transport: Arc<dyn Transport>,
     timeout: Duration,
     require_snapshot: bool,
+    initial_resize: Option<(u16, u16)>,
 ) -> Result<ValidationReport, CliError> {
-    match execute_validation(transport, timeout, require_snapshot) {
+    match execute_validation(transport, timeout, require_snapshot, initial_resize) {
         Ok(report) => Ok(report),
         Err(err) => {
             warn!(
@@ -224,9 +228,12 @@ fn execute_validation(
     transport: Arc<dyn Transport>,
     timeout: Duration,
     require_snapshot: bool,
+    initial_resize: Option<(u16, u16)>,
 ) -> Result<ValidationReport, ValidationFailure> {
     send_ready_sentinel(transport.as_ref())?;
-    send_initial_resize(transport.as_ref())?;
+    if let Some((cols, rows)) = initial_resize {
+        send_resize(transport.as_ref(), cols, rows)?;
+    }
     let start = Instant::now();
     let mut report = run_validation_loop(transport, timeout, require_snapshot)?;
     report.duration = start.elapsed();
@@ -301,8 +308,8 @@ pub fn log_report(summary: &ValidationReport) {
     }
 }
 
-fn send_initial_resize(transport: &dyn Transport) -> Result<(), ValidationFailure> {
-    let resize = WireClientFrame::Resize { cols: 80, rows: 24 };
+fn send_resize(transport: &dyn Transport, cols: u16, rows: u16) -> Result<(), ValidationFailure> {
+    let resize = WireClientFrame::Resize { cols, rows };
     let bytes = protocol::encode_client_frame_binary(&resize);
     transport
         .send_bytes(&bytes)
@@ -315,4 +322,25 @@ fn send_ready_sentinel(transport: &dyn Transport) -> Result<(), ValidationFailur
         .send_text("__ready__")
         .map(|_| ())
         .map_err(ValidationFailure::Transport)
+}
+
+pub fn parse_headless_resize_spec(spec: &str) -> Result<(u16, u16), CliError> {
+    let trimmed = spec.trim();
+    let Some((cols_str, rows_str)) = trimmed.split_once(|c| c == 'x' || c == 'X') else {
+        return Err(CliError::InvalidArgument(format!(
+            "invalid headless resize '{trimmed}'; expected <cols>x<rows>"
+        )));
+    };
+    let cols: u16 = cols_str
+        .parse()
+        .map_err(|_| CliError::InvalidArgument(format!("invalid column count in '{trimmed}'")))?;
+    let rows: u16 = rows_str
+        .parse()
+        .map_err(|_| CliError::InvalidArgument(format!("invalid row count in '{trimmed}'")))?;
+    if cols == 0 || rows == 0 {
+        return Err(CliError::InvalidArgument(
+            "headless resize values must be positive".into(),
+        ));
+    }
+    Ok((cols, rows))
 }

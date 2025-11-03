@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child as TokioChild, ChildStderr, Command as TokioCommand};
 use tracing::{debug, info, warn};
 use url::Url;
-use validate::{HeadlessOptions, log_report, run_headless_validation};
+use validate::{HeadlessOptions, log_report, parse_headless_resize_spec, run_headless_validation};
 
 pub async fn run(
     base_url: &str,
@@ -160,9 +160,14 @@ pub async fn run(
     }
 
     if args.headless {
+        let resize = match args.headless_resize.as_deref() {
+            Some(spec) => Some(parse_headless_resize_spec(spec)?),
+            None => None,
+        };
         let options = HeadlessOptions {
             timeout: Duration::from_secs(args.headless_timeout.max(1)),
             require_snapshot: true,
+            initial_resize: resize,
         };
         println!(
             "⚙️  Running headless validation (timeout {}s)...",
@@ -213,6 +218,7 @@ pub async fn run(
         inject_latency: None,
         headless: false,
         headless_timeout: 30,
+        headless_resize: None,
     };
 
     // If we are keeping the remote host running, we can drop SSH immediately.

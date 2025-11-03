@@ -9,7 +9,8 @@ use crate::terminal::cli::JoinArgs;
 use crate::terminal::error::CliError;
 use crate::transport::TransportKind;
 use crate::transport::ssh::validate::{
-    HeadlessOptions, log_report as log_headless_report, run_headless_validation,
+    HeadlessOptions, log_report as log_headless_report, parse_headless_resize_spec,
+    run_headless_validation,
 };
 use crate::transport::terminal::negotiation::{
     NegotiatedSingle, NegotiatedTransport, negotiate_transport,
@@ -43,6 +44,7 @@ pub async fn run_with_notify(
         inject_latency,
         headless,
         headless_timeout,
+        headless_resize,
     } = args;
 
     let (session_id, inferred_base) = interpret_session_target(&target)?;
@@ -94,6 +96,10 @@ pub async fn run_with_notify(
     print_join_banner(&joined, banner_kind, headless);
 
     if headless {
+        let parsed_resize = match headless_resize.as_deref() {
+            Some(spec) => Some(parse_headless_resize_spec(spec)?),
+            None => None,
+        };
         if let Some(tx) = connected_notify {
             let _ = tx.send(());
         }
@@ -105,6 +111,7 @@ pub async fn run_with_notify(
         let options = HeadlessOptions {
             timeout: Duration::from_secs(timeout_secs),
             require_snapshot: true,
+            initial_resize: parsed_resize,
         };
         let report = run_headless_validation(
             &base,

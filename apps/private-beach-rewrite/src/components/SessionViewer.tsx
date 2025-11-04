@@ -99,6 +99,7 @@ export function SessionViewer({ viewer, className, sessionId }: SessionViewerPro
         transport={viewer.transport ?? undefined}
         transportVersion={viewer.transportVersion ?? 0}
         autoConnect={false}
+        autoResizeHostOnViewportChange={false}
         showTopBar={false}
         showStatusBar={false}
         hideIdlePlaceholder

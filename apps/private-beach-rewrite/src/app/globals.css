@@ -343,6 +343,7 @@
     display: grid;
     grid-template-rows: auto 1fr;
     gap: 12px;
+    min-width: 0;
   }
 
   .application-tile__summary {
@@ -398,13 +399,15 @@
 
   .application-tile__preview {
     position: relative;
-    display: flex;
+    display: block;
     flex: 1 1 auto;
     border-radius: 14px;
     border: 1px solid rgba(148, 163, 184, 0.25);
     background: rgba(15, 23, 42, 0.75);
     min-height: 220px;
     overflow: hidden;
+    width: max-content;
+    max-width: 100%;
   }
 
   .session-viewer {

@@ -27,10 +27,33 @@ export class RewriteTerminalSizingStrategy implements TerminalSizingStrategy {
     }
 
     const measuredRows = Math.max(1, Math.floor(height / rowHeight));
-    const viewportRows = Math.max(1, Math.min(measuredRows, hostMeta.maxViewportRows));
+    const preferred =
+      typeof hostMeta.preferredViewportRows === 'number' && hostMeta.preferredViewportRows > 0
+        ? hostMeta.preferredViewportRows
+        : null;
+    const targetRows = preferred ?? measuredRows;
+    const viewportRows = Math.max(
+      hostMeta.minViewportRows,
+      Math.min(targetRows, hostMeta.maxViewportRows),
+    );
+    if (typeof window !== 'undefined' && window.__BEACH_TRACE) {
+      try {
+        console.info('[rewrite-sizing] rows', {
+          measuredRows,
+          preferred,
+          targetRows,
+          min: hostMeta.minViewportRows,
+          max: hostMeta.maxViewportRows,
+          result: viewportRows,
+        });
+      } catch {
+        // ignore logging errors
+      }
+    }
     return {
       viewportRows,
       measuredRows,
+      fallbackRows: preferred ?? undefined,
     };
   }
 

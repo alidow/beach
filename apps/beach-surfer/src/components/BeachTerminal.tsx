@@ -605,6 +605,42 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const cellWidthPx = Number(roundedCellWidth.toFixed(3));
   const effectiveCellWidth = measuredCellWidth && measuredCellWidth > 0 ? measuredCellWidth : cellWidthPx;
   const lastSentViewportCols = useRef<number | null>(null);
+  const computeViewportGeometry = useCallback(
+    (rect: DOMRectReadOnly) => {
+      const container = containerRef.current;
+      let availableWidth =
+        container && typeof container.clientWidth === 'number' ? container.clientWidth : rect.width;
+      let paddingLeft = 0;
+      let paddingRight = 0;
+      if (container && typeof window !== 'undefined') {
+        const computed = window.getComputedStyle(container);
+        const parsedLeft = Number.parseFloat(computed.paddingLeft ?? '0');
+        const parsedRight = Number.parseFloat(computed.paddingRight ?? '0');
+        paddingLeft = Number.isFinite(parsedLeft) ? parsedLeft : 0;
+        paddingRight = Number.isFinite(parsedRight) ? parsedRight : 0;
+      }
+      if (!Number.isFinite(availableWidth) || availableWidth <= 0) {
+        availableWidth = Number.isFinite(rect.width) ? rect.width : 0;
+      }
+      const innerWidth = Math.max(0, availableWidth - paddingLeft - paddingRight);
+      let measuredCols: number | null = null;
+      if (innerWidth > 0 && effectiveCellWidth > 0) {
+        measuredCols = Math.max(1, Math.floor(innerWidth / effectiveCellWidth));
+      }
+      const snapshotNow = store.getSnapshot();
+      const hostCols =
+        ptyColsRef.current && ptyColsRef.current > 0
+          ? ptyColsRef.current
+          : snapshotNow.cols && snapshotNow.cols > 0
+            ? snapshotNow.cols
+            : DEFAULT_TERMINAL_COLS;
+      const measuredTarget =
+        measuredCols != null ? Math.max(measuredCols, hostCols) : hostCols;
+      const targetCols = Math.max(1, Math.min(measuredTarget, MAX_VIEWPORT_COLS));
+      return { innerWidth, measuredCols, targetCols, snapshotNow };
+    },
+    [DEFAULT_TERMINAL_COLS, MAX_VIEWPORT_COLS, effectiveCellWidth, store],
+  );
   const effectiveOverlay = useMemo(() => {
     if (!enablePredictiveEcho) {
       return DEFAULT_PREDICTION_OVERLAY;
@@ -1540,36 +1576,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         return;
       }
       const clampedRows = Math.max(1, Math.min(Math.round(rows), hostMeta.maxViewportRows));
-      const current = store.getSnapshot();
-      let availableWidth =
-        typeof container.clientWidth === 'number' ? container.clientWidth : rect.width;
-      let paddingLeft = 0;
-      let paddingRight = 0;
-      if (typeof window !== 'undefined') {
-        const computed = window.getComputedStyle(container);
-        const parsedLeft = Number.parseFloat(computed.paddingLeft ?? '0');
-        const parsedRight = Number.parseFloat(computed.paddingRight ?? '0');
-        paddingLeft = Number.isFinite(parsedLeft) ? parsedLeft : 0;
-        paddingRight = Number.isFinite(parsedRight) ? parsedRight : 0;
-      }
-      if (!Number.isFinite(availableWidth) || availableWidth <= 0) {
-        availableWidth = Number.isFinite(rect.width) ? rect.width : 0;
-      }
-      const innerWidth = Math.max(0, availableWidth - paddingLeft - paddingRight);
-      let measuredCols: number | null = null;
-      if (innerWidth > 0 && effectiveCellWidth > 0) {
-        measuredCols = Math.max(1, Math.floor(innerWidth / effectiveCellWidth));
-      }
-      const fallbackCols =
-        current.cols > 0
-          ? current.cols
-          : ptyColsRef.current && ptyColsRef.current > 0
-            ? ptyColsRef.current
-            : DEFAULT_TERMINAL_COLS;
-      const targetCols = Math.max(
-        1,
-        Math.min(measuredCols ?? fallbackCols, MAX_VIEWPORT_COLS),
-      );
+      const { innerWidth, measuredCols, targetCols, snapshotNow: current } = computeViewportGeometry(rect);
       const previousSentCols = lastSentViewportCols.current;
       log('resize-commit', {
         containerHeight: rect.height,
@@ -1585,6 +1592,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         measuredCols,
         targetCols,
         previousSentCols,
+        snapshotCols: (current as any).cols ?? null,
+        hostCols: ptyColsRef.current,
       });
       logSizing('commitViewportRows', {
         rows,
@@ -1636,14 +1645,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     [
       applyContainerSizing,
       autoResizeHostOnViewportChangeEffective,
+      computeViewportGeometry,
       emitViewportState,
-      effectiveCellWidth,
-      MAX_VIEWPORT_COLS,
       lineHeight,
       log,
       queryLabel,
       sizingStrategy,
-      store,
       viewOnly,
     ],
   );
@@ -1674,12 +1681,23 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         domPendingTimestampRef.current = null;
         clearDomPendingTimeout();
         const styleRows = previousViewportRows ?? candidateRows;
-        const style = sizingStrategy.containerStyle(rect, hostMeta, styleRows);
-        applyContainerSizing(style);
+        const geometry = computeViewportGeometry(rect);
+        const previousSentCols = lastSentViewportCols.current;
+        const shouldForceCommit =
+          subscriptionRef.current !== null &&
+          (geometry.targetCols !== previousSentCols || previousSentCols === null);
+        if (shouldForceCommit) {
+          commitViewportRows(styleRows, rect, hostMeta, proposal);
+        } else {
+          const style = sizingStrategy.containerStyle(rect, hostMeta, styleRows);
+          applyContainerSizing(style);
+        }
         logSizing('scheduleViewportCommit:reuse-previous', {
           styleRows,
           candidateRows,
           domTolerance: DOM_VIEWPORT_TOLERANCE,
+          targetCols: geometry.targetCols,
+          previousSentCols,
         });
         return;
       }
@@ -1763,11 +1781,18 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         }
       }
     },
-    [applyContainerSizing, clearDomPendingTimeout, commitViewportRows, log, sizingStrategy],
+    [
+      applyContainerSizing,
+      clearDomPendingTimeout,
+      commitViewportRows,
+      computeViewportGeometry,
+      log,
+      sizingStrategy,
+    ],
   );
 
   const triggerViewportRecalc = useCallback(
-    (source: string) => {
+    (source: string, force?: boolean) => {
       const wrapper = wrapperRef.current;
       if (!wrapper) {
         return;
@@ -1775,9 +1800,13 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       const rect = wrapper.getBoundingClientRect();
       const meta = buildHostMeta(rect);
       const proposal = proposeViewport(source, rect, meta);
-      scheduleViewportCommit(proposal, rect, meta);
+      if (force && proposal.viewportRows != null) {
+        commitViewportRows(proposal.viewportRows, rect, meta, proposal, { forceLastSent: true });
+      } else {
+        scheduleViewportCommit(proposal, rect, meta);
+      }
     },
-    [buildHostMeta, proposeViewport, scheduleViewportCommit],
+    [buildHostMeta, commitViewportRows, proposeViewport, scheduleViewportCommit],
   );
 
   useEffect(() => {
@@ -1843,7 +1872,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     if (!subscriptionRef.current) {
       return;
     }
-    triggerViewportRecalc('subscription-ready');
+    triggerViewportRecalc('subscription-ready', true);
   }, [subscriptionVersion, triggerViewportRecalc]);
 
   useEffect(() => {
@@ -2646,6 +2675,21 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       case 'grid':
         trace('frame grid', frame);
         {
+          if (typeof window !== 'undefined') {
+            try {
+              console.info('[rewrite-debug][grid]', {
+                sessionId,
+                frameViewportRows: frame.viewportRows ?? null,
+                frameHistoryRows: frame.historyRows,
+                frameCols: frame.cols,
+                previousPtyRows: ptyViewportRowsRef.current,
+                previousPtyCols: ptyColsRef.current,
+                subscription: subscriptionRef.current,
+              });
+            } catch {
+              // ignore logging errors
+            }
+          }
           trace(
             'grid host metadata',
             JSON.stringify({
@@ -2738,7 +2782,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         resetPrediction(now());
         emitViewportState();
         if (subscriptionRef.current !== null) {
-          triggerViewportRecalc('grid-frame');
+    triggerViewportRecalc('grid-frame', true);
         }
         break;
       case 'snapshot':

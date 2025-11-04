@@ -55,6 +55,10 @@ const PRIVATE_BEACH_URL = 'http://localhost:3000';
 const MANAGER_URL = process.env.BEACH_TEST_MANAGER_URL || 'http://localhost:8080';
 
 test.describe('Private Beach Tile Resize - Automated', () => {
+  const missingCredentials =
+    !process.env.BEACH_TEST_SESSION_ID || !process.env.BEACH_TEST_PASSCODE;
+  test.skip(missingCredentials, 'Session credentials not configured for tile resize automation.');
+
   let beachId: string;
   let authToken: string;
   let sessionId: string;

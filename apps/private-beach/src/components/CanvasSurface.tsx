@@ -1105,6 +1105,13 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
         updateLayout('assignment-rollback-no-token', (current) =>
           removeOptimisticAssignment(current, pending.controllerId, pending.target),
         );
+        emitTelemetry('canvas.assignment.failure', {
+          privateBeachId,
+          agentId: pending.controllerId,
+          targetType: pending.target.type,
+          targetId: pending.target.id,
+          reason: 'missing-manager-token',
+        });
         onAssignmentError?.('Missing manager auth token.');
         return;
       }
@@ -1117,8 +1124,24 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
             applyAssignmentResults(current, pending, response),
           );
           const successIds = response.results.filter((result) => result.ok).map((result) => result.childId);
+          const failureResults = response.results.filter((result) => !result.ok);
           if (successIds.length > 0) {
+            emitTelemetry('canvas.assignment.success', {
+              privateBeachId,
+              agentId: pending.controllerId,
+              targetIds: successIds,
+              failureCount: failureResults.length,
+            });
             onAssignAgent?.({ agentId: pending.controllerId, targetIds: successIds, response });
+          }
+          if (failureResults.length > 0) {
+            emitTelemetry('canvas.assignment.failure', {
+              privateBeachId,
+              agentId: pending.controllerId,
+              targetIds: failureResults.map((result) => result.childId),
+              reason: 'partial-failure',
+              errors: failureResults.map((result) => result.error ?? null).slice(0, 5),
+            });
           }
           const failureMessage = summarizeAssignmentFailures(response);
           onAssignmentError?.(failureMessage ?? null);
@@ -1127,6 +1150,14 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
           updateLayout('assignment-rollback-error', (current) =>
             removeOptimisticAssignment(current, pending.controllerId, pending.target),
           );
+          emitTelemetry('canvas.assignment.failure', {
+            privateBeachId,
+            agentId: pending.controllerId,
+            targetType: pending.target.type,
+            targetId: pending.target.id,
+            reason: 'exception',
+            error: message,
+          });
           onAssignmentError?.(`Assignment failed: ${message}`);
         }
       })();

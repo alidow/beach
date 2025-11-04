@@ -12,6 +12,12 @@ import {
 import { computeDimensionUpdate, type HostDimensionSource } from './terminalHostDimensions';
 import { isPrivateBeachDebugEnabled } from '../lib/debug';
 
+declare global {
+  // Beach surfer expects this global flag at runtime when compiled outside its native bundle.
+  // eslint-disable-next-line no-var
+  var ENABLE_VISIBLE_PREVIEW_DRIVER: boolean | undefined;
+}
+
 const DEFAULT_HOST_COLS = 80;
 const DEFAULT_HOST_ROWS = 24;
 const TERMINAL_PADDING_X = 48;
@@ -25,8 +31,13 @@ const MIN_STABLE_DOM_ROWS = 6;
 const DOM_SAMPLE_ROW_TOLERANCE = 1;
 const DOM_SAMPLE_COL_TOLERANCE = 2;
 const DOM_SAMPLE_MAX_AGE_MS = 150;
+const MIN_DOM_CANVAS_DIMENSION = 16;
 const ENABLE_VISIBLE_PREVIEW_DRIVER =
   typeof process !== 'undefined' && process.env.NEXT_PUBLIC_PRIVATE_BEACH_VISIBLE_DRIVER === 'true';
+
+if (typeof globalThis !== 'undefined' && typeof globalThis.ENABLE_VISIBLE_PREVIEW_DRIVER === 'undefined') {
+  globalThis.ENABLE_VISIBLE_PREVIEW_DRIVER = ENABLE_VISIBLE_PREVIEW_DRIVER;
+}
 
 type HostDimensionCacheEntry = {
   rows: number | null;
@@ -164,6 +175,88 @@ function SessionTerminalPreviewView({
   const [isCloneVisible, setIsCloneVisible] = useState<boolean>(true);
   const prehydratedSeqRef = useRef<number | null>(null);
   const [terminalReady, setTerminalReady] = useState(false);
+  // Once we learn authoritative PTY rows/cols from the host, lock them so we
+  // don't churn geometry on subsequent transient updates.
+  const geometryLockedRef = useRef<{ rows: number | null; cols: number | null }>({ rows: null, cols: null });
+  const [lockedHostRows, setLockedHostRows] = useState<number | null>(null);
+  const [lockedHostCols, setLockedHostCols] = useState<number | null>(null);
+  const [visibleDriverViewportRows, setVisibleDriverViewportRows] = useState<number | null>(null);
+
+  const syncVisibleViewportRows = useCallback(
+    (rows: number | null | undefined) => {
+      if (!ENABLE_VISIBLE_PREVIEW_DRIVER || !viewer.store) {
+        return;
+      }
+      if (!rows || rows <= 0) {
+        return;
+      }
+      const clampedRows = Math.max(1, Math.round(rows));
+      try {
+        const snapshot = viewer.store.getSnapshot();
+        const lastRow = Array.isArray(snapshot.rows) && snapshot.rows.length > 0 ? snapshot.rows[snapshot.rows.length - 1] : null;
+        const bufferRows =
+          lastRow && typeof lastRow.absolute === 'number'
+            ? Math.max(1, Math.min(512, lastRow.absolute - snapshot.baseRow + 1))
+            : snapshot.viewportHeight > 0
+            ? Math.max(1, Math.min(512, snapshot.viewportHeight))
+            : clampedRows;
+        const desiredRows = Math.max(clampedRows, bufferRows);
+        if (snapshot.viewportHeight !== desiredRows) {
+          if (typeof window !== 'undefined') {
+            try {
+              console.info('[terminal][trace] visible-driver viewport-sync', {
+                sessionId,
+                requestedRows: rows,
+                bufferRows,
+                desiredRows,
+                snapshotViewport: snapshot.viewportHeight,
+              });
+            } catch {
+              // ignore logging errors
+            }
+          }
+          viewer.store.setViewport(snapshot.viewportTop, desiredRows);
+        }
+      } catch {
+        // ignore viewport sync failures
+      }
+    },
+    [viewer.store],
+  );
+
+  useEffect(() => {
+    if (!ENABLE_VISIBLE_PREVIEW_DRIVER || !viewer.store) {
+      return;
+    }
+    const unsubscribe = viewer.store.subscribe(() => {
+      try {
+        const snapshot = viewer.store!.getSnapshot();
+        const last =
+          Array.isArray(snapshot.rows) && snapshot.rows.length > 0
+            ? snapshot.rows[snapshot.rows.length - 1]
+            : null;
+        if (!last || typeof last.absolute !== 'number') {
+          return;
+        }
+        const candidateRows = Math.max(1, Math.min(512, last.absolute - snapshot.baseRow + 1));
+        syncVisibleViewportRows(candidateRows);
+      } catch {
+        // ignore snapshot failures
+      }
+    });
+    return unsubscribe;
+  }, [syncVisibleViewportRows, viewer.store]);
+  useEffect(() => {
+    if (!ENABLE_VISIBLE_PREVIEW_DRIVER) {
+      return;
+    }
+    const hasLockedGeometry =
+      (lockedHostRows != null && lockedHostRows > 0) || (lockedHostCols != null && lockedHostCols > 0);
+    if (!hasLockedGeometry) {
+      return;
+    }
+    setDomRawVersion((version) => (version + 1) % 1_000_000);
+  }, [lockedHostCols, lockedHostRows]);
   const isPassiveTile = !locked;
   const driverViewOnly = isPassiveTile;
   const cloneViewOnly = isPassiveTile;
@@ -212,6 +305,7 @@ function SessionTerminalPreviewView({
     domPendingSampleRef.current = null;
     domPendingTimestampRef.current = null;
     domCommittedSampleRef.current = null;
+    setVisibleDriverViewportRows(null);
   }, [sessionId]);
   useEffect(() => {
     setTerminalReady(true);
@@ -388,44 +482,51 @@ function SessionTerminalPreviewView({
           : null;
       const measuredViewportCols = viewportState.viewportCols > 0 ? viewportState.viewportCols : null;
 
-      let hostViewportRows = rawHostRows;
-      let hostViewportCols = rawHostCols;
-      // Heuristic correction: some sessions report swapped rows/cols (e.g. rows=106, cols=62).
-      if (
-        hostViewportRows != null &&
-        hostViewportCols != null &&
-        hostViewportRows > hostViewportCols &&
-        // prefer swap when rows are unusually large and cols unusually small
-        ((hostViewportRows >= 80 && hostViewportCols <= 80) || hostViewportRows / Math.max(1, hostViewportCols) >= 1.5)
-      ) {
-        const correctedRows = hostViewportCols;
-        const correctedCols = hostViewportRows;
-        if (typeof window !== 'undefined') {
-          try {
-            console.warn('[terminal][diag] host-dimensions-swap-corrected', {
-              sessionId,
-              previousRows: hostViewportRows,
-              previousCols: hostViewportCols,
-              correctedRows,
-              correctedCols,
-            });
-          } catch {
-            // ignore logging issues
+      let hostViewportRows = geometryLockedRef.current.rows ?? rawHostRows;
+      let hostViewportCols = geometryLockedRef.current.cols ?? rawHostCols;
+      if (geometryLockedRef.current.rows == null || geometryLockedRef.current.cols == null) {
+        // Heuristic correction: some sessions report swapped rows/cols (e.g. rows=106, cols=62).
+        if (
+          hostViewportRows != null &&
+          hostViewportCols != null &&
+          hostViewportRows > hostViewportCols &&
+          ((hostViewportRows >= 80 && hostViewportCols <= 80) ||
+            hostViewportRows / Math.max(1, hostViewportCols) >= 1.5)
+        ) {
+          const correctedRows = hostViewportCols;
+          const correctedCols = hostViewportRows;
+          if (typeof window !== 'undefined') {
+            try {
+              console.warn('[terminal][diag] host-dimensions-swap-corrected', {
+                sessionId,
+                previousRows: hostViewportRows,
+                previousCols: hostViewportCols,
+                correctedRows,
+                correctedCols,
+              });
+            } catch {
+              // ignore logging issues
+            }
           }
+          hostViewportRows = correctedRows;
+          hostViewportCols = correctedCols;
         }
-        hostViewportRows = correctedRows;
-        hostViewportCols = correctedCols;
       }
 
+      // If geometry is locked, use the locked values.
+      const lockedRows = geometryLockedRef.current.rows;
+      const lockedCols = geometryLockedRef.current.cols;
+      const effectiveHostRows = lockedRows && lockedRows > 0 ? lockedRows : hostViewportRows;
+      const effectiveHostCols = lockedCols && lockedCols > 0 ? lockedCols : hostViewportCols;
       const nextRowResult = computeDimensionUpdate(
         current.rows,
-        hostViewportRows,
+        effectiveHostRows,
         fallbackRowsCandidate,
         hostRowSourceRef.current,
       );
       const nextColResult = computeDimensionUpdate(
         current.cols,
-        hostViewportCols,
+        effectiveHostCols,
         fallbackColsCandidate,
         hostColSourceRef.current,
       );
@@ -442,6 +543,27 @@ function SessionTerminalPreviewView({
         timestamp: Date.now(),
       };
       hostDimensionCache.set(sessionId, cacheEntry);
+
+      // Lock authoritative geometry once both rows/cols are known.
+      if (
+        geometryLockedRef.current.rows == null &&
+        geometryLockedRef.current.cols == null &&
+        hostViewportRows != null &&
+        hostViewportCols != null
+      ) {
+        geometryLockedRef.current = { rows: hostViewportRows, cols: hostViewportCols };
+        setLockedHostRows(hostViewportRows);
+        setLockedHostCols(hostViewportCols);
+        if (typeof window !== 'undefined') {
+          try {
+            console.info('[terminal][diag] host-geometry-locked', {
+              sessionId,
+              rows: hostViewportRows,
+              cols: hostViewportCols,
+            });
+          } catch {}
+        }
+      }
 
       if (!changed) {
         return current;
@@ -823,12 +945,15 @@ function SessionTerminalPreviewView({
   const authoritativeHostRows = hostDimensions.rows ?? hostViewportRows ?? null;
   const authoritativeHostCols = hostDimensions.cols ?? hostViewportCols ?? null;
 
+  // Prefer locked geometry when available, then authoritative host values.
   const resolvedHostRows =
-    authoritativeHostRows != null ? authoritativeHostRows : DEFAULT_HOST_ROWS;
+    (lockedHostRows && lockedHostRows > 0 ? lockedHostRows : null) ??
+    (authoritativeHostRows != null ? authoritativeHostRows : DEFAULT_HOST_ROWS);
   const resolvedHostCols =
-    authoritativeHostCols != null
+    (lockedHostCols && lockedHostCols > 0 ? lockedHostCols : null) ??
+    (authoritativeHostCols != null
       ? authoritativeHostCols
-      : (viewer.store?.getSnapshot()?.cols ?? DEFAULT_HOST_COLS) || DEFAULT_HOST_COLS;
+      : (viewer.store?.getSnapshot()?.cols ?? DEFAULT_HOST_COLS) || DEFAULT_HOST_COLS);
 
   const fallbackHostRows =
     resolvedHostRows ?? pickMaxPositive(measuredViewportRows, DEFAULT_HOST_ROWS) ?? DEFAULT_HOST_ROWS;
@@ -848,36 +973,86 @@ function SessionTerminalPreviewView({
     return estimateHostPixelSize(cols, rows, effectiveFontSize);
   }, [driverHostCols, driverHostRows, effectiveFontSize]);
 
+  const storeSnapshot = useMemo(() => {
+    try {
+      return viewer.store?.getSnapshot() ?? null;
+    } catch {
+      return null;
+    }
+  }, [viewer.store]);
+
+  const estimatedBufferRows = useMemo(() => {
+    if (!storeSnapshot) {
+      return null;
+    }
+    const last = Array.isArray(storeSnapshot.rows) && storeSnapshot.rows.length > 0
+      ? storeSnapshot.rows[storeSnapshot.rows.length - 1]
+      : null;
+    if (!last || typeof last.absolute !== 'number') {
+      return storeSnapshot.viewportHeight && storeSnapshot.viewportHeight > 0
+        ? storeSnapshot.viewportHeight
+        : null;
+    }
+    return Math.max(1, Math.min(512, last.absolute - storeSnapshot.baseRow + 1));
+  }, [storeSnapshot]);
+
   const hasRemoteHostDimensions =
     hostRowSourceRef.current === 'pty' || hostColSourceRef.current === 'pty';
-  // For visible driver, we still want DOM pixels to drive preview scaling
-  // even when PTY dimensions are known. We only skip DOM for scaling when
-  // explicitly disabled.
-  const shouldSkipDomMeasurements = disableDomMeasurements || hasRemoteHostDimensions;
+  const domStableAvailable = domCommittedSampleRef.current != null;
+  const allowDomForScaling = ENABLE_VISIBLE_PREVIEW_DRIVER
+    ? domStableAvailable
+    : Boolean(!disableDomMeasurements && !hasRemoteHostDimensions);
+  const shouldSkipDomMeasurements = ENABLE_VISIBLE_PREVIEW_DRIVER
+    ? !domStableAvailable
+    : disableDomMeasurements || hasRemoteHostDimensions;
 
   const previewMeasurements = useMemo<PreviewMeasurements | null>(() => {
     void domRawVersion;
-    if (
-      resolvedHostCols == null ||
-      resolvedHostRows == null ||
-      resolvedHostCols <= 0 ||
-      resolvedHostRows <= 0
-    ) {
+    const derivedHostRowsRaw =
+      resolvedHostRows && resolvedHostRows > 0
+        ? resolvedHostRows
+        : ENABLE_VISIBLE_PREVIEW_DRIVER
+            ? Math.max(
+                1,
+                Math.round(
+                  (visibleDriverViewportRows && visibleDriverViewportRows > 0
+                    ? visibleDriverViewportRows
+                    : estimatedBufferRows && estimatedBufferRows > 0
+                      ? estimatedBufferRows
+                      : fallbackHostRows ?? DEFAULT_HOST_ROWS) ?? DEFAULT_HOST_ROWS,
+                ),
+              )
+            : null;
+    const derivedHostRows =
+      derivedHostRowsRaw && derivedHostRowsRaw > 0
+        ? derivedHostRowsRaw
+        : fallbackHostRows && fallbackHostRows > 0
+          ? fallbackHostRows
+          : DEFAULT_HOST_ROWS;
+    if (resolvedHostCols == null || resolvedHostCols <= 0 || !derivedHostRows || derivedHostRows <= 0) {
       return null;
     }
     let rawWidth = hostPixelSize.width;
     let rawHeight = hostPixelSize.height;
-    if (!shouldSkipDomMeasurements) {
+    const adoptDomDimensions = (candidateWidth: number, candidateHeight: number) => {
+      if (!Number.isFinite(candidateWidth) || !Number.isFinite(candidateHeight)) {
+        return;
+      }
+      if (candidateWidth <= MIN_DOM_CANVAS_DIMENSION || candidateHeight <= MIN_DOM_CANVAS_DIMENSION) {
+        return;
+      }
+      rawWidth = Math.max(rawWidth, candidateWidth);
+      rawHeight = Math.max(rawHeight, candidateHeight);
+    };
+    if (allowDomForScaling) {
       const domRaw = domRawSizeRef.current;
-      if (
-        domRaw &&
-        Number.isFinite(domRaw.width) &&
-        Number.isFinite(domRaw.height) &&
-        domRaw.width > 0 &&
-        domRaw.height > 0
-      ) {
-        rawWidth = domRaw.width;
-        rawHeight = domRaw.height;
+      if (domRaw && domRaw.width > 0 && domRaw.height > 0) {
+        adoptDomDimensions(domRaw.width, domRaw.height);
+      } else {
+        const committed = domCommittedSampleRef.current;
+        if (committed && committed.rawWidth > 0 && committed.rawHeight > 0) {
+          adoptDomDimensions(committed.rawWidth, committed.rawHeight);
+        }
       }
     }
     if (!Number.isFinite(rawWidth) || rawWidth <= 0 || !Number.isFinite(rawHeight) || rawHeight <= 0) {
@@ -897,13 +1072,24 @@ function SessionTerminalPreviewView({
       targetHeight,
       rawWidth: Math.round(rawWidth),
       rawHeight: Math.round(rawHeight),
-      hostRows: resolvedHostRows,
+      hostRows: derivedHostRows,
       hostCols: resolvedHostCols,
       measurementVersion: measurementVersionRef.current,
       hostRowSource: hostRowSourceRef.current,
       hostColSource: hostColSourceRef.current,
     };
-  }, [domRawVersion, hostPixelSize.height, hostPixelSize.width, resolvedHostCols, resolvedHostRows, shouldSkipDomMeasurements]);
+  }, [
+    allowDomForScaling,
+    domRawVersion,
+    estimatedBufferRows,
+    fallbackHostRows,
+    hostPixelSize.height,
+    hostPixelSize.width,
+    resolvedHostCols,
+    resolvedHostRows,
+    shouldSkipDomMeasurements,
+    visibleDriverViewportRows,
+  ]);
 
   const effectiveScale =
     typeof scale === 'number' && Number.isFinite(scale) && scale > 0 ? scale : previewMeasurements?.scale ?? 1;
@@ -911,6 +1097,9 @@ function SessionTerminalPreviewView({
   useEffect(() => {
     const previous = measurementsRef.current;
     const next = previewMeasurements;
+    if (typeof window !== 'undefined') {
+      (window as any).__PREVIEW_MEASUREMENTS__ = next ?? null;
+    }
     const changed =
       previous?.targetWidth !== next?.targetWidth ||
       previous?.targetHeight !== next?.targetHeight ||
@@ -924,6 +1113,7 @@ function SessionTerminalPreviewView({
     measurementsRef.current = next ?? null;
     if (typeof window !== 'undefined') {
       try {
+        (window as any).__PREVIEW_MEASUREMENTS__ = next ?? null;
         const payload = {
           sessionId,
           measurement: next,
@@ -945,13 +1135,11 @@ function SessionTerminalPreviewView({
       updatePreviewStatus('connecting');
       return;
     }
-    if (viewer.status === 'connected') {
-      if (previewMeasurements) {
-        updatePreviewStatus('ready');
-      } else {
-        updatePreviewStatus('initializing');
-      }
+    if (viewer.status === 'connected' && previewMeasurements) {
+      updatePreviewStatus('ready');
+      return;
     }
+    updatePreviewStatus('initializing');
   }, [previewMeasurements, updatePreviewStatus, viewer.status]);
 
   // For visible-driver previews, once the terminal is ready, follow tail so
@@ -1088,14 +1276,62 @@ function SessionTerminalPreviewView({
         const hostSourceIsRemote =
           hostRowSourceRef.current === 'pty' || hostColSourceRef.current === 'pty';
 
-        // In visible-driver mode, always capture DOM raw size for scaling,
-        // but avoid mutating host dimensions when PTY is authoritative.
+        // In visible-driver mode with PTY geometry known, we still need a
+        // stable DOM raw size to align preview scaling to the driver's actual
+        // canvas. Capture and mark it as committed, but do NOT mutate host
+        // dimensions from DOM.
         if (hostSourceIsRemote && ENABLE_VISIBLE_PREVIEW_DRIVER) {
+          if (
+            rawWidthFromDom <= MIN_DOM_CANVAS_DIMENSION ||
+            rawHeightFromDom <= MIN_DOM_CANVAS_DIMENSION ||
+            !Number.isFinite(rawWidthFromDom) ||
+            !Number.isFinite(rawHeightFromDom)
+          ) {
+            return;
+          }
           const prev = domRawSizeRef.current;
           const widthDelta = !prev ? Number.POSITIVE_INFINITY : Math.abs(prev.width - rawWidthFromDom);
           const heightDelta = !prev ? Number.POSITIVE_INFINITY : Math.abs(prev.height - rawHeightFromDom);
           if (!prev || widthDelta > 1 || heightDelta > 1) {
-            domRawSizeRef.current = { width: rawWidthFromDom, height: rawHeightFromDom };
+            domRawSizeRef.current = {
+              width: rawWidthFromDom,
+              height: rawHeightFromDom,
+            };
+            const inferredRows = Math.max(
+              1,
+              Math.round(
+                (rawHeightFromDom - TERMINAL_PADDING_Y) /
+                  Math.max(1, Math.round(effectiveFontSize * 1.4)),
+              ),
+            );
+            const inferredCols = Math.max(
+              1,
+              Math.round(
+                (rawWidthFromDom - TERMINAL_PADDING_X) /
+                  Math.max(
+                    1,
+                    Math.round((effectiveFontSize / BASE_TERMINAL_FONT_SIZE) * BASE_TERMINAL_CELL_WIDTH),
+                  ),
+              ),
+            );
+            domCommittedSampleRef.current = {
+              rawWidth: rawWidthFromDom,
+              rawHeight: rawHeightFromDom,
+              rows: inferredRows,
+              cols: inferredCols,
+            };
+            if (typeof window !== 'undefined') {
+              (window as any).__VISIBLE_DRIVER_RAW_SIZE__ = {
+                rawWidth: rawWidthFromDom,
+                rawHeight: rawHeightFromDom,
+                rows: inferredRows,
+                cols: inferredCols,
+              };
+            }
+            setVisibleDriverViewportRows((prevRows) =>
+              inferredRows > 0 && (!prevRows || Math.abs(prevRows - inferredRows) > 1) ? inferredRows : prevRows,
+            );
+            syncVisibleViewportRows(inferredRows);
             setDomRawVersion((version) => (version + 1) % 1_000_000);
             measurementVersionRef.current = (measurementVersionRef.current % 1_000_000) + 1;
           }
@@ -1135,6 +1371,15 @@ function SessionTerminalPreviewView({
             };
             setDomRawVersion((version) => (version + 1) % 1_000_000);
             measurementVersionRef.current = (measurementVersionRef.current % 1_000_000) + 1;
+          }
+          if (ENABLE_VISIBLE_PREVIEW_DRIVER && candidate.rows > 0) {
+            setVisibleDriverViewportRows((prevRows) =>
+              !prevRows || Math.abs(prevRows - candidate.rows) > 1 ? candidate.rows : prevRows,
+            );
+            syncVisibleViewportRows(candidate.rows);
+            if (typeof window !== 'undefined') {
+              (window as any).__VISIBLE_DRIVER_RAW_SIZE__ = candidate;
+            }
           }
           setHostDimensions((current) => {
             const nextRowResult = computeDimensionUpdate(
@@ -1198,6 +1443,12 @@ function SessionTerminalPreviewView({
           domPendingSampleRef.current = null;
           domPendingTimestampRef.current = null;
           commitSample(sample);
+          if (ENABLE_VISIBLE_PREVIEW_DRIVER && sample.rows > 0) {
+            setVisibleDriverViewportRows((prevRows) =>
+              !prevRows || Math.abs(prevRows - sample.rows) > 1 ? sample.rows : prevRows,
+            );
+            syncVisibleViewportRows(sample.rows);
+          }
           return;
         }
 
@@ -1210,6 +1461,12 @@ function SessionTerminalPreviewView({
           domPendingSampleRef.current = null;
           domPendingTimestampRef.current = null;
           commitSample(sample);
+          if (ENABLE_VISIBLE_PREVIEW_DRIVER && sample.rows > 0) {
+            setVisibleDriverViewportRows((prevRows) =>
+              !prevRows || Math.abs(prevRows - sample.rows) > 1 ? sample.rows : prevRows,
+            );
+            syncVisibleViewportRows(sample.rows);
+          }
           return;
         }
 
@@ -1225,12 +1482,18 @@ function SessionTerminalPreviewView({
           domPendingSampleRef.current = null;
           domPendingTimestampRef.current = null;
           commitSample(staleSample);
+          if (ENABLE_VISIBLE_PREVIEW_DRIVER && staleSample.rows > 0) {
+            setVisibleDriverViewportRows((prevRows) =>
+              !prevRows || Math.abs(prevRows - staleSample.rows) > 1 ? staleSample.rows : prevRows,
+            );
+            syncVisibleViewportRows(staleSample.rows);
+          }
         }
       }
     };
     const handle = window.requestAnimationFrame(logDimensions);
     return () => window.cancelAnimationFrame(handle);
-  }, [effectiveFontSize, effectiveScale, previewMeasurements, sessionId]);
+  }, [effectiveFontSize, effectiveScale, previewMeasurements, sessionId, syncVisibleViewportRows]);
 
   useEffect(() => {
     if (
@@ -1313,6 +1576,12 @@ function SessionTerminalPreviewView({
     const scale = previewMeasurements.scale;
     const transform =
       typeof scale === 'number' && Number.isFinite(scale) && scale !== 1 ? `scale(${scale})` : undefined;
+    if (ENABLE_VISIBLE_PREVIEW_DRIVER) {
+      return {
+        transform,
+        transformOrigin: 'top left',
+      };
+    }
     return {
       width: `${previewMeasurements.rawWidth}px`,
       height: `${previewMeasurements.rawHeight}px`,
@@ -1465,7 +1734,16 @@ function SessionTerminalPreviewView({
                   showStatusBar={variant === 'full'}
                   autoResizeHostOnViewportChange={false}
                   disableViewportMeasurements
-                  forcedViewportRows={resolvedHostRows ?? DEFAULT_HOST_ROWS}
+                  forcedViewportRows={
+                    (visibleDriverViewportRows && visibleDriverViewportRows > 0
+                      ? Math.round(visibleDriverViewportRows)
+                      : null) ??
+                    (ENABLE_VISIBLE_PREVIEW_DRIVER && estimatedBufferRows && estimatedBufferRows > 0
+                      ? Math.round(estimatedBufferRows)
+                      : null) ??
+                    resolvedHostRows ??
+                    DEFAULT_HOST_ROWS
+                  }
                   onViewportStateChange={handleViewportStateChange}
                   maxRenderFps={20}
                   hideIdlePlaceholder

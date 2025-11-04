@@ -209,6 +209,7 @@ class SessionTileController {
   private connectionHandles = new Map<string, () => void>();
   private connectionStates = new Map<string, { key: string | null; ready: boolean; reason: string | null }>();
   private layoutChangeCallback: ((layout: ApiCanvasLayout) => void) | null = null;
+  private overrideTelemetry = new Map<string, { start: boolean; success: boolean }>();
 
   hydrate(input: HydrateInput) {
     this.privateBeachId = input.privateBeachId ?? null;
@@ -580,6 +581,7 @@ class SessionTileController {
       this.viewerStateOverrides.set(tileId, state);
     } else {
       this.viewerStateOverrides.delete(tileId);
+      this.overrideTelemetry.delete(tileId);
     }
     this.updateTileSnapshot(tileId, (current) => ({
       ...current,
@@ -868,6 +870,7 @@ class SessionTileController {
           this.connectionHandles.delete(tileId);
         }
         this.connectionStates.delete(tileId);
+        this.emitOverrideConnectionTelemetry(tileId, snapshot.session ?? this.sessions.get(tileId) ?? null, override);
         viewerConnectionService.disconnectTile(tileId);
         continue;
       }
@@ -907,6 +910,45 @@ class SessionTileController {
       );
       this.connectionHandles.set(tileId, handle);
       this.connectionStates.set(tileId, connectionState);
+    }
+  }
+
+  private emitOverrideConnectionTelemetry(
+    tileId: string,
+    session: SessionSummary | null,
+    override: TerminalViewerState,
+  ) {
+    const key = tileId;
+    let record = this.overrideTelemetry.get(key);
+    if (!record) {
+      record = { start: false, success: false };
+      this.overrideTelemetry.set(key, record);
+    }
+    const telemetryContext = {
+      tileId,
+      sessionId: session?.session_id ?? tileId,
+      privateBeachId: session?.private_beach_id ?? this.privateBeachId,
+      managerUrl: this.managerUrl,
+    };
+    if (!record.start) {
+      record.start = true;
+      emitTelemetry('canvas.tile.connect.start', {
+        ...telemetryContext,
+        status: override.status ?? 'connected',
+        retry: false,
+        attempt: 1,
+        synthetic: true,
+      });
+    }
+    if (!record.success && override.status === 'connected') {
+      record.success = true;
+      emitTelemetry('canvas.tile.connect.success', {
+        ...telemetryContext,
+        latencyMs: override.latencyMs ?? null,
+        retries: 0,
+        attempt: 1,
+        synthetic: true,
+      });
     }
   }
 

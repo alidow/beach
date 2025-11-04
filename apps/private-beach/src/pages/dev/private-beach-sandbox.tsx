@@ -1,7 +1,7 @@
 import { useRouter } from 'next/router';
 import Head from 'next/head';
 import ErrorPage from 'next/error';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import CanvasSurface from '../../components/CanvasSurface';
 import SessionDrawer from '../../components/SessionDrawer';
 import { Badge } from '../../components/ui/badge';
@@ -16,6 +16,8 @@ import {
 import type { SessionCredentialOverride, TerminalViewerState } from '../../hooks/terminalViewerTypes';
 import { createStaticTerminalViewer } from '../../sandbox/staticTerminal';
 import { resolveTerminalFixture } from '../../sandbox/fixtures';
+import { emitTelemetry } from '../../lib/telemetry';
+import { resolvePrivateBeachRewriteEnabled } from '../../lib/featureFlags';
 
 const SANDBOX_ENABLED =
   process.env.NEXT_PUBLIC_ENABLE_PRIVATE_BEACH_SANDBOX === 'true' || process.env.NODE_ENV !== 'production';
@@ -49,6 +51,7 @@ type SandboxConfig = {
   shouldFetchFromApi: boolean;
   skipApi: boolean;
   signature: string;
+  rewriteEnabled: boolean;
 };
 
 function firstQueryValue(value: string | string[] | undefined): string | null {
@@ -168,7 +171,11 @@ function mergeSpec(existing: SessionSpec | undefined, incoming: SessionSpec): Se
   };
 }
 
-function parseSandboxConfig(query: ReturnType<typeof useRouter>['query'], isReady: boolean): SandboxConfig {
+function parseSandboxConfig(
+  query: ReturnType<typeof useRouter>['query'],
+  isReady: boolean,
+  asPath: string | null | undefined,
+): SandboxConfig {
   const privateBeachId = decodeParam(firstQueryValue(query.privateBeachId ?? query.pb));
   const managerUrl =
     decodeParam(firstQueryValue(query.managerUrl ?? query.manager)) ?? DEFAULT_MANAGER_URL;
@@ -182,6 +189,9 @@ function parseSandboxConfig(query: ReturnType<typeof useRouter>['query'], isRead
   const fixtureMap = parseKeyValueList(
     query.terminalFixtures ?? query.terminalFixture ?? query.mockTerminals ?? query.fixtures,
   );
+  const searchSegment =
+    typeof asPath === 'string' && asPath.includes('?') ? asPath.slice(asPath.indexOf('?')) : null;
+  const rewriteEnabled = resolvePrivateBeachRewriteEnabled({ search: searchSegment });
   const specById = new Map<string, SessionSpec>();
 
   const upsert = (spec: SessionSpec) => {
@@ -218,6 +228,7 @@ function parseSandboxConfig(query: ReturnType<typeof useRouter>['query'], isRead
     passcodes: Array.from(passcodeMap.entries()),
     titles: Array.from(titleMap.entries()),
     fixtures: Array.from(fixtureMap.entries()),
+    rewriteEnabled,
   });
 
   return {
@@ -237,6 +248,7 @@ function parseSandboxConfig(query: ReturnType<typeof useRouter>['query'], isRead
     shouldFetchFromApi,
     skipApi,
     signature,
+    rewriteEnabled,
   };
 }
 
@@ -450,7 +462,10 @@ function redactToken(token: string | null): string {
 
 function PrivateBeachSandboxPage() {
   const router = useRouter();
-  const config = useMemo(() => parseSandboxConfig(router.query, router.isReady), [router.isReady, router.query]);
+  const config = useMemo(
+    () => parseSandboxConfig(router.query, router.isReady, router.asPath ?? null),
+    [router.asPath, router.isReady, router.query],
+  );
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [layout, setLayout] = useState<CanvasLayout | null>(null);
   const [loading, setLoading] = useState(false);
@@ -492,6 +507,51 @@ function PrivateBeachSandboxPage() {
     }
     return { agents, applications };
   }, [sessions]);
+  const rewriteTelemetrySentRef = useRef(false);
+  const emittedTileTelemetry = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    if (!config.ready || rewriteTelemetrySentRef.current) {
+      return;
+    }
+    rewriteTelemetrySentRef.current = true;
+    emitTelemetry('canvas.rewrite.flag-state', {
+      privateBeachId: config.privateBeachId ?? undefined,
+      managerUrl: config.managerUrl,
+      enabled: config.rewriteEnabled,
+      source: 'sandbox',
+    });
+  }, [config.managerUrl, config.privateBeachId, config.ready, config.rewriteEnabled]);
+
+  useEffect(() => {
+    if (!config.ready) {
+      return;
+    }
+    const sessionsForTelemetry = [...partitionedSessions.applications, ...partitionedSessions.agents];
+    for (const session of sessionsForTelemetry) {
+      const tileId = session.session_id;
+      if (!tileId || emittedTileTelemetry.current.has(tileId)) {
+        continue;
+      }
+      emittedTileTelemetry.current.add(tileId);
+      emitTelemetry('canvas.tile.create', {
+        privateBeachId: session.private_beach_id ?? config.privateBeachId ?? undefined,
+        managerUrl: config.managerUrl,
+        tileId,
+        nodeType: 'application',
+        sessionId: session.session_id,
+        rewriteEnabled: config.rewriteEnabled,
+        harnessType: session.harness_type ?? null,
+        source: 'sandbox',
+      });
+    }
+  }, [
+    config.managerUrl,
+    config.privateBeachId,
+    config.ready,
+    config.rewriteEnabled,
+    partitionedSessions,
+  ]);
 
   useEffect(() => {
     if (!router.isReady || !SANDBOX_ENABLED) {

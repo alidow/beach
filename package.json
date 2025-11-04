@@ -2,6 +2,7 @@
   "devDependencies": {
     "@clerk/clerk-sdk-node": "^4.13.23",
     "@playwright/test": "^1.55.1",
+    "chrome-remote-interface": "^0.33.0",
     "dotenv": "^17.2.3",
     "eventsource": "^4.0.0"
   },

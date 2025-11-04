@@ -1,8 +1,14 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Mock } from 'vitest';
 import type { TerminalViewerState } from '../../hooks/terminalViewerTypes';
 import { getViewerCounters, resetViewerCounters } from '../metricsRegistry';
+vi.mock('../../lib/telemetry', () => ({
+  emitTelemetry: vi.fn(),
+}));
+import { emitTelemetry } from '../../lib/telemetry';
 
 let ViewerConnectionService: typeof import('../viewerConnectionService').ViewerConnectionService;
+const mockedTelemetry = emitTelemetry as unknown as Mock;
 
 function makeViewerState(
   status: TerminalViewerState['status'],
@@ -37,6 +43,7 @@ describe('viewerMetrics / viewerConnectionService', () => {
     service = new ViewerConnectionService();
     service.resetMetrics();
     resetViewerCounters();
+    mockedTelemetry.mockClear();
   });
 
   it('captures connects, reconnects, and disconnects via debug emit', () => {
@@ -98,6 +105,23 @@ describe('viewerMetrics / viewerConnectionService', () => {
 
     const metricsSnapshot = service.getTileMetrics('tile-latency');
     expect(metricsSnapshot.completed).toBeGreaterThanOrEqual(1);
+  });
+
+  it('emits telemetry for connection lifecycle events', () => {
+    service.connectTile(
+      'tile-telemetry',
+      { sessionId: 'tile-telemetry', privateBeachId: 'pb-test', managerUrl: 'https://manager.example', authToken: 'token' },
+      vi.fn(),
+    );
+
+    service.debugEmit('tile-telemetry', makeViewerState('connecting', { connecting: true }));
+    service.debugEmit('tile-telemetry', makeViewerState('connected', { connecting: false, latencyMs: 42 }));
+    service.debugEmit('tile-telemetry', makeViewerState('error', { connecting: false, error: 'boom' }));
+
+    const events = mockedTelemetry.mock.calls.map(([event, payload]) => ({ event, payload: payload as Record<string, unknown> }));
+    expect(events.some((entry) => entry.event === 'canvas.tile.connect.start')).toBe(true);
+    expect(events.some((entry) => entry.event === 'canvas.tile.connect.success')).toBe(true);
+    expect(events.some((entry) => entry.event === 'canvas.tile.connect.failure')).toBe(true);
   });
 
   afterAll(() => {

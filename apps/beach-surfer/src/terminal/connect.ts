@@ -45,6 +45,16 @@ export async function connectBrowserTransport(
     hasPasscode: Boolean(options.passcode),
     hasViewerToken: Boolean(options.viewerToken),
   });
+  if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+    // eslint-disable-next-line no-console
+    console.info('[connectBrowserTransport][rewrite] start', {
+      sessionId: options.sessionId,
+      baseUrl: options.baseUrl,
+      hasPasscode: Boolean(options.passcode),
+      hasViewerToken: Boolean(options.viewerToken),
+      hasAuthorization: Boolean(options.authorizationToken && options.authorizationToken.trim().length > 0),
+    });
+  }
 
   const join = await fetchJoinMetadata(options);
   trace?.mark('join_metadata:received', {
@@ -52,6 +62,15 @@ export async function connectBrowserTransport(
     pollIntervalMs: join.pollIntervalMs,
     signalingUrl: join.signalingUrl,
   });
+  if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+    // eslint-disable-next-line no-console
+    console.info('[connectBrowserTransport][rewrite] joinMetadata.received', {
+      sessionId: options.sessionId,
+      role: join.role,
+      pollIntervalMs: join.pollIntervalMs,
+      signalingUrl: join.signalingUrl,
+    });
+  }
   const websocketUrl = join.websocketUrl ?? deriveWebsocketUrl(options.baseUrl, options.sessionId);
   trace?.mark('signaling:connect_start', { websocketUrl });
   const signaling = await SignalingClient.connect({
@@ -64,6 +83,13 @@ export async function connectBrowserTransport(
     trace,
   });
   trace?.mark('signaling:ready', { peerId: signaling.peerId });
+  if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+    // eslint-disable-next-line no-console
+    console.info('[connectBrowserTransport][rewrite] signaling.connected', {
+      sessionId: options.sessionId,
+      peerId: signaling.peerId,
+    });
+  }
   let webrtcResult: Awaited<ReturnType<typeof connectWebRtcTransport>>;
   try {
     webrtcResult = await connectWebRtcTransport({
@@ -83,6 +109,13 @@ export async function connectBrowserTransport(
     trace?.mark('webrtc:connect_error', {
       message: error instanceof Error ? error.message : String(error),
     });
+    if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+      // eslint-disable-next-line no-console
+      console.error('[connectBrowserTransport][rewrite] webrtc.connect_error', {
+        sessionId: options.sessionId,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
     throw error;
   }
   const { transport: webRtcTransport, remotePeerId, secure } = webrtcResult;
@@ -90,6 +123,14 @@ export async function connectBrowserTransport(
     remotePeerId,
     secureMode: secure?.mode ?? 'plaintext',
   });
+  if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+    // eslint-disable-next-line no-console
+    console.info('[connectBrowserTransport][rewrite] webrtc.connected', {
+      sessionId: options.sessionId,
+      remotePeerId,
+      secureMode: secure?.mode ?? 'plaintext',
+    });
+  }
   const transport = new DataChannelTerminalTransport(webRtcTransport, {
     logger: options.logger,
     secureContext: secure,
@@ -111,6 +152,12 @@ export async function connectBrowserTransport(
     close: () => {
       transport.close();
       signaling.close();
+      if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+        // eslint-disable-next-line no-console
+        console.info('[connectBrowserTransport][rewrite] connection.closed', {
+          sessionId: options.sessionId,
+        });
+      }
     },
   };
 }
@@ -133,6 +180,13 @@ async function fetchJoinMetadata(options: ConnectBrowserTransportOptions): Promi
   const trace = options.trace ?? null;
   const url = `${options.baseUrl.replace(/\/$/, '')}/sessions/${options.sessionId}/join`;
   trace?.mark('join_metadata:request', { url });
+  if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+    // eslint-disable-next-line no-console
+    console.info('[connectBrowserTransport][rewrite] joinMetadata.request', {
+      sessionId: options.sessionId,
+      url,
+    });
+  }
   let response: Response;
   try {
     const headers: Record<string, string> = {
@@ -159,11 +213,26 @@ async function fetchJoinMetadata(options: ConnectBrowserTransportOptions): Promi
     throw error;
   }
   trace?.mark('join_metadata:response', { status: response.status });
+  if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+    // eslint-disable-next-line no-console
+    console.info('[connectBrowserTransport][rewrite] joinMetadata.response', {
+      sessionId: options.sessionId,
+      status: response.status,
+    });
+  }
   if (!response.ok) {
     trace?.mark('join_metadata:failure', {
       status: response.status,
       statusText: response.statusText,
     });
+    if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+      // eslint-disable-next-line no-console
+      console.error('[connectBrowserTransport][rewrite] joinMetadata.failure', {
+        sessionId: options.sessionId,
+        status: response.status,
+        statusText: response.statusText,
+      });
+    }
     throw new Error(`join request failed: ${response.status} ${response.statusText}`);
   }
   const payload: JoinSessionResponse = await response.json();

@@ -17,6 +17,27 @@ import { createConnectionTrace, type ConnectionTrace } from '../lib/connectionTr
 import type { ServerMessage } from '../transport/signaling';
 import type { SecureTransportSummary } from '../transport/webrtc';
 
+function logSizing(step: string, detail: Record<string, unknown>): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  if (process.env.NODE_ENV === 'production') {
+    return;
+  }
+  try {
+    console.info('[beach-terminal][sizing]', step, JSON.stringify(detail));
+  } catch (error) {
+    console.info('[beach-terminal][sizing]', step, detail, error);
+  }
+}
+import type {
+  TerminalSizingStrategy,
+  TerminalSizingHostMeta,
+  TerminalViewportProposal,
+  TerminalScrollPolicy,
+} from '../../../private-beach/src/components/terminalSizing';
+import { createLegacyTerminalSizingStrategy } from '../../../private-beach/src/components/terminalSizing';
+
 export type TerminalStatus = 'idle' | 'connecting' | 'connected' | 'error' | 'closed';
 
 type JoinOverlayState =
@@ -157,6 +178,87 @@ let joinStateSubscriberCounter = 0;
 function nextJoinStateSubscriberId(): string {
   joinStateSubscriberCounter += 1;
   return `terminal-${joinStateSubscriberCounter}`;
+}
+
+function usePredictionUx(
+  enabled: boolean,
+  onOverlayUpdate: (state: PredictionOverlayState) => void,
+): {
+  tick: (timestamp: number) => PredictionOverlayState | null;
+  recordSend: (seq: number, timestampMs: number, predicted: boolean) => PredictionOverlayState | null;
+  recordAck: (seq: number, timestamp: number) => PredictionOverlayState | null;
+  reset: (timestamp: number) => PredictionOverlayState | null;
+} {
+  const uxRef = useRef<PredictionUx | null>(enabled ? new PredictionUx() : null);
+
+  useEffect(() => {
+    if (!enabled) {
+      uxRef.current = null;
+      onOverlayUpdate(DEFAULT_PREDICTION_OVERLAY);
+      return;
+    }
+    if (!uxRef.current) {
+      uxRef.current = new PredictionUx();
+    }
+  }, [enabled, onOverlayUpdate]);
+
+  const tick = useCallback(
+    (timestamp: number) => {
+      if (!enabled || !uxRef.current) {
+        return null;
+      }
+      const update = uxRef.current.tick(timestamp);
+      if (update) {
+        onOverlayUpdate(update);
+      }
+      return update ?? null;
+    },
+    [enabled, onOverlayUpdate],
+  );
+
+  const recordSend = useCallback(
+    (seq: number, timestampMs: number, predicted: boolean) => {
+      if (!enabled || !uxRef.current) {
+        return null;
+      }
+      const update = uxRef.current.recordSend(seq, timestampMs, predicted);
+      if (update) {
+        onOverlayUpdate(update);
+      }
+      return update ?? null;
+    },
+    [enabled, onOverlayUpdate],
+  );
+
+  const recordAck = useCallback(
+    (seq: number, timestamp: number) => {
+      if (!enabled || !uxRef.current) {
+        return null;
+      }
+      const update = uxRef.current.recordAck(seq, timestamp);
+      if (update) {
+        onOverlayUpdate(update);
+      }
+      return update ?? null;
+    },
+    [enabled, onOverlayUpdate],
+  );
+
+  const reset = useCallback(
+    (timestamp: number) => {
+      if (!uxRef.current) {
+        return null;
+      }
+      const update = uxRef.current.reset(timestamp);
+      if (update) {
+        onOverlayUpdate(update);
+      }
+      return update ?? null;
+    },
+    [onOverlayUpdate],
+  );
+
+  return { tick, recordSend, recordAck, reset };
 }
 
 function subscribeJoinState(
@@ -360,6 +462,10 @@ export interface BeachTerminalProps {
   // Maximum render FPS for internal rAF-based updates; undefined or <=0 disables throttling
   maxRenderFps?: number;
   viewOnly?: boolean;
+  sizingStrategy?: TerminalSizingStrategy;
+  enablePredictiveEcho?: boolean;
+  enableKeyboardShortcuts?: boolean;
+  showJoinOverlay?: boolean;
 }
 
 export interface TerminalViewportState {
@@ -375,6 +481,7 @@ export interface TerminalViewportState {
 
 export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const MAX_VIEWPORT_ROWS = 512;
+  const MAX_VIEWPORT_COLS = 512;
   const MIN_STABLE_VIEWPORT_ROWS = 6;
   const {
     sessionId,
@@ -400,9 +507,21 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     hideIdlePlaceholder = false,
     maxRenderFps,
     viewOnly = false,
+    sizingStrategy: providedSizingStrategy,
+    enablePredictiveEcho = true,
+    enableKeyboardShortcuts = true,
+    showJoinOverlay = true,
   } = props;
 
   const store = useMemo(() => providedStore ?? createTerminalStore(), [providedStore]);
+  const sizingStrategy = useMemo<TerminalSizingStrategy>(
+    () => providedSizingStrategy ?? createLegacyTerminalSizingStrategy(),
+    [providedSizingStrategy],
+  );
+  const scrollPolicy = useMemo<TerminalScrollPolicy>(
+    () => sizingStrategy.scrollPolicy(),
+    [sizingStrategy],
+  );
   const autoResizeHostOnViewportChangeEffective =
     !viewOnly && autoResizeHostOnViewportChange;
   if (IS_DEV && typeof window !== 'undefined') {
@@ -411,9 +530,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const snapshot = useTerminalSnapshot(store);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const containerStyleKeysRef = useRef<string[]>([]);
   const headerRef = useRef<HTMLDivElement | null>(null);
   const transportRef = useRef<TerminalTransport | null>(providedTransport ?? null);
-  const predictionUxRef = useRef<PredictionUx>(new PredictionUx());
   const connectionRef = useRef<BrowserTransportConnection | null>(null);
   const connectionTraceRef = useRef<ConnectionTrace | null>(null);
   const subscriptionRef = useRef<number | null>(null);
@@ -451,22 +570,50 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     visible: false,
     underline: false,
   });
+  const {
+    tick: predictionTick,
+    recordSend: recordPredictionSend,
+    recordAck: recordPredictionAck,
+    reset: resetPrediction,
+  } = usePredictionUx(enablePredictiveEcho, setPredictionOverlay);
   const [ptyViewportRows, setPtyViewportRows] = useState<number | null>(null);
   const ptyViewportRowsRef = useRef<number | null>(null);
   const [ptyCols, setPtyCols] = useState<number | null>(null);
   const ptyColsRef = useRef<number | null>(null);
+  const [subscriptionVersion, setSubscriptionVersion] = useState(0);
   // Debounce DOM-driven viewport measurements to avoid transient oscillation
   // from StrictMode remounts and layout thrash from rewriting the PTY size.
   const domPendingViewportRowsRef = useRef<number | null>(null);
   const domPendingTimestampRef = useRef<number | null>(null);
+  const domPendingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [measuredCellWidth, setMeasuredCellWidth] = useState<number | null>(null);
+  const clearDomPendingTimeout = useCallback(() => {
+    if (domPendingTimeoutRef.current !== null) {
+      clearTimeout(domPendingTimeoutRef.current);
+      domPendingTimeoutRef.current = null;
+    }
+  }, []);
   const DOM_VIEWPORT_DEBOUNCE_MS = 120;
   const DOM_VIEWPORT_TOLERANCE = 1; // rows
+  const devicePixelRatioValue =
+    typeof window !== 'undefined' && typeof window.devicePixelRatio === 'number'
+      ? window.devicePixelRatio || 1
+      : 1;
+  const baseCellWidth = (fontSize / BASE_TERMINAL_FONT_SIZE) * BASE_TERMINAL_CELL_WIDTH;
+  const dpr = Math.max(1, devicePixelRatioValue);
+  const roundedCellWidth = Math.max(1, Math.round(baseCellWidth * dpr) / dpr);
+  const cellWidthPx = Number(roundedCellWidth.toFixed(3));
+  const effectiveCellWidth = measuredCellWidth && measuredCellWidth > 0 ? measuredCellWidth : cellWidthPx;
+  const lastSentViewportCols = useRef<number | null>(null);
   const effectiveOverlay = useMemo(() => {
+    if (!enablePredictiveEcho) {
+      return DEFAULT_PREDICTION_OVERLAY;
+    }
     if (predictionOverlay.visible || !snapshot.hasPredictions) {
       return predictionOverlay;
     }
     return { ...predictionOverlay, visible: true };
-  }, [predictionOverlay, snapshot.hasPredictions]);
+  }, [enablePredictiveEcho, predictionOverlay, snapshot.hasPredictions]);
   const joinTimersRef = useRef<{ short?: number; long?: number; hide?: number }>({});
   const peerIdRef = useRef<string | null>(null);
   const handshakeReadyRef = useRef(false);
@@ -572,9 +719,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       if (!intervalMs || timestamp - lastTick >= intervalMs) {
         lastTick = timestamp;
         store.pruneAckedPredictions(timestamp, PREDICTION_ACK_GRACE_MS);
-        const update = predictionUxRef.current.tick(timestamp);
-        if (update) {
-          setPredictionOverlay(update);
+        if (enablePredictiveEcho) {
+          predictionTick(timestamp);
         }
       }
       raf = window.requestAnimationFrame(step);
@@ -585,7 +731,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         window.cancelAnimationFrame(raf);
       }
     };
-  }, [store, maxRenderFps]);
+  }, [store, maxRenderFps, enablePredictiveEcho, predictionTick]);
   const log = useCallback((message: string, detail?: Record<string, unknown>) => {
     if (typeof window === 'undefined' || !window.__BEACH_TRACE) {
       return;
@@ -597,6 +743,43 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     } else {
       console.info(`${prefix} ${message}`);
     }
+  }, []);
+  const applyContainerSizing = useCallback((style: CSSProperties | undefined) => {
+    const container = containerRef.current;
+    if (!container) {
+      return;
+    }
+
+    if (containerStyleKeysRef.current.length > 0) {
+      for (const key of containerStyleKeysRef.current) {
+        if (key.startsWith('--')) {
+          container.style.removeProperty(key);
+        } else {
+          (container.style as any)[key] = '';
+        }
+      }
+      containerStyleKeysRef.current = [];
+    }
+
+    if (!style) {
+      return;
+    }
+
+    const nextKeys: string[] = [];
+    Object.entries(style).forEach(([key, value]) => {
+      if (value == null) {
+        return;
+      }
+      nextKeys.push(key);
+      if (key.startsWith('--')) {
+        container.style.setProperty(key, String(value));
+      } else {
+        const cssValue =
+          typeof value === 'number' && Number.isFinite(value) ? `${value}` : String(value);
+        (container.style as any)[key] = cssValue;
+      }
+    });
+    containerStyleKeysRef.current = nextKeys;
   }, []);
 
   const sendHostResize = useCallback(() => {
@@ -627,6 +810,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     });
     try {
       transport.send({ type: 'resize', cols: targetCols, rows: measuredRows });
+      lastSentViewportCols.current = targetCols;
     } catch (err) {
       if (IS_DEV) {
         console.warn('[beach-surfer] send_host_resize failed', err);
@@ -666,6 +850,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       });
       try {
         transport.send({ type: 'resize', cols, rows });
+        lastSentViewportCols.current = cols;
       } catch (err) {
         if (IS_DEV) {
           console.warn('[beach-surfer] request_host_resize failed', err);
@@ -981,8 +1166,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   }
   const lineHeight = computeLineHeight(fontSize);
   const [measuredLineHeight, setMeasuredLineHeight] = useState<number>(lineHeight);
-  const [measuredCellWidth, setMeasuredCellWidth] = useState<number | null>(null);
-  const effectiveLineHeight = measuredLineHeight > 0 ? measuredLineHeight : lineHeight;
+  const minEffectiveLineHeight = Math.max(4, lineHeight * 0.4);
+  const effectiveLineHeight = measuredLineHeight >= minEffectiveLineHeight ? measuredLineHeight : lineHeight;
   const totalRows = snapshot.rows.length;
   const firstAbsolute = lines.length > 0 ? lines[0]!.absolute : snapshot.baseRow;
   const lastAbsolute = lines.length > 0 ? lines[lines.length - 1]!.absolute : firstAbsolute;
@@ -1056,11 +1241,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     if (typeof window === 'undefined') {
       return;
     }
-    if (disableViewportMeasurements) {
-      setMeasuredLineHeight(lineHeight);
-      setMeasuredCellWidth(null);
-      return;
-    }
+    // Always measure row height and cell width for accurate pixel sizing,
+    // even when viewport measurements are disabled.
     const container = containerRef.current;
     if (!container) {
       return;
@@ -1077,7 +1259,18 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         }
         const rect = row.getBoundingClientRect();
         if (Number.isFinite(rect.height) && rect.height > 0) {
-          setMeasuredLineHeight((prev) => (Math.abs(prev - rect.height) > 0.1 ? rect.height : prev));
+          setMeasuredLineHeight((prev) => {
+            const next = rect.height;
+            if (next >= minEffectiveLineHeight) {
+              return Math.abs(prev - next) > 0.1 ? next : prev;
+            }
+            // Ignore obviously scaled values; if we already dipped below the
+            // threshold, snap back to our font-derived baseline.
+            if (prev < minEffectiveLineHeight) {
+              return lineHeight;
+            }
+            return prev;
+          });
         }
         let nextCellWidth: number | null = null;
         const spans = Array.from(row.querySelectorAll<HTMLSpanElement>('span'));
@@ -1124,10 +1317,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       }
       window.removeEventListener('resize', scheduleMeasure);
     };
-  }, [disableViewportMeasurements, snapshot.cols, fontFamily, fontSize, lines.length, lineHeight]);
+  }, [snapshot.cols, fontFamily, fontSize, lines.length, lineHeight, minEffectiveLineHeight]);
 
   useEffect(() => {
     transportRef.current = providedTransport ?? null;
+    lastSentViewportRows.current = 0;
+    lastSentViewportCols.current = null;
     setSecureSummary(null);
     ptyViewportRowsRef.current = null;
     setPtyViewportRows((prev) => (prev === null ? prev : null));
@@ -1243,6 +1438,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       }
       connectionRef.current = null;
       transportRef.current = null;
+      lastSentViewportRows.current = 0;
+      lastSentViewportCols.current = null;
       setActiveConnection(null);
       setSecureSummary(null);
       setPeerId(null);
@@ -1257,140 +1454,235 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoConnect, sessionId, baseUrl, passcode, queryLabel]);
 
-  useEffect(() => {
-    const wrapper = wrapperRef.current;
-    const container = containerRef.current;
-    if (!wrapper || !container) {
-      return;
-    }
-    if (disableViewportMeasurements) {
-      const desiredRows = (() => {
-        if (typeof forcedViewportRows === 'number' && forcedViewportRows > 0) {
-          return forcedViewportRows;
-        }
-        if (ptyViewportRowsRef.current && ptyViewportRowsRef.current > 0) {
-          return ptyViewportRowsRef.current;
-        }
-        return 24;
-      })();
-      let viewportRows = Math.max(1, Math.min(desiredRows, MAX_VIEWPORT_ROWS));
-      const previousViewportRows = lastMeasuredViewportRows.current;
-      if (
-        previousViewportRows != null &&
-        previousViewportRows >= MIN_STABLE_VIEWPORT_ROWS &&
-        viewportRows < MIN_STABLE_VIEWPORT_ROWS
+  const buildHostMeta = useCallback(
+    (rect: DOMRectReadOnly): TerminalSizingHostMeta => {
+      let preferred: number | null = null;
+      if (typeof forcedViewportRows === 'number' && forcedViewportRows > 0) {
+        preferred = forcedViewportRows;
+      } else if (ptyViewportRowsRef.current && ptyViewportRowsRef.current > 0) {
+        preferred = ptyViewportRowsRef.current;
+      } else if (
+        typeof globalThis !== 'undefined' &&
+        (globalThis as Record<string, any>).ENABLE_VISIBLE_PREVIEW_DRIVER
       ) {
-        viewportRows = previousViewportRows;
-      }
-      const snapshotNow = store.getSnapshot();
-      const viewportTop = snapshotNow.viewportTop;
-      store.setViewport(viewportTop, viewportRows);
-      lastMeasuredViewportRows.current = viewportRows;
-      lastSentViewportRows.current = viewportRows;
-      container.style.removeProperty('maxHeight');
-      container.style.removeProperty('--beach-terminal-max-height');
-      if (typeof window !== 'undefined') {
         try {
-          console.info('[terminal][trace] disable-measurements viewport-set', {
-            sessionId,
-            forcedViewportRows,
-            desiredRows,
-            appliedRows: viewportRows,
-            viewportTop,
-            snapshotViewportHeight: snapshotNow.viewportHeight,
-            snapshotFollowTail: snapshotNow.followTail,
-          });
+          const snapshotNow = store.getSnapshot();
+          const candidate = Math.max(
+            snapshotNow.viewportHeight > 0 ? snapshotNow.viewportHeight : 0,
+            snapshotNow.rows.length,
+          );
+          if (candidate > 0) {
+            preferred = candidate;
+          }
         } catch {
-          // ignore logging issues
+          // ignore snapshot errors
         }
       }
-      emitViewportState();
-      return;
-    }
-    const observer = new ResizeObserver(() => {
-      // Measure the container's actual viewport size
-      // This is the fixed available space, not affected by internal padding
-      const containerRect = container.getBoundingClientRect();
-      const viewportHeight = containerRect.height;
-      const rowHeight = Math.max(1, effectiveLineHeight);
-      const measured = Math.max(1, Math.floor(viewportHeight / rowHeight));
-      // Clamp to the physical window height so we never report more rows than
-      // the screen can actually display. Using innerHeight keeps the loop from
-      // chasing scrollHeight growth when content expands.
-      const windowRows = typeof window !== 'undefined'
-        ? Math.max(1, Math.floor(window.innerHeight / rowHeight))
-        : MAX_VIEWPORT_ROWS;
-      const fallbackRows = Math.max(1, Math.min(windowRows, MAX_VIEWPORT_ROWS));
-      const previousViewportRows = lastMeasuredViewportRows.current;
-      let candidateRows = Math.max(1, Math.min(measured, fallbackRows));
-      if (
-        previousViewportRows != null &&
-        previousViewportRows >= MIN_STABLE_VIEWPORT_ROWS &&
-        candidateRows <= Math.max(1, Math.floor(MIN_STABLE_VIEWPORT_ROWS / 2))
-      ) {
-        candidateRows = previousViewportRows;
-      }
-
-      const commitRows = (rows: number) => {
-        // Tie the container max height to the committed viewport rows, not
-        // the window-derived fallback. This prevents the terminal from being
-        // squeezed into a smaller box than the visible viewport allows.
-        const maxHeightPx = Math.max(1, Math.ceil(rows * rowHeight));
-        container.style.maxHeight = `${maxHeightPx}px`;
-        container.style.setProperty('--beach-terminal-max-height', `${maxHeightPx}px`);
-        const current = store.getSnapshot();
-        log('resize-commit', {
-          containerHeight: containerRect.height,
-          viewportHeight,
-          lineHeight,
-          measuredRows: measured,
-          windowRows,
-          committedRows: rows,
-          lastSent: lastSentViewportRows.current,
-          baseRow: current.baseRow,
-          totalRows: current.rows.length,
-          followTail: current.followTail,
-        });
-        store.setViewport(current.viewportTop, rows);
-        lastMeasuredViewportRows.current = rows;
-        emitViewportState();
-        if (suppressNextResizeRef.current) {
-          suppressNextResizeRef.current = false;
-          return;
-        }
-        // Only send resize if the viewport size actually changed
-        if (
-          autoResizeHostOnViewportChangeEffective &&
-          subscriptionRef.current !== null &&
-          transportRef.current &&
-          rows !== lastSentViewportRows.current
-        ) {
-          const label = queryLabel ?? null;
-          const peerId = peerIdRef.current;
-          log('auto_host_resize', {
-            targetCols: current.cols,
-            targetRows: rows,
-            clientLabel: label ?? null,
-            peerId: peerId ?? null,
-            viewOnly,
-          });
-          transportRef.current.send({ type: 'resize', cols: current.cols, rows });
-          lastSentViewportRows.current = rows;
-        }
+      const meta: TerminalSizingHostMeta = {
+        lineHeightPx: effectiveLineHeight,
+        minViewportRows: MIN_STABLE_VIEWPORT_ROWS,
+        maxViewportRows: MAX_VIEWPORT_ROWS,
+        lastViewportRows: lastMeasuredViewportRows.current,
+        disableViewportMeasurements,
+        forcedViewportRows: typeof forcedViewportRows === 'number' ? forcedViewportRows : null,
+        preferredViewportRows: preferred,
+        windowInnerHeightPx:
+          typeof window !== 'undefined' && typeof window.innerHeight === 'number'
+            ? window.innerHeight
+            : null,
+        defaultViewportRows: 24,
       };
+      logSizing('buildHostMeta', {
+        sessionId: sessionId ?? null,
+        rectHeight: Number.isFinite(rect.height) ? Number(rect.height.toFixed(2)) : rect.height,
+        disableViewportMeasurements,
+        preferredViewportRows: preferred,
+        forcedViewportRows: typeof forcedViewportRows === 'number' ? forcedViewportRows : null,
+        lastViewportRows: lastMeasuredViewportRows.current,
+      });
+      return meta;
+    },
+    [disableViewportMeasurements, effectiveLineHeight, forcedViewportRows, store],
+  );
 
-      const pending = domPendingViewportRowsRef.current;
+  const proposeViewport = useCallback(
+    (source: string, rect: DOMRectReadOnly, meta: TerminalSizingHostMeta): TerminalViewportProposal => {
+      const proposal = sizingStrategy.nextViewport(rect, meta);
+      logSizing('nextViewport', {
+        source,
+        rectHeight: Number.isFinite(rect.height) ? Number(rect.height.toFixed(2)) : rect.height,
+        rectWidth: Number.isFinite(rect.width) ? Number(rect.width.toFixed(2)) : rect.width,
+        viewportRows: proposal.viewportRows ?? null,
+        measuredRows: proposal.measuredRows ?? null,
+        fallbackRows: proposal.fallbackRows ?? null,
+        minViewportRows: meta.minViewportRows,
+        maxViewportRows: meta.maxViewportRows,
+        preferredViewportRows: meta.preferredViewportRows ?? null,
+        lastViewportRows: meta.lastViewportRows ?? null,
+        forcedViewportRows: meta.forcedViewportRows ?? null,
+        disableViewportMeasurements: meta.disableViewportMeasurements,
+      });
+      return proposal;
+    },
+    [sizingStrategy],
+  );
+
+  const commitViewportRows = useCallback(
+    (
+      rows: number,
+      rect: DOMRectReadOnly,
+      hostMeta: TerminalSizingHostMeta,
+      proposal?: TerminalViewportProposal,
+      options?: { forceLastSent?: boolean },
+    ) => {
+      const container = containerRef.current;
+      if (!container) {
+        return;
+      }
+      const clampedRows = Math.max(1, Math.min(Math.round(rows), hostMeta.maxViewportRows));
+      const current = store.getSnapshot();
+      let availableWidth =
+        typeof container.clientWidth === 'number' ? container.clientWidth : rect.width;
+      let paddingLeft = 0;
+      let paddingRight = 0;
+      if (typeof window !== 'undefined') {
+        const computed = window.getComputedStyle(container);
+        const parsedLeft = Number.parseFloat(computed.paddingLeft ?? '0');
+        const parsedRight = Number.parseFloat(computed.paddingRight ?? '0');
+        paddingLeft = Number.isFinite(parsedLeft) ? parsedLeft : 0;
+        paddingRight = Number.isFinite(parsedRight) ? parsedRight : 0;
+      }
+      if (!Number.isFinite(availableWidth) || availableWidth <= 0) {
+        availableWidth = Number.isFinite(rect.width) ? rect.width : 0;
+      }
+      const innerWidth = Math.max(0, availableWidth - paddingLeft - paddingRight);
+      let measuredCols: number | null = null;
+      if (innerWidth > 0 && effectiveCellWidth > 0) {
+        measuredCols = Math.max(1, Math.floor(innerWidth / effectiveCellWidth));
+      }
+      const fallbackCols =
+        current.cols > 0
+          ? current.cols
+          : ptyColsRef.current && ptyColsRef.current > 0
+            ? ptyColsRef.current
+            : DEFAULT_TERMINAL_COLS;
+      const targetCols = Math.max(
+        1,
+        Math.min(measuredCols ?? fallbackCols, MAX_VIEWPORT_COLS),
+      );
+      const previousSentCols = lastSentViewportCols.current;
+      log('resize-commit', {
+        containerHeight: rect.height,
+        viewportHeight: rect.height,
+        lineHeight,
+        measuredRows: proposal?.measuredRows,
+        fallbackRows: proposal?.fallbackRows,
+        committedRows: clampedRows,
+        lastSent: lastSentViewportRows.current,
+        baseRow: current.baseRow,
+        totalRows: current.rows.length,
+        followTail: current.followTail,
+        measuredCols,
+        targetCols,
+        previousSentCols,
+      });
+      logSizing('commitViewportRows', {
+        rows,
+        clampedRows,
+        measuredRows: proposal?.measuredRows ?? null,
+        fallbackRows: proposal?.fallbackRows ?? null,
+        forceLastSent: Boolean(options?.forceLastSent),
+        lastSentViewportRows: lastSentViewportRows.current,
+        viewportTop: current.viewportTop,
+        totalRows: current.rows.length,
+        measuredCols,
+        innerWidth,
+        targetCols,
+        cellWidth: effectiveCellWidth,
+        lastSentViewportCols: previousSentCols ?? null,
+      });
+      store.setViewport(current.viewportTop, clampedRows);
+      lastMeasuredViewportRows.current = clampedRows;
+      emitViewportState();
+      if (suppressNextResizeRef.current) {
+        suppressNextResizeRef.current = false;
+      } else if (
+        autoResizeHostOnViewportChangeEffective &&
+        subscriptionRef.current !== null &&
+        transportRef.current &&
+        (clampedRows !== lastSentViewportRows.current ||
+          targetCols !== previousSentCols)
+      ) {
+        const label = queryLabel ?? null;
+        const peerId = peerIdRef.current;
+        log('auto_host_resize', {
+          targetCols,
+          targetRows: clampedRows,
+          clientLabel: label ?? null,
+          peerId: peerId ?? null,
+          viewOnly,
+        });
+        transportRef.current.send({ type: 'resize', cols: targetCols, rows: clampedRows });
+        lastSentViewportRows.current = clampedRows;
+        lastSentViewportCols.current = targetCols;
+      }
+      if (options?.forceLastSent) {
+        lastSentViewportRows.current = clampedRows;
+        lastSentViewportCols.current = targetCols;
+      }
+      const style = sizingStrategy.containerStyle(rect, hostMeta, clampedRows);
+      applyContainerSizing(style);
+    },
+    [
+      applyContainerSizing,
+      autoResizeHostOnViewportChangeEffective,
+      emitViewportState,
+      effectiveCellWidth,
+      MAX_VIEWPORT_COLS,
+      lineHeight,
+      log,
+      queryLabel,
+      sizingStrategy,
+      store,
+      viewOnly,
+    ],
+  );
+
+  const scheduleViewportCommit = useCallback(
+    (proposal: TerminalViewportProposal, rect: DOMRectReadOnly, hostMeta: TerminalSizingHostMeta) => {
+      if (!proposal || proposal.viewportRows == null) {
+        return;
+      }
+      const candidateRows = Math.max(1, Math.round(proposal.viewportRows));
+      const previousViewportRows = lastMeasuredViewportRows.current;
       const nowTs = now();
-      // If same as committed, clear any pending and skip
+      const pending = domPendingViewportRowsRef.current;
+      logSizing('scheduleViewportCommit', {
+        candidateRows,
+        measuredRows: proposal.measuredRows ?? null,
+        fallbackRows: proposal.fallbackRows ?? null,
+        previousViewportRows: previousViewportRows ?? null,
+        pendingRows: pending ?? null,
+        pendingAgeMs:
+          domPendingTimestampRef.current != null ? nowTs - domPendingTimestampRef.current : null,
+      });
       if (
         previousViewportRows != null &&
         Math.abs(previousViewportRows - candidateRows) <= DOM_VIEWPORT_TOLERANCE
       ) {
         domPendingViewportRowsRef.current = null;
         domPendingTimestampRef.current = null;
+        clearDomPendingTimeout();
+        const styleRows = previousViewportRows ?? candidateRows;
+        const style = sizingStrategy.containerStyle(rect, hostMeta, styleRows);
+        applyContainerSizing(style);
+        logSizing('scheduleViewportCommit:reuse-previous', {
+          styleRows,
+          candidateRows,
+          domTolerance: DOM_VIEWPORT_TOLERANCE,
+        });
         return;
       }
-      // If same as pending and debounce window elapsed, commit
       if (
         pending != null &&
         Math.abs(pending - candidateRows) <= DOM_VIEWPORT_TOLERANCE &&
@@ -1399,46 +1691,170 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       ) {
         domPendingViewportRowsRef.current = null;
         domPendingTimestampRef.current = null;
-        commitRows(candidateRows);
+        clearDomPendingTimeout();
+        commitViewportRows(candidateRows, rect, hostMeta, proposal);
+        logSizing('scheduleViewportCommit:commit-pending', {
+          candidateRows,
+          debounceMs: DOM_VIEWPORT_DEBOUNCE_MS,
+        });
         return;
       }
-      // If differs from pending, update pending and log sample; allow stale pending to commit
       const pendingAge =
         domPendingTimestampRef.current != null ? nowTs - domPendingTimestampRef.current : null;
-      if (pending != null && pendingAge != null && pendingAge >= DOM_VIEWPORT_DEBOUNCE_MS * 2) {
-        // Commit stale pending sample to avoid starvation
+      if (
+        pending != null &&
+        pendingAge != null &&
+        pendingAge >= DOM_VIEWPORT_DEBOUNCE_MS * 2 &&
+        Math.abs(pending - candidateRows) <= DOM_VIEWPORT_TOLERANCE
+      ) {
         const stale = pending;
         domPendingViewportRowsRef.current = null;
         domPendingTimestampRef.current = null;
-        commitRows(stale);
+        clearDomPendingTimeout();
+        commitViewportRows(stale, rect, hostMeta, proposal);
+        logSizing('scheduleViewportCommit:commit-stale', {
+          staleRows: stale,
+          pendingAge,
+        });
         return;
       }
       if (pending == null || Math.abs(pending - candidateRows) > DOM_VIEWPORT_TOLERANCE) {
+        if (
+          pending != null &&
+          Math.abs(pending - candidateRows) > DOM_VIEWPORT_TOLERANCE &&
+          domPendingTimestampRef.current != null
+        ) {
+          logSizing('scheduleViewportCommit:replace-pending', {
+            previousPendingRows: pending,
+            candidateRows,
+            pendingAge,
+          });
+        }
         domPendingViewportRowsRef.current = candidateRows;
         domPendingTimestampRef.current = nowTs;
+        clearDomPendingTimeout();
         log('resize-sample', {
-          measuredRows: measured,
+          measuredRows: proposal.measuredRows,
           candidateRows,
-          fallbackRows,
+          fallbackRows: proposal.fallbackRows,
           previousViewportRows,
         });
+        logSizing('scheduleViewportCommit:set-pending', {
+          candidateRows,
+          previousViewportRows: previousViewportRows ?? null,
+        });
+        if (typeof window !== 'undefined') {
+          domPendingTimeoutRef.current = window.setTimeout(() => {
+            if (
+              domPendingViewportRowsRef.current === candidateRows &&
+              domPendingTimestampRef.current != null
+            ) {
+              const age = now() - domPendingTimestampRef.current;
+              domPendingViewportRowsRef.current = null;
+              domPendingTimestampRef.current = null;
+              clearDomPendingTimeout();
+              commitViewportRows(candidateRows, rect, hostMeta, proposal);
+              logSizing('scheduleViewportCommit:timeout-commit', {
+                candidateRows,
+                pendingAgeMs: age,
+              });
+            }
+          }, DOM_VIEWPORT_DEBOUNCE_MS * 2);
+        }
       }
+    },
+    [applyContainerSizing, clearDomPendingTimeout, commitViewportRows, log, sizingStrategy],
+  );
+
+  const triggerViewportRecalc = useCallback(
+    (source: string) => {
+      const wrapper = wrapperRef.current;
+      if (!wrapper) {
+        return;
+      }
+      const rect = wrapper.getBoundingClientRect();
+      const meta = buildHostMeta(rect);
+      const proposal = proposeViewport(source, rect, meta);
+      scheduleViewportCommit(proposal, rect, meta);
+    },
+    [buildHostMeta, proposeViewport, scheduleViewportCommit],
+  );
+
+  useEffect(() => {
+    const wrapper = wrapperRef.current;
+    const container = containerRef.current;
+    if (!wrapper || !container) {
+      return;
+    }
+
+    const initialRect = wrapper.getBoundingClientRect();
+    const initialMeta = buildHostMeta(initialRect);
+
+    if (initialMeta.disableViewportMeasurements) {
+      const proposal = proposeViewport('initial:disable-measurements', initialRect, initialMeta);
+      if (proposal.viewportRows != null) {
+        domPendingViewportRowsRef.current = null;
+        domPendingTimestampRef.current = null;
+        clearDomPendingTimeout();
+        commitViewportRows(
+          proposal.viewportRows,
+          initialRect,
+          initialMeta,
+          proposal,
+          { forceLastSent: true },
+        );
+      }
+      return;
+    }
+
+    if (typeof ResizeObserver === 'undefined') {
+      return;
+    }
+
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[entries.length - 1];
+      const rect = entry?.contentRect ?? wrapper.getBoundingClientRect();
+      const meta = buildHostMeta(rect);
+      const proposal = proposeViewport('resize-observer:entry', rect, meta);
+      scheduleViewportCommit(proposal, rect, meta);
     });
-    // Observe the wrapper, not the scroll container
+
     observer.observe(wrapper);
-    return () => observer.disconnect();
+
+    const proposal = proposeViewport('resize-observer:initial', initialRect, initialMeta);
+    scheduleViewportCommit(proposal, initialRect, initialMeta);
+
+    return () => {
+      observer.disconnect();
+      clearDomPendingTimeout();
+      domPendingViewportRowsRef.current = null;
+      domPendingTimestampRef.current = null;
+    };
   }, [
-    autoResizeHostOnViewportChangeEffective,
-    disableViewportMeasurements,
-    effectiveLineHeight,
-    emitViewportState,
-    forcedViewportRows,
-    lineHeight,
-    log,
-    queryLabel,
-    store,
-    viewOnly,
+    buildHostMeta,
+    commitViewportRows,
+    proposeViewport,
+    clearDomPendingTimeout,
+    scheduleViewportCommit,
+    sizingStrategy,
   ]);
+
+  useEffect(() => {
+    if (!subscriptionRef.current) {
+      return;
+    }
+    triggerViewportRecalc('subscription-ready');
+  }, [subscriptionVersion, triggerViewportRecalc]);
+
+  useEffect(() => {
+    if (!subscriptionRef.current) {
+      return;
+    }
+    if (measuredCellWidth == null) {
+      return;
+    }
+    triggerViewportRecalc('cell-width-update');
+  }, [measuredCellWidth, triggerViewportRecalc]);
 
   useEffect(() => {
     const connection = activeConnection;
@@ -1486,7 +1902,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
 
   useEffect(() => {
     const element = containerRef.current;
-    if (!element || !snapshot.followTail) {
+    if (!element || scrollPolicy !== 'follow-tail' || !snapshot.followTail) {
       return;
     }
     const applyScroll = () => {
@@ -1551,7 +1967,18 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       };
     }
     applyScroll();
-  }, [snapshot.followTail, snapshot.baseRow, snapshot.rows.length, lastAbsolute, lineHeight, topPadding, bottomPadding, lines.length, effectiveLineHeight]);
+  }, [
+    snapshot.followTail,
+    snapshot.baseRow,
+    snapshot.rows.length,
+    lastAbsolute,
+    lineHeight,
+    topPadding,
+    bottomPadding,
+    lines.length,
+    effectiveLineHeight,
+    scrollPolicy,
+  ]);
 
   const INPUT_MAX_FRAME_BYTES = 32 * 1024; // conservative cap per input frame
 
@@ -1589,12 +2016,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       const timestampMs = now();
       transport.send({ type: 'input', seq, data: slice });
       const predictionApplied = predicts ? store.registerPrediction(seq, slice) : false;
-      const overlayUpdate = predictionUxRef.current.recordSend(seq, timestampMs, predicts && predictionApplied);
-      if (overlayUpdate) {
-        setPredictionOverlay(overlayUpdate);
-      }
+      recordPredictionSend(seq, timestampMs, predicts && predictionApplied);
     }
-  }, [store]);
+  }, [store, recordPredictionSend]);
 
   const enqueueInput = useCallback((data: Uint8Array, predict: boolean) => {
     pendingInputRef.current.push({ data, predict });
@@ -1605,6 +2029,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   }, [flushPendingInput]);
 
   const handleKeyDown: React.KeyboardEventHandler<HTMLDivElement> = (event) => {
+    if (!enableKeyboardShortcuts) {
+      return;
+    }
     const transport = transportRef.current;
     if (!transport) {
       trace('handleKeyDown: no transport');
@@ -1624,6 +2051,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   };
 
   const handlePaste: React.ClipboardEventHandler<HTMLDivElement> = (event) => {
+    if (!enableKeyboardShortcuts) {
+      return;
+    }
     const transport = transportRef.current;
     if (!transport) {
       trace('handlePaste: no transport');
@@ -1795,17 +2225,6 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     !isFullscreen && 'rounded-b-[22px]',
   );
 
-  const devicePixelRatioValue =
-    typeof window !== 'undefined' && typeof window.devicePixelRatio === 'number'
-      ? window.devicePixelRatio || 1
-      : 1;
-  const baseCellWidth = (fontSize / BASE_TERMINAL_FONT_SIZE) * BASE_TERMINAL_CELL_WIDTH;
-  const dpr = Math.max(1, devicePixelRatioValue);
-  const roundedCellWidth = Math.max(1, Math.round(baseCellWidth * dpr) / dpr);
-  const cellWidthPx = Number(roundedCellWidth.toFixed(3));
-
-  const effectiveCellWidth = measuredCellWidth && measuredCellWidth > 0 ? measuredCellWidth : cellWidthPx;
-
   const containerStyle: CSSProperties & {
     '--beach-terminal-line-height': string;
     '--beach-terminal-cell-width': string;
@@ -1855,6 +2274,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     });
     try {
       transport.send({ type: 'resize', cols: targetCols, rows: clampedRows });
+      lastSentViewportCols.current = targetCols;
     } catch (err) {
       if (IS_DEV) {
         console.warn('[beach-surfer] match_host_viewport send failed', err);
@@ -1909,7 +2329,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           aria-hidden
         />
       </div>
-      <JoinStatusOverlay state={joinState} message={joinMessage} isFullscreen={isFullscreen} />
+      {showJoinOverlay ? (
+        <JoinStatusOverlay state={joinState} message={joinMessage} isFullscreen={isFullscreen} />
+      ) : null}
       {showTopBar ? (
         <header
           ref={headerRef}
@@ -2032,7 +2454,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     const atBottom = shouldReenableFollowTail(remainingPixels, pixelsPerRow);
     const nearBottom = remainingPixels <= pixelsPerRow * 2;
     const previousFollowTail = snapshot.followTail;
-    store.setFollowTail(atBottom);
+    if (scrollPolicy === 'follow-tail') {
+      store.setFollowTail(atBottom);
+    }
     const nextSnapshot = store.getSnapshot();
     trace('scroll tail decision', {
       previousFollowTail,
@@ -2051,6 +2475,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       totalRows,
       firstAbsolute,
       lastAbsolute,
+      scrollPolicy,
     });
     logScrollDiagnostics(
       element,
@@ -2110,6 +2535,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
 
   function bindTransport(transport: TerminalTransport): void {
     subscriptionRef.current = null;
+    setSubscriptionVersion((v) => v + 1);
     handshakeReadyRef.current = false;
     const frameHandler = (event: Event) => {
       const frame = (event as CustomEvent<HostFrame>).detail;
@@ -2144,6 +2570,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           enterDisconnectedState();
         }
         subscriptionRef.current = null;
+        setSubscriptionVersion((v) => v + 1);
         setSecureSummary(null);
         setStatus('closed');
       },
@@ -2200,14 +2627,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         }
         store.reset();
         subscriptionRef.current = frame.subscription;
+        setSubscriptionVersion((v) => v + 1);
         inputSeqRef.current = 0;
         store.setCursorSupport(Boolean(frame.features & FEATURE_CURSOR_SYNC));
-        {
-          const overlayReset = predictionUxRef.current.reset(now());
-          if (overlayReset) {
-            setPredictionOverlay(overlayReset);
-          }
-        }
+        resetPrediction(now());
         summarizeSnapshot(store);
         handshakeReadyRef.current = true;
         enterApprovedState(joinStateRef.current === 'approved' ? joinMessage ?? undefined : undefined);
@@ -2298,6 +2721,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           if (lastSentViewportRows.current === 0) {
             lastSentViewportRows.current = deviceViewport;
           }
+          if (lastSentViewportCols.current == null && frame.cols > 0) {
+            lastSentViewportCols.current = Math.max(1, Math.min(frame.cols, MAX_VIEWPORT_COLS));
+          }
           suppressNextResizeRef.current = true;
           log('grid frame', {
             baseRow: frame.baseRow,
@@ -2309,13 +2735,11 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
             historyEnd,
           });
         }
-        {
-          const overlayReset = predictionUxRef.current.reset(now());
-          if (overlayReset) {
-            setPredictionOverlay(overlayReset);
-          }
-        }
+        resetPrediction(now());
         emitViewportState();
+        if (subscriptionRef.current !== null) {
+          triggerViewportRecalc('grid-frame');
+        }
         break;
       case 'snapshot':
       case 'delta':
@@ -2347,10 +2771,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         const timestamp = now();
         predictiveLog('server_frame', { frame: 'input_ack', seq: frame.seq });
         store.ackPrediction(frame.seq, timestamp);
-        const overlayUpdate = predictionUxRef.current.recordAck(frame.seq, timestamp);
-        if (overlayUpdate) {
-          setPredictionOverlay(overlayUpdate);
-        }
+        recordPredictionAck(frame.seq, timestamp);
         break;
       }
       case 'cursor':

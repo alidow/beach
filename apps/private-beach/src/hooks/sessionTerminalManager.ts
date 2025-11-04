@@ -65,12 +65,34 @@ const KEEP_ALIVE_MS = 15_000;
 const RECONNECT_DELAY_MS = 1_500;
 const MAX_RECONNECT_DELAY_MS = 15_000;
 
+function debugLog(message: string, detail?: Record<string, unknown>) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  if (process.env.NODE_ENV === 'production') {
+    return;
+  }
+  const payload = detail ? JSON.stringify(detail) : '';
+  // eslint-disable-next-line no-console
+  console.info(`[terminal-manager][rewrite] ${message}${payload ? ` ${payload}` : ''}`);
+}
+
 export function acquireTerminalConnection(
   key: string,
   params: PreparedConnectionParams,
   subscriber: Subscriber,
 ): () => void {
   const entry = getOrCreateEntry(key, params);
+  debugLog('acquireTerminalConnection', {
+    key,
+    sessionId: params.sessionId,
+    privateBeachId: params.privateBeachId,
+    managerUrl: params.managerUrl,
+    hasAuthToken: params.effectiveAuthToken.length > 0,
+    hasOverrideCredentials: params.hasOverrideCredentials,
+    needsCredentialFetch: params.needsCredentialFetch,
+    existingSubscribers: entry.subscribers.size,
+  });
   retainEntry(entry);
   entry.subscribers.add(subscriber);
   subscriber(buildSnapshot(entry));
@@ -121,6 +143,12 @@ function getOrCreateEntry(key: string, params: PreparedConnectionParams): Manage
     lastCloseReason: null,
   };
   entries.set(key, entry);
+  debugLog('managerEntry.created', {
+    key,
+    sessionId: params.sessionId,
+    privateBeachId: params.privateBeachId,
+    managerUrl: params.managerUrl,
+  });
   return entry;
 }
 
@@ -170,6 +198,11 @@ function disposeEntry(entry: ManagerEntry, reason: string) {
   entry.reconnectTimer = null;
   detachListeners(entry);
   closeConnection(entry, reason);
+  debugLog('managerEntry.disposed', {
+    key: entry.key,
+    sessionId: entry.params.sessionId,
+    reason,
+  });
   entries.delete(entry.key);
 }
 
@@ -206,6 +239,11 @@ function ensureEntryConnection(entry: ManagerEntry) {
     }
     return;
   }
+  debugLog('ensureEntryConnection.start', {
+    key: entry.key,
+    sessionId: entry.params.sessionId,
+    status: entry.status,
+  });
   entry.connectPromise = (async () => {
     try {
       entry.connecting = true;
@@ -216,6 +254,13 @@ function ensureEntryConnection(entry: ManagerEntry) {
       notifySubscribers(entry);
 
       const { passcode, viewerToken } = await resolveCredentials(entry);
+      debugLog('ensureEntryConnection.credentials', {
+        key: entry.key,
+        sessionId: entry.params.sessionId,
+        hasPasscode: Boolean(passcode),
+        hasViewerToken: Boolean(viewerToken),
+        fetched: !entry.params.hasOverrideCredentials,
+      });
       const connection = await connectBrowserTransport({
         sessionId: entry.params.sessionId,
         baseUrl: entry.params.managerUrl,
@@ -245,6 +290,10 @@ function ensureEntryConnection(entry: ManagerEntry) {
       entry.reconnectAttempts = 0;
       entry.lastCloseReason = null;
       notifySubscribers(entry);
+      debugLog('ensureEntryConnection.connected', {
+        key: entry.key,
+        sessionId: entry.params.sessionId,
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       entry.connecting = false;
@@ -256,8 +305,18 @@ function ensureEntryConnection(entry: ManagerEntry) {
       entry.reconnectAttempts = Math.min(entry.reconnectAttempts + 1, 8);
       entry.lastCloseReason = message;
       scheduleReconnect(entry, { immediate: false });
+      debugLog('ensureEntryConnection.error', {
+        key: entry.key,
+        sessionId: entry.params.sessionId,
+        message,
+      });
     } finally {
       entry.connectPromise = null;
+      debugLog('ensureEntryConnection.finalize', {
+        key: entry.key,
+        sessionId: entry.params.sessionId,
+        disposed: entry.disposed,
+      });
     }
   })();
 }
@@ -269,12 +328,23 @@ async function resolveCredentials(entry: ManagerEntry): Promise<{
   if (entry.params.hasOverrideCredentials) {
     const pass = entry.params.overrides.passcode;
     const viewerToken = entry.params.overrides.viewerToken;
+    debugLog('resolveCredentials.override', {
+      key: entry.key,
+      sessionId: entry.params.sessionId,
+      hasPasscode: Boolean(pass),
+      hasViewerToken: Boolean(viewerToken),
+    });
     return {
       passcode: pass && pass.length > 0 ? pass : null,
       viewerToken: viewerToken && viewerToken.length > 0 ? viewerToken : null,
     };
   }
   if (entry.params.needsCredentialFetch) {
+    debugLog('resolveCredentials.fetch_start', {
+      key: entry.key,
+      sessionId: entry.params.sessionId,
+      privateBeachId: entry.params.privateBeachId,
+    });
     const credential = await fetchViewerCredential(
       entry.params.privateBeachId!,
       entry.params.sessionId,
@@ -285,6 +355,13 @@ async function resolveCredentials(entry: ManagerEntry): Promise<{
     if (credentialType === 'viewer_token') {
       const viewerToken = credential.credential?.trim() || null;
       const passcode = credential.passcode != null ? String(credential.passcode).trim() : '';
+      debugLog('resolveCredentials.fetch_success', {
+        key: entry.key,
+        sessionId: entry.params.sessionId,
+        credentialType,
+        hasPasscode: passcode.length > 0,
+        hasViewerToken: Boolean(viewerToken),
+      });
       return {
         passcode: passcode.length > 0 ? passcode : null,
         viewerToken,
@@ -292,13 +369,30 @@ async function resolveCredentials(entry: ManagerEntry): Promise<{
     }
     if (credential.credential != null) {
       const pass = String(credential.credential).trim();
+      debugLog('resolveCredentials.fetch_success', {
+        key: entry.key,
+        sessionId: entry.params.sessionId,
+        credentialType: 'passcode',
+        hasPasscode: pass.length > 0,
+        hasViewerToken: false,
+      });
       return {
         passcode: pass.length > 0 ? pass : null,
         viewerToken: null,
       };
     }
+    debugLog('resolveCredentials.fetch_failure', {
+      key: entry.key,
+      sessionId: entry.params.sessionId,
+      reason: 'viewer passcode unavailable',
+    });
     throw new Error('viewer passcode unavailable');
   }
+  debugLog('resolveCredentials.fetch_failure', {
+    key: entry.key,
+    sessionId: entry.params.sessionId,
+    reason: 'missing override credentials',
+  });
   throw new Error('Missing override credentials');
 }
 
@@ -310,6 +404,10 @@ function attachListeners(entry: ManagerEntry, connection: BrowserTransportConnec
     entry.status = 'connected';
     entry.connecting = false;
     notifySubscribers(entry);
+    debugLog('transport.open', {
+      key: entry.key,
+      sessionId: entry.params.sessionId,
+    });
   };
   transport.addEventListener('open', openHandler as EventListener);
   detachFns.push(() => transport.removeEventListener('open', openHandler as EventListener));
@@ -350,6 +448,11 @@ function attachListeners(entry: ManagerEntry, connection: BrowserTransportConnec
     entry.lastCloseReason = eventReason ?? 'transport-close';
     notifySubscribers(entry);
     scheduleReconnect(entry, { reason: entry.lastCloseReason ?? undefined });
+    debugLog('transport.close', {
+      key: entry.key,
+      sessionId: entry.params.sessionId,
+      reason: entry.lastCloseReason,
+    });
   };
   transport.addEventListener('close', closeHandler as EventListener);
   detachFns.push(() => transport.removeEventListener('close', closeHandler as EventListener));
@@ -361,6 +464,11 @@ function attachListeners(entry: ManagerEntry, connection: BrowserTransportConnec
     entry.secureSummary = null;
     entry.transport = null;
     notifySubscribers(entry);
+    debugLog('transport.error', {
+      key: entry.key,
+      sessionId: entry.params.sessionId,
+      message: entry.error,
+    });
   };
   transport.addEventListener('error', errorHandler as EventListener);
   detachFns.push(() => transport.removeEventListener('error', errorHandler as EventListener));

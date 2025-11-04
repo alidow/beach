@@ -1,0 +1,3 @@
+{
+  "extends": ["../private-beach/.eslintrc.json"]
+}

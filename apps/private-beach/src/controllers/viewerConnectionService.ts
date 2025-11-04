@@ -7,6 +7,7 @@ import {
 } from '../hooks/sessionTerminalManager';
 import type { SessionCredentialOverride, TerminalViewerState, TerminalViewerStatus } from '../hooks/terminalViewerTypes';
 import { incrementViewerCounter, resetViewerCounters, type ViewerTileCounters } from './metricsRegistry';
+import { emitTelemetry } from '../lib/telemetry';
 
 type ConnectionPreparation =
   | {
@@ -36,10 +37,25 @@ type TileEntry = {
   key: string | null;
   unsubscribe: (() => void) | null;
   preparation: ConnectionPreparation;
+  sessionId: string | null;
+  privateBeachId: string | null;
+  managerUrl: string | null;
   lastSnapshot: TerminalViewerState;
   lastStatus: TerminalViewerStatus;
   metrics: ViewerTileCounters;
 };
+
+function debugLog(message: string, detail?: Record<string, unknown>) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  if (process.env.NODE_ENV === 'production') {
+    return;
+  }
+  const payload = detail ? JSON.stringify(detail) : '';
+  // eslint-disable-next-line no-console
+  console.info(`[viewer-service][rewrite] ${message}${payload ? ` ${payload}` : ''}`);
+}
 
 const IDLE_STATE: TerminalViewerState & { transportVersion?: number } = {
   store: null,
@@ -135,21 +151,44 @@ export class ViewerConnectionService {
   connectTile(tileId: string, input: ConnectionInput, subscriber: TileSubscriber): () => void {
     const preparation = toPreparedConnection(input);
     const existing = this.tiles.get(tileId);
+    debugLog('connectTile.request', {
+      tileId,
+      sessionId: input.sessionId ?? null,
+      privateBeachId: input.privateBeachId ?? null,
+      managerUrl: input.managerUrl ?? null,
+      hasAuthToken: Boolean(input.authToken && input.authToken.trim().length > 0),
+      override: input.override
+        ? {
+            hasPasscode: Boolean(input.override.passcode),
+            hasViewerToken: Boolean(input.override.viewerToken),
+            skipCredentialFetch: Boolean(input.override.skipCredentialFetch),
+          }
+        : null,
+      ready: preparation.ready,
+      reason: preparation.ready ? null : preparation.reason,
+    });
 
     if (existing && existing.subscriber !== subscriber) {
       existing.subscriber = subscriber;
     }
 
+    const baseSessionId = input.sessionId?.trim() ?? null;
+    const basePrivateBeachId = input.privateBeachId?.trim() ?? null;
+    const baseManagerUrl = input.managerUrl?.trim() ?? null;
+
     if (!preparation.ready) {
-      this.disposeTile(tileId, existing);
+      this.disposeTile(tileId, existing, 'replacement');
       const idle = cloneViewerState(IDLE_STATE);
       subscriber(idle);
-      this.tiles.set(tileId, {
+      const entry: TileEntry = {
         tileId,
         subscriber,
         key: null,
         unsubscribe: null,
         preparation,
+        sessionId: baseSessionId,
+        privateBeachId: basePrivateBeachId,
+        managerUrl: baseManagerUrl,
         lastSnapshot: idle,
         lastStatus: idle.status,
         metrics:
@@ -160,6 +199,18 @@ export class ViewerConnectionService {
             failures: 0,
             disposed: 0,
           },
+      };
+      this.tiles.set(tileId, entry);
+      debugLog('connectTile.precondition_failed', {
+        tileId,
+        reason: preparation.reason,
+      });
+      emitTelemetry('canvas.tile.connect.failure', {
+        tileId,
+        sessionId: entry.sessionId,
+        privateBeachId: entry.privateBeachId,
+        managerUrl: entry.managerUrl,
+        reason: `precondition:${preparation.reason}`,
       });
       return () => {
         this.disconnectTile(tileId);
@@ -169,13 +220,21 @@ export class ViewerConnectionService {
     if (existing && existing.key === preparation.key && existing.unsubscribe) {
       existing.preparation = preparation;
       existing.subscriber = subscriber;
+      existing.sessionId = preparation.params.sessionId ?? baseSessionId;
+      existing.privateBeachId = preparation.params.privateBeachId ?? basePrivateBeachId;
+      existing.managerUrl = preparation.params.managerUrl ?? baseManagerUrl;
+      debugLog('connectTile.reuse_existing', {
+        tileId,
+        sessionId: existing.sessionId,
+        key: existing.key,
+      });
       subscriber(existing.lastSnapshot);
       return () => {
         this.disconnectTile(tileId);
       };
     }
 
-    this.disposeTile(tileId, existing);
+    this.disposeTile(tileId, existing, 'replacement');
 
     const entry: TileEntry = {
       tileId,
@@ -183,6 +242,9 @@ export class ViewerConnectionService {
       key: preparation.key,
       unsubscribe: null,
       preparation,
+      sessionId: preparation.params.sessionId ?? baseSessionId,
+      privateBeachId: preparation.params.privateBeachId ?? basePrivateBeachId,
+      managerUrl: preparation.params.managerUrl ?? baseManagerUrl,
       lastSnapshot: cloneViewerState(IDLE_STATE),
       lastStatus: 'idle',
       metrics:
@@ -194,6 +256,11 @@ export class ViewerConnectionService {
           disposed: 0,
         },
     };
+    debugLog('connectTile.start_connection', {
+      tileId,
+      sessionId: entry.sessionId,
+      key: entry.key,
+    });
 
     entry.unsubscribe = acquireTerminalConnection(preparation.key, preparation.params, (snapshot: ManagerSnapshot) => {
       this.deliverSnapshot(tileId, entry, snapshot);
@@ -207,7 +274,7 @@ export class ViewerConnectionService {
 
   disconnectTile(tileId: string) {
     const entry = this.tiles.get(tileId);
-    this.disposeTile(tileId, entry);
+    this.disposeTile(tileId, entry, 'disconnect');
     if (entry) {
       this.tiles.delete(tileId);
     }
@@ -250,6 +317,12 @@ export class ViewerConnectionService {
     const prevStatus = entry.lastStatus;
     const prevConnecting = entry.lastSnapshot.connecting;
     const next = cloneViewerState(snapshot as TerminalViewerState);
+    const telemetryContext = {
+      tileId,
+      sessionId: entry.sessionId,
+      privateBeachId: entry.privateBeachId,
+      managerUrl: entry.managerUrl,
+    };
 
     if (
       (snapshot.connecting && !prevConnecting) ||
@@ -257,23 +330,60 @@ export class ViewerConnectionService {
     ) {
       entry.metrics.started += 1;
       this.record(tileId, 'started');
+      let isRetry = false;
       if (
         snapshot.status === 'reconnecting' ||
         (snapshot.status === 'connecting' && prevStatus !== 'idle' && prevStatus !== 'connecting')
       ) {
         entry.metrics.retries += 1;
         this.record(tileId, 'retries');
+        isRetry = true;
       }
+      emitTelemetry('canvas.tile.connect.start', {
+        ...telemetryContext,
+        status: snapshot.status,
+        retry: isRetry,
+        attempt: entry.metrics.started,
+      });
     }
 
     if (snapshot.status === 'connected' && prevStatus !== 'connected') {
       entry.metrics.completed += 1;
       this.record(tileId, 'completed');
+      emitTelemetry('canvas.tile.connect.success', {
+        ...telemetryContext,
+        latencyMs: snapshot.latencyMs ?? null,
+        retries: entry.metrics.retries,
+        attempt: entry.metrics.started,
+      });
+      debugLog('connectTile.status_connected', {
+        tileId,
+        sessionId: entry.sessionId,
+        latencyMs: snapshot.latencyMs ?? null,
+        retries: entry.metrics.retries,
+        attempt: entry.metrics.started,
+      });
     }
 
     if (snapshot.status === 'error' && snapshot.error && prevStatus !== 'error') {
       entry.metrics.failures += 1;
       this.record(tileId, 'failures');
+      const errorMessage =
+        typeof snapshot.error === 'string'
+          ? snapshot.error
+          : (snapshot.error as { message?: string } | null | undefined)?.message ?? null;
+      emitTelemetry('canvas.tile.connect.failure', {
+        ...telemetryContext,
+        reason: 'viewer-error',
+        error: errorMessage,
+        attempt: entry.metrics.started,
+        retries: entry.metrics.retries,
+      });
+      debugLog('connectTile.status_error', {
+        tileId,
+        sessionId: entry.sessionId,
+        error: errorMessage,
+      });
     }
 
     entry.lastSnapshot = next;
@@ -285,7 +395,11 @@ export class ViewerConnectionService {
     }
   }
 
-  private disposeTile(tileId: string, entry: TileEntry | undefined) {
+  private disposeTile(
+    tileId: string,
+    entry: TileEntry | undefined,
+    reason: 'disconnect' | 'replacement' | 'precondition' | 'unknown' = 'unknown',
+  ) {
     if (!entry) {
       return;
     }
@@ -298,6 +412,19 @@ export class ViewerConnectionService {
     }
     entry.metrics.disposed += 1;
     this.record(tileId, 'disposed');
+    debugLog('connectTile.dispose', {
+      tileId,
+      reason,
+      disposals: entry.metrics.disposed,
+    });
+    emitTelemetry('canvas.tile.connect.disposed', {
+      tileId,
+      sessionId: entry.sessionId,
+      privateBeachId: entry.privateBeachId,
+      managerUrl: entry.managerUrl,
+      reason,
+      disposals: entry.metrics.disposed,
+    });
   }
 }
 

@@ -15,6 +15,8 @@ function buildSandboxUrl(): string {
     sessions: `${SESSION.id}|application|${SESSION.title}`,
     passcodes: `${SESSION.id}:${SESSION.joinCode}`,
     titles: `${SESSION.id}:${SESSION.title}`,
+    terminalFixtures: `${SESSION.id}:pong-lhs`,
+    rewrite: '1',
   });
   return `/dev/private-beach-sandbox?${params.toString()}`;
 }

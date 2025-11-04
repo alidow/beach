@@ -32,6 +32,8 @@ import { BeachSettingsButton } from '../../../components/settings/SettingsButton
 import { AgentExplorer } from '../../../components/AgentExplorer';
 import { AssignmentDetailPane } from '../../../components/AssignmentDetailPane';
 import { debugLog, debugStack } from '../../../lib/debug';
+import { emitTelemetry } from '../../../lib/telemetry';
+import { isPrivateBeachRewriteEnabled, resolvePrivateBeachRewriteEnabled } from '../../../lib/featureFlags';
 import { useControllerPairingStreams } from '../../../hooks/useControllerPairingStreams';
 import { buildAssignmentModel } from '../../../lib/assignments';
 
@@ -143,6 +145,7 @@ export default function BeachDashboard() {
   const [assignmentPaneOpen, setAssignmentPaneOpen] = useState(false);
   const [assignmentSaving, setAssignmentSaving] = useState(false);
   const [assignmentError, setAssignmentError] = useState<string | null>(null);
+  const [rewriteEnabled, setRewriteEnabled] = useState(() => resolvePrivateBeachRewriteEnabled());
   const canvasLayoutRef = useRef<CanvasLayout | null>(null);
   const formatAssignmentError = useCallback((message: string) => {
     if (message === 'controller_pairing_api_unavailable') {
@@ -171,6 +174,20 @@ export default function BeachDashboard() {
   useEffect(() => {
     canvasLayoutRef.current = canvasLayout;
   }, [canvasLayout]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    setRewriteEnabled(isPrivateBeachRewriteEnabled());
+  }, []);
+
+  useEffect(() => {
+    emitTelemetry('canvas.rewrite.flag-state', {
+      privateBeachId: id ?? null,
+      enabled: rewriteEnabled,
+    });
+  }, [id, rewriteEnabled]);
 
   const refreshManagerToken = useCallback(async () => {
     if (!isLoaded || !isSignedIn) {
@@ -442,6 +459,12 @@ export default function BeachDashboard() {
       }
       const sessionsById = new Map(sessions.map((session) => [session.session_id, session] as const));
       let nextLayout: CanvasLayout | null = null;
+       const createdTiles: {
+         sessionId: string;
+         position: { x: number; y: number };
+         order: number;
+         sessionName: string | null;
+       }[] = [];
       setCanvasLayout((prev) => {
         const base = ensureLayoutMetadata(prev);
         const tiles = { ...base.tiles };
@@ -451,6 +474,7 @@ export default function BeachDashboard() {
           if (tiles[sessionId]) {
             continue;
           }
+          const placementOrder = index;
           const position = computeAutoPosition(index);
           index += 1;
           const session = sessionsById.get(sessionId);
@@ -465,6 +489,12 @@ export default function BeachDashboard() {
             toolbarPinned: false,
           };
           changed = true;
+          createdTiles.push({
+            sessionId,
+            position,
+            order: placementOrder,
+            sessionName: session?.display_name ?? session?.metadata?.name ?? null,
+          });
         }
         if (!changed) {
           return prev ?? base;
@@ -479,11 +509,21 @@ export default function BeachDashboard() {
       if (nextLayout) {
         void persistCanvasLayout(nextLayout);
       }
+      for (const entry of createdTiles) {
+        emitTelemetry('canvas.tile.create', {
+          privateBeachId: id,
+          sessionId: entry.sessionId,
+          position: entry.position,
+          order: entry.order,
+          rewriteEnabled,
+          sessionName: entry.sessionName,
+        });
+      }
       for (const sessionId of filteredIds) {
         knownSessionIds.current.add(sessionId);
       }
     },
-    [id, sessions, persistCanvasLayout],
+    [id, sessions, persistCanvasLayout, rewriteEnabled],
   );
 
   const refresh = useCallback(
@@ -789,11 +829,22 @@ export default function BeachDashboard() {
     (sessionId: string) => {
       if (!id) return;
       let nextLayout: CanvasLayout | null = null;
+      let removedTile: {
+        sessionId: string;
+        kind: string | undefined;
+        position: { x: number; y: number } | undefined;
+      } | null = null;
       setCanvasLayout((prev) => {
         const base = ensureLayoutMetadata(prev);
-        if (!base.tiles[sessionId]) {
+        const existing = base.tiles[sessionId];
+        if (!existing) {
           return prev ?? base;
         }
+        removedTile = {
+          sessionId,
+          kind: existing.kind,
+          position: existing.position,
+        };
         const { [sessionId]: _omit, ...rest } = base.tiles;
         const next = withUpdatedTimestamp({
           ...base,
@@ -805,8 +856,18 @@ export default function BeachDashboard() {
       if (nextLayout) {
         void persistCanvasLayout(nextLayout);
       }
+      if (removedTile) {
+        emitTelemetry('canvas.tile.remove', {
+          privateBeachId: id,
+          sessionId: removedTile.sessionId,
+          kind: removedTile.kind ?? 'application',
+          position: removedTile.position ?? null,
+          remainingTiles: Object.keys(nextLayout?.tiles ?? {}).length,
+          rewriteEnabled,
+        });
+      }
     },
-    [id, persistCanvasLayout],
+    [id, persistCanvasLayout, rewriteEnabled],
   );
 
   const sessionById = useMemo(() => new Map(sessions.map((s) => [s.session_id, s])), [sessions]);
@@ -1091,7 +1152,7 @@ export default function BeachDashboard() {
 
   return (
     <BeachSettingsProvider value={settingsContextValue}>
-      <div className="flex min-h-screen flex-col">
+      <div className="flex min-h-screen flex-col" data-rewrite-enabled={rewriteEnabled ? 'true' : 'false'}>
         <TopNav
           currentId={id}
           onSwitch={(v) => router.push(`/beaches/${v}`)}

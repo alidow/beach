@@ -14,9 +14,9 @@ type NodeDrawerProps = {
 };
 
 const CARD_BASE_CLASSES =
-  'relative select-none rounded-lg border border-border bg-card/90 p-4 shadow-sm transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary';
-const CARD_HOVER_CLASSES = 'hover:border-primary/70 hover:bg-card';
-const CARD_ACTIVE_CLASSES = 'ring-2 ring-primary border-transparent';
+  'relative select-none rounded-2xl border border-white/10 bg-slate-950/60 p-4 shadow-[0_20px_60px_rgba(2,6,23,0.55)] transition-colors duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-0 focus-visible:ring-sky-400/60';
+const CARD_HOVER_CLASSES = 'hover:border-sky-400/60 hover:bg-slate-900/70';
+const CARD_ACTIVE_CLASSES = 'ring-2 ring-sky-400/70 border-sky-400/70 bg-slate-900/60';
 const CARD_DRAGGING_CLASSES = 'cursor-grabbing opacity-70';
 
 const APPLICATION_MIME = 'application/reactflow';
@@ -108,8 +108,8 @@ export function NodeDrawer({ nodes, activeNodeId, onNodeDragStart, onNodeDragEnd
   const { drawerOpen, toggleDrawer, closeDrawer } = useCanvasUI();
 
   const panelClass = [
-    'pointer-events-auto absolute right-4 top-20 z-40 w-80 max-w-[90vw] rounded-2xl border border-border bg-card/95 p-5 shadow-2xl backdrop-blur transition-all duration-200 ease-out',
-    drawerOpen ? 'translate-y-0 opacity-100' : 'pointer-events-none -translate-y-2 opacity-0',
+    'pointer-events-auto absolute right-6 top-16 z-40 w-80 max-w-[90vw] rounded-[28px] border border-white/10 bg-slate-950/80 p-5 shadow-[0_35px_120px_rgba(2,6,23,0.7)] backdrop-blur-xl transition-all duration-200 ease-out',
+    drawerOpen ? 'translate-y-0 opacity-100' : 'pointer-events-none -translate-y-3 opacity-0',
   ]
     .filter(Boolean)
     .join(' ');
@@ -119,31 +119,31 @@ export function NodeDrawer({ nodes, activeNodeId, onNodeDragStart, onNodeDragEnd
       <button
         type="button"
         onClick={toggleDrawer}
-        className="pointer-events-auto absolute right-4 top-4 z-50 inline-flex items-center gap-2 rounded-full border border-border bg-card/90 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-foreground shadow-sm backdrop-blur transition hover:bg-card focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+        className="pointer-events-auto absolute right-6 top-3 z-50 inline-flex items-center gap-2 rounded-full border border-white/10 bg-slate-950/70 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-300 shadow-[0_15px_40px_rgba(2,6,23,0.65)] transition hover:border-white/30 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
         aria-expanded={drawerOpen}
         aria-label={drawerOpen ? 'Hide node catalog' : 'Show node catalog'}
       >
         {drawerOpen ? 'Close Catalog' : 'Open Catalog'}
       </button>
       <aside className={panelClass} aria-label="Node catalog">
-        <div className="mb-4 flex items-center justify-between">
+        <div className="mb-4 flex items-center justify-between gap-3">
           <header className="space-y-1">
-            <h2 className="text-sm font-semibold text-foreground">Node Catalog</h2>
-            <p className="text-xs text-muted-foreground">
-              Drag nodes onto the canvas to create new tiles. Drops snap to the 8px grid.
+            <h2 className="text-sm font-semibold text-white">Node Catalog</h2>
+            <p className="text-xs text-slate-400">
+              Drag onto the surface. Hold <kbd className="rounded bg-white/10 px-1 text-[10px] font-semibold">Cmd</kbd>+<kbd className="rounded bg-white/10 px-1 text-[10px] font-semibold">B</kbd> to toggle.
             </p>
           </header>
           <button
             type="button"
             onClick={closeDrawer}
-            className="inline-flex h-7 items-center justify-center rounded-full border border-border bg-card px-3 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground transition hover:bg-card/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+            className="inline-flex h-7 items-center justify-center rounded-full border border-white/10 bg-white/5 px-3 text-[11px] font-semibold uppercase tracking-[0.22em] text-slate-300 transition hover:border-white/30 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
           >
             Close
           </button>
         </div>
         <div className="flex-1 space-y-3 overflow-y-auto pr-1">
           {nodes.length === 0 ? (
-            <p className="rounded-md border border-dashed border-border bg-background/60 p-3 text-xs text-muted-foreground">
+            <p className="rounded-xl border border-dashed border-white/10 bg-white/5 p-3 text-xs text-slate-400">
               No nodes registered yet. Coordinate with WS-A to populate catalog data.
             </p>
           ) : (

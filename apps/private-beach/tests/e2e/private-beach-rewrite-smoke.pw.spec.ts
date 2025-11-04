@@ -29,6 +29,17 @@ test('rewrite telemetry emits expected canvas events', async ({ page }) => {
   const tile = page.getByTestId('rf__node-tile:sandbox-session');
   await expect(tile).toBeVisible();
 
+  const catalogToggle = page.getByRole('button', { name: 'Open Catalog' });
+  await catalogToggle.click();
+
+  const catalogNode = page.getByTestId('catalog-node-application');
+  await expect(catalogNode).toBeVisible();
+
+  const surface = page.getByTestId('flow-canvas');
+  await catalogNode.dragTo(surface, { targetPosition: { x: 320, y: 240 } });
+
+  await expect(page.locator('[data-testid^="rf__node-tile:"]')).toHaveCount(2);
+
   await page.waitForFunction(() => {
     const anyWindow = window as unknown as Record<string, unknown>;
     const events = anyWindow.__telemetry_log__ as Array<{ event: string; payload: any }> | undefined;
@@ -54,8 +65,8 @@ test('rewrite telemetry emits expected canvas events', async ({ page }) => {
   const flagEvents = events.filter((entry) => entry.event === 'canvas.rewrite.flag-state');
   expect(flagEvents.some((entry) => (entry.payload?.enabled as boolean | undefined) === true)).toBe(true);
 
-  const createEvent = events.find((entry) => entry.event === 'canvas.tile.create');
-  expect(createEvent?.payload?.sessionId).toBe('sandbox-session');
+  const createEvents = events.filter((entry) => entry.event === 'canvas.tile.create');
+  expect(createEvents.some((entry) => entry.payload?.sessionId === 'sandbox-session')).toBe(true);
 
   const successEvent = events.find((entry) => entry.event === 'canvas.tile.connect.success');
   expect(successEvent?.payload?.sessionId).toBe('sandbox-session');

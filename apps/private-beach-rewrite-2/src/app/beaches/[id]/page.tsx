@@ -55,10 +55,7 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
   }
 
   return (
-    <div
-      className="flex min-h-screen flex-col bg-background"
-      data-private-beach-rewrite={rewriteEnabled ? 'enabled' : 'disabled'}
-    >
+    <div className="flex h-screen flex-col overflow-hidden bg-transparent" data-private-beach-rewrite={rewriteEnabled ? 'enabled' : 'disabled'}>
       <BeachCanvasShell
         beachId={beach.id}
         beachName={beach.name}

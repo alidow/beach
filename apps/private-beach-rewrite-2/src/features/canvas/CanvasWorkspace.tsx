@@ -1,7 +1,7 @@
 'use client';
 
-import { useMemo, useState } from 'react';
-import { CanvasUIProvider } from './CanvasContext';
+import { useEffect, useMemo, useState } from 'react';
+import { CanvasUIProvider, useCanvasUI } from './CanvasContext';
 import { CanvasEventsProvider } from './CanvasEventsContext';
 import { FlowCanvas } from './FlowCanvas';
 import { NodeDrawer } from './NodeDrawer';
@@ -19,6 +19,25 @@ type CanvasWorkspaceProps = {
 };
 
 const DEFAULT_GRID_SIZE = 8;
+
+function CanvasHotkeyBinder() {
+  const { toggleDrawer } = useCanvasUI();
+
+  useEffect(() => {
+    const isMac = typeof navigator !== 'undefined' ? /Mac|iPhone|iPod|iPad/i.test(navigator.platform) : true;
+    const handler = (event: KeyboardEvent) => {
+      const isMeta = isMac ? event.metaKey : event.ctrlKey;
+      if (isMeta && (event.key === 'b' || event.key === 'B')) {
+        event.preventDefault();
+        toggleDrawer();
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [toggleDrawer]);
+
+  return null;
+}
 
 export function CanvasWorkspace({
   nodes,
@@ -44,7 +63,8 @@ export function CanvasWorkspace({
   return (
     <CanvasEventsProvider value={eventsValue}>
       <CanvasUIProvider initialDrawerOpen={initialDrawerOpen}>
-        <div className="relative flex h-full min-h-0 w-full flex-1">
+        <CanvasHotkeyBinder />
+        <div className="relative flex h-full min-h-0 w-full px-6 pb-6 pt-4">
           <FlowCanvas
             onNodePlacement={onNodePlacement}
             onTileMove={onTileMove}

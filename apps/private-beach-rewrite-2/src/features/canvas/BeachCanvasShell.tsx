@@ -68,7 +68,6 @@ function BeachCanvasShellInner({
   rewriteEnabled = false,
   className,
 }: BeachCanvasShellProps) {
-  const NAV_HEIGHT = 56;
   const { createTile } = useTileActions();
 
   const catalog = useMemo(() => DEFAULT_CATALOG, []);
@@ -123,33 +122,39 @@ function BeachCanvasShellInner({
     });
   }, [beachId, rewriteEnabled]);
 
-  const wrapperClassName = ['relative flex flex-1 min-h-screen w-full flex-col', className ?? '']
+  const wrapperClassName = [
+    'relative z-0 flex h-full min-h-0 w-full flex-col bg-slate-950 text-slate-200',
+    "after:pointer-events-none after:absolute after:inset-0 after:-z-10 after:content-[''] after:bg-[radial-gradient(circle_at_top,rgba(56,189,248,0.18),transparent_60%)]",
+    className ?? '',
+  ]
     .filter(Boolean)
     .join(' ');
 
   return (
     <div className={wrapperClassName}>
-      <header className="flex h-14 flex-shrink-0 items-center justify-between border-b border-border bg-background/80 px-4 backdrop-blur">
-        <div className="flex items-center gap-3">
+      <header className="relative z-30 flex h-12 items-center justify-between border-b border-white/10 bg-slate-950/70 px-6 backdrop-blur-xl">
+        <div className="flex items-center gap-4">
           {backHref ? (
             <Link
               href={backHref}
-              className="inline-flex items-center gap-1 text-xs font-medium text-muted-foreground transition hover:text-foreground"
+              className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/5 text-[13px] font-semibold text-slate-300 transition hover:text-white"
             >
               <span aria-hidden>←</span>
-              Back
             </Link>
           ) : null}
-          <div className="flex flex-col">
-            <span className="text-[11px] uppercase tracking-wide text-muted-foreground">Private Beach</span>
-            <span className="text-sm font-semibold text-foreground">{beachName}</span>
+          <div className="flex items-center gap-3">
+            <span className="inline-flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.4em] text-slate-400">
+              <span className="h-1.5 w-1.5 rounded-full bg-sky-400" aria-hidden />
+              Private Beach
+            </span>
+            <span className="text-sm font-semibold text-white/90">{beachName}</span>
           </div>
         </div>
+        <div className="flex items-center gap-2 text-[11px] font-medium text-slate-400">
+          <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1">React Flow Workspace</span>
+        </div>
       </header>
-      <div
-        className="relative flex h-full flex-1 min-h-0 flex-col overflow-hidden"
-        style={{ minHeight: `calc(100vh - ${NAV_HEIGHT}px)` }}
-      >
+      <div className="relative flex flex-1 min-h-0 flex-col overflow-hidden">
         <CanvasWorkspace
           nodes={catalog}
           onNodePlacement={handlePlacement}
@@ -157,7 +162,7 @@ function BeachCanvasShellInner({
           privateBeachId={beachId}
           managerUrl={managerUrl}
           rewriteEnabled={rewriteEnabled}
-          initialDrawerOpen={false}
+          initialDrawerOpen
         />
       </div>
     </div>

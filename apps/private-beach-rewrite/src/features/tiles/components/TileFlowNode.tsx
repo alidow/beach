@@ -2,16 +2,15 @@
 
 import { useCallback, useMemo, useRef } from 'react';
 import type { MouseEvent, PointerEvent } from 'react';
+import type { NodeProps } from 'reactflow';
 import { ApplicationTile } from '@/components/ApplicationTile';
-import { TILE_HEADER_HEIGHT, TILE_GRID_SNAP_PX } from '../constants';
+import { TILE_HEADER_HEIGHT } from '../constants';
 import { useTileActions } from '../store';
-import type { TileDescriptor, TilePosition, TileSessionMeta, TileSize } from '../types';
-import { snapPosition, snapSize } from '../utils';
+import type { TileDescriptor, TileSessionMeta } from '../types';
+import { snapSize } from '../utils';
 import { emitTelemetry } from '../../../../../private-beach/src/lib/telemetry';
-import { useCanvasEvents } from '@/features/canvas/CanvasEventsContext';
-import type { TileMovePayload } from '@/features/canvas/types';
 
-type TileNodeProps = {
+type TileFlowNodeData = {
   tile: TileDescriptor;
   orderIndex: number;
   isActive: boolean;
@@ -19,7 +18,6 @@ type TileNodeProps = {
   privateBeachId: string;
   managerUrl: string;
   rewriteEnabled: boolean;
-  onMove?: (payload: TileMovePayload) => void;
 };
 
 type ResizeState = {
@@ -28,16 +26,7 @@ type ResizeState = {
   startY: number;
   width: number;
   height: number;
-  lastSize?: TileSize;
-};
-
-type DragState = {
-  pointerId: number;
-  startX: number;
-  startY: number;
-  initialPosition: TilePosition;
-  lastPosition: TilePosition;
-  hasStarted: boolean;
+  lastSize?: { width: number; height: number };
 };
 
 function metaEqual(a: TileSessionMeta | null | undefined, b: TileSessionMeta | null | undefined) {
@@ -62,21 +51,12 @@ function isInteractiveElement(target: EventTarget | null): boolean {
   return Boolean(target.closest('button, input, textarea, select, a, label'));
 }
 
-export function TileNode({
-  tile,
-  orderIndex,
-  isActive,
-  isResizing,
-  privateBeachId,
-  managerUrl,
-  rewriteEnabled,
-  onMove,
-}: TileNodeProps) {
-  const { removeTile, bringToFront, setActiveTile, beginResize, resizeTile, endResize, updateTileMeta, setTilePosition } =
-    useTileActions();
+type Props = NodeProps<TileFlowNodeData>;
+
+export function TileFlowNode({ data }: Props) {
+  const { tile, orderIndex, isActive, isResizing, privateBeachId, managerUrl, rewriteEnabled } = data;
+  const { removeTile, bringToFront, setActiveTile, beginResize, resizeTile, endResize, updateTileMeta } = useTileActions();
   const resizeStateRef = useRef<ResizeState | null>(null);
-  const dragStateRef = useRef<DragState | null>(null);
-  const { reportTileMove } = useCanvasEvents();
 
   const zIndex = useMemo(() => 10 + orderIndex, [orderIndex]);
 
@@ -101,138 +81,10 @@ export function TileNode({
       bringToFront(tile.id);
       setActiveTile(tile.id);
       if (isInteractiveElement(event.target)) {
-        dragStateRef.current = null;
-        return;
-      }
-      const state: DragState = {
-        pointerId: event.pointerId,
-        startX: event.clientX,
-        startY: event.clientY,
-        initialPosition: { ...tile.position },
-        lastPosition: { ...tile.position },
-        hasStarted: false,
-      };
-      dragStateRef.current = state;
-      try {
-        event.currentTarget.setPointerCapture(event.pointerId);
-      } catch {
-        // ignore pointer capture failures
+        event.stopPropagation();
       }
     },
-    [bringToFront, setActiveTile, tile.id, tile.position],
-  );
-
-  const handlePointerMove = useCallback(
-    (event: PointerEvent<HTMLElement>) => {
-      const state = dragStateRef.current;
-      if (!state || state.pointerId !== event.pointerId) {
-        return;
-      }
-      const deltaX = event.clientX - state.startX;
-      const deltaY = event.clientY - state.startY;
-      if (!state.hasStarted) {
-        if (Math.abs(deltaX) + Math.abs(deltaY) < 4) {
-          return;
-        }
-        state.hasStarted = true;
-        emitTelemetry('canvas.drag.start', {
-          privateBeachId,
-          tileId: tile.id,
-          nodeType: tile.nodeType,
-          x: state.initialPosition.x,
-          y: state.initialPosition.y,
-          rewriteEnabled,
-        });
-      }
-      const nextPosition = snapPosition({
-        x: state.initialPosition.x + deltaX,
-        y: state.initialPosition.y + deltaY,
-      });
-      if (nextPosition.x === state.lastPosition.x && nextPosition.y === state.lastPosition.y) {
-        return;
-      }
-      state.lastPosition = nextPosition;
-      setTilePosition(tile.id, nextPosition);
-      event.preventDefault();
-    },
-    [privateBeachId, rewriteEnabled, setTilePosition, tile.id, tile.nodeType],
-  );
-
-  const releaseDragPointer = useCallback((event: PointerEvent<HTMLElement>) => {
-    try {
-      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-        event.currentTarget.releasePointerCapture(event.pointerId);
-      }
-    } catch {
-      // ignore capture release failures
-    }
-  }, []);
-
-  const handlePointerUp = useCallback(
-    (event: PointerEvent<HTMLElement>) => {
-      const state = dragStateRef.current;
-      if (state && state.pointerId === event.pointerId) {
-        if (state.hasStarted) {
-          const surfaceElement = event.currentTarget.closest('.tile-canvas__surface') as HTMLElement | null;
-          const boundsRect = surfaceElement?.getBoundingClientRect();
-          const canvasBounds = boundsRect
-            ? { width: boundsRect.width, height: boundsRect.height }
-            : { width: 0, height: 0 };
-          const rawPosition = {
-            x: state.initialPosition.x + (event.clientX - state.startX),
-            y: state.initialPosition.y + (event.clientY - state.startY),
-          };
-          const snappedPosition = state.lastPosition ?? state.initialPosition;
-          const payload: TileMovePayload = {
-            tileId: tile.id,
-            source: 'pointer',
-            rawPosition,
-            snappedPosition,
-            delta: {
-              x: snappedPosition.x - state.initialPosition.x,
-              y: snappedPosition.y - state.initialPosition.y,
-            },
-            canvasBounds,
-            gridSize: TILE_GRID_SNAP_PX,
-            timestamp: Date.now(),
-          };
-          onMove?.(payload);
-          reportTileMove({
-            tileId: tile.id,
-            size: { ...tile.size },
-            originalPosition: state.initialPosition,
-            rawPosition,
-            snappedPosition,
-            source: 'pointer',
-          });
-          emitTelemetry('canvas.drag.stop', {
-            privateBeachId,
-            tileId: tile.id,
-            nodeType: tile.nodeType,
-            x: snappedPosition.x,
-            y: snappedPosition.y,
-            rewriteEnabled,
-          });
-          console.info('[ws-d] tile moved', {
-            privateBeachId,
-            tileId: tile.id,
-            position: { ...snappedPosition },
-            rewriteEnabled,
-          });
-        }
-        dragStateRef.current = null;
-      }
-      releaseDragPointer(event);
-    },
-    [onMove, privateBeachId, releaseDragPointer, reportTileMove, rewriteEnabled, tile.id, tile.nodeType, tile.size],
-  );
-
-  const handlePointerCancel = useCallback(
-    (event: PointerEvent<HTMLElement>) => {
-      dragStateRef.current = null;
-      releaseDragPointer(event);
-    },
-    [releaseDragPointer],
+    [bringToFront, setActiveTile, tile.id],
   );
 
   const handleResizePointerDown = useCallback(
@@ -251,7 +103,11 @@ export function TileNode({
         height,
         lastSize: { width, height },
       };
-      event.currentTarget.setPointerCapture(event.pointerId);
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId);
+      } catch {
+        // ignore pointer capture issues
+      }
     },
     [beginResize, bringToFront, setActiveTile, tile.id, tile.size],
   );
@@ -280,7 +136,7 @@ export function TileNode({
         event.currentTarget.releasePointerCapture(event.pointerId);
       }
     } catch {
-      // Ignore release errors
+      // ignore release errors
     }
   }, []);
 
@@ -344,17 +200,13 @@ export function TileNode({
     <article
       className={`tile-node${isActive ? ' tile-node--active' : ''}${isResizing ? ' tile-node--resizing' : ''}`}
       style={{
-        left: `${tile.position.x}px`,
-        top: `${tile.position.y}px`,
-        width: `${tile.size.width}px`,
-        height: `${tile.size.height}px`,
+        width: '100%',
+        height: '100%',
         zIndex,
       }}
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={handlePointerUp}
-      onPointerCancel={handlePointerCancel}
+      data-testid={`rf__node-tile:${tile.id}`}
       data-tile-id={tile.id}
+      onPointerDown={handlePointerDown}
     >
       <header className="tile-node__header" style={{ minHeight: TILE_HEADER_HEIGHT }}>
         <div className="tile-node__title">

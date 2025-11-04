@@ -146,6 +146,35 @@ services:
       - "3002:3002"
     networks:
       - beach-network
+  private-beach-rewrite-2:
+    image: node:20
+    container_name: private-beach-rewrite-2
+    working_dir: /app/apps/private-beach-rewrite-2
+    command: sh -c "npm ci || npm install; npm run dev -- -p 3003"
+    environment:
+      NEXT_PUBLIC_PRIVATE_BEACH_REWRITE_ENABLED: "1"
+      NEXT_PUBLIC_PRIVATE_BEACH_MANAGER_URL: http://localhost:8080
+      PRIVATE_BEACH_MANAGER_URL: http://beach-manager:8080
+      PRIVATE_BEACH_MANAGER_TOKEN: ${PRIVATE_BEACH_MANAGER_TOKEN:-}
+      NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE: ${NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE:-}
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:-}
+      CLERK_SECRET_KEY: ${CLERK_SECRET_KEY:-}
+      BEACH_TEST_MODE: ${BEACH_TEST_MODE:-true}
+      TAILWIND_MODE: watch
+      CHOKIDAR_USEPOLLING: "true"
+    volumes:
+      - .:/app
+    depends_on:
+      beach-manager:
+        condition: service_started
+      db-seed:
+        condition: service_completed_successfully
+      private-beach-migrate:
+        condition: service_completed_successfully
+    ports:
+      - "3003:3003"
+    networks:
+      - beach-network
   private-beach-migrate:
     image: postgres:15-alpine
     container_name: private-beach-migrate

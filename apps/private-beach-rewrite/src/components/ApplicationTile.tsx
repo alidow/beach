@@ -1,13 +1,14 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import type { SessionSummary } from '@private-beach/shared-api';
-import { attachByCode, updateSessionRoleById } from '@private-beach-rewrite/lib/api';
+import { attachByCode, fetchSessionStateSnapshot, updateSessionRoleById } from '@private-beach-rewrite/lib/api';
 import type { TileSessionMeta } from '@private-beach-rewrite/features/tiles';
 import type { SessionCredentialOverride } from '../../../private-beach/src/hooks/terminalViewerTypes';
 import { useManagerToken, buildManagerUrl } from '../hooks/useManagerToken';
 import { useSessionConnection } from '../hooks/useSessionConnection';
 import { SessionViewer } from './SessionViewer';
+import { hydrateTerminalStoreFromDiff } from '../../../private-beach/src/lib/terminalHydrator';
 
 type ApplicationTileProps = {
   tileId: string;
@@ -66,6 +67,7 @@ export function ApplicationTile({
   const [attachError, setAttachError] = useState<string | null>(null);
   const [roleWarning, setRoleWarning] = useState<string | null>(null);
   const [credentialOverride, setCredentialOverride] = useState<SessionCredentialOverride | null>(null);
+  const prehydratedSequenceRef = useRef<string | null>(null);
 
   const {
     token: managerToken,
@@ -90,6 +92,43 @@ export function ApplicationTile({
     authToken: managerToken,
     credentialOverride: credentialOverride ?? undefined,
   });
+
+  useEffect(() => {
+    const store = viewer.store;
+    const sessionId = sessionMeta?.sessionId?.trim();
+    const token = managerToken?.trim();
+    if (!store || !sessionId || !token || !managerUrl) {
+      return;
+    }
+    let cancelled = false;
+    const fetchAndHydrate = async () => {
+      try {
+        const diff = await fetchSessionStateSnapshot(sessionId, token, managerUrl);
+        if (!diff || cancelled) {
+          return;
+        }
+        const sequenceKey = `${sessionId}:${diff.sequence ?? 0}`;
+        if (prehydratedSequenceRef.current === sequenceKey) {
+          return;
+        }
+        const hydrated = hydrateTerminalStoreFromDiff(store, diff, {});
+        if (hydrated) {
+          prehydratedSequenceRef.current = sequenceKey;
+          if (typeof window !== 'undefined') {
+            console.info('[terminal][hydrate] applied cached diff', { sessionId, sequence: diff.sequence ?? 0 });
+          }
+        }
+      } catch (error) {
+        if (typeof window !== 'undefined') {
+          console.warn('[terminal][hydrate] snapshot fetch failed', { sessionId, error });
+        }
+      }
+    };
+    fetchAndHydrate();
+    return () => {
+      cancelled = true;
+    };
+  }, [managerToken, managerUrl, sessionMeta?.sessionId, viewer.store]);
 
   const connectionTone = useMemo(() => {
     switch (viewer.status) {

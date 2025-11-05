@@ -2,6 +2,7 @@
 
 ## 2025-11-06 · Flow Canvas polish & coverage
 - Reworked the page/shell layout and added a `ResizeObserver` gate so the React Flow surface always gets a real height before mount, eliminating the blank canvas warning.
+- Synced React Flow node dimensions with tile resize events and tightened the tile preview CSS so the blue resize affordances track the terminal surface again.
 - Added a temporary fallback when `getBeachMeta` responds with 409 to keep the rewrite beach page usable while the upstream conflict is debugged.
 - Introduced a Vitest harness for the rewrite app with focused `FlowCanvas` tests covering tile mapping and catalog drop snapping.
 

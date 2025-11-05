@@ -107,19 +107,34 @@ function FlowCanvasInner({
   const handleNodesChange = useCallback(
     (changes: NodeChange[]) => {
       changes.forEach((change) => {
-        if (change.type !== 'position' || !change.position) {
+        if (change.type === 'position' && change.position) {
+          const snapped = snapPoint(change.position, gridSize);
+          const tile = state.tiles[change.id];
+          if (!tile) return;
+          if (snapped.x === tile.position.x && snapped.y === tile.position.y) {
+            return;
+          }
+          setTilePosition(change.id, snapped);
           return;
         }
-        const snapped = snapPoint(change.position, gridSize);
-        const tile = state.tiles[change.id];
-        if (!tile) return;
-        if (snapped.x === tile.position.x && snapped.y === tile.position.y) {
-          return;
+        if (change.type === 'dimensions' && change.dimensions) {
+          const tile = state.tiles[change.id];
+          if (!tile) return;
+          const snapped = snapSize({
+            width: change.dimensions.width ?? tile.size.width,
+            height: change.dimensions.height ?? tile.size.height,
+          });
+          if (
+            snapped.width === tile.size.width &&
+            snapped.height === tile.size.height
+          ) {
+            return;
+          }
+          resizeTile(change.id, snapped);
         }
-        setTilePosition(change.id, snapped);
       });
     },
-    [gridSize, setTilePosition, state.tiles],
+    [gridSize, resizeTile, setTilePosition, state.tiles],
   );
 
   const handleNodeDragStart: NodeDragEventHandler = useCallback(
@@ -208,6 +223,7 @@ function FlowCanvasInner({
     const width = event.width ?? node.width ?? tile.size.width;
     const height = event.height ?? node.height ?? tile.size.height;
     const snapped = snapSize({ width, height });
+    console.info('[ws-c][flow] resize-progress', { id: node.id, width, height, snapped });
     resizeTile(node.id, snapped);
   }, [resizeTile, state.tiles]);
 
@@ -217,6 +233,7 @@ function FlowCanvasInner({
     const width = event.width ?? node.width ?? tile.size.width;
     const height = event.height ?? node.height ?? tile.size.height;
     const snapped = snapSize({ width, height });
+    console.info('[ws-c][flow] resize-stop', { id: node.id, width, height, snapped });
     resizeTile(node.id, snapped);
     endResize(node.id);
     emitTelemetry('canvas.resize.stop', {

@@ -90,7 +90,8 @@ export function TileFlowNode({ data }: Props) {
       if (event.button !== 0) {
         return;
       }
-      if (isInteractive) {
+      if (isInteractive && isInteractiveElement(event.target)) {
+        // Keep events inside interactive UI (inputs, buttons) from initiating drags.
         event.stopPropagation();
         return;
       }
@@ -107,7 +108,7 @@ export function TileFlowNode({ data }: Props) {
     (event: PointerEvent<HTMLButtonElement>) => {
       event.preventDefault();
       event.stopPropagation();
-      if (isInteractive) {
+      if (isInteractive && isInteractiveElement(event.target)) {
         return;
       }
       bringToFront(tile.id);
@@ -250,6 +251,16 @@ export function TileFlowNode({ data }: Props) {
     [tile.id, tile.sessionMeta, updateTileMeta],
   );
 
+  const handleToggleInteractive = useCallback(() => {
+    if (isInteractive) {
+      setInteractiveTile(null);
+      return;
+    }
+    bringToFront(tile.id);
+    setActiveTile(tile.id);
+    setInteractiveTile(tile.id);
+  }, [bringToFront, isInteractive, setActiveTile, setInteractiveTile, tile.id]);
+
   const nodeClass = cn(
     'group relative flex h-full w-full select-none flex-col overflow-hidden rounded-2xl border border-slate-700/60 bg-slate-950/80 text-slate-200 shadow-[0_28px_80px_rgba(2,6,23,0.6)] backdrop-blur-xl transition-all duration-200',
     isActive && 'border-sky-400/60 shadow-[0_32px_90px_rgba(14,165,233,0.35)]',
@@ -286,7 +297,7 @@ export function TileFlowNode({ data }: Props) {
         <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={() => setInteractiveTile(isInteractive ? null : tile.id)}
+            onClick={handleToggleInteractive}
             aria-pressed={isInteractive}
             data-tile-drag-ignore="true"
             className={cn(
@@ -312,8 +323,8 @@ export function TileFlowNode({ data }: Props) {
       </header>
       <section
         className={cn(
-          'flex flex-1 flex-col gap-4 overflow-hidden bg-slate-950/60 p-4 transition-colors',
-          isInteractive ? 'pointer-events-auto' : 'pointer-events-none opacity-[0.98]',
+          'flex flex-1 flex-col gap-4 overflow-hidden bg-slate-950/60 p-4 transition-opacity',
+          !isInteractive && 'opacity-[0.98]',
         )}
         data-tile-drag-ignore="true"
       >

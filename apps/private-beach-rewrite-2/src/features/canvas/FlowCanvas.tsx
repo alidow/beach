@@ -93,7 +93,7 @@ function FlowCanvasInner({
             rewriteEnabled,
           },
           position: tile.position,
-          draggable: !isInteractive,
+          draggable: true,
           selectable: false,
           connectable: false,
           style: {

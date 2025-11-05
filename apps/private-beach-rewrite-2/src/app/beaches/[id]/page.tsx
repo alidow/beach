@@ -17,7 +17,8 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
   const { userId, getToken } = safeAuth();
   const template = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
 
-  const { token, source } = await resolveManagerToken(userId ? getToken : undefined, template);
+  const allowedGetToken = userId ? getToken : undefined;
+  const { token, source } = await resolveManagerToken(allowedGetToken, template);
   const managerBaseUrl = resolveManagerBaseUrl();
   const rewriteEnabled = resolveRewriteFlag(searchParams);
 
@@ -48,8 +49,21 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
   try {
     beach = await getBeachMeta(beachId, token, managerBaseUrl);
   } catch (error) {
-    if (error instanceof Error && error.message === 'not_found') {
-      notFound();
+    if (error instanceof Error) {
+      const status = (error as any).status ?? null;
+      if (error.message === 'not_found') {
+        notFound();
+      }
+      if (status === 409) {
+        return (
+          <div className="flex h-screen flex-col overflow-hidden bg-transparent">
+            <AppShellTopNav backHref="/beaches" title="Private Beach" subtitle={beachId} />
+            <main className="flex flex-1 items-center justify-center px-6 text-center text-sm text-slate-400">
+              This beach is currently updating its layout. Please wait a moment and try again.
+            </main>
+          </div>
+        );
+      }
     }
     throw error;
   }
@@ -73,7 +87,8 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   const { userId, getToken } = safeAuth();
   const template = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
 
-  const { token } = await resolveManagerToken(userId ? getToken : undefined, template);
+  const allowedGetToken = userId ? getToken : undefined;
+  const { token } = await resolveManagerToken(allowedGetToken, template);
   const managerBaseUrl = resolveManagerBaseUrl();
 
   if (!token) {

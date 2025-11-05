@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useMemo } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import type { MouseEvent, PointerEvent } from 'react';
 import { NodeResizer, type NodeProps } from 'reactflow';
 import { ApplicationTile } from '@/components/ApplicationTile';
@@ -47,8 +47,33 @@ type Props = NodeProps<TileFlowNodeData>;
 export function TileFlowNode({ data }: Props) {
   const { tile, orderIndex, isActive, isResizing, privateBeachId, managerUrl, rewriteEnabled } = data;
   const { removeTile, bringToFront, setActiveTile, beginResize, resizeTile, endResize, updateTileMeta } = useTileActions();
+  const nodeRef = useRef<HTMLElement | null>(null);
 
   const zIndex = useMemo(() => 10 + orderIndex, [orderIndex]);
+
+  useEffect(() => {
+    const node = nodeRef.current;
+    if (!node) return;
+    if (typeof ResizeObserver === 'undefined') {
+      return;
+    }
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      if (data.isResizing) return;
+      const width = Math.round(entry.contentRect.width);
+      const height = Math.round(entry.contentRect.height);
+      const snapped = snapSize({ width, height });
+      if (snapped.width === tile.size.width && snapped.height === tile.size.height) {
+        return;
+      }
+      resizeTile(tile.id, snapped);
+    });
+    observer.observe(node);
+    return () => {
+      observer.disconnect();
+    };
+  }, [data.isResizing, resizeTile, tile.id, tile.size.height, tile.size.width]);
 
   const handleRemove = useCallback(
     (event: MouseEvent<HTMLButtonElement>) => {
@@ -122,6 +147,7 @@ export function TileFlowNode({ data }: Props) {
 
   return (
     <article
+      ref={nodeRef}
       className={`tile-node${isActive ? ' tile-node--active' : ''}${isResizing ? ' tile-node--resizing' : ''}`}
       style={{
         width: '100%',

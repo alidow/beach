@@ -823,7 +823,7 @@ export class TerminalGridCache {
         absolutes: rows.map((row) => row.absolute),
       });
       if (typeof console !== 'undefined') {
-        console.info('[beach-trace][cache][visibleRows tail]', {
+        const payload = {
           limit: normalizedLimit,
           requestedHeight: height,
           viewportHeight: this.viewportHeight,
@@ -841,7 +841,12 @@ export class TerminalGridCache {
           tailPadRanges: this.tailPadRanges.map((range) => ({ ...range })),
           rowKinds: rows.map((row) => row.kind),
           absolutes: rows.map((row) => row.absolute),
-        });
+        };
+        try {
+          console.info('[beach-trace][cache][visibleRows tail]', JSON.stringify(payload));
+        } catch {
+          console.info('[beach-trace][cache][visibleRows tail]', payload);
+        }
       }
       if (tailPaddingApplied && typeof window !== 'undefined' && Array.isArray((window as typeof window & { __BEACH_TRACE_HISTORY?: unknown[] }).__BEACH_TRACE_HISTORY)) {
         (window as typeof window & { __BEACH_TRACE_HISTORY: unknown[] }).__BEACH_TRACE_HISTORY.push({
@@ -896,7 +901,7 @@ export class TerminalGridCache {
       absolutes: rows.map((row) => row.absolute),
     });
     if (typeof console !== 'undefined') {
-      console.info('[beach-trace][cache][visibleRows window]', {
+      const payload = {
         limit: normalizedLimit,
         requestedHeight: height,
         viewportHeight: this.viewportHeight,
@@ -908,7 +913,12 @@ export class TerminalGridCache {
         tailPadRanges: this.tailPadRanges.map((range) => ({ ...range })),
         rowKinds: rows.map((row) => row.kind),
         absolutes: rows.map((row) => row.absolute),
-      });
+      };
+      try {
+        console.info('[beach-trace][cache][visibleRows window]', JSON.stringify(payload));
+      } catch {
+        console.info('[beach-trace][cache][visibleRows window]', payload);
+      }
     }
     if (typeof window !== 'undefined' && Array.isArray((window as typeof window & { __BEACH_TRACE_HISTORY?: unknown[] }).__BEACH_TRACE_HISTORY)) {
       (window as typeof window & { __BEACH_TRACE_HISTORY: unknown[] }).__BEACH_TRACE_HISTORY.push({

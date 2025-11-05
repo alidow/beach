@@ -1295,6 +1295,29 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         }
         const rect = row.getBoundingClientRect();
         if (Number.isFinite(rect.height) && rect.height > 0) {
+          if (typeof window !== 'undefined' && window.__BEACH_TRACE) {
+            try {
+              const containerSample = containerRef.current;
+              const rowClassList = Array.from(row.classList ?? []);
+              const dataset = row.dataset ? { ...row.dataset } : undefined;
+              const textSample = row.textContent
+                ? row.textContent.replace(/\u00a0/g, ' ').slice(0, 64)
+                : null;
+              const sample = {
+                height: Number(rect.height.toFixed(3)),
+                classList: rowClassList,
+                dataset,
+                childCount: row.childElementCount,
+                scrollTop: containerSample?.scrollTop ?? null,
+                clientHeight: containerSample?.clientHeight ?? null,
+                scrollHeight: containerSample?.scrollHeight ?? null,
+                textSample,
+              };
+              console.info('[beach-terminal][measure] row-height-sample', JSON.stringify(sample));
+            } catch (error) {
+              console.warn('[beach-terminal][measure] row-height-log-failed', error);
+            }
+          }
           setMeasuredLineHeight((prev) => {
             const next = rect.height;
             if (next >= minEffectiveLineHeight) {
@@ -3127,7 +3150,7 @@ export function buildLines(
     lineAbsolutes: lines.map((line) => line.absolute),
   });
   if (typeof console !== 'undefined') {
-    console.info('[beach-trace][terminal][buildLines result]', {
+    const payload = {
       limit,
       followTail: snapshot.followTail,
       viewportTop: snapshot.viewportTop,
@@ -3137,7 +3160,12 @@ export function buildLines(
       absolutes: rows.map((row) => row.absolute),
       lineKinds: lines.map((line) => line.kind),
       lineAbsolutes: lines.map((line) => line.absolute),
-    });
+    };
+    try {
+      console.info('[beach-trace][terminal][buildLines result]', JSON.stringify(payload));
+    } catch {
+      console.info('[beach-trace][terminal][buildLines result]', payload);
+    }
   }
   if (typeof window !== 'undefined' && Array.isArray((window as typeof window & { __BEACH_TRACE_HISTORY?: unknown[] }).__BEACH_TRACE_HISTORY)) {
     (window as typeof window & { __BEACH_TRACE_HISTORY: unknown[] }).__BEACH_TRACE_HISTORY.push({

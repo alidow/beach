@@ -24,11 +24,12 @@ use beach_buggy::{
     StyledCell, TerminalFrame,
 };
 use beach_client_core::cache::terminal::packed::unpack_cell;
-use beach_client_core::protocol::{CursorFrame, Update as WireUpdate};
+use beach_client_core::protocol::{ClientFrame, CursorFrame, Update as WireUpdate};
 use beach_client_core::{
-    decode_host_frame_binary, negotiate_transport, CliError, HostFrame as WireHostFrame,
-    NegotiatedSingle, NegotiatedTransport, PackedCell, Payload, SessionConfig, SessionError,
-    SessionHandle, SessionManager, Style, StyleId, TerminalGrid, TransportError, TransportOffer,
+    decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
+    HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell, Payload,
+    SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId, TerminalGrid,
+    TransportError, TransportOffer,
 };
 use chrono::{DateTime, Duration, Utc};
 use prometheus::IntGauge;
@@ -197,6 +198,9 @@ struct ViewerCursor {
 struct ManagerViewerState {
     grid: TerminalGrid,
     cursor: Option<ViewerCursor>,
+    subscription: Option<u64>,
+    next_request_id: u64,
+    requested_history: bool,
     diff_seq: AtomicU64,
 }
 
@@ -205,6 +209,9 @@ impl ManagerViewerState {
         Self {
             grid: TerminalGrid::with_history_limit(1, 1, 1024),
             cursor: None,
+            subscription: None,
+            next_request_id: 1,
+            requested_history: false,
             diff_seq: AtomicU64::new(0),
         }
     }
@@ -219,6 +226,10 @@ impl ManagerViewerState {
         let viewport = viewport_rows.unwrap_or(history_rows).max(1) as usize;
         let cols = cols.max(1) as usize;
         let history_limit = history_rows.max(viewport_rows.unwrap_or(history_rows)) as usize;
+        info!(
+            target = "private_beach",
+            cols, history_rows, base_row, viewport_rows, "manager viewer grid reset"
+        );
         self.grid = TerminalGrid::with_history_limit(viewport, cols, history_limit.max(viewport));
         self.grid.set_viewport_size(viewport, cols);
         self.grid.set_row_offset(base_row);
@@ -329,9 +340,11 @@ impl ManagerViewerState {
 
     fn handle_host_frame(&mut self, frame: &WireHostFrame) -> Option<StateDiff> {
         match frame {
-            WireHostFrame::Hello { .. } => {
+            WireHostFrame::Hello { subscription, .. } => {
                 self.cursor = None;
                 self.diff_seq.store(0, Ordering::SeqCst);
+                self.subscription = Some(*subscription);
+                self.requested_history = false;
                 None
             }
             WireHostFrame::Grid {
@@ -341,6 +354,7 @@ impl ManagerViewerState {
                 viewport_rows,
             } => {
                 self.reset_grid(*cols, *history_rows, *base_row, *viewport_rows);
+                self.requested_history = false;
                 None
             }
             WireHostFrame::Snapshot {
@@ -371,6 +385,12 @@ impl ManagerViewerState {
 
     fn build_diff(&self) -> StateDiff {
         let frame = capture_terminal_frame_simple(&self.grid, self.cursor.as_ref());
+        if let (Some(rows), Some(base_row)) = (frame.rows, frame.base_row) {
+            info!(
+                target = "private_beach",
+                rows, base_row, "manager viewer diff captured"
+            );
+        }
         let sequence = self.diff_seq.fetch_add(1, Ordering::SeqCst) + 1;
         StateDiff {
             sequence,
@@ -378,15 +398,44 @@ impl ManagerViewerState {
             payload: build_terminal_payload(&frame),
         }
     }
+
+    fn take_history_request(&mut self, history_rows: u32, base_row: u64) -> Option<ClientFrame> {
+        if self.requested_history {
+            return None;
+        }
+        let subscription = self.subscription?;
+        let total_rows = base_row.saturating_add(history_rows as u64);
+        if total_rows == 0 {
+            return None;
+        }
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        self.requested_history = true;
+        Some(ClientFrame::RequestBackfill {
+            subscription,
+            request_id,
+            start_row: 0,
+            count: total_rows
+                .min(u32::MAX as u64)
+                .try_into()
+                .unwrap_or(u32::MAX),
+        })
+    }
 }
 
 fn capture_terminal_frame_simple(
     grid: &TerminalGrid,
     cursor: Option<&ViewerCursor>,
 ) -> TerminalFrame {
-    let (viewport_rows, viewport_cols) = grid.viewport_size();
-    let total_rows = grid.rows();
-    let rows = viewport_rows.min(total_rows);
+    let col_count = grid.cols().max(1);
+    let start_row = grid.first_row_id().unwrap_or_else(|| grid.row_offset());
+    let end_row = grid.last_row_id().unwrap_or(start_row.saturating_sub(1));
+    let rows = if end_row >= start_row {
+        (end_row - start_row + 1) as usize
+    } else {
+        0
+    };
+    let base_row = start_row;
     let style_table = grid.style_table.clone();
     let style_entries = style_table.entries();
     if let Some((first_id, first_style)) = style_entries.get(0) {
@@ -413,35 +462,40 @@ fn capture_terminal_frame_simple(
     let mut lines = Vec::with_capacity(rows);
     let mut styled_lines = Vec::with_capacity(rows);
 
-    for row in 0..rows {
-        let mut cells = Vec::with_capacity(viewport_cols);
-        for col in 0..viewport_cols {
-            let (raw_char, style_id) = grid
-                .get_cell_relaxed(row, col)
-                .map(|snapshot| unpack_cell(snapshot.cell))
-                .unwrap_or((' ', StyleId::DEFAULT));
-            let ch = if raw_char == '\0' { ' ' } else { raw_char };
-            let style = style_lookup.get(&style_id.0).copied().unwrap_or_default();
-            cells.push(StyledCell {
-                ch,
-                style: CellStylePayload {
-                    id: style_id.0,
-                    fg: style.fg,
-                    bg: style.bg,
-                    attrs: style.attrs as u32,
-                },
-            });
-        }
-        while let Some(last) = cells.last() {
-            if last.ch == ' ' && last.style.id == StyleId::DEFAULT.0 {
-                cells.pop();
-            } else {
-                break;
+    if rows > 0 {
+        for absolute in start_row..=end_row {
+            let Some(index) = grid.index_of_row(absolute) else {
+                continue;
+            };
+            let mut cells = Vec::with_capacity(col_count);
+            for col in 0..col_count {
+                let (raw_char, style_id) = grid
+                    .get_cell_relaxed(index, col)
+                    .map(|snapshot| unpack_cell(snapshot.cell))
+                    .unwrap_or((' ', StyleId::DEFAULT));
+                let ch = if raw_char == '\0' { ' ' } else { raw_char };
+                let style = style_lookup.get(&style_id.0).copied().unwrap_or_default();
+                cells.push(StyledCell {
+                    ch,
+                    style: CellStylePayload {
+                        id: style_id.0,
+                        fg: style.fg,
+                        bg: style.bg,
+                        attrs: style.attrs as u32,
+                    },
+                });
             }
+            while let Some(last) = cells.last() {
+                if last.ch == ' ' && last.style.id == StyleId::DEFAULT.0 {
+                    cells.pop();
+                } else {
+                    break;
+                }
+            }
+            let line: String = cells.iter().map(|cell| cell.ch).collect();
+            lines.push(line);
+            styled_lines.push(cells);
         }
-        let line: String = cells.iter().map(|cell| cell.ch).collect();
-        lines.push(line);
-        styled_lines.push(cells);
     }
 
     let cursor = cursor.map(|cursor| CursorPosition {
@@ -463,8 +517,9 @@ fn capture_terminal_frame_simple(
         lines,
         styled_lines: Some(styled_lines),
         styles: Some(styles),
-        cols: Some(viewport_cols),
+        cols: Some(col_count),
         rows: Some(rows),
+        base_row: Some(base_row),
         cursor,
     }
 }
@@ -505,6 +560,9 @@ fn build_terminal_payload(frame: &TerminalFrame) -> serde_json::Value {
     }
     if let Some(rows) = frame.rows {
         payload.insert("rows".into(), serde_json::json!(rows));
+    }
+    if let Some(base_row) = frame.base_row {
+        payload.insert("base_row".into(), serde_json::json!(base_row));
     }
     serde_json::Value::Object(payload)
 }
@@ -4872,6 +4930,34 @@ async fn viewer_connect_once(
                                 if now_ms >= *timestamp_ms {
                                     let latency_ms = now_ms - *timestamp_ms;
                                     latency_hist.observe(latency_ms as f64);
+                                }
+                            }
+                            if let WireHostFrame::Grid {
+                                history_rows,
+                                base_row,
+                                ..
+                            } = &frame
+                            {
+                                if let Some(request) =
+                                    viewer_state.take_history_request(*history_rows, *base_row)
+                                {
+                                    let payload = encode_client_frame_binary(&request);
+                                    if let Err(err) = transport.send_bytes(&payload) {
+                                        warn!(
+                                            target = "private_beach",
+                                            session_id = %session_id,
+                                            error = %err,
+                                            "manager viewer failed to request history backfill"
+                                        );
+                                    } else {
+                                        debug!(
+                                            target = "private_beach",
+                                            session_id = %session_id,
+                                            start = 0,
+                                            rows = history_rows,
+                                            "manager viewer requested terminal backfill"
+                                        );
+                                    }
                                 }
                             }
                             if let Some(diff) = viewer_state.handle_host_frame(&frame) {

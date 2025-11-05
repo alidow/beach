@@ -27,6 +27,7 @@ export type TerminalFramePayload = {
   rows?: number | null;
   cols?: number | null;
   cursor?: { row?: number | null; col?: number | null } | null;
+  base_row?: number | null;
 };
 
 export type TerminalStateDiff = {
@@ -212,6 +213,11 @@ export function hydrateTerminalStoreFromDiff(
 
   const styledLines = Array.isArray(payload.styled_lines) ? payload.styled_lines : null;
   const plainLines = Array.isArray(payload.lines) ? payload.lines : null;
+  const baseRowRaw = payload.base_row;
+  const baseRow =
+    typeof baseRowRaw === 'number' && Number.isFinite(baseRowRaw) && baseRowRaw >= 0
+      ? Math.min(Math.floor(baseRowRaw), Number.MAX_SAFE_INTEGER)
+      : 0;
 
   for (let rowIndex = 0; rowIndex < rows; rowIndex += 1) {
     let cells: number[] | null = null;
@@ -224,16 +230,15 @@ export function hydrateTerminalStoreFromDiff(
     }
     updates.push({
       type: 'row',
-      row: rowIndex,
+      row: baseRow + rowIndex,
       seq: diff.sequence,
       cells,
     });
   }
 
   store.reset();
+  store.setHistoryOrigin(baseRow);
   store.setGridSize(rows, cols);
-  store.setHistoryOrigin(0);
-  store.setBaseRow(0);
   store.setFollowTail(false);
   store.applyUpdates(updates, { authoritative: true, origin: 'state-diff-hydrate' });
 
@@ -241,7 +246,8 @@ export function hydrateTerminalStoreFromDiff(
     1,
     Math.min(rows, typeof options.viewportRows === 'number' && options.viewportRows > 0 ? options.viewportRows : rows),
   );
-  const viewportTop = Math.max(0, rows - viewportRows);
+  const totalAbsoluteRows = baseRow + rows;
+  const viewportTop = Math.max(baseRow, totalAbsoluteRows - viewportRows);
   store.setViewport(viewportTop, viewportRows);
 
   const cursorFrame = buildCursorFrame(payload.cursor, diff.sequence);
@@ -293,6 +299,7 @@ export function makeDiffFromLines(lines: readonly string[], sequence = 0): Termi
       styled_lines: null,
       styles: null,
       cursor: null,
+      base_row: 0,
     },
   };
 }

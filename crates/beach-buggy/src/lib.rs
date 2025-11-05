@@ -262,6 +262,8 @@ pub struct TerminalFrame {
     pub cols: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_row: Option<u64>,
     pub cursor: Option<CursorPosition>,
 }
 
@@ -1649,6 +1651,7 @@ mod tests {
             styles: None,
             cols: None,
             rows: None,
+            base_row: None,
             cursor: Some(CursorPosition {
                 row: 0,
                 col: line.len(),

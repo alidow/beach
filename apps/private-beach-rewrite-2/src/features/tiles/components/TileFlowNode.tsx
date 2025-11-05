@@ -43,6 +43,10 @@ function metaEqual(a: TileSessionMeta | null | undefined, b: TileSessionMeta | n
   );
 }
 
+function isResizeHandle(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement && target.dataset.tileResizeHandle === 'true';
+}
+
 function isInteractiveElement(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) {
     return false;
@@ -90,7 +94,8 @@ export function TileFlowNode({ data }: Props) {
       if (event.button !== 0) {
         return;
       }
-      if (isInteractive && isInteractiveElement(event.target)) {
+      const target = event.target;
+      if (isInteractive && isInteractiveElement(target) && !isResizeHandle(target)) {
         // Keep events inside interactive UI (inputs, buttons) from initiating drags.
         event.stopPropagation();
         return;
@@ -107,10 +112,12 @@ export function TileFlowNode({ data }: Props) {
   const handleResizePointerDown = useCallback(
     (event: PointerEvent<HTMLButtonElement>) => {
       event.preventDefault();
-      event.stopPropagation();
-      if (isInteractive && isInteractiveElement(event.target)) {
+      const target = event.target;
+      const allowWhileInteractive = isResizeHandle(target);
+      if (isInteractive && !allowWhileInteractive) {
         return;
       }
+      event.stopPropagation();
       bringToFront(tile.id);
       setActiveTile(tile.id);
       beginResize(tile.id);
@@ -324,7 +331,7 @@ export function TileFlowNode({ data }: Props) {
       <section
         className={cn(
           'flex flex-1 flex-col gap-4 overflow-hidden bg-slate-950/60 p-4 transition-opacity',
-          !isInteractive && 'opacity-[0.98]',
+          isInteractive ? 'pointer-events-auto' : 'pointer-events-none opacity-[0.98] select-none',
         )}
         data-tile-drag-ignore="true"
       >
@@ -345,6 +352,7 @@ export function TileFlowNode({ data }: Props) {
         onPointerUp={handleResizePointerUp}
         onPointerCancel={handleResizePointerCancel}
         data-tile-drag-ignore="true"
+        data-tile-resize-handle="true"
       />
     </article>
   );

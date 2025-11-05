@@ -190,20 +190,6 @@
     font-size: 0.9rem;
   }
 
-  .tile-node__resize {
-    position: absolute;
-    width: 20px;
-    height: 20px;
-    border: none;
-    background: linear-gradient(135deg, rgba(59, 130, 246, 0.35), rgba(59, 130, 246, 0));
-    cursor: se-resize;
-    border-radius: 6px 0 6px 0;
-  }
-
-  .tile-node__resize--se {
-    bottom: 6px;
-    right: 6px;
-  }
 
   .application-tile {
     display: grid;

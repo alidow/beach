@@ -274,7 +274,7 @@ function FlowCanvasInner({
   return (
     <div
       ref={wrapperRef}
-      className="relative flex-1 h-full w-full overflow-hidden rounded-[32px] border border-white/10 bg-slate-950/40 shadow-[0_50px_140px_rgba(2,6,23,0.65)] backdrop-blur-2xl"
+      className="relative flex-1 h-full w-full overflow-hidden bg-slate-950/40 backdrop-blur-2xl"
       data-testid="flow-canvas"
     >
       <ReactFlow

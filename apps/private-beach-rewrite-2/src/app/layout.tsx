@@ -1,9 +1,10 @@
-import { ClerkProvider } from '@clerk/nextjs';
 import type { Metadata } from 'next';
+import { ClerkProvider } from '@clerk/nextjs';
 import { ThemeProvider } from '../../../private-beach/src/components/theme-provider';
 import { ThemeDebugger } from '../../../private-beach/src/components/theme-debugger';
 import '@/lib/ensureReactCache';
 import './globals.css';
+import '../../../beach-surfer/src/styles.css';
 
 export const metadata: Metadata = {
   title: 'Private Beach Rewrite',

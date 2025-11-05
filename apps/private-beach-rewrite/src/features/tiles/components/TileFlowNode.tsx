@@ -1,10 +1,10 @@
 'use client';
 
-import { useCallback, useMemo, useRef } from 'react';
+import { useCallback, useMemo } from 'react';
 import type { MouseEvent, PointerEvent } from 'react';
-import type { NodeProps } from 'reactflow';
+import { NodeResizer, type NodeProps } from 'reactflow';
 import { ApplicationTile } from '@/components/ApplicationTile';
-import { TILE_HEADER_HEIGHT } from '../constants';
+import { TILE_HEADER_HEIGHT, MIN_TILE_WIDTH, MIN_TILE_HEIGHT } from '../constants';
 import { useTileActions } from '../store';
 import type { TileDescriptor, TileSessionMeta } from '../types';
 import { snapSize } from '../utils';
@@ -18,15 +18,6 @@ type TileFlowNodeData = {
   privateBeachId: string;
   managerUrl: string;
   rewriteEnabled: boolean;
-};
-
-type ResizeState = {
-  pointerId: number;
-  startX: number;
-  startY: number;
-  width: number;
-  height: number;
-  lastSize?: { width: number; height: number };
 };
 
 function metaEqual(a: TileSessionMeta | null | undefined, b: TileSessionMeta | null | undefined) {
@@ -56,7 +47,6 @@ type Props = NodeProps<TileFlowNodeData>;
 export function TileFlowNode({ data }: Props) {
   const { tile, orderIndex, isActive, isResizing, privateBeachId, managerUrl, rewriteEnabled } = data;
   const { removeTile, bringToFront, setActiveTile, beginResize, resizeTile, endResize, updateTileMeta } = useTileActions();
-  const resizeStateRef = useRef<ResizeState | null>(null);
 
   const zIndex = useMemo(() => 10 + orderIndex, [orderIndex]);
 
@@ -87,95 +77,29 @@ export function TileFlowNode({ data }: Props) {
     [bringToFront, setActiveTile, tile.id],
   );
 
-  const handleResizePointerDown = useCallback(
-    (event: PointerEvent<HTMLButtonElement>) => {
-      event.preventDefault();
-      event.stopPropagation();
-      bringToFront(tile.id);
-      setActiveTile(tile.id);
-      beginResize(tile.id);
-      const { width, height } = tile.size;
-      resizeStateRef.current = {
-        pointerId: event.pointerId,
-        startX: event.clientX,
-        startY: event.clientY,
-        width,
-        height,
-        lastSize: { width, height },
-      };
-      try {
-        event.currentTarget.setPointerCapture(event.pointerId);
-      } catch {
-        // ignore pointer capture issues
-      }
-    },
-    [beginResize, bringToFront, setActiveTile, tile.id, tile.size],
-  );
+  const handleResizeStart = useCallback(() => {
+    beginResize(tile.id);
+    bringToFront(tile.id);
+    setActiveTile(tile.id);
+  }, [beginResize, bringToFront, setActiveTile, tile.id]);
 
-  const handleResizePointerMove = useCallback(
-    (event: PointerEvent<HTMLButtonElement>) => {
-      const state = resizeStateRef.current;
-      if (!state || state.pointerId !== event.pointerId) {
-        return;
-      }
-      const deltaX = event.clientX - state.startX;
-      const deltaY = event.clientY - state.startY;
-      const nextSize = snapSize({
-        width: state.width + deltaX,
-        height: state.height + deltaY,
-      });
-      state.lastSize = nextSize;
-      resizeTile(tile.id, nextSize);
-    },
-    [resizeTile, tile.id],
-  );
+  const handleResize = useCallback((_: unknown, params: { width: number; height: number }) => {
+    const snapped = snapSize({ width: params.width, height: params.height });
+    resizeTile(tile.id, snapped);
+  }, [resizeTile, tile.id]);
 
-  const releaseResizePointer = useCallback((event: PointerEvent<HTMLButtonElement>) => {
-    try {
-      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-        event.currentTarget.releasePointerCapture(event.pointerId);
-      }
-    } catch {
-      // ignore release errors
-    }
-  }, []);
-
-  const handleResizePointerUp = useCallback(
-    (event: PointerEvent<HTMLButtonElement>) => {
-      const state = resizeStateRef.current;
-      if (!state || state.pointerId !== event.pointerId) {
-        return;
-      }
-      releaseResizePointer(event);
-      endResize(tile.id);
-      if (state.lastSize) {
-        emitTelemetry('canvas.resize.stop', {
-          privateBeachId,
-          tileId: tile.id,
-          width: state.lastSize.width,
-          height: state.lastSize.height,
-          rewriteEnabled,
-        });
-        console.info('[ws-d] tile resized', {
-          privateBeachId,
-          tileId: tile.id,
-          size: { ...state.lastSize },
-          rewriteEnabled,
-        });
-      }
-      resizeStateRef.current = null;
-    },
-    [endResize, privateBeachId, releaseResizePointer, rewriteEnabled, tile.id],
-  );
-
-  const handleResizePointerCancel = useCallback(
-    (event: PointerEvent<HTMLButtonElement>) => {
-      releaseResizePointer(event);
-      endResize(tile.id);
-      resizeStateRef.current = null;
-    },
-    [endResize, releaseResizePointer, tile.id],
-  );
+  const handleResizeEnd = useCallback((_: unknown, params: { width: number; height: number }) => {
+    const snapped = snapSize({ width: params.width, height: params.height });
+    resizeTile(tile.id, snapped);
+    endResize(tile.id);
+    emitTelemetry('canvas.resize.stop', {
+      privateBeachId,
+      tileId: tile.id,
+      width: snapped.width,
+      height: snapped.height,
+      rewriteEnabled,
+    });
+  }, [endResize, privateBeachId, resizeTile, rewriteEnabled, tile.id]);
 
   const title = tile.sessionMeta?.title ?? tile.sessionMeta?.sessionId ?? 'Application Tile';
   const subtitle = useMemo(() => {
@@ -208,6 +132,16 @@ export function TileFlowNode({ data }: Props) {
       data-tile-id={tile.id}
       onPointerDown={handlePointerDown}
     >
+      <NodeResizer
+        isVisible={isActive || isResizing}
+        minWidth={MIN_TILE_WIDTH}
+        minHeight={MIN_TILE_HEIGHT}
+        onResizeStart={handleResizeStart}
+        onResize={handleResize}
+        onResizeEnd={handleResizeEnd}
+        handleStyle={{ width: 14, height: 14, borderRadius: 4, background: 'rgba(59,130,246,0.7)', border: '1px solid rgba(15,23,42,0.6)' }}
+        lineStyle={{ borderColor: 'rgba(59,130,246,0.35)' }}
+      />
       <header className="tile-node__header" style={{ minHeight: TILE_HEADER_HEIGHT }}>
         <div className="tile-node__title">
           <span title={title}>{title}</span>
@@ -226,16 +160,6 @@ export function TileFlowNode({ data }: Props) {
           onSessionMetaChange={handleMetaChange}
         />
       </section>
-      <button
-        type="button"
-        className="tile-node__resize tile-node__resize--se"
-        aria-label="Resize tile"
-        onPointerDown={handleResizePointerDown}
-        onPointerMove={handleResizePointerMove}
-        onPointerUp={handleResizePointerUp}
-        onPointerCancel={handleResizePointerCancel}
-        data-tile-drag-ignore="true"
-      />
     </article>
   );
 }

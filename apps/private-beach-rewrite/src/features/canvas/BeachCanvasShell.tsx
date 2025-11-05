@@ -69,6 +69,7 @@ function BeachCanvasShellInner({
   className,
 }: BeachCanvasShellProps) {
   const NAV_HEIGHT = 56;
+  const CANVAS_VIEWPORT_HEIGHT = `calc(100vh - ${NAV_HEIGHT}px)`;
   const { createTile } = useTileActions();
 
   const catalog = useMemo(() => DEFAULT_CATALOG, []);
@@ -123,7 +124,7 @@ function BeachCanvasShellInner({
     });
   }, [beachId, rewriteEnabled]);
 
-  const wrapperClassName = ['relative flex flex-1 min-h-screen w-full flex-col', className ?? '']
+  const wrapperClassName = ['relative flex h-full flex-1 min-h-0 w-full flex-col overflow-hidden', className ?? '']
     .filter(Boolean)
     .join(' ');
 
@@ -147,8 +148,8 @@ function BeachCanvasShellInner({
         </div>
       </header>
       <div
-        className="relative flex h-full flex-1 min-h-0 flex-col overflow-hidden"
-        style={{ minHeight: `calc(100vh - ${NAV_HEIGHT}px)` }}
+        className="relative flex flex-1 min-h-0 flex-col overflow-hidden"
+        style={{ minHeight: CANVAS_VIEWPORT_HEIGHT }}
       >
         <CanvasWorkspace
           nodes={catalog}

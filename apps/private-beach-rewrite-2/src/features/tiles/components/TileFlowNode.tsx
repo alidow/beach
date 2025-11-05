@@ -91,6 +91,7 @@ export function TileFlowNode({ data }: Props) {
         return;
       }
       if (isInteractive) {
+        event.stopPropagation();
         return;
       }
       bringToFront(tile.id);

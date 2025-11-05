@@ -11,11 +11,13 @@ import ReactFlow, {
   type Node,
   type NodeChange,
   type NodeDragEventHandler,
+  type NodeResizeEvent,
 } from 'reactflow';
 import { emitTelemetry } from '../../../../private-beach/src/lib/telemetry';
 import { TileFlowNode } from '@/features/tiles/components/TileFlowNode';
 import { TILE_GRID_SNAP_PX } from '@/features/tiles/constants';
 import { useTileActions, useTileState } from '@/features/tiles/store';
+import { snapSize } from '@/features/tiles/utils';
 import { buildManagerUrl } from '@/hooks/useManagerToken';
 import { useCanvasEvents } from './CanvasEventsContext';
 import type { CanvasNodeDefinition, CanvasPoint, NodePlacementPayload, TileMovePayload } from './types';
@@ -65,7 +67,7 @@ function FlowCanvasInner({
   const dragSnapshotRef = useRef<DragSnapshot | null>(null);
   const { screenToFlowPosition } = useReactFlow();
   const state = useTileState();
-  const { setTilePosition, bringToFront, setActiveTile } = useTileActions();
+  const { setTilePosition, bringToFront, setActiveTile, resizeTile, beginResize, endResize } = useTileActions();
   const { reportTileMove } = useCanvasEvents();
   const [containerReady, setContainerReady] = useState(false);
 
@@ -105,15 +107,16 @@ function FlowCanvasInner({
   const handleNodesChange = useCallback(
     (changes: NodeChange[]) => {
       changes.forEach((change) => {
-        if (change.type === 'position' && change.position) {
-          const snapped = snapPoint(change.position, gridSize);
-          const tile = state.tiles[change.id];
-          if (!tile) return;
-          if (snapped.x === tile.position.x && snapped.y === tile.position.y) {
-            return;
-          }
-          setTilePosition(change.id, snapped);
+        if (change.type !== 'position' || !change.position) {
+          return;
         }
+        const snapped = snapPoint(change.position, gridSize);
+        const tile = state.tiles[change.id];
+        if (!tile) return;
+        if (snapped.x === tile.position.x && snapped.y === tile.position.y) {
+          return;
+        }
+        setTilePosition(change.id, snapped);
       });
     },
     [gridSize, setTilePosition, state.tiles],
@@ -141,19 +144,6 @@ function FlowCanvasInner({
     [bringToFront, privateBeachId, rewriteEnabled, setActiveTile, state.tiles],
   );
 
-  const handleNodeDrag: NodeDragEventHandler = useCallback(
-    (_event, node) => {
-      const tile = state.tiles[node.id];
-      if (!tile) return;
-      const snapped = snapPoint(node.position, gridSize);
-      if (snapped.x === tile.position.x && snapped.y === tile.position.y) {
-        return;
-      }
-      setTilePosition(node.id, snapped);
-    },
-    [gridSize, setTilePosition, state.tiles],
-  );
-
   const handleNodeDragStop: NodeDragEventHandler = useCallback(
     (_event, node) => {
       const tile = state.tiles[node.id];
@@ -163,8 +153,6 @@ function FlowCanvasInner({
         return;
       }
       const snappedPosition = snapPoint(node.position, gridSize);
-      setTilePosition(node.id, snappedPosition);
-
       const delta = {
         x: snappedPosition.x - snapshot.originalPosition.x,
         y: snappedPosition.y - snapshot.originalPosition.y,
@@ -204,8 +192,41 @@ function FlowCanvasInner({
         rewriteEnabled,
       });
     },
-    [gridSize, onTileMove, privateBeachId, reportTileMove, rewriteEnabled, setTilePosition, state.tiles],
+    [gridSize, onTileMove, privateBeachId, reportTileMove, rewriteEnabled, state.tiles],
   );
+
+
+  const handleNodeResizeStart = useCallback((event: NodeResizeEvent, node: Node) => {
+    bringToFront(node.id);
+    setActiveTile(node.id);
+    beginResize(node.id);
+  }, [beginResize, bringToFront, setActiveTile]);
+
+  const handleNodeResize = useCallback((event: NodeResizeEvent, node: Node) => {
+    const tile = state.tiles[node.id];
+    if (!tile) return;
+    const width = event.width ?? node.width ?? tile.size.width;
+    const height = event.height ?? node.height ?? tile.size.height;
+    const snapped = snapSize({ width, height });
+    resizeTile(node.id, snapped);
+  }, [resizeTile, state.tiles]);
+
+  const handleNodeResizeStop = useCallback((event: NodeResizeEvent, node: Node) => {
+    const tile = state.tiles[node.id];
+    if (!tile) return;
+    const width = event.width ?? node.width ?? tile.size.width;
+    const height = event.height ?? node.height ?? tile.size.height;
+    const snapped = snapSize({ width, height });
+    resizeTile(node.id, snapped);
+    endResize(node.id);
+    emitTelemetry('canvas.resize.stop', {
+      privateBeachId,
+      tileId: node.id,
+      width: snapped.width,
+      height: snapped.height,
+      rewriteEnabled,
+    });
+  }, [endResize, privateBeachId, resizeTile, rewriteEnabled, state.tiles]);
 
   const handleDrop = useCallback(
     (event: DragEvent) => {
@@ -295,25 +316,45 @@ function FlowCanvasInner({
   }, [handleDragOver, handleDrop]);
 
   useEffect(() => {
-    let rafId: number | null = null;
-    let attempts = 0;
-    const measure = () => {
-      const node = wrapperRef.current;
-      if (!node) {
-        setContainerReady(false);
-        return;
-      }
-      const rect = node.getBoundingClientRect();
-      const ready = rect.width > 0 && rect.height > 12;
-      console.info('[ws-c][flow] container-measure', { width: rect.width, height: rect.height, ready, attempts });
+    const node = wrapperRef.current;
+    if (!node) {
+      setContainerReady(false);
+      return;
+    }
+
+    const MIN_READY_HEIGHT = 48;
+
+    const applyMeasurement = (rect: DOMRectReadOnly | DOMRect) => {
+      const ready = rect.width > 0 && rect.height > MIN_READY_HEIGHT;
+      console.info('[ws-c][flow] container-measure', {
+        width: rect.width,
+        height: rect.height,
+        ready,
+      });
       setContainerReady(ready);
-      if (!ready && attempts < 10) {
-        attempts += 1;
-        rafId = requestAnimationFrame(measure);
-      }
     };
 
-    measure();
+    applyMeasurement(node.getBoundingClientRect());
+
+    if (typeof ResizeObserver !== 'undefined') {
+      const observer = new ResizeObserver((entries) => {
+        const entry = entries[0];
+        if (!entry) return;
+        const rect = entry.contentRect ?? node.getBoundingClientRect();
+        applyMeasurement(rect);
+      });
+      observer.observe(node);
+      return () => {
+        observer.disconnect();
+      };
+    }
+
+    let rafId: number | null = null;
+    const poll = () => {
+      applyMeasurement(node.getBoundingClientRect());
+      rafId = requestAnimationFrame(poll);
+    };
+    rafId = requestAnimationFrame(poll);
     return () => {
       if (rafId !== null) {
         cancelAnimationFrame(rafId);
@@ -326,7 +367,7 @@ function FlowCanvasInner({
       ref={wrapperRef}
       className="relative flex h-full flex-1 w-full overflow-hidden rounded-xl border border-border bg-card/60 shadow-inner"
       data-testid="flow-canvas"
-      style={{ minHeight: 'calc(100vh - 56px)', height: 'calc(100vh - 56px)' }}
+      style={{ minHeight: '100%', height: '100%' }}
     >
       {containerReady ? (
         <ReactFlow
@@ -334,7 +375,6 @@ function FlowCanvasInner({
           edges={[]}
           nodeTypes={nodeTypes}
           onNodesChange={handleNodesChange}
-          onNodeDrag={handleNodeDrag}
           onNodeDragStart={handleNodeDragStart}
           onNodeDragStop={handleNodeDragStop}
           nodesDraggable
@@ -352,6 +392,10 @@ function FlowCanvasInner({
           proOptions={{ hideAttribution: true }}
           className="flex-1 h-full w-full"
           style={{ width: '100%', height: '100%' }}
+          nodesResizable
+          onNodeResize={handleNodeResize}
+          onNodeResizeStart={handleNodeResizeStart}
+          onNodeResizeStop={handleNodeResizeStop}
         >
           <Background gap={gridSize} color="rgba(148, 163, 184, 0.18)" />
           <Controls

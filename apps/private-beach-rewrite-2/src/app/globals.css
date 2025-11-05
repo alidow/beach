@@ -25,6 +25,11 @@
     --ring: 199 89% 58%;
     --radius: 1rem;
     --font-sans: 'Inter', 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif;
+    --font-mono: 'JetBrains Mono', 'SFMono-Regular', 'Menlo', 'Consolas', monospace;
+    --terminal-frame: 219 46% 11%;
+    --terminal-bezel: 218 58% 12.5%;
+    --terminal-screen: 221 47% 6%;
+    --terminal-glow: 199 89% 36%;
     color-scheme: dark;
   }
 

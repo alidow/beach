@@ -48,15 +48,47 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
   try {
     beach = await getBeachMeta(beachId, token, managerBaseUrl);
   } catch (error) {
-    if (error instanceof Error && error.message === 'not_found') {
-      notFound();
+    if (error instanceof Error) {
+      const status = (error as any).status;
+      if (error.message === 'not_found') {
+        notFound();
+      }
+      if (status === 409) {
+        const payload = (error as any).payload ?? null;
+        const fallbackName =
+          payload && typeof payload.name === 'string' && payload.name.trim().length > 0
+            ? payload.name
+            : 'Unnamed Beach';
+        const fallbackSlug =
+          payload && typeof payload.slug === 'string' && payload.slug.trim().length > 0
+            ? payload.slug
+            : beachId;
+        console.warn('[rewrite] getBeachMeta conflict; falling back to placeholder metadata', {
+          beachId,
+          payload,
+        });
+        beach = {
+          id: beachId,
+          name: fallbackName,
+          slug: fallbackSlug,
+          created_at: Date.now(),
+          settings: payload?.settings ?? {},
+        };
+      } else {
+        throw error;
+      }
+    } else {
+      throw error;
     }
-    throw error;
+  }
+
+  if (!beach) {
+    throw new Error('Unable to resolve beach metadata.');
   }
 
   return (
     <div
-      className="flex min-h-screen flex-col bg-background"
+      className="flex h-screen min-h-screen flex-col bg-background"
       data-private-beach-rewrite={rewriteEnabled ? 'enabled' : 'disabled'}
     >
       <BeachCanvasShell
@@ -93,11 +125,23 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
       description: `Canvas workspace preview for ${beach.name}.`,
     };
   } catch (error) {
-    if (error instanceof Error && error.message === 'not_found') {
-      return {
-        title: 'Beach not found · Private Beach Rewrite',
-        description: 'The requested private beach could not be located.',
-      };
+    if (error instanceof Error) {
+      if (error.message === 'not_found') {
+        return {
+          title: 'Beach not found · Private Beach Rewrite',
+          description: 'The requested private beach could not be located.',
+        };
+      }
+      if ((error as any).status === 409) {
+        console.warn('[rewrite] getBeachMeta conflict while building metadata', {
+          beachId: params.id,
+          payload: (error as any).payload ?? null,
+        });
+        return {
+          title: 'Private Beach Rewrite · Beach',
+          description: 'Metadata unavailable due to upstream conflict.',
+        };
+      }
     }
     return {
       title: 'Private Beach Rewrite · Beach',

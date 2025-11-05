@@ -64,7 +64,7 @@ export function CanvasWorkspace({
     <CanvasEventsProvider value={eventsValue}>
       <CanvasUIProvider initialDrawerOpen={initialDrawerOpen}>
         <CanvasHotkeyBinder />
-        <div className="relative flex h-full min-h-0 w-full px-6 pb-6 pt-4">
+        <div className="relative flex h-full min-h-0 w-full">
           <FlowCanvas
             onNodePlacement={onNodePlacement}
             onTileMove={onTileMove}

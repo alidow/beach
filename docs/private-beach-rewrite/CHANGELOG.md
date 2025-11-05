@@ -1,5 +1,14 @@
 # Private Beach Rewrite · Changelog
 
+## 2025-11-06 · Flow Canvas polish & coverage
+- Reworked the page/shell layout and added a `ResizeObserver` gate so the React Flow surface always gets a real height before mount, eliminating the blank canvas warning.
+- Added a temporary fallback when `getBeachMeta` responds with 409 to keep the rewrite beach page usable while the upstream conflict is debugged.
+- Introduced a Vitest harness for the rewrite app with focused `FlowCanvas` tests covering tile mapping and catalog drop snapping.
+
+**Follow-ups**
+- Trace and resolve the upstream 409 responses so the metadata fallback can be removed.
+- Expand rewrite-side tests to cover tile resize/drag telemetry once the interaction surface stabilises.
+
 ## 2025-11-04 · React Flow Canvas Integration
 - Replaced the bespoke DnD Kit canvas with the new `FlowCanvas` powered by React Flow, preserving tile focus, snapping, and telemetry payloads.
 - Added HTML5 catalog → canvas drag and drop, grid-aware placement, and exhaustive React Flow logging for QA.

@@ -599,7 +599,16 @@ export async function createBeach(name: string, slug: string | undefined, token:
 export async function getBeachMeta(id: string, token: string | null, baseUrl?: string): Promise<BeachMeta> {
   const res = await fetch(`${base(baseUrl)}/private-beaches/${id}`, { headers: authHeaders(token) });
   if (res.status === 404) throw new Error('not_found');
-  if (!res.ok) throw new Error(`getBeachMeta failed ${res.status}`);
+  if (!res.ok) {
+    const error = new Error(`getBeachMeta failed ${res.status}`);
+    (error as any).status = res.status;
+    try {
+      (error as any).payload = await res.json();
+    } catch {
+      // ignore payload parse failure
+    }
+    throw error;
+  }
   return res.json();
 }
 

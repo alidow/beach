@@ -78,6 +78,7 @@ function FlowCanvasInner({
       .map((tileId, index) => {
         const tile = state.tiles[tileId];
         if (!tile) return null;
+        const isInteractive = state.interactiveId === tile.id;
         return {
           id: tile.id,
           type: 'tile',
@@ -86,12 +87,13 @@ function FlowCanvasInner({
             orderIndex: index,
             isActive: state.activeId === tile.id,
             isResizing: Boolean(state.resizing[tile.id]),
+            isInteractive,
             privateBeachId,
             managerUrl: resolvedManagerUrl,
             rewriteEnabled,
           },
           position: tile.position,
-          draggable: true,
+          draggable: !isInteractive,
           selectable: false,
           connectable: false,
           style: {

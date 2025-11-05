@@ -23,13 +23,15 @@ type Action =
   | { type: 'SET_TILE_POSITION'; payload: { id: string; position: Partial<TilePosition> } }
   | { type: 'SET_TILE_SIZE'; payload: { id: string; size: TileResizeInput } }
   | { type: 'START_RESIZE'; payload: { id: string } }
-  | { type: 'END_RESIZE'; payload: { id: string } };
+  | { type: 'END_RESIZE'; payload: { id: string } }
+  | { type: 'SET_INTERACTIVE_TILE'; payload: { id: string | null } };
 
 const INITIAL_STATE: TileState = {
   tiles: {},
   order: [],
   activeId: null,
   resizing: {},
+  interactiveId: null,
 };
 
 function ensureOrder(order: string[], id: string): string[] {
@@ -85,11 +87,23 @@ function reducer(state: TileState, action: Action): TileState {
             return next;
           })()
         : state.resizing;
+      let interactiveId = state.interactiveId && !tiles[state.interactiveId] ? null : state.interactiveId;
+      const hasSession = Boolean(descriptor.sessionMeta?.sessionId);
+      const previouslyHadSession = Boolean(existing?.sessionMeta?.sessionId);
+      if (!existing && !hasSession) {
+        interactiveId = descriptor.id;
+      } else if (previouslyHadSession && !hasSession) {
+        interactiveId = descriptor.id;
+      } else if (interactiveId === descriptor.id && hasSession && !previouslyHadSession && !shouldFocus) {
+        // keep as-is unless it was auto-selected above; no-op
+      }
       return {
+        ...state,
         tiles,
         order,
         activeId: shouldFocus ? id : state.activeId,
         resizing,
+        interactiveId,
       };
     }
     case 'REMOVE_TILE': {
@@ -104,7 +118,8 @@ function reducer(state: TileState, action: Action): TileState {
       delete resizing[id];
       const activeId =
         state.activeId === id ? (order.length > 0 ? order[order.length - 1] : null) : state.activeId;
-      return { tiles, order, activeId, resizing };
+      const interactiveId = state.interactiveId === id ? null : state.interactiveId;
+      return { ...state, tiles, order, activeId, resizing, interactiveId };
     }
     case 'SET_ACTIVE_TILE': {
       const { id } = action.payload;
@@ -193,6 +208,22 @@ function reducer(state: TileState, action: Action): TileState {
       delete resizing[id];
       return { ...state, resizing };
     }
+    case 'SET_INTERACTIVE_TILE': {
+      const { id } = action.payload;
+      if (id === null) {
+        if (state.interactiveId === null) {
+          return state;
+        }
+        return { ...state, interactiveId: null };
+      }
+      if (!state.tiles[id]) {
+        return state.interactiveId === null ? state : { ...state, interactiveId: null };
+      }
+      if (state.interactiveId === id) {
+        return state;
+      }
+      return { ...state, interactiveId: id };
+    }
     default:
       return state;
   }
@@ -233,6 +264,7 @@ export function useTileActions() {
         dispatch({ type: 'SET_TILE_SIZE', payload: { id, size } }),
       beginResize: (id: string) => dispatch({ type: 'START_RESIZE', payload: { id } }),
       endResize: (id: string) => dispatch({ type: 'END_RESIZE', payload: { id } }),
+      setInteractiveTile: (id: string | null) => dispatch({ type: 'SET_INTERACTIVE_TILE', payload: { id } }),
     }),
     [dispatch],
   );

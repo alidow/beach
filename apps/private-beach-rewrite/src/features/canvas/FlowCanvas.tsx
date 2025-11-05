@@ -2,11 +2,12 @@
 
 import 'reactflow/dist/style.css';
 
-import { useCallback, useEffect, useMemo, useRef, useState, useLayoutEffect } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactFlow, {
   Background,
   ReactFlowProvider,
   useReactFlow,
+  Controls,
   type Node,
   type NodeChange,
   type NodeDragEventHandler,
@@ -69,38 +70,6 @@ function FlowCanvasInner({
   const [containerReady, setContainerReady] = useState(false);
 
   const resolvedManagerUrl = useMemo(() => buildManagerUrl(managerUrl), [managerUrl]);
-
-  const ensureContainerMeasurements = useCallback(() => {
-    const node = wrapperRef.current;
-    if (!node) {
-      console.warn('[ws-c][flow] container-missing');
-      setContainerReady(false);
-      return;
-    }
-    const rect = node.getBoundingClientRect();
-    console.info('[ws-c][flow] container-measure', { width: rect.width, height: rect.height });
-    setContainerReady(rect.width > 0 && rect.height > 0);
-  }, []);
-
-  useLayoutEffect(() => {
-    const node = wrapperRef.current;
-    if (!node) {
-      console.warn('[ws-c][flow] container-ref-null');
-      setContainerReady(false);
-      return;
-    }
-
-    ensureContainerMeasurements();
-
-    if (typeof ResizeObserver === 'undefined') {
-      const id = requestAnimationFrame(ensureContainerMeasurements);
-      return () => cancelAnimationFrame(id);
-    }
-
-    const observer = new ResizeObserver(() => ensureContainerMeasurements());
-    observer.observe(node);
-    return () => observer.disconnect();
-  }, [ensureContainerMeasurements]);
 
   const nodes: Node[] = useMemo(() => {
     return state.order
@@ -325,12 +294,39 @@ function FlowCanvasInner({
     };
   }, [handleDragOver, handleDrop]);
 
+  useEffect(() => {
+    let rafId: number | null = null;
+    let attempts = 0;
+    const measure = () => {
+      const node = wrapperRef.current;
+      if (!node) {
+        setContainerReady(false);
+        return;
+      }
+      const rect = node.getBoundingClientRect();
+      const ready = rect.width > 0 && rect.height > 12;
+      console.info('[ws-c][flow] container-measure', { width: rect.width, height: rect.height, ready, attempts });
+      setContainerReady(ready);
+      if (!ready && attempts < 10) {
+        attempts += 1;
+        rafId = requestAnimationFrame(measure);
+      }
+    };
+
+    measure();
+    return () => {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+      }
+    };
+  }, []);
+
   return (
     <div
       ref={wrapperRef}
-      className="relative flex h-full flex-1 min-h-0 w-full overflow-hidden rounded-xl border border-border bg-card/60 shadow-inner"
+      className="relative flex h-full flex-1 w-full overflow-hidden rounded-xl border border-border bg-card/60 shadow-inner"
       data-testid="flow-canvas"
-      style={{ minHeight: '100%' }}
+      style={{ minHeight: 'calc(100vh - 56px)', height: 'calc(100vh - 56px)' }}
     >
       {containerReady ? (
         <ReactFlow
@@ -344,11 +340,13 @@ function FlowCanvasInner({
           nodesDraggable
           nodesConnectable={false}
           elementsSelectable={false}
-          panOnScroll={false}
-          panOnDrag={false}
-          zoomOnScroll={false}
-          zoomOnPinch={false}
+          panOnScroll
+          panOnDrag
+          zoomOnScroll
+          zoomOnPinch
           zoomOnDoubleClick={false}
+          minZoom={0.25}
+          maxZoom={2}
           fitView={false}
           elevateNodesOnSelect
           proOptions={{ hideAttribution: true }}
@@ -356,6 +354,11 @@ function FlowCanvasInner({
           style={{ width: '100%', height: '100%' }}
         >
           <Background gap={gridSize} color="rgba(148, 163, 184, 0.18)" />
+          <Controls
+            showInteractive={false}
+            position="bottom-right"
+            className="bg-card/80 text-foreground"
+          />
         </ReactFlow>
       ) : (
         <div className="flex h-full w-full items-center justify-center text-xs text-muted-foreground">Preparing canvas…</div>

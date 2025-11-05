@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { MouseEvent, PointerEvent } from 'react';
 import type { NodeProps } from 'reactflow';
 import { ApplicationTile } from '@/components/ApplicationTile';
@@ -19,6 +19,7 @@ type TileFlowNodeData = {
   privateBeachId: string;
   managerUrl: string;
   rewriteEnabled: boolean;
+  isInteractive: boolean;
 };
 
 type ResizeState = {
@@ -55,9 +56,19 @@ function isInteractiveElement(target: EventTarget | null): boolean {
 type Props = NodeProps<TileFlowNodeData>;
 
 export function TileFlowNode({ data }: Props) {
-  const { tile, orderIndex, isActive, isResizing, privateBeachId, managerUrl, rewriteEnabled } = data;
-  const { removeTile, bringToFront, setActiveTile, beginResize, resizeTile, endResize, updateTileMeta } = useTileActions();
+  const { tile, orderIndex, isActive, isResizing, isInteractive, privateBeachId, managerUrl, rewriteEnabled } = data;
+  const {
+    removeTile,
+    bringToFront,
+    setActiveTile,
+    beginResize,
+    resizeTile,
+    endResize,
+    updateTileMeta,
+    setInteractiveTile,
+  } = useTileActions();
   const resizeStateRef = useRef<ResizeState | null>(null);
+  const [hovered, setHovered] = useState(false);
 
   const zIndex = useMemo(() => 10 + orderIndex, [orderIndex]);
 
@@ -79,19 +90,25 @@ export function TileFlowNode({ data }: Props) {
       if (event.button !== 0) {
         return;
       }
+      if (isInteractive) {
+        return;
+      }
       bringToFront(tile.id);
       setActiveTile(tile.id);
       if (isInteractiveElement(event.target)) {
         event.stopPropagation();
       }
     },
-    [bringToFront, setActiveTile, tile.id],
+    [bringToFront, isInteractive, setActiveTile, tile.id],
   );
 
   const handleResizePointerDown = useCallback(
     (event: PointerEvent<HTMLButtonElement>) => {
       event.preventDefault();
       event.stopPropagation();
+      if (isInteractive) {
+        return;
+      }
       bringToFront(tile.id);
       setActiveTile(tile.id);
       beginResize(tile.id);
@@ -110,7 +127,7 @@ export function TileFlowNode({ data }: Props) {
         // ignore pointer capture issues
       }
     },
-    [beginResize, bringToFront, setActiveTile, tile.id, tile.size],
+    [beginResize, bringToFront, isInteractive, setActiveTile, tile.id, tile.size],
   );
 
   const handleResizePointerMove = useCallback(
@@ -178,6 +195,41 @@ export function TileFlowNode({ data }: Props) {
     [endResize, releaseResizePointer, tile.id],
   );
 
+  const handlePointerEnterNode = useCallback(() => {
+    setHovered(true);
+  }, []);
+
+  const handlePointerLeaveNode = useCallback(() => {
+    setHovered(false);
+    if (isInteractive) {
+      setInteractiveTile(null);
+    }
+  }, [isInteractive, setInteractiveTile]);
+
+  useEffect(() => {
+    if (!hovered) {
+      return;
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const isSpace = event.key === ' ' || event.key === 'Spacebar' || event.code === 'Space';
+      if (isSpace) {
+        event.preventDefault();
+        setInteractiveTile(isInteractive ? null : tile.id);
+        return;
+      }
+      if (event.key === 'Escape') {
+        if (isInteractive) {
+          event.preventDefault();
+          setInteractiveTile(null);
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [hovered, isInteractive, setInteractiveTile, tile.id]);
+
   const title = tile.sessionMeta?.title ?? tile.sessionMeta?.sessionId ?? 'Application Tile';
   const subtitle = useMemo(() => {
     if (!tile.sessionMeta) return 'Disconnected';
@@ -201,6 +253,7 @@ export function TileFlowNode({ data }: Props) {
     'group relative flex h-full w-full select-none flex-col overflow-hidden rounded-2xl border border-slate-700/60 bg-slate-950/80 text-slate-200 shadow-[0_28px_80px_rgba(2,6,23,0.6)] backdrop-blur-xl transition-all duration-200',
     isActive && 'border-sky-400/60 shadow-[0_32px_90px_rgba(14,165,233,0.35)]',
     isResizing && 'cursor-[se-resize]',
+    isInteractive && 'border-sky-300/70 shadow-[0_32px_90px_rgba(56,189,248,0.45)] cursor-auto',
   );
 
   return (
@@ -210,6 +263,9 @@ export function TileFlowNode({ data }: Props) {
       data-testid={`rf__node-tile:${tile.id}`}
       data-tile-id={tile.id}
       onPointerDown={handlePointerDown}
+      onPointerEnter={handlePointerEnterNode}
+      onPointerLeave={handlePointerLeaveNode}
+      data-tile-interactive={isInteractive ? 'true' : 'false'}
     >
       <header
         className="flex min-h-[44px] items-center justify-between border-b border-white/10 bg-slate-900/80 px-4 py-2.5 backdrop-blur"
@@ -220,18 +276,44 @@ export function TileFlowNode({ data }: Props) {
             {title}
           </span>
           {subtitle ? <small className="truncate text-[11px] uppercase tracking-[0.18em] text-slate-400">{subtitle}</small> : null}
+          {isInteractive ? (
+            <span className="mt-0.5 inline-flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.28em] text-sky-200">
+              Live Control
+            </span>
+          ) : null}
         </div>
-        <button
-          type="button"
-          className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-500/40 bg-red-500/15 text-base font-semibold text-red-200 transition hover:border-red-400/70 hover:bg-red-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400/60"
-          onClick={handleRemove}
-          data-tile-drag-ignore="true"
-        >
-          ×
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setInteractiveTile(isInteractive ? null : tile.id)}
+            aria-pressed={isInteractive}
+            data-tile-drag-ignore="true"
+            className={cn(
+              'inline-flex h-7 items-center justify-center rounded-full border px-3 text-[10px] font-semibold uppercase tracking-[0.24em] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60',
+              isInteractive
+                ? 'border-sky-400/70 bg-sky-500/20 text-sky-50'
+                : 'border-white/15 bg-white/5 text-slate-300 hover:border-white/30 hover:text-white',
+            )}
+            title="Toggle interactive mode (Space)"
+          >
+            {isInteractive ? 'Done' : 'Interact'}
+          </button>
+          <button
+            type="button"
+            className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-500/40 bg-red-500/15 text-base font-semibold text-red-200 transition hover:border-red-400/70 hover:bg-red-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400/60"
+            onClick={handleRemove}
+            data-tile-drag-ignore="true"
+            title="Remove tile"
+          >
+            ×
+          </button>
+        </div>
       </header>
       <section
-        className="flex flex-1 flex-col gap-4 overflow-hidden bg-slate-950/60 p-4"
+        className={cn(
+          'flex flex-1 flex-col gap-4 overflow-hidden bg-slate-950/60 p-4 transition-colors',
+          isInteractive ? 'pointer-events-auto' : 'pointer-events-none opacity-[0.98]',
+        )}
         data-tile-drag-ignore="true"
       >
         <ApplicationTile

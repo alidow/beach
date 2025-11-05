@@ -35,6 +35,7 @@ export type TileState = {
   order: string[];
   activeId: string | null;
   resizing: Record<string, boolean>;
+  interactiveId: string | null;
 };
 
 export type TileCreateInput = {

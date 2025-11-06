@@ -148,8 +148,8 @@ export function SessionViewer({ viewer, className, sessionId, disableViewportMea
         if (needsViewportAdjust) {
           store.setViewport(tailTop, effectiveHeight);
         }
-        if (!store.getSnapshot().followTail) {
-          store.setFollowTail(true);
+        if (store.getSnapshot().followTail) {
+          store.setFollowTail(false);
         }
         restoring = false;
         if (process.env.NODE_ENV !== 'production') {

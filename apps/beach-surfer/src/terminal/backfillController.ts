@@ -212,19 +212,19 @@ export class BackfillController {
             });
             this.issueRequest(requestId, tailGap.start, count);
             this.lastRequestAt = now;
-            if (!this.forcedFollowTail) {
-              this.store.setFollowTail(true);
-              this.forcedFollowTail = true;
-              this.restoreFollowTail = !snapshotFollowTail;
-              trace('follow_tail_forced', { reason: 'internal-gap' });
-              info('follow_tail_forced', {
-                reason: 'internal-gap',
-                viewportBottom,
-                start: tailGap.start,
-                end: requestEnd,
-                restoreFollowTail: this.restoreFollowTail,
-              });
-            }
+          if (!this.forcedFollowTail && snapshotFollowTail) {
+            this.store.setFollowTail(true);
+            this.forcedFollowTail = true;
+            this.restoreFollowTail = !snapshotFollowTail;
+            trace('follow_tail_forced', { reason: 'internal-gap' });
+            info('follow_tail_forced', {
+              reason: 'internal-gap',
+              viewportBottom,
+              start: tailGap.start,
+              end: requestEnd,
+              restoreFollowTail: this.restoreFollowTail,
+            });
+          }
             return;
           }
           trace('viewport_gap_request_skipped', {
@@ -267,7 +267,7 @@ export class BackfillController {
           });
           this.issueRequest(requestId, gapStart, count);
           this.lastRequestAt = now;
-          if (!this.forcedFollowTail) {
+          if (!this.forcedFollowTail && snapshotFollowTail) {
             this.store.setFollowTail(true);
             this.forcedFollowTail = true;
             this.restoreFollowTail = !snapshotFollowTail;

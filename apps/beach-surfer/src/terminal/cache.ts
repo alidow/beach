@@ -775,14 +775,25 @@ export class TerminalGridCache {
       let padStartAbsolute: number | null = null;
 
       if (actualRowsToShow === 0) {
-        const padStart = anchor - (height - 1);
-        padStartAbsolute = padStart;
-        for (let offset = 0; offset < height; offset += 1) {
-          const absolute = padStart + offset;
-          rows.push(createMissingRow(absolute));
-        }
-        if (padCount > 0) {
-          tailPaddingApplied = true;
+        if (highestLoaded !== null) {
+          const fallbackStart = Math.max(this.baseRow, highestLoaded - (height - 1));
+          actualStartAbsolute = fallbackStart;
+          for (let offset = 0; offset < height; offset += 1) {
+            const absolute = fallbackStart + offset;
+            rows.push(materializeRow(absolute));
+          }
+          tailPaddingApplied = false;
+          padStartAbsolute = null;
+        } else {
+          const padStart = anchor - (height - 1);
+          padStartAbsolute = padStart;
+          for (let offset = 0; offset < height; offset += 1) {
+            const absolute = padStart + offset;
+            rows.push(createMissingRow(absolute));
+          }
+          if (padCount > 0) {
+            tailPaddingApplied = true;
+          }
         }
       } else {
         const tailFloor = anchor - (effectiveGridHeight - 1);

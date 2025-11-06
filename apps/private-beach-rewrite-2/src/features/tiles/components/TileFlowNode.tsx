@@ -341,7 +341,6 @@ export function TileFlowNode({ data, dragging }: Props) {
           managerUrl={managerUrl}
           sessionMeta={tile.sessionMeta ?? null}
           onSessionMetaChange={handleMetaChange}
-          disableViewportMeasurements={dragging}
         />
       </section>
       <button

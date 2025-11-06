@@ -48,6 +48,7 @@ export function TileFlowNode({ data, dragging }: Props) {
   const { tile, orderIndex, isActive, isResizing, privateBeachId, managerUrl, rewriteEnabled } = data;
   const { removeTile, bringToFront, setActiveTile, beginResize, resizeTile, endResize, updateTileMeta } = useTileActions();
   const nodeRef = useRef<HTMLElement | null>(null);
+  const draggingRef = useRef(false);
 
   const zIndex = useMemo(() => 10 + orderIndex, [orderIndex]);
 
@@ -184,7 +185,6 @@ export function TileFlowNode({ data, dragging }: Props) {
           managerUrl={managerUrl}
           sessionMeta={tile.sessionMeta ?? null}
           onSessionMetaChange={handleMetaChange}
-          disableViewportMeasurements={dragging}
         />
       </section>
     </article>

@@ -422,6 +422,9 @@ function SessionTerminalPreviewView({
               hostCols: patchedState.hostCols,
               viewOnly: patchedState.viewOnly,
               canSendResize: patchedState.canSendResize,
+              followTailDesired: patchedState.followTailDesired,
+              followTailPhase: patchedState.followTailPhase,
+              tailPaddingRows: patchedState.tailPaddingRows,
             }),
           );
         } catch {
@@ -437,6 +440,9 @@ function SessionTerminalPreviewView({
           hostViewportRows: patchedState.hostViewportRows,
           hostCols: patchedState.hostCols,
           viewOnly: patchedState.viewOnly,
+          followTailDesired: patchedState.followTailDesired,
+          followTailPhase: patchedState.followTailPhase,
+          tailPaddingRows: patchedState.tailPaddingRows,
         });
       }
       setViewportState(patchedState);
@@ -1142,21 +1148,6 @@ function SessionTerminalPreviewView({
     updatePreviewStatus('initializing');
   }, [previewMeasurements, updatePreviewStatus, viewer.status]);
 
-  // For visible-driver previews, once the terminal is ready, follow tail so
-  // the most recent content (bottom) is visible and we don't hide the last
-  // few rows due to partial height rounding.
-  useEffect(() => {
-    if (previewStatus !== 'ready' || !viewer.store) return;
-    try {
-      viewer.store.setFollowTail(true);
-      if (typeof window !== 'undefined') {
-        console.info('[terminal][trace] follow-tail:enabled', { sessionId });
-      }
-    } catch {
-      // ignore
-    }
-  }, [previewStatus, sessionId, viewer.store]);
-
   useEffect(() => {
     if (!viewer.store) {
       return;
@@ -1684,12 +1675,27 @@ function SessionTerminalPreviewView({
     variant === 'preview'
       ? 'absolute inset-0 flex items-center justify-center bg-neutral-950/90 text-xs text-muted-foreground'
       : 'absolute inset-0 flex items-center justify-center bg-neutral-950 text-sm text-muted-foreground';
+  const tailSyncing =
+    viewportState?.followTailDesired &&
+    viewportState.followTailPhase !== 'manual_scrollback' &&
+    (viewportState.tailPaddingRows ?? 0) > 0;
+  const tailManual = viewportState?.followTailPhase === 'manual_scrollback';
 
   return (
     <div className={containerClass}>
       <div className="pointer-events-none absolute left-2 top-2 flex flex-wrap items-center gap-2 font-semibold uppercase tracking-[0.2em]">
         <span className={`${overlayTextClass} rounded-full px-3 py-1 ${secureClass}`}>{secureLabel}</span>
         <span className={`${overlayTextClass} rounded-full px-3 py-1 ${latencyClass}`}>{latencyLabel}</span>
+        {tailSyncing ? (
+          <span className={`${overlayTextClass} rounded-full bg-[#14213b] px-3 py-1 text-[#d1dcff]`}>
+            Syncing Tail
+          </span>
+        ) : null}
+        {tailManual ? (
+          <span className={`${overlayTextClass} rounded-full bg-[#3b1421] px-3 py-1 text-[#ffd1dc]`}>
+            Scrollback
+          </span>
+        ) : null}
       </div>
       <div className="relative flex w-full items-start justify-start overflow-hidden">
         {!ENABLE_VISIBLE_PREVIEW_DRIVER && (

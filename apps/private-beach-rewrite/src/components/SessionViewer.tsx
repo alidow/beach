@@ -1,8 +1,8 @@
 'use client';
 
-import { useEffect } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { TerminalViewerState } from '../../../private-beach/src/hooks/terminalViewerTypes';
-import { BeachTerminal } from '../../../beach-surfer/src/components/BeachTerminal';
+import { BeachTerminal, type JoinOverlayState } from '../../../beach-surfer/src/components/BeachTerminal';
 import { rewriteTerminalSizingStrategy } from './rewriteTerminalSizing';
 
 type SessionViewerProps = {
@@ -16,6 +16,42 @@ export function SessionViewer({ viewer, className, sessionId, disableViewportMea
   const status = viewer.status ?? 'idle';
   const showLoading = status === 'idle' || status === 'connecting' || status === 'reconnecting';
   const showError = status === 'error' && Boolean(viewer.error);
+  const [joinState, setJoinState] = useState<{ state: JoinOverlayState; message: string | null }>({
+    state: 'idle',
+    message: null,
+  });
+
+  useEffect(() => {
+    setJoinState({ state: 'idle', message: null });
+  }, [sessionId]);
+
+  const joinOverlay = useMemo(() => {
+    if (showError) {
+      return null;
+    }
+    switch (joinState.state) {
+      case 'waiting':
+        return {
+          variant: 'info' as const,
+          message: joinState.message ?? 'Waiting for host approval…',
+        };
+      case 'denied':
+        return {
+          variant: 'error' as const,
+          message: joinState.message ?? 'Join request denied by host.',
+        };
+      case 'disconnected':
+        return {
+          variant: 'error' as const,
+          message: joinState.message ?? 'Disconnected before host approval.',
+        };
+      case 'connecting':
+      case 'approved':
+      case 'idle':
+      default:
+        return null;
+    }
+  }, [joinState, showError]);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -146,94 +182,6 @@ export function SessionViewer({ viewer, className, sessionId, disableViewportMea
 
   }, [showError, showLoading, status, viewer.error, viewer.latencyMs, viewer.store, viewer.transport, viewer.transportVersion, sessionId]);
 
-  useEffect(() => {
-    const store = viewer.store;
-    if (!store || !viewer.transport) {
-      return undefined;
-    }
-
-    let restoring = false;
-
-    const ensureFollowTail = (reason: string) => {
-      if (restoring) {
-        return;
-      }
-      try {
-        const snapshot = store.getSnapshot();
-        if (!snapshot) {
-          return;
-        }
-        const { rows, viewportHeight, viewportTop, baseRow, followTail } = snapshot;
-        let highestLoaded: number | null = null;
-        let lowestLoaded: number | null = null;
-        let loadedCount = 0;
-        for (let index = 0; index < rows.length; index += 1) {
-          const row = rows[index];
-          if (row && row.kind === 'loaded') {
-            loadedCount += 1;
-            if (lowestLoaded === null || row.absolute < lowestLoaded) {
-              lowestLoaded = row.absolute;
-            }
-          }
-        }
-        for (let index = rows.length - 1; index >= 0; index -= 1) {
-          const row = rows[index];
-          if (row && row.kind === 'loaded') {
-            highestLoaded = row.absolute;
-            break;
-          }
-        }
-        if (highestLoaded === null || lowestLoaded === null || loadedCount === 0) {
-          return;
-        }
-        const effectiveHeight =
-          viewportHeight && viewportHeight > 0 ? viewportHeight : Math.max(1, rows.length || 1);
-        const loadedSpan = highestLoaded - lowestLoaded + 1;
-        if (loadedSpan < effectiveHeight) {
-          return;
-        }
-        const tailTop = Math.max(baseRow, highestLoaded - (effectiveHeight - 1));
-        const needsViewportAdjust = viewportTop !== tailTop || viewportHeight !== effectiveHeight;
-        if (followTail && !needsViewportAdjust) {
-          return;
-        }
-        restoring = true;
-        if (needsViewportAdjust) {
-          store.setViewport(tailTop, effectiveHeight);
-        }
-        if (store.getSnapshot().followTail) {
-          store.setFollowTail(false);
-        }
-        restoring = false;
-        if (process.env.NODE_ENV !== 'production') {
-          console.info('[rewrite-terminal][follow-tail-restore]', {
-            sessionId,
-            reason,
-            baseRow,
-            previousViewportTop: viewportTop,
-            previousViewportHeight: viewportHeight,
-            rows: rows.length,
-            tailTop,
-            effectiveHeight,
-          });
-        }
-      } catch (error) {
-        restoring = false;
-        console.warn('[rewrite-terminal][follow-tail-restore] failed', { sessionId, reason, error });
-      }
-    };
-
-    ensureFollowTail('effect-init');
-    const unsubscribe = store.subscribe(() => ensureFollowTail('store-update'));
-    return () => {
-      try {
-        unsubscribe?.();
-      } catch (error) {
-        console.warn('[rewrite-terminal][follow-tail-restore] unsubscribe failed', { sessionId, error });
-      }
-    };
-  }, [sessionId, viewer.store, viewer.transport, viewer.transportVersion]);
-
   return (
     <div className={`session-viewer${className ? ` ${className}` : ''}`} data-status={status}>
       <BeachTerminal
@@ -251,6 +199,7 @@ export function SessionViewer({ viewer, className, sessionId, disableViewportMea
         showJoinOverlay={false}
         enablePredictiveEcho={false}
         disableViewportMeasurements={disableViewportMeasurements}
+        onJoinStateChange={setJoinState}
       />
       {showLoading ? (
         <div className="session-viewer__overlay">
@@ -260,6 +209,15 @@ export function SessionViewer({ viewer, className, sessionId, disableViewportMea
       {showError ? (
         <div className="session-viewer__overlay session-viewer__overlay--error">
           <span>{viewer.error ?? 'Unknown terminal error'}</span>
+        </div>
+      ) : null}
+      {!showLoading && !showError && joinOverlay ? (
+        <div
+          className={`session-viewer__overlay${
+            joinOverlay.variant === 'error' ? ' session-viewer__overlay--error' : ''
+          }`}
+        >
+          <span>{joinOverlay.message}</span>
         </div>
       ) : null}
     </div>

@@ -43,6 +43,7 @@ interface TailRequestContext {
   nearBottom: boolean;
   followTailDesired: boolean;
   phase: FollowTailIntentPhase;
+  tailPaddingRows: number;
 }
 
 export class BackfillController {
@@ -103,7 +104,10 @@ export class BackfillController {
     const snapshotFollowTail = snapshot.followTail;
     const effectiveFollowTail =
       context.followTailDesired &&
-      (snapshotFollowTail || context.nearBottom || context.phase === 'catching_up');
+      (snapshotFollowTail ||
+        context.nearBottom ||
+        context.phase === 'catching_up' ||
+        context.tailPaddingRows > 0);
     const highestLoaded = maxLoadedRow(snapshot.rows);
     const highestTracked = snapshot.baseRow + snapshot.rows.length - 1;
     const viewportBottom = snapshot.viewportHeight > 0
@@ -113,6 +117,7 @@ export class BackfillController {
       followTailDesired: context.followTailDesired,
       followTailPhase: context.phase,
       nearBottom: context.nearBottom,
+      tailPaddingRows: context.tailPaddingRows,
       snapshotFollowTail,
       effectiveFollowTail,
       baseRow: snapshot.baseRow,
@@ -129,6 +134,7 @@ export class BackfillController {
       followTailDesired: context.followTailDesired,
       followTailPhase: context.phase,
       nearBottom: context.nearBottom,
+      tailPaddingRows: context.tailPaddingRows,
       snapshotFollowTail,
       effectiveFollowTail,
       viewportTop: snapshot.viewportTop,

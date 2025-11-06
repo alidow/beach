@@ -761,6 +761,10 @@ export class TerminalGridCache {
     let tailPaddingApplied = false;
     let fallbackFromSnapshot = false;
 
+    const highestLoaded = this.findHighestLoadedRow();
+    const highestLoadedSlot = highestLoaded !== null ? this.getRow(highestLoaded) : undefined;
+    const highestLoadedAvailable = highestLoadedSlot?.kind === 'loaded';
+
     const materializeRow = (absolute: number, options: { ignoreTailPad?: boolean } = {}): RowSlot => {
       const ignoreTailPad = Boolean(options.ignoreTailPad);
       const slot = this.getRow(absolute);
@@ -780,11 +784,11 @@ export class TerminalGridCache {
     };
 
     if (this.followTail) {
-      const highestLoaded = this.findHighestLoadedRow();
-      const highestLoadedAvailable =
-        highestLoaded !== null && this.getRow(highestLoaded)?.kind === 'loaded';
       const lastTracked = this.rows.length > 0 ? this.baseRow + this.rows.length - 1 : this.baseRow;
-      const anchor = Math.max(lastTracked, highestLoaded ?? Number.NEGATIVE_INFINITY);
+      const anchor =
+        highestLoadedAvailable && highestLoaded !== null
+          ? highestLoaded
+          : Math.max(lastTracked, highestLoaded ?? Number.NEGATIVE_INFINITY);
       const effectiveGridHeight = this.gridHeight > 0 ? this.gridHeight : 0;
       let actualRowsToShow = effectiveGridHeight > 0 ? Math.min(height, effectiveGridHeight) : 0;
       let padCount = Math.max(0, height - actualRowsToShow);
@@ -799,7 +803,7 @@ export class TerminalGridCache {
             ? snapshotLoadedRows.slice(Math.max(0, snapshotLoadedRows.length - height))
             : [];
 
-        if (snapshotSlice.length > 0) {
+        if (snapshotSlice.length > 0 && !highestLoadedAvailable) {
           const padStart = snapshotSlice[0]!.absolute - (height - snapshotSlice.length);
           const padCountSnapshot = Math.max(0, height - snapshotSlice.length);
           if (padCountSnapshot > 0) {
@@ -928,7 +932,10 @@ export class TerminalGridCache {
       return rows;
     }
     const maxStart = Math.max(this.baseRow, this.baseRow + this.rows.length - height);
-    const startAbsolute = clamp(this.viewportTop, this.baseRow, maxStart);
+    const startAbsolute =
+      this.viewportHeight <= 0 && highestLoadedAvailable && highestLoaded !== null
+        ? Math.max(this.baseRow, highestLoaded - (height - 1))
+        : clamp(this.viewportTop, this.baseRow, maxStart);
     for (let offset = 0; offset < height; offset += 1) {
       const absolute = startAbsolute + offset;
       rows.push(materializeRow(absolute));

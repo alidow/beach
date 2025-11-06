@@ -19,11 +19,11 @@ export class RewriteTerminalSizingStrategy implements TerminalSizingStrategy {
       if (hostMeta.forcedViewportRows && hostMeta.forcedViewportRows > 0) {
         return hostMeta.forcedViewportRows;
       }
-      if (hostMeta.preferredViewportRows && hostMeta.preferredViewportRows > 0) {
-        return hostMeta.preferredViewportRows;
-      }
       if (hostMeta.lastViewportRows && hostMeta.lastViewportRows > 0) {
         return hostMeta.lastViewportRows;
+      }
+      if (hostMeta.preferredViewportRows && hostMeta.preferredViewportRows > 0) {
+        return hostMeta.preferredViewportRows;
       }
       return hostMeta.defaultViewportRows;
     };
@@ -52,7 +52,10 @@ export class RewriteTerminalSizingStrategy implements TerminalSizingStrategy {
       typeof hostMeta.preferredViewportRows === 'number' && hostMeta.preferredViewportRows > 0
         ? hostMeta.preferredViewportRows
         : null;
-    const targetRows = preferred ?? measuredRows;
+    const measuredSlack = Math.max(1, Math.ceil(measuredRows * 0.2));
+    const maxWithSlack = measuredRows + measuredSlack;
+    const preferredWithSlack = preferred != null ? Math.min(preferred, maxWithSlack) : null;
+    const targetRows = preferredWithSlack != null ? Math.max(measuredRows, preferredWithSlack) : measuredRows;
     const viewportRows = clampRows(targetRows);
     if (typeof window !== 'undefined' && window.__BEACH_TRACE) {
       try {

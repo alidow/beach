@@ -53,6 +53,7 @@ describe('BackfillController follow-tail intent', () => {
       nearBottom: false,
       followTailDesired: false,
       phase: 'manual_scrollback',
+      tailPaddingRows: 0,
     });
 
     const snapshotAfter = store.getSnapshot();
@@ -78,10 +79,36 @@ describe('BackfillController follow-tail intent', () => {
       nearBottom: false,
       followTailDesired: true,
       phase: 'catching_up',
+      tailPaddingRows: 0,
     });
 
     const snapshotAfter = store.getSnapshot();
     expect(sendFrame).toHaveBeenCalled();
     expect(snapshotAfter.followTail).toBe(false);
+  });
+
+  it('treats placeholder padding as tail intent when scanning for gaps', () => {
+    const store = new TerminalGridStore();
+    store.setGridSize(120, 80);
+    seedRows(store, 0, 110);
+    store.markPendingRange(110, 120);
+    store.setViewport(96, 24);
+    store.setFollowTail(true);
+
+    const sendFrame = vi.fn();
+    const controller = new BackfillController(store, sendFrame);
+    controller.handleFrame(helloFrame());
+
+    const snapshotBefore = store.getSnapshot();
+    controller.maybeRequest(snapshotBefore, {
+      nearBottom: false,
+      followTailDesired: true,
+      phase: 'follow_tail',
+      tailPaddingRows: 12,
+    });
+
+    expect(sendFrame).toHaveBeenCalled();
+    const snapshotAfter = store.getSnapshot();
+    expect(snapshotAfter.followTail).toBe(true);
   });
 });

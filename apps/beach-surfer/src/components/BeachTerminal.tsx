@@ -41,7 +41,7 @@ import { createLegacyTerminalSizingStrategy } from '../../../private-beach/src/c
 
 export type TerminalStatus = 'idle' | 'connecting' | 'connected' | 'error' | 'closed';
 
-type JoinOverlayState =
+export type JoinOverlayState =
   | 'idle'
   | 'connecting'
   | 'waiting'
@@ -467,6 +467,7 @@ export interface BeachTerminalProps {
   enablePredictiveEcho?: boolean;
   enableKeyboardShortcuts?: boolean;
   showJoinOverlay?: boolean;
+  onJoinStateChange?: (snapshot: { state: JoinOverlayState; message: string | null }) => void;
 }
 
 export type FollowTailPhase = 'hydrating' | 'follow_tail' | 'manual_scrollback' | 'catching_up';
@@ -484,6 +485,7 @@ export interface TerminalViewportState {
   followTailPhase: FollowTailPhase;
   atTail: boolean;
   remainingTailPixels: number;
+  tailPaddingRows: number;
 }
 
 export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
@@ -518,6 +520,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     enablePredictiveEcho = true,
     enableKeyboardShortcuts = true,
     showJoinOverlay = true,
+    onJoinStateChange,
   } = props;
 
   const store = useMemo(() => providedStore ?? createTerminalStore(), [providedStore]);
@@ -562,6 +565,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     followTailPhase: FollowTailPhase;
     atTail: boolean;
     remainingTailPixels: number;
+    tailPaddingRows: number;
   } | null>(null);
   const disableMeasurementsPrevRef = useRef<boolean>(disableViewportMeasurements);
   const [status, setStatus] = useState<TerminalStatus>(
@@ -595,10 +599,13 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const followTailPhaseRef = useRef<FollowTailPhase>('hydrating');
   const hydratingRef = useRef<boolean>(true);
   const programmaticScrollRef = useRef<boolean>(false);
-  const tailMetricsRef = useRef<{ remainingPixels: number; atTail: boolean }>({
+  const lastScrollSnapshotRef = useRef<{ top: number; height: number }>({ top: 0, height: 0 });
+  const tailMetricsRef = useRef<{ remainingPixels: number; atTail: boolean; paddingRows: number }>({
     remainingPixels: Number.POSITIVE_INFINITY,
     atTail: false,
+    paddingRows: 0,
   });
+  const tailPaddingRowsRef = useRef<number>(0);
   const {
     tick: predictionTick,
     recordSend: recordPredictionSend,
@@ -689,18 +696,6 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     [],
   );
 
-  const setFollowTailPhase = useCallback(
-    (phase: FollowTailPhase, reason: string) => {
-      if (followTailPhaseRef.current === phase) {
-        return;
-      }
-      followTailPhaseRef.current = phase;
-      setFollowTailPhaseState(phase);
-      trace('follow_tail_phase', { phase, reason });
-    },
-    [],
-  );
-
   const setFollowTailDesired = useCallback(
     (desired: boolean, reason: string) => {
       if (followTailDesiredRef.current === desired) {
@@ -719,26 +714,69 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       const phase = followTailPhaseRef.current;
       const hydrating = hydratingRef.current;
       trace('follow_tail_apply_intent', { desired, hydrating, phase, reason });
-      if (hydrating) {
-        store.setFollowTail(false);
-        return;
-      }
-      store.setFollowTail(desired);
+      const effective = hydrating ? false : desired && phase !== 'manual_scrollback';
+      store.setFollowTail(effective);
     },
     [store],
   );
 
-  const updateTailMetrics = useCallback(
-    (remainingPixels: number, atTail: boolean, reason: string) => {
-      const previous = tailMetricsRef.current;
-      if (
-        previous.remainingPixels === remainingPixels &&
-        previous.atTail === atTail
-      ) {
+  const setFollowTailPhase = useCallback(
+    (phase: FollowTailPhase, reason: string) => {
+      if (followTailPhaseRef.current === phase) {
         return;
       }
-      tailMetricsRef.current = { remainingPixels, atTail };
-      trace('follow_tail_metrics', { remainingPixels, atTail, reason });
+      followTailPhaseRef.current = phase;
+      setFollowTailPhaseState(phase);
+      trace('follow_tail_phase', { phase, reason });
+    },
+    [],
+  );
+
+  const enterManualScrollback = useCallback(
+    (reason: string) => {
+      setFollowTailDesired(false, reason);
+      setFollowTailPhase('manual_scrollback', reason);
+      applyFollowTailIntent(reason);
+    },
+    [applyFollowTailIntent, setFollowTailDesired, setFollowTailPhase],
+  );
+
+  const enterTailIntent = useCallback(
+    (reason: string) => {
+      setFollowTailDesired(true, reason);
+      const nextPhase = tailPaddingRowsRef.current > 0 ? 'catching_up' : 'follow_tail';
+      setFollowTailPhase(nextPhase, reason);
+      applyFollowTailIntent(reason);
+    },
+    [applyFollowTailIntent, setFollowTailDesired, setFollowTailPhase],
+  );
+
+  const updateTailMetrics = useCallback(
+    (remainingPixels: number, atTail: boolean, reason: string) => {
+      const state = tailMetricsRef.current;
+      if (state.remainingPixels === remainingPixels && state.atTail === atTail) {
+        return;
+      }
+      state.remainingPixels = remainingPixels;
+      state.atTail = atTail;
+      trace('follow_tail_metrics', { remainingPixels, atTail, paddingRows: state.paddingRows, reason });
+    },
+    [],
+  );
+
+  const syncTailPadding = useCallback(
+    (paddingRows: number, reason: string) => {
+      const state = tailMetricsRef.current;
+      if (state.paddingRows === paddingRows) {
+        return;
+      }
+      state.paddingRows = paddingRows;
+      trace('follow_tail_metrics', {
+        remainingPixels: state.remainingPixels,
+        atTail: state.atTail,
+        paddingRows,
+        reason,
+      });
     },
     [],
   );
@@ -770,8 +808,11 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       }
       LAST_JOIN_STATE.set(sessionId, snapshot);
       emitJoinState(sessionId, snapshot, skipEmitId);
+      if (onJoinStateChange) {
+        onJoinStateChange(snapshot);
+      }
     },
-    [sessionId],
+    [onJoinStateChange, sessionId],
   );
   const finishConnectionTrace = useCallback(
     (outcome: 'success' | 'error' | 'cancelled', extra: Record<string, unknown> = {}) => {
@@ -990,6 +1031,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     const hostViewportRows = ptyViewportRowsRef.current;
     const hostCols = ptyColsRef.current;
     const canSendResize = Boolean(transportRef.current) && !viewOnly;
+    tailMetricsRef.current.paddingRows = tailPaddingRowsRef.current;
     const tailMetrics = tailMetricsRef.current;
     const followTailDesired = followTailDesiredRef.current;
     const followTailPhase = followTailPhaseRef.current;
@@ -1004,6 +1046,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       followTailPhase,
       atTail: tailMetrics.atTail,
       remainingTailPixels: tailMetrics.remainingPixels,
+      tailPaddingRows: tailMetrics.paddingRows,
     };
     const previous = lastViewportReportRef.current;
     trace(
@@ -1019,6 +1062,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         followTailPhase,
         atTail: tailMetrics.atTail,
         remainingTailPixels: tailMetrics.remainingPixels,
+        tailPaddingRows: tailMetrics.paddingRows,
         suppressed: Boolean(
           previous &&
             previous.viewportRows === nextReport.viewportRows &&
@@ -1030,7 +1074,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
             previous.followTailDesired === nextReport.followTailDesired &&
             previous.followTailPhase === nextReport.followTailPhase &&
             previous.atTail === nextReport.atTail &&
-            previous.remainingTailPixels === nextReport.remainingTailPixels,
+            previous.remainingTailPixels === nextReport.remainingTailPixels &&
+            previous.tailPaddingRows === nextReport.tailPaddingRows,
         ),
       }),
     );
@@ -1045,7 +1090,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         previous.followTailDesired === nextReport.followTailDesired &&
         previous.followTailPhase === nextReport.followTailPhase &&
         previous.atTail === nextReport.atTail &&
-        previous.remainingTailPixels === nextReport.remainingTailPixels
+        previous.remainingTailPixels === nextReport.remainingTailPixels &&
+        previous.tailPaddingRows === nextReport.tailPaddingRows
     ) {
       return;
     }
@@ -1064,6 +1110,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           followTailPhase: nextReport.followTailPhase,
           atTail: nextReport.atTail,
           remainingTailPixels: nextReport.remainingTailPixels,
+          tailPaddingRows: nextReport.tailPaddingRows,
         });
       } catch {
         // ignore logging issues
@@ -1090,40 +1137,27 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         return;
       }
       hydratingRef.current = false;
-      const desired = followTailDesiredRef.current;
-      const snapshotNow = store.getSnapshot();
-      const nextPhase: FollowTailPhase = desired
-        ? snapshotNow.followTail
-          ? 'follow_tail'
-          : 'catching_up'
-        : 'manual_scrollback';
-      setFollowTailPhase(nextPhase, reason);
+      if (followTailDesiredRef.current) {
+        const phase = tailPaddingRowsRef.current > 0 ? 'catching_up' : 'follow_tail';
+        setFollowTailPhase(phase, reason);
+      } else {
+        setFollowTailPhase('manual_scrollback', reason);
+      }
       applyFollowTailIntent(reason);
       emitViewportState();
     },
-    [applyFollowTailIntent, emitViewportState, setFollowTailPhase, store],
+    [applyFollowTailIntent, emitViewportState, setFollowTailPhase],
   );
 
   useEffect(() => {
     followTailDesiredRef.current = followTailDesiredState;
-  }, [followTailDesiredState]);
+    applyFollowTailIntent('intent-state-change');
+  }, [followTailDesiredState, applyFollowTailIntent]);
 
   useEffect(() => {
     followTailPhaseRef.current = followTailPhaseState;
-  }, [followTailPhaseState]);
-
-  useEffect(() => {
-    if (hydratingRef.current) {
-      return;
-    }
-    const desired = followTailDesiredRef.current;
-    const nextPhase: FollowTailPhase = desired
-      ? snapshot.followTail
-        ? 'follow_tail'
-        : 'catching_up'
-      : 'manual_scrollback';
-    setFollowTailPhase(nextPhase, 'snapshot-sync');
-  }, [snapshot.followTail, followTailDesiredState, setFollowTailPhase]);
+    applyFollowTailIntent('phase-state-change');
+  }, [followTailPhaseState, applyFollowTailIntent]);
 
   const enterWaitingState = useCallback(
     (message?: string) => {
@@ -1293,6 +1327,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         default:
           break;
       }
+      if (onJoinStateChange) {
+        onJoinStateChange({ state, message });
+      }
     };
     const cached = LAST_JOIN_STATE.get(sessionId);
     if (cached) {
@@ -1309,6 +1346,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     enterWaitingState,
     joinMessage,
     joinState,
+    onJoinStateChange,
     sessionId,
     updateJoinStateCache,
   ]);
@@ -1330,6 +1368,31 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     }
   }, [hideIdlePlaceholder, status, onStatusChange]);
   const lines = useMemo(() => buildLines(snapshot, 600, effectiveOverlay), [snapshot, effectiveOverlay]);
+  const placeholderRowsInViewport = useMemo(
+    () => lines.reduce((count, line) => (line.kind === 'loaded' ? count : count + 1), 0),
+    [lines],
+  );
+
+  useEffect(() => {
+    tailPaddingRowsRef.current = placeholderRowsInViewport;
+    syncTailPadding(placeholderRowsInViewport, 'placeholder-sync');
+    if (
+      !hydratingRef.current &&
+      followTailDesiredRef.current &&
+      followTailPhaseRef.current !== 'manual_scrollback'
+    ) {
+      const nextPhase = placeholderRowsInViewport > 0 ? 'catching_up' : 'follow_tail';
+      if (followTailPhaseRef.current !== nextPhase) {
+        setFollowTailPhase(nextPhase, 'placeholder-sync');
+        applyFollowTailIntent('placeholder-sync');
+      }
+    }
+  }, [
+    placeholderRowsInViewport,
+    applyFollowTailIntent,
+    setFollowTailPhase,
+    syncTailPadding,
+  ]);
   if (IS_DEV && typeof window !== 'undefined' && window.__BEACH_TRACE) {
     const sample = lines.slice(-5).map((line) => ({
       absolute: line.absolute,
@@ -2162,7 +2225,20 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
 
   useEffect(() => {
     const element = containerRef.current;
-    if (!element || scrollPolicy !== 'follow-tail' || !snapshot.followTail) {
+    if (!element) {
+      return;
+    }
+    lastScrollSnapshotRef.current = { top: element.scrollTop, height: element.clientHeight };
+  }, [snapshot.viewportTop, snapshot.viewportHeight]);
+
+  useEffect(() => {
+    const element = containerRef.current;
+    if (
+      !element ||
+      scrollPolicy !== 'follow-tail' ||
+      !followTailDesiredState ||
+      followTailPhaseState === 'manual_scrollback'
+    ) {
       return;
     }
     const applyScroll = () => {
@@ -2240,7 +2316,6 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     }
     applyScroll();
   }, [
-    snapshot.followTail,
     snapshot.baseRow,
     snapshot.rows.length,
     lastAbsolute,
@@ -2250,6 +2325,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     lines.length,
     effectiveLineHeight,
     scrollPolicy,
+    followTailDesiredState,
+    followTailPhaseState,
   ]);
 
   const INPUT_MAX_FRAME_BYTES = 32 * 1024; // conservative cap per input frame
@@ -2547,12 +2624,38 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     try {
       transport.send({ type: 'resize', cols: targetCols, rows: clampedRows });
       lastSentViewportCols.current = targetCols;
+      enterTailIntent('match-host-viewport');
     } catch (err) {
       if (IS_DEV) {
         console.warn('[beach-surfer] match_host_viewport send failed', err);
       }
     }
-  }, [log, queryLabel, store, viewOnly]);
+  }, [enterTailIntent, log, queryLabel, store, viewOnly]);
+
+  const handleJumpToTail = useCallback(() => {
+    const element = containerRef.current;
+    if (!element) {
+      enterTailIntent('jump-to-tail');
+      return;
+    }
+    enterTailIntent('jump-to-tail');
+    const target = element.scrollHeight - element.clientHeight;
+    if (target < 0) {
+      return;
+    }
+    programmaticScrollRef.current = true;
+    element.scrollTop = target;
+    lastScrollSnapshotRef.current = { top: element.scrollTop, height: element.clientHeight };
+    if (typeof queueMicrotask === 'function') {
+      queueMicrotask(() => {
+        programmaticScrollRef.current = false;
+      });
+    } else {
+      setTimeout(() => {
+        programmaticScrollRef.current = false;
+      }, 0);
+    }
+  }, [enterTailIntent]);
   const statusColor = useMemo(() => {
     switch (status) {
       case 'connected':
@@ -2586,6 +2689,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       ? 'cursor-not-allowed border border-[#1b2638] bg-[#101724] text-[#4c5d7f] opacity-60'
       : 'border border-[#254f8c] bg-[#2d60aa] text-[#d7e4ff] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.18)] hover:bg-[#346bc0]',
   );
+  const jumpToTailAvailable =
+    scrollPolicy === 'follow-tail' &&
+    (!followTailDesiredState || followTailPhaseState === 'manual_scrollback');
 
   return (
     <div ref={wrapperRef} className={wrapperClasses}>
@@ -2692,7 +2798,16 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       </div>
       {showStatusBar ? (
         <footer className={statusBarClasses}>
-          {renderStatus()}
+          <span>{renderStatus()}</span>
+          {jumpToTailAvailable ? (
+            <button
+              type="button"
+              onClick={handleJumpToTail}
+              className="ml-auto inline-flex items-center gap-1 rounded-full border border-[#1f2937] bg-[#19202c] px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.32em] text-[#d3dbef] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.12)] transition hover:bg-[#1f2736] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40"
+            >
+              Jump to tail
+            </button>
+          ) : null}
         </footer>
       ) : null}
     </div>
@@ -2701,6 +2816,14 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   function handleScroll(event: UIEvent<HTMLDivElement>): void {
     const element = event.currentTarget;
     const pixelsPerRow = Math.max(1, effectiveLineHeight);
+    const previousSnapshot = lastScrollSnapshotRef.current;
+    const previousScrollTop = previousSnapshot.top;
+    const previousHeight = previousSnapshot.height;
+    const scrollEpsilon = Math.max(1, pixelsPerRow * 0.25);
+    const heightChanged = Math.abs(previousHeight - element.clientHeight) > scrollEpsilon;
+    const deltaPixels = element.scrollTop - previousScrollTop;
+    const userScrolledUp = deltaPixels < -scrollEpsilon && !heightChanged;
+    lastScrollSnapshotRef.current = { top: element.scrollTop, height: element.clientHeight };
     const approxRow = Math.max(
       snapshot.baseRow,
       snapshot.baseRow + Math.floor(element.scrollTop / pixelsPerRow),
@@ -2723,7 +2846,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     });
 
     const remainingPixels = Math.max(0, element.scrollHeight - (element.scrollTop + element.clientHeight));
-    const atTail = shouldReenableFollowTail(remainingPixels, pixelsPerRow);
+    const hasTailPadding = tailPaddingRowsRef.current > 0;
+    const atTail = hasTailPadding
+      ? followTailDesiredRef.current
+      : shouldReenableFollowTail(remainingPixels, pixelsPerRow);
     updateTailMetrics(remainingPixels, atTail, 'scroll');
     const nearBottom = remainingPixels <= pixelsPerRow * 2;
     const previousFollowTail = snapshot.followTail;
@@ -2731,22 +2857,27 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     if (programmatic) {
       programmaticScrollRef.current = false;
     }
-    if (!programmatic && scrollPolicy === 'follow-tail') {
-      if (!atTail && followTailDesiredRef.current) {
-        setFollowTailDesired(false, 'user-scroll-away');
-      } else if (atTail && !followTailDesiredRef.current) {
-        setFollowTailDesired(true, 'user-scroll-tail');
-      }
+    const inferredProgrammatic = programmatic || heightChanged;
+    if (!inferredProgrammatic && scrollPolicy === 'follow-tail') {
       hydratingRef.current = false;
-      applyFollowTailIntent('scroll');
+      if (followTailDesiredRef.current && userScrolledUp) {
+        enterManualScrollback('user-scroll-away');
+      }
     }
     const nextSnapshot = store.getSnapshot();
     trace('scroll tail decision', {
       previousFollowTail,
       requestedFollowTail: followTailDesiredRef.current,
       appliedFollowTail: nextSnapshot.followTail,
+      phase: followTailPhaseRef.current,
       nearBottom,
       remainingPixels,
+      atTail,
+      hasTailPadding,
+      tailPaddingRows: tailPaddingRowsRef.current,
+      programmaticScroll: programmatic,
+      heightChanged,
+      inferredProgrammatic,
       lineHeight,
       measuredLineHeight: pixelsPerRow,
       viewportRows,
@@ -2774,6 +2905,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       nearBottom,
       followTailDesired: followTailDesiredRef.current,
       phase: followTailPhaseRef.current,
+      tailPaddingRows: tailPaddingRowsRef.current,
     });
     emitViewportState();
   }
@@ -3116,6 +3248,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           nearBottom: current.followTail,
           followTailDesired: followTailDesiredRef.current,
           phase: followTailPhaseRef.current,
+          tailPaddingRows: tailPaddingRowsRef.current,
         });
         break;
       }

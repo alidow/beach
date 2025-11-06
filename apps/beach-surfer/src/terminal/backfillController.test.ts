@@ -59,6 +59,7 @@ describe('BackfillController', () => {
       nearBottom: true,
       followTailDesired: true,
       phase: 'follow_tail',
+      tailPaddingRows: 0,
     });
 
     expect(frames).toHaveLength(1);

@@ -106,4 +106,49 @@ describe('TerminalGridCache tail fallback', () => {
     expect(fallbackLines.map((line) => line.kind)).toEqual(['loaded', 'loaded', 'loaded', 'loaded']);
     expect(fallbackLines[fallbackLines.length - 1]?.absolute).toBe(99);
   });
+
+  it('prefers live rows over stale snapshot when tail padding extends above base row', () => {
+    const store = new TerminalGridStore();
+    const cache = (store as unknown as { cache: any }).cache;
+
+    store.setBaseRow(0);
+    store.setGridSize(200, 80);
+
+    const initialUpdates = [];
+    for (let row = 0; row < 140; row += 1) {
+      initialUpdates.push({
+        type: 'row' as const,
+        row,
+        seq: row + 1,
+        cells: makeCells(`Initial ${row}`),
+      });
+    }
+    store.applyUpdates(initialUpdates, { authoritative: true });
+    store.setViewport(120, 20);
+    store.setFollowTail(true);
+
+    // Prime the snapshot with older rows.
+    buildLines(store.getSnapshot(), 20);
+
+    // Append enough rows to expand the tail significantly.
+    const appendedUpdates = [];
+    for (let row = 140; row < 170; row += 1) {
+      appendedUpdates.push({
+        type: 'row' as const,
+        row,
+        seq: row + 1,
+        cells: makeCells(`Appended ${row}`),
+      });
+    }
+    store.applyUpdates(appendedUpdates, { authoritative: true });
+    cache.gridHeight = 0;
+
+    const snapshot = store.getSnapshot();
+    const lines = buildLines(snapshot, 20);
+
+    const absolutes = lines.map((line) => line.absolute);
+    expect(absolutes[0]).toBeGreaterThanOrEqual(150);
+    expect(absolutes[absolutes.length - 1]).toBe(169);
+    expect(lines.every((line) => line.kind === 'loaded')).toBe(true);
+  });
 });

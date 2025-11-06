@@ -19,11 +19,11 @@ export class RewriteTerminalSizingStrategy implements TerminalSizingStrategy {
       if (hostMeta.forcedViewportRows && hostMeta.forcedViewportRows > 0) {
         return hostMeta.forcedViewportRows;
       }
-      if (hostMeta.preferredViewportRows && hostMeta.preferredViewportRows > 0) {
-        return hostMeta.preferredViewportRows;
-      }
       if (hostMeta.lastViewportRows && hostMeta.lastViewportRows > 0) {
         return hostMeta.lastViewportRows;
+      }
+      if (hostMeta.preferredViewportRows && hostMeta.preferredViewportRows > 0) {
+        return hostMeta.preferredViewportRows;
       }
       return hostMeta.defaultViewportRows;
     };
@@ -48,11 +48,16 @@ export class RewriteTerminalSizingStrategy implements TerminalSizingStrategy {
     }
 
     const measuredRows = Math.max(1, Math.floor(height / rowHeight));
-    const preferred =
+    const rawPreferred =
       typeof hostMeta.preferredViewportRows === 'number' && hostMeta.preferredViewportRows > 0
         ? hostMeta.preferredViewportRows
         : null;
-    const targetRows = preferred ?? measuredRows;
+    const preferred =
+      rawPreferred !== null ? clampRows(rawPreferred) : null;
+    const overshootAllowance = Math.max(2, Math.ceil(measuredRows * 0.2));
+    const preferredTapered =
+      preferred !== null ? Math.min(preferred, measuredRows + overshootAllowance) : null;
+    const targetRows = preferredTapered ?? measuredRows;
     const viewportRows = clampRows(targetRows);
     if (typeof window !== 'undefined' && window.__BEACH_TRACE) {
       try {
@@ -68,10 +73,11 @@ export class RewriteTerminalSizingStrategy implements TerminalSizingStrategy {
         // ignore logging errors
       }
     }
+    const fallbackRows = rawPreferred ?? undefined;
     return {
       viewportRows,
       measuredRows,
-      fallbackRows: preferred ?? undefined,
+      fallbackRows,
     };
   }
 

@@ -23,6 +23,7 @@ describe('buildLines', () => {
       ],
       { authoritative: true },
     );
+    store.setFollowTail(true);
     store.setViewport(100, 2);
 
     const snapshot = store.getSnapshot();
@@ -58,6 +59,7 @@ describe('buildLines', () => {
       packRow(3, 'row3'),
     ]);
     store.setFollowTail(false);
+    store.setViewport(1, 2);
     store.setViewport(1, 2);
 
     const snapshot = store.getSnapshot();

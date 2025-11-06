@@ -9,21 +9,42 @@ import type {
 export class RewriteTerminalSizingStrategy implements TerminalSizingStrategy {
   nextViewport(tileRect: DOMRectReadOnly, hostMeta: TerminalSizingHostMeta): TerminalViewportProposal {
     const rowHeight = Math.max(1, Math.floor(hostMeta.lineHeightPx));
+    const clampRows = (rows: number | null | undefined): number => {
+      const numeric = Number.isFinite(rows) && rows != null ? Math.round(rows as number) : 0;
+      const safe = numeric > 0 ? numeric : hostMeta.defaultViewportRows;
+      return Math.max(hostMeta.minViewportRows, Math.min(safe, hostMeta.maxViewportRows));
+    };
+
+    const resolveFallback = (): number => {
+      if (hostMeta.forcedViewportRows && hostMeta.forcedViewportRows > 0) {
+        return hostMeta.forcedViewportRows;
+      }
+      if (hostMeta.preferredViewportRows && hostMeta.preferredViewportRows > 0) {
+        return hostMeta.preferredViewportRows;
+      }
+      if (hostMeta.lastViewportRows && hostMeta.lastViewportRows > 0) {
+        return hostMeta.lastViewportRows;
+      }
+      return hostMeta.defaultViewportRows;
+    };
+
+    if (hostMeta.disableViewportMeasurements) {
+      const fallbackRows = resolveFallback();
+      return {
+        viewportRows: clampRows(fallbackRows),
+        fallbackRows,
+      };
+    }
+
     if (rowHeight <= 0) {
-      const fallback =
-        hostMeta.preferredViewportRows ??
-        hostMeta.lastViewportRows ??
-        hostMeta.defaultViewportRows;
-      return { viewportRows: Math.max(1, fallback ?? hostMeta.defaultViewportRows) };
+      const fallbackRows = resolveFallback();
+      return { viewportRows: clampRows(fallbackRows), fallbackRows };
     }
 
     const height = Number.isFinite(tileRect.height) ? Math.max(0, tileRect.height) : 0;
     if (height <= 0) {
-      const fallback =
-        hostMeta.preferredViewportRows ??
-        hostMeta.lastViewportRows ??
-        hostMeta.defaultViewportRows;
-      return { viewportRows: Math.max(1, fallback ?? hostMeta.defaultViewportRows) };
+      const fallbackRows = resolveFallback();
+      return { viewportRows: clampRows(fallbackRows), fallbackRows };
     }
 
     const measuredRows = Math.max(1, Math.floor(height / rowHeight));
@@ -32,10 +53,7 @@ export class RewriteTerminalSizingStrategy implements TerminalSizingStrategy {
         ? hostMeta.preferredViewportRows
         : null;
     const targetRows = preferred ?? measuredRows;
-    const viewportRows = Math.max(
-      hostMeta.minViewportRows,
-      Math.min(targetRows, hostMeta.maxViewportRows),
-    );
+    const viewportRows = clampRows(targetRows);
     if (typeof window !== 'undefined' && window.__BEACH_TRACE) {
       try {
         console.info('[rewrite-sizing] rows', {

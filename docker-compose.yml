@@ -76,6 +76,22 @@ services:
       - "4132:4132"
     networks:
       - beach-network
+  beach-surfer:
+    image: node:20
+    container_name: beach-surfer
+    working_dir: /app/apps/beach-surfer
+    command: sh -c "rm -f package-lock.json && npm install --force && npm run dev -- --host"
+    environment:
+      VITE_SESSION_SERVER_URL: http://localhost:4132
+    volumes:
+      - .:/app
+      - beach-surfer-node-modules:/app/apps/beach-surfer/node_modules
+    depends_on:
+      - beach-road
+    ports:
+      - "5173:5173"
+    networks:
+      - beach-network
   beach-gate:
     image: node:20
     container_name: beach-gate
@@ -276,6 +292,7 @@ volumes:
   cargo-registry-beach-manager:
   cargo-registry-beach-road:
   cargo-registry-beach-lifeguard:
+  beach-surfer-node-modules:
 
 networks:
   beach-network:

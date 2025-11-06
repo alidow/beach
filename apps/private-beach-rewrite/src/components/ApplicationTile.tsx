@@ -16,6 +16,7 @@ type ApplicationTileProps = {
   managerUrl?: string;
   sessionMeta?: TileSessionMeta | null;
   onSessionMetaChange?: (meta: TileSessionMeta | null) => void;
+  disableViewportMeasurements?: boolean;
 };
 
 type SubmitState = 'idle' | 'attaching';
@@ -60,6 +61,7 @@ export function ApplicationTile({
   managerUrl = buildManagerUrl(),
   sessionMeta,
   onSessionMetaChange,
+  disableViewportMeasurements = false,
 }: ApplicationTileProps) {
   const [sessionIdInput, setSessionIdInput] = useState(sessionMeta?.sessionId ?? '');
   const [codeInput, setCodeInput] = useState('');
@@ -115,7 +117,23 @@ export function ApplicationTile({
         if (hydrated) {
           prehydratedSequenceRef.current = sequenceKey;
           if (typeof window !== 'undefined') {
-            console.info('[terminal][hydrate] applied cached diff', { sessionId, sequence: diff.sequence ?? 0 });
+            try {
+              const snapshot = store.getSnapshot();
+              console.info('[terminal][hydrate] applied cached diff', {
+                sessionId,
+                sequence: diff.sequence ?? 0,
+                rows: snapshot.rows.length,
+                baseRow: snapshot.baseRow,
+                viewportTop: snapshot.viewportTop,
+                viewportHeight: snapshot.viewportHeight,
+              });
+            } catch (error) {
+              console.info('[terminal][hydrate] applied cached diff', {
+                sessionId,
+                sequence: diff.sequence ?? 0,
+                snapshotError: error instanceof Error ? error.message : String(error),
+              });
+            }
           }
         }
       } catch (error) {
@@ -292,7 +310,11 @@ export function ApplicationTile({
             <p className="application-tile__error application-tile__error--inline">{viewer.error}</p>
           )}
           <div className="application-tile__preview">
-            <SessionViewer viewer={viewer} sessionId={sessionMeta?.sessionId ?? null} />
+            <SessionViewer
+              viewer={viewer}
+              sessionId={sessionMeta?.sessionId ?? null}
+              disableViewportMeasurements={disableViewportMeasurements}
+            />
           </div>
         </div>
       )}

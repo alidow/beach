@@ -44,7 +44,7 @@ function isInteractiveElement(target: EventTarget | null): boolean {
 
 type Props = NodeProps<TileFlowNodeData>;
 
-export function TileFlowNode({ data }: Props) {
+export function TileFlowNode({ data, dragging }: Props) {
   const { tile, orderIndex, isActive, isResizing, privateBeachId, managerUrl, rewriteEnabled } = data;
   const { removeTile, bringToFront, setActiveTile, beginResize, resizeTile, endResize, updateTileMeta } = useTileActions();
   const nodeRef = useRef<HTMLElement | null>(null);
@@ -184,6 +184,7 @@ export function TileFlowNode({ data }: Props) {
           managerUrl={managerUrl}
           sessionMeta={tile.sessionMeta ?? null}
           onSessionMetaChange={handleMetaChange}
+          disableViewportMeasurements={dragging}
         />
       </section>
     </article>

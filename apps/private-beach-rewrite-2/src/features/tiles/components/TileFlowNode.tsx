@@ -59,7 +59,7 @@ function isInteractiveElement(target: EventTarget | null): boolean {
 
 type Props = NodeProps<TileFlowNodeData>;
 
-export function TileFlowNode({ data }: Props) {
+export function TileFlowNode({ data, dragging }: Props) {
   const { tile, orderIndex, isActive, isResizing, isInteractive, privateBeachId, managerUrl, rewriteEnabled } = data;
   const {
     removeTile,
@@ -341,6 +341,7 @@ export function TileFlowNode({ data }: Props) {
           managerUrl={managerUrl}
           sessionMeta={tile.sessionMeta ?? null}
           onSessionMetaChange={handleMetaChange}
+          disableViewportMeasurements={dragging}
         />
       </section>
       <button

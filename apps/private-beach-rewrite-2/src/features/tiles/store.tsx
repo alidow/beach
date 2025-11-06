@@ -21,6 +21,7 @@ type Action =
   | { type: 'SET_ACTIVE_TILE'; payload: { id: string | null } }
   | { type: 'BRING_TO_FRONT'; payload: { id: string } }
   | { type: 'SET_TILE_POSITION'; payload: { id: string; position: Partial<TilePosition> } }
+  | { type: 'SET_TILE_POSITION_IMMEDIATE'; payload: { id: string; position: Partial<TilePosition> } }
   | { type: 'SET_TILE_SIZE'; payload: { id: string; size: TileResizeInput } }
   | { type: 'START_RESIZE'; payload: { id: string } }
   | { type: 'END_RESIZE'; payload: { id: string } }
@@ -163,6 +164,29 @@ function reducer(state: TileState, action: Action): TileState {
       };
       return { ...state, tiles };
     }
+    case 'SET_TILE_POSITION_IMMEDIATE': {
+      const { id, position: patch } = action.payload;
+      const tile = state.tiles[id];
+      if (!tile) {
+        return state;
+      }
+      const x =
+        typeof patch.x === 'number' && Number.isFinite(patch.x) ? patch.x : tile.position.x;
+      const y =
+        typeof patch.y === 'number' && Number.isFinite(patch.y) ? patch.y : tile.position.y;
+      if (x === tile.position.x && y === tile.position.y) {
+        return state;
+      }
+      const tiles = {
+        ...state.tiles,
+        [id]: {
+          ...tile,
+          position: { x, y },
+          updatedAt: Date.now(),
+        },
+      };
+      return { ...state, tiles };
+    }
     case 'SET_TILE_SIZE': {
       const { id, size } = action.payload;
       const tile = state.tiles[id];
@@ -260,6 +284,8 @@ export function useTileActions() {
         dispatch({ type: 'UPSERT_TILE', payload: { input: { id, sessionMeta, focus: false } } }),
       setTilePosition: (id: string, position: Partial<TilePosition>) =>
         dispatch({ type: 'SET_TILE_POSITION', payload: { id, position } }),
+      setTilePositionImmediate: (id: string, position: Partial<TilePosition>) =>
+        dispatch({ type: 'SET_TILE_POSITION_IMMEDIATE', payload: { id, position } }),
       resizeTile: (id: string, size: TileResizeInput) =>
         dispatch({ type: 'SET_TILE_SIZE', payload: { id, size } }),
       beginResize: (id: string) => dispatch({ type: 'START_RESIZE', payload: { id } }),

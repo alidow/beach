@@ -13,9 +13,20 @@ function trace(...parts: unknown[]): void {
   }
 }
 
+function info(label: string, payload?: unknown): void {
+  if (typeof window !== 'undefined' && window.__BEACH_TRACE) {
+    if (payload === undefined) {
+      console.info('[beach-trace][backfill]', label);
+    } else {
+      console.info('[beach-trace][backfill]', label, payload);
+    }
+  }
+}
+
 const BACKFILL_LOOKAHEAD_ROWS = 64;
 const BACKFILL_MAX_ROWS_PER_REQUEST = 256;
 const BACKFILL_THROTTLE_MS = 200;
+const FORCED_FOLLOW_TAIL_RESTORE_SLACK = 2;
 
 interface PendingRange {
   id: number;
@@ -33,6 +44,8 @@ export class BackfillController {
   private nextRequestId = 1;
   private pending: PendingRange[] = [];
   private lastRequestAt = 0;
+  private forcedFollowTail = false;
+  private restoreFollowTail = false;
 
   constructor(store: TerminalGridStore, sendFrame: SendFrameFn) {
     this.store = store;
@@ -79,21 +92,80 @@ export class BackfillController {
       return;
     }
     const now = Date.now();
+    const snapshotFollowTail = snapshot.followTail;
+    const effectiveFollowTail = followTail || snapshotFollowTail;
+    const highestLoaded = maxLoadedRow(snapshot.rows);
+    const highestTracked = snapshot.baseRow + snapshot.rows.length - 1;
+    const viewportBottom = snapshot.viewportHeight > 0
+      ? snapshot.viewportTop + snapshot.viewportHeight - 1
+      : snapshot.viewportTop;
     trace('maybe_request', {
-      followTail,
+      followTailParam: followTail,
+      snapshotFollowTail,
+      effectiveFollowTail,
       baseRow: snapshot.baseRow,
       viewportTop: snapshot.viewportTop,
       viewportHeight: snapshot.viewportHeight,
+      viewportBottom,
+      highestLoaded,
+      highestTracked,
       totalRows: snapshot.rows.length,
       pending: this.pending.length,
       lastRequestAt: this.lastRequestAt,
     });
+    info('maybe_request', {
+      followTailParam: followTail,
+      snapshotFollowTail,
+      effectiveFollowTail,
+      viewportTop: snapshot.viewportTop,
+      viewportBottom,
+      highestLoaded,
+      highestTracked,
+      pendingRequests: this.pending.length,
+    });
+
+    if (this.forcedFollowTail) {
+      if (highestLoaded !== null && viewportBottom <= highestLoaded) {
+        const distanceToTail = highestLoaded - viewportBottom;
+        const shouldRestore = this.restoreFollowTail
+          && snapshotFollowTail
+          && distanceToTail <= FORCED_FOLLOW_TAIL_RESTORE_SLACK;
+        trace('follow_tail_restore_ready', {
+          viewportBottom,
+          highestLoaded,
+          restoreFollowTail: this.restoreFollowTail,
+          snapshotFollowTail,
+          distanceToTail,
+          slack: FORCED_FOLLOW_TAIL_RESTORE_SLACK,
+          shouldRestore,
+        });
+        if (shouldRestore) {
+          this.store.setFollowTail(false);
+          info('follow_tail_restored', {
+            viewportBottom,
+            highestLoaded,
+            distanceToTail,
+            slack: FORCED_FOLLOW_TAIL_RESTORE_SLACK,
+          });
+        }
+        this.forcedFollowTail = false;
+        this.restoreFollowTail = false;
+      } else {
+        const distanceToTail = highestLoaded !== null ? highestLoaded - viewportBottom : null;
+        trace('follow_tail_restore_pending', {
+          viewportBottom,
+          highestLoaded,
+          distanceToTail,
+          slack: FORCED_FOLLOW_TAIL_RESTORE_SLACK,
+        });
+      }
+    }
     if (now - this.lastRequestAt < BACKFILL_THROTTLE_MS) {
       trace('maybe_request_skipped_throttle', { elapsed: now - this.lastRequestAt });
       return;
     }
 
-    if (followTail) {
+    if (effectiveFollowTail) {
       const tailGap = findTailGap(snapshot);
       trace('follow_tail_scan', { tailGap });
       if (tailGap) {
@@ -115,6 +187,102 @@ export class BackfillController {
         return;
       }
       trace('tail_gap_missing', {});
+    }
+
+    if (!snapshotFollowTail && snapshot.viewportHeight > 0) {
+      const tailGap = findTailGap(snapshot);
+      if (tailGap) {
+        trace('viewport_gap_scan', { tailGap, viewportBottom });
+        if (viewportBottom >= tailGap.start) {
+          const requestEnd = Math.min(
+            tailGap.end,
+            tailGap.start + BACKFILL_MAX_ROWS_PER_REQUEST,
+            viewportBottom + 1,
+          );
+          const count = Math.max(0, requestEnd - tailGap.start);
+          const pending = this.isRangePending(tailGap.start, requestEnd);
+          if (count > 0 && !pending) {
+            const requestId = this.enqueueRequest(tailGap.start, requestEnd);
+            trace('viewport_gap_request_sent', {
+              requestId,
+              start: tailGap.start,
+              end: requestEnd,
+              count,
+              reason: 'internal-gap',
+            });
+            this.issueRequest(requestId, tailGap.start, count);
+            this.lastRequestAt = now;
+            if (!this.forcedFollowTail) {
+              this.store.setFollowTail(true);
+              this.forcedFollowTail = true;
+              this.restoreFollowTail = !snapshotFollowTail;
+              trace('follow_tail_forced', { reason: 'internal-gap' });
+              info('follow_tail_forced', {
+                reason: 'internal-gap',
+                viewportBottom,
+                start: tailGap.start,
+                end: requestEnd,
+                restoreFollowTail: this.restoreFollowTail,
+              });
+            }
+            return;
+          }
+          trace('viewport_gap_request_skipped', {
+            start: tailGap.start,
+            end: requestEnd,
+            count,
+            pending,
+          });
+        }
+      } else {
+        trace('viewport_gap_none', {});
+      }
+
+      if (highestLoaded !== null && viewportBottom > highestLoaded) {
+        const gapStart = highestLoaded + 1;
+        const gapEnd = Math.min(
+          Math.max(gapStart, viewportBottom + 1),
+          gapStart + BACKFILL_MAX_ROWS_PER_REQUEST,
+          highestTracked + 1,
+        );
+        const count = Math.max(0, gapEnd - gapStart);
+        const pending = this.isRangePending(gapStart, gapEnd);
+        trace('viewport_tail_extension', {
+          gapStart,
+          gapEnd,
+          count,
+          pending,
+          highestLoaded,
+          highestTracked,
+          viewportBottom,
+        });
+        if (count > 0 && !pending) {
+          const requestId = this.enqueueRequest(gapStart, gapEnd);
+          trace('viewport_tail_request_sent', {
+            requestId,
+            start: gapStart,
+            end: gapEnd,
+            count,
+            reason: 'viewport-extension',
+          });
+          this.issueRequest(requestId, gapStart, count);
+          this.lastRequestAt = now;
+          if (!this.forcedFollowTail) {
+            this.store.setFollowTail(true);
+            this.forcedFollowTail = true;
+            this.restoreFollowTail = !snapshotFollowTail;
+            trace('follow_tail_forced', { reason: 'viewport-extension' });
+            info('follow_tail_forced', {
+              reason: 'viewport-extension',
+              gapStart,
+              gapEnd,
+              viewportBottom,
+              restoreFollowTail: this.restoreFollowTail,
+            });
+          }
+          return;
+        }
+      }
     }
 
     const earliestLoaded = minLoadedRow(snapshot.rows);
@@ -149,7 +317,7 @@ export class BackfillController {
     }
 
     const requestId = this.enqueueRequest(start, end);
-    trace('maybe_request_sent', { requestId, start, end, count, followTail });
+    trace('maybe_request_sent', { requestId, start, end, count, followTail: effectiveFollowTail });
     this.issueRequest(requestId, start, count);
     this.lastRequestAt = now;
   }

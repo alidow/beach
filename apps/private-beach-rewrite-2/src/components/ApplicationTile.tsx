@@ -16,6 +16,7 @@ type ApplicationTileProps = {
   managerUrl?: string;
   sessionMeta?: TileSessionMeta | null;
   onSessionMetaChange?: (meta: TileSessionMeta | null) => void;
+  disableViewportMeasurements?: boolean;
 };
 
 type SubmitState = 'idle' | 'attaching';
@@ -60,6 +61,7 @@ export function ApplicationTile({
   managerUrl = buildManagerUrl(),
   sessionMeta,
   onSessionMetaChange,
+  disableViewportMeasurements = false,
 }: ApplicationTileProps) {
   const [sessionIdInput, setSessionIdInput] = useState(sessionMeta?.sessionId ?? '');
   const [codeInput, setCodeInput] = useState('');
@@ -291,6 +293,7 @@ export function ApplicationTile({
             viewer={viewer}
             sessionId={sessionMeta?.sessionId ?? null}
             className="relative flex min-h-[220px] flex-1 overflow-hidden rounded-2xl border border-white/10 bg-slate-950/80 shadow-[0_30px_80px_rgba(2,6,23,0.65)] backdrop-blur-xl"
+            disableViewportMeasurements={disableViewportMeasurements}
           />
         </div>
       )}

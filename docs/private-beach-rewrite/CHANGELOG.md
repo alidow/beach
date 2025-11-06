@@ -1,5 +1,9 @@
 # Private Beach Rewrite · Changelog
 
+## 2025-11-07 · Terminal history preservation
+- Guarded the React Flow terminal client handshake so it keeps any prehydrated history from manager snapshots (and ignores zero-history grid frames) instead of trimming to the host-advertised base row, removing the blank top gap on long sessions.
+- Added a Vitest regression test that exercises the grid reconciliation path and proves we retain the earliest rows when the host reports a later base row.
+
 ## 2025-11-06 · Flow Canvas polish & coverage
 - Reworked the page/shell layout and added a `ResizeObserver` gate so the React Flow surface always gets a real height before mount, eliminating the blank canvas warning.
 - Synced React Flow node dimensions with tile resize events and tightened the tile preview CSS so the blue resize affordances track the terminal surface again.

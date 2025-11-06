@@ -386,7 +386,7 @@ impl ManagerViewerState {
     fn build_diff(&self) -> StateDiff {
         let frame = capture_terminal_frame_simple(&self.grid, self.cursor.as_ref());
         if let (Some(rows), Some(base_row)) = (frame.rows, frame.base_row) {
-            info!(
+            debug!(
                 target = "private_beach",
                 rows, base_row, "manager viewer diff captured"
             );
@@ -439,7 +439,7 @@ fn capture_terminal_frame_simple(
     let style_table = grid.style_table.clone();
     let style_entries = style_table.entries();
     if let Some((first_id, first_style)) = style_entries.get(0) {
-        info!(
+        debug!(
             target = "private_beach",
             styles = style_entries.len(),
             sample_id = first_id.0,
@@ -449,7 +449,7 @@ fn capture_terminal_frame_simple(
             "manager viewer style snapshot"
         );
     } else {
-        info!(
+        debug!(
             target = "private_beach",
             styles = 0,
             "manager viewer style snapshot"
@@ -2535,7 +2535,7 @@ impl AppState {
             Backend::Postgres(pool) => {
                 let session_uuid = parse_uuid(session_id, "session_id")?;
                 let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
-                info!(
+                debug!(
                     session_id = %session_id,
                     private_beach_id = %identifiers.private_beach_id,
                     sequence = diff.sequence,

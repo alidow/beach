@@ -9,9 +9,10 @@ type SessionViewerProps = {
   viewer: TerminalViewerState;
   className?: string;
   sessionId?: string | null;
+  disableViewportMeasurements?: boolean;
 };
 
-export function SessionViewer({ viewer, className, sessionId }: SessionViewerProps) {
+export function SessionViewer({ viewer, className, sessionId, disableViewportMeasurements = false }: SessionViewerProps) {
   const status = viewer.status ?? 'idle';
   const showLoading = status === 'idle' || status === 'connecting' || status === 'reconnecting';
   const showError = status === 'error' && Boolean(viewer.error);
@@ -57,6 +58,59 @@ export function SessionViewer({ viewer, className, sessionId }: SessionViewerPro
   }, [sessionId, viewer.store]);
 
   useEffect(() => {
+    if (!viewer.store) {
+      return undefined;
+    }
+
+    const logSnapshot = (reason: string) => {
+      try {
+        const snap = viewer.store!.getSnapshot();
+        const sample = snap.rows
+          .slice(0, 20)
+          .map((row) =>
+            row.kind === 'loaded'
+              ? {
+                  absolute: row.absolute,
+                  text: row.cells.map((cell) => cell.char).join('').trimEnd(),
+                }
+              : { absolute: row.absolute, text: `[${row.kind}]` },
+          );
+        // eslint-disable-next-line no-console
+        console.info(
+          `[rewrite-terminal][snapshot-sample] ${JSON.stringify({
+            sessionId,
+            reason,
+            baseRow: snap.baseRow,
+            rows: snap.rows.length,
+            sample,
+          })}`,
+        );
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.warn('[rewrite-terminal][snapshot-sample] failed', {
+          sessionId,
+          reason,
+          error,
+        });
+      }
+    };
+
+    logSnapshot('effect-init');
+    const unsubscribe = viewer.store.subscribe(() => logSnapshot('store-update'));
+    return () => {
+      try {
+        unsubscribe();
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.warn('[rewrite-terminal][snapshot-sample] unsubscribe error', {
+          sessionId,
+          error,
+        });
+      }
+    };
+  }, [sessionId, viewer.store]);
+
+  useEffect(() => {
     if (typeof window === 'undefined') {
       return;
     }
@@ -89,7 +143,96 @@ export function SessionViewer({ viewer, className, sessionId }: SessionViewerPro
     };
     // eslint-disable-next-line no-console
     console.info('[rewrite-terminal][ui]', JSON.stringify(payload));
+
   }, [showError, showLoading, status, viewer.error, viewer.latencyMs, viewer.store, viewer.transport, viewer.transportVersion, sessionId]);
+
+  useEffect(() => {
+    const store = viewer.store;
+    if (!store || !viewer.transport) {
+      return undefined;
+    }
+
+    let restoring = false;
+
+    const ensureFollowTail = (reason: string) => {
+      if (restoring) {
+        return;
+      }
+      try {
+        const snapshot = store.getSnapshot();
+        if (!snapshot) {
+          return;
+        }
+        const { rows, viewportHeight, viewportTop, baseRow, followTail } = snapshot;
+        let highestLoaded: number | null = null;
+        let lowestLoaded: number | null = null;
+        let loadedCount = 0;
+        for (let index = 0; index < rows.length; index += 1) {
+          const row = rows[index];
+          if (row && row.kind === 'loaded') {
+            loadedCount += 1;
+            if (lowestLoaded === null || row.absolute < lowestLoaded) {
+              lowestLoaded = row.absolute;
+            }
+          }
+        }
+        for (let index = rows.length - 1; index >= 0; index -= 1) {
+          const row = rows[index];
+          if (row && row.kind === 'loaded') {
+            highestLoaded = row.absolute;
+            break;
+          }
+        }
+        if (highestLoaded === null || lowestLoaded === null || loadedCount === 0) {
+          return;
+        }
+        const effectiveHeight =
+          viewportHeight && viewportHeight > 0 ? viewportHeight : Math.max(1, rows.length || 1);
+        const loadedSpan = highestLoaded - lowestLoaded + 1;
+        if (loadedSpan < effectiveHeight) {
+          return;
+        }
+        const tailTop = Math.max(baseRow, highestLoaded - (effectiveHeight - 1));
+        const needsViewportAdjust = viewportTop !== tailTop || viewportHeight !== effectiveHeight;
+        if (followTail && !needsViewportAdjust) {
+          return;
+        }
+        restoring = true;
+        if (needsViewportAdjust) {
+          store.setViewport(tailTop, effectiveHeight);
+        }
+        if (!store.getSnapshot().followTail) {
+          store.setFollowTail(true);
+        }
+        restoring = false;
+        if (process.env.NODE_ENV !== 'production') {
+          console.info('[rewrite-terminal][follow-tail-restore]', {
+            sessionId,
+            reason,
+            baseRow,
+            previousViewportTop: viewportTop,
+            previousViewportHeight: viewportHeight,
+            rows: rows.length,
+            tailTop,
+            effectiveHeight,
+          });
+        }
+      } catch (error) {
+        restoring = false;
+        console.warn('[rewrite-terminal][follow-tail-restore] failed', { sessionId, reason, error });
+      }
+    };
+
+    ensureFollowTail('effect-init');
+    const unsubscribe = store.subscribe(() => ensureFollowTail('store-update'));
+    return () => {
+      try {
+        unsubscribe?.();
+      } catch (error) {
+        console.warn('[rewrite-terminal][follow-tail-restore] unsubscribe failed', { sessionId, error });
+      }
+    };
+  }, [sessionId, viewer.store, viewer.transport, viewer.transportVersion]);
 
   return (
     <div className={`session-viewer${className ? ` ${className}` : ''}`} data-status={status}>
@@ -107,6 +250,7 @@ export function SessionViewer({ viewer, className, sessionId }: SessionViewerPro
         sessionId={sessionId ?? undefined}
         showJoinOverlay={false}
         enablePredictiveEcho={false}
+        disableViewportMeasurements={disableViewportMeasurements}
       />
       {showLoading ? (
         <div className="session-viewer__overlay">

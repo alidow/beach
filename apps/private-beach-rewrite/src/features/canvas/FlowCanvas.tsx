@@ -67,7 +67,15 @@ function FlowCanvasInner({
   const dragSnapshotRef = useRef<DragSnapshot | null>(null);
   const { screenToFlowPosition } = useReactFlow();
   const state = useTileState();
-  const { setTilePosition, bringToFront, setActiveTile, resizeTile, beginResize, endResize } = useTileActions();
+  const {
+    setTilePosition,
+    setTilePositionImmediate,
+    bringToFront,
+    setActiveTile,
+    resizeTile,
+    beginResize,
+    endResize,
+  } = useTileActions();
   const { reportTileMove } = useCanvasEvents();
   const [containerReady, setContainerReady] = useState(false);
 
@@ -108,9 +116,13 @@ function FlowCanvasInner({
     (changes: NodeChange[]) => {
       changes.forEach((change) => {
         if (change.type === 'position' && change.position) {
-          const snapped = snapPoint(change.position, gridSize);
           const tile = state.tiles[change.id];
           if (!tile) return;
+          if (change.dragging) {
+            setTilePositionImmediate(change.id, change.position);
+            return;
+          }
+          const snapped = snapPoint(change.position, gridSize);
           if (snapped.x === tile.position.x && snapped.y === tile.position.y) {
             return;
           }
@@ -134,7 +146,7 @@ function FlowCanvasInner({
         }
       });
     },
-    [gridSize, resizeTile, setTilePosition, state.tiles],
+    [gridSize, resizeTile, setTilePosition, setTilePositionImmediate, state.tiles],
   );
 
   const handleNodeDragStart: NodeDragEventHandler = useCallback(

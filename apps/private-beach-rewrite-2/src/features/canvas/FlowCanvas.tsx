@@ -68,7 +68,7 @@ function FlowCanvasInner({
   const flow = useReactFlow();
   const { screenToFlowPosition } = flow;
   const state = useTileState();
-  const { setTilePosition, bringToFront, setActiveTile } = useTileActions();
+  const { setTilePosition, setTilePositionImmediate, bringToFront, setActiveTile } = useTileActions();
   const { reportTileMove } = useCanvasEvents();
 
   const resolvedManagerUrl = useMemo(() => buildManagerUrl(managerUrl), [managerUrl]);
@@ -110,9 +110,13 @@ function FlowCanvasInner({
     (changes: NodeChange[]) => {
       changes.forEach((change) => {
         if (change.type === 'position' && change.position) {
-          const snapped = snapPoint(change.position, gridSize);
           const tile = state.tiles[change.id];
           if (!tile) return;
+          if (change.dragging) {
+            setTilePositionImmediate(change.id, change.position);
+            return;
+          }
+          const snapped = snapPoint(change.position, gridSize);
           if (snapped.x === tile.position.x && snapped.y === tile.position.y) {
             return;
           }
@@ -120,7 +124,7 @@ function FlowCanvasInner({
         }
       });
     },
-    [gridSize, setTilePosition, state.tiles],
+    [gridSize, setTilePosition, setTilePositionImmediate, state.tiles],
   );
 
   const handleNodeDragStart: NodeDragEventHandler = useCallback(
@@ -149,13 +153,9 @@ function FlowCanvasInner({
     (_event, node) => {
       const tile = state.tiles[node.id];
       if (!tile) return;
-      const snapped = snapPoint(node.position, gridSize);
-      if (snapped.x === tile.position.x && snapped.y === tile.position.y) {
-        return;
-      }
-      setTilePosition(node.id, snapped);
+      setTilePositionImmediate(node.id, node.position);
     },
-    [gridSize, setTilePosition, state.tiles],
+    [setTilePositionImmediate, state.tiles],
   );
 
   const handleNodeDragStop: NodeDragEventHandler = useCallback(

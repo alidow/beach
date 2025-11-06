@@ -19,7 +19,14 @@ import { TILE_GRID_SNAP_PX } from '@/features/tiles/constants';
 import { useTileActions, useTileState } from '@/features/tiles/store';
 import { buildManagerUrl } from '@/hooks/useManagerToken';
 import { useCanvasEvents } from './CanvasEventsContext';
-import type { CanvasNodeDefinition, CanvasPoint, NodePlacementPayload, TileMovePayload } from './types';
+import { clampPointToBounds, snapPointToGrid } from './positioning';
+import type {
+  CanvasBounds,
+  CanvasNodeDefinition,
+  CanvasPoint,
+  NodePlacementPayload,
+  TileMovePayload,
+} from './types';
 
 const APPLICATION_MIME = 'application/reactflow';
 const nodeTypes = { tile: TileFlowNode };
@@ -42,19 +49,6 @@ type CatalogDragPayload = Pick<CanvasNodeDefinition, 'id' | 'nodeType' | 'defaul
 
 const zoomSelector = (state: ReactFlowState) => state.transform[2] ?? 1;
 
-function snapPoint(point: CanvasPoint, gridSize: number): CanvasPoint {
-  if (gridSize <= 0) return point;
-  const snap = (value: number) => Math.round(value / gridSize) * gridSize;
-  return { x: snap(point.x), y: snap(point.y) };
-}
-
-function clampPosition(position: CanvasPoint, size: { width: number; height: number }, bounds: CanvasPoint) {
-  return {
-    x: Math.min(Math.max(position.x, 0), Math.max(0, bounds.x - size.width)),
-    y: Math.min(Math.max(position.y, 0), Math.max(0, bounds.y - size.height)),
-  };
-}
-
 function FlowCanvasInner({
   onNodePlacement,
   onTileMove,
@@ -70,6 +64,25 @@ function FlowCanvasInner({
   const state = useTileState();
   const { setTilePosition, setTilePositionImmediate, bringToFront, setActiveTile } = useTileActions();
   const { reportTileMove } = useCanvasEvents();
+
+  const readCanvasBounds = useCallback((): CanvasBounds | null => {
+    const rect = wrapperRef.current?.getBoundingClientRect();
+    if (!rect) {
+      return null;
+    }
+    return { width: rect.width, height: rect.height };
+  }, []);
+
+  const clampToCanvas = useCallback(
+    (position: CanvasPoint, size: { width: number; height: number }): CanvasPoint => {
+      const bounds = readCanvasBounds();
+      if (!bounds) {
+        return position;
+      }
+      return clampPointToBounds(position, size, bounds);
+    },
+    [readCanvasBounds],
+  );
 
   const resolvedManagerUrl = useMemo(() => buildManagerUrl(managerUrl), [managerUrl]);
 
@@ -113,18 +126,20 @@ function FlowCanvasInner({
           const tile = state.tiles[change.id];
           if (!tile) return;
           if (change.dragging) {
-            setTilePositionImmediate(change.id, change.position);
+            const clamped = clampToCanvas(change.position, tile.size);
+            setTilePositionImmediate(change.id, clamped);
             return;
           }
-          const snapped = snapPoint(change.position, gridSize);
-          if (snapped.x === tile.position.x && snapped.y === tile.position.y) {
+          const snapped = snapPointToGrid(change.position, gridSize);
+          const clamped = clampToCanvas(snapped, tile.size);
+          if (clamped.x === tile.position.x && clamped.y === tile.position.y) {
             return;
           }
-          setTilePosition(change.id, snapped);
+          setTilePosition(change.id, clamped);
         }
       });
     },
-    [gridSize, setTilePosition, setTilePositionImmediate, state.tiles],
+    [clampToCanvas, gridSize, setTilePosition, setTilePositionImmediate, state.tiles],
   );
 
   const handleNodeDragStart: NodeDragEventHandler = useCallback(
@@ -153,9 +168,10 @@ function FlowCanvasInner({
     (_event, node) => {
       const tile = state.tiles[node.id];
       if (!tile) return;
-      setTilePositionImmediate(node.id, node.position);
+      const clamped = clampToCanvas(node.position, tile.size);
+      setTilePositionImmediate(node.id, clamped);
     },
-    [setTilePositionImmediate, state.tiles],
+    [clampToCanvas, setTilePositionImmediate, state.tiles],
   );
 
   const handleNodeDragStop: NodeDragEventHandler = useCallback(
@@ -166,22 +182,23 @@ function FlowCanvasInner({
       if (!tile || !snapshot || snapshot.tileId !== node.id) {
         return;
       }
-      const snappedPosition = snapPoint(node.position, gridSize);
-      setTilePosition(node.id, snappedPosition);
+      const snappedPosition = snapPointToGrid(node.position, gridSize);
+      const clampedPosition = clampToCanvas(snappedPosition, tile.size);
+      setTilePosition(node.id, clampedPosition);
 
       const delta = {
-        x: snappedPosition.x - snapshot.originalPosition.x,
-        y: snappedPosition.y - snapshot.originalPosition.y,
+        x: clampedPosition.x - snapshot.originalPosition.x,
+        y: clampedPosition.y - snapshot.originalPosition.y,
       };
 
-      const wrapperBounds = wrapperRef.current?.getBoundingClientRect();
-      const canvasBounds = wrapperBounds ? { width: wrapperBounds.width, height: wrapperBounds.height } : { width: 0, height: 0 };
+      const bounds = readCanvasBounds();
+      const canvasBounds = bounds ?? { width: 0, height: 0 };
 
       const payload: TileMovePayload = {
         tileId: node.id,
         source: 'pointer',
         rawPosition: node.position,
-        snappedPosition,
+        snappedPosition: clampedPosition,
         delta,
         canvasBounds,
         gridSize,
@@ -195,7 +212,7 @@ function FlowCanvasInner({
         size: { ...tile.size },
         originalPosition: snapshot.originalPosition,
         rawPosition: node.position,
-        snappedPosition,
+        snappedPosition: clampedPosition,
         source: 'pointer',
       });
 
@@ -203,12 +220,12 @@ function FlowCanvasInner({
         privateBeachId,
         tileId: node.id,
         nodeType: tile.nodeType,
-        x: snappedPosition.x,
-        y: snappedPosition.y,
+        x: clampedPosition.x,
+        y: clampedPosition.y,
         rewriteEnabled,
       });
     },
-    [gridSize, onTileMove, privateBeachId, reportTileMove, rewriteEnabled, setTilePosition, state.tiles],
+    [clampToCanvas, gridSize, onTileMove, privateBeachId, readCanvasBounds, reportTileMove, rewriteEnabled, setTilePosition, state.tiles],
   );
 
   const handleDrop = useCallback(
@@ -229,13 +246,12 @@ function FlowCanvasInner({
       if (!payload) return;
 
       const flowPosition = screenToFlowPosition({ x: event.clientX, y: event.clientY });
-      const snapped = snapPoint(flowPosition, gridSize);
+      const snapped = snapPointToGrid(flowPosition, gridSize);
 
-      const container = wrapperRef.current;
-      const bounds = container?.getBoundingClientRect();
+      const bounds = readCanvasBounds();
       const width = bounds?.width ?? 0;
       const height = bounds?.height ?? 0;
-      const clamped = clampPosition(snapped, payload.defaultSize, { x: width, y: height });
+      const clamped = bounds ? clampPointToBounds(snapped, payload.defaultSize, bounds) : snapped;
 
       onNodePlacement({
         catalogId: payload.id,
@@ -248,7 +264,7 @@ function FlowCanvasInner({
         source: 'catalog',
       });
     },
-    [gridSize, onNodePlacement, screenToFlowPosition],
+    [gridSize, onNodePlacement, readCanvasBounds, screenToFlowPosition],
   );
 
   const handleDragOver = useCallback((event: DragEvent) => {

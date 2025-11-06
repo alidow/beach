@@ -1,13 +1,11 @@
 'use client';
 
 import { createContext, useContext, useMemo, useReducer } from 'react';
-import {
-  DEFAULT_TILE_HEIGHT,
-  DEFAULT_TILE_WIDTH,
-} from './constants';
+import { DEFAULT_TILE_HEIGHT, DEFAULT_TILE_WIDTH } from './constants';
 import type {
   TileCreateInput,
   TileDescriptor,
+  TileNodeType,
   TilePosition,
   TileResizeInput,
   TileSessionMeta,
@@ -27,13 +25,15 @@ type Action =
   | { type: 'END_RESIZE'; payload: { id: string } }
   | { type: 'SET_INTERACTIVE_TILE'; payload: { id: string | null } };
 
-const INITIAL_STATE: TileState = {
-  tiles: {},
-  order: [],
-  activeId: null,
-  resizing: {},
-  interactiveId: null,
-};
+function createEmptyState(): TileState {
+  return {
+    tiles: {},
+    order: [],
+    activeId: null,
+    resizing: {},
+    interactiveId: null,
+  };
+}
 
 function ensureOrder(order: string[], id: string): string[] {
   return order.includes(id) ? order : [...order, id];
@@ -42,6 +42,23 @@ function ensureOrder(order: string[], id: string): string[] {
 function bringToFront(order: string[], id: string): string[] {
   const filtered = order.filter((value) => value !== id);
   return [...filtered, id];
+}
+
+function ensureAgentMeta(
+  desiredType: TileNodeType,
+  existingMeta: TileDescriptor['agentMeta'],
+  inputMeta?: TileCreateInput['agentMeta'],
+): TileDescriptor['agentMeta'] {
+  if (inputMeta !== undefined) {
+    return inputMeta;
+  }
+  if (existingMeta) {
+    return existingMeta;
+  }
+  if (desiredType === 'agent') {
+    return { role: '', responsibility: '', isEditing: true };
+  }
+  return null;
 }
 
 function reducer(state: TileState, action: Action): TileState {
@@ -57,21 +74,25 @@ function reducer(state: TileState, action: Action): TileState {
       const position = snapPosition({ ...basePosition, ...input.position });
       const sessionMeta =
         input.sessionMeta !== undefined ? input.sessionMeta : existing?.sessionMeta ?? null;
+      const nodeType = input.nodeType ?? existing?.nodeType ?? 'application';
+      const agentMeta = ensureAgentMeta(nodeType, existing?.agentMeta ?? null, input.agentMeta);
       const descriptor: TileDescriptor = existing
         ? {
             ...existing,
-            nodeType: input.nodeType ?? existing.nodeType,
+            nodeType,
             position,
             size,
             sessionMeta,
+            agentMeta,
             updatedAt: now,
           }
         : {
             id,
-            nodeType: input.nodeType ?? 'application',
+            nodeType,
             position,
             size,
             sessionMeta,
+            agentMeta,
             createdAt: now,
             updatedAt: now,
           };
@@ -253,13 +274,20 @@ function reducer(state: TileState, action: Action): TileState {
   }
 }
 
-const TileStateContext = createContext<TileState>(INITIAL_STATE);
+const TileStateContext = createContext<TileState>(createEmptyState());
 const TileDispatchContext = createContext<React.Dispatch<Action>>(() => {
   throw new Error('TileDispatchContext not initialized');
 });
 
-export function TileStoreProvider({ children }: { children: React.ReactNode }) {
-  const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
+type TileStoreProviderProps = {
+  children: React.ReactNode;
+  initialState?: TileState;
+};
+
+export function TileStoreProvider({ children, initialState }: TileStoreProviderProps) {
+  const [state, dispatch] = useReducer(reducer, initialState ?? createEmptyState(), (value) =>
+    value ?? createEmptyState(),
+  );
   const memoState = useMemo(() => state, [state]);
   return (
     <TileDispatchContext.Provider value={dispatch}>

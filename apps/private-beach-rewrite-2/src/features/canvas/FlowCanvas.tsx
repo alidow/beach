@@ -2,16 +2,21 @@
 
 import 'reactflow/dist/style.css';
 
-import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactFlow, {
   Background,
   ReactFlowProvider,
+  addEdge,
+  applyEdgeChanges,
   useReactFlow,
   useStore,
-  type ReactFlowState,
+  type Connection,
+  type Edge,
+  type EdgeChange,
   type Node,
   type NodeChange,
   type NodeDragEventHandler,
+  type ReactFlowState,
 } from 'reactflow';
 import { emitTelemetry } from '../../../../private-beach/src/lib/telemetry';
 import { TileFlowNode } from '@/features/tiles/components/TileFlowNode';
@@ -20,6 +25,7 @@ import { useTileActions, useTileState } from '@/features/tiles/store';
 import { buildManagerUrl } from '@/hooks/useManagerToken';
 import { useCanvasEvents } from './CanvasEventsContext';
 import { clampPointToBounds, snapPointToGrid } from './positioning';
+import { AssignmentEdge, type AssignmentEdgeData, type UpdateMode } from './AssignmentEdge';
 import type {
   CanvasBounds,
   CanvasNodeDefinition,
@@ -30,6 +36,7 @@ import type {
 
 const APPLICATION_MIME = 'application/reactflow';
 const nodeTypes = { tile: TileFlowNode };
+const edgeTypes = { assignment: AssignmentEdge };
 
 type FlowCanvasProps = {
   onNodePlacement: (payload: NodePlacementPayload) => void;
@@ -59,19 +66,32 @@ function FlowCanvasInner({
 }: FlowCanvasProps) {
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const dragSnapshotRef = useRef<DragSnapshot | null>(null);
+  const canvasBoundsRef = useRef<CanvasBounds | null>(null);
+  const [canvasBounds, setCanvasBounds] = useState<CanvasBounds | null>(null);
+  const [edges, setEdges] = useState<Array<Edge<AssignmentEdgeData>>>([]);
   const flow = useReactFlow();
   const { screenToFlowPosition } = flow;
   const state = useTileState();
   const { setTilePosition, setTilePositionImmediate, bringToFront, setActiveTile } = useTileActions();
   const { reportTileMove } = useCanvasEvents();
 
+  const applyCanvasBounds = useCallback((bounds: CanvasBounds | null) => {
+    canvasBoundsRef.current = bounds;
+    setCanvasBounds(bounds);
+  }, []);
+
   const readCanvasBounds = useCallback((): CanvasBounds | null => {
+    if (canvasBoundsRef.current) {
+      return canvasBoundsRef.current;
+    }
     const rect = wrapperRef.current?.getBoundingClientRect();
     if (!rect) {
       return null;
     }
-    return { width: rect.width, height: rect.height };
-  }, []);
+    const bounds = { width: rect.width, height: rect.height };
+    applyCanvasBounds(bounds);
+    return bounds;
+  }, [applyCanvasBounds]);
 
   const clampToCanvas = useCallback(
     (position: CanvasPoint, size: { width: number; height: number }): CanvasPoint => {
@@ -108,7 +128,7 @@ function FlowCanvasInner({
           position: tile.position,
           draggable: true,
           selectable: false,
-          connectable: false,
+          connectable: true,
           style: {
             width: tile.size.width,
             height: tile.size.height,
@@ -118,6 +138,34 @@ function FlowCanvasInner({
       })
       .filter((node): node is Node => Boolean(node));
   }, [privateBeachId, resolvedManagerUrl, rewriteEnabled, state]);
+
+  const handleEdgeSave = useCallback(
+    ({ id, instructions, updateMode, pollFrequency }: { id: string; instructions: string; updateMode: UpdateMode; pollFrequency: number }) => {
+      setEdges((current) =>
+        current.map((edge) =>
+          edge.id === id
+            ? {
+                ...edge,
+                data: { ...edge.data, instructions, updateMode, pollFrequency, isEditing: false },
+              }
+            : edge,
+        ),
+      );
+    },
+    [],
+  );
+
+  const handleEdgeEdit = useCallback(({ id }: { id: string }) => {
+    setEdges((current) =>
+      current.map((edge) =>
+        edge.id === id ? { ...edge, data: { ...edge.data, isEditing: true } } : edge,
+      ),
+    );
+  }, []);
+
+  const handleEdgeDelete = useCallback(({ id }: { id: string }) => {
+    setEdges((current) => current.filter((edge) => edge.id !== id));
+  }, []);
 
   const handleNodesChange = useCallback(
     (changes: NodeChange[]) => {
@@ -140,6 +188,45 @@ function FlowCanvasInner({
       });
     },
     [clampToCanvas, gridSize, setTilePosition, setTilePositionImmediate, state.tiles],
+  );
+
+  const handleEdgesChange = useCallback(
+    (changes: EdgeChange[]) => setEdges((eds) => applyEdgeChanges(changes, eds)),
+    [],
+  );
+
+  const handleConnect = useCallback(
+    (connection: Connection) => {
+      if (!connection.source || !connection.target) {
+        return;
+      }
+      const sourceTile = state.tiles[connection.source];
+      const targetTile = state.tiles[connection.target];
+      if (!sourceTile || !targetTile) {
+        return;
+      }
+      if (sourceTile.nodeType !== 'agent') {
+        return;
+      }
+      const edgeId = `assignment-${Date.now()}-${Math.round(Math.random() * 1000)}`;
+      const edge: Edge<AssignmentEdgeData> = {
+        id: edgeId,
+        type: 'assignment',
+        source: connection.source,
+        target: connection.target,
+        data: {
+          instructions: '',
+          updateMode: 'idle-summary',
+          pollFrequency: 60,
+          isEditing: true,
+          onSave: handleEdgeSave,
+          onEdit: handleEdgeEdit,
+          onDelete: handleEdgeDelete,
+        },
+      };
+      setEdges((current) => addEdge(edge, current));
+    },
+    [handleEdgeDelete, handleEdgeEdit, handleEdgeSave, state.tiles],
   );
 
   const handleNodeDragStart: NodeDragEventHandler = useCallback(
@@ -287,6 +374,43 @@ function FlowCanvasInner({
     };
   }, [handleDragOver, handleDrop]);
 
+  useEffect(() => {
+    const node = wrapperRef.current;
+    if (!node) {
+      return undefined;
+    }
+    const rect = node.getBoundingClientRect();
+    applyCanvasBounds({ width: rect.width, height: rect.height });
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) {
+        return;
+      }
+      applyCanvasBounds({
+        width: entry.contentRect.width,
+        height: entry.contentRect.height,
+      });
+    });
+    observer.observe(node);
+    return () => {
+      observer.disconnect();
+    };
+  }, [applyCanvasBounds]);
+
+  useEffect(() => {
+    setEdges((current) => current.filter((edge) => state.tiles[edge.source] && state.tiles[edge.target]));
+  }, [state.tiles]);
+
+  const nodeExtent = useMemo(() => {
+    if (!canvasBounds) {
+      return undefined;
+    }
+    return [
+      [0, 0],
+      [canvasBounds.width, canvasBounds.height],
+    ] as [[number, number], [number, number]];
+  }, [canvasBounds]);
+
   return (
     <div
       ref={wrapperRef}
@@ -295,14 +419,17 @@ function FlowCanvasInner({
     >
       <ReactFlow
         nodes={nodes}
-        edges={[]}
+        edges={edges}
         nodeTypes={nodeTypes}
+        edgeTypes={edgeTypes}
         onNodesChange={handleNodesChange}
+        onEdgesChange={handleEdgesChange}
+        onConnect={handleConnect}
         onNodeDrag={handleNodeDrag}
         onNodeDragStart={handleNodeDragStart}
         onNodeDragStop={handleNodeDragStop}
         nodesDraggable
-        nodesConnectable={false}
+        nodesConnectable
         elementsSelectable={false}
         panOnScroll={false}
         panOnDrag={false}
@@ -315,6 +442,7 @@ function FlowCanvasInner({
         className="h-full w-full"
         minZoom={0.2}
         maxZoom={1.75}
+        nodeExtent={nodeExtent}
         style={{ width: '100%', height: '100%' }}
       >
         <Background gap={gridSize} color="rgba(56, 189, 248, 0.12)" />

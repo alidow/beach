@@ -4,9 +4,11 @@ import Link from 'next/link';
 import { useCallback, useEffect, useMemo } from 'react';
 import { CanvasWorkspace } from './CanvasWorkspace';
 import type { CanvasNodeDefinition, NodePlacementPayload, TileMovePayload } from './types';
-import { TileStoreProvider, useTileActions } from '@/features/tiles';
+import type { CanvasLayout } from '@/lib/api';
+import { TileStoreProvider, layoutToTileState, serializeTileStateKey, useTileActions } from '@/features/tiles';
 import { ManagerTokenProvider } from '@/hooks/ManagerTokenContext';
 import { emitTelemetry } from '../../../../private-beach/src/lib/telemetry';
+import { useTileLayoutPersistence } from './useTileLayoutPersistence';
 
 type BeachCanvasShellProps = {
   beachId: string;
@@ -14,8 +16,13 @@ type BeachCanvasShellProps = {
   backHref?: string;
   managerUrl?: string;
   managerToken?: string | null;
+  initialLayout?: CanvasLayout | null;
   rewriteEnabled?: boolean;
   className?: string;
+};
+
+type BeachCanvasShellInnerProps = Omit<BeachCanvasShellProps, 'managerToken'> & {
+  initialTileSignature?: string;
 };
 
 const DEFAULT_CATALOG: CanvasNodeDefinition[] = [
@@ -41,17 +48,26 @@ export function BeachCanvasShell({
   backHref = '/beaches',
   managerUrl,
   managerToken,
+  initialLayout,
   rewriteEnabled = false,
   className,
 }: BeachCanvasShellProps) {
+  const initialTileState = useMemo(() => layoutToTileState(initialLayout), [initialLayout]);
+  const initialTileSignature = useMemo(
+    () => serializeTileStateKey(initialTileState),
+    [initialTileState],
+  );
+
   return (
-    <TileStoreProvider>
+    <TileStoreProvider initialState={initialTileState}>
       <ManagerTokenProvider initialToken={managerToken}>
         <BeachCanvasShellInner
           beachId={beachId}
           beachName={beachName}
           backHref={backHref}
           managerUrl={managerUrl}
+          initialLayout={initialLayout}
+          initialTileSignature={initialTileSignature}
           rewriteEnabled={rewriteEnabled}
           className={className}
         />
@@ -65,12 +81,21 @@ function BeachCanvasShellInner({
   beachName,
   backHref = '/beaches',
   managerUrl,
+  initialLayout,
+  initialTileSignature,
   rewriteEnabled = false,
   className,
-}: BeachCanvasShellProps) {
+}: BeachCanvasShellInnerProps) {
   const NAV_HEIGHT = 56;
   const CANVAS_VIEWPORT_HEIGHT = `calc(100vh - ${NAV_HEIGHT}px)`;
   const { createTile } = useTileActions();
+
+  useTileLayoutPersistence({
+    beachId,
+    managerUrl,
+    initialLayout,
+    initialSignature: initialTileSignature,
+  });
 
   const catalog = useMemo(() => DEFAULT_CATALOG, []);
 

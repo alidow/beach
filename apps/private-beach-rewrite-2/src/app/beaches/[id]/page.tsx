@@ -1,8 +1,8 @@
 import { notFound } from 'next/navigation';
 import { BeachCanvasShell } from '@/features/canvas';
 import { AppShellTopNav } from '@/components/AppShellTopNav';
-import type { BeachMeta } from '@/lib/api';
-import { getBeachMeta } from '@/lib/api';
+import type { BeachMeta, CanvasLayout } from '@/lib/api';
+import { getBeachMeta, getCanvasLayout } from '@/lib/api';
 import { resolveManagerBaseUrl, resolveManagerToken, resolveRewriteFlag } from '@/lib/serverSecrets';
 import type { Metadata } from 'next';
 import { safeAuth } from '@/lib/serverAuth';
@@ -46,6 +46,7 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
   }
 
   let beach: BeachMeta | null = null;
+  let layout: CanvasLayout | null = null;
   try {
     beach = await getBeachMeta(beachId, token, managerBaseUrl);
   } catch (error) {
@@ -68,6 +69,14 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
     throw error;
   }
 
+  try {
+    layout = await getCanvasLayout(beach.id, token, managerBaseUrl);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn('[rewrite-2] getCanvasLayout failed', { beachId: beach.id, error: message });
+    layout = null;
+  }
+
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-transparent" data-private-beach-rewrite={rewriteEnabled ? 'enabled' : 'disabled'}>
       <BeachCanvasShell
@@ -76,6 +85,7 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
         backHref="/beaches"
         managerUrl={managerBaseUrl}
         managerToken={token}
+        initialLayout={layout}
         rewriteEnabled={rewriteEnabled}
         className="flex-1"
       />

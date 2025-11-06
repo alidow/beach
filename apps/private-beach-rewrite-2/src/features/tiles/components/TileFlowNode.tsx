@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { MouseEvent, PointerEvent } from 'react';
+import { Handle, Position } from 'reactflow';
 import type { NodeProps } from 'reactflow';
 import { ApplicationTile } from '@/components/ApplicationTile';
 import { cn } from '@/lib/cn';
@@ -59,7 +60,7 @@ function isInteractiveElement(target: EventTarget | null): boolean {
 
 type Props = NodeProps<TileFlowNodeData>;
 
-export function TileFlowNode({ data, dragging }: Props) {
+function ApplicationTileNode({ data, dragging }: Props) {
   const { tile, orderIndex, isActive, isResizing, isInteractive, privateBeachId, managerUrl, rewriteEnabled } = data;
   const {
     removeTile,
@@ -73,6 +74,7 @@ export function TileFlowNode({ data, dragging }: Props) {
   } = useTileActions();
   const resizeStateRef = useRef<ResizeState | null>(null);
   const [hovered, setHovered] = useState(false);
+
 
   const zIndex = useMemo(() => 10 + orderIndex, [orderIndex]);
 
@@ -354,6 +356,190 @@ export function TileFlowNode({ data, dragging }: Props) {
         data-tile-drag-ignore="true"
         data-tile-resize-handle="true"
       />
+      <Handle
+        type="target"
+        position={Position.Left}
+        className="h-3 w-3 border-none bg-indigo-200/80 transition hover:bg-indigo-300"
+        onPointerDown={(event) => event.stopPropagation()}
+      />
     </article>
   );
+}
+
+function AgentTileNode({ data }: Props) {
+  const {
+    removeTile,
+    bringToFront,
+    setActiveTile,
+    createTile,
+  } = useTileActions();
+  const { tile, orderIndex, privateBeachId, rewriteEnabled } = data;
+  const meta = useMemo(() => tile.agentMeta ?? { role: '', responsibility: '', isEditing: true }, [tile.agentMeta]);
+  const [role, setRole] = useState(meta.role);
+  const [responsibility, setResponsibility] = useState(meta.responsibility);
+  const zIndex = useMemo(() => 10 + orderIndex, [orderIndex]);
+
+  useEffect(() => {
+    if (!meta.isEditing) {
+      setRole(meta.role);
+      setResponsibility(meta.responsibility);
+    }
+  }, [meta.isEditing, meta.responsibility, meta.role]);
+
+  const handleSave = useCallback(() => {
+    const nextMeta = {
+      role: role.trim(),
+      responsibility: responsibility.trim(),
+      isEditing: false,
+    } as const;
+    if (!nextMeta.role || !nextMeta.responsibility) {
+      return;
+    }
+    createTile({ id: tile.id, agentMeta: nextMeta, focus: false });
+  }, [createTile, responsibility, role, tile.id]);
+
+  const handleEdit = useCallback(() => {
+    createTile({ id: tile.id, agentMeta: { ...meta, isEditing: true }, focus: false });
+  }, [createTile, meta, tile.id]);
+
+  const handleCancel = useCallback(() => {
+    if (!meta.role && !meta.responsibility) {
+      removeTile(tile.id);
+      return;
+    }
+    setRole(meta.role);
+    setResponsibility(meta.responsibility);
+    createTile({ id: tile.id, agentMeta: { ...meta, isEditing: false }, focus: false });
+  }, [createTile, meta, removeTile, tile.id]);
+
+  const handleRemove = useCallback(() => {
+    emitTelemetry('canvas.tile.remove', {
+      privateBeachId,
+      tileId: tile.id,
+      rewriteEnabled,
+    });
+    removeTile(tile.id);
+  }, [privateBeachId, removeTile, rewriteEnabled, tile.id]);
+
+  const handlePointerDown = useCallback(
+    (event: PointerEvent<HTMLElement>) => {
+      if (event.button !== 0) return;
+      bringToFront(tile.id);
+      setActiveTile(tile.id);
+    },
+    [bringToFront, setActiveTile, tile.id],
+  );
+
+  const showEditor = meta.isEditing || (!meta.role && !meta.responsibility);
+
+  return (
+    <article
+      className="relative flex h-full w-full flex-col rounded-2xl border border-indigo-500/30 bg-slate-900/80 text-slate-100 shadow-[0_24px_70px_rgba(15,23,42,0.65)]"
+      style={{ width: '100%', height: '100%', zIndex }}
+      onPointerDown={handlePointerDown}
+      data-testid={`rf__node-agent:${tile.id}`}
+    >
+      <header className="flex items-center justify-between border-b border-white/10 px-4 py-2">
+        <div className="flex flex-col">
+          <span className="text-sm font-semibold text-white">Agent</span>
+          {!showEditor && (
+            <small className="text-[11px] text-slate-300">{meta.role || 'Unassigned role'}</small>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          {!showEditor ? (
+            <button
+              type="button"
+              onClick={handleEdit}
+              className="rounded-full border border-indigo-500/50 bg-indigo-500/20 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.2em] text-indigo-100"
+            >
+              Edit
+            </button>
+          ) : null}
+          <button
+            type="button"
+            onClick={handleRemove}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-500/40 bg-red-500/10 text-base text-red-200"
+          >
+            ×
+          </button>
+        </div>
+      </header>
+      <section className="flex flex-1 flex-col gap-3 px-4 py-3 text-sm text-slate-200">
+        {showEditor ? (
+          <>
+            <label className="text-xs font-semibold uppercase tracking-wide text-slate-400" htmlFor={`agent-role-${tile.id}`}>
+              Role
+            </label>
+            <input
+              id={`agent-role-${tile.id}`}
+              value={role}
+              onChange={(event) => setRole(event.target.value)}
+              className="rounded border border-white/10 bg-white/5 px-3 py-2 text-sm text-white focus:border-indigo-400 focus:outline-none"
+              placeholder="e.g. Deploy orchestrator"
+            />
+            <label className="text-xs font-semibold uppercase tracking-wide text-slate-400" htmlFor={`agent-resp-${tile.id}`}>
+              Responsibility
+            </label>
+            <textarea
+              id={`agent-resp-${tile.id}`}
+              value={responsibility}
+              onChange={(event) => setResponsibility(event.target.value)}
+              rows={3}
+              className="rounded border border-white/10 bg-white/5 px-3 py-2 text-sm text-white focus:border-indigo-400 focus:outline-none"
+              placeholder="Describe what this agent should manage"
+            />
+            <div className="mt-auto flex gap-2 pt-2 text-xs">
+              <button
+                type="button"
+                onClick={handleSave}
+                className="flex-1 rounded bg-indigo-600 px-3 py-2 font-semibold text-white disabled:opacity-40"
+                disabled={!role.trim() || !responsibility.trim()}
+              >
+                Save
+              </button>
+              <button
+                type="button"
+                onClick={handleCancel}
+                className="flex-1 rounded border border-white/15 px-3 py-2 font-semibold text-slate-200"
+              >
+                Cancel
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">Role</p>
+              <p className="text-sm text-white/90">{meta.role}</p>
+            </div>
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">Responsibility</p>
+              <p className="text-sm text-white/90">{meta.responsibility}</p>
+            </div>
+            <p className="text-[11px] text-slate-400">Drag the connector to assign this agent to other tiles.</p>
+          </>
+        )}
+      </section>
+      <Handle
+        type="target"
+        position={Position.Left}
+        className="h-3 w-3 border-none bg-indigo-200/80"
+        onPointerDown={(event) => event.stopPropagation()}
+      />
+      <Handle
+        type="source"
+        position={Position.Right}
+        className="h-3 w-3 border-none bg-indigo-500"
+        onPointerDown={(event) => event.stopPropagation()}
+      />
+    </article>
+  );
+}
+
+export function TileFlowNode(props: Props) {
+  if (props.data.tile.nodeType === 'agent') {
+    return <AgentTileNode {...props} />;
+  }
+  return <ApplicationTileNode {...props} />;
 }

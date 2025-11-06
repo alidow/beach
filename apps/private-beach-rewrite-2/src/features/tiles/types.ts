@@ -1,6 +1,6 @@
 'use client';
 
-export type TileNodeType = 'application';
+export type TileNodeType = 'application' | 'agent';
 
 export type TilePosition = {
   x: number;
@@ -20,12 +20,19 @@ export type TileSessionMeta = {
   pendingActions?: number | null;
 };
 
+export type AgentMetadata = {
+  role: string;
+  responsibility: string;
+  isEditing: boolean;
+};
+
 export type TileDescriptor = {
   id: string;
   nodeType: TileNodeType;
   position: TilePosition;
   size: TileSize;
   sessionMeta?: TileSessionMeta | null;
+  agentMeta?: AgentMetadata | null;
   createdAt: number;
   updatedAt: number;
 };
@@ -44,6 +51,7 @@ export type TileCreateInput = {
   position?: Partial<TilePosition>;
   size?: Partial<TileSize>;
   sessionMeta?: TileSessionMeta | null;
+  agentMeta?: AgentMetadata | null;
   focus?: boolean;
 };
 

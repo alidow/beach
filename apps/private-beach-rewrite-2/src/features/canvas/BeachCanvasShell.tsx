@@ -4,9 +4,12 @@ import Link from 'next/link';
 import { useCallback, useEffect, useMemo } from 'react';
 import { CanvasWorkspace } from './CanvasWorkspace';
 import type { CanvasNodeDefinition, NodePlacementPayload, TileMovePayload } from './types';
-import { TileStoreProvider, useTileActions } from '@/features/tiles';
+import type { CanvasLayout } from '@/lib/api';
+import { TileStoreProvider, layoutToTileState, serializeTileStateKey, useTileActions } from '@/features/tiles';
+import type { TileNodeType } from '@/features/tiles/types';
 import { ManagerTokenProvider } from '@/hooks/ManagerTokenContext';
 import { emitTelemetry } from '../../../../private-beach/src/lib/telemetry';
+import { useTileLayoutPersistence } from './useTileLayoutPersistence';
 
 type BeachCanvasShellProps = {
   beachId: string;
@@ -14,8 +17,13 @@ type BeachCanvasShellProps = {
   backHref?: string;
   managerUrl?: string;
   managerToken?: string | null;
+  initialLayout?: CanvasLayout | null;
   rewriteEnabled?: boolean;
   className?: string;
+};
+
+type BeachCanvasShellInnerProps = Omit<BeachCanvasShellProps, 'managerToken'> & {
+  initialTileSignature?: string;
 };
 
 const DEFAULT_CATALOG: CanvasNodeDefinition[] = [
@@ -27,6 +35,16 @@ const DEFAULT_CATALOG: CanvasNodeDefinition[] = [
     defaultSize: {
       width: 448,
       height: 320,
+    },
+  },
+  {
+    id: 'agent',
+    nodeType: 'agent',
+    label: 'Agent Tile',
+    description: 'Describe an automation agent and connect it to applications to orchestrate work.',
+    defaultSize: {
+      width: 360,
+      height: 260,
     },
   },
 ];
@@ -41,17 +59,26 @@ export function BeachCanvasShell({
   backHref = '/beaches',
   managerUrl,
   managerToken,
+  initialLayout,
   rewriteEnabled = false,
   className,
 }: BeachCanvasShellProps) {
+  const initialTileState = useMemo(() => layoutToTileState(initialLayout), [initialLayout]);
+  const initialTileSignature = useMemo(
+    () => serializeTileStateKey(initialTileState),
+    [initialTileState],
+  );
+
   return (
-    <TileStoreProvider>
+    <TileStoreProvider initialState={initialTileState}>
       <ManagerTokenProvider initialToken={managerToken}>
         <BeachCanvasShellInner
           beachId={beachId}
           beachName={beachName}
           backHref={backHref}
           managerUrl={managerUrl}
+          initialLayout={initialLayout}
+          initialTileSignature={initialTileSignature}
           rewriteEnabled={rewriteEnabled}
           className={className}
         />
@@ -65,10 +92,19 @@ function BeachCanvasShellInner({
   beachName,
   backHref = '/beaches',
   managerUrl,
+  initialLayout,
+  initialTileSignature,
   rewriteEnabled = false,
   className,
-}: BeachCanvasShellProps) {
+}: BeachCanvasShellInnerProps) {
   const { createTile } = useTileActions();
+
+  useTileLayoutPersistence({
+    beachId,
+    managerUrl,
+    initialLayout,
+    initialSignature: initialTileSignature,
+  });
 
   const catalog = useMemo(() => DEFAULT_CATALOG, []);
 
@@ -77,11 +113,13 @@ function BeachCanvasShellInner({
       const timestamp = Date.now();
       const recordId = buildPlacementId(payload, timestamp);
 
+      const nodeType = payload.nodeType as TileNodeType;
       createTile({
         id: recordId,
-        nodeType: payload.nodeType as 'application',
+        nodeType,
         position: payload.snappedPosition,
         size: payload.size,
+        agentMeta: nodeType === 'agent' ? { role: '', responsibility: '', isEditing: true } : undefined,
         focus: true,
       });
 

@@ -1,10 +1,7 @@
 'use client';
 
 import { createContext, useContext, useMemo, useReducer } from 'react';
-import {
-  DEFAULT_TILE_HEIGHT,
-  DEFAULT_TILE_WIDTH,
-} from './constants';
+import { DEFAULT_TILE_HEIGHT, DEFAULT_TILE_WIDTH } from './constants';
 import type {
   TileCreateInput,
   TileDescriptor,
@@ -26,12 +23,14 @@ type Action =
   | { type: 'START_RESIZE'; payload: { id: string } }
   | { type: 'END_RESIZE'; payload: { id: string } };
 
-const INITIAL_STATE: TileState = {
-  tiles: {},
-  order: [],
-  activeId: null,
-  resizing: {},
-};
+function createEmptyState(): TileState {
+  return {
+    tiles: {},
+    order: [],
+    activeId: null,
+    resizing: {},
+  };
+}
 
 function ensureOrder(order: string[], id: string): string[] {
   return order.includes(id) ? order : [...order, id];
@@ -222,13 +221,20 @@ function reducer(state: TileState, action: Action): TileState {
   }
 }
 
-const TileStateContext = createContext<TileState>(INITIAL_STATE);
+const TileStateContext = createContext<TileState>(createEmptyState());
 const TileDispatchContext = createContext<React.Dispatch<Action>>(() => {
   throw new Error('TileDispatchContext not initialized');
 });
 
-export function TileStoreProvider({ children }: { children: React.ReactNode }) {
-  const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
+type TileStoreProviderProps = {
+  children: React.ReactNode;
+  initialState?: TileState;
+};
+
+export function TileStoreProvider({ children, initialState }: TileStoreProviderProps) {
+  const [state, dispatch] = useReducer(reducer, initialState ?? createEmptyState(), (value) =>
+    value ?? createEmptyState(),
+  );
   const memoState = useMemo(() => state, [state]);
   return (
     <TileDispatchContext.Provider value={dispatch}>

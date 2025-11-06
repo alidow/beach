@@ -597,7 +597,10 @@ export async function createBeach(name: string, slug: string | undefined, token:
 }
 
 export async function getBeachMeta(id: string, token: string | null, baseUrl?: string): Promise<BeachMeta> {
-  const res = await fetch(`${base(baseUrl)}/private-beaches/${id}`, { headers: authHeaders(token) });
+  const res = await fetch(`${base(baseUrl)}/private-beaches/${id}`, {
+    headers: authHeaders(token),
+    cache: 'no-store',
+  });
   if (res.status === 404) throw new Error('not_found');
   if (!res.ok) {
     const error = new Error(`getBeachMeta failed ${res.status}`);
@@ -663,6 +666,7 @@ export type CanvasLayout = {
 export async function getCanvasLayout(id: string, token: string | null, baseUrl?: string): Promise<CanvasLayout> {
   const res = await fetch(`${base(baseUrl)}/private-beaches/${id}/layout`, {
     headers: authHeaders(token),
+    cache: 'no-store',
   });
   if (!res.ok) throw new Error(`getCanvasLayout failed ${res.status}`);
   const data = (await res.json()) as Partial<CanvasLayout>;

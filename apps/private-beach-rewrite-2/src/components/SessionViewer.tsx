@@ -182,15 +182,9 @@ export function SessionViewer({ viewer, className, sessionId, disableViewportMea
   }, [sessionId, viewer.store, viewer.transport, viewer.transportVersion]);
 
   return (
-    <div
-      className={cn(
-        'relative flex h-full min-h-0 w-full flex-1 overflow-hidden rounded-2xl bg-[radial-gradient(circle_at_top,rgba(30,41,59,0.95),rgba(15,23,42,0.92))]',
-        className,
-      )}
-      data-status={status}
-    >
+    <div className={cn('relative flex h-full min-h-0 w-full flex-1 overflow-hidden', className)} data-status={status}>
       <BeachTerminal
-        className="flex h-full w-full flex-1"
+        className="flex h-full w-full flex-1 border border-slate-800/70 bg-[#060910]/95 shadow-[0_30px_80px_rgba(8,12,24,0.55)]"
         store={viewer.store ?? undefined}
         transport={viewer.transport ?? undefined}
         transportVersion={viewer.transportVersion ?? 0}

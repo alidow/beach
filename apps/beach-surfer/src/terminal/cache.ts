@@ -1,4 +1,5 @@
 import type { CursorFrame, Update } from '../protocol/types';
+import { captureTrace } from '../lib/traceCapture';
 
 declare global {
   interface Window {
@@ -207,6 +208,7 @@ export class TerminalGridCache {
   private tailPadSeqThreshold: number | null = null;
   private tailPadRanges: RowRange[] = [];
   private gridHeight = 0;
+  private lastTailSnapshot: RowSlot[] | null = null;
 
   constructor(options: TerminalGridCacheOptions = {}) {
     this.maxHistory = options.maxHistory ?? DEFAULT_HISTORY_LIMIT;
@@ -380,6 +382,7 @@ export class TerminalGridCache {
     this.tailPadSeqThreshold = null;
     this.tailPadRanges = [];
     this.gridHeight = 0;
+    this.lastTailSnapshot = null;
   }
 
   setGridSize(totalRows: number, cols: number): boolean {
@@ -464,6 +467,13 @@ export class TerminalGridCache {
       nextTop: clampedTop,
       nextHeight: clampedHeight,
     });
+    captureTrace('setViewport', {
+      previousTop,
+      previousHeight,
+      nextTop: clampedTop,
+      nextHeight: clampedHeight,
+      followTail: this.followTail,
+    });
     this.viewportTop = clampedTop;
     this.viewportHeight = clampedHeight;
     this.initialViewportApplied = true;
@@ -523,11 +533,13 @@ export class TerminalGridCache {
   }
 
   setFollowTail(enabled: boolean): boolean {
-    if (this.followTail === enabled) {
+    const previous = this.followTail;
+    if (previous === enabled) {
       return false;
     }
-    trace('setFollowTail', { previous: this.followTail, next: enabled });
+    trace('setFollowTail', { previous, next: enabled });
     this.followTail = enabled;
+    captureTrace('setFollowTail', { previous, next: enabled });
     return true;
   }
 
@@ -747,10 +759,13 @@ export class TerminalGridCache {
 
     const rows: RowSlot[] = [];
     let tailPaddingApplied = false;
+    let fallbackFromSnapshot = false;
 
-    const materializeRow = (absolute: number): RowSlot => {
+    const materializeRow = (absolute: number, options: { ignoreTailPad?: boolean } = {}): RowSlot => {
+      const ignoreTailPad = Boolean(options.ignoreTailPad);
       const slot = this.getRow(absolute);
       if (
+        !ignoreTailPad &&
         this.tailPadRanges.length > 0 &&
         this.tailPadSeqThreshold !== null &&
         this.isWithinTailPad(absolute)
@@ -766,23 +781,51 @@ export class TerminalGridCache {
 
     if (this.followTail) {
       const highestLoaded = this.findHighestLoadedRow();
+      const highestLoadedAvailable =
+        highestLoaded !== null && this.getRow(highestLoaded)?.kind === 'loaded';
       const lastTracked = this.rows.length > 0 ? this.baseRow + this.rows.length - 1 : this.baseRow;
       const anchor = Math.max(lastTracked, highestLoaded ?? Number.NEGATIVE_INFINITY);
       const effectiveGridHeight = this.gridHeight > 0 ? this.gridHeight : 0;
-      const actualRowsToShow = effectiveGridHeight > 0 ? Math.min(height, effectiveGridHeight) : 0;
-      const padCount = height - actualRowsToShow;
+      let actualRowsToShow = effectiveGridHeight > 0 ? Math.min(height, effectiveGridHeight) : 0;
+      let padCount = Math.max(0, height - actualRowsToShow);
       let actualStartAbsolute: number | null = null;
       let padStartAbsolute: number | null = null;
 
       if (actualRowsToShow === 0) {
-        if (highestLoaded !== null) {
+        const snapshotLoadedRows =
+          this.lastTailSnapshot?.filter((row) => row.kind === 'loaded') ?? [];
+        const snapshotSlice =
+          snapshotLoadedRows.length > 0
+            ? snapshotLoadedRows.slice(Math.max(0, snapshotLoadedRows.length - height))
+            : [];
+
+        if (snapshotSlice.length > 0) {
+          const padStart = snapshotSlice[0]!.absolute - (height - snapshotSlice.length);
+          const padCountSnapshot = Math.max(0, height - snapshotSlice.length);
+          if (padCountSnapshot > 0) {
+            padStartAbsolute = padStart;
+            for (let offset = 0; offset < padCountSnapshot; offset += 1) {
+              const absolute = padStart + offset;
+              rows.push(createMissingRow(absolute));
+            }
+            tailPaddingApplied = true;
+          } else {
+            padStartAbsolute = null;
+          }
+          for (const slot of snapshotSlice) {
+            rows.push(cloneRowSlot(slot));
+          }
+          actualRowsToShow = snapshotSlice.length;
+          actualStartAbsolute = snapshotSlice.length > 0 ? snapshotSlice[0]!.absolute : null;
+          fallbackFromSnapshot = true;
+        } else if (highestLoadedAvailable) {
           const fallbackStart = Math.max(this.baseRow, highestLoaded - (height - 1));
           actualStartAbsolute = fallbackStart;
           for (let offset = 0; offset < height; offset += 1) {
             const absolute = fallbackStart + offset;
-            rows.push(materializeRow(absolute));
+            rows.push(materializeRow(absolute, { ignoreTailPad: true }));
           }
-          tailPaddingApplied = false;
+          actualRowsToShow = rows.filter((row) => row.kind === 'loaded').length;
           padStartAbsolute = null;
         } else {
           const padStart = anchor - (height - 1);
@@ -813,8 +856,12 @@ export class TerminalGridCache {
           rows.push(materializeRow(absolute));
         }
       }
+      const loadedRowsInTail = rows.filter((row) => row.kind === 'loaded');
+      actualRowsToShow = loadedRowsInTail.length;
+      padCount = Math.max(0, height - actualRowsToShow);
+      tailPaddingApplied = rows.some((row) => row.kind !== 'loaded');
 
-      trace('visibleRows tail', {
+      const tailPayload = {
         limit: normalizedLimit,
         requestedHeight: height,
         viewportHeight: this.viewportHeight,
@@ -832,31 +879,15 @@ export class TerminalGridCache {
         tailPadRanges: this.tailPadRanges.map((range) => ({ ...range })),
         rowKinds: rows.map((row) => row.kind),
         absolutes: rows.map((row) => row.absolute),
-      });
+        fallbackFromSnapshot,
+      };
+      trace('visibleRows tail', tailPayload);
+      captureTrace('visibleRows tail', tailPayload);
       if (typeof console !== 'undefined') {
-        const payload = {
-          limit: normalizedLimit,
-          requestedHeight: height,
-          viewportHeight: this.viewportHeight,
-          baseRow: this.baseRow,
-          highestLoaded,
-          lastTracked,
-          anchor,
-          gridHeight: this.gridHeight,
-          padCount,
-          actualRowsToShow,
-          padStartAbsolute,
-          actualStartAbsolute,
-          followTail: this.followTail,
-          tailPadSeqThreshold: this.tailPadSeqThreshold,
-          tailPadRanges: this.tailPadRanges.map((range) => ({ ...range })),
-          rowKinds: rows.map((row) => row.kind),
-          absolutes: rows.map((row) => row.absolute),
-        };
         try {
-          console.info('[beach-trace][cache][visibleRows tail]', JSON.stringify(payload));
+          console.info('[beach-trace][cache][visibleRows tail]', JSON.stringify(tailPayload));
         } catch {
-          console.info('[beach-trace][cache][visibleRows tail]', payload);
+          console.info('[beach-trace][cache][visibleRows tail]', tailPayload);
         }
       }
       if (tailPaddingApplied && typeof window !== 'undefined' && Array.isArray((window as typeof window & { __BEACH_TRACE_HISTORY?: unknown[] }).__BEACH_TRACE_HISTORY)) {
@@ -888,6 +919,12 @@ export class TerminalGridCache {
         this.tailPadSeqThreshold = null;
         this.tailPadRanges = [];
       }
+      const loadedRows = rows.filter((row) => row.kind === 'loaded');
+      if (loadedRows.length > 0) {
+        this.lastTailSnapshot = loadedRows.map((row) => cloneRowSlot(row));
+      } else if (!fallbackFromSnapshot && !tailPaddingApplied) {
+        this.lastTailSnapshot = null;
+      }
       return rows;
     }
     const maxStart = Math.max(this.baseRow, this.baseRow + this.rows.length - height);
@@ -898,7 +935,7 @@ export class TerminalGridCache {
     }
     // Do not drop tail padding prematurely; leave the mask in place so we can
     // detect redundant replays on the next update.
-    trace('visibleRows window', {
+    const windowPayload = {
       limit: normalizedLimit,
       requestedHeight: height,
       viewportHeight: this.viewportHeight,
@@ -910,25 +947,14 @@ export class TerminalGridCache {
       tailPadRanges: this.tailPadRanges.map((range) => ({ ...range })),
       rowKinds: rows.map((row) => row.kind),
       absolutes: rows.map((row) => row.absolute),
-    });
+    };
+    trace('visibleRows window', windowPayload);
+    captureTrace('visibleRows window', windowPayload);
     if (typeof console !== 'undefined') {
-      const payload = {
-        limit: normalizedLimit,
-        requestedHeight: height,
-        viewportHeight: this.viewportHeight,
-        baseRow: this.baseRow,
-        startAbsolute,
-        maxStart,
-        followTail: this.followTail,
-        tailPadSeqThreshold: this.tailPadSeqThreshold,
-        tailPadRanges: this.tailPadRanges.map((range) => ({ ...range })),
-        rowKinds: rows.map((row) => row.kind),
-        absolutes: rows.map((row) => row.absolute),
-      };
       try {
-        console.info('[beach-trace][cache][visibleRows window]', JSON.stringify(payload));
+        console.info('[beach-trace][cache][visibleRows window]', JSON.stringify(windowPayload));
       } catch {
-        console.info('[beach-trace][cache][visibleRows window]', payload);
+        console.info('[beach-trace][cache][visibleRows window]', windowPayload);
       }
     }
     if (typeof window !== 'undefined' && Array.isArray((window as typeof window & { __BEACH_TRACE_HISTORY?: unknown[] }).__BEACH_TRACE_HISTORY)) {
@@ -953,6 +979,12 @@ export class TerminalGridCache {
     if (!tailPaddingApplied && this.tailPadRanges.length > 0) {
       this.tailPadSeqThreshold = null;
       this.tailPadRanges = [];
+    }
+    const windowLoadedRows = rows.filter((row) => row.kind === 'loaded');
+    if (windowLoadedRows.length > 0) {
+      this.lastTailSnapshot = windowLoadedRows.map((row) => cloneRowSlot(row));
+    } else if (!fallbackFromSnapshot && this.followTail && tailPaddingApplied) {
+      this.lastTailSnapshot = null;
     }
     return rows;
   }
@@ -2772,7 +2804,19 @@ export class TerminalGridCache {
       if (slot.kind !== 'loaded') {
         continue;
       }
-      const width = this.rowDisplayWidth(slot.absolute);
+      let width = 0;
+      if (slot.absolute >= this.baseRow) {
+        width = this.rowDisplayWidth(slot.absolute);
+      }
+      if (width === 0) {
+        for (let col = slot.cells.length - 1; col >= 0; col -= 1) {
+          const cell = slot.cells[col]!;
+          if (cell.char !== ' ' || cell.styleId !== 0) {
+            width = col + 1;
+            break;
+          }
+        }
+      }
       if (width > 0) {
         return slot.absolute;
       }

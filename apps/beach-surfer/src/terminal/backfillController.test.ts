@@ -55,7 +55,11 @@ describe('BackfillController', () => {
     });
     controller.handleFrame(helloFrame());
 
-    controller.maybeRequest(store.getSnapshot(), true);
+    controller.maybeRequest(store.getSnapshot(), {
+      nearBottom: true,
+      followTailDesired: true,
+      phase: 'follow_tail',
+    });
 
     expect(frames).toHaveLength(1);
     const request = frames[0];

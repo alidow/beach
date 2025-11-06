@@ -143,15 +143,8 @@ function BeachCanvasShellInner({
             </Link>
           ) : null}
           <div className="flex items-center gap-3">
-            <span className="inline-flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.4em] text-slate-400">
-              <span className="h-1.5 w-1.5 rounded-full bg-sky-400" aria-hidden />
-              Private Beach
-            </span>
             <span className="text-sm font-semibold text-white/90">{beachName}</span>
           </div>
-        </div>
-        <div className="flex items-center gap-2 text-[11px] font-medium text-slate-400">
-          <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1">React Flow Workspace</span>
         </div>
       </header>
       <div className="relative flex flex-1 min-h-0 flex-col overflow-hidden">

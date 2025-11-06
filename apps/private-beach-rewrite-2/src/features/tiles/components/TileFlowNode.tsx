@@ -330,7 +330,7 @@ export function TileFlowNode({ data, dragging }: Props) {
       </header>
       <section
         className={cn(
-          'flex flex-1 flex-col gap-4 overflow-hidden bg-slate-950/60 p-4 transition-opacity',
+          'flex flex-1 flex-col gap-3 overflow-hidden bg-slate-950/60 transition-opacity',
           isInteractive ? 'pointer-events-auto' : 'pointer-events-none opacity-[0.98] select-none',
         )}
         data-tile-drag-ignore="true"

@@ -142,7 +142,6 @@ function BeachCanvasShellInner({
             </Link>
           ) : null}
           <div className="flex flex-col">
-            <span className="text-[11px] uppercase tracking-wide text-muted-foreground">Private Beach</span>
             <span className="text-sm font-semibold text-foreground">{beachName}</span>
           </div>
         </div>

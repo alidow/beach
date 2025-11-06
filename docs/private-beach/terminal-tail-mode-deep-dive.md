@@ -79,8 +79,69 @@ These changes stop the immediate blanking, but tail-mode intent is still fragile
    - Resize thrash across sizing strategies.
    - Hydration + reconnect while off-tail.
 
+## 6. Non-browser Regression Tests (pre-fix)
+
+These tests let us repro the tile behaviour without a browser. They consume real log data captured from the failing sessions so we can assert on the exact follow-tail and padding transitions before we touch the implementation.
+
+### 6.1 Harness
+- Use Vitest/Jest + Testing Library to render `BeachTerminal` inside a `<div style="display:flex; height:320px; min-height:0">`.
+- Mock `ResizeObserver` to drive wrapper sizes deterministically.
+- Drive a real `TerminalGridStore` via `createTerminalStore()` so we exercise the actual cache/backfill code (no shallow mocks).
+- Add a helper to parse trace logs (e.g. `temp/private-beach-rewrite-2.log`) into a sequence of “frames” `{ type: 'setViewport', payload }`, “rows”, “followTail events” etc. Each test loads a snapshot JSON fixture derived from the logs.
+
+### 6.2 Test Scenarios
+1. **Hydration replay with gridHeight=0 fallback**
+   - Fixture: log segment where `visibleRows tail` output shows `"rowKinds":["missing",…]`.
+   - Steps: apply hydration frames (setGridSize + applyUpdates), then simulated tail gap/backfill.
+   - Assertions: last `buildLines` call contains `loaded` rows, not `missing`; `store.getSnapshot().followTail` remains false.
+
+2. **For-loop flood + TUI (`top`)**
+   - Fixture: capture host PTY output sequence (150 echo lines then `top` redraw) from logs.
+   - Drive updates into the store frame-by-frame.
+   - Assert after each frame that the rendered DOM’s last row matches the host tail (no blank viewport) when `followTailDesired` is true.
+   - Also assert the store snapshot reports `viewportTop` tracking the tail indices from the log.
+
+3. **User scroll-off tail with new content**
+   - Start from the tail after hydration → scroll the container up via `userEvent.scroll`.
+   - Replay a few “delta” frames pulled from logs.
+   - Assert `followTailDesired` stays false, `visibleRows` uses window mode, and the component emits the “new output” signal (placeholder until UX is wired).
+
+4. **Resize thrash during updates**
+   - Alternate wrapper heights (e.g. 240px ↔ 360px) while replaying log frames.
+   - Verify `visibleRows` never returns all `missing` rows, and that the rendered viewport sticks to the tail once the resize settles.
+
+5. **Backfill re-entry guard**
+   - Load a log snippet where `BackfillController` previously forced follow-tail (look for `follow_tail_forced` lines).
+   - With the new guard, replay the same frames and assert the store does **not** flip `followTail` when the snapshot reported false.
+
+### 6.3 Fixtures & Logging
+- Extract fixtures from real logs (`temp/private-beach-rewrite-2.log`) and store them under `apps/beach-surfer/src/terminal/__fixtures__/`.
+- Augment BeachTerminal + cache trace logging so we capture: `followTailDesired`, `isAtTail`, `rowKinds`, `viewportTop/Height`. Use these in the fixtures for deterministic assertions.
+
+### 6.4 CI hook
+- Add a `vitest --runInBand --config beach-terminal.vitest.config.ts` script that runs only these non-browser tests.
+- Require the suite to pass **before** any implementation change so we can confirm the current regression behaviour (tests should fail on the blanking assertions); once we implement the fix, the same tests should go green.
+
 ## 6. Summary
 
 - BeachTerminal must be the single source of truth for tail vs. scrollback; host tiles simply embed it.
 - The blanking regression stemmed from tail padding returning placeholders and backfill overriding intent—both guarded now.
 - Next step: codify the state machine above, add instrumentation, and deliver the UX affordances so the rewrite behaves predictably under hydration and resize thrash.
+
+### Data Capture Workflow (for the tests above)
+
+1. Open the rewrite tile in the browser and run:
+   ```js
+   window.__BEACH_TRACE_START__();
+   ```
+2. Reproduce the scenario (hydrate, run the for-loop, launch `top`, resize if needed).
+3. Dump the trace to a file:
+   ```js
+   const frames = window.__BEACH_TRACE_DUMP__();
+   copy(JSON.stringify(frames, null, 2)); // paste into capture.json
+   ```
+4. Convert to a fixture:
+   ```bash
+   pnpm ts-node scripts/convert-terminal-capture.ts capture.json apps/beach-surfer/src/terminal/__fixtures__/rewrite-tail-session.json
+   ```
+5. Run the non-browser tests (to be added) to confirm they reproduce the captured behaviour before applying code changes.

@@ -37,6 +37,14 @@ interface PendingRange {
 
 type SendFrameFn = (frame: ClientFrame) => void;
 
+type FollowTailIntentPhase = 'hydrating' | 'follow_tail' | 'manual_scrollback' | 'catching_up';
+
+interface TailRequestContext {
+  nearBottom: boolean;
+  followTailDesired: boolean;
+  phase: FollowTailIntentPhase;
+}
+
 export class BackfillController {
   private readonly store: TerminalGridStore;
   private readonly sendFrame: SendFrameFn;
@@ -87,20 +95,24 @@ export class BackfillController {
     }
   }
 
-  maybeRequest(snapshot: TerminalGridSnapshot, followTail: boolean): void {
+  maybeRequest(snapshot: TerminalGridSnapshot, context: TailRequestContext): void {
     if (!this.subscriptionId) {
       return;
     }
     const now = Date.now();
     const snapshotFollowTail = snapshot.followTail;
-    const effectiveFollowTail = followTail || snapshotFollowTail;
+    const effectiveFollowTail =
+      context.followTailDesired &&
+      (snapshotFollowTail || context.nearBottom || context.phase === 'catching_up');
     const highestLoaded = maxLoadedRow(snapshot.rows);
     const highestTracked = snapshot.baseRow + snapshot.rows.length - 1;
     const viewportBottom = snapshot.viewportHeight > 0
       ? snapshot.viewportTop + snapshot.viewportHeight - 1
       : snapshot.viewportTop;
     trace('maybe_request', {
-      followTailParam: followTail,
+      followTailDesired: context.followTailDesired,
+      followTailPhase: context.phase,
+      nearBottom: context.nearBottom,
       snapshotFollowTail,
       effectiveFollowTail,
       baseRow: snapshot.baseRow,
@@ -114,7 +126,9 @@ export class BackfillController {
       lastRequestAt: this.lastRequestAt,
     });
     info('maybe_request', {
-      followTailParam: followTail,
+      followTailDesired: context.followTailDesired,
+      followTailPhase: context.phase,
+      nearBottom: context.nearBottom,
       snapshotFollowTail,
       effectiveFollowTail,
       viewportTop: snapshot.viewportTop,
@@ -193,12 +207,15 @@ export class BackfillController {
       const tailGap = findTailGap(snapshot);
       if (tailGap) {
         trace('viewport_gap_scan', { tailGap, viewportBottom });
-        if (viewportBottom >= tailGap.start) {
-          const requestEnd = Math.min(
-            tailGap.end,
-            tailGap.start + BACKFILL_MAX_ROWS_PER_REQUEST,
-            viewportBottom + 1,
-          );
+        const viewportLimitedEnd = viewportBottom >= tailGap.start
+          ? Math.min(tailGap.end, viewportBottom + 1)
+          : tailGap.end;
+        const requestEnd = Math.min(
+          tailGap.start + BACKFILL_MAX_ROWS_PER_REQUEST,
+          viewportLimitedEnd,
+          tailGap.end,
+        );
+        if (requestEnd > tailGap.start) {
           const count = Math.max(0, requestEnd - tailGap.start);
           const pending = this.isRangePending(tailGap.start, requestEnd);
           if (count > 0 && !pending) {
@@ -208,23 +225,23 @@ export class BackfillController {
               start: tailGap.start,
               end: requestEnd,
               count,
-              reason: 'internal-gap',
+              reason: viewportBottom >= tailGap.start ? 'internal-gap' : 'tail-gap-offscreen',
             });
             this.issueRequest(requestId, tailGap.start, count);
             this.lastRequestAt = now;
-          if (!this.forcedFollowTail && snapshotFollowTail) {
-            this.store.setFollowTail(true);
-            this.forcedFollowTail = true;
-            this.restoreFollowTail = !snapshotFollowTail;
-            trace('follow_tail_forced', { reason: 'internal-gap' });
-            info('follow_tail_forced', {
-              reason: 'internal-gap',
-              viewportBottom,
-              start: tailGap.start,
-              end: requestEnd,
-              restoreFollowTail: this.restoreFollowTail,
-            });
-          }
+            if (!this.forcedFollowTail && snapshotFollowTail && context.followTailDesired) {
+              this.store.setFollowTail(true);
+              this.forcedFollowTail = true;
+              this.restoreFollowTail = !snapshotFollowTail;
+              trace('follow_tail_forced', { reason: 'internal-gap' });
+              info('follow_tail_forced', {
+                reason: 'internal-gap',
+                viewportBottom,
+                start: tailGap.start,
+                end: requestEnd,
+                restoreFollowTail: this.restoreFollowTail,
+              });
+            }
             return;
           }
           trace('viewport_gap_request_skipped', {
@@ -233,7 +250,14 @@ export class BackfillController {
             count,
             pending,
           });
+          return;
         }
+        trace('viewport_gap_request_ignored', {
+          start: tailGap.start,
+          end: tailGap.end,
+          viewportLimitedEnd,
+        });
+        return;
       } else {
         trace('viewport_gap_none', {});
       }
@@ -267,7 +291,7 @@ export class BackfillController {
           });
           this.issueRequest(requestId, gapStart, count);
           this.lastRequestAt = now;
-          if (!this.forcedFollowTail && snapshotFollowTail) {
+          if (!this.forcedFollowTail && snapshotFollowTail && context.followTailDesired) {
             this.store.setFollowTail(true);
             this.forcedFollowTail = true;
             this.restoreFollowTail = !snapshotFollowTail;
@@ -404,32 +428,24 @@ function maxLoadedRow(rows: TerminalGridSnapshot['rows']): number | null {
 }
 
 function findTailGap(snapshot: TerminalGridSnapshot): { start: number; end: number } | null {
-  const highest = maxLoadedRow(snapshot.rows);
-  if (highest === null) {
+  const highestLoaded = maxLoadedRow(snapshot.rows);
+  const trackedEndExclusive = snapshot.baseRow + snapshot.rows.length;
+  const scanEndExclusive = Math.max(
+    trackedEndExclusive,
+    highestLoaded !== null ? highestLoaded + 1 : snapshot.baseRow,
+  );
+  const scanStart = Math.max(snapshot.baseRow, scanEndExclusive - BACKFILL_LOOKAHEAD_ROWS);
+  if (scanEndExclusive <= scanStart) {
     return null;
   }
-  const scanStart = Math.max(snapshot.baseRow, highest - BACKFILL_LOOKAHEAD_ROWS);
   let gapStart: number | null = null;
-  for (let absolute = scanStart; absolute <= highest; absolute += 1) {
+  for (let absolute = scanStart; absolute < scanEndExclusive; absolute += 1) {
     const index = absolute - snapshot.baseRow;
     if (index < 0 || index >= snapshot.rows.length) {
       continue;
     }
     const slot = snapshot.rows[index];
-    if (!slot) {
-      if (gapStart === null) {
-        gapStart = absolute;
-      }
-      continue;
-    }
-    if (slot.kind !== 'loaded') {
-      if (gapStart === null) {
-        gapStart = absolute;
-      }
-      continue;
-    }
-    if (slot.latestSeq === 0) {
-      // Row exists only because of local predictions and has never been confirmed.
+    if (!slot || slot.kind !== 'loaded' || slot.latestSeq === 0) {
       if (gapStart === null) {
         gapStart = absolute;
       }
@@ -440,7 +456,7 @@ function findTailGap(snapshot: TerminalGridSnapshot): { start: number; end: numb
     }
   }
   if (gapStart !== null) {
-    return { start: gapStart, end: highest + 1 };
+    return { start: gapStart, end: scanEndExclusive };
   }
   return null;
 }

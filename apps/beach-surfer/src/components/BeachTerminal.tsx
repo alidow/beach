@@ -14,6 +14,7 @@ import type { TerminalTransport } from '../transport/terminalTransport';
 import { BackfillController } from '../terminal/backfillController';
 import { cn } from '../lib/utils';
 import { createConnectionTrace, type ConnectionTrace } from '../lib/connectionTrace';
+import { captureTrace, ensureTraceCaptureHelpers, serializeHostFrame } from '../lib/traceCapture';
 import type { ServerMessage } from '../transport/signaling';
 import type { SecureTransportSummary } from '../transport/webrtc';
 
@@ -468,6 +469,8 @@ export interface BeachTerminalProps {
   showJoinOverlay?: boolean;
 }
 
+export type FollowTailPhase = 'hydrating' | 'follow_tail' | 'manual_scrollback' | 'catching_up';
+
 export interface TerminalViewportState {
   viewportRows: number;
   viewportCols: number;
@@ -477,6 +480,10 @@ export interface TerminalViewportState {
   viewOnly: boolean;
   sendHostResize?: () => void;
   requestHostResize?: (opts: { rows: number; cols?: number }) => void;
+  followTailDesired: boolean;
+  followTailPhase: FollowTailPhase;
+  atTail: boolean;
+  remainingTailPixels: number;
 }
 
 export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
@@ -551,6 +558,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     hostCols: number | null;
     canSendResize: boolean;
     viewOnly: boolean;
+    followTailDesired: boolean;
+    followTailPhase: FollowTailPhase;
+    atTail: boolean;
+    remainingTailPixels: number;
   } | null>(null);
   const disableMeasurementsPrevRef = useRef<boolean>(disableViewportMeasurements);
   const [status, setStatus] = useState<TerminalStatus>(
@@ -570,6 +581,23 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const [predictionOverlay, setPredictionOverlay] = useState<PredictionOverlayState>({
     visible: false,
     underline: false,
+  });
+  const initialFollowTailDesired = useMemo(() => {
+    const snapshotNow = store.getSnapshot();
+    if (snapshotNow.rows.length > 0) {
+      return snapshotNow.followTail;
+    }
+    return true;
+  }, [store]);
+  const [followTailDesiredState, setFollowTailDesiredState] = useState<boolean>(initialFollowTailDesired);
+  const followTailDesiredRef = useRef(followTailDesiredState);
+  const [followTailPhaseState, setFollowTailPhaseState] = useState<FollowTailPhase>('hydrating');
+  const followTailPhaseRef = useRef<FollowTailPhase>('hydrating');
+  const hydratingRef = useRef<boolean>(true);
+  const programmaticScrollRef = useRef<boolean>(false);
+  const tailMetricsRef = useRef<{ remainingPixels: number; atTail: boolean }>({
+    remainingPixels: Number.POSITIVE_INFINITY,
+    atTail: false,
   });
   const {
     tick: predictionTick,
@@ -660,6 +688,61 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     },
     [],
   );
+
+  const setFollowTailPhase = useCallback(
+    (phase: FollowTailPhase, reason: string) => {
+      if (followTailPhaseRef.current === phase) {
+        return;
+      }
+      followTailPhaseRef.current = phase;
+      setFollowTailPhaseState(phase);
+      trace('follow_tail_phase', { phase, reason });
+    },
+    [],
+  );
+
+  const setFollowTailDesired = useCallback(
+    (desired: boolean, reason: string) => {
+      if (followTailDesiredRef.current === desired) {
+        return;
+      }
+      followTailDesiredRef.current = desired;
+      setFollowTailDesiredState(desired);
+      trace('follow_tail_intent', { desired, reason });
+    },
+    [],
+  );
+
+  const applyFollowTailIntent = useCallback(
+    (reason: string) => {
+      const desired = followTailDesiredRef.current;
+      const phase = followTailPhaseRef.current;
+      const hydrating = hydratingRef.current;
+      trace('follow_tail_apply_intent', { desired, hydrating, phase, reason });
+      if (hydrating) {
+        store.setFollowTail(false);
+        return;
+      }
+      store.setFollowTail(desired);
+    },
+    [store],
+  );
+
+  const updateTailMetrics = useCallback(
+    (remainingPixels: number, atTail: boolean, reason: string) => {
+      const previous = tailMetricsRef.current;
+      if (
+        previous.remainingPixels === remainingPixels &&
+        previous.atTail === atTail
+      ) {
+        return;
+      }
+      tailMetricsRef.current = { remainingPixels, atTail };
+      trace('follow_tail_metrics', { remainingPixels, atTail, reason });
+    },
+    [],
+  );
+
   const subscriberIdRef = useRef<string>('');
   if (!subscriberIdRef.current) {
     subscriberIdRef.current = nextJoinStateSubscriberId();
@@ -907,6 +990,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     const hostViewportRows = ptyViewportRowsRef.current;
     const hostCols = ptyColsRef.current;
     const canSendResize = Boolean(transportRef.current) && !viewOnly;
+    const tailMetrics = tailMetricsRef.current;
+    const followTailDesired = followTailDesiredRef.current;
+    const followTailPhase = followTailPhaseRef.current;
     const nextReport = {
       viewportRows,
       viewportCols,
@@ -914,6 +1000,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       hostCols,
       canSendResize,
       viewOnly,
+      followTailDesired,
+      followTailPhase,
+      atTail: tailMetrics.atTail,
+      remainingTailPixels: tailMetrics.remainingPixels,
     };
     const previous = lastViewportReportRef.current;
     trace(
@@ -925,6 +1015,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         hostCols,
         canSendResize,
         viewOnly,
+        followTailDesired,
+        followTailPhase,
+        atTail: tailMetrics.atTail,
+        remainingTailPixels: tailMetrics.remainingPixels,
         suppressed: Boolean(
           previous &&
             previous.viewportRows === nextReport.viewportRows &&
@@ -932,7 +1026,11 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
             previous.hostViewportRows === nextReport.hostViewportRows &&
             previous.hostCols === nextReport.hostCols &&
             previous.canSendResize === nextReport.canSendResize &&
-            previous.viewOnly === nextReport.viewOnly,
+            previous.viewOnly === nextReport.viewOnly &&
+            previous.followTailDesired === nextReport.followTailDesired &&
+            previous.followTailPhase === nextReport.followTailPhase &&
+            previous.atTail === nextReport.atTail &&
+            previous.remainingTailPixels === nextReport.remainingTailPixels,
         ),
       }),
     );
@@ -940,10 +1038,14 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       previous &&
       previous.viewportRows === nextReport.viewportRows &&
       previous.viewportCols === nextReport.viewportCols &&
-      previous.hostViewportRows === nextReport.hostViewportRows &&
-      previous.hostCols === nextReport.hostCols &&
-      previous.canSendResize === nextReport.canSendResize &&
-      previous.viewOnly === nextReport.viewOnly
+        previous.hostViewportRows === nextReport.hostViewportRows &&
+        previous.hostCols === nextReport.hostCols &&
+        previous.canSendResize === nextReport.canSendResize &&
+        previous.viewOnly === nextReport.viewOnly &&
+        previous.followTailDesired === nextReport.followTailDesired &&
+        previous.followTailPhase === nextReport.followTailPhase &&
+        previous.atTail === nextReport.atTail &&
+        previous.remainingTailPixels === nextReport.remainingTailPixels
     ) {
       return;
     }
@@ -958,6 +1060,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           hostCols: nextReport.hostCols,
           canSendResize,
           viewOnly: nextReport.viewOnly,
+          followTailDesired: nextReport.followTailDesired,
+          followTailPhase: nextReport.followTailPhase,
+          atTail: nextReport.atTail,
+          remainingTailPixels: nextReport.remainingTailPixels,
         });
       } catch {
         // ignore logging issues
@@ -977,6 +1083,47 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     lastViewportReportRef.current = null;
     emitViewportState();
   }, [emitViewportState]);
+
+  const exitHydration = useCallback(
+    (reason: string) => {
+      if (!hydratingRef.current) {
+        return;
+      }
+      hydratingRef.current = false;
+      const desired = followTailDesiredRef.current;
+      const snapshotNow = store.getSnapshot();
+      const nextPhase: FollowTailPhase = desired
+        ? snapshotNow.followTail
+          ? 'follow_tail'
+          : 'catching_up'
+        : 'manual_scrollback';
+      setFollowTailPhase(nextPhase, reason);
+      applyFollowTailIntent(reason);
+      emitViewportState();
+    },
+    [applyFollowTailIntent, emitViewportState, setFollowTailPhase, store],
+  );
+
+  useEffect(() => {
+    followTailDesiredRef.current = followTailDesiredState;
+  }, [followTailDesiredState]);
+
+  useEffect(() => {
+    followTailPhaseRef.current = followTailPhaseState;
+  }, [followTailPhaseState]);
+
+  useEffect(() => {
+    if (hydratingRef.current) {
+      return;
+    }
+    const desired = followTailDesiredRef.current;
+    const nextPhase: FollowTailPhase = desired
+      ? snapshot.followTail
+        ? 'follow_tail'
+        : 'catching_up'
+      : 'manual_scrollback';
+    setFollowTailPhase(nextPhase, 'snapshot-sync');
+  }, [snapshot.followTail, followTailDesiredState, setFollowTailPhase]);
 
   const enterWaitingState = useCallback(
     (message?: string) => {
@@ -2054,7 +2201,19 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       const maxAutoRewind = rowHeight * 1.5;
       // Only adjust upward if we're nudging by about a row; avoid yanking the user to the top.
       if (desired >= currentTop || upwardsDelta <= maxAutoRewind) {
-        element.scrollTop = desired;
+        if (element.scrollTop !== desired) {
+          programmaticScrollRef.current = true;
+          element.scrollTop = desired;
+          if (typeof queueMicrotask === 'function') {
+            queueMicrotask(() => {
+              programmaticScrollRef.current = false;
+            });
+          } else {
+            setTimeout(() => {
+              programmaticScrollRef.current = false;
+            }, 0);
+          }
+        }
       } else if (IS_DEV && typeof window !== 'undefined' && window.__BEACH_TRACE) {
         console.debug('[beach-trace][terminal] autoscroll skipped rewind', {
           before: currentTop,
@@ -2564,16 +2723,27 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     });
 
     const remainingPixels = Math.max(0, element.scrollHeight - (element.scrollTop + element.clientHeight));
-    const atBottom = shouldReenableFollowTail(remainingPixels, pixelsPerRow);
+    const atTail = shouldReenableFollowTail(remainingPixels, pixelsPerRow);
+    updateTailMetrics(remainingPixels, atTail, 'scroll');
     const nearBottom = remainingPixels <= pixelsPerRow * 2;
     const previousFollowTail = snapshot.followTail;
-    if (scrollPolicy === 'follow-tail') {
-      store.setFollowTail(atBottom);
+    const programmatic = programmaticScrollRef.current;
+    if (programmatic) {
+      programmaticScrollRef.current = false;
+    }
+    if (!programmatic && scrollPolicy === 'follow-tail') {
+      if (!atTail && followTailDesiredRef.current) {
+        setFollowTailDesired(false, 'user-scroll-away');
+      } else if (atTail && !followTailDesiredRef.current) {
+        setFollowTailDesired(true, 'user-scroll-tail');
+      }
+      hydratingRef.current = false;
+      applyFollowTailIntent('scroll');
     }
     const nextSnapshot = store.getSnapshot();
     trace('scroll tail decision', {
       previousFollowTail,
-      requestedFollowTail: atBottom,
+      requestedFollowTail: followTailDesiredRef.current,
       appliedFollowTail: nextSnapshot.followTail,
       nearBottom,
       remainingPixels,
@@ -2594,13 +2764,18 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       element,
       remainingPixels,
       viewportRows,
-      atBottom,
+      atTail,
       nextSnapshot,
       lines,
       firstAbsolute,
       lastAbsolute,
     );
-    backfillController.maybeRequest(nextSnapshot, nearBottom);
+    backfillController.maybeRequest(nextSnapshot, {
+      nearBottom,
+      followTailDesired: followTailDesiredRef.current,
+      phase: followTailPhaseRef.current,
+    });
+    emitViewportState();
   }
 
   function renderStatus(): string {
@@ -2713,6 +2888,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   }
 
   function handleHostFrame(frame: HostFrame): void {
+    captureTrace('host-frame', serializeHostFrame(frame));
     backfillController.handleFrame(frame);
     switch (frame.type) {
       case 'hello':
@@ -2745,6 +2921,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         store.setCursorSupport(Boolean(frame.features & FEATURE_CURSOR_SYNC));
         resetPrediction(now());
         summarizeSnapshot(store);
+        hydratingRef.current = true;
+        setFollowTailPhase('hydrating', 'frame-hello');
+        applyFollowTailIntent('frame-hello');
+        updateTailMetrics(Number.POSITIVE_INFINITY, false, 'frame-hello');
         handshakeReadyRef.current = true;
         enterApprovedState(joinStateRef.current === 'approved' ? joinMessage ?? undefined : undefined);
         markConnectionTrace('beach_terminal:hello_received', {
@@ -2864,6 +3044,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         const desiredCols = Math.max(hydratedCols || 0, frame.cols);
         store.setGridSize(desiredTotalRows, desiredCols);
         store.setFollowTail(false);
+        hydratingRef.current = true;
+        setFollowTailPhase('hydrating', 'frame-grid');
+        applyFollowTailIntent('frame-grid');
         {
           const deviceViewport = Math.max(
             1,
@@ -2927,11 +3110,17 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           backfillController.finalizeHistoryBackfill(frame);
         }
         summarizeSnapshot(store);
+        exitHydration(`frame-${frame.type}`);
         const current = store.getSnapshot();
-        backfillController.maybeRequest(current, current.followTail);
+        backfillController.maybeRequest(current, {
+          nearBottom: current.followTail,
+          followTailDesired: followTailDesiredRef.current,
+          phase: followTailPhaseRef.current,
+        });
         break;
       }
       case 'snapshot_complete':
+        exitHydration('frame-snapshot-complete');
         break;
       case 'input_ack': {
         const timestamp = now();
@@ -3237,7 +3426,7 @@ export function buildLines(
     lines.push({ absolute: row.absolute, kind: row.kind, cells });
   }
 
-  trace('buildLines result', {
+  const buildLinesPayload = {
     limit,
     followTail: snapshot.followTail,
     viewportTop: snapshot.viewportTop,
@@ -3247,23 +3436,14 @@ export function buildLines(
     absolutes: rows.map((row) => row.absolute),
     lineKinds: lines.map((line) => line.kind),
     lineAbsolutes: lines.map((line) => line.absolute),
-  });
+  };
+  trace('buildLines result', buildLinesPayload);
+  captureTrace('buildLines', buildLinesPayload);
   if (typeof console !== 'undefined') {
-    const payload = {
-      limit,
-      followTail: snapshot.followTail,
-      viewportTop: snapshot.viewportTop,
-      viewportHeight: snapshot.viewportHeight,
-      baseRow: snapshot.baseRow,
-      rowKinds: rows.map((row) => row.kind),
-      absolutes: rows.map((row) => row.absolute),
-      lineKinds: lines.map((line) => line.kind),
-      lineAbsolutes: lines.map((line) => line.absolute),
-    };
     try {
-      console.info('[beach-trace][terminal][buildLines result]', JSON.stringify(payload));
+      console.info('[beach-trace][terminal][buildLines result]', JSON.stringify(buildLinesPayload));
     } catch {
-      console.info('[beach-trace][terminal][buildLines result]', payload);
+      console.info('[beach-trace][terminal][buildLines result]', buildLinesPayload);
     }
   }
   if (typeof window !== 'undefined' && Array.isArray((window as typeof window & { __BEACH_TRACE_HISTORY?: unknown[] }).__BEACH_TRACE_HISTORY)) {
@@ -3519,3 +3699,4 @@ function IdlePlaceholder({
     </div>
   );
 }
+ensureTraceCaptureHelpers();

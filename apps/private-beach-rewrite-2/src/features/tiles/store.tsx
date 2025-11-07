@@ -10,6 +10,7 @@ import type {
   TileResizeInput,
   TileSessionMeta,
   TileState,
+  TileViewportSnapshot,
 } from './types';
 import { computeAutoPosition, generateTileId, snapPosition, snapSize } from './utils';
 
@@ -23,7 +24,8 @@ type Action =
   | { type: 'SET_TILE_SIZE'; payload: { id: string; size: TileResizeInput } }
   | { type: 'START_RESIZE'; payload: { id: string } }
   | { type: 'END_RESIZE'; payload: { id: string } }
-  | { type: 'SET_INTERACTIVE_TILE'; payload: { id: string | null } };
+  | { type: 'SET_INTERACTIVE_TILE'; payload: { id: string | null } }
+  | { type: 'SET_TILE_VIEWPORT'; payload: { id: string; viewport: TileViewportSnapshot | null } };
 
 function createEmptyState(): TileState {
   return {
@@ -32,6 +34,7 @@ function createEmptyState(): TileState {
     activeId: null,
     resizing: {},
     interactiveId: null,
+    viewport: {},
   };
 }
 
@@ -59,6 +62,23 @@ function ensureAgentMeta(
     return { role: '', responsibility: '', isEditing: true };
   }
   return null;
+}
+
+function viewportEqual(a: TileViewportSnapshot | undefined, b: TileViewportSnapshot | null): boolean {
+  if (!a && !b) {
+    return true;
+  }
+  if (!a || !b) {
+    return false;
+  }
+  return (
+    a.hostRows === b.hostRows &&
+    a.hostCols === b.hostCols &&
+    a.viewportRows === b.viewportRows &&
+    a.viewportCols === b.viewportCols &&
+    a.pixelsPerRow === b.pixelsPerRow &&
+    a.pixelsPerCol === b.pixelsPerCol
+  );
 }
 
 function reducer(state: TileState, action: Action): TileState {
@@ -141,7 +161,9 @@ function reducer(state: TileState, action: Action): TileState {
       const activeId =
         state.activeId === id ? (order.length > 0 ? order[order.length - 1] : null) : state.activeId;
       const interactiveId = state.interactiveId === id ? null : state.interactiveId;
-      return { ...state, tiles, order, activeId, resizing, interactiveId };
+      const viewport = { ...state.viewport };
+      delete viewport[id];
+      return { ...state, tiles, order, activeId, resizing, interactiveId, viewport };
     }
     case 'SET_ACTIVE_TILE': {
       const { id } = action.payload;
@@ -269,9 +291,52 @@ function reducer(state: TileState, action: Action): TileState {
       }
       return { ...state, interactiveId: id };
     }
+    case 'SET_TILE_VIEWPORT': {
+      const { id, viewport } = action.payload;
+      if (!state.tiles[id]) {
+        if (!state.viewport[id]) {
+          return state;
+        }
+        const nextViewport = { ...state.viewport };
+        delete nextViewport[id];
+        return { ...state, viewport: nextViewport };
+      }
+      if (!viewport) {
+        if (!state.viewport[id]) {
+          return state;
+        }
+        const nextViewport = { ...state.viewport };
+        delete nextViewport[id];
+        return { ...state, viewport: nextViewport };
+      }
+      const existing = state.viewport[id];
+      if (viewportEqual(existing, viewport)) {
+        return state;
+      }
+      return {
+        ...state,
+        viewport: {
+          ...state.viewport,
+          [id]: viewport,
+        },
+      };
+    }
     default:
       return state;
   }
+}
+
+function hydrateInitialState(state: TileState | null | undefined): TileState {
+  const base = state ?? createEmptyState();
+  return {
+    ...createEmptyState(),
+    ...base,
+    tiles: base.tiles ?? {},
+    order: Array.isArray(base.order) ? base.order : [],
+    resizing: base.resizing ?? {},
+    interactiveId: base.interactiveId ?? null,
+    viewport: base.viewport ?? {},
+  };
 }
 
 const TileStateContext = createContext<TileState>(createEmptyState());
@@ -285,9 +350,7 @@ type TileStoreProviderProps = {
 };
 
 export function TileStoreProvider({ children, initialState }: TileStoreProviderProps) {
-  const [state, dispatch] = useReducer(reducer, initialState ?? createEmptyState(), (value) =>
-    value ?? createEmptyState(),
-  );
+  const [state, dispatch] = useReducer(reducer, initialState ?? null, hydrateInitialState);
   const memoState = useMemo(() => state, [state]);
   return (
     <TileDispatchContext.Provider value={dispatch}>
@@ -319,6 +382,8 @@ export function useTileActions() {
       beginResize: (id: string) => dispatch({ type: 'START_RESIZE', payload: { id } }),
       endResize: (id: string) => dispatch({ type: 'END_RESIZE', payload: { id } }),
       setInteractiveTile: (id: string | null) => dispatch({ type: 'SET_INTERACTIVE_TILE', payload: { id } }),
+      updateTileViewport: (id: string, viewport: TileViewportSnapshot | null) =>
+        dispatch({ type: 'SET_TILE_VIEWPORT', payload: { id, viewport } }),
     }),
     [dispatch],
   );

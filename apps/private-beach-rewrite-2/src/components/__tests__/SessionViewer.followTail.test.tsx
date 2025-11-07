@@ -50,6 +50,7 @@ describe('SessionViewer follow-tail intent (rewrite-2)', () => {
     render(
       <SessionViewer
         viewer={viewer}
+        tileId="tile-follow"
         sessionId="rewrite2-session"
         disableViewportMeasurements
       />,

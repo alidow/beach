@@ -111,6 +111,7 @@ function FlowCanvasInner({
             privateBeachId,
             managerUrl: resolvedManagerUrl,
             rewriteEnabled,
+            viewportMetrics: state.viewport[tile.id] ?? null,
           },
           position: tile.position,
           draggable: true,
@@ -403,7 +404,7 @@ function FlowCanvasInner({
         nodesConnectable
         elementsSelectable={false}
         panOnScroll={false}
-        panOnDrag={false}
+        panOnDrag
         zoomOnScroll={false}
         zoomOnPinch
         zoomOnDoubleClick={false}

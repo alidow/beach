@@ -2,15 +2,16 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { MouseEvent, PointerEvent } from 'react';
-import { Handle, Position } from 'reactflow';
-import type { NodeProps } from 'reactflow';
+import { Handle, Position, useStore } from 'reactflow';
+import type { NodeProps, ReactFlowState } from 'reactflow';
 import { ApplicationTile } from '@/components/ApplicationTile';
 import { cn } from '@/lib/cn';
 import { TILE_HEADER_HEIGHT } from '../constants';
 import { useTileActions } from '../store';
-import type { TileDescriptor, TileSessionMeta } from '../types';
+import type { TileDescriptor, TileSessionMeta, TileViewportSnapshot } from '../types';
 import { snapSize } from '../utils';
 import { emitTelemetry } from '../../../../../private-beach/src/lib/telemetry';
+import { computeAutoResizeSize } from '../autoResize';
 
 type TileFlowNodeData = {
   tile: TileDescriptor;
@@ -21,6 +22,7 @@ type TileFlowNodeData = {
   managerUrl: string;
   rewriteEnabled: boolean;
   isInteractive: boolean;
+  viewportMetrics: TileViewportSnapshot | null;
 };
 
 type ResizeState = {
@@ -58,10 +60,33 @@ function isInteractiveElement(target: EventTarget | null): boolean {
   return Boolean(target.closest('button, input, textarea, select, a, label'));
 }
 
+function logAutoResizeEvent(tileId: string, step: string, detail: Record<string, unknown> = {}) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  try {
+    console.info('[tile][auto-resize]', step, JSON.stringify({ tileId, ...detail }));
+  } catch (error) {
+    console.info('[tile][auto-resize]', step, { tileId, ...detail });
+  }
+}
+
 type Props = NodeProps<TileFlowNodeData>;
 
+const zoomSelector = (state: ReactFlowState) => state.transform[2] ?? 1;
+
 export function TileFlowNode({ data, dragging }: Props) {
-  const { tile, orderIndex, isActive, isResizing, isInteractive, privateBeachId, managerUrl, rewriteEnabled } = data;
+  const {
+    tile,
+    orderIndex,
+    isActive,
+    isResizing,
+    isInteractive,
+    privateBeachId,
+    managerUrl,
+    rewriteEnabled,
+    viewportMetrics,
+  } = data;
   const {
     removeTile,
     bringToFront,
@@ -73,6 +98,7 @@ export function TileFlowNode({ data, dragging }: Props) {
     setInteractiveTile,
     createTile,
   } = useTileActions();
+  const nodeRef = useRef<HTMLElement | null>(null);
   const resizeStateRef = useRef<ResizeState | null>(null);
   const [hovered, setHovered] = useState(false);
   const isAgent = tile.nodeType === 'agent';
@@ -82,6 +108,7 @@ export function TileFlowNode({ data, dragging }: Props) {
   );
   const [agentRole, setAgentRole] = useState(agentMeta.role);
   const [agentResponsibility, setAgentResponsibility] = useState(agentMeta.responsibility);
+  const zoom = useStore(zoomSelector);
 
 
   const zIndex = useMemo(() => 10 + orderIndex, [orderIndex]);
@@ -147,6 +174,103 @@ export function TileFlowNode({ data, dragging }: Props) {
     });
   }, [agentMeta, createTile, isAgent, removeTile, tile.id]);
 
+  const handleAutoResize = useCallback(() => {
+    logAutoResizeEvent(tile.id, 'attempt', {
+      hasMetrics: Boolean(viewportMetrics),
+      zoom: zoom ?? null,
+    });
+    if (!viewportMetrics) {
+      logAutoResizeEvent(tile.id, 'missing-metrics');
+      return;
+    }
+    const hostRows = viewportMetrics.hostRows ?? null;
+    const hostCols = viewportMetrics.hostCols ?? null;
+    const pixelsPerRow = viewportMetrics.pixelsPerRow ?? null;
+    const pixelsPerCol = viewportMetrics.pixelsPerCol ?? null;
+    if (!hostRows || !hostCols || !pixelsPerRow || !pixelsPerCol) {
+      logAutoResizeEvent(tile.id, 'incomplete-metrics', {
+        hostRows,
+        hostCols,
+        pixelsPerRow,
+        pixelsPerCol,
+      });
+      return;
+    }
+    const container = nodeRef.current;
+    if (!container) {
+      logAutoResizeEvent(tile.id, 'missing-container');
+      return;
+    }
+    const terminal = container.querySelector<HTMLElement>(
+      `[data-terminal-root="true"][data-terminal-tile="${tile.id}"]`,
+    );
+    if (!terminal) {
+      logAutoResizeEvent(tile.id, 'missing-terminal');
+      return;
+    }
+    const tileRect = container.getBoundingClientRect();
+    const terminalRect = terminal.getBoundingClientRect();
+    if (tileRect.width <= 0 || tileRect.height <= 0 || terminalRect.width <= 0 || terminalRect.height <= 0) {
+      logAutoResizeEvent(tile.id, 'invalid-rect', { tileRect, terminalRect });
+      return;
+    }
+    const chromeWidthPx = Math.max(0, tileRect.width - terminalRect.width);
+    const chromeHeightPx = Math.max(0, tileRect.height - terminalRect.height);
+    const nextSize = computeAutoResizeSize({
+      metrics: viewportMetrics,
+      chromeWidthPx,
+      chromeHeightPx,
+      zoom: zoom ?? 1,
+    });
+    if (!nextSize) {
+      logAutoResizeEvent(tile.id, 'compute-failed', { chromeWidthPx, chromeHeightPx });
+      return;
+    }
+    if (nextSize.width === tile.size.width && nextSize.height === tile.size.height) {
+      logAutoResizeEvent(tile.id, 'no-op', nextSize);
+      return;
+    }
+    logAutoResizeEvent(tile.id, 'apply', {
+      size: nextSize,
+      chromeWidthPx,
+      chromeHeightPx,
+      zoom: zoom ?? 1,
+    });
+    resizeTile(tile.id, nextSize);
+    emitTelemetry('canvas.resize.auto', {
+      privateBeachId,
+      tileId: tile.id,
+      hostRows,
+      hostCols,
+      viewportRows: viewportMetrics.viewportRows ?? null,
+      viewportCols: viewportMetrics.viewportCols ?? null,
+      pixelsPerRow,
+      pixelsPerCol,
+      zoom: zoom ?? 1,
+      rewriteEnabled,
+      size: nextSize,
+    });
+  }, [
+    viewportMetrics,
+    nodeRef,
+    zoom,
+    resizeTile,
+    tile.id,
+    tile.size.height,
+    tile.size.width,
+    privateBeachId,
+    rewriteEnabled,
+  ]);
+
+  const handleResizeDoubleClick = useCallback(
+    (event: MouseEvent<HTMLButtonElement>) => {
+      event.preventDefault();
+      event.stopPropagation();
+      logAutoResizeEvent(tile.id, 'double-click');
+      handleAutoResize();
+    },
+    [handleAutoResize, tile.id],
+  );
   const handlePointerDown = useCallback(
     (event: PointerEvent<HTMLElement>) => {
       if (event.button !== 0) {
@@ -169,6 +293,13 @@ export function TileFlowNode({ data, dragging }: Props) {
 
   const handleResizePointerDown = useCallback(
     (event: PointerEvent<HTMLButtonElement>) => {
+      if (event.detail >= 2) {
+        event.preventDefault();
+        event.stopPropagation();
+        logAutoResizeEvent(tile.id, 'pointer-detail', { detail: event.detail });
+        handleAutoResize();
+        return;
+      }
       event.preventDefault();
       const target = event.target;
       const allowWhileInteractive = isResizeHandle(target);
@@ -194,7 +325,7 @@ export function TileFlowNode({ data, dragging }: Props) {
         // ignore pointer capture issues
       }
     },
-    [beginResize, bringToFront, isInteractive, setActiveTile, tile.id, tile.size],
+    [beginResize, bringToFront, handleAutoResize, isInteractive, setActiveTile, tile.id, tile.size],
   );
 
   const handleResizePointerMove = useCallback(
@@ -339,6 +470,7 @@ export function TileFlowNode({ data, dragging }: Props) {
 
   return (
     <article
+      ref={nodeRef}
       className={nodeClass}
       style={{ width: '100%', height: '100%', zIndex }}
       data-testid={`rf__node-tile:${tile.id}`}
@@ -496,6 +628,7 @@ export function TileFlowNode({ data, dragging }: Props) {
         onPointerMove={handleResizePointerMove}
         onPointerUp={handleResizePointerUp}
         onPointerCancel={handleResizePointerCancel}
+        onDoubleClick={handleResizeDoubleClick}
         data-tile-drag-ignore="true"
         data-tile-resize-handle="true"
       />

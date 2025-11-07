@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import type { SessionSummary } from '@private-beach/shared-api';
 import { attachByCode, fetchSessionStateSnapshot, updateSessionRoleById } from '@/lib/api';
-import type { TileSessionMeta } from '@/features/tiles';
+import type { TileSessionMeta, TileViewportSnapshot } from '@/features/tiles';
+import { useTileActions } from '@/features/tiles';
 import { buildSessionMetadataWithTile, sessionSummaryToTileMeta } from '@/features/tiles/sessionMeta';
 import type { SessionCredentialOverride } from '../../../private-beach/src/hooks/terminalViewerTypes';
 import { useManagerToken, buildManagerUrl } from '../hooks/useManagerToken';
@@ -12,6 +13,8 @@ import { SessionViewer } from './SessionViewer';
 import {
   hydrateTerminalStoreFromDiff,
   type CellStylePayload,
+  type TerminalFramePayload,
+  type TerminalStateDiff,
 } from '../../../private-beach/src/lib/terminalHydrator';
 import type { Update } from '../../../beach-surfer/src/protocol/types';
 
@@ -75,6 +78,72 @@ function buildStyleUpdates(styles: CellStylePayload[] | null | undefined, sequen
   return updates;
 }
 
+function normalizePositiveInteger(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return Math.trunc(value);
+  }
+  return null;
+}
+
+function normalizePositiveFloat(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return Number(value);
+  }
+  return null;
+}
+
+function inferHostRows(payload: TerminalFramePayload | null | undefined): number | null {
+  if (!payload) {
+    return null;
+  }
+  const direct = normalizePositiveInteger(payload.rows);
+  if (direct) {
+    return direct;
+  }
+  if (Array.isArray(payload.styled_lines) && payload.styled_lines.length > 0) {
+    const count = payload.styled_lines.length;
+    return count > 0 ? count : null;
+  }
+  if (Array.isArray(payload.lines) && payload.lines.length > 0) {
+    const count = payload.lines.length;
+    return count > 0 ? count : null;
+  }
+  return null;
+}
+
+function inferHostCols(payload: TerminalFramePayload | null | undefined): number | null {
+  if (!payload) {
+    return null;
+  }
+  const direct = normalizePositiveInteger(payload.cols);
+  if (direct) {
+    return direct;
+  }
+  if (Array.isArray(payload.styled_lines) && payload.styled_lines.length > 0) {
+    const maxStyled = payload.styled_lines.reduce((max, row) => {
+      if (!Array.isArray(row)) {
+        return max;
+      }
+      return Math.max(max, row.length);
+    }, 0);
+    if (maxStyled > 0) {
+      return maxStyled;
+    }
+  }
+  if (Array.isArray(payload.lines) && payload.lines.length > 0) {
+    const maxPlain = payload.lines.reduce((max, line) => {
+      if (typeof line !== 'string') {
+        return max;
+      }
+      return Math.max(max, Array.from(line).length);
+    }, 0);
+    if (maxPlain > 0) {
+      return maxPlain;
+    }
+  }
+  return null;
+}
+
 type ApplicationTileProps = {
   tileId: string;
   privateBeachId: string;
@@ -116,7 +185,11 @@ export function ApplicationTile({
   const [credentialOverride, setCredentialOverride] = useState<SessionCredentialOverride | null>(null);
   const prehydratedSequenceRef = useRef<string | null>(null);
   const cachedStyleUpdatesRef = useRef<Update[] | null>(null);
+  const cachedDiffRef = useRef<TerminalStateDiff | null>(null);
+  const restoringRef = useRef(false);
   const lastSessionIdRef = useRef<string | null>(sessionMeta?.sessionId ?? null);
+  const { updateTileViewport } = useTileActions();
+  const lastViewportSnapshotRef = useRef<TileViewportSnapshot | null>(null);
   const hydrationRetryTimerRef = useRef<number | null>(null);
   const hydrationAttemptRef = useRef(0);
 
@@ -135,6 +208,105 @@ export function ApplicationTile({
     }
   }, [sessionMeta?.sessionId, sessionIdInput]);
 
+  useEffect(() => {
+    lastViewportSnapshotRef.current = null;
+    updateTileViewport(tileId, null);
+    logViewportMetricEvent(tileId, 'reset', {});
+    return () => {
+      updateTileViewport(tileId, null);
+      logViewportMetricEvent(tileId, 'cleanup', {});
+    };
+  }, [tileId, updateTileViewport]);
+
+  const resolveIntegerMetric = useCallback(
+    (incoming: number | null | undefined, previous: number | null | undefined) => {
+      if (incoming === undefined) {
+        return previous ?? null;
+      }
+      if (incoming === null) {
+        return null;
+      }
+      return normalizePositiveInteger(incoming) ?? previous ?? null;
+    },
+    [],
+  );
+
+  const resolveFloatMetric = useCallback(
+    (incoming: number | null | undefined, previous: number | null | undefined) => {
+      if (incoming === undefined) {
+        return previous ?? null;
+      }
+      if (incoming === null) {
+        return null;
+      }
+      return normalizePositiveFloat(incoming) ?? previous ?? null;
+    },
+    [],
+  );
+
+  const applyViewportPatch = useCallback(
+    (patch: Partial<TileViewportSnapshot> | null, source: string) => {
+      if (!patch) {
+        if (!lastViewportSnapshotRef.current) {
+          return;
+        }
+        lastViewportSnapshotRef.current = null;
+        updateTileViewport(tileId, null);
+        logViewportMetricEvent(tileId, 'clear', { source });
+        return;
+      }
+      const previous = lastViewportSnapshotRef.current;
+      const next: TileViewportSnapshot = {
+        tileId,
+        hostRows: resolveIntegerMetric(patch.hostRows, previous?.hostRows),
+        hostCols: resolveIntegerMetric(patch.hostCols, previous?.hostCols),
+        viewportRows: resolveIntegerMetric(patch.viewportRows, previous?.viewportRows),
+        viewportCols: resolveIntegerMetric(patch.viewportCols, previous?.viewportCols),
+        pixelsPerRow: resolveFloatMetric(patch.pixelsPerRow, previous?.pixelsPerRow),
+        pixelsPerCol: resolveFloatMetric(patch.pixelsPerCol, previous?.pixelsPerCol),
+      };
+      const same =
+        previous &&
+        previous.hostRows === next.hostRows &&
+        previous.hostCols === next.hostCols &&
+        previous.viewportRows === next.viewportRows &&
+        previous.viewportCols === next.viewportCols &&
+        previous.pixelsPerRow === next.pixelsPerRow &&
+        previous.pixelsPerCol === next.pixelsPerCol;
+      if (same) {
+        return;
+      }
+      lastViewportSnapshotRef.current = next;
+      updateTileViewport(tileId, next);
+      logViewportMetricEvent(tileId, 'update', {
+        source,
+        hostRows: next.hostRows,
+        hostCols: next.hostCols,
+        viewportRows: next.viewportRows,
+        viewportCols: next.viewportCols,
+        pixelsPerRow: next.pixelsPerRow,
+        pixelsPerCol: next.pixelsPerCol,
+      });
+    },
+    [resolveFloatMetric, resolveIntegerMetric, tileId, updateTileViewport],
+  );
+
+  const handleViewportMetrics = useCallback(
+    (snapshot: TileViewportSnapshot | null) => {
+      if (!snapshot) {
+        applyViewportPatch(null, 'terminal');
+        return;
+      }
+      const normalized: Partial<TileViewportSnapshot> = {
+        ...snapshot,
+        hostRows: snapshot.hostRows ?? undefined,
+        hostCols: snapshot.hostCols ?? undefined,
+      };
+      applyViewportPatch(normalized, 'terminal');
+    },
+    [applyViewportPatch],
+  );
+
   const viewer = useSessionConnection({
     tileId,
     sessionId: sessionMeta?.sessionId ?? null,
@@ -150,6 +322,8 @@ export function ApplicationTile({
       lastSessionIdRef.current = currentSessionId;
       prehydratedSequenceRef.current = null;
       cachedStyleUpdatesRef.current = null;
+      cachedDiffRef.current = null;
+      restoringRef.current = false;
       hydrationAttemptRef.current = 0;
       if (hydrationRetryTimerRef.current != null && typeof window !== 'undefined') {
         window.clearTimeout(hydrationRetryTimerRef.current);
@@ -244,6 +418,7 @@ export function ApplicationTile({
         if (hydrated) {
           hydrationAttemptRef.current = 0;
           prehydratedSequenceRef.current = sequenceKey;
+          cachedDiffRef.current = diff;
           cachedStyleUpdatesRef.current = buildStyleUpdates(diff.payload.styles ?? null, diff.sequence ?? 0);
           if (cachedStyleUpdatesRef.current.length > 0) {
             store.applyUpdates(cachedStyleUpdatesRef.current, {
@@ -255,6 +430,18 @@ export function ApplicationTile({
               sequence: diff.sequence ?? 0,
               count: cachedStyleUpdatesRef.current.length,
             });
+          }
+          const hostRows = inferHostRows(diff.payload);
+          const hostCols = inferHostCols(diff.payload);
+          if (hostRows || hostCols) {
+            applyViewportPatch(
+              {
+                tileId,
+                hostRows: hostRows ?? undefined,
+                hostCols: hostCols ?? undefined,
+              },
+              'hydrate',
+            );
           }
           try {
             const snapshot = store.getSnapshot();
@@ -296,7 +483,7 @@ export function ApplicationTile({
       }
       hydrationRetryTimerRef.current = null;
     };
-  }, [managerToken, managerUrl, refresh, sessionMeta?.sessionId, viewer.store]);
+  }, [applyViewportPatch, managerToken, managerUrl, refresh, sessionMeta?.sessionId, viewer.store]);
 
   useEffect(() => {
     const store = viewer.store;
@@ -304,15 +491,29 @@ export function ApplicationTile({
       return undefined;
     }
 
-    const maybeApplyCachedStyles = (reason: string) => {
-      const styleUpdates = cachedStyleUpdatesRef.current;
-      if (!styleUpdates || styleUpdates.length === 0) {
+    const maybeRestoreSnapshot = (reason: string) => {
+      if (restoringRef.current) {
         return;
       }
       try {
         const snapshot = store.getSnapshot?.();
+        const rows = snapshot?.rows?.length ?? 0;
         const styleCount = snapshot?.styles ? snapshot.styles.size : 0;
-        if (styleCount > 1) {
+        if (rows === 0 && cachedDiffRef.current) {
+          restoringRef.current = true;
+          const applied = hydrateTerminalStoreFromDiff(store, cachedDiffRef.current, {});
+          restoringRef.current = false;
+          if (applied) {
+            logHydration('diff-restore', {
+              sessionId: sessionMeta?.sessionId ?? null,
+              reason,
+              rowsRestored: cachedDiffRef.current.payload.rows ?? null,
+            });
+            return;
+          }
+        }
+        const styleUpdates = cachedStyleUpdatesRef.current;
+        if (!styleUpdates || styleUpdates.length === 0 || styleCount > 1) {
           return;
         }
         store.applyUpdates(styleUpdates, { authoritative: false, origin: 'cached-style-restore' });
@@ -323,7 +524,8 @@ export function ApplicationTile({
           previousStyleCount: styleCount,
         });
       } catch (error) {
-        logHydration('styles-restore-error', {
+        restoringRef.current = false;
+        logHydration('restore-error', {
           sessionId: sessionMeta?.sessionId ?? null,
           reason,
           error: error instanceof Error ? error.message : String(error),
@@ -331,19 +533,19 @@ export function ApplicationTile({
       }
     };
 
-    maybeApplyCachedStyles('effect-init');
+    maybeRestoreSnapshot('effect-init');
 
     if (typeof store.subscribe !== 'function') {
       return undefined;
     }
     const unsubscribe = store.subscribe(() => {
-      maybeApplyCachedStyles('store-update');
+      maybeRestoreSnapshot('store-update');
     });
     return () => {
       try {
         unsubscribe();
       } catch (error) {
-        logHydration('styles-restore-unsubscribe-error', {
+        logHydration('restore-unsubscribe-error', {
           sessionId: sessionMeta?.sessionId ?? null,
           error: error instanceof Error ? error.message : String(error),
         });
@@ -489,12 +691,28 @@ export function ApplicationTile({
             </p>
           )}
           <SessionViewer
+            tileId={tileId}
             viewer={viewer}
             sessionId={sessionMeta?.sessionId ?? null}
             disableViewportMeasurements={disableViewportMeasurements}
+            onViewportMetrics={handleViewportMetrics}
           />
         </div>
       )}
     </div>
   );
+}
+function logViewportMetricEvent(
+  tileId: string,
+  event: string,
+  detail: Record<string, unknown>,
+) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  try {
+    console.info('[tile][viewport]', event, JSON.stringify({ tileId, ...detail }));
+  } catch {
+    console.info('[tile][viewport]', event, { tileId, ...detail });
+  }
 }

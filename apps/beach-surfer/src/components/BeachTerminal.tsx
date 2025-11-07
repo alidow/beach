@@ -486,6 +486,8 @@ export interface TerminalViewportState {
   atTail: boolean;
   remainingTailPixels: number;
   tailPaddingRows: number;
+  pixelsPerRow: number | null;
+  pixelsPerCol: number | null;
 }
 
 export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
@@ -566,8 +568,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     atTail: boolean;
     remainingTailPixels: number;
     tailPaddingRows: number;
+    pixelsPerRow: number | null;
+    pixelsPerCol: number | null;
   } | null>(null);
   const disableMeasurementsPrevRef = useRef<boolean>(disableViewportMeasurements);
+  const pixelsPerRowRef = useRef<number | null>(null);
+  const pixelsPerColRef = useRef<number | null>(null);
   const [status, setStatus] = useState<TerminalStatus>(
     providedTransport ? 'connected' : 'idle',
   );
@@ -1035,6 +1041,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     const tailMetrics = tailMetricsRef.current;
     const followTailDesired = followTailDesiredRef.current;
     const followTailPhase = followTailPhaseRef.current;
+    const pixelsPerRow = pixelsPerRowRef.current;
+    const pixelsPerCol = pixelsPerColRef.current;
     const nextReport = {
       viewportRows,
       viewportCols,
@@ -1047,6 +1055,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       atTail: tailMetrics.atTail,
       remainingTailPixels: tailMetrics.remainingPixels,
       tailPaddingRows: tailMetrics.paddingRows,
+      pixelsPerRow,
+      pixelsPerCol,
     };
     const previous = lastViewportReportRef.current;
     trace(
@@ -1063,6 +1073,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         atTail: tailMetrics.atTail,
         remainingTailPixels: tailMetrics.remainingPixels,
         tailPaddingRows: tailMetrics.paddingRows,
+        pixelsPerRow,
+        pixelsPerCol,
         suppressed: Boolean(
           previous &&
             previous.viewportRows === nextReport.viewportRows &&
@@ -1075,7 +1087,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
             previous.followTailPhase === nextReport.followTailPhase &&
             previous.atTail === nextReport.atTail &&
             previous.remainingTailPixels === nextReport.remainingTailPixels &&
-            previous.tailPaddingRows === nextReport.tailPaddingRows,
+            previous.tailPaddingRows === nextReport.tailPaddingRows &&
+            previous.pixelsPerRow === nextReport.pixelsPerRow &&
+            previous.pixelsPerCol === nextReport.pixelsPerCol,
         ),
       }),
     );
@@ -1091,7 +1105,9 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         previous.followTailPhase === nextReport.followTailPhase &&
         previous.atTail === nextReport.atTail &&
         previous.remainingTailPixels === nextReport.remainingTailPixels &&
-        previous.tailPaddingRows === nextReport.tailPaddingRows
+        previous.tailPaddingRows === nextReport.tailPaddingRows &&
+        previous.pixelsPerRow === nextReport.pixelsPerRow &&
+        previous.pixelsPerCol === nextReport.pixelsPerCol
     ) {
       return;
     }
@@ -1111,6 +1127,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           atTail: nextReport.atTail,
           remainingTailPixels: nextReport.remainingTailPixels,
           tailPaddingRows: nextReport.tailPaddingRows,
+          pixelsPerRow: nextReport.pixelsPerRow,
+          pixelsPerCol: nextReport.pixelsPerCol,
         });
       } catch {
         // ignore logging issues
@@ -1415,6 +1433,14 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const [measuredLineHeight, setMeasuredLineHeight] = useState<number>(lineHeight);
   const minEffectiveLineHeight = Math.max(4, lineHeight * 0.4);
   const effectiveLineHeight = measuredLineHeight >= minEffectiveLineHeight ? measuredLineHeight : lineHeight;
+  useEffect(() => {
+    const normalized =
+      Number.isFinite(effectiveLineHeight) && effectiveLineHeight > 0 ? Number(effectiveLineHeight) : null;
+    if (pixelsPerRowRef.current !== normalized) {
+      pixelsPerRowRef.current = normalized;
+      emitViewportState();
+    }
+  }, [effectiveLineHeight, emitViewportState]);
   const totalRows = snapshot.rows.length;
   const firstAbsolute = lines.length > 0 ? lines[0]!.absolute : snapshot.baseRow;
   const lastAbsolute = lines.length > 0 ? lines[lines.length - 1]!.absolute : firstAbsolute;

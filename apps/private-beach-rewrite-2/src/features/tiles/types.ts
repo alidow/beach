@@ -37,12 +37,23 @@ export type TileDescriptor = {
   updatedAt: number;
 };
 
+export type TileViewportSnapshot = {
+  tileId: string;
+  hostRows: number | null;
+  hostCols: number | null;
+  viewportRows: number | null;
+  viewportCols: number | null;
+  pixelsPerRow: number | null;
+  pixelsPerCol: number | null;
+};
+
 export type TileState = {
   tiles: Record<string, TileDescriptor>;
   order: string[];
   activeId: string | null;
   resizing: Record<string, boolean>;
   interactiveId: string | null;
+  viewport: Record<string, TileViewportSnapshot>;
 };
 
 export type TileCreateInput = {

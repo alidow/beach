@@ -68,6 +68,7 @@ describe('tile persistence helpers (rewrite-2)', () => {
       activeId: null,
       resizing: {},
       interactiveId: null,
+      viewport: {},
     };
     const key = serializeTileStateKey(orphanState);
     expect(key).toContain('only');

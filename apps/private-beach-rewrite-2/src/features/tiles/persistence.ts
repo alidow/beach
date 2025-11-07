@@ -140,6 +140,7 @@ export function layoutToTileState(layout: CanvasLayout | null | undefined): Tile
     activeId: null,
     resizing: {},
     interactiveId,
+    viewport: {},
   };
 }
 

@@ -1,8 +1,8 @@
 import { notFound } from 'next/navigation';
 import { BeachCanvasShell } from '@/features/canvas';
 import { AppShellTopNav } from '@/components/AppShellTopNav';
-import type { BeachMeta, CanvasLayout } from '@/lib/api';
-import { getBeachMeta, getCanvasLayout } from '@/lib/api';
+import type { BeachMeta, CanvasLayout, SessionSummary } from '@/lib/api';
+import { getBeachMeta, getCanvasLayout, listSessions } from '@/lib/api';
 import { resolveManagerBaseUrl, resolveManagerToken, resolveRewriteFlag } from '@/lib/serverSecrets';
 import type { Metadata } from 'next';
 import { safeAuth } from '@/lib/serverAuth';
@@ -46,6 +46,7 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
 
   let beach: BeachMeta | null = null;
   let layout: CanvasLayout | null = null;
+  let sessions: SessionSummary[] = [];
   try {
     beach = await getBeachMeta(beachId, token, managerBaseUrl);
   } catch (error) {
@@ -104,6 +105,18 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
     layout = null;
   }
 
+  try {
+    sessions = await listSessions(beach.id, token, managerBaseUrl);
+  } catch (error) {
+    if (error instanceof Error) {
+      console.warn('[rewrite] failed to fetch sessions', {
+        beachId: beach.id,
+        error: error.message,
+      });
+    }
+    sessions = [];
+  }
+
   return (
     <div
       className="flex h-screen min-h-screen flex-col bg-background"
@@ -116,6 +129,7 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
         managerUrl={managerBaseUrl}
         managerToken={token}
         initialLayout={layout}
+        initialSessions={sessions}
         rewriteEnabled={rewriteEnabled}
         className="flex-1"
       />

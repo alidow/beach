@@ -1,8 +1,8 @@
 import { notFound } from 'next/navigation';
 import { BeachCanvasShell } from '@/features/canvas';
 import { AppShellTopNav } from '@/components/AppShellTopNav';
-import type { BeachMeta, CanvasLayout } from '@/lib/api';
-import { getBeachMeta, getCanvasLayout } from '@/lib/api';
+import type { BeachMeta, CanvasLayout, SessionSummary } from '@/lib/api';
+import { getBeachMeta, getCanvasLayout, listSessions } from '@/lib/api';
 import { resolveManagerBaseUrl, resolveManagerToken, resolveRewriteFlag } from '@/lib/serverSecrets';
 import type { Metadata } from 'next';
 import { safeAuth } from '@/lib/serverAuth';
@@ -69,12 +69,25 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
     throw error;
   }
 
+  let sessions: SessionSummary[] = [];
   try {
     layout = await getCanvasLayout(beach.id, token, managerBaseUrl);
+    console.info('[rewrite-2] loaded layout', {
+      beachId: beach.id,
+      tileCount: Object.keys(layout?.tiles ?? {}).length,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.warn('[rewrite-2] getCanvasLayout failed', { beachId: beach.id, error: message });
     layout = null;
+  }
+
+  try {
+    sessions = await listSessions(beach.id, token, managerBaseUrl);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn('[rewrite-2] listSessions failed', { beachId: beach.id, error: message });
+    sessions = [];
   }
 
   return (
@@ -86,6 +99,7 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
         managerUrl={managerBaseUrl}
         managerToken={token}
         initialLayout={layout}
+        initialSessions={sessions}
         rewriteEnabled={rewriteEnabled}
         className="flex-1"
       />

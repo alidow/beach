@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import type { SessionSummary } from '@private-beach/shared-api';
 import { attachByCode, fetchSessionStateSnapshot, updateSessionRoleById } from '@/lib/api';
 import type { TileSessionMeta } from '@/features/tiles';
+import { buildSessionMetadataWithTile, sessionSummaryToTileMeta } from '@/features/tiles/sessionMeta';
 import type { SessionCredentialOverride } from '../../../private-beach/src/hooks/terminalViewerTypes';
 import { useManagerToken, buildManagerUrl } from '../hooks/useManagerToken';
 import { useSessionConnection } from '../hooks/useSessionConnection';
@@ -15,6 +16,20 @@ import {
 import type { Update } from '../../../beach-surfer/src/protocol/types';
 
 const DEFAULT_STYLE_ID = 0;
+
+function logHydration(event: string, detail: Record<string, unknown>) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  try {
+    console.info('[terminal][hydrate]', event, JSON.stringify(detail ?? {}));
+  } catch (error) {
+    console.info('[terminal][hydrate]', event, {
+      fallback: true,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
 
 function sanitizeStyleId(raw: unknown, fallback = DEFAULT_STYLE_ID): number {
   if (typeof raw === 'number' && Number.isFinite(raw)) {
@@ -71,26 +86,6 @@ type ApplicationTileProps = {
 
 type SubmitState = 'idle' | 'attaching';
 
-function sessionSummaryToMeta(session: SessionSummary): TileSessionMeta {
-  const metadata = session.metadata;
-  let title: string | null = null;
-  if (metadata && typeof metadata === 'object') {
-    const record = metadata as Record<string, unknown>;
-    if (typeof record.title === 'string') {
-      title = record.title as string;
-    } else if (typeof record.name === 'string') {
-      title = record.name as string;
-    }
-  }
-  return {
-    sessionId: session.session_id,
-    title: title ?? session.session_id,
-    harnessType: session.harness_type ?? null,
-    status: 'attached',
-    pendingActions: session.pending_actions ?? 0,
-  };
-}
-
 function statusLabel(status: string): string {
   switch (status) {
     case 'connected':
@@ -122,6 +117,8 @@ export function ApplicationTile({
   const prehydratedSequenceRef = useRef<string | null>(null);
   const cachedStyleUpdatesRef = useRef<Update[] | null>(null);
   const lastSessionIdRef = useRef<string | null>(sessionMeta?.sessionId ?? null);
+  const hydrationRetryTimerRef = useRef<number | null>(null);
+  const hydrationAttemptRef = useRef(0);
 
   const {
     token: managerToken,
@@ -153,6 +150,11 @@ export function ApplicationTile({
       lastSessionIdRef.current = currentSessionId;
       prehydratedSequenceRef.current = null;
       cachedStyleUpdatesRef.current = null;
+      hydrationAttemptRef.current = 0;
+      if (hydrationRetryTimerRef.current != null && typeof window !== 'undefined') {
+        window.clearTimeout(hydrationRetryTimerRef.current);
+      }
+      hydrationRetryTimerRef.current = null;
     }
   }, [sessionMeta?.sessionId]);
 
@@ -160,38 +162,87 @@ export function ApplicationTile({
     const store = viewer.store;
     const sessionId = sessionMeta?.sessionId?.trim();
     if (!store || !sessionId || !managerUrl) {
+      logHydration('skip:missing-context', {
+        hasStore: Boolean(store),
+        sessionIdPresent: Boolean(sessionId),
+        hasManagerUrl: Boolean(managerUrl),
+      });
       return;
     }
     let cancelled = false;
+    const scheduleRetry = (reason: string) => {
+      if (cancelled || typeof window === 'undefined') {
+        return;
+      }
+      if (hydrationRetryTimerRef.current != null) {
+        return;
+      }
+      const backoffStep = Math.min(hydrationAttemptRef.current, 5);
+      const delay = Math.min(1000 * 2 ** backoffStep, 10000);
+      hydrationRetryTimerRef.current = window.setTimeout(() => {
+        hydrationRetryTimerRef.current = null;
+        void fetchAndHydrate();
+      }, delay);
+      logHydration('retry-scheduled', {
+        sessionId,
+        reason,
+        delayMs: delay,
+        attempt: hydrationAttemptRef.current,
+      });
+    };
+
     const fetchAndHydrate = async () => {
+      hydrationAttemptRef.current += 1;
       let token = managerToken?.trim();
       if (!token) {
         try {
           const refreshed = await refresh();
           token = refreshed?.trim() ?? '';
         } catch (refreshError) {
-          if (typeof window !== 'undefined') {
-            console.warn('[terminal][hydrate] token refresh failed', {
-              sessionId,
-              error: refreshError,
-            });
-          }
+          logHydration('token-refresh-failed', {
+            sessionId,
+            error: refreshError instanceof Error ? refreshError.message : String(refreshError),
+          });
         }
       }
       if (!token || cancelled) {
+        logHydration('skip:no-token', {
+          sessionId,
+          hadInitialToken: Boolean(managerToken?.trim()),
+          cancelled,
+        });
+        scheduleRetry('no-token');
         return;
       }
       try {
+        logHydration('fetch:start', {
+          sessionId,
+          hasToken: Boolean(token),
+          cancelled,
+        });
         const diff = await fetchSessionStateSnapshot(sessionId, token, managerUrl);
         if (!diff || cancelled) {
+          logHydration(cancelled ? 'skip:cancelled' : 'skip:no-diff', {
+            sessionId,
+            cancelled,
+            attempt: hydrationAttemptRef.current,
+          });
+          if (!cancelled) {
+            scheduleRetry('no-diff');
+          }
           return;
         }
         const sequenceKey = `${sessionId}:${diff.sequence ?? 0}`;
         if (prehydratedSequenceRef.current === sequenceKey) {
+          logHydration('skip:already-applied', {
+            sessionId,
+            sequence: diff.sequence ?? 0,
+          });
           return;
         }
         const hydrated = hydrateTerminalStoreFromDiff(store, diff, {});
         if (hydrated) {
+          hydrationAttemptRef.current = 0;
           prehydratedSequenceRef.current = sequenceKey;
           cachedStyleUpdatesRef.current = buildStyleUpdates(diff.payload.styles ?? null, diff.sequence ?? 0);
           if (cachedStyleUpdatesRef.current.length > 0) {
@@ -199,50 +250,106 @@ export function ApplicationTile({
               authoritative: false,
               origin: 'cached-style-refresh',
             });
+            logHydration('styles-applied', {
+              sessionId,
+              sequence: diff.sequence ?? 0,
+              count: cachedStyleUpdatesRef.current.length,
+            });
           }
-          if (typeof window !== 'undefined') {
-            try {
-              const snapshot = store.getSnapshot();
-              console.info('[terminal][hydrate] applied cached diff', {
-                sessionId,
-                sequence: diff.sequence ?? 0,
-                rows: snapshot.rows.length,
-                baseRow: snapshot.baseRow,
-                viewportTop: snapshot.viewportTop,
-                viewportHeight: snapshot.viewportHeight,
-              });
-            } catch (error) {
-              console.info('[terminal][hydrate] applied cached diff', {
-                sessionId,
-                sequence: diff.sequence ?? 0,
-                snapshotError: error instanceof Error ? error.message : String(error),
-              });
-            }
+          try {
+            const snapshot = store.getSnapshot();
+            logHydration('applied-cached-diff', {
+              sessionId,
+              sequence: diff.sequence ?? 0,
+              rows: snapshot.rows.length,
+              baseRow: snapshot.baseRow,
+              viewportTop: snapshot.viewportTop,
+              viewportHeight: snapshot.viewportHeight,
+            });
+          } catch (error) {
+            logHydration('applied-cached-diff', {
+              sessionId,
+              sequence: diff.sequence ?? 0,
+              snapshotError: error instanceof Error ? error.message : String(error),
+            });
           }
+        } else {
+          logHydration('hydrate-returned-false', {
+            sessionId,
+            sequence: diff.sequence ?? 0,
+          });
+          scheduleRetry('hydrate-false');
         }
       } catch (error) {
-        if (typeof window !== 'undefined') {
-          console.warn('[terminal][hydrate] snapshot fetch failed', { sessionId, error });
-        }
+        logHydration('fetch:error', {
+          sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        scheduleRetry('fetch-error');
       }
     };
     fetchAndHydrate();
     return () => {
       cancelled = true;
+      if (hydrationRetryTimerRef.current != null && typeof window !== 'undefined') {
+        window.clearTimeout(hydrationRetryTimerRef.current);
+      }
+      hydrationRetryTimerRef.current = null;
     };
   }, [managerToken, managerUrl, refresh, sessionMeta?.sessionId, viewer.store]);
 
   useEffect(() => {
     const store = viewer.store;
-    const styleUpdates = cachedStyleUpdatesRef.current;
-    if (!store || !styleUpdates || styleUpdates.length === 0) {
-      return;
+    if (!store) {
+      return undefined;
     }
-    if (viewer.status !== 'connected' && viewer.status !== 'reconnecting') {
-      return;
+
+    const maybeApplyCachedStyles = (reason: string) => {
+      const styleUpdates = cachedStyleUpdatesRef.current;
+      if (!styleUpdates || styleUpdates.length === 0) {
+        return;
+      }
+      try {
+        const snapshot = store.getSnapshot?.();
+        const styleCount = snapshot?.styles ? snapshot.styles.size : 0;
+        if (styleCount > 1) {
+          return;
+        }
+        store.applyUpdates(styleUpdates, { authoritative: false, origin: 'cached-style-restore' });
+        logHydration('styles-restore', {
+          sessionId: sessionMeta?.sessionId ?? null,
+          reason,
+          count: styleUpdates.length,
+          previousStyleCount: styleCount,
+        });
+      } catch (error) {
+        logHydration('styles-restore-error', {
+          sessionId: sessionMeta?.sessionId ?? null,
+          reason,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    };
+
+    maybeApplyCachedStyles('effect-init');
+
+    if (typeof store.subscribe !== 'function') {
+      return undefined;
     }
-    store.applyUpdates(styleUpdates, { authoritative: false, origin: 'cached-style-refresh' });
-  }, [viewer.status, viewer.store]);
+    const unsubscribe = store.subscribe(() => {
+      maybeApplyCachedStyles('store-update');
+    });
+    return () => {
+      try {
+        unsubscribe();
+      } catch (error) {
+        logHydration('styles-restore-unsubscribe-error', {
+          sessionId: sessionMeta?.sessionId ?? null,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    };
+  }, [sessionMeta?.sessionId, viewer.store]);
 
   useEffect(() => {
     if (!sessionMeta || !onSessionMetaChange) {
@@ -292,18 +399,19 @@ export function ApplicationTile({
         if (!session) {
           throw new Error('Attach response missing session payload.');
         }
-        const nextMeta = sessionSummaryToMeta(session);
+        const nextMeta = sessionSummaryToTileMeta(session);
         onSessionMetaChange?.(nextMeta);
         setCredentialOverride({ passcode: trimmedCode });
         setCodeInput('');
         setSessionIdInput(session.session_id);
         try {
+          const metadataPayload = buildSessionMetadataWithTile(session.metadata, tileId, nextMeta);
           await updateSessionRoleById(
             session.session_id,
             'application',
             token,
             managerUrl,
-            session.metadata,
+            metadataPayload,
             session.location_hint ?? null,
           );
         } catch (roleErr) {

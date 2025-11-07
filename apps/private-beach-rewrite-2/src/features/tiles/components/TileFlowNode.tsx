@@ -60,7 +60,7 @@ function isInteractiveElement(target: EventTarget | null): boolean {
 
 type Props = NodeProps<TileFlowNodeData>;
 
-function ApplicationTileNode({ data, dragging }: Props) {
+export function TileFlowNode({ data, dragging }: Props) {
   const { tile, orderIndex, isActive, isResizing, isInteractive, privateBeachId, managerUrl, rewriteEnabled } = data;
   const {
     removeTile,
@@ -71,12 +71,30 @@ function ApplicationTileNode({ data, dragging }: Props) {
     endResize,
     updateTileMeta,
     setInteractiveTile,
+    createTile,
   } = useTileActions();
   const resizeStateRef = useRef<ResizeState | null>(null);
   const [hovered, setHovered] = useState(false);
+  const isAgent = tile.nodeType === 'agent';
+  const agentMeta = useMemo(
+    () => tile.agentMeta ?? { role: '', responsibility: '', isEditing: true },
+    [tile.agentMeta],
+  );
+  const [agentRole, setAgentRole] = useState(agentMeta.role);
+  const [agentResponsibility, setAgentResponsibility] = useState(agentMeta.responsibility);
 
 
   const zIndex = useMemo(() => 10 + orderIndex, [orderIndex]);
+
+  useEffect(() => {
+    if (!isAgent) {
+      return;
+    }
+    if (!agentMeta.isEditing) {
+      setAgentRole(agentMeta.role);
+      setAgentResponsibility(agentMeta.responsibility);
+    }
+  }, [agentMeta.isEditing, agentMeta.responsibility, agentMeta.role, isAgent]);
 
   const handleRemove = useCallback(
     (event: MouseEvent<HTMLButtonElement>) => {
@@ -90,6 +108,44 @@ function ApplicationTileNode({ data, dragging }: Props) {
     },
     [privateBeachId, removeTile, rewriteEnabled, tile.id],
   );
+
+  const handleAgentSave = useCallback(() => {
+    if (!isAgent) return;
+    const nextRole = agentRole.trim();
+    const nextResp = agentResponsibility.trim();
+    if (!nextRole || !nextResp) {
+      return;
+    }
+    createTile({
+      id: tile.id,
+      agentMeta: { role: nextRole, responsibility: nextResp, isEditing: false },
+      focus: false,
+    });
+  }, [agentResponsibility, agentRole, createTile, isAgent, tile.id]);
+
+  const handleAgentEdit = useCallback(() => {
+    if (!isAgent) return;
+    createTile({
+      id: tile.id,
+      agentMeta: { ...agentMeta, isEditing: true },
+      focus: false,
+    });
+  }, [agentMeta, createTile, isAgent, tile.id]);
+
+  const handleAgentCancel = useCallback(() => {
+    if (!isAgent) return;
+    if (!agentMeta.role && !agentMeta.responsibility) {
+      removeTile(tile.id);
+      return;
+    }
+    setAgentRole(agentMeta.role);
+    setAgentResponsibility(agentMeta.responsibility);
+    createTile({
+      id: tile.id,
+      agentMeta: { ...agentMeta, isEditing: false },
+      focus: false,
+    });
+  }, [agentMeta, createTile, isAgent, removeTile, tile.id]);
 
   const handlePointerDown = useCallback(
     (event: PointerEvent<HTMLElement>) => {
@@ -248,6 +304,10 @@ function ApplicationTileNode({ data, dragging }: Props) {
     if (tile.sessionMeta.harnessType) return tile.sessionMeta.harnessType;
     return 'Attached';
   }, [tile.sessionMeta]);
+  const headerTitle = isAgent ? 'Agent' : title;
+  const headerSubtitle = isAgent ? agentMeta.role || 'Define this agent' : subtitle;
+  const showAgentEditor = isAgent && (agentMeta.isEditing || (!agentMeta.role && !agentMeta.responsibility));
+  const shouldRenderViewer = !isAgent || !showAgentEditor;
 
   const handleMetaChange = useCallback(
     (meta: TileSessionMeta | null) => {
@@ -293,10 +353,14 @@ function ApplicationTileNode({ data, dragging }: Props) {
         style={{ minHeight: TILE_HEADER_HEIGHT }}
       >
         <div className="flex min-w-0 flex-col gap-1">
-          <span className="truncate text-sm font-semibold text-white/90" title={title}>
-            {title}
+          <span className="truncate text-sm font-semibold text-white/90" title={headerTitle}>
+            {headerTitle}
           </span>
-          {subtitle ? <small className="truncate text-[11px] uppercase tracking-[0.18em] text-slate-400">{subtitle}</small> : null}
+          {headerSubtitle ? (
+            <small className="truncate text-[11px] uppercase tracking-[0.18em] text-slate-400">
+              {headerSubtitle}
+            </small>
+          ) : null}
           {isInteractive ? (
             <span className="mt-0.5 inline-flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.28em] text-sky-200">
               Live Control
@@ -304,6 +368,16 @@ function ApplicationTileNode({ data, dragging }: Props) {
           ) : null}
         </div>
         <div className="flex items-center gap-2">
+          {isAgent && !showAgentEditor ? (
+            <button
+              type="button"
+              onClick={handleAgentEdit}
+              data-tile-drag-ignore="true"
+              className="inline-flex h-7 items-center justify-center rounded-full border border-indigo-400/40 bg-indigo-500/10 px-3 text-[10px] font-semibold uppercase tracking-[0.24em] text-indigo-100"
+            >
+              Edit
+            </button>
+          ) : null}
           <button
             type="button"
             onClick={handleToggleInteractive}
@@ -330,21 +404,90 @@ function ApplicationTileNode({ data, dragging }: Props) {
           </button>
         </div>
       </header>
-      <section
-        className={cn(
-          'flex flex-1 flex-col gap-3 overflow-hidden bg-slate-950/60 transition-opacity',
-          isInteractive ? 'pointer-events-auto' : 'pointer-events-none opacity-[0.98] select-none',
-        )}
-        data-tile-drag-ignore="true"
-      >
-        <ApplicationTile
-          tileId={tile.id}
-          privateBeachId={privateBeachId}
-          managerUrl={managerUrl}
-          sessionMeta={tile.sessionMeta ?? null}
-          onSessionMetaChange={handleMetaChange}
-        />
-      </section>
+      {isAgent ? (
+        <div
+          className="border-b border-white/5 bg-slate-950/70 px-4 py-3 text-sm text-slate-300"
+          data-tile-drag-ignore="true"
+        >
+          {showAgentEditor ? (
+            <div className="space-y-2">
+              <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400" htmlFor={`agent-role-${tile.id}`}>
+                Role
+              </label>
+              <input
+                id={`agent-role-${tile.id}`}
+                value={agentRole}
+                onChange={(event) => setAgentRole(event.target.value)}
+                className="w-full rounded border border-white/10 bg-white/5 px-3 py-2 text-sm text-white focus:border-indigo-400 focus:outline-none"
+                placeholder="e.g. Deploy orchestrator"
+              />
+              <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400" htmlFor={`agent-resp-${tile.id}`}>
+                Responsibility
+              </label>
+              <textarea
+                id={`agent-resp-${tile.id}`}
+                value={agentResponsibility}
+                onChange={(event) => setAgentResponsibility(event.target.value)}
+                rows={3}
+                className="w-full rounded border border-white/10 bg-white/5 px-3 py-2 text-sm text-white focus:border-indigo-400 focus:outline-none"
+                placeholder="Describe how this agent should manage connected sessions"
+              />
+              <div className="flex gap-2 pt-1 text-xs">
+                <button
+                  type="button"
+                  onClick={handleAgentSave}
+                  className="flex-1 rounded bg-indigo-600 px-3 py-2 font-semibold text-white disabled:opacity-40"
+                  disabled={!agentRole.trim() || !agentResponsibility.trim()}
+                >
+                  Save
+                </button>
+                <button
+                  type="button"
+                  onClick={handleAgentCancel}
+                  className="flex-1 rounded border border-white/15 px-3 py-2 font-semibold text-slate-200"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2 text-xs">
+              <div>
+                <p className="font-semibold uppercase tracking-[0.2em] text-slate-400">Role</p>
+                <p className="text-sm text-white/90">{agentMeta.role}</p>
+              </div>
+              <div>
+                <p className="font-semibold uppercase tracking-[0.2em] text-slate-400">Responsibility</p>
+                <p className="text-sm text-white/90">{agentMeta.responsibility}</p>
+              </div>
+              <p className="text-[11px] text-slate-400">
+                Drag the right connector to an application or another agent to define how this agent should manage it.
+              </p>
+            </div>
+          )}
+        </div>
+      ) : null}
+      {shouldRenderViewer ? (
+        <section
+          className={cn(
+            'flex flex-1 flex-col gap-3 overflow-hidden bg-slate-950/60 transition-opacity',
+            isInteractive ? 'pointer-events-auto' : 'pointer-events-none opacity-[0.98] select-none',
+          )}
+          data-tile-drag-ignore="true"
+        >
+          <ApplicationTile
+            tileId={tile.id}
+            privateBeachId={privateBeachId}
+            managerUrl={managerUrl}
+            sessionMeta={tile.sessionMeta ?? null}
+            onSessionMetaChange={handleMetaChange}
+          />
+        </section>
+      ) : (
+        <div className="flex flex-1 items-center justify-center bg-slate-950/60 px-4 text-center text-sm text-slate-400" data-tile-drag-ignore="true">
+          Save this agent&rsquo;s role and responsibility to start connecting it to sessions.
+        </div>
+      )}
       <button
         type="button"
         className="absolute bottom-3 right-3 z-10 h-5 w-5 cursor-nwse-resize rounded-md border border-sky-400/40 bg-[radial-gradient(circle_at_top_left,rgba(56,189,248,0.6),rgba(56,189,248,0.05))] text-transparent transition hover:border-sky-400/60 hover:shadow-[0_0_12px_rgba(56,189,248,0.45)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
@@ -362,184 +505,14 @@ function ApplicationTileNode({ data, dragging }: Props) {
         className="h-3 w-3 border-none bg-indigo-200/80 transition hover:bg-indigo-300"
         onPointerDown={(event) => event.stopPropagation()}
       />
+      {isAgent ? (
+        <Handle
+          type="source"
+          position={Position.Right}
+          className="h-3 w-3 border-none bg-indigo-500 transition hover:bg-indigo-400"
+          onPointerDown={(event) => event.stopPropagation()}
+        />
+      ) : null}
     </article>
   );
-}
-
-function AgentTileNode({ data }: Props) {
-  const {
-    removeTile,
-    bringToFront,
-    setActiveTile,
-    createTile,
-  } = useTileActions();
-  const { tile, orderIndex, privateBeachId, rewriteEnabled } = data;
-  const meta = useMemo(() => tile.agentMeta ?? { role: '', responsibility: '', isEditing: true }, [tile.agentMeta]);
-  const [role, setRole] = useState(meta.role);
-  const [responsibility, setResponsibility] = useState(meta.responsibility);
-  const zIndex = useMemo(() => 10 + orderIndex, [orderIndex]);
-
-  useEffect(() => {
-    if (!meta.isEditing) {
-      setRole(meta.role);
-      setResponsibility(meta.responsibility);
-    }
-  }, [meta.isEditing, meta.responsibility, meta.role]);
-
-  const handleSave = useCallback(() => {
-    const nextMeta = {
-      role: role.trim(),
-      responsibility: responsibility.trim(),
-      isEditing: false,
-    } as const;
-    if (!nextMeta.role || !nextMeta.responsibility) {
-      return;
-    }
-    createTile({ id: tile.id, agentMeta: nextMeta, focus: false });
-  }, [createTile, responsibility, role, tile.id]);
-
-  const handleEdit = useCallback(() => {
-    createTile({ id: tile.id, agentMeta: { ...meta, isEditing: true }, focus: false });
-  }, [createTile, meta, tile.id]);
-
-  const handleCancel = useCallback(() => {
-    if (!meta.role && !meta.responsibility) {
-      removeTile(tile.id);
-      return;
-    }
-    setRole(meta.role);
-    setResponsibility(meta.responsibility);
-    createTile({ id: tile.id, agentMeta: { ...meta, isEditing: false }, focus: false });
-  }, [createTile, meta, removeTile, tile.id]);
-
-  const handleRemove = useCallback(() => {
-    emitTelemetry('canvas.tile.remove', {
-      privateBeachId,
-      tileId: tile.id,
-      rewriteEnabled,
-    });
-    removeTile(tile.id);
-  }, [privateBeachId, removeTile, rewriteEnabled, tile.id]);
-
-  const handlePointerDown = useCallback(
-    (event: PointerEvent<HTMLElement>) => {
-      if (event.button !== 0) return;
-      bringToFront(tile.id);
-      setActiveTile(tile.id);
-    },
-    [bringToFront, setActiveTile, tile.id],
-  );
-
-  const showEditor = meta.isEditing || (!meta.role && !meta.responsibility);
-
-  return (
-    <article
-      className="relative flex h-full w-full flex-col rounded-2xl border border-indigo-500/30 bg-slate-900/80 text-slate-100 shadow-[0_24px_70px_rgba(15,23,42,0.65)]"
-      style={{ width: '100%', height: '100%', zIndex }}
-      onPointerDown={handlePointerDown}
-      data-testid={`rf__node-agent:${tile.id}`}
-    >
-      <header className="flex items-center justify-between border-b border-white/10 px-4 py-2">
-        <div className="flex flex-col">
-          <span className="text-sm font-semibold text-white">Agent</span>
-          {!showEditor && (
-            <small className="text-[11px] text-slate-300">{meta.role || 'Unassigned role'}</small>
-          )}
-        </div>
-        <div className="flex items-center gap-2">
-          {!showEditor ? (
-            <button
-              type="button"
-              onClick={handleEdit}
-              className="rounded-full border border-indigo-500/50 bg-indigo-500/20 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.2em] text-indigo-100"
-            >
-              Edit
-            </button>
-          ) : null}
-          <button
-            type="button"
-            onClick={handleRemove}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-500/40 bg-red-500/10 text-base text-red-200"
-          >
-            ×
-          </button>
-        </div>
-      </header>
-      <section className="flex flex-1 flex-col gap-3 px-4 py-3 text-sm text-slate-200">
-        {showEditor ? (
-          <>
-            <label className="text-xs font-semibold uppercase tracking-wide text-slate-400" htmlFor={`agent-role-${tile.id}`}>
-              Role
-            </label>
-            <input
-              id={`agent-role-${tile.id}`}
-              value={role}
-              onChange={(event) => setRole(event.target.value)}
-              className="rounded border border-white/10 bg-white/5 px-3 py-2 text-sm text-white focus:border-indigo-400 focus:outline-none"
-              placeholder="e.g. Deploy orchestrator"
-            />
-            <label className="text-xs font-semibold uppercase tracking-wide text-slate-400" htmlFor={`agent-resp-${tile.id}`}>
-              Responsibility
-            </label>
-            <textarea
-              id={`agent-resp-${tile.id}`}
-              value={responsibility}
-              onChange={(event) => setResponsibility(event.target.value)}
-              rows={3}
-              className="rounded border border-white/10 bg-white/5 px-3 py-2 text-sm text-white focus:border-indigo-400 focus:outline-none"
-              placeholder="Describe what this agent should manage"
-            />
-            <div className="mt-auto flex gap-2 pt-2 text-xs">
-              <button
-                type="button"
-                onClick={handleSave}
-                className="flex-1 rounded bg-indigo-600 px-3 py-2 font-semibold text-white disabled:opacity-40"
-                disabled={!role.trim() || !responsibility.trim()}
-              >
-                Save
-              </button>
-              <button
-                type="button"
-                onClick={handleCancel}
-                className="flex-1 rounded border border-white/15 px-3 py-2 font-semibold text-slate-200"
-              >
-                Cancel
-              </button>
-            </div>
-          </>
-        ) : (
-          <>
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">Role</p>
-              <p className="text-sm text-white/90">{meta.role}</p>
-            </div>
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400">Responsibility</p>
-              <p className="text-sm text-white/90">{meta.responsibility}</p>
-            </div>
-            <p className="text-[11px] text-slate-400">Drag the connector to assign this agent to other tiles.</p>
-          </>
-        )}
-      </section>
-      <Handle
-        type="target"
-        position={Position.Left}
-        className="h-3 w-3 border-none bg-indigo-200/80"
-        onPointerDown={(event) => event.stopPropagation()}
-      />
-      <Handle
-        type="source"
-        position={Position.Right}
-        className="h-3 w-3 border-none bg-indigo-500"
-        onPointerDown={(event) => event.stopPropagation()}
-      />
-    </article>
-  );
-}
-
-export function TileFlowNode(props: Props) {
-  if (props.data.tile.nodeType === 'agent') {
-    return <AgentTileNode {...props} />;
-  }
-  return <ApplicationTileNode {...props} />;
 }

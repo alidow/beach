@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } fro
 import type { SessionSummary } from '@private-beach/shared-api';
 import { attachByCode, fetchSessionStateSnapshot, updateSessionRoleById } from '@private-beach-rewrite/lib/api';
 import type { TileSessionMeta } from '@private-beach-rewrite/features/tiles';
+import { buildSessionMetadataWithTile, sessionSummaryToTileMeta } from '@private-beach-rewrite/features/tiles/sessionMeta';
 import type { SessionCredentialOverride } from '../../../private-beach/src/hooks/terminalViewerTypes';
 import { useManagerToken, buildManagerUrl } from '../hooks/useManagerToken';
 import { useSessionConnection } from '../hooks/useSessionConnection';
@@ -20,26 +21,6 @@ type ApplicationTileProps = {
 };
 
 type SubmitState = 'idle' | 'attaching';
-
-function sessionSummaryToMeta(session: SessionSummary): TileSessionMeta {
-  const metadata = session.metadata;
-  let title: string | null = null;
-  if (metadata && typeof metadata === 'object') {
-    const record = metadata as Record<string, unknown>;
-    if (typeof record.title === 'string') {
-      title = record.title as string;
-    } else if (typeof record.name === 'string') {
-      title = record.name as string;
-    }
-  }
-  return {
-    sessionId: session.session_id,
-    title: title ?? session.session_id,
-    harnessType: session.harness_type ?? null,
-    status: 'attached',
-    pendingActions: session.pending_actions ?? 0,
-  };
-}
 
 function statusLabel(status: string): string {
   switch (status) {
@@ -213,18 +194,19 @@ export function ApplicationTile({
         if (!session) {
           throw new Error('Attach response missing session payload.');
         }
-        const nextMeta = sessionSummaryToMeta(session);
+        const nextMeta = sessionSummaryToTileMeta(session);
         onSessionMetaChange?.(nextMeta);
         setCredentialOverride({ passcode: trimmedCode });
         setCodeInput('');
         setSessionIdInput(session.session_id);
         try {
+          const metadataPayload = buildSessionMetadataWithTile(session.metadata, tileId, nextMeta);
           await updateSessionRoleById(
             session.session_id,
             'application',
             token,
             managerUrl,
-            session.metadata,
+            metadataPayload,
             session.location_hint ?? null,
           );
         } catch (roleErr) {

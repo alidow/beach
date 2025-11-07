@@ -1,6 +1,6 @@
 import type { CanvasLayout } from '@/lib/api';
 import { DEFAULT_TILE_HEIGHT, DEFAULT_TILE_WIDTH } from './constants';
-import type { TileDescriptor, TileSessionMeta, TileState } from './types';
+import type { AgentMetadata, TileDescriptor, TileSessionMeta, TileState } from './types';
 
 const DEFAULT_VIEWPORT = { zoom: 1, pan: { x: 0, y: 0 } } as const;
 
@@ -49,6 +49,20 @@ function normalizeSessionMeta(input: unknown): TileSessionMeta | null {
   };
 }
 
+function normalizeAgentMeta(source: unknown, nodeType: TileDescriptor['nodeType']): AgentMetadata | null {
+  if (nodeType !== 'agent' || !source || typeof source !== 'object') {
+    return null;
+  }
+  const record = source as Record<string, unknown>;
+  const role = typeof record.role === 'string' ? record.role : '';
+  const responsibility = typeof record.responsibility === 'string' ? record.responsibility : '';
+  const isEditing = typeof record.isEditing === 'boolean' ? record.isEditing : false;
+  if (!role && !responsibility) {
+    return { role: '', responsibility: '', isEditing: true };
+  }
+  return { role, responsibility, isEditing };
+}
+
 function extractTileDescriptor(
   tileId: string,
   tile: CanvasLayout['tiles'][string],
@@ -67,6 +81,13 @@ function extractTileDescriptor(
     tile?.metadata && typeof tile.metadata === 'object'
       ? (tile.metadata as Record<string, unknown>)
       : undefined;
+  const nodeTypeRaw =
+    typeof metadataRecord?.nodeType === 'string'
+      ? (metadataRecord.nodeType as string)
+      : typeof tile?.kind === 'string'
+        ? (tile.kind as string)
+        : 'application';
+  const nodeType = nodeTypeRaw === 'agent' ? 'agent' : 'application';
   const createdAt =
     typeof metadataRecord?.createdAt === 'number'
       ? (metadataRecord.createdAt as number)
@@ -78,10 +99,11 @@ function extractTileDescriptor(
 
   return {
     id: tile?.id ?? tileId,
-    nodeType: 'application',
+    nodeType,
     position,
     size,
     sessionMeta: normalizeSessionMeta(metadataRecord),
+    agentMeta: normalizeAgentMeta(metadataRecord?.agentMeta, nodeType),
     createdAt,
     updatedAt,
   };
@@ -112,7 +134,6 @@ export function layoutToTileState(layout: CanvasLayout | null | undefined): Tile
       interactiveId = descriptor.id;
     }
   }
-
   return {
     tiles,
     order,
@@ -125,7 +146,7 @@ export function layoutToTileState(layout: CanvasLayout | null | undefined): Tile
 export function tileStateToLayout(state: TileState, baseLayout?: CanvasLayout | null): CanvasLayout {
   const base = baseLayout ?? buildEmptyLayout();
   const now = Date.now();
-  const tiles: CanvasLayout['tiles'] = {};
+  const tilesOut: CanvasLayout['tiles'] = {};
   const baseTiles = base.tiles ?? {};
   const canonicalOrder = buildCanonicalOrder(state);
 
@@ -144,8 +165,14 @@ export function tileStateToLayout(state: TileState, baseLayout?: CanvasLayout | 
     } else if ('sessionMeta' in metadataBase) {
       delete metadataBase.sessionMeta;
     }
+    metadataBase.nodeType = tile.nodeType;
+    if (tile.nodeType === 'agent') {
+      metadataBase.agentMeta = tile.agentMeta ?? { role: '', responsibility: '', isEditing: true };
+    } else if ('agentMeta' in metadataBase) {
+      delete metadataBase.agentMeta;
+    }
 
-    tiles[tile.id] = {
+    tilesOut[tile.id] = {
       id: tile.id,
       kind: 'application',
       position: { ...tile.position },
@@ -162,7 +189,7 @@ export function tileStateToLayout(state: TileState, baseLayout?: CanvasLayout | 
   return {
     version: 3,
     viewport: base.viewport ?? { ...DEFAULT_VIEWPORT },
-    tiles,
+    tiles: tilesOut,
     agents: base.agents ?? {},
     groups: base.groups ?? {},
     controlAssignments: base.controlAssignments ?? {},
@@ -185,7 +212,7 @@ export function serializeTileStateKey(state: TileState): string {
       if (!tile) {
         return `${tileId}:missing`;
       }
-      const meta = tile.sessionMeta
+      const sessionSignature = tile.sessionMeta
         ? [
             tile.sessionMeta.sessionId ?? '',
             tile.sessionMeta.title ?? '',
@@ -193,14 +220,24 @@ export function serializeTileStateKey(state: TileState): string {
             tile.sessionMeta.harnessType ?? '',
             tile.sessionMeta.pendingActions ?? '',
           ].join('~')
-        : 'meta:none';
+        : 'session:none';
+      const agentSignature =
+        tile.nodeType === 'agent'
+          ? [
+              tile.agentMeta?.role ?? '',
+              tile.agentMeta?.responsibility ?? '',
+              tile.agentMeta?.isEditing ? 'editing' : 'saved',
+            ].join('~')
+          : 'agent:none';
       return [
         tile.id,
+        tile.nodeType,
         tile.position.x,
         tile.position.y,
         tile.size.width,
         tile.size.height,
-        meta,
+        sessionSignature,
+        agentSignature,
       ].join(':');
     })
     .join('|');

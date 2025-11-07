@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { putCanvasLayout, type CanvasLayout } from '@/lib/api';
 import { serializeTileStateKey, tileStateToLayout } from '@/features/tiles/persistence';
 import { useTileState } from '@/features/tiles/store';
@@ -24,9 +24,14 @@ export function useTileLayoutPersistence({
   const tileState = useTileState();
   const { token: managerToken } = useManagerToken();
   const signature = useMemo(() => serializeTileStateKey(tileState), [tileState]);
+  const tileStateRef = useRef(tileState);
+  tileStateRef.current = tileState;
+  const signatureRef = useRef(signature);
+  signatureRef.current = signature;
   const baseLayoutRef = useRef<CanvasLayout | null>(initialLayout ?? null);
   const lastSavedSignatureRef = useRef<string>(initialSignature ?? '');
   const pendingSignatureRef = useRef<string | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     baseLayoutRef.current = initialLayout ?? baseLayoutRef.current;
@@ -38,44 +43,98 @@ export function useTileLayoutPersistence({
     }
   }, [initialSignature]);
 
-  useEffect(() => {
-    if (!beachId || !managerUrl || !managerToken) {
-      return;
-    }
-    if (signature.length === 0) {
-      return;
-    }
-    if (signature === lastSavedSignatureRef.current || signature === pendingSignatureRef.current) {
-      return;
-    }
-
-    pendingSignatureRef.current = signature;
-
-    const handle = setTimeout(() => {
-      const previousLayout = baseLayoutRef.current;
-      const nextLayout = tileStateToLayout(tileState, previousLayout ?? undefined);
-      baseLayoutRef.current = nextLayout;
-      void putCanvasLayout(beachId, nextLayout, managerToken, managerUrl)
-        .then((saved) => {
-          baseLayoutRef.current = saved;
-          lastSavedSignatureRef.current = signature;
-          pendingSignatureRef.current = null;
-        })
-        .catch((error) => {
-          console.warn('[rewrite-2] failed to persist canvas layout', {
+  const performPersist = useCallback(
+    async (sig: string) => {
+      if (!beachId || !managerUrl || !managerToken) {
+        if (typeof window !== 'undefined') {
+          console.warn('[rewrite-2] persistence skipped (missing deps)', {
             beachId,
-            error: error instanceof Error ? error.message : String(error),
+            hasManagerUrl: Boolean(managerUrl),
+            hasToken: Boolean(managerToken),
           });
-          baseLayoutRef.current = previousLayout ?? null;
-          pendingSignatureRef.current = null;
+        }
+        return;
+      }
+      const previousLayout = baseLayoutRef.current;
+      const nextLayout = tileStateToLayout(tileStateRef.current, previousLayout ?? undefined);
+      baseLayoutRef.current = nextLayout;
+      try {
+        const saved = await putCanvasLayout(beachId, nextLayout, managerToken, managerUrl);
+        baseLayoutRef.current = saved;
+        lastSavedSignatureRef.current = sig;
+        pendingSignatureRef.current = null;
+        if (typeof window !== 'undefined') {
+          console.info('[rewrite-2] layout persisted', { beachId, signature: sig });
+        }
+      } catch (error) {
+        console.warn('[rewrite-2] failed to persist canvas layout', {
+          beachId,
+          error: error instanceof Error ? error.message : String(error),
         });
-    }, debounceMs);
-
-    return () => {
-      clearTimeout(handle);
-      if (pendingSignatureRef.current === signature) {
+        baseLayoutRef.current = previousLayout ?? null;
         pendingSignatureRef.current = null;
       }
+    },
+    [beachId, managerToken, managerUrl],
+  );
+
+  const schedulePersist = useCallback(
+    (sig: string, options?: { immediate?: boolean }) => {
+      if (sig.length === 0) {
+        return;
+      }
+      if (!options?.immediate) {
+        if (sig === lastSavedSignatureRef.current || sig === pendingSignatureRef.current) {
+          return;
+        }
+        pendingSignatureRef.current = sig;
+        if (timerRef.current) {
+          clearTimeout(timerRef.current);
+        }
+        timerRef.current = setTimeout(() => {
+          timerRef.current = null;
+          void performPersist(sig);
+        }, debounceMs);
+        if (typeof window !== 'undefined') {
+          console.info('[rewrite-2] scheduling layout persist', { beachId, signature: sig });
+        }
+        return;
+      }
+
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+      pendingSignatureRef.current = sig;
+      void performPersist(sig);
+    },
+    [debounceMs, performPersist, beachId],
+  );
+
+  useEffect(() => {
+    schedulePersist(signature);
+  }, [schedulePersist, signature]);
+
+  const requestImmediatePersist = useCallback(() => {
+    const sig = signatureRef.current;
+    if (typeof window === 'undefined') {
+      schedulePersist(sig, { immediate: true });
+      return;
+    }
+    requestAnimationFrame(() => {
+      schedulePersist(sig, { immediate: true });
+    });
+  }, [schedulePersist]);
+
+  useEffect(() => {
+    const handler = () => {
+      schedulePersist(signatureRef.current, { immediate: true });
     };
-  }, [signature, beachId, managerUrl, managerToken, debounceMs, tileState]);
+    window.addEventListener('beforeunload', handler);
+    return () => {
+      window.removeEventListener('beforeunload', handler);
+    };
+  }, [schedulePersist]);
+
+  return requestImmediatePersist;
 }

@@ -5,8 +5,11 @@ import { useCallback, useEffect, useMemo } from 'react';
 import { CanvasWorkspace } from './CanvasWorkspace';
 import type { CanvasNodeDefinition, NodePlacementPayload, TileMovePayload } from './types';
 import type { CanvasLayout } from '@/lib/api';
-import { TileStoreProvider, layoutToTileState, serializeTileStateKey, useTileActions } from '@/features/tiles';
+import type { SessionSummary } from '@private-beach/shared-api';
+import { TileStoreProvider, layoutToTileState, serializeTileStateKey, useTileActions, useTileState } from '@/features/tiles';
+import { extractTileLinkFromMetadata, sessionSummaryToTileMeta } from '@/features/tiles/sessionMeta';
 import { ManagerTokenProvider } from '@/hooks/ManagerTokenContext';
+import { buildManagerUrl } from '@/hooks/useManagerToken';
 import { emitTelemetry } from '../../../../private-beach/src/lib/telemetry';
 import { useTileLayoutPersistence } from './useTileLayoutPersistence';
 
@@ -17,6 +20,7 @@ type BeachCanvasShellProps = {
   managerUrl?: string;
   managerToken?: string | null;
   initialLayout?: CanvasLayout | null;
+  initialSessions?: SessionSummary[];
   rewriteEnabled?: boolean;
   className?: string;
 };
@@ -49,6 +53,7 @@ export function BeachCanvasShell({
   managerUrl,
   managerToken,
   initialLayout,
+  initialSessions,
   rewriteEnabled = false,
   className,
 }: BeachCanvasShellProps) {
@@ -57,6 +62,7 @@ export function BeachCanvasShell({
     () => serializeTileStateKey(initialTileState),
     [initialTileState],
   );
+  const resolvedManagerUrl = useMemo(() => buildManagerUrl(managerUrl), [managerUrl]);
 
   return (
     <TileStoreProvider initialState={initialTileState}>
@@ -65,7 +71,8 @@ export function BeachCanvasShell({
           beachId={beachId}
           beachName={beachName}
           backHref={backHref}
-          managerUrl={managerUrl}
+          managerUrl={resolvedManagerUrl}
+          initialSessions={initialSessions}
           initialLayout={initialLayout}
           initialTileSignature={initialTileSignature}
           rewriteEnabled={rewriteEnabled}
@@ -81,6 +88,7 @@ function BeachCanvasShellInner({
   beachName,
   backHref = '/beaches',
   managerUrl,
+  initialSessions,
   initialLayout,
   initialTileSignature,
   rewriteEnabled = false,
@@ -88,9 +96,10 @@ function BeachCanvasShellInner({
 }: BeachCanvasShellInnerProps) {
   const NAV_HEIGHT = 56;
   const CANVAS_VIEWPORT_HEIGHT = `calc(100vh - ${NAV_HEIGHT}px)`;
-  const { createTile } = useTileActions();
+  const { createTile, updateTileMeta } = useTileActions();
+  const tileState = useTileState();
 
-  useTileLayoutPersistence({
+  const requestImmediatePersist = useTileLayoutPersistence({
     beachId,
     managerUrl,
     initialLayout,
@@ -122,8 +131,9 @@ function BeachCanvasShellInner({
         height: payload.size.height,
         rewriteEnabled,
       });
+      requestImmediatePersist();
     },
-    [beachId, createTile, rewriteEnabled],
+    [beachId, createTile, requestImmediatePersist, rewriteEnabled],
   );
 
   const handleTileMove = useCallback(
@@ -138,8 +148,9 @@ function BeachCanvasShellInner({
         deltaY: payload.delta.y,
         rewriteEnabled,
       });
+      requestImmediatePersist();
     },
-    [beachId, rewriteEnabled],
+    [beachId, requestImmediatePersist, rewriteEnabled],
   );
 
   useEffect(() => {
@@ -152,6 +163,27 @@ function BeachCanvasShellInner({
   const wrapperClassName = ['relative flex h-full flex-1 min-h-0 w-full flex-col overflow-hidden', className ?? '']
     .filter(Boolean)
     .join(' ');
+
+  useEffect(() => {
+    if (!initialSessions || initialSessions.length === 0) {
+      return;
+    }
+    for (const session of initialSessions) {
+      const tileId = extractTileLinkFromMetadata(session.metadata);
+      if (!tileId) {
+        continue;
+      }
+      const tile = tileState.tiles[tileId];
+      if (!tile) {
+        continue;
+      }
+      if (tile.sessionMeta?.sessionId === session.session_id) {
+        continue;
+      }
+      const meta = sessionSummaryToTileMeta(session);
+      updateTileMeta(tileId, meta);
+    }
+  }, [initialSessions, tileState.tiles, updateTileMeta]);
 
   return (
     <div className={wrapperClassName}>

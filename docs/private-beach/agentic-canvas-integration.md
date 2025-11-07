@@ -13,22 +13,22 @@ Ship the agent tile/node type inside the actual rewrite dashboard (the `/beaches
 - `TileFlowNode` currently renders the classic session tile. We will introduce `AgentTileFlowNode` (new component) and map based on `tile.nodeType`.
 - Canvas events + persistence hooks (`useTileLayoutPersistence`) need to understand the agent metadata so layout exports/imports don’t drop fields. For now the data remains in client state; manager persistence will be wired later.
 
-## Implementation Plan
+## Implementation Plan (Updated)
 1. **State model upgrades**
-   - Extend `TileDescriptor` with `nodeType`, `agentMetadata`, and `relationships` arrays.
-   - Actions: `UPSERT_TILE` will accept `nodeType`. New actions to toggle agent editing, save role/responsibility, and upsert relationship capsules per edge ID.
+   - `TileDescriptor` includes `nodeType` and `agentMeta`. The tile store also owns a normalized `relationships` map (`relationshipOrder`) so edge state survives reloads.
+   - Actions cover tile CRUD, agent editing toggles, and relationship add/update/remove. `ApplicationTile` continues to drive session metadata while agent metadata lives alongside the tile.
 2. **Node components**
-   - Add `AgentTileFlowNode` (mirrors sandbox `AgentNode`, adapted to the tile store + SessionTile chrome so it blends in).
-   - Update `FlowCanvas` `nodeTypes` to include `agent` and dispatch connectors only when source is agent.
-3. **Edges / capsules**
-   - Introduce `AssignmentEdge` (adapted from `RelationshipEdge`). Use React Flow `edges` array that already exists for selection/resizing (currently empty). On connect, push an edge with `data` referencing tile IDs; store resulting instructions/mode back into the tile store for persistence.
-   - Rendering: `FlowCanvas`’s `edgeTypes` includes `assignment`. The capsule uses store callbacks to update instructions/mode.
+   - `TileFlowNode` renders either the existing application chrome or an agent wrapper (inline editor + live terminal preview + four-sided connector handles). Agent tiles always show the terminal preview even while editing metadata.
+   - All tiles expose target handles; agent tiles also expose source handles.
+3. **Edges / capsules / persistence**
+   - React Flow edges derive from the store’s `relationships` map. Capsules open via `EdgeLabelRenderer` with an icon-only trigger; delete happens inside the form.
+   - `tileStateToLayout` writes each tile’s `nodeType` + `agentMeta` into the layout payload (using `metadata.nodeType` and `metadata.agentMeta`) and serializes relationships into `metadata.agentRelationships`/`metadata.agentRelationshipOrder`. `layoutToTileState` hydrates both tiles and relationships from that payload.
 4. **User entry points**
-   - Update tile catalog / add-tile menu so “Agent” is an option. On add, we create a tile with `nodeType: 'agent'`, blank metadata, and auto-open the inline editor.
-   - Keep everything else identical (dragging/resizing, add session tile, etc.).
+   - The node catalog includes “Agent Tile.” Dropping one opens the inline editor. Session attach + terminal preview uses the existing `ApplicationTile` component so no functionality diverges.
+   - Dragging a connector prompts for instructions + cadence via the capsule UI; the data lands in the relationship store and persists with the layout.
 5. **Testing/Validation**
-   - Manual: run rewrite-2 dev server (`npm run dev -- --port 3003`), visit `/beaches/<id>`, add an agent tile, fill role/responsibility, connect to an existing session tile, enter capsule answers, save, edit, remove.
-   - Automated: run `npm run lint` (existing coverage). Optional: add a basic component test to ensure `AgentTileFlowNode` renders inline editor state.
+   - Manual: run rewrite-2 dev server, add agents/applications, connect them, reload, confirm tile roles and connectors persist.
+   - Automated: `npm run lint` (existing coverage). Optional targeted tests for layout serialization helpers.
 
 ## Follow-ups (out of scope now)
 - Persist agent metadata via layout API + manager once contracts are ready.

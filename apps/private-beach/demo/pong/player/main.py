@@ -85,6 +85,7 @@ class PongView:
         self.status_message = "Ready."
         self.last_frame_time = time.monotonic()
         self._last_hud_rows: Set[int] = set()
+        self._last_paddle_cells: Set[Tuple[int, int]] = set()
 
         self._colors_initialized = False
         self.color_border = curses.A_BOLD
@@ -422,6 +423,12 @@ class PongView:
         inner_left: int,
         inner_right: int,
     ) -> None:
+        if self._last_paddle_cells:
+            for row, col in self._last_paddle_cells:
+                if inner_top <= row <= inner_bottom and inner_left <= col <= inner_right:
+                    self._addch_safe(row, col, " ")
+            self._last_paddle_cells.clear()
+
         glyph_set = PADDLE_GLYPHS["lhs" if self.mode == "lhs" else "rhs"]
         half_height = PADDLE_HEIGHT / 2
         top_row = int(round(self.paddle.y - half_height))
@@ -433,8 +440,10 @@ class PongView:
             if inner_top <= row <= inner_bottom
         ]
         if not rows:
+            self._last_paddle_cells = set()
             return
 
+        new_cells: Set[Tuple[int, int]] = set()
         for index, row in enumerate(rows):
             if len(rows) > 1 and index == 0:
                 glyph = glyph_set["cap_top"]
@@ -447,6 +456,7 @@ class PongView:
                 attr = self.color_paddle
 
             self._addch_safe(row, self.paddle.x, glyph, attr)
+            new_cells.add((row, self.paddle.x))
 
             accent_x = self.paddle.x + (1 if self.mode == "lhs" else -1)
             if inner_left <= accent_x <= inner_right:
@@ -456,6 +466,9 @@ class PongView:
                     glyph_set["accent"],
                     self.color_paddle | curses.A_DIM,
                 )
+                new_cells.add((row, accent_x))
+
+        self._last_paddle_cells = new_cells
 
     def _draw_ball(
         self,

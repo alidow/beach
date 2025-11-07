@@ -3,14 +3,31 @@ import { eq } from 'drizzle-orm';
 import { db, ensureMigrated } from '../../../db/client';
 import { canvasLayouts, tileLayouts } from '../../../db/schema';
 
+type CanvasAgentRelationship = {
+	id: string;
+	sourceId: string;
+	targetId: string;
+	sourceHandleId?: string | null;
+	targetHandleId?: string | null;
+	instructions?: string | null;
+	updateMode?: 'idle-summary' | 'push' | 'poll';
+	pollFrequency?: number | null;
+};
+
 type CanvasLayout = {
-  version: 3;
-  viewport: { zoom: number; pan: { x: number; y: number } };
-  tiles: Record<string, { id: string; kind: 'application'; position: { x: number; y: number }; size: { width: number; height: number }; zIndex: number; groupId?: string; zoom?: number; locked?: boolean; toolbarPinned?: boolean }>;
-  agents: Record<string, { id: string; position: { x: number; y: number }; size: { width: number; height: number }; zIndex: number; icon?: string; status?: 'idle' | 'controlling' }>;
-  groups: Record<string, { id: string; name?: string; memberIds: string[]; position: { x: number; y: number }; size: { width: number; height: number }; zIndex: number; collapsed?: boolean }>;
-  controlAssignments: Record<string, { controllerId: string; targetType: 'tile' | 'group'; targetId: string }>;
-  metadata: { createdAt: number; updatedAt: number; migratedFrom?: number };
+	version: 3;
+	viewport: { zoom: number; pan: { x: number; y: number } };
+	tiles: Record<string, { id: string; kind: 'application'; position: { x: number; y: number }; size: { width: number; height: number }; zIndex: number; groupId?: string; zoom?: number; locked?: boolean; toolbarPinned?: boolean }>;
+	agents: Record<string, { id: string; position: { x: number; y: number }; size: { width: number; height: number }; zIndex: number; icon?: string; status?: 'idle' | 'controlling' }>;
+	groups: Record<string, { id: string; name?: string; memberIds: string[]; position: { x: number; y: number }; size: { width: number; height: number }; zIndex: number; collapsed?: boolean }>;
+	controlAssignments: Record<string, { controllerId: string; targetType: 'tile' | 'group'; targetId: string }>;
+	metadata: {
+		createdAt: number;
+		updatedAt: number;
+		migratedFrom?: number;
+		agentRelationships?: Record<string, CanvasAgentRelationship>;
+		agentRelationshipOrder?: string[];
+	};
 };
 
 function isRecord(v: unknown): v is Record<string, unknown> {

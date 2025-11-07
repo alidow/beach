@@ -38,6 +38,17 @@ export type TileLayout = typeof tileLayouts.$inferSelect;
 export type NewTileLayout = typeof tileLayouts.$inferInsert;
 
 // Canvas layout (v3) persisted as a JSON graph per beach.
+export type CanvasAgentRelationshipJson = {
+  id: string;
+  sourceId: string;
+  targetId: string;
+  sourceHandleId?: string | null;
+  targetHandleId?: string | null;
+  instructions?: string | null;
+  updateMode?: 'idle-summary' | 'push' | 'poll';
+  pollFrequency?: number | null;
+};
+
 export type CanvasLayoutJson = {
   version: 3;
   viewport: { zoom: number; pan: { x: number; y: number } };
@@ -79,7 +90,13 @@ export type CanvasLayoutJson = {
     }
   >;
   controlAssignments: Record<string, { controllerId: string; targetType: 'tile' | 'group'; targetId: string }>;
-  metadata: { createdAt: number; updatedAt: number; migratedFrom?: number };
+  metadata: {
+    createdAt: number;
+    updatedAt: number;
+    migratedFrom?: number;
+    agentRelationships?: Record<string, CanvasAgentRelationshipJson>;
+    agentRelationshipOrder?: string[];
+  };
 };
 
 export const canvasLayouts = pgTable('surfer_canvas_layout', {

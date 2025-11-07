@@ -4,7 +4,6 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import type { SessionSummary } from '@private-beach/shared-api';
 import { attachByCode, fetchSessionStateSnapshot, updateSessionRoleById } from '@/lib/api';
 import type { TileSessionMeta, TileViewportSnapshot } from '@/features/tiles';
-import { useTileActions } from '@/features/tiles';
 import { buildSessionMetadataWithTile, sessionSummaryToTileMeta } from '@/features/tiles/sessionMeta';
 import type { SessionCredentialOverride } from '../../../private-beach/src/hooks/terminalViewerTypes';
 import { useManagerToken, buildManagerUrl } from '../hooks/useManagerToken';
@@ -151,6 +150,7 @@ type ApplicationTileProps = {
   sessionMeta?: TileSessionMeta | null;
   onSessionMetaChange?: (meta: TileSessionMeta | null) => void;
   disableViewportMeasurements?: boolean;
+  onViewportMetricsChange?: (snapshot: TileViewportSnapshot | null) => void;
 };
 
 type SubmitState = 'idle' | 'attaching';
@@ -176,6 +176,7 @@ export function ApplicationTile({
   sessionMeta,
   onSessionMetaChange,
   disableViewportMeasurements = false,
+  onViewportMetricsChange,
 }: ApplicationTileProps) {
   const [sessionIdInput, setSessionIdInput] = useState(sessionMeta?.sessionId ?? '');
   const [codeInput, setCodeInput] = useState('');
@@ -188,7 +189,6 @@ export function ApplicationTile({
   const cachedDiffRef = useRef<TerminalStateDiff | null>(null);
   const restoringRef = useRef(false);
   const lastSessionIdRef = useRef<string | null>(sessionMeta?.sessionId ?? null);
-  const { updateTileViewport } = useTileActions();
   const lastViewportSnapshotRef = useRef<TileViewportSnapshot | null>(null);
   const hydrationRetryTimerRef = useRef<number | null>(null);
   const hydrationAttemptRef = useRef(0);
@@ -210,13 +210,13 @@ export function ApplicationTile({
 
   useEffect(() => {
     lastViewportSnapshotRef.current = null;
-    updateTileViewport(tileId, null);
+    onViewportMetricsChange?.(null);
     logViewportMetricEvent(tileId, 'reset', {});
     return () => {
-      updateTileViewport(tileId, null);
+      onViewportMetricsChange?.(null);
       logViewportMetricEvent(tileId, 'cleanup', {});
     };
-  }, [tileId, updateTileViewport]);
+  }, [onViewportMetricsChange, tileId]);
 
   const resolveIntegerMetric = useCallback(
     (incoming: number | null | undefined, previous: number | null | undefined) => {
@@ -251,7 +251,7 @@ export function ApplicationTile({
           return;
         }
         lastViewportSnapshotRef.current = null;
-        updateTileViewport(tileId, null);
+        onViewportMetricsChange?.(null);
         logViewportMetricEvent(tileId, 'clear', { source });
         return;
       }
@@ -265,6 +265,23 @@ export function ApplicationTile({
         pixelsPerRow: resolveFloatMetric(patch.pixelsPerRow, previous?.pixelsPerRow),
         pixelsPerCol: resolveFloatMetric(patch.pixelsPerCol, previous?.pixelsPerCol),
       };
+      if (
+        next.hostRows != null &&
+        next.hostCols != null &&
+        next.hostRows > next.hostCols &&
+        next.hostRows >= 80 &&
+        next.hostCols <= 80 &&
+        next.hostRows >= next.hostCols * 1.2
+      ) {
+        logViewportMetricEvent(tileId, 'swap-host-dimensions', {
+          source,
+          hostRows: next.hostRows,
+          hostCols: next.hostCols,
+        });
+        const swapped = next.hostRows;
+        next.hostRows = next.hostCols;
+        next.hostCols = swapped;
+      }
       const same =
         previous &&
         previous.hostRows === next.hostRows &&
@@ -277,7 +294,7 @@ export function ApplicationTile({
         return;
       }
       lastViewportSnapshotRef.current = next;
-      updateTileViewport(tileId, next);
+      onViewportMetricsChange?.(next);
       logViewportMetricEvent(tileId, 'update', {
         source,
         hostRows: next.hostRows,
@@ -288,7 +305,7 @@ export function ApplicationTile({
         pixelsPerCol: next.pixelsPerCol,
       });
     },
-    [resolveFloatMetric, resolveIntegerMetric, tileId, updateTileViewport],
+    [onViewportMetricsChange, resolveFloatMetric, resolveIntegerMetric, tileId],
   );
 
   const handleViewportMetrics = useCallback(
@@ -483,7 +500,7 @@ export function ApplicationTile({
       }
       hydrationRetryTimerRef.current = null;
     };
-  }, [applyViewportPatch, managerToken, managerUrl, refresh, sessionMeta?.sessionId, viewer.store]);
+  }, [applyViewportPatch, managerToken, managerUrl, refresh, sessionMeta?.sessionId, tileId, viewer.store]);
 
   useEffect(() => {
     const store = viewer.store;
@@ -627,7 +644,7 @@ export function ApplicationTile({
         setSubmitState('idle');
       }
     },
-    [codeInput, managerToken, managerUrl, onSessionMetaChange, privateBeachId, refresh, sessionIdInput],
+    [codeInput, managerToken, managerUrl, onSessionMetaChange, privateBeachId, refresh, sessionIdInput, tileId],
   );
 
   const disabled = submitState !== 'idle' || tokenLoading;

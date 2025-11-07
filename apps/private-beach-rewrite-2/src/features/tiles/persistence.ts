@@ -1,6 +1,12 @@
-import type { CanvasLayout } from '@/lib/api';
+import type { CanvasAgentRelationship, CanvasLayout } from '@/lib/api';
 import { DEFAULT_TILE_HEIGHT, DEFAULT_TILE_WIDTH } from './constants';
-import type { AgentMetadata, TileDescriptor, TileSessionMeta, TileState } from './types';
+import type {
+  AgentMetadata,
+  RelationshipDescriptor,
+  TileDescriptor,
+  TileSessionMeta,
+  TileState,
+} from './types';
 
 const DEFAULT_VIEWPORT = { zoom: 1, pan: { x: 0, y: 0 } } as const;
 
@@ -63,6 +69,118 @@ function normalizeAgentMeta(source: unknown, nodeType: TileDescriptor['nodeType'
   return { role, responsibility, isEditing };
 }
 
+const VALID_RELATIONSHIP_MODES: RelationshipDescriptor['updateMode'][] = ['idle-summary', 'push', 'poll'];
+
+function isRelationshipUpdateMode(value: unknown): value is RelationshipDescriptor['updateMode'] {
+  return typeof value === 'string' && VALID_RELATIONSHIP_MODES.includes(value as RelationshipDescriptor['updateMode']);
+}
+
+function sanitizePollFrequency(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const normalized = Math.round(value);
+    return Math.max(5, Math.min(86400, normalized));
+  }
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) {
+      const normalized = Math.round(parsed);
+      return Math.max(5, Math.min(86400, normalized));
+    }
+  }
+  return 60;
+}
+
+type SerializedRelationship = CanvasAgentRelationship;
+
+function normalizeRelationshipEntry(input: unknown, fallbackId: string): RelationshipDescriptor | null {
+  if (!input || typeof input !== 'object') {
+    return null;
+  }
+  const record = input as Record<string, unknown>;
+  const sourceId = typeof record.sourceId === 'string' ? record.sourceId : '';
+  const targetId = typeof record.targetId === 'string' ? record.targetId : '';
+  if (!sourceId || !targetId) {
+    return null;
+  }
+  const idRaw = typeof record.id === 'string' && record.id.trim().length > 0 ? record.id : fallbackId;
+  const updateMode = isRelationshipUpdateMode(record.updateMode) ? (record.updateMode as RelationshipDescriptor['updateMode']) : 'idle-summary';
+  const pollFrequency = sanitizePollFrequency(record.pollFrequency);
+  return {
+    id: idRaw,
+    sourceId,
+    targetId,
+    sourceHandleId: typeof record.sourceHandleId === 'string' ? record.sourceHandleId : null,
+    targetHandleId: typeof record.targetHandleId === 'string' ? record.targetHandleId : null,
+    instructions: typeof record.instructions === 'string' ? record.instructions : '',
+    updateMode,
+    pollFrequency,
+  };
+}
+
+function extractRelationshipsFromMetadata(
+  layout: CanvasLayout,
+  tiles: Record<string, TileDescriptor>,
+): Pick<TileState, 'relationships' | 'relationshipOrder'> {
+  const metadata = layout.metadata;
+  const rawRelationships = metadata?.agentRelationships ?? {};
+  const orderFromMetadata = Array.isArray(metadata?.agentRelationshipOrder)
+    ? metadata?.agentRelationshipOrder.filter((value): value is string => typeof value === 'string' && value.length > 0)
+    : [];
+  const relationships: Record<string, RelationshipDescriptor> = {};
+  const relationshipOrder: string[] = [];
+  const pushRelationship = (descriptor: RelationshipDescriptor | null) => {
+    if (!descriptor) {
+      return;
+    }
+    if (!tiles[descriptor.sourceId] || !tiles[descriptor.targetId]) {
+      return;
+    }
+    if (relationships[descriptor.id]) {
+      return;
+    }
+    relationships[descriptor.id] = descriptor;
+    relationshipOrder.push(descriptor.id);
+  };
+  for (const relId of orderFromMetadata) {
+    pushRelationship(normalizeRelationshipEntry(rawRelationships?.[relId], relId));
+  }
+  for (const [relId, raw] of Object.entries(rawRelationships ?? {})) {
+    if (relationships[relId]) {
+      continue;
+    }
+    pushRelationship(normalizeRelationshipEntry(raw, relId));
+  }
+  return { relationships, relationshipOrder };
+}
+
+function serializeRelationships(state: TileState): {
+  records: Record<string, SerializedRelationship> | null;
+  order: string[];
+} {
+  const order = buildRelationshipOrder(state);
+  if (order.length === 0) {
+    return { records: null, order: [] };
+  }
+  const records: Record<string, SerializedRelationship> = {};
+  for (const relId of order) {
+    const rel = state.relationships[relId];
+    if (!rel) {
+      continue;
+    }
+    records[relId] = {
+      id: rel.id,
+      sourceId: rel.sourceId,
+      targetId: rel.targetId,
+      sourceHandleId: rel.sourceHandleId ?? null,
+      targetHandleId: rel.targetHandleId ?? null,
+      instructions: rel.instructions || null,
+      updateMode: rel.updateMode,
+      pollFrequency: rel.pollFrequency,
+    };
+  }
+  return { records, order };
+}
+
 function extractTileDescriptor(
   tileId: string,
   tile: CanvasLayout['tiles'][string],
@@ -123,33 +241,37 @@ export function layoutToTileState(layout: CanvasLayout | null | undefined): Tile
     return aZ - bZ;
   });
 
-  const tiles: Record<string, TileDescriptor> = {};
-  const order: string[] = [];
-  let interactiveId: string | null = null;
-  for (const [tileKey, tile] of entries) {
-    const descriptor = extractTileDescriptor(tileKey, tile, timestamp);
-    tiles[descriptor.id] = descriptor;
-    order.push(descriptor.id);
-    if (!interactiveId && !descriptor.sessionMeta?.sessionId) {
-      interactiveId = descriptor.id;
-    }
-  }
-  return {
-    tiles,
-    order,
-    activeId: null,
-    resizing: {},
-    interactiveId,
-    viewport: {},
-  };
+	const tiles: Record<string, TileDescriptor> = {};
+	const order: string[] = [];
+	let interactiveId: string | null = null;
+	for (const [tileKey, tile] of entries) {
+		const descriptor = extractTileDescriptor(tileKey, tile, timestamp);
+		tiles[descriptor.id] = descriptor;
+		order.push(descriptor.id);
+		if (!interactiveId && !descriptor.sessionMeta?.sessionId) {
+			interactiveId = descriptor.id;
+		}
+	}
+	const { relationships, relationshipOrder } = extractRelationshipsFromMetadata(base, tiles);
+	return {
+		tiles,
+		order,
+		relationships,
+		relationshipOrder,
+		activeId: null,
+		resizing: {},
+		interactiveId,
+		viewport: {},
+	};
 }
 
 export function tileStateToLayout(state: TileState, baseLayout?: CanvasLayout | null): CanvasLayout {
-  const base = baseLayout ?? buildEmptyLayout();
-  const now = Date.now();
-  const tilesOut: CanvasLayout['tiles'] = {};
-  const baseTiles = base.tiles ?? {};
-  const canonicalOrder = buildCanonicalOrder(state);
+	const base = baseLayout ?? buildEmptyLayout();
+	const now = Date.now();
+	const tilesOut: CanvasLayout['tiles'] = {};
+	const baseTiles = base.tiles ?? {};
+	const canonicalOrder = buildCanonicalOrder(state);
+	const { records: serializedRelationships, order: serializedRelationshipOrder } = serializeRelationships(state);
 
   canonicalOrder.forEach((tileId, orderIndex) => {
     const tile = state.tiles[tileId];
@@ -187,77 +309,123 @@ export function tileStateToLayout(state: TileState, baseLayout?: CanvasLayout | 
     };
   });
 
-  return {
-    version: 3,
-    viewport: base.viewport ?? { ...DEFAULT_VIEWPORT },
-    tiles: tilesOut,
-    agents: base.agents ?? {},
-    groups: base.groups ?? {},
-    controlAssignments: base.controlAssignments ?? {},
-    metadata: {
-      createdAt: base.metadata?.createdAt ?? now,
-      updatedAt: now,
-      migratedFrom: base.metadata?.migratedFrom,
-    },
-  };
+	const metadataOut: CanvasLayout['metadata'] = {
+		createdAt: base.metadata?.createdAt ?? now,
+		updatedAt: now,
+		migratedFrom: base.metadata?.migratedFrom,
+	};
+	if (serializedRelationships && Object.keys(serializedRelationships).length > 0) {
+		metadataOut.agentRelationships = serializedRelationships;
+		metadataOut.agentRelationshipOrder = serializedRelationshipOrder;
+	}
+	return {
+		version: 3,
+		viewport: base.viewport ?? { ...DEFAULT_VIEWPORT },
+		tiles: tilesOut,
+		agents: base.agents ?? {},
+		groups: base.groups ?? {},
+		controlAssignments: base.controlAssignments ?? {},
+		metadata: metadataOut,
+	};
 }
 
 export function serializeTileStateKey(state: TileState): string {
-  const order = buildCanonicalOrder(state);
-  if (order.length === 0) {
-    return 'tiles:none';
-  }
-  return order
-    .map((tileId) => {
-      const tile = state.tiles[tileId];
-      if (!tile) {
-        return `${tileId}:missing`;
-      }
-      const sessionSignature = tile.sessionMeta
-        ? [
-            tile.sessionMeta.sessionId ?? '',
-            tile.sessionMeta.title ?? '',
-            tile.sessionMeta.status ?? '',
-            tile.sessionMeta.harnessType ?? '',
-            tile.sessionMeta.pendingActions ?? '',
-          ].join('~')
-        : 'session:none';
-      const agentSignature =
-        tile.nodeType === 'agent'
-          ? [
-              tile.agentMeta?.role ?? '',
-              tile.agentMeta?.responsibility ?? '',
-              tile.agentMeta?.isEditing ? 'editing' : 'saved',
-            ].join('~')
-          : 'agent:none';
-      return [
-        tile.id,
-        tile.nodeType,
-        tile.position.x,
-        tile.position.y,
-        tile.size.width,
-        tile.size.height,
-        sessionSignature,
-        agentSignature,
-      ].join(':');
-    })
-    .join('|');
+	const tileOrder = buildCanonicalOrder(state);
+	const tileSignature =
+		tileOrder.length === 0
+			? 'tiles:none'
+			: tileOrder
+					.map((tileId) => {
+						const tile = state.tiles[tileId];
+						if (!tile) {
+							return `${tileId}:missing`;
+						}
+						const sessionSignature = tile.sessionMeta
+							? [
+									 tile.sessionMeta.sessionId ?? '',
+									 tile.sessionMeta.title ?? '',
+									 tile.sessionMeta.status ?? '',
+									 tile.sessionMeta.harnessType ?? '',
+									 tile.sessionMeta.pendingActions ?? '',
+							  ].join('~')
+							: 'session:none';
+						const agentSignature =
+							tile.nodeType === 'agent'
+								? [
+									 tile.agentMeta?.role ?? '',
+									 tile.agentMeta?.responsibility ?? '',
+									 tile.agentMeta?.isEditing ? 'editing' : 'saved',
+							  ].join('~')
+								: 'agent:none';
+						return [
+							tile.id,
+							tile.nodeType,
+							tile.position.x,
+							tile.position.y,
+							tile.size.width,
+							tile.size.height,
+							sessionSignature,
+							agentSignature,
+						].join(':');
+					})
+					.join('|');
+	const relationshipOrder = buildRelationshipOrder(state);
+	const relationshipSignature =
+		relationshipOrder.length === 0
+			? 'relationships:none'
+			: relationshipOrder
+					.map((relId) => {
+						const rel = state.relationships[relId];
+						if (!rel) {
+							return `${relId}:missing`;
+						}
+						return [
+							rel.id,
+							rel.sourceId,
+							rel.targetId,
+							rel.sourceHandleId ?? '',
+							rel.targetHandleId ?? '',
+							rel.instructions ?? '',
+							rel.updateMode,
+							rel.pollFrequency ?? '',
+						].join(':');
+					})
+					.join('|');
+	return `${tileSignature}::${relationshipSignature}`;
 }
 
 function buildCanonicalOrder(state: TileState): string[] {
-  const seen = new Set<string>();
-  const order: string[] = [];
-  for (const id of state.order) {
-    if (id && !seen.has(id)) {
-      order.push(id);
-      seen.add(id);
-    }
-  }
-  for (const id of Object.keys(state.tiles)) {
-    if (!seen.has(id)) {
-      order.push(id);
-      seen.add(id);
-    }
-  }
-  return order;
+	const seen = new Set<string>();
+	const order: string[] = [];
+	for (const id of state.order) {
+		if (id && !seen.has(id)) {
+			order.push(id);
+			seen.add(id);
+		}
+	}
+	for (const id of Object.keys(state.tiles)) {
+		if (!seen.has(id)) {
+			order.push(id);
+			seen.add(id);
+		}
+	}
+	return order;
+}
+
+function buildRelationshipOrder(state: TileState): string[] {
+	const seen = new Set<string>();
+	const order: string[] = [];
+	for (const id of state.relationshipOrder) {
+		if (id && !seen.has(id) && state.relationships[id]) {
+			order.push(id);
+			seen.add(id);
+		}
+	}
+	for (const id of Object.keys(state.relationships)) {
+		if (!seen.has(id)) {
+			order.push(id);
+			seen.add(id);
+		}
+	}
+	return order;
 }

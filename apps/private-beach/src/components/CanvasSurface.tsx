@@ -516,6 +516,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     viewerStateOverrides: viewerStateOverridesProp,
   } = props;
   const reactFlow = useReactFlow();
+  const memoizedNodeTypes = useMemo(() => nodeTypes, []);
   const { load, setNodes: setCanvasNodes, updateNode, setViewport, setSelection } = useCanvasActions();
   const { selection, nodes: canvasNodes } = useCanvasState();
   const { onDropNode, onCreateGroup, onAssignAgent, onAssignmentError } = useCanvasHandlers();
@@ -1398,7 +1399,7 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
   return (
     <div ref={wrapperRef} className="relative h-full w-full">
       <ReactFlow
-        nodeTypes={nodeTypes}
+        nodeTypes={memoizedNodeTypes}
         nodes={rfNodes}
         edges={edges}
         onNodesChange={handleNodesChange}

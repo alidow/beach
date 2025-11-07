@@ -6,13 +6,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactFlow, {
   Background,
   ReactFlowProvider,
-  addEdge,
-  applyEdgeChanges,
+  MarkerType,
   useReactFlow,
   useStore,
   type Connection,
   type Edge,
-  type EdgeChange,
   type Node,
   type NodeChange,
   type NodeDragEventHandler,
@@ -37,6 +35,15 @@ import type {
 const APPLICATION_MIME = 'application/reactflow';
 const nodeTypes = { tile: TileFlowNode };
 const edgeTypes = { assignment: AssignmentEdge };
+const defaultEdgeOptions = {
+  type: 'smoothstep' as const,
+  markerEnd: {
+    type: MarkerType.ArrowClosed,
+    color: '#94a3b8',
+    width: 18,
+    height: 18,
+  },
+};
 
 type FlowCanvasProps = {
   onNodePlacement: (payload: NodePlacementPayload) => void;
@@ -67,11 +74,22 @@ function FlowCanvasInner({
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const dragSnapshotRef = useRef<DragSnapshot | null>(null);
   const canvasBoundsRef = useRef<CanvasBounds | null>(null);
-  const [edges, setEdges] = useState<Array<Edge<AssignmentEdgeData>>>([]);
+  const [editingEdgeId, setEditingEdgeId] = useState<string | null>(null);
   const flow = useReactFlow();
   const { screenToFlowPosition } = flow;
+  const memoizedNodeTypes = useMemo(() => nodeTypes, []);
+  const memoizedEdgeTypes = useMemo(() => edgeTypes, []);
   const state = useTileState();
-  const { setTilePosition, setTilePositionImmediate, bringToFront, setActiveTile } = useTileActions();
+  const { order, tiles, activeId, resizing, interactiveId } = state;
+  const {
+    setTilePosition,
+    setTilePositionImmediate,
+    bringToFront,
+    setActiveTile,
+    addRelationship,
+    updateRelationship,
+    removeRelationship,
+  } = useTileActions();
   const { reportTileMove } = useCanvasEvents();
 
   const applyCanvasBounds = useCallback((bounds: CanvasBounds | null) => {
@@ -94,24 +112,23 @@ function FlowCanvasInner({
   const resolvedManagerUrl = useMemo(() => buildManagerUrl(managerUrl), [managerUrl]);
 
   const nodes: Node[] = useMemo(() => {
-    return state.order
+    return order
       .map((tileId, index) => {
-        const tile = state.tiles[tileId];
+        const tile = tiles[tileId];
         if (!tile) return null;
-        const isInteractive = state.interactiveId === tile.id;
+        const isInteractive = interactiveId === tile.id;
         return {
           id: tile.id,
           type: 'tile',
           data: {
             tile,
             orderIndex: index,
-            isActive: state.activeId === tile.id,
-            isResizing: Boolean(state.resizing[tile.id]),
+            isActive: activeId === tile.id,
+            isResizing: Boolean(resizing[tile.id]),
             isInteractive,
             privateBeachId,
             managerUrl: resolvedManagerUrl,
             rewriteEnabled,
-            viewportMetrics: state.viewport[tile.id] ?? null,
           },
           position: tile.position,
           draggable: true,
@@ -125,35 +142,24 @@ function FlowCanvasInner({
         } satisfies Node;
       })
       .filter((node): node is Node => Boolean(node));
-  }, [privateBeachId, resolvedManagerUrl, rewriteEnabled, state]);
+  }, [activeId, interactiveId, order, privateBeachId, resolvedManagerUrl, resizing, rewriteEnabled, tiles]);
 
   const handleEdgeSave = useCallback(
     ({ id, instructions, updateMode, pollFrequency }: { id: string; instructions: string; updateMode: UpdateMode; pollFrequency: number }) => {
-      setEdges((current) =>
-        current.map((edge) =>
-          edge.id === id
-            ? {
-                ...edge,
-                data: { ...edge.data, instructions, updateMode, pollFrequency, isEditing: false },
-              }
-            : edge,
-        ),
-      );
+      updateRelationship(id, { instructions, updateMode, pollFrequency });
+      setEditingEdgeId(null);
     },
-    [],
+    [updateRelationship],
   );
 
   const handleEdgeEdit = useCallback(({ id }: { id: string }) => {
-    setEdges((current) =>
-      current.map((edge) =>
-        edge.id === id ? { ...edge, data: { ...edge.data, isEditing: true } } : edge,
-      ),
-    );
+    setEditingEdgeId(id);
   }, []);
 
   const handleEdgeDelete = useCallback(({ id }: { id: string }) => {
-    setEdges((current) => current.filter((edge) => edge.id !== id));
-  }, []);
+    removeRelationship(id);
+    setEditingEdgeId((current) => (current === id ? null : current));
+  }, [removeRelationship]);
 
   const handleNodesChange = useCallback(
     (changes: NodeChange[]) => {
@@ -176,11 +182,6 @@ function FlowCanvasInner({
     [gridSize, setTilePosition, setTilePositionImmediate, state.tiles],
   );
 
-  const handleEdgesChange = useCallback(
-    (changes: EdgeChange[]) => setEdges((eds) => applyEdgeChanges(changes, eds)),
-    [],
-  );
-
   const handleConnect = useCallback(
     (connection: Connection) => {
       if (!connection.source || !connection.target) {
@@ -195,24 +196,13 @@ function FlowCanvasInner({
         return;
       }
       const edgeId = `assignment-${Date.now()}-${Math.round(Math.random() * 1000)}`;
-      const edge: Edge<AssignmentEdgeData> = {
-        id: edgeId,
-        type: 'assignment',
-        source: connection.source,
-        target: connection.target,
-        data: {
-          instructions: '',
-          updateMode: 'idle-summary',
-          pollFrequency: 60,
-          isEditing: true,
-          onSave: handleEdgeSave,
-          onEdit: handleEdgeEdit,
-          onDelete: handleEdgeDelete,
-        },
-      };
-      setEdges((current) => addEdge(edge, current));
+      addRelationship(edgeId, connection.source, connection.target, {
+        sourceHandleId: connection.sourceHandle,
+        targetHandleId: connection.targetHandle,
+      });
+      setEditingEdgeId(edgeId);
     },
-    [handleEdgeDelete, handleEdgeEdit, handleEdgeSave, state.tiles],
+    [addRelationship, state.tiles],
   );
 
   const handleNodeDragStart: NodeDragEventHandler = useCallback(
@@ -379,9 +369,34 @@ function FlowCanvasInner({
     };
   }, [applyCanvasBounds]);
 
-  useEffect(() => {
-    setEdges((current) => current.filter((edge) => state.tiles[edge.source] && state.tiles[edge.target]));
-  }, [state.tiles]);
+  const edgeElements = useMemo(() =>
+    state.relationshipOrder
+      .map((relId) => {
+        const rel = state.relationships[relId];
+        if (!rel) return null;
+        if (!state.tiles[rel.sourceId] || !state.tiles[rel.targetId]) {
+          return null;
+        }
+        return {
+          id: rel.id,
+          type: 'assignment',
+          source: rel.sourceId,
+          target: rel.targetId,
+          sourceHandle: rel.sourceHandleId ?? undefined,
+          targetHandle: rel.targetHandleId ?? undefined,
+          data: {
+            instructions: rel.instructions,
+            updateMode: rel.updateMode as UpdateMode,
+            pollFrequency: rel.pollFrequency,
+            isEditing: editingEdgeId === rel.id,
+            onSave: handleEdgeSave,
+            onEdit: handleEdgeEdit,
+            onDelete: handleEdgeDelete,
+          },
+        } satisfies Edge<AssignmentEdgeData>;
+      })
+      .filter((edge): edge is Edge<AssignmentEdgeData> => Boolean(edge)),
+  [editingEdgeId, handleEdgeDelete, handleEdgeEdit, handleEdgeSave, state.relationshipOrder, state.relationships, state.tiles]);
 
   return (
     <div
@@ -391,15 +406,18 @@ function FlowCanvasInner({
     >
       <ReactFlow
         nodes={nodes}
-        edges={edges}
-        nodeTypes={nodeTypes}
-        edgeTypes={edgeTypes}
+        edges={edgeElements}
+        nodeTypes={memoizedNodeTypes}
+        edgeTypes={memoizedEdgeTypes}
+        defaultEdgeOptions={defaultEdgeOptions}
         onNodesChange={handleNodesChange}
-        onEdgesChange={handleEdgesChange}
+        onEdgesChange={() => undefined}
         onConnect={handleConnect}
         onNodeDrag={handleNodeDrag}
         onNodeDragStart={handleNodeDragStart}
         onNodeDragStop={handleNodeDragStop}
+        connectionMode="loose"
+        connectionRadius={36}
         nodesDraggable
         nodesConnectable
         elementsSelectable={false}

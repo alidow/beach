@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { MouseEvent, PointerEvent } from 'react';
+import type { CSSProperties, MouseEvent, PointerEvent } from 'react';
 import { Handle, Position, useStore } from 'reactflow';
 import type { NodeProps, ReactFlowState } from 'reactflow';
 import { ApplicationTile } from '@/components/ApplicationTile';
@@ -22,7 +22,6 @@ type TileFlowNodeData = {
   managerUrl: string;
   rewriteEnabled: boolean;
   isInteractive: boolean;
-  viewportMetrics: TileViewportSnapshot | null;
 };
 
 type ResizeState = {
@@ -33,6 +32,20 @@ type ResizeState = {
   height: number;
   lastSize?: { width: number; height: number };
 };
+
+const HANDLE_BASE_CLASS =
+  'pointer-events-auto h-7 w-7 rounded-full border-[1.5px] transition shadow-[0_0_12px_rgba(15,23,42,0.5)] flex items-center justify-center text-[10px] font-semibold';
+const TARGET_HANDLE_CLASS = `${HANDLE_BASE_CLASS} border-white/70 bg-slate-900/90 text-white hover:border-white hover:bg-slate-900`;
+const SOURCE_HANDLE_CLASS = `${HANDLE_BASE_CLASS} border-indigo-300/80 bg-indigo-500/90 text-white hover:border-indigo-100 hover:bg-indigo-400`;
+
+type HandleDef = { key: 'top' | 'right' | 'bottom' | 'left'; pos: Position; style: CSSProperties };
+
+const HANDLE_DEFS: HandleDef[] = [
+  { key: 'top', pos: Position.Top, style: { top: -12, left: '50%', transform: 'translate(-50%, -50%)' } },
+  { key: 'right', pos: Position.Right, style: { right: -12, top: '50%', transform: 'translate(50%, -50%)' } },
+  { key: 'bottom', pos: Position.Bottom, style: { bottom: -12, left: '50%', transform: 'translate(-50%, 50%)' } },
+  { key: 'left', pos: Position.Left, style: { left: -12, top: '50%', transform: 'translate(-50%, -50%)' } },
+];
 
 function metaEqual(a: TileSessionMeta | null | undefined, b: TileSessionMeta | null | undefined) {
   if (!a && !b) return true;
@@ -55,6 +68,9 @@ function isInteractiveElement(target: EventTarget | null): boolean {
     return false;
   }
   if (target.closest('[data-tile-drag-ignore="true"]')) {
+    return true;
+  }
+  if (target.closest('[data-terminal-root="true"], [data-terminal-content="true"]')) {
     return true;
   }
   return Boolean(target.closest('button, input, textarea, select, a, label'));
@@ -85,7 +101,6 @@ export function TileFlowNode({ data, dragging }: Props) {
     privateBeachId,
     managerUrl,
     rewriteEnabled,
-    viewportMetrics,
   } = data;
   const {
     removeTile,
@@ -99,6 +114,7 @@ export function TileFlowNode({ data, dragging }: Props) {
     createTile,
   } = useTileActions();
   const nodeRef = useRef<HTMLElement | null>(null);
+  const viewportMetricsRef = useRef<TileViewportSnapshot | null>(null);
   const resizeStateRef = useRef<ResizeState | null>(null);
   const [hovered, setHovered] = useState(false);
   const isAgent = tile.nodeType === 'agent';
@@ -175,6 +191,7 @@ export function TileFlowNode({ data, dragging }: Props) {
   }, [agentMeta, createTile, isAgent, removeTile, tile.id]);
 
   const handleAutoResize = useCallback(() => {
+    const viewportMetrics = viewportMetricsRef.current;
     logAutoResizeEvent(tile.id, 'attempt', {
       hasMetrics: Boolean(viewportMetrics),
       zoom: zoom ?? null,
@@ -201,9 +218,11 @@ export function TileFlowNode({ data, dragging }: Props) {
       logAutoResizeEvent(tile.id, 'missing-container');
       return;
     }
-    const terminal = container.querySelector<HTMLElement>(
+    const terminalRoot = container.querySelector<HTMLElement>(
       `[data-terminal-root="true"][data-terminal-tile="${tile.id}"]`,
     );
+    const terminalContent = terminalRoot?.querySelector<HTMLElement>('[data-terminal-content="true"]') ?? terminalRoot;
+    const terminal = terminalContent ?? terminalRoot;
     if (!terminal) {
       logAutoResizeEvent(tile.id, 'missing-terminal');
       return;
@@ -214,13 +233,26 @@ export function TileFlowNode({ data, dragging }: Props) {
       logAutoResizeEvent(tile.id, 'invalid-rect', { tileRect, terminalRect });
       return;
     }
-    const chromeWidthPx = Math.max(0, tileRect.width - terminalRect.width);
-    const chromeHeightPx = Math.max(0, tileRect.height - terminalRect.height);
+    const zoomFactor = zoom && zoom > 0 ? zoom : 1;
+    const tileWidthPx = tileRect.width / zoomFactor;
+    const tileHeightPx = tileRect.height / zoomFactor;
+    const terminalWidthPx = terminalRect.width / zoomFactor;
+    const terminalHeightPx = terminalRect.height / zoomFactor;
+    const chromeWidthPx = Math.max(0, tileWidthPx - terminalWidthPx);
+    const chromeHeightPx = Math.max(0, tileHeightPx - terminalHeightPx);
+    const viewportCols = viewportMetrics.viewportCols ?? hostCols ?? null;
+    const viewportRows = viewportMetrics.viewportRows ?? hostRows ?? null;
+    const observedCellWidth =
+      viewportCols && viewportCols > 0 ? terminalWidthPx / viewportCols : null;
+    const observedRowHeight =
+      viewportRows && viewportRows > 0 ? terminalHeightPx / viewportRows : null;
     const nextSize = computeAutoResizeSize({
       metrics: viewportMetrics,
       chromeWidthPx,
       chromeHeightPx,
       zoom: zoom ?? 1,
+      observedCellWidth,
+      observedRowHeight,
     });
     if (!nextSize) {
       logAutoResizeEvent(tile.id, 'compute-failed', { chromeWidthPx, chromeHeightPx });
@@ -235,6 +267,8 @@ export function TileFlowNode({ data, dragging }: Props) {
       chromeWidthPx,
       chromeHeightPx,
       zoom: zoom ?? 1,
+      observedCellWidth,
+      observedRowHeight,
     });
     resizeTile(tile.id, nextSize);
     emitTelemetry('canvas.resize.auto', {
@@ -250,17 +284,7 @@ export function TileFlowNode({ data, dragging }: Props) {
       rewriteEnabled,
       size: nextSize,
     });
-  }, [
-    viewportMetrics,
-    nodeRef,
-    zoom,
-    resizeTile,
-    tile.id,
-    tile.size.height,
-    tile.size.width,
-    privateBeachId,
-    rewriteEnabled,
-  ]);
+  }, [nodeRef, privateBeachId, resizeTile, rewriteEnabled, tile.id, tile.size.height, tile.size.width, zoom]);
 
   const handleResizeDoubleClick = useCallback(
     (event: MouseEvent<HTMLButtonElement>) => {
@@ -395,14 +419,11 @@ export function TileFlowNode({ data, dragging }: Props) {
 
   const handlePointerEnterNode = useCallback(() => {
     setHovered(true);
-  }, []);
+  }, [setHovered]);
 
   const handlePointerLeaveNode = useCallback(() => {
     setHovered(false);
-    if (isInteractive) {
-      setInteractiveTile(null);
-    }
-  }, [isInteractive, setInteractiveTile]);
+  }, [setHovered]);
 
   useEffect(() => {
     if (!hovered) {
@@ -410,23 +431,34 @@ export function TileFlowNode({ data, dragging }: Props) {
     }
     const handleKeyDown = (event: KeyboardEvent) => {
       const isSpace = event.key === ' ' || event.key === 'Spacebar' || event.code === 'Space';
-      if (isSpace) {
-        event.preventDefault();
-        setInteractiveTile(isInteractive ? null : tile.id);
+      if (!isSpace) {
         return;
       }
-      if (event.key === 'Escape') {
-        if (isInteractive) {
-          event.preventDefault();
-          setInteractiveTile(null);
-        }
-      }
+      event.preventDefault();
+      setInteractiveTile(isInteractive ? null : tile.id);
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
     };
   }, [hovered, isInteractive, setInteractiveTile, tile.id]);
+
+  useEffect(() => {
+    if (!isInteractive) {
+      return;
+    }
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') {
+        return;
+      }
+      event.preventDefault();
+      setInteractiveTile(null);
+    };
+    window.addEventListener('keydown', handleEscape);
+    return () => {
+      window.removeEventListener('keydown', handleEscape);
+    };
+  }, [isInteractive, setInteractiveTile]);
 
   const title = tile.sessionMeta?.title ?? tile.sessionMeta?.sessionId ?? 'Application Tile';
   const subtitle = useMemo(() => {
@@ -438,7 +470,6 @@ export function TileFlowNode({ data, dragging }: Props) {
   const headerTitle = isAgent ? 'Agent' : title;
   const headerSubtitle = isAgent ? agentMeta.role || 'Define this agent' : subtitle;
   const showAgentEditor = isAgent && (agentMeta.isEditing || (!agentMeta.role && !agentMeta.responsibility));
-  const shouldRenderViewer = !isAgent || !showAgentEditor;
 
   const handleMetaChange = useCallback(
     (meta: TileSessionMeta | null) => {
@@ -461,8 +492,14 @@ export function TileFlowNode({ data, dragging }: Props) {
     setInteractiveTile(tile.id);
   }, [bringToFront, isInteractive, setActiveTile, setInteractiveTile, tile.id]);
 
+  const handleViewportMetricsChange = useCallback((snapshot: TileViewportSnapshot | null) => {
+    viewportMetricsRef.current = snapshot;
+  }, []);
+
+  const showInteractOverlay = !isAgent && !isInteractive && hovered;
+
   const nodeClass = cn(
-    'group relative flex h-full w-full select-none flex-col overflow-hidden rounded-2xl border border-slate-700/60 bg-slate-950/80 text-slate-200 shadow-[0_28px_80px_rgba(2,6,23,0.6)] backdrop-blur-xl transition-all duration-200',
+    'group relative flex h-full w-full select-none flex-col overflow-visible rounded-2xl border border-slate-700/60 bg-slate-950/80 text-slate-200 shadow-[0_28px_80px_rgba(2,6,23,0.6)] backdrop-blur-xl transition-all duration-200',
     isActive && 'border-sky-400/60 shadow-[0_32px_90px_rgba(14,165,233,0.35)]',
     isResizing && 'cursor-[se-resize]',
     isInteractive && 'border-sky-300/70 shadow-[0_32px_90px_rgba(56,189,248,0.45)] cursor-auto',
@@ -480,6 +517,22 @@ export function TileFlowNode({ data, dragging }: Props) {
       onPointerLeave={handlePointerLeaveNode}
       data-tile-interactive={isInteractive ? 'true' : 'false'}
     >
+      <div
+        className={cn(
+          'pointer-events-none absolute inset-0 z-30 flex items-center justify-center rounded-2xl bg-slate-950/40 transition-opacity duration-150',
+          showInteractOverlay ? 'opacity-100' : 'opacity-0'
+        )}
+        aria-hidden={!showInteractOverlay}
+      >
+        <button
+          type="button"
+          onClick={handleToggleInteractive}
+          className="pointer-events-auto inline-flex items-center gap-2 rounded-full border border-amber-200/70 bg-amber-300/90 px-4 py-2 text-xs font-semibold uppercase tracking-[0.28em] text-slate-900 shadow-lg transition hover:bg-amber-200"
+          data-tile-drag-ignore="true"
+        >
+          Interact
+        </button>
+      </div>
       <header
         className="flex min-h-[44px] items-center justify-between border-b border-white/10 bg-slate-900/80 px-4 py-2.5 backdrop-blur"
         style={{ minHeight: TILE_HEADER_HEIGHT }}
@@ -510,21 +563,6 @@ export function TileFlowNode({ data, dragging }: Props) {
               Edit
             </button>
           ) : null}
-          <button
-            type="button"
-            onClick={handleToggleInteractive}
-            aria-pressed={isInteractive}
-            data-tile-drag-ignore="true"
-            className={cn(
-              'inline-flex h-7 items-center justify-center rounded-full border px-3 text-[10px] font-semibold uppercase tracking-[0.24em] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60',
-              isInteractive
-                ? 'border-sky-400/70 bg-sky-500/20 text-sky-50'
-                : 'border-white/15 bg-white/5 text-slate-300 hover:border-white/30 hover:text-white',
-            )}
-            title="Toggle interactive mode (Space)"
-          >
-            {isInteractive ? 'Done' : 'Interact'}
-          </button>
           <button
             type="button"
             className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-500/40 bg-red-500/15 text-base font-semibold text-red-200 transition hover:border-red-400/70 hover:bg-red-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400/60"
@@ -599,27 +637,30 @@ export function TileFlowNode({ data, dragging }: Props) {
           )}
         </div>
       ) : null}
-      {shouldRenderViewer ? (
-        <section
-          className={cn(
-            'flex flex-1 flex-col gap-3 overflow-hidden bg-slate-950/60 transition-opacity',
-            isInteractive ? 'pointer-events-auto' : 'pointer-events-none opacity-[0.98] select-none',
-          )}
+      {showAgentEditor ? (
+        <div
+          className="border-t border-white/5 bg-slate-950/60 px-4 py-2 text-center text-[11px] text-slate-400"
           data-tile-drag-ignore="true"
         >
-          <ApplicationTile
-            tileId={tile.id}
-            privateBeachId={privateBeachId}
-            managerUrl={managerUrl}
-            sessionMeta={tile.sessionMeta ?? null}
-            onSessionMetaChange={handleMetaChange}
-          />
-        </section>
-      ) : (
-        <div className="flex flex-1 items-center justify-center bg-slate-950/60 px-4 text-center text-sm text-slate-400" data-tile-drag-ignore="true">
-          Save this agent&rsquo;s role and responsibility to start connecting it to sessions.
+          Save this agent&rsquo;s role and responsibility to keep it pinned, but the session preview remains available below.
         </div>
-      )}
+      ) : null}
+      <section
+        className={cn(
+          'flex flex-1 flex-col gap-3 overflow-hidden bg-slate-950/60 transition-opacity',
+          isInteractive ? 'pointer-events-auto' : 'pointer-events-none opacity-[0.98] select-none',
+        )}
+        data-tile-drag-ignore="true"
+      >
+        <ApplicationTile
+          tileId={tile.id}
+          privateBeachId={privateBeachId}
+          managerUrl={managerUrl}
+          sessionMeta={tile.sessionMeta ?? null}
+          onSessionMetaChange={handleMetaChange}
+          onViewportMetricsChange={handleViewportMetricsChange}
+        />
+      </section>
       <button
         type="button"
         className="absolute bottom-3 right-3 z-10 h-5 w-5 cursor-nwse-resize rounded-md border border-sky-400/40 bg-[radial-gradient(circle_at_top_left,rgba(56,189,248,0.6),rgba(56,189,248,0.05))] text-transparent transition hover:border-sky-400/60 hover:shadow-[0_0_12px_rgba(56,189,248,0.45)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
@@ -632,20 +673,30 @@ export function TileFlowNode({ data, dragging }: Props) {
         data-tile-drag-ignore="true"
         data-tile-resize-handle="true"
       />
-      <Handle
-        type="target"
-        position={Position.Left}
-        className="h-3 w-3 border-none bg-indigo-200/80 transition hover:bg-indigo-300"
-        onPointerDown={(event) => event.stopPropagation()}
-      />
-      {isAgent ? (
+      {HANDLE_DEFS.map(({ key, pos, style }) => (
         <Handle
-          type="source"
-          position={Position.Right}
-          className="h-3 w-3 border-none bg-indigo-500 transition hover:bg-indigo-400"
+          key={`target-${key}`}
+          type="target"
+          position={pos}
+          id={`target-${key}`}
+          className={TARGET_HANDLE_CLASS}
+          style={style}
           onPointerDown={(event) => event.stopPropagation()}
         />
-      ) : null}
+      ))}
+      {isAgent
+        ? HANDLE_DEFS.map(({ key, pos, style }) => (
+            <Handle
+              key={`source-${key}`}
+              type="source"
+              position={pos}
+              id={`source-${key}`}
+              className={SOURCE_HANDLE_CLASS}
+              style={style}
+              onPointerDown={(event) => event.stopPropagation()}
+            />
+          ))
+        : null}
     </article>
   );
 }

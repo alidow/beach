@@ -9,14 +9,14 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::auth::{AuthConfig, AuthContext};
-use crate::fastpath::{send_actions_over_fast_path, FastPathRegistry, FastPathSession};
+use crate::fastpath::{FastPathRegistry, FastPathSession, send_actions_over_fast_path};
 use crate::metrics;
 use beach_buggy::{
     AckStatus, ActionAck, ActionCommand, CellStylePayload, CursorPosition, HarnessType,
@@ -26,20 +26,20 @@ use beach_buggy::{
 use beach_client_core::cache::terminal::packed::unpack_cell;
 use beach_client_core::protocol::{ClientFrame, CursorFrame, Update as WireUpdate};
 use beach_client_core::{
-    decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
-    HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell, Payload,
-    SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId, TerminalGrid,
-    TransportError, TransportOffer,
+    CliError, HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell,
+    Payload, SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId,
+    TerminalGrid, TransportError, TransportOffer, decode_host_frame_binary,
+    encode_client_frame_binary, negotiate_transport,
 };
 use chrono::{DateTime, Duration, Utc};
 use prometheus::IntGauge;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use sqlx::{types::Json, FromRow, PgPool, Row};
-use tokio::sync::{broadcast, RwLock};
+use sqlx::{FromRow, PgPool, Row, types::Json};
+use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tracing::{debug, info, warn};
+use tracing::{Level, debug, info, trace, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -828,6 +828,20 @@ struct ControllerPairingRow {
     update_cadence: ControllerUpdateCadence,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, FromRow)]
+struct ControllerAgentSessionRow {
+    controller_origin_session_id: Uuid,
+    controller_metadata: Option<Json<serde_json::Value>>,
+}
+
+fn metadata_role_is_agent(metadata: Option<&serde_json::Value>) -> bool {
+    metadata
+        .and_then(|value| value.get("role"))
+        .and_then(|role| role.as_str())
+        .map(|role| role.eq_ignore_ascii_case("agent"))
+        .unwrap_or(false)
 }
 
 impl ControllerPairingRow {
@@ -1674,7 +1688,7 @@ impl AppState {
                 {
                     Ok(row) => row,
                     Err(StateError::ControllerMismatch) => {
-                        return Err(StateError::ControllerLeaseRequired)
+                        return Err(StateError::ControllerLeaseRequired);
                     }
                     Err(err) => return Err(err),
                 };
@@ -1853,7 +1867,7 @@ impl AppState {
                 {
                     Ok(row) => row,
                     Err(StateError::ControllerMismatch) => {
-                        return Err(StateError::ControllerLeaseRequired)
+                        return Err(StateError::ControllerLeaseRequired);
                     }
                     Err(err) => return Err(err),
                 };
@@ -2140,6 +2154,9 @@ impl AppState {
                 }
 
                 let session_uuid_str = session_uuid.to_string();
+                let trace_context = self
+                    .build_agent_trace_context(pool, &identifiers, &actions)
+                    .await;
                 let mut fast_path_error: Option<String> = None;
                 match send_actions_over_fast_path(&self.fast_paths, &session_uuid_str, &actions)
                     .await
@@ -2188,6 +2205,16 @@ impl AppState {
                             }),
                         )
                         .await;
+                        if let Some((agent_sessions, payload)) = trace_context.as_ref() {
+                            Self::log_agent_bridge_payload(
+                                agent_sessions,
+                                &session_uuid,
+                                &identifiers.private_beach_id,
+                                payload,
+                                "agent_to_child",
+                                "fast_path",
+                            );
+                        }
                         return Ok(());
                     }
                     Ok(false) => {
@@ -2294,6 +2321,17 @@ impl AppState {
                 )
                 .await;
 
+                if let Some((agent_sessions, payload)) = trace_context.as_ref() {
+                    Self::log_agent_bridge_payload(
+                        agent_sessions,
+                        &session_uuid,
+                        &identifiers.private_beach_id,
+                        payload,
+                        "agent_to_child",
+                        "http_fallback",
+                    );
+                }
+
                 Ok(())
             }
         }
@@ -2314,6 +2352,10 @@ impl AppState {
                 if actions.is_empty() {
                     return Ok(actions);
                 }
+
+                let trace_context = self
+                    .build_agent_trace_context(pool, &identifiers, &actions)
+                    .await;
 
                 let label0 = identifiers.private_beach_id.to_string();
                 let label1 = session_uuid.to_string();
@@ -2361,6 +2403,18 @@ impl AppState {
                 }
                 tx.commit().await?;
                 self.fallback.clear_pending_actions(session_id).await;
+
+                if let Some((agent_sessions, payload)) = trace_context.as_ref() {
+                    Self::log_agent_bridge_payload(
+                        agent_sessions,
+                        &session_uuid,
+                        &identifiers.private_beach_id,
+                        payload,
+                        "agent_to_child",
+                        "delivery",
+                    );
+                }
+
                 Ok(actions)
             }
         }
@@ -2641,7 +2695,7 @@ impl AppState {
                     None => match self.fetch_session_identifiers(pool, &session_uuid).await {
                         Ok(_) => return Err(StateError::PrivateBeachNotFound),
                         Err(StateError::SessionNotFound) => {
-                            return Err(StateError::SessionNotFound)
+                            return Err(StateError::SessionNotFound);
                         }
                         Err(other) => return Err(other),
                     },
@@ -3036,6 +3090,8 @@ fn legacy_layout_to_canvas(
             created_at: now_ms,
             updated_at: now_ms,
             migrated_from: Some(2),
+            agent_relationships: HashMap::new(),
+            agent_relationship_order: Vec::new(),
         },
     }
     .ensure_version()
@@ -4713,6 +4769,111 @@ impl AppState {
         tx.commit().await?;
         Ok(layout)
     }
+
+    async fn build_agent_trace_context(
+        &self,
+        pool: &PgPool,
+        identifiers: &DbSessionIdentifiers,
+        actions: &[ActionCommand],
+    ) -> Option<(Vec<String>, String)> {
+        if !tracing::enabled!(Level::TRACE) {
+            return None;
+        }
+        let agents = match self
+            .fetch_agent_controller_sessions(
+                pool,
+                &identifiers.private_beach_id,
+                identifiers.session_id,
+            )
+            .await
+        {
+            Ok(list) => list,
+            Err(err) => {
+                debug!(
+                    target = "agent_controller_comms",
+                    session_id = %identifiers.session_id,
+                    error = %err,
+                    "failed to resolve agent controllers for trace logging"
+                );
+                return None;
+            }
+        };
+        if agents.is_empty() {
+            return None;
+        }
+        match serde_json::to_string(actions) {
+            Ok(payload) => Some((agents, payload)),
+            Err(err) => {
+                debug!(
+                    target = "agent_controller_comms",
+                    session_id = %identifiers.session_id,
+                    error = %err,
+                    "failed to serialize action payload for trace logging"
+                );
+                None
+            }
+        }
+    }
+
+    async fn fetch_agent_controller_sessions(
+        &self,
+        pool: &PgPool,
+        private_beach_id: &Uuid,
+        child_session_id: Uuid,
+    ) -> Result<Vec<String>, StateError> {
+        let mut tx = pool.begin().await?;
+        self.set_rls_context_tx(&mut tx, private_beach_id).await?;
+        let rows = sqlx::query_as::<_, ControllerAgentSessionRow>(
+            r#"
+            SELECT controller.origin_session_id AS controller_origin_session_id,
+                   controller.metadata AS controller_metadata
+            FROM controller_pairing cp
+            INNER JOIN session controller ON controller.id = cp.controller_session_id
+            WHERE cp.child_session_id = $1
+            "#,
+        )
+        .bind(child_session_id)
+        .fetch_all(tx.as_mut())
+        .await?;
+        tx.commit().await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let metadata = row.controller_metadata.as_ref().map(|json| &json.0);
+                if metadata_role_is_agent(metadata) {
+                    Some(row.controller_origin_session_id.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
+    fn log_agent_bridge_payload(
+        agent_sessions: &[String],
+        child_session_id: &Uuid,
+        private_beach_id: &Uuid,
+        payload: &str,
+        direction: &'static str,
+        transport: &'static str,
+    ) {
+        if agent_sessions.is_empty() || !tracing::enabled!(Level::TRACE) {
+            return;
+        }
+        let joined = agent_sessions.join(",");
+        trace!(
+            target = "agent_controller_comms",
+            direction = direction,
+            transport = transport,
+            agent_sessions = %joined,
+            child_session_id = %child_session_id,
+            private_beach_id = %private_beach_id,
+            bytes = payload.as_bytes().len(),
+            payload = %payload,
+            "agent harness communication"
+        );
+    }
 }
 
 #[allow(dead_code)]
@@ -5334,17 +5495,17 @@ mod tests {
     use super::*;
     use crate::state::test_support;
     use beach_buggy::{HarnessType, RegisterSessionRequest};
-    use beach_client_core::cache::terminal::packed::{pack_color_default, pack_color_rgb, StyleId};
+    use beach_client_core::cache::terminal::packed::{StyleId, pack_color_default, pack_color_rgb};
     use beach_client_core::protocol::{
         HostFrame as WireHostFrame, Lane, LaneBudgetFrame, SyncConfigFrame, Update as WireUpdate,
     };
     use serde_json::json;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use std::time::SystemTime;
-    use tokio::time::{sleep, timeout, Duration};
+    use tokio::time::{Duration, sleep, timeout};
 
     #[test_timeout::tokio_timeout_test(10)]
     async fn spawn_viewer_worker_smoke_test_records_state_and_stream() {

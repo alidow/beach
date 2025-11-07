@@ -1,6 +1,7 @@
 'use client';
 
-import { useState, useTransition } from 'react';
+import { useEffect, useState, useTransition } from 'react';
+import { createPortal } from 'react-dom';
 import { useRouter } from 'next/navigation';
 import { createBeachAction } from '@/app/beaches/actions';
 import { Button } from '../../../private-beach/src/components/ui/button';
@@ -12,7 +13,12 @@ export function CreateBeachButton() {
   const [slug, setSlug] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
+  const [portalTarget, setPortalTarget] = useState<HTMLElement | null>(null);
   const router = useRouter();
+
+  useEffect(() => {
+    setPortalTarget(document.body);
+  }, []);
 
   const debug = (...args: unknown[]) => {
     if (process.env.NODE_ENV !== 'production') {
@@ -64,14 +70,11 @@ export function CreateBeachButton() {
 
   debug('render', { open, nameLength: name.length, slugLength: slug.length, hasError: Boolean(error), isPending });
 
-  return (
-    <>
-      <Button size="sm" onClick={() => handleOpenChange(true, 'trigger-click')}>
-        New Beach
-      </Button>
-      {open ? (
+  const modalContent = !open
+    ? null
+    : (
         <div
-          className="fixed inset-0 z-50"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
           role="dialog"
           aria-modal="true"
           aria-labelledby="create-beach-dialog-title"
@@ -81,7 +84,7 @@ export function CreateBeachButton() {
             className="absolute inset-0 bg-black/50 backdrop-blur-sm transition-opacity dark:bg-black/70"
             onClick={() => handleOpenChange(false, 'backdrop-click')}
           />
-          <div className="absolute left-1/2 top-1/2 w-[420px] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-card text-card-foreground shadow-xl">
+          <div className="relative z-10 w-full max-w-md rounded-lg border border-border bg-card text-card-foreground shadow-xl">
             <div className="p-4">
               <h3 id="create-beach-dialog-title" className="mb-1 text-sm font-semibold">
                 Create Private Beach
@@ -128,7 +131,14 @@ export function CreateBeachButton() {
             </div>
           </div>
         </div>
-      ) : null}
+      );
+
+  return (
+    <>
+      <Button size="sm" onClick={() => handleOpenChange(true, 'trigger-click')}>
+        New Beach
+      </Button>
+      {portalTarget && modalContent ? createPortal(modalContent, portalTarget) : null}
     </>
   );
 }

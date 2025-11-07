@@ -105,7 +105,7 @@ function BeachCanvasShellInner({
   rewriteEnabled = false,
   className,
 }: BeachCanvasShellInnerProps) {
-  const { createTile, updateTileMeta } = useTileActions();
+  const { createTile, updateTileMeta, setInteractiveTile } = useTileActions();
   const tileState = useTileState();
 
   const requestImmediatePersist = useTileLayoutPersistence({
@@ -171,6 +171,14 @@ function BeachCanvasShellInner({
     });
   }, [beachId, rewriteEnabled]);
 
+  const interactiveTileId = tileState.interactiveId;
+  const interactiveTile = interactiveTileId ? tileState.tiles[interactiveTileId] : null;
+  const interactiveSessionTitle = interactiveTile?.sessionMeta?.title ?? interactiveTile?.sessionMeta?.sessionId ?? null;
+  const showInteractiveBadge = Boolean(interactiveTile?.sessionMeta?.sessionId);
+  const handleClearInteractive = useCallback(() => {
+    setInteractiveTile(null);
+  }, [setInteractiveTile]);
+
   const wrapperClassName = [
     'relative z-0 flex h-full min-h-0 w-full flex-col bg-slate-950 text-slate-200',
     "after:pointer-events-none after:absolute after:inset-0 after:-z-10 after:content-[''] after:bg-[radial-gradient(circle_at_top,rgba(56,189,248,0.18),transparent_60%)]",
@@ -215,6 +223,26 @@ function BeachCanvasShellInner({
           <div className="flex items-center gap-3">
             <span className="text-sm font-semibold text-white/90">{beachName}</span>
           </div>
+        </div>
+        <div className="flex items-center gap-3">
+          {showInteractiveBadge && interactiveSessionTitle ? (
+            <button
+              type="button"
+              onClick={handleClearInteractive}
+              className="inline-flex max-w-xs items-center gap-2 rounded-full border border-amber-200/50 bg-amber-300/90 px-3 py-1 text-[11px] font-semibold text-slate-900 shadow-lg transition hover:bg-amber-200"
+              title="Stop interacting with this session"
+            >
+              <span className="text-[10px] uppercase tracking-[0.3em]">Interact</span>
+              <span className="truncate text-xs font-semibold tracking-wide">{interactiveSessionTitle}</span>
+              <span
+                aria-hidden="true"
+                className="ml-0.5 inline-flex h-4 w-4 items-center justify-center rounded-full bg-slate-900/30 text-[11px] font-bold"
+              >
+                ×
+              </span>
+              <span className="sr-only">Stop interacting with {interactiveSessionTitle}</span>
+            </button>
+          ) : null}
         </div>
       </header>
       <div className="relative flex flex-1 min-h-0 flex-col overflow-hidden">

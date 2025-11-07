@@ -221,7 +221,7 @@ function SessionTerminalPreviewView({
         // ignore viewport sync failures
       }
     },
-    [viewer.store],
+    [sessionId, viewer.store],
   );
 
   useEffect(() => {
@@ -835,7 +835,7 @@ function SessionTerminalPreviewView({
 
   useEffect(() => {
     prehydratedSeqRef.current = null;
-  }, [viewer.store]);
+  }, [sessionId, viewer.store]);
 
   useEffect(() => {
     if (!viewer.store || !cachedStateDiff) {
@@ -1004,13 +1004,12 @@ function SessionTerminalPreviewView({
 
   const hasRemoteHostDimensions =
     hostRowSourceRef.current === 'pty' || hostColSourceRef.current === 'pty';
-  const domStableAvailable = domCommittedSampleRef.current != null;
+  const domSampleAvailable = Boolean(domCommittedSampleRef.current || domRawSizeRef.current);
+  const canCaptureDomSamples = !disableDomMeasurements && !hasRemoteHostDimensions;
   const allowDomForScaling = ENABLE_VISIBLE_PREVIEW_DRIVER
-    ? domStableAvailable
-    : Boolean(!disableDomMeasurements && !hasRemoteHostDimensions);
-  const shouldSkipDomMeasurements = ENABLE_VISIBLE_PREVIEW_DRIVER
-    ? !domStableAvailable
-    : disableDomMeasurements || hasRemoteHostDimensions;
+    ? domSampleAvailable
+    : Boolean(domSampleAvailable || canCaptureDomSamples);
+  const shouldCaptureDomMeasurements = ENABLE_VISIBLE_PREVIEW_DRIVER ? true : canCaptureDomSamples;
 
   const previewMeasurements = useMemo<PreviewMeasurements | null>(() => {
     void domRawVersion;
@@ -1093,7 +1092,6 @@ function SessionTerminalPreviewView({
     hostPixelSize.width,
     resolvedHostCols,
     resolvedHostRows,
-    shouldSkipDomMeasurements,
     visibleDriverViewportRows,
   ]);
 
@@ -1239,7 +1237,7 @@ function SessionTerminalPreviewView({
   ]);
 
   useEffect(() => {
-    if (typeof window === 'undefined') return;
+    if (typeof window === 'undefined' || !shouldCaptureDomMeasurements) return;
     const node = cloneWrapperRef.current;
     if (!node || !previewMeasurements) {
       return;
@@ -1484,7 +1482,14 @@ function SessionTerminalPreviewView({
     };
     const handle = window.requestAnimationFrame(logDimensions);
     return () => window.cancelAnimationFrame(handle);
-  }, [effectiveFontSize, effectiveScale, previewMeasurements, sessionId, syncVisibleViewportRows]);
+  }, [
+    effectiveFontSize,
+    effectiveScale,
+    previewMeasurements,
+    sessionId,
+    shouldCaptureDomMeasurements,
+    syncVisibleViewportRows,
+  ]);
 
   useEffect(() => {
     if (

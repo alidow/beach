@@ -25,12 +25,32 @@ type Action =
   | { type: 'START_RESIZE'; payload: { id: string } }
   | { type: 'END_RESIZE'; payload: { id: string } }
   | { type: 'SET_INTERACTIVE_TILE'; payload: { id: string | null } }
-  | { type: 'SET_TILE_VIEWPORT'; payload: { id: string; viewport: TileViewportSnapshot | null } };
+  | { type: 'SET_TILE_VIEWPORT'; payload: { id: string; viewport: TileViewportSnapshot | null } }
+  | {
+      type: 'ADD_RELATIONSHIP';
+      payload: {
+        id: string;
+        sourceId: string;
+        targetId: string;
+        sourceHandleId?: string | null;
+        targetHandleId?: string | null;
+      };
+    }
+  | {
+      type: 'UPDATE_RELATIONSHIP';
+      payload: {
+        id: string;
+        patch: Partial<Omit<TileState['relationships'][string], 'id' | 'sourceId' | 'targetId'>>;
+      };
+    }
+  | { type: 'REMOVE_RELATIONSHIP'; payload: { id: string } };
 
 function createEmptyState(): TileState {
   return {
     tiles: {},
     order: [],
+    relationships: {},
+    relationshipOrder: [],
     activeId: null,
     resizing: {},
     interactiveId: null,
@@ -158,12 +178,34 @@ function reducer(state: TileState, action: Action): TileState {
       const order = state.order.filter((value) => value !== id);
       const resizing = { ...state.resizing };
       delete resizing[id];
+      const relationships = { ...state.relationships };
+      const relationshipOrder = state.relationshipOrder.filter((relId) => {
+        const rel = relationships[relId];
+        if (!rel) {
+          return false;
+        }
+        if (rel.sourceId === id || rel.targetId === id) {
+          delete relationships[relId];
+          return false;
+        }
+        return true;
+      });
       const activeId =
         state.activeId === id ? (order.length > 0 ? order[order.length - 1] : null) : state.activeId;
       const interactiveId = state.interactiveId === id ? null : state.interactiveId;
       const viewport = { ...state.viewport };
       delete viewport[id];
-      return { ...state, tiles, order, activeId, resizing, interactiveId, viewport };
+      return {
+        ...state,
+        tiles,
+        order,
+        relationships,
+        relationshipOrder,
+        activeId,
+        resizing,
+        interactiveId,
+        viewport,
+      };
     }
     case 'SET_ACTIVE_TILE': {
       const { id } = action.payload;
@@ -321,6 +363,64 @@ function reducer(state: TileState, action: Action): TileState {
         },
       };
     }
+    case 'ADD_RELATIONSHIP': {
+      const { id, sourceId, targetId, sourceHandleId, targetHandleId } = action.payload;
+      if (!state.tiles[sourceId] || !state.tiles[targetId]) {
+        return state;
+      }
+      if (state.relationships[id]) {
+        return state;
+      }
+      return {
+        ...state,
+        relationships: {
+          ...state.relationships,
+          [id]: {
+            id,
+            sourceId,
+            targetId,
+            sourceHandleId: sourceHandleId ?? null,
+            targetHandleId: targetHandleId ?? null,
+            instructions: '',
+            updateMode: 'idle-summary',
+            pollFrequency: 60,
+          },
+        },
+        relationshipOrder: state.relationshipOrder.includes(id)
+          ? state.relationshipOrder
+          : [...state.relationshipOrder, id],
+      };
+    }
+    case 'UPDATE_RELATIONSHIP': {
+      const { id, patch } = action.payload;
+      const existing = state.relationships[id];
+      if (!existing) {
+        return state;
+      }
+      return {
+        ...state,
+        relationships: {
+          ...state.relationships,
+          [id]: {
+            ...existing,
+            ...patch,
+          },
+        },
+      };
+    }
+    case 'REMOVE_RELATIONSHIP': {
+      const { id } = action.payload;
+      if (!state.relationships[id]) {
+        return state;
+      }
+      const next = { ...state.relationships };
+      delete next[id];
+      return {
+        ...state,
+        relationships: next,
+        relationshipOrder: state.relationshipOrder.filter((value) => value !== id),
+      };
+    }
     default:
       return state;
   }
@@ -333,6 +433,8 @@ function hydrateInitialState(state: TileState | null | undefined): TileState {
     ...base,
     tiles: base.tiles ?? {},
     order: Array.isArray(base.order) ? base.order : [],
+    relationships: base.relationships ?? {},
+    relationshipOrder: Array.isArray(base.relationshipOrder) ? base.relationshipOrder : [],
     resizing: base.resizing ?? {},
     interactiveId: base.interactiveId ?? null,
     viewport: base.viewport ?? {},
@@ -384,6 +486,21 @@ export function useTileActions() {
       setInteractiveTile: (id: string | null) => dispatch({ type: 'SET_INTERACTIVE_TILE', payload: { id } }),
       updateTileViewport: (id: string, viewport: TileViewportSnapshot | null) =>
         dispatch({ type: 'SET_TILE_VIEWPORT', payload: { id, viewport } }),
+      addRelationship: (
+        id: string,
+        sourceId: string,
+        targetId: string,
+        options?: { sourceHandleId?: string | null; targetHandleId?: string | null },
+      ) =>
+        dispatch({
+          type: 'ADD_RELATIONSHIP',
+          payload: { id, sourceId, targetId, sourceHandleId: options?.sourceHandleId, targetHandleId: options?.targetHandleId },
+        }),
+      updateRelationship: (
+        id: string,
+        patch: Partial<Omit<TileState['relationships'][string], 'id' | 'sourceId' | 'targetId'>>,
+      ) => dispatch({ type: 'UPDATE_RELATIONSHIP', payload: { id, patch } }),
+      removeRelationship: (id: string) => dispatch({ type: 'REMOVE_RELATIONSHIP', payload: { id } }),
     }),
     [dispatch],
   );

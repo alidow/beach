@@ -1,11 +1,23 @@
 import { notFound } from 'next/navigation';
-import { BeachCanvasShell } from '@/features/canvas';
+import dynamic from 'next/dynamic';
 import { AppShellTopNav } from '@/components/AppShellTopNav';
 import type { BeachMeta, CanvasLayout, SessionSummary } from '@/lib/api';
 import { getBeachMeta, getCanvasLayout, listSessions } from '@/lib/api';
 import { resolveManagerBaseUrl, resolveManagerToken, resolveRewriteFlag } from '@/lib/serverSecrets';
 import type { Metadata } from 'next';
 import { safeAuth } from '@/lib/serverAuth';
+
+const BeachCanvasShell = dynamic(
+  () => import('@/features/canvas/BeachCanvasShell').then((mod) => mod.BeachCanvasShell),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+        Loading canvas…
+      </div>
+    ),
+  },
+);
 
 type PageProps = {
   params: { id: string };

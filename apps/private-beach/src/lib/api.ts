@@ -659,8 +659,14 @@ export type CanvasLayout = {
       padding?: number;
     }
   >;
-  controlAssignments: Record<string, { controllerId: string; targetType: 'tile' | 'group'; targetId: string }>;
-  metadata: { createdAt: number; updatedAt: number; migratedFrom?: number };
+	controlAssignments: Record<string, { controllerId: string; targetType: 'tile' | 'group'; targetId: string }>;
+	metadata: {
+		createdAt: number;
+		updatedAt: number;
+		migratedFrom?: number;
+		agentRelationships?: Record<string, CanvasAgentRelationship>;
+		agentRelationshipOrder?: string[];
+	} & Record<string, unknown>;
 };
 
 export async function getCanvasLayout(id: string, token: string | null, baseUrl?: string): Promise<CanvasLayout> {
@@ -753,11 +759,24 @@ export type ControllerAssignment = {
 };
 
 export type ControllerAssignmentResult = {
-  controller_session_id: string;
-  child_session_id: string;
-  ok: boolean;
-  error?: string;
-  pairing?: ControllerPairing;
+	controller_session_id: string;
+	child_session_id: string;
+	ok: boolean;
+	error?: string;
+	pairing?: ControllerPairing;
+};
+
+export type AgentRelationshipUpdateMode = 'idle-summary' | 'push' | 'poll';
+
+export type CanvasAgentRelationship = {
+	id: string;
+	sourceId: string;
+	targetId: string;
+	sourceHandleId?: string | null;
+	targetHandleId?: string | null;
+	instructions?: string | null;
+	updateMode?: AgentRelationshipUpdateMode;
+	pollFrequency?: number | null;
 };
 
 export async function batchControllerAssignments(

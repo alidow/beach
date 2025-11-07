@@ -44,7 +44,7 @@ export default async function BeachesPage() {
       />
       <main className="flex-1">
         <div className="mx-auto w-full max-w-5xl px-4 pb-12 pt-6 sm:px-6 lg:px-8">
-          <BeachesList beaches={beaches} isSignedIn={isSignedIn} error={loadError} />
+          <BeachesList beaches={beaches} error={loadError} />
         </div>
       </main>
     </div>

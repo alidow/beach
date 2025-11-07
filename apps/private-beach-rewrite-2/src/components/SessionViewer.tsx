@@ -161,23 +161,25 @@ export function SessionViewer({
         data-terminal-root="true"
         data-terminal-tile={tileId}
       >
-        <BeachTerminal
-          className="flex h-full w-full flex-1 border border-slate-800/70 bg-[#060910]/95 shadow-[0_30px_80px_rgba(8,12,24,0.55)]"
-          store={viewer.store ?? undefined}
-          transport={viewer.transport ?? undefined}
-          transportVersion={viewer.transportVersion ?? 0}
-          autoConnect={false}
-          autoResizeHostOnViewportChange={false}
-          showTopBar={false}
-          showStatusBar={false}
-          hideIdlePlaceholder
-          sizingStrategy={rewriteTerminalSizingStrategy}
-          sessionId={sessionId ?? undefined}
-          showJoinOverlay={false}
-          enablePredictiveEcho={false}
-          disableViewportMeasurements={disableViewportMeasurements}
-          onViewportStateChange={handleViewportStateChange}
-        />
+        <div className="flex h-full w-full flex-1" data-terminal-content="true">
+          <BeachTerminal
+            className="flex h-full w-full flex-1 border border-slate-800/70 bg-[#060910]/95 shadow-[0_30px_80px_rgba(8,12,24,0.55)]"
+            store={viewer.store ?? undefined}
+            transport={viewer.transport ?? undefined}
+            transportVersion={viewer.transportVersion ?? 0}
+            autoConnect={false}
+            autoResizeHostOnViewportChange={false}
+            showTopBar={false}
+            showStatusBar={false}
+            hideIdlePlaceholder
+            sizingStrategy={rewriteTerminalSizingStrategy}
+            sessionId={sessionId ?? undefined}
+            showJoinOverlay={false}
+            enablePredictiveEcho={false}
+            disableViewportMeasurements={disableViewportMeasurements}
+            onViewportStateChange={handleViewportStateChange}
+          />
+        </div>
       </div>
       {showLoading ? (
         <div className="absolute inset-0 z-10 flex items-center justify-center bg-slate-950/70 text-[13px] font-semibold text-slate-100 backdrop-blur-sm">

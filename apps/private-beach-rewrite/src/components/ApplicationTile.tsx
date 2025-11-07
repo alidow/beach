@@ -220,7 +220,7 @@ export function ApplicationTile({
         setSubmitState('idle');
       }
     },
-    [codeInput, managerToken, managerUrl, onSessionMetaChange, privateBeachId, refresh, sessionIdInput],
+    [codeInput, managerToken, managerUrl, onSessionMetaChange, privateBeachId, refresh, sessionIdInput, tileId],
   );
 
   const handleDisconnect = useCallback(() => {

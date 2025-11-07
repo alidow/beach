@@ -22,6 +22,17 @@ export type CanvasEdge = {
   data?: Record<string, unknown>;
 };
 
+export type CanvasAgentRelationship = {
+  id: string;
+  sourceId: string;
+  targetId: string;
+  sourceHandleId?: string | null;
+  targetHandleId?: string | null;
+  instructions?: string | null;
+  updateMode?: 'idle-summary' | 'push' | 'poll';
+  pollFrequency?: number | null;
+};
+
 // Node types
 export type CanvasTileNode = {
   id: string;
@@ -66,7 +77,13 @@ export type CanvasLayout = {
   agents: Record<string, CanvasAgentNode>;
   edges?: CanvasEdge[];
   viewport?: CanvasLayoutViewport;
-  metadata: { createdAt: number; updatedAt: number; migratedFrom?: number } & Record<string, unknown>;
+  metadata: {
+    createdAt: number;
+    updatedAt: number;
+    migratedFrom?: number;
+    agentRelationships?: Record<string, CanvasAgentRelationship>;
+    agentRelationshipOrder?: string[];
+  } & Record<string, unknown>;
   controlAssignments: Record<string, { controllerId: string; targetType: 'tile' | 'group'; targetId: string }>;
 };
 

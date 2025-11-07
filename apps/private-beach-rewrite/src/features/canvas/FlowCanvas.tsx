@@ -66,6 +66,7 @@ function FlowCanvasInner({
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const dragSnapshotRef = useRef<DragSnapshot | null>(null);
   const { screenToFlowPosition } = useReactFlow();
+  const memoizedNodeTypes = useMemo(() => nodeTypes, []);
   const state = useTileState();
   const {
     setTilePosition,
@@ -402,7 +403,7 @@ function FlowCanvasInner({
         <ReactFlow
           nodes={nodes}
           edges={[]}
-          nodeTypes={nodeTypes}
+          nodeTypes={memoizedNodeTypes}
           onNodesChange={handleNodesChange}
           onNodeDragStart={handleNodeDragStart}
           onNodeDragStop={handleNodeDragStop}

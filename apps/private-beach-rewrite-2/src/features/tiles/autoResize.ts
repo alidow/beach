@@ -8,6 +8,8 @@ type AutoResizeInput = {
   chromeWidthPx: number;
   chromeHeightPx: number;
   zoom: number;
+  observedRowHeight?: number | null;
+  observedCellWidth?: number | null;
 };
 
 function normalizePositive(value: number | null | undefined): number | null {
@@ -20,16 +22,31 @@ function normalizePositive(value: number | null | undefined): number | null {
   return value;
 }
 
+function selectMetric(
+  preferred: number | null,
+  fallback: number | null,
+  kind: 'row' | 'col',
+): number | null {
+  const lowerBound = kind === 'row' ? 6 : 4;
+  const upperBound = kind === 'row' ? 40 : 32;
+  const choose = (value: number | null) =>
+    value != null && value >= lowerBound && value <= upperBound ? value : null;
+  return choose(preferred) ?? choose(fallback) ?? preferred ?? fallback ?? null;
+}
+
 export function computeAutoResizeSize(input: AutoResizeInput): TileSize | null {
   const rows = normalizePositive(input.metrics.hostRows);
   const cols = normalizePositive(input.metrics.hostCols);
-  const pixelsPerRow = normalizePositive(input.metrics.pixelsPerRow);
-  const pixelsPerCol = normalizePositive(input.metrics.pixelsPerCol);
+  const metricRow = normalizePositive(input.metrics.pixelsPerRow);
+  const metricCol = normalizePositive(input.metrics.pixelsPerCol);
+  const observedRow = normalizePositive(input.observedRowHeight);
+  const observedCol = normalizePositive(input.observedCellWidth);
+  const pixelsPerRow = selectMetric(metricRow, observedRow, 'row');
+  const pixelsPerCol = selectMetric(metricCol, observedCol, 'col');
   if (!rows || !cols || !pixelsPerRow || !pixelsPerCol) {
     return null;
   }
 
-  const zoom = normalizePositive(input.zoom) ?? 1;
   const terminalWidthPx = cols * pixelsPerCol;
   const terminalHeightPx = rows * pixelsPerRow;
   const chromeWidthPx = Number.isFinite(input.chromeWidthPx) ? Math.max(0, input.chromeWidthPx) : 0;
@@ -40,8 +57,8 @@ export function computeAutoResizeSize(input: AutoResizeInput): TileSize | null {
     return null;
   }
 
-  const flowWidth = desiredTileWidthPx / zoom;
-  const flowHeight = desiredTileHeightPx / zoom;
+  const flowWidth = desiredTileWidthPx;
+  const flowHeight = desiredTileHeightPx;
   if (!Number.isFinite(flowWidth) || !Number.isFinite(flowHeight)) {
     return null;
   }

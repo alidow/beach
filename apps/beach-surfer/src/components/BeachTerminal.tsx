@@ -1149,6 +1149,15 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     emitViewportState();
   }, [emitViewportState]);
 
+  useEffect(() => {
+    const normalized =
+      Number.isFinite(effectiveCellWidth) && effectiveCellWidth > 0 ? Number(effectiveCellWidth) : null;
+    if (pixelsPerColRef.current !== normalized) {
+      pixelsPerColRef.current = normalized;
+      emitViewportState();
+    }
+  }, [effectiveCellWidth, emitViewportState]);
+
   const exitHydration = useCallback(
     (reason: string) => {
       if (!hydratingRef.current) {
@@ -2126,7 +2135,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
 
     const observer = new ResizeObserver((entries) => {
       const entry = entries[entries.length - 1];
-      const rect = entry?.contentRect ?? wrapper.getBoundingClientRect();
+      const rect =
+        entry && entry.target instanceof Element
+          ? entry.target.getBoundingClientRect()
+          : wrapper.getBoundingClientRect();
       const meta = buildHostMeta(rect);
       const proposal = proposeViewport('resize-observer:entry', rect, meta);
       scheduleViewportCommit(proposal, rect, meta);

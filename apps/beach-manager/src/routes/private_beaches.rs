@@ -129,12 +129,45 @@ pub struct CanvasAssignment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CanvasAgentUpdateMode {
+    #[serde(rename = "idle-summary")]
+    IdleSummary,
+    #[serde(rename = "push")]
+    Push,
+    #[serde(rename = "poll")]
+    Poll,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CanvasAgentRelationship {
+    pub id: String,
+    pub source_id: String,
+    pub target_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_handle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_handle_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_mode: Option<CanvasAgentUpdateMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_frequency: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CanvasMetadata {
     pub created_at: i64,
     pub updated_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migrated_from: Option<i64>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub agent_relationships: HashMap<String, CanvasAgentRelationship>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_relationship_order: Vec<String>,
 }
 
 impl Default for CanvasMetadata {
@@ -143,6 +176,8 @@ impl Default for CanvasMetadata {
             created_at: 0,
             updated_at: 0,
             migrated_from: None,
+            agent_relationships: HashMap::new(),
+            agent_relationship_order: Vec::new(),
         }
     }
 }
@@ -183,6 +218,8 @@ impl CanvasLayout {
                 created_at: now_ms,
                 updated_at: now_ms,
                 migrated_from: None,
+                agent_relationships: HashMap::new(),
+                agent_relationship_order: Vec::new(),
             },
         }
     }

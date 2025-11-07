@@ -1,10 +1,10 @@
 'use client';
 
-import { memo, useMemo, useState } from 'react';
+import { memo, useEffect, useMemo, useState } from 'react';
 import {
   BaseEdge,
   EdgeLabelRenderer,
-  getBezierPath,
+  getSmoothStepPath,
   type EdgeProps,
 } from 'reactflow';
 
@@ -20,12 +20,6 @@ export type AssignmentEdgeData = {
   onDelete: (payload: { id: string }) => void;
 };
 
-const MODE_LABEL: Record<UpdateMode, string> = {
-  'idle-summary': 'Idle summary',
-  push: 'Managed session pushes',
-  poll: 'Polling',
-};
-
 export const AssignmentEdge = memo(function AssignmentEdge({
   id,
   sourceX,
@@ -38,12 +32,33 @@ export const AssignmentEdge = memo(function AssignmentEdge({
   data,
 }: EdgeProps<AssignmentEdgeData>) {
   const [edgePath, labelX, labelY] = useMemo(
-    () => getBezierPath({ sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition }),
+    () =>
+      getSmoothStepPath({
+        sourceX,
+        sourceY,
+        targetX,
+        targetY,
+        sourcePosition,
+        targetPosition,
+        borderRadius: 24,
+      }),
     [sourcePosition, sourceX, sourceY, targetPosition, targetX, targetY],
   );
   const [instructions, setInstructions] = useState(data.instructions);
   const [updateMode, setUpdateMode] = useState<UpdateMode>(data.updateMode);
   const [pollFrequency, setPollFrequency] = useState<number>(data.pollFrequency);
+
+  useEffect(() => {
+    setInstructions(data.instructions);
+  }, [data.instructions]);
+
+  useEffect(() => {
+    setUpdateMode(data.updateMode);
+  }, [data.updateMode]);
+
+  useEffect(() => {
+    setPollFrequency(data.pollFrequency);
+  }, [data.pollFrequency]);
 
   const handleSubmit = (event: React.FormEvent) => {
     event.preventDefault();
@@ -58,7 +73,11 @@ export const AssignmentEdge = memo(function AssignmentEdge({
       <EdgeLabelRenderer>
         <div
           className="pointer-events-auto"
-          style={{ transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)` }}
+          style={{
+            transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)` ,
+            zIndex: 1000,
+            position: 'absolute',
+          }}
         >
           {data.isEditing ? (
             <form
@@ -139,33 +158,15 @@ export const AssignmentEdge = memo(function AssignmentEdge({
               </div>
             </form>
           ) : (
-            <div
+            <button
+              type="button"
+              onClick={() => data.onEdit({ id })}
               onPointerDown={(event) => event.stopPropagation()}
-              className="group flex items-center gap-2 rounded-full border border-slate-200 bg-white/95 px-3 py-1 text-[11px] font-semibold text-slate-700 shadow"
+              className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-white/60 bg-slate-900/80 text-sm text-white shadow-md transition hover:border-white/90 hover:bg-slate-900"
+              aria-label="View assignment details"
             >
-              <span className="text-[10px] uppercase tracking-wide text-indigo-600">
-                {MODE_LABEL[updateMode]}
-              </span>
-              {instructions ? (
-                <span className="text-slate-500">
-                  • {instructions.length > 60 ? `${instructions.slice(0, 60)}…` : instructions}
-                </span>
-              ) : null}
-              <button
-                type="button"
-                onClick={() => data.onEdit({ id })}
-                className="rounded border border-transparent px-1 text-[10px] font-semibold text-indigo-600 hover:border-indigo-200 hover:bg-indigo-50"
-              >
-                Edit
-              </button>
-              <button
-                type="button"
-                onClick={handleDelete}
-                className="rounded border border-transparent px-1 text-[10px] font-semibold text-red-500 hover:border-red-200 hover:bg-red-50"
-              >
-                Remove
-              </button>
-            </div>
+              ⓘ
+            </button>
           )}
         </div>
       </EdgeLabelRenderer>

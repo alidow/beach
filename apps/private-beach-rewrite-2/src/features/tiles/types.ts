@@ -26,6 +26,17 @@ export type AgentMetadata = {
   isEditing: boolean;
 };
 
+export type RelationshipDescriptor = {
+  id: string;
+  sourceId: string;
+  targetId: string;
+  sourceHandleId?: string | null;
+  targetHandleId?: string | null;
+  instructions: string;
+  updateMode: 'idle-summary' | 'push' | 'poll';
+  pollFrequency: number;
+};
+
 export type TileDescriptor = {
   id: string;
   nodeType: TileNodeType;
@@ -50,6 +61,8 @@ export type TileViewportSnapshot = {
 export type TileState = {
   tiles: Record<string, TileDescriptor>;
   order: string[];
+  relationships: Record<string, RelationshipDescriptor>;
+  relationshipOrder: string[];
   activeId: string | null;
   resizing: Record<string, boolean>;
   interactiveId: string | null;

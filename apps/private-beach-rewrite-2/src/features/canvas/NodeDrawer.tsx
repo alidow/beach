@@ -36,15 +36,20 @@ function buildCardClassName({ active, dragging }: { active: boolean; dragging: b
 type DraggableNodeCardProps = {
   node: CanvasNodeDefinition;
   isActive: boolean;
+  disabled?: boolean;
   onDragStart?: (nodeId: string) => void;
   onDragEnd?: () => void;
 };
 
-function DraggableNodeCard({ node, isActive, onDragStart, onDragEnd }: DraggableNodeCardProps) {
+function DraggableNodeCard({ node, isActive, disabled = false, onDragStart, onDragEnd }: DraggableNodeCardProps) {
   const [dragging, setDragging] = useState(false);
 
   const handleDragStart = useCallback(
     (event: DragEvent<HTMLDivElement>) => {
+      if (disabled) {
+        event.preventDefault();
+        return;
+      }
       setDragging(true);
       console.info('[ws-c][catalog] drag-start', { nodeId: node.id, label: node.label });
       onDragStart?.(node.id);
@@ -75,14 +80,17 @@ function DraggableNodeCard({ node, isActive, onDragStart, onDragEnd }: Draggable
         }
       }
     },
-    [node.defaultSize, node.id, node.label, node.nodeType, onDragStart],
+    [disabled, node.defaultSize, node.id, node.label, node.nodeType, onDragStart],
   );
 
   const handleDragEnd = useCallback(() => {
+    if (disabled) {
+      return;
+    }
     setDragging(false);
     console.info('[ws-c][catalog] drag-end', { nodeId: node.id });
     onDragEnd?.();
-  }, [node.id, onDragEnd]);
+  }, [disabled, node.id, onDragEnd]);
 
   const className = useMemo(
     () => buildCardClassName({ active: isActive || dragging, dragging }),
@@ -91,11 +99,11 @@ function DraggableNodeCard({ node, isActive, onDragStart, onDragEnd }: Draggable
 
   return (
     <div
-      draggable
+      draggable={!disabled}
       onDragStart={handleDragStart}
       onDragEnd={handleDragEnd}
       className={className}
-      tabIndex={0}
+      tabIndex={disabled ? -1 : 0}
       aria-roledescription="Draggable node"
       data-testid={`catalog-node-${node.id}`}
     >
@@ -108,8 +116,8 @@ export function NodeDrawer({ nodes, activeNodeId, onNodeDragStart, onNodeDragEnd
   const { drawerOpen, toggleDrawer, closeDrawer } = useCanvasUI();
 
   const panelClass = [
-    'pointer-events-auto absolute right-6 top-16 z-40 w-80 max-w-[90vw] rounded-[28px] border border-white/10 bg-slate-950/80 p-5 shadow-[0_35px_120px_rgba(2,6,23,0.7)] backdrop-blur-xl transition-all duration-200 ease-out',
-    drawerOpen ? 'translate-y-0 opacity-100' : 'pointer-events-none -translate-y-3 opacity-0',
+    'absolute left-6 top-16 z-40 w-80 max-w-[90vw] rounded-[28px] border border-white/10 bg-slate-950/80 p-5 shadow-[0_35px_120px_rgba(2,6,23,0.7)] backdrop-blur-xl transition-all duration-200 ease-out',
+    drawerOpen ? 'pointer-events-auto translate-y-0 opacity-100' : 'pointer-events-none -translate-y-3 opacity-0',
   ]
     .filter(Boolean)
     .join(' ');
@@ -119,13 +127,13 @@ export function NodeDrawer({ nodes, activeNodeId, onNodeDragStart, onNodeDragEnd
       <button
         type="button"
         onClick={toggleDrawer}
-        className="pointer-events-auto absolute right-6 top-3 z-50 inline-flex items-center gap-2 rounded-full border border-white/10 bg-slate-950/70 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-300 shadow-[0_15px_40px_rgba(2,6,23,0.65)] transition hover:border-white/30 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
+        className="pointer-events-auto absolute left-6 top-3 z-50 inline-flex items-center gap-2 rounded-full border border-white/10 bg-slate-950/70 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-300 shadow-[0_15px_40px_rgba(2,6,23,0.65)] transition hover:border-white/30 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
         aria-expanded={drawerOpen}
         aria-label={drawerOpen ? 'Hide node catalog' : 'Show node catalog'}
       >
         {drawerOpen ? 'Close Catalog' : 'Open Catalog'}
       </button>
-      <aside className={panelClass} aria-label="Node catalog">
+      <aside className={panelClass} aria-label="Node catalog" aria-hidden={!drawerOpen} data-state={drawerOpen ? 'open' : 'closed'}>
         <div className="mb-4 flex items-center justify-between gap-3">
           <header className="space-y-1">
             <h2 className="text-sm font-semibold text-white">Node Catalog</h2>
@@ -152,6 +160,7 @@ export function NodeDrawer({ nodes, activeNodeId, onNodeDragStart, onNodeDragEnd
                 key={node.id}
                 node={node}
                 isActive={activeNodeId === node.id}
+                disabled={!drawerOpen}
                 onDragStart={onNodeDragStart}
                 onDragEnd={onNodeDragEnd}
               />

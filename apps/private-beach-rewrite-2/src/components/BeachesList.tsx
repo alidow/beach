@@ -7,13 +7,27 @@ import { Input } from '../../../private-beach/src/components/ui/input';
 import { Card, CardContent, CardHeader } from '../../../private-beach/src/components/ui/card';
 import { Button } from '../../../private-beach/src/components/ui/button';
 
+const createdAtFormatter = typeof Intl !== 'undefined'
+  ? new Intl.DateTimeFormat('en-US', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'UTC' })
+  : null;
+
+const formatCreatedAt = (value: string) => {
+  if (!createdAtFormatter) {
+    return new Date(value).toISOString();
+  }
+  try {
+    return createdAtFormatter.format(new Date(value));
+  } catch {
+    return new Date(value).toISOString();
+  }
+};
+
 type Props = {
   beaches: BeachSummary[];
-  isSignedIn: boolean;
   error?: string | null;
 };
 
-export function BeachesList({ beaches, isSignedIn, error }: Props) {
+export function BeachesList({ beaches, error }: Props) {
   const [query, setQuery] = useState('');
 
   const filtered = useMemo(() => {
@@ -33,17 +47,6 @@ export function BeachesList({ beaches, isSignedIn, error }: Props) {
         <h2 className="text-sm font-semibold text-destructive-foreground">Unable to load beaches</h2>
         <p className="mt-2 text-destructive-foreground/80">
           {error}
-        </p>
-      </div>
-    );
-  }
-
-  if (!isSignedIn) {
-    return (
-      <div className="mx-auto max-w-2xl rounded-lg border border-dashed border-border bg-background/60 p-8 text-center">
-        <h2 className="text-lg font-semibold">You need to sign in</h2>
-        <p className="mt-2 text-sm text-muted-foreground">
-          Sign in to view your private beaches and continue with the rewrite workspace.
         </p>
       </div>
     );
@@ -85,7 +88,7 @@ export function BeachesList({ beaches, isSignedIn, error }: Props) {
                 </div>
               </CardHeader>
               <CardContent className="text-xs text-muted-foreground">
-                Created {new Date(beach.created_at).toLocaleString()}
+                Created {formatCreatedAt(beach.created_at)}
               </CardContent>
             </Card>
           ))}

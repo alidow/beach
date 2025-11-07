@@ -32,7 +32,23 @@ const SAMPLE_LAYOUT: CanvasLayout = {
   agents: {},
   groups: {},
   controlAssignments: {},
-  metadata: { createdAt: 100, updatedAt: 200 },
+  metadata: {
+    createdAt: 100,
+    updatedAt: 200,
+    agentRelationships: {
+      'rel-1': {
+        id: 'rel-1',
+        sourceId: 'first',
+        targetId: 'second',
+        sourceHandleId: 'source-right',
+        targetHandleId: 'target-left',
+        instructions: 'Monitor app',
+        updateMode: 'poll',
+        pollFrequency: 45,
+      },
+    },
+    agentRelationshipOrder: ['rel-1'],
+  },
 };
 
 describe('tile persistence helpers (rewrite-2)', () => {
@@ -41,6 +57,15 @@ describe('tile persistence helpers (rewrite-2)', () => {
     expect(state.order).toEqual(['first', 'second']);
     expect(state.tiles.second.sessionMeta?.sessionId).toBe('sess-2');
     expect(state.interactiveId).toBe('first');
+    expect(state.relationshipOrder).toEqual(['rel-1']);
+    expect(state.relationships['rel-1']).toMatchObject({
+      sourceId: 'first',
+      targetId: 'second',
+      sourceHandleId: 'source-right',
+      instructions: 'Monitor app',
+      updateMode: 'poll',
+      pollFrequency: 45,
+    });
   });
 
   it('serializes tile state back into layout preserving viewport metadata', () => {
@@ -49,6 +74,8 @@ describe('tile persistence helpers (rewrite-2)', () => {
     expect(serialized.tiles.second.position).toEqual({ x: 160, y: 96 });
     expect(serialized.tiles.second.metadata?.sessionMeta).toMatchObject({ sessionId: 'sess-2' });
     expect(serialized.metadata.createdAt).toBe(SAMPLE_LAYOUT.metadata.createdAt);
+    expect(serialized.metadata.agentRelationships?.['rel-1']).toMatchObject({ instructions: 'Monitor app', updateMode: 'poll' });
+    expect(serialized.metadata.agentRelationshipOrder).toEqual(['rel-1']);
   });
 
   it('includes orphan tiles in the serialized key', () => {
@@ -65,6 +92,8 @@ describe('tile persistence helpers (rewrite-2)', () => {
         },
       },
       order: [],
+      relationships: {},
+      relationshipOrder: [],
       activeId: null,
       resizing: {},
       interactiveId: null,
@@ -72,5 +101,12 @@ describe('tile persistence helpers (rewrite-2)', () => {
     };
     const key = serializeTileStateKey(orphanState);
     expect(key).toContain('only');
+    expect(key).toContain('relationships:none');
+  });
+
+  it('captures relationship signatures in the serialized key', () => {
+    const state = layoutToTileState(SAMPLE_LAYOUT);
+    const key = serializeTileStateKey(state);
+    expect(key).toContain('rel-1:first:second');
   });
 });

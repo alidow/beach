@@ -55,6 +55,30 @@ function normalizeSessionMeta(input: unknown): TileSessionMeta | null {
   };
 }
 
+function normalizeTraceMetadata(record: Record<string, unknown>): AgentMetadata['trace'] | undefined {
+  const rawTrace = record.trace;
+  if (rawTrace && typeof rawTrace === 'object') {
+    const traceRecord = rawTrace as Record<string, unknown>;
+    if (typeof traceRecord.enabled === 'boolean') {
+      const normalized: AgentMetadata['trace'] = { enabled: traceRecord.enabled };
+      const traceId = traceRecord.trace_id;
+      if (typeof traceId === 'string' && traceId.trim().length > 0) {
+        normalized.trace_id = traceId.trim();
+      }
+      return normalized;
+    }
+  }
+  if (typeof record.traceEnabled === 'boolean') {
+    const normalized: AgentMetadata['trace'] = { enabled: Boolean(record.traceEnabled) };
+    const legacyTraceId = record.traceId;
+    if (record.traceEnabled && typeof legacyTraceId === 'string' && legacyTraceId.trim().length > 0) {
+      normalized.trace_id = legacyTraceId.trim();
+    }
+    return normalized;
+  }
+  return undefined;
+}
+
 function normalizeAgentMeta(source: unknown, nodeType: TileDescriptor['nodeType']): AgentMetadata | null {
   if (nodeType !== 'agent' || !source || typeof source !== 'object') {
     return null;
@@ -62,11 +86,21 @@ function normalizeAgentMeta(source: unknown, nodeType: TileDescriptor['nodeType'
   const record = source as Record<string, unknown>;
   const role = typeof record.role === 'string' ? record.role : '';
   const responsibility = typeof record.responsibility === 'string' ? record.responsibility : '';
-  const isEditing = typeof record.isEditing === 'boolean' ? record.isEditing : false;
-  if (!role && !responsibility) {
-    return { role: '', responsibility: '', isEditing: true };
+  const isEditing =
+    typeof record.isEditing === 'boolean' ? record.isEditing : !role && !responsibility;
+  const agentMeta: AgentMetadata = {
+    role,
+    responsibility,
+    isEditing,
+  };
+  const trace = normalizeTraceMetadata(record);
+  if (trace) {
+    agentMeta.trace = trace;
   }
-  return { role, responsibility, isEditing };
+  if (!role && !responsibility) {
+    agentMeta.isEditing = true;
+  }
+  return agentMeta;
 }
 
 const VALID_RELATIONSHIP_MODES: RelationshipDescriptor['updateMode'][] = ['idle-summary', 'push', 'poll'];
@@ -109,6 +143,8 @@ function normalizeRelationshipEntry(input: unknown, fallbackId: string): Relatio
     id: idRaw,
     sourceId,
     targetId,
+    sourceSessionId: typeof record.sourceSessionId === 'string' ? record.sourceSessionId : null,
+    targetSessionId: typeof record.targetSessionId === 'string' ? record.targetSessionId : null,
     sourceHandleId: typeof record.sourceHandleId === 'string' ? record.sourceHandleId : null,
     targetHandleId: typeof record.targetHandleId === 'string' ? record.targetHandleId : null,
     instructions: typeof record.instructions === 'string' ? record.instructions : '',
@@ -150,6 +186,15 @@ function extractRelationshipsFromMetadata(
     }
     pushRelationship(normalizeRelationshipEntry(raw, relId));
   }
+  for (const rel of Object.values(relationships)) {
+    if (!rel) {
+      continue;
+    }
+    const sourceSession = tiles[rel.sourceId]?.sessionMeta?.sessionId ?? null;
+    const targetSession = tiles[rel.targetId]?.sessionMeta?.sessionId ?? null;
+    rel.sourceSessionId = rel.sourceSessionId ?? sourceSession;
+    rel.targetSessionId = rel.targetSessionId ?? targetSession;
+  }
   return { relationships, relationshipOrder };
 }
 
@@ -171,6 +216,8 @@ function serializeRelationships(state: TileState): {
       id: rel.id,
       sourceId: rel.sourceId,
       targetId: rel.targetId,
+      sourceSessionId: rel.sourceSessionId ?? null,
+      targetSessionId: rel.targetSessionId ?? null,
       sourceHandleId: rel.sourceHandleId ?? null,
       targetHandleId: rel.targetHandleId ?? null,
       instructions: rel.instructions || null,
@@ -243,14 +290,10 @@ export function layoutToTileState(layout: CanvasLayout | null | undefined): Tile
 
 	const tiles: Record<string, TileDescriptor> = {};
 	const order: string[] = [];
-	let interactiveId: string | null = null;
 	for (const [tileKey, tile] of entries) {
 		const descriptor = extractTileDescriptor(tileKey, tile, timestamp);
 		tiles[descriptor.id] = descriptor;
 		order.push(descriptor.id);
-		if (!interactiveId && !descriptor.sessionMeta?.sessionId) {
-			interactiveId = descriptor.id;
-		}
 	}
 	const { relationships, relationshipOrder } = extractRelationshipsFromMetadata(base, tiles);
 	return {
@@ -260,7 +303,7 @@ export function layoutToTileState(layout: CanvasLayout | null | undefined): Tile
 		relationshipOrder,
 		activeId: null,
 		resizing: {},
-		interactiveId,
+		interactiveId: null,
 		viewport: {},
 	};
 }

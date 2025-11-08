@@ -65,6 +65,18 @@ const KEEP_ALIVE_MS = 15_000;
 const RECONNECT_DELAY_MS = 1_500;
 const MAX_RECONNECT_DELAY_MS = 15_000;
 
+type SnapshotSummary = {
+  followTail: boolean | null;
+  baseRow: number | null;
+  viewportHeight: number | null;
+  rowCount: number | null;
+};
+
+type FollowTailDecision = {
+  enable: boolean;
+  reason: string;
+};
+
 function debugLog(message: string, detail?: Record<string, unknown>) {
   if (typeof window === 'undefined') {
     return;
@@ -75,6 +87,71 @@ function debugLog(message: string, detail?: Record<string, unknown>) {
   const payload = detail ? JSON.stringify(detail) : '';
   // eslint-disable-next-line no-console
   console.info(`[terminal-manager][rewrite] ${message}${payload ? ` ${payload}` : ''}`);
+}
+
+function summarizeStoreSnapshot(store: TerminalGridStore): SnapshotSummary | null {
+  try {
+    const snapshot = store.getSnapshot();
+    return {
+      followTail: snapshot.followTail,
+      baseRow: snapshot.baseRow,
+      viewportHeight: snapshot.viewportHeight,
+      rowCount: snapshot.rows.length,
+    };
+  } catch (error) {
+    debugLog('followTail.snapshot_error', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+function decideFollowTailRestore(summary: SnapshotSummary | null): FollowTailDecision {
+  if (!summary) {
+    return { enable: true, reason: 'auto-tail:no-snapshot' };
+  }
+  if (summary.followTail) {
+    return { enable: true, reason: 'preserve-follow-tail' };
+  }
+  const rowCount = summary.rowCount ?? 0;
+  if (rowCount <= 0) {
+    return { enable: true, reason: 'auto-tail:empty-grid' };
+  }
+  const viewportHeight = summary.viewportHeight ?? 0;
+  if (viewportHeight > 0 && rowCount <= viewportHeight) {
+    return { enable: true, reason: 'auto-tail:grid-fits-viewport' };
+  }
+  return { enable: false, reason: 'preserve-manual-scroll' };
+}
+
+function applyFollowTailState(entry: ManagerEntry, enable: boolean, reason: string, summary?: SnapshotSummary | null) {
+  const snapshot = summary ?? summarizeStoreSnapshot(entry.store);
+  const changed = entry.store.setFollowTail(enable);
+  if (!enable) {
+    return;
+  }
+  debugLog('followTail.set', {
+    key: entry.key,
+    sessionId: entry.params.sessionId,
+    reason,
+    applied: changed,
+    previousFollowTail: snapshot?.followTail ?? null,
+    baseRow: snapshot?.baseRow ?? null,
+    viewportHeight: snapshot?.viewportHeight ?? null,
+    rowCount: snapshot?.rowCount ?? null,
+  });
+}
+
+function logFollowTailSkip(entry: ManagerEntry, reason: string, summary: SnapshotSummary | null) {
+  debugLog('followTail.skip_enable', {
+    key: entry.key,
+    sessionId: entry.params.sessionId,
+    reason,
+    previousFollowTail: summary?.followTail ?? null,
+    baseRow: summary?.baseRow ?? null,
+    viewportHeight: summary?.viewportHeight ?? null,
+    rowCount: summary?.rowCount ?? null,
+  });
 }
 
 export function acquireTerminalConnection(
@@ -119,7 +196,6 @@ function getOrCreateEntry(key: string, params: PreparedConnectionParams): Manage
     return existing;
   }
   const store = new TerminalGridStore(80);
-  store.setFollowTail(true);
   const entry: ManagerEntry = {
     key,
     params,
@@ -142,6 +218,7 @@ function getOrCreateEntry(key: string, params: PreparedConnectionParams): Manage
     reconnectAttempts: 0,
     lastCloseReason: null,
   };
+  applyFollowTailState(entry, true, 'entry-init');
   entries.set(key, entry);
   debugLog('managerEntry.created', {
     key,
@@ -279,8 +356,14 @@ function ensureEntryConnection(entry: ManagerEntry) {
       detachListeners(entry);
       entry.connection = connection;
       entry.transport = connection.transport;
+      const snapshotBeforeReset = summarizeStoreSnapshot(entry.store);
       entry.store.reset();
-      entry.store.setFollowTail(true);
+      const followTailDecision = decideFollowTailRestore(snapshotBeforeReset);
+      if (followTailDecision.enable) {
+        applyFollowTailState(entry, true, followTailDecision.reason, snapshotBeforeReset);
+      } else {
+        logFollowTailSkip(entry, followTailDecision.reason, snapshotBeforeReset);
+      }
       entry.connecting = false;
       entry.status = 'connected';
       entry.secureSummary = connection.secure ?? null;

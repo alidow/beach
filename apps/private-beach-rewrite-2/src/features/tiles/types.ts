@@ -20,16 +20,24 @@ export type TileSessionMeta = {
   pendingActions?: number | null;
 };
 
+export type AgentTraceMetadata = {
+  enabled: boolean;
+  trace_id?: string | null;
+};
+
 export type AgentMetadata = {
   role: string;
   responsibility: string;
   isEditing: boolean;
+  trace?: AgentTraceMetadata;
 };
 
 export type RelationshipDescriptor = {
   id: string;
   sourceId: string;
   targetId: string;
+  sourceSessionId?: string | null;
+  targetSessionId?: string | null;
   sourceHandleId?: string | null;
   targetHandleId?: string | null;
   instructions: string;

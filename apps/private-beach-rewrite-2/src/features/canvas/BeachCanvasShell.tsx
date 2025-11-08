@@ -173,11 +173,27 @@ function BeachCanvasShellInner({
 
   const interactiveTileId = tileState.interactiveId;
   const interactiveTile = interactiveTileId ? tileState.tiles[interactiveTileId] : null;
-  const interactiveSessionTitle = interactiveTile?.sessionMeta?.title ?? interactiveTile?.sessionMeta?.sessionId ?? null;
-  const showInteractiveBadge = Boolean(interactiveTile?.sessionMeta?.sessionId);
+  const interactiveSessionTitle = interactiveTile?.sessionMeta?.title ?? null;
+  const interactiveSessionId = interactiveTile?.sessionMeta?.sessionId ?? null;
+  const interactiveBadgeCode = interactiveSessionId ? interactiveSessionId.slice(0, 5) : null;
+  const showInteractiveBadge = Boolean(interactiveBadgeCode);
   const handleClearInteractive = useCallback(() => {
     setInteractiveTile(null);
   }, [setInteractiveTile]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    const payload = interactiveTile
+      ? {
+          tileId: interactiveTile.id,
+          sessionId: interactiveTile.sessionMeta?.sessionId ?? null,
+          title: interactiveTile.sessionMeta?.title ?? null,
+        }
+      : { tileId: null };
+    console.info('[rewrite-2] interactive-state', payload);
+  }, [interactiveTile, interactiveTile?.sessionMeta?.sessionId, interactiveTileId]);
 
   const wrapperClassName = [
     'relative z-0 flex h-full min-h-0 w-full flex-col bg-slate-950 text-slate-200',
@@ -225,22 +241,22 @@ function BeachCanvasShellInner({
           </div>
         </div>
         <div className="flex items-center gap-3">
-          {showInteractiveBadge && interactiveSessionTitle ? (
+          {showInteractiveBadge && interactiveBadgeCode ? (
             <button
               type="button"
               onClick={handleClearInteractive}
-              className="inline-flex max-w-xs items-center gap-2 rounded-full border border-amber-200/50 bg-amber-300/90 px-3 py-1 text-[11px] font-semibold text-slate-900 shadow-lg transition hover:bg-amber-200"
+              className="inline-flex items-center gap-1.5 rounded-full border border-orange-300/60 bg-orange-400/85 px-2.5 py-0.5 text-[10px] font-semibold text-slate-950 shadow-[0_12px_28px_rgba(249,115,22,0.35)] transition hover:bg-orange-300"
               title="Stop interacting with this session"
             >
-              <span className="text-[10px] uppercase tracking-[0.3em]">Interact</span>
-              <span className="truncate text-xs font-semibold tracking-wide">{interactiveSessionTitle}</span>
+              <span className="text-[9px] uppercase tracking-[0.32em]">Interact</span>
+              <span className="font-mono text-[11px] tracking-wide">#{interactiveBadgeCode}</span>
               <span
                 aria-hidden="true"
                 className="ml-0.5 inline-flex h-4 w-4 items-center justify-center rounded-full bg-slate-900/30 text-[11px] font-bold"
               >
                 ×
               </span>
-              <span className="sr-only">Stop interacting with {interactiveSessionTitle}</span>
+              <span className="sr-only">Stop interacting with {interactiveSessionTitle ?? `session ${interactiveBadgeCode}`}</span>
             </button>
           ) : null}
         </div>

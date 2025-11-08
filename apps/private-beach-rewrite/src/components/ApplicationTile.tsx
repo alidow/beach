@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import type { SessionSummary } from '@private-beach/shared-api';
 import { attachByCode, fetchSessionStateSnapshot, updateSessionRoleById } from '@private-beach-rewrite/lib/api';
-import type { TileSessionMeta } from '@private-beach-rewrite/features/tiles';
+import type { TileSessionMeta, TileViewportSnapshot } from '@private-beach-rewrite/features/tiles';
 import { buildSessionMetadataWithTile, sessionSummaryToTileMeta } from '@private-beach-rewrite/features/tiles/sessionMeta';
 import type { SessionCredentialOverride } from '../../../private-beach/src/hooks/terminalViewerTypes';
 import { useManagerToken, buildManagerUrl } from '../hooks/useManagerToken';
@@ -18,6 +18,8 @@ type ApplicationTileProps = {
   sessionMeta?: TileSessionMeta | null;
   onSessionMetaChange?: (meta: TileSessionMeta | null) => void;
   disableViewportMeasurements?: boolean;
+  onViewportMetricsChange?: (snapshot: TileViewportSnapshot | null) => void;
+  interactive?: boolean;
 };
 
 type SubmitState = 'idle' | 'attaching';
@@ -43,6 +45,8 @@ export function ApplicationTile({
   sessionMeta,
   onSessionMetaChange,
   disableViewportMeasurements = false,
+  onViewportMetricsChange,
+  interactive = true,
 }: ApplicationTileProps) {
   const [sessionIdInput, setSessionIdInput] = useState(sessionMeta?.sessionId ?? '');
   const [codeInput, setCodeInput] = useState('');
@@ -233,7 +237,7 @@ export function ApplicationTile({
   const hasSession = Boolean(sessionMeta?.sessionId);
 
   return (
-    <div className="application-tile">
+    <div className={`application-tile${interactive ? '' : ' application-tile--interactive-disabled'}`}>
       <div className={`application-tile__status application-tile__status--${connectionTone}`}>
         <span>{connectionLabel}</span>
         {viewer.latencyMs != null && viewer.latencyMs > 0 && (
@@ -294,8 +298,10 @@ export function ApplicationTile({
           <div className="application-tile__preview">
             <SessionViewer
               viewer={viewer}
+              tileId={tileId}
               sessionId={sessionMeta?.sessionId ?? null}
               disableViewportMeasurements={disableViewportMeasurements}
+              onViewportMetricsChange={onViewportMetricsChange}
             />
           </div>
         </div>

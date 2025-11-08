@@ -143,6 +143,10 @@ function inferHostCols(payload: TerminalFramePayload | null | undefined): number
   return null;
 }
 
+type TraceContext = {
+  traceId?: string | null;
+};
+
 type ApplicationTileProps = {
   tileId: string;
   privateBeachId: string;
@@ -151,6 +155,7 @@ type ApplicationTileProps = {
   onSessionMetaChange?: (meta: TileSessionMeta | null) => void;
   disableViewportMeasurements?: boolean;
   onViewportMetricsChange?: (snapshot: TileViewportSnapshot | null) => void;
+  traceContext?: TraceContext | null;
 };
 
 type SubmitState = 'idle' | 'attaching';
@@ -177,6 +182,7 @@ export function ApplicationTile({
   onSessionMetaChange,
   disableViewportMeasurements = false,
   onViewportMetricsChange,
+  traceContext = null,
 }: ApplicationTileProps) {
   const [sessionIdInput, setSessionIdInput] = useState(sessionMeta?.sessionId ?? '');
   const [codeInput, setCodeInput] = useState('');
@@ -331,6 +337,7 @@ export function ApplicationTile({
     managerUrl,
     authToken: managerToken,
     credentialOverride: credentialOverride ?? undefined,
+    traceContext: traceContext ?? undefined,
   });
 
   useEffect(() => {

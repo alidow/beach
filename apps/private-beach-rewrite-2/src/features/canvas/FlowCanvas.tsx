@@ -20,10 +20,19 @@ import { emitTelemetry } from '../../../../private-beach/src/lib/telemetry';
 import { TileFlowNode } from '@/features/tiles/components/TileFlowNode';
 import { TILE_GRID_SNAP_PX } from '@/features/tiles/constants';
 import { useTileActions, useTileState } from '@/features/tiles/store';
-import { buildManagerUrl } from '@/hooks/useManagerToken';
+import type { RelationshipDescriptor } from '@/features/tiles/types';
+import {
+  acquireController,
+  batchControllerAssignments,
+  deleteControllerPairing,
+  type ControllerUpdateCadence,
+} from '@/lib/api';
+import { recordTraceLog, useTraceLogs, clearTraceLogs } from '@/features/trace/traceLogStore';
+import { buildManagerUrl, useManagerToken } from '@/hooks/useManagerToken';
 import { useCanvasEvents } from './CanvasEventsContext';
 import { snapPointToGrid } from './positioning';
 import { AssignmentEdge, type AssignmentEdgeData, type UpdateMode } from './AssignmentEdge';
+import { TraceMonitorPanel } from './TraceMonitorPanel';
 import type {
   CanvasBounds,
   CanvasNodeDefinition,
@@ -45,6 +54,9 @@ const defaultEdgeOptions = {
   },
 };
 
+const CONTROLLER_LEASE_TTL_MS = 120_000;
+const CONTROLLER_LEASE_REFRESH_BUFFER_MS = 5_000;
+
 type FlowCanvasProps = {
   onNodePlacement: (payload: NodePlacementPayload) => void;
   onTileMove?: (payload: TileMovePayload) => void;
@@ -63,6 +75,13 @@ type CatalogDragPayload = Pick<CanvasNodeDefinition, 'id' | 'nodeType' | 'defaul
 
 const zoomSelector = (state: ReactFlowState) => state.transform[2] ?? 1;
 
+type PairingHistoryEntry = {
+  id: string;
+  status: 'ok' | 'error';
+  message: string | null;
+  timestamp: number;
+};
+
 function FlowCanvasInner({
   onNodePlacement,
   onTileMove,
@@ -74,7 +93,22 @@ function FlowCanvasInner({
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const dragSnapshotRef = useRef<DragSnapshot | null>(null);
   const canvasBoundsRef = useRef<CanvasBounds | null>(null);
+  const relationshipSyncKeysRef = useRef<Record<string, string>>({});
+  const previousRelationshipsRef = useRef<Record<string, RelationshipDescriptor>>({});
+  const [relationshipErrors, setRelationshipErrors] = useState<Record<string, string>>({});
+  const [relationshipSyncHistory, setRelationshipSyncHistory] = useState<Record<string, PairingHistoryEntry[]>>({});
+  const [syncNonce, setSyncNonce] = useState(0);
+  const [traceOverlay, setTraceOverlay] = useState<{
+    relationshipId: string;
+    traceId: string;
+    instruction: string;
+    cadence: ControllerUpdateCadence | null;
+    pollFrequency: number | null;
+  } | null>(null);
+  const traceLogs = useTraceLogs(traceOverlay?.traceId ?? null);
   const [editingEdgeId, setEditingEdgeId] = useState<string | null>(null);
+  const { token: managerToken, refresh: refreshManagerToken } = useManagerToken();
+  const controllerLeaseExpiryRef = useRef<Record<string, number>>({});
   const flow = useReactFlow();
   const { screenToFlowPosition } = flow;
   const memoizedNodeTypes = useMemo(() => nodeTypes, []);
@@ -111,6 +145,36 @@ function FlowCanvasInner({
 
   const resolvedManagerUrl = useMemo(() => buildManagerUrl(managerUrl), [managerUrl]);
 
+  const ensureControllerLease = useCallback(
+    async (controllerSessionId: string, authToken: string) => {
+      if (!controllerSessionId) {
+        throw new Error('controller session id missing for lease acquisition');
+      }
+      const now = Date.now();
+      const expiry = controllerLeaseExpiryRef.current[controllerSessionId];
+      if (expiry && expiry - now > CONTROLLER_LEASE_REFRESH_BUFFER_MS) {
+        return;
+      }
+      try {
+        const lease = await acquireController(
+          controllerSessionId,
+          CONTROLLER_LEASE_TTL_MS,
+          authToken,
+          resolvedManagerUrl,
+        );
+        const nextExpiry = lease.expires_at_ms ?? now + CONTROLLER_LEASE_TTL_MS;
+        controllerLeaseExpiryRef.current[controllerSessionId] = nextExpiry;
+      } catch (error) {
+        console.warn('[rewrite-2] failed to acquire controller lease', {
+          controllerSessionId,
+          error,
+        });
+        throw error;
+      }
+    },
+    [resolvedManagerUrl],
+  );
+
   const nodes: Node[] = useMemo(() => {
     return order
       .map((tileId, index) => {
@@ -146,20 +210,236 @@ function FlowCanvasInner({
 
   const handleEdgeSave = useCallback(
     ({ id, instructions, updateMode, pollFrequency }: { id: string; instructions: string; updateMode: UpdateMode; pollFrequency: number }) => {
+      const relationship = state.relationships[id];
+      const sourceTile = relationship ? state.tiles[relationship.sourceId] : undefined;
+      const targetTile = relationship ? state.tiles[relationship.targetId] : undefined;
+      delete relationshipSyncKeysRef.current[id];
+      setRelationshipErrors((prev) => {
+        if (!(id in prev)) {
+          return prev;
+        }
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
       updateRelationship(id, { instructions, updateMode, pollFrequency });
       setEditingEdgeId(null);
+      if (!relationship || !sourceTile || !targetTile) {
+        console.warn('[rewrite-2] missing relationship context for edge save', { relationshipId: id });
+        return;
+      }
+      const controllerSessionId = sourceTile.sessionMeta?.sessionId;
+      const childSessionId = targetTile.sessionMeta?.sessionId;
+      if (!controllerSessionId || !childSessionId) {
+        console.warn('[rewrite-2] edge save missing session ids', {
+          relationshipId: id,
+          controllerSessionId,
+          childSessionId,
+        });
+        return;
+      }
+      const role = sourceTile.agentMeta?.role?.trim() ?? '';
+      const responsibility = sourceTile.agentMeta?.responsibility?.trim() ?? '';
+      const trimmedInstructions = instructions.trim();
+      if (!role || !responsibility || !trimmedInstructions) {
+        console.warn('[rewrite-2] edge save missing prompt context', {
+          relationshipId: id,
+          role,
+          responsibility,
+          hasInstructions: Boolean(trimmedInstructions),
+        });
+        return;
+      }
+      if (!privateBeachId) {
+        console.warn('[rewrite-2] private beach id missing for edge save');
+        return;
+      }
+      const promptTemplate = buildPromptTemplate(role, responsibility, trimmedInstructions);
+      const updateCadence = mapUpdateModeToCadence(updateMode);
+      const traceId =
+        sourceTile.agentMeta?.trace?.enabled && sourceTile.agentMeta.trace.trace_id
+          ? sourceTile.agentMeta.trace.trace_id
+          : null;
+      void (async () => {
+        try {
+          const authToken = managerToken ?? (await refreshManagerToken());
+          if (!authToken) {
+            console.warn('[rewrite-2] missing manager token for batch assignment', { relationshipId: id });
+            setRelationshipErrors((prev) => ({
+              ...prev,
+              [id]: 'Manager token unavailable. Please sign in again.',
+            }));
+            return;
+          }
+          await ensureControllerLease(controllerSessionId, authToken);
+          await batchControllerAssignments(
+            privateBeachId,
+            [
+              {
+                controller_session_id: controllerSessionId,
+                child_session_id: childSessionId,
+                prompt_template: promptTemplate,
+                update_cadence: updateCadence,
+              },
+            ],
+            authToken,
+            resolvedManagerUrl,
+            traceId ?? undefined,
+          );
+          console.info('[rewrite-2] controller assignment saved', {
+            relationshipId: id,
+            controller_session_id: controllerSessionId,
+            child_session_id: childSessionId,
+          });
+          setRelationshipErrors((prev) => {
+            if (!(id in prev)) {
+              return prev;
+            }
+            const next = { ...prev };
+            delete next[id];
+            return next;
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Failed to sync assignment';
+          console.warn('[rewrite-2] failed to save controller assignment', {
+            relationshipId: id,
+            error,
+          });
+          setRelationshipErrors((prev) => ({ ...prev, [id]: message }));
+        }
+      })();
     },
-    [updateRelationship],
+    [
+      ensureControllerLease,
+      managerToken,
+      privateBeachId,
+      refreshManagerToken,
+      resolvedManagerUrl,
+      setRelationshipErrors,
+      state.relationships,
+      state.tiles,
+      updateRelationship,
+    ],
   );
 
   const handleEdgeEdit = useCallback(({ id }: { id: string }) => {
     setEditingEdgeId(id);
   }, []);
 
-  const handleEdgeDelete = useCallback(({ id }: { id: string }) => {
-    removeRelationship(id);
-    setEditingEdgeId((current) => (current === id ? null : current));
-  }, [removeRelationship]);
+  const handleShowTraceOverlay = useCallback(
+    ({ id }: { id: string }) => {
+      const relationship = state.relationships[id];
+      if (!relationship) {
+        return;
+      }
+      const sourceTile = state.tiles[relationship.sourceId];
+      const traceId =
+        sourceTile && sourceTile.agentMeta?.trace?.enabled ? sourceTile.agentMeta.trace.trace_id ?? null : null;
+      if (!traceId) {
+        return;
+      }
+      setTraceOverlay({
+        relationshipId: id,
+        traceId,
+        instruction: relationship.instructions,
+        cadence: mapUpdateModeToCadence(relationship.updateMode as UpdateMode),
+        pollFrequency: relationship.pollFrequency ?? null,
+      });
+    },
+    [state.relationships, state.tiles],
+  );
+
+  const teardownRelationshipByData = useCallback(
+    async (relationship?: RelationshipDescriptor, traceId?: string | null) => {
+      if (!relationship) {
+        return;
+      }
+      if (relationship.id) {
+        delete relationshipSyncKeysRef.current[relationship.id];
+      }
+      if (!relationship.sourceSessionId || !relationship.targetSessionId) {
+        return;
+      }
+      const authToken = managerToken ?? (await refreshManagerToken());
+      if (!authToken) {
+        return;
+      }
+      if (traceId) {
+        recordTraceLog(traceId, {
+          source: 'assignments',
+          level: 'info',
+          message: 'Deleting controller pairing',
+          detail: {
+            controller_session_id: relationship.sourceSessionId ?? null,
+            child_session_id: relationship.targetSessionId ?? null,
+            relationship_id: relationship.id,
+          },
+        });
+      }
+      try {
+        await deleteControllerPairing(
+          relationship.sourceSessionId,
+          relationship.targetSessionId,
+          authToken,
+          resolvedManagerUrl,
+          traceId ?? undefined,
+        );
+        if (traceId) {
+          recordTraceLog(traceId, {
+            source: 'assignments',
+            level: 'info',
+            message: 'Controller pairing deleted',
+            detail: {
+              controller_session_id: relationship.sourceSessionId ?? null,
+              child_session_id: relationship.targetSessionId ?? null,
+              relationship_id: relationship.id,
+            },
+          });
+        }
+      } catch (error) {
+        if (traceId) {
+          recordTraceLog(traceId, {
+            source: 'assignments',
+            level: 'error',
+            message: 'Failed to delete controller pairing',
+            detail: {
+              controller_session_id: relationship.sourceSessionId ?? null,
+              child_session_id: relationship.targetSessionId ?? null,
+              relationship_id: relationship.id,
+              error: error instanceof Error ? error.message : String(error),
+            },
+          });
+        }
+        console.warn('[rewrite-2] failed to delete controller pairing', error);
+      }
+    },
+    [managerToken, refreshManagerToken, resolvedManagerUrl],
+  );
+
+  const handleEdgeDelete = useCallback(
+    ({ id }: { id: string }) => {
+      const relationship = state.relationships[id];
+      const traceId =
+        relationship && state.tiles[relationship.sourceId]?.agentMeta?.trace?.enabled
+          ? state.tiles[relationship.sourceId]?.agentMeta?.trace?.trace_id ?? null
+          : null;
+      void teardownRelationshipByData(relationship, traceId);
+      removeRelationship(id);
+      delete relationshipSyncKeysRef.current[id];
+      previousRelationshipsRef.current = { ...previousRelationshipsRef.current };
+      delete previousRelationshipsRef.current[id];
+      setRelationshipErrors((prev) => {
+        if (!(id in prev)) {
+          return prev;
+        }
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      setEditingEdgeId((current) => (current === id ? null : current));
+    },
+    [removeRelationship, state.relationships, state.tiles, teardownRelationshipByData],
+  );
 
   const handleNodesChange = useCallback(
     (changes: NodeChange[]) => {
@@ -347,6 +627,316 @@ function FlowCanvasInner({
   }, [handleDragOver, handleDrop]);
 
   useEffect(() => {
+    const previous = previousRelationshipsRef.current;
+    for (const relId of Object.keys(previous)) {
+      if (!state.relationships[relId]) {
+        const relationship = previous[relId];
+        const traceId =
+          relationship && state.tiles[relationship.sourceId]?.agentMeta?.trace?.enabled
+            ? state.tiles[relationship.sourceId]?.agentMeta?.trace?.trace_id ?? null
+            : null;
+        void teardownRelationshipByData(relationship, traceId);
+      }
+    }
+    previousRelationshipsRef.current = { ...state.relationships };
+  }, [state.relationships, state.tiles, teardownRelationshipByData]);
+
+  useEffect(() => {
+    if (!traceOverlay) {
+      return;
+    }
+    const relationship = state.relationships[traceOverlay.relationshipId];
+    if (!relationship) {
+      clearTraceLogs(traceOverlay.traceId);
+      setTraceOverlay(null);
+      return;
+    }
+    const sourceTile = state.tiles[relationship.sourceId];
+    const nextTraceId =
+      sourceTile && sourceTile.agentMeta?.trace?.enabled ? sourceTile.agentMeta?.trace?.trace_id ?? null : null;
+    if (!nextTraceId) {
+      clearTraceLogs(traceOverlay.traceId);
+      setTraceOverlay(null);
+      return;
+    }
+    if (nextTraceId !== traceOverlay.traceId) {
+      setTraceOverlay((current) => (current ? { ...current, traceId: nextTraceId } : current));
+    }
+  }, [state.relationships, state.tiles, traceOverlay]);
+
+  const handleRelationshipRetry = useCallback(
+    ({ id }: { id: string }) => {
+      delete relationshipSyncKeysRef.current[id];
+      setRelationshipErrors((prev) => {
+        if (!(id in prev)) {
+          return prev;
+        }
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+      setSyncNonce((value) => value + 1);
+    },
+    [],
+  );
+
+  useEffect(() => {
+    const presentIds = new Set(state.relationshipOrder);
+    for (const cachedId of Object.keys(relationshipSyncKeysRef.current)) {
+      if (!presentIds.has(cachedId)) {
+        delete relationshipSyncKeysRef.current[cachedId];
+      }
+    }
+    if (!privateBeachId) {
+      return;
+    }
+    type PendingAssignment = {
+      rel: RelationshipDescriptor;
+      key: string;
+      prompt: string;
+      traceId: string | null;
+      controller_session_id: string;
+      child_session_id: string;
+      cadence: ControllerUpdateCadence;
+    };
+    const seenPairs = new Set<string>();
+    const pending: PendingAssignment[] = [];
+    for (let index = state.relationshipOrder.length - 1; index >= 0; index -= 1) {
+      const relId = state.relationshipOrder[index];
+      const rel = state.relationships[relId];
+      if (!rel) {
+        continue;
+      }
+      const sourceTile = state.tiles[rel.sourceId];
+      const targetTile = state.tiles[rel.targetId];
+      if (!sourceTile || !targetTile) {
+        continue;
+      }
+      const controllerSessionId = sourceTile.sessionMeta?.sessionId;
+      const childSessionId = targetTile.sessionMeta?.sessionId;
+      if (!controllerSessionId || !childSessionId) {
+        continue;
+      }
+      const pairKey = `${controllerSessionId}|${childSessionId}`;
+      if (seenPairs.has(pairKey)) {
+        continue;
+      }
+      seenPairs.add(pairKey);
+      const role = sourceTile.agentMeta?.role?.trim() ?? '';
+      const responsibility = sourceTile.agentMeta?.responsibility?.trim() ?? '';
+      const instructions = rel.instructions.trim();
+      if (!role || !responsibility || !instructions) {
+        continue;
+      }
+      const prompt = buildPromptTemplate(role, responsibility, instructions);
+      const signature = [
+        controllerSessionId,
+        childSessionId,
+        prompt,
+        rel.updateMode,
+        rel.pollFrequency,
+      ].join('|');
+      if (relationshipSyncKeysRef.current[relId] === signature) {
+        continue;
+      }
+      const traceId =
+        sourceTile.agentMeta?.trace?.enabled && sourceTile.agentMeta.trace.trace_id
+          ? sourceTile.agentMeta.trace.trace_id
+          : null;
+      pending.push({
+        rel,
+        key: signature,
+        prompt,
+        traceId,
+        controller_session_id: controllerSessionId,
+        child_session_id: childSessionId,
+        cadence: mapUpdateModeToCadence(rel.updateMode as UpdateMode),
+      });
+    }
+    if (pending.length === 0) {
+      return;
+    }
+    const orderedPending = pending.reverse();
+    let cancelled = false;
+    const run = async () => {
+      const authToken = managerToken ?? (await refreshManagerToken());
+      if (!authToken || cancelled) {
+        return;
+      }
+      const uniqueControllers = Array.from(
+        new Set(orderedPending.map((entry) => entry.controller_session_id)),
+      );
+      const leaseFailures = new Map<string, string>();
+      for (const controllerId of uniqueControllers) {
+        if (cancelled) {
+          return;
+        }
+        try {
+          await ensureControllerLease(controllerId, authToken);
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : 'Controller lease acquisition failed';
+          leaseFailures.set(controllerId, message);
+        }
+      }
+      if (leaseFailures.size > 0) {
+        setRelationshipErrors((prev) => {
+          const next = { ...prev };
+          orderedPending.forEach((entry) => {
+            const message = leaseFailures.get(entry.controller_session_id);
+            if (message) {
+              next[entry.rel.id] = message;
+            }
+          });
+          return next;
+        });
+      }
+      const runnableEntries = orderedPending.filter(
+        (entry) => !leaseFailures.has(entry.controller_session_id),
+      );
+      if (runnableEntries.length === 0) {
+        return;
+      }
+      const grouped = new Map<string, { traceId: string | null; entries: PendingAssignment[] }>();
+      for (const entry of runnableEntries) {
+        const key = entry.traceId ?? 'no-trace';
+        if (!grouped.has(key)) {
+          grouped.set(key, { traceId: entry.traceId, entries: [] });
+        }
+        grouped.get(key)!.entries.push(entry);
+      }
+      for (const group of grouped.values()) {
+        if (cancelled) {
+          break;
+        }
+        const relationshipIds = group.entries.map(({ rel }) => rel.id);
+        if (group.traceId) {
+          recordTraceLog(group.traceId, {
+            source: 'assignments',
+            level: 'info',
+            message: `Syncing ${group.entries.length} assignment${group.entries.length === 1 ? '' : 's'}`,
+            detail: {
+              private_beach_id: privateBeachId,
+              relationship_ids: relationshipIds,
+            },
+          });
+        }
+        try {
+          const assignments = group.entries.map((entry) => ({
+            controller_session_id: entry.controller_session_id,
+            child_session_id: entry.child_session_id,
+            prompt_template: entry.prompt,
+            update_cadence: entry.cadence,
+          }));
+          const results = await batchControllerAssignments(
+            privateBeachId,
+            assignments,
+            authToken,
+            resolvedManagerUrl,
+            group.traceId ?? undefined,
+          );
+          if (cancelled) {
+            break;
+          }
+          const historyUpdates: Array<{ relId: string; entry: PairingHistoryEntry }> = [];
+          results.forEach((result, index) => {
+            const entry = group.entries[index];
+            if (!entry) {
+              return;
+            }
+            const relId = entry.rel.id;
+            const timestamp = Date.now();
+            const historyEntry: PairingHistoryEntry = {
+              id: `${relId}-${timestamp}-${index}`,
+              status: result?.ok ? 'ok' : 'error',
+              message: result?.error ?? null,
+              timestamp,
+            };
+            historyUpdates.push({ relId, entry: historyEntry });
+            if (result?.ok) {
+              relationshipSyncKeysRef.current[relId] = entry.key;
+              setRelationshipErrors((prev) => {
+                if (!(relId in prev)) {
+                  return prev;
+                }
+                const next = { ...prev };
+                delete next[relId];
+                return next;
+              });
+              if (group.traceId) {
+                recordTraceLog(group.traceId, {
+                  source: 'assignments',
+                  level: 'info',
+                  message: 'Controller pairing synced',
+                  detail: {
+                    relationship_id: relId,
+                    controller_session_id: entry.controller_session_id,
+                    child_session_id: entry.child_session_id,
+                  },
+                });
+              }
+            } else {
+              const message = result?.error || 'Failed to sync controller pairing';
+              setRelationshipErrors((prev) => ({ ...prev, [relId]: message }));
+              if (group.traceId) {
+                recordTraceLog(group.traceId, {
+                  source: 'assignments',
+                  level: 'error',
+                  message: 'Controller pairing failed',
+                  detail: {
+                    relationship_id: relId,
+                    controller_session_id: entry.controller_session_id,
+                    child_session_id: entry.child_session_id,
+                    error: message,
+                  },
+                });
+              }
+            }
+          });
+          if (historyUpdates.length > 0) {
+            setRelationshipSyncHistory((prev) => {
+              const next = { ...prev };
+              historyUpdates.forEach(({ relId, entry }) => {
+                const existing = next[relId] ?? [];
+                next[relId] = [entry, ...existing].slice(0, 8);
+              });
+              return next;
+            });
+          }
+        } catch (error) {
+          if (group.traceId) {
+            recordTraceLog(group.traceId, {
+              source: 'assignments',
+              level: 'error',
+              message: 'Failed to sync controller assignments',
+              detail: {
+                private_beach_id: privateBeachId,
+                relationship_ids: relationshipIds,
+                error: error instanceof Error ? error.message : String(error),
+              },
+            });
+          }
+          console.error('[rewrite-2] failed to sync controller assignments', error);
+        }
+      }
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    managerToken,
+    ensureControllerLease,
+    refreshManagerToken,
+    privateBeachId,
+    resolvedManagerUrl,
+    state.relationshipOrder,
+    state.relationships,
+    state.tiles,
+    syncNonce,
+  ]);
+
+  useEffect(() => {
     const node = wrapperRef.current;
     if (!node) {
       return undefined;
@@ -377,6 +967,8 @@ function FlowCanvasInner({
         if (!state.tiles[rel.sourceId] || !state.tiles[rel.targetId]) {
           return null;
         }
+        const sourceTile = state.tiles[rel.sourceId]!;
+        const traceButtonEnabled = Boolean(sourceTile.agentMeta?.trace?.enabled && sourceTile.agentMeta?.trace?.trace_id);
         return {
           id: rel.id,
           type: 'assignment',
@@ -389,14 +981,46 @@ function FlowCanvasInner({
             updateMode: rel.updateMode as UpdateMode,
             pollFrequency: rel.pollFrequency,
             isEditing: editingEdgeId === rel.id,
+            status: relationshipErrors[rel.id] ? 'error' : 'ok',
+            statusMessage: relationshipErrors[rel.id] ?? null,
+            onRetry: relationshipErrors[rel.id] ? handleRelationshipRetry : undefined,
             onSave: handleEdgeSave,
             onEdit: handleEdgeEdit,
             onDelete: handleEdgeDelete,
+            onShowTrace: traceButtonEnabled ? handleShowTraceOverlay : undefined,
           },
         } satisfies Edge<AssignmentEdgeData>;
       })
       .filter((edge): edge is Edge<AssignmentEdgeData> => Boolean(edge)),
-  [editingEdgeId, handleEdgeDelete, handleEdgeEdit, handleEdgeSave, state.relationshipOrder, state.relationships, state.tiles]);
+  [editingEdgeId, handleEdgeDelete, handleEdgeEdit, handleEdgeSave, handleRelationshipRetry, handleShowTraceOverlay, relationshipErrors, state.relationshipOrder, state.relationships, state.tiles]);
+
+  const traceOverlayProps = useMemo(() => {
+    if (!traceOverlay) {
+      return null;
+    }
+    const relationship = state.relationships[traceOverlay.relationshipId];
+    if (!relationship) {
+      return null;
+    }
+    const sourceTile = state.tiles[relationship.sourceId];
+    const targetTile = state.tiles[relationship.targetId];
+    if (!sourceTile || !sourceTile.agentMeta?.trace?.enabled || !sourceTile.agentMeta?.trace?.trace_id) {
+      return null;
+    }
+    const history = relationshipSyncHistory[relationship.id] ?? [];
+    return {
+      traceId: traceOverlay.traceId,
+      agentRole: sourceTile.agentMeta.role,
+      agentResponsibility: sourceTile.agentMeta.responsibility,
+      instructions: traceOverlay.instruction,
+      cadence: traceOverlay.cadence,
+      pollFrequency: traceOverlay.pollFrequency,
+      sourceSessionId: relationship.sourceSessionId ?? null,
+      targetSessionId: relationship.targetSessionId ?? null,
+      pairingHistory: history,
+      logs: traceLogs,
+    };
+  }, [relationshipSyncHistory, state.relationships, state.tiles, traceLogs, traceOverlay]);
 
   return (
     <div
@@ -437,6 +1061,24 @@ function FlowCanvasInner({
         <Background gap={gridSize} color="rgba(56, 189, 248, 0.12)" />
       </ReactFlow>
       <CanvasViewportControls />
+      {traceOverlayProps ? (
+        <TraceMonitorPanel
+          traceId={traceOverlayProps.traceId}
+          agentRole={traceOverlayProps.agentRole}
+          agentResponsibility={traceOverlayProps.agentResponsibility}
+          instructions={traceOverlayProps.instructions}
+          cadence={traceOverlayProps.cadence}
+          pollFrequency={traceOverlayProps.pollFrequency}
+          sourceSessionId={traceOverlayProps.sourceSessionId}
+          targetSessionId={traceOverlayProps.targetSessionId}
+          pairingHistory={traceOverlayProps.pairingHistory}
+          logs={traceOverlayProps.logs}
+          onClose={() => {
+            clearTraceLogs(traceOverlayProps.traceId);
+            setTraceOverlay(null);
+          }}
+        />
+      ) : null}
     </div>
   );
 }
@@ -494,4 +1136,20 @@ export function FlowCanvas(props: FlowCanvasProps) {
       <FlowCanvasInner {...props} />
     </ReactFlowProvider>
   );
+}
+
+function mapUpdateModeToCadence(mode: UpdateMode): ControllerUpdateCadence {
+  if (mode === 'push') {
+    return 'fast';
+  }
+  return 'slow';
+}
+
+function buildPromptTemplate(role: string, responsibility: string, instructions: string): string {
+  const parts = [
+    `Role:\n${role.trim()}`,
+    `Responsibility:\n${responsibility.trim()}`,
+    `Instructions:\n${instructions.trim()}`,
+  ];
+  return parts.join('\n\n');
 }

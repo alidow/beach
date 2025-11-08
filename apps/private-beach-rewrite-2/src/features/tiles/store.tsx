@@ -3,6 +3,9 @@
 import { createContext, useContext, useMemo, useReducer } from 'react';
 import { DEFAULT_TILE_HEIGHT, DEFAULT_TILE_WIDTH } from './constants';
 import type {
+  AgentMetadata,
+  AgentTraceMetadata,
+  RelationshipDescriptor,
   TileCreateInput,
   TileDescriptor,
   TileNodeType,
@@ -67,16 +70,66 @@ function bringToFront(order: string[], id: string): string[] {
   return [...filtered, id];
 }
 
+type LegacyAgentMeta = AgentMetadata & {
+  traceEnabled?: boolean;
+  traceId?: string | null;
+};
+
+function coerceAgentTrace(meta: LegacyAgentMeta | TileCreateInput['agentMeta'] | null | undefined): AgentTraceMetadata | undefined {
+  if (!meta) {
+    return undefined;
+  }
+  const record = meta as Record<string, unknown>;
+  const rawTrace = record.trace;
+  if (rawTrace && typeof rawTrace === 'object' && rawTrace !== null) {
+    const enabled = typeof (rawTrace as Record<string, unknown>).enabled === 'boolean' ? Boolean((rawTrace as Record<string, unknown>).enabled) : undefined;
+    if (typeof enabled === 'boolean') {
+      const normalized: AgentTraceMetadata = { enabled };
+      const traceId = (rawTrace as Record<string, unknown>).trace_id;
+      if (typeof traceId === 'string' && traceId.trim().length > 0) {
+        normalized.trace_id = traceId.trim();
+      }
+      return normalized;
+    }
+  }
+  if (typeof record.traceEnabled === 'boolean') {
+    const normalized: AgentTraceMetadata = { enabled: Boolean(record.traceEnabled) };
+    if (record.traceEnabled && typeof record.traceId === 'string' && record.traceId.trim().length > 0) {
+      normalized.trace_id = record.traceId.trim();
+    }
+    return normalized;
+  }
+  return undefined;
+}
+
 function ensureAgentMeta(
   desiredType: TileNodeType,
   existingMeta: TileDescriptor['agentMeta'],
   inputMeta?: TileCreateInput['agentMeta'],
 ): TileDescriptor['agentMeta'] {
   if (inputMeta !== undefined) {
-    return inputMeta;
+    const trace = coerceAgentTrace(inputMeta);
+    const meta: AgentMetadata = {
+      role: inputMeta.role ?? '',
+      responsibility: inputMeta.responsibility ?? '',
+      isEditing: typeof inputMeta.isEditing === 'boolean' ? inputMeta.isEditing : true,
+    };
+    if (trace) {
+      meta.trace = trace;
+    }
+    return meta;
   }
   if (existingMeta) {
-    return existingMeta;
+    const trace = coerceAgentTrace(existingMeta as LegacyAgentMeta);
+    const meta: AgentMetadata = {
+      role: existingMeta.role,
+      responsibility: existingMeta.responsibility,
+      isEditing: existingMeta.isEditing,
+    };
+    if (trace) {
+      meta.trace = trace;
+    }
+    return meta;
   }
   if (desiredType === 'agent') {
     return { role: '', responsibility: '', isEditing: true };
@@ -99,6 +152,37 @@ function viewportEqual(a: TileViewportSnapshot | undefined, b: TileViewportSnaps
     a.pixelsPerRow === b.pixelsPerRow &&
     a.pixelsPerCol === b.pixelsPerCol
   );
+}
+
+function syncRelationshipSessionRefs(
+  relationships: Record<string, RelationshipDescriptor>,
+  tile: TileDescriptor | undefined,
+): Record<string, RelationshipDescriptor> | null {
+  if (!tile) {
+    return null;
+  }
+  const sessionId = tile.sessionMeta?.sessionId ?? null;
+  let next: Record<string, RelationshipDescriptor> | null = null;
+  for (const [relId, rel] of Object.entries(relationships)) {
+    const ensureNext = () => {
+      if (!next) {
+        next = { ...relationships };
+      }
+      if (!next[relId]) {
+        next[relId] = { ...rel };
+      }
+      return next[relId];
+    };
+    if (rel.sourceId === tile.id && rel.sourceSessionId !== sessionId) {
+      const target = ensureNext();
+      target.sourceSessionId = sessionId;
+    }
+    if (rel.targetId === tile.id && rel.targetSessionId !== sessionId) {
+      const target = ensureNext();
+      target.targetSessionId = sessionId;
+    }
+  }
+  return next;
 }
 
 function reducer(state: TileState, action: Action): TileState {
@@ -159,9 +243,15 @@ function reducer(state: TileState, action: Action): TileState {
       } else if (interactiveId === descriptor.id && hasSession && !previouslyHadSession && !shouldFocus) {
         // keep as-is unless it was auto-selected above; no-op
       }
+      let nextRelationships = state.relationships;
+      const synced = syncRelationshipSessionRefs(state.relationships, descriptor);
+      if (synced) {
+        nextRelationships = synced;
+      }
       return {
         ...state,
         tiles,
+        relationships: nextRelationships,
         order,
         activeId: shouldFocus ? id : state.activeId,
         resizing,
@@ -371,6 +461,8 @@ function reducer(state: TileState, action: Action): TileState {
       if (state.relationships[id]) {
         return state;
       }
+      const sourceSessionId = state.tiles[sourceId]?.sessionMeta?.sessionId ?? null;
+      const targetSessionId = state.tiles[targetId]?.sessionMeta?.sessionId ?? null;
       return {
         ...state,
         relationships: {
@@ -379,6 +471,8 @@ function reducer(state: TileState, action: Action): TileState {
             id,
             sourceId,
             targetId,
+            sourceSessionId,
+            targetSessionId,
             sourceHandleId: sourceHandleId ?? null,
             targetHandleId: targetHandleId ?? null,
             instructions: '',

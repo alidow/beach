@@ -71,18 +71,34 @@ export type ViewerCredential = {
   passcode?: string | null;
 };
 
+export type McpBridge = {
+  id: string;
+  name: string;
+  description: string;
+  endpoint?: string | null;
+};
+
+export type AgentOnboardResponse = {
+  agent_token: string;
+  prompt_pack: any;
+  mcp_bridges: McpBridge[];
+};
+
 function base(baseUrl?: string) {
   if (baseUrl) return baseUrl;
   return process.env.NEXT_PUBLIC_MANAGER_URL || 'http://localhost:8080';
 }
 
-function authHeaders(token: string | null) {
+function authHeaders(token: string | null, extra?: Record<string, string>) {
   if (!token || token.trim().length === 0) {
     throw new Error('missing manager auth token');
   }
   const trimmed = token.trim();
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   headers['authorization'] = `Bearer ${trimmed}`;
+  if (extra) {
+    Object.assign(headers, extra);
+  }
   return headers;
 }
 
@@ -478,10 +494,11 @@ export async function deleteControllerPairing(
   childSessionId: string,
   token: string | null,
   baseUrl?: string,
+  traceId?: string | null,
 ): Promise<void> {
   const res = await fetch(`${base(baseUrl)}/sessions/${controllerSessionId}/controllers/${childSessionId}`, {
     method: 'DELETE',
-    headers: authHeaders(token),
+    headers: authHeaders(token, traceId ? { 'x-trace-id': traceId } : undefined),
   });
   if (res.status === 404) {
     throw new Error('controller_pairing_api_unavailable');
@@ -772,6 +789,8 @@ export type CanvasAgentRelationship = {
 	id: string;
 	sourceId: string;
 	targetId: string;
+	sourceSessionId?: string | null;
+	targetSessionId?: string | null;
 	sourceHandleId?: string | null;
 	targetHandleId?: string | null;
 	instructions?: string | null;
@@ -784,13 +803,14 @@ export async function batchControllerAssignments(
   assignments: ControllerAssignment[],
   token: string | null,
   baseUrl?: string,
+  traceId?: string | null,
 ): Promise<ControllerAssignmentResult[]> {
   if (!Array.isArray(assignments) || assignments.length === 0) {
     throw new Error('assignments array required');
   }
   const res = await fetch(`${base(baseUrl)}/private-beaches/${privateBeachId}/controller-assignments/batch`, {
     method: 'POST',
-    headers: authHeaders(token),
+    headers: authHeaders(token, traceId ? { 'x-trace-id': traceId } : undefined),
     body: JSON.stringify({ assignments }),
   });
   if (!res.ok) throw new Error(`batchControllerAssignments failed ${res.status}`);
@@ -806,5 +826,28 @@ export async function updateBeach(id: string, patch: { name?: string; slug?: str
     body: JSON.stringify(patch),
   });
   if (!res.ok) throw new Error(`updateBeach failed ${res.status}`);
+  return res.json();
+}
+
+export async function onboardAgent(
+  sessionId: string,
+  templateId: string,
+  scopedRoles: string[],
+  token: string | null,
+  baseUrl?: string,
+  options?: Record<string, unknown>,
+  traceId?: string,
+): Promise<AgentOnboardResponse> {
+  const res = await fetch(`${base(baseUrl)}/agents/onboard`, {
+    method: 'POST',
+    headers: authHeaders(token, traceId ? { 'x-trace-id': traceId } : undefined),
+    body: JSON.stringify({
+      session_id: sessionId,
+      template_id: templateId,
+      scoped_roles: scopedRoles,
+      options: options ?? {},
+    }),
+  });
+  if (!res.ok) throw new Error(`onboardAgent failed ${res.status}`);
   return res.json();
 }

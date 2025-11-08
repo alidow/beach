@@ -7,6 +7,8 @@ type CanvasAgentRelationship = {
 	id: string;
 	sourceId: string;
 	targetId: string;
+	sourceSessionId?: string | null;
+	targetSessionId?: string | null;
 	sourceHandleId?: string | null;
 	targetHandleId?: string | null;
 	instructions?: string | null;

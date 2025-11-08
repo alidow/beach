@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { viewerConnectionService } from '../../../private-beach/src/controllers/viewerConnectionService';
+import { recordTraceLog } from '@/features/trace/traceLogStore';
 import type {
   SessionCredentialOverride,
   TerminalViewerState,
@@ -24,6 +25,7 @@ type UseSessionConnectionParams = {
   managerUrl?: string;
   authToken?: string | null;
   credentialOverride?: SessionCredentialOverride | null;
+  traceContext?: { traceId?: string | null };
 };
 
 export function useSessionConnection({
@@ -33,6 +35,7 @@ export function useSessionConnection({
   managerUrl,
   authToken,
   credentialOverride,
+  traceContext,
 }: UseSessionConnectionParams) {
   const [viewer, setViewer] = useState<TerminalViewerState>(IDLE_VIEWER_STATE);
   const lastLogKeyRef = useRef<string | null>(null);
@@ -48,6 +51,9 @@ export function useSessionConnection({
     return [passcode, viewerToken, auth, skip].join('|');
   }, [credentialOverride]);
 
+  const normalizedTraceId = traceContext?.traceId?.trim();
+  const traceId = normalizedTraceId && normalizedTraceId.length > 0 ? normalizedTraceId : null;
+
   useEffect(() => {
     if (!sessionId || !managerUrl || !authToken) {
       setViewer(IDLE_VIEWER_STATE);
@@ -61,6 +67,7 @@ export function useSessionConnection({
         managerUrl,
         authToken,
         override: credentialOverride ?? undefined,
+        traceId,
       },
       (snapshot) => {
         if (typeof window !== 'undefined') {
@@ -90,6 +97,7 @@ export function useSessionConnection({
             lastLogKeyRef.current = nextKey;
             const payload = {
               tileId,
+              trace_id: traceId ?? null,
               status: snapshot.status,
               connecting: snapshot.connecting,
               transport: Boolean(snapshot.transport),
@@ -102,6 +110,14 @@ export function useSessionConnection({
             };
             // eslint-disable-next-line no-console
             console.info('[rewrite-terminal][connection]', JSON.stringify(payload));
+            if (traceId) {
+              recordTraceLog(traceId, {
+                source: 'viewer',
+                level: snapshot.error ? 'warn' : 'info',
+                message: `Viewer connection ${snapshot.status}`,
+                detail: payload,
+              });
+            }
           }
         }
         setViewer(snapshot);
@@ -110,7 +126,7 @@ export function useSessionConnection({
     return () => {
       disconnect();
     };
-  }, [authToken, credentialOverride, managerUrl, overrideSignature, privateBeachId, sessionId, tileId]);
+  }, [authToken, credentialOverride, managerUrl, overrideSignature, privateBeachId, sessionId, tileId, traceId]);
 
   return viewer;
 }

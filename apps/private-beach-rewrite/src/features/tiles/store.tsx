@@ -21,7 +21,8 @@ type Action =
   | { type: 'SET_TILE_POSITION_IMMEDIATE'; payload: { id: string; position: Partial<TilePosition> } }
   | { type: 'SET_TILE_SIZE'; payload: { id: string; size: TileResizeInput } }
   | { type: 'START_RESIZE'; payload: { id: string } }
-  | { type: 'END_RESIZE'; payload: { id: string } };
+  | { type: 'END_RESIZE'; payload: { id: string } }
+  | { type: 'SET_INTERACTIVE_TILE'; payload: { id: string | null } };
 
 function createEmptyState(): TileState {
   return {
@@ -29,6 +30,7 @@ function createEmptyState(): TileState {
     order: [],
     activeId: null,
     resizing: {},
+    interactiveId: null,
   };
 }
 
@@ -90,6 +92,12 @@ function reducer(state: TileState, action: Action): TileState {
         order,
         activeId: shouldFocus ? id : state.activeId,
         resizing,
+        interactiveId:
+          input.interactive === true
+            ? id
+            : input.interactive === false && state.interactiveId === id
+              ? null
+              : state.interactiveId,
       };
     }
     case 'REMOVE_TILE': {
@@ -216,6 +224,13 @@ function reducer(state: TileState, action: Action): TileState {
       delete resizing[id];
       return { ...state, resizing };
     }
+    case 'SET_INTERACTIVE_TILE': {
+      const { id } = action.payload;
+      if (id && !state.tiles[id]) {
+        return { ...state, interactiveId: null };
+      }
+      return { ...state, interactiveId: id };
+    }
     default:
       return state;
   }
@@ -261,11 +276,13 @@ export function useTileActions() {
         dispatch({ type: 'SET_TILE_POSITION', payload: { id, position } }),
       setTilePositionImmediate: (id: string, position: Partial<TilePosition>) =>
         dispatch({ type: 'SET_TILE_POSITION_IMMEDIATE', payload: { id, position } }),
-      resizeTile: (id: string, size: TileResizeInput) =>
-        dispatch({ type: 'SET_TILE_SIZE', payload: { id, size } }),
-      beginResize: (id: string) => dispatch({ type: 'START_RESIZE', payload: { id } }),
-      endResize: (id: string) => dispatch({ type: 'END_RESIZE', payload: { id } }),
-    }),
+        resizeTile: (id: string, size: TileResizeInput) =>
+          dispatch({ type: 'SET_TILE_SIZE', payload: { id, size } }),
+        beginResize: (id: string) => dispatch({ type: 'START_RESIZE', payload: { id } }),
+        endResize: (id: string) => dispatch({ type: 'END_RESIZE', payload: { id } }),
+        setInteractiveTile: (id: string | null) =>
+          dispatch({ type: 'SET_INTERACTIVE_TILE', payload: { id } }),
+      }),
     [dispatch],
   );
 }

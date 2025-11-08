@@ -52,11 +52,11 @@ const SAMPLE_LAYOUT: CanvasLayout = {
 };
 
 describe('tile persistence helpers (rewrite-2)', () => {
-  it('hydrates tile state with ordered entries and interactive id', () => {
-    const state = layoutToTileState(SAMPLE_LAYOUT);
-    expect(state.order).toEqual(['first', 'second']);
-    expect(state.tiles.second.sessionMeta?.sessionId).toBe('sess-2');
-    expect(state.interactiveId).toBe('first');
+	it('hydrates tile state with ordered entries and leaves interactive mode unset', () => {
+		const state = layoutToTileState(SAMPLE_LAYOUT);
+		expect(state.order).toEqual(['first', 'second']);
+		expect(state.tiles.second.sessionMeta?.sessionId).toBe('sess-2');
+		expect(state.interactiveId).toBeNull();
     expect(state.relationshipOrder).toEqual(['rel-1']);
     expect(state.relationships['rel-1']).toMatchObject({
       sourceId: 'first',
@@ -65,6 +65,8 @@ describe('tile persistence helpers (rewrite-2)', () => {
       instructions: 'Monitor app',
       updateMode: 'poll',
       pollFrequency: 45,
+      sourceSessionId: null,
+      targetSessionId: 'sess-2',
     });
   });
 
@@ -74,7 +76,11 @@ describe('tile persistence helpers (rewrite-2)', () => {
     expect(serialized.tiles.second.position).toEqual({ x: 160, y: 96 });
     expect(serialized.tiles.second.metadata?.sessionMeta).toMatchObject({ sessionId: 'sess-2' });
     expect(serialized.metadata.createdAt).toBe(SAMPLE_LAYOUT.metadata.createdAt);
-    expect(serialized.metadata.agentRelationships?.['rel-1']).toMatchObject({ instructions: 'Monitor app', updateMode: 'poll' });
+    expect(serialized.metadata.agentRelationships?.['rel-1']).toMatchObject({
+      instructions: 'Monitor app',
+      updateMode: 'poll',
+      targetSessionId: 'sess-2',
+    });
     expect(serialized.metadata.agentRelationshipOrder).toEqual(['rel-1']);
   });
 

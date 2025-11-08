@@ -6,12 +6,15 @@ import { Handle, Position, useStore } from 'reactflow';
 import type { NodeProps, ReactFlowState } from 'reactflow';
 import { ApplicationTile } from '@/components/ApplicationTile';
 import { cn } from '@/lib/cn';
+import { listSessions, onboardAgent, updateSessionMetadata, updateSessionRoleById } from '@/lib/api';
+import { buildManagerUrl, useManagerToken } from '@/hooks/useManagerToken';
 import { TILE_HEADER_HEIGHT } from '../constants';
 import { useTileActions } from '../store';
-import type { TileDescriptor, TileSessionMeta, TileViewportSnapshot } from '../types';
+import type { AgentMetadata, TileDescriptor, TileSessionMeta, TileViewportSnapshot } from '../types';
 import { snapSize } from '../utils';
 import { emitTelemetry } from '../../../../../private-beach/src/lib/telemetry';
 import { computeAutoResizeSize } from '../autoResize';
+import { buildSessionMetadataWithTile } from '../sessionMeta';
 
 type TileFlowNodeData = {
   tile: TileDescriptor;
@@ -46,6 +49,55 @@ const HANDLE_DEFS: HandleDef[] = [
   { key: 'bottom', pos: Position.Bottom, style: { bottom: -12, left: '50%', transform: 'translate(-50%, 50%)' } },
   { key: 'left', pos: Position.Left, style: { left: -12, top: '50%', transform: 'translate(-50%, -50%)' } },
 ];
+
+const AUTO_RESIZE_TOLERANCE_PX = 1;
+
+function generateTraceId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `trace-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+type LegacyAgentMeta = AgentMetadata & {
+  traceEnabled?: boolean;
+  traceId?: string | null;
+};
+
+function coerceAgentTrace(meta?: LegacyAgentMeta | null): AgentMetadata['trace'] | undefined {
+  if (meta?.trace && typeof meta.trace.enabled === 'boolean') {
+    if (!meta.trace.enabled) {
+      return { enabled: false };
+    }
+    return {
+      enabled: true,
+      trace_id: meta.trace.trace_id ?? undefined,
+    };
+  }
+  if (typeof meta?.traceEnabled === 'boolean') {
+    if (!meta.traceEnabled) {
+      return { enabled: false };
+    }
+    return {
+      enabled: true,
+      trace_id: meta.traceId ?? undefined,
+    };
+  }
+  return undefined;
+}
+
+function normalizeAgentMeta(meta?: LegacyAgentMeta | null): AgentMetadata {
+  const trace = coerceAgentTrace(meta);
+  const normalized: AgentMetadata = {
+    role: meta?.role ?? '',
+    responsibility: meta?.responsibility ?? '',
+    isEditing: meta?.isEditing ?? true,
+  };
+  if (trace) {
+    normalized.trace = trace;
+  }
+  return normalized;
+}
 
 function metaEqual(a: TileSessionMeta | null | undefined, b: TileSessionMeta | null | undefined) {
   if (!a && !b) return true;
@@ -102,6 +154,7 @@ export function TileFlowNode({ data, dragging }: Props) {
     managerUrl,
     rewriteEnabled,
   } = data;
+  const managerBaseUrl = useMemo(() => buildManagerUrl(managerUrl), [managerUrl]);
   const {
     removeTile,
     bringToFront,
@@ -112,18 +165,21 @@ export function TileFlowNode({ data, dragging }: Props) {
     updateTileMeta,
     setInteractiveTile,
     createTile,
+    updateTileViewport,
   } = useTileActions();
   const nodeRef = useRef<HTMLElement | null>(null);
   const viewportMetricsRef = useRef<TileViewportSnapshot | null>(null);
   const resizeStateRef = useRef<ResizeState | null>(null);
   const [hovered, setHovered] = useState(false);
   const isAgent = tile.nodeType === 'agent';
-  const agentMeta = useMemo(
-    () => tile.agentMeta ?? { role: '', responsibility: '', isEditing: true },
-    [tile.agentMeta],
-  );
+  const agentMeta = useMemo(() => normalizeAgentMeta(tile.agentMeta ?? null), [tile.agentMeta]);
   const [agentRole, setAgentRole] = useState(agentMeta.role);
   const [agentResponsibility, setAgentResponsibility] = useState(agentMeta.responsibility);
+  const { token: managerToken, refresh: refreshManagerToken } = useManagerToken();
+  const [agentTraceEnabled, setAgentTraceEnabled] = useState(Boolean(agentMeta.trace?.enabled));
+  const [agentTraceId, setAgentTraceId] = useState<string | null>(agentMeta.trace?.trace_id ?? null);
+  const [agentSaveState, setAgentSaveState] = useState<'idle' | 'saving'>('idle');
+  const [agentSaveNotice, setAgentSaveNotice] = useState<string | null>(null);
   const zoom = useStore(zoomSelector);
 
 
@@ -136,8 +192,56 @@ export function TileFlowNode({ data, dragging }: Props) {
     if (!agentMeta.isEditing) {
       setAgentRole(agentMeta.role);
       setAgentResponsibility(agentMeta.responsibility);
+      setAgentTraceEnabled(Boolean(agentMeta.trace?.enabled));
+      setAgentTraceId(agentMeta.trace?.trace_id ?? null);
     }
-  }, [agentMeta.isEditing, agentMeta.responsibility, agentMeta.role, isAgent]);
+  }, [
+    agentMeta.isEditing,
+    agentMeta.responsibility,
+    agentMeta.role,
+    agentMeta.trace?.enabled,
+    agentMeta.trace?.trace_id,
+    isAgent,
+  ]);
+
+  useEffect(() => {
+    if (agentMeta.isEditing) {
+      setAgentSaveNotice(null);
+    }
+  }, [agentMeta.isEditing]);
+
+  const handleTraceToggle = useCallback(
+    (enabled: boolean) => {
+      setAgentTraceEnabled(enabled);
+      if (enabled) {
+        if (!agentTraceId) {
+          setAgentTraceId(generateTraceId());
+        }
+        return;
+      }
+      setAgentTraceId(null);
+    },
+    [agentTraceId],
+  );
+
+  const handleTraceRefresh = useCallback(() => {
+    setAgentTraceId(generateTraceId());
+  }, []);
+
+  const ensureTraceState = useCallback(() => {
+    if (!agentTraceEnabled) {
+      if (agentTraceId !== null) {
+        setAgentTraceId(null);
+      }
+      return { enabled: false, traceId: null as string | null };
+    }
+    if (agentTraceId) {
+      return { enabled: true, traceId: agentTraceId };
+    }
+    const id = generateTraceId();
+    setAgentTraceId(id);
+    return { enabled: true, traceId: id };
+  }, [agentTraceEnabled, agentTraceId]);
 
   const handleRemove = useCallback(
     (event: MouseEvent<HTMLButtonElement>) => {
@@ -152,6 +256,85 @@ export function TileFlowNode({ data, dragging }: Props) {
     [privateBeachId, removeTile, rewriteEnabled, tile.id],
   );
 
+  const runAgentOnboarding = useCallback(
+    async (metaPayload: AgentMetadata) => {
+      if (!tile.sessionMeta?.sessionId || !privateBeachId) {
+        return;
+      }
+      setAgentSaveState('saving');
+      setAgentSaveNotice(null);
+      try {
+        const token = managerToken ?? (await refreshManagerToken());
+        if (!token) {
+          console.warn('[agent-tile] unable to acquire manager token for onboarding', {
+            tileId: tile.id,
+          });
+          return;
+        }
+        const sessionId = tile.sessionMeta.sessionId;
+        const sessions = await listSessions(privateBeachId, token, managerBaseUrl);
+        const summary = sessions.find((session) => session.session_id === sessionId) ?? null;
+        if (!summary) {
+          console.warn('[agent-tile] agent session not found on manager', {
+            tileId: tile.id,
+            sessionId,
+          });
+          return;
+        }
+        await updateSessionRoleById(
+          sessionId,
+          'agent',
+          token,
+          managerBaseUrl,
+          summary.metadata,
+          summary.location_hint ?? null,
+        );
+        const traceId = metaPayload.trace?.enabled ? metaPayload.trace.trace_id ?? undefined : undefined;
+        const onboarding = await onboardAgent(
+          sessionId,
+          'pong',
+          ['agent'],
+          token,
+          managerBaseUrl,
+          undefined,
+          traceId,
+        );
+        const metadataPayload = buildSessionMetadataWithTile(summary.metadata, tile.id, tile.sessionMeta ?? {});
+        metadataPayload.role = 'agent';
+        metadataPayload.agent = {
+          profile: 'pong',
+          prompt_pack: onboarding.prompt_pack ?? null,
+          mcp_bridges: onboarding.mcp_bridges ?? [],
+        };
+        if (metaPayload.trace?.enabled) {
+          metadataPayload.agent.trace = {
+            enabled: true,
+            trace_id: metaPayload.trace.trace_id ?? null,
+          };
+        }
+        await updateSessionMetadata(
+          sessionId,
+          {
+            metadata: metadataPayload,
+            location_hint: summary.location_hint ?? null,
+          },
+          token,
+          managerBaseUrl,
+        );
+        setAgentSaveNotice('Agent onboarding updated.');
+      } catch (error) {
+        console.warn('[agent-tile] onboarding failed', {
+          tileId: tile.id,
+          sessionId: tile.sessionMeta?.sessionId,
+          error,
+        });
+      } finally {
+        setAgentSaveState('idle');
+      }
+    },
+    [managerBaseUrl, managerToken, privateBeachId, refreshManagerToken, tile.id, tile.sessionMeta],
+  );
+
   const handleAgentSave = useCallback(() => {
     if (!isAgent) return;
     const nextRole = agentRole.trim();
@@ -159,12 +342,37 @@ export function TileFlowNode({ data, dragging }: Props) {
     if (!nextRole || !nextResp) {
       return;
     }
+    const traceState = ensureTraceState();
+    const nextMeta: AgentMetadata = {
+      role: nextRole,
+      responsibility: nextResp,
+      isEditing: false,
+    };
+    if (traceState.enabled) {
+      nextMeta.trace = {
+        enabled: true,
+        trace_id: traceState.traceId ?? undefined,
+      };
+    }
     createTile({
       id: tile.id,
-      agentMeta: { role: nextRole, responsibility: nextResp, isEditing: false },
+      agentMeta: nextMeta,
       focus: false,
     });
-  }, [agentResponsibility, agentRole, createTile, isAgent, tile.id]);
+    if (tile.sessionMeta?.sessionId && privateBeachId) {
+      void runAgentOnboarding(nextMeta);
+    }
+  }, [
+    agentResponsibility,
+    agentRole,
+    createTile,
+    ensureTraceState,
+    isAgent,
+    privateBeachId,
+    runAgentOnboarding,
+    tile.id,
+    tile.sessionMeta,
+  ]);
 
   const handleAgentEdit = useCallback(() => {
     if (!isAgent) return;
@@ -183,6 +391,8 @@ export function TileFlowNode({ data, dragging }: Props) {
     }
     setAgentRole(agentMeta.role);
     setAgentResponsibility(agentMeta.responsibility);
+    setAgentTraceEnabled(Boolean(agentMeta.trace?.enabled));
+    setAgentTraceId(agentMeta.trace?.trace_id ?? null);
     createTile({
       id: tile.id,
       agentMeta: { ...agentMeta, isEditing: false },
@@ -191,6 +401,10 @@ export function TileFlowNode({ data, dragging }: Props) {
   }, [agentMeta, createTile, isAgent, removeTile, tile.id]);
 
   const handleAutoResize = useCallback(() => {
+    if (isResizing) {
+      logAutoResizeEvent(tile.id, 'skip-resizing');
+      return;
+    }
     const viewportMetrics = viewportMetricsRef.current;
     logAutoResizeEvent(tile.id, 'attempt', {
       hasMetrics: Boolean(viewportMetrics),
@@ -262,6 +476,15 @@ export function TileFlowNode({ data, dragging }: Props) {
       logAutoResizeEvent(tile.id, 'no-op', nextSize);
       return;
     }
+    const deltaWidth = Math.abs(nextSize.width - tile.size.width);
+    const deltaHeight = Math.abs(nextSize.height - tile.size.height);
+    if (deltaWidth <= AUTO_RESIZE_TOLERANCE_PX && deltaHeight <= AUTO_RESIZE_TOLERANCE_PX) {
+      logAutoResizeEvent(tile.id, 'tolerance-skip', {
+        size: nextSize,
+        current: tile.size,
+      });
+      return;
+    }
     logAutoResizeEvent(tile.id, 'apply', {
       size: nextSize,
       chromeWidthPx,
@@ -284,7 +507,7 @@ export function TileFlowNode({ data, dragging }: Props) {
       rewriteEnabled,
       size: nextSize,
     });
-  }, [nodeRef, privateBeachId, resizeTile, rewriteEnabled, tile.id, tile.size.height, tile.size.width, zoom]);
+  }, [isResizing, nodeRef, privateBeachId, resizeTile, rewriteEnabled, tile.id, tile.size.height, tile.size.width, zoom]);
 
   const handleResizeDoubleClick = useCallback(
     (event: MouseEvent<HTMLButtonElement>) => {
@@ -492,9 +715,13 @@ export function TileFlowNode({ data, dragging }: Props) {
     setInteractiveTile(tile.id);
   }, [bringToFront, isInteractive, setActiveTile, setInteractiveTile, tile.id]);
 
-  const handleViewportMetricsChange = useCallback((snapshot: TileViewportSnapshot | null) => {
-    viewportMetricsRef.current = snapshot;
-  }, []);
+  const handleViewportMetricsChange = useCallback(
+    (snapshot: TileViewportSnapshot | null) => {
+      viewportMetricsRef.current = snapshot;
+      updateTileViewport(tile.id, snapshot);
+    },
+    [tile.id, updateTileViewport],
+  );
 
   const showInteractOverlay = !isAgent && !isInteractive && hovered;
 
@@ -502,7 +729,7 @@ export function TileFlowNode({ data, dragging }: Props) {
     'group relative flex h-full w-full select-none flex-col overflow-visible rounded-2xl border border-slate-700/60 bg-slate-950/80 text-slate-200 shadow-[0_28px_80px_rgba(2,6,23,0.6)] backdrop-blur-xl transition-all duration-200',
     isActive && 'border-sky-400/60 shadow-[0_32px_90px_rgba(14,165,233,0.35)]',
     isResizing && 'cursor-[se-resize]',
-    isInteractive && 'border-sky-300/70 shadow-[0_32px_90px_rgba(56,189,248,0.45)] cursor-auto',
+    isInteractive && 'border-amber-400/80 shadow-[0_32px_90px_rgba(251,146,60,0.45)] ring-1 ring-amber-300/70 cursor-auto',
   );
 
   return (
@@ -547,7 +774,7 @@ export function TileFlowNode({ data, dragging }: Props) {
             </small>
           ) : null}
           {isInteractive ? (
-            <span className="mt-0.5 inline-flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.28em] text-sky-200">
+            <span className="mt-0.5 inline-flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.28em] text-amber-200">
               Live Control
             </span>
           ) : null}
@@ -579,6 +806,16 @@ export function TileFlowNode({ data, dragging }: Props) {
           className="border-b border-white/5 bg-slate-950/70 px-4 py-3 text-sm text-slate-300"
           data-tile-drag-ignore="true"
         >
+          {agentSaveState === 'saving' ? (
+            <p className="mb-2 rounded border border-sky-400/40 bg-sky-500/10 px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-sky-100">
+              Updating agent…
+            </p>
+          ) : null}
+          {agentSaveNotice ? (
+            <p className="mb-2 rounded border border-emerald-400/30 bg-emerald-500/10 px-3 py-1 text-[11px] text-emerald-100">
+              {agentSaveNotice}
+            </p>
+          ) : null}
           {showAgentEditor ? (
             <div className="space-y-2">
               <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400" htmlFor={`agent-role-${tile.id}`}>
@@ -602,6 +839,29 @@ export function TileFlowNode({ data, dragging }: Props) {
                 className="w-full rounded border border-white/10 bg-white/5 px-3 py-2 text-sm text-white focus:border-indigo-400 focus:outline-none"
                 placeholder="Describe how this agent should manage connected sessions"
               />
+              <label className="mt-2 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-400">
+                <input
+                  type="checkbox"
+                  checked={agentTraceEnabled}
+                  onChange={(event) => handleTraceToggle(event.target.checked)}
+                  className="h-4 w-4 rounded border border-white/20 bg-slate-900 text-indigo-400 focus:ring-indigo-400"
+                />
+                <span>Trace Logging</span>
+              </label>
+              {agentTraceEnabled ? (
+                <div className="flex items-center justify-between rounded-md border border-white/10 bg-white/5 px-3 py-2 text-[11px] text-slate-300">
+                  <span className="font-mono text-[10px]">
+                    {(agentTraceId ?? 'pending…').slice(0, 36)}
+                  </span>
+                  <button
+                    type="button"
+                    className="text-[10px] font-semibold uppercase tracking-[0.2em] text-sky-300"
+                    onClick={handleTraceRefresh}
+                  >
+                    Refresh
+                  </button>
+                </div>
+              ) : null}
               <div className="flex gap-2 pt-1 text-xs">
                 <button
                   type="button"
@@ -609,7 +869,7 @@ export function TileFlowNode({ data, dragging }: Props) {
                   className="flex-1 rounded bg-indigo-600 px-3 py-2 font-semibold text-white disabled:opacity-40"
                   disabled={!agentRole.trim() || !agentResponsibility.trim()}
                 >
-                  Save
+                  {agentSaveState === 'saving' ? 'Saving…' : 'Save'}
                 </button>
                 <button
                   type="button"
@@ -629,6 +889,12 @@ export function TileFlowNode({ data, dragging }: Props) {
               <div>
                 <p className="font-semibold uppercase tracking-[0.2em] text-slate-400">Responsibility</p>
                 <p className="text-sm text-white/90">{agentMeta.responsibility}</p>
+              </div>
+              <div>
+                <p className="font-semibold uppercase tracking-[0.2em] text-slate-400">Trace</p>
+                <p className="text-sm text-white/90">
+                  {agentMeta.trace?.enabled ? `Enabled (${agentMeta.trace.trace_id ?? 'pending'})` : 'Disabled'}
+                </p>
               </div>
               <p className="text-[11px] text-slate-400">
                 Drag the right connector to an application or another agent to define how this agent should manage it.
@@ -655,10 +921,17 @@ export function TileFlowNode({ data, dragging }: Props) {
         <ApplicationTile
           tileId={tile.id}
           privateBeachId={privateBeachId}
-          managerUrl={managerUrl}
+          managerUrl={managerBaseUrl}
           sessionMeta={tile.sessionMeta ?? null}
           onSessionMetaChange={handleMetaChange}
           onViewportMetricsChange={handleViewportMetricsChange}
+          traceContext={
+            isAgent && agentMeta.trace?.enabled
+              ? {
+                  traceId: agentMeta.trace?.trace_id ?? null,
+                }
+              : undefined
+          }
         />
       </section>
       <button

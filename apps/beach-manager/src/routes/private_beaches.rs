@@ -1,15 +1,16 @@
 use axum::{
-    extract::{Path, State},
     Json,
+    extract::{Path, State},
+    http::HeaderMap,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::state::{AppState, StateError, ViewerTokenError};
 
-use super::{sessions::ensure_scope, ApiError, ApiResult, AuthToken};
+use super::{ApiError, ApiResult, AuthToken, sessions::ensure_scope};
 
 #[derive(Debug, Deserialize)]
 pub struct CreateBeachRequest {
@@ -90,6 +91,8 @@ pub struct CanvasTileNode {
     pub locked: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolbar_pinned: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -240,6 +243,67 @@ impl CanvasLayout {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn canvas_layout_round_trips_tile_metadata() {
+        let mut layout = CanvasLayout::empty(0);
+        layout.tiles.insert(
+            "agent-1".into(),
+            CanvasTileNode {
+                id: "agent-1".into(),
+                position: CanvasPoint { x: 16.0, y: 24.0 },
+                size: CanvasSize {
+                    width: 320.0,
+                    height: 240.0,
+                },
+                z_index: 4,
+                group_id: None,
+                zoom: Some(0.8),
+                locked: Some(true),
+                toolbar_pinned: Some(false),
+                metadata: Some(json!({
+                    "nodeType": "agent",
+                    "agentMeta": {
+                        "role": "Planner",
+                        "responsibility": "Coordinate deploys",
+                    },
+                })),
+            },
+        );
+
+        let serialized = serde_json::to_value(&layout).expect("serialize layout");
+        let tile = serialized
+            .get("tiles")
+            .and_then(|tiles| tiles.get("agent-1"))
+            .expect("tile entry");
+        assert_eq!(
+            tile.get("metadata")
+                .and_then(|meta| meta.get("nodeType"))
+                .and_then(|node| node.as_str()),
+            Some("agent"),
+            "metadata should be serialized alongside tile"
+        );
+
+        let round_tripped: CanvasLayout =
+            serde_json::from_value(serialized).expect("deserialize layout");
+        let round_tile = round_tripped.tiles.get("agent-1").expect("tile entry");
+        assert_eq!(
+            round_tile
+                .metadata
+                .as_ref()
+                .and_then(|meta| meta.get("agentMeta"))
+                .and_then(|meta| meta.get("role"))
+                .and_then(|role| role.as_str()),
+            Some("Planner"),
+            "metadata should round-trip through serde"
+        );
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct ViewerCredentialResponse {
     pub credential_type: &'static str,
@@ -289,11 +353,23 @@ pub async fn batch_controller_assignments(
     State(state): State<AppState>,
     token: AuthToken,
     Path(_id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<BatchAssignmentsRequest>,
 ) -> ApiResult<BatchAssignmentsResponse> {
     ensure_scope(&token, "pb:control.write")?;
     if body.assignments.is_empty() {
         return Err(ApiError::BadRequest("assignments array required".into()));
+    }
+    if let Some(trace_header) = headers
+        .get("x-trace-id")
+        .and_then(|value| value.to_str().ok())
+    {
+        info!(
+            target: "controller.assignments",
+            trace_id = trace_header,
+            assignments = body.assignments.len(),
+            "batch controller assignments request"
+        );
     }
     let mut results = Vec::with_capacity(body.assignments.len());
     for item in body.assignments.into_iter() {

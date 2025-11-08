@@ -15,6 +15,10 @@ export type AssignmentEdgeData = {
   updateMode: UpdateMode;
   pollFrequency: number;
   isEditing: boolean;
+  status?: 'ok' | 'error';
+  statusMessage?: string | null;
+  onRetry?: (payload: { id: string }) => void;
+  onShowTrace?: (payload: { id: string }) => void;
   onSave: (payload: { id: string; instructions: string; updateMode: UpdateMode; pollFrequency: number }) => void;
   onEdit: (payload: { id: string }) => void;
   onDelete: (payload: { id: string }) => void;
@@ -158,15 +162,47 @@ export const AssignmentEdge = memo(function AssignmentEdge({
               </div>
             </form>
           ) : (
-            <button
-              type="button"
-              onClick={() => data.onEdit({ id })}
-              onPointerDown={(event) => event.stopPropagation()}
-              className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-white/60 bg-slate-900/80 text-sm text-white shadow-md transition hover:border-white/90 hover:bg-slate-900"
-              aria-label="View assignment details"
-            >
-              ⓘ
-            </button>
+            <div className="flex flex-col items-center gap-2">
+              <button
+                type="button"
+                onClick={() => data.onEdit({ id })}
+                onPointerDown={(event) => event.stopPropagation()}
+                className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-white/60 bg-slate-900/80 text-sm text-white shadow-md transition hover:border-white/90 hover:bg-slate-900"
+                aria-label="View assignment details"
+              >
+                ⓘ
+              </button>
+              {data.onShowTrace ? (
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    data.onShowTrace?.({ id });
+                  }}
+                  className="inline-flex items-center justify-center rounded-full border border-sky-400/70 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.2em] text-sky-100 hover:border-sky-200"
+                >
+                  Trace
+                </button>
+              ) : null}
+              {data.status === 'error' && data.statusMessage ? (
+                <div className="w-48 rounded-xl border border-red-400/40 bg-red-500/10 px-3 py-2 text-[10px] text-red-100 shadow-lg">
+                  <p className="font-semibold uppercase tracking-[0.2em]">Pairing failed</p>
+                  <p className="mt-1">{data.statusMessage}</p>
+                  {data.onRetry ? (
+                    <button
+                      type="button"
+                      className="mt-2 inline-flex items-center justify-center rounded border border-red-200/60 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.2em] text-red-100 hover:border-red-100 hover:text-white"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        data.onRetry?.({ id });
+                      }}
+                    >
+                      Retry
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
           )}
         </div>
       </EdgeLabelRenderer>

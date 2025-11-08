@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use axum::{
     extract::{Path, Query, State},
+    http::HeaderMap,
     Json,
 };
 use beach_buggy::{
@@ -144,12 +145,27 @@ pub async fn list_sessions(
     State(state): State<AppState>,
     token: AuthToken,
     Path(private_beach_id): Path<String>,
+    headers: HeaderMap,
 ) -> ApiResult<Vec<SessionSummary>> {
     ensure_scope(&token, "pb:sessions.read")?;
     let sessions = state
         .list_sessions(&private_beach_id)
         .await
         .map_err(map_state_err)?;
+    if let Some(trace_id) = headers
+        .get("x-trace-id")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        info!(
+            target: "trace.sessions",
+            trace_id,
+            private_beach_id = %private_beach_id,
+            session_count = sessions.len(),
+            "list_sessions trace request"
+        );
+    }
     Ok(Json(sessions))
 }
 
@@ -225,8 +241,21 @@ pub async fn delete_controller_pairing(
     State(state): State<AppState>,
     token: AuthToken,
     Path((controller_session_id, child_session_id)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> ApiResult<serde_json::Value> {
     ensure_scope(&token, "pb:control.write")?;
+    if let Some(trace_header) = headers
+        .get("x-trace-id")
+        .and_then(|value| value.to_str().ok())
+    {
+        info!(
+            target: "controller.assignments",
+            trace_id = trace_header,
+            controller_session_id,
+            child_session_id,
+            "delete controller pairing request"
+        );
+    }
     state
         .delete_controller_pairing(
             &controller_session_id,
@@ -242,11 +271,24 @@ pub async fn queue_actions(
     State(state): State<AppState>,
     token: AuthToken,
     Path(session_id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<QueueActionsRequest>,
 ) -> ApiResult<serde_json::Value> {
     ensure_scope(&token, "pb:control.write")?;
     if body.actions.is_empty() {
         return Err(ApiError::BadRequest("actions array required".into()));
+    }
+    if let Some(trace_id) = headers
+        .get("x-trace-id")
+        .and_then(|value| value.to_str().ok())
+    {
+        info!(
+            target: "controller.actions",
+            trace_id,
+            session_id,
+            action_count = body.actions.len(),
+            "queue_actions request"
+        );
     }
 
     state
@@ -369,6 +411,7 @@ pub struct EventsFilter {
 pub async fn onboard_agent(
     State(state): State<AppState>,
     token: AuthToken,
+    headers: HeaderMap,
     Json(body): Json<OnboardAgentRequest>,
 ) -> ApiResult<AgentOnboardResponse> {
     ensure_scope(&token, "pb:agents.onboard")?;
@@ -381,6 +424,21 @@ pub async fn onboard_agent(
         )
         .await
         .map_err(map_state_err)?;
+    if let Some(trace_id) = headers
+        .get("x-trace-id")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        info!(
+            target: "trace.agents",
+            trace_id,
+            session_id = %body.session_id,
+            template_id = %body.template_id,
+            bridge_count = response.mcp_bridges.len(),
+            "agent onboard response tagged"
+        );
+    }
     Ok(Json(response))
 }
 

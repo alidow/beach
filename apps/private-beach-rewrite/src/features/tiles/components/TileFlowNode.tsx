@@ -2,13 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useRef } from 'react';
 import type { MouseEvent, PointerEvent } from 'react';
-import { NodeResizer, type NodeProps } from 'reactflow';
+import { NodeResizer, type NodeProps, useStore, type ReactFlowState } from 'reactflow';
 import { ApplicationTile } from '@/components/ApplicationTile';
 import { TILE_HEADER_HEIGHT, MIN_TILE_WIDTH, MIN_TILE_HEIGHT } from '../constants';
 import { useTileActions } from '../store';
-import type { TileDescriptor, TileSessionMeta } from '../types';
+import type { TileDescriptor, TileSessionMeta, TileViewportSnapshot } from '../types';
 import { snapSize } from '../utils';
 import { emitTelemetry } from '../../../../../private-beach/src/lib/telemetry';
+import { computeAutoResizeSize } from '../autoResize';
 
 type TileFlowNodeData = {
   tile: TileDescriptor;
@@ -42,39 +43,30 @@ function isInteractiveElement(target: EventTarget | null): boolean {
   return Boolean(target.closest('button, input, textarea, select, a, label'));
 }
 
+const zoomSelector = (state: ReactFlowState) => state.transform[2] ?? 1;
+const AUTO_RESIZE_TOLERANCE_PX = 1;
+
+function logAutoResizeEvent(tileId: string, step: string, detail: Record<string, unknown> = {}) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  try {
+    console.info('[tile][auto-resize]', step, JSON.stringify({ tileId, ...detail }));
+  } catch {
+    console.info('[tile][auto-resize]', step, { tileId, ...detail });
+  }
+}
+
 type Props = NodeProps<TileFlowNodeData>;
 
 export function TileFlowNode({ data, dragging }: Props) {
   const { tile, orderIndex, isActive, isResizing, privateBeachId, managerUrl, rewriteEnabled } = data;
   const { removeTile, bringToFront, setActiveTile, beginResize, resizeTile, endResize, updateTileMeta } = useTileActions();
   const nodeRef = useRef<HTMLElement | null>(null);
-  const draggingRef = useRef(false);
+  const viewportMetricsRef = useRef<TileViewportSnapshot | null>(null);
+  const zoom = useStore(zoomSelector);
 
   const zIndex = useMemo(() => 10 + orderIndex, [orderIndex]);
-
-  useEffect(() => {
-    const node = nodeRef.current;
-    if (!node) return;
-    if (typeof ResizeObserver === 'undefined') {
-      return;
-    }
-    const observer = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (!entry) return;
-      if (data.isResizing) return;
-      const width = Math.round(entry.contentRect.width);
-      const height = Math.round(entry.contentRect.height);
-      const snapped = snapSize({ width, height });
-      if (snapped.width === tile.size.width && snapped.height === tile.size.height) {
-        return;
-      }
-      resizeTile(tile.id, snapped);
-    });
-    observer.observe(node);
-    return () => {
-      observer.disconnect();
-    };
-  }, [data.isResizing, resizeTile, tile.id, tile.size.height, tile.size.width]);
 
   const handleRemove = useCallback(
     (event: MouseEvent<HTMLButtonElement>) => {
@@ -146,6 +138,152 @@ export function TileFlowNode({ data, dragging }: Props) {
     [tile.id, tile.sessionMeta, updateTileMeta],
   );
 
+  const handleAutoResize = useCallback(() => {
+    if (isResizing) {
+      logAutoResizeEvent(tile.id, 'skip-resizing');
+      return;
+    }
+    const viewportMetrics = viewportMetricsRef.current;
+    logAutoResizeEvent(tile.id, 'attempt', {
+      hasMetrics: Boolean(viewportMetrics),
+      zoom: zoom ?? null,
+    });
+    if (!viewportMetrics) {
+      logAutoResizeEvent(tile.id, 'missing-metrics');
+      return;
+    }
+    const hostRows = viewportMetrics.hostRows ?? null;
+    const hostCols = viewportMetrics.hostCols ?? null;
+    const pixelsPerRow = viewportMetrics.pixelsPerRow ?? null;
+    const pixelsPerCol = viewportMetrics.pixelsPerCol ?? null;
+    if (!hostRows || !hostCols || !pixelsPerRow || !pixelsPerCol) {
+      logAutoResizeEvent(tile.id, 'incomplete-metrics', {
+        hostRows,
+        hostCols,
+        pixelsPerRow,
+        pixelsPerCol,
+      });
+      return;
+    }
+    const container = nodeRef.current;
+    if (!container) {
+      logAutoResizeEvent(tile.id, 'missing-container');
+      return;
+    }
+    const terminalRoot = container.querySelector<HTMLElement>(
+      `[data-terminal-root="true"][data-terminal-tile="${tile.id}"]`,
+    );
+    const terminalContent =
+      terminalRoot?.querySelector<HTMLElement>('[data-terminal-content="true"]') ?? terminalRoot;
+    const terminal = terminalContent ?? terminalRoot;
+    if (!terminal) {
+      logAutoResizeEvent(tile.id, 'missing-terminal');
+      return;
+    }
+    const tileRect = container.getBoundingClientRect();
+    const terminalRect = terminal.getBoundingClientRect();
+    if (tileRect.width <= 0 || tileRect.height <= 0 || terminalRect.width <= 0 || terminalRect.height <= 0) {
+      logAutoResizeEvent(tile.id, 'invalid-rect', { tileRect, terminalRect });
+      return;
+    }
+    const zoomFactor = zoom && zoom > 0 ? zoom : 1;
+    const tileWidthPx = tileRect.width / zoomFactor;
+    const tileHeightPx = tileRect.height / zoomFactor;
+    const terminalWidthPx = terminalRect.width / zoomFactor;
+    const terminalHeightPx = terminalRect.height / zoomFactor;
+    const chromeWidthPx = Math.max(0, tileWidthPx - terminalWidthPx);
+    const chromeHeightPx = Math.max(0, tileHeightPx - terminalHeightPx);
+    const viewportCols = viewportMetrics.viewportCols ?? hostCols ?? null;
+    const viewportRows = viewportMetrics.viewportRows ?? hostRows ?? null;
+    const observedCellWidth =
+      viewportCols && viewportCols > 0 ? terminalWidthPx / viewportCols : null;
+    const observedRowHeight =
+      viewportRows && viewportRows > 0 ? terminalHeightPx / viewportRows : null;
+    const nextSize = computeAutoResizeSize({
+      metrics: viewportMetrics,
+      chromeWidthPx,
+      chromeHeightPx,
+      zoom: zoom ?? 1,
+      observedCellWidth,
+      observedRowHeight,
+    });
+    if (!nextSize) {
+      logAutoResizeEvent(tile.id, 'compute-failed', { chromeWidthPx, chromeHeightPx });
+      return;
+    }
+    if (nextSize.width === tile.size.width && nextSize.height === tile.size.height) {
+      logAutoResizeEvent(tile.id, 'no-op', nextSize);
+      return;
+    }
+    const deltaWidth = Math.abs(nextSize.width - tile.size.width);
+    const deltaHeight = Math.abs(nextSize.height - tile.size.height);
+    if (deltaWidth <= AUTO_RESIZE_TOLERANCE_PX && deltaHeight <= AUTO_RESIZE_TOLERANCE_PX) {
+      logAutoResizeEvent(tile.id, 'tolerance-skip', {
+        size: nextSize,
+        current: tile.size,
+      });
+      return;
+    }
+    logAutoResizeEvent(tile.id, 'apply', {
+      size: nextSize,
+      chromeWidthPx,
+      chromeHeightPx,
+      zoom: zoom ?? 1,
+      observedCellWidth,
+      observedRowHeight,
+    });
+    resizeTile(tile.id, nextSize);
+    emitTelemetry('canvas.resize.auto', {
+      privateBeachId,
+      tileId: tile.id,
+      hostRows,
+      hostCols,
+      viewportRows: viewportMetrics.viewportRows ?? null,
+      viewportCols: viewportMetrics.viewportCols ?? null,
+      pixelsPerRow,
+      pixelsPerCol,
+      zoom: zoom ?? 1,
+      rewriteEnabled,
+      size: nextSize,
+    });
+  }, [
+    isResizing,
+    nodeRef,
+    privateBeachId,
+    resizeTile,
+    rewriteEnabled,
+    tile.id,
+    tile.size.height,
+    tile.size.width,
+    zoom,
+  ]);
+
+  const handleViewportMetricsChange = useCallback(
+    (snapshot: TileViewportSnapshot | null) => {
+      viewportMetricsRef.current = snapshot;
+      if (!snapshot) {
+        logAutoResizeEvent(tile.id, 'metrics-cleared');
+        return;
+      }
+      logAutoResizeEvent(tile.id, 'metrics-updated', {
+        hostRows: snapshot.hostRows,
+        hostCols: snapshot.hostCols,
+        viewportRows: snapshot.viewportRows,
+        viewportCols: snapshot.viewportCols,
+        pixelsPerRow: snapshot.pixelsPerRow,
+        pixelsPerCol: snapshot.pixelsPerCol,
+      });
+    },
+    [tile.id],
+  );
+
+  useEffect(() => {
+    if (!tile.sessionMeta?.sessionId) {
+      viewportMetricsRef.current = null;
+      logAutoResizeEvent(tile.id, 'session-cleared');
+    }
+  }, [tile.sessionMeta?.sessionId]);
+
   return (
     <article
       ref={nodeRef}
@@ -185,6 +323,8 @@ export function TileFlowNode({ data, dragging }: Props) {
           managerUrl={managerUrl}
           sessionMeta={tile.sessionMeta ?? null}
           onSessionMetaChange={handleMetaChange}
+          onViewportMetricsChange={handleViewportMetricsChange}
+          interactive={tile.interactive !== false}
         />
       </section>
     </article>

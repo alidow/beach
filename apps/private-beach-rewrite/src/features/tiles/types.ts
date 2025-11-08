@@ -26,8 +26,19 @@ export type TileDescriptor = {
   position: TilePosition;
   size: TileSize;
   sessionMeta?: TileSessionMeta | null;
+  interactive?: boolean;
   createdAt: number;
   updatedAt: number;
+};
+
+export type TileViewportSnapshot = {
+  tileId: string;
+  hostRows: number | null;
+  hostCols: number | null;
+  viewportRows: number | null;
+  viewportCols: number | null;
+  pixelsPerRow: number | null;
+  pixelsPerCol: number | null;
 };
 
 export type TileState = {
@@ -35,6 +46,7 @@ export type TileState = {
   order: string[];
   activeId: string | null;
   resizing: Record<string, boolean>;
+  interactiveId: string | null;
 };
 
 export type TileCreateInput = {

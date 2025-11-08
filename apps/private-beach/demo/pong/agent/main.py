@@ -24,7 +24,7 @@ import uuid
 from dataclasses import dataclass, field
 from getpass import getpass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 import sys
 import urllib.error
 import urllib.parse
@@ -161,6 +161,66 @@ class StateSubscriber(threading.Thread):
                     break
 
 
+class PairingSubscriber(threading.Thread):
+    def __init__(
+        self,
+        client: PrivateBeachManagerClient,
+        controller_session_id: str,
+        private_beach_id: str,
+        output: "queue.Queue[Tuple[str, object]]",
+        stop_event: threading.Event,
+        on_pairing: Callable[[str, str, Dict[str, object]], None],
+    ) -> None:
+        super().__init__(daemon=True)
+        self.client = client
+        self.controller_session_id = controller_session_id
+        self.private_beach_id = private_beach_id
+        self.output = output
+        self.stop_event = stop_event
+        self._local_stop = threading.Event()
+        self._callback = on_pairing
+
+    def stop(self) -> None:
+        self._local_stop.set()
+
+    def run(self) -> None:  # pragma: no cover - network path
+        while not self.stop_event.is_set() and not self._local_stop.is_set():
+            try:
+                for payload in self.client.subscribe_controller_pairings(
+                    self.controller_session_id
+                ):
+                    if self.stop_event.is_set() or self._local_stop.is_set():
+                        return
+                    self._handle_event(payload)
+            except ManagerRequestError as exc:
+                self.output.put(("error", f"pairing stream error: {exc}"))
+                if self.stop_event.wait(2.0) or self._local_stop.wait(2.0):
+                    break
+
+    def _handle_event(self, payload: Dict[str, object]) -> None:
+        child_session_id = payload.get("child_session_id")
+        action_raw = payload.get("action")
+        pairing = payload.get("pairing") or {}
+        if not isinstance(child_session_id, str):
+            return
+        action = str(action_raw or "").lower()
+        metadata = fetch_relationship_metadata(
+            self.client,
+            self.private_beach_id,
+            self.controller_session_id,
+            child_session_id,
+            self.output,
+        )
+        metadata["update_cadence"] = pairing.get("update_cadence")
+        self._callback(child_session_id, action, metadata)
+        self.output.put(
+            (
+                "info",
+                f"pairing {action or 'unknown'} child={child_session_id} cadence={pairing.get('update_cadence')} trace={metadata.get('trace_id') or 'off'} poll={metadata.get('poll_frequency')}",
+            )
+        )
+
+
 class LeaseRenewer(threading.Thread):
     def __init__(
         self,
@@ -204,6 +264,70 @@ class LeaseRenewer(threading.Thread):
         self.output.put(("info", "controller lease renewer stopped"))
 
 
+class StatePoller(threading.Thread):
+    def __init__(
+        self,
+        client: PrivateBeachManagerClient,
+        session_id: str,
+        output: "queue.Queue[Tuple[str, object]]",
+        global_stop: threading.Event,
+        interval: float,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.client = client
+        self.session_id = session_id
+        self.output = output
+        self._global_stop = global_stop
+        self._local_stop = threading.Event()
+        self._interval = max(float(interval), 0.5)
+        self._interval_lock = threading.Lock()
+
+    def update_interval(self, interval: float) -> None:
+        with self._interval_lock:
+            self._interval = max(float(interval), 0.5)
+
+    def stop(self) -> None:
+        self._local_stop.set()
+
+    def _current_interval(self) -> float:
+        with self._interval_lock:
+            return self._interval
+
+    def run(self) -> None:  # pragma: no cover - network path
+        while not self._global_stop.is_set() and not self._local_stop.is_set():
+            try:
+                payload = self.client.fetch_state_snapshot(self.session_id)
+                if payload:
+                    event = {
+                        "session_id": self.session_id,
+                        "payload": payload,
+                        "received_at": time.time(),
+                    }
+                    self.output.put(("diff", event))
+            except ManagerRequestError as exc:
+                self.output.put(
+                    ("error", f"state poll error ({self.session_id}): {exc}")
+                )
+                if self._wait_interval(2.0):
+                    break
+                continue
+            if self._wait_interval(self._current_interval()):
+                break
+        self.output.put(("info", f"state poller stopped for {self.session_id}"))
+
+    def _wait_interval(self, interval: float) -> bool:
+        delay = max(interval, 0.5)
+        elapsed = 0.0
+        step = min(0.5, delay)
+        while elapsed < delay:
+            remaining = delay - elapsed
+            window = min(step, remaining)
+            if self._global_stop.wait(window) or self._local_stop.is_set():
+                return True
+            elapsed += window
+        return False
+
+
 @dataclass
 class AutopairContext:
     controller_session_id: str
@@ -211,6 +335,8 @@ class AutopairContext:
     child_sessions: Dict[str, str]
     session_roles: Dict[str, str]
     lease_expires_at_ms: int
+    prompt_pack: Optional[Dict[str, object]] = None
+    mcp_bridges: Optional[List[Dict[str, object]]] = None
 
 
 def _metadata_dict(value: Optional[object]) -> Dict[str, object]:
@@ -245,6 +371,8 @@ def autopair_sessions(
 
     agent_session_id: Optional[str] = None
     child_sessions: Dict[str, str] = {}
+    agent_prompt_pack: Optional[Dict[str, object]] = None
+    agent_bridges: Optional[List[Dict[str, object]]] = None
 
     for attempt in range(max(1, attempts)):
         try:
@@ -271,6 +399,16 @@ def autopair_sessions(
                     agent_session_id = session_id
                 elif session_tag and tag == session_tag:
                     agent_session_id = session_id
+                agent_meta = metadata.get("agent")
+                if isinstance(agent_meta, dict):
+                    pack = agent_meta.get("prompt_pack")
+                    if isinstance(pack, dict):
+                        agent_prompt_pack = pack
+                    bridges = agent_meta.get("mcp_bridges")
+                    if isinstance(bridges, list):
+                        filtered = [entry for entry in bridges if isinstance(entry, dict)]
+                        if filtered:
+                            agent_bridges = filtered
 
         if agent_session_id and child_sessions:
             break
@@ -334,6 +472,8 @@ def autopair_sessions(
         child_sessions=child_sessions,
         session_roles=session_roles,
         lease_expires_at_ms=lease.expires_at_ms,
+        prompt_pack=agent_prompt_pack,
+        mcp_bridges=agent_bridges,
     )
 
 
@@ -364,6 +504,7 @@ class MCPClient:
             default_controller_token.strip() if default_controller_token else None
         )
         self._session_tokens: Dict[str, str] = dict(session_tokens or {})
+        self._trace_ids: Dict[str, Optional[str]] = {}
         self._timeout = timeout
         self._target = target
         self._lock = threading.Lock()
@@ -393,20 +534,34 @@ class MCPClient:
     def current_session_token(self, session_id: str) -> Optional[str]:
         return self._session_tokens.get(session_id) or self._default_controller_token
 
-    def queue_terminal_write(self, session_id: str, data: str) -> None:
+    def set_trace_id(self, session_id: str, trace_id: Optional[str]) -> None:
+        if trace_id:
+            self._trace_ids[session_id] = trace_id
+        elif session_id in self._trace_ids:
+            del self._trace_ids[session_id]
+
+    @property
+    def http_enabled(self) -> bool:
+        return bool(self._base_url)
+
+    def queue_terminal_write(self, session_id: str, data: str) -> bool:
         command_id = str(uuid.uuid4())
         action_payload = {
             "id": command_id,
             "action_type": "terminal_write",
             "payload": {"bytes": data},
         }
+        trace_id = self._trace_ids.get(session_id)
+        if trace_id:
+            action_payload["meta"] = {"trace_id": trace_id}
         transport_label = "log"
         status = "recorded"
 
+        send_success = True
         if self._base_url:
             transport_label = "http"
-            success = self._send_http(session_id, action_payload)
-            status = "sent" if success else "error"
+            send_success = self._send_http(session_id, action_payload)
+            status = "sent" if send_success else "error"
 
         serialized = json.dumps(
             {
@@ -447,8 +602,10 @@ class MCPClient:
                 "command": data.strip(),
                 "transport": transport_label,
                 "status": status,
+                "trace_id": trace_id,
             }
         )
+        return send_success
 
     def _send_http(self, session_id: str, action_payload: Dict[str, object]) -> bool:
         token = self.current_session_token(session_id)
@@ -478,6 +635,9 @@ class MCPClient:
         }
         if self._auth_token:
             headers["Authorization"] = f"Bearer {self._auth_token}"
+        trace_id = self._trace_ids.get(session_id)
+        if trace_id:
+            headers["X-Trace-Id"] = trace_id
 
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
@@ -615,7 +775,7 @@ class SessionState:
 class AgentApp:
     def __init__(
         self,
-        stdscr: "curses._CursesWindow",
+        stdscr: Optional["curses._CursesWindow"],
         session_roles: Dict[str, str],
         diff_queue: "queue.Queue[Tuple[str, object]]",
         mcp_client: MCPClient,
@@ -625,6 +785,9 @@ class AgentApp:
         max_step: float,
         min_threshold: float,
         command_interval: float,
+        prompt_pack: Optional[Dict[str, object]] = None,
+        mcp_bridges: Optional[List[Dict[str, object]]] = None,
+        headless: bool = False,
     ) -> None:
         self.stdscr = stdscr
         self.session_roles = session_roles
@@ -636,6 +799,8 @@ class AgentApp:
         self.max_step = max_step
         self.min_threshold = min_threshold
         self.command_interval = command_interval
+        self.prompt_pack = prompt_pack or {}
+        self.headless = headless
 
         self.sessions: Dict[str, SessionState] = {}
         self.logs: List[str] = []
@@ -646,6 +811,27 @@ class AgentApp:
         self.last_spawn_time = 0.0
         self.last_draw_time = 0.0
         self.score = {"lhs": 0, "rhs": 0}
+        self.prompt_lines: List[str] = []
+        self.prompt_directives: Dict[str, object] = {}
+        self.prompt_panel_visible = False
+        self.bridge_defs = self._normalize_bridges(mcp_bridges)
+        self.bridge_states: Dict[str, str] = {}
+        self._bridge_endpoint_lookup = {
+            entry["endpoint"]: entry["id"]
+            for entry in self.bridge_defs
+            if isinstance(entry.get("endpoint"), str)
+        }
+        self._serve_preference: str = "random"
+        self._next_forced_side: Optional[str] = None
+        self._last_serve_side: Optional[str] = None
+        self._apply_prompt_pack()
+        for bridge in self.bridge_defs:
+            bridge_id = bridge["id"]
+            state = "pending"
+            endpoint = bridge.get("endpoint")
+            if endpoint == "private_beach.queue_action" and not self.mcp.http_enabled:
+                state = "disabled"
+            self.bridge_states[bridge_id] = state
 
     # ------------------------------------------------------------------ Logging
     def log(self, message: str, level: str = "info") -> None:
@@ -654,6 +840,8 @@ class AgentApp:
         self.logs.append(entry)
         if len(self.logs) > LOG_LIMIT:
             self.logs = self.logs[-LOG_LIMIT:]
+        if self.headless:
+            print(entry, flush=True)
 
     def log_event(self, event: Dict[str, object]) -> None:
         level = str(event.get("level", "info"))
@@ -665,13 +853,96 @@ class AgentApp:
             command = event.get("command", "")
             transport = event.get("transport", "log")
             status = event.get("status", "queued")
+            trace_note = ""
+            trace_value = event.get("trace_id")
+            if isinstance(trace_value, str) and trace_value.strip():
+                trace_note = f" trace={trace_value.strip()}"
             self.log(
-                f"[{status}] {session_id} via {transport}: {command}",
+                f"[{status}] {session_id} via {transport}: {command}{trace_note}",
                 level="action",
             )
         else:
             message = event.get("message", "")
             self.log(str(message), level=level)
+
+    # ----------------------------------------------------------- Prompt/Bridges
+    def _normalize_bridges(
+        self, entries: Optional[List[Dict[str, object]]]
+    ) -> List[Dict[str, object]]:
+        normalized: List[Dict[str, object]] = []
+        if not entries:
+            return normalized
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            bridge_id = str(entry.get("id") or entry.get("name") or "").strip()
+            if not bridge_id:
+                continue
+            record: Dict[str, object] = {
+                "id": bridge_id,
+                "name": str(entry.get("name") or bridge_id),
+            }
+            endpoint = entry.get("endpoint")
+            if isinstance(endpoint, str) and endpoint.strip():
+                record["endpoint"] = endpoint.strip()
+            normalized.append(record)
+        return normalized
+
+    def _apply_prompt_pack(self) -> None:
+        instructions = self.prompt_pack.get("instructions")
+        if isinstance(instructions, str) and instructions.strip():
+            self.prompt_lines = [line.rstrip() for line in instructions.strip().splitlines()]
+            if not self.headless:
+                self.log("Prompt instructions synchronized.", level="info")
+        options = self.prompt_pack.get("options")
+        directives: Dict[str, object] = {}
+        if isinstance(options, dict):
+            autopilot_opts = options.get("autopilot")
+            if isinstance(autopilot_opts, dict):
+                directives = autopilot_opts
+            else:
+                directives = options
+        self.prompt_directives = directives
+        if directives:
+            self._configure_from_prompt_options(directives)
+
+    def _configure_from_prompt_options(self, directives: Dict[str, object]) -> None:
+        serve_pref = directives.get("serve_preference")
+        if isinstance(serve_pref, str):
+            normalized = serve_pref.lower()
+            if normalized in {"lhs", "rhs", "alternate", "random"}:
+                self._serve_preference = normalized
+        initial_serve = directives.get("initial_serve")
+        if isinstance(initial_serve, str):
+            lowered = initial_serve.lower()
+            if lowered in {"lhs", "rhs"}:
+                self._next_forced_side = lowered
+        strategy = directives.get("paddle_strategy")
+        if isinstance(strategy, str):
+            self._apply_paddle_strategy(strategy.lower())
+        serve_interval = directives.get("serve_interval")
+        if isinstance(serve_interval, (int, float)) and serve_interval > 0:
+            self.serve_interval = float(serve_interval)
+        command_interval = directives.get("command_interval")
+        if isinstance(command_interval, (int, float)) and command_interval > 0:
+            self.command_interval = float(command_interval)
+        max_step = directives.get("max_step")
+        if isinstance(max_step, (int, float)) and max_step > 0:
+            self.max_step = float(max_step)
+        min_threshold = directives.get("min_threshold")
+        if isinstance(min_threshold, (int, float)) and min_threshold > 0:
+            self.min_threshold = float(min_threshold)
+        autopilot_enabled = directives.get("autopilot_enabled")
+        if isinstance(autopilot_enabled, bool):
+            self.autopilot_enabled = autopilot_enabled
+
+    def _apply_paddle_strategy(self, strategy: str) -> None:
+        if strategy == "aggressive":
+            self.max_step = max(self.max_step, self.max_step * 1.25)
+            self.min_threshold = max(0.1, self.min_threshold * 0.6)
+        elif strategy == "defensive":
+            self.max_step = max(0.5, self.max_step * 0.75)
+            self.min_threshold = min(1.0, self.min_threshold * 1.3)
 
     # ---------------------------------------------------------- Session helpers
     def ensure_session(self, session_id: str) -> SessionState:
@@ -704,15 +975,17 @@ class AgentApp:
 
     # ------------------------------------------------------------ Main control
     def run(self) -> None:
-        curses.curs_set(0)
-        self.stdscr.nodelay(True)
+        if not self.headless and self.stdscr:
+            curses.curs_set(0)
+            self.stdscr.nodelay(True)
         while self.running:
             now = time.monotonic()
             self._drain_incoming(now)
             if self.autopilot_enabled:
                 self._autopilot_tick(now)
-            self._draw(now)
-            self._handle_keys()
+            if not self.headless:
+                self._draw(now)
+                self._handle_keys()
             time.sleep(0.03)
         self.mcp.close()
 
@@ -725,10 +998,18 @@ class AgentApp:
                 break
             if kind == "diff":
                 self._handle_diff(payload, now)
+                self._set_bridge_state_for_endpoint(
+                    "private_beach.subscribe_state", "streaming"
+                )
             elif kind == "info":
                 self.log(str(payload), level="info")
             elif kind == "error":
-                self.log(str(payload), level="error")
+                message = str(payload)
+                if "state stream error" in message:
+                    self._set_bridge_state_for_endpoint(
+                        "private_beach.subscribe_state", "error"
+                    )
+                self.log(message, level="error")
             elif kind == "mcp":
                 if isinstance(payload, str):
                     try:
@@ -801,7 +1082,16 @@ class AgentApp:
             ]
             if not candidates:
                 return
-            target = random.choice(candidates)
+            target: Optional[SessionState] = None
+            if self._next_forced_side:
+                forced = self._select_session_by_side(candidates, self._next_forced_side)
+                if forced:
+                    target = forced
+                self._next_forced_side = None
+            if target is None:
+                target = self._select_serve_target(candidates)
+            if target is None:
+                return
         spawn_y = self._random_spawn_row(target)
         dx_mag = random.uniform(*self.serve_dx)
         dy_mag = random.uniform(*self.serve_dy)
@@ -887,12 +1177,114 @@ class AgentApp:
             return row + lead
         return row
 
+    def _select_session_by_side(
+        self, candidates: List[SessionState], side: str
+    ) -> Optional[SessionState]:
+        for session in candidates:
+            if session.side == side:
+                self._last_serve_side = side
+                return session
+        return None
+
+    def _select_serve_target(
+        self, candidates: List[SessionState]
+    ) -> Optional[SessionState]:
+        if not candidates:
+            return None
+        if self._serve_preference in {"lhs", "rhs"}:
+            match = self._select_session_by_side(candidates, self._serve_preference)
+            if match:
+                return match
+        if self._serve_preference == "alternate" and self._last_serve_side in {"lhs", "rhs"}:
+            next_side = "rhs" if self._last_serve_side == "lhs" else "lhs"
+            match = self._select_session_by_side(candidates, next_side)
+            if match:
+                return match
+        choice = random.choice(candidates)
+        if choice.side in {"lhs", "rhs"}:
+            self._last_serve_side = choice.side
+        return choice
+
+    def _build_status_line(self, width: int) -> str:
+        parts: List[str] = []
+        if self.bridge_defs:
+            bridge_summary = " ".join(
+                self._format_bridge_status(bridge) for bridge in self.bridge_defs[:3]
+            )
+            if bridge_summary:
+                parts.append(f"Bridges: {bridge_summary}")
+        if self.prompt_lines:
+            toggle = "ON" if self.prompt_panel_visible else "OFF"
+            parts.append(f"[P]rompt {toggle}")
+        if not parts:
+            return ""
+        summary = "  ".join(parts)
+        return summary[: max(width - 1, 0)]
+
+    def _format_bridge_status(self, bridge: Dict[str, object]) -> str:
+        bridge_id = bridge.get("id") or "bridge"
+        name = bridge.get("name") or bridge_id
+        status = self.bridge_states.get(str(bridge_id), "pending")
+        return f"{name}[{status}]"
+
+    def _draw_prompt_panel(self, start_y: int, width: int, max_height: int) -> int:
+        if max_height <= 2:
+            return 0
+        lines = self.prompt_lines or []
+        panel_height = min(max_height, len(lines) + 2)
+        self._addstr_safe(start_y, 1, width - 2, " Prompt Pack ")
+        available = panel_height - 1
+        for idx, line in enumerate(lines[: available]):
+            self._addstr_safe(start_y + 1 + idx, 2, width - 4, line)
+        summary = self._prompt_directives_summary()
+        if summary:
+            footer_row = start_y + panel_height - 1
+            self._addstr_safe(footer_row, 2, width - 4, f"Directives: {summary}")
+        return panel_height
+
+    def _prompt_directives_summary(self) -> str:
+        if not self.prompt_directives:
+            return ""
+        parts: List[str] = []
+        serve_pref = self.prompt_directives.get("serve_preference") or self.prompt_directives.get(
+            "initial_serve"
+        )
+        if isinstance(serve_pref, str):
+            parts.append(f"serve={serve_pref}")
+        strategy = self.prompt_directives.get("paddle_strategy")
+        if isinstance(strategy, str):
+            parts.append(f"strategy={strategy}")
+        return ", ".join(parts)
+
+    def _set_bridge_state(self, bridge_id: str, state: str) -> None:
+        if bridge_id not in self.bridge_states:
+            return
+        previous = self.bridge_states.get(bridge_id)
+        if previous == state:
+            return
+        self.bridge_states[bridge_id] = state
+        if self.headless:
+            self.log(f"bridge {bridge_id} -> {state}", level="debug")
+
+    def _set_bridge_state_for_endpoint(self, endpoint: Optional[str], state: str) -> None:
+        if not endpoint:
+            return
+        bridge_id = self._bridge_endpoint_lookup.get(endpoint)
+        if bridge_id:
+            self._set_bridge_state(bridge_id, state)
+
     def _send_command(self, session: SessionState, command: str) -> None:
         payload = f"{command}\n"
-        self.mcp.queue_terminal_write(session.session_id, payload)
+        success = self.mcp.queue_terminal_write(session.session_id, payload)
+        if success:
+            self._set_bridge_state_for_endpoint("private_beach.queue_action", "sent")
+        else:
+            self._set_bridge_state_for_endpoint("private_beach.queue_action", "error")
 
     # -------------------------------------------------------------- Commands
     def _handle_keys(self) -> None:
+        if self.headless or not self.stdscr:
+            return
         while True:
             ch = self.stdscr.getch()
             if ch == -1:
@@ -907,6 +1299,9 @@ class AgentApp:
                 continue
             if ch in (curses.KEY_BACKSPACE, 127, 8):
                 self.input_buffer = self.input_buffer[:-1]
+                continue
+            if ch in (ord("p"), ord("P")):
+                self.prompt_panel_visible = not self.prompt_panel_visible
                 continue
             if 32 <= ch <= 126:
                 self.input_buffer += chr(ch)
@@ -998,16 +1393,28 @@ class AgentApp:
 
     # ------------------------------------------------------------------- Draw
     def _draw(self, now: float) -> None:
+        if not self.stdscr:
+            self.last_draw_time = now
+            return
         height, width = self.stdscr.getmaxyx()
         self.stdscr.erase()
         title = f" Private Beach Pong Agent — autopilot {'ON' if self.autopilot_enabled else 'OFF'} "
         self.stdscr.addstr(0, 0, title[: max(width - 1, 0)])
         score_text = f"LHS {self.score.get('lhs', 0)} | RHS {self.score.get('rhs', 0)}"
         self._addstr_safe(0, max(width - len(score_text) - 2, 0), width, score_text)
-        separator_y = 1
+        status_line = self._build_status_line(width)
+        status_y = 1
+        if status_line:
+            self._addstr_safe(status_y, 0, width, status_line)
+        separator_y = status_y + 1
         if width > 0:
             self.stdscr.hline(separator_y, 0, curses.ACS_HLINE, width)
         log_top = separator_y + 1
+        prompt_panel_space = max(height - (PROMPT_BOX_HEIGHT + 4), 3)
+        panel_height = 0
+        if self.prompt_panel_visible and self.prompt_lines and prompt_panel_space > 2:
+            panel_height = self._draw_prompt_panel(log_top, width, prompt_panel_space)
+            log_top += panel_height
         prompt_height = PROMPT_BOX_HEIGHT + 1
         usable_height = max(height - log_top - prompt_height, 1)
         status_width = min(40, max(width // 3, 20))
@@ -1139,6 +1546,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Disable automatic discovery/pairing.",
     )
     parser.set_defaults(auto_pair=True)
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run without the curses UI (automation/test mode).",
+    )
     parser.add_argument(
         "--pair-template",
         help="Prompt template to associate with controller pairings.",
@@ -1274,6 +1686,8 @@ def main() -> int:
     session_role_map = parse_session_mapping(args.session)
     diff_queue: "queue.Queue[Tuple[str, object]]" = queue.Queue()
     stop_event = threading.Event()
+    state_subscribers: Dict[str, StateSubscriber] = {}
+    state_pollers: Dict[str, StatePoller] = {}
 
     manager_client: Optional[PrivateBeachManagerClient] = None
     if args.mcp_base_url:
@@ -1297,6 +1711,10 @@ def main() -> int:
             for child_session in autopair_ctx.child_sessions.values():
                 session_tokens.setdefault(child_session, autopair_ctx.controller_token)
             session_role_map.update(autopair_ctx.session_roles)
+            if autopair_ctx.prompt_pack:
+                instructions = autopair_ctx.prompt_pack.get("instructions")
+                if isinstance(instructions, str) and instructions.strip():
+                    diff_queue.put(("info", "agent prompt synchronized from onboarding"))
 
     diff_queue.put(("info", f"session roles: {session_role_map}"))
 
@@ -1319,7 +1737,42 @@ def main() -> int:
         log_path=args.action_log,
     )
 
-    subscribers: List[StateSubscriber] = []
+    def start_state_stream(session_id: str, role: Optional[str] = None) -> None:
+        if not manager_client or session_id in state_subscribers:
+            return
+        subscriber = StateSubscriber(
+            manager_client,
+            session_id,
+            diff_queue,
+            stop_event,
+            role=role,
+        )
+        subscriber.start()
+        state_subscribers[session_id] = subscriber
+
+    def start_or_update_poller(session_id: str, interval: float) -> None:
+        if not manager_client:
+            return
+        poller = state_pollers.get(session_id)
+        if poller:
+            poller.update_interval(interval)
+            return
+        poller = StatePoller(
+            manager_client,
+            session_id,
+            diff_queue,
+            stop_event,
+            interval,
+        )
+        poller.start()
+        state_pollers[session_id] = poller
+
+    def stop_state_poller(session_id: str) -> None:
+        poller = state_pollers.pop(session_id, None)
+        if poller:
+            poller.stop()
+            poller.join(timeout=1.0)
+
     if manager_client:
         subscribe_roles = {
             session_id
@@ -1329,15 +1782,7 @@ def main() -> int:
         if autopair_ctx:
             subscribe_roles.update(autopair_ctx.child_sessions.values())
         for session_id in sorted(subscribe_roles):
-            subscriber = StateSubscriber(
-                manager_client,
-                session_id,
-                diff_queue,
-                stop_event,
-                role=session_role_map.get(session_id),
-            )
-            subscriber.start()
-            subscribers.append(subscriber)
+            start_state_stream(session_id, session_role_map.get(session_id))
     else:
         diff_queue.put(("warn", "manager client unavailable; skipping state streams"))
 
@@ -1358,7 +1803,41 @@ def main() -> int:
         )
         renewer.start()
 
-    def run_app(stdscr: "curses._CursesWindow") -> None:
+    pairing_thread: Optional[PairingSubscriber] = None
+
+    def handle_pairing_event(child_session_id: str, action: str, metadata: Dict[str, object]) -> None:
+        trace_value = metadata.get("trace_id")
+        if isinstance(trace_value, str) and trace_value.strip():
+            mcp_client.set_trace_id(child_session_id, trace_value.strip())
+        else:
+            mcp_client.set_trace_id(child_session_id, None)
+        poll_freq = metadata.get("poll_frequency")
+        if isinstance(poll_freq, (int, float)) and poll_freq > 0:
+            start_or_update_poller(child_session_id, float(poll_freq))
+        else:
+            stop_state_poller(child_session_id)
+        if action != "removed":
+            start_state_stream(child_session_id, session_role_map.get(child_session_id))
+        else:
+            stop_state_poller(child_session_id)
+
+    if (
+        manager_client
+        and args.private_beach_id
+        and autopair_ctx
+        and autopair_ctx.controller_session_id
+    ):
+        pairing_thread = PairingSubscriber(
+            manager_client,
+            autopair_ctx.controller_session_id,
+            args.private_beach_id,
+            diff_queue,
+            stop_event,
+            handle_pairing_event,
+        )
+        pairing_thread.start()
+
+    def run_app(stdscr: Optional["curses._CursesWindow"]) -> None:
         app = AgentApp(
             stdscr=stdscr,
             session_roles=session_role_map,
@@ -1370,6 +1849,9 @@ def main() -> int:
             max_step=args.max_step,
             min_threshold=args.min_threshold,
             command_interval=args.command_interval,
+            prompt_pack=getattr(autopair_ctx, "prompt_pack", None) if autopair_ctx else None,
+            mcp_bridges=getattr(autopair_ctx, "mcp_bridges", None) if autopair_ctx else None,
+            headless=args.headless,
         )
         try:
             app.log("agent ready", level="info")
@@ -1378,15 +1860,85 @@ def main() -> int:
             pass
 
     try:
-        curses.wrapper(run_app)
+        if args.headless:
+            run_app(None)
+        else:
+            curses.wrapper(run_app)
     finally:
         stop_event.set()
-        for subscriber in subscribers:
+        for subscriber in state_subscribers.values():
             subscriber.join(timeout=1.0)
+        for poller in state_pollers.values():
+            poller.stop()
+            poller.join(timeout=1.0)
         if renewer:
             renewer.join(timeout=1.0)
+        if pairing_thread:
+            pairing_thread.stop()
+            pairing_thread.join(timeout=1.0)
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+def fetch_relationship_metadata(
+    client: PrivateBeachManagerClient,
+    private_beach_id: str,
+    controller_session_id: str,
+    child_session_id: str,
+    output: "queue.Queue[Tuple[str, object]]",
+) -> Dict[str, object]:
+    meta: Dict[str, object] = {}
+    try:
+        layout = client.get_canvas_layout(private_beach_id)
+    except ManagerRequestError as exc:
+        output.put(("error", f"layout fetch failed: {exc}"))
+        return meta
+    session_to_tile: Dict[str, str] = {}
+    tiles = layout.get("tiles")
+    if isinstance(tiles, dict):
+        for tile_id, tile_entry in tiles.items():
+            metadata = _metadata_dict(_metadata_dict(tile_entry).get("metadata"))
+            session_meta = _metadata_dict(metadata.get("sessionMeta"))
+            session_id = session_meta.get("sessionId")
+            if isinstance(session_id, str) and session_id.strip():
+                session_to_tile[session_id.strip()] = tile_id
+    agent_tile_id = session_to_tile.get(controller_session_id)
+    child_tile_id = session_to_tile.get(child_session_id)
+    if not agent_tile_id or not child_tile_id:
+        return meta
+    metadata = _metadata_dict(layout.get("metadata"))
+    relationships = metadata.get("agentRelationships")
+    if isinstance(relationships, dict):
+        for raw in relationships.values():
+            record = _metadata_dict(raw)
+            if record.get("sourceId") == agent_tile_id and record.get("targetId") == child_tile_id:
+                poll_freq = record.get("pollFrequency")
+                if isinstance(poll_freq, (int, float)):
+                    meta["poll_frequency"] = float(poll_freq)
+                else:
+                    meta["poll_frequency"] = None
+                trace_id = resolve_trace_id_from_layout(layout, agent_tile_id)
+                if trace_id:
+                    meta["trace_id"] = trace_id
+                return meta
+    return meta
+
+
+def resolve_trace_id_from_layout(layout: Dict[str, object], tile_id: Optional[object]) -> Optional[str]:
+    if not isinstance(tile_id, str):
+        return None
+    tiles = layout.get("tiles")
+    if not isinstance(tiles, dict):
+        return None
+    tile_entry = tiles.get(tile_id)
+    if not isinstance(tile_entry, dict):
+        return None
+    metadata = _metadata_dict(tile_entry.get("metadata"))
+    agent_meta = _metadata_dict(metadata.get("agentMeta"))
+    trace_meta = _metadata_dict(agent_meta.get("trace"))
+    enabled = trace_meta.get("enabled")
+    trace_id = trace_meta.get("trace_id")
+    if enabled and isinstance(trace_id, str) and trace_id.strip():
+        return trace_id.strip()
+    return None

@@ -39,5 +39,61 @@ cargo run  -- \
 head -n 1 "$LOG_DIR/bootstrap.json"
 
 
-http://localhost:3001/beaches
+http://localhost:3003/beaches
 
+------------
+
+
+Here are cargo-run commands for both players and the agent, matching your pattern and not relying on session-id env vars. Run each in its own terminal.
+
+LHS player (single line)
+
+LOG_DIR="$HOME/beach-debug"; mkdir -p "$LOG_DIR"
+cd ~/development/beach && cargo run --bin beach -- \
+  --log-level trace \
+  --log-file "$LOG_DIR/beach-host-lhs.log" \
+  --session-server http://localhost:4132/ \
+  host \
+  --bootstrap-output json \
+  --wait \
+  -- /usr/bin/env python3 ~/development/beach/apps/private-beach/demo/pong/player/main.py --mode lhs \
+  | tee "$LOG_DIR/bootstrap-lhs.json"
+
+RHS player (single line)
+
+LOG_DIR="$HOME/beach-debug"; mkdir -p "$LOG_DIR"
+cd ~/development/beach && cargo run --bin beach -- \
+  --log-level trace \
+  --log-file "$LOG_DIR/beach-host-rhs.log" \
+  --session-server http://localhost:4132/ \
+  host \
+  --bootstrap-output json \
+  --wait \
+  -- /usr/bin/env python3 ~/development/beach/apps/private-beach/demo/pong/player/main.py --mode rhs \
+  | tee "$LOG_DIR/bootstrap-rhs.json"
+
+Agent (single line; no session-id envs; just declare beach + manager)
+
+LOG_DIR="$HOME/beach-debug"; mkdir -p "$LOG_DIR"
+cd ~/development/beach && cargo run --bin beach -- \
+  --log-level trace \
+  --log-file "$LOG_DIR/beach-host-agent.log" \
+  --session-server http://localhost:4132/ \
+  host \
+  --bootstrap-output json \
+  --wait \
+  -- /usr/bin/env python3 ~/development/beach/apps/private-beach/demo/pong/agent/main.py \
+       --private-beach-id "<YOUR_BEACH_ID>" \
+       --mcp-base-url "http://localhost:8080" \
+       --lease-reason "pong_showcase" \
+  | tee "$LOG_DIR/bootstrap-agent.json"
+
+
+LOG_DIR="$HOME/beach-debug" \
+apps/private-beach/demo/pong/tools/print-session-codes.sh
+
+Notes
+
+Start the two players and the agent in separate terminals.
+In the dashboard, attach each session (you can read the JSON from the bootstrap files if needed, but you don’t have to export anything).
+Draw edges from the agent tile to LHS and RHS tiles to declare roles; the agent will discover pairings via controller SSE and start controlling.

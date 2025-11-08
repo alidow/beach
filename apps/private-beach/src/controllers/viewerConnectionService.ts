@@ -43,6 +43,7 @@ type TileEntry = {
   lastSnapshot: TerminalViewerState;
   lastStatus: TerminalViewerStatus;
   metrics: ViewerTileCounters;
+  traceId?: string | null;
 };
 
 function debugLog(message: string, detail?: Record<string, unknown>) {
@@ -149,9 +150,12 @@ export class ViewerConnectionService {
   }
 
   connectTile(tileId: string, input: ConnectionInput, subscriber: TileSubscriber): () => void {
+    const normalizedTraceId =
+      typeof input.traceId === 'string' && input.traceId.trim().length > 0 ? input.traceId.trim() : null;
     const preparation = toPreparedConnection(input);
     const existing = this.tiles.get(tileId);
     debugLog('connectTile.request', {
+      trace_id: normalizedTraceId,
       tileId,
       sessionId: input.sessionId ?? null,
       privateBeachId: input.privateBeachId ?? null,
@@ -191,6 +195,7 @@ export class ViewerConnectionService {
         managerUrl: baseManagerUrl,
         lastSnapshot: idle,
         lastStatus: idle.status,
+        traceId: normalizedTraceId,
         metrics:
           existing?.metrics ?? {
             started: 0,
@@ -202,6 +207,7 @@ export class ViewerConnectionService {
       };
       this.tiles.set(tileId, entry);
       debugLog('connectTile.precondition_failed', {
+        trace_id: normalizedTraceId,
         tileId,
         reason: preparation.reason,
       });
@@ -223,7 +229,9 @@ export class ViewerConnectionService {
       existing.sessionId = preparation.params.sessionId ?? baseSessionId;
       existing.privateBeachId = preparation.params.privateBeachId ?? basePrivateBeachId;
       existing.managerUrl = preparation.params.managerUrl ?? baseManagerUrl;
+      existing.traceId = normalizedTraceId ?? existing.traceId ?? null;
       debugLog('connectTile.reuse_existing', {
+        trace_id: normalizedTraceId,
         tileId,
         sessionId: existing.sessionId,
         key: existing.key,
@@ -247,6 +255,7 @@ export class ViewerConnectionService {
       managerUrl: preparation.params.managerUrl ?? baseManagerUrl,
       lastSnapshot: cloneViewerState(IDLE_STATE),
       lastStatus: 'idle',
+      traceId: normalizedTraceId,
       metrics:
         existing?.metrics ?? {
           started: 0,
@@ -257,6 +266,7 @@ export class ViewerConnectionService {
         },
     };
     debugLog('connectTile.start_connection', {
+      trace_id: normalizedTraceId,
       tileId,
       sessionId: entry.sessionId,
       key: entry.key,
@@ -357,6 +367,7 @@ export class ViewerConnectionService {
         attempt: entry.metrics.started,
       });
       debugLog('connectTile.status_connected', {
+        trace_id: entry.traceId ?? null,
         tileId,
         sessionId: entry.sessionId,
         latencyMs: snapshot.latencyMs ?? null,
@@ -380,6 +391,7 @@ export class ViewerConnectionService {
         retries: entry.metrics.retries,
       });
       debugLog('connectTile.status_error', {
+        trace_id: entry.traceId ?? null,
         tileId,
         sessionId: entry.sessionId,
         error: errorMessage,
@@ -413,6 +425,7 @@ export class ViewerConnectionService {
     entry.metrics.disposed += 1;
     this.record(tileId, 'disposed');
     debugLog('connectTile.dispose', {
+      trace_id: entry.traceId ?? null,
       tileId,
       reason,
       disposals: entry.metrics.disposed,

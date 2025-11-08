@@ -3108,6 +3108,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         break;
       case 'grid':
         trace('frame grid', frame);
+        const previousViewportRows = ptyViewportRowsRef.current;
         {
           if (typeof window !== 'undefined') {
             try {
@@ -3116,7 +3117,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
                 frameViewportRows: frame.viewportRows ?? null,
                 frameHistoryRows: frame.historyRows,
                 frameCols: frame.cols,
-                previousPtyRows: ptyViewportRowsRef.current,
+                previousPtyRows: previousViewportRows,
                 previousPtyCols: ptyColsRef.current,
                 subscription: subscriptionRef.current,
               });
@@ -3130,15 +3131,31 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
               frameViewportRows: frame.viewportRows ?? null,
               frameHistoryRows: frame.historyRows,
               frameCols: frame.cols,
-              previousPtyRows: ptyViewportRowsRef.current,
+              previousPtyRows: previousViewportRows,
               previousPtyCols: ptyColsRef.current,
             }),
           );
+          if (
+            typeof frame.viewportRows === 'number' &&
+            frame.viewportRows > 0 &&
+            frame.cols > 0 &&
+            frame.viewportRows >= 80 &&
+            frame.cols <= 80 &&
+            frame.viewportRows >= frame.cols * 1.2
+          ) {
+            logSizing('grid host dimension anomaly', {
+              frameViewportRows: frame.viewportRows,
+              frameCols: frame.cols,
+              historyRows: frame.historyRows,
+              previousViewportRows,
+              previousCols: ptyColsRef.current,
+              subscription: subscriptionRef.current,
+            });
+          }
           const nextCols = Math.max(1, frame.cols);
           ptyColsRef.current = nextCols;
           setPtyCols((prev) => (prev === nextCols ? prev : nextCols));
         }
-        const previousViewportRows = ptyViewportRowsRef.current;
         const rawViewportRows =
           typeof frame.viewportRows === 'number' && frame.viewportRows > 0
             ? frame.viewportRows

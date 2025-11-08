@@ -9,14 +9,14 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
     time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::auth::{AuthConfig, AuthContext};
-use crate::fastpath::{FastPathRegistry, FastPathSession, send_actions_over_fast_path};
+use crate::fastpath::{send_actions_over_fast_path, FastPathRegistry, FastPathSession};
 use crate::metrics;
 use beach_buggy::{
     AckStatus, ActionAck, ActionCommand, CellStylePayload, CursorPosition, HarnessType,
@@ -26,20 +26,20 @@ use beach_buggy::{
 use beach_client_core::cache::terminal::packed::unpack_cell;
 use beach_client_core::protocol::{ClientFrame, CursorFrame, Update as WireUpdate};
 use beach_client_core::{
-    CliError, HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell,
-    Payload, SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId,
-    TerminalGrid, TransportError, TransportOffer, decode_host_frame_binary,
-    encode_client_frame_binary, negotiate_transport,
+    decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
+    HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell, Payload,
+    SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId, TerminalGrid,
+    TransportError, TransportOffer,
 };
 use chrono::{DateTime, Duration, Utc};
 use prometheus::IntGauge;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool, Row, types::Json};
-use tokio::sync::{RwLock, broadcast};
+use sqlx::{types::Json, FromRow, PgPool, Row};
+use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tracing::{Level, debug, info, trace, warn};
+use tracing::{debug, info, trace, warn, Level};
 use url::Url;
 use uuid::Uuid;
 
@@ -1721,8 +1721,8 @@ impl AppState {
                     RETURNING
                         controller_session_id,
                         child_session_id,
-                        (SELECT origin_session_id FROM session WHERE id = controller_pairing.controller_session_id),
-                        (SELECT origin_session_id FROM session WHERE id = controller_pairing.child_session_id),
+                        (SELECT origin_session_id FROM session WHERE id = controller_pairing.controller_session_id) AS controller_origin_session_id,
+                        (SELECT origin_session_id FROM session WHERE id = controller_pairing.child_session_id) AS child_origin_session_id,
                         prompt_template,
                         update_cadence,
                         created_at,
@@ -1889,8 +1889,8 @@ impl AppState {
                     RETURNING
                         controller_session_id,
                         child_session_id,
-                        (SELECT origin_session_id FROM session WHERE id = controller_pairing.controller_session_id),
-                        (SELECT origin_session_id FROM session WHERE id = controller_pairing.child_session_id),
+                        (SELECT origin_session_id FROM session WHERE id = controller_pairing.controller_session_id) AS controller_origin_session_id,
+                        (SELECT origin_session_id FROM session WHERE id = controller_pairing.child_session_id) AS child_origin_session_id,
                         prompt_template,
                         update_cadence,
                         created_at,
@@ -3074,6 +3074,7 @@ fn legacy_layout_to_canvas(
                     zoom,
                     locked,
                     toolbar_pinned,
+                    metadata: None,
                 },
             );
         }
@@ -5495,17 +5496,17 @@ mod tests {
     use super::*;
     use crate::state::test_support;
     use beach_buggy::{HarnessType, RegisterSessionRequest};
-    use beach_client_core::cache::terminal::packed::{StyleId, pack_color_default, pack_color_rgb};
+    use beach_client_core::cache::terminal::packed::{pack_color_default, pack_color_rgb, StyleId};
     use beach_client_core::protocol::{
         HostFrame as WireHostFrame, Lane, LaneBudgetFrame, SyncConfigFrame, Update as WireUpdate,
     };
     use serde_json::json;
     use std::sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     };
     use std::time::SystemTime;
-    use tokio::time::{Duration, sleep, timeout};
+    use tokio::time::{sleep, timeout, Duration};
 
     #[test_timeout::tokio_timeout_test(10)]
     async fn spawn_viewer_worker_smoke_test_records_state_and_stream() {

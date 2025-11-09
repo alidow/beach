@@ -102,6 +102,23 @@
     width: var(--beach-terminal-cell-width, 0.6em);
   }
 
+  .xterm-row span[data-box-vertical] {
+    position: relative;
+  }
+
+  .xterm-row span[data-box-vertical]::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 50%;
+    width: max(1px, calc(var(--beach-terminal-cell-width, 0.6em) * 0.18));
+    transform: translateX(-50%);
+    background-color: currentColor;
+    border-radius: 9999px;
+    pointer-events: none;
+  }
+
   .xterm-row span[data-predicted='true'] {
     text-decoration: none;
   }

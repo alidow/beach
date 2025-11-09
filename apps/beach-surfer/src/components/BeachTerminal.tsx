@@ -4142,6 +4142,7 @@ function LineRow({
         const predicted = predictedCell || isPredictedCursor;
         const underline = predicted && overlayUnderline;
         const char = cell.char === ' ' ? NBSP : cell.char;
+        const isVerticalBox = VERTICAL_BOX_CHARS.has(cell.char);
         return (
           <span
             key={index}
@@ -4149,6 +4150,7 @@ function LineRow({
             data-predicted={predicted || undefined}
             data-predicted-underline={underline || undefined}
             data-predicted-cursor={isPredictedCursor || undefined}
+            data-box-vertical={isVerticalBox || undefined}
           >
             {char}
           </span>
@@ -4222,6 +4224,7 @@ export function shouldReenableFollowTail(remainingPixels: number, lineHeightPx: 
 const DEFAULT_FOREGROUND = '#e2e8f0';
 const DEFAULT_BACKGROUND = 'hsl(var(--terminal-screen))';
 const NBSP = '\u00A0';
+const VERTICAL_BOX_CHARS = new Set(['│', '┃', '║', '┆', '┊', '╎', '╽', '╿', '¦']);
 const DEFAULT_TERMINAL_COLS = 80;
 const DEFAULT_TERMINAL_ROWS = 24;
 const BASE_TERMINAL_FONT_SIZE = 14;

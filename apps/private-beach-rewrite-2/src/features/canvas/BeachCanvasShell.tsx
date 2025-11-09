@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { useCallback, useEffect, useMemo } from 'react';
 import { CanvasWorkspace } from './CanvasWorkspace';
+import { ThemeToggleButton } from '@/components/ThemeToggleButton';
 import type { CanvasNodeDefinition, NodePlacementPayload, TileMovePayload } from './types';
 import type { CanvasLayout } from '@/lib/api';
 import type { SessionSummary } from '@private-beach/shared-api';
@@ -260,6 +261,7 @@ function BeachCanvasShellInner({
               <span className="sr-only">Stop interacting with {interactiveSessionTitle ?? `session ${interactiveBadgeCode}`}</span>
             </button>
           ) : null}
+          <ThemeToggleButton />
         </div>
       </header>
       <div className="relative flex flex-1 min-h-0 flex-col overflow-hidden">

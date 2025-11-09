@@ -671,14 +671,6 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
     [endResize, releaseResizePointer, tile.id],
   );
 
-  const handlePointerEnterNode = useCallback(() => {
-    setHovered(true);
-  }, [setHovered]);
-
-  const handlePointerLeaveNode = useCallback(() => {
-    setHovered(false);
-  }, [setHovered]);
-
   useEffect(() => {
     if (!hovered) {
       return;
@@ -802,8 +794,8 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
           event.stopPropagation();
         }
       }}
-      onPointerEnter={handlePointerEnterNode}
-      onPointerLeave={handlePointerLeaveNode}
+      onPointerEnter={() => setHovered(true)}
+      onPointerLeave={() => setHovered(false)}
       data-tile-interactive={isInteractive ? 'true' : 'false'}
     >
       <div
@@ -994,14 +986,24 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
       ) : null}
       <section
         className={cn(
-          'flex flex-1 flex-col gap-3 overflow-hidden bg-slate-950/60 transition-opacity',
+          'relative flex flex-1 flex-col gap-3 overflow-hidden bg-slate-950/60 transition-opacity',
           isInteractive ? 'pointer-events-auto select-text' : 'pointer-events-none opacity-[0.98] select-none',
           dragging && 'pointer-events-none',
         )}
         data-tile-drag-ignore="true"
-        onPointerEnter={() => setTerminalHover(true)}
-        onPointerLeave={() => setTerminalHover(false)}
       >
+        {!isInteractive ? (
+          <div
+            className="pointer-events-auto absolute inset-0 z-10"
+            onPointerEnter={() => setTerminalHover(true)}
+            onPointerLeave={() => setTerminalHover(false)}
+            onClick={(event) => {
+              // Let clicks fall through so users can still double-click to enter interact mode
+              event.stopPropagation();
+              handleToggleInteractive();
+            }}
+          />
+        ) : null}
         <ApplicationTile
           tileId={tile.id}
           privateBeachId={privateBeachId}

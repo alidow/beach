@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { SignedIn, SignedOut, SignInButton, UserButton } from '@clerk/nextjs';
 import { Button } from '../../../private-beach/src/components/ui/button';
+import { ThemeToggleButton } from './ThemeToggleButton';
 
 type MetaItem = {
   label: string;
@@ -51,6 +52,7 @@ export function AppShellTopNav({ backHref, backLabel = 'Back', title, subtitle, 
         </div>
         <div className="flex items-center gap-2">
           {actions}
+          <ThemeToggleButton />
           <SignedIn>
             <UserButton afterSignOutUrl="/sign-in" />
           </SignedIn>

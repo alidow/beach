@@ -58,3 +58,23 @@
     text-decoration: none;
   }
 }
+
+@layer components {
+  /* React Flow node wrapper stabilization during drag */
+  .react-flow__node.dragging,
+  .react-flow__node.selected.dragging,
+  .react-flow__node:has(.rf-drag-handle:active) {
+    will-change: transform;
+    transform: translateZ(0);
+    backface-visibility: hidden;
+    contain: layout paint;
+    filter: none !important;
+    -webkit-filter: none !important;
+    box-shadow: none !important;
+  }
+
+  .react-flow__node.dragging * {
+    user-select: none;
+    pointer-events: none;
+  }
+}

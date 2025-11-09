@@ -1614,7 +1614,10 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   }, [showTopBar]);
 
   useLayoutEffect(() => {
-    if (typeof window === 'undefined') {
+    if (typeof window === 'undefined' || lockViewportToHost) {
+      if (lockViewportToHost) {
+        logLockViewportDiagnostic('skip-dom-measure', { reason: 'lockViewportToHost' });
+      }
       return;
     }
     // Measure actual glyph metrics so CSS cell sizing and viewport math reflect the true font/zoom.
@@ -1623,10 +1626,6 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       return;
     }
     applyFontMetrics();
-    if (lockViewportToHost) {
-      logLockViewportDiagnostic('skip-dom-measure', { reason: 'lockViewportToHost' });
-      return;
-    }
     let frame = -1;
     const scheduleMeasure = () => {
       if (frame !== -1) {
@@ -1744,7 +1743,14 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         vv.removeEventListener('scroll', scheduleMeasure);
       }
     };
-  }, [snapshot.cols, fontFamily, fontSize, lines.length, lineHeight, minEffectiveLineHeight, applyFontMetrics]);
+  }, [snapshot.cols, fontFamily, fontSize, lines.length, lineHeight, minEffectiveLineHeight, applyFontMetrics, logLockViewportDiagnostic, lockViewportToHost]);
+
+  useEffect(() => {
+    if (!lockViewportToHost) {
+      return;
+    }
+    applyFontMetrics();
+  }, [lockViewportToHost, applyFontMetrics]);
   useEffect(() => {
     transportRef.current = providedTransport ?? null;
     lastSentViewportRows.current = 0;

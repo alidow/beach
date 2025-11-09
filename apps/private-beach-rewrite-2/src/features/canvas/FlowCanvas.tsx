@@ -107,6 +107,7 @@ function FlowCanvasInner({
   } | null>(null);
   const traceLogs = useTraceLogs(traceOverlay?.traceId ?? null);
   const [editingEdgeId, setEditingEdgeId] = useState<string | null>(null);
+  const [dragCount, setDragCount] = useState(0);
   const { token: managerToken, refresh: refreshManagerToken } = useManagerToken();
   const controllerLeaseExpiryRef = useRef<Record<string, number>>({});
   const flow = useReactFlow();
@@ -449,6 +450,8 @@ function FlowCanvasInner({
         if (change.type === 'position' && change.position) {
           const tile = state.tiles[change.id];
           if (!tile) return;
+          // Keep controlled node positions in sync while dragging to avoid
+          // React Flow re-applying stale positions (can cause flicker).
           if (change.dragging) {
             setTilePositionImmediate(change.id, change.position);
             return;
@@ -497,6 +500,7 @@ function FlowCanvasInner({
         tileId: node.id,
         originalPosition: { ...tile.position },
       };
+      setDragCount((c) => c + 1);
       emitTelemetry('canvas.drag.start', {
         privateBeachId,
         tileId: node.id,
@@ -509,14 +513,8 @@ function FlowCanvasInner({
     [bringToFront, privateBeachId, rewriteEnabled, setActiveTile, state.tiles],
   );
 
-  const handleNodeDrag: NodeDragEventHandler = useCallback(
-    (_event, node) => {
-      const tile = state.tiles[node.id];
-      if (!tile) return;
-      setTilePositionImmediate(node.id, node.position);
-    },
-    [setTilePositionImmediate, state.tiles],
-  );
+  // We update live positions via onNodesChange (change.dragging),
+  // so we avoid duplicating updates in onNodeDrag to reduce re-renders.
 
   const handleNodeDragStop: NodeDragEventHandler = useCallback(
     (_event, node) => {
@@ -524,6 +522,7 @@ function FlowCanvasInner({
       const snapshot = dragSnapshotRef.current;
       dragSnapshotRef.current = null;
       if (!tile || !snapshot || snapshot.tileId !== node.id) {
+        setDragCount((c) => (c > 0 ? c - 1 : 0));
         return;
       }
       const snappedPosition = snapPointToGrid(node.position, gridSize);
@@ -567,6 +566,7 @@ function FlowCanvasInner({
         y: snappedPosition.y,
         rewriteEnabled,
       });
+      setDragCount((c) => (c > 0 ? c - 1 : 0));
     },
     [gridSize, onTileMove, privateBeachId, readCanvasBounds, reportTileMove, rewriteEnabled, setTilePosition, state.tiles],
   );
@@ -1024,10 +1024,12 @@ function FlowCanvasInner({
     };
   }, [relationshipSyncHistory, state.relationships, state.tiles, traceLogs, traceOverlay]);
 
+  const isDragging = dragCount > 0;
+
   return (
     <div
       ref={wrapperRef}
-      className="relative flex-1 h-full w-full overflow-hidden bg-slate-950/40 backdrop-blur-2xl"
+      className={`relative flex-1 h-full w-full overflow-hidden bg-neutral-900 dark:bg-neutral-950 ${isDragging ? '' : 'backdrop-blur-2xl'}`}
       data-testid="flow-canvas"
     >
       <ReactFlow
@@ -1038,32 +1040,37 @@ function FlowCanvasInner({
         defaultEdgeOptions={defaultEdgeOptions}
         // Restrict dragging to the tile header to avoid drag conflicts
         // with dynamic content inside the node body (terminal, etc.).
-        dragHandle=".rf-drag-handle"
+        nodeDragHandle=".rf-drag-handle"
         onNodesChange={handleNodesChange}
         onEdgesChange={() => undefined}
         onConnect={handleConnect}
-        onNodeDrag={handleNodeDrag}
         onNodeDragStart={handleNodeDragStart}
         onNodeDragStop={handleNodeDragStop}
         connectionMode="loose"
         connectionRadius={36}
+        // Always allow node dragging; we restrict the drag start area via
+        // `nodeDragHandle` so interactive content does not interfere.
         nodesDraggable
         nodesConnectable
         elementsSelectable={false}
+        // Keep nodes rendered during drag to avoid viewport-culling flicker
+        onlyRenderVisibleElements={false}
+        selectNodesOnDrag={false}
         panOnScroll={false}
+        // Allow panning with left-drag on the pane (not on nodes)
         panOnDrag
         zoomOnScroll={false}
         zoomOnPinch
         zoomOnDoubleClick={false}
         fitView={false}
-        elevateNodesOnSelect
+        elevateNodesOnSelect={false}
         proOptions={{ hideAttribution: true }}
         className="h-full w-full"
         minZoom={0.2}
         maxZoom={1.75}
-        style={{ width: '100%', height: '100%' }}
+        style={{ width: '100%', height: '100%', transform: 'translateZ(0)', willChange: 'transform' }}
       >
-        <Background gap={gridSize} color="rgba(56, 189, 248, 0.12)" />
+        <Background gap={gridSize} color="rgba(160, 160, 160, 0.12)" />
       </ReactFlow>
       <CanvasViewportControls />
       {traceOverlayProps ? (

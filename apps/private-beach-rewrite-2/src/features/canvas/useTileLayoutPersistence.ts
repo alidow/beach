@@ -12,6 +12,7 @@ type PersistenceOptions = {
   debounceMs?: number;
   initialLayout?: CanvasLayout | null;
   initialSignature?: string;
+  auto?: boolean;
 };
 
 export function useTileLayoutPersistence({
@@ -20,6 +21,7 @@ export function useTileLayoutPersistence({
   debounceMs = 200,
   initialLayout,
   initialSignature,
+  auto = true,
 }: PersistenceOptions) {
   const tileState = useTileState();
   const { token: managerToken } = useManagerToken();
@@ -95,9 +97,7 @@ export function useTileLayoutPersistence({
           timerRef.current = null;
           void performPersist(sig);
         }, debounceMs);
-        if (typeof window !== 'undefined') {
-          console.info('[rewrite-2] scheduling layout persist', { beachId, signature: sig });
-        }
+        // Avoid verbose logging during frequent state updates like dragging.
         return;
       }
 
@@ -112,8 +112,9 @@ export function useTileLayoutPersistence({
   );
 
   useEffect(() => {
+    if (!auto) return;
     schedulePersist(signature);
-  }, [schedulePersist, signature]);
+  }, [auto, schedulePersist, signature]);
 
   const requestImmediatePersist = useCallback(() => {
     const sig = signatureRef.current;

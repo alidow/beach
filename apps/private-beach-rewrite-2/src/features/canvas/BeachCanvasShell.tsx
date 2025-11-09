@@ -113,6 +113,7 @@ function BeachCanvasShellInner({
     managerUrl,
     initialLayout,
     initialSignature: initialTileSignature,
+    auto: false,
   });
 
   const catalog = useMemo(() => DEFAULT_CATALOG, []);

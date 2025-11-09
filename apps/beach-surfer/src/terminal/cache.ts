@@ -489,11 +489,12 @@ export class TerminalGridCache {
     if (previousHeight > 0 && bottomAtTail && this.latestAppliedSeq > 0 && (tailExposedTop > 0 || tailExposedBottom > 0)) {
       this.tailPadSeqThreshold = this.latestAppliedSeq;
       const newRanges: RowRange[] = [];
-      if (tailExposedTop > 0) {
-        newRanges.push({ start: clampedTop, end: clampedTop + tailExposedTop });
-      }
       if (tailExposedBottom > 0) {
-        newRanges.push({ start: viewportBottom - tailExposedBottom, end: viewportBottom });
+        const padStart = Math.max(tailBottom, viewportBottom - tailExposedBottom);
+        const padEnd = Math.max(padStart, viewportBottom);
+        if (padEnd > padStart) {
+          newRanges.push({ start: padStart, end: padEnd });
+        }
       }
       appendAndMergeRanges(this.tailPadRanges, newRanges);
       trace('setViewport tail_pad_threshold', {
@@ -782,6 +783,13 @@ export class TerminalGridCache {
       }
       return slot ?? createMissingRow(absolute);
     };
+
+    if (!Number.isFinite(limit)) {
+      for (let offset = 0; offset < this.rows.length; offset += 1) {
+        rows.push(materializeRow(this.baseRow + offset));
+      }
+      return rows;
+    }
 
     if (this.followTail) {
       const lastTracked = this.rows.length > 0 ? this.baseRow + this.rows.length - 1 : this.baseRow;

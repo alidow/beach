@@ -383,15 +383,12 @@ export function serializeTileStateKey(state: TileState): string {
 						if (!tile) {
 							return `${tileId}:missing`;
 						}
-						const sessionSignature = tile.sessionMeta
-							? [
-									 tile.sessionMeta.sessionId ?? '',
-									 tile.sessionMeta.title ?? '',
-									 tile.sessionMeta.status ?? '',
-									 tile.sessionMeta.harnessType ?? '',
-									 tile.sessionMeta.pendingActions ?? '',
-							  ].join('~')
-							: 'session:none';
+					const sessionSignature = tile.sessionMeta
+						? [
+							 tile.sessionMeta.sessionId ?? '',
+							 tile.sessionMeta.title ?? '',
+					  ].join('~')
+						: 'session:none';
 						const agentSignature =
 							tile.nodeType === 'agent'
 								? [

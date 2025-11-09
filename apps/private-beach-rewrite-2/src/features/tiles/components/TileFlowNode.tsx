@@ -454,19 +454,10 @@ export function TileFlowNode({ data, dragging }: Props) {
     const terminalHeightPx = terminalRect.height / zoomFactor;
     const chromeWidthPx = Math.max(0, tileWidthPx - terminalWidthPx);
     const chromeHeightPx = Math.max(0, tileHeightPx - terminalHeightPx);
-    const viewportCols = viewportMetrics.viewportCols ?? hostCols ?? null;
-    const viewportRows = viewportMetrics.viewportRows ?? hostRows ?? null;
-    const observedCellWidth =
-      viewportCols && viewportCols > 0 ? terminalWidthPx / viewportCols : null;
-    const observedRowHeight =
-      viewportRows && viewportRows > 0 ? terminalHeightPx / viewportRows : null;
     const nextSize = computeAutoResizeSize({
       metrics: viewportMetrics,
       chromeWidthPx,
       chromeHeightPx,
-      zoom: zoom ?? 1,
-      observedCellWidth,
-      observedRowHeight,
     });
     if (!nextSize) {
       logAutoResizeEvent(tile.id, 'compute-failed', { chromeWidthPx, chromeHeightPx });
@@ -490,8 +481,6 @@ export function TileFlowNode({ data, dragging }: Props) {
       chromeWidthPx,
       chromeHeightPx,
       zoom: zoom ?? 1,
-      observedCellWidth,
-      observedRowHeight,
     });
     resizeTile(tile.id, nextSize);
     emitTelemetry('canvas.resize.auto', {

@@ -1,10 +1,11 @@
 use std::cmp;
+use std::collections::{HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::sync::Arc;
 
-use crate::cache::terminal::TerminalGrid;
+use crate::cache::terminal::{PackedCell, TerminalGrid, unpack_cell};
 use crate::cache::{GridCache, Seq};
-use crate::model::terminal::diff::{CacheUpdate, HistoryTrim, RowSnapshot};
+use crate::model::terminal::diff::{CacheUpdate, HistoryTrim, RowSnapshot, StyleDefinition};
 use crate::sync::{
     DeltaSlice, DeltaSource, PriorityLane, SnapshotSlice, SnapshotSource, SyncConfig, SyncUpdate,
     Watermark,
@@ -45,7 +46,11 @@ impl TerminalSync {
         }
     }
 
-    fn collect_row(&self, row_index: usize) -> Option<CacheUpdate> {
+    fn collect_row(
+        &self,
+        row_index: usize,
+        cursor: &mut TerminalSnapshotCursor,
+    ) -> Option<CacheUpdate> {
         let (_, cols) = self.grid.dims();
         let absolute_row = self.grid.row_id_at(row_index)?;
         let absolute_row_usize = usize::try_from(absolute_row).ok()?;
@@ -63,6 +68,7 @@ impl TerminalSync {
             max_seq = max_seq.max(snapshot.seq);
             cells.push(snapshot.cell);
         }
+        self.enqueue_styles_for_cells(&cells, max_seq, cursor);
         Some(CacheUpdate::Row(RowSnapshot::new(
             absolute_row_usize,
             max_seq,
@@ -70,9 +76,13 @@ impl TerminalSync {
         )))
     }
 
-    fn collect_row_by_absolute(&self, absolute_row: u64) -> Option<CacheUpdate> {
+    fn collect_row_by_absolute(
+        &self,
+        absolute_row: u64,
+        cursor: &mut TerminalSnapshotCursor,
+    ) -> Option<CacheUpdate> {
         let index = self.grid.index_of_row(absolute_row)?;
-        self.collect_row(index)
+        self.collect_row(index, cursor)
     }
 
     fn initial_snapshot_floor(&self, first: u64, last: u64) -> u64 {
@@ -98,6 +108,45 @@ impl TerminalSync {
         }
         max_seq
     }
+
+    fn seed_style_table(&self, cursor: &mut TerminalSnapshotCursor) {
+        for (style_id, style) in self.grid.style_table.entries() {
+            let id = style_id.0;
+            if id == 0 {
+                continue;
+            }
+            if cursor.emitted_styles.insert(id) {
+                cursor
+                    .pending_styles
+                    .push_back(CacheUpdate::Style(StyleDefinition::new(style_id, 0, style)));
+            }
+        }
+        cursor.styles_seeded = true;
+    }
+
+    fn enqueue_styles_for_cells(
+        &self,
+        cells: &[PackedCell],
+        seq: Seq,
+        cursor: &mut TerminalSnapshotCursor,
+    ) {
+        for packed in cells {
+            let (_, style_id) = unpack_cell(*packed);
+            let id = style_id.0;
+            if id == 0 {
+                continue;
+            }
+            if cursor.emitted_styles.insert(id) {
+                if let Some(style) = self.grid.style_table.get(style_id) {
+                    cursor
+                        .pending_styles
+                        .push_back(CacheUpdate::Style(StyleDefinition::new(
+                            style_id, seq, style,
+                        )));
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -107,6 +156,10 @@ pub struct TerminalSnapshotCursor {
     next_recent_row: Option<u64>,
     recent_floor: u64,
     next_history_row: Option<u64>,
+    pending_styles: VecDeque<CacheUpdate>,
+    pending_rows: VecDeque<CacheUpdate>,
+    emitted_styles: HashSet<u32>,
+    styles_seeded: bool,
 }
 
 impl SnapshotSource<CacheUpdate> for TerminalSync {
@@ -121,6 +174,10 @@ impl SnapshotSource<CacheUpdate> for TerminalSync {
         let last_row_id = self.grid.last_row_id();
         match lane {
             PriorityLane::Foreground => {
+                cursor.pending_styles.clear();
+                cursor.pending_rows.clear();
+                cursor.emitted_styles.clear();
+                cursor.styles_seeded = false;
                 if let Some(last) = last_row_id {
                     let first = first_row_id.unwrap_or(last);
                     let floor = self.initial_snapshot_floor(first, last);
@@ -165,7 +222,20 @@ impl SnapshotSource<CacheUpdate> for TerminalSync {
 
         match lane {
             PriorityLane::Foreground => {
+                if !cursor.styles_seeded {
+                    self.seed_style_table(cursor);
+                }
                 while updates.len() < budget {
+                    if let Some(style_update) = cursor.pending_styles.pop_front() {
+                        max_seq = max_seq.max(style_update.seq());
+                        updates.push(style_update);
+                        continue;
+                    }
+                    if let Some(row_update) = cursor.pending_rows.pop_front() {
+                        max_seq = max_seq.max(row_update.seq());
+                        updates.push(row_update);
+                        continue;
+                    }
                     let absolute = match cursor.next_foreground_row {
                         Some(row) => row,
                         None => break,
@@ -179,11 +249,11 @@ impl SnapshotSource<CacheUpdate> for TerminalSync {
                     } else {
                         absolute.checked_sub(1)
                     };
-                    if let Some(update) = self.collect_row_by_absolute(absolute) {
-                        max_seq = max_seq.max(update.seq());
-                        updates.push(update);
-                    }
                     cursor.next_foreground_row = next_value;
+                    if let Some(update) = self.collect_row_by_absolute(absolute, cursor) {
+                        cursor.pending_rows.push_back(update);
+                        continue;
+                    }
                     if cursor.next_foreground_row.is_none() {
                         break;
                     }
@@ -191,6 +261,16 @@ impl SnapshotSource<CacheUpdate> for TerminalSync {
             }
             PriorityLane::Recent => {
                 while updates.len() < budget {
+                    if let Some(style_update) = cursor.pending_styles.pop_front() {
+                        max_seq = max_seq.max(style_update.seq());
+                        updates.push(style_update);
+                        continue;
+                    }
+                    if let Some(row_update) = cursor.pending_rows.pop_front() {
+                        max_seq = max_seq.max(row_update.seq());
+                        updates.push(row_update);
+                        continue;
+                    }
                     let absolute = match cursor.next_recent_row {
                         Some(row) => row,
                         None => break,
@@ -205,18 +285,33 @@ impl SnapshotSource<CacheUpdate> for TerminalSync {
                     } else {
                         absolute.checked_sub(1)
                     };
-                    if let Some(update) = self.collect_row_by_absolute(absolute) {
-                        max_seq = max_seq.max(update.seq());
-                        updates.push(update);
-                    }
                     cursor.next_recent_row = next_value;
+                    if let Some(update) = self.collect_row_by_absolute(absolute, cursor) {
+                        cursor.pending_rows.push_back(update);
+                        continue;
+                    }
                     if cursor.next_recent_row.is_none() {
                         break;
                     }
                 }
             }
             PriorityLane::History => {
-                return None;
+                while updates.len() < budget {
+                    if let Some(style_update) = cursor.pending_styles.pop_front() {
+                        max_seq = max_seq.max(style_update.seq());
+                        updates.push(style_update);
+                        continue;
+                    }
+                    if let Some(row_update) = cursor.pending_rows.pop_front() {
+                        max_seq = max_seq.max(row_update.seq());
+                        updates.push(row_update);
+                        continue;
+                    }
+                    break;
+                }
+                if updates.is_empty() {
+                    return None;
+                }
             }
         }
 
@@ -317,7 +412,11 @@ impl TerminalSync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::terminal::{Style, StyleId, TerminalGrid};
+    use crate::cache::terminal::packed::attrs_to_byte;
+    use crate::cache::terminal::{
+        Style, StyleId, TerminalGrid, pack_color_from_heavy, unpack_cell,
+    };
+    use crate::model::terminal::cell::{CellAttributes, Color as HeavyColor};
     use crate::model::terminal::{CellWrite, RectFill};
     use crate::sync::{LaneBudget, ServerSynchronizer, SubscriptionId};
 
@@ -413,7 +512,6 @@ mod tests {
         assert_eq!(hello.subscription_id, subscription_id);
 
         let mut foreground_total = 0;
-        let mut foreground_first_chunk = None;
         let mut recent_rows = 0;
         let mut history_rows = 0;
         let mut last_foreground_watermark = 0;
@@ -428,11 +526,9 @@ mod tests {
                         foreground_total += 1;
                         last_foreground_watermark = last_foreground_watermark.max(row.seq);
                     }
-                    _ => panic!("foreground lane expected row snapshots"),
+                    CacheUpdate::Style(_) => {}
+                    _ => panic!("foreground lane expected row or style snapshots"),
                 }
-            }
-            if foreground_first_chunk.is_none() {
-                foreground_first_chunk = Some(chunk.updates.len());
             }
             assert!(chunk.updates.len() <= config.budget_for(PriorityLane::Foreground));
             if !chunk.has_more {
@@ -440,10 +536,6 @@ mod tests {
             }
         }
         assert_eq!(foreground_total, config.initial_snapshot_lines.min(rows));
-        assert_eq!(
-            foreground_first_chunk.unwrap_or(0),
-            config.budget_for(PriorityLane::Foreground)
-        );
 
         while let Some(chunk) = server_sync.snapshot_chunk(subscription_id, PriorityLane::Recent) {
             for update in &chunk.updates {
@@ -452,6 +544,7 @@ mod tests {
                         assert!(row.row < rows);
                         recent_rows += 1;
                     }
+                    CacheUpdate::Style(_) => {}
                     _ => panic!("recent lane expected row snapshots"),
                 }
             }
@@ -478,5 +571,47 @@ mod tests {
                     .all(|update| update.seq() > since)
             );
         }
+    }
+
+    #[test_timeout::timeout]
+    fn snapshot_emits_styles_before_rows() {
+        let grid = Arc::new(TerminalGrid::new(4, 4));
+        let style = Style {
+            fg: pack_color_from_heavy(&HeavyColor::Rgb(255, 0, 0)),
+            bg: pack_color_from_heavy(&HeavyColor::Default),
+            attrs: attrs_to_byte(&CellAttributes {
+                bold: true,
+                ..CellAttributes::default()
+            }),
+        };
+        let style_id = grid.ensure_style_id(style);
+        let packed = TerminalGrid::pack_char_with_style('Z', style_id);
+        grid.write_packed_cell_if_newer(0, 0, 1, packed).unwrap();
+        let snapshot = grid.get_cell_relaxed(0, 0).unwrap();
+        assert_eq!(unpack_cell(snapshot.cell).1.0, style_id.0);
+
+        let delta_stream = Arc::new(NullTerminalDeltaStream);
+        let config = SyncConfig {
+            snapshot_budgets: vec![
+                LaneBudget::new(PriorityLane::Foreground, 4),
+                LaneBudget::new(PriorityLane::Recent, 4),
+                LaneBudget::new(PriorityLane::History, 4),
+            ],
+            initial_snapshot_lines: 1,
+            ..Default::default()
+        };
+        let terminal_sync = Arc::new(TerminalSync::new(grid, delta_stream, config.clone()));
+        let mut server_sync = ServerSynchronizer::new(terminal_sync, config);
+        let subscription_id = SubscriptionId(7);
+        let chunk = server_sync
+            .snapshot_chunk(subscription_id, PriorityLane::Foreground)
+            .expect("expected snapshot chunk");
+        assert!(matches!(chunk.updates.first(), Some(CacheUpdate::Style(_))));
+        assert!(
+            chunk
+                .updates
+                .iter()
+                .any(|update| matches!(update, CacheUpdate::Row(_)))
+        );
     }
 }

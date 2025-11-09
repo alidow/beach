@@ -190,11 +190,12 @@ pub(crate) fn collect_backfill_chunk(
         delivered = delivered.saturating_add(1);
     }
 
-    if delivered > 0 {
+    let mut style_updates = Vec::new();
+    if !style_ids.is_empty() {
         let style_table = grid.style_table.clone();
         for style_id in style_ids {
             if let Some(style) = style_table.get(style_id) {
-                updates.push(CacheUpdate::Style(StyleDefinition::new(
+                style_updates.push(CacheUpdate::Style(StyleDefinition::new(
                     style_id,
                     effective_start,
                     style,
@@ -203,10 +204,86 @@ pub(crate) fn collect_backfill_chunk(
         }
     }
 
-    BackfillChunk {
-        updates,
-        attempted: max_rows,
-        delivered,
+    if !style_updates.is_empty() {
+        let mut combined = style_updates;
+        combined.extend(updates);
+        BackfillChunk {
+            updates: combined,
+            attempted: max_rows,
+            delivered,
+        }
+    } else {
+        BackfillChunk {
+            updates,
+            attempted: max_rows,
+            delivered,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_backfill_chunk;
+    use crate::cache::terminal::{
+        Style, TerminalGrid, attrs_to_byte, pack_cell, pack_color_from_heavy,
+    };
+    use crate::model::terminal::cell::{CellAttributes, Color as HeavyColor};
+    use crate::model::terminal::diff::CacheUpdate;
+
+    fn make_style(fg: HeavyColor, bg: HeavyColor, attrs: CellAttributes) -> Style {
+        Style {
+            fg: pack_color_from_heavy(&fg),
+            bg: pack_color_from_heavy(&bg),
+            attrs: attrs_to_byte(&attrs),
+        }
+    }
+
+    #[test]
+    fn backfill_chunk_includes_styles_before_rows() {
+        let grid = TerminalGrid::new(4, 4);
+        let style = make_style(
+            HeavyColor::Rgb(255, 0, 0),
+            HeavyColor::Default,
+            CellAttributes::default(),
+        );
+        let style_id = grid.ensure_style_id(style);
+        let packed = pack_cell('A', style_id);
+        grid.write_packed_cell_if_newer(0, 0, 1, packed).unwrap();
+
+        let chunk = collect_backfill_chunk(&grid, 0, 1);
+        assert_eq!(chunk.delivered, 1);
+        assert!(matches!(chunk.updates.first(), Some(CacheUpdate::Style(_))));
+        assert!(
+            chunk
+                .updates
+                .iter()
+                .skip(1)
+                .any(|update| matches!(update, CacheUpdate::Row(_)))
+        );
+    }
+
+    #[test]
+    fn backfill_chunk_emits_styles_even_when_multiple_rows_requested() {
+        let grid = TerminalGrid::new(4, 4);
+        let style = make_style(
+            HeavyColor::Indexed(3),
+            HeavyColor::Default,
+            CellAttributes {
+                bold: true,
+                ..CellAttributes::default()
+            },
+        );
+        let style_id = grid.ensure_style_id(style);
+        let packed = pack_cell('Z', style_id);
+        grid.write_packed_cell_if_newer(2, 1, 5, packed).unwrap();
+
+        let chunk = collect_backfill_chunk(&grid, 0, 4);
+        assert!(
+            chunk
+                .updates
+                .iter()
+                .any(|update| matches!(update, CacheUpdate::Style(_)))
+        );
     }
 }
 

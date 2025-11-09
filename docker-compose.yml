@@ -102,6 +102,7 @@ services:
       BEACH_GATE_PORT: 4133
       BEACH_GATE_TOKEN_ISSUER: beach-gate
       BEACH_GATE_SERVICE_AUDIENCE: beach-services
+      BEACH_GATE_DEFAULT_ENTITLEMENTS: "rescue:fallback,private-beach:turn"
     volumes:
       - .:/app
     ports:

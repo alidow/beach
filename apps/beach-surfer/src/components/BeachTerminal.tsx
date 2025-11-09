@@ -31,6 +31,20 @@ function logSizing(step: string, detail: Record<string, unknown>): void {
     console.info('[beach-terminal][sizing]', step, detail, error);
   }
 }
+
+function logCellMetric(kind: string, detail: Record<string, unknown>): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  if (!(window as typeof window & { __BEACH_TRACE?: boolean }).__BEACH_TRACE) {
+    return;
+  }
+  try {
+    console.info(`[beach-terminal][${kind}]`, JSON.stringify(detail));
+  } catch (error) {
+    console.info(`[beach-terminal][${kind}]`, detail, error);
+  }
+}
 import type {
   TerminalSizingStrategy,
   TerminalSizingHostMeta,
@@ -164,6 +178,11 @@ const PREDICTION_GLITCH_REPAIR_MIN_INTERVAL_MS = 150;
 const PREDICTION_GLITCH_FLAG_THRESHOLD_MS = 5000;
 const PREDICTION_SRTT_ALPHA = 0.125;
 const PREDICTION_ACK_GRACE_MS = 90;
+
+// Guardrail: implicit host PTY resizes are extremely dangerous while the viewport
+// measurement stack is under active refactor. Keep this false unless a user
+// explicitly opts into host resizing via dedicated controls.
+const ENABLE_IMPLICIT_HOST_RESIZE = false;
 
 type JoinStateSnapshot = { state: JoinOverlayState; message: string | null };
 
@@ -455,6 +474,7 @@ export interface BeachTerminalProps {
   onToggleFullscreen?: (next: boolean) => void;
   showTopBar?: boolean;
   fallbackOverrides?: FallbackOverrides;
+  // Danger: implicit PTY resizing can clobber host layouts. Leave false unless explicitly requested.
   autoResizeHostOnViewportChange?: boolean;
   onViewportStateChange?: (state: TerminalViewportState) => void;
   disableViewportMeasurements?: boolean;
@@ -511,7 +531,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     isFullscreen = false,
     onToggleFullscreen,
     showTopBar = true,
-    autoResizeHostOnViewportChange = true,
+    autoResizeHostOnViewportChange = false,
     onViewportStateChange,
     disableViewportMeasurements = false,
     forcedViewportRows = null,
@@ -535,7 +555,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     [sizingStrategy],
   );
   const autoResizeHostOnViewportChangeEffective =
-    !viewOnly && autoResizeHostOnViewportChange;
+    ENABLE_IMPLICIT_HOST_RESIZE && !viewOnly && autoResizeHostOnViewportChange;
   if (IS_DEV && typeof window !== 'undefined') {
     (window as any).beachStore = store;
   }
@@ -1394,7 +1414,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       setShowIdlePlaceholder(true);
     }
   }, [hideIdlePlaceholder, status, onStatusChange]);
-  const lines = useMemo(() => buildLines(snapshot, 600, effectiveOverlay), [snapshot, effectiveOverlay]);
+  const lines = useMemo(() => buildLines(snapshot, Number.POSITIVE_INFINITY, effectiveOverlay), [snapshot, effectiveOverlay]);
   const placeholderRowsInViewport = useMemo(
     () => lines.reduce((count, line) => (line.kind === 'loaded' ? count : count + 1), 0),
     [lines],
@@ -1442,6 +1462,26 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const [measuredLineHeight, setMeasuredLineHeight] = useState<number>(lineHeight);
   const minEffectiveLineHeight = Math.max(4, lineHeight * 0.4);
   const effectiveLineHeight = measuredLineHeight >= minEffectiveLineHeight ? measuredLineHeight : lineHeight;
+  const applyFontMetrics = useCallback(() => {
+    const metrics = measureFontGlyphMetrics(fontFamily, fontSize);
+    if (!metrics) {
+      return false;
+    }
+    const { cellWidth, lineHeight: measuredHeight } = metrics;
+    setMeasuredCellWidth((prev) => {
+      if (prev === null || Math.abs(prev - cellWidth) > 0.05) {
+        return cellWidth;
+      }
+      return prev;
+    });
+    setMeasuredLineHeight((prev) => {
+      if (Math.abs(prev - measuredHeight) > 0.1) {
+        return measuredHeight;
+      }
+      return prev;
+    });
+    return true;
+  }, [fontFamily, fontSize]);
   useEffect(() => {
     const normalized =
       Number.isFinite(effectiveLineHeight) && effectiveLineHeight > 0 ? Number(effectiveLineHeight) : null;
@@ -1523,18 +1563,19 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     if (typeof window === 'undefined') {
       return;
     }
-    // Always measure row height and cell width for accurate pixel sizing,
-    // even when viewport measurements are disabled.
+    // Measure actual glyph metrics so CSS cell sizing and viewport math reflect the true font/zoom.
     const container = containerRef.current;
     if (!container) {
       return;
     }
+    applyFontMetrics();
     let frame = -1;
     const scheduleMeasure = () => {
       if (frame !== -1) {
         window.cancelAnimationFrame(frame);
       }
       frame = window.requestAnimationFrame(() => {
+        applyFontMetrics();
         const row = container.querySelector<HTMLDivElement>('.xterm-row');
         if (!row) {
           return;
@@ -1571,8 +1612,6 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
             if (next >= minAcceptableLineHeight) {
               return Math.abs(prev - next) > 0.1 ? next : prev;
             }
-            // Ignore obviously scaled values; if we already dipped below the
-            // threshold, snap back to our font-derived baseline.
             if (prev < minEffectiveLineHeight) {
               return lineHeight;
             }
@@ -1580,6 +1619,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           });
         }
         let nextCellWidth: number | null = null;
+        let measurementSource: 'glyph_span' | 'row_width' | 'fallback' = 'fallback';
         const spans = Array.from(row.querySelectorAll<HTMLSpanElement>('span'));
         const glyphSpan = spans.find((span) => {
           const text = span.textContent?.replace(/\u00A0/g, ' ').trim() ?? '';
@@ -1589,6 +1629,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           const glyphRect = glyphSpan.getBoundingClientRect();
           if (Number.isFinite(glyphRect.width) && glyphRect.width > 0) {
             nextCellWidth = glyphRect.width;
+            measurementSource = 'glyph_span';
           }
         }
         if ((!nextCellWidth || nextCellWidth <= 0) && Number.isFinite(rect.width) && rect.width > 0) {
@@ -1598,9 +1639,21 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
           const widthPerCell = rect.width / Math.max(1, colsCount);
           if (Number.isFinite(widthPerCell) && widthPerCell > 0) {
             nextCellWidth = widthPerCell;
+            measurementSource = 'row_width';
           }
         }
         if (nextCellWidth && nextCellWidth > 0) {
+          logCellMetric('dom-measure', {
+            sessionId: sessionId ?? null,
+            source: measurementSource,
+            nextCellWidth,
+            spans: spans.length,
+            snapshotCols: snapshot.cols,
+            baseCellWidth,
+            fontFamily,
+            fontSize,
+            rowHeight: rect.height,
+          });
           setMeasuredCellWidth((prev) =>
             prev === null || Math.abs(prev - nextCellWidth) > 0.1 ? nextCellWidth : prev,
           );
@@ -1615,6 +1668,11 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       observer.observe(container);
     }
     window.addEventListener('resize', scheduleMeasure);
+    const vv = window.visualViewport;
+    if (vv) {
+      vv.addEventListener('resize', scheduleMeasure);
+      vv.addEventListener('scroll', scheduleMeasure);
+    }
     return () => {
       if (frame !== -1) {
         window.cancelAnimationFrame(frame);
@@ -1623,9 +1681,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
         observer.disconnect();
       }
       window.removeEventListener('resize', scheduleMeasure);
+      if (vv) {
+        vv.removeEventListener('resize', scheduleMeasure);
+        vv.removeEventListener('scroll', scheduleMeasure);
+      }
     };
-  }, [snapshot.cols, fontFamily, fontSize, lines.length, lineHeight, minEffectiveLineHeight]);
-
+  }, [snapshot.cols, fontFamily, fontSize, lines.length, lineHeight, minEffectiveLineHeight, applyFontMetrics]);
   useEffect(() => {
     transportRef.current = providedTransport ?? null;
     lastSentViewportRows.current = 0;
@@ -1884,6 +1945,13 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       store.setViewport(current.viewportTop, clampedRows);
       lastMeasuredViewportRows.current = clampedRows;
       emitViewportState();
+      const snapshotAfterCommit = store.getSnapshot();
+      backfillController.maybeRequest(snapshotAfterCommit, {
+        nearBottom: snapshotAfterCommit.followTail,
+        followTailDesired: followTailDesiredRef.current,
+        phase: followTailPhaseRef.current,
+        tailPaddingRows: tailPaddingRowsRef.current,
+      });
       if (suppressNextResizeRef.current) {
         suppressNextResizeRef.current = false;
       } else if (
@@ -1914,6 +1982,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       applyContainerSizing(style);
     },
     [
+      backfillController,
       applyContainerSizing,
       autoResizeHostOnViewportChangeEffective,
       computeViewportGeometry,
@@ -2917,7 +2986,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       heightChanged,
       inferredProgrammatic,
       lineHeight,
-      measuredLineHeight: pixelsPerRow,
+      lineHeightPx: pixelsPerRow,
       viewportRows,
       measuredRows,
       approxRow,
@@ -3512,7 +3581,7 @@ interface RenderLine {
 
 export function buildLines(
   snapshot: TerminalGridSnapshot,
-  limit: number,
+  limit = Number.POSITIVE_INFINITY,
   overlay: PredictionOverlayState = DEFAULT_PREDICTION_OVERLAY,
 ): RenderLine[] {
   const rows = snapshot.visibleRows(limit);
@@ -3757,6 +3826,44 @@ function LineRow({
 
 function computeLineHeight(fontSize: number): number {
   return Math.round(fontSize * 1.4);
+}
+
+function measureFontGlyphMetrics(
+  fontFamily: string,
+  fontSize: number,
+): { cellWidth: number; lineHeight: number } | null {
+  if (typeof document === 'undefined') {
+    return null;
+  }
+  const sampleText = 'MMMMMMMMMM';
+  const measure = document.createElement('span');
+  measure.textContent = sampleText;
+  measure.style.position = 'absolute';
+  measure.style.visibility = 'hidden';
+  measure.style.whiteSpace = 'pre';
+  measure.style.fontFamily = fontFamily;
+  measure.style.fontSize = `${fontSize}px`;
+  measure.style.lineHeight = 'normal';
+  measure.style.fontKerning = 'none';
+  measure.style.margin = '0';
+  measure.style.padding = '0';
+  measure.style.letterSpacing = '0';
+  document.body.appendChild(measure);
+  const rect = measure.getBoundingClientRect();
+  measure.remove();
+  if (!Number.isFinite(rect.width) || rect.width <= 0 || !Number.isFinite(rect.height) || rect.height <= 0) {
+    logCellMetric('font-metrics-miss', { fontFamily, fontSize, width: rect.width, height: rect.height });
+    return null;
+  }
+  const widthPerChar = rect.width / sampleText.length;
+  logCellMetric('font-metrics', {
+    fontFamily,
+    fontSize,
+    sampleWidth: rect.width,
+    sampleHeight: rect.height,
+    glyphWidth: widthPerChar,
+  });
+  return { cellWidth: widthPerChar, lineHeight: rect.height };
 }
 
 export function shouldReenableFollowTail(remainingPixels: number, lineHeightPx: number): boolean {

@@ -1,7 +1,7 @@
 use axum::{
-    Json,
     extract::{Path, State},
     http::HeaderMap,
+    Json,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use tracing::{info, warn};
 
 use crate::state::{AppState, StateError, ViewerTokenError};
 
-use super::{ApiError, ApiResult, AuthToken, sessions::ensure_scope};
+use super::{sessions::ensure_scope, ApiError, ApiResult, AuthToken};
 
 #[derive(Debug, Deserialize)]
 pub struct CreateBeachRequest {

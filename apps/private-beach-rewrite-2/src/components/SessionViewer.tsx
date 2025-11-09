@@ -38,6 +38,7 @@ export function SessionViewer({
   const showLoading = status === 'idle' || status === 'connecting' || status === 'reconnecting';
   const showError = status === 'error' && Boolean(viewer.error);
   const metricsRef = useRef<TileViewportSnapshot | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -154,8 +155,194 @@ export function SessionViewer({
     [onViewportMetrics, tileId],
   );
 
+  // Quantize terminal cell width to the device-pixel grid (and canvas scale)
+  // to reduce horizontal drift from subpixel widths.
+  // Guard: set window.__BEACH_DISABLE_CELL_QUANTIZE = true to disable.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if ((globalThis as Record<string, any>).__BEACH_DISABLE_CELL_QUANTIZE) return;
+
+    const root = rootRef.current;
+    if (!root) return;
+
+    const terminalEl = root.querySelector<HTMLElement>('.beach-terminal');
+    if (!terminalEl) return;
+
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    const originalVar = terminalEl.style.getPropertyValue('--beach-terminal-cell-width');
+
+    let raf = 0;
+    let ro: ResizeObserver | null = null;
+
+    const applyQuantize = () => {
+      try {
+        const computed = window.getComputedStyle(terminalEl);
+        let cssVal = computed.getPropertyValue('--beach-terminal-cell-width');
+        if (!cssVal || !cssVal.trim()) cssVal = originalVar;
+        const px = parseFloat(cssVal);
+        if (!Number.isFinite(px) || px <= 0) return;
+        const { scale } = readTransformChain(terminalEl);
+        const denom = dpr * (Number.isFinite(scale) && scale > 0 ? scale : 1);
+        const quantized = Math.max(0.25, Math.round(px * denom) / denom);
+        if (Math.abs(quantized - px) > 0.002) {
+          terminalEl.style.setProperty('--beach-terminal-cell-width', `${quantized.toFixed(3)}px`);
+        }
+      } catch {
+        // ignore
+      }
+    };
+
+    const schedule = () => {
+      if (raf) cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(applyQuantize);
+    };
+
+    schedule();
+    if ('ResizeObserver' in window) {
+      ro = new ResizeObserver(() => schedule());
+      ro.observe(terminalEl);
+      ro.observe(root);
+    }
+    window.addEventListener('resize', schedule);
+
+    return () => {
+      if (raf) cancelAnimationFrame(raf);
+      if (ro) ro.disconnect();
+      window.removeEventListener('resize', schedule);
+      try {
+        if (originalVar) {
+          terminalEl.style.setProperty('--beach-terminal-cell-width', originalVar);
+        } else {
+          terminalEl.style.removeProperty('--beach-terminal-cell-width');
+        }
+      } catch {}
+    };
+  }, []);
+
+  // Pixel-snap terminal content to the device pixel grid to avoid
+  // subpixel misalignment when the canvas pan/translate is fractional.
+  // Guarded by a global opt-out flag: set window.__BEACH_DISABLE_PIXEL_SNAP = true
+  // to disable without code changes.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if ((globalThis as Record<string, any>).__BEACH_DISABLE_PIXEL_SNAP) return;
+
+    const root = rootRef.current;
+    if (!root) return;
+    const content = root.querySelector<HTMLElement>('[data-terminal-content="true"]');
+    if (!content) return;
+
+    let raf = 0;
+    let ro: ResizeObserver | null = null;
+    const initialTransform = content.style.transform && content.style.transform !== 'none'
+      ? content.style.transform
+      : '';
+
+    const applySnap = () => {
+      try {
+        const rect = content.getBoundingClientRect();
+        const dpr = Math.max(1, window.devicePixelRatio || 1);
+        const leftDevice = rect.left * dpr;
+        const frac = leftDevice - Math.round(leftDevice);
+        const offsetDevice = Math.abs(frac) < 0.01 ? 0 : -frac;
+        const offsetCss = offsetDevice / dpr;
+        const base = initialTransform;
+        const snap = `translateX(${offsetCss.toFixed(3)}px)`;
+        content.style.willChange = 'transform';
+        content.style.transform = base ? `${base} ${snap}` : snap;
+      } catch {
+        // ignore
+      }
+    };
+
+    const schedule = () => {
+      if (raf) cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(applySnap);
+    };
+
+    schedule();
+    if ('ResizeObserver' in window) {
+      ro = new ResizeObserver(() => schedule());
+      ro.observe(root);
+      const contentEl = content as Element;
+      ro.observe(contentEl);
+    }
+    window.addEventListener('resize', schedule);
+    return () => {
+      if (raf) cancelAnimationFrame(raf);
+      if (ro) ro.disconnect();
+      window.removeEventListener('resize', schedule);
+      try {
+        content.style.transform = initialTransform;
+        if (!initialTransform) content.style.removeProperty('transform');
+        content.style.willChange = '';
+      } catch {}
+    };
+  }, []);
+
+  // Verbose instrumentation for diagnosing alignment issues.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (!(globalThis as Record<string, any>).__BEACH_TILE_TRACE) return;
+    const root = rootRef.current;
+    if (!root) return;
+    const terminalEl = root.querySelector<HTMLElement>('.beach-terminal');
+    if (!terminalEl) return;
+
+    const logSnapshot = (reason: string) => {
+      try {
+        const computed = window.getComputedStyle(terminalEl);
+        const cssVar = computed.getPropertyValue('--beach-terminal-cell-width');
+        const cssPx = parseFloat(cssVar);
+        const letterSpacing = computed.letterSpacing;
+        const fontFamily = computed.fontFamily;
+        const fontSize = computed.fontSize;
+        const span = terminalEl.querySelector<HTMLSpanElement>('.xterm-row span');
+        const spanWidth = span ? span.getBoundingClientRect().width : null;
+        const row = terminalEl.querySelector('.xterm-row');
+        const renderedCells = row ? row.querySelectorAll('span').length : null;
+        const { scale: flowScale, translateX, translateY } = readTransformChain(root);
+        const { scale: terminalScale, translateX: terminalTranslateX, translateY: terminalTranslateY } =
+          readTransformChain(terminalEl);
+        const metrics = metricsRef.current;
+        // eslint-disable-next-line no-console
+        console.info('[rewrite-terminal][tile-trace]', JSON.stringify({
+          reason,
+          tileId,
+          cssCellWidthPx: Number.isFinite(cssPx) ? cssPx : null,
+          spanWidthPx: spanWidth,
+          letterSpacing,
+          fontFamily,
+          fontSize,
+          flowScale,
+          flowTranslateX: translateX,
+          flowTranslateY: translateY,
+          terminalScale,
+          terminalTranslateX,
+          terminalTranslateY,
+          dpr: window.devicePixelRatio || 1,
+          renderedCells,
+          metrics,
+        }));
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.warn('[rewrite-terminal][tile-trace] error', error);
+      }
+    };
+
+    logSnapshot('initial');
+    const interval = window.setInterval(() => logSnapshot('interval'), 1500);
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [tileId]);
+
   return (
-    <div className={cn('relative flex h-full min-h-0 w-full flex-1 overflow-hidden', className)} data-status={status}>
+    <div
+      ref={rootRef}
+      className={cn('relative flex h-full min-h-0 w-full flex-1 overflow-hidden', className)}
+      data-status={status}
+    >
       <div
         className="flex h-full w-full flex-1"
         data-terminal-root="true"
@@ -193,4 +380,61 @@ export function SessionViewer({
       ) : null}
     </div>
   );
+}
+
+function readTransformChain(element: Element | null): { scale: number; translateX: number; translateY: number } {
+  if (typeof window === 'undefined') {
+    return { scale: 1, translateX: 0, translateY: 0 };
+  }
+  let current: Element | null = element;
+  while (current) {
+    const computed = window.getComputedStyle(current);
+    const raw = computed.transform || (computed as any).webkitTransform || '';
+    const parsed = parseTransformMatrix(raw);
+    if (parsed) {
+      return parsed;
+    }
+    current = current.parentElement;
+  }
+  return { scale: 1, translateX: 0, translateY: 0 };
+}
+
+function parseTransformMatrix(value: string): { scale: number; translateX: number; translateY: number } | null {
+  if (!value || value === 'none') {
+    return null;
+  }
+  const matrix2d = value.match(/matrix\(([-0-9.,\s]+)\)/);
+  if (matrix2d && matrix2d[1]) {
+    const parts = matrix2d[1]
+      .split(',')
+      .map((segment) => parseFloat(segment.trim()));
+    if (parts.length >= 6 && parts.every((num) => Number.isFinite(num))) {
+      const [a, b, , , tx, ty] = parts;
+      const scale = Math.sqrt(a * a + b * b) || 1;
+      return {
+        scale,
+        translateX: Number.isFinite(tx) ? tx : 0,
+        translateY: Number.isFinite(ty) ? ty : 0,
+      };
+    }
+  }
+  const matrix3d = value.match(/matrix3d\(([-0-9.,\s]+)\)/);
+  if (matrix3d && matrix3d[1]) {
+    const parts = matrix3d[1]
+      .split(',')
+      .map((segment) => parseFloat(segment.trim()));
+    if (parts.length >= 16 && parts.every((num) => Number.isFinite(num))) {
+      const a = parts[0];
+      const b = parts[1];
+      const tx = parts[12];
+      const ty = parts[13];
+      const scale = Math.sqrt(a * a + b * b) || 1;
+      return {
+        scale,
+        translateX: Number.isFinite(tx) ? tx : 0,
+        translateY: Number.isFinite(ty) ? ty : 0,
+      };
+    }
+  }
+  return null;
 }

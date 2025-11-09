@@ -13,14 +13,13 @@ const baseMetrics: TileViewportSnapshot = {
 };
 
 describe('computeAutoResizeSize', () => {
-  it('calculates snapped flow dimensions accounting for chrome and zoom', () => {
+  it('calculates snapped flow dimensions accounting for chrome', () => {
     const result = computeAutoResizeSize({
       metrics: baseMetrics,
       chromeWidthPx: 120,
       chromeHeightPx: 80,
-      zoom: 0.5,
     });
-    expect(result).toEqual({ width: 2400, height: 1600 });
+    expect(result).toEqual({ width: 1200, height: 800 });
   });
 
   it('returns null when host metrics are incomplete', () => {
@@ -29,17 +28,15 @@ describe('computeAutoResizeSize', () => {
       metrics: missingMetrics,
       chromeWidthPx: 0,
       chromeHeightPx: 0,
-      zoom: 1,
     });
     expect(result).toBeNull();
   });
 
-  it('falls back to zoom=1 when provided zoom is invalid', () => {
+  it('clamps negative chrome deltas to zero', () => {
     const result = computeAutoResizeSize({
       metrics: baseMetrics,
       chromeWidthPx: -50,
       chromeHeightPx: -10,
-      zoom: 0,
     });
     expect(result).toEqual({ width: 1080, height: 720 });
   });

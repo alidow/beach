@@ -21,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = AppConfig::from_env();
     let mut state = if let Some(db_url) = &cfg.database_url {
         match PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(20)
             .connect(db_url)
             .await
         {

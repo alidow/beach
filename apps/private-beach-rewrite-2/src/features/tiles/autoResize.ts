@@ -7,9 +7,6 @@ type AutoResizeInput = {
   metrics: TileViewportSnapshot;
   chromeWidthPx: number;
   chromeHeightPx: number;
-  zoom: number;
-  observedRowHeight?: number | null;
-  observedCellWidth?: number | null;
 };
 
 function normalizePositive(value: number | null | undefined): number | null {
@@ -22,27 +19,12 @@ function normalizePositive(value: number | null | undefined): number | null {
   return value;
 }
 
-function selectMetric(
-  preferred: number | null,
-  fallback: number | null,
-  kind: 'row' | 'col',
-): number | null {
-  const lowerBound = kind === 'row' ? 6 : 4;
-  const upperBound = kind === 'row' ? 40 : 32;
-  const choose = (value: number | null) =>
-    value != null && value >= lowerBound && value <= upperBound ? value : null;
-  return choose(preferred) ?? choose(fallback) ?? preferred ?? fallback ?? null;
-}
-
 export function computeAutoResizeSize(input: AutoResizeInput): TileSize | null {
   const rows = normalizePositive(input.metrics.hostRows);
   const cols = normalizePositive(input.metrics.hostCols);
-  const metricRow = normalizePositive(input.metrics.pixelsPerRow);
-  const metricCol = normalizePositive(input.metrics.pixelsPerCol);
-  const observedRow = normalizePositive(input.observedRowHeight);
-  const observedCol = normalizePositive(input.observedCellWidth);
-  const pixelsPerRow = selectMetric(metricRow, observedRow, 'row');
-  const pixelsPerCol = selectMetric(metricCol, observedCol, 'col');
+  // Prefer the terminal-reported fixed metrics to avoid zoom/transform skew.
+  const pixelsPerRow = normalizePositive(input.metrics.pixelsPerRow);
+  const pixelsPerCol = normalizePositive(input.metrics.pixelsPerCol);
   if (!rows || !cols || !pixelsPerRow || !pixelsPerCol) {
     return null;
   }
@@ -57,6 +39,7 @@ export function computeAutoResizeSize(input: AutoResizeInput): TileSize | null {
     return null;
   }
 
+  // React Flow node sizes are specified in unscaled (pre-zoom) coordinates.
   const flowWidth = desiredTileWidthPx;
   const flowHeight = desiredTileHeightPx;
   if (!Number.isFinite(flowWidth) || !Number.isFinite(flowHeight)) {

@@ -46,6 +46,9 @@ http://localhost:3003/beaches
 
 Here are cargo-run commands for both players and the agent, matching your pattern and not relying on session-id env vars. Run each in its own terminal.
 
+
+
+
 LHS player (single line)
 
 LOG_DIR="$HOME/beach-debug"; mkdir -p "$LOG_DIR"
@@ -74,19 +77,10 @@ cd ~/development/beach && cargo run --bin beach -- \
 
 Agent (single line; no session-id envs; just declare beach + manager)
 
-LOG_DIR="$HOME/beach-debug"; mkdir -p "$LOG_DIR"
-cd ~/development/beach && cargo run --bin beach -- \
-  --log-level trace \
-  --log-file "$LOG_DIR/beach-host-agent.log" \
-  --session-server http://localhost:4132/ \
-  host \
-  --bootstrap-output json \
-  --wait \
-  -- /usr/bin/env python3 ~/development/beach/apps/private-beach/demo/pong/agent/main.py \
-       --private-beach-id "<YOUR_BEACH_ID>" \
-       --mcp-base-url "http://localhost:8080" \
-       --lease-reason "pong_showcase" \
-  | tee "$LOG_DIR/bootstrap-agent.json"
+cd ~/development/beach
+chmod +x apps/private-beach/demo/pong/tools/run-agent.sh
+apps/private-beach/demo/pong/tools/run-agent.sh 4185e6be-4c1a-40a0-b285-272f8b44265f
+
 
 
 LOG_DIR="$HOME/beach-debug" \

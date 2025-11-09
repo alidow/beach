@@ -1889,11 +1889,18 @@ def fetch_relationship_metadata(
     output: "queue.Queue[Tuple[str, object]]",
 ) -> Dict[str, object]:
     meta: Dict[str, object] = {}
-    try:
-        layout = client.get_canvas_layout(private_beach_id)
-    except ManagerRequestError as exc:
-        output.put(("error", f"layout fetch failed: {exc}"))
-        return meta
+    now = time.time()
+    layout: Optional[Dict[str, object]] = None
+    cached = LAYOUT_CACHE.get(private_beach_id)
+    if cached and now - cached[0] < LAYOUT_CACHE_TTL:
+        layout = cached[1]
+    else:
+        try:
+            layout = client.get_canvas_layout(private_beach_id)
+            LAYOUT_CACHE[private_beach_id] = (now, layout)
+        except ManagerRequestError as exc:
+            output.put(("error", f"layout fetch failed: {exc}"))
+            return meta
     session_to_tile: Dict[str, str] = {}
     tiles = layout.get("tiles")
     if isinstance(tiles, dict):
@@ -1942,3 +1949,6 @@ def resolve_trace_id_from_layout(layout: Dict[str, object], tile_id: Optional[ob
     if enabled and isinstance(trace_id, str) and trace_id.strip():
         return trace_id.strip()
     return None
+# cache for expensive layout fetches: private_beach_id -> (timestamp, layout)
+LAYOUT_CACHE: Dict[str, Tuple[float, Dict[str, object]]] = {}
+LAYOUT_CACHE_TTL = 2.0  # seconds

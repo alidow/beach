@@ -180,7 +180,7 @@ export function ApplicationTile({
   managerUrl = buildManagerUrl(),
   sessionMeta,
   onSessionMetaChange,
-  disableViewportMeasurements = false,
+  disableViewportMeasurements = true,
   onViewportMetricsChange,
   traceContext = null,
 }: ApplicationTileProps) {
@@ -270,6 +270,10 @@ export function ApplicationTile({
         viewportCols: resolveIntegerMetric(patch.viewportCols, previous?.viewportCols),
         pixelsPerRow: resolveFloatMetric(patch.pixelsPerRow, previous?.pixelsPerRow),
         pixelsPerCol: resolveFloatMetric(patch.pixelsPerCol, previous?.pixelsPerCol),
+        hostWidthPx: resolveFloatMetric(patch.hostWidthPx, previous?.hostWidthPx),
+        hostHeightPx: resolveFloatMetric(patch.hostHeightPx, previous?.hostHeightPx),
+        cellWidthPx: resolveFloatMetric(patch.cellWidthPx, previous?.cellWidthPx),
+        cellHeightPx: resolveFloatMetric(patch.cellHeightPx, previous?.cellHeightPx),
       };
       if (
         next.hostRows != null &&
@@ -295,7 +299,11 @@ export function ApplicationTile({
         previous.viewportRows === next.viewportRows &&
         previous.viewportCols === next.viewportCols &&
         previous.pixelsPerRow === next.pixelsPerRow &&
-        previous.pixelsPerCol === next.pixelsPerCol;
+        previous.pixelsPerCol === next.pixelsPerCol &&
+        previous.hostWidthPx === next.hostWidthPx &&
+        previous.hostHeightPx === next.hostHeightPx &&
+        previous.cellWidthPx === next.cellWidthPx &&
+        previous.cellHeightPx === next.cellHeightPx;
       if (same) {
         return;
       }
@@ -309,6 +317,10 @@ export function ApplicationTile({
         viewportCols: next.viewportCols,
         pixelsPerRow: next.pixelsPerRow,
         pixelsPerCol: next.pixelsPerCol,
+        hostWidthPx: next.hostWidthPx,
+        hostHeightPx: next.hostHeightPx,
+        cellWidthPx: next.cellWidthPx,
+        cellHeightPx: next.cellHeightPx,
       });
     },
     [onViewportMetricsChange, resolveFloatMetric, resolveIntegerMetric, tileId],
@@ -324,6 +336,10 @@ export function ApplicationTile({
         ...snapshot,
         hostRows: snapshot.hostRows ?? undefined,
         hostCols: snapshot.hostCols ?? undefined,
+        hostWidthPx: snapshot.hostWidthPx ?? undefined,
+        hostHeightPx: snapshot.hostHeightPx ?? undefined,
+        cellWidthPx: snapshot.cellWidthPx ?? undefined,
+        cellHeightPx: snapshot.cellHeightPx ?? undefined,
       };
       applyViewportPatch(normalized, 'terminal');
     },

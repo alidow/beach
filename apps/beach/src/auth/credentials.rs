@@ -4,6 +4,7 @@ use crate::auth::error::AuthError;
 use crate::auth::passphrase;
 use directories::BaseDirs;
 use keyring::Entry;
+use std::env;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -29,6 +30,9 @@ pub struct AccessTokenCache {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RefreshTokenRecord {
     Keyring { service: String, account: String },
+    /// Plaintext token stored directly in the credentials file (0600 perms).
+    /// Matches the common pattern used by many CLIs (aws, gcloud, azure).
+    Plain { token: String },
     Encrypted { blob: EncryptedBlob },
 }
 
@@ -36,12 +40,26 @@ impl RefreshTokenRecord {
     pub fn read(&self) -> Result<String, AuthError> {
         match self {
             RefreshTokenRecord::Keyring { service, account } => {
+                // Respect opt-out: if keychain use is not explicitly enabled,
+                // avoid touching the OS keychain to prevent a macOS prompt.
+                let use_keychain = env::var("BEACH_AUTH_USE_KEYCHAIN")
+                    .map(|v| matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    ))
+                    .unwrap_or(false);
+                if !use_keychain {
+                    return Err(AuthError::Keyring(
+                        "keychain access disabled via BEACH_AUTH_USE_KEYCHAIN=false; re-login required".into(),
+                    ));
+                }
                 let entry = Entry::new(service, account)
                     .map_err(|err| AuthError::Keyring(err.to_string()))?;
                 entry
                     .get_password()
                     .map_err(|err| AuthError::Keyring(err.to_string()))
             }
+            RefreshTokenRecord::Plain { token } => Ok(token.clone()),
             RefreshTokenRecord::Encrypted { blob } => {
                 let passphrase = passphrase::require_passphrase()?;
                 crypto::decrypt(&passphrase, blob)
@@ -50,43 +68,65 @@ impl RefreshTokenRecord {
     }
 
     pub fn write(profile: &str, gateway: &Url, token: &str) -> Result<Self, AuthError> {
-        let host = gateway.host_str().unwrap_or("beach");
-        let account = format!("{profile}@{host}");
-        match Entry::new(KEYRING_SERVICE, &account) {
-            Ok(entry) => {
-                entry
-                    .set_password(token)
-                    .map_err(|err| AuthError::Keyring(err.to_string()))?;
-                Ok(RefreshTokenRecord::Keyring {
-                    service: KEYRING_SERVICE.to_string(),
-                    account,
-                })
-            }
-            Err(err) => {
-                tracing::warn!(
-                    target: "beach::auth",
-                    error = %err,
-                    "keyring unavailable; falling back to passphrase-protected storage"
-                );
-                let passphrase = passphrase::require_passphrase()?;
-                let blob = crypto::encrypt(&passphrase, token)?;
-                Ok(RefreshTokenRecord::Encrypted { blob })
-            }
-        }
-    }
+        // Storage policy (in order):
+        // 1) If BEACH_AUTH_USE_KEYCHAIN is truthy -> use OS keychain
+        // 2) Else if BEACH_AUTH_PASSPHRASE is set -> store encrypted blob
+        // 3) Else -> store plaintext in the credentials file (0600 perms)
 
-    pub fn delete(&self) {
-        if let RefreshTokenRecord::Keyring { service, account } = self {
-            if let Ok(entry) = Entry::new(service, account) {
-                if let Err(err) = entry.delete_password() {
+        fn env_truthy(name: &str) -> bool {
+            env::var(name)
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false)
+        }
+
+        if env_truthy("BEACH_AUTH_USE_KEYCHAIN") {
+            let host = gateway.host_str().unwrap_or("beach");
+            let account = format!("{profile}@{host}");
+            match Entry::new(KEYRING_SERVICE, &account) {
+                Ok(entry) => {
+                    entry
+                        .set_password(token)
+                        .map_err(|err| AuthError::Keyring(err.to_string()))?;
+                    return Ok(RefreshTokenRecord::Keyring {
+                        service: KEYRING_SERVICE.to_string(),
+                        account,
+                    });
+                }
+                Err(err) => {
                     tracing::warn!(
                         target: "beach::auth",
                         error = %err,
-                        service = %service,
-                        account = %account,
-                        "failed to delete keyring entry"
+                        "keyring unavailable; falling back to passphrase/plaintext storage"
                     );
                 }
+            }
+        }
+
+        if let Ok(Some(pass)) = passphrase::optional_passphrase() {
+            let blob = crypto::encrypt(&pass, token)?;
+            return Ok(RefreshTokenRecord::Encrypted { blob });
+        }
+
+        Ok(RefreshTokenRecord::Plain { token: token.to_string() })
+    }
+
+    pub fn delete(&self) {
+        match self {
+            RefreshTokenRecord::Keyring { service, account } => {
+                if let Ok(entry) = Entry::new(service, account) {
+                    if let Err(err) = entry.delete_password() {
+                        tracing::warn!(
+                            target: "beach::auth",
+                            error = %err,
+                            service = %service,
+                            account = %account,
+                            "failed to delete keyring entry"
+                        );
+                    }
+                }
+            }
+            RefreshTokenRecord::Plain { .. } | RefreshTokenRecord::Encrypted { .. } => {
+                // nothing to delete from external stores
             }
         }
     }

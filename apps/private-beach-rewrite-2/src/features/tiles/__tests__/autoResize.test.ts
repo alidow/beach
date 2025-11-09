@@ -10,6 +10,10 @@ const baseMetrics: TileViewportSnapshot = {
   viewportCols: 100,
   pixelsPerRow: 18,
   pixelsPerCol: 9,
+  hostWidthPx: null,
+  hostHeightPx: null,
+  cellWidthPx: 9,
+  cellHeightPx: 18,
 };
 
 describe('computeAutoResizeSize', () => {
@@ -39,5 +43,19 @@ describe('computeAutoResizeSize', () => {
       chromeHeightPx: -10,
     });
     expect(result).toEqual({ width: 1080, height: 720 });
+  });
+
+  it('prefers host pixel sizes when available', () => {
+    const metrics: TileViewportSnapshot = {
+      ...baseMetrics,
+      hostWidthPx: 640,
+      hostHeightPx: 320,
+    };
+    const result = computeAutoResizeSize({
+      metrics,
+      chromeWidthPx: 10,
+      chromeHeightPx: 20,
+    });
+    expect(result).toEqual({ width: 650, height: 340 });
   });
 });

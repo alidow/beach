@@ -102,6 +102,10 @@ describe('FlowCanvas viewport updates', () => {
       viewportCols: 100,
       pixelsPerRow: 12,
       pixelsPerCol: 6,
+      hostWidthPx: null,
+      hostHeightPx: null,
+      cellWidthPx: 6,
+      cellHeightPx: 12,
     };
 
     act(() => {

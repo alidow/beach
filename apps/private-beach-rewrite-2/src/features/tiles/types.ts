@@ -64,6 +64,10 @@ export type TileViewportSnapshot = {
   viewportCols: number | null;
   pixelsPerRow: number | null;
   pixelsPerCol: number | null;
+  hostWidthPx: number | null;
+  hostHeightPx: number | null;
+  cellWidthPx: number | null;
+  cellHeightPx: number | null;
 };
 
 export type TileState = {

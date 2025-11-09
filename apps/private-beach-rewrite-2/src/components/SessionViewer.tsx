@@ -31,7 +31,7 @@ export function SessionViewer({
   tileId,
   className,
   sessionId,
-  disableViewportMeasurements = false,
+  disableViewportMeasurements = true,
   onViewportMetrics,
 }: SessionViewerProps) {
   const status = viewer.status ?? 'idle';
@@ -136,6 +136,10 @@ export function SessionViewer({
         viewportCols: normalizeMetric(state.viewportCols),
         pixelsPerRow: normalizeMetric(state.pixelsPerRow),
         pixelsPerCol: normalizeMetric(state.pixelsPerCol),
+        hostWidthPx: normalizeMetric(state.hostPixelWidth),
+        hostHeightPx: normalizeMetric(state.hostPixelHeight),
+        cellWidthPx: normalizeMetric(state.pixelsPerCol),
+        cellHeightPx: normalizeMetric(state.pixelsPerRow),
       };
       const previous = metricsRef.current;
       if (
@@ -145,7 +149,11 @@ export function SessionViewer({
         previous.viewportRows === snapshot.viewportRows &&
         previous.viewportCols === snapshot.viewportCols &&
         previous.pixelsPerRow === snapshot.pixelsPerRow &&
-        previous.pixelsPerCol === snapshot.pixelsPerCol
+        previous.pixelsPerCol === snapshot.pixelsPerCol &&
+        previous.hostWidthPx === snapshot.hostWidthPx &&
+        previous.hostHeightPx === snapshot.hostHeightPx &&
+        previous.cellWidthPx === snapshot.cellWidthPx &&
+        previous.cellHeightPx === snapshot.cellHeightPx
       ) {
         return;
       }
@@ -348,7 +356,7 @@ export function SessionViewer({
         data-terminal-root="true"
         data-terminal-tile={tileId}
       >
-        <div className="flex h-full w-full flex-1" data-terminal-content="true">
+        <div className="flex h-full w-full flex-1 overflow-hidden" data-terminal-content="true">
           <BeachTerminal
             className="flex h-full w-full flex-1 border border-slate-800/70 bg-[#060910]/95 shadow-[0_30px_80px_rgba(8,12,24,0.55)]"
             store={viewer.store ?? undefined}
@@ -364,6 +372,7 @@ export function SessionViewer({
             showJoinOverlay={false}
             enablePredictiveEcho={false}
             disableViewportMeasurements={disableViewportMeasurements}
+            lockViewportToHost
             onViewportStateChange={handleViewportStateChange}
           />
         </div>

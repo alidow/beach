@@ -418,15 +418,8 @@ export function TileFlowNode({ data, dragging }: Props) {
     const hostCols = viewportMetrics.hostCols ?? null;
     const pixelsPerRow = viewportMetrics.pixelsPerRow ?? null;
     const pixelsPerCol = viewportMetrics.pixelsPerCol ?? null;
-    if (!hostRows || !hostCols || !pixelsPerRow || !pixelsPerCol) {
-      logAutoResizeEvent(tile.id, 'incomplete-metrics', {
-        hostRows,
-        hostCols,
-        pixelsPerRow,
-        pixelsPerCol,
-      });
-      return;
-    }
+    const hostWidthPx = viewportMetrics.hostWidthPx ?? null;
+    const hostHeightPx = viewportMetrics.hostHeightPx ?? null;
     const container = nodeRef.current;
     if (!container) {
       logAutoResizeEvent(tile.id, 'missing-container');
@@ -460,7 +453,16 @@ export function TileFlowNode({ data, dragging }: Props) {
       chromeHeightPx,
     });
     if (!nextSize) {
-      logAutoResizeEvent(tile.id, 'compute-failed', { chromeWidthPx, chromeHeightPx });
+      logAutoResizeEvent(tile.id, 'compute-failed', {
+        chromeWidthPx,
+        chromeHeightPx,
+        hostRows,
+        hostCols,
+        hostWidthPx,
+        hostHeightPx,
+        pixelsPerRow,
+        pixelsPerCol,
+      });
       return;
     }
     if (nextSize.width === tile.size.width && nextSize.height === tile.size.height) {
@@ -492,6 +494,8 @@ export function TileFlowNode({ data, dragging }: Props) {
       viewportCols: viewportMetrics.viewportCols ?? null,
       pixelsPerRow,
       pixelsPerCol,
+      hostWidthPx,
+      hostHeightPx,
       zoom: zoom ?? 1,
       rewriteEnabled,
       size: nextSize,

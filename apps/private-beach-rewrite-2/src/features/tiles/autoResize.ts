@@ -20,19 +20,27 @@ function normalizePositive(value: number | null | undefined): number | null {
 }
 
 export function computeAutoResizeSize(input: AutoResizeInput): TileSize | null {
+  const chromeWidthPx = Number.isFinite(input.chromeWidthPx) ? Math.max(0, input.chromeWidthPx) : 0;
+  const chromeHeightPx = Number.isFinite(input.chromeHeightPx) ? Math.max(0, input.chromeHeightPx) : 0;
+  const preferredWidth = normalizePositive(input.metrics.hostWidthPx);
+  const preferredHeight = normalizePositive(input.metrics.hostHeightPx);
   const rows = normalizePositive(input.metrics.hostRows);
   const cols = normalizePositive(input.metrics.hostCols);
-  // Prefer the terminal-reported fixed metrics to avoid zoom/transform skew.
   const pixelsPerRow = normalizePositive(input.metrics.pixelsPerRow);
   const pixelsPerCol = normalizePositive(input.metrics.pixelsPerCol);
-  if (!rows || !cols || !pixelsPerRow || !pixelsPerCol) {
+
+  let terminalWidthPx = preferredWidth;
+  let terminalHeightPx = preferredHeight;
+  if (!terminalWidthPx && cols && pixelsPerCol) {
+    terminalWidthPx = cols * pixelsPerCol;
+  }
+  if (!terminalHeightPx && rows && pixelsPerRow) {
+    terminalHeightPx = rows * pixelsPerRow;
+  }
+  if (!terminalWidthPx || !terminalHeightPx) {
     return null;
   }
 
-  const terminalWidthPx = cols * pixelsPerCol;
-  const terminalHeightPx = rows * pixelsPerRow;
-  const chromeWidthPx = Number.isFinite(input.chromeWidthPx) ? Math.max(0, input.chromeWidthPx) : 0;
-  const chromeHeightPx = Number.isFinite(input.chromeHeightPx) ? Math.max(0, input.chromeHeightPx) : 0;
   const desiredTileWidthPx = terminalWidthPx + chromeWidthPx;
   const desiredTileHeightPx = terminalHeightPx + chromeHeightPx;
   if (!Number.isFinite(desiredTileWidthPx) || !Number.isFinite(desiredTileHeightPx)) {

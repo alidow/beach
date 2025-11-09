@@ -150,7 +150,11 @@ function viewportEqual(a: TileViewportSnapshot | undefined, b: TileViewportSnaps
     a.viewportRows === b.viewportRows &&
     a.viewportCols === b.viewportCols &&
     a.pixelsPerRow === b.pixelsPerRow &&
-    a.pixelsPerCol === b.pixelsPerCol
+    a.pixelsPerCol === b.pixelsPerCol &&
+    a.hostWidthPx === b.hostWidthPx &&
+    a.hostHeightPx === b.hostHeightPx &&
+    a.cellWidthPx === b.cellWidthPx &&
+    a.cellHeightPx === b.cellHeightPx
   );
 }
 

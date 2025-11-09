@@ -430,6 +430,7 @@ export function TileFlowNode({ data, dragging }: Props) {
     );
     const terminalContent = terminalRoot?.querySelector<HTMLElement>('[data-terminal-content="true"]') ?? terminalRoot;
     const terminal = terminalContent ?? terminalRoot;
+    const beachTerminal = terminalRoot?.querySelector<HTMLElement>('.beach-terminal') ?? terminal;
     if (!terminal) {
       logAutoResizeEvent(tile.id, 'missing-terminal');
       return;
@@ -485,6 +486,20 @@ export function TileFlowNode({ data, dragging }: Props) {
       zoom: zoom ?? 1,
     });
     resizeTile(tile.id, nextSize);
+    if (beachTerminal) {
+      beachTerminal.scrollTo?.({ top: 0, left: 0, behavior: 'auto' });
+      beachTerminal.scrollTop = 0;
+      beachTerminal.scrollLeft = 0;
+      if (terminal && terminal !== beachTerminal) {
+        terminal.scrollTo?.({ top: 0, left: 0, behavior: 'auto' });
+        terminal.scrollTop = 0;
+        terminal.scrollLeft = 0;
+      }
+      logAutoResizeEvent(tile.id, 'reset-scroll', {
+        scrollTop: beachTerminal.scrollTop,
+        scrollLeft: beachTerminal.scrollLeft,
+      });
+    }
     emitTelemetry('canvas.resize.auto', {
       privateBeachId,
       tileId: tile.id,
@@ -724,7 +739,9 @@ export function TileFlowNode({ data, dragging }: Props) {
   const showInteractOverlay = !isAgent && !isInteractive && hovered;
 
   const nodeClass = cn(
-    'group relative flex h-full w-full select-none flex-col overflow-visible rounded-2xl border border-slate-700/60 bg-slate-950/80 text-slate-200 shadow-[0_28px_80px_rgba(2,6,23,0.6)] backdrop-blur-xl transition-all duration-200',
+    // Avoid transitioning transform while dragging (can cause flicker).
+    // Limit transitions to visual properties only.
+    'group relative flex h-full w-full select-none flex-col overflow-visible rounded-2xl border border-slate-700/60 bg-slate-950/80 text-slate-200 shadow-[0_28px_80px_rgba(2,6,23,0.6)] backdrop-blur-xl transition-[box-shadow,border-color] duration-150',
     isActive && 'border-sky-400/60 shadow-[0_32px_90px_rgba(14,165,233,0.35)]',
     isResizing && 'cursor-[se-resize]',
     isInteractive && 'border-amber-400/80 shadow-[0_32px_90px_rgba(251,146,60,0.45)] ring-1 ring-amber-300/70 cursor-auto',
@@ -734,7 +751,7 @@ export function TileFlowNode({ data, dragging }: Props) {
     <article
       ref={nodeRef}
       className={nodeClass}
-      style={{ width: '100%', height: '100%', zIndex }}
+      style={{ width: '100%', height: '100%', zIndex, willChange: 'transform' }}
       data-testid={`rf__node-tile:${tile.id}`}
       data-tile-id={tile.id}
       onPointerDown={handlePointerDown}
@@ -759,7 +776,7 @@ export function TileFlowNode({ data, dragging }: Props) {
         </button>
       </div>
       <header
-        className="flex min-h-[44px] items-center justify-between border-b border-white/10 bg-slate-900/80 px-4 py-2.5 backdrop-blur"
+        className="rf-drag-handle flex min-h-[44px] items-center justify-between border-b border-white/10 bg-slate-900/80 px-4 py-2.5 backdrop-blur"
         style={{ minHeight: TILE_HEADER_HEIGHT }}
       >
         <div className="flex min-w-0 flex-col gap-1">

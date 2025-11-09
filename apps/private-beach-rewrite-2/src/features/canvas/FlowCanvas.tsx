@@ -195,7 +195,9 @@ function FlowCanvasInner({
             rewriteEnabled,
           },
           position: tile.position,
-          draggable: true,
+          // Disable dragging while a tile is in interactive mode so mouse
+          // selections/clicks are not hijacked by React Flow drag logic.
+          draggable: !isInteractive,
           selectable: false,
           connectable: true,
           style: {
@@ -1034,6 +1036,9 @@ function FlowCanvasInner({
         nodeTypes={memoizedNodeTypes}
         edgeTypes={memoizedEdgeTypes}
         defaultEdgeOptions={defaultEdgeOptions}
+        // Restrict dragging to the tile header to avoid drag conflicts
+        // with dynamic content inside the node body (terminal, etc.).
+        dragHandle=".rf-drag-handle"
         onNodesChange={handleNodesChange}
         onEdgesChange={() => undefined}
         onConnect={handleConnect}

@@ -529,7 +529,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     store: providedStore,
     fallbackOverrides,
     className,
-    fontFamily = "'SFMono-Regular', 'Menlo', 'Consolas', monospace",
+    fontFamily = "'JetBrains Mono', 'SFMono-Regular', 'Menlo', 'Consolas', monospace",
     fontSize = 14,
     showStatusBar = true,
     isFullscreen = false,

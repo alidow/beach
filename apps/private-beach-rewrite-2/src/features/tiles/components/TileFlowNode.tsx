@@ -650,8 +650,13 @@ export function TileFlowNode({ data, dragging }: Props) {
       if (!isSpace) {
         return;
       }
+      // Space should enter interactive mode when hovered, but not exit it.
+      // If already interactive, allow the event to propagate so inputs receive spaces.
+      if (isInteractive) {
+        return;
+      }
       event.preventDefault();
-      setInteractiveTile(isInteractive ? null : tile.id);
+      setInteractiveTile(tile.id);
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => {

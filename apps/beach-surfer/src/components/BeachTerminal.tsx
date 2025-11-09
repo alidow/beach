@@ -481,6 +481,7 @@ export interface BeachTerminalProps {
   forcedViewportRows?: number | null;
   hideIdlePlaceholder?: boolean;
   lockViewportToHost?: boolean;
+  cellMetrics?: { widthPx: number; heightPx: number };
   // Maximum render FPS for internal rAF-based updates; undefined or <=0 disables throttling
   maxRenderFps?: number;
   viewOnly?: boolean;
@@ -540,6 +541,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     forcedViewportRows = null,
     hideIdlePlaceholder = false,
     lockViewportToHost = false,
+    cellMetrics,
     maxRenderFps,
     viewOnly = false,
     sizingStrategy: providedSizingStrategy,
@@ -1098,8 +1100,14 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     const snapshotNow = store.getSnapshot();
     const viewportRows = Math.max(1, Math.min(lastMeasuredViewportRows.current, MAX_VIEWPORT_ROWS));
     const viewportCols = snapshotNow.cols;
-    const hostViewportRows = ptyViewportRowsRef.current;
-    const hostCols = ptyColsRef.current;
+    const derivedHostRows = snapshotNow.rows.length > 0 ? snapshotNow.rows.length : null;
+    const derivedHostCols = snapshotNow.cols && snapshotNow.cols > 0 ? snapshotNow.cols : DEFAULT_TERMINAL_COLS;
+    const hostViewportRows =
+      ptyViewportRowsRef.current && ptyViewportRowsRef.current > 0
+        ? ptyViewportRowsRef.current
+        : derivedHostRows;
+    const hostCols =
+      ptyColsRef.current && ptyColsRef.current > 0 ? ptyColsRef.current : derivedHostCols;
     const canSendResize = Boolean(transportRef.current) && !viewOnly;
     tailMetricsRef.current.paddingRows = tailPaddingRowsRef.current;
     const tailMetrics = tailMetricsRef.current;
@@ -1516,26 +1524,99 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   const [measuredLineHeight, setMeasuredLineHeight] = useState<number>(lineHeight);
   const minEffectiveLineHeight = Math.max(4, lineHeight * 0.4);
   const effectiveLineHeight = measuredLineHeight >= minEffectiveLineHeight ? measuredLineHeight : lineHeight;
-  const applyFontMetrics = useCallback(() => {
-    const metrics = measureFontGlyphMetrics(fontFamily, fontSize);
-    if (!metrics) {
-      return false;
+  const logMetricSource = useCallback(
+    (event: string, detail: Record<string, unknown> = {}) => {
+      logCellMetric('cell-metrics', {
+        event,
+        sessionId: sessionId ?? null,
+        ...detail,
+      });
+    },
+    [sessionId],
+  );
+  useEffect(() => {
+    if (!cellMetrics) {
+      return;
     }
-    const { cellWidth, lineHeight: measuredHeight } = metrics;
+    const width = Number(cellMetrics.widthPx);
+    const height = Number(cellMetrics.heightPx);
+    if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
+      return;
+    }
     setMeasuredCellWidth((prev) => {
-      if (prev === null || Math.abs(prev - cellWidth) > 0.05) {
-        return cellWidth;
+      if (prev === null || Math.abs(prev - width) > 0.05) {
+        return width;
       }
       return prev;
     });
     setMeasuredLineHeight((prev) => {
-      if (Math.abs(prev - measuredHeight) > 0.1) {
-        return measuredHeight;
+      if (Math.abs(prev - height) > 0.1) {
+        return height;
       }
       return prev;
     });
-    return true;
-  }, [fontFamily, fontSize]);
+    logMetricSource('cell-metrics', {
+      source: 'props',
+      widthPx: Number(width.toFixed(4)),
+      heightPx: Number(height.toFixed(4)),
+    });
+  }, [cellMetrics, logMetricSource]);
+  const applyFontMetrics = useCallback(
+    (source: 'font-probe' | 'fallback' | 'css-sync' = 'font-probe') => {
+      const metrics = measureFontGlyphMetrics(fontFamily, fontSize);
+      if (!metrics) {
+        logMetricSource('probe-miss', { source, fontFamily, fontSize });
+        return false;
+      }
+      const { cellWidth, lineHeight: measuredHeight } = metrics;
+      setMeasuredCellWidth((prev) => {
+        if (prev === null || Math.abs(prev - cellWidth) > 0.05) {
+          return cellWidth;
+        }
+        return prev;
+      });
+      setMeasuredLineHeight((prev) => {
+        if (Math.abs(prev - measuredHeight) > 0.1) {
+          return measuredHeight;
+        }
+        return prev;
+      });
+      logMetricSource('cell-metrics', {
+        source,
+        widthPx: Number(cellWidth.toFixed(4)),
+        heightPx: Number(measuredHeight.toFixed(4)),
+        fontFamily,
+        fontSize,
+      });
+      return true;
+    },
+    [fontFamily, fontSize, logMetricSource],
+  );
+  const applyFallbackMetrics = useCallback(
+    (reason: string) => {
+      const width = cellWidthPx;
+      const height = lineHeight;
+      setMeasuredCellWidth((prev) => {
+        if (prev === null || Math.abs(prev - width) > 0.05) {
+          return width;
+        }
+        return prev;
+      });
+      setMeasuredLineHeight((prev) => {
+        if (Math.abs(prev - height) > 0.1) {
+          return height;
+        }
+        return prev;
+      });
+      logMetricSource('cell-metrics', {
+        source: 'fallback',
+        reason,
+        widthPx: Number(width.toFixed(4)),
+        heightPx: Number(height.toFixed(4)),
+      });
+    },
+    [cellWidthPx, lineHeight, logMetricSource],
+  );
   useEffect(() => {
     const normalized =
       Number.isFinite(effectiveLineHeight) && effectiveLineHeight > 0 ? Number(effectiveLineHeight) : null;
@@ -1746,11 +1827,145 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   }, [snapshot.cols, fontFamily, fontSize, lines.length, lineHeight, minEffectiveLineHeight, applyFontMetrics, logLockViewportDiagnostic, lockViewportToHost]);
 
   useEffect(() => {
+    if (!lockViewportToHost || cellMetrics) {
+      return;
+    }
+    let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    const scheduleRetry = (attempt: number) => {
+      if (cancelled) {
+        return;
+      }
+      const delay = Math.min(2000, 150 * Math.pow(2, attempt));
+      retryTimer = setTimeout(() => {
+        if (cancelled) {
+          return;
+        }
+        runProbe(attempt + 1);
+      }, delay);
+    };
+    const runProbe = (attempt = 0) => {
+      if (cancelled) {
+        return;
+      }
+      const success = applyFontMetrics('font-probe');
+      if (!success) {
+        if (attempt >= 5) {
+          applyFallbackMetrics('probe-failed');
+          return;
+        }
+        scheduleRetry(attempt);
+      }
+    };
+    const waitForFonts = async () => {
+      if (typeof document === 'undefined' || !document.fonts?.ready) {
+        runProbe();
+        return;
+      }
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
+      const timeout = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error('fonts-timeout')), 5000);
+      });
+      try {
+        await Promise.race([document.fonts.ready, timeout]);
+        if (!cancelled) {
+          runProbe();
+        }
+      } catch (error) {
+        logMetricSource('font-ready-timeout', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+        applyFallbackMetrics('fonts-timeout');
+      } finally {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+      }
+    };
+    waitForFonts();
+
+    const handleViewportChange = () => {
+      runProbe();
+    };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('resize', handleViewportChange);
+      window.addEventListener('orientationchange', handleViewportChange);
+    }
+    const visual = typeof window !== 'undefined' ? window.visualViewport : null;
+    if (visual) {
+      visual.addEventListener('resize', handleViewportChange);
+      visual.addEventListener('scroll', handleViewportChange);
+    }
+    return () => {
+      cancelled = true;
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('resize', handleViewportChange);
+        window.removeEventListener('orientationchange', handleViewportChange);
+      }
+      if (visual) {
+        visual.removeEventListener('resize', handleViewportChange);
+        visual.removeEventListener('scroll', handleViewportChange);
+      }
+    };
+  }, [lockViewportToHost, cellMetrics, applyFontMetrics, applyFallbackMetrics, logMetricSource]);
+  useEffect(() => {
     if (!lockViewportToHost) {
       return;
     }
-    applyFontMetrics();
-  }, [lockViewportToHost, applyFontMetrics]);
+    if (typeof window === 'undefined') {
+      return;
+    }
+    const container = containerRef.current;
+    if (!container) {
+      return;
+    }
+    const CSS_SYNC_TOLERANCE = 0.01;
+    let raf = -1;
+    const syncFromCss = () => {
+      raf = -1;
+      try {
+        const computed = window.getComputedStyle(container);
+        const cssValue = computed.getPropertyValue('--beach-terminal-cell-width');
+        const parsed = Number.parseFloat(cssValue);
+        if (Number.isFinite(parsed) && parsed > 0) {
+          setMeasuredCellWidth((prev) => {
+            if (prev === null || Math.abs(prev - parsed) > CSS_SYNC_TOLERANCE) {
+              logMetricSource('cell-metrics', {
+                source: 'css-sync',
+                widthPx: Number(parsed.toFixed(4)),
+                previous: prev,
+              });
+              return parsed;
+            }
+            return prev;
+          });
+        }
+      } catch (error) {
+        logMetricSource('css-sync-error', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    };
+    const scheduleSync = () => {
+      if (raf !== -1) {
+        window.cancelAnimationFrame(raf);
+      }
+      raf = window.requestAnimationFrame(syncFromCss);
+    };
+    syncFromCss();
+    const observer = new MutationObserver(scheduleSync);
+    observer.observe(container, { attributes: true, attributeFilter: ['style'] });
+    return () => {
+      observer.disconnect();
+      if (raf !== -1) {
+        window.cancelAnimationFrame(raf);
+      }
+    };
+  }, [lockViewportToHost, logMetricSource]);
   useEffect(() => {
     transportRef.current = providedTransport ?? null;
     lastSentViewportRows.current = 0;

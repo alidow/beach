@@ -1,76 +1,56 @@
 # Tile Terminal Stabilization Plan
 
 ## Objective
-Reproduce the exact rendering behavior of BeachTerminal in the standalone beach-surfer client when the component is embedded inside canvas tiles. Specifically:
-1. **Eliminate DOM-based glyph measurements inside transformed tiles.** Provide per-cell metrics via props sourced from a hidden, unscaled glyph probe.
-2. **Lock BeachTerminal to host PTY dimensions** when requested so DOM width/height never trigger logical reflow. The tile merely crops/scrolls.
-3. **Ensure tile-driven actions never resize the host PTY.** Double-click auto-resize changes only the tile’s dimensions; host stays fixed.
-4. **Add instrumentation** so if any assumption fails (missing PTY dimensions, missing glyph metrics), we know immediately why.
+Locked BeachTerminal instances inside React Flow tiles already avoid DOM-driven viewport logic. Remaining issues are glyph metrics that occasionally drift (fonts not loaded, DPR changes, SessionViewer quantization mismatch) and missing diagnostics when metrics fall back. This plan tightens that lifecycle without reimplementing features we already ship (lock mode, host-metric auto-resize, PTY protection).
 
-## Root Causes (Validated)
-- **Scaled measurements.** `useLayoutEffect` samples `.xterm-row` via `getBoundingClientRect`. Inside React Flow, those coordinates include the node’s `transform` (scale + fractional translate), so `--beach-terminal-cell-width`/`line-height` get overwritten with distorted values. DOM dumps show line heights jumping to ~445 px.
-- **Viewport feedback loop.** Even with `autoResizeHostOnViewportChange=false`, BeachTerminal still updates `viewportCols` from `container.clientWidth / cellWidth`. When the tile shrinks, the logical grid shrinks. Host PTY is unaffected, but the client now renders fewer columns, so the horizontal border never reaches the vertical bars.
-- **Tile auto-resize guessed from DOM.** Double-click handler measures the DOM width/height of the terminal inside the transformed tile and uses that to compute new tile dimensions, compounding errors.
+## Current State Check
+- `lockViewportToHost` is wired end-to-end; DOM resize observers and `.xterm-row` probes no-op when locked (`apps/beach-surfer/src/components/BeachTerminal.tsx`).
+- `TerminalViewportState` already exposes `pixelsPerRow`, `pixelsPerCol`, `hostPixelWidth`, `hostPixelHeight`; rewrite-2 consumes them for auto-resize.
+- Double-click auto-resize operates purely on host metrics; no host PTY resize frames are sent.
+- SessionViewer adds a quantization effect to snap `--beach-terminal-cell-width` to the React Flow scale/device pixel ratio, but BeachTerminal is unaware of that post-process.
 
-## Solution Overview
-| Area | Change |
-| --- | --- |
-| Glyph metrics | Provide via prop (`cellMetrics`). New `TerminalGlyphProbe` component renders in a portal outside React Flow, waits for fonts to load, measures a glyph, and passes `{ widthPx, heightPx }` back. When `cellMetrics` is supplied BeachTerminal must never query `.xterm-row`. |
-| Viewport lock | Add `lockViewportToHost` mode. When true: (a) `computeViewportGeometry` returns host cols; (b) `resolveHostViewportRows` returns host rows; (c) DOM-based `scheduleViewportCommit`/debounce/ResizeObserver paths are disabled; (d) BeachTerminal only reflows when host PTY reports a different size. |
-| Tile wrapper | Wrap BeachTerminal in fixed-size div (`overflow: hidden auto`). Tile size equals `hostPixelWidth/Height + chrome offsets`. Scrolling/cropping handled by wrapper. |
-| Auto-resize | `computeAutoResizeSize` now requires `hostPixelWidth/Height`. Double-click aborts (with telemetry) if metrics missing. Never send host resize frames. |
-| Diagnostics | Console warnings under `window.__BEACH_TRACE` when host metrics missing, glyph metrics missing, or tile attempts to resize without required data. |
+## Gaps Observed
+1. **Font readiness / re-measurements** – `measureFontGlyphMetrics` can run before fonts load and doesn’t re-run when devicePixelRatio changes while locked.
+2. **Metric provenance** – We cannot distinguish “props vs probe vs fallback”, which makes debugging hard.
+3. **Quantization mismatch** – SessionViewer may rewrite the CSS variable after BeachTerminal measures, so `pixelsPerCol` emitted to tiles can drift from what the DOM actually renders.
+4. **Instrumentation** – We lack precise tracing for “fonts never resolved”, “using fallback metrics”, or “host rows missing under lock”.
 
-## Detailed Implementation Steps
-### 1. BeachTerminal changes (apps/beach-surfer/src/components/BeachTerminal.tsx)
-1. **Props**
-   - `cellMetrics?: { widthPx: number; heightPx: number }`
-   - `lockViewportToHost?: boolean` (default false)
-2. **Measurement logic**
-   - If `cellMetrics` present, set `measuredCellWidth`/`measuredLineHeight` from props and skip all DOM probes.
-   - If `lockViewportToHost` true and `cellMetrics` missing, rely exclusively on `measureFontGlyphMetrics` (offscreen probe) and *never* query `.xterm-row`.
-3. **Viewport control**
-   - `computeViewportGeometry` returns `{ targetCols: hostCols ?? DEFAULT_TERMINAL_COLS }` when locked; measuredCols remains `null`.
-   - `resolveHostViewportRows` returns host rows (`ptyViewportRowsRef`) when available; until then, fallback 80×24 but log `[lock-viewport] missing-host-rows` once.
-   - Guard `scheduleViewportCommit`, `domPendingViewport*`, and `disableViewport` toggles behind `!lockViewportToHost` so DOM width changes are ignored.
-4. **State emission**
-   - Extend `TerminalViewportState` with `hostPixelWidth`, `hostPixelHeight`, `cellWidthPx`, `cellHeightPx`.
-   - Emit diagnostics when host PTY hasn’t reported its size after handshake (helps trace host bugs).
+## Plan of Record
 
-### 2. Glyph probe component
-- Create `apps/beach-surfer/src/components/TerminalGlyphProbe.tsx`:
-  - Uses `ReactDOM.createPortal` to render offscreen.
-  - Waits for `document.fonts.ready` before measuring.
-  - Calls `onMetrics({ widthPx, heightPx })` once; cleans up DOM node afterward.
-- Export hook `useTerminalGlyphMetrics(fontFamily, fontSize)` that manages probe lifecycle and returns cached metrics.
+### 1. BeachTerminal metric lifecycle
+1. Add optional `cellMetrics?: { widthPx: number; heightPx: number }`. When provided we immediately set `measuredCellWidth`/`measuredLineHeight`, skip probes, and log `[beach-terminal][cell-metrics] source=props`.
+2. When locked and no `cellMetrics`, upgrade the existing probe:
+   - Await `document.fonts?.ready` with a 5 s timeout + retry/backoff, then fall back to baked metrics (log `source=fallback`).
+   - Re-run the probe whenever `window.resize`, `visualViewport` events, or `matchMedia('(resolution)')` fire so zoom/DPR changes propagate.
+   - Every successful measurement logs `source=font-probe` plus duration.
+3. After each measurement (whether from props or probe) read back `--beach-terminal-cell-width` via `getComputedStyle(container)` when locked; if it differs from `measuredCellWidth`, update `pixelsPerColRef` and emit a viewport state so host pixel metrics match whatever quantization did.
+4. Keep the DOM `.xterm-row` observer disabled in lock mode as today; no new DOM sampling is introduced.
 
-### 3. Rewrite-2 tile integration
-1. **SessionViewer**
-   - Call `useTerminalGlyphMetrics` (or provide metrics from parent). Pass `cellMetrics` + `lockViewportToHost` to BeachTerminal. Ensure `disableViewportMeasurements` stays true for tiles.
-   - Wrap BeachTerminal with a fixed-size div (`overflow: auto`) so cropping is purely CSS.
-2. **ApplicationTile / TileFlowNode**
-   - Store latest `hostPixelWidth/Height` + `cellWidthPx/Height` in `viewportMetricsRef`.
-   - Remove any DOM-based measurement (getBoundingClientRect) from auto-resize path.
-   - Ensure double-click handler aborts unless host metrics ready; log `[tile][auto-resize] missing-host-metrics` when absent.
+### 2. SessionViewer alignment
+1. Keep the existing quantization effect but, after it writes the CSS custom property, emit the quantized width/height through a ref so we can compare against viewport metrics (mainly for tracing).
+2. Pass through the optional `cellMetrics` prop when a parent wants to supply pre-probed metrics (hook will come in a later milestone—out of scope today, but the prop unblocks future work).
+3. Add `window.__BEACH_TILE_TRACE` logs whenever quantization runs or when host metrics arrive without glyph metrics.
 
-### 4. Auto-resize utility
-- Update `computeAutoResizeSize` to require host pixel metrics (throw away DOM fallbacks). Use `cellWidthPx * hostCols` if `hostWidthPx` missing, but only if metrics were provided explicitly via props (not DOM measurement).
-- Add unit tests covering: (a) host metrics available → expect width/height match; (b) metrics missing → returns null.
+### 3. Diagnostics & telemetry
+- Add helper `logMetricSource(event, extra)` behind `window.__BEACH_TRACE` to capture `source`, `fontLoaded`, `durationMs`, and whether fallback was used.
+- Emit `[beach-terminal][lock-viewport] missing-host-rows` only once per lock session (already happens) but include the metric-source snapshot for easier debugging.
+- Surface quantized cell metrics inside `TileViewportSnapshot` (new optional fields `quantizedCellWidthPx`, `quantizedCellHeightPx`). Auto-resize telemetry should include both the host-derived and quantized widths so we can spot discrepancies.
 
-### 5. Diagnostics / Telemetry
-- `window.__BEACH_TRACE` in BeachTerminal logs:
-  - When host metrics missing under lock (`missing-host-rows`, `schedule-missing-host-rows`).
-  - When glyph probe metrics are applied (`cell-metrics:source=props` or `font-probe`).
-- `window.__BEACH_TILE_TRACE` logs tile-level events: glyph metrics ready, auto-resize attempt, host metrics missing, etc.
-- Telemetry events for auto-resize (`canvas.resize.auto`) include host pixel metrics and whether resize was skipped.
+### 4. Progress Tracker
 
-## Red-Team Considerations & Mitigations
-| Risk | Mitigation |
-| --- | --- |
-| Fonts not loaded when probe runs | Await `document.fonts.ready`, retry with exponential backoff, fallback to default metrics with warning. |
-| Host PTY never reports size | New diagnostics make this obvious; tile should display a banner (future work) if host size missing.
-| BeachTerminal still used in contexts that rely on DOM sizing | `cellMetrics` and `lockViewportToHost` default off; existing behavior unchanged for beach-surfer.
-| CSS padding/margins cause tile crop mismatch | Document tile chrome offsets and add helper to compute `contentWidth = tile.width - chromeWidth`.
-| Double-click still resizes host | Explicitly remove/send no host resize frames; add telemetry assert when resize frame would have been sent.
+| Task | Owner | Status |
+| --- | --- | --- |
+| Add `cellMetrics` prop + metric source logging in `BeachTerminal` | Codex | ☑ |
+| Implement font-ready wait + DPR refresh loop | Codex | ☑ |
+| Sync `pixelsPerCol` with quantized CSS var when locked | Codex | ☑ |
+| Extend SessionViewer instrumentation for quantization + optional `cellMetrics` pass-through | Codex | ☑ |
+| Update telemetry payloads/tests for new metric fields | Codex | ☐ |
 
-This plan provides enough detail that another engineer can implement it end-to-end: add the glyph probe, extend BeachTerminal props, wire host-lock mode, update tiles, and add instrumentation/tests. EOF
+Progress rows will flip to ☑ as we land changes.
+
+## Red-Team Notes
+- **Fonts never resolve** – timeout falls back to conservative metrics and logs `[beach-terminal][cell-metrics] source=fallback`.
+- **Multiple tiles** – Optional `cellMetrics` lets a higher-level cache distribute metrics so we don’t probe per tile in the future.
+- **Drift between host metrics & rendered CSS** – Reading back the CSS variable after quantization keeps telemetry honest even under fractional React Flow scales.
+
+EOF

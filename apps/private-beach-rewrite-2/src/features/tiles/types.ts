@@ -68,6 +68,8 @@ export type TileViewportSnapshot = {
   hostHeightPx: number | null;
   cellWidthPx: number | null;
   cellHeightPx: number | null;
+  quantizedCellWidthPx?: number | null;
+  quantizedCellHeightPx?: number | null;
 };
 
 export type TileState = {

@@ -341,6 +341,25 @@ export function ApplicationTile({
         cellWidthPx: snapshot.cellWidthPx ?? undefined,
         cellHeightPx: snapshot.cellHeightPx ?? undefined,
       };
+      if (
+        normalized.hostRows &&
+        normalized.hostCols &&
+        normalized.pixelsPerRow &&
+        normalized.pixelsPerCol &&
+        normalized.hostRows > normalized.hostCols * 1.5
+      ) {
+        logViewportMetricEvent(tileId, 'swap-host-dimensions', {
+          source: 'terminal',
+          hostRows: normalized.hostRows,
+          hostCols: normalized.hostCols,
+        });
+        const swappedRows = normalized.hostCols;
+        const swappedCols = normalized.hostRows;
+        normalized.hostRows = swappedRows;
+        normalized.hostCols = swappedCols;
+        normalized.hostWidthPx = swappedCols * normalized.pixelsPerCol;
+        normalized.hostHeightPx = swappedRows * normalized.pixelsPerRow;
+      }
       applyViewportPatch(normalized, 'terminal');
     },
     [applyViewportPatch],

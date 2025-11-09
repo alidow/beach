@@ -93,6 +93,7 @@
     letter-spacing: 0;
     font-kerning: none;
     word-spacing: 0;
+    white-space: nowrap;
   }
 
   .xterm-row span {

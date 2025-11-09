@@ -14,6 +14,7 @@ type SessionViewerProps = {
   sessionId?: string | null;
   disableViewportMeasurements?: boolean;
   onViewportMetrics?: (snapshot: TileViewportSnapshot | null) => void;
+  cellMetrics?: { widthPx: number; heightPx: number };
 };
 
 function normalizeMetric(value: number | null | undefined): number | null {
@@ -33,11 +34,16 @@ export function SessionViewer({
   sessionId,
   disableViewportMeasurements = true,
   onViewportMetrics,
+  cellMetrics,
 }: SessionViewerProps) {
   const status = viewer.status ?? 'idle';
   const showLoading = status === 'idle' || status === 'connecting' || status === 'reconnecting';
   const showError = status === 'error' && Boolean(viewer.error);
   const metricsRef = useRef<TileViewportSnapshot | null>(null);
+  const quantizedCellMetricsRef = useRef<{ width: number | null; height: number | null }>({
+    width: null,
+    height: null,
+  });
   const rootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -140,6 +146,8 @@ export function SessionViewer({
         hostHeightPx: normalizeMetric(state.hostPixelHeight),
         cellWidthPx: normalizeMetric(state.pixelsPerCol),
         cellHeightPx: normalizeMetric(state.pixelsPerRow),
+        quantizedCellWidthPx: normalizeMetric(quantizedCellMetricsRef.current.width),
+        quantizedCellHeightPx: normalizeMetric(quantizedCellMetricsRef.current.height),
       };
       const previous = metricsRef.current;
       if (
@@ -153,7 +161,9 @@ export function SessionViewer({
         previous.hostWidthPx === snapshot.hostWidthPx &&
         previous.hostHeightPx === snapshot.hostHeightPx &&
         previous.cellWidthPx === snapshot.cellWidthPx &&
-        previous.cellHeightPx === snapshot.cellHeightPx
+        previous.cellHeightPx === snapshot.cellHeightPx &&
+        previous.quantizedCellWidthPx === snapshot.quantizedCellWidthPx &&
+        previous.quantizedCellHeightPx === snapshot.quantizedCellHeightPx
       ) {
         return;
       }
@@ -192,8 +202,27 @@ export function SessionViewer({
         const { scale } = readTransformChain(terminalEl);
         const denom = dpr * (Number.isFinite(scale) && scale > 0 ? scale : 1);
         const quantized = Math.max(0.25, Math.round(px * denom) / denom);
-        if (Math.abs(quantized - px) > 0.002) {
+        const delta = Math.abs(quantized - px);
+        if (delta > 0.002) {
           terminalEl.style.setProperty('--beach-terminal-cell-width', `${quantized.toFixed(3)}px`);
+        }
+        quantizedCellMetricsRef.current.width = quantized;
+        quantizedCellMetricsRef.current.height = null;
+        const traceEnabled = Boolean((globalThis as Record<string, any>).__BEACH_TILE_TRACE);
+        if (traceEnabled) {
+          try {
+            console.info('[rewrite-terminal][tile-trace]', JSON.stringify({
+              reason: 'quantize',
+              tileId,
+              cssCellWidthPx: Number.isFinite(px) ? px : null,
+              quantizedCellWidthPx: quantized,
+              delta,
+              scale,
+              denom,
+            }));
+          } catch {
+            // ignore logging errors
+          }
         }
       } catch {
         // ignore
@@ -373,6 +402,7 @@ export function SessionViewer({
             enablePredictiveEcho={false}
             disableViewportMeasurements={disableViewportMeasurements}
             lockViewportToHost
+            cellMetrics={cellMetrics}
             onViewportStateChange={handleViewportStateChange}
           />
         </div>

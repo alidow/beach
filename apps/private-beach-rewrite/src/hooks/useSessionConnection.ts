@@ -17,6 +17,16 @@ const IDLE_VIEWER_STATE: TerminalViewerState = {
   latencyMs: null,
 };
 
+function isTerminalTraceEnabled(): boolean {
+  if (typeof globalThis !== 'undefined' && (globalThis as Record<string, any>).__BEACH_TILE_TRACE) {
+    return true;
+  }
+  if (typeof process !== 'undefined' && process.env?.NEXT_PUBLIC_PRIVATE_BEACH_TERMINAL_TRACE === '1') {
+    return true;
+  }
+  return false;
+}
+
 type UseSessionConnectionParams = {
   tileId: string;
   sessionId?: string | null;
@@ -49,66 +59,71 @@ export function useSessionConnection({
   }, [credentialOverride]);
 
   useEffect(() => {
+    let disconnect: (() => void) | null = null;
+
     if (!sessionId || !managerUrl || !authToken) {
       setViewer(IDLE_VIEWER_STATE);
-      return;
-    }
-    const disconnect = viewerConnectionService.connectTile(
-      tileId,
-      {
-        sessionId,
-        privateBeachId: privateBeachId ?? null,
-        managerUrl,
-        authToken,
-        override: credentialOverride ?? undefined,
-      },
-      (snapshot) => {
-        if (typeof window !== 'undefined') {
-          let keyRows: string | number = 'no-store';
-          let gridSummary: { rows: number; viewportHeight: number; baseRow: number } | null = null;
-          try {
-            const gridSnapshot = snapshot.store?.getSnapshot();
-            if (gridSnapshot) {
-              keyRows = gridSnapshot.rows.length;
-              gridSummary = {
-                rows: gridSnapshot.rows.length,
-                viewportHeight: gridSnapshot.viewportHeight,
-                baseRow: gridSnapshot.baseRow,
-              };
+    } else {
+      disconnect = viewerConnectionService.connectTile(
+        tileId,
+        {
+          sessionId,
+          privateBeachId: privateBeachId ?? null,
+          managerUrl,
+          authToken,
+          override: credentialOverride ?? undefined,
+        },
+        (snapshot) => {
+          if (typeof window !== 'undefined' && isTerminalTraceEnabled()) {
+            let keyRows: string | number = 'no-store';
+            let gridSummary: { rows: number; viewportHeight: number; baseRow: number } | null = null;
+            try {
+              const gridSnapshot = snapshot.store?.getSnapshot();
+              if (gridSnapshot) {
+                keyRows = gridSnapshot.rows.length;
+                gridSummary = {
+                  rows: gridSnapshot.rows.length,
+                  viewportHeight: gridSnapshot.viewportHeight,
+                  baseRow: gridSnapshot.baseRow,
+                };
+              }
+            } catch (error) {
+              keyRows = `grid-error:${String(error)}`;
             }
-          } catch (error) {
-            keyRows = `grid-error:${String(error)}`;
+            const nextKey = [
+              snapshot.status,
+              snapshot.connecting ? '1' : '0',
+              snapshot.transport ? 'transport' : 'no-transport',
+              snapshot.transportVersion ?? 0,
+              keyRows,
+            ].join('|');
+            if (lastLogKeyRef.current !== nextKey) {
+              lastLogKeyRef.current = nextKey;
+              const payload = {
+                tileId,
+                status: snapshot.status,
+                connecting: snapshot.connecting,
+                transport: Boolean(snapshot.transport),
+                transportVersion: snapshot.transportVersion ?? 0,
+                store: Boolean(snapshot.store),
+                grid: gridSummary,
+                latencyMs: snapshot.latencyMs ?? null,
+                secureMode: snapshot.secureSummary?.mode ?? null,
+                error: snapshot.error ?? null,
+              };
+              // eslint-disable-next-line no-console
+              console.info('[rewrite-terminal][connection]', JSON.stringify(payload));
+            }
           }
-          const nextKey = [
-            snapshot.status,
-            snapshot.connecting ? '1' : '0',
-            snapshot.transport ? 'transport' : 'no-transport',
-            snapshot.transportVersion ?? 0,
-            keyRows,
-          ].join('|');
-          if (lastLogKeyRef.current !== nextKey) {
-            lastLogKeyRef.current = nextKey;
-            const payload = {
-              tileId,
-              status: snapshot.status,
-              connecting: snapshot.connecting,
-              transport: Boolean(snapshot.transport),
-              transportVersion: snapshot.transportVersion ?? 0,
-              store: Boolean(snapshot.store),
-              grid: gridSummary,
-              latencyMs: snapshot.latencyMs ?? null,
-              secureMode: snapshot.secureSummary?.mode ?? null,
-              error: snapshot.error ?? null,
-            };
-            // eslint-disable-next-line no-console
-            console.info('[rewrite-terminal][connection]', JSON.stringify(payload));
-          }
-        }
-        setViewer(snapshot);
-      },
-    );
+          setViewer(snapshot);
+        },
+      );
+    }
+
     return () => {
-      disconnect();
+      if (disconnect) {
+        disconnect();
+      }
     };
   }, [authToken, credentialOverride, managerUrl, overrideSignature, privateBeachId, sessionId, tileId]);
 

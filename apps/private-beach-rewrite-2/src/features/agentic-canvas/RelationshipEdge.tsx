@@ -64,7 +64,7 @@ const RelationshipEdge = memo(function RelationshipEdge({
                 value={instructions}
                 onChange={(event) => setInstructions(event.target.value)}
                 rows={3}
-                className="mt-2 w-full rounded border border-slate-200 px-2 py-1 text-xs focus:border-indigo-500 focus:outline-none"
+                className="mt-2 w-full rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500"
                 placeholder="Describe how this agent should manage the session"
               />
               <p className="mt-2 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
@@ -102,10 +102,10 @@ const RelationshipEdge = memo(function RelationshipEdge({
                   <span>Poll every</span>
                   <input
                     type="number"
-                    min={5}
+                    min={1}
                     value={pollFrequency}
                     onChange={(event) => setPollFrequency(Number(event.target.value) || 0)}
-                    className="w-16 rounded border border-slate-200 px-1 py-0.5 text-right"
+                    className="w-16 rounded border border-slate-200 bg-white px-1 py-0.5 text-right text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500"
                   />
                   <span>seconds</span>
                 </label>

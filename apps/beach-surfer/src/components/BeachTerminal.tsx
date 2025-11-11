@@ -85,6 +85,16 @@ declare global {
   }
 }
 
+function isTerminalTraceEnabled(): boolean {
+  if (typeof globalThis !== 'undefined' && (globalThis as Record<string, any>).__BEACH_TILE_TRACE) {
+    return true;
+  }
+  if (typeof process !== 'undefined' && process.env?.NEXT_PUBLIC_PRIVATE_BEACH_TERMINAL_TRACE === '1') {
+    return true;
+  }
+  return false;
+}
+
 function isDevEnvironment(): boolean {
   if (typeof import.meta !== 'undefined') {
     const metaEnv = (import.meta as Record<string, any>).env;
@@ -4044,7 +4054,8 @@ export function buildLines(
   };
   trace('buildLines result', buildLinesPayload);
   captureTrace('buildLines', buildLinesPayload);
-  if (typeof console !== 'undefined') {
+  const terminalTraceEnabled = isTerminalTraceEnabled();
+  if (terminalTraceEnabled && typeof console !== 'undefined') {
     try {
       console.info('[beach-trace][terminal][buildLines result]', JSON.stringify(buildLinesPayload));
     } catch {

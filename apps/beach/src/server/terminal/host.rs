@@ -43,6 +43,12 @@ use crate::transport::terminal::negotiation::{
     TransportSupervisor, negotiate_transport,
 };
 use crate::transport::{Payload, Transport, TransportError, TransportKind};
+use beach_buggy::{
+    AckStatus as CtrlAckStatus, ActionAck as CtrlActionAck, ActionCommand as CtrlActionCommand,
+    HttpTransport as ManagerHttpTransport, ManagerTransport,
+    StaticTokenProvider as ManagerStaticTokenProvider,
+};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Read, Write};
@@ -50,7 +56,7 @@ use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{
     mpsc::{self, UnboundedSender},
     oneshot,
@@ -295,6 +301,111 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     };
 
     info!(session_id = %session_id, "host ready");
+
+    // Spawn a lightweight controller action consumer so manager-queued terminal_write
+    // actions can drive this host (used by the Pong demo agent). This is best-effort:
+    // if the manager URL/token aren’t configured, the host runs normally.
+    if let Some(manager_url) = std::env::var("PRIVATE_BEACH_MANAGER_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| std::env::var("NEXT_PUBLIC_MANAGER_URL").ok())
+    {
+        let manager_url = manager_url.trim().to_string();
+        let manager_url_spawn = manager_url.clone();
+        let env_token = std::env::var("PRIVATE_BEACH_MANAGER_TOKEN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let token = if let Some(token) = env_token {
+            Some(token)
+        } else {
+            auth::maybe_access_token(None, auth::manager_requires_access_token(&manager_url))
+                .await
+                .ok()
+                .flatten()
+        };
+        if let Some(bearer) = token {
+            let writer_for_actions = writer.clone();
+            let session_for_actions = session_id.clone();
+            tokio::spawn(async move {
+                let transport: ManagerHttpTransport<ManagerStaticTokenProvider> =
+                    match ManagerHttpTransport::new(
+                        &manager_url_spawn,
+                        ManagerStaticTokenProvider::new(bearer),
+                    ) {
+                        Ok(t) => t,
+                        Err(err) => {
+                            warn!(target = "controller.actions", error = %err, "manager transport init failed");
+                            return;
+                        }
+                    };
+                loop {
+                    match transport.receive_actions(&session_for_actions).await {
+                        Ok(received) if !received.is_empty() => {
+                            let commands: Vec<CtrlActionCommand> = received;
+                            for cmd in commands.iter() {
+                                if cmd.action_type.as_str() == "terminal_write" {
+                                    if let Some(bytes) =
+                                        cmd.payload.get("bytes").and_then(|v: &Value| v.as_str())
+                                    {
+                                        match writer_for_actions.write(bytes.as_bytes()) {
+                                            Ok(()) => {
+                                                debug!(
+                                                    target = "controller.actions",
+                                                    session_id = %session_for_actions,
+                                                    command_id = %cmd.id,
+                                                    bytes = bytes.len(),
+                                                    "applied terminal_write action"
+                                                );
+                                            }
+                                            Err(err) => {
+                                                warn!(target = "controller.actions", error = %err, "pty write failed for action");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            let acks: Vec<CtrlActionAck> = commands
+                                .iter()
+                                .map(|c| CtrlActionAck {
+                                    id: c.id.clone(),
+                                    status: CtrlAckStatus::Ok,
+                                    applied_at: std::time::SystemTime::now(),
+                                    latency_ms: None,
+                                    error_code: None,
+                                    error_message: None,
+                                })
+                                .collect();
+                            if let Err(err) =
+                                transport.ack_actions(&session_for_actions, acks).await
+                            {
+                                warn!(target = "controller.actions", error = %err, "ack failed");
+                            }
+                        }
+                        Ok(_) => {
+                            // Idle backoff to avoid busy loop.
+                            sleep(Duration::from_millis(50)).await;
+                        }
+                        Err(err) => {
+                            warn!(target = "controller.actions", error = %err, "receive_actions failed; retrying");
+                            sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            });
+            info!(target = "controller.actions", session_id = %session_id, manager = %manager_url, "controller action consumer started");
+        } else {
+            debug!(
+                target = "controller.actions",
+                "manager token unavailable; action consumer disabled"
+            );
+        }
+    } else {
+        debug!(
+            target = "controller.actions",
+            "manager url not configured; action consumer disabled (set PRIVATE_BEACH_MANAGER_URL)"
+        );
+    }
 
     let input_handles: Arc<Mutex<Vec<thread::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
     let mut forward_transports: Vec<ForwardTransport> = Vec::new();
@@ -948,6 +1059,8 @@ fn spawn_webrtc_acceptor(
         let mut ready_tx = ready_tx;
         loop {
             let passphrase = join_code.as_deref();
+            let negotiation_started = Instant::now();
+            debug!(session_id = %session_id, "negotiating transport");
             match negotiate_transport(&session_handle, passphrase, None, false).await {
                 Ok(NegotiatedTransport::Single(NegotiatedSingle {
                     transport,
@@ -955,7 +1068,13 @@ fn spawn_webrtc_acceptor(
                     signaling_client: _,
                 })) => {
                     let selected_kind = transport.kind();
-                    info!(session_id = %session_id, transport = ?selected_kind, "transport negotiated");
+                    let elapsed_ms = negotiation_started.elapsed().as_millis() as u64;
+                    info!(
+                        session_id = %session_id,
+                        transport = ?selected_kind,
+                        elapsed_ms,
+                        "transport negotiated"
+                    );
                     let metadata = JoinAuthorizationMetadata::from_parts(
                         selected_kind,
                         None,
@@ -980,7 +1099,19 @@ fn spawn_webrtc_acceptor(
                         continue;
                     }
                     if hint_pending || auto_grant {
-                        let _ = transport.send_text("beach:status:approval_granted");
+                        match transport.send_text("beach:status:approval_granted") {
+                            Ok(_) => info!(
+                                session_id = %session_id,
+                                transport = ?selected_kind,
+                                "emitted beach:status:approval_granted"
+                            ),
+                            Err(err) => warn!(
+                                session_id = %session_id,
+                                transport = ?selected_kind,
+                                error = %err,
+                                "failed to emit beach:status:approval_granted"
+                            ),
+                        }
                     }
 
                     let shared_transport = Arc::new(SharedTransport::new(transport.clone()));
@@ -1095,9 +1226,11 @@ fn spawn_webrtc_acceptor(
                 }) => {
                     let transport = connection.transport();
                     let channels = connection.channels();
+                    let elapsed_ms = negotiation_started.elapsed().as_millis() as u64;
                     info!(
                         session_id = %session_id,
                         transport = "webrtc-multi",
+                        elapsed_ms,
                         "transport negotiated with offerer supervisor"
                     );
                     let metadata = JoinAuthorizationMetadata::from_parts(
@@ -1123,7 +1256,21 @@ fn spawn_webrtc_acceptor(
                         continue;
                     }
                     if hint_pending || auto_grant {
-                        let _ = transport.send_text("beach:status:approval_granted");
+                        match transport.send_text("beach:status:approval_granted") {
+                            Ok(_) => info!(
+                                session_id = %session_id,
+                                peer_id = %peer_id,
+                                handshake_id = %handshake_id,
+                                "emitted beach:status:approval_granted"
+                            ),
+                            Err(err) => warn!(
+                                session_id = %session_id,
+                                peer_id = %peer_id,
+                                handshake_id = %handshake_id,
+                                error = %err,
+                                "failed to emit beach:status:approval_granted"
+                            ),
+                        }
                     }
 
                     let shared_transport = Arc::new(SharedTransport::new(transport.clone()));
@@ -1220,6 +1367,7 @@ fn spawn_webrtc_acceptor(
                     }
 
                     spawn_viewer_accept_loop(
+                        session_id.clone(),
                         supervisor,
                         forwarder_tx.clone(),
                         writer.clone(),
@@ -1236,9 +1384,11 @@ fn spawn_webrtc_acceptor(
                     break;
                 }
                 Err(err) => {
+                    let elapsed_ms = negotiation_started.elapsed().as_millis() as u64;
                     warn!(
                         session_id = %session_id,
                         error = %err,
+                        elapsed_ms,
                         "transport negotiation failed; retrying"
                     );
                     sleep(Duration::from_secs(1)).await;
@@ -1250,6 +1400,7 @@ fn spawn_webrtc_acceptor(
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_viewer_accept_loop(
+    session_id: String,
     supervisor: Arc<OffererSupervisor>,
     forwarder_tx: UnboundedSender<ForwarderCommand>,
     writer: PtyWriter,
@@ -1299,7 +1450,23 @@ fn spawn_viewer_accept_loop(
                 continue;
             }
             if hint_pending || auto_grant {
-                let _ = transport_arc.send_text("beach:status:approval_granted");
+                match transport_arc.send_text("beach:status:approval_granted") {
+                    Ok(_) => info!(
+                        target = "webrtc",
+                        session_id = %session_id,
+                        peer_id = %peer_id,
+                        handshake_id = %handshake_id,
+                        "emitted beach:status:approval_granted"
+                    ),
+                    Err(err) => warn!(
+                        target = "webrtc",
+                        session_id = %session_id,
+                        peer_id = %peer_id,
+                        handshake_id = %handshake_id,
+                        error = %err,
+                        "failed to emit beach:status:approval_granted"
+                    ),
+                }
             }
 
             let shared_transport = Arc::new(SharedTransport::new(transport_arc.clone()));

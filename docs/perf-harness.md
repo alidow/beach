@@ -20,7 +20,7 @@ savings hold steady.
 1. Enable binary framing and perf counters:
    ```bash
    export BEACH_PROTO_BINARY=1
-   export BEACH_PROFILE=1
+   export BEACH_PERF=1
    RUST_LOG=perf=debug,beach=debug cargo run -p beach -- --local-preview
    ```
 2. Drive an editor workload (e.g. Vim) for ~30 seconds.

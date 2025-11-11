@@ -40,11 +40,14 @@ services:
       PUBLIC_MANAGER_URL: http://127.0.0.1:8080
       BEACH_GATE_URL: ${BEACH_GATE_URL:-http://beach-gate:4133}
       BEACH_SESSION_SERVER: http://beach-road:4132
-      RUST_LOG: info
+      STDOUT_LOG: ${BEACH_MANAGER_STDOUT_LOG:-info}
+      BEACH_MANAGER_FILE_LOG: ${BEACH_MANAGER_FILE_LOG:-trace}
+      LOG_PATH: /var/log/beach-manager/beach-manager.log
     volumes:
       - .:/app
       - cargo-target:/app/target
       - cargo-registry-beach-manager:/usr/local/cargo/registry
+      - ./logs/beach-manager:/var/log/beach-manager
     depends_on:
       postgres:
         condition: service_healthy

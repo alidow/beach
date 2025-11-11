@@ -717,7 +717,18 @@ pub async fn get_webrtc_offer(
             let _ = storage.update_session_ttl(&session_id).await;
             Ok(Json(payload))
         }
-        None => Err(StatusCode::NOT_FOUND),
+        None => {
+            let exists = storage
+                .session_exists(&session_id)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            if !exists {
+                return Err(StatusCode::NOT_FOUND);
+            }
+            // Maintain legacy semantics so existing clients keep polling instead of parsing
+            // an empty body from a 204/200 response.
+            Err(StatusCode::NOT_FOUND)
+        }
     }
 }
 
@@ -776,7 +787,17 @@ pub async fn get_webrtc_answer(
             let _ = storage.update_session_ttl(&session_id).await;
             Ok(Json(payload))
         }
-        None => Err(StatusCode::NOT_FOUND),
+        None => {
+            let exists = storage
+                .session_exists(&session_id)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            if !exists {
+                return Err(StatusCode::NOT_FOUND);
+            }
+            // Align answer polling semantics with offer polling.
+            Err(StatusCode::NOT_FOUND)
+        }
     }
 }
 

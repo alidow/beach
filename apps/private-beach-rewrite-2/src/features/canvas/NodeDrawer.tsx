@@ -2,6 +2,7 @@
 
 import { useCallback, useMemo, useState } from 'react';
 import type { DragEvent } from 'react';
+import { Boxes } from 'lucide-react';
 import { useCanvasUI } from './CanvasContext';
 import { NodeCardContent } from './NodeCard';
 import type { CanvasNodeDefinition } from './types';
@@ -113,7 +114,7 @@ function DraggableNodeCard({ node, isActive, disabled = false, onDragStart, onDr
 }
 
 export function NodeDrawer({ nodes, activeNodeId, onNodeDragStart, onNodeDragEnd }: NodeDrawerProps) {
-  const { drawerOpen, toggleDrawer, closeDrawer } = useCanvasUI();
+  const { drawerOpen, openDrawer, closeDrawer } = useCanvasUI();
 
   const panelClass = [
     'absolute left-6 top-16 z-40 w-80 max-w-[90vw] rounded-[28px] border border-white/10 bg-slate-950/80 p-5 shadow-[0_35px_120px_rgba(2,6,23,0.7)] backdrop-blur-xl transition-all duration-200 ease-out',
@@ -124,15 +125,17 @@ export function NodeDrawer({ nodes, activeNodeId, onNodeDragStart, onNodeDragEnd
 
   return (
     <>
-      <button
-        type="button"
-        onClick={toggleDrawer}
-        className="pointer-events-auto absolute left-6 top-3 z-50 inline-flex items-center gap-2 rounded-full border border-white/10 bg-slate-950/70 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-300 shadow-[0_15px_40px_rgba(2,6,23,0.65)] transition hover:border-white/30 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
-        aria-expanded={drawerOpen}
-        aria-label={drawerOpen ? 'Hide node catalog' : 'Show node catalog'}
-      >
-        {drawerOpen ? 'Close Catalog' : 'Open Catalog'}
-      </button>
+      {!drawerOpen ? (
+        <button
+          type="button"
+          onClick={openDrawer}
+          className="pointer-events-auto absolute left-6 top-3 z-50 inline-flex h-10 w-10 items-center justify-center rounded-full border border-white/10 bg-slate-950/70 text-slate-200 shadow-[0_15px_40px_rgba(2,6,23,0.65)] transition hover:border-white/30 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
+          aria-expanded={false}
+          aria-label="Show node catalog"
+        >
+          <Boxes className="h-4 w-4" aria-hidden="true" />
+        </button>
+      ) : null}
       <aside className={panelClass} aria-label="Node catalog" aria-hidden={!drawerOpen} data-state={drawerOpen ? 'open' : 'closed'}>
         <div className="mb-4 flex items-center justify-between gap-3">
           <header className="space-y-1">

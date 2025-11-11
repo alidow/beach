@@ -693,7 +693,7 @@ export function ApplicationTile({
   const hasSession = Boolean(sessionMeta?.sessionId);
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-4 text-[13px] text-slate-200">
+    <div className="flex h-full min-h-0 flex-col gap-4 text-[13px] text-slate-800 dark:text-slate-200">
       {!hasSession ? (
         <form className="grid gap-3" onSubmit={handleAttach}>
           <label className="grid gap-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
@@ -703,7 +703,7 @@ export function ApplicationTile({
               onChange={(event) => setSessionIdInput(event.target.value)}
               placeholder="sess-1234…"
               autoComplete="off"
-              className="h-10 rounded-full border border-white/10 bg-white/5 px-4 text-[13px] font-medium text-white placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
+              className="h-10 rounded-full border border-slate-300 dark:border-white/10 bg-white dark:bg-white/5 px-4 text-[13px] font-medium text-slate-900 dark:text-white placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
             />
           </label>
           <label className="grid gap-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
@@ -713,13 +713,13 @@ export function ApplicationTile({
               onChange={(event) => setCodeInput(event.target.value)}
               placeholder="6-digit code"
               autoComplete="off"
-              className="h-10 rounded-full border border-white/10 bg-white/5 px-4 text-[13px] font-medium text-white placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
+              className="h-10 rounded-full border border-slate-300 dark:border-white/10 bg-white dark:bg-white/5 px-4 text-[13px] font-medium text-slate-900 dark:text-white placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
             />
           </label>
           <button
             type="submit"
             disabled={disabled}
-            className="mt-2 inline-flex h-10 items-center justify-center rounded-full border border-sky-400/60 bg-sky-500/20 px-6 text-sm font-semibold uppercase tracking-[0.18em] text-sky-100 transition hover:border-sky-300/80 hover:bg-sky-500/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60 disabled:cursor-not-allowed disabled:opacity-50"
+            className="mt-2 inline-flex h-10 items-center justify-center rounded-full border border-sky-300/60 dark:border-sky-400/60 bg-sky-500/20 px-6 text-sm font-semibold uppercase tracking-[0.18em] text-sky-900 dark:text-sky-100 transition hover:border-sky-400/70 hover:bg-sky-500/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60 disabled:cursor-not-allowed disabled:opacity-50"
           >
             {submitState === 'attaching' ? 'Attaching…' : 'Connect'}
           </button>
@@ -728,16 +728,16 @@ export function ApplicationTile({
             <p className="text-[11px] text-slate-400">Sign in with Clerk to request manager credentials.</p>
           )}
           {tokenError && (
-            <p className="rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-100">{tokenError}</p>
+            <p className="rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-800 dark:text-red-100">{tokenError}</p>
           )}
           {attachError && (
-            <p className="rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-100">{attachError}</p>
+            <p className="rounded-xl border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-800 dark:text-red-100">{attachError}</p>
           )}
         </form>
       ) : (
         <div className="flex flex-1 min-h-0 flex-col gap-4">
           {roleWarning && (
-            <p className="rounded-xl border border-amber-400/40 bg-amber-400/10 px-3 py-2 text-xs text-amber-100">
+            <p className="rounded-xl border border-amber-400/40 bg-amber-400/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-100">
               {roleWarning}
             </p>
           )}

@@ -10,15 +10,17 @@ use config::AppConfig;
 use routes::build_router;
 use sqlx::postgres::PgPoolOptions;
 use state::AppState;
-use std::{net::SocketAddr, time::Duration};
-use tracing::{info, warn, Level};
+use std::{net::SocketAddr, path::Path, sync::OnceLock, time::Duration};
+use tracing::{info, warn};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{filter::EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    init_tracing();
-
     let cfg = AppConfig::from_env();
+    init_tracing(cfg.log_path.as_deref());
+
     let mut state = if let Some(db_url) = &cfg.database_url {
         match PgPoolOptions::new()
             .max_connections(20)
@@ -101,9 +103,82 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
-    tracing_subscriber::FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+static FILE_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
+
+fn init_tracing(log_path: Option<&str>) {
+    use tracing_subscriber::filter::FilterExt;
+    use tracing_subscriber::prelude::*;
+
+    let stdout_directives = std::env::var("BEACH_MANAGER_STDOUT_LOG")
+        .or_else(|_| std::env::var("STDOUT_LOG"))
+        .or_else(|_| std::env::var("RUST_LOG_STDOUT"))
+        .unwrap_or_else(|_| "info".to_string());
+    let stdout_filter =
+        EnvFilter::try_new(stdout_directives).unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_filter(stdout_filter);
+
+    let registry = tracing_subscriber::registry().with(stdout_layer);
+
+    if let Some(path) = log_path.and_then(|p| {
+        let trimmed = p.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }) {
+        if let Some((writer, guard)) = build_file_writer(path) {
+            let _ = FILE_GUARD.set(guard);
+            let file_directives = std::env::var("BEACH_MANAGER_FILE_LOG")
+                .or_else(|_| std::env::var("FILE_LOG"))
+                .or_else(|_| std::env::var("RUST_LOG_FILE"))
+                .unwrap_or_else(|_| "trace".to_string());
+            let file_filter =
+                EnvFilter::try_new(file_directives).unwrap_or_else(|_| EnvFilter::new("trace"));
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(writer)
+                .with_filter(file_filter);
+            registry.with(file_layer).init();
+            return;
+        }
+    }
+
+    registry.init();
+}
+
+fn build_file_writer(
+    path: &str,
+) -> Option<(tracing_appender::non_blocking::NonBlocking, WorkerGuard)> {
+    let path = Path::new(path);
+    if let Some(parent) = path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            eprintln!(
+                "beach-manager tracing: failed to create directory {}: {err}",
+                parent.display()
+            );
+            return None;
+        }
+    }
+
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!(
+                "beach-manager tracing: failed to open {}: {err}",
+                path.display()
+            );
+            return None;
+        }
+    };
+
+    Some(tracing_appender::non_blocking(file))
 }

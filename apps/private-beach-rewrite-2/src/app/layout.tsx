@@ -3,8 +3,9 @@ import { ClerkProvider } from '@clerk/nextjs';
 import { ThemeProvider } from '../../../private-beach/src/components/theme-provider';
 import { ThemeDebugger } from '../../../private-beach/src/components/theme-debugger';
 import '@/lib/ensureReactCache';
-import './globals.css';
+// Load shared styles first, then override with rewrite-2 tokens so our light palette wins.
 import '../../../beach-surfer/src/styles.css';
+import './globals.css';
 
 export const metadata: Metadata = {
   title: 'Private Beach Rewrite',

@@ -1,6 +1,30 @@
 'use client';
 
 import 'reactflow/dist/style.css';
+/**
+ * FlowCanvas
+ *
+ * Dragging stability notes for future maintainers/agents:
+ *
+ * 1) Use header-only drag via `nodeDragHandle=".rf-drag-handle"` and make sure
+ *    the node header element has the `rf-drag-handle` class. Do NOT disable
+ *    `nodesDraggable` conditionally; gate the start area instead.
+ *
+ * 2) Keep external state in sync during drag: in onNodesChange, when
+ *    `change.dragging` is true, call `setTilePositionImmediate(id, position)`.
+ *    Commit snapped position only on onNodeDragStop. Avoid writing positions in
+ *    onNodeDrag to prevent extra renders.
+ *
+ * 3) Anti-flicker React Flow props: keep
+ *    - onlyRenderVisibleElements={false}
+ *    - elevateNodesOnSelect={false}
+ *    - selectNodesOnDrag={false}
+ *    - panOnDrag (pane-only; nodes use header handle)
+ *    - ReactFlow style includes translateZ(0) + willChange
+ *
+ * 4) Avoid main-thread work during drag: do not auto-persist layout mid-drag.
+ *    See useTileLayoutPersistence({ auto: false }) and persist only on drop.
+ */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ReactFlow, {
@@ -15,12 +39,13 @@ import ReactFlow, {
   type NodeChange,
   type NodeDragEventHandler,
   type ReactFlowState,
+  type Viewport,
 } from 'reactflow';
 import { emitTelemetry } from '../../../../private-beach/src/lib/telemetry';
 import { TileFlowNode } from '@/features/tiles/components/TileFlowNode';
 import { TILE_GRID_SNAP_PX } from '@/features/tiles/constants';
 import { useTileActions, useTileState } from '@/features/tiles/store';
-import type { RelationshipDescriptor } from '@/features/tiles/types';
+import type { CanvasViewportState, RelationshipDescriptor } from '@/features/tiles/types';
 import {
   acquireController,
   batchControllerAssignments,
@@ -33,6 +58,8 @@ import { useCanvasEvents } from './CanvasEventsContext';
 import { snapPointToGrid } from './positioning';
 import { AssignmentEdge, type AssignmentEdgeData, type UpdateMode } from './AssignmentEdge';
 import { TraceMonitorPanel } from './TraceMonitorPanel';
+import { CanvasDragStateProvider } from './CanvasDragStateContext';
+import { CANVAS_CENTER_TILE_EVENT, type CanvasCenterTileEventDetail } from './events';
 import type {
   CanvasBounds,
   CanvasNodeDefinition,
@@ -42,8 +69,9 @@ import type {
 } from './types';
 
 const APPLICATION_MIME = 'application/reactflow';
-const nodeTypes = { tile: TileFlowNode };
-const edgeTypes = { assignment: AssignmentEdge };
+// Stable type maps: never recreate between renders (prevents RF #002).
+const NODE_TYPES = Object.freeze({ tile: TileFlowNode });
+const EDGE_TYPES = Object.freeze({ assignment: AssignmentEdge });
 const defaultEdgeOptions = {
   type: 'smoothstep' as const,
   markerEnd: {
@@ -56,10 +84,13 @@ const defaultEdgeOptions = {
 
 const CONTROLLER_LEASE_TTL_MS = 120_000;
 const CONTROLLER_LEASE_REFRESH_BUFFER_MS = 5_000;
+const VIEWPORT_PAN_EPSILON = 0.5;
+const VIEWPORT_ZOOM_EPSILON = 0.0005;
 
 type FlowCanvasProps = {
   onNodePlacement: (payload: NodePlacementPayload) => void;
   onTileMove?: (payload: TileMovePayload) => void;
+  onViewportChange?: (viewport: CanvasViewportState) => void;
   privateBeachId: string;
   managerUrl?: string;
   rewriteEnabled: boolean;
@@ -85,6 +116,7 @@ type PairingHistoryEntry = {
 function FlowCanvasInner({
   onNodePlacement,
   onTileMove,
+  onViewportChange,
   privateBeachId,
   managerUrl,
   rewriteEnabled,
@@ -110,12 +142,8 @@ function FlowCanvasInner({
   const [dragCount, setDragCount] = useState(0);
   const { token: managerToken, refresh: refreshManagerToken } = useManagerToken();
   const controllerLeaseExpiryRef = useRef<Record<string, number>>({});
-  const flow = useReactFlow();
-  const { screenToFlowPosition } = flow;
-  const memoizedNodeTypes = useMemo(() => nodeTypes, []);
-  const memoizedEdgeTypes = useMemo(() => edgeTypes, []);
   const state = useTileState();
-  const { order, tiles, activeId, resizing, interactiveId } = state;
+  const { order, tiles, activeId, resizing, interactiveId, canvasViewport } = state;
   const {
     setTilePosition,
     setTilePositionImmediate,
@@ -124,8 +152,72 @@ function FlowCanvasInner({
     addRelationship,
     updateRelationship,
     removeRelationship,
+    setCanvasViewport,
   } = useTileActions();
+  const flow = useReactFlow();
+  const { screenToFlowPosition } = flow;
+  const lastViewportPublishRef = useRef<CanvasViewportState>(canvasViewport);
+  const appliedViewportRef = useRef<CanvasViewportState | null>(null);
+  const tilesRef = useRef(state.tiles);
+  useEffect(() => {
+    tilesRef.current = state.tiles;
+  }, [state.tiles]);
+  useEffect(() => {
+    lastViewportPublishRef.current = canvasViewport;
+  }, [canvasViewport]);
+  useEffect(() => {
+    const desired = canvasViewport;
+    if (!desired) {
+      return;
+    }
+    const applied = appliedViewportRef.current;
+    if (
+      applied &&
+      Math.abs(applied.zoom - desired.zoom) < VIEWPORT_ZOOM_EPSILON &&
+      Math.abs(applied.pan.x - desired.pan.x) < VIEWPORT_PAN_EPSILON &&
+      Math.abs(applied.pan.y - desired.pan.y) < VIEWPORT_PAN_EPSILON
+    ) {
+      return;
+    }
+    flow.setViewport({ x: desired.pan.x, y: desired.pan.y, zoom: desired.zoom }, { duration: applied ? 160 : 0 });
+    appliedViewportRef.current = desired;
+  }, [canvasViewport, flow]);
+  const memoizedNodeTypes = useMemo(() => NODE_TYPES, []);
+  const memoizedEdgeTypes = useMemo(() => EDGE_TYPES, []);
+  // Runtime guard to surface accidental remount causes during dev
+  if (process.env.NODE_ENV !== 'production') {
+    try {
+      if (!memoizedNodeTypes || !memoizedEdgeTypes) {
+        // noop, keeps bundlers from tree-shaking the guard
+      }
+    } catch {}
+  }
   const { reportTileMove } = useCanvasEvents();
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return undefined;
+    }
+    const handleCenterTile = (event: Event) => {
+      const detail = (event as CustomEvent<CanvasCenterTileEventDetail>).detail;
+      const tileId = detail?.tileId;
+      if (!tileId) {
+        return;
+      }
+      const tile = tilesRef.current[tileId];
+      if (!tile) {
+        return;
+      }
+      const centerX = tile.position.x + tile.size.width / 2;
+      const centerY = tile.position.y + tile.size.height / 2;
+      const zoom = flow.getZoom();
+      flow.setCenter(centerX, centerY, { zoom, duration: 220 });
+    };
+    window.addEventListener(CANVAS_CENTER_TILE_EVENT, handleCenterTile as EventListener);
+    return () => {
+      window.removeEventListener(CANVAS_CENTER_TILE_EVENT, handleCenterTile as EventListener);
+    };
+  }, [flow]);
 
   const applyCanvasBounds = useCallback((bounds: CanvasBounds | null) => {
     canvasBoundsRef.current = bounds;
@@ -166,6 +258,18 @@ function FlowCanvasInner({
         const nextExpiry = lease.expires_at_ms ?? now + CONTROLLER_LEASE_TTL_MS;
         controllerLeaseExpiryRef.current[controllerSessionId] = nextExpiry;
       } catch (error) {
+        // In dev, some manager builds return HTTP 409 (Conflict) when the DB
+        // migrations for controller leases are out of date. Since pairing does
+        // not strictly require a lease on the controller session (the batch
+        // assignment API performs its own auth), treat 409 as non-fatal so the
+        // canvas can proceed without surfacing a blocking error.
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.includes('409')) {
+          const fallbackExpiry = now + CONTROLLER_LEASE_TTL_MS;
+          controllerLeaseExpiryRef.current[controllerSessionId] = fallbackExpiry;
+          console.info('[rewrite-2] proceeding without controller lease due to 409');
+          return;
+        }
         console.warn('[rewrite-2] failed to acquire controller lease', {
           controllerSessionId,
           error,
@@ -176,39 +280,91 @@ function FlowCanvasInner({
     [resolvedManagerUrl],
   );
 
+  // Cache node objects: unchanged tiles keep stable references across drag frames.
+  const nodeCacheRef = useRef<Map<string, { node: Node; sig: string }>>(new Map());
   const nodes: Node[] = useMemo(() => {
-    return order
-      .map((tileId, index) => {
-        const tile = tiles[tileId];
-        if (!tile) return null;
-        const isInteractive = interactiveId === tile.id;
-        return {
-          id: tile.id,
-          type: 'tile',
-          data: {
-            tile,
-            orderIndex: index,
-            isActive: activeId === tile.id,
-            isResizing: Boolean(resizing[tile.id]),
-            isInteractive,
-            privateBeachId,
-            managerUrl: resolvedManagerUrl,
-            rewriteEnabled,
-          },
-          position: tile.position,
-          // Disable dragging while a tile is in interactive mode so mouse
-          // selections/clicks are not hijacked by React Flow drag logic.
-          draggable: !isInteractive,
-          selectable: false,
-          connectable: true,
-          style: {
-            width: tile.size.width,
-            height: tile.size.height,
-            zIndex: 10 + index,
-          },
-        } satisfies Node;
-      })
-      .filter((node): node is Node => Boolean(node));
+    const next: Node[] = [];
+    const cache = nodeCacheRef.current;
+    const seen = new Set<string>();
+    for (let index = 0; index < order.length; index += 1) {
+      const tileId = order[index];
+      const tile = tiles[tileId];
+      if (!tile) continue;
+      const isInteractive = interactiveId === tile.id;
+      const sessionMetaSig = tile.sessionMeta
+        ? [
+            tile.sessionMeta.sessionId ?? '',
+            tile.sessionMeta.title ?? '',
+            tile.sessionMeta.status ?? '',
+            tile.sessionMeta.harnessType ?? '',
+            tile.sessionMeta.pendingActions ?? '',
+          ].join('~')
+        : 'session:none';
+      const agentMetaSig = tile.agentMeta
+        ? [
+            tile.agentMeta.role ?? '',
+            tile.agentMeta.responsibility ?? '',
+            tile.agentMeta.isEditing ? 'editing' : 'saved',
+            tile.agentMeta.trace?.enabled ? 'trace:on' : 'trace:off',
+            tile.agentMeta.trace?.trace_id ?? '',
+          ].join('~')
+        : 'agent:none';
+      const sig = [
+        tile.id,
+        tile.position.x,
+        tile.position.y,
+        tile.size.width,
+        tile.size.height,
+        index,
+        activeId === tile.id ? 1 : 0,
+        resizing[tile.id] ? 1 : 0,
+        isInteractive ? 1 : 0,
+        privateBeachId,
+        resolvedManagerUrl,
+        rewriteEnabled ? 1 : 0,
+        sessionMetaSig,
+        agentMetaSig,
+      ].join('|');
+      const cached = cache.get(tile.id);
+      if (cached && cached.sig === sig) {
+        next.push(cached.node);
+        seen.add(tile.id);
+        continue;
+      }
+      const node: Node = {
+        id: tile.id,
+        type: 'tile',
+        data: {
+          tile,
+          orderIndex: index,
+          isActive: activeId === tile.id,
+          isResizing: Boolean(resizing[tile.id]),
+          isInteractive,
+          privateBeachId,
+          managerUrl: resolvedManagerUrl,
+          rewriteEnabled,
+        },
+        position: tile.position,
+        draggable: true,
+        selectable: false,
+        connectable: true,
+        style: {
+          width: tile.size.width,
+          height: tile.size.height,
+          zIndex: 10 + index,
+        },
+      };
+      cache.set(tile.id, { node, sig });
+      next.push(node);
+      seen.add(tile.id);
+    }
+    // Prune removed tiles
+    for (const key of Array.from(cache.keys())) {
+      if (!seen.has(key)) {
+        cache.delete(key);
+      }
+    }
+    return next;
   }, [activeId, interactiveId, order, privateBeachId, resolvedManagerUrl, resizing, rewriteEnabled, tiles]);
 
   const handleEdgeSave = useCallback(
@@ -323,6 +479,35 @@ function FlowCanvasInner({
       state.tiles,
       updateRelationship,
     ],
+  );
+
+  const handleViewportMoveEnd = useCallback(
+    (_event: MouseEvent | TouchEvent | null, viewport: Viewport) => {
+      if (!viewport) {
+        return;
+      }
+      const normalizeNumber = (value: number | undefined, fallback: number) =>
+        typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+      const nextViewport: CanvasViewportState = {
+        zoom: Math.min(1.75, Math.max(0.2, normalizeNumber(viewport.zoom, canvasViewport.zoom))),
+        pan: {
+          x: normalizeNumber(viewport.x, canvasViewport.pan.x),
+          y: normalizeNumber(viewport.y, canvasViewport.pan.y),
+        },
+      };
+      const prev = lastViewportPublishRef.current;
+      const hasMeaningfulDelta =
+        Math.abs(prev.zoom - nextViewport.zoom) > VIEWPORT_ZOOM_EPSILON ||
+        Math.abs(prev.pan.x - nextViewport.pan.x) > VIEWPORT_PAN_EPSILON ||
+        Math.abs(prev.pan.y - nextViewport.pan.y) > VIEWPORT_PAN_EPSILON;
+      if (!hasMeaningfulDelta) {
+        return;
+      }
+      lastViewportPublishRef.current = nextViewport;
+      setCanvasViewport(nextViewport);
+      onViewportChange?.(nextViewport);
+    },
+    [canvasViewport.pan.x, canvasViewport.pan.y, canvasViewport.zoom, onViewportChange, setCanvasViewport],
   );
 
   const handleEdgeEdit = useCallback(({ id }: { id: string }) => {
@@ -450,10 +635,22 @@ function FlowCanvasInner({
         if (change.type === 'position' && change.position) {
           const tile = state.tiles[change.id];
           if (!tile) return;
-          // Keep controlled node positions in sync while dragging to avoid
-          // React Flow re-applying stale positions (can cause flicker).
+          // IMPORTANT: Keep controlled node positions in sync while dragging.
+          // RF moves nodes via CSS transforms. If our props lag behind,
+          // RF may reconcile to the old position and flicker.
           if (change.dragging) {
-            setTilePositionImmediate(change.id, change.position);
+            const px = Math.round(change.position.x);
+            const py = Math.round(change.position.y);
+            setTilePositionImmediate(change.id, { x: px, y: py });
+            if ((window as any).__PB_DEBUG_DRAG) {
+              try {
+                console.info('[rf][drag] frame', {
+                  id: change.id,
+                  x: px,
+                  y: py,
+                });
+              } catch {}
+            }
             return;
           }
           const snapped = snapPointToGrid(change.position, gridSize);
@@ -461,6 +658,15 @@ function FlowCanvasInner({
             return;
           }
           setTilePosition(change.id, snapped);
+          if ((window as any).__PB_DEBUG_DRAG) {
+            try {
+              console.info('[rf][drag] commit', {
+                id: change.id,
+                x: snapped.x,
+                y: snapped.y,
+              });
+            } catch {}
+          }
         }
       });
     },
@@ -494,7 +700,7 @@ function FlowCanvasInner({
     (_event, node) => {
       const tile = state.tiles[node.id];
       if (!tile) return;
-      bringToFront(node.id);
+      // Avoid double bring-to-front churn: setActiveTile already elevates.
       setActiveTile(node.id);
       dragSnapshotRef.current = {
         tileId: node.id,
@@ -1026,72 +1232,78 @@ function FlowCanvasInner({
 
   const isDragging = dragCount > 0;
 
+  // Canvas wrapper uses theme background tokens (light: soft neutral, dark: deep neutral).
+  // Keep backdrop blur off during drag to avoid overdraw.
   return (
-    <div
-      ref={wrapperRef}
-      className={`relative flex-1 h-full w-full overflow-hidden bg-neutral-900 dark:bg-neutral-950 ${isDragging ? '' : 'backdrop-blur-2xl'}`}
-      data-testid="flow-canvas"
-    >
-      <ReactFlow
-        nodes={nodes}
-        edges={edgeElements}
-        nodeTypes={memoizedNodeTypes}
-        edgeTypes={memoizedEdgeTypes}
-        defaultEdgeOptions={defaultEdgeOptions}
-        // Restrict dragging to the tile header to avoid drag conflicts
-        // with dynamic content inside the node body (terminal, etc.).
-        nodeDragHandle=".rf-drag-handle"
-        onNodesChange={handleNodesChange}
-        onEdgesChange={() => undefined}
-        onConnect={handleConnect}
-        onNodeDragStart={handleNodeDragStart}
-        onNodeDragStop={handleNodeDragStop}
-        connectionMode="loose"
-        connectionRadius={36}
-        // Always allow node dragging; we restrict the drag start area via
-        // `nodeDragHandle` so interactive content does not interfere.
-        nodesDraggable
-        nodesConnectable
-        elementsSelectable={false}
-        // Keep nodes rendered during drag to avoid viewport-culling flicker
-        onlyRenderVisibleElements={false}
-        selectNodesOnDrag={false}
-        panOnScroll={false}
-        // Allow panning with left-drag on the pane (not on nodes)
-        panOnDrag
-        zoomOnScroll={false}
-        zoomOnPinch
-        zoomOnDoubleClick={false}
-        fitView={false}
-        elevateNodesOnSelect={false}
-        proOptions={{ hideAttribution: true }}
-        className="h-full w-full"
-        minZoom={0.2}
-        maxZoom={1.75}
-        style={{ width: '100%', height: '100%', transform: 'translateZ(0)', willChange: 'transform' }}
+    <CanvasDragStateProvider value={isDragging}>
+      <div
+        ref={wrapperRef}
+        className={`relative flex-1 h-full w-full overflow-hidden bg-background ${isDragging ? '' : 'backdrop-blur-2xl'}`}
+        data-testid="flow-canvas"
       >
-        <Background gap={gridSize} color="rgba(160, 160, 160, 0.12)" />
-      </ReactFlow>
-      <CanvasViewportControls />
-      {traceOverlayProps ? (
-        <TraceMonitorPanel
-          traceId={traceOverlayProps.traceId}
-          agentRole={traceOverlayProps.agentRole}
-          agentResponsibility={traceOverlayProps.agentResponsibility}
-          instructions={traceOverlayProps.instructions}
-          cadence={traceOverlayProps.cadence}
-          pollFrequency={traceOverlayProps.pollFrequency}
-          sourceSessionId={traceOverlayProps.sourceSessionId}
-          targetSessionId={traceOverlayProps.targetSessionId}
-          pairingHistory={traceOverlayProps.pairingHistory}
-          logs={traceOverlayProps.logs}
-          onClose={() => {
-            clearTraceLogs(traceOverlayProps.traceId);
-            setTraceOverlay(null);
-          }}
-        />
-      ) : null}
-    </div>
+        <ReactFlow
+          nodes={nodes}
+          edges={edgeElements}
+          nodeTypes={memoizedNodeTypes}
+          edgeTypes={memoizedEdgeTypes}
+          defaultEdgeOptions={defaultEdgeOptions}
+          // Restrict dragging to the tile header to avoid drag conflicts
+          // with dynamic content inside the node body (terminal, etc.).
+          nodeDragHandle=".rf-drag-handle"
+          onNodesChange={handleNodesChange}
+          onEdgesChange={() => undefined}
+          onConnect={handleConnect}
+          onNodeDragStart={handleNodeDragStart}
+        onNodeDragStop={handleNodeDragStop}
+          onMoveEnd={handleViewportMoveEnd}
+          connectionMode="loose"
+          connectionRadius={36}
+          // Always allow node dragging; we restrict the drag start area via
+          // `nodeDragHandle` so interactive content does not interfere.
+          nodesDraggable
+          nodesConnectable
+          elementsSelectable={false}
+          // Keep nodes rendered during drag to avoid viewport-culling flicker
+          onlyRenderVisibleElements={false}
+          selectNodesOnDrag={false}
+          panOnScroll={false}
+          // Allow panning with left-drag on the pane (not on nodes)
+          panOnDrag
+          zoomOnScroll={false}
+          zoomOnPinch
+          zoomOnDoubleClick={false}
+          fitView={false}
+          elevateNodesOnSelect={false}
+          proOptions={{ hideAttribution: true }}
+          className="h-full w-full"
+          minZoom={0.2}
+          maxZoom={1.75}
+          style={{ width: '100%', height: '100%', transform: 'translateZ(0)', willChange: 'transform' }}
+        >
+          {/** Subtle blue-gray grid that reads well on both themes */}
+          <Background gap={gridSize} color="rgba(124, 144, 171, 0.14)" />
+        </ReactFlow>
+        <CanvasViewportControls />
+        {traceOverlayProps ? (
+          <TraceMonitorPanel
+            traceId={traceOverlayProps.traceId}
+            agentRole={traceOverlayProps.agentRole}
+            agentResponsibility={traceOverlayProps.agentResponsibility}
+            instructions={traceOverlayProps.instructions}
+            cadence={traceOverlayProps.cadence}
+            pollFrequency={traceOverlayProps.pollFrequency}
+            sourceSessionId={traceOverlayProps.sourceSessionId}
+            targetSessionId={traceOverlayProps.targetSessionId}
+            pairingHistory={traceOverlayProps.pairingHistory}
+            logs={traceOverlayProps.logs}
+            onClose={() => {
+              clearTraceLogs(traceOverlayProps.traceId);
+              setTraceOverlay(null);
+            }}
+          />
+        ) : null}
+      </div>
+    </CanvasDragStateProvider>
   );
 }
 

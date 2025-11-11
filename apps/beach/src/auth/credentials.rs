@@ -4,9 +4,9 @@ use crate::auth::error::AuthError;
 use crate::auth::passphrase;
 use directories::BaseDirs;
 use keyring::Entry;
-use std::env;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -29,11 +29,18 @@ pub struct AccessTokenCache {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RefreshTokenRecord {
-    Keyring { service: String, account: String },
+    Keyring {
+        service: String,
+        account: String,
+    },
     /// Plaintext token stored directly in the credentials file (0600 perms).
     /// Matches the common pattern used by many CLIs (aws, gcloud, azure).
-    Plain { token: String },
-    Encrypted { blob: EncryptedBlob },
+    Plain {
+        token: String,
+    },
+    Encrypted {
+        blob: EncryptedBlob,
+    },
 }
 
 impl RefreshTokenRecord {
@@ -43,10 +50,12 @@ impl RefreshTokenRecord {
                 // Respect opt-out: if keychain use is not explicitly enabled,
                 // avoid touching the OS keychain to prevent a macOS prompt.
                 let use_keychain = env::var("BEACH_AUTH_USE_KEYCHAIN")
-                    .map(|v| matches!(
-                        v.trim().to_ascii_lowercase().as_str(),
-                        "1" | "true" | "yes" | "on"
-                    ))
+                    .map(|v| {
+                        matches!(
+                            v.trim().to_ascii_lowercase().as_str(),
+                            "1" | "true" | "yes" | "on"
+                        )
+                    })
                     .unwrap_or(false);
                 if !use_keychain {
                     return Err(AuthError::Keyring(
@@ -75,7 +84,12 @@ impl RefreshTokenRecord {
 
         fn env_truthy(name: &str) -> bool {
             env::var(name)
-                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+                .map(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
                 .unwrap_or(false)
         }
 
@@ -107,7 +121,9 @@ impl RefreshTokenRecord {
             return Ok(RefreshTokenRecord::Encrypted { blob });
         }
 
-        Ok(RefreshTokenRecord::Plain { token: token.to_string() })
+        Ok(RefreshTokenRecord::Plain {
+            token: token.to_string(),
+        })
     }
 
     pub fn delete(&self) {

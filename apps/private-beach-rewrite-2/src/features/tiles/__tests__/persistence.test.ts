@@ -57,6 +57,7 @@ describe('tile persistence helpers (rewrite-2)', () => {
 		expect(state.order).toEqual(['first', 'second']);
 		expect(state.tiles.second.sessionMeta?.sessionId).toBe('sess-2');
 		expect(state.interactiveId).toBeNull();
+    expect(state.canvasViewport).toEqual({ zoom: 1.2, pan: { x: -12, y: 5 } });
     expect(state.relationshipOrder).toEqual(['rel-1']);
     expect(state.relationships['rel-1']).toMatchObject({
       sourceId: 'first',
@@ -82,6 +83,7 @@ describe('tile persistence helpers (rewrite-2)', () => {
       targetSessionId: 'sess-2',
     });
     expect(serialized.metadata.agentRelationshipOrder).toEqual(['rel-1']);
+    expect(serialized.viewport).toEqual({ zoom: 1.2, pan: { x: -12, y: 5 } });
   });
 
   it('includes orphan tiles in the serialized key', () => {
@@ -104,6 +106,7 @@ describe('tile persistence helpers (rewrite-2)', () => {
       resizing: {},
       interactiveId: null,
       viewport: {},
+      canvasViewport: { zoom: 1, pan: { x: 0, y: 0 } },
     };
     const key = serializeTileStateKey(orphanState);
     expect(key).toContain('only');
@@ -114,5 +117,6 @@ describe('tile persistence helpers (rewrite-2)', () => {
     const state = layoutToTileState(SAMPLE_LAYOUT);
     const key = serializeTileStateKey(state);
     expect(key).toContain('rel-1:first:second');
+    expect(key).toContain('viewport:1.200:-12.000:5.000');
   });
 });

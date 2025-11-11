@@ -1,20 +1,44 @@
 import type { CanvasAgentRelationship, CanvasLayout } from '@/lib/api';
-import { DEFAULT_TILE_HEIGHT, DEFAULT_TILE_WIDTH } from './constants';
+import { DEFAULT_CANVAS_VIEWPORT, DEFAULT_TILE_HEIGHT, DEFAULT_TILE_WIDTH } from './constants';
 import type {
   AgentMetadata,
   RelationshipDescriptor,
   TileDescriptor,
   TileSessionMeta,
   TileState,
+  CanvasViewportState,
 } from './types';
 
-const DEFAULT_VIEWPORT = { zoom: 1, pan: { x: 0, y: 0 } } as const;
+function clampZoom(zoom: number): number {
+  if (!Number.isFinite(zoom)) {
+    return DEFAULT_CANVAS_VIEWPORT.zoom;
+  }
+  return Math.min(1.75, Math.max(0.2, zoom));
+}
+
+function normalizeCanvasViewport(input?: CanvasLayout['viewport'] | CanvasViewportState | null): CanvasViewportState {
+  if (!input || typeof input !== 'object') {
+    return { ...DEFAULT_CANVAS_VIEWPORT, pan: { ...DEFAULT_CANVAS_VIEWPORT.pan } };
+  }
+  const zoom = clampZoom(
+    typeof input.zoom === 'number' && Number.isFinite(input.zoom) ? input.zoom : DEFAULT_CANVAS_VIEWPORT.zoom,
+  );
+  const panX =
+    typeof input.pan === 'object' && input.pan && typeof input.pan.x === 'number' && Number.isFinite(input.pan.x)
+      ? input.pan.x
+      : DEFAULT_CANVAS_VIEWPORT.pan.x;
+  const panY =
+    typeof input.pan === 'object' && input.pan && typeof input.pan.y === 'number' && Number.isFinite(input.pan.y)
+      ? input.pan.y
+      : DEFAULT_CANVAS_VIEWPORT.pan.y;
+  return { zoom, pan: { x: panX, y: panY } };
+}
 
 function buildEmptyLayout(): CanvasLayout {
   const now = Date.now();
   return {
     version: 3,
-    viewport: { ...DEFAULT_VIEWPORT },
+    viewport: normalizeCanvasViewport(DEFAULT_CANVAS_VIEWPORT),
     tiles: {},
     agents: {},
     groups: {},
@@ -112,13 +136,13 @@ function isRelationshipUpdateMode(value: unknown): value is RelationshipDescript
 function sanitizePollFrequency(value: unknown): number {
   if (typeof value === 'number' && Number.isFinite(value)) {
     const normalized = Math.round(value);
-    return Math.max(5, Math.min(86400, normalized));
+    return Math.max(1, Math.min(86400, normalized));
   }
   if (typeof value === 'string') {
     const parsed = Number(value);
     if (Number.isFinite(parsed)) {
       const normalized = Math.round(parsed);
-      return Math.max(5, Math.min(86400, normalized));
+      return Math.max(1, Math.min(86400, normalized));
     }
   }
   return 60;
@@ -305,6 +329,7 @@ export function layoutToTileState(layout: CanvasLayout | null | undefined): Tile
 		resizing: {},
 		interactiveId: null,
 		viewport: {},
+		canvasViewport: normalizeCanvasViewport(base.viewport),
 	};
 }
 
@@ -361,15 +386,23 @@ export function tileStateToLayout(state: TileState, baseLayout?: CanvasLayout | 
 		metadataOut.agentRelationships = serializedRelationships;
 		metadataOut.agentRelationshipOrder = serializedRelationshipOrder;
 	}
+	const viewportOut = normalizeCanvasViewport(state.canvasViewport ?? base.viewport ?? DEFAULT_CANVAS_VIEWPORT);
 	return {
 		version: 3,
-		viewport: base.viewport ?? { ...DEFAULT_VIEWPORT },
+		viewport: viewportOut,
 		tiles: tilesOut,
 		agents: base.agents ?? {},
 		groups: base.groups ?? {},
 		controlAssignments: base.controlAssignments ?? {},
 		metadata: metadataOut,
 	};
+}
+
+function formatViewportNumber(value: number): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return '0.000';
+  }
+  return value.toFixed(3);
 }
 
 export function serializeTileStateKey(state: TileState): string {
@@ -431,7 +464,14 @@ export function serializeTileStateKey(state: TileState): string {
 						].join(':');
 					})
 					.join('|');
-	return `${tileSignature}::${relationshipSignature}`;
+	const viewport = state.canvasViewport ?? DEFAULT_CANVAS_VIEWPORT;
+	const viewportSignature = [
+		'viewport',
+		formatViewportNumber(viewport.zoom),
+		formatViewportNumber(viewport.pan.x),
+		formatViewportNumber(viewport.pan.y),
+	].join(':');
+	return `${tileSignature}::${relationshipSignature}::${viewportSignature}`;
 }
 
 function buildCanonicalOrder(state: TileState): string[] {

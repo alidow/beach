@@ -212,8 +212,8 @@
 | `issued_at` | `timestamptz` DEFAULT now() |
 | `expires_at` | `timestamptz` | Lease expiry; manager enforces renewals before this timestamp |
 | `revoked_at` | `timestamptz` NULL | Populated when lease is forcefully ended |
-| Unique | `(session_id)` | Only one active lease per session |
-| Notes | | Token string issued to controllers equals `id`; RLS restricts to same private beach and scoped roles |
+| Unique | — | Multiple concurrent leases per session; uniqueness enforced by `id` |
+| Notes | | Token string issued to controllers equals `id`; concurrent leases are differentiated by account/reason metadata and validated independently. RLS restricts reads to the same private beach and scoped roles. |
 
 ### session_runtime
 | Column | Type | Notes |

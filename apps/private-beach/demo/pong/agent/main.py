@@ -21,10 +21,11 @@ import socket
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from getpass import getpass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 import sys
 import urllib.error
 import urllib.parse
@@ -48,6 +49,23 @@ DEFAULT_SERVE_INTERVAL = 3.0
 DEFAULT_MAX_STEP = 2.5
 DEFAULT_MIN_THRESHOLD = 0.4
 DEFAULT_COMMAND_INTERVAL = 0.08
+
+PADDLE_GLYPHS = frozenset(
+    {
+        "#",
+        "|",
+        "║",
+        "│",
+        "\u258c",  # ▌
+        "\u2590",  # ▐
+        "\u259b",  # ▛
+        "\u259c",  # ▜
+        "\u2599",  # ▙
+        "\u259f",  # ▟
+    }
+)
+
+BALL_GLYPHS = frozenset({"o", ".", "*", "\u25cf"})  # supports ● plus ascii fallbacks
 
 
 def parse_host_port(value: str) -> Optional[Tuple[str, int]]:
@@ -132,20 +150,24 @@ class StateSubscriber(threading.Thread):
         self.output = output
         self.stop_event = stop_event
         self.role = role
+        self._local_stop = threading.Event()
+
+    def stop(self) -> None:
+        self._local_stop.set()
 
     def run(self) -> None:  # pragma: no cover - network path
         label = self.role or "session"
-        while not self.stop_event.is_set():
+        while not self.stop_event.is_set() and not self._local_stop.is_set():
             try:
                 for payload in self.client.subscribe_state(self.session_id):
+                    if self.stop_event.is_set() or self._local_stop.is_set():
+                        return
                     event = {
                         "session_id": self.session_id,
                         "payload": payload,
                         "received_at": time.time(),
                     }
                     self.output.put(("diff", event))
-                    if self.stop_event.is_set():
-                        break
             except ManagerRequestError as exc:
                 self.output.put(
                     (
@@ -153,11 +175,11 @@ class StateSubscriber(threading.Thread):
                         f"state stream error ({label} {self.session_id}): {exc}",
                     )
                 )
-                if self.stop_event.wait(2.0):
+                if self.stop_event.wait(2.0) or self._local_stop.wait(2.0):
                     break
             else:
                 # Stream ended without error; avoid tight loop.
-                if self.stop_event.wait(1.0):
+                if self.stop_event.wait(1.0) or self._local_stop.wait(1.0):
                     break
 
 
@@ -354,6 +376,231 @@ def _metadata_dict(value: Optional[object]) -> Dict[str, object]:
     return {}
 
 
+def _normalize_session_role(value: Optional[object]) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"agent", "lhs", "rhs"}:
+        return normalized
+    if normalized in {"application", "app"}:
+        return "application"
+    return None
+
+
+def _build_tile_indexes(
+    layout: Optional[Dict[str, object]],
+) -> Tuple[Dict[str, Dict[str, object]], Dict[str, Dict[str, object]]]:
+    tile_lookup: Dict[str, Dict[str, object]] = {}
+    session_lookup: Dict[str, Dict[str, object]] = {}
+    if not layout or not isinstance(layout, dict):
+        return tile_lookup, session_lookup
+    tiles = layout.get("tiles")
+    if not isinstance(tiles, dict):
+        return tile_lookup, session_lookup
+    for tile_id, raw in tiles.items():
+        if not isinstance(raw, dict):
+            continue
+        metadata = _metadata_dict(raw.get("metadata"))
+        session_meta = _metadata_dict(metadata.get("sessionMeta"))
+        agent_meta = _metadata_dict(metadata.get("agentMeta"))
+        session_id = session_meta.get("sessionId")
+        position = raw.get("position")
+        x_pos: Optional[float] = None
+        if isinstance(position, dict):
+            x_val = position.get("x")
+            if isinstance(x_val, (int, float)):
+                x_pos = float(x_val)
+        tile_info = {
+            "tile_id": tile_id,
+            "session_id": session_id if isinstance(session_id, str) else None,
+            "metadata": metadata,
+            "agent_meta": agent_meta if agent_meta else None,
+            "node_type": metadata.get("nodeType"),
+            "position_x": x_pos,
+        }
+        tile_lookup[tile_id] = tile_info
+        session_key = tile_info["session_id"]
+        if isinstance(session_key, str) and session_key:
+            session_lookup[session_key] = tile_info
+    return tile_lookup, session_lookup
+
+
+def _build_agent_relationship_index(
+    layout: Optional[Dict[str, object]],
+    tile_lookup: Dict[str, Dict[str, object]],
+) -> Dict[str, List[Tuple[str, Optional[float]]]]:
+    index: Dict[str, List[Tuple[str, Optional[float]]]] = {}
+    if not layout or not isinstance(layout, dict):
+        return index
+    metadata = _metadata_dict(layout.get("metadata"))
+    relationships = metadata.get("agentRelationships")
+    if not isinstance(relationships, dict):
+        return index
+    for record in relationships.values():
+        entry = _metadata_dict(record)
+        source_id = entry.get("sourceId")
+        target_id = entry.get("targetId")
+        if not isinstance(source_id, str) or not isinstance(target_id, str):
+            continue
+        source_tile = tile_lookup.get(source_id)
+        target_tile = tile_lookup.get(target_id)
+        if not source_tile or not target_tile:
+            continue
+        source_session = source_tile.get("session_id")
+        target_session = target_tile.get("session_id")
+        if not isinstance(source_session, str) or not isinstance(target_session, str):
+            continue
+        target_x = target_tile.get("position_x")
+        index.setdefault(source_session, []).append((target_session, target_x))
+    return index
+
+
+def _assign_children_from_layout(
+    agent_session_id: str,
+    current_children: Dict[str, str],
+    relationship_index: Dict[str, List[Tuple[str, Optional[float]]]],
+    session_tile_lookup: Dict[str, Dict[str, object]],
+) -> Dict[str, str]:
+    """Use agentRelationships/positions to infer lhs/rhs when metadata is missing."""
+    updated = dict(current_children)
+    agent_tile = session_tile_lookup.get(agent_session_id, {})
+    agent_x = agent_tile.get("position_x")
+    relationships = relationship_index.get(agent_session_id, [])
+    if not relationships:
+        return updated
+    used_sessions = set(updated.values())
+    left_candidates: List[Tuple[str, Optional[float]]] = []
+    right_candidates: List[Tuple[str, Optional[float]]] = []
+    fallback: List[Tuple[str, Optional[float]]] = []
+    for session_id, pos in relationships:
+        if not isinstance(session_id, str) or session_id == agent_session_id:
+            continue
+        if session_id in used_sessions:
+            continue
+        if isinstance(agent_x, (int, float)) and isinstance(pos, (int, float)):
+            if pos <= agent_x:
+                left_candidates.append((session_id, pos))
+            else:
+                right_candidates.append((session_id, pos))
+        else:
+            fallback.append((session_id, pos))
+
+    def _assign_from(bucket, side):
+        if side in updated:
+            return
+        bucket.sort(key=lambda entry: (float("inf") if entry[1] is None else entry[1], entry[0]))
+        while bucket:
+            session_id, _ = bucket.pop(0)
+            if session_id in used_sessions:
+                continue
+            updated[side] = session_id
+            used_sessions.add(session_id)
+            return
+
+    _assign_from(left_candidates, "lhs")
+    _assign_from(right_candidates, "rhs")
+    # If one side is still missing, fall back to any remaining related tiles.
+    fallback.sort(key=lambda entry: (float("inf") if entry[1] is None else entry[1], entry[0]))
+    for side in ("lhs", "rhs"):
+        if side in updated:
+            continue
+        while fallback:
+            session_id, _ = fallback.pop(0)
+            if session_id in used_sessions:
+                continue
+            updated[side] = session_id
+            used_sessions.add(session_id)
+            break
+    return updated
+
+
+def _infer_tile_role(tile_info: Optional[Dict[str, object]]) -> Optional[str]:
+    if not tile_info:
+        return None
+    node_type = tile_info.get("node_type")
+    if isinstance(node_type, str) and node_type.lower() == "agent":
+        return "agent"
+    agent_meta = tile_info.get("agent_meta")
+    if isinstance(agent_meta, dict) and agent_meta:
+        return "agent"
+    return "application"
+
+
+def fetch_relationship_metadata(
+    client: PrivateBeachManagerClient,
+    private_beach_id: str,
+    controller_session_id: str,
+    child_session_id: str,
+    output: "queue.Queue[Tuple[str, object]]",
+) -> Dict[str, object]:
+    meta: Dict[str, object] = {}
+    now = time.time()
+    layout: Optional[Dict[str, object]] = None
+    cached = LAYOUT_CACHE.get(private_beach_id)
+    if cached and now - cached[0] < LAYOUT_CACHE_TTL:
+        layout = cached[1]
+    else:
+        try:
+            layout = client.get_canvas_layout(private_beach_id)
+            LAYOUT_CACHE[private_beach_id] = (now, layout)
+        except ManagerRequestError as exc:
+            output.put(("error", f"layout fetch failed: {exc}"))
+            return meta
+    session_to_tile: Dict[str, str] = {}
+    tiles = layout.get("tiles")
+    if isinstance(tiles, dict):
+        for tile_id, tile_entry in tiles.items():
+            metadata = _metadata_dict(_metadata_dict(tile_entry).get("metadata"))
+            session_meta = _metadata_dict(metadata.get("sessionMeta"))
+            session_id = session_meta.get("sessionId")
+            if isinstance(session_id, str) and session_id.strip():
+                session_to_tile[session_id.strip()] = tile_id
+    agent_tile_id = session_to_tile.get(controller_session_id)
+    child_tile_id = session_to_tile.get(child_session_id)
+    if not agent_tile_id or not child_tile_id:
+        return meta
+    metadata = _metadata_dict(layout.get("metadata"))
+    relationships = metadata.get("agentRelationships")
+    if isinstance(relationships, dict):
+        for raw in relationships.values():
+            record = _metadata_dict(raw)
+            if record.get("sourceId") == agent_tile_id and record.get("targetId") == child_tile_id:
+                poll_freq = record.get("pollFrequency")
+                if isinstance(poll_freq, (int, float)):
+                    meta["poll_frequency"] = float(poll_freq)
+                else:
+                    meta["poll_frequency"] = None
+                trace_id = resolve_trace_id_from_layout(layout, agent_tile_id)
+                if trace_id:
+                    meta["trace_id"] = trace_id
+                return meta
+    return meta
+
+
+def resolve_trace_id_from_layout(layout: Dict[str, object], tile_id: Optional[object]) -> Optional[str]:
+    if not isinstance(tile_id, str):
+        return None
+    tiles = layout.get("tiles")
+    if not isinstance(tiles, dict):
+        return None
+    tile_entry = tiles.get(tile_id)
+    if not isinstance(tile_entry, dict):
+        return None
+    metadata = _metadata_dict(tile_entry.get("metadata"))
+    agent_meta = _metadata_dict(metadata.get("agentMeta"))
+    trace_meta = _metadata_dict(agent_meta.get("trace"))
+    enabled = trace_meta.get("enabled")
+    trace_id = trace_meta.get("trace_id")
+    if enabled and isinstance(trace_id, str) and trace_id.strip():
+        return trace_id.strip()
+    return None
+
+
+# cache for expensive layout fetches: private_beach_id -> (timestamp, layout)
+LAYOUT_CACHE: Dict[str, Tuple[float, Dict[str, object]]] = {}
+LAYOUT_CACHE_TTL = 2.0  # seconds
+
+
 def autopair_sessions(
     args:
         argparse.Namespace,
@@ -383,50 +630,163 @@ def autopair_sessions(
                 return None
             time.sleep(interval)
             continue
+        layout: Optional[Dict[str, object]] = None
+        try:
+            layout = client.get_canvas_layout(private_beach_id)
+        except ManagerRequestError as exc:
+            diff_queue.put(("warn", f"layout discovery failed: {exc}"))
+        tile_lookup, session_tile_lookup = _build_tile_indexes(layout)
+        relationship_index = _build_agent_relationship_index(layout, tile_lookup)
+
+        current_agent: Optional[str] = None
+        current_children: Dict[str, str] = {}
+        current_prompt_pack: Optional[Dict[str, object]] = None
+        current_bridges: Optional[List[Dict[str, object]]] = None
+        application_candidates: List[Tuple[str, Optional[float]]] = []
 
         for summary in summaries:
             session_id = summary.get("session_id")
             metadata = _metadata_dict(summary.get("metadata"))
-            role = metadata.get("pong_role")
+            declared_role = _normalize_session_role(metadata.get("pong_role"))
+            if declared_role is None:
+                declared_role = _normalize_session_role(metadata.get("role"))
             tag = metadata.get("pong_tag")
+            tile_info = session_tile_lookup.get(session_id or "") if session_id else None
+            if not tile_info:
+                tile_id = metadata.get("rewrite_tile_id")
+                if isinstance(tile_id, str):
+                    tile_info = tile_lookup.get(tile_id)
+            tile_role = _infer_tile_role(tile_info)
+            if declared_role == "application" and tile_role == "agent":
+                declared_role = "agent"
+            if declared_role is None and tile_role:
+                declared_role = tile_role
+            tile_tag = tile_info.get("tile_id") if tile_info else None
+            if not isinstance(tag, str) and isinstance(tile_tag, str):
+                tag = tile_tag
 
             if not isinstance(session_id, str):
                 continue
-            if isinstance(role, str) and role in {"lhs", "rhs"}:
-                child_sessions.setdefault(role, session_id)
-            if role == "agent":
-                if session_tag is None and agent_session_id is None:
-                    agent_session_id = session_id
+            if declared_role in {"lhs", "rhs"}:
+                current_children.setdefault(declared_role, session_id)
+            elif declared_role == "application":
+                if tile_role != "agent":
+                    application_candidates.append(
+                        (session_id, tile_info.get("position_x") if tile_info else None)
+                    )
+            if declared_role == "agent":
+                if session_tag is None and current_agent is None:
+                    current_agent = session_id
                 elif session_tag and tag == session_tag:
-                    agent_session_id = session_id
+                    current_agent = session_id
                 agent_meta = metadata.get("agent")
+                if not isinstance(agent_meta, dict) and tile_info:
+                    agent_meta = _metadata_dict(tile_info.get("agent_meta"))
                 if isinstance(agent_meta, dict):
                     pack = agent_meta.get("prompt_pack")
                     if isinstance(pack, dict):
-                        agent_prompt_pack = pack
+                        current_prompt_pack = pack
                     bridges = agent_meta.get("mcp_bridges")
                     if isinstance(bridges, list):
                         filtered = [entry for entry in bridges if isinstance(entry, dict)]
                         if filtered:
-                            agent_bridges = filtered
+                            current_bridges = filtered
 
-        if agent_session_id and child_sessions:
+        if current_agent:
+            current_children = _assign_children_from_layout(
+                current_agent,
+                current_children,
+                relationship_index,
+                session_tile_lookup,
+            )
+
+        missing_sides = [side for side in ("lhs", "rhs") if side not in current_children]
+        if missing_sides and application_candidates:
+            application_candidates.sort(
+                key=lambda entry: (float("inf") if entry[1] is None else entry[1], entry[0])
+            )
+            used = set(current_children.values())
+            for side in missing_sides:
+                assigned: Optional[str] = None
+                for session_id, _ in application_candidates:
+                    if session_id in used:
+                        continue
+                    assigned = session_id
+                    used.add(session_id)
+                    break
+                if assigned:
+                    current_children[side] = assigned
+
+        if len(current_children) < 2 and application_candidates:
+            # Fallback: pick the first two application sessions even if we cannot
+            # confidently map them via layout metadata. This prevents the agent from
+            # running without children when tiles were recreated without persisted roles.
+            used = set(current_children.values())
+            for session_id, _ in application_candidates:
+                if session_id in used:
+                    continue
+                if "lhs" not in current_children:
+                    current_children["lhs"] = session_id
+                elif "rhs" not in current_children:
+                    current_children["rhs"] = session_id
+                used.add(session_id)
+                if "lhs" in current_children and "rhs" in current_children:
+                    diff_queue.put(
+                        (
+                            "warn",
+                            "autopair fallback assigned paddle sessions "
+                            f"(lhs={current_children['lhs']} rhs={current_children['rhs']})",
+                        )
+                    )
+                    break
+
+        if current_agent and current_children:
+            agent_session_id = current_agent
+            child_sessions = current_children
+            agent_prompt_pack = current_prompt_pack
+            agent_bridges = current_bridges
             break
         if attempt < attempts - 1:
             time.sleep(interval)
 
     if not agent_session_id:
-        diff_queue.put(("warn", "autopair: no agent session discovered"))
+        session_count = len(child_sessions)
+        diff_queue.put(
+            ("warn", f"autopair: no agent session discovered (children={session_count})")
+        )
         return None
 
     if not child_sessions:
         diff_queue.put(("warn", "autopair: no paddle sessions discovered"))
         return None
 
+    diff_queue.put(
+        (
+            "info",
+            f"autopair discovered agent={agent_session_id} children={child_sessions}",
+        )
+    )
+
     session_roles = {
         agent_session_id: "agent",
         **{sid: role for role, sid in child_sessions.items()},
     }
+
+    lease_reason = getattr(args, "lease_reason", "pong_autopilot")
+    lease_ttl = getattr(args, "lease_ttl", 30_000)
+    try:
+        lease = client.acquire_controller_lease(
+            agent_session_id, lease_ttl, lease_reason
+        )
+        diff_queue.put(
+            (
+                "info",
+                f"controller lease acquired (expires at {lease.expires_at_ms})",
+            )
+        )
+    except ManagerRequestError as exc:
+        diff_queue.put(("error", f"failed to acquire controller lease: {exc}"))
+        return None
 
     prompt_template = getattr(args, "pair_template", None)
     update_cadence = getattr(args, "pair_cadence", None)
@@ -449,22 +809,6 @@ def autopair_sessions(
                     f"failed to pair agent with {role} session {session_id}: {exc}",
                 )
             )
-
-    lease_reason = getattr(args, "lease_reason", "pong_autopilot")
-    lease_ttl = getattr(args, "lease_ttl", 30_000)
-    try:
-        lease = client.acquire_controller_lease(
-            agent_session_id, lease_ttl, lease_reason
-        )
-        diff_queue.put(
-            (
-                "info",
-                f"controller lease acquired (expires at {lease.expires_at_ms})",
-            )
-        )
-    except ManagerRequestError as exc:
-        diff_queue.put(("error", f"failed to acquire controller lease: {exc}"))
-        return None
 
     return AutopairContext(
         controller_session_id=agent_session_id,
@@ -490,6 +834,7 @@ class MCPClient:
         target: Optional[Tuple[str, int]] = None,
         log_path: Optional[Path] = None,
         timeout: float = 5.0,
+        on_conflict: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._callback = action_callback
         if base_url:
@@ -511,6 +856,7 @@ class MCPClient:
         self._socket: Optional[socket.socket] = None
         self._log_path = log_path
         self._log_fp = None
+        self._on_conflict = on_conflict
         if self._log_path:
             self._log_fp = self._log_path.open("a", encoding="utf-8")
         if self._target:
@@ -527,6 +873,10 @@ class MCPClient:
 
     def set_session_token(self, session_id: str, token: str) -> None:
         self._session_tokens[session_id] = token
+
+    def clear_session_token(self, session_id: str) -> None:
+        if session_id in self._session_tokens:
+            del self._session_tokens[session_id]
 
     def set_default_controller_token(self, token: Optional[str]) -> None:
         self._default_controller_token = token
@@ -653,6 +1003,8 @@ class MCPClient:
                     "message": f"queue_action HTTP {exc.code} for {session_id}: {detail}",
                 }
             )
+            if exc.code == 409 and self._on_conflict:
+                self._on_conflict(session_id)
             return False
         except urllib.error.URLError as exc:
             self._callback(
@@ -710,17 +1062,13 @@ class SessionState:
         self.last_update = now
         self._detect_paddle()
         self._detect_ball(now)
-        if self.ball:
-            self.ball_exit = None
-        else:
-            self.ball_velocity = None
 
     def _detect_paddle(self) -> None:
         rows: List[int] = []
         cols: List[int] = []
         for row_idx, line in enumerate(self.lines):
             for col_idx, char in enumerate(line):
-                if char == "#":
+                if char in PADDLE_GLYPHS:
                     rows.append(row_idx)
                     cols.append(col_idx)
         if rows:
@@ -734,9 +1082,11 @@ class SessionState:
     def _detect_ball(self, now: float) -> None:
         found: Optional[Tuple[float, float]] = None
         for row_idx, line in enumerate(self.lines):
-            col_idx = line.find("o")
-            if col_idx != -1:
-                found = (float(row_idx), float(col_idx))
+            for col_idx, char in enumerate(line):
+                if char in BALL_GLYPHS:
+                    found = (float(row_idx), float(col_idx))
+                    break
+            if found:
                 break
         if found:
             if self.ball_position is not None:
@@ -1033,10 +1383,22 @@ class AgentApp:
         else:
             return
         session_id = event.get("session_id")
-        payload = event.get("payload", {})
-        if not isinstance(session_id, str) or not isinstance(payload, dict):
+        raw_payload = event.get("payload", {})
+        if not isinstance(session_id, str) or not isinstance(raw_payload, dict):
             self.log(f"invalid diff structure: {event}", level="warn")
             return
+        sequence = event.get("sequence")
+        if not isinstance(sequence, int):
+            seq_value = raw_payload.get("sequence")
+            sequence = int(seq_value) if isinstance(seq_value, int) else 0
+
+        payload = raw_payload
+        if payload.get("type") is None and isinstance(payload.get("payload"), dict):
+            payload = payload.get("payload", {})
+        if not isinstance(payload, dict):
+            self.log(f"invalid payload envelope: {event}", level="warn")
+            return
+
         payload_type = payload.get("type")
         if payload_type != "terminal_full":
             self.log(f"ignoring payload type {payload_type}", level="debug")
@@ -1049,7 +1411,6 @@ class AgentApp:
             col = cursor_raw.get("col")
             if isinstance(row, int) and isinstance(col, int):
                 cursor = (row, col)
-        sequence = event.get("sequence", 0)
         session = self.ensure_session(session_id)
         if session.side is None and session_id in self.session_roles:
             session.side = self.session_roles[session_id]
@@ -1688,6 +2049,7 @@ def main() -> int:
     stop_event = threading.Event()
     state_subscribers: Dict[str, StateSubscriber] = {}
     state_pollers: Dict[str, StatePoller] = {}
+    child_lease_renewers: Dict[str, Tuple[LeaseRenewer, threading.Event]] = {}
 
     manager_client: Optional[PrivateBeachManagerClient] = None
     if args.mcp_base_url:
@@ -1701,31 +2063,10 @@ def main() -> int:
         )
         args.auto_pair = False
 
-    autopair_ctx: Optional[AutopairContext] = None
-    if args.auto_pair and manager_client and args.private_beach_id:
-        autopair_ctx = autopair_sessions(args, manager_client, diff_queue)
-        if autopair_ctx:
-            session_tokens.setdefault(
-                autopair_ctx.controller_session_id, autopair_ctx.controller_token
-            )
-            for child_session in autopair_ctx.child_sessions.values():
-                session_tokens.setdefault(child_session, autopair_ctx.controller_token)
-            session_role_map.update(autopair_ctx.session_roles)
-            if autopair_ctx.prompt_pack:
-                instructions = autopair_ctx.prompt_pack.get("instructions")
-                if isinstance(instructions, str) and instructions.strip():
-                    diff_queue.put(("info", "agent prompt synchronized from onboarding"))
-
-    diff_queue.put(("info", f"session roles: {session_role_map}"))
-
     def log_action_event(event: Dict[str, object]) -> None:
         diff_queue.put(("mcp", json.dumps(event)))
 
-    default_token = (
-        autopair_ctx.controller_token
-        if autopair_ctx and autopair_ctx.controller_token
-        else args.default_controller_token
-    )
+    default_token = args.default_controller_token
 
     mcp_client = MCPClient(
         action_callback=log_action_event,
@@ -1735,6 +2076,7 @@ def main() -> int:
         session_tokens=session_tokens,
         target=args.actions_target,
         log_path=args.action_log,
+        on_conflict=lambda sid: schedule_autopair_refresh(f"queue_action 409 for {sid}"),
     )
 
     def start_state_stream(session_id: str, role: Optional[str] = None) -> None:
@@ -1749,6 +2091,70 @@ def main() -> int:
         )
         subscriber.start()
         state_subscribers[session_id] = subscriber
+
+    def stop_state_stream(session_id: str) -> None:
+        subscriber = state_subscribers.pop(session_id, None)
+        if subscriber:
+            subscriber.stop()
+            subscriber.join(timeout=1.0)
+
+    def stop_child_lease(session_id: str) -> None:
+        renewer_entry = child_lease_renewers.pop(session_id, None)
+        if renewer_entry:
+            renewer, local_stop = renewer_entry
+            local_stop.set()
+            renewer.join(timeout=1.0)
+            session_tokens.pop(session_id, None)
+            mcp_client.clear_session_token(session_id)
+
+    def ensure_child_lease(session_id: str, role: Optional[str], *, force: bool = False) -> None:
+        if not manager_client:
+            return
+        if session_id in child_lease_renewers:
+            if not force:
+                return
+            stop_child_lease(session_id)
+        lease_reason = args.lease_reason or "pong_autopilot"
+        reason = f"{lease_reason}:{role}" if role else lease_reason
+        try:
+            lease = manager_client.acquire_controller_lease(
+                session_id, args.lease_ttl, reason
+            )
+        except ManagerRequestError as exc:
+            diff_queue.put(
+                (
+                    "error",
+                    f"failed to acquire controller lease for {session_id}: {exc}",
+                )
+            )
+            return
+
+        session_tokens[session_id] = lease.controller_token
+        mcp_client.set_session_token(session_id, lease.controller_token)
+        diff_queue.put(
+            (
+                "info",
+                f"controller lease acquired for {session_id} (expires at {lease.expires_at_ms})",
+            )
+        )
+
+        local_stop = threading.Event()
+
+        def _update_token(updated: ControllerLease) -> None:
+            session_tokens[session_id] = updated.controller_token
+            mcp_client.set_session_token(session_id, updated.controller_token)
+
+        renewer = LeaseRenewer(
+            manager_client,
+            session_id,
+            args.lease_ttl,
+            diff_queue,
+            local_stop,
+            _update_token,
+            reason=reason,
+        )
+        renewer.start()
+        child_lease_renewers[session_id] = (renewer, local_stop)
 
     def start_or_update_poller(session_id: str, interval: float) -> None:
         if not manager_client:
@@ -1773,37 +2179,38 @@ def main() -> int:
             poller.stop()
             poller.join(timeout=1.0)
 
+    def cleanup_session(session_id: str) -> None:
+        stop_state_poller(session_id)
+        stop_child_lease(session_id)
+        stop_state_stream(session_id)
+        mcp_client.clear_session_token(session_id)
+        mcp_client.set_trace_id(session_id, None)
+
     if manager_client:
         subscribe_roles = {
             session_id
             for session_id, role in session_role_map.items()
             if role in {"lhs", "rhs"}
         }
-        if autopair_ctx:
-            subscribe_roles.update(autopair_ctx.child_sessions.values())
         for session_id in sorted(subscribe_roles):
             start_state_stream(session_id, session_role_map.get(session_id))
+            ensure_child_lease(session_id, session_role_map.get(session_id))
     else:
         diff_queue.put(("warn", "manager client unavailable; skipping state streams"))
 
     renewer: Optional[LeaseRenewer] = None
-    if autopair_ctx and manager_client:
 
-        def _update_token(lease: ControllerLease) -> None:
-            mcp_client.set_default_controller_token(lease.controller_token)
-
-        renewer = LeaseRenewer(
-            manager_client,
-            autopair_ctx.controller_session_id,
-            args.lease_ttl,
-            diff_queue,
-            stop_event,
-            _update_token,
-            reason=args.lease_reason,
-        )
-        renewer.start()
+    def _update_token(lease: ControllerLease) -> None:
+        mcp_client.set_default_controller_token(lease.controller_token)
 
     pairing_thread: Optional[PairingSubscriber] = None
+
+    def schedule_autopair_refresh(reason: str) -> None:
+        if not (args.auto_pair and manager_client and autopair_ready.is_set()):
+            return
+        with autopair_refresh_lock:
+            autopair_refresh_reasons.append(reason)
+        autopair_refresh_event.set()
 
     def handle_pairing_event(child_session_id: str, action: str, metadata: Dict[str, object]) -> None:
         trace_value = metadata.get("trace_id")
@@ -1818,24 +2225,176 @@ def main() -> int:
             stop_state_poller(child_session_id)
         if action != "removed":
             start_state_stream(child_session_id, session_role_map.get(child_session_id))
+            ensure_child_lease(child_session_id, session_role_map.get(child_session_id))
         else:
             stop_state_poller(child_session_id)
+            stop_child_lease(child_session_id)
+            stop_state_stream(child_session_id)
 
-    if (
-        manager_client
-        and args.private_beach_id
-        and autopair_ctx
-        and autopair_ctx.controller_session_id
-    ):
-        pairing_thread = PairingSubscriber(
-            manager_client,
-            autopair_ctx.controller_session_id,
-            args.private_beach_id,
-            diff_queue,
-            stop_event,
-            handle_pairing_event,
+    autopair_ctx: Optional[AutopairContext] = None
+    autopair_ready = threading.Event()
+    autopair_managed_sessions: Set[str] = set()
+    controller_lease_stop: Optional[threading.Event] = None
+    autopair_refresh_event = threading.Event()
+    autopair_refresh_reasons: Deque[str] = deque(maxlen=16)
+    autopair_refresh_lock = threading.Lock()
+
+    def apply_autopair_context(ctx: AutopairContext, *, force: bool = False) -> None:
+        nonlocal autopair_ctx, renewer, pairing_thread, controller_lease_stop, autopair_managed_sessions
+        previous_ctx = autopair_ctx
+        previous_sessions = set(autopair_managed_sessions)
+        autopair_ctx = ctx
+        autopair_ready.set()
+        autopair_managed_sessions = set(ctx.session_roles.keys())
+        removed_sessions = previous_sessions - autopair_managed_sessions
+        for session_id in removed_sessions:
+            cleanup_session(session_id)
+            session_role_map.pop(session_id, None)
+
+        mcp_client.set_default_controller_token(None)
+        mcp_client.set_session_token(ctx.controller_session_id, ctx.controller_token)
+        session_role_map.update(ctx.session_roles)
+        diff_queue.put(("info", f"session roles: {session_role_map}"))
+
+        if manager_client:
+            new_children = set(ctx.child_sessions.values())
+            previous_children = (
+                set(previous_ctx.child_sessions.values()) if previous_ctx else set()
+            )
+            for session_id in new_children:
+                start_state_stream(session_id, session_role_map.get(session_id))
+                ensure_child_lease(session_id, session_role_map.get(session_id), force=True)
+            for session_id in sorted(new_children - previous_children):
+                try:
+                    snapshot = manager_client.fetch_state_snapshot(session_id)
+                except ManagerRequestError as exc:
+                    diff_queue.put(
+                        ("warn", f"snapshot fetch failed for {session_id}: {exc}")
+                    )
+                else:
+                    if snapshot:
+                        diff_queue.put(
+                            (
+                                "diff",
+                                {
+                                    "session_id": session_id,
+                                    "payload": snapshot,
+                                    "received_at": time.time(),
+                                },
+                            )
+                        )
+
+            controller_changed = (
+                not previous_ctx
+                or previous_ctx.controller_session_id != ctx.controller_session_id
+            )
+            if controller_changed and controller_lease_stop:
+                controller_lease_stop.set()
+                controller_lease_stop = None
+            if controller_changed and renewer:
+                renewer.join(timeout=1.0)
+                renewer = None
+
+            if not controller_lease_stop:
+                controller_lease_stop = threading.Event()
+
+            if not renewer:
+                renewer = LeaseRenewer(
+                    manager_client,
+                    ctx.controller_session_id,
+                    args.lease_ttl,
+                    diff_queue,
+                    controller_lease_stop,
+                    _update_token,
+                    reason=args.lease_reason,
+                )
+                renewer.start()
+
+            if args.private_beach_id:
+                if controller_changed and pairing_thread:
+                    pairing_thread.stop()
+                    pairing_thread.join(timeout=1.0)
+                    pairing_thread = None
+                if not pairing_thread:
+                    pairing_thread = PairingSubscriber(
+                        manager_client,
+                        ctx.controller_session_id,
+                        args.private_beach_id,
+                        diff_queue,
+                        stop_event,
+                        handle_pairing_event,
+                    )
+                    pairing_thread.start()
+
+        if ctx.prompt_pack:
+            instructions = ctx.prompt_pack.get("instructions")
+            if isinstance(instructions, str) and instructions.strip():
+                diff_queue.put(("info", "agent prompt synchronized from onboarding"))
+
+    def run_autopair_attempt(force: bool = False) -> bool:
+        if not (args.auto_pair and manager_client and args.private_beach_id):
+            return False
+        if autopair_ready.is_set() and not force:
+            return False
+        ctx = autopair_sessions(args, manager_client, diff_queue)
+        if ctx:
+            apply_autopair_context(ctx, force=force)
+            return True
+        return False
+
+    if not run_autopair_attempt():
+        if args.auto_pair and manager_client and args.private_beach_id:
+            diff_queue.put(
+                (
+                    "warn",
+                    "autopair pending; waiting for tiles to attach before taking control",
+                )
+            )
+
+            def autopair_retry_loop() -> None:
+                delay = max(args.discovery_interval, 1.0)
+                while not stop_event.wait(delay):
+                    if run_autopair_attempt():
+                        break
+
+            threading.Thread(target=autopair_retry_loop, daemon=True).start()
+        else:
+            diff_queue.put(("info", f"session roles: {session_role_map}"))
+
+    autopair_refresh_thread: Optional[threading.Thread] = None
+
+    if args.auto_pair and manager_client and args.private_beach_id:
+
+        def autopair_refresh_loop() -> None:
+            backoff = 2.0
+            while not stop_event.is_set():
+                autopair_refresh_event.wait()
+                autopair_refresh_event.clear()
+                if stop_event.is_set():
+                    break
+                with autopair_refresh_lock:
+                    reasons = list(autopair_refresh_reasons)
+                    autopair_refresh_reasons.clear()
+                reason_msg = reasons[-1] if reasons else "unknown trigger"
+                diff_queue.put(
+                    ("warn", f"autopair refresh triggered ({reason_msg})")
+                )
+                if run_autopair_attempt(force=True):
+                    diff_queue.put(("info", "autopair refresh complete"))
+                    backoff = 2.0
+                else:
+                    diff_queue.put(
+                        ("warn", "autopair refresh failed; retrying shortly")
+                    )
+                    if stop_event.wait(backoff):
+                        break
+                    autopair_refresh_event.set()
+                    backoff = min(backoff * 2, 30.0)
+
+        autopair_refresh_thread = threading.Thread(
+            target=autopair_refresh_loop, daemon=True, name="autopair-refresh"
         )
-        pairing_thread.start()
+        autopair_refresh_thread.start()
 
     def run_app(stdscr: Optional["curses._CursesWindow"]) -> None:
         app = AgentApp(
@@ -1866,89 +2425,26 @@ def main() -> int:
             curses.wrapper(run_app)
     finally:
         stop_event.set()
-        for subscriber in state_subscribers.values():
+        for subscriber in list(state_subscribers.values()):
+            subscriber.stop()
             subscriber.join(timeout=1.0)
         for poller in state_pollers.values():
             poller.stop()
             poller.join(timeout=1.0)
+        for session_id in list(child_lease_renewers.keys()):
+            stop_child_lease(session_id)
         if renewer:
+            if controller_lease_stop:
+                controller_lease_stop.set()
             renewer.join(timeout=1.0)
         if pairing_thread:
             pairing_thread.stop()
             pairing_thread.join(timeout=1.0)
+        if autopair_refresh_thread:
+            autopair_refresh_event.set()
+            autopair_refresh_thread.join(timeout=1.0)
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-def fetch_relationship_metadata(
-    client: PrivateBeachManagerClient,
-    private_beach_id: str,
-    controller_session_id: str,
-    child_session_id: str,
-    output: "queue.Queue[Tuple[str, object]]",
-) -> Dict[str, object]:
-    meta: Dict[str, object] = {}
-    now = time.time()
-    layout: Optional[Dict[str, object]] = None
-    cached = LAYOUT_CACHE.get(private_beach_id)
-    if cached and now - cached[0] < LAYOUT_CACHE_TTL:
-        layout = cached[1]
-    else:
-        try:
-            layout = client.get_canvas_layout(private_beach_id)
-            LAYOUT_CACHE[private_beach_id] = (now, layout)
-        except ManagerRequestError as exc:
-            output.put(("error", f"layout fetch failed: {exc}"))
-            return meta
-    session_to_tile: Dict[str, str] = {}
-    tiles = layout.get("tiles")
-    if isinstance(tiles, dict):
-        for tile_id, tile_entry in tiles.items():
-            metadata = _metadata_dict(_metadata_dict(tile_entry).get("metadata"))
-            session_meta = _metadata_dict(metadata.get("sessionMeta"))
-            session_id = session_meta.get("sessionId")
-            if isinstance(session_id, str) and session_id.strip():
-                session_to_tile[session_id.strip()] = tile_id
-    agent_tile_id = session_to_tile.get(controller_session_id)
-    child_tile_id = session_to_tile.get(child_session_id)
-    if not agent_tile_id or not child_tile_id:
-        return meta
-    metadata = _metadata_dict(layout.get("metadata"))
-    relationships = metadata.get("agentRelationships")
-    if isinstance(relationships, dict):
-        for raw in relationships.values():
-            record = _metadata_dict(raw)
-            if record.get("sourceId") == agent_tile_id and record.get("targetId") == child_tile_id:
-                poll_freq = record.get("pollFrequency")
-                if isinstance(poll_freq, (int, float)):
-                    meta["poll_frequency"] = float(poll_freq)
-                else:
-                    meta["poll_frequency"] = None
-                trace_id = resolve_trace_id_from_layout(layout, agent_tile_id)
-                if trace_id:
-                    meta["trace_id"] = trace_id
-                return meta
-    return meta
-
-
-def resolve_trace_id_from_layout(layout: Dict[str, object], tile_id: Optional[object]) -> Optional[str]:
-    if not isinstance(tile_id, str):
-        return None
-    tiles = layout.get("tiles")
-    if not isinstance(tiles, dict):
-        return None
-    tile_entry = tiles.get(tile_id)
-    if not isinstance(tile_entry, dict):
-        return None
-    metadata = _metadata_dict(tile_entry.get("metadata"))
-    agent_meta = _metadata_dict(metadata.get("agentMeta"))
-    trace_meta = _metadata_dict(agent_meta.get("trace"))
-    enabled = trace_meta.get("enabled")
-    trace_id = trace_meta.get("trace_id")
-    if enabled and isinstance(trace_id, str) and trace_id.strip():
-        return trace_id.strip()
-    return None
-# cache for expensive layout fetches: private_beach_id -> (timestamp, layout)
-LAYOUT_CACHE: Dict[str, Tuple[float, Dict[str, object]]] = {}
-LAYOUT_CACHE_TTL = 2.0  # seconds

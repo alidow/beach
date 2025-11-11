@@ -9,9 +9,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
+    thread,
     time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -29,14 +30,14 @@ use beach_client_core::{
     decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
     HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell, Payload,
     SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId, TerminalGrid,
-    TransportError, TransportOffer,
+    Transport, TransportError, TransportOffer,
 };
 use chrono::{DateTime, Duration, Utc};
 use prometheus::IntGauge;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sqlx::{types::Json, FromRow, PgPool, Row};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, info, trace, warn, Level};
@@ -61,6 +62,7 @@ pub struct AppState {
     events: Arc<RwLock<HashMap<String, broadcast::Sender<StreamEvent>>>>,
     fast_paths: FastPathRegistry,
     viewer_workers: Arc<RwLock<HashMap<String, ViewerWorker>>>,
+    controller_workers: Arc<RwLock<HashMap<String, ControllerForwarderWorker>>>,
     viewer_tokens: Option<ViewerTokenClient>,
     http: reqwest::Client,
     road_base_url: String,
@@ -89,7 +91,7 @@ struct SessionRecord {
     metadata: Option<serde_json::Value>,
     version: String,
     harness_id: String,
-    controller_token: Option<String>,
+    controller_leases: HashMap<String, ControllerLeaseMemory>,
     viewer_passcode: Option<String>,
     lease_ttl_ms: u64,
     transport_hints: HashMap<String, serde_json::Value>,
@@ -100,7 +102,19 @@ struct SessionRecord {
     last_state: Option<StateDiff>,
 }
 
+#[derive(Debug, Clone)]
+struct ControllerLeaseMemory {
+    expires_at_ms: i64,
+    controller_account_id: Option<String>,
+    issued_by_account_id: Option<String>,
+    reason: Option<String>,
+}
+
 struct ViewerWorker {
+    handle: JoinHandle<()>,
+}
+
+struct ControllerForwarderWorker {
     handle: JoinHandle<()>,
 }
 
@@ -877,6 +891,7 @@ impl AppState {
             events: Arc::new(RwLock::new(HashMap::new())),
             fast_paths: FastPathRegistry::new(),
             viewer_workers: Arc::new(RwLock::new(HashMap::new())),
+            controller_workers: Arc::new(RwLock::new(HashMap::new())),
             viewer_tokens: None,
             http: reqwest::Client::new(),
             road_base_url: std::env::var("BEACH_ROAD_URL")
@@ -899,6 +914,7 @@ impl AppState {
             events: Arc::new(RwLock::new(HashMap::new())),
             fast_paths: FastPathRegistry::new(),
             viewer_workers: Arc::new(RwLock::new(HashMap::new())),
+            controller_workers: Arc::new(RwLock::new(HashMap::new())),
             viewer_tokens: None,
             http: reqwest::Client::new(),
             road_base_url: std::env::var("BEACH_ROAD_URL")
@@ -1129,8 +1145,10 @@ impl AppState {
                         )
                     });
                 rec.viewer_passcode = Some(code.to_string());
+                let token = rec.first_lease_token();
                 rec.append_event(
                     ControllerEventType::Registered,
+                    token,
                     Some("attach_by_code".into()),
                 );
                 if let Err(err) = self.spawn_viewer_worker(origin_session_id).await {
@@ -1139,6 +1157,14 @@ impl AppState {
                         session_id = %origin_session_id,
                         error = %err,
                         "failed to start viewer worker after attach_by_code (memory backend)"
+                    );
+                }
+                if let Err(err) = self.spawn_controller_forwarder(origin_session_id).await {
+                    warn!(
+                        target = "controller.forwarder",
+                        session_id = %origin_session_id,
+                        error = %err,
+                        "failed to start controller forwarder (memory backend)"
                     );
                 }
                 Ok(SessionSummary::from_record(rec))
@@ -1232,6 +1258,14 @@ impl AppState {
                         "failed to start viewer worker after attach_by_code"
                     );
                 }
+                if let Err(err) = self.spawn_controller_forwarder(origin_session_id).await {
+                    warn!(
+                        target = "controller.forwarder",
+                        session_id = %origin_session_id,
+                        error = %err,
+                        "failed to start controller forwarder"
+                    );
+                }
 
                 // Return summary (best-effort from DB fields)
                 let mut list = self.list_sessions(private_beach_id).await?;
@@ -1263,8 +1297,10 @@ impl AppState {
                         duplicates += 1;
                     } else {
                         attached += 1;
+                        let token = entry.first_lease_token();
                         entry.append_event(
                             ControllerEventType::Registered,
+                            token,
                             Some("attach_owned".into()),
                         );
                     }
@@ -1442,12 +1478,20 @@ impl AppState {
                         s.metadata,
                         s.location_hint,
                         sr.last_health,
-                        cl.id AS controller_token,
-                        cl.expires_at,
-                        cl.revoked_at
+                        lease.id AS controller_token,
+                        lease.expires_at,
+                        lease.revoked_at
                     FROM session s
                     LEFT JOIN session_runtime sr ON sr.session_id = s.id
-                    LEFT JOIN controller_lease cl ON cl.session_id = s.id
+                    LEFT JOIN LATERAL (
+                        SELECT cl.id, cl.expires_at, cl.revoked_at
+                        FROM controller_lease cl
+                        WHERE cl.session_id = s.id
+                          AND cl.revoked_at IS NULL
+                          AND cl.expires_at > NOW()
+                        ORDER BY cl.expires_at DESC
+                        LIMIT 1
+                    ) AS lease ON TRUE
                     WHERE s.private_beach_id = $1
                     ORDER BY s.created_at ASC
                     "#,
@@ -1607,7 +1651,7 @@ impl AppState {
                     (controller, child)
                 };
 
-                if controller.controller_token.is_none() {
+                if controller.controller_leases.is_empty() {
                     return Err(StateError::ControllerLeaseRequired);
                 }
                 if controller.private_beach_id != child.private_beach_id {
@@ -1641,7 +1685,12 @@ impl AppState {
                 {
                     let mut sessions = self.fallback.sessions.write().await;
                     if let Some(record) = sessions.get_mut(controller_session_id) {
-                        record.append_event(ControllerEventType::PairingAdded, prompt_template);
+                        let token = record.first_lease_token();
+                        record.append_event(
+                            ControllerEventType::PairingAdded,
+                            token,
+                            prompt_template,
+                        );
                     }
                 }
 
@@ -1682,19 +1731,10 @@ impl AppState {
                     return Err(StateError::CrossBeachPairing);
                 }
 
-                let lease = match self
-                    .fetch_active_lease(pool, controller_identifiers.session_id)
-                    .await
-                {
-                    Ok(row) => row,
-                    Err(StateError::ControllerMismatch) => {
-                        return Err(StateError::ControllerLeaseRequired);
-                    }
-                    Err(err) => return Err(err),
-                };
-                if !is_active_lease(lease.expires_at, lease.revoked_at) {
-                    return Err(StateError::ControllerLeaseRequired);
-                }
+                let lease = self
+                    .fetch_any_active_lease(pool, controller_identifiers.session_id)
+                    .await?
+                    .ok_or(StateError::ControllerLeaseRequired)?;
 
                 let cadence = update_cadence.unwrap_or_default();
                 let mut tx = pool.begin().await?;
@@ -1806,7 +1846,7 @@ impl AppState {
                 }
                 .ok_or(StateError::SessionNotFound)?;
 
-                if controller.controller_token.is_none() {
+                if controller.controller_leases.is_empty() {
                     return Err(StateError::ControllerLeaseRequired);
                 }
 
@@ -1821,7 +1861,8 @@ impl AppState {
                 {
                     let mut sessions = self.fallback.sessions.write().await;
                     if let Some(record) = sessions.get_mut(controller_session_id) {
-                        record.append_event(ControllerEventType::PairingRemoved, None);
+                        let token = record.first_lease_token();
+                        record.append_event(ControllerEventType::PairingRemoved, token, None);
                     }
                 }
 
@@ -1861,19 +1902,10 @@ impl AppState {
                     return Err(StateError::CrossBeachPairing);
                 }
 
-                let lease = match self
-                    .fetch_active_lease(pool, controller_identifiers.session_id)
-                    .await
-                {
-                    Ok(row) => row,
-                    Err(StateError::ControllerMismatch) => {
-                        return Err(StateError::ControllerLeaseRequired);
-                    }
-                    Err(err) => return Err(err),
-                };
-                if !is_active_lease(lease.expires_at, lease.revoked_at) {
-                    return Err(StateError::ControllerLeaseRequired);
-                }
+                let lease = self
+                    .fetch_any_active_lease(pool, controller_identifiers.session_id)
+                    .await?
+                    .ok_or(StateError::ControllerLeaseRequired)?;
 
                 let mut tx = pool.begin().await?;
                 self.set_rls_context_tx(&mut tx, &controller_identifiers.private_beach_id)
@@ -1977,53 +2009,112 @@ impl AppState {
                 let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
                 let ttl = ttl_override.unwrap_or(DEFAULT_LEASE_TTL_MS).max(1_000);
                 let expires_at = Utc::now() + Duration::milliseconds(ttl as i64);
-                let controller_token = Uuid::new_v4();
                 let requester_uuid = requester;
 
                 let mut tx = pool.begin().await?;
                 self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
                     .await?;
-                sqlx::query(
-                    r#"
-                    INSERT INTO controller_lease (
-                        id, session_id, controller_account_id, issued_by_account_id,
-                        reason, issued_at, expires_at, revoked_at
+                if let Some(account) = requester_uuid {
+                    self.set_account_context_tx(&mut tx, Some(&account)).await?;
+                } else {
+                    self.set_account_context_tx(&mut tx, None).await?;
+                }
+
+                let existing = self
+                    .fetch_active_lease_for_actor_tx(
+                        &mut tx,
+                        identifiers.session_id,
+                        requester_uuid,
+                        reason.as_deref(),
                     )
-                    VALUES ($1, $2, $3, $3, $4, NOW(), $5, NULL)
-                    ON CONFLICT (session_id)
-                    DO UPDATE SET
-                        id = EXCLUDED.id,
-                        controller_account_id = EXCLUDED.controller_account_id,
-                        issued_by_account_id = EXCLUDED.issued_by_account_id,
-                        reason = EXCLUDED.reason,
-                        issued_at = NOW(),
-                        expires_at = EXCLUDED.expires_at,
-                        revoked_at = NULL
-                    "#,
-                )
-                .bind(controller_token)
-                .bind(identifiers.session_id)
-                .bind(requester_uuid)
-                .bind(reason.clone())
-                .bind(expires_at)
-                .execute(tx.as_mut())
-                .await?;
+                    .await?;
+
+                let (controller_token, lease_account_id) = if let Some(lease) = existing {
+                    sqlx::query(
+                        r#"
+                        UPDATE controller_lease
+                        SET expires_at = $1, issued_at = NOW()
+                        WHERE id = $2
+                        "#,
+                    )
+                    .bind(expires_at)
+                    .bind(lease.id)
+                    .execute(tx.as_mut())
+                    .await?;
+                    (lease.id, lease.controller_account_id)
+                } else {
+                    // Attempt to create a new lease for this (account, reason).
+                    // In some dev environments, a legacy unique constraint on (session_id)
+                    // may still exist. If the INSERT fails with a unique violation, fall
+                    // back to returning any active lease for the session so callers can
+                    // proceed (semantically equivalent to idempotent renew).
+                    let new_token = Uuid::new_v4();
+                    let insert_result = sqlx::query(
+                        r#"
+                        INSERT INTO controller_lease (
+                            id, session_id, controller_account_id, issued_by_account_id,
+                            reason, issued_at, expires_at, revoked_at
+                        )
+                        VALUES ($1, $2, $3, $3, $4, NOW(), $5, NULL)
+                        "#,
+                    )
+                    .bind(new_token)
+                    .bind(identifiers.session_id)
+                    .bind(requester_uuid)
+                    .bind(reason.clone())
+                    .bind(expires_at)
+                    .execute(tx.as_mut())
+                    .await;
+                    match insert_result {
+                        Ok(_) => (new_token, requester_uuid),
+                        Err(err) => {
+                            // 23505 = unique_violation
+                            let is_unique = matches!(&err, sqlx::Error::Database(db)
+                                if db.code().as_deref() == Some("23505"));
+                            if is_unique {
+                                // Return the most recent active lease for this session.
+                                let active = self
+                                    .list_active_leases_tx(&mut tx, identifiers.session_id)
+                                    .await?;
+                                if let Some(lease) = active.first() {
+                                    (lease.id, lease.controller_account_id)
+                                } else {
+                                    // No active leases despite unique violation; bubble up.
+                                    return Err(err.into());
+                                }
+                            } else {
+                                return Err(err.into());
+                            }
+                        }
+                    }
+                };
 
                 self.insert_controller_event(
                     &mut tx,
                     identifiers.session_id,
                     "lease_acquired",
                     Some(controller_token),
-                    requester_uuid,
+                    lease_account_id,
                     requester_uuid,
                     reason.clone(),
                 )
                 .await?;
 
+                let active_leases = self
+                    .list_active_leases_tx(&mut tx, identifiers.session_id)
+                    .await?;
+
                 tx.commit().await?;
 
                 self.fallback
-                    .acknowledge_controller(session_id, controller_token.to_string(), ttl)
+                    .acknowledge_controller(
+                        session_id,
+                        controller_token.to_string(),
+                        ttl,
+                        lease_account_id.map(|u| u.to_string()),
+                        requester_uuid.map(|u| u.to_string()),
+                        reason.clone(),
+                    )
                     .await;
 
                 // Emit a controller event on the SSE channel
@@ -2034,12 +2125,19 @@ impl AppState {
                         event_type: ControllerEventType::LeaseAcquired,
                         controller_token: Some(controller_token.to_string()),
                         timestamp_ms: now_ms(),
-                        reason,
-                        controller_account_id: requester_uuid.map(|u| u.to_string()),
+                        reason: reason.clone(),
+                        controller_account_id: lease_account_id.map(|u| u.to_string()),
                         issued_by_account_id: requester_uuid.map(|u| u.to_string()),
                     }),
                 )
                 .await;
+
+                self.log_controller_leases(
+                    "lease_update",
+                    session_id,
+                    &identifiers.private_beach_id.to_string(),
+                    &active_leases,
+                );
 
                 Ok(ControllerLeaseResponse {
                     controller_token: controller_token.to_string(),
@@ -2096,7 +2194,9 @@ impl AppState {
                 .await?;
 
                 tx.commit().await?;
-                self.fallback.clear_controller(session_id).await;
+                self.fallback
+                    .clear_controller(session_id, Some(controller_token))
+                    .await;
 
                 self.publish(
                     session_id,
@@ -2137,21 +2237,17 @@ impl AppState {
                 let token_uuid = parse_uuid(controller_token, "controller_token")?;
                 let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
                 let lease = self
-                    .fetch_active_lease(pool, identifiers.session_id)
+                    .fetch_active_lease_for_token(pool, identifiers.session_id, token_uuid)
                     .await?;
-
-                if lease.id != token_uuid {
-                    return Err(StateError::ControllerMismatch);
-                }
-
-                let now = Utc::now();
-                if lease
-                    .expires_at
-                    .map(|expires_at| expires_at < now)
-                    .unwrap_or(true)
-                {
-                    return Err(StateError::ControllerMismatch);
-                }
+                let active_leases = self
+                    .list_active_leases(pool, identifiers.session_id)
+                    .await?;
+                self.log_controller_leases(
+                    "queue_actions_validate",
+                    session_id,
+                    &identifiers.private_beach_id.to_string(),
+                    &active_leases,
+                );
 
                 let session_uuid_str = session_uuid.to_string();
                 let trace_context = self
@@ -2189,6 +2285,15 @@ impl AppState {
                         )
                         .await?;
                         tx.commit().await?;
+
+                        debug!(
+                            target = "controller.delivery",
+                            session_id = %session_uuid,
+                            private_beach_id = %identifiers.private_beach_id,
+                            action_count = actions.len(),
+                            transport = "fast_path",
+                            "dispatched actions via fast-path"
+                        );
 
                         self.publish(
                             session_id,
@@ -2241,6 +2346,16 @@ impl AppState {
                         .await;
                     }
                 }
+
+                debug!(
+                    target = "controller.delivery",
+                    session_id = %session_uuid,
+                    private_beach_id = %identifiers.private_beach_id,
+                    action_count = actions.len(),
+                    transport = "http_fallback",
+                    fast_path_error = fast_path_error.as_deref(),
+                    "queuing actions via Redis fallback"
+                );
 
                 self.enqueue_actions_redis(
                     &identifiers.private_beach_id.to_string(),
@@ -2364,13 +2479,13 @@ impl AppState {
                     .with_label_values(&labels)
                     .inc_by(actions.len() as u64);
 
+                let active_lease = self
+                    .fetch_any_active_lease(pool, identifiers.session_id)
+                    .await?;
                 let mut tx = pool.begin().await?;
                 self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
                     .await?;
-                if let Some(lease) = self
-                    .fetch_active_lease_optional(&mut tx, identifiers.session_id)
-                    .await?
-                {
+                if let Some(lease) = active_lease {
                     let token_str = lease.id.to_string();
                     self.insert_controller_event(
                         &mut tx,
@@ -2415,6 +2530,16 @@ impl AppState {
                     );
                 }
 
+                if !actions.is_empty() {
+                    debug!(
+                        target = "controller.delivery",
+                        session_id = %session_uuid,
+                        private_beach_id = %identifiers.private_beach_id,
+                        action_count = actions.len(),
+                        "polled actions for delivery to host"
+                    );
+                }
+
                 Ok(actions)
             }
         }
@@ -2453,6 +2578,13 @@ impl AppState {
                     }
                     self.update_pairing_transport_status(session_id, status)
                         .await;
+                    debug!(
+                        target = "controller.delivery",
+                        session_id,
+                        ack_count = acks.len(),
+                        via_fast_path,
+                        "controller acks recorded (memory backend)"
+                    );
                 }
                 Ok(())
             }
@@ -2517,6 +2649,14 @@ impl AppState {
                     }
                     self.update_pairing_transport_status(&session_uuid_str, status)
                         .await;
+                    debug!(
+                        target = "controller.delivery",
+                        session_id = %session_uuid,
+                        private_beach_id = %identifiers.private_beach_id,
+                        ack_count = acks.len(),
+                        via_fast_path,
+                        "controller acks persisted"
+                    );
                 }
                 Ok(())
             }
@@ -2761,6 +2901,40 @@ impl AppState {
         Ok(())
     }
 
+    pub async fn spawn_controller_forwarder(&self, session_id: &str) -> Result<(), StateError> {
+        let (private_beach_id, join_code) = {
+            let sessions = self.fallback.sessions.read().await;
+            let record = sessions
+                .get(session_id)
+                .ok_or(StateError::SessionNotFound)?;
+            let passcode = match &record.viewer_passcode {
+                Some(code) => code.clone(),
+                None => {
+                    debug!(
+                        target = "controller.forwarder",
+                        session_id = %session_id,
+                        "viewer passcode not set; skipping controller forwarder"
+                    );
+                    return Ok(());
+                }
+            };
+            (record.private_beach_id.clone(), passcode)
+        };
+
+        let mut workers = self.controller_workers.write().await;
+        if let Some(existing) = workers.remove(session_id) {
+            existing.handle.abort();
+        }
+        let state_clone = self.clone();
+        let session_id_owned = session_id.to_string();
+        let handle = tokio::spawn(async move {
+            run_controller_forwarder(state_clone, session_id_owned, private_beach_id, join_code)
+                .await;
+        });
+        workers.insert(session_id.to_string(), ControllerForwarderWorker { handle });
+        Ok(())
+    }
+
     pub async fn emergency_stop(
         &self,
         session_id: &str,
@@ -2771,7 +2945,7 @@ impl AppState {
             Backend::Memory => {
                 // Clear pending and release controller
                 self.fallback.clear_pending_actions(session_id).await;
-                self.fallback.clear_controller(session_id).await;
+                self.fallback.clear_controller(session_id, None).await;
                 self.publish(
                     session_id,
                     StreamEvent::ControllerEvent(ControllerEvent {
@@ -2827,7 +3001,7 @@ impl AppState {
                 tx.commit().await?;
 
                 self.fallback.clear_pending_actions(session_id).await;
-                self.fallback.clear_controller(session_id).await;
+                self.fallback.clear_controller(session_id, None).await;
 
                 self.publish(
                     session_id,
@@ -3005,6 +3179,40 @@ impl AppState {
     }
 }
 
+fn parse_redis_action_stream(value: redis::Value) -> Result<Vec<ActionCommand>, StateError> {
+    let mut actions = Vec::new();
+    if let redis::Value::Bulk(streams) = value {
+        let mut idx = 0;
+        while idx + 1 < streams.len() {
+            if let redis::Value::Bulk(entries) = &streams[idx + 1] {
+                for entry in entries {
+                    if let redis::Value::Bulk(entry_parts) = entry {
+                        if entry_parts.len() < 2 {
+                            continue;
+                        }
+                        if let redis::Value::Bulk(fields) = &entry_parts[1] {
+                            let mut field_idx = 0;
+                            while field_idx + 1 < fields.len() {
+                                let field_name =
+                                    redis::from_redis_value::<String>(&fields[field_idx])?;
+                                if field_name == "payload" {
+                                    let payload_str: String =
+                                        redis::from_redis_value(&fields[field_idx + 1])?;
+                                    let action: ActionCommand = serde_json::from_str(&payload_str)?;
+                                    actions.push(action);
+                                }
+                                field_idx += 2;
+                            }
+                        }
+                    }
+                }
+            }
+            idx += 2;
+        }
+    }
+    Ok(actions)
+}
+
 fn legacy_layout_to_canvas(
     layout_value: Option<&serde_json::Value>,
     now_ms: i64,
@@ -3129,7 +3337,7 @@ impl InnerState {
         &self,
         req: &RegisterSessionRequest,
         harness_id: &str,
-        controller_token: Option<String>,
+        controller_lease: Option<(String, ControllerLeaseMemory)>,
     ) {
         let mut sessions = self.sessions.write().await;
         let entry = sessions.entry(req.session_id.clone()).or_insert_with(|| {
@@ -3141,22 +3349,44 @@ impl InnerState {
         entry.version = req.version.clone();
         entry.harness_type = req.harness_type.clone();
         entry.harness_id = harness_id.to_string();
-        entry.controller_token = controller_token;
+        entry.controller_leases.clear();
+        if let Some((token, lease)) = controller_lease {
+            entry.controller_leases.insert(token, lease);
+        }
         entry.viewer_passcode = req.viewer_passcode.clone();
     }
 
-    async fn acknowledge_controller(&self, session_id: &str, token: String, ttl: u64) {
+    async fn acknowledge_controller(
+        &self,
+        session_id: &str,
+        token: String,
+        ttl: u64,
+        controller_account_id: Option<String>,
+        issued_by_account_id: Option<String>,
+        reason: Option<String>,
+    ) {
         let mut sessions = self.sessions.write().await;
         if let Some(record) = sessions.get_mut(session_id) {
-            record.controller_token = Some(token);
+            let expires_at_ms = now_ms() + ttl as i64;
+            record.ensure_lease(
+                token.clone(),
+                expires_at_ms,
+                controller_account_id,
+                issued_by_account_id,
+                reason,
+            );
             record.lease_ttl_ms = ttl;
         }
     }
 
-    async fn clear_controller(&self, session_id: &str) {
+    async fn clear_controller(&self, session_id: &str, token: Option<&str>) {
         let mut sessions = self.sessions.write().await;
         if let Some(record) = sessions.get_mut(session_id) {
-            record.controller_token = None;
+            if let Some(token) = token {
+                record.remove_lease(token);
+            } else {
+                record.clear_leases();
+            }
         }
     }
 
@@ -3362,7 +3592,7 @@ impl SessionRecord {
             metadata: None,
             version: "unknown".into(),
             harness_id,
-            controller_token: None,
+            controller_leases: HashMap::new(),
             viewer_passcode: None,
             lease_ttl_ms: DEFAULT_LEASE_TTL_MS,
             transport_hints,
@@ -3374,21 +3604,76 @@ impl SessionRecord {
         }
     }
 
-    fn append_event(&mut self, event_type: ControllerEventType, reason: Option<String>) {
+    fn append_event(
+        &mut self,
+        event_type: ControllerEventType,
+        controller_token: Option<String>,
+        reason: Option<String>,
+    ) {
         self.controller_events.push(ControllerEvent {
             id: Uuid::new_v4().to_string(),
             event_type,
-            controller_token: self.controller_token.clone(),
+            controller_token,
             timestamp_ms: now_ms(),
             reason,
             controller_account_id: None,
             issued_by_account_id: None,
         });
     }
+
+    fn lease(&self, token: &str) -> Option<&ControllerLeaseMemory> {
+        self.controller_leases.get(token)
+    }
+
+    fn ensure_lease(
+        &mut self,
+        token: String,
+        expires_at_ms: i64,
+        controller_account_id: Option<String>,
+        issued_by_account_id: Option<String>,
+        reason: Option<String>,
+    ) {
+        self.controller_leases.insert(
+            token,
+            ControllerLeaseMemory {
+                expires_at_ms,
+                controller_account_id,
+                issued_by_account_id,
+                reason,
+            },
+        );
+    }
+
+    fn remove_lease(&mut self, token: &str) -> bool {
+        self.controller_leases.remove(token).is_some()
+    }
+
+    fn clear_leases(&mut self) {
+        self.controller_leases.clear();
+    }
+
+    fn first_lease_token(&self) -> Option<String> {
+        self.controller_leases.keys().next().cloned()
+    }
+
+    fn find_lease_mut_by_reason(
+        &mut self,
+        reason: Option<&str>,
+    ) -> Option<(&String, &mut ControllerLeaseMemory)> {
+        self.controller_leases
+            .iter_mut()
+            .find(|(_, lease)| lease.reason.as_deref() == reason)
+    }
 }
 
 impl SessionSummary {
     fn from_record(record: &SessionRecord) -> Self {
+        let (controller_token, controller_expires_at_ms) = record
+            .controller_leases
+            .iter()
+            .next()
+            .map(|(token, lease)| (Some(token.clone()), Some(lease.expires_at_ms)))
+            .unwrap_or((None, None));
         Self {
             session_id: record.session_id.clone(),
             private_beach_id: record.private_beach_id.clone(),
@@ -3398,11 +3683,8 @@ impl SessionSummary {
             metadata: record.metadata.clone(),
             version: record.version.clone(),
             harness_id: record.harness_id.clone(),
-            controller_token: record.controller_token.clone(),
-            controller_expires_at_ms: record
-                .controller_token
-                .as_ref()
-                .map(|_| now_ms() + record.lease_ttl_ms as i64),
+            controller_token,
+            controller_expires_at_ms,
             pending_actions: record.pending_actions.len(),
             pending_unacked: record.pending_actions.len(),
             last_health: record.last_health.clone(),
@@ -3415,6 +3697,11 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn truncate_uuid(id: &Uuid) -> String {
+    let full = id.to_string();
+    full.split('-').next().unwrap_or(&full).to_string()
 }
 
 fn parse_uuid(value: &str, label: &str) -> Result<Uuid, StateError> {
@@ -3571,15 +3858,22 @@ impl AppState {
         entry.harness_type = req.harness_type.clone();
         entry.viewer_passcode = req.viewer_passcode.clone();
 
-        if entry.controller_token.is_none() {
-            entry.controller_token = Some(Uuid::new_v4().to_string());
+        if entry.controller_leases.is_empty() {
+            let token = Uuid::new_v4().to_string();
+            let expires_at_ms = now_ms() + entry.lease_ttl_ms as i64;
+            entry.ensure_lease(token, expires_at_ms, None, None, None);
         }
 
-        entry.append_event(ControllerEventType::Registered, None);
+        let controller_token = entry.first_lease_token();
+        entry.append_event(
+            ControllerEventType::Registered,
+            controller_token.clone(),
+            None,
+        );
 
         let response = RegisterSessionResponse {
             harness_id: entry.harness_id.clone(),
-            controller_token: entry.controller_token.clone(),
+            controller_token,
             lease_ttl_ms: entry.lease_ttl_ms,
             state_cache_url: entry.state_cache_url.clone(),
             transport_hints: entry.transport_hints.clone(),
@@ -3678,24 +3972,27 @@ impl AppState {
 
         sqlx::query(
             r#"
+            UPDATE controller_lease
+            SET revoked_at = NOW(), expires_at = NOW()
+            WHERE session_id = $1
+            "#,
+        )
+        .bind(db_session_id)
+        .execute(tx.as_mut())
+        .await?;
+
+        sqlx::query(
+            r#"
             INSERT INTO controller_lease (
                 id, session_id, controller_account_id, issued_by_account_id,
                 reason, issued_at, expires_at, revoked_at
             )
-            VALUES ($1, $2, NULL, NULL, NULL, NOW(), $3, NULL)
-            ON CONFLICT (session_id)
-            DO UPDATE SET
-                id = EXCLUDED.id,
-                controller_account_id = NULL,
-                issued_by_account_id = NULL,
-                reason = NULL,
-                issued_at = NOW(),
-                expires_at = EXCLUDED.expires_at,
-                revoked_at = NULL
+            VALUES ($1, $2, NULL, NULL, $3, NOW(), $4, NULL)
             "#,
         )
         .bind(controller_token)
         .bind(db_session_id)
+        .bind(Some("session_register"))
         .bind(expires_at)
         .execute(tx.as_mut())
         .await?;
@@ -3724,11 +4021,17 @@ impl AppState {
 
         tx.commit().await?;
 
+        let fallback_lease = ControllerLeaseMemory {
+            expires_at_ms: expires_at.timestamp_millis(),
+            controller_account_id: None,
+            issued_by_account_id: None,
+            reason: None,
+        };
         self.fallback
             .ensure_session(
                 &req,
                 &harness_id.to_string(),
-                Some(controller_token.to_string()),
+                Some((controller_token.to_string(), fallback_lease)),
             )
             .await;
 
@@ -3770,12 +4073,26 @@ impl AppState {
             .ok_or(StateError::SessionNotFound)?;
 
         record.lease_ttl_ms = ttl;
-        record.controller_token = Some(Uuid::new_v4().to_string());
-        record.append_event(ControllerEventType::LeaseAcquired, reason);
+        let expires_at_ms = now_ms() + ttl as i64;
+        let token = if let Some((token, lease)) = record.find_lease_mut_by_reason(reason.as_deref())
+        {
+            lease.expires_at_ms = expires_at_ms;
+            token.clone()
+        } else {
+            let token = Uuid::new_v4().to_string();
+            record.ensure_lease(token.clone(), expires_at_ms, None, None, reason.clone());
+            token
+        };
+        record.append_event(
+            ControllerEventType::LeaseAcquired,
+            Some(token.clone()),
+            reason,
+        );
+        self.log_memory_leases("lease_update", record);
 
         Ok(ControllerLeaseResponse {
-            controller_token: record.controller_token.clone().unwrap(),
-            expires_at_ms: now_ms() + ttl as i64,
+            controller_token: token,
+            expires_at_ms,
         })
     }
 
@@ -3788,17 +4105,22 @@ impl AppState {
         let record = sessions
             .get_mut(session_id)
             .ok_or(StateError::SessionNotFound)?;
-        if record.controller_token.as_deref() != Some(controller_token) {
+        if !record.remove_lease(controller_token) {
             return Err(StateError::ControllerMismatch);
         }
-        record.controller_token = None;
-        record.append_event(ControllerEventType::LeaseReleased, None);
+        let token_string = controller_token.to_string();
+        record.append_event(
+            ControllerEventType::LeaseReleased,
+            Some(token_string.clone()),
+            None,
+        );
+        self.log_memory_leases("lease_release", record);
         self.publish(
             session_id,
             StreamEvent::ControllerEvent(ControllerEvent {
                 id: Uuid::new_v4().to_string(),
                 event_type: ControllerEventType::LeaseReleased,
-                controller_token: None,
+                controller_token: Some(token_string),
                 timestamp_ms: now_ms(),
                 reason: None,
                 controller_account_id: None,
@@ -3819,19 +4141,27 @@ impl AppState {
         let record = sessions
             .get_mut(session_id)
             .ok_or(StateError::SessionNotFound)?;
-        if record.controller_token.as_deref() != Some(controller_token) {
+        let Some(lease) = record.lease(controller_token).cloned() else {
+            return Err(StateError::ControllerMismatch);
+        };
+        if lease.expires_at_ms <= now_ms() {
             return Err(StateError::ControllerMismatch);
         }
         for action in actions {
             record.pending_actions.push_back(action);
         }
-        record.append_event(ControllerEventType::ActionsQueued, None);
-        let controller_token = record.controller_token.clone();
+        self.log_memory_leases("queue_actions_validate", record);
+        let token_string = controller_token.to_string();
+        record.append_event(
+            ControllerEventType::ActionsQueued,
+            Some(token_string.clone()),
+            None,
+        );
         let event_time = now_ms();
         let event = StreamEvent::ControllerEvent(ControllerEvent {
             id: Uuid::new_v4().to_string(),
             event_type: ControllerEventType::ActionsQueued,
-            controller_token,
+            controller_token: Some(token_string),
             timestamp_ms: event_time,
             reason: None,
             controller_account_id: None,
@@ -3859,12 +4189,13 @@ impl AppState {
             .ok_or(StateError::SessionNotFound)?;
         let actions: Vec<ActionCommand> = record.pending_actions.drain(..).collect();
         if !actions.is_empty() {
+            let token = record.first_lease_token();
             self.publish(
                 session_id,
                 StreamEvent::ControllerEvent(ControllerEvent {
                     id: Uuid::new_v4().to_string(),
                     event_type: ControllerEventType::ActionsAcked,
-                    controller_token: record.controller_token.clone(),
+                    controller_token: token,
                     timestamp_ms: now_ms(),
                     reason: None,
                     controller_account_id: None,
@@ -3886,7 +4217,8 @@ impl AppState {
             .get_mut(session_id)
             .ok_or(StateError::SessionNotFound)?;
         record.last_health = Some(heartbeat.clone());
-        record.append_event(ControllerEventType::HealthReported, None);
+        let token = record.first_lease_token();
+        record.append_event(ControllerEventType::HealthReported, token, None);
         self.publish(session_id, StreamEvent::Health(heartbeat))
             .await;
         Ok(())
@@ -3905,7 +4237,8 @@ impl AppState {
         self.store_state_redis(&record.private_beach_id, session_id, &diff_clone)
             .await?;
         record.last_state = Some(diff);
-        record.append_event(ControllerEventType::StateUpdated, None);
+        let token = record.first_lease_token();
+        record.append_event(ControllerEventType::StateUpdated, token, None);
         self.publish(session_id, StreamEvent::State(diff_clone))
             .await;
         Ok(())
@@ -4003,42 +4336,188 @@ impl AppState {
         Ok(row)
     }
 
-    async fn fetch_active_lease(
+    async fn fetch_active_lease_for_actor_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        session_id: Uuid,
+        controller_account_id: Option<Uuid>,
+        reason: Option<&str>,
+    ) -> Result<Option<LeaseRow>, StateError> {
+        let row: Option<LeaseRow> = sqlx::query_as(
+            r#"
+            SELECT id, controller_account_id, issued_by_account_id, reason, expires_at, revoked_at
+            FROM controller_lease
+            WHERE session_id = $1
+              AND revoked_at IS NULL
+              AND expires_at > NOW()
+              AND (controller_account_id IS NOT DISTINCT FROM $2)
+              AND (reason IS NOT DISTINCT FROM $3)
+            ORDER BY expires_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(session_id)
+        .bind(controller_account_id)
+        .bind(reason)
+        .fetch_optional(tx.as_mut())
+        .await?;
+
+        Ok(row)
+    }
+
+    async fn fetch_active_lease_for_token(
         &self,
         pool: &PgPool,
         session_id: Uuid,
+        token_id: Uuid,
     ) -> Result<LeaseRow, StateError> {
         let row: Option<LeaseRow> = sqlx::query_as(
             r#"
-            SELECT id, controller_account_id, expires_at, revoked_at
+            SELECT id, controller_account_id, issued_by_account_id, reason, expires_at, revoked_at
             FROM controller_lease
             WHERE session_id = $1
+              AND id = $2
+            "#,
+        )
+        .bind(session_id)
+        .bind(token_id)
+        .fetch_optional(pool)
+        .await?;
+
+        match row {
+            Some(lease) if is_active_lease(lease.expires_at, lease.revoked_at) => Ok(lease),
+            _ => Err(StateError::ControllerMismatch),
+        }
+    }
+
+    async fn list_active_leases_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        session_id: Uuid,
+    ) -> Result<Vec<LeaseRow>, StateError> {
+        let rows: Vec<LeaseRow> = sqlx::query_as(
+            r#"
+            SELECT id, controller_account_id, issued_by_account_id, reason, expires_at, revoked_at
+            FROM controller_lease
+            WHERE session_id = $1
+              AND revoked_at IS NULL
+              AND expires_at > NOW()
+            ORDER BY expires_at DESC
+            "#,
+        )
+        .bind(session_id)
+        .fetch_all(tx.as_mut())
+        .await?;
+
+        Ok(rows)
+    }
+
+    async fn list_active_leases(
+        &self,
+        pool: &PgPool,
+        session_id: Uuid,
+    ) -> Result<Vec<LeaseRow>, StateError> {
+        let rows: Vec<LeaseRow> = sqlx::query_as(
+            r#"
+            SELECT id, controller_account_id, issued_by_account_id, reason, expires_at, revoked_at
+            FROM controller_lease
+            WHERE session_id = $1
+              AND revoked_at IS NULL
+              AND expires_at > NOW()
+            ORDER BY expires_at DESC
+            "#,
+        )
+        .bind(session_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    async fn fetch_any_active_lease(
+        &self,
+        pool: &PgPool,
+        session_id: Uuid,
+    ) -> Result<Option<LeaseRow>, StateError> {
+        let row: Option<LeaseRow> = sqlx::query_as(
+            r#"
+            SELECT id, controller_account_id, issued_by_account_id, reason, expires_at, revoked_at
+            FROM controller_lease
+            WHERE session_id = $1
+              AND revoked_at IS NULL
+              AND expires_at > NOW()
+            ORDER BY expires_at DESC
+            LIMIT 1
             "#,
         )
         .bind(session_id)
         .fetch_optional(pool)
         .await?;
 
-        row.ok_or(StateError::ControllerMismatch)
+        Ok(row)
     }
 
-    async fn fetch_active_lease_optional(
+    fn log_controller_leases(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-        session_id: Uuid,
-    ) -> Result<Option<LeaseRow>, StateError> {
-        let row: Option<LeaseRow> = sqlx::query_as(
-            r#"
-            SELECT id, controller_account_id, expires_at, revoked_at
-            FROM controller_lease
-            WHERE session_id = $1
-            "#,
-        )
-        .bind(session_id)
-        .fetch_optional(tx.as_mut())
-        .await?;
+        event: &str,
+        session_id: &str,
+        private_beach_id: &str,
+        leases: &[LeaseRow],
+    ) {
+        if !tracing::enabled!(Level::INFO) {
+            return;
+        }
+        let now = now_ms();
+        let summary: Vec<String> = leases
+            .iter()
+            .map(|lease| {
+                let token = truncate_uuid(&lease.id);
+                let account = lease
+                    .controller_account_id
+                    .as_ref()
+                    .map(truncate_uuid)
+                    .unwrap_or_else(|| "anon".into());
+                let expires_in = lease
+                    .expires_at
+                    .map(|dt| (dt.timestamp_millis() - now).max(0))
+                    .unwrap_or(0);
+                let reason = lease.reason.as_deref().unwrap_or("<none>");
+                format!("{token}@{account}:expires_in={expires_in}ms reason={reason}")
+            })
+            .collect();
+        info!(
+            target = "controller.leases",
+            event,
+            session_id = %session_id,
+            private_beach_id = %private_beach_id,
+            active = leases.len(),
+            controllers = ?summary
+        );
+    }
 
-        Ok(row)
+    fn log_memory_leases(&self, event: &str, record: &SessionRecord) {
+        if !tracing::enabled!(Level::INFO) {
+            return;
+        }
+        let now = now_ms();
+        let summary: Vec<String> = record
+            .controller_leases
+            .iter()
+            .map(|(token, lease)| {
+                let account = lease.controller_account_id.as_deref().unwrap_or("anon");
+                let expires_in = (lease.expires_at_ms - now).max(0);
+                let reason = lease.reason.as_deref().unwrap_or("<none>");
+                format!("{token}@{account}:expires_in={expires_in}ms reason={reason}")
+            })
+            .collect();
+        info!(
+            target = "controller.leases",
+            event,
+            session_id = %record.session_id,
+            private_beach_id = %record.private_beach_id,
+            active = record.controller_leases.len(),
+            controllers = ?summary
+        );
     }
 
     async fn insert_controller_event(
@@ -4158,6 +4637,27 @@ impl AppState {
         Ok(())
     }
 
+    async fn ensure_action_consumer_group(
+        &self,
+        conn: &mut redis::aio::Connection,
+        stream_key: &str,
+    ) -> Result<(), StateError> {
+        if let Err(err) = redis::cmd("XGROUP")
+            .arg("CREATE")
+            .arg(stream_key)
+            .arg(REDIS_ACTION_GROUP)
+            .arg("0")
+            .arg("MKSTREAM")
+            .query_async::<_, ()>(conn)
+            .await
+        {
+            if err.code() != Some("BUSYGROUP") {
+                return Err(StateError::Redis(err));
+            }
+        }
+        Ok(())
+    }
+
     async fn drain_actions_redis(
         &self,
         private_beach_id: &str,
@@ -4167,34 +4667,34 @@ impl AppState {
             let mut conn = client.get_async_connection().await?;
             let key = redis_actions_key(private_beach_id, session_id);
             let consumer = format!("{REDIS_ACTION_CONSUMER_PREFIX}:{session_id}");
+            self.ensure_action_consumer_group(&mut conn, &key).await?;
 
-            let value: redis::Value = redis::cmd("XREADGROUP")
-                .arg("GROUP")
-                .arg(REDIS_ACTION_GROUP)
-                .arg(&consumer)
-                .arg("COUNT")
-                .arg(64)
-                .arg("STREAMS")
-                .arg(&key)
-                .arg(">")
-                .query_async(&mut conn)
-                .await?;
+            let value: redis::Value = loop {
+                match redis::cmd("XREADGROUP")
+                    .arg("GROUP")
+                    .arg(REDIS_ACTION_GROUP)
+                    .arg(&consumer)
+                    .arg("COUNT")
+                    .arg(64)
+                    .arg("STREAMS")
+                    .arg(&key)
+                    .arg(">")
+                    .query_async(&mut conn)
+                    .await
+                {
+                    Ok(val) => break val,
+                    Err(err) if err.code() == Some("NOGROUP") => {
+                        self.ensure_action_consumer_group(&mut conn, &key).await?;
+                        continue;
+                    }
+                    Err(err) => return Err(StateError::Redis(err)),
+                }
+            };
 
             let mut actions = Vec::new();
 
             if !matches!(value, redis::Value::Nil) {
-                let streams: Vec<(String, Vec<(String, Vec<(String, String)>)>)> =
-                    redis::from_redis_value(&value)?;
-                for (_stream, entries) in streams {
-                    for (_entry_id, fields) in entries {
-                        for (field, value) in fields {
-                            if field == "payload" {
-                                let action: ActionCommand = serde_json::from_str(&value)?;
-                                actions.push(action);
-                            }
-                        }
-                    }
-                }
+                actions = parse_redis_action_stream(value)?;
             }
 
             return Ok(actions);
@@ -4878,10 +5378,12 @@ impl AppState {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, FromRow)]
+#[derive(Debug, Clone, FromRow)]
 struct LeaseRow {
     id: Uuid,
     controller_account_id: Option<Uuid>,
+    issued_by_account_id: Option<Uuid>,
+    reason: Option<String>,
     expires_at: Option<DateTime<Utc>>,
     revoked_at: Option<DateTime<Utc>>,
 }
@@ -5241,6 +5743,373 @@ fn rewrite_loopback_transports(
     }
 
     Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ControllerForwarderError {
+    #[error("session join failed: {0}")]
+    Join(String),
+    #[error("transport negotiation failed: {0}")]
+    Negotiation(String),
+    #[error("transport error: {0}")]
+    Transport(String),
+    #[error(transparent)]
+    State(#[from] StateError),
+    #[error("unsupported transport role")]
+    UnsupportedTransport,
+}
+
+async fn run_controller_forwarder(
+    state: AppState,
+    session_id: String,
+    private_beach_id: String,
+    join_code: String,
+) {
+    let mut attempts = 0usize;
+    loop {
+        attempts = attempts.saturating_add(1);
+        match controller_forwarder_once(&state, &session_id, &private_beach_id, &join_code).await {
+            Ok(()) => {
+                info!(
+                    target = "controller.forwarder",
+                    session_id = %session_id,
+                    private_beach_id = %private_beach_id,
+                    "controller forwarder stopped"
+                );
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    target = "controller.forwarder",
+                    session_id = %session_id,
+                    private_beach_id = %private_beach_id,
+                    error = %err,
+                    attempts,
+                    "controller forwarder failed; retrying"
+                );
+                sleep(StdDuration::from_secs(3)).await;
+            }
+        }
+    }
+}
+
+async fn controller_forwarder_once(
+    state: &AppState,
+    session_id: &str,
+    private_beach_id: &str,
+    join_code: &str,
+) -> Result<(), ControllerForwarderError> {
+    let config = SessionConfig::new(&state.road_base_url)
+        .map_err(|err| ControllerForwarderError::Join(err.to_string()))?;
+    let manager = SessionManager::new(config)
+        .map_err(|err| ControllerForwarderError::Join(err.to_string()))?;
+    let joined = manager
+        .join(
+            session_id,
+            Some(join_code),
+            None,
+            Some("pb-controller"),
+            false,
+        )
+        .await
+        .map_err(|err| ControllerForwarderError::Join(err.to_string()))?;
+    let handle = joined.into_handle();
+    let negotiated = negotiate_transport(&handle, Some(join_code), Some("pb-controller"), false)
+        .await
+        .map_err(|err| ControllerForwarderError::Negotiation(err.to_string()))?;
+    match negotiated {
+        NegotiatedTransport::Single(single) => {
+            drive_controller_forwarder(
+                state,
+                private_beach_id,
+                session_id,
+                single.transport,
+                single.webrtc_channels.is_some(),
+            )
+            .await
+        }
+        NegotiatedTransport::WebRtcOfferer { .. } => {
+            Err(ControllerForwarderError::UnsupportedTransport)
+        }
+    }
+}
+
+struct PendingControllerAction {
+    action: ActionCommand,
+    sent_at: Instant,
+}
+
+enum ForwarderEvent {
+    Ack(u64),
+    Shutdown(String),
+}
+
+struct ForwarderReader {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ForwarderReader {
+    fn spawn(transport: Arc<dyn Transport>, tx: mpsc::UnboundedSender<ForwarderEvent>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let handle = thread::spawn(move || {
+            let timeout = StdDuration::from_millis(250);
+            while !stop_clone.load(Ordering::Relaxed) {
+                match transport.recv(timeout) {
+                    Ok(message) => match message.payload {
+                        Payload::Binary(bytes) => {
+                            if let Ok(frame) = decode_host_frame_binary(&bytes) {
+                                match frame {
+                                    WireHostFrame::InputAck { seq } => {
+                                        let _ = tx.send(ForwarderEvent::Ack(seq));
+                                    }
+                                    WireHostFrame::Shutdown => {
+                                        let _ = tx.send(ForwarderEvent::Shutdown(
+                                            "host requested shutdown".into(),
+                                        ));
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Payload::Text(text) => {
+                            let trimmed = text.trim();
+                            if trimmed == "__ready__" || trimmed == "__offer_ready__" {
+                                continue;
+                            }
+                        }
+                    },
+                    Err(TransportError::Timeout) => {}
+                    Err(TransportError::ChannelClosed) => {
+                        let _ = tx.send(ForwarderEvent::Shutdown(
+                            "controller transport closed".into(),
+                        ));
+                        break;
+                    }
+                    Err(err) => {
+                        let _ = tx.send(ForwarderEvent::Shutdown(format!(
+                            "controller transport error: {err}"
+                        )));
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for ForwarderReader {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+async fn drive_controller_forwarder(
+    state: &AppState,
+    private_beach_id: &str,
+    session_id: &str,
+    transport: Arc<dyn Transport>,
+    via_fast_path: bool,
+) -> Result<(), ControllerForwarderError> {
+    let transport_label = if via_fast_path {
+        "fast_path"
+    } else {
+        "http_fallback"
+    };
+    info!(
+        target = "controller.forwarder",
+        session_id = %session_id,
+        private_beach_id = %private_beach_id,
+        transport = transport_label,
+        "controller forwarder connected"
+    );
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let _reader_guard = ForwarderReader::spawn(transport.clone(), event_tx);
+    let mut pending: HashMap<u64, PendingControllerAction> = HashMap::new();
+    let mut next_seq: u64 = 0;
+    let mut idle_delay = tokio::time::interval(StdDuration::from_millis(200));
+    idle_delay.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let labels = [private_beach_id, session_id];
+
+    loop {
+        tokio::select! {
+            event = event_rx.recv() => {
+                match event {
+                    Some(ForwarderEvent::Ack(seq)) => {
+                        if let Some(pending_action) = pending.remove(&seq) {
+                            let latency = pending_action.sent_at.elapsed().as_millis() as u64;
+                            let ack = ActionAck {
+                                id: pending_action.action.id.clone(),
+                                status: AckStatus::Ok,
+                                applied_at: SystemTime::now(),
+                                latency_ms: Some(latency),
+                                error_code: None,
+                                error_message: None,
+                            };
+                            state
+                                .ack_actions(session_id, vec![ack], None, via_fast_path)
+                                .await?;
+                            metrics::ACTIONS_ACKED.with_label_values(&labels).inc();
+                            metrics::ACTION_LATENCY_MS
+                                .with_label_values(&labels)
+                                .observe(latency as f64);
+                            debug!(
+                                target = "controller.delivery",
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                action_id = %pending_action.action.id,
+                                seq,
+                                transport = transport_label,
+                                "controller action acked"
+                            );
+                        } else {
+                            trace!(
+                                target = "controller.forwarder",
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                seq,
+                                "received ack for unknown sequence"
+                            );
+                        }
+                    }
+                    Some(ForwarderEvent::Shutdown(reason)) => {
+                        fail_pending_actions(state, session_id, pending, via_fast_path, &reason).await;
+                        return Err(ControllerForwarderError::Transport(reason));
+                    }
+                    None => {
+                        fail_pending_actions(state, session_id, pending, via_fast_path, "ack listener closed").await;
+                        return Err(ControllerForwarderError::Transport(
+                            "ack listener closed".into(),
+                        ));
+                    }
+                }
+            }
+            _ = idle_delay.tick() => {
+                let actions = state.poll_actions(session_id).await?;
+                if actions.is_empty() {
+                    continue;
+                }
+                for action in actions {
+                    match serialize_terminal_write(&action) {
+                        Ok(bytes) => {
+                            next_seq = next_seq.saturating_add(1);
+                            let frame = ClientFrame::Input {
+                                seq: next_seq,
+                                data: bytes,
+                            };
+                            let encoded = encode_client_frame_binary(&frame);
+                            transport
+                                .send_bytes(&encoded)
+                                .map_err(|err| ControllerForwarderError::Transport(err.to_string()))?;
+                            metrics::ACTIONS_DELIVERED.with_label_values(&labels).inc();
+                            debug!(
+                                target = "controller.delivery",
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                action_id = %action.id,
+                                seq = next_seq,
+                                transport = transport_label,
+                                "forwarded controller action"
+                            );
+                            pending.insert(
+                                next_seq,
+                                PendingControllerAction {
+                                    action,
+                                    sent_at: Instant::now(),
+                                },
+                            );
+                        }
+                        Err(err_msg) => {
+                            warn!(
+                                target = "controller.forwarder",
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                error = %err_msg,
+                                "rejecting unsupported action"
+                            );
+                            let ack = ActionAck {
+                                id: action.id.clone(),
+                                status: AckStatus::Rejected,
+                                applied_at: SystemTime::now(),
+                                latency_ms: None,
+                                error_code: Some("unsupported_action".into()),
+                                error_message: Some(err_msg),
+                            };
+                            if let Err(err) = state
+                                .ack_actions(session_id, vec![ack], None, via_fast_path)
+                                .await
+                            {
+                                warn!(
+                                    target = "controller.forwarder",
+                                    session_id = %session_id,
+                                    error = %err,
+                                    "failed to reject unsupported action"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn fail_pending_actions(
+    state: &AppState,
+    session_id: &str,
+    pending: HashMap<u64, PendingControllerAction>,
+    via_fast_path: bool,
+    reason: &str,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let now = SystemTime::now();
+    let acks: Vec<ActionAck> = pending
+        .into_values()
+        .map(|pending_action| ActionAck {
+            id: pending_action.action.id,
+            status: AckStatus::Preempted,
+            applied_at: now,
+            latency_ms: None,
+            error_code: Some("controller_forwarder".into()),
+            error_message: Some(reason.to_string()),
+        })
+        .collect();
+    if let Err(err) = state
+        .ack_actions(session_id, acks, None, via_fast_path)
+        .await
+    {
+        warn!(
+            target = "controller.forwarder",
+            session_id = %session_id,
+            error = %err,
+            "failed to ack pending actions after disconnect"
+        );
+    }
+}
+
+fn serialize_terminal_write(action: &ActionCommand) -> Result<Vec<u8>, String> {
+    if action.action_type.as_str() != "terminal_write" {
+        return Err(format!("unsupported action type {}", action.action_type));
+    }
+    let bytes = action
+        .payload
+        .get("bytes")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "terminal_write payload missing bytes".to_string())?;
+    Ok(bytes.as_bytes().to_vec())
 }
 
 fn rewrite_webrtc_offer(

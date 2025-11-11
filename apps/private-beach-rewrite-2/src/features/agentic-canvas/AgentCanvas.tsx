@@ -24,8 +24,9 @@ import type { AgentNodeData, ApplicationNodeData, AssignmentEdgeData, UpdateMode
 const AGENT_NODE_SIZE = { width: 260, height: 240 };
 const APPLICATION_NODE_SIZE = { width: 230, height: 200 };
 
-const nodeTypes = { agent: AgentNode, application: ApplicationNode };
-const edgeTypes = { assignment: RelationshipEdge };
+// Stable maps to avoid React Flow #002 remounts during drag
+const NODE_TYPES = Object.freeze({ agent: AgentNode, application: ApplicationNode });
+const EDGE_TYPES = Object.freeze({ assignment: RelationshipEdge });
 
 function AgentCanvasInner() {
   const [nodes, setNodes] = useState<Array<Node<AgentNodeData | ApplicationNodeData>>>([]);
@@ -245,8 +246,8 @@ function AgentCanvasInner() {
     [handleEdgeDelete, handleEdgeEdit, handleEdgeSave, nodes],
   );
 
-  const memoNodeTypes = useMemo(() => nodeTypes, []);
-  const memoEdgeTypes = useMemo(() => edgeTypes, []);
+  const memoNodeTypes = useMemo(() => NODE_TYPES, []);
+  const memoEdgeTypes = useMemo(() => EDGE_TYPES, []);
 
   return (
     <div className="flex h-full flex-col gap-3">

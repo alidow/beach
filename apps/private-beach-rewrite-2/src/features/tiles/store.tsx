@@ -1,7 +1,7 @@
 'use client';
 
 import { createContext, useContext, useMemo, useReducer } from 'react';
-import { DEFAULT_TILE_HEIGHT, DEFAULT_TILE_WIDTH } from './constants';
+import { DEFAULT_CANVAS_VIEWPORT, DEFAULT_TILE_HEIGHT, DEFAULT_TILE_WIDTH } from './constants';
 import type {
   AgentMetadata,
   AgentTraceMetadata,
@@ -14,6 +14,7 @@ import type {
   TileSessionMeta,
   TileState,
   TileViewportSnapshot,
+  CanvasViewportState,
 } from './types';
 import { computeAutoPosition, generateTileId, snapPosition, snapSize } from './utils';
 
@@ -29,6 +30,7 @@ type Action =
   | { type: 'END_RESIZE'; payload: { id: string } }
   | { type: 'SET_INTERACTIVE_TILE'; payload: { id: string | null } }
   | { type: 'SET_TILE_VIEWPORT'; payload: { id: string; viewport: TileViewportSnapshot | null } }
+  | { type: 'SET_CANVAS_VIEWPORT'; payload: { viewport: CanvasViewportState } }
   | {
       type: 'ADD_RELATIONSHIP';
       payload: {
@@ -48,6 +50,22 @@ type Action =
     }
   | { type: 'REMOVE_RELATIONSHIP'; payload: { id: string } };
 
+function cloneCanvasViewport(viewport?: CanvasViewportState | null): CanvasViewportState {
+  const zoom =
+    typeof viewport?.zoom === 'number' && Number.isFinite(viewport.zoom)
+      ? Math.min(1.75, Math.max(0.2, viewport.zoom))
+      : DEFAULT_CANVAS_VIEWPORT.zoom;
+  const panX =
+    typeof viewport?.pan?.x === 'number' && Number.isFinite(viewport.pan.x)
+      ? viewport.pan.x
+      : DEFAULT_CANVAS_VIEWPORT.pan.x;
+  const panY =
+    typeof viewport?.pan?.y === 'number' && Number.isFinite(viewport.pan.y)
+      ? viewport.pan.y
+      : DEFAULT_CANVAS_VIEWPORT.pan.y;
+  return { zoom, pan: { x: panX, y: panY } };
+}
+
 function createEmptyState(): TileState {
   return {
     tiles: {},
@@ -58,6 +76,7 @@ function createEmptyState(): TileState {
     resizing: {},
     interactiveId: null,
     viewport: {},
+    canvasViewport: cloneCanvasViewport(DEFAULT_CANVAS_VIEWPORT),
   };
 }
 
@@ -66,6 +85,9 @@ function ensureOrder(order: string[], id: string): string[] {
 }
 
 function bringToFront(order: string[], id: string): string[] {
+  if (order.length > 0 && order[order.length - 1] === id) {
+    return order;
+  }
   const filtered = order.filter((value) => value !== id);
   return [...filtered, id];
 }
@@ -457,6 +479,18 @@ function reducer(state: TileState, action: Action): TileState {
         },
       };
     }
+    case 'SET_CANVAS_VIEWPORT': {
+      const nextViewport = cloneCanvasViewport(action.payload.viewport);
+      const prev = state.canvasViewport;
+      if (
+        Math.abs(prev.zoom - nextViewport.zoom) < 0.0001 &&
+        Math.abs(prev.pan.x - nextViewport.pan.x) < 0.0001 &&
+        Math.abs(prev.pan.y - nextViewport.pan.y) < 0.0001
+      ) {
+        return state;
+      }
+      return { ...state, canvasViewport: nextViewport };
+    }
     case 'ADD_RELATIONSHIP': {
       const { id, sourceId, targetId, sourceHandleId, targetHandleId } = action.payload;
       if (!state.tiles[sourceId] || !state.tiles[targetId]) {
@@ -536,6 +570,7 @@ function hydrateInitialState(state: TileState | null | undefined): TileState {
     resizing: base.resizing ?? {},
     interactiveId: base.interactiveId ?? null,
     viewport: base.viewport ?? {},
+    canvasViewport: cloneCanvasViewport(base.canvasViewport),
   };
 }
 
@@ -584,6 +619,8 @@ export function useTileActions() {
       setInteractiveTile: (id: string | null) => dispatch({ type: 'SET_INTERACTIVE_TILE', payload: { id } }),
       updateTileViewport: (id: string, viewport: TileViewportSnapshot | null) =>
         dispatch({ type: 'SET_TILE_VIEWPORT', payload: { id, viewport } }),
+      setCanvasViewport: (viewport: CanvasViewportState) =>
+        dispatch({ type: 'SET_CANVAS_VIEWPORT', payload: { viewport } }),
       addRelationship: (
         id: string,
         sourceId: string,

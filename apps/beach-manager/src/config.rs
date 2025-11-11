@@ -24,6 +24,8 @@ pub struct AppConfig {
     pub beach_road_url: Option<String>,
     #[serde(default)]
     pub public_manager_url: Option<String>,
+    #[serde(default)]
+    pub log_path: Option<String>,
 }
 
 impl AppConfig {
@@ -44,6 +46,7 @@ impl AppConfig {
                 auth_bypass: false,
                 beach_road_url: None,
                 public_manager_url: None,
+                log_path: None,
             })
     }
 }

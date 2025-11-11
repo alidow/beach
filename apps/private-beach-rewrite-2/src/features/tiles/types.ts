@@ -72,6 +72,11 @@ export type TileViewportSnapshot = {
   quantizedCellHeightPx?: number | null;
 };
 
+export type CanvasViewportState = {
+  zoom: number;
+  pan: { x: number; y: number };
+};
+
 export type TileState = {
   tiles: Record<string, TileDescriptor>;
   order: string[];
@@ -81,6 +86,7 @@ export type TileState = {
   resizing: Record<string, boolean>;
   interactiveId: string | null;
   viewport: Record<string, TileViewportSnapshot>;
+  canvasViewport: CanvasViewportState;
 };
 
 export type TileCreateInput = {

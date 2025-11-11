@@ -34,7 +34,7 @@ _Last updated: 2025-09-22_
 
 4. **Benchmark rerun**
    - Re-run the perf harness (`cargo test -p beach --test perf_harness -- --ignored --show-output`) and the interactive vim benchmark to quantify headroom vs. SSH+tmux after each optimisation.
-   - Capture logs with `BEACH_PROFILE=1` to compare `sync_send_bytes`, `client_handle_frame`, and `pty_chunk_process` before vs. after micro-optimizations.
+  - Capture logs with `BEACH_PERF=1` (or legacy `BEACH_PROFILE=1`) to compare `sync_send_bytes`, `client_handle_frame`, and `pty_chunk_process` before vs. after micro-optimizations.
 
 ## Handoff Notes
 

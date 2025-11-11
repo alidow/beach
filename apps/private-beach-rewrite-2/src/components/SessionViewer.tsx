@@ -2,10 +2,15 @@
 
 import { useCallback, useEffect, useRef } from 'react';
 import type { TerminalViewerState } from '../../../private-beach/src/hooks/terminalViewerTypes';
-import { BeachTerminal, type TerminalViewportState } from '../../../beach-surfer/src/components/BeachTerminal';
+import {
+  BeachTerminal,
+  type JoinOverlayState,
+  type TerminalViewportState,
+} from '../../../beach-surfer/src/components/BeachTerminal';
 import { rewriteTerminalSizingStrategy } from './rewriteTerminalSizing';
 import { cn } from '@/lib/cn';
 import type { TileViewportSnapshot } from '@/features/tiles';
+import { DragFreezeBoundary } from './DragFreezeBoundary';
 
 type SessionViewerProps = {
   viewer: TerminalViewerState;
@@ -16,6 +21,16 @@ type SessionViewerProps = {
   onViewportMetrics?: (snapshot: TileViewportSnapshot | null) => void;
   cellMetrics?: { widthPx: number; heightPx: number };
 };
+
+function isTerminalTraceEnabled(): boolean {
+  if (typeof globalThis !== 'undefined' && (globalThis as Record<string, any>).__BEACH_TILE_TRACE) {
+    return true;
+  }
+  if (typeof process !== 'undefined' && process.env?.NEXT_PUBLIC_PRIVATE_BEACH_TERMINAL_TRACE === '1') {
+    return true;
+  }
+  return false;
+}
 
 function normalizeMetric(value: number | null | undefined): number | null {
   if (typeof value !== 'number') {
@@ -47,7 +62,7 @@ export function SessionViewer({
   const rootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    if (typeof window === 'undefined') {
+    if (typeof window === 'undefined' || !isTerminalTraceEnabled()) {
       return undefined;
     }
     const store = viewer.store;
@@ -87,7 +102,7 @@ export function SessionViewer({
   }, [sessionId, viewer.store]);
 
   useEffect(() => {
-    if (typeof window === 'undefined') {
+    if (typeof window === 'undefined' || !isTerminalTraceEnabled()) {
       return;
     }
     let snapshotSummary: { rows: number; viewportHeight: number; baseRow: number } | null = null;
@@ -173,6 +188,13 @@ export function SessionViewer({
     [onViewportMetrics, tileId],
   );
 
+  const handleJoinStateChange = useCallback(
+    (_snapshot: { state: JoinOverlayState; message: string | null }) => {
+      // Placeholder to keep hook usage inside component scope.
+    },
+    [],
+  );
+
   // Quantize terminal cell width to the device-pixel grid (and canvas scale)
   // to reduce horizontal drift from subpixel widths.
   // Guard: set window.__BEACH_DISABLE_CELL_QUANTIZE = true to disable.
@@ -208,7 +230,7 @@ export function SessionViewer({
         }
         quantizedCellMetricsRef.current.width = quantized;
         quantizedCellMetricsRef.current.height = null;
-        const traceEnabled = Boolean((globalThis as Record<string, any>).__BEACH_TILE_TRACE);
+        const traceEnabled = isTerminalTraceEnabled();
         if (traceEnabled) {
           try {
             console.info('[rewrite-terminal][tile-trace]', JSON.stringify({
@@ -319,8 +341,7 @@ export function SessionViewer({
 
   // Verbose instrumentation for diagnosing alignment issues.
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    if (!(globalThis as Record<string, any>).__BEACH_TILE_TRACE) return;
+    if (typeof window === 'undefined' || !isTerminalTraceEnabled()) return;
     const root = rootRef.current;
     if (!root) return;
     const terminalEl = root.querySelector<HTMLElement>('.beach-terminal');
@@ -386,25 +407,28 @@ export function SessionViewer({
         data-terminal-tile={tileId}
       >
         <div className="flex h-full w-full flex-1 overflow-hidden" data-terminal-content="true">
-          <BeachTerminal
-            className="flex h-full w-full flex-1 border border-slate-800/70 bg-[#060910]/95 shadow-[0_30px_80px_rgba(8,12,24,0.55)]"
-            store={viewer.store ?? undefined}
-            transport={viewer.transport ?? undefined}
-            transportVersion={viewer.transportVersion ?? 0}
-            autoConnect={false}
-            autoResizeHostOnViewportChange={false}
-            showTopBar={false}
-            showStatusBar={false}
-            hideIdlePlaceholder
-            sizingStrategy={rewriteTerminalSizingStrategy}
-            sessionId={sessionId ?? undefined}
-            showJoinOverlay={false}
-            enablePredictiveEcho={false}
-            disableViewportMeasurements={disableViewportMeasurements}
-            lockViewportToHost
-            cellMetrics={cellMetrics}
-            onViewportStateChange={handleViewportStateChange}
-          />
+          <DragFreezeBoundary>
+            <BeachTerminal
+              className="flex h-full w-full flex-1 border border-slate-800/70 bg-[#060910]/95 shadow-[0_30px_80px_rgba(8,12,24,0.55)]"
+              store={viewer.store ?? undefined}
+              transport={viewer.transport ?? undefined}
+              transportVersion={viewer.transportVersion ?? 0}
+              autoConnect={false}
+              autoResizeHostOnViewportChange={false}
+              showTopBar={false}
+              showStatusBar={false}
+              hideIdlePlaceholder
+              sizingStrategy={rewriteTerminalSizingStrategy}
+              sessionId={sessionId ?? undefined}
+              showJoinOverlay={false}
+              enablePredictiveEcho={false}
+              disableViewportMeasurements={disableViewportMeasurements}
+              lockViewportToHost
+              cellMetrics={cellMetrics}
+              onViewportStateChange={handleViewportStateChange}
+              onJoinStateChange={handleJoinStateChange}
+            />
+          </DragFreezeBoundary>
         </div>
       </div>
       {showLoading ? (

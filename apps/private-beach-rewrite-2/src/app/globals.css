@@ -3,7 +3,45 @@
 @tailwind utilities;
 
 @layer base {
+  /*
+   * Theme tokens (light-first).
+   * Define light theme in :root, then override in .dark.
+   * This keeps light as the default when the OS/browser prefers light.
+   */
   :root {
+    /* Light theme tuned for canvas UIs (inspired by Figma/Miro/Notion neutrals) */
+    --background: 215 35% 97%; /* soft slate-50 with a hint of blue */
+    --foreground: 222 47% 11%;  /* slate-900 */
+    --muted: 215 28% 95%;      /* pale gray for subdued surfaces */
+    --muted-foreground: 215 16% 40%;
+    --popover: 0 0% 100%;      /* keep popovers/cards crisp white */
+    --popover-foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --border: 214 24% 88%;     /* light gray borders */
+    --input: 214 24% 88%;
+    --primary: 213 90% 52%;    /* sky-500 for occasional accent */
+    --primary-foreground: 210 40% 98%;
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 222 47% 11%;
+    --accent: 210 32% 96%;     /* faint bluish-gray accent */
+    --accent-foreground: 222 47% 11%;
+    --destructive: 0 72% 50%;
+    --destructive-foreground: 0 0% 98%;
+    --ring: 213 94% 68%;       /* sky-400-ish focus ring */
+    --radius: 1rem;
+    --font-sans: 'Inter', 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif;
+    --font-mono: 'JetBrains Mono', 'SFMono-Regular', 'Menlo', 'Consolas', monospace;
+    /* Terminal palette tokens (used by shared terminal styles) */
+    --terminal-frame: 210 20% 98%;
+    --terminal-bezel: 210 20% 96%;
+    --terminal-screen: 210 30% 98%;
+    --terminal-glow: 199 89% 36%;
+    color-scheme: light;
+  }
+
+  /* Dark theme overrides */
+  .dark {
     --background: 222 56% 4%;
     --foreground: 210 40% 98%;
     --muted: 219 32% 16%;
@@ -23,9 +61,6 @@
     --destructive: 0 85% 60%;
     --destructive-foreground: 210 40% 98%;
     --ring: 199 89% 58%;
-    --radius: 1rem;
-    --font-sans: 'Inter', 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif;
-    --font-mono: 'JetBrains Mono', 'SFMono-Regular', 'Menlo', 'Consolas', monospace;
     --terminal-frame: 219 46% 11%;
     --terminal-bezel: 218 58% 12.5%;
     --terminal-screen: 221 47% 6%;
@@ -46,7 +81,13 @@
     margin: 0;
     min-height: 100vh;
     font-family: var(--font-sans);
-    @apply bg-gradient-to-b from-slate-950 via-slate-950 to-slate-950 text-foreground antialiased;
+    /* Light mode: very light canvas */
+    @apply bg-background text-foreground antialiased;
+  }
+
+  /* Dark mode keeps the rich gradient and glows */
+  .dark body {
+    @apply bg-gradient-to-b from-slate-950 via-slate-950 to-slate-950;
     background-image:
       radial-gradient(60% 80% at 15% 10%, rgba(56, 189, 248, 0.18), transparent),
       radial-gradient(45% 60% at 85% 15%, rgba(168, 85, 247, 0.18), transparent),
@@ -60,21 +101,35 @@
 }
 
 @layer components {
-  /* React Flow node wrapper stabilization during drag */
+  /* React Flow node wrapper stabilization during drag.
+     React Flow toggles inline `visibility:hidden` while it clones/ghosts nodes,
+     so explicitly force visibility/opacity to keep tiles from blinking. */
   .react-flow__node.dragging,
-  .react-flow__node.selected.dragging,
-  .react-flow__node:has(.rf-drag-handle:active) {
+  .react-flow__node.selected.dragging {
     will-change: transform;
     transform: translateZ(0);
     backface-visibility: hidden;
-    contain: layout paint;
-    filter: none !important;
-    -webkit-filter: none !important;
-    box-shadow: none !important;
+    visibility: visible !important;
+    opacity: 1 !important;
   }
 
+  /* During drag: disable selection globally; pointer-events are controlled per subtree. */
   .react-flow__node.dragging * {
-    user-select: none;
-    pointer-events: none;
+    user-select: none !important;
+  }
+
+  /* Allow the drag handle to continue receiving events during drag */
+  /* The drag handle remains active; child content selection is already off */
+  .react-flow__node.dragging .rf-drag-handle {
+    pointer-events: auto !important;
+  }
+  /* Avoid edge handle capture while node is moving */
+  .react-flow__node.dragging .react-flow__handle {
+    pointer-events: none !important;
+  }
+
+  /* Allow selection when interactive mode is active and the node is NOT dragging. */
+  .react-flow__node:not(.dragging) [data-tile-interactive='true'] * {
+    user-select: text;
   }
 }

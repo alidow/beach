@@ -39,7 +39,7 @@ This document tracks the remaining milestones for the new `beach` stack. Each ph
 
 - Automate latency/throughput benchmarks comparing beach vs. `ssh $USER@localhost` + tmux, targeting ≥30% lower echo latency.
 - Capture keystroke-to-render timings, steady-state frame cadence, and bandwidth utilisation, exporting CSV summaries.
-- Integrate with `BEACH_PROFILE=1` so emulator/sync timings feed the benchmark reports.
+- Integrate with `BEACH_PERF=1` (legacy `BEACH_PROFILE=1`) so emulator/sync timings feed the benchmark reports.
 - Add loopback packet capture hooks so binary protocol payloads can be diffed against mosh baselines.
 
 ## 🆕 7. Binary Protocol + Diff Precision

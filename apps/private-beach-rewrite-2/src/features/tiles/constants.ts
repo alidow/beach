@@ -11,3 +11,4 @@ export const SURFACE_MIN_HEIGHT = 600;
 export const SURFACE_PADDING_PX = 160;
 
 export const TILE_HEADER_HEIGHT = 44;
+export const DEFAULT_CANVAS_VIEWPORT = { zoom: 1, pan: { x: 0, y: 0 } } as const;

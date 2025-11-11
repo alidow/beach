@@ -80,6 +80,18 @@ async fn postgres_sqlx_e2e() {
         .expect("acquire controller");
     assert!(!lease.controller_token.is_empty());
 
+    let renewed = state
+        .acquire_controller(&session_id, Some(5_000), Some("e2e".into()), None)
+        .await
+        .expect("renew controller");
+    assert_eq!(lease.controller_token, renewed.controller_token);
+
+    let tile_lease = state
+        .acquire_controller(&session_id, Some(5_000), Some("ui".into()), None)
+        .await
+        .expect("acquire secondary controller");
+    assert_ne!(tile_lease.controller_token, lease.controller_token);
+
     // Queue an action and poll it back
     let cmd = ActionCommand {
         id: "pg-e2e-1".into(),
@@ -113,6 +125,38 @@ async fn postgres_sqlx_e2e() {
         .ack_actions(&session_id, vec![ack], None, false)
         .await
         .expect("ack actions");
+
+    // Second controller should be able to queue concurrently
+    let cmd2 = ActionCommand {
+        id: "pg-e2e-2".into(),
+        action_type: "key".into(),
+        payload: serde_json::json!({"key": "y"}),
+        expires_at: None,
+    };
+    state
+        .queue_actions(
+            &session_id,
+            &tile_lease.controller_token,
+            vec![cmd2.clone()],
+            None,
+        )
+        .await
+        .expect("queue actions from second controller");
+    let polled2 = state.poll_actions(&session_id).await.expect("poll second");
+    assert_eq!(polled2.len(), 1);
+    assert_eq!(polled2[0].id, cmd2.id);
+    let ack2 = ActionAck {
+        id: cmd2.id.clone(),
+        status: AckStatus::Ok,
+        applied_at: std::time::SystemTime::now(),
+        latency_ms: Some(12),
+        error_code: None,
+        error_message: None,
+    };
+    state
+        .ack_actions(&session_id, vec![ack2], None, false)
+        .await
+        .expect("ack second action");
 
     // Record health and state
     let hb = HealthHeartbeat {

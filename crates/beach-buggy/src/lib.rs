@@ -480,6 +480,12 @@ impl<T: ManagerTransport> SessionHarness<T> {
                 "queued new actions for session {}",
                 self.config.session_id
             );
+            debug!(
+                target = "controller.actions",
+                session_id = %self.config.session_id,
+                command_count = commands.len(),
+                "host received actions from manager"
+            );
         }
 
         Ok(commands)
@@ -508,9 +514,10 @@ impl<T: ManagerTransport> SessionHarness<T> {
             return Err(HarnessError::InvalidState("action not found in queue"));
         }
 
+        let ack_status = status.clone();
         let ack = ActionAck {
             id: command_id.to_owned(),
-            status,
+            status: ack_status,
             applied_at: SystemTime::now(),
             latency_ms: None,
             error_code: error.map(ToOwned::to_owned),
@@ -520,6 +527,13 @@ impl<T: ManagerTransport> SessionHarness<T> {
         self.transport
             .ack_actions(&self.config.session_id, vec![ack])
             .await?;
+        debug!(
+            target = "controller.actions",
+            session_id = %self.config.session_id,
+            command_id,
+            status = ?status,
+            "acknowledged controller action"
+        );
         Ok(())
     }
 

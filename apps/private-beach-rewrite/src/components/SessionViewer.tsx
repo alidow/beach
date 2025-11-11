@@ -15,6 +15,16 @@ type SessionViewerProps = {
   onViewportMetricsChange?: (snapshot: TileViewportSnapshot | null) => void;
 };
 
+function isTerminalTraceEnabled(): boolean {
+  if (typeof globalThis !== 'undefined' && (globalThis as Record<string, any>).__BEACH_TILE_TRACE) {
+    return true;
+  }
+  if (typeof process !== 'undefined' && process.env?.NEXT_PUBLIC_PRIVATE_BEACH_TERMINAL_TRACE === '1') {
+    return true;
+  }
+  return false;
+}
+
 function normalizeMetric(value: number | null | undefined): number | null {
   if (typeof value !== 'number') {
     return null;
@@ -74,7 +84,7 @@ export function SessionViewer({
   }, [joinState, showError]);
 
   useEffect(() => {
-    if (typeof window === 'undefined') {
+    if (typeof window === 'undefined' || !isTerminalTraceEnabled()) {
       return undefined;
     }
     const store = viewer.store;
@@ -114,7 +124,7 @@ export function SessionViewer({
   }, [sessionId, viewer.store]);
 
   useEffect(() => {
-    if (!viewer.store) {
+    if (!viewer.store || !isTerminalTraceEnabled()) {
       return undefined;
     }
 
@@ -167,7 +177,7 @@ export function SessionViewer({
   }, [sessionId, viewer.store]);
 
   useEffect(() => {
-    if (typeof window === 'undefined') {
+    if (typeof window === 'undefined' || !isTerminalTraceEnabled()) {
       return;
     }
     let snapshotSummary: { rows: number; viewportHeight: number; baseRow: number } | null = null;

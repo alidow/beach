@@ -68,6 +68,15 @@ function normaliseCredential(payload: ViewerCredentialPayload): NormalisedCreden
     return { passcode: passcode || undefined, viewerToken: credential };
   }
 
+  // Fallback support: some manager builds return a one-time passcode instead of a token.
+  // CabanaSessionPlayer accepts a passcode when no explicit viewer token is provided.
+  if (type === 'viewer_passcode') {
+    if (!credential) {
+      throw new Error('viewer passcode is missing');
+    }
+    return { passcode: credential, viewerToken: '' };
+  }
+
   throw new Error(`unsupported viewer credential type: ${payload.credential_type ?? 'unknown'}`);
 }
 

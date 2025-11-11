@@ -3,10 +3,17 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+fn env_truthy(var: &str) -> Option<bool> {
+    std::env::var(var).map(|v| v != "0" && !v.is_empty()).ok()
+}
+
 static PERF_ENABLED: Lazy<bool> = Lazy::new(|| {
-    std::env::var("BEACH_PROFILE")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false)
+    env_truthy("BEACH_PERF")
+        .or_else(|| env_truthy("BEACH_TELEMETRY"))
+        .unwrap_or_else(|| {
+            // Backwards compat: BEACH_PROFILE used to double as the perf toggle.
+            matches!(std::env::var("BEACH_PROFILE").ok().as_deref(), Some("1"))
+        })
 });
 
 static STATS: Lazy<Mutex<HashMap<&'static str, PerfStat>>> =

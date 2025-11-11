@@ -1,6 +1,19 @@
 'use client';
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+/**
+ * TileFlowNode
+ *
+ * Dragging stability notes:
+ * - The header carries `rf-drag-handle` so React Flow only starts drags from
+ *   the header. This prevents conflicts with dynamic content inside the body
+ *   (terminal/editor).
+ * - While dragging, we reduce heavy visual effects and promote the wrapper to
+ *   its own compositor layer (translateZ(0), backface-visibility, containment).
+ *   This eliminates transient disappearance when transforms update quickly.
+ * - Do not re-enable `transition: all`; keep transitions limited to
+ *   [box-shadow, border-color] so we never animate transforms mid-drag.
+ */
 import type { CSSProperties, MouseEvent, PointerEvent } from 'react';
 import { Handle, Position, useStore } from 'reactflow';
 import type { NodeProps, ReactFlowState } from 'reactflow';
@@ -173,6 +186,7 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
   const lastResizeClickRef = useRef<number>(0);
   const [hovered, setHovered] = useState(false);
   const [terminalHover, setTerminalHover] = useState(false);
+  const [dragPerfMode, setDragPerfMode] = useState(false);
   const isAgent = tile.nodeType === 'agent';
   const agentMeta = useMemo(() => normalizeAgentMeta(tile.agentMeta ?? null), [tile.agentMeta]);
   const [agentRole, setAgentRole] = useState(agentMeta.role);
@@ -743,6 +757,71 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
     setInteractiveTile(tile.id);
   }, [bringToFront, isInteractive, setActiveTile, setInteractiveTile, tile.id]);
 
+  const copySelectionToClipboard = useCallback(async (text: string) => {
+    if (typeof window === 'undefined') {
+      return false;
+    }
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (error) {
+      console.warn('[tile] clipboard.writeText failed', error);
+    }
+    try {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.setAttribute('readonly', 'true');
+      textarea.style.position = 'fixed';
+      textarea.style.top = '-9999px';
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      const success = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      return success;
+    } catch (error) {
+      console.warn('[tile] execCommand copy failed', error);
+      return false;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isInteractive) {
+      return;
+    }
+    const tileElement = nodeRef.current;
+    if (!tileElement) {
+      return;
+    }
+    const handleCopyHotkey = (event: KeyboardEvent) => {
+      const isCopyKey = event.key === 'c' || event.key === 'C';
+      if (!isCopyKey || (!event.metaKey && !event.ctrlKey)) {
+        return;
+      }
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed) {
+        return;
+      }
+      const contains = (node: Node | null) => (node ? tileElement.contains(node) : false);
+      if (!contains(selection.anchorNode) || !contains(selection.focusNode)) {
+        return;
+      }
+      const text = selection.toString();
+      if (!text) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      void copySelectionToClipboard(text);
+    };
+    window.addEventListener('keydown', handleCopyHotkey, true);
+    return () => {
+      window.removeEventListener('keydown', handleCopyHotkey, true);
+    };
+  }, [copySelectionToClipboard, isInteractive]);
+
   const handleViewportMetricsChange = useCallback(
     (snapshot: TileViewportSnapshot | null) => {
       viewportMetricsRef.current = snapshot;
@@ -753,16 +832,34 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
 
   const showInteractOverlay = !isAgent && !isInteractive && terminalHover && !dragging;
 
+  useEffect(() => {
+    if (!dragging) {
+      setDragPerfMode(false);
+      return;
+    }
+    const timer = window.setTimeout(() => setDragPerfMode(true), 120);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [dragging]);
+
+  const reduceEffects = dragging && dragPerfMode;
+
   const nodeClass = cn(
-    // Avoid transitioning transform while dragging (can cause flicker).
-    // Limit transitions to visual properties only.
-    'group relative flex h-full w-full flex-col overflow-visible rounded-2xl border border-slate-700/60 bg-slate-950/80 text-slate-200 shadow-[0_28px_80px_rgba(2,6,23,0.6)] backdrop-blur-xl transition-[box-shadow,border-color] duration-150',
+    'group relative flex h-full w-full flex-col overflow-visible rounded-2xl border border-slate-300 dark:border-slate-700/60 bg-white dark:bg-slate-950/80 text-slate-800 dark:text-slate-200 transition-[box-shadow,border-color,backdrop-filter] duration-150',
     !isInteractive && 'select-none',
-    // Remove blue glow on active tiles
-    // Previously: border-sky-400/60 shadow-[0_32px_90px_rgba(14,165,233,0.35)]
     isResizing && 'cursor-[se-resize]',
-    isInteractive && 'border-amber-400/80 shadow-[0_32px_90px_rgba(251,146,60,0.45)] ring-1 ring-amber-300/70 cursor-auto',
-    dragging && 'transition-none shadow-none backdrop-blur-0',
+    isInteractive
+      ? 'border-amber-400/80 shadow-[0_32px_90px_rgba(251,146,60,0.45)] cursor-auto backdrop-blur-xl'
+      : reduceEffects
+        ? 'shadow-[0_18px_48px_rgba(2,6,23,0.45)] dark:shadow-[0_20px_60px_rgba(2,6,23,0.5)] backdrop-blur-lg select-none'
+        : 'shadow-[0_8px_30px_rgba(2,6,23,0.12)] dark:shadow-[0_28px_80px_rgba(2,6,23,0.6)] backdrop-blur-xl',
+  );
+
+  const interactHaloClass = cn(
+    'pointer-events-none absolute inset-0 z-20 rounded-[inherit] border-[1.5px] border-amber-300/90 shadow-[0_0_32px_rgba(251,191,36,0.45)] transition-opacity transition-transform duration-150 transform',
+    isInteractive ? 'opacity-100 scale-100' : 'opacity-0 scale-95',
+    dragging && 'opacity-0',
   );
 
   return (
@@ -777,10 +874,6 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
         transform: dragging ? 'translateZ(0)' : undefined,
         backfaceVisibility: 'hidden',
         transformStyle: 'preserve-3d',
-        contain: dragging ? ('layout paint' as any) : undefined,
-        // Reduce compositor work and avoid filter repainting while dragging
-        filter: dragging ? 'none' : undefined,
-        backdropFilter: dragging ? 'none' : undefined,
         isolation: 'isolate',
       }}
       data-testid={`rf__node-tile:${tile.id}`}
@@ -794,232 +887,243 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
           event.stopPropagation();
         }
       }}
-      onPointerEnter={() => setHovered(true)}
-      onPointerLeave={() => setHovered(false)}
+      onPointerEnter={() => {
+        if (dragging) return;
+        setHovered(true);
+      }}
+      onPointerLeave={() => {
+        if (dragging) return;
+        setHovered(false);
+      }}
       data-tile-interactive={isInteractive ? 'true' : 'false'}
     >
-      <div
-        className={cn(
-          'pointer-events-none absolute inset-0 z-30 flex items-center justify-center rounded-2xl bg-slate-950/40 transition-opacity duration-150',
-          showInteractOverlay ? 'opacity-100' : 'opacity-0'
-        )}
-        aria-hidden={!showInteractOverlay}
-      >
-        <button
-          type="button"
-          onClick={handleToggleInteractive}
-          className="pointer-events-auto inline-flex items-center gap-2 rounded-full border border-amber-200/70 bg-amber-300/90 px-4 py-2 text-xs font-semibold uppercase tracking-[0.28em] text-slate-900 shadow-lg transition hover:bg-amber-200"
-          data-tile-drag-ignore="true"
+      <span className={interactHaloClass} aria-hidden="true" />
+      <div className="relative flex h-full flex-1 flex-col overflow-hidden rounded-[inherit]">
+        <div
+          className={cn(
+            'pointer-events-none absolute inset-0 z-30 flex items-center justify-center rounded-[inherit] bg-white/60 dark:bg-slate-950/40 transition-opacity duration-150',
+            showInteractOverlay ? 'opacity-100' : 'opacity-0'
+          )}
+          aria-hidden={!showInteractOverlay}
         >
-          Interact
-        </button>
-      </div>
-      <header
-        className="rf-drag-handle flex min-h-[44px] items-center justify-between border-b border-white/10 bg-slate-900/80 px-4 py-2.5 backdrop-blur"
-        style={{ minHeight: TILE_HEADER_HEIGHT, backdropFilter: dragging ? 'none' as any : undefined }}
-      >
-        <div className="flex min-w-0 flex-col gap-1">
-          <span className="truncate text-sm font-semibold text-white/90" title={headerTitle}>
-            {headerTitle}
-          </span>
-          {headerSubtitle ? (
-            <small className="truncate text-[11px] uppercase tracking-[0.18em] text-slate-400">
-              {headerSubtitle}
-            </small>
-          ) : null}
-          {isInteractive ? (
-            <span className="mt-0.5 inline-flex items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.28em] text-amber-200">
-              Live Control
-            </span>
-          ) : null}
-        </div>
-        <div className="flex items-center gap-2">
           <button
             type="button"
-            className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-sky-400/40 bg-sky-500/10 text-[11px] font-semibold uppercase tracking-[0.2em] text-sky-100 transition hover:border-sky-300/70 hover:bg-sky-500/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
-            title="Resize tile to host viewport"
-            aria-label="Auto resize tile"
-            onClick={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              handleAutoResize(true);
-            }}
-            onDoubleClick={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              handleAutoResize(true);
-            }}
+            onClick={handleToggleInteractive}
+            className="pointer-events-auto inline-flex items-center gap-2 rounded-full border border-amber-200/70 bg-amber-300/90 px-4 py-2 text-xs font-semibold uppercase tracking-[0.28em] text-slate-900 shadow-lg transition hover:bg-amber-200"
             data-tile-drag-ignore="true"
           >
-            ⇱
+            Interact
           </button>
-          {isAgent && !showAgentEditor ? (
+        </div>
+        {/**
+         * Tile header styling:
+         * - Light: white bar with subtle border for a lighter, app-like chrome
+         * - Dark: translucent slate to blend with dark canvas
+         */}
+        <header
+          className="rf-drag-handle flex min-h-[44px] items-center justify-between border-b border-black/10 dark:border-white/10 bg-white/90 dark:bg-slate-900/80 px-4 py-2.5 backdrop-blur"
+          style={{ minHeight: TILE_HEADER_HEIGHT, backdropFilter: dragging ? 'none' as any : undefined }}
+        >
+          <div className="flex min-w-0 flex-col gap-1">
+            <span className="truncate text-sm font-semibold text-slate-900 dark:text-white/90" title={headerTitle}>
+              {headerTitle}
+            </span>
+            {headerSubtitle ? (
+              <small className="truncate text-[11px] uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">
+                {headerSubtitle}
+              </small>
+            ) : null}
+          </div>
+          <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={handleAgentEdit}
+              className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-sky-300/60 dark:border-sky-400/40 bg-sky-500/10 text-[11px] font-semibold uppercase tracking-[0.2em] text-sky-800 dark:text-sky-100 transition hover:border-sky-400/70 hover:bg-sky-500/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
+              title="Resize tile to host viewport"
+              aria-label="Auto resize tile"
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                handleAutoResize(true);
+              }}
+              onDoubleClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                handleAutoResize(true);
+              }}
               data-tile-drag-ignore="true"
-              className="inline-flex h-7 items-center justify-center rounded-full border border-indigo-400/40 bg-indigo-500/10 px-3 text-[10px] font-semibold uppercase tracking-[0.24em] text-indigo-100"
             >
-              Edit
+              ⇱
             </button>
-          ) : null}
-          <button
-            type="button"
-            className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-500/40 bg-red-500/15 text-base font-semibold text-red-200 transition hover:border-red-400/70 hover:bg-red-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400/60"
-            onClick={handleRemove}
+            {isAgent && !showAgentEditor ? (
+              <button
+                type="button"
+                onClick={handleAgentEdit}
+                data-tile-drag-ignore="true"
+                className="inline-flex h-7 items-center justify-center rounded-full border border-indigo-400/40 bg-indigo-500/10 px-3 text-[10px] font-semibold uppercase tracking-[0.24em] text-indigo-700 dark:text-indigo-100"
+              >
+                Edit
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-red-400/60 dark:border-red-500/40 bg-red-500/15 text-base font-semibold text-red-700 dark:text-red-200 transition hover:border-red-500/70 hover:bg-red-500/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400/60"
+              onClick={handleRemove}
+              data-tile-drag-ignore="true"
+              title="Remove tile"
+            >
+              ×
+            </button>
+          </div>
+        </header>
+        {isAgent ? (
+          <div
+            className="border-b border-black/5 dark:border-white/5 bg-white/80 dark:bg-slate-950/70 px-4 py-3 text-sm text-slate-600 dark:text-slate-300"
             data-tile-drag-ignore="true"
-            title="Remove tile"
           >
-            ×
-          </button>
-        </div>
-      </header>
-      {isAgent ? (
-        <div
-          className="border-b border-white/5 bg-slate-950/70 px-4 py-3 text-sm text-slate-300"
-          data-tile-drag-ignore="true"
-        >
-          {agentSaveState === 'saving' ? (
-            <p className="mb-2 rounded border border-sky-400/40 bg-sky-500/10 px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-sky-100">
-              Updating agent…
-            </p>
-          ) : null}
-          {agentSaveNotice ? (
-            <p className="mb-2 rounded border border-emerald-400/30 bg-emerald-500/10 px-3 py-1 text-[11px] text-emerald-100">
-              {agentSaveNotice}
-            </p>
-          ) : null}
-          {showAgentEditor ? (
-            <div className="space-y-2">
-              <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400" htmlFor={`agent-role-${tile.id}`}>
-                Role
-              </label>
-              <input
-                id={`agent-role-${tile.id}`}
-                value={agentRole}
-                onChange={(event) => setAgentRole(event.target.value)}
-                className="w-full rounded border border-white/10 bg-white/5 px-3 py-2 text-sm text-white focus:border-indigo-400 focus:outline-none"
-                placeholder="e.g. Deploy orchestrator"
-              />
-              <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400" htmlFor={`agent-resp-${tile.id}`}>
-                Responsibility
-              </label>
-              <textarea
-                id={`agent-resp-${tile.id}`}
-                value={agentResponsibility}
-                onChange={(event) => setAgentResponsibility(event.target.value)}
-                rows={3}
-                className="w-full rounded border border-white/10 bg-white/5 px-3 py-2 text-sm text-white focus:border-indigo-400 focus:outline-none"
-                placeholder="Describe how this agent should manage connected sessions"
-              />
-              <label className="mt-2 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-400">
+            {agentSaveState === 'saving' ? (
+              <p className="mb-2 rounded border border-sky-400/40 bg-sky-500/10 px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-sky-800 dark:text-sky-100">
+                Updating agent…
+              </p>
+            ) : null}
+            {agentSaveNotice ? (
+              <p className="mb-2 rounded border border-emerald-400/30 bg-emerald-500/10 px-3 py-1 text-[11px] text-emerald-800 dark:text-emerald-100">
+                {agentSaveNotice}
+              </p>
+            ) : null}
+            {showAgentEditor ? (
+              <div className="space-y-2">
+                <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400" htmlFor={`agent-role-${tile.id}`}>
+                  Role
+                </label>
                 <input
-                  type="checkbox"
-                  checked={agentTraceEnabled}
-                  onChange={(event) => handleTraceToggle(event.target.checked)}
-                  className="h-4 w-4 rounded border border-white/20 bg-slate-900 text-indigo-400 focus:ring-indigo-400"
+                  id={`agent-role-${tile.id}`}
+                  value={agentRole}
+                  onChange={(event) => setAgentRole(event.target.value)}
+                  className="w-full rounded border border-white/10 bg-white/5 px-3 py-2 text-sm text-white focus:border-indigo-400 focus:outline-none"
+                  placeholder="e.g. Deploy orchestrator"
                 />
-                <span>Trace Logging</span>
-              </label>
-              {agentTraceEnabled ? (
-                <div className="flex items-center justify-between rounded-md border border-white/10 bg-white/5 px-3 py-2 text-[11px] text-slate-300">
-                  <span className="font-mono text-[10px]">
-                    {(agentTraceId ?? 'pending…').slice(0, 36)}
-                  </span>
+                <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400" htmlFor={`agent-resp-${tile.id}`}>
+                  Responsibility
+                </label>
+                <textarea
+                  id={`agent-resp-${tile.id}`}
+                  value={agentResponsibility}
+                  onChange={(event) => setAgentResponsibility(event.target.value)}
+                  rows={3}
+                  className="w-full rounded border border-white/10 bg-white/5 px-3 py-2 text-sm text-white focus:border-indigo-400 focus:outline-none"
+                  placeholder="Describe how this agent should manage connected sessions"
+                />
+                <label className="mt-2 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-400">
+                  <input
+                    type="checkbox"
+                    checked={agentTraceEnabled}
+                    onChange={(event) => handleTraceToggle(event.target.checked)}
+                    className="h-4 w-4 rounded border border-white/20 bg-slate-900 text-indigo-400 focus:ring-indigo-400"
+                  />
+                  <span>Trace Logging</span>
+                </label>
+                {agentTraceEnabled ? (
+                  <div className="flex items-center justify-between rounded-md border border-white/10 bg-white/5 px-3 py-2 text-[11px] text-slate-300">
+                    <span className="font-mono text-[10px]">
+                      {(agentTraceId ?? 'pending…').slice(0, 36)}
+                    </span>
+                    <button
+                      type="button"
+                      className="text-[10px] font-semibold uppercase tracking-[0.2em] text-sky-300"
+                      onClick={handleTraceRefresh}
+                    >
+                      Refresh
+                    </button>
+                  </div>
+                ) : null}
+                <div className="flex gap-2 pt-1 text-xs">
                   <button
                     type="button"
-                    className="text-[10px] font-semibold uppercase tracking-[0.2em] text-sky-300"
-                    onClick={handleTraceRefresh}
+                    onClick={handleAgentSave}
+                    className="flex-1 rounded bg-indigo-600 px-3 py-2 font-semibold text-white disabled:opacity-40"
+                    disabled={!agentRole.trim() || !agentResponsibility.trim()}
                   >
-                    Refresh
+                    {agentSaveState === 'saving' ? 'Saving…' : 'Save'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleAgentCancel}
+                    className="flex-1 rounded border border-white/15 px-3 py-2 font-semibold text-slate-200"
+                  >
+                    Cancel
                   </button>
                 </div>
-              ) : null}
-              <div className="flex gap-2 pt-1 text-xs">
-                <button
-                  type="button"
-                  onClick={handleAgentSave}
-                  className="flex-1 rounded bg-indigo-600 px-3 py-2 font-semibold text-white disabled:opacity-40"
-                  disabled={!agentRole.trim() || !agentResponsibility.trim()}
-                >
-                  {agentSaveState === 'saving' ? 'Saving…' : 'Save'}
-                </button>
-                <button
-                  type="button"
-                  onClick={handleAgentCancel}
-                  className="flex-1 rounded border border-white/15 px-3 py-2 font-semibold text-slate-200"
-                >
-                  Cancel
-                </button>
               </div>
-            </div>
-          ) : (
-            <div className="flex flex-col gap-2 text-xs">
-              <div>
-                <p className="font-semibold uppercase tracking-[0.2em] text-slate-400">Role</p>
-                <p className="text-sm text-white/90">{agentMeta.role}</p>
-              </div>
-              <div>
-                <p className="font-semibold uppercase tracking-[0.2em] text-slate-400">Responsibility</p>
-                <p className="text-sm text-white/90">{agentMeta.responsibility}</p>
-              </div>
-              <div>
-                <p className="font-semibold uppercase tracking-[0.2em] text-slate-400">Trace</p>
-                <p className="text-sm text-white/90">
-                  {agentMeta.trace?.enabled ? `Enabled (${agentMeta.trace.trace_id ?? 'pending'})` : 'Disabled'}
+            ) : (
+              <div className="flex flex-col gap-2 text-xs">
+                <div>
+                  <p className="font-semibold uppercase tracking-[0.2em] text-slate-500 dark:text-slate-400">Role</p>
+                  <p className="text-sm text-slate-900 dark:text-white/90">{agentMeta.role}</p>
+                </div>
+                <div>
+                  <p className="font-semibold uppercase tracking-[0.2em] text-slate-500 dark:text-slate-400">Responsibility</p>
+                  <p className="text-sm text-slate-900 dark:text-white/90">{agentMeta.responsibility}</p>
+                </div>
+                <div>
+                  <p className="font-semibold uppercase tracking-[0.2em] text-slate-500 dark:text-slate-400">Trace</p>
+                  <p className="text-sm text-slate-900 dark:text-white/90">
+                    {agentMeta.trace?.enabled ? `Enabled (${agentMeta.trace.trace_id ?? 'pending'})` : 'Disabled'}
+                  </p>
+                </div>
+                <p className="text-[11px] text-slate-400">
+                  Drag the right connector to an application or another agent to define how this agent should manage it.
                 </p>
               </div>
-              <p className="text-[11px] text-slate-400">
-                Drag the right connector to an application or another agent to define how this agent should manage it.
-              </p>
-            </div>
+            )}
+          </div>
+        ) : null}
+        {showAgentEditor ? (
+          <div
+            className="border-t border-black/5 dark:border-white/5 bg-white/70 dark:bg-slate-950/60 px-4 py-2 text-center text-[11px] text-slate-500 dark:text-slate-400"
+            data-tile-drag-ignore="true"
+          >
+            Save this agent&rsquo;s role and responsibility to keep it pinned, but the session preview remains available below.
+          </div>
+        ) : null}
+        <section
+          className={cn(
+            'relative flex flex-1 flex-col gap-3 overflow-hidden bg-white/70 dark:bg-slate-950/60 transition-opacity',
+            isInteractive
+              ? 'pointer-events-auto select-text nodrag nopan'
+              : 'pointer-events-none opacity-[0.98] select-none',
+            dragging && 'pointer-events-none select-none',
           )}
-        </div>
-      ) : null}
-      {showAgentEditor ? (
-        <div
-          className="border-t border-white/5 bg-slate-950/60 px-4 py-2 text-center text-[11px] text-slate-400"
           data-tile-drag-ignore="true"
         >
-          Save this agent&rsquo;s role and responsibility to keep it pinned, but the session preview remains available below.
-        </div>
-      ) : null}
-      <section
-        className={cn(
-          'relative flex flex-1 flex-col gap-3 overflow-hidden bg-slate-950/60 transition-opacity',
-          isInteractive ? 'pointer-events-auto select-text' : 'pointer-events-none opacity-[0.98] select-none',
-          dragging && 'pointer-events-none',
-        )}
-        data-tile-drag-ignore="true"
-      >
-        {!isInteractive ? (
-          <div
-            className="pointer-events-auto absolute inset-0 z-10"
-            onPointerEnter={() => setTerminalHover(true)}
-            onPointerLeave={() => setTerminalHover(false)}
-            onClick={(event) => {
-              // Let clicks fall through so users can still double-click to enter interact mode
-              event.stopPropagation();
-              handleToggleInteractive();
-            }}
+          {!isInteractive ? (
+            <div
+              className="pointer-events-auto absolute inset-0 z-10"
+              onPointerEnter={() => setTerminalHover(true)}
+              onPointerLeave={() => setTerminalHover(false)}
+              onClick={(event) => {
+                // Let clicks fall through so users can still double-click to enter interact mode
+                event.stopPropagation();
+                handleToggleInteractive();
+              }}
+            />
+          ) : null}
+          <ApplicationTile
+            tileId={tile.id}
+            privateBeachId={privateBeachId}
+            managerUrl={managerBaseUrl}
+            sessionMeta={tile.sessionMeta ?? null}
+            onSessionMetaChange={handleMetaChange}
+            onViewportMetricsChange={handleViewportMetricsChange}
+            traceContext={
+              isAgent && agentMeta.trace?.enabled
+                ? {
+                    traceId: agentMeta.trace?.trace_id ?? null,
+                  }
+                : undefined
+            }
           />
-        ) : null}
-        <ApplicationTile
-          tileId={tile.id}
-          privateBeachId={privateBeachId}
-          managerUrl={managerBaseUrl}
-          sessionMeta={tile.sessionMeta ?? null}
-          onSessionMetaChange={handleMetaChange}
-          onViewportMetricsChange={handleViewportMetricsChange}
-          traceContext={
-            isAgent && agentMeta.trace?.enabled
-              ? {
-                  traceId: agentMeta.trace?.trace_id ?? null,
-                }
-              : undefined
-          }
-        />
-      </section>
+        </section>
+      </div>
       <button
         type="button"
         className="absolute bottom-3 right-3 z-10 h-5 w-5 cursor-nwse-resize rounded-md border border-sky-400/40 bg-[radial-gradient(circle_at_top_left,rgba(56,189,248,0.6),rgba(56,189,248,0.05))] text-transparent transition hover:border-sky-400/60 hover:shadow-[0_0_12px_rgba(56,189,248,0.45)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"

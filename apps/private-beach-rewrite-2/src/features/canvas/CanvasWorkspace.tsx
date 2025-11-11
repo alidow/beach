@@ -6,11 +6,13 @@ import { CanvasEventsProvider } from './CanvasEventsContext';
 import { FlowCanvas } from './FlowCanvas';
 import { NodeDrawer } from './NodeDrawer';
 import type { CanvasNodeDefinition, NodePlacementPayload, TileMovePayload } from './types';
+import type { CanvasViewportState } from '@/features/tiles/types';
 
 type CanvasWorkspaceProps = {
   nodes: CanvasNodeDefinition[];
   onNodePlacement: (payload: NodePlacementPayload) => void;
   onTileMove?: (payload: TileMovePayload) => void;
+  onViewportChange?: (viewport: CanvasViewportState) => void;
   privateBeachId: string;
   managerUrl?: string;
   rewriteEnabled: boolean;
@@ -43,6 +45,7 @@ export function CanvasWorkspace({
   nodes,
   onNodePlacement,
   onTileMove,
+  onViewportChange,
   privateBeachId,
   managerUrl,
   rewriteEnabled,
@@ -68,6 +71,7 @@ export function CanvasWorkspace({
           <FlowCanvas
             onNodePlacement={onNodePlacement}
             onTileMove={onTileMove}
+            onViewportChange={onViewportChange}
             privateBeachId={privateBeachId}
             managerUrl={managerUrl}
             rewriteEnabled={rewriteEnabled}

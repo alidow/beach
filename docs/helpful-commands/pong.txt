@@ -51,6 +51,7 @@ Here are cargo-run commands for both players and the agent, matching your patter
 
 LHS player (single line)
 
+export PRIVATE_BEACH_MANAGER_URL=http://localhost:8080
 LOG_DIR="$HOME/beach-debug"; mkdir -p "$LOG_DIR"
 cd ~/development/beach && cargo run --bin beach -- \
   --log-level trace \
@@ -64,6 +65,7 @@ cd ~/development/beach && cargo run --bin beach -- \
 
 RHS player (single line)
 
+export PRIVATE_BEACH_MANAGER_URL=http://localhost:8080
 LOG_DIR="$HOME/beach-debug"; mkdir -p "$LOG_DIR"
 cd ~/development/beach && cargo run --bin beach -- \
   --log-level trace \
@@ -76,6 +78,7 @@ cd ~/development/beach && cargo run --bin beach -- \
   | tee "$LOG_DIR/bootstrap-rhs.json"
 
 Agent (single line; no session-id envs; just declare beach + manager)
+
 
 cd ~/development/beach
 chmod +x apps/private-beach/demo/pong/tools/run-agent.sh

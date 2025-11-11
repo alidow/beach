@@ -15,6 +15,13 @@ type PersistenceOptions = {
   auto?: boolean;
 };
 
+/**
+ * Canvas layout persistence with optional auto-debounce.
+ *
+ * IMPORTANT: pass { auto: false } while using React Flow dragging to avoid
+ * scheduling mid-drag network calls/log spam. Instead, call the returned
+ * requestImmediatePersist() handler after placement and on drag stop.
+ */
 export function useTileLayoutPersistence({
   beachId,
   managerUrl,

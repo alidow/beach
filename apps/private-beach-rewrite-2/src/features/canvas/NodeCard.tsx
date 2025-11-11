@@ -16,16 +16,6 @@ export function NodeCardContent({ node }: NodeCardContentProps) {
         </span>
       </div>
       {node.description ? <p className="mt-2 text-xs leading-relaxed text-muted-foreground">{node.description}</p> : null}
-      <dl className="mt-3 grid grid-cols-2 gap-2 text-[11px] leading-4 text-muted-foreground">
-        <div>
-          <dt className="font-medium text-foreground">Width</dt>
-          <dd>{node.defaultSize.width}px</dd>
-        </div>
-        <div>
-          <dt className="font-medium text-foreground">Height</dt>
-          <dd>{node.defaultSize.height}px</dd>
-        </div>
-      </dl>
     </>
   );
 }

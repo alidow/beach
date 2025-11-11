@@ -3434,7 +3434,7 @@ async fn fetch_sdp(
             let payload = payload_attempt.map_err(http_error)?;
             Ok(Some(payload))
         }
-        StatusCode::NOT_FOUND => {
+        StatusCode::NO_CONTENT | StatusCode::NOT_FOUND => {
             if let Some(alt_base) = rewrite_signaling_base(base) {
                 let alt_is_fastpath = alt_base.contains("/fastpath/sessions/");
                 // Skip useless fastpath retry for answers; manager doesn't expose answer endpoint
@@ -3491,7 +3491,7 @@ async fn fetch_sdp(
                             .map_err(http_error)?;
                         Ok(Some(payload))
                     }
-                    StatusCode::NOT_FOUND => Ok(None),
+                    StatusCode::NOT_FOUND | StatusCode::NO_CONTENT => Ok(None),
                     status if status.is_server_error() => Err(TransportError::Setup(format!(
                         "signaling server returned {} (alt)",
                         status

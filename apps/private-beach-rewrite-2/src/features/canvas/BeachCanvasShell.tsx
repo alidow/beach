@@ -1,19 +1,21 @@
 'use client';
 
 import Link from 'next/link';
-import { useCallback, useEffect, useMemo } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { CanvasWorkspace } from './CanvasWorkspace';
 import { ThemeToggleButton } from '@/components/ThemeToggleButton';
 import type { CanvasNodeDefinition, NodePlacementPayload, TileMovePayload } from './types';
 import type { CanvasLayout } from '@/lib/api';
 import type { SessionSummary } from '@private-beach/shared-api';
 import { TileStoreProvider, layoutToTileState, serializeTileStateKey, useTileActions, useTileState } from '@/features/tiles';
+import type { CanvasViewportState } from '@/features/tiles/types';
 import type { TileNodeType } from '@/features/tiles/types';
 import { extractTileLinkFromMetadata, sessionSummaryToTileMeta } from '@/features/tiles/sessionMeta';
 import { ManagerTokenProvider } from '@/hooks/ManagerTokenContext';
 import { buildManagerUrl } from '@/hooks/useManagerToken';
 import { emitTelemetry } from '../../../../private-beach/src/lib/telemetry';
 import { useTileLayoutPersistence } from './useTileLayoutPersistence';
+import { CANVAS_CENTER_TILE_EVENT, type CanvasCenterTileEventDetail } from './events';
 
 type BeachCanvasShellProps = {
   beachId: string;
@@ -166,6 +168,13 @@ function BeachCanvasShellInner({
     [beachId, requestImmediatePersist, rewriteEnabled],
   );
 
+  const handleViewportChange = useCallback(
+    (_viewport: CanvasViewportState) => {
+      requestImmediatePersist();
+    },
+    [requestImmediatePersist],
+  );
+
   useEffect(() => {
     emitTelemetry('canvas.rewrite.flag-state', {
       privateBeachId: beachId,
@@ -173,15 +182,57 @@ function BeachCanvasShellInner({
     });
   }, [beachId, rewriteEnabled]);
 
+  const sessionMetaSignature = useMemo(() => {
+    const entries = Object.values(tileState.tiles).map((tile) => {
+      const meta = tile.sessionMeta;
+      if (!meta) {
+        return `${tile.id}::`;
+      }
+      return [
+        tile.id,
+        meta.sessionId ?? '',
+        meta.title ?? '',
+        meta.status ?? '',
+        meta.harnessType ?? '',
+        meta.pendingActions ?? '',
+      ].join(':');
+    });
+    if (entries.length === 0) {
+      return 'tiles:none';
+    }
+    return entries.sort().join('|');
+  }, [tileState.tiles]);
+
+  const sessionMetaPersistRef = useRef<string>(sessionMetaSignature);
+
+  useEffect(() => {
+    if (sessionMetaSignature === sessionMetaPersistRef.current) {
+      return;
+    }
+    sessionMetaPersistRef.current = sessionMetaSignature;
+    requestImmediatePersist();
+  }, [requestImmediatePersist, sessionMetaSignature]);
+
   const interactiveTileId = tileState.interactiveId;
   const interactiveTile = interactiveTileId ? tileState.tiles[interactiveTileId] : null;
   const interactiveSessionTitle = interactiveTile?.sessionMeta?.title ?? null;
   const interactiveSessionId = interactiveTile?.sessionMeta?.sessionId ?? null;
   const interactiveBadgeCode = interactiveSessionId ? interactiveSessionId.slice(0, 5) : null;
-  const showInteractiveBadge = Boolean(interactiveBadgeCode);
+  const showInteractiveBadge = Boolean(interactiveTile);
+  const interactiveBadgeLabel = interactiveBadgeCode ? `#${interactiveBadgeCode}` : 'Connecting…';
+  const interactiveBadgeSrLabel =
+    interactiveSessionTitle ?? (interactiveBadgeCode ? `session ${interactiveBadgeCode}` : 'this session');
+  const interactiveBadgeAccent = 'rgba(251, 191, 36, 0.8)';
   const handleClearInteractive = useCallback(() => {
     setInteractiveTile(null);
   }, [setInteractiveTile]);
+  const handleCenterInteractive = useCallback(() => {
+    if (typeof window === 'undefined' || !interactiveTileId) {
+      return;
+    }
+    const detail: CanvasCenterTileEventDetail = { tileId: interactiveTileId };
+    window.dispatchEvent(new CustomEvent(CANVAS_CENTER_TILE_EVENT, { detail }));
+  }, [interactiveTileId]);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -198,8 +249,9 @@ function BeachCanvasShellInner({
   }, [interactiveTile, interactiveTile?.sessionMeta?.sessionId, interactiveTileId]);
 
   const wrapperClassName = [
-    'relative z-0 flex h-full min-h-0 w-full flex-col bg-slate-950 text-slate-200',
-    "after:pointer-events-none after:absolute after:inset-0 after:-z-10 after:content-[''] after:bg-[radial-gradient(circle_at_top,rgba(56,189,248,0.18),transparent_60%)]",
+    'relative z-0 flex h-full min-h-0 w-full flex-col bg-background text-foreground',
+    // Subtle top glow only in dark mode to avoid washing out light canvas
+    "dark:after:pointer-events-none dark:after:absolute dark:after:inset-0 dark:after:-z-10 dark:after:content-[''] dark:after:bg-[radial-gradient(circle_at_top,rgba(56,189,248,0.18),transparent_60%)]",
     className ?? '',
   ]
     .filter(Boolean)
@@ -228,7 +280,7 @@ function BeachCanvasShellInner({
 
   return (
     <div className={wrapperClassName}>
-      <header className="relative z-30 flex h-12 items-center justify-between border-b border-white/10 bg-slate-950/70 px-6 backdrop-blur-xl">
+      <header className="relative z-30 flex h-12 items-center justify-between border-b border-black/10 dark:border-white/10 bg-white/90 dark:bg-slate-950/70 px-6 backdrop-blur-xl">
         <div className="flex items-center gap-4">
           {backHref ? (
             <Link
@@ -243,23 +295,31 @@ function BeachCanvasShellInner({
           </div>
         </div>
         <div className="flex items-center gap-3">
-          {showInteractiveBadge && interactiveBadgeCode ? (
-            <button
-              type="button"
-              onClick={handleClearInteractive}
-              className="inline-flex items-center gap-1.5 rounded-full border border-orange-300/60 bg-orange-400/85 px-2.5 py-0.5 text-[10px] font-semibold text-slate-950 shadow-[0_12px_28px_rgba(249,115,22,0.35)] transition hover:bg-orange-300"
-              title="Stop interacting with this session"
+          {showInteractiveBadge ? (
+            <div
+              className="inline-flex items-center gap-1.5 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold text-slate-950 shadow-[0_12px_28px_rgba(249,115,22,0.35)] transition hover:brightness-110"
+              role="group"
+              style={{ backgroundColor: interactiveBadgeAccent, borderColor: interactiveBadgeAccent }}
             >
-              <span className="text-[9px] uppercase tracking-[0.32em]">Interact</span>
-              <span className="font-mono text-[11px] tracking-wide">#{interactiveBadgeCode}</span>
-              <span
-                aria-hidden="true"
-                className="ml-0.5 inline-flex h-4 w-4 items-center justify-center rounded-full bg-slate-900/30 text-[11px] font-bold"
+              <button
+                type="button"
+                onClick={handleCenterInteractive}
+                className="flex items-center gap-1.5 rounded-full px-1.5 py-0.5 text-[10px] font-semibold text-slate-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-900/30"
+                aria-label={`Center canvas on ${interactiveBadgeSrLabel}`}
+                title="Center this tile"
+              >
+                <span className="font-mono text-[11px] tracking-wide">{interactiveBadgeLabel}</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleClearInteractive}
+                className="ml-0.5 inline-flex h-4 w-4 items-center justify-center rounded-full bg-slate-900/30 text-[11px] font-bold text-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-900/30"
+                aria-label={`Stop interacting with ${interactiveBadgeSrLabel}`}
+                title="Stop interacting with this session"
               >
                 ×
-              </span>
-              <span className="sr-only">Stop interacting with {interactiveSessionTitle ?? `session ${interactiveBadgeCode}`}</span>
-            </button>
+              </button>
+            </div>
           ) : null}
           <ThemeToggleButton />
         </div>
@@ -269,6 +329,7 @@ function BeachCanvasShellInner({
           nodes={catalog}
           onNodePlacement={handlePlacement}
           onTileMove={handleTileMove}
+          onViewportChange={handleViewportChange}
           privateBeachId={beachId}
           managerUrl={managerUrl}
           rewriteEnabled={rewriteEnabled}

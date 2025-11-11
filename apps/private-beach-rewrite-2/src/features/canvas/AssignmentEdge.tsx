@@ -96,7 +96,7 @@ export const AssignmentEdge = memo(function AssignmentEdge({
                 value={instructions}
                 onChange={(event) => setInstructions(event.target.value)}
                 rows={3}
-                className="mt-2 w-full rounded border border-slate-200 px-2 py-1 text-xs focus:border-indigo-500 focus:outline-none"
+                className="mt-2 w-full rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500"
                 placeholder="Describe how this agent should manage the connected session"
               />
               <p className="mt-3 text-[10px] font-semibold uppercase tracking-widest text-slate-500">
@@ -136,10 +136,10 @@ export const AssignmentEdge = memo(function AssignmentEdge({
                   </span>
                   <input
                     type="number"
-                    min={5}
+                    min={1}
                     value={pollFrequency}
                     onChange={(event) => setPollFrequency(Number(event.target.value) || 0)}
-                    className="h-7 w-16 rounded border border-slate-200 px-1 text-right"
+                    className="h-7 w-16 rounded border border-slate-200 bg-white px-1 text-right text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500"
                   />
                   <span>seconds</span>
                 </label>

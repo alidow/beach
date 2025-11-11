@@ -73,6 +73,7 @@ describe('FlowCanvas viewport updates', () => {
       resizing: {},
       interactiveId: null,
       viewport: {},
+      canvasViewport: { zoom: 1, pan: { x: 0, y: 0 } },
     };
 
     const noop = () => {};

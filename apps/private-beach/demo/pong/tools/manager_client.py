@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import http.client
 import json
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -231,29 +233,45 @@ class PrivateBeachManagerClient:
             headers["Authorization"] = f"Bearer {self.token}"
         if trace_id:
             headers["X-Trace-Id"] = trace_id
+        stream_timeout = max(self.timeout or 0.0, 120.0)
         request = urllib.request.Request(url, headers=headers, method="GET")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                buffer = []
-                for raw_line in response:
+            with urllib.request.urlopen(request, timeout=stream_timeout) as response:
+                buffer: List[str] = []
+                while True:
+                    try:
+                        raw_line = response.readline()
+                    except (TimeoutError, socket.timeout):
+                        continue
+                    if raw_line == b"":
+                        break
                     line = raw_line.decode("utf-8", errors="ignore").rstrip("\r\n")
                     if line.startswith("data:"):
                         buffer.append(line[5:].strip())
-                    elif not line:
-                        if not buffer:
-                            continue
-                        data_str = "\n".join(buffer)
-                        buffer.clear()
-                        if not data_str:
-                            continue
-                        try:
-                            payload = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            continue
-                        yield payload
-        except urllib.error.URLError as exc:  # pragma: no cover - network failures
+                        continue
+                    if line:
+                        continue
+                    if not buffer:
+                        continue
+                    data_str = "\n".join(buffer)
+                    buffer.clear()
+                    if not data_str:
+                        continue
+                    try:
+                        payload = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    yield payload
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            socket.timeout,
+            ConnectionResetError,
+            http.client.RemoteDisconnected,
+        ) as exc:  # pragma: no cover - network failures
+            reason = getattr(exc, "reason", str(exc))
             raise ManagerRequestError(
-                f"state subscription failed for {session_id}: {exc.reason}"
+                f"state subscription failed for {session_id}: {reason}"
             ) from exc
 
     def subscribe_controller_pairings(
@@ -269,27 +287,43 @@ class PrivateBeachManagerClient:
             headers["Authorization"] = f"Bearer {self.token}"
         if trace_id:
             headers["X-Trace-Id"] = trace_id
+        stream_timeout = max(self.timeout or 0.0, 120.0)
         request = urllib.request.Request(url, headers=headers, method="GET")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                buffer = []
-                for raw_line in response:
+            with urllib.request.urlopen(request, timeout=stream_timeout) as response:
+                buffer: List[str] = []
+                while True:
+                    try:
+                        raw_line = response.readline()
+                    except (TimeoutError, socket.timeout):
+                        continue
+                    if raw_line == b"":
+                        break
                     line = raw_line.decode("utf-8", errors="ignore").rstrip("\r\n")
                     if line.startswith("data:"):
                         buffer.append(line[5:].strip())
-                    elif not line:
-                        if not buffer:
-                            continue
-                        data_str = "\n".join(buffer)
-                        buffer.clear()
-                        if not data_str:
-                            continue
-                        try:
-                            payload = json.loads(data_str)
-                        except json.JSONDecodeError:
-                            continue
-                        yield payload
-        except urllib.error.URLError as exc:  # pragma: no cover - network failures
+                        continue
+                    if line:
+                        continue
+                    if not buffer:
+                        continue
+                    data_str = "\n".join(buffer)
+                    buffer.clear()
+                    if not data_str:
+                        continue
+                    try:
+                        payload = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    yield payload
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            socket.timeout,
+            ConnectionResetError,
+            http.client.RemoteDisconnected,
+        ) as exc:  # pragma: no cover - network failures
+            reason = getattr(exc, "reason", str(exc))
             raise ManagerRequestError(
-                f"pairing subscription failed for {controller_session_id}: {exc.reason}"
+                f"pairing subscription failed for {controller_session_id}: {reason}"
             ) from exc

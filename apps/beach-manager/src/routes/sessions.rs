@@ -14,9 +14,13 @@ use serde::Deserialize;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::state::{
-    AgentOnboardResponse, AppState, ControllerEvent, ControllerLeaseResponse, ControllerPairing,
-    ControllerUpdateCadence, JoinSessionResponsePayload, SessionSummary, StateError,
+use crate::{
+    log_throttle::{should_log_queue_event, QueueLogKind},
+    state::{
+        AgentOnboardResponse, AppState, ControllerEvent, ControllerLeaseResponse,
+        ControllerPairing, ControllerUpdateCadence, JoinSessionResponsePayload, SessionSummary,
+        StateError,
+    },
 };
 
 use super::{ApiError, ApiResult, AuthToken};
@@ -282,13 +286,15 @@ pub async fn queue_actions(
         .get("x-trace-id")
         .and_then(|value| value.to_str().ok())
     {
-        info!(
-            target: "controller.actions",
-            trace_id,
-            session_id,
-            action_count = body.actions.len(),
-            "queue_actions request"
-        );
+        if should_log_queue_event(QueueLogKind::Request, &session_id) {
+            info!(
+                target: "controller.actions",
+                trace_id,
+                session_id,
+                action_count = body.actions.len(),
+                "queue_actions request"
+            );
+        }
     }
 
     state
@@ -463,7 +469,7 @@ pub async fn attach_by_code(
     Json(body): Json<AttachByCodeRequest>,
 ) -> ApiResult<AttachByCodeResponse> {
     ensure_scope(&token, "pb:sessions.write")?;
-    let session = state
+    let session = match state
         .attach_by_code(
             &private_beach_id,
             &body.session_id,
@@ -471,7 +477,19 @@ pub async fn attach_by_code(
             token.account_uuid(),
         )
         .await
-        .map_err(map_state_err)?;
+    {
+        Ok(session) => session,
+        Err(err) => {
+            warn!(
+                target = "private_beach.sessions",
+                private_beach_id = %private_beach_id,
+                session_id = %body.session_id,
+                error = %err,
+                "session attach failed"
+            );
+            return Err(map_state_err(err));
+        }
+    };
     Ok(Json(AttachByCodeResponse {
         ok: true,
         attach_method: "code",
@@ -593,6 +611,9 @@ fn map_state_err(err: StateError) -> ApiError {
         StateError::External(msg) => {
             error!(message = %msg, "external dependency failure");
             ApiError::Upstream("external service failure")
+        }
+        StateError::ActionQueueFull { .. } => {
+            ApiError::TooManyRequests("pending controller action queue full")
         }
     }
 }

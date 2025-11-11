@@ -365,6 +365,9 @@ fn state_error(id: Option<Value>, err: StateError) -> JsonRpcResponse {
             error!(message = %message, "external service error while processing MCP request");
             (-32012, "external service error".into())
         }
+        StateError::ActionQueueFull { .. } => {
+            (-32013, "pending controller action queue full".into())
+        }
     };
 
     JsonRpcResponse {

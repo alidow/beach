@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod fastpath;
+mod log_throttle;
 mod metrics;
 mod routes;
 mod state;
@@ -11,6 +12,7 @@ use routes::build_router;
 use sqlx::postgres::PgPoolOptions;
 use state::AppState;
 use std::{net::SocketAddr, path::Path, sync::OnceLock, time::Duration};
+use tokio::time::sleep;
 use tracing::{info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{filter::EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -61,6 +63,16 @@ async fn main() -> anyhow::Result<()> {
         cfg.beach_gate_url.clone(),
         cfg.beach_gate_viewer_token.clone(),
     );
+
+    {
+        let cleanup_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                cleanup_state.cleanup_stale_sessions().await;
+                sleep(state::STALE_SESSION_SWEEP_INTERVAL).await;
+            }
+        });
+    }
 
     if let Some(redis_url) = &cfg.redis_url {
         match redis::Client::open(redis_url.clone()) {

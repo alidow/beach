@@ -59,6 +59,7 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
 
   let beach: BeachMeta | null = null;
   let layout: CanvasLayout | null = null;
+  let sessions: SessionSummary[] = [];
   try {
     beach = await getBeachMeta(beachId, token, managerBaseUrl);
   } catch (error) {
@@ -81,26 +82,38 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
     throw error;
   }
 
-  let sessions: SessionSummary[] = [];
-  try {
-    layout = await getCanvasLayout(beach.id, token, managerBaseUrl);
-    console.info('[rewrite-2] loaded layout', {
-      beachId: beach.id,
-      tileCount: Object.keys(layout?.tiles ?? {}).length,
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.warn('[rewrite-2] getCanvasLayout failed', { beachId: beach.id, error: message });
-    layout = null;
+  if (!beach) {
+    throw new Error('Unable to load beach metadata.');
   }
 
-  try {
-    sessions = await listSessions(beach.id, token, managerBaseUrl);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.warn('[rewrite-2] listSessions failed', { beachId: beach.id, error: message });
-    sessions = [];
-  }
+  const [loadedLayout, loadedSessions] = await Promise.all([
+    (async () => {
+      try {
+        const nextLayout = await getCanvasLayout(beach.id, token, managerBaseUrl);
+        console.info('[rewrite-2] loaded layout', {
+          beachId: beach.id,
+          tileCount: Object.keys(nextLayout?.tiles ?? {}).length,
+        });
+        return nextLayout;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn('[rewrite-2] getCanvasLayout failed', { beachId: beach.id, error: message });
+        return null;
+      }
+    })(),
+    (async () => {
+      try {
+        return await listSessions(beach.id, token, managerBaseUrl);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn('[rewrite-2] listSessions failed', { beachId: beach.id, error: message });
+        return [];
+      }
+    })(),
+  ]);
+
+  layout = loadedLayout;
+  sessions = loadedSessions;
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-transparent" data-private-beach-rewrite={rewriteEnabled ? 'enabled' : 'disabled'}>

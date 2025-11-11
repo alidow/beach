@@ -1,14 +1,18 @@
 import { AppShellTopNav } from '@/components/AppShellTopNav';
 
-export default function BeachLoading() {
+export default function LoadingBeachPage() {
   return (
-    <div className="flex min-h-screen flex-col bg-background">
-      <AppShellTopNav backHref="/beaches" title="Loading beach…" />
-      <main className="flex-1">
-        <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-6 px-4 pb-12 pt-6 sm:px-6 lg:px-8">
-          <div className="grid flex-1 gap-6 lg:grid-cols-[minmax(0,2fr)_minmax(320px,1fr)]">
-            <div className="min-h-[480px] rounded-lg border border-border bg-muted/40" />
-            <div className="rounded-lg border border-border bg-muted/30" />
+    <div className="flex h-screen flex-col overflow-hidden bg-transparent">
+      <AppShellTopNav backHref="/beaches" title="Private Beach" subtitle="Setting up your beach…" />
+      <main className="flex flex-1 items-center justify-center px-6 text-center text-sm text-slate-400">
+        <div className="flex flex-col items-center gap-3">
+          <div
+            className="h-10 w-10 animate-spin rounded-full border-2 border-border border-t-transparent"
+            aria-hidden
+          />
+          <div className="space-y-1">
+            <p className="font-medium text-slate-200">Preparing your beach</p>
+            <p className="text-xs text-slate-400">Loading the latest layout and session data…</p>
           </div>
         </div>
       </main>

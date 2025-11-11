@@ -17,8 +17,11 @@ use std::{
 };
 
 use crate::auth::{AuthConfig, AuthContext};
-use crate::fastpath::{send_actions_over_fast_path, FastPathRegistry, FastPathSession};
-use crate::metrics;
+use crate::{
+    fastpath::{send_actions_over_fast_path, FastPathRegistry, FastPathSession},
+    log_throttle::{should_log_queue_event, QueueLogKind},
+    metrics,
+};
 use beach_buggy::{
     AckStatus, ActionAck, ActionCommand, CellStylePayload, CursorPosition, HarnessType,
     HealthHeartbeat, RegisterSessionRequest, RegisterSessionResponse, StateDiff, StyleDefinition,
@@ -52,6 +55,9 @@ const REDIS_ACTION_CONSUMER_PREFIX: &str = "poller";
 const VIEWER_KEEPALIVE_INTERVAL: StdDuration = StdDuration::from_secs(20);
 const VIEWER_KEEPALIVE_PAYLOAD: &str = "__keepalive__";
 const VIEWER_IDLE_LOG_AFTER: StdDuration = StdDuration::from_secs(45);
+pub(crate) const STALE_SESSION_MAX_IDLE: StdDuration = StdDuration::from_secs(180);
+pub(crate) const STALE_SESSION_SWEEP_INTERVAL: StdDuration = StdDuration::from_secs(60);
+const MAX_PENDING_ACTIONS_PER_SESSION: usize = 500;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -99,6 +105,7 @@ struct SessionRecord {
     pending_actions: VecDeque<ActionCommand>,
     controller_events: Vec<ControllerEvent>,
     last_health: Option<HealthHeartbeat>,
+    last_health_at: Option<Instant>,
     last_state: Option<StateDiff>,
 }
 
@@ -607,6 +614,13 @@ pub enum StateError {
     Serde(#[from] serde_json::Error),
     #[error("external service error: {0}")]
     External(String),
+    #[error("pending controller action queue full for session {session_id} ({depth}/{limit})")]
+    ActionQueueFull {
+        session_id: String,
+        private_beach_id: String,
+        depth: usize,
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1129,12 +1143,19 @@ impl AppState {
             .await
             .unwrap_or(false);
         if !verified {
+            warn!(
+                target = "private_beach.sessions",
+                private_beach_id = %private_beach_id,
+                session_id = %origin_session_id,
+                "attach_by_code verification failed"
+            );
             return Err(StateError::InvalidIdentifier("invalid_code".into()));
         }
         // Create mapping if not exists
         match &self.backend {
             Backend::Memory => {
                 let mut sessions = self.fallback.sessions.write().await;
+                let existed = sessions.contains_key(origin_session_id);
                 let rec = sessions
                     .entry(origin_session_id.to_string())
                     .or_insert_with(|| {
@@ -1167,6 +1188,12 @@ impl AppState {
                         "failed to start controller forwarder (memory backend)"
                     );
                 }
+                log_session_attachment(
+                    private_beach_id,
+                    origin_session_id,
+                    "code",
+                    if existed { "updated" } else { "attached" },
+                );
                 Ok(SessionSummary::from_record(rec))
             }
             Backend::Postgres(pool) => {
@@ -1190,7 +1217,7 @@ impl AppState {
                     return Err(StateError::PrivateBeachNotFound);
                 }
                 // Insert session row if not exists, leave harness fields null
-                let _ = sqlx::query(
+                let insert_result = sqlx::query(
                     r#"
                     INSERT INTO session (private_beach_id, origin_session_id, kind, created_by_account_id, attach_method)
                     VALUES ($1, $2, 'terminal', $3, 'code')
@@ -1202,6 +1229,7 @@ impl AppState {
                 .bind(requester)
                 .execute(tx.as_mut())
                 .await?;
+                let inserted = insert_result.rows_affected() > 0;
 
                 // Emit a controller_event of type registered to reflect attach
                 // Look up db session id
@@ -1249,6 +1277,12 @@ impl AppState {
                         });
                     rec.viewer_passcode = Some(code.to_string());
                 }
+                log_session_attachment(
+                    private_beach_id,
+                    origin_session_id,
+                    "code",
+                    if inserted { "attached" } else { "updated" },
+                );
 
                 if let Err(err) = self.spawn_viewer_worker(origin_session_id).await {
                     warn!(
@@ -1304,6 +1338,12 @@ impl AppState {
                             Some("attach_owned".into()),
                         );
                     }
+                    log_session_attachment(
+                        private_beach_id,
+                        &id,
+                        "owned",
+                        if existed { "duplicate" } else { "attached" },
+                    );
                 }
                 Ok((attached, duplicates))
             }
@@ -1337,9 +1377,11 @@ impl AppState {
                 .await?;
                         if result.rows_affected() == 0 {
                             duplicates += 1;
+                            log_session_attachment(private_beach_id, &id, "owned", "duplicate");
                         } else {
                             attached += 1;
                             ids_to_nudge.push(id.clone());
+                            log_session_attachment(private_beach_id, &id, "owned", "attached");
                         }
                     }
                 }
@@ -2347,6 +2389,30 @@ impl AppState {
                     }
                 }
 
+                let private_beach_id_str = identifiers.private_beach_id.to_string();
+                let queue_depth = self
+                    .pending_actions_count(&private_beach_id_str, &session_uuid_str)
+                    .await?;
+                let projected_depth = queue_depth.saturating_add(actions.len());
+                if projected_depth > MAX_PENDING_ACTIONS_PER_SESSION {
+                    if should_log_queue_event(QueueLogKind::Overflow, &session_uuid_str) {
+                        warn!(
+                            target = "controller.delivery",
+                            session_id = %session_uuid,
+                            private_beach_id = %private_beach_id_str,
+                            queue_depth,
+                            attempted = actions.len(),
+                            limit = MAX_PENDING_ACTIONS_PER_SESSION,
+                            "controller action queue over limit; throttling producer"
+                        );
+                    }
+                    return Err(StateError::ActionQueueFull {
+                        session_id: session_uuid_str.clone(),
+                        private_beach_id: private_beach_id_str,
+                        depth: queue_depth,
+                        limit: MAX_PENDING_ACTIONS_PER_SESSION,
+                    });
+                }
                 debug!(
                     target = "controller.delivery",
                     session_id = %session_uuid,
@@ -2358,14 +2424,14 @@ impl AppState {
                 );
 
                 self.enqueue_actions_redis(
-                    &identifiers.private_beach_id.to_string(),
+                    &private_beach_id_str,
                     &session_uuid_str,
                     actions.clone(),
                 )
                 .await?;
 
                 // Metrics: enqueue count and queue depth gauge
-                let label0 = identifiers.private_beach_id.to_string();
+                let label0 = private_beach_id_str.clone();
                 let label1 = session_uuid_str.clone();
                 let labels = [label0.as_str(), label1.as_str()];
                 metrics::ACTIONS_ENQUEUED
@@ -2778,6 +2844,76 @@ impl AppState {
         }
     }
 
+    pub async fn cleanup_stale_sessions(&self) {
+        let active_ids: HashSet<String> = {
+            let controller = self.controller_workers.read().await;
+            let viewer = self.viewer_workers.read().await;
+            controller.keys().chain(viewer.keys()).cloned().collect()
+        };
+
+        if active_ids.is_empty() {
+            return;
+        }
+
+        let stale_candidates: Vec<String> = match &self.backend {
+            Backend::Memory => {
+                let sessions = self.fallback.sessions.read().await;
+                let now = Instant::now();
+                sessions
+                    .iter()
+                    .filter_map(|(id, record)| {
+                        if let Some(ts) = record.last_health_at {
+                            if now.duration_since(ts) > STALE_SESSION_MAX_IDLE {
+                                return Some(id.clone());
+                            }
+                        }
+                        None
+                    })
+                    .collect()
+            }
+            Backend::Postgres(pool) => {
+                let cutoff_secs = STALE_SESSION_MAX_IDLE.as_secs() as i64;
+                match sqlx::query!(
+                    r#"
+                    SELECT s.origin_session_id::text AS session_id
+                    FROM session s
+                    LEFT JOIN session_runtime r ON r.session_id = s.id
+                    WHERE
+                        (r.last_health_at IS NOT NULL AND r.last_health_at < NOW() - ($1 * INTERVAL '1 second'))
+                        OR
+                        (r.last_health_at IS NULL AND s.created_at < NOW() - ($1 * INTERVAL '1 second'))
+                    "#,
+                    cutoff_secs
+                )
+                .fetch_all(pool)
+                .await
+                {
+                    Ok(rows) => rows.into_iter().filter_map(|row| row.session_id).collect(),
+                    Err(err) => {
+                        warn!(
+                            target = "private_beach.sessions",
+                            error = %err,
+                            "failed to query stale sessions"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+        };
+
+        let mut stale_ids: Vec<String> = stale_candidates
+            .into_iter()
+            .filter(|id| active_ids.contains(id))
+            .collect();
+        stale_ids.sort();
+        stale_ids.dedup();
+
+        for session_id in stale_ids {
+            self.stop_session_workers(&session_id, "stale_session_timeout")
+                .await;
+        }
+    }
+
     pub async fn state_snapshot(&self, session_id: &str) -> Result<Option<StateDiff>, StateError> {
         match &self.backend {
             Backend::Memory => {
@@ -2933,6 +3069,40 @@ impl AppState {
         });
         workers.insert(session_id.to_string(), ControllerForwarderWorker { handle });
         Ok(())
+    }
+
+    async fn stop_session_workers(&self, session_id: &str, reason: &str) {
+        let mut removed = false;
+        {
+            let mut controllers = self.controller_workers.write().await;
+            if let Some(existing) = controllers.remove(session_id) {
+                existing.handle.abort();
+                removed = true;
+            }
+        }
+        {
+            let mut viewers = self.viewer_workers.write().await;
+            if let Some(existing) = viewers.remove(session_id) {
+                existing.handle.abort();
+                removed = true;
+            }
+        }
+
+        if removed {
+            let beach_id = {
+                let sessions = self.fallback.sessions.read().await;
+                sessions
+                    .get(session_id)
+                    .map(|record| record.private_beach_id.clone())
+            };
+            info!(
+                target = "private_beach.sessions",
+                session_id = %session_id,
+                private_beach_id = beach_id.as_deref().unwrap_or("unknown"),
+                reason,
+                "session workers stopped"
+            );
+        }
     }
 
     pub async fn emergency_stop(
@@ -3427,6 +3597,7 @@ impl InnerState {
         let mut sessions = self.sessions.write().await;
         if let Some(record) = sessions.get_mut(session_id) {
             record.last_health = Some(heartbeat);
+            record.last_health_at = Some(Instant::now());
         }
     }
 
@@ -3600,6 +3771,7 @@ impl SessionRecord {
             pending_actions: VecDeque::new(),
             controller_events: Vec::new(),
             last_health: None,
+            last_health_at: None,
             last_state: None,
         }
     }
@@ -4465,6 +4637,9 @@ impl AppState {
         leases: &[LeaseRow],
     ) {
         if !tracing::enabled!(Level::INFO) {
+            return;
+        }
+        if !should_log_queue_event(QueueLogKind::Validate, session_id) {
             return;
         }
         let now = now_ms();
@@ -5803,6 +5978,7 @@ async fn controller_forwarder_once(
         .map_err(|err| ControllerForwarderError::Join(err.to_string()))?;
     let manager = SessionManager::new(config)
         .map_err(|err| ControllerForwarderError::Join(err.to_string()))?;
+    let fallback_base = manager.config().base_url().clone();
     let joined = manager
         .join(
             session_id,
@@ -5813,7 +5989,9 @@ async fn controller_forwarder_once(
         )
         .await
         .map_err(|err| ControllerForwarderError::Join(err.to_string()))?;
-    let handle = joined.into_handle();
+    let mut handle = joined.into_handle();
+    rewrite_loopback_transports(&mut handle, &fallback_base)
+        .map_err(|err| ControllerForwarderError::Join(err.to_string()))?;
     let negotiated = negotiate_transport(&handle, Some(join_code), Some("pb-controller"), false)
         .await
         .map_err(|err| ControllerForwarderError::Negotiation(err.to_string()))?;
@@ -6187,6 +6365,17 @@ fn is_loopback_host(host: &str) -> bool {
 
 fn viewer_config_error(message: impl Into<String>) -> ViewerError {
     ViewerError::Join(SessionError::InvalidConfig(message.into()))
+}
+
+fn log_session_attachment(private_beach_id: &str, session_id: &str, method: &str, status: &str) {
+    info!(
+        target = "private_beach.sessions",
+        private_beach_id = %private_beach_id,
+        session_id = %session_id,
+        method,
+        status,
+        "session attachment updated"
+    );
 }
 
 struct ViewerGaugeGuard {

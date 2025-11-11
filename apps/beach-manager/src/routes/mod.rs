@@ -121,6 +121,7 @@ pub enum ApiError {
     Forbidden(&'static str),
     NotFound(&'static str),
     Conflict(&'static str),
+    TooManyRequests(&'static str),
     BadRequest(String),
     Upstream(&'static str),
 }
@@ -139,6 +140,14 @@ impl IntoResponse for ApiError {
                 Json(ApiErrorBody {
                     error: "unauthorized",
                     message: None,
+                }),
+            )
+                .into_response(),
+            ApiError::TooManyRequests(msg) => (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                Json(ApiErrorBody {
+                    error: "too_many_requests",
+                    message: Some(msg.to_string()),
                 }),
             )
                 .into_response(),

@@ -564,5 +564,8 @@ fn map_state_err(err: StateError) -> ApiError {
             warn!(message = %msg, "external dependency failure");
             ApiError::Upstream("external service failure")
         }
+        StateError::ActionQueueFull { .. } => {
+            ApiError::TooManyRequests("pending controller action queue full")
+        }
     }
 }

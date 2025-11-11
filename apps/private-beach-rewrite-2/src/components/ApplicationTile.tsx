@@ -695,7 +695,7 @@ export function ApplicationTile({
   return (
     <div className="flex h-full min-h-0 flex-col gap-4 text-[13px] text-slate-800 dark:text-slate-200">
       {!hasSession ? (
-        <form className="grid gap-3" onSubmit={handleAttach}>
+        <form className="grid gap-3 px-4 pt-4 pb-5" onSubmit={handleAttach}>
           <label className="grid gap-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
             <span>Session ID</span>
             <input
@@ -703,7 +703,7 @@ export function ApplicationTile({
               onChange={(event) => setSessionIdInput(event.target.value)}
               placeholder="sess-1234…"
               autoComplete="off"
-              className="h-10 rounded-full border border-slate-300 dark:border-white/10 bg-white dark:bg-white/5 px-4 text-[13px] font-medium text-slate-900 dark:text-white placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
+              className="h-10 rounded border border-slate-300 dark:border-white/10 bg-white dark:bg-white/5 px-4 text-[13px] font-medium text-slate-900 dark:text-white placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
             />
           </label>
           <label className="grid gap-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
@@ -713,7 +713,7 @@ export function ApplicationTile({
               onChange={(event) => setCodeInput(event.target.value)}
               placeholder="6-digit code"
               autoComplete="off"
-              className="h-10 rounded-full border border-slate-300 dark:border-white/10 bg-white dark:bg-white/5 px-4 text-[13px] font-medium text-slate-900 dark:text-white placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
+              className="h-10 rounded border border-slate-300 dark:border-white/10 bg-white dark:bg-white/5 px-4 text-[13px] font-medium text-slate-900 dark:text-white placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
             />
           </label>
           <button

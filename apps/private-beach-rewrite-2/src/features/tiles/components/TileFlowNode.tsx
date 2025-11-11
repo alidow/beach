@@ -833,6 +833,16 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
   const showInteractOverlay = !isAgent && !isInteractive && terminalHover && !dragging;
 
   useEffect(() => {
+    if (!isAgent) {
+      return;
+    }
+    const hasSession = Boolean(tile.sessionMeta?.sessionId);
+    if (!hasSession && !isInteractive) {
+      setInteractiveTile(tile.id);
+    }
+  }, [isAgent, isInteractive, setInteractiveTile, tile.id, tile.sessionMeta?.sessionId]);
+
+  useEffect(() => {
     if (!dragging) {
       setDragPerfMode(false);
       return;

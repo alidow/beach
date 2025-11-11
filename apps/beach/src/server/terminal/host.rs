@@ -48,7 +48,8 @@ use beach_buggy::{
     HttpTransport as ManagerHttpTransport, ManagerTransport,
     StaticTokenProvider as ManagerStaticTokenProvider,
 };
-use serde_json::Value;
+use reqwest::Client;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Read, Write};
@@ -325,6 +326,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                 .flatten()
         };
         if let Some(bearer) = token {
+            maybe_auto_attach_session(&manager_url, &session_id, &bearer).await;
             let writer_for_actions = writer.clone();
             let session_for_actions = session_id.clone();
             tokio::spawn(async move {
@@ -1623,6 +1625,82 @@ fn display_cmd(cmd: &[String]) -> String {
         }
     }
     rendered
+}
+
+async fn maybe_auto_attach_session(manager_url: &str, session_id: &str, bearer: &str) {
+    let beach_id = std::env::var("PRIVATE_BEACH_ID")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let passcode = std::env::var("PRIVATE_BEACH_SESSION_PASSCODE")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+
+    let (beach_id, passcode) = match (beach_id, passcode) {
+        (Some(id), Some(code)) => (id.trim().to_string(), code.trim().to_string()),
+        _ => {
+            debug!(
+                target = "controller.actions",
+                "skipping auto-attach; PRIVATE_BEACH_ID or PRIVATE_BEACH_SESSION_PASSCODE not set"
+            );
+            return;
+        }
+    };
+
+    let client = match Client::builder().build() {
+        Ok(c) => c,
+        Err(err) => {
+            warn!(
+                target = "controller.actions",
+                error = %err,
+                "failed to build HTTP client for auto-attach"
+            );
+            return;
+        }
+    };
+
+    let endpoint = format!(
+        "{}/private-beaches/{}/sessions/attach-by-code",
+        manager_url.trim_end_matches('/'),
+        beach_id
+    );
+
+    match client
+        .post(&endpoint)
+        .bearer_auth(bearer)
+        .json(&json!({ "session_id": session_id, "code": passcode }))
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            info!(
+                target = "controller.actions",
+                session_id = %session_id,
+                private_beach_id = %beach_id,
+                "auto-attached session via manager"
+            );
+        }
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            warn!(
+                target = "controller.actions",
+                session_id = %session_id,
+                private_beach_id = %beach_id,
+                status = %status,
+                body = %body,
+                "auto-attach request rejected"
+            );
+        }
+        Err(err) => {
+            warn!(
+                target = "controller.actions",
+                session_id = %session_id,
+                private_beach_id = %beach_id,
+                error = %err,
+                "auto-attach request failed"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

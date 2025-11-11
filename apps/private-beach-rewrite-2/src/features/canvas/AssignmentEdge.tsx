@@ -7,6 +7,8 @@ import {
   getSmoothStepPath,
   type EdgeProps,
 } from 'reactflow';
+import { cn } from '@/lib/cn';
+import { TILE_DANGER_BUTTON_CLASS, TILE_PRIMARY_BUTTON_CLASS } from '@/components/tileButtonClasses';
 
 export type UpdateMode = 'idle-summary' | 'push' | 'poll';
 
@@ -87,43 +89,45 @@ export const AssignmentEdge = memo(function AssignmentEdge({
             <form
               onSubmit={handleSubmit}
               onPointerDown={(event) => event.stopPropagation()}
-              className="w-72 rounded-2xl border border-slate-200 bg-white p-3 text-xs text-slate-700 shadow-2xl"
+              className="w-72 rounded-2xl border border-slate-200/80 bg-white/95 p-4 text-[13px] text-slate-700 shadow-2xl dark:border-white/10 dark:bg-slate-950/95 dark:text-slate-200"
             >
-              <p className="text-[10px] font-semibold uppercase tracking-widest text-slate-500">
+              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">
                 Assignment Instructions
               </p>
               <textarea
                 value={instructions}
                 onChange={(event) => setInstructions(event.target.value)}
                 rows={3}
-                className="mt-2 w-full rounded border border-slate-200 bg-white px-2 py-1 text-xs text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500"
+                className="mt-2 w-full rounded border border-slate-300 bg-white px-3 py-2 text-[13px] font-medium text-slate-900 placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60 dark:border-white/10 dark:bg-white/5 dark:text-white dark:placeholder:text-slate-400"
                 placeholder="Describe how this agent should manage the connected session"
               />
-              <p className="mt-3 text-[10px] font-semibold uppercase tracking-widest text-slate-500">
+              <p className="mt-4 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">
                 Update cadence
               </p>
-              <div className="mt-2 space-y-2">
-                <label className="flex items-center gap-2">
+              <div className="mt-2 space-y-3">
+                <label className="flex items-center gap-2 text-[13px] text-slate-700 dark:text-slate-200">
                   <input
                     type="radio"
                     name={`edge-mode-${id}`}
                     value="idle-summary"
                     checked={updateMode === 'idle-summary'}
                     onChange={() => setUpdateMode('idle-summary')}
+                    className="h-4 w-4 rounded-full border border-slate-300 text-indigo-500 focus:ring-indigo-400 dark:border-white/20 dark:bg-slate-900 dark:text-indigo-300"
                   />
                   <span>Summarize whenever the session turns idle</span>
                 </label>
-                <label className="flex items-center gap-2">
+                <label className="flex items-center gap-2 text-[13px] text-slate-700 dark:text-slate-200">
                   <input
                     type="radio"
                     name={`edge-mode-${id}`}
                     value="push"
                     checked={updateMode === 'push'}
                     onChange={() => setUpdateMode('push')}
+                    className="h-4 w-4 rounded-full border border-slate-300 text-indigo-500 focus:ring-indigo-400 dark:border-white/20 dark:bg-slate-900 dark:text-indigo-300"
                   />
                   <span>Let the managed session push MCP updates</span>
                 </label>
-                <label className="flex flex-wrap items-center gap-2">
+                <label className="flex flex-wrap items-center gap-2 text-[13px] text-slate-700 dark:text-slate-200">
                   <span className="flex items-center gap-2">
                     <input
                       type="radio"
@@ -131,6 +135,7 @@ export const AssignmentEdge = memo(function AssignmentEdge({
                       value="poll"
                       checked={updateMode === 'poll'}
                       onChange={() => setUpdateMode('poll')}
+                      className="h-4 w-4 rounded-full border border-slate-300 text-indigo-500 focus:ring-indigo-400 dark:border-white/20 dark:bg-slate-900 dark:text-indigo-300"
                     />
                     <span>Poll every</span>
                   </span>
@@ -139,15 +144,15 @@ export const AssignmentEdge = memo(function AssignmentEdge({
                     min={1}
                     value={pollFrequency}
                     onChange={(event) => setPollFrequency(Number(event.target.value) || 0)}
-                    className="h-7 w-16 rounded border border-slate-200 bg-white px-1 text-right text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500"
+                    className="h-9 w-20 rounded border border-slate-300 bg-white px-3 text-right text-[13px] font-medium text-slate-900 placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60 dark:border-white/10 dark:bg-white/5 dark:text-white dark:placeholder:text-slate-400"
                   />
                   <span>seconds</span>
                 </label>
               </div>
-              <div className="mt-3 flex gap-2">
+              <div className="mt-4 flex gap-2">
                 <button
                   type="submit"
-                  className="flex-1 rounded bg-indigo-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-500"
+                  className={cn('flex-1', TILE_PRIMARY_BUTTON_CLASS)}
                   disabled={!instructions.trim()}
                 >
                   Save
@@ -155,7 +160,7 @@ export const AssignmentEdge = memo(function AssignmentEdge({
                 <button
                   type="button"
                   onClick={handleDelete}
-                  className="rounded border border-red-300 px-3 py-1.5 text-[11px] font-semibold text-red-600 hover:bg-red-50"
+                  className={TILE_DANGER_BUTTON_CLASS}
                 >
                   Remove
                 </button>

@@ -63,5 +63,41 @@ describe('FlowCanvas ReactFlow props', () => {
     expect(props.selectNodesOnDrag).toBe(false);
     expect(props.elevateNodesOnSelect).toBe(false);
     expect(props.nodesDraggable).toBe(true);
+    expect(props.zoomOnScroll).toBe(true);
+  });
+
+  it('disables zoom-on-scroll when a tile is interactive', () => {
+    const initialState: TileState = {
+      tiles: {
+        'tile-1': {
+          id: 'tile-1',
+          nodeType: 'application',
+          position: { x: 0, y: 0 },
+          size: { width: 320, height: 240 },
+          sessionMeta: null,
+          agentMeta: null,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      },
+      order: ['tile-1'],
+      relationships: {},
+      relationshipOrder: [],
+      activeId: null,
+      resizing: {},
+      interactiveId: 'tile-1',
+      viewport: {},
+      canvasViewport: { zoom: 1, pan: { x: 0, y: 0 } },
+    };
+
+    render(
+      <TileStoreProvider initialState={initialState}>
+        <FlowCanvas onNodePlacement={() => {}} privateBeachId="beach-test" rewriteEnabled />
+      </TileStoreProvider>,
+    );
+
+    const props = propsCapture.last as Record<string, unknown>;
+    expect(props).toBeTruthy();
+    expect(props.zoomOnScroll).toBe(false);
   });
 });

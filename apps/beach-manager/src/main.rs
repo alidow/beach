@@ -10,7 +10,7 @@ use auth::{AuthConfig, AuthContext};
 use config::AppConfig;
 use routes::build_router;
 use sqlx::postgres::PgPoolOptions;
-use state::AppState;
+use state::{AppState, STALE_SESSION_SWEEP_INTERVAL};
 use std::{net::SocketAddr, path::Path, sync::OnceLock, time::Duration};
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -69,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             loop {
                 cleanup_state.cleanup_stale_sessions().await;
-                sleep(state::STALE_SESSION_SWEEP_INTERVAL).await;
+                sleep(STALE_SESSION_SWEEP_INTERVAL).await;
             }
         });
     }

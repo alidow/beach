@@ -16,6 +16,7 @@ import {
   type TerminalStateDiff,
 } from '../../../private-beach/src/lib/terminalHydrator';
 import type { Update } from '../../../beach-surfer/src/protocol/types';
+import { TILE_PRIMARY_BUTTON_CLASS } from './tileButtonClasses';
 
 const DEFAULT_STYLE_ID = 0;
 
@@ -719,7 +720,7 @@ export function ApplicationTile({
           <button
             type="submit"
             disabled={disabled}
-            className="mt-2 inline-flex h-10 items-center justify-center rounded-full border border-sky-300/60 dark:border-sky-400/60 bg-sky-500/20 px-6 text-sm font-semibold uppercase tracking-[0.18em] text-sky-900 dark:text-sky-100 transition hover:border-sky-400/70 hover:bg-sky-500/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60 disabled:cursor-not-allowed disabled:opacity-50"
+            className={`mt-3 ${TILE_PRIMARY_BUTTON_CLASS}`}
           >
             {submitState === 'attaching' ? 'Attaching…' : 'Connect'}
           </button>

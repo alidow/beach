@@ -18,6 +18,7 @@ import type { CSSProperties, MouseEvent, PointerEvent } from 'react';
 import { Handle, Position, useStore } from 'reactflow';
 import type { NodeProps, ReactFlowState } from 'reactflow';
 import { ApplicationTile } from '@/components/ApplicationTile';
+import { TILE_PRIMARY_BUTTON_CLASS, TILE_SECONDARY_BUTTON_CLASS } from '@/components/tileButtonClasses';
 import { cn } from '@/lib/cn';
 import { listSessions, onboardAgent, updateSessionMetadata, updateSessionRoleById } from '@/lib/api';
 import { buildManagerUrl, useManagerToken } from '@/hooks/useManagerToken';
@@ -1050,7 +1051,7 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
                   <button
                     type="button"
                     onClick={handleAgentSave}
-                    className="flex-1 rounded bg-indigo-600 px-3 py-2 font-semibold text-white disabled:opacity-40"
+                    className={cn('flex-1', TILE_PRIMARY_BUTTON_CLASS)}
                     disabled={!agentRole.trim() || !agentResponsibility.trim()}
                   >
                     {agentSaveState === 'saving' ? 'Saving…' : 'Save'}
@@ -1058,7 +1059,7 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
                   <button
                     type="button"
                     onClick={handleAgentCancel}
-                    className="flex-1 rounded border border-white/15 px-3 py-2 font-semibold text-slate-200"
+                    className={cn('flex-1', TILE_SECONDARY_BUTTON_CLASS)}
                   >
                     Cancel
                   </button>

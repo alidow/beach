@@ -56,6 +56,7 @@ const VIEWER_KEEPALIVE_INTERVAL: StdDuration = StdDuration::from_secs(20);
 const VIEWER_KEEPALIVE_PAYLOAD: &str = "__keepalive__";
 const VIEWER_IDLE_LOG_AFTER: StdDuration = StdDuration::from_secs(45);
 pub(crate) const STALE_SESSION_MAX_IDLE: StdDuration = StdDuration::from_secs(180);
+#[allow(dead_code)]
 pub(crate) const STALE_SESSION_SWEEP_INTERVAL: StdDuration = StdDuration::from_secs(60);
 const MAX_PENDING_ACTIONS_PER_SESSION: usize = 500;
 
@@ -2872,7 +2873,7 @@ impl AppState {
                     .collect()
             }
             Backend::Postgres(pool) => {
-                let cutoff_secs = STALE_SESSION_MAX_IDLE.as_secs() as i64;
+                let cutoff_secs = STALE_SESSION_MAX_IDLE.as_secs() as f64;
                 match sqlx::query!(
                     r#"
                     SELECT s.origin_session_id::text AS session_id

@@ -1231,6 +1231,7 @@ function FlowCanvasInner({
   }, [relationshipSyncHistory, state.relationships, state.tiles, traceLogs, traceOverlay]);
 
   const isDragging = dragCount > 0;
+  const zoomOnScrollEnabled = !interactiveId;
 
   // Canvas wrapper uses theme background tokens (light: soft neutral, dark: deep neutral).
   // Keep backdrop blur off during drag to avoid overdraw.
@@ -1269,7 +1270,8 @@ function FlowCanvasInner({
           panOnScroll={false}
           // Allow panning with left-drag on the pane (not on nodes)
           panOnDrag
-          zoomOnScroll={false}
+          // Enable wheel-driven zoom unless a tile is in interactive mode so scrolling stays scoped to that tile.
+          zoomOnScroll={zoomOnScrollEnabled}
           zoomOnPinch
           zoomOnDoubleClick={false}
           fitView={false}

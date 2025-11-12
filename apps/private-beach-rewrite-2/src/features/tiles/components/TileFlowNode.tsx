@@ -41,6 +41,7 @@ type TileFlowNodeData = {
   isResizing: boolean;
   privateBeachId: string;
   managerUrl: string;
+  roadUrl: string;
   rewriteEnabled: boolean;
   isInteractive: boolean;
   interactiveTileId: string | null;
@@ -79,6 +80,14 @@ function generateTraceId(): string {
     return crypto.randomUUID();
   }
   return `trace-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function slugifyTemplateId(source: string | undefined): string {
+  if (!source) return 'generic-agent';
+  const trimmed = source.trim().toLowerCase();
+  if (!trimmed) return 'generic-agent';
+  const slug = trimmed.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return slug || 'generic-agent';
 }
 
 type LegacyAgentMeta = AgentMetadata & {
@@ -175,6 +184,7 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
     interactiveTileId,
     privateBeachId,
     managerUrl,
+    roadUrl,
     rewriteEnabled,
   } = data;
   const managerBaseUrl = useMemo(() => buildManagerUrl(managerUrl), [managerUrl]);
@@ -195,6 +205,7 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
   const viewportMetricsRef = useRef<TileViewportSnapshot | null>(null);
   const resizeStateRef = useRef<ResizeState | null>(null);
   const lastResizeClickRef = useRef<number>(0);
+  const autoInteractLockedRef = useRef(false);
   const [hovered, setHovered] = useState(false);
   const [terminalHover, setTerminalHover] = useState(false);
   const [dragPerfMode, setDragPerfMode] = useState(false);
@@ -209,6 +220,16 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
   const [agentSaveState, setAgentSaveState] = useState<'idle' | 'saving'>('idle');
   const [agentSaveNotice, setAgentSaveNotice] = useState<string | null>(null);
   const zoom = useStore(zoomSelector);
+
+  useEffect(() => {
+    autoInteractLockedRef.current = false;
+  }, [tile.id]);
+
+  useEffect(() => {
+    if (isInteractive) {
+      autoInteractLockedRef.current = true;
+    }
+  }, [isInteractive]);
 
   const handleTerminalHoverEnter = useCallback(() => {
     setTerminalHover(true);
@@ -306,20 +327,29 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
         tileId: tile.id,
         rewriteEnabled,
       });
-      // Best-effort: issue a detach control message to the host so it tears down
-      // any active controller consumer. Road URL is resolved from env via lib/road.
+// Best-effort: issue a detach control message to the host so it tears down
+      // any active controller consumer. Road URL comes from the beach settings.
       const sessionId = tile.sessionMeta?.sessionId?.trim();
-      if (sessionId && sessionId.length > 0) {
+      const controlUrl = roadUrl?.trim();
+      if (sessionId && sessionId.length > 0 && controlUrl) {
         (async () => {
           try {
             const token = managerToken ?? (await refreshManagerToken());
-            await sendControlMessage(sessionId, 'manager_detach', { reason: 'tile_removed' }, token ?? null);
+            await sendControlMessage(
+              sessionId,
+              'manager_detach',
+              { reason: 'tile_removed' },
+              token ?? null,
+              controlUrl,
+            );
           } catch (err) {
             try {
               console.warn('[tile] detach control send failed', err);
             } catch {}
           }
         })();
+      } else if (sessionId && !controlUrl) {
+        console.warn('[tile] detach skipped; road url missing');
       }
       removeTile(tile.id);
     },
@@ -327,6 +357,7 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
       privateBeachId,
       managerToken,
       refreshManagerToken,
+      roadUrl,
       removeTile,
       rewriteEnabled,
       tile.id,
@@ -368,13 +399,18 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
           summary.location_hint ?? null,
         );
         const traceId = metaPayload.trace?.enabled ? metaPayload.trace.trace_id ?? undefined : undefined;
+        const scopedRole = metaPayload.role?.trim() || 'agent';
+        const templateId = slugifyTemplateId(metaPayload.role);
         const onboarding = await onboardAgent(
           sessionId,
-          'pong',
-          ['agent'],
+          templateId,
+          [scopedRole],
           token,
           managerBaseUrl,
-          undefined,
+          {
+            role: scopedRole,
+            responsibility: metaPayload.responsibility?.trim() || undefined,
+          },
           traceId,
         );
         const metadataPayload = buildSessionMetadataWithTile(summary.metadata, tile.id, tile.sessionMeta ?? {}) as Record<
@@ -383,7 +419,8 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
         >;
         metadataPayload.role = 'agent';
         metadataPayload.agent = {
-          profile: 'pong',
+          profile: scopedRole,
+          responsibility: metaPayload.responsibility?.trim() || undefined,
           prompt_pack: onboarding.prompt_pack ?? null,
           mcp_bridges: onboarding.mcp_bridges ?? [],
         };
@@ -904,14 +941,15 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
     if (hasSession) {
       return;
     }
+    if (autoInteractLockedRef.current) {
+      return;
+    }
     if (interactiveTileId && interactiveTileId !== tile.id) {
       return;
     }
-    if (isInteractive) {
-      return;
-    }
     setInteractiveTile(tile.id);
-  }, [hasSession, interactiveTileId, isAgent, isInteractive, setInteractiveTile, tile.id]);
+    autoInteractLockedRef.current = true;
+  }, [hasSession, interactiveTileId, isAgent, setInteractiveTile, tile.id]);
 
   useEffect(() => {
     if (!dragging) {
@@ -1203,6 +1241,7 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
             tileId={tile.id}
             privateBeachId={privateBeachId}
             managerUrl={managerBaseUrl}
+            roadUrl={roadUrl}
             sessionMeta={tile.sessionMeta ?? null}
             onSessionMetaChange={handleMetaChange}
             onViewportMetricsChange={handleViewportMetricsChange}
@@ -1281,6 +1320,7 @@ function propsAreEqual(prev: Props, next: Props) {
   if ((pd as any).isInteractive !== (nd as any).isInteractive) return false;
   if (pd.privateBeachId !== nd.privateBeachId) return false;
   if (pd.managerUrl !== nd.managerUrl) return false;
+  if (pd.roadUrl !== nd.roadUrl) return false;
   if (pd.rewriteEnabled !== nd.rewriteEnabled) return false;
   // Allow changes in session meta or viewport to propagate when present.
   if (!shallowEqual(pd.tile.sessionMeta ?? null, nd.tile.sessionMeta ?? null)) return false;

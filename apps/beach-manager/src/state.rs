@@ -58,6 +58,8 @@ const VIEWER_IDLE_LOG_AFTER: StdDuration = StdDuration::from_secs(45);
 pub(crate) const STALE_SESSION_MAX_IDLE: StdDuration = StdDuration::from_secs(60);
 #[allow(dead_code)]
 pub(crate) const STALE_SESSION_SWEEP_INTERVAL: StdDuration = StdDuration::from_secs(5);
+const CONTROLLER_CHANNEL_LABEL: &str = "mgr-actions";
+const LEGACY_CONTROLLER_CHANNEL_LABEL: &str = "pb-controller";
 const VIEWER_HEALTH_REPORT_INTERVAL: StdDuration = StdDuration::from_secs(15);
 const MAX_PENDING_ACTIONS_PER_SESSION: usize = 500;
 const STREAM_EVENT_NO_SUBSCRIBERS_LOG_KIND: &str = "stream_event_no_subscribers";
@@ -1455,7 +1457,11 @@ impl AppState {
         }
     }
 
-    pub(crate) async fn verify_code_with_road(&self, origin_session_id: &str, code: &str) -> Result<bool, ()> {
+    pub(crate) async fn verify_code_with_road(
+        &self,
+        origin_session_id: &str,
+        code: &str,
+    ) -> Result<bool, ()> {
         let url = format!(
             "{}/sessions/{}/verify-code",
             self.road_base_url.trim_end_matches('/'),
@@ -2675,6 +2681,59 @@ impl AppState {
         }
     }
 
+    pub async fn validate_controller_consumer_token(
+        &self,
+        session_id: &str,
+        controller_token: &str,
+    ) -> Result<Option<Uuid>, StateError> {
+        match &self.backend {
+            Backend::Memory => {
+                self.validate_controller_consumer_token_memory(session_id, controller_token)
+                    .await
+            }
+            Backend::Postgres(pool) => {
+                let session_uuid = parse_uuid(session_id, "session_id")?;
+                let token_uuid = parse_uuid(controller_token, "controller_token")?;
+                let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
+                let mut tx = pool.begin().await?;
+                self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
+                    .await?;
+                let lease: Option<LeaseRow> = sqlx::query_as(
+                    r#"
+                    SELECT id, controller_account_id, issued_by_account_id, reason, expires_at, revoked_at
+                    FROM controller_lease
+                    WHERE session_id = $1 AND id = $2 AND revoked_at IS NULL
+                    "#,
+                )
+                .bind(identifiers.session_id)
+                .bind(token_uuid)
+                .fetch_optional(tx.as_mut())
+                .await?;
+
+                let lease = match lease {
+                    Some(row) => row,
+                    None => return Err(StateError::ControllerMismatch),
+                };
+
+                let new_expiry = Utc::now() + Duration::milliseconds(DEFAULT_LEASE_TTL_MS as i64);
+                sqlx::query(
+                    r#"
+                    UPDATE controller_lease
+                    SET expires_at = $1
+                    WHERE id = $2
+                    "#,
+                )
+                .bind(new_expiry)
+                .bind(lease.id)
+                .execute(tx.as_mut())
+                .await?;
+                tx.commit().await?;
+
+                Ok(lease.controller_account_id)
+            }
+        }
+    }
+
     pub async fn ack_actions(
         &self,
         session_id: &str,
@@ -3875,6 +3934,10 @@ impl SessionRecord {
         self.controller_leases.get(token)
     }
 
+    fn lease_mut(&mut self, token: &str) -> Option<&mut ControllerLeaseMemory> {
+        self.controller_leases.get_mut(token)
+    }
+
     fn ensure_lease(
         &mut self,
         token: String,
@@ -4427,6 +4490,26 @@ impl AppState {
 
         self.publish(session_id, event).await;
         Ok(())
+    }
+
+    async fn validate_controller_consumer_token_memory(
+        &self,
+        session_id: &str,
+        controller_token: &str,
+    ) -> Result<Option<Uuid>, StateError> {
+        let mut sessions = self.fallback.sessions.write().await;
+        let record = sessions
+            .get_mut(session_id)
+            .ok_or(StateError::SessionNotFound)?;
+        let lease = record
+            .lease_mut(controller_token)
+            .ok_or(StateError::ControllerMismatch)?;
+        let account_uuid = lease
+            .controller_account_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok());
+        lease.expires_at_ms = now_ms() + DEFAULT_LEASE_TTL_MS as i64;
+        Ok(account_uuid)
     }
 
     async fn poll_actions_memory(
@@ -6095,25 +6178,50 @@ async fn controller_forwarder_once(
     private_beach_id: &str,
     join_code: &str,
 ) -> Result<(), ControllerForwarderError> {
+    let labels = [CONTROLLER_CHANNEL_LABEL, LEGACY_CONTROLLER_CHANNEL_LABEL];
+    let mut last_err: Option<ControllerForwarderError> = None;
+    for label in labels {
+        match controller_forwarder_once_with_label(
+            state,
+            session_id,
+            private_beach_id,
+            join_code,
+            label,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                continue;
+            }
+        }
+    }
+    Err(last_err.unwrap_or(ControllerForwarderError::Join(
+        "controller forwarder negotiation failed".into(),
+    )))
+}
+
+async fn controller_forwarder_once_with_label(
+    state: &AppState,
+    session_id: &str,
+    private_beach_id: &str,
+    join_code: &str,
+    label: &str,
+) -> Result<(), ControllerForwarderError> {
     let config = SessionConfig::new(&state.road_base_url)
         .map_err(|err| ControllerForwarderError::Join(err.to_string()))?;
     let manager = SessionManager::new(config)
         .map_err(|err| ControllerForwarderError::Join(err.to_string()))?;
     let fallback_base = manager.config().base_url().clone();
     let joined = manager
-        .join(
-            session_id,
-            Some(join_code),
-            None,
-            Some("pb-controller"),
-            false,
-        )
+        .join(session_id, Some(join_code), None, Some(label), false)
         .await
         .map_err(|err| ControllerForwarderError::Join(err.to_string()))?;
     let mut handle = joined.into_handle();
     rewrite_loopback_transports(&mut handle, &fallback_base)
         .map_err(|err| ControllerForwarderError::Join(err.to_string()))?;
-    let negotiated = negotiate_transport(&handle, Some(join_code), Some("pb-controller"), false)
+    let negotiated = negotiate_transport(&handle, Some(join_code), Some(label), false)
         .await
         .map_err(|err| ControllerForwarderError::Negotiation(err.to_string()))?;
     match negotiated {

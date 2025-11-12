@@ -928,7 +928,9 @@ pub async fn poll_control(
         .ok_or(StatusCode::NOT_FOUND)?;
     // Require a valid code to read control messages
     let ok = match body.code.as_deref() {
-        Some(code) => verify_passphrase(code, &session.passphrase_hash) || code == session.join_code,
+        Some(code) => {
+            verify_passphrase(code, &session.passphrase_hash) || code == session.join_code
+        }
         None => false,
     };
     if !ok {

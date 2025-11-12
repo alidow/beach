@@ -115,6 +115,39 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
   layout = loadedLayout;
   sessions = loadedSessions;
 
+  const managerRoadUrl = (() => {
+    const settings = beach.settings && typeof beach.settings === 'object' ? (beach.settings as any) : null;
+    const managerSettings = settings && typeof settings.manager === 'object' ? (settings.manager as any) : null;
+    const fromSettings =
+      managerSettings && typeof managerSettings.road_url === 'string'
+        ? managerSettings.road_url.trim()
+        : '';
+    const candidates = [
+      fromSettings,
+      process.env.PRIVATE_BEACH_ROAD_URL,
+      process.env.NEXT_PUBLIC_PRIVATE_BEACH_ROAD_URL,
+      process.env.NEXT_PUBLIC_ROAD_URL,
+      process.env.NEXT_PUBLIC_SESSION_SERVER_URL,
+    ];
+    for (const candidate of candidates) {
+      if (candidate && candidate.trim().length > 0) {
+        return candidate.trim();
+      }
+    }
+    return '';
+  })();
+
+  if (!managerRoadUrl) {
+    return (
+      <div className="flex min-h-screen flex-col bg-background">
+        <AppShellTopNav backHref="/beaches" title="Private Beach" subtitle={beach.name} />
+        <main className="flex flex-1 items-center justify-center px-6 text-center text-sm text-muted-foreground">
+          Configure a Beach Road URL for this beach (settings → Manager → road_url) or set NEXT_PUBLIC_PRIVATE_BEACH_ROAD_URL / PRIVATE_BEACH_ROAD_URL, then refresh.
+        </main>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-transparent" data-private-beach-rewrite={rewriteEnabled ? 'enabled' : 'disabled'}>
       <BeachCanvasShell
@@ -122,6 +155,7 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
         beachName={beach.name}
         backHref="/beaches"
         managerUrl={managerBaseUrl}
+        roadUrl={managerRoadUrl}
         managerToken={token}
         initialLayout={layout}
         initialSessions={sessions}

@@ -24,6 +24,11 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let cfg = AppConfig::from_env();
     init_tracing(cfg.log_path.as_deref());
+    let build_id = option_env!("BEACH_BUILD_ID").unwrap_or("dev-unknown");
+    info!(
+        target = "beach_manager.build",
+        build_id, "Beach Manager build"
+    );
     info!(
         target = "beach_manager.config",
         bind_addr = %cfg.bind_addr,

@@ -1,6 +1,10 @@
 LOG_DIR="$HOME/beach-debug"
 mkdir -p "$LOG_DIR"
 
+# Rebuild the CLI host whenever fast_path/controller changes land.
+# This keeps the public hosts and mgr-actions controller channel in sync with manager queues.
+cargo build --bin beach >/dev/null
+
 ~/development/beach/target/debug/beach \
   --log-level trace \
   --log-file /tmp/beach-host.log \
@@ -44,7 +48,7 @@ http://localhost:3003/beaches
 ------------
 
 
-Here are cargo-run commands for both players and the agent, matching your pattern and not relying on session-id env vars. Run each in its own terminal.
+Here are cargo-run commands for both players and the agent, matching your pattern and not relying on session-id env vars. Run each in its own terminal. With the controller auto-handshake in place the hosts no longer need `PRIVATE_BEACH_*` variables, but keeping `PRIVATE_BEACH_MANAGER_URL` exported provides a backwards-compatible fallback if Beach Road control delivery is unavailable.
 
 
 
@@ -94,3 +98,5 @@ Notes
 Start the two players and the agent in separate terminals.
 In the dashboard, attach each session (you can read the JSON from the bootstrap files if needed, but you don’t have to export anything).
 Draw edges from the agent tile to LHS and RHS tiles to declare roles; the agent will discover pairings via controller SSE and start controlling.
+Hosts automatically switch to the fast path `pb-controller` channel for controller actions; HTTP polling resumes only if that channel drops, so make sure Beach Road is reachable before testing. If you change the CLI, rebuild before launching hosts so the fast_path InputAck and HTTP fallback code stays in sync with the manager.
+> ⚠️ As of Nov 2025 the controller channel label changed to `mgr-actions`. Rebuild the CLI (`cargo build --bin beach`) and restart `beach-manager` / `beach-road` containers after pulling new code so hosts and manager agree on the label.

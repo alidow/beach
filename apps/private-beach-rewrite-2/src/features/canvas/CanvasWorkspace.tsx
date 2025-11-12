@@ -15,6 +15,7 @@ type CanvasWorkspaceProps = {
   onViewportChange?: (viewport: CanvasViewportState) => void;
   privateBeachId: string;
   managerUrl?: string;
+  roadUrl?: string;
   rewriteEnabled: boolean;
   initialDrawerOpen?: boolean;
   gridSize?: number;
@@ -48,6 +49,7 @@ export function CanvasWorkspace({
   onViewportChange,
   privateBeachId,
   managerUrl,
+  roadUrl,
   rewriteEnabled,
   initialDrawerOpen = true,
   gridSize = DEFAULT_GRID_SIZE,
@@ -74,6 +76,7 @@ export function CanvasWorkspace({
             onViewportChange={onViewportChange}
             privateBeachId={privateBeachId}
             managerUrl={managerUrl}
+            roadUrl={roadUrl}
             rewriteEnabled={rewriteEnabled}
             gridSize={gridSize}
           />

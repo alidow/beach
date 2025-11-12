@@ -60,7 +60,7 @@ import {
   type ControllerUpdateCadence,
 } from '@/lib/api';
 import { recordTraceLog, useTraceLogs, clearTraceLogs } from '@/features/trace/traceLogStore';
-import { buildManagerUrl, useManagerToken } from '@/hooks/useManagerToken';
+import { buildManagerUrl, buildRoadUrl, useManagerToken } from '@/hooks/useManagerToken';
 import { useCanvasEvents } from './CanvasEventsContext';
 import { snapPointToGrid } from './positioning';
 import { AssignmentEdge, type AssignmentEdgeData } from './AssignmentEdge';
@@ -100,6 +100,7 @@ type FlowCanvasProps = {
   onViewportChange?: (viewport: CanvasViewportState) => void;
   privateBeachId: string;
   managerUrl?: string;
+  roadUrl?: string;
   rewriteEnabled: boolean;
   gridSize?: number;
 };
@@ -126,6 +127,7 @@ function FlowCanvasInner({
   onViewportChange,
   privateBeachId,
   managerUrl,
+  roadUrl,
   rewriteEnabled,
   gridSize = TILE_GRID_SNAP_PX,
 }: FlowCanvasProps) {
@@ -244,6 +246,14 @@ function FlowCanvasInner({
   }, [applyCanvasBounds]);
 
   const resolvedManagerUrl = useMemo(() => buildManagerUrl(managerUrl), [managerUrl]);
+  const resolvedRoadUrl = useMemo(() => {
+    try {
+      return buildRoadUrl(roadUrl);
+    } catch (error) {
+      console.error('[rewrite-2] missing road url', error);
+      return '';
+    }
+  }, [roadUrl]);
 
   const ensureControllerLease = useCallback(
     async (controllerSessionId: string, authToken: string) => {
@@ -328,6 +338,7 @@ function FlowCanvasInner({
         isInteractive ? 1 : 0,
         privateBeachId,
         resolvedManagerUrl,
+        resolvedRoadUrl,
         rewriteEnabled ? 1 : 0,
         sessionMetaSig,
         agentMetaSig,
@@ -349,6 +360,7 @@ function FlowCanvasInner({
           isInteractive,
           privateBeachId,
           managerUrl: resolvedManagerUrl,
+          roadUrl: resolvedRoadUrl,
           rewriteEnabled,
           interactiveTileId: interactiveId,
         },
@@ -373,7 +385,17 @@ function FlowCanvasInner({
       }
     }
     return next;
-  }, [activeId, interactiveId, order, privateBeachId, resolvedManagerUrl, resizing, rewriteEnabled, tiles]);
+  }, [
+    activeId,
+    interactiveId,
+    order,
+    privateBeachId,
+    resolvedManagerUrl,
+    resolvedRoadUrl,
+    resizing,
+    rewriteEnabled,
+    tiles,
+  ]);
 
   const handleEdgeSave = useCallback(
     ({

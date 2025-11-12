@@ -1,3 +1,30 @@
+const { execSync } = require('child_process');
+
+const resolveBuildId = () => {
+  const existing = process.env.NEXT_PUBLIC_BEACH_BUILD_ID;
+  if (existing && existing.trim().length > 0) {
+    return existing.trim();
+  }
+  let gitSha = 'nogit';
+  try {
+    gitSha = execSync('git rev-parse --short HEAD').toString().trim() || 'nogit';
+  } catch {
+    // no-op: keep default
+  }
+  const timestamp = new Date()
+    .toISOString()
+    .replace(/[:.]/g, '')
+    .replace('T', '-')
+    .replace('Z', '');
+  const buildId = `${timestamp}-${gitSha}`;
+  process.env.NEXT_PUBLIC_BEACH_BUILD_ID = buildId;
+  return buildId;
+};
+
+const BUILD_ID = resolveBuildId();
+// eslint-disable-next-line no-console
+console.info('[private-beach-rewrite-build]', { buildId: BUILD_ID });
+
 const describeEnv = () => {
   const summary = {
     NEXT_PUBLIC_PRIVATE_BEACH_MANAGER_URL:
@@ -11,6 +38,8 @@ const describeEnv = () => {
     ),
     NEXT_PUBLIC_PRIVATE_BEACH_TERMINAL_TRACE:
       process.env.NEXT_PUBLIC_PRIVATE_BEACH_TERMINAL_TRACE ?? '0',
+    NEXT_PUBLIC_BEACH_BUILD_ID:
+      process.env.NEXT_PUBLIC_BEACH_BUILD_ID ?? '(unset)',
   };
   // eslint-disable-next-line no-console
   console.info('[private-beach-rewrite-config]', summary);

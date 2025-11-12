@@ -22,6 +22,7 @@ type BeachCanvasShellProps = {
   beachName: string;
   backHref?: string;
   managerUrl?: string;
+  roadUrl?: string;
   managerToken?: string | null;
   initialLayout?: CanvasLayout | null;
   initialSessions?: SessionSummary[];
@@ -65,6 +66,7 @@ export function BeachCanvasShell({
   beachName,
   backHref = '/beaches',
   managerUrl,
+  roadUrl,
   managerToken,
   initialLayout,
   initialSessions,
@@ -86,6 +88,7 @@ export function BeachCanvasShell({
           beachName={beachName}
           backHref={backHref}
           managerUrl={resolvedManagerUrl}
+          roadUrl={roadUrl}
           initialLayout={initialLayout}
           initialSessions={initialSessions}
           initialTileSignature={initialTileSignature}
@@ -102,6 +105,7 @@ function BeachCanvasShellInner({
   beachName,
   backHref = '/beaches',
   managerUrl,
+  roadUrl,
   initialLayout,
   initialSessions,
   initialTileSignature,
@@ -332,6 +336,7 @@ function BeachCanvasShellInner({
           onViewportChange={handleViewportChange}
           privateBeachId={beachId}
           managerUrl={managerUrl}
+          roadUrl={roadUrl}
           rewriteEnabled={rewriteEnabled}
           initialDrawerOpen
         />

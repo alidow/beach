@@ -32,6 +32,7 @@ pub struct NegotiatedSingle {
     pub transport: Arc<dyn Transport>,
     pub webrtc_channels: Option<WebRtcChannels>,
     pub signaling_client: Option<Arc<SignalingClient>>,
+    pub metadata: HashMap<String, String>,
 }
 
 pub enum NegotiatedTransport {
@@ -173,6 +174,7 @@ pub async fn negotiate_transport(
                             transport: connection.transport(),
                             webrtc_channels: Some(connection.channels()),
                             signaling_client: connection.signaling_client(),
+                            metadata: connection.metadata().unwrap_or_default(),
                         }));
                     }
                     Err(err) => {
@@ -201,6 +203,7 @@ pub async fn negotiate_transport(
                         transport,
                         webrtc_channels: None,
                         signaling_client: None,
+                        metadata: HashMap::new(),
                     }));
                 }
                 Err(err) => {
@@ -221,6 +224,7 @@ pub async fn negotiate_transport(
                         transport,
                         webrtc_channels: None,
                         signaling_client: None,
+                        metadata: HashMap::new(),
                     }));
                 }
                 Err(err) => {
@@ -446,24 +450,41 @@ fn matches_ignore_ascii_true(value: &str) -> bool {
 
 pub(crate) struct SharedTransport {
     inner: RwLock<Arc<dyn Transport>>,
+    metadata: RwLock<Option<HashMap<String, String>>>,
 }
 
 impl SharedTransport {
-    pub(crate) fn new(initial: Arc<dyn Transport>) -> Self {
+    pub(crate) fn new(
+        initial: Arc<dyn Transport>,
+        metadata: Option<HashMap<String, String>>,
+    ) -> Self {
         Self {
             inner: RwLock::new(initial),
+            metadata: RwLock::new(metadata),
         }
     }
 
-    pub(crate) fn swap(&self, next: Arc<dyn Transport>) {
+    pub(crate) fn swap(&self, next: Arc<dyn Transport>, metadata: Option<HashMap<String, String>>) {
         let mut guard = self.inner.write().expect("shared transport poisoned");
         *guard = next;
+        let mut meta_guard = self
+            .metadata
+            .write()
+            .expect("shared transport metadata poisoned");
+        *meta_guard = metadata;
     }
 
     pub(crate) fn current(&self) -> Arc<dyn Transport> {
         self.inner
             .read()
             .expect("shared transport poisoned")
+            .clone()
+    }
+
+    pub(crate) fn metadata(&self) -> Option<HashMap<String, String>> {
+        self.metadata
+            .read()
+            .expect("shared transport metadata poisoned")
             .clone()
     }
 }
@@ -474,7 +495,31 @@ impl fmt::Debug for SharedTransport {
         f.debug_struct("SharedTransport")
             .field("transport_id", &current.id())
             .field("transport_kind", &current.kind())
+            .field("metadata", &self.metadata())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::TransportPair;
+
+    #[test]
+    fn shared_transport_tracks_metadata() {
+        let pair = TransportPair::new(TransportKind::Ipc);
+        let client: Arc<dyn Transport> = Arc::from(pair.client);
+        let server: Arc<dyn Transport> = Arc::from(pair.server);
+
+        let mut meta = HashMap::new();
+        meta.insert("label".to_string(), "pb-controller".to_string());
+        let shared = SharedTransport::new(client.clone(), Some(meta.clone()));
+        assert_eq!(shared.metadata(), Some(meta.clone()));
+
+        let mut new_meta = HashMap::new();
+        new_meta.insert("label".to_string(), "pb-controller-2".to_string());
+        shared.swap(server.clone(), Some(new_meta.clone()));
+        assert_eq!(shared.metadata(), Some(new_meta));
     }
 }
 
@@ -557,11 +602,12 @@ impl TransportSupervisor {
                 {
                     Ok(NegotiatedTransport::Single(NegotiatedSingle {
                         transport: new_transport,
+                        metadata: new_metadata,
                         ..
                     })) => {
                         let kind = new_transport.kind();
                         let id = new_transport.id().0;
-                        this.shared.swap(new_transport);
+                        this.shared.swap(new_transport, Some(new_metadata));
                         info!(
                             target = "transport_mod::failover",
                             ?kind,
@@ -575,7 +621,7 @@ impl TransportSupervisor {
                         let transport = connection.transport();
                         let kind = transport.kind();
                         let id = transport.id().0;
-                        this.shared.swap(transport);
+                        this.shared.swap(transport, connection.metadata());
                         info!(
                             target = "transport_mod::failover",
                             ?kind,

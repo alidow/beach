@@ -388,6 +388,7 @@ pub struct WebRtcConnection {
     channels: WebRtcChannels,
     secure: Option<Arc<HandshakeResult>>,
     signaling_client: Option<Arc<SignalingClient>>,
+    metadata: Option<HashMap<String, String>>,
 }
 
 impl WebRtcConnection {
@@ -396,12 +397,14 @@ impl WebRtcConnection {
         channels: WebRtcChannels,
         secure: Option<Arc<HandshakeResult>>,
         signaling_client: Option<Arc<SignalingClient>>,
+        metadata: Option<HashMap<String, String>>,
     ) -> Self {
         Self {
             transport,
             channels,
             secure,
             signaling_client,
+            metadata,
         }
     }
 
@@ -419,6 +422,10 @@ impl WebRtcConnection {
 
     pub fn signaling_client(&self) -> Option<Arc<SignalingClient>> {
         self.signaling_client.clone()
+    }
+
+    pub fn metadata(&self) -> Option<HashMap<String, String>> {
+        self.metadata.clone()
     }
 }
 
@@ -2046,6 +2053,7 @@ async fn negotiate_offerer_peer(
             .or_insert(result.verification_code.clone());
     }
 
+    let connection_metadata = peer_metadata.clone();
     Ok(Some(OffererAcceptedTransport {
         peer_id: peer_id,
         handshake_id,
@@ -2055,6 +2063,7 @@ async fn negotiate_offerer_peer(
             channels,
             secure_context,
             Some(Arc::clone(&inner.signaling_client)),
+            Some(connection_metadata),
         ),
     }))
 }
@@ -3239,13 +3248,35 @@ async fn connect_answerer(
         }
     }
     let transport_dyn: Arc<dyn Transport> = transport.clone();
+    let mut connection_metadata = signaling_client.remote_metadata().await.unwrap_or_default();
+    if let Some(local_meta) = build_label_metadata(label) {
+        for (key, value) in local_meta {
+            connection_metadata.entry(key).or_insert(value);
+        }
+    }
+    let metadata = if connection_metadata.is_empty() {
+        None
+    } else {
+        Some(connection_metadata)
+    };
 
     Ok(WebRtcConnection::new(
         transport_dyn,
         channels,
         secure_context,
         Some(Arc::clone(&signaling_client)),
+        metadata,
     ))
+}
+
+fn build_label_metadata(label: Option<&str>) -> Option<HashMap<String, String>> {
+    let trimmed = label?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut map = HashMap::new();
+    map.insert("label".to_string(), trimmed.to_string());
+    Some(map)
 }
 
 fn endpoint(base: &str, suffix: &str) -> Result<Url, TransportError> {

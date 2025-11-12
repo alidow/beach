@@ -119,7 +119,11 @@ impl Storage {
         Ok(results)
     }
 
-    pub async fn ack_control(&self, session_id: &str, control_id: &str) -> Result<(), redis::RedisError> {
+    pub async fn ack_control(
+        &self,
+        session_id: &str,
+        control_id: &str,
+    ) -> Result<(), redis::RedisError> {
         let mut conn = self.redis.clone();
         let queue_key = format!("session:{}:control:queue", session_id);
         let payload_key = format!("session:{}:control:{}", session_id, control_id);

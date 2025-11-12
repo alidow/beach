@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { attachByCode, attachOwned, updateSessionRoleById, acquireController, type SessionRole } from '../lib/api';
+import { attachByCode, attachOwned, updateSessionRoleById, issueControllerHandshake, type SessionRole } from '../lib/api';
 import { listMySessions, RoadMySession, sendControlMessage, pollControl } from '../lib/road';
 import { Dialog } from './ui/dialog';
 import { Input } from './ui/input';
@@ -92,18 +92,16 @@ export default function AddSessionModal({ open, onOpenChange, privateBeachId, ma
     console.info('[add-session] attach by code response', {
       session: resp?.session?.session_id,
     });
-    // Acquire a controller lease and send handshake payload via Beach Road
+    // Acquire a controller handshake payload via the manager so the host can auto-attach.
     try {
-      const lease = await acquireController(resp.session.session_id, 30_000, token, managerUrl);
-      const handshake = {
-        private_beach_id: privateBeachId,
-        manager_url: managerUrl,
-        controller_token: lease.controller_token,
-        lease_expires_at_ms: lease.expires_at_ms,
-        stale_session_idle_secs: 60,
-        viewer_health_interval_secs: 15,
-      };
-      onHandshakeIssued?.(resp.session.session_id, lease.controller_token);
+      const handshake = await issueControllerHandshake(
+        resp.session.session_id,
+        code.trim(),
+        privateBeachId,
+        token,
+        managerUrl,
+      );
+      onHandshakeIssued?.(resp.session.session_id, handshake.controller_token);
       console.info('[add-session] issuing control handshake to road', {
         sessionId: resp.session.session_id,
         managerUrl,

@@ -45,22 +45,20 @@ use crate::transport::terminal::negotiation::{
 use crate::transport::{Payload, Transport, TransportError, TransportKind};
 use beach_buggy::{
     AckStatus as CtrlAckStatus, ActionAck as CtrlActionAck, ActionCommand as CtrlActionCommand,
-    HttpTransport as ManagerHttpTransport, ManagerTransport,
-    StaticTokenProvider as ManagerStaticTokenProvider,
 };
-use reqwest::Client;
-use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::fmt::Write as _;
+use reqwest::{Client, StatusCode};
+use serde_json::json;
+use std::fmt::{self, Write as _};
 use std::io::{self, IsTerminal, Read, Write};
 use std::process;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+use tokio::runtime::Handle;
 use tokio::sync::{
     mpsc::{self, UnboundedSender},
-    oneshot,
+    oneshot, watch,
 };
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
@@ -70,6 +68,8 @@ use transport_mod::webrtc::{OffererAcceptedTransport, OffererSupervisor};
 
 pub(crate) const MCP_CHANNEL_LABEL: &str = "mcp-jsonrpc";
 pub(crate) const MCP_CHANNEL_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const CONTROLLER_CHANNEL_LABEL: &str = "mgr-actions";
+pub(crate) const LEGACY_CONTROLLER_CHANNEL_LABEL: &str = "pb-controller";
 
 #[tracing::instrument(
     name = "beach::terminal::host::run",
@@ -152,6 +152,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
 
     let hosted = manager.host().await?;
     let session_id = hosted.session_id().to_string();
+    let controller_ctx = Arc::new(ControllerActionContext::new(session_id.clone()));
     tracing::Span::current().record("session_id", &display(&session_id));
     if bootstrap_mode {
         info!(
@@ -309,6 +310,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         let poll_session_id = session_id.clone();
         let poll_join_code = join_code.clone();
         let writer_for_actions = writer.clone();
+        let controller_ctx_for_actions = controller_ctx.clone();
         tokio::spawn(async move {
             let http = match Client::builder().build() {
                 Ok(c) => c,
@@ -343,7 +345,8 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                         if let Some(list) = body.get("messages").and_then(|v| v.as_array()) {
                             for item in list {
                                 let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                                let control_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                let control_id =
+                                    item.get("id").and_then(|v| v.as_str()).unwrap_or("");
                                 if kind == "manager_handshake" {
                                     if let Some(payload) = item.get("payload") {
                                         let manager_url = payload
@@ -356,20 +359,24 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("")
                                             .to_string();
-                                        if !consumer_started && !manager_url.is_empty() && !controller_token.is_empty() {
+                                        if !consumer_started
+                                            && !manager_url.is_empty()
+                                            && !controller_token.is_empty()
+                                        {
                                             info!(
                                                 target = "controller.actions",
                                                 session_id = %poll_session_id,
                                                 manager = %manager_url,
                                                 "manager handshake received; starting action consumer"
                                             );
-                                            // Use the controller token as bearer; manager auth bypass accepts any token in dev
-                                            let bearer = controller_token.clone();
+                                            let auth = ManagerActionAuth::ControllerToken(
+                                                controller_token.clone(),
+                                            );
                                             consumer_handle = spawn_action_consumer(
+                                                controller_ctx_for_actions.clone(),
                                                 manager_url.clone(),
-                                                bearer,
+                                                auth,
                                                 writer_for_actions.clone(),
-                                                poll_session_id.clone(),
                                             );
                                             consumer_started = true;
                                         }
@@ -426,7 +433,6 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         .or_else(|| std::env::var("NEXT_PUBLIC_MANAGER_URL").ok())
     {
         let manager_url = manager_url.trim().to_string();
-        let manager_url_spawn = manager_url.clone();
         let env_token = std::env::var("PRIVATE_BEACH_MANAGER_TOKEN")
             .ok()
             .map(|v| v.trim().to_string())
@@ -441,75 +447,27 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         };
         if let Some(bearer) = token {
             maybe_auto_attach_session(&manager_url, &session_id, &bearer).await;
-            let writer_for_actions = writer.clone();
-            let session_for_actions = session_id.clone();
-            tokio::spawn(async move {
-                let transport: ManagerHttpTransport<ManagerStaticTokenProvider> =
-                    match ManagerHttpTransport::new(
-                        &manager_url_spawn,
-                        ManagerStaticTokenProvider::new(bearer),
-                    ) {
-                        Ok(t) => t,
-                        Err(err) => {
-                            warn!(target = "controller.actions", error = %err, "manager transport init failed");
-                            return;
-                        }
-                    };
-                loop {
-                    match transport.receive_actions(&session_for_actions).await {
-                        Ok(received) if !received.is_empty() => {
-                            let commands: Vec<CtrlActionCommand> = received;
-                            for cmd in commands.iter() {
-                                if cmd.action_type.as_str() == "terminal_write" {
-                                    if let Some(bytes) =
-                                        cmd.payload.get("bytes").and_then(|v: &Value| v.as_str())
-                                    {
-                                        match writer_for_actions.write(bytes.as_bytes()) {
-                                            Ok(()) => {
-                                                debug!(
-                                                    target = "controller.actions",
-                                                    session_id = %session_for_actions,
-                                                    command_id = %cmd.id,
-                                                    bytes = bytes.len(),
-                                                    "applied terminal_write action"
-                                                );
-                                            }
-                                            Err(err) => {
-                                                warn!(target = "controller.actions", error = %err, "pty write failed for action");
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            let acks: Vec<CtrlActionAck> = commands
-                                .iter()
-                                .map(|c| CtrlActionAck {
-                                    id: c.id.clone(),
-                                    status: CtrlAckStatus::Ok,
-                                    applied_at: std::time::SystemTime::now(),
-                                    latency_ms: None,
-                                    error_code: None,
-                                    error_message: None,
-                                })
-                                .collect();
-                            if let Err(err) =
-                                transport.ack_actions(&session_for_actions, acks).await
-                            {
-                                warn!(target = "controller.actions", error = %err, "ack failed");
-                            }
-                        }
-                        Ok(_) => {
-                            // Idle backoff to avoid busy loop.
-                            sleep(Duration::from_millis(50)).await;
-                        }
-                        Err(err) => {
-                            warn!(target = "controller.actions", error = %err, "receive_actions failed; retrying");
-                            sleep(Duration::from_secs(1)).await;
-                        }
-                    }
-                }
-            });
-            info!(target = "controller.actions", session_id = %session_id, manager = %manager_url, "controller action consumer started");
+            let auth = ManagerActionAuth::Bearer(bearer.clone());
+            if let Some(_handle) = spawn_action_consumer(
+                controller_ctx.clone(),
+                manager_url.clone(),
+                auth,
+                writer.clone(),
+            ) {
+                info!(
+                    target = "controller.actions",
+                    session_id = %session_id,
+                    manager = %manager_url,
+                    "controller action consumer started"
+                );
+            } else {
+                warn!(
+                    target = "controller.actions",
+                    session_id = %session_id,
+                    manager = %manager_url,
+                    "failed to start controller action consumer"
+                );
+            }
         } else {
             debug!(
                 target = "controller.actions",
@@ -545,6 +503,8 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                 None,
                 None,
                 None,
+                None,
+                session_id.clone(),
                 None,
             );
             input_handles.lock().unwrap().push(handle);
@@ -615,6 +575,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         mcp_handle.clone(),
         Arc::clone(&mcp_bridges),
         first_ready_tx,
+        Arc::clone(&controller_ctx),
     );
 
     if wait_for_peer {
@@ -720,45 +681,502 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-fn spawn_action_consumer(
-    manager_url: String,
-    bearer: String,
-    writer_for_actions: PtyWriter,
-    session_for_actions: String,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let manager_url_spawn = manager_url.clone();
-    let transport: ManagerHttpTransport<ManagerStaticTokenProvider> =
-        match ManagerHttpTransport::new(&manager_url, ManagerStaticTokenProvider::new(bearer)) {
-            Ok(t) => t,
-            Err(err) => {
-                warn!(target = "controller.actions", error = %err, "manager transport init failed");
-                return None;
+#[derive(Clone)]
+enum ManagerActionAuth {
+    Bearer(String),
+    ControllerToken(String),
+}
+
+struct ManagerActionClient {
+    http: Client,
+    base_url: String,
+    auth: ManagerActionAuth,
+}
+
+#[derive(Debug)]
+enum ManagerActionError {
+    Http(reqwest::Error),
+    Status(StatusCode, String),
+    Decode(String),
+}
+
+impl fmt::Display for ManagerActionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ManagerActionError::Http(err) => write!(f, "http send error: {err}"),
+            ManagerActionError::Status(code, body) => {
+                write!(f, "unexpected status {} body={}", code, body)
             }
+            ManagerActionError::Decode(err) => write!(f, "decode error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ManagerActionError {}
+
+impl ManagerActionClient {
+    fn new(base_url: String, auth: ManagerActionAuth) -> Result<Self, reqwest::Error> {
+        let http = Client::builder().build()?;
+        Ok(Self {
+            http,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            auth,
+        })
+    }
+
+    fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth {
+            ManagerActionAuth::Bearer(token) => req.bearer_auth(token),
+            ManagerActionAuth::ControllerToken(token) => {
+                req.query(&[("controller_token", token.as_str())])
+            }
+        }
+    }
+
+    async fn send(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, ManagerActionError> {
+        let resp = req.send().await.map_err(ManagerActionError::Http)?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ManagerActionError::Status(status, body));
+        }
+        Ok(resp)
+    }
+
+    async fn receive_actions(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<CtrlActionCommand>, ManagerActionError> {
+        let url = format!("{}/sessions/{session_id}/actions/poll", self.base_url);
+        let resp = self.send(self.apply_auth(self.http.get(url))).await?;
+        resp.json::<Vec<CtrlActionCommand>>()
+            .await
+            .map_err(|err| ManagerActionError::Decode(err.to_string()))
+    }
+
+    async fn ack_actions(
+        &self,
+        session_id: &str,
+        acks: Vec<CtrlActionAck>,
+    ) -> Result<(), ManagerActionError> {
+        if acks.is_empty() {
+            return Ok(());
+        }
+        let url = format!("{}/sessions/{session_id}/actions/ack", self.base_url);
+        self.send(self.apply_auth(self.http.post(url).json(&acks)))
+            .await
+            .map(|_| ())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControllerTransportState {
+    HttpOnly,
+    FastPathPreferred,
+}
+
+impl Default for ControllerTransportState {
+    fn default() -> Self {
+        ControllerTransportState::HttpOnly
+    }
+}
+
+struct ControllerTransportSwitch {
+    tx: watch::Sender<ControllerTransportState>,
+    active_fast_paths: AtomicUsize,
+}
+
+impl ControllerTransportSwitch {
+    fn new() -> Self {
+        let (tx, _) = watch::channel(ControllerTransportState::HttpOnly);
+        Self {
+            tx,
+            active_fast_paths: AtomicUsize::new(0),
+        }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<ControllerTransportState> {
+        self.tx.subscribe()
+    }
+
+    fn fast_path_online(&self) -> bool {
+        let previous = self.active_fast_paths.fetch_add(1, Ordering::SeqCst);
+        if previous == 0 {
+            let _ = self.tx.send(ControllerTransportState::FastPathPreferred);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn fast_path_offline(&self) -> bool {
+        let mut current = self.active_fast_paths.load(Ordering::SeqCst);
+        while current > 0 {
+            match self.active_fast_paths.compare_exchange(
+                current,
+                current - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    if current == 1 {
+                        let _ = self.tx.send(ControllerTransportState::HttpOnly);
+                        return true;
+                    }
+                    return false;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+        false
+    }
+
+    #[cfg(test)]
+    fn current_state(&self) -> ControllerTransportState {
+        *self.tx.borrow()
+    }
+}
+
+#[derive(Clone)]
+struct ControllerActionContext {
+    session_id: String,
+    client: Arc<RwLock<Option<Arc<ManagerActionClient>>>>,
+    switch: Arc<ControllerTransportSwitch>,
+}
+
+impl ControllerActionContext {
+    fn new(session_id: String) -> Self {
+        Self {
+            session_id,
+            client: Arc::new(RwLock::new(None)),
+            switch: Arc::new(ControllerTransportSwitch::new()),
+        }
+    }
+
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    fn set_client(&self, client: Arc<ManagerActionClient>) {
+        let mut guard = self.client.write().unwrap();
+        *guard = Some(client);
+    }
+
+    fn manager_client(&self) -> Option<Arc<ManagerActionClient>> {
+        self.client.read().unwrap().clone()
+    }
+
+    fn subscribe(&self) -> watch::Receiver<ControllerTransportState> {
+        self.switch.subscribe()
+    }
+
+    fn fast_path_online(&self) {
+        if self.switch.fast_path_online() {
+            info!(
+                target = "controller.actions.fast_path",
+                session_id = %self.session_id,
+                "fast_path controller channel active"
+            );
+        }
+    }
+
+    fn fast_path_offline(&self) {
+        if self.switch.fast_path_offline() {
+            info!(
+                target = "controller.actions.fast_path",
+                session_id = %self.session_id,
+                "fast_path controller channel inactive; resuming http poller"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    fn current_state(&self) -> ControllerTransportState {
+        self.switch.current_state()
+    }
+}
+
+fn controller_action_bytes<'a>(action: &'a CtrlActionCommand) -> Result<&'a str, String> {
+    if action.action_type.as_str() != "terminal_write" {
+        return Err(format!("unsupported action type {}", action.action_type));
+    }
+    action
+        .payload
+        .get("bytes")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "terminal_write payload missing bytes".to_string())
+}
+
+struct ControllerChannelOutcome {
+    channel_closed: bool,
+    fatal_error: bool,
+}
+
+fn run_fast_path_controller_channel(
+    transport: Arc<dyn Transport>,
+    transport_kind: TransportKind,
+    writer: PtyWriter,
+    session_id: &str,
+    client_label: Option<String>,
+    client_peer_id: Option<String>,
+    controller_ctx: Arc<ControllerActionContext>,
+    runtime: Handle,
+) -> ControllerChannelOutcome {
+    controller_ctx.fast_path_online();
+    let transport_id = transport.id().0;
+    info!(
+        target = "controller.actions.fast_path",
+        session_id = %session_id,
+        transport_id,
+        transport = ?transport_kind,
+        client_label = client_label.as_deref(),
+        client_peer_id = client_peer_id.as_deref(),
+        "fast path controller channel ready"
+    );
+    let mut channel_closed = false;
+    let mut fatal_error = false;
+    let mut last_seq: Seq = 0;
+
+    loop {
+        match transport.recv(Duration::from_millis(250)) {
+            Ok(message) => match message.payload {
+                Payload::Binary(bytes) => match protocol::decode_client_frame_binary(&bytes) {
+                    Ok(WireClientFrame::Input { seq, data }) => {
+                        if seq <= last_seq {
+                            trace!(
+                                target = "controller.actions.fast_path",
+                                session_id = %session_id,
+                                transport_id,
+                                seq,
+                                "duplicate fast path input detected"
+                            );
+                            send_host_frame(&transport, HostFrame::InputAck { seq }).ok();
+                            continue;
+                        }
+
+                        if let Err(err) = writer.write(&data) {
+                            error!(
+                                target = "controller.actions.fast_path",
+                                session_id = %session_id,
+                                transport_id,
+                                seq,
+                                error = %err,
+                                "failed to write fast path input to PTY"
+                            );
+                            fatal_error = true;
+                            break;
+                        }
+
+                        debug!(
+                            target = "controller.actions.fast_path.apply",
+                            session_id = %session_id,
+                            transport_id,
+                            seq,
+                            bytes = data.len(),
+                            "applied fast path controller bytes"
+                        );
+                        last_seq = seq;
+
+                        if let Err(err) = send_host_frame(&transport, HostFrame::InputAck { seq }) {
+                            warn!(
+                                target = "controller.actions.fast_path",
+                                session_id = %session_id,
+                                transport_id,
+                                seq,
+                                error = %err,
+                                "failed to send fast path input ack"
+                            );
+                        }
+
+                        if let Some((client, action_id)) = controller_ctx
+                            .manager_client()
+                            .and_then(|client| fast_path_action_id(&data).map(|id| (client, id)))
+                        {
+                            spawn_optional_http_ack(
+                                runtime.clone(),
+                                client,
+                                session_id.to_string(),
+                                action_id,
+                                seq,
+                            );
+                        }
+                    }
+                    Ok(_) => {
+                        trace!(
+                            target = "controller.actions.fast_path",
+                            session_id = %session_id,
+                            transport_id,
+                            "ignoring non-input fast path frame"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            target = "controller.actions.fast_path",
+                            session_id = %session_id,
+                            transport_id,
+                            error = %err,
+                            "failed to decode fast path frame"
+                        );
+                    }
+                },
+                Payload::Text(text) => {
+                    let trimmed = text.trim();
+                    if trimmed == "__ready__" || trimmed == "__offer_ready__" {
+                        continue;
+                    }
+                    trace!(
+                        target = "controller.actions.fast_path",
+                        session_id = %session_id,
+                        transport_id,
+                        payload = %trimmed,
+                        "ignoring fast path text payload"
+                    );
+                }
+            },
+            Err(TransportError::Timeout) => continue,
+            Err(TransportError::ChannelClosed) => {
+                channel_closed = true;
+                break;
+            }
+            Err(err) => {
+                fatal_error = true;
+                warn!(
+                    target = "controller.actions.fast_path",
+                    session_id = %session_id,
+                    transport_id,
+                    error = %err,
+                    "fast path controller channel error"
+                );
+                break;
+            }
+        }
+    }
+
+    controller_ctx.fast_path_offline();
+    ControllerChannelOutcome {
+        channel_closed,
+        fatal_error,
+    }
+}
+
+fn fast_path_action_id(data: &[u8]) -> Option<String> {
+    serde_json::from_slice::<CtrlActionCommand>(data)
+        .ok()
+        .map(|cmd| cmd.id)
+}
+
+fn spawn_optional_http_ack(
+    runtime: Handle,
+    client: Arc<ManagerActionClient>,
+    session_id: String,
+    action_id: String,
+    seq: Seq,
+) {
+    runtime.spawn(async move {
+        let ack = CtrlActionAck {
+            id: action_id.clone(),
+            status: CtrlAckStatus::Ok,
+            applied_at: SystemTime::now(),
+            latency_ms: None,
+            error_code: None,
+            error_message: None,
         };
+        if let Err(err) = client.ack_actions(&session_id, vec![ack]).await {
+            warn!(
+                target = "controller.actions.fast_path.ack",
+                session_id = %session_id,
+                action_id = %action_id,
+                seq,
+                error = %err,
+                "optional http ack for fast path action failed"
+            );
+        } else {
+            debug!(
+                target = "controller.actions.fast_path.ack",
+                session_id = %session_id,
+                action_id = %action_id,
+                seq,
+                "fast path action acked via http"
+            );
+        }
+    });
+}
+
+fn spawn_action_consumer(
+    ctx: Arc<ControllerActionContext>,
+    manager_url: String,
+    auth: ManagerActionAuth,
+    writer_for_actions: PtyWriter,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let client = match ManagerActionClient::new(manager_url.clone(), auth) {
+        Ok(c) => c,
+        Err(err) => {
+            warn!(
+                target = "controller.actions",
+                error = %err,
+                manager = %manager_url,
+                "manager action client init failed"
+            );
+            return None;
+        }
+    };
+
+    let client = Arc::new(client);
+    ctx.set_client(client.clone());
+    let mut transport_state = ctx.subscribe();
+    let session_for_actions = ctx.session_id().to_string();
+
     Some(tokio::spawn(async move {
+        let mut paused_for_fast_path = false;
         loop {
-            match transport.receive_actions(&session_for_actions).await {
+            if matches!(
+                *transport_state.borrow(),
+                ControllerTransportState::FastPathPreferred
+            ) {
+                if !paused_for_fast_path {
+                    debug!(
+                        target = "controller.actions.fast_path",
+                        session_id = %session_for_actions,
+                        "http action poller paused (fast path active)"
+                    );
+                    paused_for_fast_path = true;
+                }
+                if transport_state.changed().await.is_err() {
+                    break;
+                }
+                continue;
+            }
+            paused_for_fast_path = false;
+            match client.receive_actions(&session_for_actions).await {
                 Ok(received) if !received.is_empty() => {
                     let commands: Vec<CtrlActionCommand> = received;
                     for cmd in commands.iter() {
-                        if cmd.action_type.as_str() == "terminal_write" {
-                            if let Some(bytes) =
-                                cmd.payload.get("bytes").and_then(|v: &Value| v.as_str())
-                            {
-                                match writer_for_actions.write(bytes.as_bytes()) {
-                                    Ok(()) => {
-                                        debug!(
-                                            target = "controller.actions",
-                                            session_id = %session_for_actions,
-                                            command_id = %cmd.id,
-                                            bytes = bytes.len(),
-                                            "applied terminal_write action"
-                                        );
-                                    }
-                                    Err(err) => {
-                                        warn!(target = "controller.actions", error = %err, "pty write failed for action");
-                                    }
+                        match controller_action_bytes(cmd) {
+                            Ok(bytes) => match writer_for_actions.write(bytes.as_bytes()) {
+                                Ok(()) => {
+                                    debug!(
+                                        target = "controller.actions",
+                                        session_id = %session_for_actions,
+                                        command_id = %cmd.id,
+                                        bytes = bytes.len(),
+                                        "applied terminal_write action"
+                                    );
                                 }
+                                Err(err) => {
+                                    warn!(target = "controller.actions", error = %err, "pty write failed for action");
+                                }
+                            },
+                            Err(err) => {
+                                warn!(
+                                    target = "controller.actions",
+                                    session_id = %session_for_actions,
+                                    command_id = %cmd.id,
+                                    error = %err,
+                                    "unsupported controller action"
+                                );
                             }
                         }
                     }
@@ -773,7 +1191,7 @@ fn spawn_action_consumer(
                             error_message: None,
                         })
                         .collect();
-                    if let Err(err) = transport.ack_actions(&session_for_actions, acks).await {
+                    if let Err(err) = client.ack_actions(&session_for_actions, acks).await {
                         warn!(target = "controller.actions", error = %err, "ack failed");
                     }
                 }
@@ -932,7 +1350,10 @@ fn spawn_input_listener(
     client_label: Option<String>,
     client_peer_id: Option<String>,
     gate: Option<Arc<HostInputGate>>,
+    session_id: String,
+    controller_ctx: Option<Arc<ControllerActionContext>>,
 ) -> thread::JoinHandle<()> {
+    let runtime_handle = Handle::try_current().ok();
     let transport_id = transport.id().0;
     let transport_kind = transport.kind();
     thread::spawn(move || {
@@ -947,250 +1368,257 @@ fn spawn_input_listener(
         );
         let mut channel_closed = false;
         let mut fatal_error = false;
-        loop {
-            if let Some(g) = &gate {
-                g.wait_until_resumed();
+        let is_controller_channel = controller_ctx
+            .as_ref()
+            .map(|_| {
+                matches!(
+                    client_label.as_deref(),
+                    Some(CONTROLLER_CHANNEL_LABEL) | Some(LEGACY_CONTROLLER_CHANNEL_LABEL)
+                )
+            })
+            .unwrap_or(false);
+
+        if is_controller_channel {
+            match (controller_ctx, runtime_handle) {
+                (Some(ctx), Some(handle)) => {
+                    let outcome = run_fast_path_controller_channel(
+                        Arc::clone(&transport),
+                        transport_kind,
+                        writer.clone(),
+                        &session_id,
+                        client_label.clone(),
+                        client_peer_id.clone(),
+                        ctx,
+                        handle,
+                    );
+                    channel_closed = outcome.channel_closed;
+                    fatal_error = outcome.fatal_error;
+                }
+                _ => {
+                    fatal_error = true;
+                    error!(
+                        target = "controller.actions.fast_path",
+                        session_id = %session_id,
+                        transport_id,
+                        "unable to start fast path controller channel (missing runtime/context)"
+                    );
+                }
             }
-            match transport.recv(Duration::from_millis(250)) {
-                Ok(message) => {
-                    let transport_sequence = message.sequence;
-                    match message.payload {
-                        Payload::Binary(bytes) => {
-                            match protocol::decode_client_frame_binary(&bytes) {
-                                Ok(frame) => {
-                                    if tracing::enabled!(Level::TRACE) {
-                                        trace!(
+        } else {
+            loop {
+                if let Some(g) = &gate {
+                    g.wait_until_resumed();
+                }
+                match transport.recv(Duration::from_millis(250)) {
+                    Ok(message) => {
+                        let transport_sequence = message.sequence;
+                        match message.payload {
+                            Payload::Binary(bytes) => {
+                                match protocol::decode_client_frame_binary(&bytes) {
+                                    Ok(frame) => {
+                                        if tracing::enabled!(Level::TRACE) {
+                                            trace!(
+                                                target = "sync::incoming",
+                                                transport_id,
+                                                transport = ?transport_kind,
+                                                transport_sequence,
+                                                frame = client_frame_label(&frame),
+                                                payload_len = bytes.len(),
+                                                "received client frame"
+                                            );
+                                        }
+                                        match frame {
+                                            WireClientFrame::Input { seq, data } => {
+                                                if let Some(g) = &gate {
+                                                    g.wait_until_resumed();
+                                                }
+                                                if seq <= last_seq {
+                                                    trace!(
+                                                        target = "sync::incoming",
+                                                        transport_id,
+                                                        transport = ?transport_kind,
+                                                        seq,
+                                                        "dropping duplicate input sequence"
+                                                    );
+                                                    continue;
+                                                }
+                                                if let Err(err) = writer.write(&data) {
+                                                    error!(
+                                                        target = "sync::incoming",
+                                                        transport_id,
+                                                        transport = ?transport_kind,
+                                                        seq,
+                                                        error = %err,
+                                                        "pty write failed"
+                                                    );
+                                                    break;
+                                                }
+                                                if tracing::enabled!(Level::TRACE) {
+                                                    trace!(
+                                                        target = "sync::incoming",
+                                                        transport_id,
+                                                        transport = ?transport_kind,
+                                                        seq,
+                                                        bytes = data.len(),
+                                                        dump = %logctl::hexdump(&data),
+                                                        "forwarded client input"
+                                                    );
+                                                }
+                                                last_seq = seq;
+                                            }
+                                            WireClientFrame::Resize { cols, rows } => {
+                                                let clamped_cols = cols.min(MAX_PTY_COLS);
+                                                let clamped_rows = rows.min(MAX_PTY_ROWS);
+                                                if let Err(err) =
+                                                    process.resize(clamped_cols, clamped_rows)
+                                                {
+                                                    warn!(
+                                                        target = "sync::incoming",
+                                                        transport_id,
+                                                        transport = ?transport_kind,
+                                                        cols = clamped_cols,
+                                                        rows = clamped_rows,
+                                                        error = %err,
+                                                        "pty resize failed"
+                                                    );
+                                                }
+                                                if let Ok(mut guard) = emulator.lock() {
+                                                    guard.resize(
+                                                        clamped_rows as usize,
+                                                        clamped_cols as usize,
+                                                    );
+                                                }
+                                                if tracing::enabled!(Level::TRACE) {
+                                                    trace!(
+                                                        target = "sync::incoming",
+                                                        transport_id,
+                                                        transport = ?transport_kind,
+                                                        cols = clamped_cols,
+                                                        rows = clamped_rows,
+                                                        client_label = client_label.as_deref(),
+                                                        client_peer_id = client_peer_id.as_deref(),
+                                                        "processed resize request"
+                                                    );
+                                                }
+                                            }
+                                            WireClientFrame::ViewportCommand { command } => {
+                                                if let Err(err) = handle_viewport_command(
+                                                    command,
+                                                    &writer,
+                                                    transport_id,
+                                                    &transport_kind,
+                                                    &grid,
+                                                    &forwarder_tx,
+                                                ) {
+                                                    warn!(
+                                                        target = "sync::incoming",
+                                                        transport_id,
+                                                        transport = ?transport_kind,
+                                                        error = %err,
+                                                        command = ?command,
+                                                        "viewport command failed"
+                                                    );
+                                                }
+                                            }
+                                            WireClientFrame::RequestBackfill {
+                                                subscription,
+                                                request_id,
+                                                start_row,
+                                                count,
+                                            } => {
+                                                let capped =
+                                                    count.min(MAX_BACKFILL_ROWS_PER_REQUEST);
+                                                if capped == 0 {
+                                                    continue;
+                                                }
+                                                if let Err(err) =
+                                                    backfill_tx.send(BackfillCommand {
+                                                        transport_id: transport.id(),
+                                                        subscription,
+                                                        request_id,
+                                                        start_row,
+                                                        count: capped,
+                                                    })
+                                                {
+                                                    warn!(
+                                                        target = "sync::incoming",
+                                                        transport_id,
+                                                        transport = ?transport_kind,
+                                                        request_id,
+                                                        error = %err,
+                                                        "failed to enqueue backfill request"
+                                                    );
+                                                } else {
+                                                    trace!(
+                                                        target = "sync::incoming",
+                                                        transport_id,
+                                                        transport = ?transport_kind,
+                                                        request_id,
+                                                        start_row,
+                                                        requested = count,
+                                                        enqueued = capped,
+                                                        "queued history backfill request"
+                                                    );
+                                                }
+                                            }
+                                            WireClientFrame::Unknown => {}
+                                        }
+                                    }
+                                    Err(err) => {
+                                        warn!(
                                             target = "sync::incoming",
                                             transport_id,
                                             transport = ?transport_kind,
                                             transport_sequence,
-                                            frame = client_frame_label(&frame),
-                                            payload_len = bytes.len(),
-                                            "received client frame"
+                                            error = %err,
+                                            "failed to decode client frame"
                                         );
                                     }
-                                    match frame {
-                                        WireClientFrame::Input { seq, data } => {
-                                            if let Some(g) = &gate {
-                                                g.wait_until_resumed();
-                                            }
-                                            if seq <= last_seq {
-                                                trace!(
-                                                    target = "sync::incoming",
-                                                    transport_id,
-                                                    transport = ?transport_kind,
-                                                    seq,
-                                                    "dropping duplicate input sequence"
-                                                );
-                                                continue;
-                                            }
-                                            if let Err(err) = writer.write(&data) {
-                                                error!(
-                                                    target = "sync::incoming",
-                                                    transport_id,
-                                                    transport = ?transport_kind,
-                                                    seq,
-                                                    error = %err,
-                                                    "pty write failed"
-                                                );
-                                                break;
-                                            }
-                                            if tracing::enabled!(Level::TRACE) {
-                                                trace!(
-                                                    target = "sync::incoming",
-                                                    transport_id,
-                                                    transport = ?transport_kind,
-                                                    seq,
-                                                    bytes = data.len(),
-                                                    dump = %logctl::hexdump(&data),
-                                                    "client input bytes"
-                                                );
-                                            }
-                                            last_seq = seq;
-                                            let _ = send_host_frame(
-                                                &transport,
-                                                HostFrame::InputAck { seq },
-                                            );
-                                            debug!(
-                                                target = "sync::incoming",
-                                                transport_id,
-                                                transport = ?transport_kind,
-                                                seq,
-                                                "input applied and acked"
-                                            );
-                                        }
-                                        WireClientFrame::Resize { cols, rows } => {
-                                            let clamped_cols = cols.min(MAX_PTY_COLS);
-                                            let clamped_rows = rows.min(MAX_PTY_ROWS);
-                                            if cols != clamped_cols || rows != clamped_rows {
-                                                trace!(
-                                                    target = "sync::incoming",
-                                                    transport_id,
-                                                    transport = ?transport_kind,
-                                                    requested_cols = cols,
-                                                    requested_rows = rows,
-                                                    clamped_cols,
-                                                    clamped_rows,
-                                                    "clamped resize request"
-                                                );
-                                            }
-                                            if let Err(err) =
-                                                process.resize(clamped_cols, clamped_rows)
-                                            {
-                                                warn!(
-                                                    target = "sync::incoming",
-                                                    transport_id,
-                                                    transport = ?transport_kind,
-                                                    error = %err,
-                                                    cols = clamped_cols,
-                                                    rows = clamped_rows,
-                                                    "pty resize failed"
-                                                );
-                                            }
-                                            if let Ok(mut guard) = emulator.lock() {
-                                                guard.resize(
-                                                    clamped_rows as usize,
-                                                    clamped_cols as usize,
-                                                );
-                                            }
-                                            grid.set_viewport_size(
-                                                clamped_rows as usize,
-                                                clamped_cols as usize,
-                                            );
-                                            let history_rows = grid.rows();
-                                            let _ = send_host_frame(
-                                                &transport,
-                                                HostFrame::Grid {
-                                                    cols: clamped_cols as u32,
-                                                    history_rows: history_rows as u32,
-                                                    base_row: grid.row_offset(),
-                                                    viewport_rows: Some(clamped_rows as u32),
-                                                },
-                                            );
-                                            debug!(
-                                                target = "sync::incoming",
-                                                transport_id,
-                                                transport = ?transport_kind,
-                                                cols = clamped_cols,
-                                                rows = clamped_rows,
-                                                client_label = client_label.as_deref(),
-                                                client_peer_id = client_peer_id.as_deref(),
-                                                "processed resize request"
-                                            );
-                                        }
-                                        WireClientFrame::ViewportCommand { command } => {
-                                            if let Err(err) = handle_viewport_command(
-                                                command,
-                                                &writer,
-                                                transport_id,
-                                                &transport_kind,
-                                                &grid,
-                                                &forwarder_tx,
-                                            ) {
-                                                warn!(
-                                                    target = "sync::incoming",
-                                                    transport_id,
-                                                    transport = ?transport_kind,
-                                                    error = %err,
-                                                    command = ?command,
-                                                    "viewport command failed"
-                                                );
-                                            }
-                                        }
-                                        WireClientFrame::RequestBackfill {
-                                            subscription,
-                                            request_id,
-                                            start_row,
-                                            count,
-                                        } => {
-                                            let capped = count.min(MAX_BACKFILL_ROWS_PER_REQUEST);
-                                            if capped == 0 {
-                                                continue;
-                                            }
-                                            if let Err(err) = backfill_tx.send(BackfillCommand {
-                                                transport_id: transport.id(),
-                                                subscription,
-                                                request_id,
-                                                start_row,
-                                                count: capped,
-                                            }) {
-                                                warn!(
-                                                    target = "sync::incoming",
-                                                    transport_id,
-                                                    transport = ?transport_kind,
-                                                    request_id,
-                                                    error = %err,
-                                                    "failed to enqueue backfill request"
-                                                );
-                                            } else {
-                                                trace!(
-                                                    target = "sync::incoming",
-                                                    transport_id,
-                                                    transport = ?transport_kind,
-                                                    request_id,
-                                                    start_row,
-                                                    requested = count,
-                                                    enqueued = capped,
-                                                    "queued history backfill request"
-                                                );
-                                            }
-                                        }
-                                        WireClientFrame::Unknown => {}
-                                    }
                                 }
-                                Err(err) => {
-                                    warn!(
+                            }
+                            Payload::Text(text) => {
+                                let trimmed = text.trim();
+                                if trimmed == "__ready__" || trimmed == "__offer_ready__" {
+                                    trace!(
                                         target = "sync::incoming",
                                         transport_id,
                                         transport = ?transport_kind,
                                         transport_sequence,
-                                        error = %err,
-                                        "failed to decode client frame"
+                                        "ignoring handshake sentinel"
+                                    );
+                                } else {
+                                    debug!(
+                                        target = "sync::incoming",
+                                        transport_id,
+                                        transport = ?transport_kind,
+                                        transport_sequence,
+                                        payload = %trimmed,
+                                        "ignoring unexpected text payload"
                                     );
                                 }
                             }
                         }
-                        Payload::Text(text) => {
-                            let trimmed = text.trim();
-                            if trimmed == "__ready__" || trimmed == "__offer_ready__" {
-                                trace!(
-                                    target = "sync::incoming",
-                                    transport_id,
-                                    transport = ?transport_kind,
-                                    transport_sequence,
-                                    "ignoring handshake sentinel"
-                                );
-                            } else {
-                                debug!(
-                                    target = "sync::incoming",
-                                    transport_id,
-                                    transport = ?transport_kind,
-                                    transport_sequence,
-                                    payload = %trimmed,
-                                    "ignoring unexpected text payload"
-                                );
-                            }
-                        }
                     }
-                }
-                Err(TransportError::Timeout) => continue,
-                Err(TransportError::ChannelClosed) => {
-                    channel_closed = true;
-                    break;
-                }
-                Err(err) => {
-                    warn!(
-                        target = "sync::incoming",
-                        transport_id,
-                        transport = ?transport_kind,
-                        error = %err,
-                        "input listener error"
-                    );
-                    fatal_error = true;
-                    break;
+                    Err(TransportError::Timeout) => continue,
+                    Err(TransportError::ChannelClosed) => {
+                        channel_closed = true;
+                        break;
+                    }
+                    Err(err) => {
+                        warn!(
+                            target = "sync::incoming",
+                            transport_id,
+                            transport = ?transport_kind,
+                            error = %err,
+                            "input listener error"
+                        );
+                        fatal_error = true;
+                        break;
+                    }
                 }
             }
         }
+
         debug!(
             target = "sync::incoming",
             transport_id,
@@ -1239,9 +1667,11 @@ fn spawn_webrtc_acceptor(
     mcp_handle: Option<McpServerHandle>,
     mcp_bridges: Arc<Mutex<Vec<JoinHandle<()>>>>,
     ready_tx: Option<oneshot::Sender<()>>,
+    controller_ctx_handle: Arc<ControllerActionContext>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ready_tx = ready_tx;
+        let controller_ctx_clone = controller_ctx_handle;
         loop {
             let passphrase = join_code.as_deref();
             let negotiation_started = Instant::now();
@@ -1251,6 +1681,7 @@ fn spawn_webrtc_acceptor(
                     transport,
                     webrtc_channels,
                     signaling_client: _,
+                    metadata: single_metadata,
                 })) => {
                     let selected_kind = transport.kind();
                     let elapsed_ms = negotiation_started.elapsed().as_millis() as u64;
@@ -1265,7 +1696,7 @@ fn spawn_webrtc_acceptor(
                         None,
                         None,
                         Some("primary transport".to_string()),
-                        HashMap::new(),
+                        single_metadata.clone(),
                     );
                     let hint_pending = authorizer.should_emit_pending_hint();
                     let auto_grant = authorizer.should_emit_auto_granted();
@@ -1299,7 +1730,10 @@ fn spawn_webrtc_acceptor(
                         }
                     }
 
-                    let shared_transport = Arc::new(SharedTransport::new(transport.clone()));
+                    let shared_transport = Arc::new(SharedTransport::new(
+                        transport.clone(),
+                        Some(metadata.metadata.clone()),
+                    ));
                     {
                         let mut guard = transports.lock().unwrap();
                         guard.push(shared_transport.clone());
@@ -1383,6 +1817,8 @@ fn spawn_webrtc_acceptor(
                         metadata.label.clone(),
                         metadata.peer_id.clone(),
                         authorizer.gate(),
+                        session_id.clone(),
+                        Some(controller_ctx_clone.clone()),
                     );
                     input_handles.lock().unwrap().push(listener);
                     if forwarder_tx
@@ -1458,7 +1894,10 @@ fn spawn_webrtc_acceptor(
                         }
                     }
 
-                    let shared_transport = Arc::new(SharedTransport::new(transport.clone()));
+                    let shared_transport = Arc::new(SharedTransport::new(
+                        transport.clone(),
+                        Some(metadata.metadata.clone()),
+                    ));
                     {
                         let mut guard = transports.lock().unwrap();
                         guard.push(shared_transport.clone());
@@ -1532,6 +1971,8 @@ fn spawn_webrtc_acceptor(
                         metadata.label.clone(),
                         metadata.peer_id.clone(),
                         authorizer.gate(),
+                        session_id.clone(),
+                        Some(controller_ctx_clone.clone()),
                     );
                     input_handles.lock().unwrap().push(listener);
                     if forwarder_tx
@@ -1565,6 +2006,7 @@ fn spawn_webrtc_acceptor(
                         Arc::clone(&authorizer),
                         mcp_handle.clone(),
                         Arc::clone(&mcp_bridges),
+                        controller_ctx_clone.clone(),
                     );
                     break;
                 }
@@ -1598,6 +2040,7 @@ fn spawn_viewer_accept_loop(
     authorizer: Arc<JoinAuthorizer>,
     mcp_handle: Option<McpServerHandle>,
     mcp_bridges: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    controller_ctx: Arc<ControllerActionContext>,
 ) {
     tokio::spawn(async move {
         while let Ok(accepted) = supervisor.next().await {
@@ -1654,7 +2097,10 @@ fn spawn_viewer_accept_loop(
                 }
             }
 
-            let shared_transport = Arc::new(SharedTransport::new(transport_arc.clone()));
+            let shared_transport = Arc::new(SharedTransport::new(
+                transport_arc.clone(),
+                Some(auth_metadata.metadata.clone()),
+            ));
             {
                 let mut guard = transports.lock().unwrap();
                 guard.push(shared_transport.clone());
@@ -1728,6 +2174,8 @@ fn spawn_viewer_accept_loop(
                 auth_metadata.label.clone(),
                 auth_metadata.peer_id.clone(),
                 authorizer.gate(),
+                session_id.clone(),
+                Some(controller_ctx.clone()),
             );
             input_handles.lock().unwrap().push(listener);
 
@@ -1915,11 +2363,125 @@ mod tests {
     use crate::transport::{Payload, TransportKind, TransportPair};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+    use std::thread;
     use std::time::{Duration as StdDuration, Instant};
     use tokio::io::BufReader;
     use tokio::io::{AsyncWriteExt, duplex};
+    use tokio::runtime::Runtime;
     use tokio::time::{Instant as TokioInstant, sleep, timeout};
     use uuid::Uuid;
+
+    #[derive(Clone)]
+    struct TestWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for TestWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.buffer.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fast_path_channel_writes_and_acks_without_manager() {
+        let runtime = Runtime::new().expect("runtime");
+        let pair = TransportPair::new(TransportKind::Ipc);
+        let host_transport: Arc<dyn Transport> = Arc::from(pair.server);
+        let remote_transport: Arc<dyn Transport> = Arc::from(pair.client);
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = PtyWriter::for_test(Box::new(TestWriter {
+            buffer: buffer.clone(),
+        }));
+
+        let ctx = Arc::new(ControllerActionContext::new("sess-fast-path".into()));
+        let handle = runtime.handle().clone();
+
+        let host_ctx = ctx.clone();
+        let transport_clone = host_transport.clone();
+        let writer_clone = writer.clone();
+        let join = thread::spawn(move || {
+            run_fast_path_controller_channel(
+                transport_clone,
+                TransportKind::Ipc,
+                writer_clone,
+                "sess-fast-path",
+                Some(CONTROLLER_CHANNEL_LABEL.to_string()),
+                Some("peer-1".to_string()),
+                host_ctx,
+                handle,
+            )
+        });
+
+        let frame = WireClientFrame::Input {
+            seq: 1,
+            data: b"ping".to_vec(),
+        };
+        let encoded = protocol::encode_client_frame_binary(&frame);
+        remote_transport
+            .send_bytes(&encoded)
+            .expect("send client frame");
+
+        let ack_msg = remote_transport
+            .recv(StdDuration::from_secs(1))
+            .expect("recv ack");
+        match ack_msg.payload {
+            Payload::Binary(bytes) => {
+                let ack = protocol::decode_host_frame_binary(&bytes).expect("decode host frame");
+                match ack {
+                    WireHostFrame::InputAck { seq } => assert_eq!(seq, 1),
+                    other => panic!("unexpected host frame: {other:?}"),
+                }
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+
+        drop(remote_transport);
+        let outcome = join.join().expect("join fast path thread");
+        assert!(outcome.channel_closed);
+        assert_eq!(*buffer.lock().unwrap(), b"ping");
+    }
+
+    #[test]
+    fn fast_path_channel_drop_resets_transport_state() {
+        let runtime = Runtime::new().expect("runtime");
+        let pair = TransportPair::new(TransportKind::Ipc);
+        let host_transport: Arc<dyn Transport> = Arc::from(pair.server);
+        let remote_transport: Arc<dyn Transport> = Arc::from(pair.client);
+
+        let writer = PtyWriter::for_test(Box::new(TestWriter {
+            buffer: Arc::new(Mutex::new(Vec::new())),
+        }));
+
+        let ctx = Arc::new(ControllerActionContext::new("sess-drop".into()));
+        let handle = runtime.handle().clone();
+
+        let host_ctx = ctx.clone();
+        let transport_clone = host_transport.clone();
+        let writer_clone = writer.clone();
+        let join = thread::spawn(move || {
+            run_fast_path_controller_channel(
+                transport_clone,
+                TransportKind::Ipc,
+                writer_clone,
+                "sess-drop",
+                Some(CONTROLLER_CHANNEL_LABEL.to_string()),
+                Some("peer-2".to_string()),
+                host_ctx,
+                handle,
+            )
+        });
+
+        drop(remote_transport);
+        let outcome = join.join().expect("fast path join");
+        assert!(outcome.channel_closed);
+        assert_eq!(ctx.current_state(), ControllerTransportState::HttpOnly);
+    }
 
     #[test]
     fn bootstrap_handshake_serializes_expected_fields() {

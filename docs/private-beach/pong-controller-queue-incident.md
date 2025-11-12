@@ -46,4 +46,13 @@
    - Use `XLEN pb:<beach>:sess:<session>:actions` to validate depth and confirm no consumers exist.
 4. **Root-cause the 422 layout error**
    - Check manager logs for the matching request to see why layout updates are rejected; ensures UI → manager contract isn’t broken for other APIs too.
+5. **Rebuild and redeploy the CLI host whenever controller transport changes**
+   - The fast_path `pb-controller` consumer now sends PTY bytes + InputAck directly; stale binaries fall back to HTTP-only mode and immediately overflow manager queues. Run `cargo build --bin beach` (or rebuild the docker image) before launching demo hosts so the automatic fast_path ↔ HTTP fallback switch engages.
 
+## Nov 2025 Follow-up: Controller Channel Labels
+- Beach Manager’s controller forwarder can only stream actions over a WebRTC data channel labelled `mgr-actions`, while CLI hosts historically registered a legacy `pb-controller` channel.
+- Hosts paused their HTTP pollers as soon as any fast-path channel appeared, but the manager never recognized that channel, so every controller write fell back to the HTTP queue and eventually hit `queue_depth=500`.
+- Fix:
+  1. Standardize on `mgr-actions` for new builds (host + manager) while still accepting the legacy label for backward compatibility.
+  2. Manager now attempts the modern label first and automatically retries with `pb-controller` if the remote host has not been upgraded.
+  3. Update docs/helpful-commands to remind folks to rebuild the CLI/containers so the new label propagates everywhere.

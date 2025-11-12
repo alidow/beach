@@ -117,6 +117,12 @@ pub struct ControllerHandshakeResponse {
     pub viewer_health_interval_secs: u64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ControllerConsumeQuery {
+    #[serde(default)]
+    pub controller_token: Option<String>,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct AttachByCodeResponse {
     pub ok: bool,
@@ -237,19 +243,33 @@ pub async fn issue_controller_handshake(
 
     // Attach (or re-attach) the session via code to ensure the manager tracks it for this beach.
     let session_summary = match state
-        .attach_by_code(&target_beach, &session_id, &body.passcode, token.account_uuid())
+        .attach_by_code(
+            &target_beach,
+            &session_id,
+            &body.passcode,
+            token.account_uuid(),
+        )
         .await
     {
         Ok(summary) => summary,
-        Err(StateError::InvalidIdentifier(_)) => return Err(ApiError::Forbidden("invalid_passcode")),
-        Err(StateError::PrivateBeachNotFound) => return Err(ApiError::NotFound("private beach not found")),
+        Err(StateError::InvalidIdentifier(_)) => {
+            return Err(ApiError::Forbidden("invalid_passcode"))
+        }
+        Err(StateError::PrivateBeachNotFound) => {
+            return Err(ApiError::NotFound("private beach not found"))
+        }
         Err(StateError::SessionNotFound) => return Err(ApiError::NotFound("session not found")),
         Err(err) => return Err(map_state_err(err)),
     };
 
     // Acquire (or renew) a controller lease for this host session
     let lease = state
-        .acquire_controller(&session_id, None, Some("auto_handshake".into()), token.account_uuid())
+        .acquire_controller(
+            &session_id,
+            None,
+            Some("auto_handshake".into()),
+            token.account_uuid(),
+        )
         .await
         .map_err(map_state_err)?;
 
@@ -386,10 +406,18 @@ pub async fn queue_actions(
 
 pub async fn poll_actions(
     State(state): State<AppState>,
-    token: AuthToken,
     Path(session_id): Path<String>,
+    Query(query): Query<ControllerConsumeQuery>,
+    token: Option<AuthToken>,
 ) -> ApiResult<Vec<ActionCommand>> {
-    ensure_scope(&token, "pb:control.consume")?;
+    resolve_control_consumer(
+        &state,
+        &session_id,
+        query.controller_token.as_deref(),
+        token.as_ref(),
+        "pb:control.consume",
+    )
+    .await?;
     let commands = state
         .poll_actions(&session_id)
         .await
@@ -399,16 +427,44 @@ pub async fn poll_actions(
 
 pub async fn ack_actions(
     State(state): State<AppState>,
-    token: AuthToken,
     Path(session_id): Path<String>,
+    Query(query): Query<ControllerConsumeQuery>,
+    token: Option<AuthToken>,
     Json(body): Json<Vec<ActionAck>>,
 ) -> ApiResult<serde_json::Value> {
-    ensure_scope(&token, "pb:control.consume")?;
+    let actor_account_id = resolve_control_consumer(
+        &state,
+        &session_id,
+        query.controller_token.as_deref(),
+        token.as_ref(),
+        "pb:control.consume",
+    )
+    .await?;
     state
-        .ack_actions(&session_id, body, token.account_uuid(), false)
+        .ack_actions(&session_id, body, actor_account_id, false)
         .await
         .map_err(map_state_err)?;
     Ok(Json(serde_json::json!({ "acknowledged": true })))
+}
+
+async fn resolve_control_consumer(
+    state: &AppState,
+    session_id: &str,
+    controller_token: Option<&str>,
+    token: Option<&AuthToken>,
+    scope: &'static str,
+) -> Result<Option<Uuid>, ApiError> {
+    if let Some(value) = controller_token {
+        let account_uuid = state
+            .validate_controller_consumer_token(session_id, value)
+            .await
+            .map_err(map_state_err)?;
+        return Ok(account_uuid);
+    }
+
+    let auth = token.ok_or(ApiError::Unauthorized)?;
+    ensure_scope(auth, scope)?;
+    Ok(auth.account_uuid())
 }
 
 pub async fn signal_health(

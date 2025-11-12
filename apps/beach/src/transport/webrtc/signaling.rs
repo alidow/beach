@@ -169,6 +169,7 @@ pub struct SignalingClient {
     send_tx: mpsc::UnboundedSender<ClientMessage>,
     signal_rx: AsyncMutex<mpsc::UnboundedReceiver<WebRTCSignal>>,
     remote_peer: RwLock<Option<String>>,
+    remote_metadata: RwLock<Option<HashMap<String, String>>>,
     remote_notify: Notify,
     locked_peer: RwLock<Option<String>>,
     remote_generation: AtomicU64,
@@ -217,6 +218,7 @@ impl SignalingClient {
             send_tx,
             signal_rx: AsyncMutex::new(signal_rx),
             remote_peer: RwLock::new(None),
+            remote_metadata: RwLock::new(None),
             remote_notify: Notify::new(),
             locked_peer: RwLock::new(None),
             remote_generation: AtomicU64::new(0),
@@ -368,6 +370,10 @@ impl SignalingClient {
         guard
             .take()
             .ok_or_else(|| TransportError::Setup("remote event stream already taken".into()))
+    }
+
+    pub async fn remote_metadata(&self) -> Option<HashMap<String, String>> {
+        self.remote_metadata.read().await.clone()
     }
 
     pub fn peer_id(&self) -> &str {
@@ -577,7 +583,8 @@ impl SignalingClient {
         // treat the remote server as "self" and never set the remote peer.
         if self.expected_remote_role != PeerRole::Client {
             if peer.role == self.expected_remote_role {
-                self.set_remote_peer(peer.id).await;
+                self.set_remote_peer(peer.id.clone()).await;
+                self.set_remote_metadata(peer.metadata.clone()).await;
             }
             return;
         }
@@ -714,7 +721,7 @@ impl SignalingClient {
         };
 
         let mut guard = self.remote_peer.write().await;
-        if guard.as_deref() == Some(peer_id) {
+        let cleared = if guard.as_deref() == Some(peer_id) {
             *guard = None;
             let generation = self.remote_generation.fetch_add(1, Ordering::SeqCst) + 1;
             self.remote_notify.notify_waiters();
@@ -724,7 +731,10 @@ impl SignalingClient {
                 generation,
                 "cleared remote peer"
             );
-        }
+            true
+        } else {
+            false
+        };
         drop(guard);
 
         if unlock_ok {
@@ -733,6 +743,15 @@ impl SignalingClient {
                 *lock = None;
             }
         }
+
+        if cleared {
+            self.set_remote_metadata(None).await;
+        }
+    }
+
+    async fn set_remote_metadata(&self, metadata: Option<HashMap<String, String>>) {
+        let mut guard = self.remote_metadata.write().await;
+        *guard = metadata;
     }
 }
 
@@ -846,4 +865,52 @@ fn derive_websocket_url(signaling_url: &str) -> Result<Url, TransportError> {
     ws.set_query(None);
     ws.set_fragment(None);
     Ok(ws)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_client(expected_remote_role: PeerRole) -> Arc<SignalingClient> {
+        let (send_tx, _) = mpsc::unbounded_channel();
+        let (_signal_tx, signal_rx) = mpsc::unbounded_channel();
+        let (remote_events_tx, remote_events_rx) = mpsc::unbounded_channel();
+        Arc::new(SignalingClient {
+            peer_id: "peer".into(),
+            expected_remote_role,
+            send_tx,
+            signal_rx: AsyncMutex::new(signal_rx),
+            remote_peer: RwLock::new(None),
+            remote_metadata: RwLock::new(None),
+            remote_notify: Notify::new(),
+            locked_peer: RwLock::new(None),
+            remote_generation: AtomicU64::new(0),
+            assigned_peer_id: RwLock::new(None),
+            peer_generation_counter: AtomicU64::new(0),
+            peer_channels: RwLock::new(HashMap::new()),
+            remote_events_tx,
+            remote_events_rx: AsyncMutex::new(Some(remote_events_rx)),
+            tasks: Mutex::new(Vec::new()),
+            passphrase: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn register_client_peer_stores_metadata_for_non_client_roles() {
+        let client = make_client(PeerRole::Server);
+        let mut metadata = HashMap::new();
+        metadata.insert("label".to_string(), "pb-controller".to_string());
+        let peer = PeerInfo {
+            id: "server-1".into(),
+            role: PeerRole::Server,
+            joined_at: 0,
+            supported_transports: vec![],
+            preferred_transport: None,
+            metadata: Some(metadata.clone()),
+        };
+
+        client.register_client_peer(peer).await;
+
+        assert_eq!(client.remote_metadata().await, Some(metadata));
+    }
 }

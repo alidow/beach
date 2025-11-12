@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Always run from repo root so docker-compose.yml is resolved correctly.
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT_DIR"
+
+echo "Bringing down all docker compose services..."
+docker compose down --remove-orphans --volumes
+
+# Remove any lingering project-scoped volumes (Compose normally prefixes them
+# with \"$(basename "$ROOT_DIR")_\").
+echo "Removing dangling beach* volumes (if any)..."
+mapfile -t BEACH_VOLUMES < <(docker volume ls --format '{{.Name}}' | grep -E '^(beach[_-].+)' || true)
+if ((${#BEACH_VOLUMES[@]})); then
+  docker volume rm "${BEACH_VOLUMES[@]}" 2>/dev/null || true
+fi
+
+echo "Docker environment reset complete."

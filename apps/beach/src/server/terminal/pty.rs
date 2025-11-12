@@ -173,6 +173,13 @@ impl PtyWriter {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(writer: Box<dyn std::io::Write + Send>) -> Self {
+        Self {
+            writer: Arc::new(Mutex::new(writer)),
+        }
+    }
+
     pub fn write(&self, bytes: &[u8]) -> Result<()> {
         let mut guard = self.writer.lock().unwrap();
         guard.write_all(bytes).context("write to PTY")?;

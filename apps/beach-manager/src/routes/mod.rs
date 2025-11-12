@@ -337,6 +337,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn controller_token_query_allows_poll_and_ack() {
+        let state = AppState::new();
+        let app = build_router(state.clone());
+
+        let register_body = json!({
+            "session_id": "sess-query",
+            "private_beach_id": "pb-query",
+            "harness_type": HarnessType::TerminalShim,
+            "capabilities": ["terminal_diff_v1"],
+            "location_hint": null,
+            "metadata": null,
+            "version": "0.1.0"
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/register")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(register_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let register_resp: RegisterSessionResponse = serde_json::from_slice(&bytes).unwrap();
+        let controller_token = register_resp
+            .controller_token
+            .clone()
+            .expect("controller token present");
+
+        let queue_body = json!({
+            "controller_token": controller_token,
+            "actions": [{
+                "id": "cmd-query",
+                "action_type": "terminal_write",
+                "payload": { "bytes": "ping" }
+            }]
+        });
+        let queue_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/sess-query/actions")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(queue_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queue_resp.status(), StatusCode::OK);
+
+        let poll_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/sessions/sess-query/actions/poll?controller_token={}",
+                        controller_token
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(poll_resp.status(), StatusCode::OK);
+        let bytes = body::to_bytes(poll_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let commands: Vec<ActionCommand> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].id, "cmd-query");
+
+        let ack = ActionAck {
+            id: "cmd-query".into(),
+            status: AckStatus::Ok,
+            applied_at: SystemTime::now(),
+            latency_ms: Some(4),
+            error_code: None,
+            error_message: None,
+        };
+        let ack_body = serde_json::to_string(&vec![ack]).unwrap();
+        let ack_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/sessions/sess-query/actions/ack?controller_token={}",
+                        controller_token
+                    ))
+                    .header("content-type", "application/json")
+                    .body(Body::from(ack_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ack_resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn controller_pairing_crud() {
         let state = AppState::new();
         let app = build_router(state.clone());
@@ -670,7 +780,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let bytes = body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(payload["private_beach_id"], beach_id);
         assert!(payload["controller_token"].as_str().unwrap().len() > 0);

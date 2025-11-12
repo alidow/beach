@@ -1,17 +1,17 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import type { SessionSummary } from '@private-beach/shared-api';
 import {
   attachByCode,
   fetchSessionStateSnapshot,
   updateSessionRoleById,
-  acquireController,
+  issueControllerHandshake,
 } from '@/lib/api';
 import type { TileSessionMeta, TileViewportSnapshot } from '@/features/tiles';
 import { buildSessionMetadataWithTile, sessionSummaryToTileMeta } from '@/features/tiles/sessionMeta';
 import type { SessionCredentialOverride } from '../../../private-beach/src/hooks/terminalViewerTypes';
-import { useManagerToken, buildManagerUrl } from '../hooks/useManagerToken';
+import { useManagerToken, buildManagerUrl, buildRoadUrl } from '../hooks/useManagerToken';
 import { sendControlMessage } from '@/lib/road';
 import { useSessionConnection } from '../hooks/useSessionConnection';
 import { SessionViewer } from './SessionViewer';
@@ -27,6 +27,9 @@ import { Input } from './ui/input';
 import { Label } from './ui/label';
 
 const DEFAULT_STYLE_ID = 0;
+const HANDSHAKE_RENEW_BUFFER_MS = 5_000;
+const HANDSHAKE_RENEW_MIN_MS = 5_000;
+const HANDSHAKE_RENEW_FALLBACK_MS = 20_000;
 
 function logHydration(event: string, detail: Record<string, unknown>) {
   if (typeof window === 'undefined') {
@@ -160,6 +163,7 @@ type ApplicationTileProps = {
   tileId: string;
   privateBeachId: string;
   managerUrl?: string;
+  roadUrl?: string;
   sessionMeta?: TileSessionMeta | null;
   onSessionMetaChange?: (meta: TileSessionMeta | null) => void;
   disableViewportMeasurements?: boolean;
@@ -187,6 +191,7 @@ export function ApplicationTile({
   tileId,
   privateBeachId,
   managerUrl = buildManagerUrl(),
+  roadUrl,
   sessionMeta,
   onSessionMetaChange,
   disableViewportMeasurements = true,
@@ -207,6 +212,8 @@ export function ApplicationTile({
   const lastViewportSnapshotRef = useRef<TileViewportSnapshot | null>(null);
   const hydrationRetryTimerRef = useRef<number | null>(null);
   const hydrationAttemptRef = useRef(0);
+  const handshakeRenewTimerRef = useRef<number | null>(null);
+  const lastHandshakeContextRef = useRef<{ sessionId: string; passcode: string } | null>(null);
 
   const {
     token: managerToken,
@@ -217,11 +224,108 @@ export function ApplicationTile({
     refresh,
   } = useManagerToken();
 
-  useEffect(() => {
-    if (sessionMeta?.sessionId && sessionMeta.sessionId !== sessionIdInput) {
-      setSessionIdInput(sessionMeta.sessionId);
+  const resolvedRoadUrl = useMemo(() => {
+    if (roadUrl && roadUrl.trim().length > 0) {
+      return roadUrl.trim();
     }
-  }, [sessionMeta?.sessionId, sessionIdInput]);
+    try {
+      return buildRoadUrl();
+    } catch (error) {
+      console.error('[application-tile] missing road url', error);
+      return '';
+    }
+  }, [roadUrl]);
+
+  const clearHandshakeRenewal = useCallback(() => {
+    if (handshakeRenewTimerRef.current !== null && typeof window !== 'undefined') {
+      window.clearTimeout(handshakeRenewTimerRef.current);
+      handshakeRenewTimerRef.current = null;
+    }
+  }, []);
+
+  const deliverHandshake = useCallback(
+    async (sessionId: string, passcode: string) => {
+      if (!privateBeachId) {
+        throw new Error('Missing private beach identifier for handshake');
+      }
+      if (!resolvedRoadUrl) {
+        throw new Error(
+          'Beach Road URL is not configured. Set NEXT_PUBLIC_PRIVATE_BEACH_ROAD_URL or define road_url in Private Beach settings.',
+        );
+      }
+
+      const ensureToken = async () => {
+        if (managerToken && managerToken.trim().length > 0) {
+          return managerToken;
+        }
+        return await refresh();
+      };
+
+      const token = await ensureToken();
+      if (!token) {
+        throw new Error('Unable to fetch manager token for controller handshake');
+      }
+
+      const handshake = await issueControllerHandshake(
+        sessionId,
+        passcode,
+        privateBeachId,
+        token,
+        managerUrl,
+      );
+      await sendControlMessage(sessionId, 'manager_handshake', handshake, token ?? null, resolvedRoadUrl);
+
+      lastHandshakeContextRef.current = { sessionId, passcode };
+
+      if (typeof window !== 'undefined') {
+        clearHandshakeRenewal();
+        const targetExpiry = handshake.lease_expires_at_ms ?? Date.now() + HANDSHAKE_RENEW_FALLBACK_MS;
+        const delay = Math.max(
+          HANDSHAKE_RENEW_MIN_MS,
+          targetExpiry - Date.now() - HANDSHAKE_RENEW_BUFFER_MS,
+        );
+        handshakeRenewTimerRef.current = window.setTimeout(() => {
+          void deliverHandshake(sessionId, passcode).catch((error) => {
+            console.warn('[application-tile] handshake renewal failed', {
+              sessionId,
+              error,
+            });
+          });
+        }, delay);
+      }
+    },
+    [clearHandshakeRenewal, managerToken, managerUrl, privateBeachId, refresh, resolvedRoadUrl],
+  );
+
+useEffect(() => {
+  if (sessionMeta?.sessionId && sessionMeta.sessionId !== sessionIdInput) {
+    setSessionIdInput(sessionMeta.sessionId);
+  }
+}, [sessionMeta?.sessionId, sessionIdInput]);
+
+  useEffect(() => () => clearHandshakeRenewal(), [clearHandshakeRenewal]);
+
+  useEffect(() => {
+    const sessionId = sessionMeta?.sessionId?.trim();
+    const passcode = credentialOverride?.passcode?.trim();
+    if (!sessionId || !passcode) {
+      clearHandshakeRenewal();
+      return;
+    }
+    const ctx = lastHandshakeContextRef.current;
+    if (ctx && ctx.sessionId === sessionId && ctx.passcode === passcode) {
+      return;
+    }
+    lastHandshakeContextRef.current = { sessionId, passcode };
+    void deliverHandshake(sessionId, passcode).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      setAttachError(message);
+      console.warn('[application-tile] automatic handshake failed', {
+        sessionId,
+        error,
+      });
+    });
+  }, [credentialOverride?.passcode, deliverHandshake, clearHandshakeRenewal, sessionMeta?.sessionId]);
 
   useEffect(() => {
     lastViewportSnapshotRef.current = null;
@@ -674,19 +778,11 @@ export function ApplicationTile({
         setCredentialOverride({ passcode: trimmedCode });
         setCodeInput('');
         setSessionIdInput(session.session_id);
-        // Acquire a controller lease and hand the credentials to the host via Beach Road.
         try {
-          const lease = await acquireController(session.session_id, 30_000, token, managerUrl);
-          const handshake = {
-            private_beach_id: privateBeachId,
-            manager_url: managerUrl,
-            controller_token: lease.controller_token,
-            lease_expires_at_ms: lease.expires_at_ms,
-            stale_session_idle_secs: 60,
-            viewer_health_interval_secs: 15,
-          };
-          await sendControlMessage(session.session_id, 'manager_handshake', handshake, token ?? null);
+          await deliverHandshake(session.session_id, trimmedCode);
         } catch (handshakeErr) {
+          const message = handshakeErr instanceof Error ? handshakeErr.message : String(handshakeErr);
+          setAttachError(message);
           try {
             console.warn('[application-tile] handshake delivery failed', {
               sessionId: session.session_id,
@@ -718,7 +814,17 @@ export function ApplicationTile({
         setSubmitState('idle');
       }
     },
-    [codeInput, managerToken, managerUrl, onSessionMetaChange, privateBeachId, refresh, sessionIdInput, tileId],
+    [
+      codeInput,
+      deliverHandshake,
+      managerToken,
+      managerUrl,
+      onSessionMetaChange,
+      privateBeachId,
+      refresh,
+      sessionIdInput,
+      tileId,
+    ],
   );
 
   const disabled = submitState !== 'idle' || tokenLoading;

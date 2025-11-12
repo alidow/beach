@@ -113,3 +113,21 @@ export function buildManagerUrl(fallback?: string | null): string {
   }
   return 'http://localhost:8080';
 }
+
+export function buildRoadUrl(fallback?: string | null): string {
+  const candidates = [
+    process.env.NEXT_PUBLIC_PRIVATE_BEACH_ROAD_URL,
+    process.env.NEXT_PUBLIC_ROAD_URL,
+    process.env.NEXT_PUBLIC_SESSION_SERVER_URL,
+    fallback,
+    process.env.PRIVATE_BEACH_ROAD_URL,
+  ];
+  for (const candidate of candidates) {
+    if (candidate && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+  throw new Error(
+    'Beach Road URL is not configured. Set NEXT_PUBLIC_PRIVATE_BEACH_ROAD_URL (or add road_url in Private Beach settings).',
+  );
+}

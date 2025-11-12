@@ -2,6 +2,7 @@
 name = "beach-manager"
 version = "0.0.1"
 edition = "2021"
+build = "build.rs"
 
 [dependencies]
 beach_client_core = { package = "beach", path = "../beach" }
@@ -41,3 +42,6 @@ tower = { version = "0.4", features = ["util"] }
 serde_json = "1.0"
 test-timeout = { path = "../../crates/test-timeout" }
 bytes = "1"
+
+[build-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

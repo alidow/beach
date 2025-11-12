@@ -995,6 +995,22 @@ class MCPClient:
                 # Drain response to allow connection reuse.
                 response.read()
             return True
+        except TimeoutError as exc:
+            self._callback(
+                {
+                    "level": "error",
+                    "message": f"queue_action timeout for {session_id}: {exc}",
+                }
+            )
+            return False
+        except socket.timeout as exc:  # pragma: no cover - network path
+            self._callback(
+                {
+                    "level": "error",
+                    "message": f"queue_action socket timeout for {session_id}: {exc}",
+                }
+            )
+            return False
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")
             self._callback(
@@ -1045,6 +1061,8 @@ class SessionState:
     ball_exit: Optional[str] = None
     ball_exit_time: float = 0.0
     last_velocity: Optional[Tuple[float, float]] = None
+    action_failures: int = 0
+    action_backoff_until: float = 0.0
 
 
     def apply_terminal_frame(
@@ -1635,12 +1653,30 @@ class AgentApp:
             self._set_bridge_state(bridge_id, state)
 
     def _send_command(self, session: SessionState, command: str) -> None:
+        now = time.monotonic()
+        if session.action_backoff_until > now:
+            remaining = session.action_backoff_until - now
+            self.log(
+                f"backing off controller commands for {session.session_id} ({remaining:.2f}s remaining)",
+                level="debug",
+            )
+            self._set_bridge_state_for_endpoint("private_beach.queue_action", "waiting")
+            return
         payload = f"{command}\n"
         success = self.mcp.queue_terminal_write(session.session_id, payload)
         if success:
             self._set_bridge_state_for_endpoint("private_beach.queue_action", "sent")
+            session.action_failures = 0
+            session.action_backoff_until = 0.0
         else:
             self._set_bridge_state_for_endpoint("private_beach.queue_action", "error")
+            session.action_failures = min(session.action_failures + 1, 8)
+            delay = min(0.5 * (2 ** (session.action_failures - 1)), 10.0)
+            session.action_backoff_until = now + delay
+            self.log(
+                f"queue_action failed for {session.session_id}; retrying in {delay:.2f}s",
+                level="warn",
+            )
 
     # -------------------------------------------------------------- Commands
     def _handle_keys(self) -> None:

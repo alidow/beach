@@ -7,6 +7,7 @@ export type TerminalViewerStatus = 'idle' | 'connecting' | 'connected' | 'reconn
 export type TerminalViewerState = {
   store: TerminalGridStore | null;
   transport: TerminalTransport | null;
+  transportVersion?: number;
   connecting: boolean;
   error: string | null;
   status: TerminalViewerStatus;

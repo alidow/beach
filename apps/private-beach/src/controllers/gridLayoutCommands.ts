@@ -1,7 +1,7 @@
 'use client';
 
 import type { Layout as ReactGridLayoutItem } from 'react-grid-layout';
-import type { SharedCanvasLayout } from '../canvas';
+import type { CanvasLayout } from '../canvas';
 import type { BeachLayoutItem } from '../lib/api';
 import {
   applyGridMetadataToLayout,
@@ -13,7 +13,7 @@ import {
 } from './gridLayout';
 
 export type GridCommandResult = {
-  layout: SharedCanvasLayout;
+  layout: CanvasLayout;
   snapshot: GridLayoutSnapshot;
   mutated: boolean;
 };
@@ -27,7 +27,7 @@ export type ReactGridCommandContext = GridCommandContext & {
   cols: number;
 };
 
-function applySnapshot(layout: SharedCanvasLayout, snapshot: GridLayoutSnapshot): GridCommandResult {
+function applySnapshot(layout: CanvasLayout, snapshot: GridLayoutSnapshot): GridCommandResult {
   const withDashboard = withLayoutDashboardMetadata(layout, snapshot);
   const updatedLayout = applyGridMetadataToLayout(withDashboard, snapshot.tiles);
   const mutated = !Object.is(updatedLayout, layout);
@@ -39,7 +39,7 @@ function applySnapshot(layout: SharedCanvasLayout, snapshot: GridLayoutSnapshot)
 }
 
 function applyReactGridCommand(
-  layout: SharedCanvasLayout,
+  layout: CanvasLayout,
   nextLayouts: ReactGridLayoutItem[],
   context: ReactGridCommandContext,
   options?: { manualLayout?: boolean },
@@ -59,7 +59,7 @@ function applyReactGridCommand(
 }
 
 export function applyGridDragCommand(
-  layout: SharedCanvasLayout,
+  layout: CanvasLayout,
   nextLayouts: ReactGridLayoutItem[],
   context: ReactGridCommandContext,
 ): GridCommandResult {
@@ -67,7 +67,7 @@ export function applyGridDragCommand(
 }
 
 export function applyGridResizeCommand(
-  layout: SharedCanvasLayout,
+  layout: CanvasLayout,
   nextLayouts: ReactGridLayoutItem[],
   context: ReactGridCommandContext,
 ): GridCommandResult {
@@ -75,7 +75,7 @@ export function applyGridResizeCommand(
 }
 
 export function applyGridAutosizeCommand(
-  layout: SharedCanvasLayout,
+  layout: CanvasLayout,
   nextLayouts: ReactGridLayoutItem[],
   context: ReactGridCommandContext,
 ): GridCommandResult {
@@ -83,7 +83,7 @@ export function applyGridAutosizeCommand(
 }
 
 export function applyGridPresetCommand(
-  layout: SharedCanvasLayout,
+  layout: CanvasLayout,
   preset: BeachLayoutItem[],
   context?: GridCommandContext & { defaultCols?: number; defaultRowHeightPx?: number },
   options?: { manualLayout?: boolean },

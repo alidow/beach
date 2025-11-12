@@ -67,8 +67,21 @@ async fn main() {
     // Otherwise, run as server
     // Load configuration
     let config = Config::from_env();
+    info!(
+        target = "beach_road.config",
+        port = config.port,
+        redis_endpoint = %sanitize_url_for_log(&config.redis_url),
+        session_ttl_seconds = config.session_ttl_seconds,
+        fallback_guardrail_threshold = config.fallback_guardrail_threshold,
+        fallback_token_ttl_seconds = config.fallback_token_ttl_seconds,
+        fallback_require_oidc = config.fallback_require_oidc,
+        fallback_paused = config.fallback_paused,
+        fallback_jwks_configured = config.fallback_jwks_url.is_some(),
+        viewer_token_audience = %config.viewer_token_audience,
+        viewer_token_secret_configured = config.viewer_token_mac_secret.is_some()
+    );
     info!("Starting Beach Road session server on port {}", config.port);
-    info!("Redis URL: {}", config.redis_url);
+    info!("Redis URL: {}", sanitize_url_for_log(&config.redis_url));
     info!("Session TTL: {} seconds", config.session_ttl_seconds);
     info!(
         "Fallback guardrail threshold: {:.3}% (token ttl {} seconds, oidc required: {})",
@@ -161,6 +174,9 @@ async fn main() {
         .route("/sessions/:id/join", post(join_session))
         .route("/sessions/:id/verify-code", post(handlers::verify_code))
         .route("/me/sessions", get(handlers::list_my_sessions))
+        .route("/sessions/:id/control", post(handlers::post_control))
+        .route("/sessions/:id/control/poll", post(handlers::poll_control))
+        .route("/sessions/:id/control/ack", post(handlers::ack_control))
         .route(
             "/sessions/:id/webrtc/offer",
             get(get_webrtc_offer).post(post_webrtc_offer),
@@ -229,4 +245,12 @@ fn install_metrics_recorder() -> PrometheusHandle {
     PrometheusBuilder::new()
         .install_recorder()
         .expect("failed to install Prometheus recorder")
+}
+
+fn sanitize_url_for_log(raw: &str) -> String {
+    if let Some((_, rest)) = raw.rsplit_once('@') {
+        format!("***@{}", rest)
+    } else {
+        raw.to_string()
+    }
 }

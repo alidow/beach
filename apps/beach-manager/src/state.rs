@@ -9,8 +9,8 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
@@ -18,8 +18,8 @@ use std::{
 
 use crate::auth::{AuthConfig, AuthContext};
 use crate::{
-    fastpath::{send_actions_over_fast_path, FastPathRegistry, FastPathSession},
-    log_throttle::{should_log_queue_event, QueueLogKind},
+    fastpath::{FastPathRegistry, FastPathSession, send_actions_over_fast_path},
+    log_throttle::{QueueLogKind, should_log_custom_event, should_log_queue_event},
     metrics,
 };
 use beach_buggy::{
@@ -30,20 +30,20 @@ use beach_buggy::{
 use beach_client_core::cache::terminal::packed::unpack_cell;
 use beach_client_core::protocol::{ClientFrame, CursorFrame, Update as WireUpdate};
 use beach_client_core::{
-    decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
-    HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell, Payload,
-    SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId, TerminalGrid,
-    Transport, TransportError, TransportOffer,
+    CliError, HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell,
+    Payload, SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId,
+    TerminalGrid, Transport, TransportError, TransportOffer, decode_host_frame_binary,
+    encode_client_frame_binary, negotiate_transport,
 };
 use chrono::{DateTime, Duration, Utc};
 use prometheus::IntGauge;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use sqlx::{types::Json, FromRow, PgPool, Row};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use sqlx::{FromRow, PgPool, Row, types::Json};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tracing::{debug, info, trace, warn, Level};
+use tracing::{Level, debug, info, trace, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -55,10 +55,17 @@ const REDIS_ACTION_CONSUMER_PREFIX: &str = "poller";
 const VIEWER_KEEPALIVE_INTERVAL: StdDuration = StdDuration::from_secs(20);
 const VIEWER_KEEPALIVE_PAYLOAD: &str = "__keepalive__";
 const VIEWER_IDLE_LOG_AFTER: StdDuration = StdDuration::from_secs(45);
-pub(crate) const STALE_SESSION_MAX_IDLE: StdDuration = StdDuration::from_secs(180);
+pub(crate) const STALE_SESSION_MAX_IDLE: StdDuration = StdDuration::from_secs(60);
 #[allow(dead_code)]
-pub(crate) const STALE_SESSION_SWEEP_INTERVAL: StdDuration = StdDuration::from_secs(60);
+pub(crate) const STALE_SESSION_SWEEP_INTERVAL: StdDuration = StdDuration::from_secs(5);
+const VIEWER_HEALTH_REPORT_INTERVAL: StdDuration = StdDuration::from_secs(15);
 const MAX_PENDING_ACTIONS_PER_SESSION: usize = 500;
+const STREAM_EVENT_NO_SUBSCRIBERS_LOG_KIND: &str = "stream_event_no_subscribers";
+const STREAM_EVENT_NO_SUBSCRIBERS_LOG_SECS: u64 = 30;
+
+pub fn viewer_health_report_interval() -> StdDuration {
+    VIEWER_HEALTH_REPORT_INTERVAL
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -224,6 +231,7 @@ struct ManagerViewerState {
     next_request_id: u64,
     requested_history: bool,
     diff_seq: AtomicU64,
+    last_health_report: Option<Instant>,
 }
 
 impl ManagerViewerState {
@@ -235,6 +243,17 @@ impl ManagerViewerState {
             next_request_id: 1,
             requested_history: false,
             diff_seq: AtomicU64::new(0),
+            last_health_report: None,
+        }
+    }
+
+    fn claim_health_report_slot(&mut self, now: Instant) -> bool {
+        match self.last_health_report {
+            Some(previous) if now.duration_since(previous) < VIEWER_HEALTH_REPORT_INTERVAL => false,
+            _ => {
+                self.last_health_report = Some(now);
+                true
+            }
         }
     }
 
@@ -974,6 +993,10 @@ impl AppState {
         self
     }
 
+    pub fn public_manager_url(&self) -> &str {
+        &self.public_manager_url
+    }
+
     pub(crate) async fn viewer_token(
         &self,
         session_id: &str,
@@ -1048,6 +1071,13 @@ impl AppState {
         tx.subscribe()
     }
 
+    async fn clear_session_stream(&self, session_id: &str) {
+        let mut map = self.events.write().await;
+        if map.remove(session_id).is_some() {
+            debug!(session_id = %session_id, "session stream cleared");
+        }
+    }
+
     async fn publish(&self, session_id: &str, event: StreamEvent) {
         let tx_opt = { self.events.read().await.get(session_id).cloned() };
         if let Some(tx) = tx_opt {
@@ -1057,13 +1087,27 @@ impl AppState {
                 StreamEvent::Health(_) => "health",
                 StreamEvent::ControllerPairing(_) => "controller_pairing",
             };
-            if tx.send(event).is_err() {
-                info!(
-                    session_id = %session_id,
-                    event_kind,
-                    "no subscribers to receive stream event"
-                );
+            if tx.receiver_count() == 0 {
+                self.log_no_stream_subscribers(session_id, event_kind);
+                return;
             }
+            if tx.send(event).is_err() {
+                self.log_no_stream_subscribers(session_id, event_kind);
+            }
+        }
+    }
+
+    fn log_no_stream_subscribers(&self, session_id: &str, event_kind: &'static str) {
+        if should_log_custom_event(
+            STREAM_EVENT_NO_SUBSCRIBERS_LOG_KIND,
+            session_id,
+            StdDuration::from_secs(STREAM_EVENT_NO_SUBSCRIBERS_LOG_SECS),
+        ) {
+            info!(
+                session_id = %session_id,
+                event_kind,
+                "no subscribers to receive stream event"
+            );
         }
     }
 
@@ -1138,19 +1182,38 @@ impl AppState {
         code: &str,
         requester: Option<Uuid>,
     ) -> Result<SessionSummary, StateError> {
-        // Verify with Beach Road
-        let verified = self
-            .verify_code_with_road(origin_session_id, code)
-            .await
+        let skip_verify = std::env::var("BEACH_SKIP_ROAD_VERIFY")
+            .ok()
+            .map(|v| v.trim().eq_ignore_ascii_case("1") || v.trim().eq_ignore_ascii_case("true"))
             .unwrap_or(false);
-        if !verified {
-            warn!(
+        if !skip_verify {
+            // Verify with Beach Road
+            let verified = self
+                .verify_code_with_road(origin_session_id, code)
+                .await
+                .unwrap_or(false);
+            if !verified {
+                warn!(
+                    target = "private_beach.sessions",
+                    private_beach_id = %private_beach_id,
+                    session_id = %origin_session_id,
+                    "attach_by_code verification failed"
+                );
+                return Err(StateError::InvalidIdentifier("invalid_code".into()));
+            }
+            info!(
                 target = "private_beach.sessions",
                 private_beach_id = %private_beach_id,
                 session_id = %origin_session_id,
-                "attach_by_code verification failed"
+                "attach_by_code verification succeeded"
             );
-            return Err(StateError::InvalidIdentifier("invalid_code".into()));
+        } else {
+            info!(
+                target = "private_beach.sessions",
+                private_beach_id = %private_beach_id,
+                session_id = %origin_session_id,
+                "attach_by_code verification skipped via env override"
+            );
         }
         // Create mapping if not exists
         match &self.backend {
@@ -1392,7 +1455,7 @@ impl AppState {
         }
     }
 
-    async fn verify_code_with_road(&self, origin_session_id: &str, code: &str) -> Result<bool, ()> {
+    pub(crate) async fn verify_code_with_road(&self, origin_session_id: &str, code: &str) -> Result<bool, ()> {
         let url = format!(
             "{}/sessions/{}/verify-code",
             self.road_base_url.trim_end_matches('/'),
@@ -2856,6 +2919,13 @@ impl AppState {
             return;
         }
 
+        trace!(
+            target = "private_beach.sessions",
+            active_workers = active_ids.len(),
+            idle_threshold_secs = STALE_SESSION_MAX_IDLE.as_secs(),
+            "running stale session sweep"
+        );
+
         let stale_candidates: Vec<String> = match &self.backend {
             Backend::Memory => {
                 let sessions = self.fallback.sessions.read().await;
@@ -2909,9 +2979,10 @@ impl AppState {
         stale_ids.sort();
         stale_ids.dedup();
 
-        for session_id in stale_ids {
-            self.stop_session_workers(&session_id, "stale_session_timeout")
+        for session_id in &stale_ids {
+            self.stop_session_workers(session_id, "stale_session_timeout")
                 .await;
+            self.clear_session_stream(session_id).await;
         }
     }
 
@@ -3064,6 +3135,12 @@ impl AppState {
         }
         let state_clone = self.clone();
         let session_id_owned = session_id.to_string();
+        info!(
+            target = "controller.forwarder",
+            session_id = %session_id,
+            private_beach_id = %private_beach_id,
+            "starting controller forwarder worker"
+        );
         let handle = tokio::spawn(async move {
             run_controller_forwarder(state_clone, session_id_owned, private_beach_id, join_code)
                 .await;
@@ -5743,6 +5820,8 @@ async fn viewer_connect_once(
                 match message.payload {
                     Payload::Binary(bytes) => match decode_host_frame_binary(&bytes) {
                         Ok(frame) => {
+                            let report_health = matches!(frame, WireHostFrame::Heartbeat { .. })
+                                && viewer_state.claim_health_report_slot(Instant::now());
                             let frame_type = match &frame {
                                 WireHostFrame::Hello { .. } => "hello",
                                 WireHostFrame::Grid { .. } => "grid",
@@ -5814,6 +5893,20 @@ async fn viewer_connect_once(
                                     );
                                 }
                             }
+                            if report_health {
+                                if let Err(err) =
+                                    persist_viewer_heartbeat(state, private_beach_id, session_id)
+                                        .await
+                                {
+                                    debug!(
+                                        target = "private_beach",
+                                        session_id = %session_id,
+                                        private_beach_id = %private_beach_id,
+                                        error = %err,
+                                        "manager viewer failed to record heartbeat"
+                                    );
+                                }
+                            }
                             if matches!(frame, WireHostFrame::Shutdown) {
                                 info!(
                                     target = "private_beach",
@@ -5879,6 +5972,33 @@ async fn viewer_connect_once(
             }
         }
     }
+}
+
+async fn persist_viewer_heartbeat(
+    state: &AppState,
+    private_beach_id: &str,
+    session_id: &str,
+) -> Result<(), StateError> {
+    let queue_depth = state
+        .pending_actions_count(private_beach_id, session_id)
+        .await?;
+    if should_log_custom_event("viewer_heartbeat", session_id, StdDuration::from_secs(30)) {
+        info!(
+            target = "private_beach.health",
+            session_id = %session_id,
+            private_beach_id = %private_beach_id,
+            queue_depth,
+            "viewer heartbeat recorded"
+        );
+    }
+    let heartbeat = HealthHeartbeat {
+        queue_depth,
+        cpu_load: None,
+        memory_bytes: None,
+        degraded: false,
+        warnings: Vec::new(),
+    };
+    state.record_health(session_id, heartbeat).await
 }
 
 fn rewrite_loopback_transports(
@@ -6177,7 +6297,39 @@ async fn drive_controller_forwarder(
             _ = idle_delay.tick() => {
                 let actions = state.poll_actions(session_id).await?;
                 if actions.is_empty() {
+                    if !pending.is_empty()
+                        && should_log_custom_event(
+                            "controller_forwarder_pending",
+                            session_id,
+                            StdDuration::from_secs(20),
+                        )
+                    {
+                        warn!(
+                            target = "controller.forwarder",
+                            session_id = %session_id,
+                            private_beach_id = %private_beach_id,
+                            inflight = pending.len(),
+                            transport = transport_label,
+                            "controller forwarder awaiting acknowledgements before requesting more actions"
+                        );
+                    }
                     continue;
+                }
+                if should_log_custom_event(
+                    "controller_forwarder_dispatch",
+                    session_id,
+                    StdDuration::from_secs(10),
+                ) {
+                    info!(
+                        target = "controller.forwarder",
+                        session_id = %session_id,
+                        private_beach_id = %private_beach_id,
+                        fetched = actions.len(),
+                        inflight = pending.len(),
+                        transport = transport_label,
+                        via_fast_path,
+                        "controller forwarder dispatching actions to host"
+                    );
                 }
                 for action in actions {
                     match serialize_terminal_write(&action) {
@@ -6555,17 +6707,17 @@ mod tests {
     use super::*;
     use crate::state::test_support;
     use beach_buggy::{HarnessType, RegisterSessionRequest};
-    use beach_client_core::cache::terminal::packed::{pack_color_default, pack_color_rgb, StyleId};
+    use beach_client_core::cache::terminal::packed::{StyleId, pack_color_default, pack_color_rgb};
     use beach_client_core::protocol::{
         HostFrame as WireHostFrame, Lane, LaneBudgetFrame, SyncConfigFrame, Update as WireUpdate,
     };
     use serde_json::json;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use std::time::SystemTime;
-    use tokio::time::{sleep, timeout, Duration};
+    use tokio::time::{Duration, sleep, timeout};
 
     #[test_timeout::tokio_timeout_test(10)]
     async fn spawn_viewer_worker_smoke_test_records_state_and_stream() {

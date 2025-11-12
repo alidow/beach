@@ -2,11 +2,17 @@
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import type { SessionSummary } from '@private-beach/shared-api';
-import { attachByCode, fetchSessionStateSnapshot, updateSessionRoleById } from '@/lib/api';
+import {
+  attachByCode,
+  fetchSessionStateSnapshot,
+  updateSessionRoleById,
+  acquireController,
+} from '@/lib/api';
 import type { TileSessionMeta, TileViewportSnapshot } from '@/features/tiles';
 import { buildSessionMetadataWithTile, sessionSummaryToTileMeta } from '@/features/tiles/sessionMeta';
 import type { SessionCredentialOverride } from '../../../private-beach/src/hooks/terminalViewerTypes';
 import { useManagerToken, buildManagerUrl } from '../hooks/useManagerToken';
+import { sendControlMessage } from '@/lib/road';
 import { useSessionConnection } from '../hooks/useSessionConnection';
 import { SessionViewer } from './SessionViewer';
 import {
@@ -16,7 +22,9 @@ import {
   type TerminalStateDiff,
 } from '../../../private-beach/src/lib/terminalHydrator';
 import type { Update } from '../../../beach-surfer/src/protocol/types';
-import { TILE_PRIMARY_BUTTON_CLASS } from './tileButtonClasses';
+import { Button } from './ui/button';
+import { Input } from './ui/input';
+import { Label } from './ui/label';
 
 const DEFAULT_STYLE_ID = 0;
 
@@ -363,7 +371,7 @@ export function ApplicationTile({
       }
       applyViewportPatch(normalized, 'terminal');
     },
-    [applyViewportPatch],
+    [applyViewportPatch, tileId],
   );
 
   const viewer = useSessionConnection({
@@ -666,6 +674,29 @@ export function ApplicationTile({
         setCredentialOverride({ passcode: trimmedCode });
         setCodeInput('');
         setSessionIdInput(session.session_id);
+        // Acquire a controller lease and hand the credentials to the host via Beach Road.
+        try {
+          const lease = await acquireController(session.session_id, 30_000, token, managerUrl);
+          const handshake = {
+            private_beach_id: privateBeachId,
+            manager_url: managerUrl,
+            controller_token: lease.controller_token,
+            lease_expires_at_ms: lease.expires_at_ms,
+            stale_session_idle_secs: 60,
+            viewer_health_interval_secs: 15,
+          };
+          await sendControlMessage(session.session_id, 'manager_handshake', handshake, token ?? null);
+        } catch (handshakeErr) {
+          try {
+            console.warn('[application-tile] handshake delivery failed', {
+              sessionId: session.session_id,
+              error: handshakeErr,
+            });
+          } catch {
+            /* noop */
+          }
+        }
+
         try {
           const metadataPayload = buildSessionMetadataWithTile(session.metadata, tileId, nextMeta);
           await updateSessionRoleById(
@@ -692,38 +723,49 @@ export function ApplicationTile({
 
   const disabled = submitState !== 'idle' || tokenLoading;
   const hasSession = Boolean(sessionMeta?.sessionId);
+  const sessionIdFieldId = `${tileId}-session-id`;
+  const passcodeFieldId = `${tileId}-session-passcode`;
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-4 text-[13px] text-slate-800 dark:text-slate-200">
       {!hasSession ? (
-        <form className="grid gap-3 px-4 pt-4 pb-5" onSubmit={handleAttach}>
-          <label className="grid gap-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
-            <span>Session ID</span>
-            <input
+        <form
+          className="space-y-4 rounded-2xl border border-border/70 bg-card/80 px-4 py-5 text-sm text-card-foreground shadow-[0_12px_30px_rgba(2,6,23,0.08)]"
+          onSubmit={handleAttach}
+        >
+          <div className="space-y-2">
+            <Label htmlFor={sessionIdFieldId} className="text-[11px]">
+              Session ID
+            </Label>
+            <Input
+              id={sessionIdFieldId}
               value={sessionIdInput}
               onChange={(event) => setSessionIdInput(event.target.value)}
               placeholder="sess-1234…"
               autoComplete="off"
-              className="h-10 rounded border border-slate-300 dark:border-white/10 bg-white dark:bg-white/5 px-4 text-[13px] font-medium text-slate-900 dark:text-white placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
+              className="h-10 text-[13px] font-medium"
             />
-          </label>
-          <label className="grid gap-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-400">
-            <span>Passcode</span>
-            <input
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor={passcodeFieldId} className="text-[11px]">
+              Passcode
+            </Label>
+            <Input
+              id={passcodeFieldId}
               value={codeInput}
               onChange={(event) => setCodeInput(event.target.value)}
               placeholder="6-digit code"
               autoComplete="off"
-              className="h-10 rounded border border-slate-300 dark:border-white/10 bg-white dark:bg-white/5 px-4 text-[13px] font-medium text-slate-900 dark:text-white placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
+              className="h-10 text-[13px] font-medium"
             />
-          </label>
-          <button
+          </div>
+          <Button
             type="submit"
             disabled={disabled}
-            className={`mt-3 ${TILE_PRIMARY_BUTTON_CLASS}`}
+            className="w-full text-[11px] font-semibold uppercase tracking-[0.18em]"
           >
             {submitState === 'attaching' ? 'Attaching…' : 'Connect'}
-          </button>
+          </Button>
           {!isLoaded && <p className="text-[11px] text-slate-400">Loading authentication…</p>}
           {isLoaded && !isSignedIn && (
             <p className="text-[11px] text-slate-400">Sign in with Clerk to request manager credentials.</p>

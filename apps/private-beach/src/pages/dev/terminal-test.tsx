@@ -1,10 +1,13 @@
-import dynamic from 'next/dynamic';
-
-const TerminalPreviewHarness = dynamic(
-  () => import('../../../../temp/terminal-preview-harness').then((mod) => mod.TerminalPreviewHarness),
-  { ssr: false, loading: () => <div className="p-6 text-sm text-muted-foreground">Loading harness…</div> },
-);
+'use client';
 
 export default function TerminalTestPage() {
-  return <TerminalPreviewHarness />;
+  return (
+    <div className="p-6 text-sm leading-relaxed text-muted-foreground">
+      <p className="font-semibold text-foreground">Terminal preview harness not configured.</p>
+      <p className="mt-2">
+        Create <code>temp/terminal-preview-harness.tsx</code> and export a <code>TerminalPreviewHarness</code>{' '}
+        component to enable this development page. Until then, this placeholder keeps the build healthy.
+      </p>
+    </div>
+  );
 }

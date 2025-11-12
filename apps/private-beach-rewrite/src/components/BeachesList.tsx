@@ -11,14 +11,15 @@ const createdAtFormatter = typeof Intl !== 'undefined'
   ? new Intl.DateTimeFormat('en-US', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'UTC' })
   : null;
 
-const formatCreatedAt = (value: string) => {
+const formatCreatedAt = (value: string | number | Date) => {
+  const date = value instanceof Date ? value : new Date(value);
   if (!createdAtFormatter) {
-    return new Date(value).toISOString();
+    return date.toISOString();
   }
   try {
-    return createdAtFormatter.format(new Date(value));
+    return createdAtFormatter.format(date);
   } catch {
-    return new Date(value).toISOString();
+    return date.toISOString();
   }
 };
 

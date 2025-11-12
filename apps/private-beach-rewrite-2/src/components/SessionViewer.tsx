@@ -276,7 +276,7 @@ export function SessionViewer({
         }
       } catch {}
     };
-  }, []);
+  }, [tileId]);
 
   // Pixel-snap terminal content to the device pixel grid to avoid
   // subpixel misalignment when the canvas pan/translate is fractional.
@@ -432,12 +432,12 @@ export function SessionViewer({
         </div>
       </div>
       {showLoading ? (
-        <div className="absolute inset-0 z-10 flex items-center justify-center bg-slate-950/70 text-[13px] font-semibold text-slate-100 backdrop-blur-sm">
+        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-slate-950/70 text-[13px] font-semibold text-slate-100 backdrop-blur-sm">
           <span>{status === 'connecting' ? 'Connecting to session…' : 'Preparing terminal…'}</span>
         </div>
       ) : null}
       {showError ? (
-        <div className="absolute inset-0 z-10 flex items-center justify-center bg-red-500/15 text-[13px] font-semibold text-red-200 backdrop-blur-sm">
+        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-red-500/15 text-[13px] font-semibold text-red-200 backdrop-blur-sm">
           <span>{viewer.error ?? 'Unknown terminal error'}</span>
         </div>
       ) : null}

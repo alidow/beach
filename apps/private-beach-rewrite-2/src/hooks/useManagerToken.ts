@@ -87,7 +87,7 @@ export function useManagerToken(): ManagerTokenState {
       loading,
       error,
       isLoaded: Boolean(fallbackToken) || isLoaded,
-      isSignedIn: Boolean(fallbackToken) || isSignedIn,
+      isSignedIn: Boolean(fallbackToken) || Boolean(isSignedIn),
       refresh,
     }),
     [token, loading, error, fallbackToken, isLoaded, isSignedIn, refresh],

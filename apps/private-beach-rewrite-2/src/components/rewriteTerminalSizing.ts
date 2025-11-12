@@ -90,7 +90,7 @@ export class RewriteTerminalSizingStrategy implements TerminalSizingStrategy {
     const heightPx = Math.max(1, Math.ceil(viewportRows * rowHeight));
     return {
       '--beach-terminal-max-height': `${heightPx}px`,
-    };
+    } as CSSProperties;
   }
 
   scrollPolicy(): TerminalScrollPolicy {

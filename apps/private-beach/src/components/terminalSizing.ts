@@ -26,9 +26,13 @@ export interface TerminalSizingStrategy {
     tileRect: DOMRectReadOnly,
     hostMeta: TerminalSizingHostMeta,
     viewportRows: number,
-  ): CSSProperties | undefined;
+  ): TerminalSizingStyle | undefined;
   scrollPolicy(): TerminalScrollPolicy;
 }
+
+type TerminalSizingStyle = CSSProperties & {
+  '--beach-terminal-max-height'?: string;
+};
 
 export class LegacyTerminalSizingStrategy implements TerminalSizingStrategy {
   private clampRows(rows: number, max: number): number {
@@ -75,7 +79,7 @@ export class LegacyTerminalSizingStrategy implements TerminalSizingStrategy {
     _tileRect: DOMRectReadOnly,
     hostMeta: TerminalSizingHostMeta,
     viewportRows: number,
-  ): CSSProperties | undefined {
+  ): TerminalSizingStyle | undefined {
     const rowHeight = Math.max(1, Math.floor(hostMeta.lineHeightPx));
 
     if (hostMeta.disableViewportMeasurements) {

@@ -503,6 +503,7 @@ export interface BeachTerminalProps {
 }
 
 export type FollowTailPhase = 'hydrating' | 'follow_tail' | 'manual_scrollback' | 'catching_up';
+type TimeoutHandle = ReturnType<typeof setTimeout> | number;
 
 export interface TerminalViewportState {
   viewportRows: number;
@@ -608,6 +609,8 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
     tailPaddingRows: number;
     pixelsPerRow: number | null;
     pixelsPerCol: number | null;
+    hostPixelWidth: number | null;
+    hostPixelHeight: number | null;
   } | null>(null);
   const disableMeasurementsPrevRef = useRef<boolean>(disableViewportMeasurementsEffective);
   const lockViewportWarnedRef = useRef(false);
@@ -682,7 +685,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
   // from StrictMode remounts and layout thrash from rewriting the PTY size.
   const domPendingViewportRowsRef = useRef<number | null>(null);
   const domPendingTimestampRef = useRef<number | null>(null);
-  const domPendingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const domPendingTimeoutRef = useRef<TimeoutHandle | null>(null);
   const [measuredCellWidth, setMeasuredCellWidth] = useState<number | null>(null);
   const clearDomPendingTimeout = useCallback(() => {
     if (domPendingTimeoutRef.current !== null) {
@@ -1790,11 +1793,12 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
             measurementSource = 'row_width';
           }
         }
-        if (nextCellWidth && nextCellWidth > 0) {
+        if (nextCellWidth !== null && nextCellWidth > 0) {
+          const stableWidth = nextCellWidth;
           logCellMetric('dom-measure', {
             sessionId: sessionId ?? null,
             source: measurementSource,
-            nextCellWidth,
+            nextCellWidth: stableWidth,
             spans: spans.length,
             snapshotCols: snapshot.cols,
             baseCellWidth,
@@ -1803,7 +1807,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
             rowHeight: rect.height,
           });
           setMeasuredCellWidth((prev) =>
-            prev === null || Math.abs(prev - nextCellWidth) > 0.1 ? nextCellWidth : prev,
+            prev === null || Math.abs(prev - stableWidth) > 0.1 ? stableWidth : prev,
           );
         }
       });
@@ -3589,7 +3593,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
             : previousViewportRows && previousViewportRows > 0
               ? previousViewportRows
               : null;
-        if (rawViewportRows > 0) {
+        if (rawViewportRows !== null && rawViewportRows > 0) {
           const clampedRows = Math.max(1, Math.min(rawViewportRows, MAX_VIEWPORT_ROWS));
           trace(
             'grid host viewport applied',

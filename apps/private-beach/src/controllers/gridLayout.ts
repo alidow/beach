@@ -46,7 +46,7 @@ export type GridDashboardMetadata = {
   layoutHostCols?: number | null;
   layoutHostRows?: number | null;
   hasHostDimensions?: boolean;
-  preview?: GridPreviewMetrics | null;
+  preview?: PreviewMetrics | null;
   previewStatus?: 'connecting' | 'initializing' | 'ready' | 'error';
   viewState?: TileViewState;
 };

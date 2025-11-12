@@ -21,9 +21,11 @@ import {
   createControllerPairing,
   deleteControllerPairing,
   updateSessionRole,
+  acquireController,
   buildMetadataWithRole,
   type SessionRole,
   type ControllerPairing,
+  revokeControllerHandshake,
 } from '../../../lib/api';
 import type { CanvasLayout, ControllerUpdateCadence } from '../../../lib/api';
 import type { BatchAssignmentResponse } from '../../../canvas';
@@ -41,6 +43,12 @@ const DEFAULT_CANVAS_TILE_WIDTH = 448;
 const DEFAULT_CANVAS_TILE_HEIGHT = 448;
 const DEFAULT_CANVAS_TILE_GAP = 32;
 const AUTO_LAYOUT_COLUMNS = 4;
+
+type RemovedTileInfo = {
+  sessionId: string;
+  kind?: string;
+  position?: { x: number; y: number };
+};
 
 function emptyCanvasLayout(): CanvasLayout {
   const now = Date.now();
@@ -170,6 +178,7 @@ export default function BeachDashboard() {
 
   const managerUrl = managerSettings.managerUrl;
   const roadUrl = managerSettings.roadUrl;
+  const handshakeTokensRef = useRef<Map<string, string>>(new Map());
 
   useEffect(() => {
     canvasLayoutRef.current = canvasLayout;
@@ -489,11 +498,13 @@ export default function BeachDashboard() {
             toolbarPinned: false,
           };
           changed = true;
+          const legacyName =
+            (session as SessionSummary & { display_name?: string | null })?.display_name ?? null;
           createdTiles.push({
             sessionId,
             position,
             order: placementOrder,
-            sessionName: session?.display_name ?? session?.metadata?.name ?? null,
+            sessionName: legacyName ?? session?.metadata?.name ?? null,
           });
         }
         if (!changed) {
@@ -828,12 +839,26 @@ export default function BeachDashboard() {
   const removeTile = useCallback(
     (sessionId: string) => {
       if (!id) return;
+      // Revoke controller lease if we previously issued a handshake for this session
+      const token = handshakeTokensRef.current.get(sessionId);
+      if (token) {
+        const doRevoke = async () => {
+          try {
+            const managerToken = await ensureManagerToken();
+            if (!managerToken) return;
+            await revokeControllerHandshake(sessionId, token, managerToken, managerUrl);
+          } catch (err) {
+            console.warn('[dashboard] revokeControllerHandshake failed', { sessionId, err });
+          } finally {
+            handshakeTokensRef.current.delete(sessionId);
+          }
+        };
+        void doRevoke();
+      }
+      // Placeholder: lease revocation managed by handshake-token map below (if available)
       let nextLayout: CanvasLayout | null = null;
-      let removedTile: {
-        sessionId: string;
-        kind: string | undefined;
-        position: { x: number; y: number } | undefined;
-      } | null = null;
+      let removedTile: RemovedTileInfo | null = null;
+      let remainingTileCount = 0;
       setCanvasLayout((prev) => {
         const base = ensureLayoutMetadata(prev);
         const existing = base.tiles[sessionId];
@@ -851,23 +876,26 @@ export default function BeachDashboard() {
           tiles: rest,
         });
         nextLayout = next;
+        remainingTileCount = Object.keys(next.tiles).length;
         return next;
       });
       if (nextLayout) {
         void persistCanvasLayout(nextLayout);
       }
-      if (removedTile) {
+      const removedTileInfo = removedTile;
+      if (removedTileInfo) {
+        const info = removedTileInfo as RemovedTileInfo;
         emitTelemetry('canvas.tile.remove', {
           privateBeachId: id,
-          sessionId: removedTile.sessionId,
-          kind: removedTile.kind ?? 'application',
-          position: removedTile.position ?? null,
-          remainingTiles: Object.keys(nextLayout?.tiles ?? {}).length,
+          sessionId: info.sessionId,
+          kind: info.kind ?? 'application',
+          position: info.position ?? null,
+          remainingTiles: remainingTileCount,
           rewriteEnabled,
         });
       }
     },
-    [id, persistCanvasLayout, rewriteEnabled],
+    [ensureManagerToken, id, managerUrl, persistCanvasLayout, rewriteEnabled],
   );
 
   const sessionById = useMemo(() => new Map(sessions.map((s) => [s.session_id, s])), [sessions]);
@@ -1011,6 +1039,15 @@ export default function BeachDashboard() {
       setAssignmentSaving(true);
       setAssignmentError(null);
       try {
+        // Manager requires the controller session to hold a lease before pairing
+        try {
+          await acquireController(agentId, 30_000, managerToken, managerUrl);
+        } catch (leaseErr: any) {
+          console.warn('[assignments] acquireController (create) failed', {
+            controller: agentId,
+            error: leaseErr?.message ?? String(leaseErr),
+          });
+        }
         const created = await createControllerPairing(
           agentId,
           {
@@ -1066,6 +1103,14 @@ export default function BeachDashboard() {
       setAssignmentSaving(true);
       setAssignmentError(null);
       try {
+        try {
+          await acquireController(controllerId, 30_000, managerToken, managerUrl);
+        } catch (leaseErr: any) {
+          console.warn('[assignments] acquireController (update) failed', {
+            controller: controllerId,
+            error: leaseErr?.message ?? String(leaseErr),
+          });
+        }
         const updated = await createControllerPairing(
           controllerId,
           {
@@ -1108,6 +1153,14 @@ export default function BeachDashboard() {
       setAssignmentSaving(true);
       setAssignmentError(null);
       try {
+        try {
+          await acquireController(controllerId, 30_000, managerToken, managerUrl);
+        } catch (leaseErr: any) {
+          console.warn('[assignments] acquireController (delete) failed', {
+            controller: controllerId,
+            error: leaseErr?.message ?? String(leaseErr),
+          });
+        }
         await deleteControllerPairing(controllerId, childId, managerToken, managerUrl);
         setAssignments((prev) =>
           prev.filter(
@@ -1159,7 +1212,7 @@ export default function BeachDashboard() {
           right={
             <div className="flex items-center gap-2">
               <Button
-                variant={sidebarOpen ? 'default' : 'outline'}
+                variant={sidebarOpen ? 'primary' : 'outline'}
                 onClick={() => setSidebarOpen((prev) => !prev)}
                 aria-pressed={sidebarOpen}
               >
@@ -1253,6 +1306,9 @@ export default function BeachDashboard() {
                 }).catch(() => {});
               }
             }
+            onHandshakeIssued={(sessionId, controllerToken) => {
+              handshakeTokensRef.current.set(sessionId, controllerToken);
+            }}
           />
         )}
         <AssignmentDetailPane

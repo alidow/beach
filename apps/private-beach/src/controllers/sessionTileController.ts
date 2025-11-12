@@ -22,6 +22,7 @@ import {
   withTileGridMetadata,
   type GridDashboardMetadata,
   type GridLayoutSnapshot,
+  type GridLayoutUnits,
   type TileGridMetadataUpdate,
 } from './gridLayout';
 import type { GridCommandResult } from './gridLayoutCommands';

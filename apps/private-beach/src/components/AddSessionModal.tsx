@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
-import { attachByCode, attachOwned, updateSessionRoleById, type SessionRole } from '../lib/api';
-import { listMySessions, RoadMySession } from '../lib/road';
+import { attachByCode, attachOwned, updateSessionRoleById, acquireController, type SessionRole } from '../lib/api';
+import { listMySessions, RoadMySession, sendControlMessage, pollControl } from '../lib/road';
 import { Dialog } from './ui/dialog';
 import { Input } from './ui/input';
 import { Button } from './ui/button';
@@ -13,9 +13,10 @@ type Props = {
   roadUrl?: string;
   token: string | null;
   onAttached?: (ids: string[]) => void;
+  onHandshakeIssued?: (sessionId: string, controllerToken: string) => void;
 };
 
-export default function AddSessionModal({ open, onOpenChange, privateBeachId, managerUrl, roadUrl, token, onAttached }: Props) {
+export default function AddSessionModal({ open, onOpenChange, privateBeachId, managerUrl, roadUrl, token, onAttached, onHandshakeIssued }: Props) {
   const [tab, setTab] = useState<'code' | 'mine' | 'new'>('code');
   const [sessionId, setSessionId] = useState('');
   const [code, setCode] = useState('');
@@ -25,6 +26,8 @@ export default function AddSessionModal({ open, onOpenChange, privateBeachId, ma
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [attachRole, setAttachRole] = useState<SessionRole>('application');
   const hasToken = token && token.trim().length > 0;
+  const [ackWaiting, setAckWaiting] = useState(false);
+  const [ackStatus, setAckStatus] = useState<'idle' | 'waiting' | 'acked' | 'timeout' | 'error'>('idle');
 
   useEffect(() => {
     if (!open) {
@@ -33,6 +36,8 @@ export default function AddSessionModal({ open, onOpenChange, privateBeachId, ma
       setSessionId('');
       setCode('');
       setError(null);
+      setAckWaiting(false);
+      setAckStatus('idle');
     }
   }, [open]);
 
@@ -87,6 +92,54 @@ export default function AddSessionModal({ open, onOpenChange, privateBeachId, ma
     console.info('[add-session] attach by code response', {
       session: resp?.session?.session_id,
     });
+    // Acquire a controller lease and send handshake payload via Beach Road
+    try {
+      const lease = await acquireController(resp.session.session_id, 30_000, token, managerUrl);
+      const handshake = {
+        private_beach_id: privateBeachId,
+        manager_url: managerUrl,
+        controller_token: lease.controller_token,
+        lease_expires_at_ms: lease.expires_at_ms,
+        stale_session_idle_secs: 60,
+        viewer_health_interval_secs: 15,
+      };
+      onHandshakeIssued?.(resp.session.session_id, lease.controller_token);
+      console.info('[add-session] issuing control handshake to road', {
+        sessionId: resp.session.session_id,
+        managerUrl,
+      });
+      const ctl = await sendControlMessage(
+        resp.session.session_id,
+        'manager_handshake',
+        handshake,
+        token,
+        roadUrl,
+      );
+      // Await ACK by polling for disappearance of control id
+      setAckWaiting(true);
+      setAckStatus('waiting');
+      const maxTries = 12;
+      let acknowledged = false;
+      for (let i = 0; i < maxTries; i++) {
+        try {
+          const { messages } = await pollControl(resp.session.session_id, code.trim(), roadUrl);
+          const stillPresent = messages.some((m: any) => m && m.id === ctl.control_id);
+          if (!stillPresent) {
+            acknowledged = true;
+            break;
+          }
+        } catch (err) {
+          console.warn('[add-session] control poll failed (continuing)', err);
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      setAckStatus(acknowledged ? 'acked' : 'timeout');
+    } catch (e) {
+      console.warn('[add-session] handshake delivery failed (continuing)', {
+        error: e,
+      });
+      setAckStatus('error');
+    }
     try {
       await updateSessionRoleById(
         resp.session.session_id,
@@ -172,7 +225,7 @@ export default function AddSessionModal({ open, onOpenChange, privateBeachId, ma
             <div className="flex gap-2">
               <Button
                 type="button"
-                variant={attachRole === 'application' ? 'default' : 'outline'}
+                variant={attachRole === 'application' ? 'primary' : 'outline'}
                 onClick={() => setAttachRole('application')}
                 size="sm"
               >
@@ -180,7 +233,7 @@ export default function AddSessionModal({ open, onOpenChange, privateBeachId, ma
               </Button>
               <Button
                 type="button"
-                variant={attachRole === 'agent' ? 'default' : 'outline'}
+                variant={attachRole === 'agent' ? 'primary' : 'outline'}
                 onClick={() => setAttachRole('agent')}
                 size="sm"
               >
@@ -197,6 +250,14 @@ export default function AddSessionModal({ open, onOpenChange, privateBeachId, ma
               <Input placeholder="Session ID (UUID)" value={sessionId} onChange={(e) => setSessionId(e.target.value)} />
               <Input placeholder="6-digit code" value={code} onChange={(e) => setCode(e.target.value)} />
               {error && <div className="rounded border border-red-200/80 bg-red-500/10 p-2 text-xs text-red-600 dark:text-red-400">{error}</div>}
+              {ackWaiting && (
+                <div className="rounded border border-blue-200/80 bg-blue-500/10 p-2 text-xs text-blue-700 dark:text-blue-300">
+                  {ackStatus === 'waiting' && 'Waiting for host ACK…'}
+                  {ackStatus === 'acked' && 'Handshake acknowledged by host.'}
+                  {ackStatus === 'timeout' && 'No ACK from host yet (continuing).'}
+                  {ackStatus === 'error' && 'Handshake delivery failed (continuing).'}
+                </div>
+              )}
               <div className="flex justify-end">
                 <Button onClick={submitCode} disabled={loading || !sessionId || !code || !hasToken}>{loading ? 'Verifying…' : 'Attach'}</Button>
               </div>

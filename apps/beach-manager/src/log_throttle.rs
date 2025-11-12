@@ -30,6 +30,14 @@ struct LogKey {
 
 static QUEUE_LOG_MEMORY: Lazy<Mutex<HashMap<LogKey, Instant>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+#[derive(Eq, PartialEq, Hash)]
+struct CustomLogKey {
+    kind: &'static str,
+    session_id: String,
+}
+
+static CUSTOM_LOG_MEMORY: Lazy<Mutex<HashMap<CustomLogKey, Instant>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 pub fn should_log_queue_event(kind: QueueLogKind, session_id: &str) -> bool {
     let mut guard = QUEUE_LOG_MEMORY
@@ -42,6 +50,24 @@ pub fn should_log_queue_event(kind: QueueLogKind, session_id: &str) -> bool {
     let now = Instant::now();
     if let Some(last) = guard.get(&key) {
         if now.duration_since(*last) < kind.interval() {
+            return false;
+        }
+    }
+    guard.insert(key, now);
+    true
+}
+
+pub fn should_log_custom_event(kind: &'static str, session_id: &str, interval: Duration) -> bool {
+    let mut guard = CUSTOM_LOG_MEMORY
+        .lock()
+        .expect("custom log throttle mutex poisoned");
+    let key = CustomLogKey {
+        kind,
+        session_id: session_id.to_string(),
+    };
+    let now = Instant::now();
+    if let Some(last) = guard.get(&key) {
+        if now.duration_since(*last) < interval {
             return false;
         }
     }

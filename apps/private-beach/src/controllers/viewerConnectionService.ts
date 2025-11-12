@@ -27,6 +27,7 @@ type ConnectionInput = {
   managerUrl: string | null | undefined;
   authToken: string | null | undefined;
   override?: SessionCredentialOverride | null | undefined;
+  traceId?: string | null | undefined;
 };
 
 type TileSubscriber = (snapshot: TerminalViewerState) => void;

@@ -58,6 +58,8 @@ const ROW_HEIGHT = 12;
 const GRID_MARGIN_X = 16;
 const GRID_MARGIN_Y = 16;
 const GRID_CONTAINER_PADDING_X = 8;
+
+type ResizeHandleAxis = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
 const GRID_CONTAINER_PADDING_Y = 8;
 const UNLOCKED_MAX_W = 96;
 const UNLOCKED_MAX_H = 96;
@@ -560,7 +562,7 @@ type TileCardProps = {
       hostCols: number | null;
     },
   ) => void;
-  onPreviewStatusChange: (sessionId: string, status: 'connecting' | 'initializing' | 'ready' | 'error') => void;
+  onPreviewStatusChange: (status: 'connecting' | 'initializing' | 'ready' | 'error') => void;
   onPreviewMeasurementsChange: (
     sessionId: string,
     measurement: PreviewMetrics | null,
@@ -733,9 +735,9 @@ function TileCard({
 
   const handlePreviewStatusChange = useCallback(
     (status: 'connecting' | 'initializing' | 'ready' | 'error') => {
-      onPreviewStatusChange(session.session_id, status);
+      onPreviewStatusChange(status);
     },
-    [onPreviewStatusChange, session.session_id],
+    [onPreviewStatusChange],
   );
 
   const [copyState, setCopyState] = useState<'idle' | 'copied'>('idle');
@@ -1003,7 +1005,7 @@ type SessionTileProps = {
       hostCols: number | null;
     },
   ) => void;
-  onPreviewStatusChange: (sessionId: string, status: 'connecting' | 'initializing' | 'ready' | 'error') => void;
+  onPreviewStatusChange: (status: 'connecting' | 'initializing' | 'ready' | 'error') => void;
   onPreviewMeasurementsChange: (sessionId: string, measurement: PreviewMetrics | null) => void;
   onHostResizeStateChange: (sessionId: string, state: HostResizeControlState | null) => void;
   isExpanded: boolean;
@@ -1047,13 +1049,6 @@ const SessionTile = forwardRef<HTMLDivElement, SessionTileProps>(
     },
     ref,
   ) => {
-    const handleTilePreviewStatusChange = useCallback(
-      (status: 'connecting' | 'initializing' | 'ready' | 'error') => {
-        onPreviewStatusChange(session.session_id, status);
-      },
-      [onPreviewStatusChange, session.session_id],
-    );
-
     const handleTilePreviewMeasurementsChange = useCallback(
       (sessionIdValue: string, measurement: PreviewMetrics | null) => {
         onPreviewMeasurementsChange(sessionIdValue, measurement);
@@ -1195,7 +1190,7 @@ const SessionTile = forwardRef<HTMLDivElement, SessionTileProps>(
         view={view}
         onMeasure={onMeasure}
         onViewport={handlePreviewViewportDimensions}
-        onPreviewStatusChange={handleTilePreviewStatusChange}
+        onPreviewStatusChange={onPreviewStatusChange}
         onPreviewMeasurementsChange={handleTilePreviewMeasurementsChange}
         onHostResizeStateChange={onHostResizeStateChange}
         isExpanded={isExpanded}
@@ -2688,7 +2683,7 @@ export default function TileCanvas({
               viewerToken={viewerToken}
               onMeasure={(measurement) => handleMeasure(session.session_id, measurement)}
               onViewport={handleViewportDimensions}
-              onPreviewStatusChange={handlePreviewStatusChange}
+              onPreviewStatusChange={(status) => handlePreviewStatusChange(session.session_id, status)}
               onPreviewMeasurementsChange={handleTilePreviewMeasurementsChange}
               onHostResizeStateChange={handleHostResizeStateChange}
               isExpanded={isExpanded}
@@ -2733,7 +2728,14 @@ export default function TileCanvas({
       if (items.length === 0) {
         const childSummaries = Array.from(target.children)
           .slice(0, 3)
-          .map((el) => ({ tag: el.tagName, className: el.className, dataAttrs: { ...el.dataset } }));
+          .map((el) => {
+            const element = el as HTMLElement;
+            return {
+              tag: element.tagName,
+              className: element.className,
+              dataAttrs: element.dataset ? { ...element.dataset } : {},
+            };
+          });
         tileDebugLog(
           '[tile-layout] dom-item pending',
           JSON.stringify({
@@ -2822,7 +2824,7 @@ export default function TileCanvas({
                 {expanded.harness_type}
               </span>
               <span className="text-xs text-muted-foreground">{expanded.location_hint || '—'}</span>
-              <Badge variant={roles.get(expanded.session_id) === 'agent' ? 'default' : 'outline'}>
+              <Badge variant={roles.get(expanded.session_id) === 'agent' ? 'default' : 'muted'}>
                 {roles.get(expanded.session_id) === 'agent' ? 'Agent' : 'Application'}
               </Badge>
             </div>

@@ -18,9 +18,13 @@ import type { CSSProperties, MouseEvent, PointerEvent } from 'react';
 import { Handle, Position, useStore } from 'reactflow';
 import type { NodeProps, ReactFlowState } from 'reactflow';
 import { ApplicationTile } from '@/components/ApplicationTile';
-import { TILE_PRIMARY_BUTTON_CLASS, TILE_SECONDARY_BUTTON_CLASS } from '@/components/tileButtonClasses';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Textarea } from '@/components/ui/textarea';
 import { cn } from '@/lib/cn';
 import { listSessions, onboardAgent, updateSessionMetadata, updateSessionRoleById } from '@/lib/api';
+import { sendControlMessage } from '@/lib/road';
 import { buildManagerUrl, useManagerToken } from '@/hooks/useManagerToken';
 import { TILE_HEADER_HEIGHT } from '../constants';
 import { useTileActions } from '../store';
@@ -39,6 +43,7 @@ type TileFlowNodeData = {
   managerUrl: string;
   rewriteEnabled: boolean;
   isInteractive: boolean;
+  interactiveTileId: string | null;
 };
 
 type ResizeState = {
@@ -65,6 +70,9 @@ const HANDLE_DEFS: HandleDef[] = [
 ];
 
 const AUTO_RESIZE_TOLERANCE_PX = 1;
+
+const INTERACT_BUTTON_SELECTOR = '[data-tile-interact-button="true"]';
+const TILE_HOVER_LAYER_SELECTOR = '[data-tile-hover-layer="true"]';
 
 function generateTraceId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -164,11 +172,13 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
     isActive,
     isResizing,
     isInteractive,
+    interactiveTileId,
     privateBeachId,
     managerUrl,
     rewriteEnabled,
   } = data;
   const managerBaseUrl = useMemo(() => buildManagerUrl(managerUrl), [managerUrl]);
+  const { token: managerToken, refresh: refreshManagerToken } = useManagerToken();
   const {
     removeTile,
     bringToFront,
@@ -190,14 +200,42 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
   const [dragPerfMode, setDragPerfMode] = useState(false);
   const isAgent = tile.nodeType === 'agent';
   const agentMeta = useMemo(() => normalizeAgentMeta(tile.agentMeta ?? null), [tile.agentMeta]);
+  const hasSession = Boolean(tile.sessionMeta?.sessionId);
   const [agentRole, setAgentRole] = useState(agentMeta.role);
   const [agentResponsibility, setAgentResponsibility] = useState(agentMeta.responsibility);
-  const { token: managerToken, refresh: refreshManagerToken } = useManagerToken();
+  
   const [agentTraceEnabled, setAgentTraceEnabled] = useState(Boolean(agentMeta.trace?.enabled));
   const [agentTraceId, setAgentTraceId] = useState<string | null>(agentMeta.trace?.trace_id ?? null);
   const [agentSaveState, setAgentSaveState] = useState<'idle' | 'saving'>('idle');
   const [agentSaveNotice, setAgentSaveNotice] = useState<string | null>(null);
   const zoom = useStore(zoomSelector);
+
+  const handleTerminalHoverEnter = useCallback(() => {
+    setTerminalHover(true);
+  }, []);
+
+  const handleTerminalHoverLeave = useCallback(
+    (event: PointerEvent<HTMLDivElement>) => {
+      const nextTarget = event.relatedTarget as HTMLElement | null;
+      if (nextTarget?.closest(INTERACT_BUTTON_SELECTOR)) {
+        return;
+      }
+      setTerminalHover(false);
+    },
+    [],
+  );
+
+  const handleInteractButtonEnter = useCallback(() => {
+    setTerminalHover(true);
+  }, []);
+
+  const handleInteractButtonLeave = useCallback((event: PointerEvent<HTMLButtonElement>) => {
+    const nextTarget = event.relatedTarget as HTMLElement | null;
+    if (nextTarget?.closest(TILE_HOVER_LAYER_SELECTOR)) {
+      return;
+    }
+    setTerminalHover(false);
+  }, []);
 
 
   const zIndex = useMemo(() => 10 + orderIndex, [orderIndex]);
@@ -268,9 +306,32 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
         tileId: tile.id,
         rewriteEnabled,
       });
+      // Best-effort: issue a detach control message to the host so it tears down
+      // any active controller consumer. Road URL is resolved from env via lib/road.
+      const sessionId = tile.sessionMeta?.sessionId?.trim();
+      if (sessionId && sessionId.length > 0) {
+        (async () => {
+          try {
+            const token = managerToken ?? (await refreshManagerToken());
+            await sendControlMessage(sessionId, 'manager_detach', { reason: 'tile_removed' }, token ?? null);
+          } catch (err) {
+            try {
+              console.warn('[tile] detach control send failed', err);
+            } catch {}
+          }
+        })();
+      }
       removeTile(tile.id);
     },
-    [privateBeachId, removeTile, rewriteEnabled, tile.id],
+    [
+      privateBeachId,
+      managerToken,
+      refreshManagerToken,
+      removeTile,
+      rewriteEnabled,
+      tile.id,
+      tile.sessionMeta?.sessionId,
+    ],
   );
 
   const runAgentOnboarding = useCallback(
@@ -316,7 +377,10 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
           undefined,
           traceId,
         );
-        const metadataPayload = buildSessionMetadataWithTile(summary.metadata, tile.id, tile.sessionMeta ?? {});
+        const metadataPayload = buildSessionMetadataWithTile(summary.metadata, tile.id, tile.sessionMeta ?? {}) as Record<
+          string,
+          any
+        >;
         metadataPayload.role = 'agent';
         metadataPayload.agent = {
           profile: 'pong',
@@ -543,7 +607,7 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
       rewriteEnabled,
       size: nextSize,
     });
-  }, [isResizing, nodeRef, privateBeachId, resizeTile, rewriteEnabled, tile.id, tile.size.height, tile.size.width, zoom]);
+  }, [isResizing, nodeRef, privateBeachId, resizeTile, rewriteEnabled, tile.id, tile.size, zoom]);
 
   const handleResizeDoubleClick = useCallback(
     (event: MouseEvent<HTMLButtonElement>) => {
@@ -837,11 +901,17 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
     if (!isAgent) {
       return;
     }
-    const hasSession = Boolean(tile.sessionMeta?.sessionId);
-    if (!hasSession && !isInteractive) {
-      setInteractiveTile(tile.id);
+    if (hasSession) {
+      return;
     }
-  }, [isAgent, isInteractive, setInteractiveTile, tile.id, tile.sessionMeta?.sessionId]);
+    if (interactiveTileId && interactiveTileId !== tile.id) {
+      return;
+    }
+    if (isInteractive) {
+      return;
+    }
+    setInteractiveTile(tile.id);
+  }, [hasSession, interactiveTileId, isAgent, isInteractive, setInteractiveTile, tile.id]);
 
   useEffect(() => {
     if (!dragging) {
@@ -922,6 +992,9 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
             onClick={handleToggleInteractive}
             className="pointer-events-auto inline-flex items-center gap-2 rounded-full border border-amber-200/70 bg-amber-300/90 px-4 py-2 text-xs font-semibold uppercase tracking-[0.28em] text-slate-900 shadow-lg transition hover:bg-amber-200"
             data-tile-drag-ignore="true"
+            data-tile-interact-button="true"
+            onPointerEnter={handleInteractButtonEnter}
+            onPointerLeave={handleInteractButtonLeave}
           >
             Interact
           </button>
@@ -1002,28 +1075,32 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
               </p>
             ) : null}
             {showAgentEditor ? (
-              <div className="space-y-2">
-                <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400" htmlFor={`agent-role-${tile.id}`}>
-                  Role
-                </label>
-                <input
-                  id={`agent-role-${tile.id}`}
-                  value={agentRole}
-                  onChange={(event) => setAgentRole(event.target.value)}
-                  className="w-full rounded border border-white/10 bg-white/5 px-3 py-2 text-sm text-white focus:border-indigo-400 focus:outline-none"
-                  placeholder="e.g. Deploy orchestrator"
-                />
-                <label className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-400" htmlFor={`agent-resp-${tile.id}`}>
-                  Responsibility
-                </label>
-                <textarea
-                  id={`agent-resp-${tile.id}`}
-                  value={agentResponsibility}
-                  onChange={(event) => setAgentResponsibility(event.target.value)}
-                  rows={3}
-                  className="w-full rounded border border-white/10 bg-white/5 px-3 py-2 text-sm text-white focus:border-indigo-400 focus:outline-none"
-                  placeholder="Describe how this agent should manage connected sessions"
-                />
+              <div className="space-y-3">
+                <div className="space-y-2">
+                  <Label htmlFor={`agent-role-${tile.id}`} className="text-[11px] text-muted-foreground dark:text-slate-300">
+                    Role
+                  </Label>
+                  <Input
+                    id={`agent-role-${tile.id}`}
+                    value={agentRole}
+                    onChange={(event) => setAgentRole(event.target.value)}
+                    placeholder="e.g. Deploy orchestrator"
+                    className="h-10 text-sm font-medium text-foreground/90 dark:text-white"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor={`agent-resp-${tile.id}`} className="text-[11px] text-muted-foreground dark:text-slate-300">
+                    Responsibility
+                  </Label>
+                  <Textarea
+                    id={`agent-resp-${tile.id}`}
+                    value={agentResponsibility}
+                    onChange={(event) => setAgentResponsibility(event.target.value)}
+                    rows={3}
+                    placeholder="Describe how this agent should manage connected sessions"
+                    className="min-h-[96px] text-sm font-medium text-foreground/90 dark:text-white"
+                  />
+                </div>
                 <label className="mt-2 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-400">
                   <input
                     type="checkbox"
@@ -1034,35 +1111,38 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
                   <span>Trace Logging</span>
                 </label>
                 {agentTraceEnabled ? (
-                  <div className="flex items-center justify-between rounded-md border border-white/10 bg-white/5 px-3 py-2 text-[11px] text-slate-300">
+                  <div className="flex items-center justify-between rounded-md border border-border/60 bg-card/70 px-3 py-2 text-[11px] text-muted-foreground dark:border-white/15 dark:bg-white/5">
                     <span className="font-mono text-[10px]">
                       {(agentTraceId ?? 'pending…').slice(0, 36)}
                     </span>
-                    <button
+                    <Button
                       type="button"
-                      className="text-[10px] font-semibold uppercase tracking-[0.2em] text-sky-300"
+                      size="sm"
+                      variant="secondary"
+                      className="h-7 px-2 text-[10px] font-semibold uppercase tracking-[0.2em]"
                       onClick={handleTraceRefresh}
                     >
                       Refresh
-                    </button>
+                    </Button>
                   </div>
                 ) : null}
                 <div className="flex gap-2 pt-1 text-xs">
-                  <button
+                  <Button
                     type="button"
                     onClick={handleAgentSave}
-                    className={cn('flex-1', TILE_PRIMARY_BUTTON_CLASS)}
+                    className="flex-1 text-[11px] font-semibold uppercase tracking-[0.2em]"
                     disabled={!agentRole.trim() || !agentResponsibility.trim()}
                   >
                     {agentSaveState === 'saving' ? 'Saving…' : 'Save'}
-                  </button>
-                  <button
+                  </Button>
+                  <Button
                     type="button"
+                    variant="outline"
                     onClick={handleAgentCancel}
-                    className={cn('flex-1', TILE_SECONDARY_BUTTON_CLASS)}
+                    className="flex-1 text-[11px] font-semibold uppercase tracking-[0.18em]"
                   >
                     Cancel
-                  </button>
+                  </Button>
                 </div>
               </div>
             ) : (
@@ -1109,8 +1189,9 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
           {!isInteractive ? (
             <div
               className="pointer-events-auto absolute inset-0 z-10"
-              onPointerEnter={() => setTerminalHover(true)}
-              onPointerLeave={() => setTerminalHover(false)}
+              data-tile-hover-layer="true"
+              onPointerEnter={handleTerminalHoverEnter}
+              onPointerLeave={handleTerminalHoverLeave}
               onClick={(event) => {
                 // Let clicks fall through so users can still double-click to enter interact mode
                 event.stopPropagation();

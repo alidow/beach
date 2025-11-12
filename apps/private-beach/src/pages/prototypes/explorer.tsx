@@ -235,24 +235,23 @@ const NODE_CATALOG = collectNodes(COLLECTION_SECTIONS);
 function filterNodes(nodes: ExplorerNode[], term: string): ExplorerNode[] {
   if (!term) return nodes;
   const needle = term.toLowerCase();
-  return nodes
-    .map((node) => {
-      const tags = node.meta?.tags ?? [];
-      const matchesSelf =
-        node.label.toLowerCase().includes(needle) ||
-        Boolean(node.meta?.region && node.meta.region.toLowerCase().includes(needle)) ||
-        Boolean(node.meta?.description && node.meta.description.toLowerCase().includes(needle)) ||
-        tags.some((tag) => tag.toLowerCase().includes(needle));
-      const filteredChildren = node.children ? filterNodes(node.children, term) : [];
-      if (matchesSelf || filteredChildren.length > 0) {
-        return {
-          ...node,
-          children: node.children ? filteredChildren : undefined,
-        };
-      }
-      return null;
-    })
-    .filter((value): value is ExplorerNode => Boolean(value));
+  const filtered: ExplorerNode[] = [];
+  for (const node of nodes) {
+    const tags = node.meta?.tags ?? [];
+    const matchesSelf =
+      node.label.toLowerCase().includes(needle) ||
+      Boolean(node.meta?.region && node.meta.region.toLowerCase().includes(needle)) ||
+      Boolean(node.meta?.description && node.meta.description.toLowerCase().includes(needle)) ||
+      tags.some((tag) => tag.toLowerCase().includes(needle));
+    const filteredChildren = node.children ? filterNodes(node.children, term) : [];
+    if (matchesSelf || filteredChildren.length > 0) {
+      filtered.push({
+        ...node,
+        children: node.children ? filteredChildren : undefined,
+      });
+    }
+  }
+  return filtered;
 }
 
 function bucketizeNodes(nodes: ExplorerNode[]): ExplorerBucket[] {

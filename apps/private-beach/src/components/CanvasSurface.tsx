@@ -619,8 +619,9 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     const map: Record<string, TerminalStateDiff> = {};
     const seen = new Set<string>();
     for (const session of tiles) {
+      const legacyLastState = (session as SessionSummary & { last_state?: unknown }).last_state ?? null;
       const diff =
-        extractTerminalStateDiff(session.last_state) ?? extractTerminalStateDiff(session.metadata);
+        extractTerminalStateDiff(legacyLastState) ?? extractTerminalStateDiff(session.metadata);
       if (diff) {
         map[session.session_id] = diff;
         seen.add(session.session_id);

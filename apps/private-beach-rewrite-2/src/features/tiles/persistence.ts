@@ -3,11 +3,13 @@ import { DEFAULT_CANVAS_VIEWPORT, DEFAULT_TILE_HEIGHT, DEFAULT_TILE_WIDTH } from
 import type {
   AgentMetadata,
   RelationshipDescriptor,
+  RelationshipUpdateMode,
   TileDescriptor,
   TileSessionMeta,
   TileState,
   CanvasViewportState,
 } from './types';
+import { sanitizeRelationshipCadenceInput } from './types';
 
 function clampZoom(zoom: number): number {
   if (!Number.isFinite(zoom)) {
@@ -127,7 +129,7 @@ function normalizeAgentMeta(source: unknown, nodeType: TileDescriptor['nodeType'
   return agentMeta;
 }
 
-const VALID_RELATIONSHIP_MODES: RelationshipDescriptor['updateMode'][] = ['idle-summary', 'push', 'poll'];
+const VALID_RELATIONSHIP_MODES: RelationshipUpdateMode[] = ['idle-summary', 'push', 'poll', 'hybrid'];
 
 function isRelationshipUpdateMode(value: unknown): value is RelationshipDescriptor['updateMode'] {
   return typeof value === 'string' && VALID_RELATIONSHIP_MODES.includes(value as RelationshipDescriptor['updateMode']);
@@ -162,7 +164,10 @@ function normalizeRelationshipEntry(input: unknown, fallbackId: string): Relatio
   }
   const idRaw = typeof record.id === 'string' && record.id.trim().length > 0 ? record.id : fallbackId;
   const updateMode = isRelationshipUpdateMode(record.updateMode) ? (record.updateMode as RelationshipDescriptor['updateMode']) : 'idle-summary';
-  const pollFrequency = sanitizePollFrequency(record.pollFrequency);
+  const pollFrequency = sanitizePollFrequency(
+    record.pollFrequency ?? (typeof record.cadence === 'object' ? (record.cadence as Record<string, unknown>)?.pollFrequencySeconds : undefined),
+  );
+  const cadence = sanitizeRelationshipCadenceInput(record.cadence, updateMode, pollFrequency);
   return {
     id: idRaw,
     sourceId,
@@ -174,6 +179,7 @@ function normalizeRelationshipEntry(input: unknown, fallbackId: string): Relatio
     instructions: typeof record.instructions === 'string' ? record.instructions : '',
     updateMode,
     pollFrequency,
+    cadence,
   };
 }
 
@@ -247,6 +253,7 @@ function serializeRelationships(state: TileState): {
       instructions: rel.instructions || null,
       updateMode: rel.updateMode,
       pollFrequency: rel.pollFrequency,
+      cadence: rel.cadence,
     };
   }
   return { records, order };
@@ -461,6 +468,15 @@ export function serializeTileStateKey(state: TileState): string {
 							rel.instructions ?? '',
 							rel.updateMode,
 							rel.pollFrequency ?? '',
+              rel.cadence
+                ? [
+                    rel.cadence.idleSummary ? 'idle:1' : 'idle:0',
+                    rel.cadence.allowChildPush ? 'mcp:1' : 'mcp:0',
+                    rel.cadence.pollEnabled ? `poll:${rel.cadence.pollFrequencySeconds}` : 'poll:off',
+                    rel.cadence.pollRequireContentChange ? 'change:1' : 'change:0',
+                    `quiet:${rel.cadence.pollQuietWindowSeconds}`,
+                  ].join(',')
+                : 'cadence:none',
 						].join(':');
 					})
 					.join('|');

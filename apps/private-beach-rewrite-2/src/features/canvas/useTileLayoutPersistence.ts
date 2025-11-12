@@ -115,7 +115,7 @@ export function useTileLayoutPersistence({
       pendingSignatureRef.current = sig;
       void performPersist(sig);
     },
-    [debounceMs, performPersist, beachId],
+    [debounceMs, performPersist],
   );
 
   useEffect(() => {

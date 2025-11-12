@@ -21,7 +21,8 @@ const LABEL_BYTES: Record<SignalingLabel, Uint8Array> = {
 const INSECURE_OVERRIDE_TOKEN = 'I_KNOW_THIS_IS_UNSAFE';
 
 export function secureSignalingEnabled(): boolean {
-  const override = import.meta.env?.VITE_ALLOW_PLAINTEXT ?? '';
+  const metaEnv = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
+  const override = metaEnv?.VITE_ALLOW_PLAINTEXT ?? '';
   return override.trim() !== INSECURE_OVERRIDE_TOKEN;
 }
 

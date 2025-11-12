@@ -303,6 +303,120 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
 
     info!(session_id = %session_id, "host ready");
 
+    // Control listener: poll Beach Road for control messages (manager handshake/detach)
+    {
+        let road_base_url = normalized_base.clone();
+        let poll_session_id = session_id.clone();
+        let poll_join_code = join_code.clone();
+        let writer_for_actions = writer.clone();
+        tokio::spawn(async move {
+            let http = match Client::builder().build() {
+                Ok(c) => c,
+                Err(err) => {
+                    warn!(target = "controller.actions", error = %err, "failed to init http client for control poll");
+                    return;
+                }
+            };
+            let mut consumer_started = false;
+            let mut consumer_handle: Option<tokio::task::JoinHandle<()>> = None;
+            loop {
+                let url = format!(
+                    "{}/sessions/{}/control/poll",
+                    road_base_url.trim_end_matches('/'),
+                    poll_session_id
+                );
+                let resp = http
+                    .post(&url)
+                    .json(&json!({ "code": poll_join_code }))
+                    .send()
+                    .await;
+                match resp {
+                    Ok(resp) if resp.status().is_success() => {
+                        let body: serde_json::Value = match resp.json().await {
+                            Ok(v) => v,
+                            Err(err) => {
+                                warn!(target = "controller.actions", error = %err, "invalid control poll payload");
+                                sleep(Duration::from_millis(500)).await;
+                                continue;
+                            }
+                        };
+                        if let Some(list) = body.get("messages").and_then(|v| v.as_array()) {
+                            for item in list {
+                                let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                                let control_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                if kind == "manager_handshake" {
+                                    if let Some(payload) = item.get("payload") {
+                                        let manager_url = payload
+                                            .get("manager_url")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let controller_token = payload
+                                            .get("controller_token")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        if !consumer_started && !manager_url.is_empty() && !controller_token.is_empty() {
+                                            info!(
+                                                target = "controller.actions",
+                                                session_id = %poll_session_id,
+                                                manager = %manager_url,
+                                                "manager handshake received; starting action consumer"
+                                            );
+                                            // Use the controller token as bearer; manager auth bypass accepts any token in dev
+                                            let bearer = controller_token.clone();
+                                            consumer_handle = spawn_action_consumer(
+                                                manager_url.clone(),
+                                                bearer,
+                                                writer_for_actions.clone(),
+                                                poll_session_id.clone(),
+                                            );
+                                            consumer_started = true;
+                                        }
+                                    }
+                                }
+                                if kind == "manager_detach" {
+                                    info!(
+                                        target = "controller.actions",
+                                        session_id = %poll_session_id,
+                                        "manager detach received; stopping action consumer"
+                                    );
+                                    if let Some(handle) = consumer_handle.take() {
+                                        handle.abort();
+                                    }
+                                    consumer_started = false;
+                                }
+                                if !control_id.is_empty() {
+                                    let ack_url = format!(
+                                        "{}/sessions/{}/control/ack",
+                                        road_base_url.trim_end_matches('/'),
+                                        poll_session_id
+                                    );
+                                    let _ = http
+                                        .post(&ack_url)
+                                        .json(&json!({ "control_id": control_id }))
+                                        .send()
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                    Ok(resp) if resp.status().as_u16() == 403 => {
+                        // Invalid code; back off more
+                        sleep(Duration::from_secs(2)).await;
+                    }
+                    Ok(_) => {
+                        sleep(Duration::from_millis(500)).await;
+                    }
+                    Err(err) => {
+                        warn!(target = "controller.actions", error = %err, "control poll failed");
+                        sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        });
+    }
+
     // Spawn a lightweight controller action consumer so manager-queued terminal_write
     // actions can drive this host (used by the Pong demo agent). This is best-effort:
     // if the manager URL/token aren’t configured, the host runs normally.
@@ -604,6 +718,75 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     }
     info!(session_id = %session_id, pid, "host command completed");
     Ok(())
+}
+
+fn spawn_action_consumer(
+    manager_url: String,
+    bearer: String,
+    writer_for_actions: PtyWriter,
+    session_for_actions: String,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let manager_url_spawn = manager_url.clone();
+    let transport: ManagerHttpTransport<ManagerStaticTokenProvider> =
+        match ManagerHttpTransport::new(&manager_url, ManagerStaticTokenProvider::new(bearer)) {
+            Ok(t) => t,
+            Err(err) => {
+                warn!(target = "controller.actions", error = %err, "manager transport init failed");
+                return None;
+            }
+        };
+    Some(tokio::spawn(async move {
+        loop {
+            match transport.receive_actions(&session_for_actions).await {
+                Ok(received) if !received.is_empty() => {
+                    let commands: Vec<CtrlActionCommand> = received;
+                    for cmd in commands.iter() {
+                        if cmd.action_type.as_str() == "terminal_write" {
+                            if let Some(bytes) =
+                                cmd.payload.get("bytes").and_then(|v: &Value| v.as_str())
+                            {
+                                match writer_for_actions.write(bytes.as_bytes()) {
+                                    Ok(()) => {
+                                        debug!(
+                                            target = "controller.actions",
+                                            session_id = %session_for_actions,
+                                            command_id = %cmd.id,
+                                            bytes = bytes.len(),
+                                            "applied terminal_write action"
+                                        );
+                                    }
+                                    Err(err) => {
+                                        warn!(target = "controller.actions", error = %err, "pty write failed for action");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let acks: Vec<CtrlActionAck> = commands
+                        .iter()
+                        .map(|c| CtrlActionAck {
+                            id: c.id.clone(),
+                            status: CtrlAckStatus::Ok,
+                            applied_at: std::time::SystemTime::now(),
+                            latency_ms: None,
+                            error_code: None,
+                            error_message: None,
+                        })
+                        .collect();
+                    if let Err(err) = transport.ack_actions(&session_for_actions, acks).await {
+                        warn!(target = "controller.actions", error = %err, "ack failed");
+                    }
+                }
+                Ok(_) => {
+                    sleep(Duration::from_millis(50)).await;
+                }
+                Err(err) => {
+                    warn!(target = "controller.actions", error = %err, "receive_actions failed; retrying");
+                    sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }))
 }
 
 fn resolve_launch_command(args: &HostArgs) -> Result<Vec<String>, CliError> {
@@ -1662,6 +1845,12 @@ async fn maybe_auto_attach_session(manager_url: &str, session_id: &str, bearer: 
         "{}/private-beaches/{}/sessions/attach-by-code",
         manager_url.trim_end_matches('/'),
         beach_id
+    );
+    info!(
+        target = "controller.actions",
+        session_id = %session_id,
+        private_beach_id = %beach_id,
+        "attempting auto-attach via manager"
     );
 
     match client

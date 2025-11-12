@@ -21,7 +21,7 @@ export async function createBeachAction(input: { name: string; slug?: string }) 
     slugProvided: Boolean(input.slug?.trim()),
   });
 
-  const { getToken } = safeAuth();
+  const { getToken } = await safeAuth();
   const template = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
   const { token, source } = await resolveManagerToken(typeof getToken === 'function' ? getToken : undefined, template);
   const managerBaseUrl = resolveManagerBaseUrl();

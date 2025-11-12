@@ -253,8 +253,7 @@ export function TileFlowNode({ data, dragging }: Props) {
     resizeTile,
     rewriteEnabled,
     tile.id,
-    tile.size.height,
-    tile.size.width,
+    tile.size,
     zoom,
   ]);
 
@@ -282,7 +281,7 @@ export function TileFlowNode({ data, dragging }: Props) {
       viewportMetricsRef.current = null;
       logAutoResizeEvent(tile.id, 'session-cleared');
     }
-  }, [tile.sessionMeta?.sessionId]);
+  }, [tile.id, tile.sessionMeta?.sessionId]);
 
   return (
     <article

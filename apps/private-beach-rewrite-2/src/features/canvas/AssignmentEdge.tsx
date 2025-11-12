@@ -7,21 +7,31 @@ import {
   getSmoothStepPath,
   type EdgeProps,
 } from 'reactflow';
-import { cn } from '@/lib/cn';
-import { TILE_DANGER_BUTTON_CLASS, TILE_PRIMARY_BUTTON_CLASS } from '@/components/tileButtonClasses';
-
-export type UpdateMode = 'idle-summary' | 'push' | 'poll';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Textarea } from '@/components/ui/textarea';
+import type { RelationshipCadenceConfig, RelationshipUpdateMode } from '../tiles/types';
+import { createDefaultRelationshipCadence, inferUpdateModeFromCadence } from '../tiles/types';
+import { cadenceHasAnyPath, formatCadenceSummary } from './updateCadence';
 
 export type AssignmentEdgeData = {
   instructions: string;
-  updateMode: UpdateMode;
+  updateMode: RelationshipUpdateMode;
   pollFrequency: number;
+  cadence: RelationshipCadenceConfig;
   isEditing: boolean;
   status?: 'ok' | 'error';
   statusMessage?: string | null;
   onRetry?: (payload: { id: string }) => void;
   onShowTrace?: (payload: { id: string }) => void;
-  onSave: (payload: { id: string; instructions: string; updateMode: UpdateMode; pollFrequency: number }) => void;
+  onSave: (payload: {
+    id: string;
+    instructions: string;
+    updateMode: RelationshipUpdateMode;
+    pollFrequency: number;
+    cadence: RelationshipCadenceConfig;
+  }) => void;
   onEdit: (payload: { id: string }) => void;
   onDelete: (payload: { id: string }) => void;
 };
@@ -50,32 +60,55 @@ export const AssignmentEdge = memo(function AssignmentEdge({
       }),
     [sourcePosition, sourceX, sourceY, targetPosition, targetX, targetY],
   );
-  const [instructions, setInstructions] = useState(data.instructions);
-  const [updateMode, setUpdateMode] = useState<UpdateMode>(data.updateMode);
-  const [pollFrequency, setPollFrequency] = useState<number>(data.pollFrequency);
+  const fallbackEdgeData = useMemo<AssignmentEdgeData>(
+    () => ({
+      instructions: '',
+      updateMode: 'poll',
+      pollFrequency: 30,
+      cadence: createDefaultRelationshipCadence(),
+      isEditing: false,
+      status: 'ok',
+      statusMessage: null,
+      onSave: () => {},
+      onEdit: () => {},
+      onDelete: () => {},
+    }),
+    [],
+  );
+  const edgeData = data ?? fallbackEdgeData;
+  const [instructions, setInstructions] = useState(edgeData.instructions);
+  const [cadence, setCadence] = useState<RelationshipCadenceConfig>(() => ({
+    ...(edgeData.cadence ?? createDefaultRelationshipCadence()),
+  }));
 
   useEffect(() => {
-    setInstructions(data.instructions);
-  }, [data.instructions]);
+    setInstructions(edgeData.instructions);
+  }, [edgeData.instructions]);
 
   useEffect(() => {
-    setUpdateMode(data.updateMode);
-  }, [data.updateMode]);
-
-  useEffect(() => {
-    setPollFrequency(data.pollFrequency);
-  }, [data.pollFrequency]);
+    setCadence({ ...(edgeData.cadence ?? createDefaultRelationshipCadence()) });
+  }, [edgeData.cadence]);
 
   const handleSubmit = (event: React.FormEvent) => {
     event.preventDefault();
-    data.onSave({ id, instructions: instructions.trim(), updateMode, pollFrequency });
+    const trimmed = instructions.trim();
+    const nextCadence = { ...cadence };
+    const nextMode = inferUpdateModeFromCadence(nextCadence);
+    edgeData.onSave({
+      id,
+      instructions: trimmed,
+      updateMode: nextMode,
+      pollFrequency: nextCadence.pollFrequencySeconds,
+      cadence: nextCadence,
+    });
   };
 
-  const handleDelete = () => data.onDelete({ id });
+  const handleDelete = () => edgeData.onDelete({ id });
+  const hasCadence = cadenceHasAnyPath(cadence);
 
   return (
     <>
-      <BaseEdge path={edgePath} markerEnd={markerEnd} className="stroke-slate-400/40" />
+      <BaseEdge path={edgePath} markerEnd={markerEnd} style={{ stroke: 'rgba(148, 163, 184, 0.4)' }} />
       <EdgeLabelRenderer>
         <div
           className="pointer-events-auto"
@@ -85,121 +118,134 @@ export const AssignmentEdge = memo(function AssignmentEdge({
             position: 'absolute',
           }}
         >
-          {data.isEditing ? (
+          {edgeData.isEditing ? (
             <form
               onSubmit={handleSubmit}
               onPointerDown={(event) => event.stopPropagation()}
-              className="w-72 rounded-2xl border border-slate-200/80 bg-white/95 p-4 text-[13px] text-slate-700 shadow-2xl dark:border-white/10 dark:bg-slate-950/95 dark:text-slate-200"
+              className="w-72 space-y-4 rounded-2xl border border-border/70 bg-card/95 p-4 text-[13px] text-card-foreground shadow-2xl dark:border-white/10 dark:bg-slate-950/95"
             >
-              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">
-                Assignment Instructions
-              </p>
-              <textarea
-                value={instructions}
-                onChange={(event) => setInstructions(event.target.value)}
-                rows={3}
-                className="mt-2 w-full rounded border border-slate-300 bg-white px-3 py-2 text-[13px] font-medium text-slate-900 placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60 dark:border-white/10 dark:bg-white/5 dark:text-white dark:placeholder:text-slate-400"
-                placeholder="Describe how this agent should manage the connected session"
-              />
-              <p className="mt-4 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">
-                Update cadence
-              </p>
-              <div className="mt-2 space-y-3">
-                <label className="flex items-center gap-2 text-[13px] text-slate-700 dark:text-slate-200">
-                  <input
-                    type="radio"
-                    name={`edge-mode-${id}`}
-                    value="idle-summary"
-                    checked={updateMode === 'idle-summary'}
-                    onChange={() => setUpdateMode('idle-summary')}
-                    className="h-4 w-4 rounded-full border border-slate-300 text-indigo-500 focus:ring-indigo-400 dark:border-white/20 dark:bg-slate-900 dark:text-indigo-300"
-                  />
-                  <span>Summarize whenever the session turns idle</span>
-                </label>
-                <label className="flex items-center gap-2 text-[13px] text-slate-700 dark:text-slate-200">
-                  <input
-                    type="radio"
-                    name={`edge-mode-${id}`}
-                    value="push"
-                    checked={updateMode === 'push'}
-                    onChange={() => setUpdateMode('push')}
-                    className="h-4 w-4 rounded-full border border-slate-300 text-indigo-500 focus:ring-indigo-400 dark:border-white/20 dark:bg-slate-900 dark:text-indigo-300"
-                  />
-                  <span>Let the managed session push MCP updates</span>
-                </label>
-                <label className="flex flex-wrap items-center gap-2 text-[13px] text-slate-700 dark:text-slate-200">
-                  <span className="flex items-center gap-2">
-                    <input
-                      type="radio"
-                      name={`edge-mode-${id}`}
-                      value="poll"
-                      checked={updateMode === 'poll'}
-                      onChange={() => setUpdateMode('poll')}
-                      className="h-4 w-4 rounded-full border border-slate-300 text-indigo-500 focus:ring-indigo-400 dark:border-white/20 dark:bg-slate-900 dark:text-indigo-300"
-                    />
-                    <span>Poll every</span>
-                  </span>
-                  <input
-                    type="number"
-                    min={1}
-                    value={pollFrequency}
-                    onChange={(event) => setPollFrequency(Number(event.target.value) || 0)}
-                    className="h-9 w-20 rounded border border-slate-300 bg-white px-3 text-right text-[13px] font-medium text-slate-900 placeholder:text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60 dark:border-white/10 dark:bg-white/5 dark:text-white dark:placeholder:text-slate-400"
-                  />
-                  <span>seconds</span>
-                </label>
+              <div className="space-y-2">
+                <Label htmlFor={`${id}-instructions`} className="text-[11px] text-muted-foreground">
+                  Manager Instructions
+                </Label>
+                <Textarea
+                  id={`${id}-instructions`}
+                  value={instructions}
+                  onChange={(event) => setInstructions(event.target.value)}
+                  rows={3}
+                  placeholder="Describe how this agent should manage the connected session (optional)"
+                  className="min-h-[96px] text-[13px] font-medium"
+                />
               </div>
-              <div className="mt-4 flex gap-2">
-                <button
+              <div className="space-y-3">
+                <Label className="text-[11px] text-muted-foreground">Update cadence</Label>
+                <label className="flex items-start gap-3 text-[13px] text-foreground/90 dark:text-slate-200">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5 h-4 w-4 rounded border border-border text-indigo-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400"
+                    checked={cadence.idleSummary}
+                    onChange={(event) =>
+                      setCadence((prev) => ({ ...prev, idleSummary: event.target.checked }))
+                    }
+                  />
+                  <span>Update whenever the child tile becomes idle</span>
+                </label>
+                <label className="flex items-start gap-3 text-[13px] text-foreground/90 dark:text-slate-200">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5 h-4 w-4 rounded border border-border text-indigo-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400"
+                    checked={cadence.allowChildPush}
+                    onChange={(event) =>
+                      setCadence((prev) => ({ ...prev, allowChildPush: event.target.checked }))
+                    }
+                  />
+                  <span>Allow the managed session to push MCP updates</span>
+                </label>
+                <div className="rounded-xl border border-border/80 bg-background/40 px-3 py-2">
+                  <label className="flex flex-wrap items-center gap-3 text-[13px] text-foreground/90 dark:text-slate-200">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5 h-4 w-4 rounded border border-border text-indigo-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400"
+                      checked={cadence.pollEnabled}
+                      onChange={(event) =>
+                        setCadence((prev) => ({ ...prev, pollEnabled: event.target.checked }))
+                      }
+                    />
+                    <span className="flex-1 min-w-[120px]">Poll every</span>
+                    <Input
+                      type="number"
+                      min={1}
+                      value={cadence.pollFrequencySeconds}
+                      onChange={(event) => {
+                        const next = Math.max(1, Math.round(Number(event.target.value) || 0));
+                        setCadence((prev) => ({ ...prev, pollFrequencySeconds: next }));
+                      }}
+                      disabled={!cadence.pollEnabled}
+                      className="h-8 w-20 text-right text-[13px] font-medium disabled:opacity-50"
+                    />
+                    <span className="text-[12px] text-muted-foreground">seconds</span>
+                  </label>
+                  <p className="ml-7 mt-2 text-[11px] text-muted-foreground">
+                    Only poll if the child changed and there were no idle or MCP updates during the
+                    last 30 seconds.
+                  </p>
+                </div>
+              </div>
+              <div className="mt-2 flex gap-2">
+                <Button
                   type="submit"
-                  className={cn('flex-1', TILE_PRIMARY_BUTTON_CLASS)}
-                  disabled={!instructions.trim()}
+                  className="flex-1 text-[11px] font-semibold uppercase tracking-[0.2em]"
+                  disabled={!hasCadence}
                 >
                   Save
-                </button>
-                <button
+                </Button>
+                <Button
                   type="button"
+                  variant="destructive"
                   onClick={handleDelete}
-                  className={TILE_DANGER_BUTTON_CLASS}
+                  className="flex-1 text-[11px] font-semibold uppercase tracking-[0.18em]"
                 >
                   Remove
-                </button>
+                </Button>
               </div>
             </form>
           ) : (
             <div className="flex flex-col items-center gap-2">
               <button
                 type="button"
-                onClick={() => data.onEdit({ id })}
+                onClick={() => edgeData.onEdit({ id })}
                 onPointerDown={(event) => event.stopPropagation()}
                 className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-white/60 bg-slate-900/80 text-sm text-white shadow-md transition hover:border-white/90 hover:bg-slate-900"
                 aria-label="View assignment details"
               >
                 ⓘ
               </button>
-              {data.onShowTrace ? (
+              <p className="max-w-[10rem] text-center text-[11px] font-medium text-white/80">
+                {formatCadenceSummary(edgeData.cadence)}
+              </p>
+              {edgeData.onShowTrace ? (
                 <button
                   type="button"
                   onClick={(event) => {
                     event.stopPropagation();
-                    data.onShowTrace?.({ id });
+                    edgeData.onShowTrace?.({ id });
                   }}
                   className="inline-flex items-center justify-center rounded-full border border-sky-400/70 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.2em] text-sky-100 hover:border-sky-200"
                 >
                   Trace
                 </button>
               ) : null}
-              {data.status === 'error' && data.statusMessage ? (
+              {edgeData.status === 'error' && edgeData.statusMessage ? (
                 <div className="w-48 rounded-xl border border-red-400/40 bg-red-500/10 px-3 py-2 text-[10px] text-red-100 shadow-lg">
                   <p className="font-semibold uppercase tracking-[0.2em]">Pairing failed</p>
-                  <p className="mt-1">{data.statusMessage}</p>
-                  {data.onRetry ? (
+                  <p className="mt-1">{edgeData.statusMessage}</p>
+                  {edgeData.onRetry ? (
                     <button
                       type="button"
                       className="mt-2 inline-flex items-center justify-center rounded border border-red-200/60 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.2em] text-red-100 hover:border-red-100 hover:text-white"
                       onClick={(event) => {
                         event.stopPropagation();
-                        data.onRetry?.({ id });
+                        edgeData.onRetry?.({ id });
                       }}
                     >
                       Retry

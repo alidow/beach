@@ -33,11 +33,12 @@ import ReactFlow, {
   MarkerType,
   useReactFlow,
   useStore,
+  ConnectionMode,
   type Connection,
   type Edge,
   type Node,
   type NodeChange,
-  type NodeDragEventHandler,
+  type NodeDragHandler,
   type ReactFlowState,
   type Viewport,
 } from 'reactflow';
@@ -45,7 +46,13 @@ import { emitTelemetry } from '../../../../private-beach/src/lib/telemetry';
 import { TileFlowNode } from '@/features/tiles/components/TileFlowNode';
 import { TILE_GRID_SNAP_PX } from '@/features/tiles/constants';
 import { useTileActions, useTileState } from '@/features/tiles/store';
-import type { CanvasViewportState, RelationshipDescriptor } from '@/features/tiles/types';
+import type {
+  CanvasViewportState,
+  RelationshipCadenceConfig,
+  RelationshipDescriptor,
+  RelationshipUpdateMode,
+} from '@/features/tiles/types';
+import { deriveCadenceFromLegacyMode } from '@/features/tiles/types';
 import {
   acquireController,
   batchControllerAssignments,
@@ -56,7 +63,7 @@ import { recordTraceLog, useTraceLogs, clearTraceLogs } from '@/features/trace/t
 import { buildManagerUrl, useManagerToken } from '@/hooks/useManagerToken';
 import { useCanvasEvents } from './CanvasEventsContext';
 import { snapPointToGrid } from './positioning';
-import { AssignmentEdge, type AssignmentEdgeData, type UpdateMode } from './AssignmentEdge';
+import { AssignmentEdge, type AssignmentEdgeData } from './AssignmentEdge';
 import { TraceMonitorPanel } from './TraceMonitorPanel';
 import { CanvasDragStateProvider } from './CanvasDragStateContext';
 import { CANVAS_CENTER_TILE_EVENT, type CanvasCenterTileEventDetail } from './events';
@@ -343,6 +350,7 @@ function FlowCanvasInner({
           privateBeachId,
           managerUrl: resolvedManagerUrl,
           rewriteEnabled,
+          interactiveTileId: interactiveId,
         },
         position: tile.position,
         draggable: true,
@@ -368,7 +376,19 @@ function FlowCanvasInner({
   }, [activeId, interactiveId, order, privateBeachId, resolvedManagerUrl, resizing, rewriteEnabled, tiles]);
 
   const handleEdgeSave = useCallback(
-    ({ id, instructions, updateMode, pollFrequency }: { id: string; instructions: string; updateMode: UpdateMode; pollFrequency: number }) => {
+    ({
+      id,
+      instructions,
+      updateMode,
+      pollFrequency,
+      cadence,
+    }: {
+      id: string;
+      instructions: string;
+      updateMode: RelationshipUpdateMode;
+      pollFrequency: number;
+      cadence: RelationshipCadenceConfig;
+    }) => {
       const relationship = state.relationships[id];
       const sourceTile = relationship ? state.tiles[relationship.sourceId] : undefined;
       const targetTile = relationship ? state.tiles[relationship.targetId] : undefined;
@@ -381,7 +401,7 @@ function FlowCanvasInner({
         delete next[id];
         return next;
       });
-      updateRelationship(id, { instructions, updateMode, pollFrequency });
+      updateRelationship(id, { instructions, updateMode, pollFrequency, cadence });
       setEditingEdgeId(null);
       if (!relationship || !sourceTile || !targetTile) {
         console.warn('[rewrite-2] missing relationship context for edge save', { relationshipId: id });
@@ -400,7 +420,7 @@ function FlowCanvasInner({
       const role = sourceTile.agentMeta?.role?.trim() ?? '';
       const responsibility = sourceTile.agentMeta?.responsibility?.trim() ?? '';
       const trimmedInstructions = instructions.trim();
-      if (!role || !responsibility || !trimmedInstructions) {
+      if (!role || !responsibility) {
         console.warn('[rewrite-2] edge save missing prompt context', {
           relationshipId: id,
           role,
@@ -414,7 +434,7 @@ function FlowCanvasInner({
         return;
       }
       const promptTemplate = buildPromptTemplate(role, responsibility, trimmedInstructions);
-      const updateCadence = mapUpdateModeToCadence(updateMode);
+      const updateCadence = mapCadenceToControllerCadence(cadence, updateMode, pollFrequency);
       const traceId =
         sourceTile.agentMeta?.trace?.enabled && sourceTile.agentMeta.trace.trace_id
           ? sourceTile.agentMeta.trace.trace_id
@@ -530,7 +550,11 @@ function FlowCanvasInner({
         relationshipId: id,
         traceId,
         instruction: relationship.instructions,
-        cadence: mapUpdateModeToCadence(relationship.updateMode as UpdateMode),
+        cadence: mapCadenceToControllerCadence(
+          relationship.cadence,
+          relationship.updateMode as RelationshipUpdateMode,
+          relationship.pollFrequency ?? 0,
+        ),
         pollFrequency: relationship.pollFrequency ?? null,
       });
     },
@@ -696,7 +720,7 @@ function FlowCanvasInner({
     [addRelationship, state.tiles],
   );
 
-  const handleNodeDragStart: NodeDragEventHandler = useCallback(
+  const handleNodeDragStart: NodeDragHandler = useCallback(
     (_event, node) => {
       const tile = state.tiles[node.id];
       if (!tile) return;
@@ -716,13 +740,13 @@ function FlowCanvasInner({
         rewriteEnabled,
       });
     },
-    [bringToFront, privateBeachId, rewriteEnabled, setActiveTile, state.tiles],
+    [privateBeachId, rewriteEnabled, setActiveTile, state.tiles],
   );
 
   // We update live positions via onNodesChange (change.dragging),
   // so we avoid duplicating updates in onNodeDrag to reduce re-renders.
 
-  const handleNodeDragStop: NodeDragEventHandler = useCallback(
+  const handleNodeDragStop: NodeDragHandler = useCallback(
     (_event, node) => {
       const tile = state.tiles[node.id];
       const snapshot = dragSnapshotRef.current;
@@ -933,7 +957,7 @@ function FlowCanvasInner({
       const role = sourceTile.agentMeta?.role?.trim() ?? '';
       const responsibility = sourceTile.agentMeta?.responsibility?.trim() ?? '';
       const instructions = rel.instructions.trim();
-      if (!role || !responsibility || !instructions) {
+      if (!role || !responsibility) {
         continue;
       }
       const prompt = buildPromptTemplate(role, responsibility, instructions);
@@ -943,6 +967,7 @@ function FlowCanvasInner({
         prompt,
         rel.updateMode,
         rel.pollFrequency,
+        JSON.stringify(rel.cadence ?? {}),
       ].join('|');
       if (relationshipSyncKeysRef.current[relId] === signature) {
         continue;
@@ -958,7 +983,11 @@ function FlowCanvasInner({
         traceId,
         controller_session_id: controllerSessionId,
         child_session_id: childSessionId,
-        cadence: mapUpdateModeToCadence(rel.updateMode as UpdateMode),
+        cadence: mapCadenceToControllerCadence(
+          rel.cadence,
+          rel.updateMode as RelationshipUpdateMode,
+          rel.pollFrequency ?? 0,
+        ),
       });
     }
     if (pending.length === 0) {
@@ -1167,8 +1196,8 @@ function FlowCanvasInner({
     };
   }, [applyCanvasBounds]);
 
-  const edgeElements = useMemo(() =>
-    state.relationshipOrder
+  const edgeElements = useMemo(() => {
+    const mapped = state.relationshipOrder
       .map((relId) => {
         const rel = state.relationships[relId];
         if (!rel) return null;
@@ -1186,8 +1215,9 @@ function FlowCanvasInner({
           targetHandle: rel.targetHandleId ?? undefined,
           data: {
             instructions: rel.instructions,
-            updateMode: rel.updateMode as UpdateMode,
+            updateMode: rel.updateMode as RelationshipUpdateMode,
             pollFrequency: rel.pollFrequency,
+            cadence: rel.cadence,
             isEditing: editingEdgeId === rel.id,
             status: relationshipErrors[rel.id] ? 'error' : 'ok',
             statusMessage: relationshipErrors[rel.id] ?? null,
@@ -1199,8 +1229,9 @@ function FlowCanvasInner({
           },
         } satisfies Edge<AssignmentEdgeData>;
       })
-      .filter((edge): edge is Edge<AssignmentEdgeData> => Boolean(edge)),
-  [editingEdgeId, handleEdgeDelete, handleEdgeEdit, handleEdgeSave, handleRelationshipRetry, handleShowTraceOverlay, relationshipErrors, state.relationshipOrder, state.relationships, state.tiles]);
+      .filter((edge): edge is NonNullable<typeof edge> => Boolean(edge));
+    return mapped as Edge<AssignmentEdgeData>[];
+  }, [editingEdgeId, handleEdgeDelete, handleEdgeEdit, handleEdgeSave, handleRelationshipRetry, handleShowTraceOverlay, relationshipErrors, state.relationshipOrder, state.relationships, state.tiles]);
 
   const traceOverlayProps = useMemo(() => {
     if (!traceOverlay) {
@@ -1248,16 +1279,13 @@ function FlowCanvasInner({
           nodeTypes={memoizedNodeTypes}
           edgeTypes={memoizedEdgeTypes}
           defaultEdgeOptions={defaultEdgeOptions}
-          // Restrict dragging to the tile header to avoid drag conflicts
-          // with dynamic content inside the node body (terminal, etc.).
-          nodeDragHandle=".rf-drag-handle"
           onNodesChange={handleNodesChange}
           onEdgesChange={() => undefined}
           onConnect={handleConnect}
           onNodeDragStart={handleNodeDragStart}
         onNodeDragStop={handleNodeDragStop}
           onMoveEnd={handleViewportMoveEnd}
-          connectionMode="loose"
+          connectionMode={ConnectionMode.Loose}
           connectionRadius={36}
           // Always allow node dragging; we restrict the drag start area via
           // `nodeDragHandle` so interactive content does not interfere.
@@ -1364,18 +1392,27 @@ export function FlowCanvas(props: FlowCanvasProps) {
   );
 }
 
-function mapUpdateModeToCadence(mode: UpdateMode): ControllerUpdateCadence {
-  if (mode === 'push') {
+function mapCadenceToControllerCadence(
+  cadence: RelationshipCadenceConfig | undefined,
+  mode: RelationshipUpdateMode | undefined,
+  pollFrequency: number,
+): ControllerUpdateCadence {
+  const config = cadence ?? deriveCadenceFromLegacyMode(mode, pollFrequency);
+  const { allowChildPush, idleSummary, pollEnabled } = config;
+  if (allowChildPush && (idleSummary || pollEnabled)) {
+    return 'balanced';
+  }
+  if (allowChildPush) {
     return 'fast';
   }
   return 'slow';
 }
 
 function buildPromptTemplate(role: string, responsibility: string, instructions: string): string {
-  const parts = [
-    `Role:\n${role.trim()}`,
-    `Responsibility:\n${responsibility.trim()}`,
-    `Instructions:\n${instructions.trim()}`,
-  ];
+  const parts = [`Role:\n${role.trim()}`, `Responsibility:\n${responsibility.trim()}`];
+  const trimmedInstructions = instructions.trim();
+  if (trimmedInstructions.length > 0) {
+    parts.push(`Instructions:\n${trimmedInstructions}`);
+  }
   return parts.join('\n\n');
 }

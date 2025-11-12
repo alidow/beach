@@ -1,3 +1,5 @@
+import type { RelationshipCadenceConfig, RelationshipUpdateMode } from '../tiles/types';
+
 export type AgentNodeData = {
   id: string;
   label: string;
@@ -19,19 +21,19 @@ export type ApplicationNodeData = {
   onEdit: (payload: { id: string }) => void;
 };
 
-export type UpdateMode = 'idle-summary' | 'push' | 'poll';
-
 export type AssignmentEdgeData = {
   instructions: string;
-  updateMode: UpdateMode;
+  updateMode: RelationshipUpdateMode;
   pollFrequency: number;
+  cadence: RelationshipCadenceConfig;
   isEditing: boolean;
   onSave: (
     payload: {
       id: string;
       instructions: string;
-      updateMode: UpdateMode;
+      updateMode: RelationshipUpdateMode;
       pollFrequency: number;
+      cadence: RelationshipCadenceConfig;
     },
   ) => void;
   onEdit: (payload: { id: string }) => void;

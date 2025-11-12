@@ -1,22 +1,28 @@
 import { auth } from '@clerk/nextjs/server';
 
-type AuthResult = ReturnType<typeof auth>;
+type AuthPromise = ReturnType<typeof auth>;
+type AuthResult = Awaited<AuthPromise>;
 
 /**
  * Wraps Clerk's `auth()` to avoid crashing when middleware is not registered.
  * For local/dev usage we fall back to an unauthenticated stub.
  */
-export function safeAuth(): AuthResult {
+export async function safeAuth(): Promise<AuthResult> {
   try {
-    return auth();
+    return await auth();
   } catch (error) {
     if (process.env.NODE_ENV !== 'production') {
       console.warn('[private-beach-rewrite] Clerk auth unavailable, continuing without session', error);
     }
-    const fallback: AuthResult = {
+    const fallback = {
       userId: null,
       sessionId: null,
+      sessionClaims: null,
+      sessionStatus: null,
       actor: null,
+      tokenType: 'session_token',
+      factorVerificationAge: null,
+      isAuthenticated: false,
       session: null,
       user: null,
       organization: null,
@@ -25,10 +31,16 @@ export function safeAuth(): AuthResult {
       orgSlug: null,
       orgPermissions: null,
       has: () => false,
-      debug: () => undefined,
+      debug: () => ({}),
       claims: {},
       getToken: async () => null,
-    };
+      redirectToSignIn: () => {
+        throw new Error('redirectToSignIn is unavailable in safeAuth fallback');
+      },
+      redirectToSignUp: () => {
+        throw new Error('redirectToSignUp is unavailable in safeAuth fallback');
+      },
+    } as unknown as AuthResult;
     return fallback;
   }
 }

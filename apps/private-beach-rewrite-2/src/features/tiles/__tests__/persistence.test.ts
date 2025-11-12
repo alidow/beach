@@ -68,6 +68,14 @@ describe('tile persistence helpers (rewrite-2)', () => {
       pollFrequency: 45,
       sourceSessionId: null,
       targetSessionId: 'sess-2',
+      cadence: {
+        idleSummary: false,
+        allowChildPush: false,
+        pollEnabled: true,
+        pollFrequencySeconds: 45,
+        pollRequireContentChange: false,
+        pollQuietWindowSeconds: 0,
+      },
     });
   });
 
@@ -81,6 +89,14 @@ describe('tile persistence helpers (rewrite-2)', () => {
       instructions: 'Monitor app',
       updateMode: 'poll',
       targetSessionId: 'sess-2',
+      cadence: {
+        idleSummary: false,
+        allowChildPush: false,
+        pollEnabled: true,
+        pollFrequencySeconds: 45,
+        pollRequireContentChange: false,
+        pollQuietWindowSeconds: 0,
+      },
     });
     expect(serialized.metadata.agentRelationshipOrder).toEqual(['rel-1']);
     expect(serialized.viewport).toEqual({ zoom: 1.2, pan: { x: -12, y: 5 } });

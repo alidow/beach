@@ -55,6 +55,7 @@ export type TileCreateInput = {
   position?: Partial<TilePosition>;
   size?: Partial<TileSize>;
   sessionMeta?: TileSessionMeta | null;
+  interactive?: boolean;
   focus?: boolean;
 };
 

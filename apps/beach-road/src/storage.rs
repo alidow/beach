@@ -9,6 +9,14 @@ use time::OffsetDateTime;
 use crate::signaling::WebRtcSdpPayload;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlMessage {
+    pub id: String,
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub enqueued_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub session_id: String,
     pub passphrase_hash: String,
@@ -58,6 +66,75 @@ impl Storage {
         let redis = ConnectionManager::new(client).await?;
 
         Ok(Self { redis, ttl_seconds })
+    }
+
+    pub async fn enqueue_control(
+        &self,
+        session_id: &str,
+        message: ControlMessage,
+    ) -> Result<(), redis::RedisError> {
+        let mut conn = self.redis.clone();
+        let queue_key = format!("session:{}:control:queue", session_id);
+        let payload_key = format!("session:{}:control:{}", session_id, message.id);
+        let serialized = serde_json::to_string(&message).unwrap_or_else(|_| "{}".into());
+        // Store payload with TTL and append to queue
+        redis::pipe()
+            .cmd("SETEX")
+            .arg(&payload_key)
+            .arg(self.ttl_seconds)
+            .arg(&serialized)
+            .ignore()
+            .cmd("RPUSH")
+            .arg(&queue_key)
+            .arg(&message.id)
+            .ignore()
+            .cmd("EXPIRE")
+            .arg(&queue_key)
+            .arg(self.ttl_seconds)
+            .ignore()
+            .query_async::<()>(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_pending_controls(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ControlMessage>, redis::RedisError> {
+        let mut conn = self.redis.clone();
+        let queue_key = format!("session:{}:control:queue", session_id);
+        let ids: Vec<String> = conn.lrange(&queue_key, 0, -1).await.unwrap_or_default();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut results = Vec::with_capacity(ids.len());
+        for id in ids {
+            let payload_key = format!("session:{}:control:{}", session_id, id);
+            if let Ok(Some(serialized)) = conn.get::<_, Option<String>>(&payload_key).await {
+                if let Ok(msg) = serde_json::from_str::<ControlMessage>(&serialized) {
+                    results.push(msg);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    pub async fn ack_control(&self, session_id: &str, control_id: &str) -> Result<(), redis::RedisError> {
+        let mut conn = self.redis.clone();
+        let queue_key = format!("session:{}:control:queue", session_id);
+        let payload_key = format!("session:{}:control:{}", session_id, control_id);
+        redis::pipe()
+            .cmd("LREM")
+            .arg(&queue_key)
+            .arg(0)
+            .arg(control_id)
+            .ignore()
+            .cmd("DEL")
+            .arg(&payload_key)
+            .ignore()
+            .query_async::<()>(&mut conn)
+            .await?;
+        Ok(())
     }
 
     pub async fn register_session(&self, session: SessionInfo) -> Result<()> {

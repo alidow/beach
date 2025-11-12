@@ -12,7 +12,7 @@ export const metadata = {
 } as const;
 
 export default async function BeachesPage() {
-  const { userId, getToken } = safeAuth();
+  const { userId, getToken } = await safeAuth();
   const isSignedIn = Boolean(userId);
 
   const template = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;

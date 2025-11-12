@@ -300,8 +300,6 @@ ALTER TABLE ONLY public.controller_event
 ALTER TABLE ONLY public.controller_lease
     ADD CONSTRAINT controller_lease_pkey PRIMARY KEY (id);
 
-ALTER TABLE ONLY public.controller_lease
-    ADD CONSTRAINT controller_lease_session_id_key UNIQUE (session_id);
 
 ALTER TABLE ONLY public.controller_pairing
     ADD CONSTRAINT controller_pairing_pkey PRIMARY KEY (controller_session_id, child_session_id);

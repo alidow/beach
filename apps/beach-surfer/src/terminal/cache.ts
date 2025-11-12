@@ -830,7 +830,7 @@ export class TerminalGridCache {
           actualRowsToShow = snapshotSlice.length;
           actualStartAbsolute = snapshotSlice.length > 0 ? snapshotSlice[0]!.absolute : null;
           fallbackFromSnapshot = true;
-        } else if (highestLoadedAvailable) {
+        } else if (highestLoadedAvailable && highestLoaded !== null) {
           const fallbackStart = Math.max(this.baseRow, highestLoaded - (height - 1));
           actualStartAbsolute = fallbackStart;
           for (let offset = 0; offset < height; offset += 1) {

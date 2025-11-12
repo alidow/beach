@@ -114,6 +114,7 @@ export function layoutToTileState(layout: CanvasLayout | null | undefined): Tile
     order,
     activeId: null,
     resizing: {},
+    interactiveId: null,
   };
 }
 

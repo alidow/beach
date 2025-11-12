@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm';
 import { jsonb, pgTable, text, timestamp } from 'drizzle-orm/pg-core';
+import type { AgentRelationshipCadence, AgentRelationshipUpdateMode } from '../lib/api';
 
 export const tileLayoutPresets = ['grid2x2', 'onePlusThree', 'focus'] as const;
 
@@ -47,8 +48,9 @@ export type CanvasAgentRelationshipJson = {
   sourceHandleId?: string | null;
   targetHandleId?: string | null;
   instructions?: string | null;
-  updateMode?: 'idle-summary' | 'push' | 'poll';
+  updateMode?: AgentRelationshipUpdateMode;
   pollFrequency?: number | null;
+  cadence?: AgentRelationshipCadence;
 };
 
 export type CanvasLayoutJson = {

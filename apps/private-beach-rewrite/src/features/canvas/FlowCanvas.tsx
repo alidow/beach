@@ -10,8 +10,7 @@ import ReactFlow, {
   Controls,
   type Node,
   type NodeChange,
-  type NodeDragEventHandler,
-  type NodeResizeEvent,
+  type NodeDragHandler,
 } from 'reactflow';
 import { emitTelemetry } from '../../../../private-beach/src/lib/telemetry';
 import { TileFlowNode } from '@/features/tiles/components/TileFlowNode';
@@ -74,16 +73,14 @@ function FlowCanvasInner({
     bringToFront,
     setActiveTile,
     resizeTile,
-    beginResize,
-    endResize,
   } = useTileActions();
   const { reportTileMove } = useCanvasEvents();
   const [containerReady, setContainerReady] = useState(false);
 
   const resolvedManagerUrl = useMemo(() => buildManagerUrl(managerUrl), [managerUrl]);
 
-  const nodes: Node[] = useMemo(() => {
-    return state.order
+  const nodes = useMemo<Node[]>(() => {
+    const result = state.order
       .map((tileId, index) => {
         const tile = state.tiles[tileId];
         if (!tile) return null;
@@ -110,7 +107,8 @@ function FlowCanvasInner({
           },
         } satisfies Node;
       })
-      .filter((node): node is Node => Boolean(node));
+      .filter((node) => node !== null) as Node[];
+    return result;
   }, [privateBeachId, resolvedManagerUrl, rewriteEnabled, state]);
 
   const handleNodesChange = useCallback(
@@ -150,7 +148,7 @@ function FlowCanvasInner({
     [gridSize, resizeTile, setTilePosition, setTilePositionImmediate, state.tiles],
   );
 
-  const handleNodeDragStart: NodeDragEventHandler = useCallback(
+  const handleNodeDragStart: NodeDragHandler = useCallback(
     (_event, node) => {
       const tile = state.tiles[node.id];
       if (!tile) return;
@@ -172,7 +170,7 @@ function FlowCanvasInner({
     [bringToFront, privateBeachId, rewriteEnabled, setActiveTile, state.tiles],
   );
 
-  const handleNodeDragStop: NodeDragEventHandler = useCallback(
+  const handleNodeDragStop: NodeDragHandler = useCallback(
     (_event, node) => {
       const tile = state.tiles[node.id];
       const snapshot = dragSnapshotRef.current;
@@ -222,42 +220,6 @@ function FlowCanvasInner({
     },
     [gridSize, onTileMove, privateBeachId, reportTileMove, rewriteEnabled, state.tiles],
   );
-
-
-  const handleNodeResizeStart = useCallback((event: NodeResizeEvent, node: Node) => {
-    bringToFront(node.id);
-    setActiveTile(node.id);
-    beginResize(node.id);
-  }, [beginResize, bringToFront, setActiveTile]);
-
-  const handleNodeResize = useCallback((event: NodeResizeEvent, node: Node) => {
-    const tile = state.tiles[node.id];
-    if (!tile) return;
-    const width = event.width ?? node.width ?? tile.size.width;
-    const height = event.height ?? node.height ?? tile.size.height;
-    const snapped = snapSize({ width, height });
-    console.info('[ws-c][flow] resize-progress', { id: node.id, width, height, snapped });
-    resizeTile(node.id, snapped);
-  }, [resizeTile, state.tiles]);
-
-  const handleNodeResizeStop = useCallback((event: NodeResizeEvent, node: Node) => {
-    const tile = state.tiles[node.id];
-    if (!tile) return;
-    const width = event.width ?? node.width ?? tile.size.width;
-    const height = event.height ?? node.height ?? tile.size.height;
-    const snapped = snapSize({ width, height });
-    console.info('[ws-c][flow] resize-stop', { id: node.id, width, height, snapped });
-    resizeTile(node.id, snapped);
-    endResize(node.id);
-    emitTelemetry('canvas.resize.stop', {
-      privateBeachId,
-      tileId: node.id,
-      width: snapped.width,
-      height: snapped.height,
-      rewriteEnabled,
-    });
-  }, [endResize, privateBeachId, resizeTile, rewriteEnabled, state.tiles]);
-
   const handleDrop = useCallback(
     (event: DragEvent) => {
       const descriptor = event.dataTransfer?.getData(APPLICATION_MIME);
@@ -328,7 +290,9 @@ function FlowCanvasInner({
     const types = event.dataTransfer ? Array.from(event.dataTransfer.types) : [];
     if (types.includes(APPLICATION_MIME)) {
       event.preventDefault();
-      event.dataTransfer.dropEffect = 'copy';
+      if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = 'copy';
+      }
     }
   }, []);
 
@@ -422,10 +386,6 @@ function FlowCanvasInner({
           proOptions={{ hideAttribution: true }}
           className="flex-1 h-full w-full"
           style={{ width: '100%', height: '100%' }}
-          nodesResizable
-          onNodeResize={handleNodeResize}
-          onNodeResizeStart={handleNodeResizeStart}
-          onNodeResizeStop={handleNodeResizeStop}
         >
           <Background gap={gridSize} color="rgba(148, 163, 184, 0.18)" />
           <Controls

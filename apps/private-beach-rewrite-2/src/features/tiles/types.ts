@@ -32,6 +32,133 @@ export type AgentMetadata = {
   trace?: AgentTraceMetadata;
 };
 
+export type RelationshipUpdateMode = 'idle-summary' | 'push' | 'poll' | 'hybrid';
+
+export type RelationshipCadenceConfig = {
+  idleSummary: boolean;
+  allowChildPush: boolean;
+  pollEnabled: boolean;
+  pollFrequencySeconds: number;
+  pollRequireContentChange: boolean;
+  pollQuietWindowSeconds: number;
+};
+
+const DEFAULT_CADENCE_BASE: RelationshipCadenceConfig = {
+  idleSummary: true,
+  allowChildPush: true,
+  pollEnabled: true,
+  pollFrequencySeconds: 30,
+  pollRequireContentChange: true,
+  pollQuietWindowSeconds: 30,
+};
+
+const MIN_POLL_FREQUENCY = 1;
+const MAX_POLL_FREQUENCY = 86400;
+
+export function createDefaultRelationshipCadence(): RelationshipCadenceConfig {
+  return { ...DEFAULT_CADENCE_BASE };
+}
+
+export function clampPollFrequency(seconds: number, fallback: number): number {
+  if (!Number.isFinite(seconds)) {
+    return fallback;
+  }
+  return Math.max(MIN_POLL_FREQUENCY, Math.min(MAX_POLL_FREQUENCY, Math.round(seconds)));
+}
+
+export function deriveCadenceFromLegacyMode(
+  mode: RelationshipUpdateMode | undefined,
+  pollFrequency: number,
+): RelationshipCadenceConfig {
+  const sanitizedFrequency = clampPollFrequency(pollFrequency, DEFAULT_CADENCE_BASE.pollFrequencySeconds);
+  switch (mode) {
+    case 'push':
+      return {
+        idleSummary: false,
+        allowChildPush: true,
+        pollEnabled: false,
+        pollFrequencySeconds: sanitizedFrequency,
+        pollRequireContentChange: false,
+        pollQuietWindowSeconds: 0,
+      };
+    case 'poll':
+      return {
+        idleSummary: false,
+        allowChildPush: false,
+        pollEnabled: true,
+        pollFrequencySeconds: sanitizedFrequency,
+        pollRequireContentChange: false,
+        pollQuietWindowSeconds: 0,
+      };
+    case 'idle-summary':
+      return {
+        idleSummary: true,
+        allowChildPush: false,
+        pollEnabled: false,
+        pollFrequencySeconds: sanitizedFrequency,
+        pollRequireContentChange: false,
+        pollQuietWindowSeconds: 0,
+      };
+    case 'hybrid':
+    default:
+      return createDefaultRelationshipCadence();
+  }
+}
+
+export function sanitizeRelationshipCadenceInput(
+  input: unknown,
+  legacyMode: RelationshipUpdateMode | undefined,
+  legacyPollFrequency: number,
+): RelationshipCadenceConfig {
+  const fallback = deriveCadenceFromLegacyMode(legacyMode, legacyPollFrequency);
+  if (!input || typeof input !== 'object') {
+    return { ...fallback };
+  }
+  const record = input as Partial<RelationshipCadenceConfig>;
+  const pollFrequencySeconds = clampPollFrequency(
+    typeof record.pollFrequencySeconds === 'number' ? record.pollFrequencySeconds : fallback.pollFrequencySeconds,
+    fallback.pollFrequencySeconds,
+  );
+  const quietSeconds =
+    typeof record.pollQuietWindowSeconds === 'number' && Number.isFinite(record.pollQuietWindowSeconds)
+      ? Math.max(0, Math.min(MAX_POLL_FREQUENCY, Math.round(record.pollQuietWindowSeconds)))
+      : fallback.pollQuietWindowSeconds;
+  return {
+    idleSummary:
+      typeof record.idleSummary === 'boolean' ? record.idleSummary : fallback.idleSummary,
+    allowChildPush:
+      typeof record.allowChildPush === 'boolean' ? record.allowChildPush : fallback.allowChildPush,
+    pollEnabled: typeof record.pollEnabled === 'boolean' ? record.pollEnabled : fallback.pollEnabled,
+    pollFrequencySeconds,
+    pollRequireContentChange:
+      typeof record.pollRequireContentChange === 'boolean'
+        ? record.pollRequireContentChange
+        : fallback.pollRequireContentChange,
+    pollQuietWindowSeconds: quietSeconds,
+  };
+}
+
+export function inferUpdateModeFromCadence(cadence: RelationshipCadenceConfig): RelationshipUpdateMode {
+  const enabled = [
+    cadence.idleSummary,
+    cadence.allowChildPush,
+    cadence.pollEnabled,
+  ].filter(Boolean).length;
+  if (enabled === 0) {
+    return 'idle-summary';
+  }
+  if (enabled > 1) {
+    return 'hybrid';
+  }
+  if (cadence.pollEnabled) {
+    return 'poll';
+  }
+  if (cadence.allowChildPush) {
+    return 'push';
+  }
+  return 'idle-summary';
+}
+
 export type RelationshipDescriptor = {
   id: string;
   sourceId: string;
@@ -41,8 +168,9 @@ export type RelationshipDescriptor = {
   sourceHandleId?: string | null;
   targetHandleId?: string | null;
   instructions: string;
-  updateMode: 'idle-summary' | 'push' | 'poll';
+  updateMode: RelationshipUpdateMode;
   pollFrequency: number;
+  cadence: RelationshipCadenceConfig;
 };
 
 export type TileDescriptor = {

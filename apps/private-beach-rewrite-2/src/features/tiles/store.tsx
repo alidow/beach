@@ -16,6 +16,7 @@ import type {
   TileViewportSnapshot,
   CanvasViewportState,
 } from './types';
+import { createDefaultRelationshipCadence } from './types';
 import { computeAutoPosition, generateTileId, snapPosition, snapSize } from './utils';
 
 type Action =
@@ -129,7 +130,10 @@ function ensureAgentMeta(
   existingMeta: TileDescriptor['agentMeta'],
   inputMeta?: TileCreateInput['agentMeta'],
 ): TileDescriptor['agentMeta'] {
-  if (inputMeta !== undefined) {
+  if (inputMeta === null) {
+    return null;
+  }
+  if (inputMeta != null) {
     const trace = coerceAgentTrace(inputMeta);
     const meta: AgentMetadata = {
       role: inputMeta.role ?? '',
@@ -514,8 +518,9 @@ function reducer(state: TileState, action: Action): TileState {
             sourceHandleId: sourceHandleId ?? null,
             targetHandleId: targetHandleId ?? null,
             instructions: '',
-            updateMode: 'idle-summary',
-            pollFrequency: 60,
+            updateMode: 'hybrid',
+            pollFrequency: 30,
+            cadence: createDefaultRelationshipCadence(),
           },
         },
         relationshipOrder: state.relationshipOrder.includes(id)

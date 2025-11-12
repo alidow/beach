@@ -822,7 +822,7 @@ async function loadNoise(): Promise<NoiseModule> {
               byteLength: wasmBinary.byteLength,
             });
           }
-          createNoiseModule(options, (module) => {
+          createNoiseModule(options, (module: unknown) => {
             try {
               const typed = module as NoiseModule;
               const exports = Object.keys(module as unknown as Record<string, unknown>);

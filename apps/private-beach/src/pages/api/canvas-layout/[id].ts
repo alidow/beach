@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 import { eq } from 'drizzle-orm';
 import { db, ensureMigrated } from '../../../db/client';
 import { canvasLayouts, tileLayouts } from '../../../db/schema';
+import type { AgentRelationshipCadence, AgentRelationshipUpdateMode } from '../../../lib/api';
 
 type CanvasAgentRelationship = {
 	id: string;
@@ -12,8 +13,9 @@ type CanvasAgentRelationship = {
 	sourceHandleId?: string | null;
 	targetHandleId?: string | null;
 	instructions?: string | null;
-	updateMode?: 'idle-summary' | 'push' | 'poll';
+	updateMode?: AgentRelationshipUpdateMode;
 	pollFrequency?: number | null;
+	cadence?: AgentRelationshipCadence;
 };
 
 type CanvasLayout = {

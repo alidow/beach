@@ -26,7 +26,7 @@ type PageProps = {
 
 export default async function BeachPage({ params, searchParams }: PageProps) {
   const beachId = params.id;
-  const { userId, getToken } = safeAuth();
+  const { userId, getToken } = await safeAuth();
   const template = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
 
   const { token, source } = await resolveManagerToken(userId ? getToken : undefined, template);
@@ -150,7 +150,7 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
 }
 
 export async function generateMetadata({ params }: PageProps): Promise<Metadata> {
-  const { userId, getToken } = safeAuth();
+  const { userId, getToken } = await safeAuth();
   const template = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
 
   const { token } = await resolveManagerToken(userId ? getToken : undefined, template);

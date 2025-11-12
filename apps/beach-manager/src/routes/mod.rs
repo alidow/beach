@@ -40,6 +40,10 @@ pub fn build_router(state: AppState) -> Router {
             post(acquire_controller).delete(release_controller),
         )
         .route(
+            "/sessions/:session_id/controller-handshake",
+            post(issue_controller_handshake).delete(revoke_controller_handshake),
+        )
+        .route(
             "/sessions/:session_id/controller-events",
             get(list_controller_events),
         )
@@ -636,5 +640,43 @@ mod tests {
             sessions[0]["session_id"],
             "6a7a7d0a-1b8b-4d80-8c13-111111111111"
         );
+    }
+
+    #[tokio::test]
+    async fn controller_handshake_endpoint_happy_path() {
+        // Skip external verify for tests
+        unsafe {
+            std::env::set_var("BEACH_SKIP_ROAD_VERIFY", "1");
+        }
+        let state = AppState::new();
+        let app = build_router(state.clone());
+        let session_id = "sess-handshake";
+        let beach_id = "pb-handshake";
+        let body = json!({
+            "passcode": "123456",
+            "requester_private_beach_id": beach_id,
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{}/controller-handshake", session_id))
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["private_beach_id"], beach_id);
+        assert!(payload["controller_token"].as_str().unwrap().len() > 0);
+        // Clean up env var
+        unsafe {
+            std::env::remove_var("BEACH_SKIP_ROAD_VERIFY");
+        }
     }
 }

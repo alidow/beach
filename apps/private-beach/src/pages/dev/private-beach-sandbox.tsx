@@ -89,59 +89,61 @@ function decodeParam(value: string | null): string | null {
 }
 
 function parseSessionEntries(input: string | string[] | undefined, role: SessionRole): SessionSpec[] {
-  return splitList(input)
-    .map((entry) => {
-      const parts = entry.split('|').map((part) => decodeParam(part.trim()) ?? '');
-      if (!parts[0]) {
-        return null;
-      }
-      const [id, titlePart, passcodePart] = parts;
-      const title = titlePart && titlePart.length > 0 ? titlePart : undefined;
-      const passcode = passcodePart && passcodePart.length > 0 ? passcodePart : undefined;
-      return {
-        id,
-        role,
-        title,
-        passcode,
-      } satisfies SessionSpec;
-    })
-    .filter((spec): spec is SessionSpec => Boolean(spec));
+  const entries = splitList(input);
+  const specs: SessionSpec[] = [];
+  for (const entry of entries) {
+    const parts = entry.split('|').map((part) => decodeParam(part.trim()) ?? '');
+    if (!parts[0]) {
+      continue;
+    }
+    const [id, titlePart, passcodePart] = parts;
+    const title = titlePart && titlePart.length > 0 ? titlePart : undefined;
+    const passcode = passcodePart && passcodePart.length > 0 ? passcodePart : undefined;
+    specs.push({
+      id,
+      role,
+      title,
+      passcode,
+    });
+  }
+  return specs;
 }
 
 function parseGeneralSessions(input: string | string[] | undefined): SessionSpec[] {
-  return splitList(input)
-    .map((entry) => {
-      const parts = entry.split('|').map((part) => decodeParam(part.trim()) ?? '');
-      if (!parts[0]) {
-        return null;
-      }
-      const id = parts[0];
-      let index = 1;
-      let role: SessionRole = 'application';
-      if (parts[index]) {
-        const normalized = parts[index].toLowerCase();
-        if (normalized === 'agent' || normalized === 'application') {
-          role = normalized as SessionRole;
-          index += 1;
-        }
-      }
-      let title: string | undefined;
-      if (parts[index] && parts[index].length > 0) {
-        title = parts[index];
+  const entries = splitList(input);
+  const specs: SessionSpec[] = [];
+  for (const entry of entries) {
+    const parts = entry.split('|').map((part) => decodeParam(part.trim()) ?? '');
+    if (!parts[0]) {
+      continue;
+    }
+    const id = parts[0];
+    let index = 1;
+    let role: SessionRole = 'application';
+    if (parts[index]) {
+      const normalized = parts[index].toLowerCase();
+      if (normalized === 'agent' || normalized === 'application') {
+        role = normalized as SessionRole;
         index += 1;
       }
-      let passcode: string | undefined;
-      if (parts[index] && parts[index].length > 0) {
-        passcode = parts[index];
-      }
-      return {
-        id,
-        role,
-        title,
-        passcode,
-      } satisfies SessionSpec;
-    })
-    .filter((spec): spec is SessionSpec => Boolean(spec));
+    }
+    let title: string | undefined;
+    if (parts[index] && parts[index].length > 0) {
+      title = parts[index];
+      index += 1;
+    }
+    let passcode: string | undefined;
+    if (parts[index] && parts[index].length > 0) {
+      passcode = parts[index];
+    }
+    specs.push({
+      id,
+      role,
+      title,
+      passcode,
+    });
+  }
+  return specs;
 }
 
 function parseKeyValueList(value: string | string[] | undefined): Map<string, string> {
@@ -699,8 +701,8 @@ function PrivateBeachSandboxPage() {
               </p>
             </div>
             <div className="flex items-center gap-2">
-              {loading ? <Badge variant="secondary">Loading</Badge> : <Badge variant="outline">Ready</Badge>}
-              {config.skipApi && <Badge variant="secondary">API Disabled</Badge>}
+              {loading ? <Badge variant="muted">Loading</Badge> : <Badge variant="success">Ready</Badge>}
+              {config.skipApi && <Badge variant="warning">API Disabled</Badge>}
             </div>
           </div>
         </div>

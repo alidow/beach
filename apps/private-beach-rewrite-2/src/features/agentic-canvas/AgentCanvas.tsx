@@ -19,7 +19,12 @@ import ReactFlow, {
 import AgentNode from './AgentNode';
 import ApplicationNode from './ApplicationNode';
 import RelationshipEdge from './RelationshipEdge';
-import type { AgentNodeData, ApplicationNodeData, AssignmentEdgeData, UpdateMode } from './types';
+import type { AgentNodeData, ApplicationNodeData, AssignmentEdgeData } from './types';
+import {
+  createDefaultRelationshipCadence,
+  type RelationshipCadenceConfig,
+  type RelationshipUpdateMode,
+} from '../tiles/types';
 
 const AGENT_NODE_SIZE = { width: 260, height: 240 };
 const APPLICATION_NODE_SIZE = { width: 230, height: 200 };
@@ -118,22 +123,36 @@ function AgentCanvasInner() {
   );
 
   const handleEdgeSave = useCallback(
-    ({ id, instructions, updateMode, pollFrequency }: { id: string; instructions: string; updateMode: UpdateMode; pollFrequency: number }) => {
+    ({
+      id,
+      instructions,
+      updateMode,
+      pollFrequency,
+      cadence,
+    }: {
+      id: string;
+      instructions: string;
+      updateMode: RelationshipUpdateMode;
+      pollFrequency: number;
+      cadence: RelationshipCadenceConfig;
+    }) => {
       setEdges((current) =>
-        current.map((edge) =>
-          edge.id === id
-            ? {
-                ...edge,
-                data: {
-                  ...edge.data,
-                  instructions,
-                  updateMode,
-                  pollFrequency,
-                  isEditing: false,
-                },
-              }
-            : edge,
-        ),
+        current.map((edge) => {
+          if (edge.id !== id || !edge.data) {
+            return edge;
+          }
+          return {
+            ...edge,
+            data: {
+              ...edge.data,
+              instructions,
+              updateMode,
+              pollFrequency,
+              cadence,
+              isEditing: false,
+            },
+          };
+        }),
       );
     },
     [],
@@ -141,17 +160,18 @@ function AgentCanvasInner() {
 
   const handleEdgeEdit = useCallback(({ id }: { id: string }) => {
     setEdges((current) =>
-      current.map((edge) =>
-        edge.id === id
-          ? {
-              ...edge,
-              data: {
-                ...edge.data,
-                isEditing: true,
-              },
-            }
-          : edge,
-      ),
+      current.map((edge) => {
+        if (edge.id !== id || !edge.data) {
+          return edge;
+        }
+        return {
+          ...edge,
+          data: {
+            ...edge.data,
+            isEditing: true,
+          },
+        };
+      }),
     );
   }, []);
 
@@ -233,8 +253,9 @@ function AgentCanvasInner() {
         target: connection.target,
         data: {
           instructions: '',
-          updateMode: 'idle-summary',
-          pollFrequency: 60,
+          updateMode: 'hybrid',
+          pollFrequency: 30,
+          cadence: createDefaultRelationshipCadence(),
           isEditing: true,
           onSave: handleEdgeSave,
           onEdit: handleEdgeEdit,

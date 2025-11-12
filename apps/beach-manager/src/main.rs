@@ -10,7 +10,9 @@ use auth::{AuthConfig, AuthContext};
 use config::AppConfig;
 use routes::build_router;
 use sqlx::postgres::PgPoolOptions;
-use state::{AppState, STALE_SESSION_SWEEP_INTERVAL};
+use state::{
+    viewer_health_report_interval, AppState, STALE_SESSION_MAX_IDLE, STALE_SESSION_SWEEP_INTERVAL,
+};
 use std::{net::SocketAddr, path::Path, sync::OnceLock, time::Duration};
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -22,6 +24,19 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let cfg = AppConfig::from_env();
     init_tracing(cfg.log_path.as_deref());
+    info!(
+        target = "beach_manager.config",
+        bind_addr = %cfg.bind_addr,
+        database_configured = cfg.database_url.is_some(),
+        redis_configured = cfg.redis_url.is_some(),
+        beach_road_url = %cfg.beach_road_url.as_deref().unwrap_or("unset"),
+        public_manager_url = %cfg.public_manager_url.as_deref().unwrap_or("unset"),
+        auth_bypass = cfg.auth_bypass,
+        stale_session_idle_secs = STALE_SESSION_MAX_IDLE.as_secs(),
+        viewer_health_interval_secs = viewer_health_report_interval().as_secs(),
+        sweep_interval_secs = STALE_SESSION_SWEEP_INTERVAL.as_secs(),
+        log_path = %cfg.log_path.as_deref().unwrap_or("unset")
+    );
 
     let mut state = if let Some(db_url) = &cfg.database_url {
         match PgPoolOptions::new()

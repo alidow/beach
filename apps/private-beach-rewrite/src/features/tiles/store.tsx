@@ -112,7 +112,8 @@ function reducer(state: TileState, action: Action): TileState {
       delete resizing[id];
       const activeId =
         state.activeId === id ? (order.length > 0 ? order[order.length - 1] : null) : state.activeId;
-      return { tiles, order, activeId, resizing };
+      const interactiveId = state.interactiveId === id ? null : state.interactiveId;
+      return { tiles, order, activeId, resizing, interactiveId };
     }
     case 'SET_ACTIVE_TILE': {
       const { id } = action.payload;

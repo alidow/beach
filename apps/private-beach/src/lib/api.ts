@@ -51,6 +51,15 @@ export type ControllerLeaseResponse = {
   expires_at_ms: number;
 };
 
+export type ControllerHandshakeResponse = {
+  private_beach_id: string;
+  manager_url: string;
+  controller_token: string;
+  lease_expires_at_ms?: number | null;
+  stale_session_idle_secs: number;
+  viewer_health_interval_secs: number;
+};
+
 export type ControllerEvent = {
   id: string;
   event_type: string;
@@ -182,6 +191,36 @@ export async function attachByCode(privateBeachId: string, sessionId: string, co
   });
   if (!res.ok) throw new Error(`attachByCode failed ${res.status}`);
   return res.json();
+}
+
+export async function issueControllerHandshake(
+  sessionId: string,
+  passcode: string,
+  privateBeachId: string,
+  token: string | null,
+  baseUrl?: string,
+): Promise<ControllerHandshakeResponse> {
+  const res = await fetch(`${base(baseUrl)}/sessions/${sessionId}/controller-handshake`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify({ passcode, requester_private_beach_id: privateBeachId }),
+  });
+  if (!res.ok) throw new Error(`issueControllerHandshake failed ${res.status}`);
+  return res.json();
+}
+
+export async function revokeControllerHandshake(
+  sessionId: string,
+  controllerToken: string,
+  token: string | null,
+  baseUrl?: string,
+): Promise<void> {
+  const res = await fetch(`${base(baseUrl)}/sessions/${sessionId}/controller-handshake`, {
+    method: 'DELETE',
+    headers: authHeaders(token),
+    body: JSON.stringify({ controller_token: controllerToken }),
+  });
+  if (!res.ok) throw new Error(`revokeControllerHandshake failed ${res.status}`);
 }
 
 export async function attachOwned(privateBeachId: string, ids: string[], token: string | null, baseUrl?: string) {
@@ -783,7 +822,18 @@ export type ControllerAssignmentResult = {
 	pairing?: ControllerPairing;
 };
 
-export type AgentRelationshipUpdateMode = 'idle-summary' | 'push' | 'poll';
+export type AgentRelationshipUpdateMode = 'idle-summary' | 'push' | 'poll' | 'hybrid';
+
+export type AgentRelationshipCadence = {
+	idleSummary?: boolean;
+	allowChildPush?: boolean;
+	poll?: {
+		enabled?: boolean;
+		frequencySeconds?: number | null;
+		requireContentChange?: boolean;
+		minQuietSeconds?: number | null;
+	};
+};
 
 export type CanvasAgentRelationship = {
 	id: string;
@@ -796,6 +846,7 @@ export type CanvasAgentRelationship = {
 	instructions?: string | null;
 	updateMode?: AgentRelationshipUpdateMode;
 	pollFrequency?: number | null;
+	cadence?: AgentRelationshipCadence;
 };
 
 export async function batchControllerAssignments(

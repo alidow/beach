@@ -26,7 +26,7 @@ use crate::{
     entitlement::{EntitlementError, EntitlementVerifier},
     session::{hash_passphrase, verify_passphrase},
     signaling::WebRtcSdpPayload,
-    storage::{SessionInfo, Storage},
+    storage::{ControlMessage, SessionInfo, Storage},
     viewer_token::{ViewerTokenError, ViewerTokenVerifier},
 };
 
@@ -857,6 +857,111 @@ pub async fn verify_code(
         })),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+// Control channel: push messages from manager/UI to a session and let the host poll/ack
+#[derive(Debug, Deserialize)]
+pub struct ControlPostRequest {
+    pub kind: String,
+    #[serde(default)]
+    pub control_id: Option<String>,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ControlPostResponse {
+    pub enqueued: bool,
+    pub control_id: String,
+}
+
+pub async fn post_control(
+    State(storage): State<SharedStorage>,
+    Path(session_id): Path<String>,
+    Json(body): Json<ControlPostRequest>,
+) -> Result<Json<ControlPostResponse>, StatusCode> {
+    let storage = (*storage).clone();
+    let session = storage
+        .get_session(&session_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let id = body
+        .control_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let msg = ControlMessage {
+        id: id.clone(),
+        kind: body.kind.clone(),
+        payload: body.payload.clone(),
+        enqueued_at: session.created_at,
+    };
+    storage
+        .enqueue_control(&session_id, msg)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(ControlPostResponse {
+        enqueued: true,
+        control_id: id,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ControlPollRequest {
+    pub code: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ControlPollResponse {
+    pub messages: Vec<ControlMessage>,
+}
+
+pub async fn poll_control(
+    State(storage): State<SharedStorage>,
+    Path(session_id): Path<String>,
+    Json(body): Json<ControlPollRequest>,
+) -> Result<Json<ControlPollResponse>, StatusCode> {
+    let storage = (*storage).clone();
+    let session = storage
+        .get_session(&session_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    // Require a valid code to read control messages
+    let ok = match body.code.as_deref() {
+        Some(code) => verify_passphrase(code, &session.passphrase_hash) || code == session.join_code,
+        None => false,
+    };
+    if !ok {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let messages = storage
+        .list_pending_controls(&session_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(ControlPollResponse { messages }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ControlAckRequest {
+    pub control_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ControlAckResponse {
+    pub acknowledged: bool,
+}
+
+pub async fn ack_control(
+    State(storage): State<SharedStorage>,
+    Path(session_id): Path<String>,
+    Json(body): Json<ControlAckRequest>,
+) -> Result<Json<ControlAckResponse>, StatusCode> {
+    let storage = (*storage).clone();
+    storage
+        .ack_control(&session_id, &body.control_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(ControlAckResponse { acknowledged: true }))
 }
 
 // New: list caller-owned active sessions

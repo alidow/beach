@@ -6,6 +6,10 @@ import type {
   TerminalScrollPolicy,
 } from '../../../private-beach/src/components/terminalSizing';
 
+type TerminalSizingStyle = CSSProperties & {
+  '--beach-terminal-max-height'?: string;
+};
+
 export class RewriteTerminalSizingStrategy implements TerminalSizingStrategy {
   nextViewport(tileRect: DOMRectReadOnly, hostMeta: TerminalSizingHostMeta): TerminalViewportProposal {
     const rowHeight = Math.max(1, Math.floor(hostMeta.lineHeightPx));
@@ -82,7 +86,7 @@ export class RewriteTerminalSizingStrategy implements TerminalSizingStrategy {
     _tileRect: DOMRectReadOnly,
     hostMeta: TerminalSizingHostMeta,
     viewportRows: number,
-  ): CSSProperties | undefined {
+  ): TerminalSizingStyle | undefined {
     const rowHeight = Math.max(1, Math.floor(hostMeta.lineHeightPx));
     const heightPx = Math.max(1, Math.ceil(viewportRows * rowHeight));
     return {

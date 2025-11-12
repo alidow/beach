@@ -99,6 +99,24 @@ pub struct JoinSessionRequestBody {
     pub viewer_token: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ControllerHandshakeRequest {
+    pub passcode: String,
+    #[serde(default)]
+    pub requester_private_beach_id: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ControllerHandshakeResponse {
+    pub private_beach_id: String,
+    pub manager_url: String,
+    pub controller_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at_ms: Option<i64>,
+    pub stale_session_idle_secs: u64,
+    pub viewer_health_interval_secs: u64,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct AttachByCodeResponse {
     pub ok: bool,
@@ -193,6 +211,62 @@ pub async fn acquire_controller(
 }
 
 pub async fn release_controller(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(session_id): Path<String>,
+    Json(body): Json<ReleaseControllerRequest>,
+) -> ApiResult<serde_json::Value> {
+    ensure_scope(&token, "pb:control.write")?;
+    state
+        .release_controller(&session_id, &body.controller_token, token.account_uuid())
+        .await
+        .map_err(map_state_err)?;
+    Ok(Json(serde_json::json!({ "released": true })))
+}
+
+pub async fn issue_controller_handshake(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(session_id): Path<String>,
+    Json(body): Json<ControllerHandshakeRequest>,
+) -> ApiResult<ControllerHandshakeResponse> {
+    ensure_scope(&token, "pb:sessions.read")?;
+    let target_beach = body
+        .requester_private_beach_id
+        .unwrap_or_else(|| "pb-unknown".into());
+
+    // Attach (or re-attach) the session via code to ensure the manager tracks it for this beach.
+    let session_summary = match state
+        .attach_by_code(&target_beach, &session_id, &body.passcode, token.account_uuid())
+        .await
+    {
+        Ok(summary) => summary,
+        Err(StateError::InvalidIdentifier(_)) => return Err(ApiError::Forbidden("invalid_passcode")),
+        Err(StateError::PrivateBeachNotFound) => return Err(ApiError::NotFound("private beach not found")),
+        Err(StateError::SessionNotFound) => return Err(ApiError::NotFound("session not found")),
+        Err(err) => return Err(map_state_err(err)),
+    };
+
+    // Acquire (or renew) a controller lease for this host session
+    let lease = state
+        .acquire_controller(&session_id, None, Some("auto_handshake".into()), token.account_uuid())
+        .await
+        .map_err(map_state_err)?;
+
+    let manager_url = state.public_manager_url().to_string();
+    let response = ControllerHandshakeResponse {
+        private_beach_id: session_summary.private_beach_id.clone(),
+        manager_url,
+        controller_token: lease.controller_token.clone(),
+        lease_expires_at_ms: Some(lease.expires_at_ms),
+        stale_session_idle_secs: crate::state::STALE_SESSION_MAX_IDLE.as_secs(),
+        viewer_health_interval_secs: crate::state::viewer_health_report_interval().as_secs(),
+    };
+
+    Ok(Json(response))
+}
+
+pub async fn revoke_controller_handshake(
     State(state): State<AppState>,
     token: AuthToken,
     Path(session_id): Path<String>,

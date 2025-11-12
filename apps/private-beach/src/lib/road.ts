@@ -26,3 +26,40 @@ export async function listMySessions(token: string | null, roadUrl?: string): Pr
   if (!res.ok) throw new Error(`road listMySessions failed ${res.status}`);
   return res.json();
 }
+
+export async function sendControlMessage(
+  sessionId: string,
+  kind: string,
+  payload: any,
+  token: string | null,
+  roadUrl?: string,
+): Promise<{ control_id: string }> {
+  if (!token || token.trim().length === 0) {
+    throw new Error('missing manager auth token for road control');
+  }
+  const res = await fetch(`${baseRoad(roadUrl)}/sessions/${sessionId}/control`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${token.trim()}`,
+    },
+    body: JSON.stringify({ kind, payload }),
+  });
+  if (!res.ok) throw new Error(`road sendControlMessage failed ${res.status}`);
+  const data = await res.json();
+  return { control_id: data.control_id };
+}
+
+export async function pollControl(
+  sessionId: string,
+  code: string,
+  roadUrl?: string,
+): Promise<{ messages: any[] }> {
+  const res = await fetch(`${baseRoad(roadUrl)}/sessions/${sessionId}/control/poll`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ code }),
+  });
+  if (!res.ok) throw new Error(`road pollControl failed ${res.status}`);
+  return res.json();
+}

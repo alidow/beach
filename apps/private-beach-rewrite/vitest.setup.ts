@@ -33,6 +33,5 @@ if (typeof globalThis.ResizeObserver === 'undefined') {
     }
   }
 
-  // @ts-expect-error – assigning to global
   globalThis.ResizeObserver = ResizeObserver;
 }

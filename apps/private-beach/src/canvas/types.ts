@@ -1,5 +1,7 @@
 'use client';
 
+import type { AgentRelationshipCadence, AgentRelationshipUpdateMode } from '../lib/api';
+
 // Shared primitive types
 export type CanvasViewport = {
   x: number;
@@ -31,8 +33,9 @@ export type CanvasAgentRelationship = {
   sourceHandleId?: string | null;
   targetHandleId?: string | null;
   instructions?: string | null;
-  updateMode?: 'idle-summary' | 'push' | 'poll';
+  updateMode?: AgentRelationshipUpdateMode;
   pollFrequency?: number | null;
+  cadence?: AgentRelationshipCadence;
 };
 
 // Node types

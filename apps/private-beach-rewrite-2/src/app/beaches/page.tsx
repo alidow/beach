@@ -14,9 +14,12 @@ export const metadata = {
 export default async function BeachesPage() {
   const { userId, getToken } = await safeAuth();
   const isSignedIn = Boolean(userId);
+  const allowedGetToken = typeof getToken === 'function' ? getToken : undefined;
 
   const template = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
-  const { token, source } = await resolveManagerToken(isSignedIn ? getToken : undefined, template);
+  const { token, source } = await resolveManagerToken(allowedGetToken, template, {
+    isAuthenticated: isSignedIn,
+  });
   const managerBaseUrl = resolveManagerBaseUrl();
 
   let beaches: BeachSummary[] = [];
@@ -28,11 +31,15 @@ export default async function BeachesPage() {
       loadError = error instanceof Error ? error.message : 'Unknown error occurred while loading beaches.';
       beaches = [];
     }
-  } else {
+  } else if (source === 'unauthenticated') {
+    loadError = 'Sign in to view your private beaches.';
+  } else if (source === 'exchange_error') {
     loadError =
-      source === 'none'
-        ? 'Missing PRIVATE_BEACH_MANAGER_TOKEN. See secret-distribution.md for setup details.'
-        : 'Unable to resolve manager auth token. Please sign in again or verify Clerk configuration.';
+      'Unable to mint a Beach Gate token. Ensure Clerk sessions are valid and Beach Gate is reachable (PRIVATE_BEACH_GATE_URL).';
+  } else if (source === 'none') {
+    loadError = 'Missing PRIVATE_BEACH_MANAGER_TOKEN. See secret-distribution.md for setup details.';
+  } else {
+    loadError = 'Unable to resolve manager auth token. Please sign in again or verify Clerk configuration.';
   }
 
   return (

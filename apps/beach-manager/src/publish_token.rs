@@ -62,7 +62,11 @@ impl PublishTokenManager {
         (token, exp)
     }
 
-    pub fn verify_for_session(&self, token: &str, session_id: &str) -> Result<PublishClaims, PublishTokenError> {
+    pub fn verify_for_session(
+        &self,
+        token: &str,
+        session_id: &str,
+    ) -> Result<PublishClaims, PublishTokenError> {
         if token.trim().is_empty() {
             return Err(PublishTokenError::Malformed);
         }
@@ -100,4 +104,3 @@ mod tests {
         matches!(err, PublishTokenError::SidMismatch);
     }
 }
-

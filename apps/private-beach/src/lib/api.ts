@@ -1,3 +1,4 @@
+import { Buffer } from 'buffer';
 import type { TerminalStateDiff } from './terminalHydrator';
 
 export type SessionSummary = {
@@ -119,14 +120,91 @@ export async function listSessions(privateBeachId: string, token: string | null,
   return res.json();
 }
 
+function decodeJwtPayload(token: string | null): Record<string, unknown> | null {
+  if (!token) return null;
+  const parts = token.split('.');
+  if (parts.length < 2) {
+    return null;
+  }
+  const segment = parts[1];
+  const normalized = segment.replace(/-/g, '+').replace(/_/g, '/');
+  const padding = normalized.length % 4 === 0 ? '' : '='.repeat(4 - (normalized.length % 4));
+  const payload = normalized + padding;
+  try {
+    if (typeof window !== 'undefined' && typeof window.atob === 'function') {
+      return JSON.parse(window.atob(payload));
+    }
+    return JSON.parse(Buffer.from(payload, 'base64').toString('utf-8'));
+  } catch (err) {
+    console.warn('[api] failed to decode JWT payload', err);
+    return null;
+  }
+}
+
+function logTokenDebug(token: string | null, details: Record<string, unknown>) {
+  const claims = decodeJwtPayload(token) as
+    | {
+        scope?: unknown;
+        scp?: unknown;
+        entitlements?: unknown;
+      }
+    | null;
+  const scope = typeof claims?.scope === 'string' ? claims.scope : null;
+  const scp = Array.isArray(claims?.scp) ? (claims?.scp as unknown[]) : null;
+  const entitlements = Array.isArray(claims?.entitlements)
+    ? (claims?.entitlements as unknown[])
+    : typeof claims?.entitlements === 'string'
+      ? claims?.entitlements
+      : null;
+  const payload: Record<string, unknown> = {
+    ...details,
+    hasToken: Boolean(token && token.trim().length > 0),
+    scope,
+    scp,
+    entitlements,
+  };
+  if (token && token.trim().length > 0) {
+    payload.tokenPrefix = token.slice(0, 12);
+  }
+  try {
+    console.info('[api] token-debug', JSON.stringify(payload));
+  } catch {
+    console.info('[api] token-debug', payload);
+  }
+}
+
 export async function acquireController(sessionId: string, ttlMs: number | undefined, token: string | null, baseUrl?: string): Promise<ControllerLeaseResponse> {
+  const ttl = ttlMs ?? 30000;
+  logTokenDebug(token, {
+    phase: 'acquireController.request',
+    sessionId,
+    ttlMs: ttl,
+    baseUrl: base(baseUrl),
+  });
   const res = await fetch(`${base(baseUrl)}/sessions/${sessionId}/controller/lease`, {
     method: 'POST',
     headers: authHeaders(token),
-    body: JSON.stringify({ ttl_ms: ttlMs ?? 30000, reason: 'surfer' }),
+    body: JSON.stringify({ ttl_ms: ttl, reason: 'surfer' }),
   });
-  if (!res.ok) throw new Error(`acquireController failed ${res.status}`);
-  return res.json();
+  if (!res.ok) {
+    const bodyText = await res.text().catch(() => null);
+    const failurePayload = {
+      sessionId,
+      status: res.status,
+      body: bodyText,
+      url: `${base(baseUrl)}/sessions/${sessionId}/controller/lease`,
+    };
+    try {
+      console.warn('[api] acquireController failed', JSON.stringify(failurePayload));
+    } catch {
+      console.warn('[api] acquireController failed', failurePayload);
+    }
+    logTokenDebug(token, { phase: 'acquireController.failure', sessionId, status: res.status });
+    throw new Error(`acquireController failed ${res.status}`);
+  }
+  const payload = await res.json();
+  logTokenDebug(token, { phase: 'acquireController.success', sessionId });
+  return payload;
 }
 
 export async function releaseController(sessionId: string, controllerToken: string, token: string | null, baseUrl?: string): Promise<void> {

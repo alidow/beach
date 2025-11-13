@@ -1,4 +1,5 @@
 import type { FastifyInstance } from 'fastify';
+import { decodeJwt } from 'jose';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { loadConfig, type BeachGateConfig } from './config.js';
 import { buildServer } from './server.js';
@@ -20,6 +21,42 @@ describe('Beach Gate server', () => {
     });
 
     server = await buildServer({ config, logger: false });
+  });
+
+  it('exposes the signing key via JWKS', async () => {
+    const response = await server.inject({
+      method: 'GET',
+      url: '/.well-known/jwks.json',
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json() as { keys: Array<Record<string, string>> };
+    expect(Array.isArray(body.keys)).toBe(true);
+    expect(body.keys).toHaveLength(1);
+
+    const entry = body.keys[0];
+    expect(entry.kty).toBe('EC');
+    expect(entry.crv).toBe('P-256');
+    expect(entry.kid).toBe(config.signingKey.kid);
+    expect(entry.alg).toBe('ES256');
+    expect(entry.use).toBe('sig');
+    expect(typeof entry.x).toBe('string');
+    expect(typeof entry.y).toBe('string');
+  });
+
+  it('issues tokens with scope and scp claims derived from entitlements', async () => {
+    const session = await performDeviceFinish(server);
+    const payload = decodeJwt(session.access_token) as {
+      sub: string;
+      entitlements: string[];
+      scope: string;
+      scp: string[];
+    };
+
+    expect(payload.sub).toBe('mock-user');
+    expect(payload.entitlements).toEqual(['rescue:fallback', 'session:group']);
+    expect(payload.scope).toBe('rescue:fallback session:group');
+    expect(payload.scp).toEqual(['rescue:fallback', 'session:group']);
   });
 
   describe('TURN credentials endpoint', () => {
@@ -165,6 +202,35 @@ describe('Beach Gate server', () => {
       } finally {
         await localServer.close();
       }
+    });
+  });
+
+  describe('auth exchange endpoint', () => {
+    it('issues gate tokens when provided a valid Clerk token', async () => {
+      const response = await server.inject({
+        method: 'POST',
+        url: '/auth/exchange',
+        headers: {
+          authorization: 'Bearer mock-clerk-token',
+        },
+      });
+
+      expect(response.statusCode).toBe(201);
+      const body = response.json() as Record<string, unknown>;
+      expect(typeof body.access_token).toBe('string');
+      expect(body.token_type).toBe('Bearer');
+      expect(body.entitlements).toEqual(['rescue:fallback', 'session:group']);
+    });
+
+    it('rejects requests without a Clerk token', async () => {
+      const response = await server.inject({
+        method: 'POST',
+        url: '/auth/exchange',
+      });
+
+      expect(response.statusCode).toBe(401);
+      const body = response.json() as Record<string, unknown>;
+      expect(body.error).toBe('unauthorized');
     });
   });
 

@@ -36,11 +36,12 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@beach-postgres:5432/beach_manager
       REDIS_URL: redis://beach-redis:6379
-      AUTH_BYPASS: "1"
+      AUTH_BYPASS: "0"
       BEACH_ROAD_URL: http://beach-road:4132
       PUBLIC_MANAGER_URL: http://127.0.0.1:8080
       BEACH_GATE_URL: ${BEACH_GATE_URL:-http://beach-gate:4133}
-      BEACH_GATE_JWKS_URL: https://shining-sunbird-15.clerk.accounts.dev/.well-known/jwks.json
+      BEACH_GATE_JWKS_URL: http://beach-gate:4133/.well-known/jwks.json
+      BEACH_GATE_ISSUER: beach-gate
       BEACH_GATE_AUDIENCE: private-beach-manager
       BEACH_SESSION_SERVER: http://beach-road:4132
       STDOUT_LOG: ${BEACH_MANAGER_STDOUT_LOG:-info}
@@ -119,8 +120,9 @@ services:
       CLERK_MOCK: "1"
       BEACH_GATE_PORT: 4133
       BEACH_GATE_TOKEN_ISSUER: beach-gate
-      BEACH_GATE_SERVICE_AUDIENCE: beach-services
-      BEACH_GATE_DEFAULT_ENTITLEMENTS: "rescue:fallback,private-beach:turn"
+      BEACH_GATE_SERVICE_AUDIENCE: private-beach-manager
+      BEACH_GATE_DEFAULT_ENTITLEMENTS: "rescue:fallback,private-beach:turn,pb:beaches.read,pb:beaches.write,pb:sessions.read,pb:sessions.write,pb:control.read,pb:control.write,pb:control.consume,pb:agents.onboard,pb:harness.publish"
+      # BEACH_GATE_SIGNING_KEY_PATH: /secrets/beach-gate-ec256.pem
     volumes:
       - .:/app
     ports:
@@ -140,6 +142,7 @@ services:
       PRIVATE_BEACH_ROAD_URL: http://localhost:4132
       PRIVATE_BEACH_MANAGER_URL: http://beach-manager:8080
       PRIVATE_BEACH_MANAGER_TOKEN: ${PRIVATE_BEACH_MANAGER_TOKEN:-}
+      PRIVATE_BEACH_GATE_URL: http://beach-gate:4133
       NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE: ${NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE:-}
       NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:-}
       CLERK_SECRET_KEY: ${CLERK_SECRET_KEY:-}

@@ -1,3 +1,4 @@
+import { Buffer } from 'buffer';
 import { useRouter } from 'next/router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useAuth } from '@clerk/nextjs';
@@ -43,6 +44,94 @@ const DEFAULT_CANVAS_TILE_WIDTH = 448;
 const DEFAULT_CANVAS_TILE_HEIGHT = 448;
 const DEFAULT_CANVAS_TILE_GAP = 32;
 const AUTO_LAYOUT_COLUMNS = 4;
+
+type JwtClaims = {
+  scope?: string;
+  scp?: string[];
+  entitlements?: string[];
+  [key: string]: unknown;
+};
+
+function base64UrlDecode(segment: string): string | null {
+  if (!segment) return null;
+  const normalized = segment.replace(/-/g, '+').replace(/_/g, '/');
+  const padding = normalized.length % 4 === 0 ? '' : '='.repeat(4 - (normalized.length % 4));
+  const payload = normalized + padding;
+  try {
+    if (typeof window !== 'undefined' && typeof window.atob === 'function') {
+      return window.atob(payload);
+    }
+    // Buffer exists in Node/SSR contexts.
+    return Buffer.from(payload, 'base64').toString('utf-8');
+  } catch (err) {
+    console.warn('[auth] failed to base64 decode token segment', err);
+    return null;
+  }
+}
+
+function decodeJwtClaims(token: string | null): JwtClaims | null {
+  if (!token) return null;
+  const parts = token.split('.');
+  if (parts.length < 2) {
+    return null;
+  }
+  const decoded = base64UrlDecode(parts[1]);
+  if (!decoded) {
+    return null;
+  }
+  try {
+    return JSON.parse(decoded);
+  } catch (err) {
+    console.warn('[auth] failed to parse token payload JSON', err);
+    return null;
+  }
+}
+
+const TOKEN_REFRESH_SKEW_MS = 30_000;
+
+function getTokenExpiryMs(token: string | null): number | null {
+  if (!token || token.trim().length === 0) {
+    return null;
+  }
+  const claims = decodeJwtClaims(token);
+  const expSeconds = (claims as Record<string, unknown>)?.exp;
+  if (typeof expSeconds !== 'number') {
+    return null;
+  }
+  return expSeconds * 1000;
+}
+
+function isTokenExpiring(token: string | null, skewMs = TOKEN_REFRESH_SKEW_MS) {
+  const expiryMs = getTokenExpiryMs(token);
+  if (!expiryMs) {
+    return false;
+  }
+  return Date.now() >= expiryMs - skewMs;
+}
+
+function logTokenClaims(token: string | null, context: Record<string, unknown>) {
+  const payload: Record<string, unknown> = {
+    ...context,
+    hasToken: Boolean(token && token.trim().length > 0),
+  };
+  if (token && token.trim().length > 0) {
+    const claims = decodeJwtClaims(token) ?? {};
+    const entitlements =
+      (claims as Record<string, unknown>)?.entitlements ??
+      (claims as Record<string, unknown>)?.entitlememts ??
+      null;
+    payload.scope = (claims as Record<string, unknown>)?.scope ?? null;
+    payload.scp = (claims as Record<string, unknown>)?.scp ?? null;
+    payload.entitlements = entitlements;
+    payload.exp = getTokenExpiryMs(token);
+    payload.tokenPrefix = token.slice(0, 12);
+  }
+  try {
+    console.info('[auth] token-claims', JSON.stringify(payload));
+  } catch {
+    console.info('[auth] token-claims', payload);
+  }
+}
 
 type RemovedTileInfo = {
   sessionId: string;
@@ -201,7 +290,7 @@ export default function BeachDashboard() {
     });
   }, [id, rewriteEnabled]);
 
-  const refreshManagerToken = useCallback(async () => {
+  const refreshManagerToken = useCallback(async (options?: { forceFresh?: boolean }) => {
     if (!isLoaded || !isSignedIn) {
       debugLog(
         'auth',
@@ -222,9 +311,10 @@ export default function BeachDashboard() {
       return null;
     }
     try {
-      const token = await getToken(
-        tokenTemplate ? { template: tokenTemplate } : undefined,
-      );
+      const token = await getToken({
+        template: tokenTemplate || undefined,
+        skipCache: options?.forceFresh ?? true,
+      });
       debugLog(
         'auth',
         'manager token refresh resolved',
@@ -232,14 +322,16 @@ export default function BeachDashboard() {
           hasToken: Boolean(token),
         },
       );
-      setManagerToken(token ?? null);
+      const normalizedToken = token ?? null;
+      setManagerToken(normalizedToken);
       if (typeof window !== 'undefined') {
         console.info('[auth] manager-token-state', {
           source: 'refresh-success',
-          hasToken: Boolean(token && token.trim().length > 0),
+          hasToken: Boolean(normalizedToken && normalizedToken.trim().length > 0),
         });
       }
-      if (token && token.trim().length > 0) {
+      logTokenClaims(normalizedToken, { phase: 'refresh-success' });
+      if (normalizedToken && normalizedToken.trim().length > 0) {
         setViewerToken((prev) => {
           const reuseExisting = Boolean(prev && prev.trim().length > 0);
           if (typeof window !== 'undefined') {
@@ -251,7 +343,7 @@ export default function BeachDashboard() {
           if (reuseExisting) {
             return prev;
           }
-          return token;
+          return normalizedToken;
         });
       } else {
         setViewerToken(null);
@@ -262,7 +354,7 @@ export default function BeachDashboard() {
           });
         }
       }
-      return token ?? null;
+      return normalizedToken;
     } catch (err: any) {
       const message = err?.message ?? String(err);
       debugLog(
@@ -281,15 +373,22 @@ export default function BeachDashboard() {
           error: message,
         });
       }
+      logTokenClaims(null, { phase: 'refresh-failure', error: message });
       return null;
     }
-  }, [isLoaded, isSignedIn, getToken, tokenTemplate]);
+  }, [getToken, isLoaded, isSignedIn, tokenTemplate]);
 
   const ensureManagerToken = useCallback(async () => {
     if (managerToken && managerToken.trim().length > 0) {
-      return managerToken;
+      if (!isTokenExpiring(managerToken)) {
+        logTokenClaims(managerToken, { phase: 'ensure-cache-hit' });
+        return managerToken;
+      }
+      debugLog('auth', 'manager token expiring; refreshing', {
+        phase: 'ensure-refresh',
+      });
     }
-    return await refreshManagerToken();
+    return await refreshManagerToken({ forceFresh: true });
   }, [managerToken, refreshManagerToken]);
 
   useEffect(() => {

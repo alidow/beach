@@ -28,7 +28,7 @@ Beach Manager is the zero-trust control plane that keeps Private Beach cohesive.
    - S3-compatible object store for persistent files and archival snapshots.
 4. **Integration Points**
    - Harness registration via `crates/beach-buggy` (terminal shim, Cabana adapter, future widgets).
-   - Private Beach Surfer UI for human workflows (Clerk-authenticated; Manager requires Clerk JWKS/issuer config).
+   - Private Beach Surfer UI for human workflows (Clerk-authenticated; Manager trusts Beach Gate JWKS/issuer config).
    - Agent SDKs (`crates/manager-sdk`) for bots or scripting.
    - Billing/analytics sinks (webhooks or internal pipelines).
 

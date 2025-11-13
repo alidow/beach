@@ -1341,9 +1341,7 @@ impl AppState {
             .get_mut("idle_snapshot")
             .and_then(|v| v.as_object_mut())
         {
-            let (token, exp) = self
-                .publish_tokens
-                .sign_for_session(&req.session_id);
+            let (token, exp) = self.publish_tokens.sign_for_session(&req.session_id);
             obj.insert(
                 "publish_token".into(),
                 serde_json::json!({

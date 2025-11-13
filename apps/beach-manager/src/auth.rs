@@ -39,7 +39,7 @@ pub struct AuthContext {
 }
 
 struct JwksCache {
-    keys: HashMap<String, DecodingKey>,
+    keys: HashMap<String, CachedDecodingKey>,
     fetched_at: Instant,
 }
 
@@ -47,6 +47,12 @@ impl JwksCache {
     fn stale(&self, ttl: Duration) -> bool {
         self.fetched_at.elapsed() > ttl
     }
+}
+
+#[derive(Clone)]
+struct CachedDecodingKey {
+    key: DecodingKey,
+    algorithm: Algorithm,
 }
 
 #[derive(Debug, Error)]
@@ -59,6 +65,8 @@ pub enum AuthError {
     MissingKid,
     #[error("unknown jwk key id {0}")]
     UnknownKey(String),
+    #[error("unsupported jwt algorithm {0}")]
+    UnsupportedAlgorithm(String),
     #[error("jwt validation failed: {0}")]
     Jwt(#[from] jsonwebtoken::errors::Error),
     #[error("jwks fetch failed: {0}")]
@@ -135,19 +143,20 @@ impl AuthContext {
         let header = decode_header(token)?;
         let kid = header.kid.ok_or(AuthError::MissingKid)?;
         let key = self.decoding_key(&kid).await?;
+        let algorithm = select_algorithm(header.alg, key.algorithm)?;
 
-        let mut validation = Validation::new(Algorithm::RS256);
+        let mut validation = Validation::new(algorithm);
         if let Some(issuer) = &self.config.issuer {
             validation.set_issuer(&[issuer]);
         }
         if let Some(audience) = &self.config.audience {
             validation.set_audience(&[audience]);
         }
-        let data = decode::<Claims>(token, &key, &validation)?;
+        let data = decode::<Claims>(token, &key.key, &validation)?;
         Ok(data.claims)
     }
 
-    async fn decoding_key(&self, kid: &str) -> Result<DecodingKey, AuthError> {
+    async fn decoding_key(&self, kid: &str) -> Result<CachedDecodingKey, AuthError> {
         {
             let cache = self.cache.read().await;
             if let Some(cache) = cache.as_ref() {
@@ -160,11 +169,11 @@ impl AuthContext {
         }
 
         let mut cache = self.cache.write().await;
-        if cache
+        let needs_refresh = cache
             .as_ref()
-            .map(|c| c.stale(self.config.cache_ttl))
-            .unwrap_or(true)
-        {
+            .map(|c| c.stale(self.config.cache_ttl) || !c.keys.contains_key(kid))
+            .unwrap_or(true);
+        if needs_refresh {
             *cache = Some(self.fetch_jwks().await?);
         }
 
@@ -190,11 +199,51 @@ impl AuthContext {
         let body: JwksResponse = resp.json().await?;
         let mut keys = HashMap::new();
         for key in body.keys {
-            if key.kty != "RSA" {
-                continue;
+            let Jwk {
+                kid,
+                kty,
+                n,
+                e,
+                x,
+                y,
+                crv,
+            } = key;
+
+            match kty.as_str() {
+                "RSA" => {
+                    let (Some(n), Some(e)) = (n, e) else {
+                        continue;
+                    };
+                    let decoding_key = DecodingKey::from_rsa_components(&n, &e)?;
+                    keys.insert(
+                        kid,
+                        CachedDecodingKey {
+                            key: decoding_key,
+                            algorithm: Algorithm::RS256,
+                        },
+                    );
+                }
+                "EC" => {
+                    if crv.as_deref() != Some("P-256") {
+                        continue;
+                    }
+                    let (Some(x), Some(y)) = (x, y) else {
+                        continue;
+                    };
+                    let decoding_key = DecodingKey::from_ec_components(&x, &y)?;
+                    keys.insert(
+                        kid,
+                        CachedDecodingKey {
+                            key: decoding_key,
+                            algorithm: Algorithm::ES256,
+                        },
+                    );
+                }
+                _ => continue,
             }
-            let decoding_key = DecodingKey::from_rsa_components(&key.n, &key.e)?;
-            keys.insert(key.kid, decoding_key);
+        }
+        if keys.is_empty() {
+            return Err(AuthError::JwksFetch("no usable keys returned".into()));
         }
         Ok(JwksCache {
             keys,
@@ -238,6 +287,16 @@ impl AuthContext {
     }
 }
 
+fn select_algorithm(header_alg: Algorithm, key_alg: Algorithm) -> Result<Algorithm, AuthError> {
+    match header_alg {
+        Algorithm::RS256 | Algorithm::ES256 if header_alg == key_alg => Ok(header_alg),
+        Algorithm::RS256 | Algorithm::ES256 => Err(AuthError::UnsupportedAlgorithm(format!(
+            "{header_alg:?} (expected {key_alg:?})"
+        ))),
+        other => Err(AuthError::UnsupportedAlgorithm(format!("{other:?}"))),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct JwksResponse {
     keys: Vec<Jwk>,
@@ -247,6 +306,9 @@ struct JwksResponse {
 struct Jwk {
     kid: String,
     kty: String,
-    n: String,
-    e: String,
+    n: Option<String>,
+    e: Option<String>,
+    x: Option<String>,
+    y: Option<String>,
+    crv: Option<String>,
 }

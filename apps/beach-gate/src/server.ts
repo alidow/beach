@@ -1,6 +1,6 @@
-import { createHmac } from 'node:crypto';
+import { createHmac, type JsonWebKey } from 'node:crypto';
 import Fastify, { FastifyInstance, FastifyReply, FastifyRequest, FastifyServerOptions } from 'fastify';
-import { BeachGateConfig, TurnConfig } from './config.js';
+import { BeachGateConfig, TurnConfig, type SigningKeyMaterial } from './config.js';
 import { ClerkClient, createClerkClient } from './clerk.js';
 import { EntitlementStore } from './entitlements.js';
 import { RefreshTokenStore } from './refresh-store.js';
@@ -49,8 +49,13 @@ export async function buildServer(deps: ServerDependencies): Promise<FastifyInst
   const entitlements = deps.entitlements ?? new EntitlementStore(config);
   const refreshTokens = deps.refreshTokens ?? new RefreshTokenStore(config.refreshTokenTtlSeconds);
   const tokens = deps.tokens ?? new TokenService(config);
+  const jwksResponse = buildJwksResponse(config.signingKey);
 
   fastify.get('/healthz', async () => ({ status: 'ok' }));
+  fastify.get('/.well-known/jwks.json', async (_request, reply) => {
+    reply.header('cache-control', 'public, max-age=60');
+    return jwksResponse;
+  });
 
   fastify.post('/device/start', async (request, reply) => {
     const body = request.body as DeviceStartBody | undefined;
@@ -222,6 +227,45 @@ export async function buildServer(deps: ServerDependencies): Promise<FastifyInst
     }
   });
 
+  fastify.post('/auth/exchange', async (request, reply) => {
+    const clerkToken = extractBearerToken(request);
+    if (!clerkToken) {
+      return reply.status(401).send({ error: 'unauthorized', detail: 'Missing Clerk token.' });
+    }
+
+    try {
+      const userInfo = await clerk.getUserInfo(clerkToken);
+      if (!userInfo?.sub) {
+        throw new Error('clerk_user_missing_sub');
+      }
+
+      const ent = entitlements.resolve({
+        userId: userInfo.sub,
+        email: typeof userInfo.email === 'string' ? userInfo.email : undefined,
+      });
+
+      const access = await tokens.issueAccessToken({
+        userId: userInfo.sub,
+        email: typeof userInfo.email === 'string' ? userInfo.email : undefined,
+        entitlements: ent.entitlements,
+        tier: ent.tier,
+        profile: ent.profile,
+      });
+
+      return reply.status(201).send({
+        access_token: access.token,
+        expires_in: access.expiresIn,
+        token_type: 'Bearer',
+        entitlements: ent.entitlements,
+        tier: ent.tier,
+        profile: ent.profile,
+      });
+    } catch (error) {
+      request.log.warn(error, 'auth.exchange_failed');
+      return reply.status(401).send({ error: 'invalid_clerk_token' });
+    }
+  });
+
   if (config.viewerToken) {
     fastify.post('/viewer/credentials', async (request, reply) => {
       const bearer = extractBearerToken(request);
@@ -315,5 +359,40 @@ function issueTurnCredentials(token: VerifiedAccessToken, turn: TurnConfig) {
     username,
     credential,
     expiresAt: expiresAtSeconds * 1000,
+  };
+}
+
+interface EcJwk {
+  kty: 'EC';
+  crv: 'P-256';
+  x: string;
+  y: string;
+  kid: string;
+  alg: 'ES256';
+  use: 'sig';
+}
+
+interface JwksResponse {
+  keys: EcJwk[];
+}
+
+function buildJwksResponse(signingKey: SigningKeyMaterial): JwksResponse {
+  const jwk = signingKey.publicKey.export({ format: 'jwk' }) as JsonWebKey;
+  if (!jwk.x || !jwk.y) {
+    throw new Error('signing key missing EC coordinates');
+  }
+
+  return {
+    keys: [
+      {
+        kty: 'EC',
+        crv: 'P-256',
+        x: jwk.x,
+        y: jwk.y,
+        kid: signingKey.kid,
+        alg: 'ES256',
+        use: 'sig',
+      },
+    ],
   };
 }

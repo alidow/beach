@@ -35,6 +35,8 @@ export interface VerifiedAccessToken extends JWTPayload {
   tier: string;
   profile: string;
   email?: string;
+  scope?: string;
+  scp?: string[];
 }
 
 export class TokenService {
@@ -43,12 +45,15 @@ export class TokenService {
   async issueAccessToken(context: AccessTokenContext): Promise<IssuedAccessToken> {
     const now = Math.floor(Date.now() / 1000);
     const expiresAtSeconds = now + this.config.accessTokenTtlSeconds;
+    const scope = context.entitlements.join(' ');
     const payload: JWTPayload = {
       sub: context.userId,
       entitlements: context.entitlements,
       tier: context.tier,
       profile: context.profile,
       email: context.email,
+      scope,
+      scp: context.entitlements,
     };
 
     const token = await new SignJWT(payload)

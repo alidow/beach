@@ -31,7 +31,7 @@ This document captures what’s built, how to run it locally, what’s left, and
 - Environment:
   - `DATABASE_URL=postgres://postgres:postgres@localhost:5432/beach_manager`
   - `REDIS_URL=redis://localhost:6379`
-  - Clerk auth (Manager): `BEACH_GATE_JWKS_URL=<clerk-jwks>`, `BEACH_GATE_ISSUER=<clerk-issuer>`, `BEACH_GATE_AUDIENCE=<audience>`; set `AUTH_BYPASS=1` only for dev overrides.
+  - Beach Gate auth (Manager): `BEACH_GATE_JWKS_URL=http://beach-gate:4133/.well-known/jwks.json`, `BEACH_GATE_ISSUER=beach-gate`, `BEACH_GATE_AUDIENCE=private-beach-manager`; keep `AUTH_BYPASS=0` unless you explicitly need the bypass.
   - Clerk auth (Surfer): `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY`, optionally `NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE`.
  - CLI auth: `CLERK_MOCK=1 beach login` (or `cargo run -p beach login`) seeds a local profile for private beaches; `BEACH_MANAGER_REQUIRE_AUTH=1` forces bearer tokens when working against custom hosts like `localhost`.
 

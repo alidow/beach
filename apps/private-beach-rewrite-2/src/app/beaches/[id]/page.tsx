@@ -29,8 +29,11 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
   const { userId, getToken } = await safeAuth();
   const template = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
 
-  const allowedGetToken = userId ? getToken : undefined;
-  const { token, source } = await resolveManagerToken(allowedGetToken, template);
+  const allowedGetToken = typeof getToken === 'function' ? getToken : undefined;
+  const isSignedIn = Boolean(userId);
+  const { token, source } = await resolveManagerToken(allowedGetToken, template, {
+    isAuthenticated: isSignedIn,
+  });
   const managerBaseUrl = resolveManagerBaseUrl();
   const rewriteEnabled = resolveRewriteFlag(searchParams);
 
@@ -43,14 +46,18 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
           subtitle={
             source === 'none'
               ? 'Manager token missing. Configure PRIVATE_BEACH_MANAGER_TOKEN to load this beach.'
-              : 'Sign in to load this beach.'
+              : source === 'exchange_error'
+                ? 'Unable to mint a Beach Gate token. Check Clerk sign-in and Gate connectivity.'
+                : 'Sign in to load this beach.'
           }
         />
         <main className="flex-1">
           <div className="mx-auto flex h-full max-w-4xl flex-col items-center justify-center px-4 text-center text-sm text-muted-foreground sm:px-6 lg:px-8">
             {source === 'none'
               ? 'We could not resolve PRIVATE_BEACH_MANAGER_TOKEN. Follow the instructions in docs/private-beach-rewrite/secret-distribution.md and refresh.'
-              : 'We could not retrieve your access token. Please sign in again to continue.'}
+              : source === 'exchange_error'
+                ? 'We were unable to exchange your Clerk session for a Beach Gate token. Verify Gate is reachable (PRIVATE_BEACH_GATE_URL) and try again.'
+                : 'We could not retrieve your access token. Please sign in again to continue.'}
           </div>
         </main>
       </div>
@@ -170,8 +177,10 @@ export async function generateMetadata({ params }: PageProps): Promise<Metadata>
   const { userId, getToken } = await safeAuth();
   const template = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
 
-  const allowedGetToken = userId ? getToken : undefined;
-  const { token } = await resolveManagerToken(allowedGetToken, template);
+  const allowedGetToken = typeof getToken === 'function' ? getToken : undefined;
+  const { token } = await resolveManagerToken(allowedGetToken, template, {
+    isAuthenticated: Boolean(userId),
+  });
   const managerBaseUrl = resolveManagerBaseUrl();
 
   if (!token) {

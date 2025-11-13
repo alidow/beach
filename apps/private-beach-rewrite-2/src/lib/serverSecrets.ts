@@ -1,4 +1,42 @@
+import { resolvePrivateBeachRewriteEnabled } from '../../../private-beach/src/lib/featureFlags';
+
 type ClerkGetTokenFn = ((options?: { template?: string }) => Promise<string | null>) | undefined;
+
+function resolveGateUrl(): string {
+  const privateUrl = process.env.PRIVATE_BEACH_GATE_URL;
+  if (privateUrl && privateUrl.trim().length > 0) {
+    return privateUrl.trim();
+  }
+  const publicUrl = process.env.NEXT_PUBLIC_PRIVATE_BEACH_GATE_URL ?? process.env.BEACH_GATE_URL;
+  if (publicUrl && publicUrl.trim().length > 0) {
+    return publicUrl.trim();
+  }
+
+  const inferred = inferGateFromManagerUrl();
+  if (inferred) {
+    return inferred;
+  }
+  return 'http://localhost:4133';
+}
+
+function inferGateFromManagerUrl(): string | null {
+  const managerUrl =
+    process.env.PRIVATE_BEACH_MANAGER_URL ??
+    process.env.NEXT_PUBLIC_PRIVATE_BEACH_MANAGER_URL ??
+    process.env.NEXT_PUBLIC_MANAGER_URL;
+  if (!managerUrl) {
+    return null;
+  }
+  try {
+    const parsed = new URL(managerUrl);
+    if (parsed.hostname === 'beach-manager') {
+      return 'http://beach-gate:4133';
+    }
+  } catch {
+    // ignore parse errors
+  }
+  return null;
+}
 
 function resolveEnvToken(): string | null {
   const direct = process.env.PRIVATE_BEACH_MANAGER_TOKEN;
@@ -12,29 +50,69 @@ function resolveEnvToken(): string | null {
   return null;
 }
 
+async function exchangeClerkTokenForGateToken(clerkToken: string): Promise<string | null> {
+  const gateUrl = resolveGateUrl();
+  const url = new URL('/auth/exchange', gateUrl);
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${clerkToken}`,
+    },
+    cache: 'no-store',
+  });
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => response.statusText);
+    throw new Error(`gate_exchange_failed:${response.status}:${detail}`);
+  }
+
+  const body = (await response.json()) as { access_token?: string };
+  const token = body.access_token?.trim() ?? '';
+  return token.length > 0 ? token : null;
+}
+
 export type ManagerTokenResolution = {
   token: string | null;
-  source: 'env' | 'clerk' | 'none';
+  source: 'env' | 'exchange' | 'unauthenticated' | 'exchange_error' | 'none';
+  detail?: string;
+};
+
+type ResolveOptions = {
+  isAuthenticated?: boolean;
 };
 
 export async function resolveManagerToken(
   getToken: ClerkGetTokenFn,
   template: string | undefined,
+  options?: ResolveOptions,
 ): Promise<ManagerTokenResolution> {
   const envToken = resolveEnvToken();
   if (envToken) {
     return { token: envToken, source: 'env' };
   }
 
+  const isAuthenticated = options?.isAuthenticated ?? true;
+  if (!isAuthenticated) {
+    return { token: null, source: 'unauthenticated' };
+  }
+
   if (typeof getToken === 'function') {
     try {
-      const token = await getToken(template ? { template } : undefined);
-      const trimmed = token?.trim() ?? '';
+      const clerkToken = await getToken(template ? { template } : undefined);
+      const trimmed = clerkToken?.trim() ?? '';
       if (trimmed.length > 0) {
-        return { token: trimmed, source: 'clerk' };
+        const gateToken = await exchangeClerkTokenForGateToken(trimmed);
+        if (gateToken) {
+          return { token: gateToken, source: 'exchange' };
+        }
+        return { token: null, source: 'exchange_error', detail: 'gate_token_missing' };
       }
-    } catch {
-      // fall through to none
+    } catch (error) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.warn('[private-beach-rewrite-2] manager token exchange failed', error);
+      }
+      const detail = error instanceof Error ? error.message : String(error);
+      return { token: null, source: 'exchange_error', detail };
     }
   }
 
@@ -52,8 +130,6 @@ export function resolveManagerBaseUrl(): string {
   }
   return 'http://localhost:8080';
 }
-
-import { resolvePrivateBeachRewriteEnabled } from '../../../private-beach/src/lib/featureFlags';
 
 type SearchParamsLike = URLSearchParams | Record<string, string | string[] | undefined> | undefined;
 
@@ -91,3 +167,6 @@ export function resolveRewriteFlag(searchParams: SearchParamsLike): boolean {
   });
 }
 
+export function resolveBeachGateUrl(): string {
+  return resolveGateUrl();
+}

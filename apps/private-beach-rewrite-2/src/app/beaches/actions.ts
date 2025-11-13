@@ -21,13 +21,26 @@ export async function createBeachAction(input: { name: string; slug?: string }) 
     slugProvided: Boolean(input.slug?.trim()),
   });
 
-  const { getToken } = await safeAuth();
+  const { userId, getToken } = await safeAuth();
+  const isSignedIn = Boolean(userId);
   const template = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
-  const { token, source } = await resolveManagerToken(typeof getToken === 'function' ? getToken : undefined, template);
+  const allowedGetToken = typeof getToken === 'function' ? getToken : undefined;
+  const { token, source } = await resolveManagerToken(allowedGetToken, template, {
+    isAuthenticated: isSignedIn,
+  });
   const managerBaseUrl = resolveManagerBaseUrl();
 
   if (!token) {
-    const reason = source === 'none' ? 'Manager token not configured.' : 'Unable to resolve Clerk token.';
+    let reason: string;
+    if (source === 'unauthenticated') {
+      reason = 'Sign in to create private beaches.';
+    } else if (source === 'exchange_error') {
+      reason = 'Unable to mint a Beach Gate token. Ensure Gate is reachable.';
+    } else if (source === 'none') {
+      reason = 'Manager token not configured.';
+    } else {
+      reason = 'Unable to resolve Clerk token.';
+    }
     debug('missing token', { source, reason });
     return { success: false, error: reason };
   }

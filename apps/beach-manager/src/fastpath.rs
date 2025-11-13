@@ -44,8 +44,7 @@ impl FastPathSession {
         ) {
             if let (Ok(start), Ok(end)) = (start_s.parse::<u16>(), end_s.parse::<u16>()) {
                 match EphemeralUDP::new(start, end) {
-                    Ok(ephemeral) =>
-                        setting.set_udp_network(UDPNetwork::Ephemeral(ephemeral)),
+                    Ok(ephemeral) => setting.set_udp_network(UDPNetwork::Ephemeral(ephemeral)),
                     Err(err) => warn!(
                         target = "fast_path",
                         port_start = start,

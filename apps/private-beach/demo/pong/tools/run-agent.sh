@@ -61,39 +61,128 @@ print(token, end='')
 PY
 }
 
-if [[ -z "${PB_MANAGER_TOKEN:-}" ]]; then
-  if ! token=$(ensure_token); then
-    echo "[run-agent] no access token cached for profile '$BEACH_PROFILE'; launching beach login..." >&2
-    (cd "$REPO_ROOT" && cargo run --bin beach -- login --name "$BEACH_PROFILE" --force)
-    if ! token=$(ensure_token); then
-      echo "[run-agent] unable to load access token after login" >&2
-      exit 1
-    fi
+login_cli() {
+  echo "[run-agent] launching beach login for profile '$BEACH_PROFILE'..." >&2
+  (cd "$REPO_ROOT" && cargo run --bin beach -- login --name "$BEACH_PROFILE" --force) >&2
+}
+
+obtain_cli_token() {
+  if token=$(ensure_token); then
+    printf '%s' "$token"
+    return 0
   fi
-  export PB_MANAGER_TOKEN="$token"
+  echo "[run-agent] no access token cached for profile '$BEACH_PROFILE'; launching beach login..." >&2
+  login_cli || return 1
+  if token=$(ensure_token); then
+    printf '%s' "$token"
+    return 0
+  fi
+  echo "[run-agent] unable to load access token after login" >&2
+  return 1
+}
+
+refresh_cli_token() {
+  login_cli || return 1
+  if token=$(ensure_token); then
+    printf '%s' "$token"
+    return 0
+  fi
+  echo "[run-agent] unable to load access token after login" >&2
+  return 1
+}
+
+USER_SUPPLIED_MANAGER_TOKEN=false
+if [[ -z "${PB_MANAGER_TOKEN:-}" ]]; then
+  if ! PB_MANAGER_TOKEN=$(obtain_cli_token); then
+    exit 1
+  fi
+  export PB_MANAGER_TOKEN
 else
+  USER_SUPPLIED_MANAGER_TOKEN=true
   echo "[run-agent] using PB_MANAGER_TOKEN from environment" >&2
 fi
 
-# Default MCP/controller tokens to manager token if not explicitly provided
+USER_SUPPLIED_MCP=false
 if [[ -z "${PB_MCP_TOKEN:-}" ]]; then
   export PB_MCP_TOKEN="$PB_MANAGER_TOKEN"
-fi
-if [[ -z "${PB_CONTROLLER_TOKEN:-}" ]]; then
-  export PB_CONTROLLER_TOKEN="$PB_MANAGER_TOKEN"
+else
+  USER_SUPPLIED_MCP=true
 fi
 
+USER_SUPPLIED_CONTROLLER=false
+if [[ -z "${PB_CONTROLLER_TOKEN:-}" ]]; then
+  export PB_CONTROLLER_TOKEN="$PB_MANAGER_TOKEN"
+else
+  USER_SUPPLIED_CONTROLLER=true
+fi
+
+sync_optional_tokens() {
+  if [[ "$USER_SUPPLIED_MCP" == "false" ]]; then
+    export PB_MCP_TOKEN="$PB_MANAGER_TOKEN"
+  fi
+  if [[ "$USER_SUPPLIED_CONTROLLER" == "false" ]]; then
+    export PB_CONTROLLER_TOKEN="$PB_MANAGER_TOKEN"
+  fi
+}
+
+check_manager_access() {
+  local token="$1"
+  local tmp
+  tmp=$(mktemp)
+  local status
+  status=$(curl -s -o "$tmp" -w "%{http_code}" \
+    -H "authorization: Bearer $token" \
+    "$PRIVATE_BEACH_MANAGER_URL/private-beaches/$PRIVATE_BEACH_ID") || status=0
+  CHECK_STATUS="$status"
+  CHECK_BODY="$(cat "$tmp")"
+  rm -f "$tmp"
+}
+
+sync_optional_tokens
+
 # Sanity-check that the manager token can access the target private beach.
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-  -H "authorization: Bearer $PB_MANAGER_TOKEN" \
-  "$PRIVATE_BEACH_MANAGER_URL/private-beaches/$PRIVATE_BEACH_ID") || STATUS=0
+check_manager_access "$PB_MANAGER_TOKEN"
+STATUS="$CHECK_STATUS"
 if [[ "$STATUS" != "200" ]]; then
-  echo "[run-agent] token cannot access private beach '$PRIVATE_BEACH_ID' (HTTP $STATUS)." >&2
-  echo "  • Profile: $BEACH_PROFILE" >&2
-  echo "  • Manager: $PRIVATE_BEACH_MANAGER_URL" >&2
-  echo "  • Fix: set PB_MANAGER_TOKEN to a Clerk JWT with scopes: pb:sessions.read pb:sessions.write pb:beaches.read pb:beaches.write pb:control.read pb:control.write pb:control.consume" >&2
-  echo "         or re-run beach login with appropriate permissions and audience." >&2
-  exit 1
+  if [[ "$USER_SUPPLIED_MANAGER_TOKEN" == "true" ]]; then
+    echo "[run-agent] provided PB_MANAGER_TOKEN cannot access private beach '$PRIVATE_BEACH_ID' (HTTP $STATUS)." >&2
+    echo "[run-agent] attempting fresh beach login for profile '$BEACH_PROFILE'..." >&2
+    if ! PB_MANAGER_TOKEN=$(refresh_cli_token); then
+      echo "[run-agent] fallback login failed; please verify credentials or scopes." >&2
+      exit 1
+    fi
+    USER_SUPPLIED_MANAGER_TOKEN=false
+  else
+    echo "[run-agent] cached access token failed with HTTP $STATUS; refreshing beach login..." >&2
+    if ! PB_MANAGER_TOKEN=$(refresh_cli_token); then
+      exit 1
+    fi
+  fi
+  export PB_MANAGER_TOKEN
+  sync_optional_tokens
+  check_manager_access "$PB_MANAGER_TOKEN"
+  STATUS="$CHECK_STATUS"
+  if [[ "$STATUS" != "200" ]]; then
+    for attempt in 1 2 3; do
+      sleep 1
+      check_manager_access "$PB_MANAGER_TOKEN"
+      STATUS="$CHECK_STATUS"
+      if [[ "$STATUS" == "200" ]]; then
+        break
+      fi
+    done
+  fi
+  if [[ "$STATUS" != "200" ]]; then
+    echo "[run-agent] token still cannot access private beach '$PRIVATE_BEACH_ID' after login (HTTP $STATUS)." >&2
+    if [[ -n "$CHECK_BODY" ]]; then
+      echo "  • Response: $CHECK_BODY" >&2
+    fi
+    echo "  • Token prefix: ${PB_MANAGER_TOKEN:0:32}..." >&2
+    echo "  • Profile: $BEACH_PROFILE" >&2
+    echo "  • Manager: $PRIVATE_BEACH_MANAGER_URL" >&2
+    echo "  • Ensure this account has pb:beaches.* / pb:sessions.* scopes for the beach." >&2
+    exit 1
+  fi
 fi
 
 LOG_FILE="$LOG_DIR/beach-host-agent.log"

@@ -14,7 +14,7 @@ type ManagerTokenState = {
 };
 
 export function useManagerToken(): ManagerTokenState {
-  const { isLoaded, isSignedIn, getToken } = useAuth();
+  const { isLoaded, isSignedIn } = useAuth();
   const { initialToken } = useInitialManagerToken();
 
   const fallbackToken = useMemo(() => {
@@ -33,14 +33,7 @@ export function useManagerToken(): ManagerTokenState {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const template = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
-
   const refresh = useCallback(async () => {
-    if (fallbackToken) {
-      setToken(fallbackToken);
-      setError(null);
-      return fallbackToken;
-    }
     if (!isLoaded) {
       setToken(null);
       setError('Authentication is still loading.');
@@ -55,10 +48,19 @@ export function useManagerToken(): ManagerTokenState {
     setLoading(true);
     setError(null);
     try {
-      const next = await getToken(template ? { template } : undefined);
-      const trimmed = next?.trim() ?? null;
-      setToken(trimmed && trimmed.length > 0 ? trimmed : null);
-      return trimmed && trimmed.length > 0 ? trimmed : null;
+      const response = await fetch('/api/manager-token', {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+      });
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(detail || 'Unable to refresh manager token.');
+      }
+      const data = (await response.json()) as { token?: string | null };
+      const nextToken = data.token?.trim() ?? null;
+      setToken(nextToken);
+      return nextToken;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setToken(null);
@@ -67,7 +69,7 @@ export function useManagerToken(): ManagerTokenState {
     } finally {
       setLoading(false);
     }
-  }, [fallbackToken, getToken, isLoaded, isSignedIn, template]);
+  }, [isLoaded, isSignedIn]);
 
   useEffect(() => {
     if (fallbackToken) {

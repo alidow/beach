@@ -30,7 +30,7 @@ use tokio::{
     sync::{broadcast, Mutex},
     time::{sleep, timeout},
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::fast_path::{parse_fast_path_endpoints, FastPathClient, FastPathConnection};
 

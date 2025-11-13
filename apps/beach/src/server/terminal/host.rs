@@ -47,16 +47,19 @@ use beach_buggy::{
     AckStatus as CtrlAckStatus, ActionAck as CtrlActionAck, ActionCommand as CtrlActionCommand,
 };
 use reqwest::{Client, StatusCode};
-use serde_json::json;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fmt::{self, Write as _};
 use std::io::{self, IsTerminal, Read, Write};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::runtime::Handle;
 use tokio::sync::{
+    Mutex as AsyncMutex, Notify,
     mpsc::{self, UnboundedSender},
     oneshot, watch,
 };
@@ -152,7 +155,11 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
 
     let hosted = manager.host().await?;
     let session_id = hosted.session_id().to_string();
-    let controller_ctx = Arc::new(ControllerActionContext::new(session_id.clone()));
+    let attach_state = Arc::new(ControllerAttachState::new());
+    let controller_ctx = Arc::new(ControllerActionContext::new(
+        session_id.clone(),
+        attach_state.clone(),
+    ));
     tracing::Span::current().record("session_id", &display(&session_id));
     if bootstrap_mode {
         info!(
@@ -311,6 +318,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         let poll_join_code = join_code.clone();
         let writer_for_actions = writer.clone();
         let controller_ctx_for_actions = controller_ctx.clone();
+        let attach_state_for_actions = attach_state.clone();
         tokio::spawn(async move {
             let http = match Client::builder().build() {
                 Ok(c) => c,
@@ -348,6 +356,12 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                                 let control_id =
                                     item.get("id").and_then(|v| v.as_str()).unwrap_or("");
                                 if kind == "manager_handshake" {
+                                    info!(
+                                        target = "controller.handshake.received",
+                                        session_id = %poll_session_id,
+                                        control_id = %control_id,
+                                        "manager handshake control message received"
+                                    );
                                     if let Some(payload) = item.get("payload") {
                                         let manager_url = payload
                                             .get("manager_url")
@@ -364,7 +378,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                                             && !controller_token.is_empty()
                                         {
                                             info!(
-                                                target = "controller.actions",
+                                                target = "controller.handshake",
                                                 session_id = %poll_session_id,
                                                 manager = %manager_url,
                                                 "manager handshake received; starting action consumer"
@@ -379,6 +393,41 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                                                 writer_for_actions.clone(),
                                             );
                                             consumer_started = true;
+                                        }
+                                        if let Some(auto_hint_value) =
+                                            payload.get("controller_auto_attach")
+                                        {
+                                            match parse_auto_attach_hint_value(auto_hint_value) {
+                                                Ok(auto_hint) => {
+                                                    info!(
+                                                        target = "controller.handshake.attach",
+                                                        session_id = %poll_session_id,
+                                                        private_beach_id = %auto_hint.private_beach_id,
+                                                        "auto-attach hint received via manager handshake"
+                                                    );
+                                                    let attach_state =
+                                                        attach_state_for_actions.clone();
+                                                    let session_for_attach =
+                                                        poll_session_id.clone();
+                                                    tokio::spawn(async move {
+                                                        trigger_auto_attach(
+                                                            auto_hint,
+                                                            AutoAttachSource::Handshake,
+                                                            session_for_attach,
+                                                            attach_state,
+                                                        )
+                                                        .await;
+                                                    });
+                                                }
+                                                Err(err) => {
+                                                    warn!(
+                                                        target = "controller.handshake.attach",
+                                                        session_id = %poll_session_id,
+                                                        error = %err,
+                                                        "failed to parse auto-attach hint from handshake"
+                                                    );
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -424,15 +473,46 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         });
     }
 
+    let metadata_auto_attach =
+        match parse_controller_auto_attach_hint(session_handle.transport_hints()) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    target = "controller.actions",
+                    session_id = %session_id,
+                    error = %err,
+                    "failed to parse controller auto-attach hint from metadata"
+                );
+                None
+            }
+        };
+    let env_manager_url = manager_url_from_env();
+    let env_auto_attach = env_auto_attach_hint(env_manager_url.as_deref());
+    let manager_url_for_actions = metadata_auto_attach
+        .as_ref()
+        .map(|hint| hint.manager_url.clone())
+        .or_else(|| env_manager_url.clone());
+
+    if let Some((hint, source)) =
+        select_auto_attach_hint(metadata_auto_attach.clone(), env_auto_attach.clone())
+    {
+        let session_for_attach = session_id.clone();
+        let attach_state_for_hint = attach_state.clone();
+        tokio::spawn(async move {
+            trigger_auto_attach(hint, source, session_for_attach, attach_state_for_hint).await;
+        });
+    } else {
+        debug!(
+            target = "controller.actions",
+            session_id = %session_id,
+            "auto-attach hint unavailable; skipping"
+        );
+    }
+
     // Spawn a lightweight controller action consumer so manager-queued terminal_write
     // actions can drive this host (used by the Pong demo agent). This is best-effort:
     // if the manager URL/token aren’t configured, the host runs normally.
-    if let Some(manager_url) = std::env::var("PRIVATE_BEACH_MANAGER_URL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| std::env::var("NEXT_PUBLIC_MANAGER_URL").ok())
-    {
-        let manager_url = manager_url.trim().to_string();
+    if let Some(manager_url) = manager_url_for_actions {
         let env_token = std::env::var("PRIVATE_BEACH_MANAGER_TOKEN")
             .ok()
             .map(|v| v.trim().to_string())
@@ -446,7 +526,6 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                 .flatten()
         };
         if let Some(bearer) = token {
-            maybe_auto_attach_session(&manager_url, &session_id, &bearer).await;
             let auth = ManagerActionAuth::Bearer(bearer.clone());
             if let Some(_handle) = spawn_action_consumer(
                 controller_ctx.clone(),
@@ -471,6 +550,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         } else {
             debug!(
                 target = "controller.actions",
+                manager = %manager_url,
                 "manager token unavailable; action consumer disabled"
             );
         }
@@ -841,18 +921,81 @@ impl ControllerTransportSwitch {
 }
 
 #[derive(Clone)]
+struct ControllerAttachState {
+    attached: Arc<AtomicBool>,
+    attempt_lock: Arc<AsyncMutex<()>>,
+    notify: Arc<Notify>,
+    blocking_flag: Arc<Mutex<bool>>,
+    blocking_cv: Arc<Condvar>,
+}
+
+impl ControllerAttachState {
+    fn new() -> Self {
+        Self {
+            attached: Arc::new(AtomicBool::new(false)),
+            attempt_lock: Arc::new(AsyncMutex::new(())),
+            notify: Arc::new(Notify::new()),
+            blocking_flag: Arc::new(Mutex::new(false)),
+            blocking_cv: Arc::new(Condvar::new()),
+        }
+    }
+
+    fn is_attached(&self) -> bool {
+        self.attached.load(Ordering::SeqCst)
+    }
+
+    fn mark_attached(&self) {
+        if !self.attached.swap(true, Ordering::SeqCst) {
+            if let Ok(mut guard) = self.blocking_flag.lock() {
+                *guard = true;
+                self.blocking_cv.notify_all();
+            }
+            self.notify.notify_waiters();
+        }
+    }
+
+    async fn wait_for_attach(&self) {
+        if self.is_attached() {
+            return;
+        }
+        loop {
+            self.notify.notified().await;
+            if self.is_attached() {
+                break;
+            }
+        }
+    }
+
+    fn wait_for_attach_blocking(&self) {
+        if self.is_attached() {
+            return;
+        }
+        let mut guard = self.blocking_flag.lock().unwrap();
+        while !*guard {
+            guard = self.blocking_cv.wait(guard).unwrap();
+        }
+    }
+
+    async fn acquire_attempt_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.attempt_lock.lock().await
+    }
+}
+
+#[derive(Clone)]
 struct ControllerActionContext {
     session_id: String,
     client: Arc<RwLock<Option<Arc<ManagerActionClient>>>>,
     switch: Arc<ControllerTransportSwitch>,
+    attach_state: Arc<ControllerAttachState>,
 }
 
 impl ControllerActionContext {
-    fn new(session_id: String) -> Self {
+    fn new(session_id: String, attach_state: Arc<ControllerAttachState>) -> Self {
         Self {
             session_id,
             client: Arc::new(RwLock::new(None)),
             switch: Arc::new(ControllerTransportSwitch::new()),
+            attach_state,
         }
     }
 
@@ -871,6 +1014,10 @@ impl ControllerActionContext {
 
     fn subscribe(&self) -> watch::Receiver<ControllerTransportState> {
         self.switch.subscribe()
+    }
+
+    fn attach_state(&self) -> Arc<ControllerAttachState> {
+        Arc::clone(&self.attach_state)
     }
 
     fn fast_path_online(&self) {
@@ -925,6 +1072,15 @@ fn run_fast_path_controller_channel(
     controller_ctx: Arc<ControllerActionContext>,
     runtime: Handle,
 ) -> ControllerChannelOutcome {
+    let attach_state = controller_ctx.attach_state();
+    if !attach_state.is_attached() {
+        info!(
+            target = "controller.actions.fast_path",
+            session_id = %session_id,
+            "waiting for manager attach before accepting fast path controller channel"
+        );
+        attach_state.wait_for_attach_blocking();
+    }
     controller_ctx.fast_path_online();
     let transport_id = transport.id().0;
     info!(
@@ -1128,8 +1284,22 @@ fn spawn_action_consumer(
     ctx.set_client(client.clone());
     let mut transport_state = ctx.subscribe();
     let session_for_actions = ctx.session_id().to_string();
+    let attach_state = ctx.attach_state();
 
     Some(tokio::spawn(async move {
+        if !attach_state.is_attached() {
+            info!(
+                target = "controller.actions",
+                session_id = %session_for_actions,
+                "waiting for manager attach before starting controller action consumer"
+            );
+            attach_state.wait_for_attach().await;
+            info!(
+                target = "controller.actions",
+                session_id = %session_for_actions,
+                "manager attach confirmed; controller action consumer starting"
+            );
+        }
         let mut paused_for_fast_path = false;
         loop {
             if matches!(
@@ -2258,84 +2428,366 @@ fn display_cmd(cmd: &[String]) -> String {
     rendered
 }
 
-async fn maybe_auto_attach_session(manager_url: &str, session_id: &str, bearer: &str) {
-    let beach_id = std::env::var("PRIVATE_BEACH_ID")
-        .ok()
-        .filter(|v| !v.trim().is_empty());
-    let passcode = std::env::var("PRIVATE_BEACH_SESSION_PASSCODE")
-        .ok()
-        .filter(|v| !v.trim().is_empty());
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct ControllerAutoAttachHint {
+    manager_url: String,
+    private_beach_id: String,
+    attach_code: String,
+    issued_at: Option<String>,
+    expires_at: Option<String>,
+}
 
-    let (beach_id, passcode) = match (beach_id, passcode) {
-        (Some(id), Some(code)) => (id.trim().to_string(), code.trim().to_string()),
-        _ => {
-            debug!(
-                target = "controller.actions",
-                "skipping auto-attach; PRIVATE_BEACH_ID or PRIVATE_BEACH_SESSION_PASSCODE not set"
-            );
-            return;
+#[derive(Debug, Deserialize)]
+struct RawAutoAttachHint {
+    manager_url: String,
+    private_beach_id: String,
+    attach_code: String,
+    #[serde(default)]
+    issued_at: Option<String>,
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+#[derive(Debug)]
+enum AutoAttachParseError {
+    Deserialize(String),
+    MissingField(&'static str),
+}
+
+impl fmt::Display for AutoAttachParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AutoAttachParseError::Deserialize(err) => write!(f, "invalid payload: {err}"),
+            AutoAttachParseError::MissingField(field) => {
+                write!(f, "missing required field {field}")
+            }
         }
-    };
+    }
+}
 
-    let client = match Client::builder().build() {
-        Ok(c) => c,
+impl std::error::Error for AutoAttachParseError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoAttachSource {
+    Metadata,
+    Env,
+    Handshake,
+}
+
+impl AutoAttachSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            AutoAttachSource::Metadata => "metadata",
+            AutoAttachSource::Env => "env",
+            AutoAttachSource::Handshake => "handshake",
+        }
+    }
+}
+
+fn parse_controller_auto_attach_hint(
+    hints: &HashMap<String, Value>,
+) -> Result<Option<ControllerAutoAttachHint>, AutoAttachParseError> {
+    match hints.get("controller_auto_attach") {
+        Some(value) if !value.is_null() => parse_auto_attach_hint_value(value).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn parse_auto_attach_hint_value(
+    value: &Value,
+) -> Result<ControllerAutoAttachHint, AutoAttachParseError> {
+    let payload: RawAutoAttachHint = serde_json::from_value(value.clone())
+        .map_err(|err| AutoAttachParseError::Deserialize(err.to_string()))?;
+    let manager_url = payload.manager_url.trim();
+    if manager_url.is_empty() {
+        return Err(AutoAttachParseError::MissingField("manager_url"));
+    }
+    let private_beach_id = payload.private_beach_id.trim();
+    if private_beach_id.is_empty() {
+        return Err(AutoAttachParseError::MissingField("private_beach_id"));
+    }
+    let attach_code = payload.attach_code.trim();
+    if attach_code.is_empty() {
+        return Err(AutoAttachParseError::MissingField("attach_code"));
+    }
+    Ok(ControllerAutoAttachHint {
+        manager_url: manager_url.to_string(),
+        private_beach_id: private_beach_id.to_string(),
+        attach_code: attach_code.to_string(),
+        issued_at: payload.issued_at,
+        expires_at: payload.expires_at,
+    })
+}
+
+fn manager_url_from_env() -> Option<String> {
+    std::env::var("PRIVATE_BEACH_MANAGER_URL")
+        .ok()
+        .or_else(|| std::env::var("NEXT_PUBLIC_MANAGER_URL").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_auto_attach_hint(manager_url: Option<&str>) -> Option<ControllerAutoAttachHint> {
+    let manager_url = manager_url?.trim();
+    if manager_url.is_empty() {
+        return None;
+    }
+    let private_beach_id = std::env::var("PRIVATE_BEACH_ID")
+        .ok()
+        .map(|value| value.trim().to_string())?;
+    if private_beach_id.is_empty() {
+        return None;
+    }
+    let attach_code = std::env::var("PRIVATE_BEACH_SESSION_PASSCODE")
+        .ok()
+        .map(|value| value.trim().to_string())?;
+    if attach_code.is_empty() {
+        return None;
+    }
+    Some(ControllerAutoAttachHint {
+        manager_url: manager_url.to_string(),
+        private_beach_id,
+        attach_code,
+        issued_at: None,
+        expires_at: None,
+    })
+}
+
+async fn resolve_manager_bearer(manager_url: &str) -> Option<String> {
+    if let Some(token) = std::env::var("PRIVATE_BEACH_MANAGER_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(token);
+    }
+    match auth::maybe_access_token(None, auth::manager_requires_access_token(manager_url)).await {
+        Ok(token) => token,
         Err(err) => {
             warn!(
                 target = "controller.actions",
+                manager = %manager_url,
                 error = %err,
-                "failed to build HTTP client for auto-attach"
+                "failed to resolve manager bearer token"
             );
-            return;
+            None
+        }
+    }
+}
+
+const AUTO_ATTACH_MAX_ATTEMPTS: usize = 5;
+const AUTO_ATTACH_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const AUTO_ATTACH_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+fn attach_log_target(source: AutoAttachSource) -> &'static str {
+    match source {
+        AutoAttachSource::Handshake => "controller.handshake.attach",
+        _ => "controller.actions",
+    }
+}
+
+fn select_auto_attach_hint(
+    metadata: Option<ControllerAutoAttachHint>,
+    env: Option<ControllerAutoAttachHint>,
+) -> Option<(ControllerAutoAttachHint, AutoAttachSource)> {
+    metadata
+        .map(|hint| (hint, AutoAttachSource::Metadata))
+        .or_else(|| env.map(|hint| (hint, AutoAttachSource::Env)))
+}
+
+async fn trigger_auto_attach(
+    hint: ControllerAutoAttachHint,
+    source: AutoAttachSource,
+    session_id: String,
+    attach_state: Arc<ControllerAttachState>,
+) {
+    if attach_state.is_attached() {
+        return;
+    }
+    let _guard = attach_state.acquire_attempt_guard().await;
+    if attach_state.is_attached() {
+        return;
+    }
+    let mut attempt = 1;
+    let mut backoff = AUTO_ATTACH_INITIAL_BACKOFF;
+    loop {
+        if maybe_auto_attach_session(&hint, &session_id, source, attempt).await {
+            attach_state.mark_attached();
+            break;
+        }
+        if attempt >= AUTO_ATTACH_MAX_ATTEMPTS {
+            warn!(
+                target = attach_log_target(source),
+                session_id = %session_id,
+                private_beach_id = %hint.private_beach_id,
+                manager = %hint.manager_url,
+                source = source.as_str(),
+                attempts = attempt,
+                "auto-attach attempts exhausted"
+            );
+            break;
+        }
+        info!(
+            target = attach_log_target(source),
+            session_id = %session_id,
+            private_beach_id = %hint.private_beach_id,
+            manager = %hint.manager_url,
+            source = source.as_str(),
+            attempt = attempt + 1,
+            backoff_ms = backoff.as_millis() as u64,
+            "auto-attach retry scheduled"
+        );
+        sleep(backoff).await;
+        attempt += 1;
+        backoff = (backoff * 2).min(AUTO_ATTACH_MAX_BACKOFF);
+    }
+}
+
+async fn maybe_auto_attach_session(
+    hint: &ControllerAutoAttachHint,
+    session_id: &str,
+    source: AutoAttachSource,
+    attempt: usize,
+) -> bool {
+    let log_target = attach_log_target(source);
+    let handshake = matches!(source, AutoAttachSource::Handshake);
+    let bearer = match resolve_manager_bearer(&hint.manager_url).await {
+        Some(token) => token,
+        None => {
+            debug!(
+                target = log_target,
+                manager = %hint.manager_url,
+                source = source.as_str(),
+                "skipping auto-attach; bearer token unavailable"
+            );
+            return false;
+        }
+    };
+    let client = match Client::builder().build() {
+        Ok(c) => c,
+        Err(err) => {
+            warn!(target = log_target, error = %err, "failed to build HTTP client for auto-attach");
+            return false;
         }
     };
 
     let endpoint = format!(
         "{}/private-beaches/{}/sessions/attach-by-code",
-        manager_url.trim_end_matches('/'),
-        beach_id
+        hint.manager_url.trim_end_matches('/'),
+        hint.private_beach_id
     );
-    info!(
-        target = "controller.actions",
-        session_id = %session_id,
-        private_beach_id = %beach_id,
-        "attempting auto-attach via manager"
-    );
+    if handshake {
+        info!(
+            target = log_target,
+            session_id = %session_id,
+            private_beach_id = %hint.private_beach_id,
+            manager = %hint.manager_url,
+            source = source.as_str(),
+            attempt,
+            issued_at = hint.issued_at.as_deref().unwrap_or("unknown"),
+            expires_at = hint.expires_at.as_deref().unwrap_or("unspecified"),
+            "auto-attach via handshake"
+        );
+    } else {
+        info!(
+            target = log_target,
+            session_id = %session_id,
+            private_beach_id = %hint.private_beach_id,
+            manager = %hint.manager_url,
+            source = source.as_str(),
+            attempt,
+            issued_at = hint.issued_at.as_deref().unwrap_or("unknown"),
+            expires_at = hint.expires_at.as_deref().unwrap_or("unspecified"),
+            "attempting auto-attach via manager"
+        );
+    }
 
     match client
         .post(&endpoint)
         .bearer_auth(bearer)
-        .json(&json!({ "session_id": session_id, "code": passcode }))
+        .json(&json!({ "session_id": session_id, "code": hint.attach_code }))
         .send()
         .await
     {
         Ok(response) if response.status().is_success() => {
-            info!(
-                target = "controller.actions",
-                session_id = %session_id,
-                private_beach_id = %beach_id,
-                "auto-attached session via manager"
-            );
+            if handshake {
+                info!(
+                    target = log_target,
+                    session_id = %session_id,
+                    private_beach_id = %hint.private_beach_id,
+                    manager = %hint.manager_url,
+                    source = source.as_str(),
+                    attempt,
+                    "auto-attached via handshake"
+                );
+            } else {
+                info!(
+                    target = log_target,
+                    session_id = %session_id,
+                    private_beach_id = %hint.private_beach_id,
+                    manager = %hint.manager_url,
+                    source = source.as_str(),
+                    attempt,
+                    "auto-attached session via manager"
+                );
+            }
+            true
         }
         Ok(response) => {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            warn!(
-                target = "controller.actions",
-                session_id = %session_id,
-                private_beach_id = %beach_id,
-                status = %status,
-                body = %body,
-                "auto-attach request rejected"
-            );
+            if handshake {
+                warn!(
+                    target = log_target,
+                    session_id = %session_id,
+                    private_beach_id = %hint.private_beach_id,
+                    manager = %hint.manager_url,
+                    source = source.as_str(),
+                    status = %status,
+                    body = %body,
+                    attempt,
+                    "handshake auto-attach rejected"
+                );
+            } else {
+                warn!(
+                    target = log_target,
+                    session_id = %session_id,
+                    private_beach_id = %hint.private_beach_id,
+                    manager = %hint.manager_url,
+                    source = source.as_str(),
+                    status = %status,
+                    body = %body,
+                    attempt,
+                    "auto-attach request rejected"
+                );
+            }
+            false
         }
         Err(err) => {
-            warn!(
-                target = "controller.actions",
-                session_id = %session_id,
-                private_beach_id = %beach_id,
-                error = %err,
-                "auto-attach request failed"
-            );
+            if handshake {
+                warn!(
+                    target = log_target,
+                    session_id = %session_id,
+                    private_beach_id = %hint.private_beach_id,
+                    manager = %hint.manager_url,
+                    source = source.as_str(),
+                    error = %err,
+                    attempt,
+                    "handshake auto-attach request failed"
+                );
+            } else {
+                warn!(
+                    target = log_target,
+                    session_id = %session_id,
+                    private_beach_id = %hint.private_beach_id,
+                    manager = %hint.manager_url,
+                    source = source.as_str(),
+                    error = %err,
+                    attempt,
+                    "auto-attach request failed"
+                );
+            }
+            false
         }
     }
 }
@@ -2362,6 +2814,7 @@ mod tests {
     use crate::sync::{ServerSynchronizer, SubscriptionId};
     use crate::transport::{Payload, TransportKind, TransportPair};
     use serde_json::json;
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration as StdDuration, Instant};
@@ -2388,6 +2841,168 @@ mod tests {
     }
 
     #[test]
+    fn parse_auto_attach_hint_from_metadata() {
+        let mut hints = HashMap::new();
+        hints.insert(
+            "controller_auto_attach".into(),
+            json!({
+                "manager_url": "http://localhost:8080",
+                "private_beach_id": "pb-123",
+                "attach_code": "CODE99",
+                "issued_at": "2024-01-01T00:00:00Z"
+            }),
+        );
+        let parsed = parse_controller_auto_attach_hint(&hints)
+            .expect("parser should succeed")
+            .expect("hint should be present");
+        assert_eq!(parsed.manager_url, "http://localhost:8080");
+        assert_eq!(parsed.private_beach_id, "pb-123");
+        assert_eq!(parsed.attach_code, "CODE99");
+        assert_eq!(parsed.issued_at.as_deref(), Some("2024-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn parse_auto_attach_hint_from_handshake_payload() {
+        let value = json!({
+            "manager_url": "http://localhost:8080",
+            "private_beach_id": "pb-456",
+            "attach_code": "654321",
+            "issued_at": "2025-02-02T12:34:56Z",
+        });
+        let parsed =
+            parse_auto_attach_hint_value(&value).expect("handshake payload should parse into hint");
+        assert_eq!(parsed.manager_url, "http://localhost:8080");
+        assert_eq!(parsed.private_beach_id, "pb-456");
+        assert_eq!(parsed.attach_code, "654321");
+        assert_eq!(parsed.issued_at.as_deref(), Some("2025-02-02T12:34:56Z"));
+    }
+
+    #[test]
+    fn controller_attach_state_wakes_blocking_waiters() {
+        let state = Arc::new(ControllerAttachState::new());
+        let wait_state = state.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = thread::spawn(move || {
+            wait_state.wait_for_attach_blocking();
+            tx.send(()).expect("send wake signal");
+        });
+        std::thread::sleep(StdDuration::from_millis(50));
+        assert!(rx.try_recv().is_err(), "waiter should still be blocked");
+        state.mark_attached();
+        rx.recv_timeout(StdDuration::from_secs(1))
+            .expect("waiter should resume once attached");
+        handle.join().expect("waiter thread joined");
+    }
+
+    #[tokio::test]
+    async fn handshake_auto_attach_retries_until_success() {
+        use hyper::body::to_bytes;
+        use hyper::service::{make_service_fn, service_fn};
+        use hyper::{Body, Method, Request, Response, Server, header};
+
+        let _token_guard = EnvGuard::set("PRIVATE_BEACH_MANAGER_TOKEN", "test-token");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_server = attempts.clone();
+        let make_svc = make_service_fn(move |_| {
+            let attempts = attempts_for_server.clone();
+            async move {
+                Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
+                    let attempts = attempts.clone();
+                    async move {
+                        assert_eq!(req.method(), Method::POST);
+                        assert_eq!(
+                            req.uri().path(),
+                            "/private-beaches/pb-99/sessions/attach-by-code"
+                        );
+                        let auth = req
+                            .headers()
+                            .get(header::AUTHORIZATION)
+                            .expect("authorization header");
+                        assert_eq!(auth, "Bearer test-token");
+                        let (_parts, body) = req.into_parts();
+                        let body = to_bytes(body).await.expect("read body");
+                        let payload: Value = serde_json::from_slice(&body).expect("json payload");
+                        assert_eq!(
+                            payload.get("session_id").and_then(|v| v.as_str()),
+                            Some("sess-1")
+                        );
+                        assert_eq!(
+                            payload.get("code").and_then(|v| v.as_str()),
+                            Some("CODE-42")
+                        );
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                        if attempt == 1 {
+                            Ok::<_, hyper::Error>(
+                                Response::builder()
+                                    .status(hyper::StatusCode::INTERNAL_SERVER_ERROR)
+                                    .body(Body::empty())
+                                    .expect("build failure response"),
+                            )
+                        } else {
+                            Ok::<_, hyper::Error>(Response::new(Body::empty()))
+                        }
+                    }
+                }))
+            }
+        });
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        std_listener.set_nonblocking(true).expect("set nonblocking");
+        let addr = std_listener.local_addr().expect("local addr");
+        let server = Server::from_tcp(std_listener)
+            .expect("server from tcp")
+            .serve(make_svc);
+        let server_handle = tokio::spawn(server);
+
+        let manager_url = format!("http://{}", addr);
+        let hint = ControllerAutoAttachHint {
+            manager_url,
+            private_beach_id: "pb-99".into(),
+            attach_code: "CODE-42".into(),
+            issued_at: None,
+            expires_at: None,
+        };
+        let attach_state = Arc::new(ControllerAttachState::new());
+        let session_id = "sess-1".to_string();
+        trigger_auto_attach(
+            hint,
+            AutoAttachSource::Handshake,
+            session_id,
+            attach_state.clone(),
+        )
+        .await;
+        assert!(attach_state.is_attached(), "attach state should be marked");
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "auto-attach should retry on failure"
+        );
+
+        server_handle.abort();
+        let _ = server_handle.await;
+    }
+
+    #[test]
+    fn select_auto_attach_hint_prefers_metadata() {
+        let metadata = Some(ControllerAutoAttachHint {
+            manager_url: "http://manager".into(),
+            private_beach_id: "pb-meta".into(),
+            attach_code: "META".into(),
+            issued_at: None,
+            expires_at: None,
+        });
+        let env = Some(ControllerAutoAttachHint {
+            manager_url: "http://env".into(),
+            private_beach_id: "pb-env".into(),
+            attach_code: "ENV".into(),
+            issued_at: None,
+            expires_at: None,
+        });
+        let (selected, source) = select_auto_attach_hint(metadata.clone(), env.clone())
+            .expect("a hint should be selected");
+        assert_eq!(source, AutoAttachSource::Metadata);
+        assert_eq!(selected.private_beach_id, "pb-meta");
+    }
+
+    #[test]
     fn fast_path_channel_writes_and_acks_without_manager() {
         let runtime = Runtime::new().expect("runtime");
         let pair = TransportPair::new(TransportKind::Ipc);
@@ -2399,7 +3014,12 @@ mod tests {
             buffer: buffer.clone(),
         }));
 
-        let ctx = Arc::new(ControllerActionContext::new("sess-fast-path".into()));
+        let attach_state = Arc::new(ControllerAttachState::new());
+        attach_state.mark_attached();
+        let ctx = Arc::new(ControllerActionContext::new(
+            "sess-fast-path".into(),
+            attach_state,
+        ));
         let handle = runtime.handle().clone();
 
         let host_ctx = ctx.clone();
@@ -2458,7 +3078,12 @@ mod tests {
             buffer: Arc::new(Mutex::new(Vec::new())),
         }));
 
-        let ctx = Arc::new(ControllerActionContext::new("sess-drop".into()));
+        let attach_state = Arc::new(ControllerAttachState::new());
+        attach_state.mark_attached();
+        let ctx = Arc::new(ControllerActionContext::new(
+            "sess-drop".into(),
+            attach_state,
+        ));
         let handle = runtime.handle().clone();
 
         let host_ctx = ctx.clone();
@@ -2695,6 +3320,29 @@ mod tests {
                 }
                 Err(TransportError::ChannelClosed) => panic!("transport channel closed"),
                 Err(err) => panic!("transport error: {err}"),
+            }
+        }
+    }
+
+    struct EnvGuard {
+        key: String,
+    }
+
+    impl EnvGuard {
+        fn set(key: &str, value: &str) -> Self {
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self {
+                key: key.to_string(),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var(&self.key);
             }
         }
     }

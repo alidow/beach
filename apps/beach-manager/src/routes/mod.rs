@@ -83,6 +83,10 @@ pub fn build_router(state: AppState) -> Router {
             post(fastpath::answer_offer),
         )
         .route(
+            "/fastpath/sessions/:session_id/webrtc/answer",
+            get(fastpath::get_local_answer),
+        )
+        .route(
             "/fastpath/sessions/:session_id/webrtc/ice",
             post(fastpath::add_remote_ice).get(fastpath::list_local_ice),
         )
@@ -125,15 +129,26 @@ pub enum ApiError {
     Forbidden(&'static str),
     NotFound(&'static str),
     Conflict(&'static str),
+    ConflictWithCode {
+        message: &'static str,
+        code: &'static str,
+    },
+    PreconditionFailed {
+        message: &'static str,
+        code: &'static str,
+    },
     TooManyRequests(&'static str),
     BadRequest(String),
     Upstream(&'static str),
+    Internal,
 }
 
 #[derive(Debug, Serialize)]
 struct ApiErrorBody<'a> {
     error: &'a str,
     message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<String>,
 }
 
 impl IntoResponse for ApiError {
@@ -144,6 +159,7 @@ impl IntoResponse for ApiError {
                 Json(ApiErrorBody {
                     error: "unauthorized",
                     message: None,
+                    error_code: None,
                 }),
             )
                 .into_response(),
@@ -152,6 +168,7 @@ impl IntoResponse for ApiError {
                 Json(ApiErrorBody {
                     error: "too_many_requests",
                     message: Some(msg.to_string()),
+                    error_code: None,
                 }),
             )
                 .into_response(),
@@ -160,6 +177,7 @@ impl IntoResponse for ApiError {
                 Json(ApiErrorBody {
                     error: "forbidden",
                     message: Some(msg.to_string()),
+                    error_code: None,
                 }),
             )
                 .into_response(),
@@ -168,6 +186,7 @@ impl IntoResponse for ApiError {
                 Json(ApiErrorBody {
                     error: "not_found",
                     message: Some(msg.to_string()),
+                    error_code: None,
                 }),
             )
                 .into_response(),
@@ -176,6 +195,25 @@ impl IntoResponse for ApiError {
                 Json(ApiErrorBody {
                     error: "conflict",
                     message: Some(msg.to_string()),
+                    error_code: None,
+                }),
+            )
+                .into_response(),
+            ApiError::ConflictWithCode { message, code } => (
+                axum::http::StatusCode::CONFLICT,
+                Json(ApiErrorBody {
+                    error: "conflict",
+                    message: Some(message.to_string()),
+                    error_code: Some(code.to_string()),
+                }),
+            )
+                .into_response(),
+            ApiError::PreconditionFailed { message, code } => (
+                axum::http::StatusCode::PRECONDITION_FAILED,
+                Json(ApiErrorBody {
+                    error: "precondition_failed",
+                    message: Some(message.to_string()),
+                    error_code: Some(code.to_string()),
                 }),
             )
                 .into_response(),
@@ -184,6 +222,7 @@ impl IntoResponse for ApiError {
                 Json(ApiErrorBody {
                     error: "bad_request",
                     message: Some(msg),
+                    error_code: None,
                 }),
             )
                 .into_response(),
@@ -192,6 +231,16 @@ impl IntoResponse for ApiError {
                 Json(ApiErrorBody {
                     error: "upstream_error",
                     message: Some(msg.to_string()),
+                    error_code: None,
+                }),
+            )
+                .into_response(),
+            ApiError::Internal => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorBody {
+                    error: "internal_error",
+                    message: Some("internal server error".into()),
+                    error_code: None,
                 }),
             )
                 .into_response(),

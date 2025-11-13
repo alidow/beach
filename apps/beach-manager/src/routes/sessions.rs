@@ -17,9 +17,9 @@ use uuid::Uuid;
 use crate::{
     log_throttle::{should_log_queue_event, QueueLogKind},
     state::{
-        AgentOnboardResponse, AppState, ControllerEvent, ControllerLeaseResponse,
-        ControllerPairing, ControllerUpdateCadence, JoinSessionResponsePayload, SessionSummary,
-        StateError,
+        AgentOnboardResponse, AppState, ControllerCommandDropReason, ControllerEvent,
+        ControllerLeaseResponse, ControllerPairing, ControllerUpdateCadence,
+        JoinSessionResponsePayload, SessionSummary, StateError,
     },
 };
 
@@ -115,6 +115,8 @@ pub struct ControllerHandshakeResponse {
     pub lease_expires_at_ms: Option<i64>,
     pub stale_session_idle_secs: u64,
     pub viewer_health_interval_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller_auto_attach: Option<crate::state::ControllerAutoAttachHint>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,10 +255,10 @@ pub async fn issue_controller_handshake(
     {
         Ok(summary) => summary,
         Err(StateError::InvalidIdentifier(_)) => {
-            return Err(ApiError::Forbidden("invalid_passcode"))
+            return Err(ApiError::Forbidden("invalid_passcode"));
         }
         Err(StateError::PrivateBeachNotFound) => {
-            return Err(ApiError::NotFound("private beach not found"))
+            return Err(ApiError::NotFound("private beach not found"));
         }
         Err(StateError::SessionNotFound) => return Err(ApiError::NotFound("session not found")),
         Err(err) => return Err(map_state_err(err)),
@@ -274,6 +276,10 @@ pub async fn issue_controller_handshake(
         .map_err(map_state_err)?;
 
     let manager_url = state.public_manager_url().to_string();
+    let controller_auto_attach = Some(state.build_controller_auto_attach_hint(
+        &session_summary.private_beach_id,
+        body.passcode.trim(),
+    ));
     let response = ControllerHandshakeResponse {
         private_beach_id: session_summary.private_beach_id.clone(),
         manager_url,
@@ -281,6 +287,7 @@ pub async fn issue_controller_handshake(
         lease_expires_at_ms: Some(lease.expires_at_ms),
         stale_session_idle_secs: crate::state::STALE_SESSION_MAX_IDLE.as_secs(),
         viewer_health_interval_secs: crate::state::viewer_health_report_interval().as_secs(),
+        controller_auto_attach,
     };
 
     Ok(Json(response))
@@ -742,8 +749,22 @@ fn map_state_err(err: StateError) -> ApiError {
             error!(message = %msg, "external dependency failure");
             ApiError::Upstream("external service failure")
         }
+        StateError::Internal(msg) => {
+            error!(message = %msg, "internal controller error");
+            ApiError::Internal
+        }
         StateError::ActionQueueFull { .. } => {
             ApiError::TooManyRequests("pending controller action queue full")
         }
+        StateError::ControllerCommandRejected { reason } => match reason {
+            ControllerCommandDropReason::FastPathNotReady => ApiError::PreconditionFailed {
+                message: reason.default_message(),
+                code: reason.code(),
+            },
+            _ => ApiError::ConflictWithCode {
+                message: reason.default_message(),
+                code: reason.code(),
+            },
+        },
     }
 }

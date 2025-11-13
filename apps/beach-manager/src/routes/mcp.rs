@@ -361,12 +361,17 @@ fn state_error(id: Option<Value>, err: StateError) -> JsonRpcResponse {
             error!(error = %serde_err, "serialization error while processing MCP request");
             (-32603, "serialization error".into())
         }
+        StateError::ControllerCommandRejected { reason } => (-32014, reason.code().into()),
         StateError::External(message) => {
             error!(message = %message, "external service error while processing MCP request");
             (-32012, "external service error".into())
         }
         StateError::ActionQueueFull { .. } => {
             (-32013, "pending controller action queue full".into())
+        }
+        StateError::Internal(message) => {
+            error!(message = %message, "internal controller error while processing MCP request");
+            (-32603, "internal server error".into())
         }
     };
 

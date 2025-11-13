@@ -1,16 +1,12 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Json,
 };
 use serde::Deserialize;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
-use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription as _;
-use webrtc::peer_connection::sdp::session_description::*;
 
-pub use crate::fastpath::FastPathSession;
-pub use crate::fastpath::{send_actions_over_fast_path, FastPathRegistry};
+use crate::fastpath::FastPathSession;
 use crate::{
     routes::{ApiError, ApiResult, AuthToken},
     state::AppState,
@@ -30,6 +26,12 @@ pub async fn answer_offer(
 ) -> ApiResult<serde_json::Value> {
     // Harness publishes; require publish scope
     crate::routes::sessions::ensure_scope(&token, "pb:harness.publish").map_err(|e| e)?;
+    if !body.r#type.eq_ignore_ascii_case("offer") {
+        return Err(ApiError::BadRequest(format!(
+            "expected SDP type 'offer', got '{}'",
+            body.r#type
+        )));
+    }
     let offer = RTCSessionDescription::offer(body.sdp)
         .map_err(|e| ApiError::BadRequest(format!("invalid offer: {e}")))?;
     let fps = FastPathSession::new(session_id.clone())
@@ -48,6 +50,13 @@ pub struct IceBody {
     pub candidate: String,
     pub sdp_mid: Option<String>,
     pub sdp_mline_index: Option<u16>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct AnswerQuery {
+    pub handshake_id: Option<String>,
+    pub to_peer: Option<String>,
+    pub from_peer: Option<String>,
 }
 
 pub async fn add_remote_ice(
@@ -85,4 +94,30 @@ pub async fn list_local_ice(
         .ok_or(ApiError::NotFound("fast path not found"))?;
     let list = fps.local_ice.read().await.clone();
     Ok(Json(serde_json::json!({ "candidates": list })))
+}
+
+pub async fn get_local_answer(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(session_id): Path<String>,
+    Query(query): Query<AnswerQuery>,
+) -> ApiResult<serde_json::Value> {
+    crate::routes::sessions::ensure_scope(&token, "pb:harness.publish").map_err(|e| e)?;
+    let fps = state
+        .fast_path_for(&session_id)
+        .await
+        .ok_or(ApiError::NotFound("fast path not found"))?;
+    let Some(answer) = fps.local_description().await else {
+        return Err(ApiError::NotFound("fast path answer not ready"));
+    };
+    let sdp = answer.sdp;
+    let typ = answer.sdp_type.to_string();
+    let payload = serde_json::json!({
+        "sdp": sdp,
+        "type": typ,
+        "handshake_id": query.handshake_id.unwrap_or_else(|| "fastpath".into()),
+        "from_peer": query.from_peer.unwrap_or_else(|| "private-beach-manager".into()),
+        "to_peer": query.to_peer.unwrap_or_else(|| "fastpath-client".into())
+    });
+    Ok(Json(payload))
 }

@@ -26,6 +26,8 @@ pub struct AppConfig {
     pub public_manager_url: Option<String>,
     #[serde(default)]
     pub log_path: Option<String>,
+    #[serde(default = "default_true")]
+    pub controller_strict_gating: bool,
 }
 
 impl AppConfig {
@@ -47,10 +49,15 @@ impl AppConfig {
                 beach_road_url: None,
                 public_manager_url: None,
                 log_path: None,
+                controller_strict_gating: true,
             })
     }
 }
 
 fn default_bind_addr() -> String {
     "0.0.0.0:8080".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }

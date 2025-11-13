@@ -237,8 +237,8 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
 
   const handleTerminalHoverLeave = useCallback(
     (event: PointerEvent<HTMLDivElement>) => {
-      const nextTarget = event.relatedTarget as HTMLElement | null;
-      if (nextTarget?.closest(INTERACT_BUTTON_SELECTOR)) {
+      const nextTarget = event.relatedTarget;
+      if (nextTarget instanceof Element && nextTarget.closest(INTERACT_BUTTON_SELECTOR)) {
         return;
       }
       setTerminalHover(false);
@@ -251,8 +251,8 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
   }, []);
 
   const handleInteractButtonLeave = useCallback((event: PointerEvent<HTMLButtonElement>) => {
-    const nextTarget = event.relatedTarget as HTMLElement | null;
-    if (nextTarget?.closest(TILE_HOVER_LAYER_SELECTOR)) {
+    const nextTarget = event.relatedTarget;
+    if (nextTarget instanceof Element && nextTarget.closest(TILE_HOVER_LAYER_SELECTOR)) {
       return;
     }
     setTerminalHover(false);

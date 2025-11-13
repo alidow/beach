@@ -100,6 +100,10 @@ impl FastPathSession {
         self.pc.add_ice_candidate(cand).await
     }
 
+    pub async fn local_description(&self) -> Option<RTCSessionDescription> {
+        self.pc.local_description().await
+    }
+
     pub fn spawn_receivers(self: &Arc<Self>, state: AppState) {
         let ack_session = Arc::clone(self);
         let ack_state = state.clone();

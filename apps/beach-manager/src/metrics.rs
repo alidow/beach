@@ -32,6 +32,32 @@ pub static ACTIONS_DELIVERED: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+pub static CONTROLLER_FAST_PATH_DELIVERIES: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "controller_fast_path_deliveries_total",
+            "Controller actions delivered over fast-path transports",
+        ),
+        &["private_beach_id", "session_id"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+pub static CONTROLLER_FAST_PATH_FALLBACKS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "controller_fast_path_fallbacks_total",
+            "Fast-path controller transport fallbacks to HTTP",
+        ),
+        &["private_beach_id", "session_id"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
 pub static ACTIONS_ACKED: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new("actions_acked_total", "Actions acked by harnesses"),
@@ -40,6 +66,35 @@ pub static ACTIONS_ACKED: Lazy<IntCounterVec> = Lazy::new(|| {
     .unwrap();
     REGISTRY.register(Box::new(c.clone())).ok();
     c
+});
+
+pub static CONTROLLER_ACTIONS_DROPPED: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "controller_actions_dropped_total",
+            "Controller commands dropped by manager gating",
+        ),
+        &["reason"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+pub static CONTROLLER_COMMAND_BLOCK_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
+    let h = HistogramVec::new(
+        HistogramOpts::new(
+            "controller_command_block_latency_seconds",
+            "Time spent blocking controller commands after attach",
+        )
+        .buckets(vec![
+            0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
+        ]),
+        &["reason"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(h.clone())).ok();
+    h
 });
 
 pub static QUEUE_DEPTH: Lazy<IntGaugeVec> = Lazy::new(|| {

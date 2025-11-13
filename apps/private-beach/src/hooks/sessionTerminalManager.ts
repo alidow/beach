@@ -1,4 +1,4 @@
-import { fetchViewerCredential } from '../lib/api';
+import { attachByCode, fetchViewerCredential } from '../lib/api';
 import {
   connectBrowserTransport,
   type BrowserTransportConnection,
@@ -58,6 +58,8 @@ type ManagerEntry = {
   disposed: boolean;
   reconnectAttempts: number;
   lastCloseReason: string | null;
+  lastAttachKey: string | null;
+  attachPromise: Promise<void> | null;
 };
 
 const entries = new Map<string, ManagerEntry>();
@@ -87,6 +89,72 @@ function debugLog(message: string, detail?: Record<string, unknown>) {
   const payload = detail ? JSON.stringify(detail) : '';
   // eslint-disable-next-line no-console
   console.info(`[terminal-manager][rewrite] ${message}${payload ? ` ${payload}` : ''}`);
+}
+
+async function ensureSessionAttached(entry: ManagerEntry, passcode: string | null): Promise<void> {
+  const trimmedPasscode = passcode?.trim();
+  if (!trimmedPasscode || trimmedPasscode.length === 0) {
+    return;
+  }
+  const privateBeachId = entry.params.privateBeachId?.trim();
+  if (!privateBeachId || privateBeachId.length === 0) {
+    return;
+  }
+  const authToken = entry.params.effectiveAuthToken?.trim();
+  if (!authToken || authToken.length === 0) {
+    return;
+  }
+  const attachKey = `${privateBeachId}:${entry.params.sessionId}:${trimmedPasscode}`;
+  if (entry.lastAttachKey === attachKey) {
+    return;
+  }
+  if (entry.attachPromise) {
+    try {
+      await entry.attachPromise;
+    } catch {
+      // ignore prior failure and retry below
+    }
+    if (entry.lastAttachKey === attachKey) {
+      return;
+    }
+  }
+  entry.attachPromise = (async () => {
+    try {
+      debugLog('session.attach_by_code.start', {
+        sessionId: entry.params.sessionId,
+        privateBeachId,
+      });
+      await attachByCode(privateBeachId, entry.params.sessionId, trimmedPasscode, authToken, entry.params.managerUrl);
+      entry.lastAttachKey = attachKey;
+      debugLog('session.attach_by_code.success', {
+        sessionId: entry.params.sessionId,
+        privateBeachId,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // Treat duplicate attaches as success; the mapping already exists.
+      if (message.includes('409')) {
+        entry.lastAttachKey = attachKey;
+        debugLog('session.attach_by_code.duplicate', {
+          sessionId: entry.params.sessionId,
+          privateBeachId,
+        });
+        return;
+      }
+      debugLog('session.attach_by_code.error', {
+        sessionId: entry.params.sessionId,
+        privateBeachId,
+        message,
+      });
+    } finally {
+      entry.attachPromise = null;
+    }
+  })();
+  try {
+    await entry.attachPromise;
+  } catch {
+    // Swallow attach failures to avoid blocking viewer connection attempts.
+  }
 }
 
 function summarizeStoreSnapshot(store: TerminalGridStore): SnapshotSummary | null {
@@ -217,6 +285,8 @@ function getOrCreateEntry(key: string, params: PreparedConnectionParams): Manage
     disposed: false,
     reconnectAttempts: 0,
     lastCloseReason: null,
+    lastAttachKey: null,
+    attachPromise: null,
   };
   applyFollowTailState(entry, true, 'entry-init');
   entries.set(key, entry);
@@ -411,6 +481,9 @@ async function resolveCredentials(entry: ManagerEntry): Promise<{
   if (entry.params.hasOverrideCredentials) {
     const pass = entry.params.overrides.passcode;
     const viewerToken = entry.params.overrides.viewerToken;
+    if (pass && pass.length > 0) {
+      await ensureSessionAttached(entry, pass);
+    }
     debugLog('resolveCredentials.override', {
       key: entry.key,
       sessionId: entry.params.sessionId,
@@ -445,6 +518,9 @@ async function resolveCredentials(entry: ManagerEntry): Promise<{
         hasPasscode: passcode.length > 0,
         hasViewerToken: Boolean(viewerToken),
       });
+      if (passcode.length > 0) {
+        await ensureSessionAttached(entry, passcode);
+      }
       return {
         passcode: passcode.length > 0 ? passcode : null,
         viewerToken,

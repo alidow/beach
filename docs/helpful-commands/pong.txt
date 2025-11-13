@@ -84,6 +84,7 @@ cd ~/development/beach && cargo run --bin beach -- \
 Agent (single line; no session-id envs; just declare beach + manager)
 
 
+export PRIVATE_BEACH_MANAGER_URL=http://localhost:8080
 cd ~/development/beach
 chmod +x apps/private-beach/demo/pong/tools/run-agent.sh
 apps/private-beach/demo/pong/tools/run-agent.sh 4185e6be-4c1a-40a0-b285-272f8b44265f

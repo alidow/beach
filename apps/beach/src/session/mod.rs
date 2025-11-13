@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -103,6 +104,7 @@ impl SessionManager {
             join_code,
             transports,
             websocket_url,
+            transport_hints,
         } = response;
 
         if !success {
@@ -136,6 +138,7 @@ impl SessionManager {
             session_url,
             join_code: Some(join_code.clone()),
             offers,
+            transport_hints,
         };
 
         Ok(HostSession { handle })
@@ -217,6 +220,7 @@ impl SessionManager {
             session_url,
             join_code: None,
             offers,
+            transport_hints: HashMap::new(),
         };
 
         Ok(JoinedSession { handle })
@@ -323,6 +327,7 @@ pub struct SessionHandle {
     pub session_url: Url,
     pub join_code: Option<String>,
     pub offers: Vec<TransportOffer>,
+    pub transport_hints: HashMap<String, Value>,
 }
 
 impl SessionHandle {
@@ -336,6 +341,10 @@ impl SessionHandle {
 
     pub fn offers(&self) -> &[TransportOffer] {
         &self.offers
+    }
+
+    pub fn transport_hints(&self) -> &HashMap<String, Value> {
+        &self.transport_hints
     }
 
     pub fn session_id(&self) -> &str {
@@ -508,6 +517,8 @@ struct RegisterSessionResponse {
     transports: Vec<AdvertisedTransport>,
     #[serde(default)]
     websocket_url: Option<String>,
+    #[serde(default)]
+    transport_hints: HashMap<String, Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -717,6 +728,7 @@ mod tests {
                     join_code: None,
                     transports: Vec::new(),
                     websocket_url: None,
+                    transport_hints: HashMap::new(),
                 });
             }
 
@@ -743,6 +755,7 @@ mod tests {
                     metadata: None,
                 }],
                 websocket_url: None,
+                transport_hints: HashMap::new(),
             })
         }
 

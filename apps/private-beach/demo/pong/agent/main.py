@@ -21,8 +21,9 @@ import socket
 import threading
 import time
 import uuid
-from collections import deque
+from collections import deque, defaultdict
 from dataclasses import dataclass, field
+from enum import Enum
 from getpass import getpass
 from pathlib import Path
 from typing import Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
@@ -66,6 +67,32 @@ PADDLE_GLYPHS = frozenset(
 )
 
 BALL_GLYPHS = frozenset({"o", ".", "*", "\u25cf"})  # supports ● plus ascii fallbacks
+TRANSPORT_READY_STATES = frozenset(
+    {"fast_path", "http_fallback", "http_poller", "state_stream"}
+)
+
+
+def normalize_transport_status(value: Optional[str]) -> str:
+    if value is None:
+        return "pending"
+    normalized = (
+        str(value)
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+    if not normalized:
+        return "pending"
+    if normalized in {"fastpath", "pb_controller", "mgr_actions", "pbcontroller"}:
+        return "fast_path"
+    if normalized in {"httpfallback", "http_fallback"}:
+        return "http_fallback"
+    if normalized in {"http", "http_poll", "http_polling", "http_poller"}:
+        return "http_poller"
+    if normalized in {"state", "state_stream", "stream"}:
+        return "state_stream"
+    return normalized
 
 
 def parse_host_port(value: str) -> Optional[Tuple[str, int]]:
@@ -191,7 +218,7 @@ class PairingSubscriber(threading.Thread):
         private_beach_id: str,
         output: "queue.Queue[Tuple[str, object]]",
         stop_event: threading.Event,
-        on_pairing: Callable[[str, str, Dict[str, object]], None],
+        on_pairing: Callable[[str, str, Dict[str, object], Dict[str, object]], None],
     ) -> None:
         super().__init__(daemon=True)
         self.client = client
@@ -234,7 +261,7 @@ class PairingSubscriber(threading.Thread):
             self.output,
         )
         metadata["update_cadence"] = pairing.get("update_cadence")
-        self._callback(child_session_id, action, metadata)
+        self._callback(child_session_id, action, metadata, pairing if isinstance(pairing, dict) else {})
         self.output.put(
             (
                 "info",
@@ -821,6 +848,14 @@ def autopair_sessions(
     )
 
 
+@dataclass
+class CommandDispatchResult:
+    success: bool
+    status: str
+    status_code: Optional[int] = None
+    detail: Optional[str] = None
+
+
 class MCPClient:
     """Thin MCP client that can queue actions over HTTP and/or a local sink."""
 
@@ -894,7 +929,7 @@ class MCPClient:
     def http_enabled(self) -> bool:
         return bool(self._base_url)
 
-    def queue_terminal_write(self, session_id: str, data: str) -> bool:
+    def queue_terminal_write(self, session_id: str, data: str) -> CommandDispatchResult:
         command_id = str(uuid.uuid4())
         action_payload = {
             "id": command_id,
@@ -907,11 +942,11 @@ class MCPClient:
         transport_label = "log"
         status = "recorded"
 
-        send_success = True
+        result = CommandDispatchResult(True, "recorded")
         if self._base_url:
             transport_label = "http"
-            send_success = self._send_http(session_id, action_payload)
-            status = "sent" if send_success else "error"
+            result = self._send_http(session_id, action_payload)
+            status = result.status
 
         serialized = json.dumps(
             {
@@ -955,9 +990,9 @@ class MCPClient:
                 "trace_id": trace_id,
             }
         )
-        return send_success
+        return result
 
-    def _send_http(self, session_id: str, action_payload: Dict[str, object]) -> bool:
+    def _send_http(self, session_id: str, action_payload: Dict[str, object]) -> CommandDispatchResult:
         token = self.current_session_token(session_id)
         if not token:
             self._callback(
@@ -966,10 +1001,10 @@ class MCPClient:
                     "message": f"no controller token configured for {session_id}; skipping queue_action",
                 }
             )
-            return False
+            return CommandDispatchResult(False, "missing_token")
 
         if not self._base_url:
-            return False
+            return CommandDispatchResult(False, "http_disabled")
 
         encoded_session = urllib.parse.quote(session_id, safe="")
         url = urllib.parse.urljoin(
@@ -994,7 +1029,7 @@ class MCPClient:
             with urllib.request.urlopen(request, timeout=self._timeout) as response:
                 # Drain response to allow connection reuse.
                 response.read()
-            return True
+            return CommandDispatchResult(True, "sent")
         except TimeoutError as exc:
             self._callback(
                 {
@@ -1002,7 +1037,7 @@ class MCPClient:
                     "message": f"queue_action timeout for {session_id}: {exc}",
                 }
             )
-            return False
+            return CommandDispatchResult(False, "timeout", detail=str(exc))
         except socket.timeout as exc:  # pragma: no cover - network path
             self._callback(
                 {
@@ -1010,7 +1045,7 @@ class MCPClient:
                     "message": f"queue_action socket timeout for {session_id}: {exc}",
                 }
             )
-            return False
+            return CommandDispatchResult(False, "timeout", detail=str(exc))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")
             self._callback(
@@ -1019,17 +1054,23 @@ class MCPClient:
                     "message": f"queue_action HTTP {exc.code} for {session_id}: {detail}",
                 }
             )
+            status = "http_error"
+            if exc.code == 429:
+                status = "throttled"
+            elif exc.code == 409:
+                status = "not_attached"
             if exc.code == 409 and self._on_conflict:
                 self._on_conflict(session_id)
-            return False
+            return CommandDispatchResult(False, status, status_code=exc.code, detail=detail)
         except urllib.error.URLError as exc:
+            message = getattr(exc, "reason", str(exc))
             self._callback(
                 {
                     "level": "error",
-                    "message": f"queue_action transport error for {session_id}: {exc.reason}",
+                    "message": f"queue_action transport error for {session_id}: {message}",
                 }
             )
-            return False
+            return CommandDispatchResult(False, "transport_error", detail=str(message))
 
     def close(self) -> None:
         if self._socket:  # pragma: no cover - cleanup path
@@ -1063,6 +1104,10 @@ class SessionState:
     last_velocity: Optional[Tuple[float, float]] = None
     action_failures: int = 0
     action_backoff_until: float = 0.0
+    lease_active: bool = False
+    transport_ready: bool = False
+    transport_status: Optional[str] = None
+    transport_last_update: float = 0.0
 
 
     def apply_terminal_frame(
@@ -1140,6 +1185,221 @@ class SessionState:
         return max((len(line) for line in self.lines), default=0)
 
 
+class CommandScheduler:
+    class RunState(Enum):
+        WAITING = "waiting"
+        RUNNING = "running"
+        PAUSED = "paused"
+
+    def __init__(
+        self,
+        log_func: Callable[[str, str], None],
+        *,
+        enabled: bool,
+        per_session_rate: int = 30,
+        readiness_timeout: float = 5.0,
+        wait_log_interval: float = 3.0,
+    ) -> None:
+        self._log = log_func
+        self.enabled = enabled
+        self.per_session_rate = max(1, int(per_session_rate))
+        self.readiness_timeout = readiness_timeout
+        self.wait_log_interval = wait_log_interval
+        self._rate_windows: Dict[str, Deque[float]] = defaultdict(deque)
+        self._last_rate_notice: Dict[str, float] = {}
+        self._players_ready = not enabled
+        self._ready_sides: Set[str] = set()
+        self._missing_sides: Set[str] = set()
+        self._missing_reasons: Dict[str, str] = {}
+        self._last_wait_log = 0.0
+        self._state = (
+            CommandScheduler.RunState.RUNNING
+            if not enabled
+            else CommandScheduler.RunState.WAITING
+        )
+        self._pause_until = 0.0
+        self._pause_reason: Optional[str] = None
+
+    @property
+    def players_ready(self) -> bool:
+        return self._players_ready
+
+    def _transition_state(
+        self, new_state: "CommandScheduler.RunState", reason: str, now: float
+    ) -> None:
+        if not self.enabled:
+            self._state = CommandScheduler.RunState.RUNNING
+            return
+        if new_state == self._state:
+            return
+        self._state = new_state
+        if new_state is CommandScheduler.RunState.WAITING:
+            self._log(
+                f"waiting for players ({reason}) before sending commands",
+                level="warn",
+            )
+            self._last_wait_log = now
+        elif new_state is CommandScheduler.RunState.RUNNING:
+            self._log("players ready; controller commands running", level="info")
+        elif new_state is CommandScheduler.RunState.PAUSED:
+            self._log(f"pausing controller commands ({reason})", level="warn")
+
+    def _update_state_after_flags(self, now: float) -> None:
+        if not self.enabled:
+            self._state = CommandScheduler.RunState.RUNNING
+            return
+        if not self._players_ready:
+            summary = self._format_missing_summary(self._missing_reasons)
+            self._transition_state(CommandScheduler.RunState.WAITING, summary, now)
+            return
+        if now < self._pause_until:
+            remaining = max(self._pause_until - now, 0.0)
+            reason = self._pause_reason or "backoff"
+            summary = f"{reason}; {remaining:.2f}s remaining"
+            self._transition_state(CommandScheduler.RunState.PAUSED, summary, now)
+            return
+        if self._state is not CommandScheduler.RunState.RUNNING:
+            self._pause_until = 0.0
+            self._pause_reason = None
+            self._transition_state(
+                CommandScheduler.RunState.RUNNING, "players ready", now
+            )
+
+    @property
+    def state(self) -> "CommandScheduler.RunState":
+        return self._state
+
+    def update_player_readiness(
+        self, sessions: Iterable[SessionState], now: float
+    ) -> bool:
+        if not self.enabled:
+            self._players_ready = True
+            return True
+        ready: Set[str] = set()
+        missing_reasons: Dict[str, str] = {}
+        for session in sessions:
+            if session.side not in {"lhs", "rhs"}:
+                continue
+            blocker = self._readiness_blocker(session, now)
+            if blocker is None:
+                ready.add(session.side)
+            else:
+                missing_reasons[session.side] = blocker
+        missing = {"lhs", "rhs"} - ready
+        for side in missing:
+            missing_reasons.setdefault(side, "absent")
+        all_ready = not missing
+        self._players_ready = all_ready
+        self._ready_sides = ready
+        self._missing_sides = missing
+        self._missing_reasons = missing_reasons
+        self._update_state_after_flags(now)
+        if not all_ready:
+            self._maybe_log_waiting(now)
+        else:
+            self._last_wait_log = 0.0
+        return all_ready
+
+    def allow_command(self, session: SessionState, now: float) -> bool:
+        if not self.enabled:
+            return True
+        if not self._players_ready:
+            return False
+        if now < self._pause_until:
+            return False
+        return self._consume_rate_slot(session, now)
+
+    def handle_result(
+        self, session: SessionState, result: CommandDispatchResult, now: float
+    ) -> None:
+        if result.success:
+            session.action_failures = 0
+            session.action_backoff_until = 0.0
+            if now >= self._pause_until:
+                self._pause_until = 0.0
+                self._pause_reason = None
+            self._update_state_after_flags(now)
+            return
+        session.action_failures = min(session.action_failures + 1, 8)
+        delay = min(0.5 * (2 ** (session.action_failures - 1)), 10.0)
+        detail = f" detail={result.detail}" if result.detail else ""
+        pause_reason: Optional[str] = None
+        if result.status == "throttled":
+            delay = max(delay, 1.5)
+            pause_reason = "throttled"
+            self._log(
+                f"manager throttled commands for {session.session_id}; backing off {delay:.2f}s",
+                level="warn",
+            )
+        elif result.status == "not_attached":
+            delay = max(delay, 2.0)
+            pause_reason = "controller_not_attached"
+            self._log(
+                f"controller not attached for {session.session_id}; retrying in {delay:.2f}s",
+                level="warn",
+            )
+        else:
+            status_note = result.status
+            if result.status_code:
+                status_note = f"{status_note} ({result.status_code})"
+            self._log(
+                f"queue_action failed for {session.session_id} ({status_note}){detail}; retrying in {delay:.2f}s",
+                level="warn",
+            )
+        session.action_backoff_until = now + delay
+        if pause_reason:
+            self._pause_reason = pause_reason
+            self._pause_until = max(self._pause_until, session.action_backoff_until)
+        self._update_state_after_flags(now)
+
+    def _consume_rate_slot(self, session: SessionState, now: float) -> bool:
+        window = self._rate_windows[session.session_id]
+        while window and now - window[0] > 1.0:
+            window.popleft()
+        if len(window) >= self.per_session_rate:
+            last_notice = self._last_rate_notice.get(session.session_id, 0.0)
+            if now - last_notice >= self.wait_log_interval:
+                label = session.side or session.session_id
+                self._log(
+                    f"rate limiter throttling {label} ({session.session_id}); max {self.per_session_rate} cmd/s",
+                    level="debug",
+                )
+                self._last_rate_notice[session.session_id] = now
+            return False
+        window.append(now)
+        return True
+
+    def _maybe_log_waiting(self, now: float) -> None:
+        if self._state is not CommandScheduler.RunState.WAITING:
+            return
+        if now - self._last_wait_log < self.wait_log_interval:
+            return
+        self._log(
+            f"waiting for players ({self._format_missing_summary(self._missing_reasons)}) before sending commands",
+            level="info",
+        )
+        self._last_wait_log = now
+
+    def _readiness_blocker(self, session: SessionState, now: float) -> Optional[str]:
+        if not session.lease_active:
+            return "lease"
+        if not session.transport_ready:
+            label = session.transport_status or "transport"
+            return f"transport:{label}"
+        if session.height <= 0:
+            return "state"
+        if now - session.last_update > self.readiness_timeout:
+            return "stale"
+        return None
+
+    def _format_missing_summary(self, reasons: Dict[str, str]) -> str:
+        if not reasons:
+            return "players"
+        parts = []
+        for side in sorted(reasons.keys()):
+            parts.append(f"{side}({reasons.get(side, 'pending')})")
+        return ", ".join(parts)
+
 class AgentApp:
     def __init__(
         self,
@@ -1156,6 +1416,7 @@ class AgentApp:
         prompt_pack: Optional[Dict[str, object]] = None,
         mcp_bridges: Optional[List[Dict[str, object]]] = None,
         headless: bool = False,
+        safe_mode: bool = True,
     ) -> None:
         self.stdscr = stdscr
         self.session_roles = session_roles
@@ -1169,6 +1430,7 @@ class AgentApp:
         self.command_interval = command_interval
         self.prompt_pack = prompt_pack or {}
         self.headless = headless
+        self.safe_mode = safe_mode
 
         self.sessions: Dict[str, SessionState] = {}
         self.logs: List[str] = []
@@ -1200,6 +1462,11 @@ class AgentApp:
             if endpoint == "private_beach.queue_action" and not self.mcp.http_enabled:
                 state = "disabled"
             self.bridge_states[bridge_id] = state
+
+        self.scheduler = CommandScheduler(
+            self.log,
+            enabled=self.safe_mode,
+        )
 
     # ------------------------------------------------------------------ Logging
     def log(self, message: str, level: str = "info") -> None:
@@ -1388,6 +1655,10 @@ class AgentApp:
                         self.log_event(event)
                 elif isinstance(payload, dict):
                     self.log_event(payload)
+            elif kind == "transport":
+                self._handle_transport_event(payload, now)
+            elif kind == "lease":
+                self._handle_lease_event(payload)
 
     def _handle_diff(self, source: object, now: float) -> None:
         if isinstance(source, str):
@@ -1416,8 +1687,11 @@ class AgentApp:
         if not isinstance(payload, dict):
             self.log(f"invalid payload envelope: {event}", level="warn")
             return
-
+        session = self.ensure_session(session_id)
         payload_type = payload.get("type")
+        if payload_type == "terminal_heartbeat":
+            session.last_update = now
+            return
         if payload_type != "terminal_full":
             self.log(f"ignoring payload type {payload_type}", level="debug")
             return
@@ -1429,15 +1703,73 @@ class AgentApp:
             col = cursor_raw.get("col")
             if isinstance(row, int) and isinstance(col, int):
                 cursor = (row, col)
-        session = self.ensure_session(session_id)
         if session.side is None and session_id in self.session_roles:
             session.side = self.session_roles[session_id]
         session.apply_terminal_frame(
             [str(line) for line in lines if isinstance(line, str)], cursor, int(sequence), now
         )
+        if (
+            not session.transport_ready
+            and session.lease_active
+            and session.height > 0
+        ):
+            session.transport_status = "state_stream"
+            session.transport_ready = True
+            session.transport_last_update = now
+            self.log(
+                f"transport ready for {session.session_id} via state stream",
+                level="info",
+            )
+
+    def _handle_transport_event(self, payload: object, now: float) -> None:
+        if not isinstance(payload, dict):
+            return
+        session_id = payload.get("session_id")
+        if not isinstance(session_id, str):
+            return
+        status = normalize_transport_status(payload.get("status"))
+        session = self.ensure_session(session_id)
+        previous_ready = session.transport_ready
+        session.transport_status = status if status != "pending" else None
+        session.transport_last_update = now
+        session.transport_ready = status in TRANSPORT_READY_STATES
+        if session.transport_ready and not previous_ready:
+            via = status or "transport"
+            self.log(
+                f"transport ready for {session.session_id} via {via}",
+                level="info",
+            )
+        elif previous_ready and not session.transport_ready:
+            label = status or "pending"
+            self.log(
+                f"transport unavailable for {session.session_id} ({label})",
+                level="warn",
+            )
+
+    def _handle_lease_event(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        session_id = payload.get("session_id")
+        if not isinstance(session_id, str):
+            return
+        status_raw = payload.get("status")
+        status = str(status_raw or "").lower()
+        session = self.ensure_session(session_id)
+        previous = session.lease_active
+        session.lease_active = status == "active"
+        if session.lease_active and not previous:
+            self.log(f"controller lease active for {session.session_id}", level="info")
+        elif previous and not session.lease_active:
+            self.log(
+                f"controller lease lost for {session.session_id}",
+                level="warn",
+            )
 
     # ------------------------------------------------------------- Autopilot
     def _autopilot_tick(self, now: float) -> None:
+        if not self.scheduler.update_player_readiness(self.sessions.values(), now):
+            self._set_bridge_state_for_endpoint("private_beach.queue_action", "waiting")
+            return
         for session in list(self.sessions.values()):
             if session.ball_exit:
                 self._handle_ball_exit(session, now)
@@ -1654,6 +1986,7 @@ class AgentApp:
 
     def _send_command(self, session: SessionState, command: str) -> None:
         now = time.monotonic()
+        self.scheduler.update_player_readiness(self.sessions.values(), now)
         if session.action_backoff_until > now:
             remaining = session.action_backoff_until - now
             self.log(
@@ -1662,21 +1995,16 @@ class AgentApp:
             )
             self._set_bridge_state_for_endpoint("private_beach.queue_action", "waiting")
             return
+        if not self.scheduler.allow_command(session, now):
+            self._set_bridge_state_for_endpoint("private_beach.queue_action", "waiting")
+            return
         payload = f"{command}\n"
-        success = self.mcp.queue_terminal_write(session.session_id, payload)
-        if success:
+        result = self.mcp.queue_terminal_write(session.session_id, payload)
+        if result.success:
             self._set_bridge_state_for_endpoint("private_beach.queue_action", "sent")
-            session.action_failures = 0
-            session.action_backoff_until = 0.0
         else:
             self._set_bridge_state_for_endpoint("private_beach.queue_action", "error")
-            session.action_failures = min(session.action_failures + 1, 8)
-            delay = min(0.5 * (2 ** (session.action_failures - 1)), 10.0)
-            session.action_backoff_until = now + delay
-            self.log(
-                f"queue_action failed for {session.session_id}; retrying in {delay:.2f}s",
-                level="warn",
-            )
+        self.scheduler.handle_result(session, result, now)
 
     # -------------------------------------------------------------- Commands
     def _handle_keys(self) -> None:
@@ -2082,6 +2410,15 @@ def main() -> int:
 
     session_role_map = parse_session_mapping(args.session)
     diff_queue: "queue.Queue[Tuple[str, object]]" = queue.Queue()
+    safe_mode_raw = os.environ.get("PONG_AGENT_SAFE_MODE")
+    safe_mode_value = safe_mode_raw.strip() if safe_mode_raw is not None else "1"
+    safe_mode_enabled = safe_mode_value.lower() not in {"0", "false", "off", "no"}
+    diff_queue.put(
+        (
+            "info",
+            f"command pacing {'enabled' if safe_mode_enabled else 'disabled'} (PONG_AGENT_SAFE_MODE={safe_mode_raw or 'unset'})",
+        )
+    )
     stop_event = threading.Event()
     state_subscribers: Dict[str, StateSubscriber] = {}
     state_pollers: Dict[str, StatePoller] = {}
@@ -2115,6 +2452,15 @@ def main() -> int:
         on_conflict=lambda sid: schedule_autopair_refresh(f"queue_action 409 for {sid}"),
     )
 
+    def publish_transport_status(
+        session_id: str, status: str, *, action: Optional[str] = None
+    ) -> None:
+        normalized = normalize_transport_status(status)
+        payload: Dict[str, object] = {"session_id": session_id, "status": normalized}
+        if action:
+            payload["action"] = action
+        diff_queue.put(("transport", payload))
+
     def start_state_stream(session_id: str, role: Optional[str] = None) -> None:
         if not manager_client or session_id in state_subscribers:
             return
@@ -2142,6 +2488,7 @@ def main() -> int:
             renewer.join(timeout=1.0)
             session_tokens.pop(session_id, None)
             mcp_client.clear_session_token(session_id)
+            diff_queue.put(("lease", {"session_id": session_id, "status": "inactive"}))
 
     def ensure_child_lease(session_id: str, role: Optional[str], *, force: bool = False) -> None:
         if not manager_client:
@@ -2173,6 +2520,7 @@ def main() -> int:
                 f"controller lease acquired for {session_id} (expires at {lease.expires_at_ms})",
             )
         )
+        diff_queue.put(("lease", {"session_id": session_id, "status": "active"}))
 
         local_stop = threading.Event()
 
@@ -2198,6 +2546,7 @@ def main() -> int:
         poller = state_pollers.get(session_id)
         if poller:
             poller.update_interval(interval)
+            publish_transport_status(session_id, "http_poller", action="poller_updated")
             return
         poller = StatePoller(
             manager_client,
@@ -2208,12 +2557,14 @@ def main() -> int:
         )
         poller.start()
         state_pollers[session_id] = poller
+        publish_transport_status(session_id, "http_poller", action="poller_started")
 
     def stop_state_poller(session_id: str) -> None:
         poller = state_pollers.pop(session_id, None)
         if poller:
             poller.stop()
             poller.join(timeout=1.0)
+            publish_transport_status(session_id, "poller_inactive", action="poller_stopped")
 
     def cleanup_session(session_id: str) -> None:
         stop_state_poller(session_id)
@@ -2248,7 +2599,12 @@ def main() -> int:
             autopair_refresh_reasons.append(reason)
         autopair_refresh_event.set()
 
-    def handle_pairing_event(child_session_id: str, action: str, metadata: Dict[str, object]) -> None:
+    def handle_pairing_event(
+        child_session_id: str,
+        action: str,
+        metadata: Dict[str, object],
+        pairing: Dict[str, object],
+    ) -> None:
         trace_value = metadata.get("trace_id")
         if isinstance(trace_value, str) and trace_value.strip():
             mcp_client.set_trace_id(child_session_id, trace_value.strip())
@@ -2266,6 +2622,16 @@ def main() -> int:
             stop_state_poller(child_session_id)
             stop_child_lease(child_session_id)
             stop_state_stream(child_session_id)
+
+        transport_status = None
+        status_payload = pairing.get("transport_status") if isinstance(pairing, dict) else None
+        if isinstance(status_payload, dict):
+            transport_status = status_payload.get("transport")
+        if action == "removed":
+            transport_status = "detached"
+        publish_transport_status(
+            child_session_id, transport_status or "pending", action=action
+        )
 
     autopair_ctx: Optional[AutopairContext] = None
     autopair_ready = threading.Event()
@@ -2447,9 +2813,15 @@ def main() -> int:
             prompt_pack=getattr(autopair_ctx, "prompt_pack", None) if autopair_ctx else None,
             mcp_bridges=getattr(autopair_ctx, "mcp_bridges", None) if autopair_ctx else None,
             headless=args.headless,
+            safe_mode=safe_mode_enabled,
         )
         try:
             app.log("agent ready", level="info")
+            pacing_label = "enabled" if safe_mode_enabled else "disabled"
+            app.log(
+                f"command pacing {pacing_label} (PONG_AGENT_SAFE_MODE={safe_mode_raw or 'unset'})",
+                level="info",
+            )
             app.run()
         finally:
             pass

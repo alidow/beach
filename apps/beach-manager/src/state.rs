@@ -7,6 +7,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    fmt,
     net::IpAddr,
     sync::{
         Arc,
@@ -32,17 +33,17 @@ use beach_client_core::protocol::{ClientFrame, CursorFrame, Update as WireUpdate
 use beach_client_core::{
     CliError, HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell,
     Payload, SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId,
-    TerminalGrid, Transport, TransportError, TransportOffer, decode_host_frame_binary,
-    encode_client_frame_binary, negotiate_transport,
+    TerminalGrid, Transport, TransportError, TransportOffer, WebRtcChannels,
+    decode_host_frame_binary, encode_client_frame_binary, negotiate_transport,
 };
 use chrono::{DateTime, Duration, Utc};
 use prometheus::IntGauge;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool, Row, types::Json};
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tracing::{Level, debug, info, trace, warn};
 use url::Url;
 use uuid::Uuid;
@@ -55,6 +56,7 @@ const REDIS_ACTION_CONSUMER_PREFIX: &str = "poller";
 const VIEWER_KEEPALIVE_INTERVAL: StdDuration = StdDuration::from_secs(20);
 const VIEWER_KEEPALIVE_PAYLOAD: &str = "__keepalive__";
 const VIEWER_IDLE_LOG_AFTER: StdDuration = StdDuration::from_secs(45);
+const STATE_STREAM_HEARTBEAT_INTERVAL: StdDuration = StdDuration::from_secs(2);
 pub(crate) const STALE_SESSION_MAX_IDLE: StdDuration = StdDuration::from_secs(60);
 #[allow(dead_code)]
 pub(crate) const STALE_SESSION_SWEEP_INTERVAL: StdDuration = StdDuration::from_secs(5);
@@ -64,9 +66,38 @@ const VIEWER_HEALTH_REPORT_INTERVAL: StdDuration = StdDuration::from_secs(15);
 const MAX_PENDING_ACTIONS_PER_SESSION: usize = 500;
 const STREAM_EVENT_NO_SUBSCRIBERS_LOG_KIND: &str = "stream_event_no_subscribers";
 const STREAM_EVENT_NO_SUBSCRIBERS_LOG_SECS: u64 = 30;
+const CONTROLLER_FAST_PATH_FLAG_ENV: &str = "CONTROLLER_FAST_PATH_ENABLED";
+const CONTROLLER_FAST_PATH_DEFAULT_ENABLED: bool = true;
+const CONTROLLER_FAST_PATH_WAIT: StdDuration = StdDuration::from_secs(15);
+const CONTROLLER_FAST_PATH_WAIT_LOG_KIND: &str = "controller_fast_path_wait";
+const CONTROLLER_FAST_PATH_READY_LOG_KIND: &str = "controller_fast_path_ready";
+const CONTROLLER_FAST_PATH_LOG_INTERVAL: StdDuration = StdDuration::from_secs(5);
+const CONTROLLER_STRICT_GATING_ENV: &str = "CONTROLLER_STRICT_GATING";
+const CONTROLLER_STRICT_GATING_DEFAULT_ENABLED: bool = true;
 
 pub fn viewer_health_report_interval() -> StdDuration {
     VIEWER_HEALTH_REPORT_INTERVAL
+}
+
+fn env_flag_enabled(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        },
+        Err(_) => default,
+    }
+}
+
+#[derive(Clone)]
+struct StateKeepaliveManager {
+    tasks: Arc<RwLock<HashMap<String, StateHeartbeatHandle>>>,
+}
+
+struct StateHeartbeatHandle {
+    cancel: Option<oneshot::Sender<()>>,
+    handle: JoinHandle<()>,
 }
 
 #[derive(Clone)]
@@ -83,6 +114,9 @@ pub struct AppState {
     http: reqwest::Client,
     road_base_url: String,
     public_manager_url: String,
+    controller_fast_path_enabled: bool,
+    controller_strict_gating: bool,
+    state_keepalive: StateKeepaliveManager,
 }
 
 #[derive(Clone)]
@@ -117,6 +151,25 @@ struct SessionRecord {
     last_health: Option<HealthHeartbeat>,
     last_health_at: Option<Instant>,
     last_state: Option<StateDiff>,
+    attached_at_ms: Option<i64>,
+    http_ready_since_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SessionReadinessSnapshot {
+    attached_at_ms: Option<i64>,
+    http_ready_since_ms: Option<i64>,
+    last_health_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControllerAutoAttachHint {
+    private_beach_id: String,
+    attach_code: String,
+    manager_url: String,
+    issued_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -200,8 +253,8 @@ struct ViewerTokenGatewayResponse {
     token: String,
     #[serde(default)]
     expires_at: Option<i64>,
-    #[serde(default)]
-    expires_in: Option<u64>,
+    #[serde(default, rename = "expires_in")]
+    _expires_in: Option<u64>,
 }
 
 pub(crate) struct ViewerTokenIssued {
@@ -610,6 +663,47 @@ fn build_terminal_payload(frame: &TerminalFrame) -> serde_json::Value {
     serde_json::Value::Object(payload)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerCommandDropReason {
+    MissingLease,
+    SessionNotBound,
+    ChildNotAttached,
+    ChildOffline,
+    FastPathNotReady,
+}
+
+impl ControllerCommandDropReason {
+    pub fn code(&self) -> &'static str {
+        match self {
+            ControllerCommandDropReason::MissingLease => "missing_lease",
+            ControllerCommandDropReason::SessionNotBound => "session_not_bound",
+            ControllerCommandDropReason::ChildNotAttached => "child_not_attached",
+            ControllerCommandDropReason::ChildOffline => "child_offline",
+            ControllerCommandDropReason::FastPathNotReady => "fast_path_not_ready",
+        }
+    }
+
+    pub fn default_message(&self) -> &'static str {
+        match self {
+            ControllerCommandDropReason::FastPathNotReady => {
+                "child session is not ready to consume commands"
+            }
+            ControllerCommandDropReason::ChildNotAttached => {
+                "child session has not attached to the private beach"
+            }
+            ControllerCommandDropReason::ChildOffline => "child session is offline",
+            ControllerCommandDropReason::SessionNotBound => "child session has no runtime binding",
+            ControllerCommandDropReason::MissingLease => "controller lease missing or expired",
+        }
+    }
+}
+
+impl fmt::Display for ControllerCommandDropReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.code())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
     #[error("session not found")]
@@ -634,8 +728,12 @@ pub enum StateError {
     Redis(#[from] redis::RedisError),
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+    #[allow(dead_code)]
     #[error("external service error: {0}")]
     External(String),
+    #[allow(dead_code)]
+    #[error("internal error: {0}")]
+    Internal(String),
     #[error("pending controller action queue full for session {session_id} ({depth}/{limit})")]
     ActionQueueFull {
         session_id: String,
@@ -643,6 +741,8 @@ pub enum StateError {
         depth: usize,
         limit: usize,
     },
+    #[error("controller command rejected ({reason})")]
+    ControllerCommandRejected { reason: ControllerCommandDropReason },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -870,8 +970,10 @@ struct ControllerEventRow {
 
 #[derive(Debug, FromRow)]
 struct ControllerPairingRow {
-    controller_session_id: Uuid,
-    child_session_id: Uuid,
+    #[sqlx(rename = "controller_session_id")]
+    _controller_session_id: Uuid,
+    #[sqlx(rename = "child_session_id")]
+    _child_session_id: Uuid,
     controller_origin_session_id: Uuid,
     child_origin_session_id: Uuid,
     prompt_template: Option<String>,
@@ -934,6 +1036,15 @@ impl AppState {
                 .unwrap_or_else(|_| "https://api.beach.sh".into()),
             public_manager_url: std::env::var("PUBLIC_MANAGER_URL")
                 .unwrap_or_else(|_| "http://localhost:8080".into()),
+            controller_fast_path_enabled: env_flag_enabled(
+                CONTROLLER_FAST_PATH_FLAG_ENV,
+                CONTROLLER_FAST_PATH_DEFAULT_ENABLED,
+            ),
+            controller_strict_gating: env_flag_enabled(
+                CONTROLLER_STRICT_GATING_ENV,
+                CONTROLLER_STRICT_GATING_DEFAULT_ENABLED,
+            ),
+            state_keepalive: StateKeepaliveManager::new(),
         }
     }
 
@@ -957,6 +1068,15 @@ impl AppState {
                 .unwrap_or_else(|_| "https://api.beach.sh".into()),
             public_manager_url: std::env::var("PUBLIC_MANAGER_URL")
                 .unwrap_or_else(|_| "http://localhost:8080".into()),
+            controller_fast_path_enabled: env_flag_enabled(
+                CONTROLLER_FAST_PATH_FLAG_ENV,
+                CONTROLLER_FAST_PATH_DEFAULT_ENABLED,
+            ),
+            controller_strict_gating: env_flag_enabled(
+                CONTROLLER_STRICT_GATING_ENV,
+                CONTROLLER_STRICT_GATING_DEFAULT_ENABLED,
+            ),
+            state_keepalive: StateKeepaliveManager::new(),
         }
     }
 
@@ -997,6 +1117,272 @@ impl AppState {
 
     pub fn public_manager_url(&self) -> &str {
         &self.public_manager_url
+    }
+
+    pub fn controller_fast_path_enabled(&self) -> bool {
+        self.controller_fast_path_enabled
+    }
+
+    pub fn controller_strict_gating(&self) -> bool {
+        self.controller_strict_gating
+    }
+
+    pub fn with_controller_strict_gating(mut self, enabled: bool) -> Self {
+        self.controller_strict_gating = enabled;
+        self
+    }
+
+    async fn mark_session_http_ready(&self, session_id: &str) {
+        self.fallback.mark_http_ready(session_id).await;
+    }
+
+    async fn fast_path_ready(&self, session_id: &str) -> bool {
+        if let Some(fps) = self.fast_paths.get(session_id).await {
+            let guard = fps.actions_tx.lock().await;
+            guard.is_some()
+        } else {
+            false
+        }
+    }
+
+    async fn enforce_controller_gate(
+        &self,
+        private_beach_id: &str,
+        session_id: &str,
+        controller_token: &str,
+        lease_id: Option<Uuid>,
+        actor_account_id: Option<Uuid>,
+        snapshot_override: Option<SessionReadinessSnapshot>,
+    ) -> Result<(), StateError> {
+        if !self.controller_strict_gating() {
+            return Ok(());
+        }
+        let readiness = match snapshot_override {
+            Some(snapshot) => Some(snapshot),
+            None => self.fallback.session_readiness_snapshot(session_id).await,
+        };
+        match self.evaluate_controller_gate(session_id, readiness).await {
+            Ok(()) => Ok(()),
+            Err(reason) => Err(self
+                .controller_command_rejection_with_snapshot(
+                    private_beach_id,
+                    session_id,
+                    controller_token,
+                    lease_id,
+                    actor_account_id,
+                    reason,
+                    readiness,
+                )
+                .await),
+        }
+    }
+
+    async fn evaluate_controller_gate(
+        &self,
+        session_id: &str,
+        readiness: Option<SessionReadinessSnapshot>,
+    ) -> Result<(), ControllerCommandDropReason> {
+        let Some(snapshot) = readiness else {
+            return Err(ControllerCommandDropReason::SessionNotBound);
+        };
+        if !snapshot.attached() {
+            return Err(ControllerCommandDropReason::ChildNotAttached);
+        }
+        if snapshot.ever_reported_health() && !snapshot.child_online() {
+            return Err(ControllerCommandDropReason::ChildOffline);
+        }
+        let fast_path_ready = self.fast_path_ready(session_id).await;
+        if !snapshot.http_ready() && !fast_path_ready {
+            return Err(ControllerCommandDropReason::FastPathNotReady);
+        }
+        Ok(())
+    }
+
+    async fn controller_command_rejection_with_snapshot(
+        &self,
+        private_beach_id: &str,
+        session_id: &str,
+        controller_token: &str,
+        lease_id: Option<Uuid>,
+        actor_account_id: Option<Uuid>,
+        reason: ControllerCommandDropReason,
+        snapshot: Option<SessionReadinessSnapshot>,
+    ) -> StateError {
+        let readiness = match snapshot {
+            Some(value) => Some(value),
+            None => self.fallback.session_readiness_snapshot(session_id).await,
+        };
+        self.record_controller_command_drop(
+            private_beach_id,
+            session_id,
+            controller_token,
+            lease_id,
+            actor_account_id,
+            readiness.as_ref(),
+            reason,
+        )
+        .await;
+        StateError::ControllerCommandRejected { reason }
+    }
+
+    async fn record_controller_command_drop(
+        &self,
+        private_beach_id: &str,
+        session_id: &str,
+        controller_token: &str,
+        lease_id: Option<Uuid>,
+        actor_account_id: Option<Uuid>,
+        readiness: Option<&SessionReadinessSnapshot>,
+        reason: ControllerCommandDropReason,
+    ) {
+        metrics::CONTROLLER_ACTIONS_DROPPED
+            .with_label_values(&[reason.code()])
+            .inc();
+
+        if let Some(snapshot) = readiness {
+            if let Some(age) = snapshot.attach_age_seconds() {
+                metrics::CONTROLLER_COMMAND_BLOCK_LATENCY
+                    .with_label_values(&[reason.code()])
+                    .observe(age);
+            }
+        }
+
+        let lease_label = lease_id.map(|id| truncate_uuid(&id));
+        let actor_label = actor_account_id.map(|id| id.to_string());
+        let fast_path_ready = self.fast_path_ready(session_id).await;
+        let attached = readiness.map(|s| s.attached()).unwrap_or(false);
+        let http_ready = readiness.map(|s| s.http_ready()).unwrap_or(false);
+        let child_online = readiness.map(|s| s.child_online()).unwrap_or(true);
+        let attach_age = readiness
+            .and_then(|s| s.attach_age_seconds())
+            .unwrap_or_default();
+
+        warn!(
+            target = "controller.actions.drop",
+            private_beach_id = %private_beach_id,
+            session_id = %session_id,
+            controller_token = %redact_controller_token(controller_token),
+            lease_id = lease_label.as_deref().unwrap_or("none"),
+            actor_account_id = actor_label.as_deref().unwrap_or("none"),
+            reason = reason.code(),
+            attached,
+            http_ready,
+            fast_path_ready,
+            child_online,
+            attach_age_secs = attach_age,
+            strict_gating = self.controller_strict_gating(),
+            "dropping controller command"
+        );
+    }
+
+    pub(crate) fn build_controller_auto_attach_hint(
+        &self,
+        private_beach_id: &str,
+        attach_code: &str,
+    ) -> ControllerAutoAttachHint {
+        ControllerAutoAttachHint {
+            private_beach_id: private_beach_id.to_string(),
+            attach_code: attach_code.to_string(),
+            manager_url: self.public_manager_url.clone(),
+            issued_at: Utc::now(),
+            expires_at: None,
+        }
+    }
+
+    fn ensure_controller_auto_attach_hint(
+        &self,
+        record: &mut SessionRecord,
+        private_beach_id: &str,
+    ) -> Result<(), serde_json::Error> {
+        if let Some(code) = record
+            .viewer_passcode
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let hint = self.build_controller_auto_attach_hint(private_beach_id, code);
+            record.upsert_controller_auto_attach_hint(&hint)?;
+        }
+        Ok(())
+    }
+
+    async fn prepare_transport_hints_for_registration(
+        &self,
+        req: &RegisterSessionRequest,
+    ) -> Result<HashMap<String, serde_json::Value>, StateError> {
+        let mut sessions = self.fallback.sessions.write().await;
+        let entry = sessions.entry(req.session_id.clone()).or_insert_with(|| {
+            SessionRecord::new(&req.session_id, &req.private_beach_id, &req.harness_type)
+        });
+        entry.viewer_passcode = req.viewer_passcode.clone();
+        self.ensure_controller_auto_attach_hint(entry, &req.private_beach_id)?;
+        Ok(entry.transport_hints.clone())
+    }
+
+    async fn send_manager_handshake(
+        &self,
+        session_id: &str,
+        private_beach_id: &str,
+        passcode: &str,
+    ) -> Result<(), StateError> {
+        let lease = self
+            .acquire_controller(session_id, None, Some("auto_handshake".into()), None)
+            .await?;
+
+        let handshake = serde_json::json!({
+            "private_beach_id": private_beach_id,
+            "manager_url": self.public_manager_url(),
+            "controller_token": lease.controller_token,
+            "lease_expires_at_ms": lease.expires_at_ms,
+            "stale_session_idle_secs": STALE_SESSION_MAX_IDLE.as_secs(),
+            "viewer_health_interval_secs": viewer_health_report_interval().as_secs(),
+            "controller_auto_attach": self
+                .build_controller_auto_attach_hint(private_beach_id, passcode),
+        });
+
+        let url = format!(
+            "{}/sessions/{}/control",
+            self.road_base_url.trim_end_matches('/'),
+            session_id
+        );
+        let body = serde_json::json!({
+            "kind": "manager_handshake",
+            "payload": handshake,
+        });
+
+        match self.http.post(url).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                info!(
+                    target = "controller.actions",
+                    session_id = %session_id,
+                    private_beach_id = %private_beach_id,
+                    "manager handshake dispatched via control channel"
+                );
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let detail = resp.text().await.unwrap_or_default();
+                warn!(
+                    target = "controller.actions",
+                    session_id = %session_id,
+                    private_beach_id = %private_beach_id,
+                    status = %status,
+                    error = %detail,
+                    "failed to enqueue manager handshake"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    target = "controller.actions",
+                    session_id = %session_id,
+                    private_beach_id = %private_beach_id,
+                    error = %err,
+                    "failed to send manager handshake"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     pub(crate) async fn viewer_token(
@@ -1078,17 +1464,13 @@ impl AppState {
         if map.remove(session_id).is_some() {
             debug!(session_id = %session_id, "session stream cleared");
         }
+        self.state_keepalive.cancel(session_id).await;
     }
 
     async fn publish(&self, session_id: &str, event: StreamEvent) {
         let tx_opt = { self.events.read().await.get(session_id).cloned() };
         if let Some(tx) = tx_opt {
-            let event_kind = match &event {
-                StreamEvent::ControllerEvent(_) => "controller_event",
-                StreamEvent::State(_) => "state",
-                StreamEvent::Health(_) => "health",
-                StreamEvent::ControllerPairing(_) => "controller_pairing",
-            };
+            let (event_kind, _) = event.as_named_json();
             if tx.receiver_count() == 0 {
                 self.log_no_stream_subscribers(session_id, event_kind);
                 return;
@@ -1111,6 +1493,30 @@ impl AppState {
                 "no subscribers to receive stream event"
             );
         }
+    }
+
+    async fn publish_state_heartbeat(&self, session_id: &str, sequence: u64) {
+        if !self.has_stream_subscribers(session_id).await {
+            return;
+        }
+        let heartbeat = StateDiff {
+            sequence,
+            emitted_at: SystemTime::now(),
+            payload: serde_json::json!({
+                "type": "terminal_heartbeat"
+            }),
+        };
+        self.publish(session_id, StreamEvent::State(heartbeat))
+            .await;
+    }
+
+    async fn has_stream_subscribers(&self, session_id: &str) -> bool {
+        self.events
+            .read()
+            .await
+            .get(session_id)
+            .map(|tx| tx.receiver_count() > 0)
+            .unwrap_or(false)
     }
 
     async fn publish_pairing_event(
@@ -1232,6 +1638,9 @@ impl AppState {
                         )
                     });
                 rec.viewer_passcode = Some(code.to_string());
+                rec.mark_attached();
+                let hint = self.build_controller_auto_attach_hint(private_beach_id, code);
+                rec.upsert_controller_auto_attach_hint(&hint)?;
                 let token = rec.first_lease_token();
                 rec.append_event(
                     ControllerEventType::Registered,
@@ -1254,6 +1663,18 @@ impl AppState {
                         "failed to start controller forwarder (memory backend)"
                     );
                 }
+                if let Err(err) = self
+                    .send_manager_handshake(origin_session_id, private_beach_id, code)
+                    .await
+                {
+                    warn!(
+                        target = "controller.actions",
+                        session_id = %origin_session_id,
+                        private_beach_id = %private_beach_id,
+                        error = %err,
+                        "failed to dispatch manager handshake after attach_by_code"
+                    );
+                }
                 log_session_attachment(
                     private_beach_id,
                     origin_session_id,
@@ -1271,6 +1692,23 @@ impl AppState {
                     requester = ?requester,
                     "attaching session via code"
                 );
+                let transport_hints_json = {
+                    let mut sessions = self.fallback.sessions.write().await;
+                    let rec = sessions
+                        .entry(origin_session_id.to_string())
+                        .or_insert_with(|| {
+                            SessionRecord::new(
+                                origin_session_id,
+                                private_beach_id,
+                                &HarnessType::Custom,
+                            )
+                        });
+                    rec.viewer_passcode = Some(code.to_string());
+                    rec.upsert_controller_auto_attach_hint(
+                        &self.build_controller_auto_attach_hint(private_beach_id, code),
+                    )?;
+                    serde_json::to_value(&rec.transport_hints)?
+                };
                 let mut tx = pool.begin().await?;
                 self.set_rls_context_tx(&mut tx, &beach_uuid).await?;
                 // Ensure the target private beach exists to avoid FK violations
@@ -1318,14 +1756,17 @@ impl AppState {
                 .await?;
                 sqlx::query(
                     r#"
-                    INSERT INTO session_runtime (session_id, viewer_passcode)
-                    VALUES ($1, $2)
+                    INSERT INTO session_runtime (session_id, viewer_passcode, transport_hints)
+                    VALUES ($1, $2, $3)
                     ON CONFLICT (session_id)
-                    DO UPDATE SET viewer_passcode = EXCLUDED.viewer_passcode
+                    DO UPDATE SET
+                        viewer_passcode = EXCLUDED.viewer_passcode,
+                        transport_hints = EXCLUDED.transport_hints
                     "#,
                 )
                 .bind(ids.session_id)
                 .bind(code)
+                .bind(Json(transport_hints_json.clone()))
                 .execute(tx.as_mut())
                 .await?;
                 tx.commit().await?;
@@ -1342,6 +1783,7 @@ impl AppState {
                             )
                         });
                     rec.viewer_passcode = Some(code.to_string());
+                    rec.mark_attached();
                 }
                 log_session_attachment(
                     private_beach_id,
@@ -1366,9 +1808,21 @@ impl AppState {
                         "failed to start controller forwarder"
                     );
                 }
+                if let Err(err) = self
+                    .send_manager_handshake(origin_session_id, private_beach_id, code)
+                    .await
+                {
+                    warn!(
+                        target = "controller.actions",
+                        session_id = %origin_session_id,
+                        private_beach_id = %private_beach_id,
+                        error = %err,
+                        "failed to dispatch manager handshake after attach_by_code"
+                    );
+                }
 
                 // Return summary (best-effort from DB fields)
-                let mut list = self.list_sessions(private_beach_id).await?;
+                let list = self.list_sessions(private_beach_id).await?;
                 if let Some(found) = list.iter().find(|s| s.session_id == origin_session_id) {
                     return Ok(found.clone());
                 }
@@ -1393,6 +1847,7 @@ impl AppState {
                     let entry = sessions.entry(id.clone()).or_insert_with(|| {
                         SessionRecord::new(&id, private_beach_id, &HarnessType::Custom)
                     });
+                    entry.mark_attached();
                     if existed {
                         duplicates += 1;
                     } else {
@@ -1449,6 +1904,7 @@ impl AppState {
                             ids_to_nudge.push(id.clone());
                             log_session_attachment(private_beach_id, &id, "owned", "attached");
                         }
+                        self.fallback.mark_attached(&id).await;
                     }
                 }
                 tx.commit().await?;
@@ -2348,9 +2804,39 @@ impl AppState {
                 let session_uuid = parse_uuid(session_id, "session_id")?;
                 let token_uuid = parse_uuid(controller_token, "controller_token")?;
                 let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
-                let lease = self
+                let private_beach_id_str = identifiers.private_beach_id.to_string();
+                let session_uuid_str = session_uuid.to_string();
+                let lease = match self
                     .fetch_active_lease_for_token(pool, identifiers.session_id, token_uuid)
+                    .await
+                {
+                    Ok(lease) => lease,
+                    Err(StateError::ControllerMismatch) if self.controller_strict_gating() => {
+                        return Err(self
+                            .controller_command_rejection_with_snapshot(
+                                &private_beach_id_str,
+                                &session_uuid_str,
+                                controller_token,
+                                None,
+                                actor_account_id,
+                                ControllerCommandDropReason::MissingLease,
+                                None,
+                            )
+                            .await);
+                    }
+                    Err(err) => return Err(err),
+                };
+                if self.controller_strict_gating() {
+                    self.enforce_controller_gate(
+                        &private_beach_id_str,
+                        &session_uuid_str,
+                        controller_token,
+                        Some(lease.id),
+                        actor_account_id,
+                        None,
+                    )
                     .await?;
+                }
                 let active_leases = self
                     .list_active_leases(pool, identifiers.session_id)
                     .await?;
@@ -2361,7 +2847,6 @@ impl AppState {
                     &active_leases,
                 );
 
-                let session_uuid_str = session_uuid.to_string();
                 let trace_context = self
                     .build_agent_trace_context(pool, &identifiers, &actions)
                     .await;
@@ -2589,6 +3074,7 @@ impl AppState {
     }
 
     pub async fn poll_actions(&self, session_id: &str) -> Result<Vec<ActionCommand>, StateError> {
+        self.mark_session_http_ready(session_id).await;
         match &self.backend {
             Backend::Memory => self.poll_actions_memory(session_id).await,
             Backend::Postgres(pool) => {
@@ -2646,7 +3132,7 @@ impl AppState {
                                 .controller_account_id
                                 .map(|u| u.to_string()),
                             issued_by_account_id: lease
-                                .controller_account_id
+                                .issued_by_account_id
                                 .map(|u| u.to_string()),
                         }),
                     )
@@ -2946,6 +3432,7 @@ impl AppState {
                 tx.commit().await?;
 
                 let diff_clone = diff.clone();
+                let diff_sequence = diff_clone.sequence;
                 self.fallback
                     .store_state(session_id, diff_clone.clone())
                     .await;
@@ -2962,6 +3449,9 @@ impl AppState {
                         .with_label_values(&[label0.as_str(), label1.as_str()])
                         .inc();
                 }
+                self.state_keepalive
+                    .schedule(self.clone(), session_id.to_string(), diff_sequence)
+                    .await;
                 Ok(())
             }
         }
@@ -3385,10 +3875,8 @@ impl AppState {
                 let mut sql = String::from(
                     "SELECT id, event_type, controller_token, reason, occurred_at, controller_account_id, issued_by_account_id FROM controller_event WHERE session_id = $1",
                 );
-                let mut idx = 2;
                 if event_type.is_some() {
                     sql.push_str(" AND event_type = $2::controller_event_type");
-                    idx += 1;
                 }
                 if since_ms.is_some() {
                     let pos = if event_type.is_some() { 3 } else { 2 };
@@ -3483,6 +3971,59 @@ impl AppState {
                 Ok(response)
             }
         }
+    }
+}
+
+impl StateKeepaliveManager {
+    fn new() -> Self {
+        Self {
+            tasks: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    async fn schedule(&self, state: AppState, session_id: String, sequence: u64) {
+        let mut tasks = self.tasks.write().await;
+        if let Some(handle) = tasks.remove(&session_id) {
+            handle.cancel();
+        }
+        let (tx, mut rx) = oneshot::channel();
+        let state_clone = state.clone();
+        let session_clone = session_id.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = sleep(STATE_STREAM_HEARTBEAT_INTERVAL) => {
+                        state_clone.publish_state_heartbeat(&session_clone, sequence).await;
+                    }
+                    _ = &mut rx => {
+                        break;
+                    }
+                }
+            }
+        });
+        tasks.insert(
+            session_id,
+            StateHeartbeatHandle {
+                cancel: Some(tx),
+                handle,
+            },
+        );
+    }
+
+    async fn cancel(&self, session_id: &str) {
+        let mut tasks = self.tasks.write().await;
+        if let Some(handle) = tasks.remove(session_id) {
+            handle.cancel();
+        }
+    }
+}
+
+impl StateHeartbeatHandle {
+    fn cancel(mut self) {
+        if let Some(tx) = self.cancel.take() {
+            let _ = tx.send(());
+        }
+        self.handle.abort();
     }
 }
 
@@ -3640,6 +4181,30 @@ impl InnerState {
         layouts.insert(beach_id.into(), layout);
     }
 
+    async fn mark_attached(&self, session_id: &str) {
+        let mut sessions = self.sessions.write().await;
+        if let Some(record) = sessions.get_mut(session_id) {
+            record.mark_attached();
+        }
+    }
+
+    async fn mark_http_ready(&self, session_id: &str) {
+        let mut sessions = self.sessions.write().await;
+        if let Some(record) = sessions.get_mut(session_id) {
+            record.mark_http_ready();
+        }
+    }
+
+    async fn session_readiness_snapshot(
+        &self,
+        session_id: &str,
+    ) -> Option<SessionReadinessSnapshot> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(session_id)
+            .map(|record| record.readiness_snapshot())
+    }
+
     async fn ensure_session(
         &self,
         req: &RegisterSessionRequest,
@@ -3661,6 +4226,17 @@ impl InnerState {
             entry.controller_leases.insert(token, lease);
         }
         entry.viewer_passcode = req.viewer_passcode.clone();
+    }
+
+    async fn set_transport_hints(
+        &self,
+        session_id: &str,
+        hints: HashMap<String, serde_json::Value>,
+    ) {
+        let mut sessions = self.sessions.write().await;
+        if let Some(record) = sessions.get_mut(session_id) {
+            record.transport_hints = hints;
+        }
     }
 
     async fn acknowledge_controller(
@@ -3910,7 +4486,19 @@ impl SessionRecord {
             last_health: None,
             last_health_at: None,
             last_state: None,
+            attached_at_ms: None,
+            http_ready_since_ms: None,
         }
+    }
+
+    fn upsert_controller_auto_attach_hint(
+        &mut self,
+        hint: &ControllerAutoAttachHint,
+    ) -> Result<(), serde_json::Error> {
+        let value = serde_json::to_value(hint)?;
+        self.transport_hints
+            .insert("controller_auto_attach".into(), value);
+        Ok(())
     }
 
     fn append_event(
@@ -3977,6 +4565,50 @@ impl SessionRecord {
             .iter_mut()
             .find(|(_, lease)| lease.reason.as_deref() == reason)
     }
+
+    fn mark_attached(&mut self) {
+        self.attached_at_ms = Some(now_ms());
+    }
+
+    fn mark_http_ready(&mut self) {
+        self.http_ready_since_ms = Some(now_ms());
+    }
+
+    fn readiness_snapshot(&self) -> SessionReadinessSnapshot {
+        SessionReadinessSnapshot {
+            attached_at_ms: self.attached_at_ms,
+            http_ready_since_ms: self.http_ready_since_ms,
+            last_health_at: self.last_health_at,
+        }
+    }
+}
+
+impl SessionReadinessSnapshot {
+    fn attached(&self) -> bool {
+        self.attached_at_ms.is_some()
+    }
+
+    fn http_ready(&self) -> bool {
+        self.http_ready_since_ms.is_some()
+    }
+
+    fn child_online(&self) -> bool {
+        match self.last_health_at {
+            Some(last) => last.elapsed() < STALE_SESSION_MAX_IDLE,
+            None => true,
+        }
+    }
+
+    fn ever_reported_health(&self) -> bool {
+        self.last_health_at.is_some()
+    }
+
+    fn attach_age_seconds(&self) -> Option<f64> {
+        self.attached_at_ms.map(|ts| {
+            let elapsed_ms = now_ms().saturating_sub(ts);
+            (elapsed_ms.max(0) as f64) / 1000.0
+        })
+    }
 }
 
 impl SessionSummary {
@@ -4015,6 +4647,13 @@ fn now_ms() -> i64 {
 fn truncate_uuid(id: &Uuid) -> String {
     let full = id.to_string();
     full.split('-').next().unwrap_or(&full).to_string()
+}
+
+fn redact_controller_token(token: &str) -> String {
+    match Uuid::parse_str(token) {
+        Ok(uuid) => truncate_uuid(&uuid),
+        Err(_) => token.chars().take(8).collect(),
+    }
 }
 
 fn parse_uuid(value: &str, label: &str) -> Result<Uuid, StateError> {
@@ -4170,6 +4809,7 @@ impl AppState {
         entry.version = req.version.clone();
         entry.harness_type = req.harness_type.clone();
         entry.viewer_passcode = req.viewer_passcode.clone();
+        self.ensure_controller_auto_attach_hint(entry, &req.private_beach_id)?;
 
         if entry.controller_leases.is_empty() {
             let token = Uuid::new_v4().to_string();
@@ -4216,7 +4856,7 @@ impl AppState {
         let harness_id = Uuid::new_v4();
         let controller_token = Uuid::new_v4();
         let kind = harness_to_session_kind(&req.harness_type);
-        let transport_hints = default_transport_hints(&req.session_id);
+        let transport_hints = self.prepare_transport_hints_for_registration(&req).await?;
         let transport_json = serde_json::to_value(&transport_hints)?;
         let capabilities = serde_json::Value::Array(
             req.capabilities
@@ -4347,6 +4987,9 @@ impl AppState {
                 Some((controller_token.to_string(), fallback_lease)),
             )
             .await;
+        self.fallback
+            .set_transport_hints(&req.session_id, transport_hints.clone())
+            .await;
 
         if let Err(err) = self.spawn_viewer_worker(&req.session_id).await {
             warn!(
@@ -4450,16 +5093,82 @@ impl AppState {
         controller_token: &str,
         actions: Vec<ActionCommand>,
     ) -> Result<(), StateError> {
+        enum LeaseState {
+            Valid {
+                private_beach_id: String,
+                readiness: Option<SessionReadinessSnapshot>,
+            },
+            Missing {
+                private_beach_id: String,
+                readiness: Option<SessionReadinessSnapshot>,
+            },
+        }
+
+        let lease_state = {
+            let mut sessions = self.fallback.sessions.write().await;
+            let record = sessions
+                .get_mut(session_id)
+                .ok_or(StateError::SessionNotFound)?;
+            let readiness = if self.controller_strict_gating() {
+                Some(record.readiness_snapshot())
+            } else {
+                None
+            };
+            let private_beach_id = record.private_beach_id.clone();
+            match record.lease(controller_token).cloned() {
+                Some(lease) if lease.expires_at_ms > now_ms() => LeaseState::Valid {
+                    private_beach_id,
+                    readiness,
+                },
+                _ => LeaseState::Missing {
+                    private_beach_id,
+                    readiness,
+                },
+            }
+        };
+
+        let (private_beach_id, readiness) = match lease_state {
+            LeaseState::Valid {
+                private_beach_id,
+                readiness,
+            } => (private_beach_id, readiness),
+            LeaseState::Missing {
+                private_beach_id,
+                readiness,
+            } => {
+                if self.controller_strict_gating() {
+                    return Err(self
+                        .controller_command_rejection_with_snapshot(
+                            &private_beach_id,
+                            session_id,
+                            controller_token,
+                            None,
+                            None,
+                            ControllerCommandDropReason::MissingLease,
+                            readiness,
+                        )
+                        .await);
+                }
+                return Err(StateError::ControllerMismatch);
+            }
+        };
+
+        if self.controller_strict_gating() {
+            self.enforce_controller_gate(
+                &private_beach_id,
+                session_id,
+                controller_token,
+                None,
+                None,
+                readiness,
+            )
+            .await?;
+        }
+
         let mut sessions = self.fallback.sessions.write().await;
         let record = sessions
             .get_mut(session_id)
             .ok_or(StateError::SessionNotFound)?;
-        let Some(lease) = record.lease(controller_token).cloned() else {
-            return Err(StateError::ControllerMismatch);
-        };
-        if lease.expires_at_ms <= now_ms() {
-            return Err(StateError::ControllerMismatch);
-        }
         for action in actions {
             record.pending_actions.push_back(action);
         }
@@ -4567,12 +5276,16 @@ impl AppState {
             .get_mut(session_id)
             .ok_or(StateError::SessionNotFound)?;
         let diff_clone = diff.clone();
+        let diff_sequence = diff_clone.sequence;
         self.store_state_redis(&record.private_beach_id, session_id, &diff_clone)
             .await?;
         record.last_state = Some(diff);
         let token = record.first_lease_token();
         record.append_event(ControllerEventType::StateUpdated, token, None);
         self.publish(session_id, StreamEvent::State(diff_clone))
+            .await;
+        self.state_keepalive
+            .schedule(self.clone(), session_id.to_string(), diff_sequence)
             .await;
         Ok(())
     }
@@ -4841,9 +5554,12 @@ impl AppState {
             .iter()
             .map(|(token, lease)| {
                 let account = lease.controller_account_id.as_deref().unwrap_or("anon");
+                let issuer = lease.issued_by_account_id.as_deref().unwrap_or("anon");
                 let expires_in = (lease.expires_at_ms - now).max(0);
                 let reason = lease.reason.as_deref().unwrap_or("<none>");
-                format!("{token}@{account}:expires_in={expires_in}ms reason={reason}")
+                format!(
+                    "{token}@{account}:issued_by={issuer} expires_in={expires_in}ms reason={reason}"
+                )
             })
             .collect();
         info!(
@@ -6225,13 +6941,20 @@ async fn controller_forwarder_once_with_label(
         .await
         .map_err(|err| ControllerForwarderError::Negotiation(err.to_string()))?;
     match negotiated {
-        NegotiatedTransport::Single(single) => {
+        NegotiatedTransport::Single(NegotiatedSingle {
+            transport,
+            webrtc_channels,
+            metadata,
+            ..
+        }) => {
+            let connection_label = metadata.get("label").cloned();
             drive_controller_forwarder(
                 state,
                 private_beach_id,
                 session_id,
-                single.transport,
-                single.webrtc_channels.is_some(),
+                transport,
+                webrtc_channels,
+                connection_label,
             )
             .await
         }
@@ -6249,6 +6972,10 @@ struct PendingControllerAction {
 enum ForwarderEvent {
     Ack(u64),
     Shutdown(String),
+    FastPathReady {
+        transport: Arc<dyn Transport>,
+        label: &'static str,
+    },
 }
 
 struct ForwarderReader {
@@ -6320,28 +7047,170 @@ impl Drop for ForwarderReader {
     }
 }
 
+struct FastPathUpgradeHandle {
+    cancel: Arc<AtomicBool>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl FastPathUpgradeHandle {
+    fn spawn(
+        channels: WebRtcChannels,
+        session_id: String,
+        private_beach_id: String,
+        event_tx: mpsc::UnboundedSender<ForwarderEvent>,
+    ) -> Self {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+
+        for label in [CONTROLLER_CHANNEL_LABEL, LEGACY_CONTROLLER_CHANNEL_LABEL] {
+            let channels = channels.clone();
+            let event_tx = event_tx.clone();
+            let cancel_flag = cancel.clone();
+            let session_id = session_id.clone();
+            let private_beach_id = private_beach_id.clone();
+            handles.push(tokio::spawn(async move {
+                loop {
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+
+                    if should_log_custom_event(
+                        CONTROLLER_FAST_PATH_WAIT_LOG_KIND,
+                        &session_id,
+                        CONTROLLER_FAST_PATH_LOG_INTERVAL,
+                    ) {
+                        trace!(
+                            target = "controller.forwarder",
+                            session_id = %session_id,
+                            private_beach_id = %private_beach_id,
+                            label,
+                            "waiting for fast-path data channel"
+                        );
+                    }
+
+                    match channels.wait_for(label).await {
+                        Ok(channel) => {
+                            if cancel_flag.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            if should_log_custom_event(
+                                CONTROLLER_FAST_PATH_READY_LOG_KIND,
+                                &session_id,
+                                CONTROLLER_FAST_PATH_LOG_INTERVAL,
+                            ) {
+                                trace!(
+                                    target = "controller.forwarder",
+                                    session_id = %session_id,
+                                    private_beach_id = %private_beach_id,
+                                    label,
+                                    "fast-path data channel detected"
+                                );
+                            }
+                            let _ = event_tx.send(ForwarderEvent::FastPathReady {
+                                transport: channel,
+                                label,
+                            });
+                            break;
+                        }
+                        Err(err) => {
+                            if cancel_flag.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            warn!(
+                                target = "controller.forwarder",
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                label,
+                                error = %err,
+                                "fast-path data channel wait failed; retrying"
+                            );
+                            sleep(StdDuration::from_secs(1)).await;
+                        }
+                    }
+                }
+            }));
+        }
+
+        Self { cancel, handles }
+    }
+}
+
+impl Drop for FastPathUpgradeHandle {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        for handle in self.handles.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+fn ensure_fast_path_probe(
+    watchers: &mut Option<FastPathUpgradeHandle>,
+    channels: &Option<WebRtcChannels>,
+    fast_path_enabled: bool,
+    via_fast_path: bool,
+    transport_is_primary: bool,
+    session_id: &str,
+    private_beach_id: &str,
+    event_tx: &mpsc::UnboundedSender<ForwarderEvent>,
+) {
+    if !fast_path_enabled || watchers.is_some() {
+        return;
+    }
+    let needs_probe = !via_fast_path || transport_is_primary;
+    if !needs_probe {
+        return;
+    }
+    if let Some(channels) = channels {
+        watchers.replace(FastPathUpgradeHandle::spawn(
+            channels.clone(),
+            session_id.to_string(),
+            private_beach_id.to_string(),
+            event_tx.clone(),
+        ));
+    }
+}
+
 async fn drive_controller_forwarder(
     state: &AppState,
     private_beach_id: &str,
     session_id: &str,
-    transport: Arc<dyn Transport>,
-    via_fast_path: bool,
+    primary_transport: Arc<dyn Transport>,
+    webrtc_channels: Option<WebRtcChannels>,
+    metadata_label: Option<String>,
 ) -> Result<(), ControllerForwarderError> {
-    let transport_label = if via_fast_path {
-        "fast_path"
-    } else {
-        "http_fallback"
-    };
+    let fast_path_enabled = state.controller_fast_path_enabled();
+    let fast_path_channels = webrtc_channels.clone();
+    let (mut transport, mut transport_label, mut via_fast_path) = select_controller_transport(
+        primary_transport.clone(),
+        fast_path_channels.clone(),
+        metadata_label.as_deref(),
+        fast_path_enabled,
+    )
+    .await;
+    let mut transport_is_primary = Arc::ptr_eq(&transport, &primary_transport);
     info!(
         target = "controller.forwarder",
         session_id = %session_id,
         private_beach_id = %private_beach_id,
         transport = transport_label,
+        via_fast_path,
         "controller forwarder connected"
     );
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    let _reader_guard = ForwarderReader::spawn(transport.clone(), event_tx);
+    let mut reader_guard = ForwarderReader::spawn(transport.clone(), event_tx.clone());
+    let mut fast_path_watchers: Option<FastPathUpgradeHandle> = None;
+    ensure_fast_path_probe(
+        &mut fast_path_watchers,
+        &fast_path_channels,
+        fast_path_enabled,
+        via_fast_path,
+        transport_is_primary,
+        session_id,
+        private_beach_id,
+        &event_tx,
+    );
     let mut pending: HashMap<u64, PendingControllerAction> = HashMap::new();
     let mut next_seq: u64 = 0;
     let mut idle_delay = tokio::time::interval(StdDuration::from_millis(200));
@@ -6391,11 +7260,96 @@ async fn drive_controller_forwarder(
                         }
                     }
                     Some(ForwarderEvent::Shutdown(reason)) => {
-                        fail_pending_actions(state, session_id, pending, via_fast_path, &reason).await;
+                        if via_fast_path {
+                            let inflight = pending.len();
+                            let drained = std::mem::take(&mut pending);
+                            fail_pending_actions(state, session_id, drained, true, &reason).await;
+                            metrics::CONTROLLER_FAST_PATH_FALLBACKS
+                                .with_label_values(&labels)
+                                .inc();
+                            warn!(
+                                target = "controller.forwarder",
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                inflight,
+                                reason = %reason,
+                                "fast-path transport closed; falling back to primary transport"
+                            );
+                            via_fast_path = false;
+                            transport_label = "http_fallback";
+                            transport = primary_transport.clone();
+                            transport_is_primary = true;
+                            drop(reader_guard);
+                            reader_guard = ForwarderReader::spawn(transport.clone(), event_tx.clone());
+                            info!(
+                                target = "controller.forwarder",
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                transport = transport_label,
+                                "controller forwarder switched transport"
+                            );
+                            ensure_fast_path_probe(
+                                &mut fast_path_watchers,
+                                &fast_path_channels,
+                                fast_path_enabled,
+                                via_fast_path,
+                                transport_is_primary,
+                                session_id,
+                                private_beach_id,
+                                &event_tx,
+                            );
+                            continue;
+                        }
+                        let drained = std::mem::take(&mut pending);
+                        fail_pending_actions(state, session_id, drained, via_fast_path, &reason).await;
                         return Err(ControllerForwarderError::Transport(reason));
                     }
+                    Some(ForwarderEvent::FastPathReady { transport: fast_transport, label }) => {
+                        if via_fast_path {
+                            trace!(
+                                target = "controller.forwarder",
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                label,
+                                "fast-path ready signal received while already active; ignoring"
+                            );
+                            continue;
+                        }
+                        fast_path_watchers = None;
+                        via_fast_path = true;
+                        transport_label = "fast_path";
+                        transport = fast_transport;
+                        transport_is_primary = false;
+                        drop(reader_guard);
+                        reader_guard = ForwarderReader::spawn(transport.clone(), event_tx.clone());
+                        let now = now_ms();
+                        state
+                            .update_pairing_transport_status(
+                                session_id,
+                                PairingTransportStatus::fast_path(now),
+                            )
+                            .await;
+                        info!(
+                            target = "controller.forwarder",
+                            session_id = %session_id,
+                            private_beach_id = %private_beach_id,
+                            label,
+                            "controller forwarder switched transport"
+                        );
+                        ensure_fast_path_probe(
+                            &mut fast_path_watchers,
+                            &fast_path_channels,
+                            fast_path_enabled,
+                            via_fast_path,
+                            transport_is_primary,
+                            session_id,
+                            private_beach_id,
+                            &event_tx,
+                        );
+                    }
                     None => {
-                        fail_pending_actions(state, session_id, pending, via_fast_path, "ack listener closed").await;
+                        let drained = std::mem::take(&mut pending);
+                        fail_pending_actions(state, session_id, drained, via_fast_path, "ack listener closed").await;
                         return Err(ControllerForwarderError::Transport(
                             "ack listener closed".into(),
                         ));
@@ -6448,10 +7402,69 @@ async fn drive_controller_forwarder(
                                 data: bytes,
                             };
                             let encoded = encode_client_frame_binary(&frame);
-                            transport
-                                .send_bytes(&encoded)
-                                .map_err(|err| ControllerForwarderError::Transport(err.to_string()))?;
-                            metrics::ACTIONS_DELIVERED.with_label_values(&labels).inc();
+                            let sent_at = loop {
+                                match transport.send_bytes(&encoded) {
+                                    Ok(_) => {
+                                        metrics::ACTIONS_DELIVERED.with_label_values(&labels).inc();
+                                        if via_fast_path {
+                                            metrics::CONTROLLER_FAST_PATH_DELIVERIES
+                                                .with_label_values(&labels)
+                                                .inc();
+                                        }
+                                        break Instant::now();
+                                    }
+                                    Err(err)
+                                        if via_fast_path
+                                            && matches!(err, TransportError::ChannelClosed | TransportError::Timeout) =>
+                                    {
+                                        let inflight = pending.len();
+                                        let drained = std::mem::take(&mut pending);
+                                        let reason = format!("fast-path send failed: {err}");
+                                        fail_pending_actions(state, session_id, drained, true, &reason).await;
+                                        metrics::CONTROLLER_FAST_PATH_FALLBACKS
+                                            .with_label_values(&labels)
+                                            .inc();
+                                        warn!(
+                                            target = "controller.forwarder",
+                                            session_id = %session_id,
+                                            private_beach_id = %private_beach_id,
+                                            inflight,
+                                            error = %err,
+                                            "fast-path send failed; falling back to primary transport"
+                                        );
+                                        via_fast_path = false;
+                                        transport_label = "http_fallback";
+                                        transport = primary_transport.clone();
+                                        transport_is_primary = true;
+                                        drop(reader_guard);
+                                        reader_guard = ForwarderReader::spawn(transport.clone(), event_tx.clone());
+                                        info!(
+                                            target = "controller.forwarder",
+                                            session_id = %session_id,
+                                            private_beach_id = %private_beach_id,
+                                            transport = transport_label,
+                                            "controller forwarder switched transport"
+                                        );
+                                        ensure_fast_path_probe(
+                                            &mut fast_path_watchers,
+                                            &fast_path_channels,
+                                            fast_path_enabled,
+                                            via_fast_path,
+                                            transport_is_primary,
+                                            session_id,
+                                            private_beach_id,
+                                            &event_tx,
+                                        );
+                                        continue;
+                                    }
+                                    Err(err) => {
+                                        let drained = std::mem::take(&mut pending);
+                                        let reason = err.to_string();
+                                        fail_pending_actions(state, session_id, drained, via_fast_path, &reason).await;
+                                        return Err(ControllerForwarderError::Transport(reason));
+                                    }
+                                }
+                            };
                             debug!(
                                 target = "controller.delivery",
                                 session_id = %session_id,
@@ -6465,7 +7478,7 @@ async fn drive_controller_forwarder(
                                 next_seq,
                                 PendingControllerAction {
                                     action,
-                                    sent_at: Instant::now(),
+                                    sent_at,
                                 },
                             );
                         }
@@ -6502,6 +7515,59 @@ async fn drive_controller_forwarder(
             }
         }
     }
+}
+
+async fn select_controller_transport(
+    primary_transport: Arc<dyn Transport>,
+    webrtc_channels: Option<WebRtcChannels>,
+    metadata_label: Option<&str>,
+    fast_path_enabled: bool,
+) -> (Arc<dyn Transport>, &'static str, bool) {
+    const LABELS: [&str; 2] = [CONTROLLER_CHANNEL_LABEL, LEGACY_CONTROLLER_CHANNEL_LABEL];
+
+    if fast_path_enabled {
+        if let Some(channels) = webrtc_channels {
+            for label in LABELS {
+                match timeout(CONTROLLER_FAST_PATH_WAIT, channels.wait_for(label)).await {
+                    Ok(Ok(channel)) => {
+                        return (channel, "fast_path", true);
+                    }
+                    Ok(Err(err)) => {
+                        debug!(
+                            target = "controller.forwarder",
+                            label,
+                            error = %err,
+                            "failed to wait for controller data channel; falling back"
+                        );
+                    }
+                    Err(_) => {
+                        debug!(
+                            target = "controller.forwarder",
+                            label, "timed out waiting for controller data channel; falling back"
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Some(label) = metadata_label {
+            if LABELS.iter().any(|candidate| *candidate == label) {
+                debug!(
+                    target = "controller.forwarder",
+                    label,
+                    "metadata label indicates controller channel; using primary transport as fast-path"
+                );
+                return (primary_transport, "fast_path", true);
+            }
+        }
+    } else {
+        debug!(
+            target = "controller.forwarder",
+            "fast-path disabled via CONTROLLER_FAST_PATH_ENABLED"
+        );
+    }
+
+    (primary_transport, "http_fallback", false)
 }
 
 async fn fail_pending_actions(
@@ -6814,17 +7880,19 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use crate::state::test_support;
-    use beach_buggy::{HarnessType, RegisterSessionRequest};
+    use beach_buggy::{ActionCommand, HarnessType, RegisterSessionRequest};
     use beach_client_core::cache::terminal::packed::{StyleId, pack_color_default, pack_color_rgb};
     use beach_client_core::protocol::{
         HostFrame as WireHostFrame, Lane, LaneBudgetFrame, SyncConfigFrame, Update as WireUpdate,
     };
+    use beach_client_core::{TransportId, TransportKind, TransportMessage};
+    use chrono::Utc;
     use serde_json::json;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use std::time::SystemTime;
+    use std::time::{Duration as StdDuration, SystemTime};
     use tokio::time::{Duration, sleep, timeout};
 
     #[test_timeout::tokio_timeout_test(10)]
@@ -7060,5 +8128,341 @@ mod tests {
         fn drop(&mut self) {
             test_support::clear_viewer_worker_override();
         }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            EnvVarGuard { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.take() {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestTransport {
+        id: TransportId,
+        peer: TransportId,
+        kind: TransportKind,
+    }
+
+    impl TestTransport {
+        fn new(id: u64, kind: TransportKind) -> Self {
+            Self {
+                id: TransportId(id),
+                peer: TransportId(id + 1),
+                kind,
+            }
+        }
+    }
+
+    impl Transport for TestTransport {
+        fn kind(&self) -> TransportKind {
+            self.kind
+        }
+
+        fn id(&self) -> TransportId {
+            self.id
+        }
+
+        fn peer(&self) -> TransportId {
+            self.peer
+        }
+
+        fn send(&self, _message: TransportMessage) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn send_text(&self, _text: &str) -> Result<u64, TransportError> {
+            Ok(0)
+        }
+
+        fn send_bytes(&self, _bytes: &[u8]) -> Result<u64, TransportError> {
+            Ok(0)
+        }
+
+        fn recv(&self, _timeout: StdDuration) -> Result<TransportMessage, TransportError> {
+            Err(TransportError::Timeout)
+        }
+
+        fn try_recv(&self) -> Result<Option<TransportMessage>, TransportError> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn select_controller_transport_prefers_fast_path_channel() {
+        let primary = Arc::new(TestTransport::new(1, TransportKind::WebSocket));
+        let fast = Arc::new(TestTransport::new(2, TransportKind::WebRtc));
+        let channels = WebRtcChannels::new();
+        channels.publish(CONTROLLER_CHANNEL_LABEL.to_string(), fast.clone());
+
+        let (selected, label, via_fast_path) =
+            select_controller_transport(primary.clone(), Some(channels), None, true).await;
+
+        assert_eq!(selected.id(), fast.id());
+        assert_eq!(label, "fast_path");
+        assert!(via_fast_path);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn select_controller_transport_times_out_without_channel() {
+        let primary = Arc::new(TestTransport::new(5, TransportKind::WebSocket));
+        let channels = WebRtcChannels::new();
+
+        let fut = select_controller_transport(primary.clone(), Some(channels), None, true);
+        tokio::pin!(fut);
+        tokio::time::advance(CONTROLLER_FAST_PATH_WAIT + StdDuration::from_secs(1)).await;
+        let (selected, label, via_fast_path) = fut.await;
+
+        assert_eq!(selected.id(), primary.id());
+        assert_eq!(label, "http_fallback");
+        assert!(!via_fast_path);
+    }
+
+    #[tokio::test]
+    async fn fast_path_watchers_emit_ready_event() {
+        let channels = WebRtcChannels::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _watcher = FastPathUpgradeHandle::spawn(
+            channels.clone(),
+            "sess-fast".into(),
+            "pb-fast".into(),
+            tx.clone(),
+        );
+
+        let fast = Arc::new(TestTransport::new(9, TransportKind::WebRtc));
+        let channels_clone = channels.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+            channels_clone.publish(CONTROLLER_CHANNEL_LABEL.to_string(), fast);
+        });
+
+        let label = tokio::time::timeout(StdDuration::from_secs(1), async {
+            loop {
+                if let Some(event) = rx.recv().await {
+                    if let ForwarderEvent::FastPathReady { label, .. } = event {
+                        break label;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("fast-path ready event timed out");
+
+        assert_eq!(label, CONTROLLER_CHANNEL_LABEL);
+    }
+
+    #[tokio::test]
+    async fn ensure_fast_path_probe_runs_when_primary_marked_fast_path() {
+        let channels = WebRtcChannels::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut watchers: Option<FastPathUpgradeHandle> = None;
+
+        ensure_fast_path_probe(
+            &mut watchers,
+            &Some(channels),
+            true,
+            true,
+            true,
+            "sess-probe",
+            "pb-probe",
+            &tx,
+        );
+
+        assert!(watchers.is_some());
+        drop(watchers);
+    }
+
+    #[test]
+    fn session_record_applies_controller_auto_attach_hint() {
+        let mut record = SessionRecord::new("sess-auto", "pb-auto", &HarnessType::Custom);
+        let hint = ControllerAutoAttachHint {
+            private_beach_id: "pb-auto".into(),
+            attach_code: "ABC123".into(),
+            manager_url: "http://localhost:8080".into(),
+            issued_at: Utc::now(),
+            expires_at: None,
+        };
+        record
+            .upsert_controller_auto_attach_hint(&hint)
+            .expect("controller hint should serialize");
+        let stored = record
+            .transport_hints
+            .get("controller_auto_attach")
+            .and_then(|value| value.as_object())
+            .expect("controller hint missing");
+        assert_eq!(
+            stored.get("private_beach_id").and_then(|v| v.as_str()),
+            Some("pb-auto")
+        );
+        assert_eq!(
+            stored.get("attach_code").and_then(|v| v.as_str()),
+            Some("ABC123")
+        );
+        assert_eq!(
+            stored.get("manager_url").and_then(|v| v.as_str()),
+            Some("http://localhost:8080")
+        );
+    }
+
+    #[test_timeout::tokio_timeout_test(10)]
+    async fn controller_commands_require_ready_session() {
+        let state = AppState::new().with_controller_strict_gating(true);
+        let session_id = "sess-ready";
+        let token = insert_manual_session(&state, session_id, |record| {
+            record.mark_attached();
+        })
+        .await;
+
+        let err = state
+            .queue_actions(session_id, &token, vec![new_action("cmd-ready-1")], None)
+            .await
+            .expect_err("gating should reject before readiness");
+
+        match err {
+            StateError::ControllerCommandRejected { reason } => {
+                assert_eq!(reason, ControllerCommandDropReason::FastPathNotReady);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        {
+            let mut sessions = state.fallback.sessions.write().await;
+            if let Some(record) = sessions.get_mut(session_id) {
+                record.mark_http_ready();
+                record.last_health_at = Some(Instant::now());
+            }
+        }
+
+        state
+            .queue_actions(session_id, &token, vec![new_action("cmd-ready-2")], None)
+            .await
+            .expect("commands accepted once ready");
+    }
+
+    #[test_timeout::tokio_timeout_test(10)]
+    async fn controller_commands_reject_missing_lease() {
+        let state = AppState::new().with_controller_strict_gating(true);
+        let session_id = Uuid::new_v4().to_string();
+        let private_beach_id = Uuid::new_v4().to_string();
+        state
+            .attach_owned(&private_beach_id, vec![session_id.clone()], None)
+            .await
+            .expect("attach_owned succeeds");
+
+        let bogus_token = Uuid::new_v4().to_string();
+        let cmd = ActionCommand {
+            id: "cmd-missing-lease".into(),
+            action_type: "key".into(),
+            payload: serde_json::json!({ "key": "y" }),
+            expires_at: None,
+        };
+
+        let err = state
+            .queue_actions(&session_id, &bogus_token, vec![cmd], None)
+            .await
+            .expect_err("invalid lease should be rejected");
+
+        match err {
+            StateError::ControllerCommandRejected { reason } => {
+                assert_eq!(reason, ControllerCommandDropReason::MissingLease);
+            }
+            other => panic!("expected missing lease rejection, got {other:?}"),
+        }
+    }
+
+    async fn insert_manual_session<F>(state: &AppState, session_id: &str, configure: F) -> String
+    where
+        F: FnOnce(&mut SessionRecord),
+    {
+        let mut sessions = state.fallback.sessions.write().await;
+        let mut record = SessionRecord::new(session_id, "pb-test", &HarnessType::Custom);
+        let token = Uuid::new_v4().to_string();
+        record.ensure_lease(
+            token.clone(),
+            now_ms() + 60_000,
+            None,
+            None,
+            Some("test".into()),
+        );
+        configure(&mut record);
+        sessions.insert(session_id.to_string(), record);
+        token
+    }
+
+    fn new_action(id: &str) -> ActionCommand {
+        ActionCommand {
+            id: id.into(),
+            action_type: "key".into(),
+            payload: json!({ "key": "w" }),
+            expires_at: None,
+        }
+    }
+
+    fn drop_metric(reason: ControllerCommandDropReason) -> u64 {
+        metrics::CONTROLLER_ACTIONS_DROPPED
+            .with_label_values(&[reason.code()])
+            .get()
+    }
+
+    #[tokio::test]
+    async fn controller_commands_reject_child_not_attached_state() {
+        let state = AppState::new().with_controller_strict_gating(true);
+        let session_id = "child-not-attached";
+        let token = insert_manual_session(&state, session_id, |_| {}).await;
+        let before = drop_metric(ControllerCommandDropReason::ChildNotAttached);
+        let err = state
+            .queue_actions(session_id, &token, vec![new_action("cmd-attach")], None)
+            .await
+            .expect_err("unattached session should reject");
+        match err {
+            StateError::ControllerCommandRejected { reason } => {
+                assert_eq!(reason, ControllerCommandDropReason::ChildNotAttached);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let after = drop_metric(ControllerCommandDropReason::ChildNotAttached);
+        assert_eq!(after, before + 1);
+    }
+
+    #[tokio::test]
+    async fn controller_commands_reject_child_offline_state() {
+        let state = AppState::new().with_controller_strict_gating(true);
+        let session_id = "child-offline";
+        let token = insert_manual_session(&state, session_id, |record| {
+            record.mark_attached();
+            record.mark_http_ready();
+            record.last_health_at =
+                Some(Instant::now() - (STALE_SESSION_MAX_IDLE + StdDuration::from_secs(5)));
+        })
+        .await;
+        let before = drop_metric(ControllerCommandDropReason::ChildOffline);
+        let err = state
+            .queue_actions(session_id, &token, vec![new_action("cmd-offline")], None)
+            .await
+            .expect_err("offline session should reject");
+        match err {
+            StateError::ControllerCommandRejected { reason } => {
+                assert_eq!(reason, ControllerCommandDropReason::ChildOffline);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let after = drop_metric(ControllerCommandDropReason::ChildOffline);
+        assert_eq!(after, before + 1);
     }
 }

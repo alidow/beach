@@ -1,5 +1,3 @@
-import type { CSSProperties } from 'react';
-
 export type TerminalScrollPolicy = 'follow-tail' | 'manual';
 
 export interface TerminalSizingHostMeta {
@@ -30,7 +28,8 @@ export interface TerminalSizingStrategy {
   scrollPolicy(): TerminalScrollPolicy;
 }
 
-type TerminalSizingStyle = CSSProperties & {
+export type TerminalSizingStyle = Partial<CSSStyleDeclaration> & {
+  [key: string]: string | number | null | undefined;
   '--beach-terminal-max-height'?: string;
 };
 

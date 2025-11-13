@@ -46,6 +46,7 @@ function logCellMetric(kind: string, detail: Record<string, unknown>): void {
   }
 }
 import type {
+  TerminalSizingStyle,
   TerminalSizingStrategy,
   TerminalSizingHostMeta,
   TerminalViewportProposal,
@@ -990,7 +991,7 @@ export function BeachTerminal(props: BeachTerminalProps): JSX.Element {
       console.info(`${prefix} ${message}`);
     }
   }, []);
-  const applyContainerSizing = useCallback((style: CSSProperties | undefined) => {
+  const applyContainerSizing = useCallback((style: TerminalSizingStyle | undefined) => {
     const container = containerRef.current;
     if (!container) {
       return;

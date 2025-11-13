@@ -6,9 +6,9 @@ use axum::{
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
-use crate::state::{AppState, StateError, ViewerTokenError};
+use crate::state::{AppState, ControllerCommandDropReason, StateError, ViewerTokenError};
 
 use super::{sessions::ensure_scope, ApiError, ApiResult, AuthToken};
 
@@ -564,8 +564,22 @@ fn map_state_err(err: StateError) -> ApiError {
             warn!(message = %msg, "external dependency failure");
             ApiError::Upstream("external service failure")
         }
+        StateError::Internal(msg) => {
+            error!(message = %msg, "internal controller error");
+            ApiError::Internal
+        }
         StateError::ActionQueueFull { .. } => {
             ApiError::TooManyRequests("pending controller action queue full")
         }
+        StateError::ControllerCommandRejected { reason } => match reason {
+            ControllerCommandDropReason::FastPathNotReady => ApiError::PreconditionFailed {
+                message: reason.default_message(),
+                code: reason.code(),
+            },
+            _ => ApiError::ConflictWithCode {
+                message: reason.default_message(),
+                code: reason.code(),
+            },
+        },
     }
 }

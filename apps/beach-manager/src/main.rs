@@ -17,7 +17,7 @@ use std::{net::SocketAddr, path::Path, sync::OnceLock, time::Duration};
 use tokio::time::sleep;
 use tracing::{info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{filter::EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::filter::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -40,7 +40,8 @@ async fn main() -> anyhow::Result<()> {
         stale_session_idle_secs = STALE_SESSION_MAX_IDLE.as_secs(),
         viewer_health_interval_secs = viewer_health_report_interval().as_secs(),
         sweep_interval_secs = STALE_SESSION_SWEEP_INTERVAL.as_secs(),
-        log_path = %cfg.log_path.as_deref().unwrap_or("unset")
+        log_path = %cfg.log_path.as_deref().unwrap_or("unset"),
+        controller_strict_gating = cfg.controller_strict_gating
     );
 
     let mut state = if let Some(db_url) = &cfg.database_url {
@@ -83,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.beach_gate_url.clone(),
         cfg.beach_gate_viewer_token.clone(),
     );
+    state = state.with_controller_strict_gating(cfg.controller_strict_gating);
 
     {
         let cleanup_state = state.clone();
@@ -138,7 +140,6 @@ async fn main() -> anyhow::Result<()> {
 static FILE_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
 fn init_tracing(log_path: Option<&str>) {
-    use tracing_subscriber::filter::FilterExt;
     use tracing_subscriber::prelude::*;
 
     let stdout_directives = std::env::var("BEACH_MANAGER_STDOUT_LOG")

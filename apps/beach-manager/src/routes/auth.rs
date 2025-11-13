@@ -28,8 +28,15 @@ impl FromRequestParts<AppState> for AuthToken {
         let token = extract_token(&parts.headers)
             .or_else(|| extract_token_from_query(parts))
             .ok_or(ApiError::Unauthorized)?;
-        let claims = state.auth_context().verify(&token).await.map_err(|err| {
-            warn!(error = ?err, "token verification failed");
+        let path = parts.uri.path().to_string();
+        let strict = requires_strict_session_auth(&path);
+        let result = if strict {
+            state.auth_context().verify_strict(&token).await
+        } else {
+            state.auth_context().verify(&token).await
+        };
+        let claims = result.map_err(|err| {
+            warn!(error = ?err, path = path, "token verification failed");
             ApiError::Unauthorized
         })?;
         Ok(AuthToken { raw: token, claims })
@@ -106,4 +113,17 @@ fn percent_decode(s: &str) -> String {
     percent_encoding::percent_decode_str(s)
         .decode_utf8_lossy()
         .to_string()
+}
+
+fn requires_strict_session_auth(path: &str) -> bool {
+    if path.starts_with("/sessions") || path.starts_with("/fastpath/sessions") {
+        return true;
+    }
+    if path.starts_with("/agents/") {
+        return true;
+    }
+    if path.starts_with("/private-beaches/") && path.contains("/sessions") {
+        return true;
+    }
+    false
 }

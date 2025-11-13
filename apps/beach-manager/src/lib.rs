@@ -4,4 +4,5 @@ pub mod fastpath;
 pub mod log_throttle;
 pub mod metrics;
 pub mod routes;
+pub mod publish_token;
 pub mod state;

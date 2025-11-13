@@ -249,6 +249,11 @@ impl Storage {
         loop {
             let handshake_id: Option<String> = conn.lpop(&queue_key, None).await?;
             let Some(handshake_id) = handshake_id else {
+                tracing::trace!(
+                    session = %session_id,
+                    %peer_id,
+                    "no webrtc offer in queue for peer"
+                );
                 return Ok(None);
             };
 
@@ -258,14 +263,100 @@ impl Storage {
                 Some(json) => {
                     let payload: WebRtcSdpPayload = serde_json::from_str(&json)?;
                     if payload.to_peer != peer_id {
-                        conn.del::<_, ()>(&payload_key).await?;
+                        // The payload targets a different peer. This likely indicates
+                        // peer-id churn or queue/key mismatch. Do not discard the payload.
+                        // Push the handshake back onto the originally targeted peer's queue
+                        // to preserve delivery and continue scanning this queue.
+                        let original_queue_key = offer_queue_key(session_id, &payload.to_peer);
+                        let _: () = conn.rpush(&original_queue_key, &handshake_id).await?;
+                        tracing::warn!(
+                            session = %session_id,
+                            %peer_id,
+                            targeted_peer = %payload.to_peer,
+                            %handshake_id,
+                            "mismatched webrtc offer encountered; re-queued to targeted peer"
+                        );
                         continue;
                     }
+                    tracing::trace!(
+                        session = %session_id,
+                        %peer_id,
+                        %handshake_id,
+                        "popped webrtc offer for peer"
+                    );
                     return Ok(Some(payload));
                 }
                 None => continue,
             }
         }
+    }
+
+    /// Attempt to retarget a pending offer whose originally targeted peer is no longer present
+    /// to the requesting `new_peer_id`. Returns the first retargeted offer payload if any.
+    pub async fn retarget_orphaned_offer_for_peer(
+        &self,
+        session_id: &str,
+        present_peers: &[String],
+        new_peer_id: &str,
+    ) -> Result<Option<WebRtcSdpPayload>> {
+        use redis::AsyncCommands;
+
+        let mut conn = self.redis.clone();
+        let present: std::collections::HashSet<&str> = present_peers.iter().map(|s| s.as_str()).collect();
+
+        let pattern = format!("session:{}:webrtc:offers:*", session_id);
+        let keys: Vec<String> = conn.keys(&pattern).await.unwrap_or_default();
+        for queue_key in keys {
+            // Extract targeted peer_id from key suffix
+            let targeted_peer = match queue_key.rsplit_once(':') {
+                Some((_, last)) => last,
+                None => continue,
+            };
+
+            // Skip queues for currently present peers; only steal from orphaned queues
+            if present.contains(targeted_peer) || targeted_peer == new_peer_id {
+                continue;
+            }
+
+            // Pop one handshake from the orphaned queue
+            let handshake_id: Option<String> = conn.lpop(&queue_key, None).await?;
+            let Some(handshake_id) = handshake_id else { continue };
+
+            // Load payload and retarget it
+            let payload_key = offer_payload_key(session_id, &handshake_id);
+            if let Some(json) = conn.get::<_, Option<String>>(&payload_key).await? {
+                let mut payload: WebRtcSdpPayload = serde_json::from_str(&json)?;
+
+                // Update payload's target
+                payload.to_peer = new_peer_id.to_string();
+                let updated = serde_json::to_string(&payload)?;
+                let _: () = conn.set_ex(&payload_key, updated, self.ttl_seconds).await?;
+
+                // Enqueue for the new peer
+                let new_queue_key = offer_queue_key(session_id, new_peer_id);
+                let _: () = conn.rpush(&new_queue_key, &handshake_id).await?;
+                let _: () = conn
+                    .expire::<_, ()>(&new_queue_key, self.ttl_seconds as i64)
+                    .await?;
+
+                tracing::info!(
+                    session = %session_id,
+                    orphaned_peer = %targeted_peer,
+                    new_peer = %new_peer_id,
+                    %handshake_id,
+                    "retargeted orphaned webrtc offer to new peer"
+                );
+
+                return Ok(Some(payload));
+            }
+        }
+
+        tracing::trace!(
+            session = %session_id,
+            %new_peer_id,
+            "no orphaned offers found to retarget"
+        );
+        Ok(None)
     }
 
     pub async fn remove_offer_from_queue(

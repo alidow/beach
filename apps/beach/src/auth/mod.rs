@@ -49,25 +49,38 @@ fn env_truthy(name: &str) -> bool {
 }
 
 pub fn manager_requires_access_token(base_url: &str) -> bool {
-    if env_truthy("BEACH_MANAGER_REQUIRE_AUTH") {
+    if env_truthy("BEACH_MANAGER_AUTH_OPTIONAL") {
+        return false;
+    }
+    if env_truthy("BEACH_MANAGER_AUTH_REQUIRED") {
         return true;
     }
 
-    if let Ok(url) = Url::parse(base_url) {
-        if let Some(host) = url.host_str() {
-            let host = host.to_ascii_lowercase();
-            if host.starts_with("private.")
-                || host.contains(".private.")
-                || host.contains("private-beach")
-                || host.contains("pb-manager")
-                || host.contains("beach-manager")
-            {
-                return true;
-            }
+    let parsed = Url::parse(base_url);
+    if let Ok(url) = parsed {
+        let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+        let scheme = url.scheme().to_ascii_lowercase();
+        if scheme == "http" && is_trusted_development_host(&host) {
+            return false;
         }
+        return true;
     }
+    true
+}
 
-    false
+fn is_trusted_development_host(host: &str) -> bool {
+    matches!(
+        host,
+        "localhost" | "127.0.0.1" | "0.0.0.0" | "host.docker.internal"
+    ) || host.starts_with("127.")
+        || host.starts_with("10.")
+        || host.starts_with("192.168.")
+        || host
+            .strip_prefix("172.")
+            .and_then(|rest| rest.split('.').next())
+            .and_then(|octet| octet.parse::<u8>().ok())
+            .map(|oct| (16..32).contains(&oct))
+            .unwrap_or(false)
 }
 
 pub async fn maybe_access_token(
@@ -114,21 +127,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_private_hosts() {
-        assert!(manager_requires_access_token("https://private.example.com"));
-        assert!(manager_requires_access_token("https://pb-manager.test"));
-        assert!(!manager_requires_access_token("https://api.beach.sh"));
-    }
-
-    #[test]
-    fn env_override_forces_auth() {
-        unsafe {
-            std::env::set_var("BEACH_MANAGER_REQUIRE_AUTH", "true");
-        }
-        assert!(manager_requires_access_token("https://api.beach.sh"));
-        unsafe {
-            std::env::remove_var("BEACH_MANAGER_REQUIRE_AUTH");
-        }
+    fn dev_loopbacks_skip_auth() {
+        assert!(!manager_requires_access_token("http://localhost:8080"));
+        assert!(!manager_requires_access_token("http://127.0.0.1:9999"));
+        assert!(!manager_requires_access_token("http://10.0.0.25:8080"));
+        assert!(manager_requires_access_token("https://localhost:8080"));
+        assert!(manager_requires_access_token("http://api.beach.sh"));
     }
 }
 pub fn apply_profile_environment(

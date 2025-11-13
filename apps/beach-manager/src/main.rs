@@ -3,6 +3,7 @@ mod config;
 mod fastpath;
 mod log_throttle;
 mod metrics;
+mod publish_token;
 mod routes;
 mod state;
 
@@ -85,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.beach_gate_viewer_token.clone(),
     );
     state = state.with_controller_strict_gating(cfg.controller_strict_gating);
+    state = state.with_idle_snapshot_interval(cfg.idle_snapshot_interval_ms);
 
     {
         let cleanup_state = state.clone();

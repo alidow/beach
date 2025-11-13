@@ -24,6 +24,7 @@ use crate::{
 };
 
 use super::{ApiError, ApiResult, AuthToken};
+use crate::auth::Claims;
 
 pub(crate) fn ensure_scope(token: &AuthToken, scope: &'static str) -> Result<(), ApiError> {
     if token.has_scope(scope) {
@@ -476,30 +477,35 @@ async fn resolve_control_consumer(
 
 pub async fn signal_health(
     State(state): State<AppState>,
-    token: AuthToken,
+    headers: HeaderMap,
     Path(session_id): Path<String>,
     Json(body): Json<HealthHeartbeat>,
 ) -> ApiResult<serde_json::Value> {
-    ensure_scope(&token, "pb:harness.publish")?;
+    let auth_path = authorize_publish(&state, &headers, &session_id).await?;
     state
         .record_health(&session_id, body)
         .await
         .map_err(map_state_err)?;
+    info!(
+        target = "private_beach",
+        session_id = %session_id,
+        auth_path,
+        "signal_health accepted"
+    );
     Ok(Json(serde_json::json!({ "recorded": true })))
 }
 
 pub async fn push_state(
     State(state): State<AppState>,
-    token: AuthToken,
+    headers: HeaderMap,
     Path(session_id): Path<String>,
     Json(body): Json<StateDiff>,
 ) -> ApiResult<serde_json::Value> {
-    ensure_scope(&token, "pb:harness.publish")?;
-    let token_preview = token.as_str().chars().take(8).collect::<String>();
+    let auth_path = authorize_publish(&state, &headers, &session_id).await?;
     info!(
         session_id = %session_id,
         sequence = body.sequence,
-        token_preview = token_preview,
+        auth_path,
         "push_state received"
     );
     state
@@ -507,6 +513,69 @@ pub async fn push_state(
         .await
         .map_err(map_state_err)?;
     Ok(Json(serde_json::json!({ "stored": true })))
+}
+
+fn extract_bearer(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|auth| auth.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+}
+
+fn claims_has_scope(claims: &Claims, scope: &str) -> bool {
+    fn matches_scope(candidate: &str, scope: &str) -> bool {
+        candidate == "*"
+            || candidate == scope
+            || (candidate.ends_with(".*") && scope.starts_with(&candidate[..candidate.len() - 2]))
+    }
+
+    if let Some(value) = &claims.scope {
+        for item in value.split_whitespace() {
+            if matches_scope(item, scope) {
+                return true;
+            }
+        }
+    }
+    if let Some(list) = &claims.scp {
+        for candidate in list {
+            if matches_scope(candidate, scope) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+async fn authorize_publish(
+    state: &AppState,
+    headers: &HeaderMap,
+    session_id: &str,
+) -> Result<&'static str, ApiError> {
+    let Some(bearer) = extract_bearer(headers) else {
+        return Err(ApiError::Unauthorized);
+    };
+
+    // First, try verifying as a publish token (strict verification; no bypass)
+    match state
+        .publish_token_manager()
+        .verify_for_session(&bearer, session_id)
+    {
+        Ok(_claims) => return Ok("publish_token"),
+        Err(_err) => {
+            // Fall back to normal Beach Auth token
+        }
+    }
+
+    let claims = state
+        .auth_context()
+        .verify_strict(&bearer)
+        .await
+        .map_err(|_| ApiError::Unauthorized)?;
+    if !claims_has_scope(&claims, "pb:harness.publish") {
+        return Err(ApiError::Forbidden("pb:harness.publish"));
+    }
+    Ok("bearer")
 }
 
 pub async fn fetch_state_snapshot(

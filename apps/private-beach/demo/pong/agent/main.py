@@ -67,9 +67,9 @@ PADDLE_GLYPHS = frozenset(
 )
 
 BALL_GLYPHS = frozenset({"o", ".", "*", "\u25cf"})  # supports ● plus ascii fallbacks
-TRANSPORT_READY_STATES = frozenset(
-    {"fast_path", "http_fallback", "http_poller", "state_stream"}
-)
+# Controller-IO readiness states. Do not treat the state stream alone as ready,
+# since rendering readiness does not guarantee controller delivery is wired.
+TRANSPORT_READY_STATES = frozenset({"fast_path", "http_fallback", "http_poller"})
 
 
 def normalize_transport_status(value: Optional[str]) -> str:
@@ -1708,18 +1708,12 @@ class AgentApp:
         session.apply_terminal_frame(
             [str(line) for line in lines if isinstance(line, str)], cursor, int(sequence), now
         )
-        if (
-            not session.transport_ready
-            and session.lease_active
-            and session.height > 0
-        ):
-            session.transport_status = "state_stream"
-            session.transport_ready = True
+        # A live state stream indicates the viewer path is healthy, but we
+        # avoid marking controller transport as ready here. The forwarder may
+        # not yet be connected, which can cause early queue saturation.
+        if session.height > 0 and session.lease_active:
+            session.transport_status = session.transport_status or "state_stream"
             session.transport_last_update = now
-            self.log(
-                f"transport ready for {session.session_id} via state stream",
-                level="info",
-            )
 
     def _handle_transport_event(self, payload: object, now: float) -> None:
         if not isinstance(payload, dict):

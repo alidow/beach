@@ -27,6 +27,8 @@ export type AssignmentEdgeData = {
   pollFrequency: number;
   cadence: RelationshipCadenceConfig;
   isEditing: boolean;
+  connectionState?: 'pending' | 'slow' | 'fast' | 'error';
+  connectionMessage?: string | null;
   onSave: (
     payload: {
       id: string;

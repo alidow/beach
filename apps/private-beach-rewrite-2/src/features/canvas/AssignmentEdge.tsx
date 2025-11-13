@@ -15,6 +15,32 @@ import type { RelationshipCadenceConfig, RelationshipUpdateMode } from '../tiles
 import { createDefaultRelationshipCadence, inferUpdateModeFromCadence } from '../tiles/types';
 import { cadenceHasAnyPath, formatCadenceSummary } from './updateCadence';
 
+export type AssignmentEdgeConnectionState = 'pending' | 'slow' | 'fast' | 'error';
+
+type EdgeStrokeStyle = {
+  stroke: string;
+  strokeWidth: number;
+};
+
+const DEFAULT_EDGE_STYLE: EdgeStrokeStyle = {
+  stroke: 'rgba(148, 163, 184, 0.5)',
+  strokeWidth: 2,
+};
+
+const CONNECTION_STYLES: Record<AssignmentEdgeConnectionState, EdgeStrokeStyle> = {
+  error: { stroke: '#ff1744', strokeWidth: 4 },
+  pending: { stroke: '#ffd60a', strokeWidth: 4 },
+  slow: { stroke: '#39ff14', strokeWidth: 3.2 },
+  fast: { stroke: '#ff5de5', strokeWidth: 4 },
+};
+
+function resolveEdgeStyle(state?: AssignmentEdgeConnectionState | null): EdgeStrokeStyle {
+  if (!state) {
+    return DEFAULT_EDGE_STYLE;
+  }
+  return CONNECTION_STYLES[state] ?? DEFAULT_EDGE_STYLE;
+}
+
 export type AssignmentEdgeData = {
   instructions: string;
   updateMode: RelationshipUpdateMode;
@@ -25,6 +51,8 @@ export type AssignmentEdgeData = {
   statusMessage?: string | null;
   onRetry?: (payload: { id: string }) => void;
   onShowTrace?: (payload: { id: string }) => void;
+  connectionState?: AssignmentEdgeConnectionState;
+  connectionMessage?: string | null;
   onSave: (payload: {
     id: string;
     instructions: string;
@@ -69,6 +97,7 @@ export const AssignmentEdge = memo(function AssignmentEdge({
       isEditing: false,
       status: 'ok',
       statusMessage: null,
+      connectionState: 'pending',
       onSave: () => {},
       onEdit: () => {},
       onDelete: () => {},
@@ -80,6 +109,12 @@ export const AssignmentEdge = memo(function AssignmentEdge({
   const [cadence, setCadence] = useState<RelationshipCadenceConfig>(() => ({
     ...(edgeData.cadence ?? createDefaultRelationshipCadence()),
   }));
+  const edgeStyle = resolveEdgeStyle(edgeData.connectionState);
+  const hasConnectionError = edgeData.connectionState === 'error';
+  const failureMessage = edgeData.connectionMessage ?? edgeData.statusMessage ?? 'Unknown error.';
+  const [showErrorPopover, setShowErrorPopover] = useState(false);
+  const [showErrorDetails, setShowErrorDetails] = useState(false);
+  const marker = markerEnd ? { ...markerEnd, color: edgeStyle.stroke } : markerEnd;
 
   useEffect(() => {
     setInstructions(edgeData.instructions);
@@ -88,6 +123,13 @@ export const AssignmentEdge = memo(function AssignmentEdge({
   useEffect(() => {
     setCadence({ ...(edgeData.cadence ?? createDefaultRelationshipCadence()) });
   }, [edgeData.cadence]);
+
+  useEffect(() => {
+    if (!hasConnectionError) {
+      setShowErrorPopover(false);
+      setShowErrorDetails(false);
+    }
+  }, [hasConnectionError]);
 
   const handleSubmit = (event: React.FormEvent) => {
     event.preventDefault();
@@ -108,7 +150,15 @@ export const AssignmentEdge = memo(function AssignmentEdge({
 
   return (
     <>
-      <BaseEdge path={edgePath} markerEnd={markerEnd} style={{ stroke: 'rgba(148, 163, 184, 0.4)' }} />
+      <BaseEdge
+        path={edgePath}
+        markerEnd={marker}
+        style={{
+          stroke: edgeStyle.stroke,
+          strokeWidth: edgeStyle.strokeWidth,
+          strokeLinecap: 'round',
+        }}
+      />
       <EdgeLabelRenderer>
         <div
           className="pointer-events-auto"
@@ -118,6 +168,44 @@ export const AssignmentEdge = memo(function AssignmentEdge({
             position: 'absolute',
           }}
         >
+          {hasConnectionError ? (
+            <div className="mb-2 flex flex-col items-center">
+              <button
+                type="button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setShowErrorPopover((prev) => !prev);
+                }}
+                className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-rose-400/80 bg-rose-600 text-lg font-semibold text-white shadow-lg transition hover:scale-105"
+                aria-label="Show connection failure details"
+              >
+                !
+              </button>
+              {showErrorPopover ? (
+                <div className="mt-3 w-60 rounded-2xl border border-rose-400/60 bg-rose-600/90 p-3 text-rose-50 shadow-2xl">
+                  <p className="text-sm font-semibold uppercase tracking-[0.25em] text-rose-100">Connection failed</p>
+                  <p className="mt-1 text-[12px] text-rose-50/90">
+                    The controller was unable to connect to this child session.
+                  </p>
+                  <button
+                    type="button"
+                    className="mt-2 inline-flex items-center gap-1 text-[11px] font-semibold uppercase tracking-[0.25em] text-rose-100 underline"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setShowErrorDetails((prev) => !prev);
+                    }}
+                  >
+                    {showErrorDetails ? 'Hide details' : 'More details'}
+                  </button>
+                  {showErrorDetails ? (
+                    <div className="mt-2 rounded-lg border border-rose-200/40 bg-rose-500/30 p-2 text-[11px] text-rose-50">
+                      {failureMessage}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
           {edgeData.isEditing ? (
             <form
               onSubmit={handleSubmit}

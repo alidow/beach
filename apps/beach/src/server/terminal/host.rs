@@ -1,6 +1,7 @@
 use crate::auth;
 use crate::cache::Seq;
-use crate::cache::terminal::TerminalGrid;
+use crate::cache::terminal::packed::unpack_cell;
+use crate::cache::terminal::{TerminalGrid, packed::StyleId};
 use crate::client::terminal::join::{kind_label, summarize_offers};
 use crate::client::terminal::{ClientError, TerminalClient};
 use crate::mcp::{
@@ -45,6 +46,8 @@ use crate::transport::terminal::negotiation::{
 use crate::transport::{Payload, Transport, TransportError, TransportKind};
 use beach_buggy::{
     AckStatus as CtrlAckStatus, ActionAck as CtrlActionAck, ActionCommand as CtrlActionCommand,
+    CellStylePayload, CursorPosition, HttpTransport, ManagerTransport, StateDiff,
+    StaticTokenProvider, StyleDefinition, StyledCell, TerminalFrame,
 };
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
@@ -53,7 +56,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Write as _};
 use std::io::{self, IsTerminal, Read, Write};
 use std::process;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -73,6 +76,8 @@ pub(crate) const MCP_CHANNEL_LABEL: &str = "mcp-jsonrpc";
 pub(crate) const MCP_CHANNEL_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const CONTROLLER_CHANNEL_LABEL: &str = "mgr-actions";
 pub(crate) const LEGACY_CONTROLLER_CHANNEL_LABEL: &str = "pb-controller";
+const IDLE_SNAPSHOT_HINT_KEY: &str = "idle_snapshot";
+const IDLE_SNAPSHOT_INTERVAL_KEY: &str = "interval_ms";
 
 #[tracing::instrument(
     name = "beach::terminal::host::run",
@@ -99,7 +104,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     }
 
     let mut config = SessionConfig::new(base_url)?;
-    if let Some(token) = access_token {
+    if let Some(token) = access_token.clone() {
         config = config.with_bearer_token(Some(token));
     }
     let manager = SessionManager::new(config)?;
@@ -212,6 +217,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let raw_guard = RawModeGuard::new(interactive);
 
     let session_handle = hosted.handle().clone();
+    let idle_snapshot_interval = parse_idle_snapshot_hint(session_handle.transport_hints());
     let join_code = hosted.join_code().to_string();
     let transports: Arc<Mutex<Vec<Arc<SharedTransport>>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -248,20 +254,64 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
 
     let (forwarder_updates_tx, forwarder_updates_rx) = mpsc::unbounded_channel();
     let cursor_tracker: Arc<Mutex<Option<CursorState>>> = Arc::new(Mutex::new(None));
+    let last_terminal_update = Arc::new(AtomicU64::new(now_millis()));
     let updates_forward_task = {
         let mut updates = updates;
         let cursor_tracker = Arc::clone(&cursor_tracker);
+        let last_terminal_update = Arc::clone(&last_terminal_update);
         tokio::spawn(async move {
             while let Some(update) = updates.recv().await {
                 if let CacheUpdate::Cursor(cursor) = &update {
                     *cursor_tracker.lock().unwrap() = Some(*cursor);
                 }
+                last_terminal_update.store(now_millis(), Ordering::Relaxed);
                 if forwarder_updates_tx.send(update).is_err() {
                     break;
                 }
             }
         })
     };
+
+    let metadata_auto_attach =
+        match parse_controller_auto_attach_hint(session_handle.transport_hints()) {
+            Ok(value) => value,
+            Err(err) => {
+                warn!(
+                    target = "controller.actions",
+                    session_id = %session_id,
+                    error = %err,
+                    "failed to parse controller auto-attach hint from metadata"
+                );
+                None
+            }
+        };
+    let env_manager_url = manager_url_from_env();
+    let env_auto_attach = env_auto_attach_hint(env_manager_url.as_deref());
+    let manager_url_for_actions = metadata_auto_attach
+        .as_ref()
+        .map(|hint| hint.manager_url.clone())
+        .or_else(|| env_manager_url.clone());
+
+    let publish_bearer = parse_idle_publish_bearer(session_handle.transport_hints())
+        .or_else(|| access_token.clone());
+    // Idle snapshot/state/health posts should go to the Manager, not the session broker.
+    // Prefer a manager URL discovered via metadata/env; fall back to the session server base.
+    let idle_publish_base = manager_url_for_actions
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| normalized_base.clone());
+    let idle_snapshot_controller = Arc::new(IdleSnapshotController::new(
+        idle_publish_base,
+        publish_bearer,
+        session_id.clone(),
+        grid.clone(),
+        Arc::clone(&cursor_tracker),
+        Arc::clone(&last_terminal_update),
+    ));
+    idle_snapshot_controller
+        .apply_hint(idle_snapshot_interval)
+        .await;
 
     let mut mcp_task: Option<JoinHandle<()>> = None;
     let mut mcp_handle: Option<McpServerHandle> = None;
@@ -319,6 +369,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         let writer_for_actions = writer.clone();
         let controller_ctx_for_actions = controller_ctx.clone();
         let attach_state_for_actions = attach_state.clone();
+        let idle_snapshots_for_actions = idle_snapshot_controller.clone();
         tokio::spawn(async move {
             let http = match Client::builder().build() {
                 Ok(c) => c,
@@ -429,6 +480,13 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                                                 }
                                             }
                                         }
+                    if let Some(idle_hint) = payload.get(IDLE_SNAPSHOT_HINT_KEY) {
+                        let (interval, token) = parse_idle_snapshot_payload(idle_hint);
+                        if let Some(tok) = token {
+                            idle_snapshots_for_actions.set_token(Some(tok)).await;
+                        }
+                        idle_snapshots_for_actions.apply_hint(interval).await;
+                    }
                                     }
                                 }
                                 if kind == "manager_detach" {
@@ -472,26 +530,6 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
             }
         });
     }
-
-    let metadata_auto_attach =
-        match parse_controller_auto_attach_hint(session_handle.transport_hints()) {
-            Ok(value) => value,
-            Err(err) => {
-                warn!(
-                    target = "controller.actions",
-                    session_id = %session_id,
-                    error = %err,
-                    "failed to parse controller auto-attach hint from metadata"
-                );
-                None
-            }
-        };
-    let env_manager_url = manager_url_from_env();
-    let env_auto_attach = env_auto_attach_hint(env_manager_url.as_deref());
-    let manager_url_for_actions = metadata_auto_attach
-        .as_ref()
-        .map(|hint| hint.manager_url.clone())
-        .or_else(|| env_manager_url.clone());
 
     if let Some((hint, source)) =
         select_auto_attach_hint(metadata_auto_attach.clone(), env_auto_attach.clone())
@@ -711,6 +749,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
 
     updates_forward_task.abort();
     let _ = updates_forward_task.await;
+    idle_snapshot_controller.shutdown().await;
 
     if let Err(err) = updates_task.await {
         warn!(
@@ -1436,6 +1475,412 @@ fn writeln_cleared(out: &mut io::StdoutLock<'_>, args: std::fmt::Arguments<'_>) 
 
 fn blank_line(out: &mut io::StdoutLock<'_>) {
     let _ = out.write_all(b"\r\x1b[2K\n");
+}
+
+fn parse_idle_snapshot_hint(hints: &HashMap<String, Value>) -> Option<Duration> {
+    let hint = hints.get(IDLE_SNAPSHOT_HINT_KEY)?;
+    let interval_ms = hint
+        .get(IDLE_SNAPSHOT_INTERVAL_KEY)
+        .and_then(|value| value.as_u64())
+        .filter(|value| *value > 0)?;
+    Some(Duration::from_millis(interval_ms))
+}
+
+fn parse_idle_publish_bearer(hints: &HashMap<String, Value>) -> Option<String> {
+    let hint = hints.get(IDLE_SNAPSHOT_HINT_KEY)?;
+    let token_value = hint.get("publish_token")?;
+    if let Some(obj) = token_value.as_object() {
+        if let Some(token) = obj.get("token").and_then(|v| v.as_str()) {
+            return Some(token.to_string());
+        }
+    }
+    token_value.as_str().map(|s| s.to_string())
+}
+
+fn parse_idle_snapshot_payload(value: &Value) -> (Option<Duration>, Option<String>) {
+    let interval = value
+        .get(IDLE_SNAPSHOT_INTERVAL_KEY)
+        .and_then(|interval| interval.as_u64())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis);
+    let token = value
+        .get("publish_token")
+        .and_then(|v| v.get("token"))
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string());
+    (interval, token)
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn capture_terminal_frame(
+    grid: &Arc<TerminalGrid>,
+    cursor_tracker: &Arc<Mutex<Option<CursorState>>>,
+) -> TerminalFrame {
+    let cols = grid.cols().max(1);
+    let start_row = grid.first_row_id().unwrap_or_else(|| grid.row_offset());
+    let end_row = grid.last_row_id().unwrap_or(start_row.saturating_sub(1));
+    let mut lines = Vec::new();
+    let mut styled_lines = Vec::new();
+    if end_row >= start_row {
+        for absolute in start_row..=end_row {
+            let Some(index) = grid.index_of_row(absolute) else {
+                continue;
+            };
+            let mut cells: Vec<StyledCell> = Vec::with_capacity(cols);
+            for col in 0..cols {
+                let (ch, style_id) = grid
+                    .get_cell_relaxed(index, col)
+                    .map(|snapshot| unpack_cell(snapshot.cell))
+                    .unwrap_or((' ', StyleId::DEFAULT));
+                let ch = if ch == '\0' { ' ' } else { ch };
+                let style = grid.style_table.get(style_id).unwrap_or_default();
+                cells.push(StyledCell {
+                    ch,
+                    style: CellStylePayload {
+                        id: style_id.0,
+                        fg: style.fg,
+                        bg: style.bg,
+                        attrs: style.attrs as u32,
+                    },
+                });
+            }
+            while let Some(last) = cells.last() {
+                if last.ch == ' ' && last.style.id == StyleId::DEFAULT.0 {
+                    cells.pop();
+                } else {
+                    break;
+                }
+            }
+            let line: String = cells.iter().map(|cell| cell.ch).collect();
+            lines.push(line);
+            styled_lines.push(cells);
+        }
+    }
+
+    let styles = grid
+        .style_table
+        .entries()
+        .into_iter()
+        .map(|(id, style)| StyleDefinition {
+            id: id.0,
+            fg: style.fg,
+            bg: style.bg,
+            attrs: style.attrs as u32,
+        })
+        .collect::<Vec<_>>();
+
+    let cursor = cursor_tracker
+        .lock()
+        .ok()
+        .and_then(|guard| (*guard).clone())
+        .map(|cursor| CursorPosition {
+            row: cursor.row,
+            col: cursor.col,
+        });
+
+    TerminalFrame {
+        lines,
+        styled_lines: Some(styled_lines),
+        styles: Some(styles),
+        cols: Some(cols),
+        rows: Some(end_row.saturating_sub(start_row).saturating_add(1) as usize),
+        base_row: Some(start_row),
+        cursor,
+    }
+}
+
+fn spawn_idle_snapshot_worker(
+    interval: Duration,
+    token: String,
+    base_url: String,
+    session_id: String,
+    grid: Arc<TerminalGrid>,
+    cursor_tracker: Arc<Mutex<Option<CursorState>>>,
+    last_terminal_update: Arc<AtomicU64>,
+) -> Option<(JoinHandle<()>, oneshot::Sender<()>)> {
+    if interval.is_zero() {
+        return None;
+    }
+    let transport = match HttpTransport::new(base_url, StaticTokenProvider::new(token)) {
+        Ok(transport) => Arc::new(transport),
+        Err(err) => {
+            warn!(
+                target = "private_beach",
+                error = %err,
+                "idle snapshot transport initialization failed"
+            );
+            return None;
+        }
+    };
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let worker = IdleSnapshotWorker::new(
+        interval,
+        grid,
+        cursor_tracker,
+        last_terminal_update,
+        Arc::new(StatePublisher::new(transport, session_id)),
+    );
+    let handle = tokio::spawn(async move {
+        worker.run(cancel_rx).await;
+    });
+    Some((handle, cancel_tx))
+}
+
+struct StatePublisher {
+    transport: Arc<HttpTransport<StaticTokenProvider>>,
+    session_id: String,
+    seq: AtomicU64,
+}
+
+impl StatePublisher {
+    fn new(transport: Arc<HttpTransport<StaticTokenProvider>>, session_id: String) -> Self {
+        Self {
+            transport,
+            session_id,
+            seq: AtomicU64::new(0),
+        }
+    }
+
+    async fn publish(&self, frame: TerminalFrame) -> Result<(), String> {
+        let payload = build_terminal_payload(&frame);
+        let diff = StateDiff {
+            sequence: self.seq.fetch_add(1, Ordering::Relaxed).saturating_add(1),
+            emitted_at: SystemTime::now(),
+            payload,
+        };
+        self.transport
+            .send_state(&self.session_id, diff)
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
+
+struct IdleSnapshotWorker {
+    interval: Duration,
+    grid: Arc<TerminalGrid>,
+    cursor_tracker: Arc<Mutex<Option<CursorState>>>,
+    last_terminal_update: Arc<AtomicU64>,
+    publisher: Arc<StatePublisher>,
+}
+
+impl IdleSnapshotWorker {
+    fn new(
+        interval: Duration,
+        grid: Arc<TerminalGrid>,
+        cursor_tracker: Arc<Mutex<Option<CursorState>>>,
+        last_terminal_update: Arc<AtomicU64>,
+        publisher: Arc<StatePublisher>,
+    ) -> Self {
+        Self {
+            interval,
+            grid,
+            cursor_tracker,
+            last_terminal_update,
+            publisher,
+        }
+    }
+
+    async fn run(self, mut shutdown: oneshot::Receiver<()>) {
+        loop {
+            tokio::select! {
+                _ = sleep(self.interval) => {
+                    let last = self.last_terminal_update.load(Ordering::Relaxed);
+                    let now = now_millis();
+                    if now.saturating_sub(last) < self.interval.as_millis() as u64 {
+                        continue;
+                    }
+                    let frame = capture_terminal_frame(&self.grid, &self.cursor_tracker);
+                    match self.publisher.publish(frame).await {
+                        Ok(_) => {
+                            self.last_terminal_update
+                                .store(now_millis(), Ordering::Relaxed);
+                        }
+                        Err(err) => {
+                            warn!(
+                                target = "private_beach",
+                                error = %err,
+                                "idle snapshot publish failed"
+                            );
+                        }
+                    }
+                }
+                _ = &mut shutdown => {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct IdleSnapshotControllerState {
+    interval: Option<Duration>,
+    handle: Option<JoinHandle<()>>,
+    cancel: Option<oneshot::Sender<()>>,
+}
+
+#[derive(Clone)]
+struct IdleSnapshotController {
+    base_url: String,
+    session_id: String,
+    token: Arc<AsyncMutex<Option<String>>>,
+    grid: Arc<TerminalGrid>,
+    cursor_tracker: Arc<Mutex<Option<CursorState>>>,
+    last_terminal_update: Arc<AtomicU64>,
+    state: Arc<AsyncMutex<IdleSnapshotControllerState>>,
+}
+
+impl IdleSnapshotController {
+    fn new(
+        base_url: String,
+        token: Option<String>,
+        session_id: String,
+        grid: Arc<TerminalGrid>,
+        cursor_tracker: Arc<Mutex<Option<CursorState>>>,
+        last_terminal_update: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            base_url,
+            session_id,
+            token: Arc::new(AsyncMutex::new(token)),
+            grid,
+            cursor_tracker,
+            last_terminal_update,
+            state: Arc::new(AsyncMutex::new(IdleSnapshotControllerState::default())),
+        }
+    }
+
+    async fn set_token(&self, token: Option<String>) {
+        {
+            let mut guard = self.token.lock().await;
+            *guard = token.clone();
+        }
+        if token.is_none() {
+            warn!(
+                target = "private_beach",
+                session_id = %self.session_id,
+                "publish token cleared; idle snapshots will rely on beach auth"
+            );
+        }
+        let active_interval = { self.state.lock().await.interval };
+        if active_interval.is_some() {
+            self.apply_hint(active_interval).await;
+        }
+    }
+
+    async fn apply_hint(&self, interval: Option<Duration>) {
+        let interval = interval.filter(|value| !value.is_zero());
+        let mut state = self.state.lock().await;
+        if interval == state.interval {
+            return;
+        }
+        let cancel = state.cancel.take();
+        let handle = state.handle.take();
+        state.interval = None;
+        drop(state);
+        if let Some(cancel) = cancel {
+            let _ = cancel.send(());
+        }
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+        if let Some(interval) = interval {
+            let token_opt = { self.token.lock().await.clone() };
+            let Some(token) = token_opt else {
+                warn!(
+                    target = "private_beach",
+                    interval_ms = interval.as_millis(),
+                    "idle snapshot hint received but no access token available"
+                );
+                return;
+            };
+            match spawn_idle_snapshot_worker(
+                interval,
+                token,
+                self.base_url.clone(),
+                self.session_id.clone(),
+                self.grid.clone(),
+                self.cursor_tracker.clone(),
+                self.last_terminal_update.clone(),
+            ) {
+                Some((handle, cancel)) => {
+                    let mut state = self.state.lock().await;
+                    state.interval = Some(interval);
+                    state.handle = Some(handle);
+                    state.cancel = Some(cancel);
+                    info!(
+                        target = "private_beach",
+                        session_id = %self.session_id,
+                        interval_ms = interval.as_millis(),
+                        "idle snapshot worker enabled"
+                    );
+                }
+                None => {
+                    warn!(
+                        target = "private_beach",
+                        session_id = %self.session_id,
+                        "idle snapshot worker failed to start"
+                    );
+                }
+            }
+        } else {
+            info!(
+                target = "private_beach",
+                session_id = %self.session_id,
+                "idle snapshot worker disabled"
+            );
+        }
+    }
+
+    async fn shutdown(&self) {
+        self.apply_hint(None).await;
+    }
+}
+
+fn build_terminal_payload(frame: &TerminalFrame) -> serde_json::Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "type".into(),
+        serde_json::Value::String("terminal_full".into()),
+    );
+    payload.insert(
+        "lines".into(),
+        serde_json::to_value(&frame.lines).expect("serialize terminal lines"),
+    );
+    if let Some(cursor) = frame.cursor {
+        payload.insert(
+            "cursor".into(),
+            serde_json::json!({ "row": cursor.row, "col": cursor.col }),
+        );
+    }
+    if let Some(styled_lines) = &frame.styled_lines {
+        payload.insert(
+            "styled_lines".into(),
+            serde_json::to_value(styled_lines).expect("serialize styled lines"),
+        );
+    }
+    if let Some(styles) = &frame.styles {
+        payload.insert(
+            "styles".into(),
+            serde_json::to_value(styles).expect("serialize style definitions"),
+        );
+    }
+    if let Some(cols) = frame.cols {
+        payload.insert("cols".into(), serde_json::json!(cols));
+    }
+    if let Some(rows) = frame.rows {
+        payload.insert("rows".into(), serde_json::json!(rows));
+    }
+    if let Some(base_row) = frame.base_row {
+        payload.insert("base_row".into(), serde_json::json!(base_row));
+    }
+    payload.into()
 }
 
 fn print_host_banner(

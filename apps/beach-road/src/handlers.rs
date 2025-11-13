@@ -28,6 +28,7 @@ use crate::{
     signaling::WebRtcSdpPayload,
     storage::{ControlMessage, SessionInfo, Storage},
     viewer_token::{ViewerTokenError, ViewerTokenVerifier},
+    websocket::SignalingState,
 };
 
 pub type SharedStorage = Arc<Storage>;
@@ -705,6 +706,7 @@ pub async fn get_webrtc_offer(
     State(storage): State<SharedStorage>,
     Path(session_id): Path<String>,
     Query(params): Query<OfferQuery>,
+    Extension(signaling): Extension<SignalingState>,
 ) -> Result<Json<WebRtcSdpPayload>, StatusCode> {
     let storage = (*storage).clone();
     match storage
@@ -718,6 +720,18 @@ pub async fn get_webrtc_offer(
             Ok(Json(payload))
         }
         None => {
+            // Fallback: if no offer queued for this peer, try retargeting from orphaned queues
+            let peers = signaling.get_peers(&session_id);
+            let present_peer_ids: Vec<String> = peers.into_iter().map(|p| p.id).collect();
+            if let Ok(Some(payload)) = storage
+                .retarget_orphaned_offer_for_peer(&session_id, &present_peer_ids, &params.peer_id)
+                .await
+            {
+                // Activity observed: refresh session TTL
+                let _ = storage.update_session_ttl(&session_id).await;
+                return Ok(Json(payload));
+            }
+
             let exists = storage
                 .session_exists(&session_id)
                 .await
@@ -725,6 +739,11 @@ pub async fn get_webrtc_offer(
             if !exists {
                 return Err(StatusCode::NOT_FOUND);
             }
+            tracing::trace!(
+                session = %session_id,
+                peer = %params.peer_id,
+                "no webrtc offer available for peer (404)"
+            );
             // Maintain legacy semantics so existing clients keep polling instead of parsing
             // an empty body from a 204/200 response.
             Err(StatusCode::NOT_FOUND)

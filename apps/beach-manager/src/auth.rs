@@ -117,14 +117,21 @@ impl AuthContext {
     }
 
     pub async fn verify(&self, token: &str) -> Result<Claims, AuthError> {
+        self.verify_with_mode(token, self.config.bypass).await
+    }
+
+    pub async fn verify_strict(&self, token: &str) -> Result<Claims, AuthError> {
+        self.verify_with_mode(token, false).await
+    }
+
+    async fn verify_with_mode(&self, token: &str, allow_bypass: bool) -> Result<Claims, AuthError> {
         if token.is_empty() {
             return Err(AuthError::MissingToken);
         }
 
-        if self.config.bypass {
+        if allow_bypass && self.config.bypass {
             return self.decode_without_verification(token);
         }
-
         let header = decode_header(token)?;
         let kid = header.kid.ok_or(AuthError::MissingKid)?;
         let key = self.decoding_key(&kid).await?;

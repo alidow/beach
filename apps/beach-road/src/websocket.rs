@@ -148,7 +148,7 @@ impl SignalingState {
     }
 
     /// Get all peers in a session
-    fn get_peers(&self, session_id: &str) -> Vec<PeerInfo> {
+    pub fn get_peers(&self, session_id: &str) -> Vec<PeerInfo> {
         self.sessions
             .get(session_id)
             .map(|peers| {

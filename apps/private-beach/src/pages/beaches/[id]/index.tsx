@@ -144,6 +144,9 @@ export default function BeachDashboard() {
   const [savingSettings, setSavingSettings] = useState(false);
   const { isLoaded, isSignedIn, getToken } = useAuth();
   const tokenTemplate = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
+  if (typeof window !== 'undefined') {
+    console.info('[auth] token-template', tokenTemplate ?? '<unset>');
+  }
   const [managerToken, setManagerToken] = useState<string | null>(null);
   const [viewerToken, setViewerToken] = useState<string | null>(null);
   const [assignments, setAssignments] = useState<ControllerPairing[]>([]);

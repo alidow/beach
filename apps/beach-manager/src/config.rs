@@ -28,6 +28,8 @@ pub struct AppConfig {
     pub log_path: Option<String>,
     #[serde(default = "default_true")]
     pub controller_strict_gating: bool,
+    #[serde(default = "default_idle_snapshot_interval")]
+    pub idle_snapshot_interval_ms: Option<u64>,
 }
 
 impl AppConfig {
@@ -50,6 +52,7 @@ impl AppConfig {
                 public_manager_url: None,
                 log_path: None,
                 controller_strict_gating: true,
+                idle_snapshot_interval_ms: default_idle_snapshot_interval(),
             })
     }
 }
@@ -60,4 +63,8 @@ fn default_bind_addr() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_idle_snapshot_interval() -> Option<u64> {
+    Some(30_000)
 }

@@ -57,13 +57,15 @@ import {
   acquireController,
   batchControllerAssignments,
   deleteControllerPairing,
+  listControllerPairingsForControllers,
   type ControllerUpdateCadence,
+  type PairingTransportStatus,
 } from '@/lib/api';
 import { recordTraceLog, useTraceLogs, clearTraceLogs } from '@/features/trace/traceLogStore';
 import { buildManagerUrl, buildRoadUrl, useManagerToken } from '@/hooks/useManagerToken';
 import { useCanvasEvents } from './CanvasEventsContext';
 import { snapPointToGrid } from './positioning';
-import { AssignmentEdge, type AssignmentEdgeData } from './AssignmentEdge';
+import { AssignmentEdge, type AssignmentEdgeConnectionState, type AssignmentEdgeData } from './AssignmentEdge';
 import { TraceMonitorPanel } from './TraceMonitorPanel';
 import { CanvasDragStateProvider } from './CanvasDragStateContext';
 import { CANVAS_CENTER_TILE_EVENT, type CanvasCenterTileEventDetail } from './events';
@@ -93,6 +95,7 @@ const CONTROLLER_LEASE_TTL_MS = 120_000;
 const CONTROLLER_LEASE_REFRESH_BUFFER_MS = 5_000;
 const VIEWPORT_PAN_EPSILON = 0.5;
 const VIEWPORT_ZOOM_EPSILON = 0.0005;
+const PAIRING_STATUS_REFRESH_MS = 15_000;
 
 type FlowCanvasProps = {
   onNodePlacement: (payload: NodePlacementPayload) => void;
@@ -138,6 +141,7 @@ function FlowCanvasInner({
   const previousRelationshipsRef = useRef<Record<string, RelationshipDescriptor>>({});
   const [relationshipErrors, setRelationshipErrors] = useState<Record<string, string>>({});
   const [relationshipSyncHistory, setRelationshipSyncHistory] = useState<Record<string, PairingHistoryEntry[]>>({});
+  const [relationshipTransports, setRelationshipTransports] = useState<Record<string, PairingTransportStatus | null>>({});
   const [syncNonce, setSyncNonce] = useState(0);
   const [traceOverlay, setTraceOverlay] = useState<{
     relationshipId: string;
@@ -918,6 +922,100 @@ function FlowCanvasInner({
     }
   }, [state.relationships, state.tiles, traceOverlay]);
 
+  useEffect(() => {
+    const baseMap: Record<string, PairingTransportStatus | null> = {};
+    state.relationshipOrder.forEach((relId) => {
+      baseMap[relId] = null;
+    });
+    setRelationshipTransports(baseMap);
+    if (!privateBeachId || !resolvedManagerUrl) {
+      return;
+    }
+    const relationshipsWithSessions = state.relationshipOrder
+      .map((relId) => {
+        const rel = state.relationships[relId];
+        if (!rel) {
+          return null;
+        }
+        const controllerSessionId =
+          rel.sourceSessionId ?? state.tiles[rel.sourceId]?.sessionMeta?.sessionId ?? null;
+        const childSessionId =
+          rel.targetSessionId ?? state.tiles[rel.targetId]?.sessionMeta?.sessionId ?? null;
+        if (!controllerSessionId || !childSessionId) {
+          return null;
+        }
+        return { relId, controllerSessionId, childSessionId };
+      })
+      .filter((entry): entry is { relId: string; controllerSessionId: string; childSessionId: string } =>
+        Boolean(entry),
+      );
+    if (relationshipsWithSessions.length === 0) {
+      return;
+    }
+    let cancelled = false;
+    const controllerIds = Array.from(
+      new Set(relationshipsWithSessions.map((entry) => entry.controllerSessionId)),
+    );
+    if (controllerIds.length === 0) {
+      return;
+    }
+
+    const fetchStatuses = async () => {
+      try {
+        const authToken = managerToken ?? (await refreshManagerToken());
+        if (!authToken || cancelled) {
+          return;
+        }
+        const pairings = await listControllerPairingsForControllers(
+          controllerIds,
+          authToken,
+          resolvedManagerUrl,
+        );
+        if (cancelled) {
+          return;
+        }
+        const lookup = new Map<string, PairingTransportStatus | null>();
+        pairings.forEach((pairing) => {
+          const key = `${pairing.controller_session_id}|${pairing.child_session_id}`;
+          lookup.set(key, pairing.transport_status ?? null);
+        });
+        const nextMap: Record<string, PairingTransportStatus | null> = { ...baseMap };
+        relationshipsWithSessions.forEach(({ relId, controllerSessionId, childSessionId }) => {
+          const key = `${controllerSessionId}|${childSessionId}`;
+          if (lookup.has(key)) {
+            nextMap[relId] = lookup.get(key) ?? null;
+          }
+        });
+        setRelationshipTransports(nextMap);
+      } catch (error) {
+        console.warn('[rewrite-2] failed to load controller pairing status', error);
+      }
+    };
+
+    void fetchStatuses();
+    let intervalId: number | null = null;
+    if (typeof window !== 'undefined') {
+      intervalId = window.setInterval(() => {
+        void fetchStatuses();
+      }, PAIRING_STATUS_REFRESH_MS);
+    }
+    return () => {
+      cancelled = true;
+      if (intervalId !== null) {
+        window.clearInterval(intervalId);
+      }
+    };
+  }, [
+    managerToken,
+    privateBeachId,
+    refreshManagerToken,
+    resolvedManagerUrl,
+    state.relationshipOrder,
+    state.relationships,
+    state.tiles,
+    syncNonce,
+  ]);
+
   const handleRelationshipRetry = useCallback(
     ({ id }: { id: string }) => {
       delete relationshipSyncKeysRef.current[id];
@@ -1228,6 +1326,22 @@ function FlowCanvasInner({
         }
         const sourceTile = state.tiles[rel.sourceId]!;
         const traceButtonEnabled = Boolean(sourceTile.agentMeta?.trace?.enabled && sourceTile.agentMeta?.trace?.trace_id);
+        const transport = relationshipTransports[rel.id];
+        let connectionState: AssignmentEdgeConnectionState = 'pending';
+        let connectionMessage: string | null = null;
+        if (relationshipErrors[rel.id]) {
+          connectionState = 'error';
+          connectionMessage = relationshipErrors[rel.id] ?? null;
+        } else if (transport) {
+          if (transport.last_error) {
+            connectionState = 'error';
+            connectionMessage = transport.last_error;
+          } else if (transport.transport === 'fast_path') {
+            connectionState = 'fast';
+          } else if (transport.transport === 'http_fallback') {
+            connectionState = 'slow';
+          }
+        }
         return {
           id: rel.id,
           type: 'assignment',
@@ -1244,6 +1358,8 @@ function FlowCanvasInner({
             status: relationshipErrors[rel.id] ? 'error' : 'ok',
             statusMessage: relationshipErrors[rel.id] ?? null,
             onRetry: relationshipErrors[rel.id] ? handleRelationshipRetry : undefined,
+            connectionState,
+            connectionMessage,
             onSave: handleEdgeSave,
             onEdit: handleEdgeEdit,
             onDelete: handleEdgeDelete,
@@ -1253,7 +1369,7 @@ function FlowCanvasInner({
       })
       .filter((edge): edge is NonNullable<typeof edge> => Boolean(edge));
     return mapped as Edge<AssignmentEdgeData>[];
-  }, [editingEdgeId, handleEdgeDelete, handleEdgeEdit, handleEdgeSave, handleRelationshipRetry, handleShowTraceOverlay, relationshipErrors, state.relationshipOrder, state.relationships, state.tiles]);
+  }, [editingEdgeId, handleEdgeDelete, handleEdgeEdit, handleEdgeSave, handleRelationshipRetry, handleShowTraceOverlay, relationshipErrors, relationshipTransports, state.relationshipOrder, state.relationships, state.tiles]);
 
   const traceOverlayProps = useMemo(() => {
     if (!traceOverlay) {

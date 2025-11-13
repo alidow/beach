@@ -1748,6 +1748,14 @@ async fn negotiate_offerer_peer(
 
     let local_id = next_transport_id();
     let remote_id = next_transport_id();
+    install_peer_connection_tracing(
+        &pc,
+        "offerer",
+        Some(handshake_id.clone()),
+        Some(inner.session_id.clone()),
+        Some(peer.id.clone()),
+        Some(local_id),
+    );
     let handshake_complete = Arc::new(AtomicBool::new(false));
     let dc_state_before = dc.ready_state();
     let pc_state_before = pc.connection_state();
@@ -2518,6 +2526,14 @@ async fn connect_answerer(
     let client_id = next_transport_id();
     let peer_id = next_transport_id();
     tracing::debug!(?client_id, ?peer_id, "answerer allocating transport ids");
+    install_peer_connection_tracing(
+        &pc,
+        "answerer",
+        Some(handshake_id.as_ref().clone()),
+        Some(session_id.clone()),
+        Some(remote_offer_peer.clone()),
+        Some(client_id),
+    );
     let signaling_for_dc = Arc::clone(&signaling_client);
     let channels_registry = channels.clone();
     let secure_sender_holder = Arc::clone(&secure_sender);
@@ -3048,35 +3064,6 @@ async fn connect_answerer(
     signaling_client
         .unlock_remote_peer(&expected_remote_peer)
         .await;
-
-    // Verbose connection state tracing for diagnosis
-    {
-        let _pc_trace = pc.clone();
-        pc.on_ice_connection_state_change(Box::new(move |state| {
-            let st = state;
-            Box::pin(async move {
-                tracing::debug!(target = "webrtc", role = "answerer", ice_connection_state = ?st, "peer connection ice state change");
-            })
-        }));
-    }
-    {
-        let _pc_trace = pc.clone();
-        pc.on_signaling_state_change(Box::new(move |state| {
-            let st = state;
-            Box::pin(async move {
-                tracing::debug!(target = "webrtc", role = "answerer", signaling_state = ?st, "peer connection signaling state change");
-            })
-        }));
-    }
-    {
-        let _pc_trace = pc.clone();
-        pc.on_ice_gathering_state_change(Box::new(move |state| {
-            let st = state;
-            Box::pin(async move {
-                tracing::debug!(target = "webrtc", role = "answerer", ice_gathering_state = ?st, "peer connection ice gathering change");
-            })
-        }));
-    }
 
     let mut attempts: usize = 0;
     let max_attempts = 1000; // 10 seconds timeout (1000 * 10ms)
@@ -4404,6 +4391,100 @@ async fn create_webrtc_pair() -> Result<TransportPair, TransportError> {
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn create_test_pair() -> Result<TransportPair, TransportError> {
     create_webrtc_pair().await
+}
+
+#[derive(Debug)]
+struct PeerConnectionTraceContext {
+    role: &'static str,
+    handshake_id: Option<String>,
+    session_id: Option<String>,
+    remote_peer: Option<String>,
+    transport_id: Option<TransportId>,
+}
+
+fn install_peer_connection_tracing(
+    pc: &Arc<RTCPeerConnection>,
+    role: &'static str,
+    handshake_id: Option<String>,
+    session_id: Option<String>,
+    remote_peer: Option<String>,
+    transport_id: Option<TransportId>,
+) {
+    let context = Arc::new(PeerConnectionTraceContext {
+        role,
+        handshake_id,
+        session_id,
+        remote_peer,
+        transport_id,
+    });
+
+    let peer_ctx = context.clone();
+    pc.on_peer_connection_state_change(Box::new(move |state| {
+        let ctx = peer_ctx.clone();
+        Box::pin(async move {
+            tracing::trace!(
+                target = "beach::transport::webrtc",
+                role = ctx.role,
+                handshake_id = ctx.handshake_id.as_deref().unwrap_or(""),
+                session_id = ctx.session_id.as_deref().unwrap_or(""),
+                remote_peer = ctx.remote_peer.as_deref().unwrap_or(""),
+                transport_id = ?ctx.transport_id,
+                new_state = ?state,
+                "peer connection state change"
+            );
+        })
+    }));
+
+    let ice_ctx = context.clone();
+    pc.on_ice_connection_state_change(Box::new(move |state| {
+        let ctx = ice_ctx.clone();
+        Box::pin(async move {
+            tracing::trace!(
+                target = "beach::transport::webrtc",
+                role = ctx.role,
+                handshake_id = ctx.handshake_id.as_deref().unwrap_or(""),
+                session_id = ctx.session_id.as_deref().unwrap_or(""),
+                remote_peer = ctx.remote_peer.as_deref().unwrap_or(""),
+                transport_id = ?ctx.transport_id,
+                new_state = ?state,
+                "peer connection ice connection state change"
+            );
+        })
+    }));
+
+    let signal_ctx = context.clone();
+    pc.on_signaling_state_change(Box::new(move |state| {
+        let ctx = signal_ctx.clone();
+        Box::pin(async move {
+            tracing::trace!(
+                target = "beach::transport::webrtc",
+                role = ctx.role,
+                handshake_id = ctx.handshake_id.as_deref().unwrap_or(""),
+                session_id = ctx.session_id.as_deref().unwrap_or(""),
+                remote_peer = ctx.remote_peer.as_deref().unwrap_or(""),
+                transport_id = ?ctx.transport_id,
+                new_state = ?state,
+                "peer connection signaling state change"
+            );
+        })
+    }));
+
+    let gather_ctx = context;
+    pc.on_ice_gathering_state_change(Box::new(move |state| {
+        let ctx = gather_ctx.clone();
+        Box::pin(async move {
+            tracing::trace!(
+                target = "beach::transport::webrtc",
+                role = ctx.role,
+                handshake_id = ctx.handshake_id.as_deref().unwrap_or(""),
+                session_id = ctx.session_id.as_deref().unwrap_or(""),
+                remote_peer = ctx.remote_peer.as_deref().unwrap_or(""),
+                transport_id = ?ctx.transport_id,
+                new_state = ?state,
+                "peer connection ice gathering state change"
+            );
+        })
+    }));
 }
 
 async fn wait_for_local_description(pc: &Arc<RTCPeerConnection>) -> Result<(), TransportError> {

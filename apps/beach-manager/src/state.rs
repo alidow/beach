@@ -10,17 +10,18 @@ use std::{
     fmt,
     net::IpAddr,
     sync::{
-        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
     },
     thread,
     time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::auth::{AuthConfig, AuthContext};
+use crate::publish_token::PublishTokenManager;
 use crate::{
-    fastpath::{FastPathRegistry, FastPathSession, send_actions_over_fast_path},
-    log_throttle::{QueueLogKind, should_log_custom_event, should_log_queue_event},
+    fastpath::{send_actions_over_fast_path, FastPathRegistry, FastPathSession},
+    log_throttle::{should_log_custom_event, should_log_queue_event, QueueLogKind},
     metrics,
 };
 use beach_buggy::{
@@ -31,20 +32,20 @@ use beach_buggy::{
 use beach_client_core::cache::terminal::packed::unpack_cell;
 use beach_client_core::protocol::{ClientFrame, CursorFrame, Update as WireUpdate};
 use beach_client_core::{
-    CliError, HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell,
-    Payload, SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId,
-    TerminalGrid, Transport, TransportError, TransportOffer, WebRtcChannels,
-    decode_host_frame_binary, encode_client_frame_binary, negotiate_transport,
+    decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
+    HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell, Payload,
+    SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId, TerminalGrid,
+    Transport, TransportError, TransportOffer, WebRtcChannels,
 };
 use chrono::{DateTime, Duration, Utc};
 use prometheus::IntGauge;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool, Row, types::Json};
-use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
+use sqlx::{types::Json, FromRow, PgPool, Row};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
-use tracing::{Level, debug, info, trace, warn};
+use tracing::{debug, info, trace, warn, Level};
 use url::Url;
 use uuid::Uuid;
 
@@ -106,6 +107,7 @@ pub struct AppState {
     fallback: Arc<InnerState>,
     redis: Option<Arc<redis::Client>>,
     auth: Arc<AuthContext>,
+    publish_tokens: Arc<PublishTokenManager>,
     events: Arc<RwLock<HashMap<String, broadcast::Sender<StreamEvent>>>>,
     fast_paths: FastPathRegistry,
     viewer_workers: Arc<RwLock<HashMap<String, ViewerWorker>>>,
@@ -116,6 +118,7 @@ pub struct AppState {
     public_manager_url: String,
     controller_fast_path_enabled: bool,
     controller_strict_gating: bool,
+    idle_snapshot_interval_ms: Option<u64>,
     state_keepalive: StateKeepaliveManager,
 }
 
@@ -1026,6 +1029,7 @@ impl AppState {
             fallback: Arc::new(InnerState::new()),
             redis: None,
             auth: Arc::new(AuthContext::new(auth_config)),
+            publish_tokens: Arc::new(PublishTokenManager::from_env()),
             events: Arc::new(RwLock::new(HashMap::new())),
             fast_paths: FastPathRegistry::new(),
             viewer_workers: Arc::new(RwLock::new(HashMap::new())),
@@ -1044,6 +1048,7 @@ impl AppState {
                 CONTROLLER_STRICT_GATING_ENV,
                 CONTROLLER_STRICT_GATING_DEFAULT_ENABLED,
             ),
+            idle_snapshot_interval_ms: None,
             state_keepalive: StateKeepaliveManager::new(),
         }
     }
@@ -1058,6 +1063,7 @@ impl AppState {
             fallback: Arc::new(InnerState::new()),
             redis: None,
             auth: Arc::new(AuthContext::new(auth_config)),
+            publish_tokens: Arc::new(PublishTokenManager::from_env()),
             events: Arc::new(RwLock::new(HashMap::new())),
             fast_paths: FastPathRegistry::new(),
             viewer_workers: Arc::new(RwLock::new(HashMap::new())),
@@ -1076,6 +1082,7 @@ impl AppState {
                 CONTROLLER_STRICT_GATING_ENV,
                 CONTROLLER_STRICT_GATING_DEFAULT_ENABLED,
             ),
+            idle_snapshot_interval_ms: None,
             state_keepalive: StateKeepaliveManager::new(),
         }
     }
@@ -1129,6 +1136,11 @@ impl AppState {
 
     pub fn with_controller_strict_gating(mut self, enabled: bool) -> Self {
         self.controller_strict_gating = enabled;
+        self
+    }
+
+    pub fn with_idle_snapshot_interval(mut self, interval_ms: Option<u64>) -> Self {
+        self.idle_snapshot_interval_ms = interval_ms;
         self
     }
 
@@ -1311,11 +1323,35 @@ impl AppState {
         req: &RegisterSessionRequest,
     ) -> Result<HashMap<String, serde_json::Value>, StateError> {
         let mut sessions = self.fallback.sessions.write().await;
+        let idle_interval = self.idle_snapshot_interval_ms;
         let entry = sessions.entry(req.session_id.clone()).or_insert_with(|| {
-            SessionRecord::new(&req.session_id, &req.private_beach_id, &req.harness_type)
+            SessionRecord::new(
+                &req.session_id,
+                &req.private_beach_id,
+                &req.harness_type,
+                idle_interval,
+            )
         });
         entry.viewer_passcode = req.viewer_passcode.clone();
         self.ensure_controller_auto_attach_hint(entry, &req.private_beach_id)?;
+        // Attach a session-scoped publish token for idle snapshots and health
+        // into the idle_snapshot hint. Hosts will prefer this over Beach Auth.
+        if let Some(obj) = entry
+            .transport_hints
+            .get_mut("idle_snapshot")
+            .and_then(|v| v.as_object_mut())
+        {
+            let (token, exp) = self
+                .publish_tokens
+                .sign_for_session(&req.session_id);
+            obj.insert(
+                "publish_token".into(),
+                serde_json::json!({
+                    "token": token,
+                    "expires_at_ms": exp * 1000,
+                }),
+            );
+        }
         Ok(entry.transport_hints.clone())
     }
 
@@ -1329,7 +1365,7 @@ impl AppState {
             .acquire_controller(session_id, None, Some("auto_handshake".into()), None)
             .await?;
 
-        let handshake = serde_json::json!({
+        let mut handshake = serde_json::json!({
             "private_beach_id": private_beach_id,
             "manager_url": self.public_manager_url(),
             "controller_token": lease.controller_token,
@@ -1339,6 +1375,19 @@ impl AppState {
             "controller_auto_attach": self
                 .build_controller_auto_attach_hint(private_beach_id, passcode),
         });
+        if let Some(interval) = self.idle_snapshot_interval_ms {
+            if let Some(obj) = handshake.as_object_mut() {
+                let (token, exp) = self.publish_tokens.sign_for_session(session_id);
+                obj.insert(
+                    "idle_snapshot".into(),
+                    serde_json::json!({
+                        "interval_ms": interval,
+                        "mode": "terminal_full",
+                        "publish_token": { "token": token, "expires_at_ms": exp * 1000 }
+                    }),
+                );
+            }
+        }
 
         let url = format!(
             "{}/sessions/{}/control",
@@ -1411,6 +1460,10 @@ impl AppState {
 
     pub fn auth_context(&self) -> Arc<AuthContext> {
         self.auth.clone()
+    }
+
+    pub fn publish_token_manager(&self) -> Arc<PublishTokenManager> {
+        self.publish_tokens.clone()
     }
 
     pub async fn attach_fast_path(&self, session_id: String, fps: FastPathSession) {
@@ -1635,6 +1688,7 @@ impl AppState {
                             origin_session_id,
                             private_beach_id,
                             &HarnessType::Custom,
+                            self.idle_snapshot_interval_ms,
                         )
                     });
                 rec.viewer_passcode = Some(code.to_string());
@@ -1701,6 +1755,7 @@ impl AppState {
                                 origin_session_id,
                                 private_beach_id,
                                 &HarnessType::Custom,
+                                self.idle_snapshot_interval_ms,
                             )
                         });
                     rec.viewer_passcode = Some(code.to_string());
@@ -1780,6 +1835,7 @@ impl AppState {
                                 origin_session_id,
                                 private_beach_id,
                                 &HarnessType::Custom,
+                                self.idle_snapshot_interval_ms,
                             )
                         });
                     rec.viewer_passcode = Some(code.to_string());
@@ -1845,7 +1901,12 @@ impl AppState {
                 for id in origin_ids {
                     let existed = sessions.contains_key(&id);
                     let entry = sessions.entry(id.clone()).or_insert_with(|| {
-                        SessionRecord::new(&id, private_beach_id, &HarnessType::Custom)
+                        SessionRecord::new(
+                            &id,
+                            private_beach_id,
+                            &HarnessType::Custom,
+                            self.idle_snapshot_interval_ms,
+                        )
                     });
                     entry.mark_attached();
                     if existed {
@@ -3131,9 +3192,7 @@ impl AppState {
                             controller_account_id: lease
                                 .controller_account_id
                                 .map(|u| u.to_string()),
-                            issued_by_account_id: lease
-                                .issued_by_account_id
-                                .map(|u| u.to_string()),
+                            issued_by_account_id: lease.issued_by_account_id.map(|u| u.to_string()),
                         }),
                     )
                     .await;
@@ -4210,10 +4269,16 @@ impl InnerState {
         req: &RegisterSessionRequest,
         harness_id: &str,
         controller_lease: Option<(String, ControllerLeaseMemory)>,
+        idle_snapshot_interval_ms: Option<u64>,
     ) {
         let mut sessions = self.sessions.write().await;
         let entry = sessions.entry(req.session_id.clone()).or_insert_with(|| {
-            SessionRecord::new(&req.session_id, &req.private_beach_id, &req.harness_type)
+            SessionRecord::new(
+                &req.session_id,
+                &req.private_beach_id,
+                &req.harness_type,
+                idle_snapshot_interval_ms,
+            )
         });
         entry.capabilities = req.capabilities.clone();
         entry.location_hint = req.location_hint.clone();
@@ -4464,9 +4529,14 @@ impl InnerState {
 }
 
 impl SessionRecord {
-    fn new(session_id: &str, private_beach_id: &str, harness_type: &HarnessType) -> Self {
+    fn new(
+        session_id: &str,
+        private_beach_id: &str,
+        harness_type: &HarnessType,
+        idle_snapshot_interval_ms: Option<u64>,
+    ) -> Self {
         let harness_id = Uuid::new_v4().to_string();
-        let transport_hints = default_transport_hints(session_id);
+        let transport_hints = default_transport_hints(session_id, idle_snapshot_interval_ms);
         Self {
             session_id: session_id.to_string(),
             private_beach_id: private_beach_id.to_string(),
@@ -4704,7 +4774,10 @@ fn harness_to_session_kind(value: &HarnessType) -> &'static str {
     }
 }
 
-fn default_transport_hints(session_id: &str) -> HashMap<String, serde_json::Value> {
+fn default_transport_hints(
+    session_id: &str,
+    idle_snapshot_interval_ms: Option<u64>,
+) -> HashMap<String, serde_json::Value> {
     let mut hints = HashMap::new();
     hints.insert(
         "actions_poll".into(),
@@ -4735,6 +4808,15 @@ fn default_transport_hints(session_id: &str) -> HashMap<String, serde_json::Valu
             "status": "experimental"
         }),
     );
+    if let Some(interval) = idle_snapshot_interval_ms {
+        hints.insert(
+            "idle_snapshot".into(),
+            serde_json::json!({
+                "interval_ms": interval,
+                "mode": "terminal_full"
+            }),
+        );
+    }
     hints
 }
 
@@ -4800,7 +4882,12 @@ impl AppState {
     ) -> Result<RegisterSessionResponse, StateError> {
         let mut sessions = self.fallback.sessions.write().await;
         let entry = sessions.entry(req.session_id.clone()).or_insert_with(|| {
-            SessionRecord::new(&req.session_id, &req.private_beach_id, &req.harness_type)
+            SessionRecord::new(
+                &req.session_id,
+                &req.private_beach_id,
+                &req.harness_type,
+                self.idle_snapshot_interval_ms,
+            )
         });
 
         entry.capabilities = req.capabilities.clone();
@@ -4985,6 +5072,7 @@ impl AppState {
                 &req,
                 &harness_id.to_string(),
                 Some((controller_token.to_string(), fallback_lease)),
+                self.idle_snapshot_interval_ms,
             )
             .await;
         self.fallback
@@ -6947,7 +7035,16 @@ async fn controller_forwarder_once_with_label(
             metadata,
             ..
         }) => {
-            let connection_label = metadata.get("label").cloned();
+            let connection_label = metadata.get("label").cloned().or_else(|| {
+                debug!(
+                    target = "controller.forwarder",
+                    session_id = %session_id,
+                    private_beach_id = %private_beach_id,
+                    requested_label = %label,
+                    "controller transport metadata missing label; using requested value"
+                );
+                Some(label.to_string())
+            });
             drive_controller_forwarder(
                 state,
                 private_beach_id,
@@ -7103,6 +7200,8 @@ impl FastPathUpgradeHandle {
                                     session_id = %session_id,
                                     private_beach_id = %private_beach_id,
                                     label,
+                                    peer_id = %channel.peer().0,
+                                    transport_id = %channel.id().0,
                                     "fast-path data channel detected"
                                 );
                             }
@@ -7189,12 +7288,16 @@ async fn drive_controller_forwarder(
     )
     .await;
     let mut transport_is_primary = Arc::ptr_eq(&transport, &primary_transport);
+    let t_id = transport.id();
+    let t_peer = transport.peer();
     info!(
         target = "controller.forwarder",
         session_id = %session_id,
         private_beach_id = %private_beach_id,
         transport = transport_label,
         via_fast_path,
+        transport_id = %t_id.0,
+        peer_id = %t_peer.0,
         "controller forwarder connected"
     );
 
@@ -7215,6 +7318,13 @@ async fn drive_controller_forwarder(
     let mut next_seq: u64 = 0;
     let mut idle_delay = tokio::time::interval(StdDuration::from_millis(200));
     idle_delay.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    // If fast-path appears healthy (sends succeed) but no acknowledgements are
+    // observed for an extended period, treat the transport as stalled and
+    // immediately fall back to the primary transport (HTTP). This prevents
+    // unbounded queue growth when the selected data channel is misbound or the
+    // remote is not consuming inputs.
+    const ACK_STALL_DEADLINE: StdDuration = StdDuration::from_millis(1500);
 
     let labels = [private_beach_id, session_id];
 
@@ -7357,6 +7467,52 @@ async fn drive_controller_forwarder(
                 }
             }
             _ = idle_delay.tick() => {
+                // Detect ack stalls: if any action has been inflight longer than
+                // the deadline without an acknowledgement, fail the pending set
+                // and switch away from the current transport.
+                if !pending.is_empty() {
+                    if let Some(oldest) = pending.values().map(|p| p.sent_at).min() {
+                        if oldest.elapsed() > ACK_STALL_DEADLINE {
+                            let inflight = pending.len();
+                            let drained = std::mem::take(&mut pending);
+                            let reason = format!(
+                                "no action acknowledgements for >{:?}; treating as stalled",
+                                ACK_STALL_DEADLINE
+                            );
+                            fail_pending_actions(state, session_id, drained, via_fast_path, &reason).await;
+                            if via_fast_path {
+                                metrics::CONTROLLER_FAST_PATH_FALLBACKS
+                                    .with_label_values(&labels)
+                                    .inc();
+                                warn!(
+                                    target = "controller.forwarder",
+                                    session_id = %session_id,
+                                    private_beach_id = %private_beach_id,
+                                    inflight,
+                                    transport = transport_label,
+                                    "ack stall detected; falling back to primary transport"
+                                );
+                                via_fast_path = false;
+                                transport_label = "http_fallback";
+                                transport = primary_transport.clone();
+                                transport_is_primary = true;
+                                drop(reader_guard);
+                                reader_guard = ForwarderReader::spawn(transport.clone(), event_tx.clone());
+                                ensure_fast_path_probe(
+                                    &mut fast_path_watchers,
+                                    &fast_path_channels,
+                                    fast_path_enabled,
+                                    via_fast_path,
+                                    transport_is_primary,
+                                    session_id,
+                                    private_beach_id,
+                                    &event_tx,
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
                 let actions = state.poll_actions(session_id).await?;
                 if actions.is_empty() {
                     if !pending.is_empty()
@@ -7530,6 +7686,13 @@ async fn select_controller_transport(
             for label in LABELS {
                 match timeout(CONTROLLER_FAST_PATH_WAIT, channels.wait_for(label)).await {
                     Ok(Ok(channel)) => {
+                        let peer = channel.peer();
+                        trace!(
+                            target = "controller.forwarder",
+                            label,
+                            peer_id = %peer.0,
+                            "selected fast-path data channel"
+                        );
                         return (channel, "fast_path", true);
                     }
                     Ok(Err(err)) => {
@@ -7881,7 +8044,7 @@ mod tests {
     use super::*;
     use crate::state::test_support;
     use beach_buggy::{ActionCommand, HarnessType, RegisterSessionRequest};
-    use beach_client_core::cache::terminal::packed::{StyleId, pack_color_default, pack_color_rgb};
+    use beach_client_core::cache::terminal::packed::{pack_color_default, pack_color_rgb, StyleId};
     use beach_client_core::protocol::{
         HostFrame as WireHostFrame, Lane, LaneBudgetFrame, SyncConfigFrame, Update as WireUpdate,
     };
@@ -7889,11 +8052,11 @@ mod tests {
     use chrono::Utc;
     use serde_json::json;
     use std::sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     };
     use std::time::{Duration as StdDuration, SystemTime};
-    use tokio::time::{Duration, sleep, timeout};
+    use tokio::time::{sleep, timeout, Duration};
 
     #[test_timeout::tokio_timeout_test(10)]
     async fn spawn_viewer_worker_smoke_test_records_state_and_stream() {
@@ -8290,7 +8453,7 @@ mod tests {
 
     #[test]
     fn session_record_applies_controller_auto_attach_hint() {
-        let mut record = SessionRecord::new("sess-auto", "pb-auto", &HarnessType::Custom);
+        let mut record = SessionRecord::new("sess-auto", "pb-auto", &HarnessType::Custom, None);
         let hint = ControllerAutoAttachHint {
             private_beach_id: "pb-auto".into(),
             attach_code: "ABC123".into(),
@@ -8391,7 +8554,7 @@ mod tests {
         F: FnOnce(&mut SessionRecord),
     {
         let mut sessions = state.fallback.sessions.write().await;
-        let mut record = SessionRecord::new(session_id, "pb-test", &HarnessType::Custom);
+        let mut record = SessionRecord::new(session_id, "pb-test", &HarnessType::Custom, None);
         let token = Uuid::new_v4().to_string();
         record.ensure_lease(
             token.clone(),

@@ -10,10 +10,12 @@ use tracing::{info, warn};
 
 use webrtc::data_channel::{data_channel_message::DataChannelMessage, RTCDataChannel};
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::Error as WebRtcError;
+use webrtc_ice::udp_network::{EphemeralUDP, UDPNetwork};
 
 use crate::{metrics, state::AppState};
 
@@ -30,11 +32,55 @@ pub struct FastPathSession {
 
 impl FastPathSession {
     pub async fn new(session_id: String) -> Result<Self, WebRtcError> {
+        // Build a WebRTC API with optional NAT 1:1 mapping and a fixed UDP port range.
+        // This allows the manager (running in Docker) to advertise the host's LAN IP
+        // and a published UDP range so external hosts can complete ICE.
+        let mut setting = webrtc::api::setting_engine::SettingEngine::default();
+
+        // Configure ephemeral UDP port range if provided.
+        if let (Ok(start_s), Ok(end_s)) = (
+            std::env::var("BEACH_ICE_PORT_START"),
+            std::env::var("BEACH_ICE_PORT_END"),
+        ) {
+            if let (Ok(start), Ok(end)) = (start_s.parse::<u16>(), end_s.parse::<u16>()) {
+                match EphemeralUDP::new(start, end) {
+                    Ok(ephemeral) =>
+                        setting.set_udp_network(UDPNetwork::Ephemeral(ephemeral)),
+                    Err(err) => warn!(
+                        target = "fast_path",
+                        port_start = start,
+                        port_end = end,
+                        error = %err,
+                        "invalid ICE UDP port range; using defaults"
+                    ),
+                }
+            }
+        }
+
+        // Optionally set a NAT 1:1 public IP so the container advertises a host-reachable
+        // address (e.g., the Mac's 192.168.x.x) instead of the internal 172.20.x.x.
+        // Prefer explicit IP via BEACH_ICE_PUBLIC_IP; otherwise try resolving a host name
+        // (defaulting to host.docker.internal) to an IPv4 address.
+        let public_ip = std::env::var("BEACH_ICE_PUBLIC_IP").ok().or_else(|| {
+            let host = std::env::var("BEACH_ICE_PUBLIC_HOST")
+                .unwrap_or_else(|_| "host.docker.internal".to_string());
+            use std::net::ToSocketAddrs;
+            // Resolve using an arbitrary port to trigger getaddrinfo.
+            (host.as_str(), 0)
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut it| it.find(|a| a.is_ipv4()).map(|a| a.ip().to_string()))
+        });
+        if let Some(ip) = public_ip {
+            setting.set_nat_1to1_ips(vec![ip], RTCIceCandidateType::Host);
+        }
+
+        let api = webrtc::api::APIBuilder::new()
+            .with_setting_engine(setting)
+            .build();
+
         let cfg = RTCConfiguration::default();
-        let pc = webrtc::api::APIBuilder::new()
-            .build()
-            .new_peer_connection(cfg)
-            .await?;
+        let pc = api.new_peer_connection(cfg).await?;
 
         Ok(FastPathSession {
             session_id,

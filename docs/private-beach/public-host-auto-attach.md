@@ -19,6 +19,16 @@ Goal: public hosts must auto-attach without any manual environment variables. Al
      "expires_at": "<timestamp>"   // optional
    }
    ```
+   Additionally, when idle snapshots are enabled, the `idle_snapshot` hint now includes a per-session `publish_token` so public hosts can publish state/health without Beach Auth logins:
+   ```json
+   {
+     "idle_snapshot": {
+       "interval_ms": 1000,
+       "mode": "terminal_full",
+       "publish_token": { "token": "<jwt>", "expires_at_ms": 1731020400000 }
+     }
+   }
+   ```
 3. The host inspects the hint first; if present it immediately POSTs `/private-beaches/<id>/sessions/attach-by-code` before starting the controller poller/fast_path. Env vars remain as fallback only. When the dashboard issues a `manager_handshake`, the payload now mirrors the same `controller_auto_attach` block so late-emitted hints (e.g., after a UI attach) reach already-running hosts without requiring a restart.
 4. Logs show whether the host attached via metadata or envs, making future diagnosis trivial.
 

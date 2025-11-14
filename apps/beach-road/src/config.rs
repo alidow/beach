@@ -5,6 +5,8 @@ pub struct Config {
     pub port: u16,
     pub redis_url: String,
     pub session_ttl_seconds: u64,
+    pub signaling_heartbeat_interval_seconds: u64,
+    pub signaling_peer_timeout_seconds: u64,
     pub fallback_guardrail_threshold: f64,
     pub fallback_token_ttl_seconds: u64,
     pub fallback_require_oidc: bool,
@@ -52,6 +54,16 @@ impl Config {
             .and_then(|val| val.parse().ok())
             .unwrap_or(fallback_jwks_cache_ttl_seconds);
 
+        let signaling_peer_timeout_seconds: u64 = env::var("SIGNALING_PEER_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|val| val.parse().ok())
+            .unwrap_or(60);
+        let signaling_heartbeat_interval_seconds: u64 =
+            env::var("SIGNALING_HEARTBEAT_INTERVAL_SECONDS")
+                .ok()
+                .and_then(|val| val.parse().ok())
+                .unwrap_or_else(|| signaling_peer_timeout_seconds.saturating_div(2).max(5));
+
         Self {
             port: env::var("BEACH_ROAD_PORT")
                 .or_else(|_| env::var("PORT"))
@@ -64,6 +76,8 @@ impl Config {
                 .ok()
                 .and_then(|t| t.parse().ok())
                 .unwrap_or(2_592_000), // default 30 days
+            signaling_heartbeat_interval_seconds,
+            signaling_peer_timeout_seconds,
             fallback_guardrail_threshold,
             fallback_token_ttl_seconds,
             fallback_require_oidc,
@@ -86,6 +100,8 @@ impl Default for Config {
             port: 4132,
             redis_url: "redis://localhost:6379".to_string(),
             session_ttl_seconds: 2_592_000,
+            signaling_heartbeat_interval_seconds: 30,
+            signaling_peer_timeout_seconds: 60,
             fallback_guardrail_threshold: 0.005,
             fallback_token_ttl_seconds: 300,
             fallback_require_oidc: false,

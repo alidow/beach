@@ -12,9 +12,7 @@ use tokio::sync::RwLock;
 
 #[derive(Clone, Debug)]
 pub struct AuthConfig {
-    pub jwks_url: Option<String>,
-    pub issuer: Option<String>,
-    pub audience: Option<String>,
+    pub authorities: Vec<AuthAuthority>,
     pub bypass: bool,
     pub cache_ttl: Duration,
 }
@@ -22,19 +20,24 @@ pub struct AuthConfig {
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            jwks_url: None,
-            issuer: None,
-            audience: None,
+            authorities: Vec::new(),
             bypass: false,
             cache_ttl: Duration::from_secs(300),
         }
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AuthAuthority {
+    pub jwks_url: String,
+    pub issuer: Option<String>,
+    pub audience: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AuthContext {
     config: AuthConfig,
-    cache: Arc<RwLock<Option<JwksCache>>>,
+    cache: Arc<RwLock<HashMap<String, JwksCache>>>,
     client: reqwest::Client,
 }
 
@@ -59,7 +62,7 @@ struct CachedDecodingKey {
 pub enum AuthError {
     #[error("missing bearer token")]
     MissingToken,
-    #[error("missing jwks url configuration")]
+    #[error("no jwks authorities configured")]
     MissingJwksConfig,
     #[error("jwt header missing kid")]
     MissingKid,
@@ -119,7 +122,7 @@ impl AuthContext {
     pub fn new(config: AuthConfig) -> Self {
         Self {
             config,
-            cache: Arc::new(RwLock::new(None)),
+            cache: Arc::new(RwLock::new(HashMap::new())),
             client: reqwest::Client::new(),
         }
     }
@@ -140,28 +143,32 @@ impl AuthContext {
         if allow_bypass && self.config.bypass {
             return self.decode_without_verification(token);
         }
-        let header = decode_header(token)?;
-        let kid = header.kid.ok_or(AuthError::MissingKid)?;
-        let key = self.decoding_key(&kid).await?;
-        let algorithm = select_algorithm(header.alg, key.algorithm)?;
+        if self.config.authorities.is_empty() {
+            return Err(AuthError::MissingJwksConfig);
+        }
 
-        let mut validation = Validation::new(algorithm);
-        if let Some(issuer) = &self.config.issuer {
-            validation.set_issuer(&[issuer]);
+        let mut last_error: Option<AuthError> = None;
+        for authority in &self.config.authorities {
+            match self.decode_with_authority(token, authority).await {
+                Ok(claims) => return Ok(claims),
+                Err(err) => last_error = Some(err),
+            }
         }
-        if let Some(audience) = &self.config.audience {
-            validation.set_audience(&[audience]);
-        }
-        let data = decode::<Claims>(token, &key.key, &validation)?;
-        Ok(data.claims)
+
+        Err(last_error.unwrap_or(AuthError::MissingJwksConfig))
     }
 
-    async fn decoding_key(&self, kid: &str) -> Result<CachedDecodingKey, AuthError> {
+    async fn decoding_key(
+        &self,
+        authority: &AuthAuthority,
+        kid: &str,
+    ) -> Result<CachedDecodingKey, AuthError> {
+        let jwks_url = authority.jwks_url.clone();
         {
             let cache = self.cache.read().await;
-            if let Some(cache) = cache.as_ref() {
-                if !cache.stale(self.config.cache_ttl) {
-                    if let Some(key) = cache.keys.get(kid) {
+            if let Some(store) = cache.get(&jwks_url) {
+                if !store.stale(self.config.cache_ttl) {
+                    if let Some(key) = store.keys.get(kid) {
                         return Ok(key.clone());
                     }
                 }
@@ -170,15 +177,16 @@ impl AuthContext {
 
         let mut cache = self.cache.write().await;
         let needs_refresh = cache
-            .as_ref()
-            .map(|c| c.stale(self.config.cache_ttl) || !c.keys.contains_key(kid))
+            .get(&jwks_url)
+            .map(|store| store.stale(self.config.cache_ttl) || !store.keys.contains_key(kid))
             .unwrap_or(true);
         if needs_refresh {
-            *cache = Some(self.fetch_jwks().await?);
+            let fetched = self.fetch_jwks(&jwks_url).await?;
+            cache.insert(jwks_url.clone(), fetched);
         }
 
-        if let Some(cache) = cache.as_ref() {
-            if let Some(key) = cache.keys.get(kid) {
+        if let Some(store) = cache.get(&jwks_url) {
+            if let Some(key) = store.keys.get(kid) {
                 return Ok(key.clone());
             }
         }
@@ -186,12 +194,7 @@ impl AuthContext {
         Err(AuthError::UnknownKey(kid.to_string()))
     }
 
-    async fn fetch_jwks(&self) -> Result<JwksCache, AuthError> {
-        let url = self
-            .config
-            .jwks_url
-            .clone()
-            .ok_or(AuthError::MissingJwksConfig)?;
+    async fn fetch_jwks(&self, url: &str) -> Result<JwksCache, AuthError> {
         let resp = self.client.get(url).send().await?;
         let resp = resp.error_for_status().map_err(|err| {
             AuthError::JwksFetch(format!("status: {}", err.status().unwrap_or_default()))
@@ -249,6 +252,27 @@ impl AuthContext {
             keys,
             fetched_at: Instant::now(),
         })
+    }
+
+    async fn decode_with_authority(
+        &self,
+        token: &str,
+        authority: &AuthAuthority,
+    ) -> Result<Claims, AuthError> {
+        let header = decode_header(token)?;
+        let kid = header.kid.ok_or(AuthError::MissingKid)?;
+        let key = self.decoding_key(authority, &kid).await?;
+        let algorithm = select_algorithm(header.alg, key.algorithm)?;
+
+        let mut validation = Validation::new(algorithm);
+        if let Some(issuer) = &authority.issuer {
+            validation.set_issuer(&[issuer]);
+        }
+        if let Some(audience) = &authority.audience {
+            validation.set_audience(&[audience]);
+        }
+        let data = decode::<Claims>(token, &key.key, &validation)?;
+        Ok(data.claims)
     }
 
     fn decode_without_verification(&self, token: &str) -> Result<Claims, AuthError> {

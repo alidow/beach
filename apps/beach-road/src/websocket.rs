@@ -11,6 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -44,14 +45,23 @@ pub struct SignalingState {
     /// Storage for session validation
     storage: SharedStorage,
     viewer_tokens: Option<ViewerTokenVerifier>,
+    heartbeat_check_interval: Duration,
+    peer_timeout: Duration,
 }
 
 impl SignalingState {
-    pub fn new(storage: SharedStorage, viewer_tokens: Option<ViewerTokenVerifier>) -> Self {
+    pub fn new(
+        storage: SharedStorage,
+        viewer_tokens: Option<ViewerTokenVerifier>,
+        heartbeat_check_interval: Duration,
+        peer_timeout: Duration,
+    ) -> Self {
         let state = Self {
             sessions: Arc::new(DashMap::new()),
             storage,
             viewer_tokens,
+            heartbeat_check_interval,
+            peer_timeout,
         };
 
         // Start heartbeat monitor task
@@ -65,8 +75,8 @@ impl SignalingState {
 
     /// Monitor heartbeats and clean up stale connections
     async fn monitor_heartbeats(&self) {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60)); // Check every minute
-        let timeout = std::time::Duration::from_secs(600); // 10 minute timeout
+        let mut interval = tokio::time::interval(self.heartbeat_check_interval);
+        let timeout = self.peer_timeout;
 
         loop {
             interval.tick().await;

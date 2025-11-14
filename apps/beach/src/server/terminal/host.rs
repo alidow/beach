@@ -46,7 +46,7 @@ use crate::transport::terminal::negotiation::{
 use crate::transport::{Payload, Transport, TransportError, TransportKind};
 use beach_buggy::{
     AckStatus as CtrlAckStatus, ActionAck as CtrlActionAck, ActionCommand as CtrlActionCommand,
-    CellStylePayload, CursorPosition, HttpTransport, ManagerTransport, StateDiff,
+    CellStylePayload, CursorPosition, HealthHeartbeat, HttpTransport, ManagerTransport, StateDiff,
     StaticTokenProvider, StyleDefinition, StyledCell, TerminalFrame,
 };
 use reqwest::{Client, StatusCode};
@@ -67,7 +67,7 @@ use tokio::sync::{
     oneshot, watch,
 };
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout};
+use tokio::time::{interval, sleep, timeout};
 use tracing::field::display;
 use tracing::{Level, debug, error, info, trace, warn};
 use transport_mod::webrtc::{OffererAcceptedTransport, OffererSupervisor};
@@ -77,7 +77,9 @@ pub(crate) const MCP_CHANNEL_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const CONTROLLER_CHANNEL_LABEL: &str = "mgr-actions";
 pub(crate) const LEGACY_CONTROLLER_CHANNEL_LABEL: &str = "pb-controller";
 const IDLE_SNAPSHOT_HINT_KEY: &str = "idle_snapshot";
+const IDLE_PUBLISH_TOKEN_HINT_KEY: &str = "idlePublishToken";
 const IDLE_SNAPSHOT_INTERVAL_KEY: &str = "interval_ms";
+const DEFAULT_HEALTH_REPORT_INTERVAL: Duration = Duration::from_secs(15);
 
 #[tracing::instrument(
     name = "beach::terminal::host::run",
@@ -312,6 +314,9 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     idle_snapshot_controller
         .apply_hint(idle_snapshot_interval)
         .await;
+    idle_snapshot_controller
+        .apply_health_interval(Some(DEFAULT_HEALTH_REPORT_INTERVAL))
+        .await;
 
     let mut mcp_task: Option<JoinHandle<()>> = None;
     let mut mcp_handle: Option<McpServerHandle> = None;
@@ -480,13 +485,38 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                                                 }
                                             }
                                         }
-                    if let Some(idle_hint) = payload.get(IDLE_SNAPSHOT_HINT_KEY) {
-                        let (interval, token) = parse_idle_snapshot_payload(idle_hint);
-                        if let Some(tok) = token {
-                            idle_snapshots_for_actions.set_token(Some(tok)).await;
-                        }
-                        idle_snapshots_for_actions.apply_hint(interval).await;
-                    }
+                                        if let Some(idle_hint) = payload.get(IDLE_SNAPSHOT_HINT_KEY)
+                                        {
+                                            let (interval, token) =
+                                                parse_idle_snapshot_payload(idle_hint);
+                                            if let Some(tok) = token {
+                                                idle_snapshots_for_actions
+                                                    .set_token(Some(tok))
+                                                    .await;
+                                            }
+                                            idle_snapshots_for_actions.apply_hint(interval).await;
+                                        }
+                                        if let Some(token_hint) =
+                                            payload.get(IDLE_PUBLISH_TOKEN_HINT_KEY)
+                                        {
+                                            if let Some(tok) = parse_publish_token_value(token_hint)
+                                            {
+                                                idle_snapshots_for_actions
+                                                    .set_token(Some(tok))
+                                                    .await;
+                                            }
+                                        }
+                                        if let Some(health_secs) = payload
+                                            .get("viewer_health_interval_secs")
+                                            .and_then(|value| value.as_u64())
+                                            .filter(|value| *value > 0)
+                                        {
+                                            idle_snapshots_for_actions
+                                                .apply_health_interval(Some(Duration::from_secs(
+                                                    health_secs,
+                                                )))
+                                                .await;
+                                        }
                                     }
                                 }
                                 if kind == "manager_detach" {
@@ -1486,15 +1516,24 @@ fn parse_idle_snapshot_hint(hints: &HashMap<String, Value>) -> Option<Duration> 
     Some(Duration::from_millis(interval_ms))
 }
 
-fn parse_idle_publish_bearer(hints: &HashMap<String, Value>) -> Option<String> {
-    let hint = hints.get(IDLE_SNAPSHOT_HINT_KEY)?;
-    let token_value = hint.get("publish_token")?;
-    if let Some(obj) = token_value.as_object() {
+fn parse_publish_token_value(value: &Value) -> Option<String> {
+    if let Some(obj) = value.as_object() {
         if let Some(token) = obj.get("token").and_then(|v| v.as_str()) {
             return Some(token.to_string());
         }
     }
-    token_value.as_str().map(|s| s.to_string())
+    value.as_str().map(|s| s.to_string())
+}
+
+fn parse_idle_publish_bearer(hints: &HashMap<String, Value>) -> Option<String> {
+    if let Some(value) = hints.get(IDLE_PUBLISH_TOKEN_HINT_KEY) {
+        if let Some(token) = parse_publish_token_value(value) {
+            return Some(token);
+        }
+    }
+    let hint = hints.get(IDLE_SNAPSHOT_HINT_KEY)?;
+    let token_value = hint.get("publish_token")?;
+    parse_publish_token_value(token_value)
 }
 
 fn parse_idle_snapshot_payload(value: &Value) -> (Option<Duration>, Option<String>) {
@@ -1505,9 +1544,7 @@ fn parse_idle_snapshot_payload(value: &Value) -> (Option<Duration>, Option<Strin
         .map(Duration::from_millis);
     let token = value
         .get("publish_token")
-        .and_then(|v| v.get("token"))
-        .and_then(|t| t.as_str())
-        .map(|s| s.to_string());
+        .and_then(parse_publish_token_value);
     (interval, token)
 }
 
@@ -1632,6 +1669,57 @@ fn spawn_idle_snapshot_worker(
     Some((handle, cancel_tx))
 }
 
+fn spawn_health_reporter(
+    period: Duration,
+    token: String,
+    base_url: String,
+    session_id: String,
+) -> Option<(JoinHandle<()>, oneshot::Sender<()>)> {
+    if period.is_zero() {
+        return None;
+    }
+    let transport = match HttpTransport::new(base_url, StaticTokenProvider::new(token)) {
+        Ok(transport) => Arc::new(transport),
+        Err(err) => {
+            warn!(
+                target = "private_beach",
+                error = %err,
+                "health reporter transport initialization failed"
+            );
+            return None;
+        }
+    };
+    let (cancel_tx, mut cancel_rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        let mut ticker = interval(period);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let heartbeat = HealthHeartbeat {
+                        queue_depth: 0,
+                        cpu_load: None,
+                        memory_bytes: None,
+                        degraded: false,
+                        warnings: Vec::new(),
+                    };
+                    if let Err(err) = transport.signal_health(&session_id, heartbeat).await {
+                        warn!(
+                            target = "private_beach",
+                            session_id = %session_id,
+                            error = %err,
+                            "health reporter publish failed"
+                        );
+                    }
+                }
+                _ = &mut cancel_rx => {
+                    break;
+                }
+            }
+        }
+    });
+    Some((handle, cancel_tx))
+}
+
 struct StatePublisher {
     transport: Arc<HttpTransport<StaticTokenProvider>>,
     session_id: String,
@@ -1725,6 +1813,13 @@ struct IdleSnapshotControllerState {
     cancel: Option<oneshot::Sender<()>>,
 }
 
+#[derive(Default)]
+struct HealthReporterState {
+    interval: Option<Duration>,
+    handle: Option<JoinHandle<()>>,
+    cancel: Option<oneshot::Sender<()>>,
+}
+
 #[derive(Clone)]
 struct IdleSnapshotController {
     base_url: String,
@@ -1734,6 +1829,7 @@ struct IdleSnapshotController {
     cursor_tracker: Arc<Mutex<Option<CursorState>>>,
     last_terminal_update: Arc<AtomicU64>,
     state: Arc<AsyncMutex<IdleSnapshotControllerState>>,
+    health: Arc<AsyncMutex<HealthReporterState>>,
 }
 
 impl IdleSnapshotController {
@@ -1753,6 +1849,7 @@ impl IdleSnapshotController {
             cursor_tracker,
             last_terminal_update,
             state: Arc::new(AsyncMutex::new(IdleSnapshotControllerState::default())),
+            health: Arc::new(AsyncMutex::new(HealthReporterState::default())),
         }
     }
 
@@ -1771,6 +1868,10 @@ impl IdleSnapshotController {
         let active_interval = { self.state.lock().await.interval };
         if active_interval.is_some() {
             self.apply_hint(active_interval).await;
+        }
+        let health_interval = { self.health.lock().await.interval };
+        if health_interval.is_some() {
+            self.apply_health_interval(health_interval).await;
         }
     }
 
@@ -1840,6 +1941,68 @@ impl IdleSnapshotController {
 
     async fn shutdown(&self) {
         self.apply_hint(None).await;
+        self.apply_health_interval(None).await;
+    }
+
+    async fn apply_health_interval(&self, interval: Option<Duration>) {
+        let interval = interval.filter(|value| !value.is_zero());
+        let mut state = self.health.lock().await;
+        if interval == state.interval {
+            return;
+        }
+        let cancel = state.cancel.take();
+        let handle = state.handle.take();
+        state.interval = None;
+        drop(state);
+        if let Some(cancel) = cancel {
+            let _ = cancel.send(());
+        }
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+        if let Some(interval) = interval {
+            let token_opt = { self.token.lock().await.clone() };
+            let Some(token) = token_opt else {
+                warn!(
+                    target = "private_beach",
+                    interval_ms = interval.as_millis(),
+                    "health reporter hint received but no access token available"
+                );
+                return;
+            };
+            match spawn_health_reporter(
+                interval,
+                token,
+                self.base_url.clone(),
+                self.session_id.clone(),
+            ) {
+                Some((handle, cancel)) => {
+                    let mut state = self.health.lock().await;
+                    state.interval = Some(interval);
+                    state.handle = Some(handle);
+                    state.cancel = Some(cancel);
+                    info!(
+                        target = "private_beach",
+                        session_id = %self.session_id,
+                        interval_ms = interval.as_millis(),
+                        "health reporter enabled"
+                    );
+                }
+                None => {
+                    warn!(
+                        target = "private_beach",
+                        session_id = %self.session_id,
+                        "failed to start health reporter"
+                    );
+                }
+            }
+        } else {
+            info!(
+                target = "private_beach",
+                session_id = %self.session_id,
+                "health reporter disabled"
+            );
+        }
     }
 }
 
@@ -3320,6 +3483,39 @@ mod tests {
         assert_eq!(parsed.private_beach_id, "pb-456");
         assert_eq!(parsed.attach_code, "654321");
         assert_eq!(parsed.issued_at.as_deref(), Some("2025-02-02T12:34:56Z"));
+    }
+
+    #[test]
+    fn parse_idle_publish_bearer_prefers_top_level_hint() {
+        let mut hints = HashMap::new();
+        hints.insert(
+            IDLE_PUBLISH_TOKEN_HINT_KEY.into(),
+            json!({ "token": "abc123", "expires_at_ms": 1 }),
+        );
+        let parsed = parse_idle_publish_bearer(&hints).expect("token expected");
+        assert_eq!(parsed, "abc123");
+    }
+
+    #[test]
+    fn parse_idle_publish_bearer_falls_back_to_idle_snapshot() {
+        let mut hints = HashMap::new();
+        hints.insert(
+            IDLE_SNAPSHOT_HINT_KEY.into(),
+            json!({
+                "interval_ms": 1000,
+                "publish_token": { "token": "nested-token" }
+            }),
+        );
+        let parsed = parse_idle_publish_bearer(&hints).expect("token expected");
+        assert_eq!(parsed, "nested-token");
+    }
+
+    #[test]
+    fn parse_idle_publish_bearer_handles_literal_tokens() {
+        let mut hints = HashMap::new();
+        hints.insert(IDLE_PUBLISH_TOKEN_HINT_KEY.into(), json!("raw-token"));
+        let parsed = parse_idle_publish_bearer(&hints).expect("token expected");
+        assert_eq!(parsed, "raw-token");
     }
 
     #[test]

@@ -7,7 +7,7 @@ mod publish_token;
 mod routes;
 mod state;
 
-use auth::{AuthConfig, AuthContext};
+use auth::{AuthAuthority, AuthConfig, AuthContext};
 use config::AppConfig;
 use routes::build_router;
 use sqlx::postgres::PgPoolOptions;
@@ -69,15 +69,30 @@ async fn main() -> anyhow::Result<()> {
         AppState::new()
     };
 
+    let mut authorities = Vec::new();
+    if let Some(url) = cfg.beach_gate_jwks_url.clone() {
+        authorities.push(AuthAuthority {
+            jwks_url: url,
+            issuer: cfg.beach_gate_issuer.clone(),
+            audience: cfg.beach_gate_audience.clone(),
+        });
+    }
+    if let Some(url) = cfg.clerk_jwks_url.clone() {
+        authorities.push(AuthAuthority {
+            jwks_url: url,
+            issuer: cfg.clerk_issuer.clone(),
+            audience: cfg.clerk_audience.clone(),
+        });
+    }
     let auth_config = AuthConfig {
-        jwks_url: cfg.beach_gate_jwks_url.clone(),
-        issuer: cfg.beach_gate_issuer.clone(),
-        audience: cfg.beach_gate_audience.clone(),
+        authorities,
         bypass: cfg.auth_bypass,
         cache_ttl: Duration::from_secs(300),
     };
-    if !auth_config.bypass && auth_config.jwks_url.is_none() {
-        warn!("authentication bypass disabled but BEACH_GATE_JWKS_URL is not set; token verification will fail");
+    if !auth_config.bypass && auth_config.authorities.is_empty() {
+        warn!(
+            "authentication bypass disabled but no JWKS authorities are configured; token verification will fail"
+        );
     }
     state = state.with_auth(AuthContext::new(auth_config));
     state = state.with_integrations(cfg.beach_road_url.clone(), cfg.public_manager_url.clone());

@@ -1,6 +1,8 @@
 import { resolvePrivateBeachRewriteEnabled } from '../../../private-beach/src/lib/featureFlags';
 
-type ClerkGetTokenFn = ((options?: { template?: string }) => Promise<string | null>) | undefined;
+type ClerkGetTokenFn =
+  | ((options?: { template?: string; skipCache?: boolean }) => Promise<string | null>)
+  | undefined;
 
 function resolveGateUrl(): string {
   const privateUrl = process.env.PRIVATE_BEACH_GATE_URL;
@@ -98,7 +100,7 @@ export async function resolveManagerToken(
 
   if (typeof getToken === 'function') {
     try {
-      const clerkToken = await getToken(template ? { template } : undefined);
+      const clerkToken = await getToken(template ? { template, skipCache: true } : { skipCache: true });
       const trimmed = clerkToken?.trim() ?? '';
       if (trimmed.length > 0) {
         const gateToken = await exchangeClerkTokenForGateToken(trimmed);

@@ -10,18 +10,18 @@ use std::{
     fmt,
     net::IpAddr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::auth::{AuthConfig, AuthContext};
-use crate::publish_token::PublishTokenManager;
+use crate::publish_token::{PublishTokenManager, SignedPublishToken};
 use crate::{
-    fastpath::{send_actions_over_fast_path, FastPathRegistry, FastPathSession},
-    log_throttle::{should_log_custom_event, should_log_queue_event, QueueLogKind},
+    fastpath::{FastPathRegistry, FastPathSession, send_actions_over_fast_path},
+    log_throttle::{QueueLogKind, should_log_custom_event, should_log_queue_event},
     metrics,
 };
 use beach_buggy::{
@@ -32,20 +32,20 @@ use beach_buggy::{
 use beach_client_core::cache::terminal::packed::unpack_cell;
 use beach_client_core::protocol::{ClientFrame, CursorFrame, Update as WireUpdate};
 use beach_client_core::{
-    decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
-    HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell, Payload,
-    SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId, TerminalGrid,
-    Transport, TransportError, TransportOffer, WebRtcChannels,
+    CliError, HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell,
+    Payload, SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId,
+    TerminalGrid, Transport, TransportError, TransportOffer, WebRtcChannels,
+    decode_host_frame_binary, encode_client_frame_binary, negotiate_transport,
 };
 use chrono::{DateTime, Duration, Utc};
 use prometheus::IntGauge;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use sqlx::{types::Json, FromRow, PgPool, Row};
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use sqlx::{FromRow, PgPool, Row, types::Json};
+use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
-use tracing::{debug, info, trace, warn, Level};
+use tracing::{Level, debug, info, trace, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -75,6 +75,7 @@ const CONTROLLER_FAST_PATH_READY_LOG_KIND: &str = "controller_fast_path_ready";
 const CONTROLLER_FAST_PATH_LOG_INTERVAL: StdDuration = StdDuration::from_secs(5);
 const CONTROLLER_STRICT_GATING_ENV: &str = "CONTROLLER_STRICT_GATING";
 const CONTROLLER_STRICT_GATING_DEFAULT_ENABLED: bool = true;
+const IDLE_PUBLISH_TOKEN_HINT_KEY: &str = "idlePublishToken";
 
 pub fn viewer_health_report_interval() -> StdDuration {
     VIEWER_HEALTH_REPORT_INTERVAL
@@ -173,6 +174,32 @@ pub struct ControllerAutoAttachHint {
     issued_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IdlePublishTokenHint {
+    pub token: String,
+    pub expires_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+}
+
+impl IdlePublishTokenHint {
+    fn from_signed(signed: &SignedPublishToken) -> Self {
+        Self {
+            token: signed.token.clone(),
+            expires_at_ms: signed.expires_at * 1000,
+            scopes: signed.scopes.clone(),
+        }
+    }
+
+    fn as_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "token": self.token,
+            "expires_at_ms": self.expires_at_ms,
+            "scopes": self.scopes,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1318,6 +1345,167 @@ impl AppState {
         Ok(())
     }
 
+    async fn refresh_idle_publish_token_hint(
+        &self,
+        session_id: &str,
+    ) -> Result<IdlePublishTokenHint, StateError> {
+        let signed = self.publish_tokens.sign_for_session(session_id);
+        let hint = IdlePublishTokenHint::from_signed(&signed);
+
+        {
+            let mut sessions = self.fallback.sessions.write().await;
+            if let Some(record) = sessions.get_mut(session_id) {
+                record.upsert_idle_publish_token_hint(&hint)?;
+            }
+        }
+
+        if let Backend::Postgres(pool) = &self.backend {
+            let session_uuid = parse_uuid(session_id, "session_id")?;
+            let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
+            let mut tx = pool.begin().await?;
+            self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
+                .await?;
+            let existing: Option<(Json<serde_json::Value>,)> = sqlx::query_as(
+                r#"
+                SELECT transport_hints
+                FROM session_runtime
+                WHERE session_id = $1
+                FOR UPDATE
+                "#,
+            )
+            .bind(identifiers.session_id)
+            .fetch_optional(tx.as_mut())
+            .await?;
+            let mut hints_map: HashMap<String, serde_json::Value> = existing
+                .map(|(Json(value),)| serde_json::from_value(value))
+                .transpose()?
+                .unwrap_or_else(|| {
+                    default_transport_hints(session_id, self.idle_snapshot_interval_ms)
+                });
+            inject_idle_publish_hint(&mut hints_map, &hint);
+            let value = serde_json::to_value(&hints_map)?;
+            sqlx::query(
+                r#"
+                INSERT INTO session_runtime (session_id, transport_hints)
+                VALUES ($1, $2)
+                ON CONFLICT (session_id) DO UPDATE SET transport_hints = EXCLUDED.transport_hints
+                "#,
+            )
+            .bind(identifiers.session_id)
+            .bind(Json(value))
+            .execute(tx.as_mut())
+            .await?;
+            tx.commit().await?;
+            self.fallback
+                .set_transport_hints(session_id, hints_map)
+                .await;
+        }
+
+        Ok(hint)
+    }
+
+    async fn clear_idle_publish_token_hint(&self, session_id: &str) -> Result<(), StateError> {
+        {
+            let mut sessions = self.fallback.sessions.write().await;
+            if let Some(record) = sessions.get_mut(session_id) {
+                record.clear_idle_publish_token_hint();
+            }
+        }
+
+        if let Backend::Postgres(pool) = &self.backend {
+            let session_uuid = parse_uuid(session_id, "session_id")?;
+            let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
+            let mut tx = pool.begin().await?;
+            self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
+                .await?;
+            let existing: Option<(Json<serde_json::Value>,)> = sqlx::query_as(
+                r#"
+                SELECT transport_hints
+                FROM session_runtime
+                WHERE session_id = $1
+                FOR UPDATE
+                "#,
+            )
+            .bind(identifiers.session_id)
+            .fetch_optional(tx.as_mut())
+            .await?;
+            let mut hints_map: HashMap<String, serde_json::Value> = existing
+                .map(|(Json(value),)| serde_json::from_value(value))
+                .transpose()?
+                .unwrap_or_else(|| {
+                    default_transport_hints(session_id, self.idle_snapshot_interval_ms)
+                });
+            remove_idle_publish_hint(&mut hints_map);
+            let value = serde_json::to_value(&hints_map)?;
+            sqlx::query(
+                r#"
+                INSERT INTO session_runtime (session_id, transport_hints)
+                VALUES ($1, $2)
+                ON CONFLICT (session_id) DO UPDATE SET transport_hints = EXCLUDED.transport_hints
+                "#,
+            )
+            .bind(identifiers.session_id)
+            .bind(Json(value))
+            .execute(tx.as_mut())
+            .await?;
+            tx.commit().await?;
+            self.fallback
+                .set_transport_hints(session_id, hints_map)
+                .await;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn load_idle_publish_token_hint(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<IdlePublishTokenHint>, StateError> {
+        {
+            let sessions = self.fallback.sessions.read().await;
+            if let Some(record) = sessions.get(session_id) {
+                if let Some(value) = record
+                    .transport_hints
+                    .get(IDLE_PUBLISH_TOKEN_HINT_KEY)
+                    .cloned()
+                {
+                    if let Ok(parsed) = serde_json::from_value(value) {
+                        return Ok(Some(parsed));
+                    }
+                }
+            }
+        }
+        match &self.backend {
+            Backend::Memory => Ok(None),
+            Backend::Postgres(pool) => {
+                let session_uuid = parse_uuid(session_id, "session_id")?;
+                let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
+                let row: Option<(Json<serde_json::Value>,)> = sqlx::query_as(
+                    r#"
+                    SELECT transport_hints
+                    FROM session_runtime
+                    WHERE session_id = $1
+                    "#,
+                )
+                .bind(identifiers.session_id)
+                .fetch_optional(pool)
+                .await?;
+                if let Some((Json(value),)) = row {
+                    if let Ok(map) =
+                        serde_json::from_value::<HashMap<String, serde_json::Value>>(value)
+                    {
+                        if let Some(token_value) = map.get(IDLE_PUBLISH_TOKEN_HINT_KEY) {
+                            if let Ok(parsed) = serde_json::from_value(token_value.clone()) {
+                                return Ok(Some(parsed));
+                            }
+                        }
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+
     async fn prepare_transport_hints_for_registration(
         &self,
         req: &RegisterSessionRequest,
@@ -1334,22 +1522,11 @@ impl AppState {
         });
         entry.viewer_passcode = req.viewer_passcode.clone();
         self.ensure_controller_auto_attach_hint(entry, &req.private_beach_id)?;
-        // Attach a session-scoped publish token for idle snapshots and health
-        // into the idle_snapshot hint. Hosts will prefer this over Beach Auth.
-        if let Some(obj) = entry
-            .transport_hints
-            .get_mut("idle_snapshot")
-            .and_then(|v| v.as_object_mut())
-        {
-            let (token, exp) = self.publish_tokens.sign_for_session(&req.session_id);
-            obj.insert(
-                "publish_token".into(),
-                serde_json::json!({
-                    "token": token,
-                    "expires_at_ms": exp * 1000,
-                }),
-            );
-        }
+        // Attach a session-scoped publish token for idle snapshots and health.
+        let hint = IdlePublishTokenHint::from_signed(
+            &self.publish_tokens.sign_for_session(&req.session_id),
+        );
+        entry.upsert_idle_publish_token_hint(&hint)?;
         Ok(entry.transport_hints.clone())
     }
 
@@ -1373,15 +1550,16 @@ impl AppState {
             "controller_auto_attach": self
                 .build_controller_auto_attach_hint(private_beach_id, passcode),
         });
-        if let Some(interval) = self.idle_snapshot_interval_ms {
-            if let Some(obj) = handshake.as_object_mut() {
-                let (token, exp) = self.publish_tokens.sign_for_session(session_id);
+        let publish_hint = self.refresh_idle_publish_token_hint(session_id).await?;
+        if let Some(obj) = handshake.as_object_mut() {
+            obj.insert(IDLE_PUBLISH_TOKEN_HINT_KEY.into(), publish_hint.as_value());
+            if let Some(interval) = self.idle_snapshot_interval_ms {
                 obj.insert(
                     "idle_snapshot".into(),
                     serde_json::json!({
                         "interval_ms": interval,
                         "mode": "terminal_full",
-                        "publish_token": { "token": token, "expires_at_ms": exp * 1000 }
+                        "publish_token": publish_hint.as_value()
                     }),
                 );
             }
@@ -1733,7 +1911,11 @@ impl AppState {
                     "code",
                     if existed { "updated" } else { "attached" },
                 );
-                Ok(SessionSummary::from_record(rec))
+                let summary = SessionSummary::from_record(rec);
+                drop(sessions);
+                self.refresh_idle_publish_token_hint(origin_session_id)
+                    .await?;
+                Ok(summary)
             }
             Backend::Postgres(pool) => {
                 let beach_uuid = parse_uuid(private_beach_id, "private_beach_id")?;
@@ -1878,6 +2060,8 @@ impl AppState {
                 // Return summary (best-effort from DB fields)
                 let list = self.list_sessions(private_beach_id).await?;
                 if let Some(found) = list.iter().find(|s| s.session_id == origin_session_id) {
+                    self.refresh_idle_publish_token_hint(origin_session_id)
+                        .await?;
                     return Ok(found.clone());
                 }
                 Err(StateError::SessionNotFound)
@@ -2626,10 +2810,10 @@ impl AppState {
         reason: Option<String>,
         requester: Option<Uuid>,
     ) -> Result<ControllerLeaseResponse, StateError> {
-        match &self.backend {
+        let response = match &self.backend {
             Backend::Memory => {
                 self.acquire_controller_memory(session_id, ttl_override, reason.clone())
-                    .await
+                    .await?
             }
             Backend::Postgres(pool) => {
                 let session_uuid = parse_uuid(session_id, "session_id")?;
@@ -2766,12 +2950,14 @@ impl AppState {
                     &active_leases,
                 );
 
-                Ok(ControllerLeaseResponse {
+                ControllerLeaseResponse {
                     controller_token: controller_token.to_string(),
                     expires_at_ms: expires_at.timestamp_millis(),
-                })
+                }
             }
-        }
+        };
+        self.refresh_idle_publish_token_hint(session_id).await?;
+        Ok(response)
     }
 
     pub async fn release_controller(
@@ -2824,6 +3010,9 @@ impl AppState {
                 self.fallback
                     .clear_controller(session_id, Some(controller_token))
                     .await;
+                if !self.fallback.has_active_leases(session_id).await {
+                    self.clear_idle_publish_token_hint(session_id).await?;
+                }
 
                 self.publish(
                     session_id,
@@ -4336,6 +4525,14 @@ impl InnerState {
         }
     }
 
+    async fn has_active_leases(&self, session_id: &str) -> bool {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(session_id)
+            .map(|record| record.has_active_leases())
+            .unwrap_or(false)
+    }
+
     async fn enqueue_actions(&self, session_id: &str, actions: Vec<ActionCommand>) {
         let mut sessions = self.sessions.write().await;
         if let Some(record) = sessions.get_mut(session_id) {
@@ -4569,6 +4766,18 @@ impl SessionRecord {
         Ok(())
     }
 
+    fn upsert_idle_publish_token_hint(
+        &mut self,
+        hint: &IdlePublishTokenHint,
+    ) -> Result<(), serde_json::Error> {
+        inject_idle_publish_hint(&mut self.transport_hints, hint);
+        Ok(())
+    }
+
+    fn clear_idle_publish_token_hint(&mut self) {
+        remove_idle_publish_hint(&mut self.transport_hints);
+    }
+
     fn append_event(
         &mut self,
         event_type: ControllerEventType,
@@ -4619,6 +4828,10 @@ impl SessionRecord {
 
     fn clear_leases(&mut self) {
         self.controller_leases.clear();
+    }
+
+    fn has_active_leases(&self) -> bool {
+        !self.controller_leases.is_empty()
     }
 
     fn first_lease_token(&self) -> Option<String> {
@@ -4849,6 +5062,30 @@ fn is_active_lease(expires_at: Option<DateTime<Utc>>, revoked_at: Option<DateTim
     revoked_at.is_none() && expires_at.map(|exp| exp > now).unwrap_or(false)
 }
 
+fn inject_idle_publish_hint(
+    hints: &mut HashMap<String, serde_json::Value>,
+    hint: &IdlePublishTokenHint,
+) {
+    let value = hint.as_value();
+    hints.insert(IDLE_PUBLISH_TOKEN_HINT_KEY.into(), value.clone());
+    if let Some(obj) = hints
+        .get_mut("idle_snapshot")
+        .and_then(|v| v.as_object_mut())
+    {
+        obj.insert("publish_token".into(), value);
+    }
+}
+
+fn remove_idle_publish_hint(hints: &mut HashMap<String, serde_json::Value>) {
+    hints.remove(IDLE_PUBLISH_TOKEN_HINT_KEY);
+    if let Some(obj) = hints
+        .get_mut("idle_snapshot")
+        .and_then(|v| v.as_object_mut())
+    {
+        obj.remove("publish_token");
+    }
+}
+
 fn pairing_action_label(action: &ControllerPairingAction) -> &'static str {
     match action {
         ControllerPairingAction::Added => "added",
@@ -4895,6 +5132,10 @@ impl AppState {
         entry.harness_type = req.harness_type.clone();
         entry.viewer_passcode = req.viewer_passcode.clone();
         self.ensure_controller_auto_attach_hint(entry, &req.private_beach_id)?;
+        let publish_hint = IdlePublishTokenHint::from_signed(
+            &self.publish_tokens.sign_for_session(&req.session_id),
+        );
+        entry.upsert_idle_publish_token_hint(&publish_hint)?;
 
         if entry.controller_leases.is_empty() {
             let token = Uuid::new_v4().to_string();
@@ -5156,7 +5397,12 @@ impl AppState {
             Some(token_string.clone()),
             None,
         );
+        let has_active = record.has_active_leases();
         self.log_memory_leases("lease_release", record);
+        drop(sessions);
+        if !has_active {
+            self.clear_idle_publish_token_hint(session_id).await?;
+        }
         self.publish(
             session_id,
             StreamEvent::ControllerEvent(ControllerEvent {
@@ -7299,6 +7545,13 @@ async fn drive_controller_forwarder(
         "controller forwarder connected"
     );
 
+    if via_fast_path {
+        let now = now_ms();
+        state
+            .update_pairing_transport_status(session_id, PairingTransportStatus::fast_path(now))
+            .await;
+    }
+
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let mut reader_guard = ForwarderReader::spawn(transport.clone(), event_tx.clone());
     let mut fast_path_watchers: Option<FastPathUpgradeHandle> = None;
@@ -8042,7 +8295,7 @@ mod tests {
     use super::*;
     use crate::state::test_support;
     use beach_buggy::{ActionCommand, HarnessType, RegisterSessionRequest};
-    use beach_client_core::cache::terminal::packed::{pack_color_default, pack_color_rgb, StyleId};
+    use beach_client_core::cache::terminal::packed::{StyleId, pack_color_default, pack_color_rgb};
     use beach_client_core::protocol::{
         HostFrame as WireHostFrame, Lane, LaneBudgetFrame, SyncConfigFrame, Update as WireUpdate,
     };
@@ -8050,11 +8303,11 @@ mod tests {
     use chrono::Utc;
     use serde_json::json;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use std::time::{Duration as StdDuration, SystemTime};
-    use tokio::time::{sleep, timeout, Duration};
+    use tokio::time::{Duration, sleep, timeout};
 
     #[test_timeout::tokio_timeout_test(10)]
     async fn spawn_viewer_worker_smoke_test_records_state_and_stream() {
@@ -8152,6 +8405,36 @@ mod tests {
             !matching.is_empty(),
             "expected redis capture for viewer diff"
         );
+    }
+
+    #[tokio::test]
+    async fn register_session_attaches_idle_publish_token_hint() {
+        let state = AppState::new().with_idle_snapshot_interval(Some(5000));
+        let register = RegisterSessionRequest {
+            session_id: "sess-publish".into(),
+            private_beach_id: "pb-publish".into(),
+            harness_type: HarnessType::TerminalShim,
+            capabilities: vec![],
+            location_hint: None,
+            metadata: None,
+            version: "1.0.0".into(),
+            viewer_passcode: Some("code-123".into()),
+        };
+        let resp = state.register_session(register).await.unwrap();
+        let publish_hint = resp
+            .transport_hints
+            .get(IDLE_PUBLISH_TOKEN_HINT_KEY)
+            .expect("publish hint stored on transport_hints");
+        assert!(publish_hint.get("token").and_then(|v| v.as_str()).is_some());
+        let idle_snapshot = resp
+            .transport_hints
+            .get("idle_snapshot")
+            .expect("idle snapshot hint present");
+        let nested = idle_snapshot
+            .get("publish_token")
+            .and_then(|value| value.get("token"))
+            .and_then(|value| value.as_str());
+        assert!(nested.is_some(), "idle snapshot hint should embed token");
     }
 
     #[test]

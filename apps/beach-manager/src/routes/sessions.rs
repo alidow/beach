@@ -118,6 +118,8 @@ pub struct ControllerHandshakeResponse {
     pub viewer_health_interval_secs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub controller_auto_attach: Option<crate::state::ControllerAutoAttachHint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_publish_token: Option<crate::state::IdlePublishTokenHint>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,6 +283,10 @@ pub async fn issue_controller_handshake(
         &session_summary.private_beach_id,
         body.passcode.trim(),
     ));
+    let idle_publish_token = state
+        .load_idle_publish_token_hint(&session_id)
+        .await
+        .map_err(map_state_err)?;
     let response = ControllerHandshakeResponse {
         private_beach_id: session_summary.private_beach_id.clone(),
         manager_url,
@@ -289,6 +295,7 @@ pub async fn issue_controller_handshake(
         stale_session_idle_secs: crate::state::STALE_SESSION_MAX_IDLE.as_secs(),
         viewer_health_interval_secs: crate::state::viewer_health_report_interval().as_secs(),
         controller_auto_attach,
+        idle_publish_token,
     };
 
     Ok(Json(response))

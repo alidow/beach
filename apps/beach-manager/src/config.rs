@@ -15,6 +15,12 @@ pub struct AppConfig {
     #[serde(default)]
     pub beach_gate_audience: Option<String>,
     #[serde(default)]
+    pub clerk_jwks_url: Option<String>,
+    #[serde(default)]
+    pub clerk_issuer: Option<String>,
+    #[serde(default)]
+    pub clerk_audience: Option<String>,
+    #[serde(default)]
     pub beach_gate_url: Option<String>,
     #[serde(default)]
     pub beach_gate_viewer_token: Option<String>,
@@ -45,6 +51,9 @@ impl AppConfig {
                 beach_gate_jwks_url: None,
                 beach_gate_issuer: None,
                 beach_gate_audience: None,
+                clerk_jwks_url: None,
+                clerk_issuer: None,
+                clerk_audience: None,
                 beach_gate_url: None,
                 beach_gate_viewer_token: None,
                 auth_bypass: false,

@@ -23,6 +23,7 @@ fi
 PRIVATE_BEACH_ID=$1
 BEACH_PROFILE=${BEACH_PROFILE:-local}
 LOG_DIR=${LOG_DIR:-"$HOME/beach-debug"}
+echo "[run-agent] LOG_DIR=$LOG_DIR" >&2
 mkdir -p "$LOG_DIR"
 
 MANAGER_URL_DEFAULT=${RUN_AGENT_MANAGER_URL:-"http://localhost:8080"}
@@ -32,6 +33,8 @@ elif [[ "${PRIVATE_BEACH_MANAGER_URL}" == "http://beach-manager:8080" ]]; then
   echo "[run-agent] overriding PRIVATE_BEACH_MANAGER_URL=http://beach-manager:8080 with $MANAGER_URL_DEFAULT for host-side connectivity" >&2
   export PRIVATE_BEACH_MANAGER_URL="$MANAGER_URL_DEFAULT"
 fi
+
+SESSION_SERVER=${RUN_AGENT_SESSION_SERVER:-${PONG_SESSION_SERVER:-http://localhost:4132/}}
 
 export BEACH_AUTH_GATEWAY=${BEACH_AUTH_GATEWAY:-"http://localhost:4133"}
 export BEACH_AUTH_SCOPE=${BEACH_AUTH_SCOPE:-"pb.full"}
@@ -193,7 +196,7 @@ cd "$REPO_ROOT"
 cargo run --bin beach -- \
   --log-level trace \
   --log-file "$LOG_FILE" \
-  --session-server http://localhost:4132/ \
+  --session-server "$SESSION_SERVER" \
   host \
   --bootstrap-output json \
   --wait \

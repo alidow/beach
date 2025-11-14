@@ -48,7 +48,32 @@ http://localhost:3003/beaches
 ------------
 
 
-Here are cargo-run commands for both players and the agent, matching your pattern and not relying on session-id env vars. Run each in its own terminal. With the controller auto-handshake in place the hosts no longer need `PRIVATE_BEACH_*` variables, but keeping `PRIVATE_BEACH_MANAGER_URL` exported provides a backwards-compatible fallback if Beach Road control delivery is unavailable.
+### Dockerized one-touch launcher (recommended)
+
+If you want to run the two players and the agent inside the `beach-manager` container, use the helper script instead of starting each process manually:
+
+```
+# Start LHS, RHS, and the agent (provide your private beach ID)
+./apps/private-beach/demo/pong/tools/pong-stack.sh start <private-beach-id>
+
+# Print session IDs + passcodes again later
+./apps/private-beach/demo/pong/tools/pong-stack.sh codes
+
+# Kill the three processes quickly
+./apps/private-beach/demo/pong/tools/pong-stack.sh stop
+```
+
+Environment knobs (optional):
+
+- `PONG_DOCKER_SERVICE` – docker compose service to exec into (default `beach-manager`).
+- `PONG_LOG_DIR` – log directory inside the container (default `/tmp/pong-stack`).
+- `PONG_SESSION_SERVER`, `PRIVATE_BEACH_MANAGER_URL` – override URLs if your stack differs from the defaults.
+
+The script uses `docker compose exec -T` so the repo root inside the container is `/app`. Logs (CLI stdout, bootstrap JSON, etc.) land in `${PONG_LOG_DIR}` within the container; inspect them with `docker compose exec beach-manager ls /tmp/pong-stack` or mount that path to the host if needed.
+
+### Manual commands (host processes)
+
+If you prefer the previous workflow (each host on the macOS side), here are the cargo-run commands for both players and the agent, matching your pattern and not relying on session-id env vars. Run each in its own terminal. With the controller auto-handshake in place the hosts no longer need `PRIVATE_BEACH_*` variables, but keeping `PRIVATE_BEACH_MANAGER_URL` exported provides a backwards-compatible fallback if Beach Road control delivery is unavailable. Once the rewrite-2 dashboard is in use, publish tokens flow automatically from the manager, so you no longer need to source `PB_MANAGER_TOKEN`/`PRIVATE_BEACH_MANAGER_TOKEN` for host heartbeats (the legacy `apps/private-beach` UI still requires its manual tokens).
 
 
 

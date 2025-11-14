@@ -97,6 +97,28 @@ const VIEWPORT_PAN_EPSILON = 0.5;
 const VIEWPORT_ZOOM_EPSILON = 0.0005;
 const PAIRING_STATUS_REFRESH_MS = 15_000;
 
+type ControllerLeaseLog = {
+  phase: string;
+  sessionId: string;
+  token?: string | null;
+  ttlMs?: number;
+  expiresAtMs?: number;
+  message?: string;
+};
+
+function logControllerLeaseEvent(entry: ControllerLeaseLog) {
+  const payload: Record<string, unknown> = {
+    ...entry,
+    hasToken: Boolean(entry.token && entry.token.trim().length > 0),
+    tokenPrefix: entry.token ? entry.token.slice(0, 12) : null,
+  };
+  try {
+    console.info('[rewrite-2] controller-lease', JSON.stringify(payload));
+  } catch {
+    console.info('[rewrite-2] controller-lease', payload);
+  }
+}
+
 type FlowCanvasProps = {
   onNodePlacement: (payload: NodePlacementPayload) => void;
   onTileMove?: (payload: TileMovePayload) => void;
@@ -269,6 +291,12 @@ function FlowCanvasInner({
       if (expiry && expiry - now > CONTROLLER_LEASE_REFRESH_BUFFER_MS) {
         return;
       }
+      logControllerLeaseEvent({
+        phase: 'request',
+        sessionId: controllerSessionId,
+        token: authToken,
+        ttlMs: CONTROLLER_LEASE_TTL_MS,
+      });
       try {
         const lease = await acquireController(
           controllerSessionId,
@@ -278,6 +306,12 @@ function FlowCanvasInner({
         );
         const nextExpiry = lease.expires_at_ms ?? now + CONTROLLER_LEASE_TTL_MS;
         controllerLeaseExpiryRef.current[controllerSessionId] = nextExpiry;
+        logControllerLeaseEvent({
+          phase: 'success',
+          sessionId: controllerSessionId,
+          token: authToken,
+          expiresAtMs: nextExpiry,
+        });
       } catch (error) {
         // In dev, some manager builds return HTTP 409 (Conflict) when the DB
         // migrations for controller leases are out of date. Since pairing does
@@ -289,11 +323,23 @@ function FlowCanvasInner({
           const fallbackExpiry = now + CONTROLLER_LEASE_TTL_MS;
           controllerLeaseExpiryRef.current[controllerSessionId] = fallbackExpiry;
           console.info('[rewrite-2] proceeding without controller lease due to 409');
+          logControllerLeaseEvent({
+            phase: 'conflict-409',
+            sessionId: controllerSessionId,
+            token: authToken,
+            expiresAtMs: fallbackExpiry,
+          });
           return;
         }
         console.warn('[rewrite-2] failed to acquire controller lease', {
           controllerSessionId,
           error,
+        });
+        logControllerLeaseEvent({
+          phase: 'failure',
+          sessionId: controllerSessionId,
+          token: authToken,
+          message,
         });
         throw error;
       }

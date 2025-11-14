@@ -128,8 +128,16 @@ async fn main() {
         info!("viewer token verification disabled");
     }
 
-    let signaling_state =
-        SignalingState::new(shared_storage.clone(), viewer_token_verifier.clone());
+    info!(
+        "signaling heartbeat check interval {}s, stale peer timeout {}s",
+        config.signaling_heartbeat_interval_seconds, config.signaling_peer_timeout_seconds
+    );
+    let signaling_state = SignalingState::new(
+        shared_storage.clone(),
+        viewer_token_verifier.clone(),
+        Duration::from_secs(config.signaling_heartbeat_interval_seconds),
+        Duration::from_secs(config.signaling_peer_timeout_seconds),
+    );
 
     if config.fallback_require_oidc && config.fallback_jwks_url.is_none() {
         error!(

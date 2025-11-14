@@ -1098,6 +1098,7 @@ class SessionState:
     previous_ball_time: Optional[float] = None
     ball_velocity: Optional[Tuple[float, float]] = None
     last_update: float = 0.0
+    last_update_label: str = "pending"
     last_move_time: float = 0.0
     ball_exit: Optional[str] = None
     ball_exit_time: float = 0.0
@@ -1109,6 +1110,9 @@ class SessionState:
     transport_status: Optional[str] = None
     transport_last_update: float = 0.0
 
+    def touch(self, now: float) -> None:
+        self.last_update = now
+        self.last_update_label = time.strftime("%H:%M:%S", time.localtime())
 
     def apply_terminal_frame(
         self,
@@ -1122,7 +1126,7 @@ class SessionState:
         self.last_sequence = sequence
         self.lines = lines
         self.cursor = cursor
-        self.last_update = now
+        self.touch(now)
         self._detect_paddle()
         self._detect_ball(now)
 
@@ -1690,7 +1694,7 @@ class AgentApp:
         session = self.ensure_session(session_id)
         payload_type = payload.get("type")
         if payload_type == "terminal_heartbeat":
-            session.last_update = now
+            session.touch(now)
             return
         if payload_type != "terminal_full":
             self.log(f"ignoring payload type {payload_type}", level="debug")
@@ -2198,11 +2202,8 @@ class AgentApp:
             self._addstr_safe(y + 2, x, width, f" velocity=({vx:.2f},{vy:.2f})")
         else:
             self._addstr_safe(y + 2, x, width, " velocity=–")
-        if session.last_update:
-            age = time.monotonic() - session.last_update
-        else:
-            age = 0.0
-        self._addstr_safe(y + 3, x, width, f" last update {age:.2f}s ago")
+        last_update_label = session.last_update_label or "pending"
+        self._addstr_safe(y + 3, x, width, f" last update {last_update_label}")
         token_marker = (
             "token=✓"
             if self.mcp.current_session_token(session.session_id)

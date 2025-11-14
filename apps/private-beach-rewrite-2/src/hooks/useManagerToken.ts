@@ -13,6 +13,71 @@ type ManagerTokenState = {
   refresh: () => Promise<string | null>;
 };
 
+const TOKEN_REFRESH_SKEW_MS = 30_000;
+
+function base64UrlDecode(segment: string): string | null {
+  if (!segment) return null;
+  const normalized = segment.replace(/-/g, '+').replace(/_/g, '/');
+  const padding = normalized.length % 4 === 0 ? '' : '='.repeat(4 - (normalized.length % 4));
+  try {
+    if (typeof window !== 'undefined' && typeof window.atob === 'function') {
+      return window.atob(normalized + padding);
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function decodeJwtClaims(token: string | null): Record<string, unknown> | null {
+  if (!token) return null;
+  const parts = token.split('.');
+  if (parts.length < 2) {
+    return null;
+  }
+  const decoded = base64UrlDecode(parts[1]);
+  if (!decoded) {
+    return null;
+  }
+  try {
+    return JSON.parse(decoded) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function getTokenExpiryMs(token: string | null): number | null {
+  if (!token) return null;
+  const claims = decodeJwtClaims(token);
+  const expSeconds = claims && typeof claims.exp === 'number' ? (claims.exp as number) : null;
+  return expSeconds ? expSeconds * 1000 : null;
+}
+
+type TokenLogContext = Record<string, unknown> & { phase: string };
+
+function logTokenDiagnostics(token: string | null, context: TokenLogContext) {
+  const payload: Record<string, unknown> = {
+    ...context,
+    hasToken: Boolean(token && token.trim().length > 0),
+  };
+  if (token && token.trim().length > 0) {
+    const claims = (decodeJwtClaims(token) ?? {}) as Record<string, unknown>;
+    const scope = typeof claims['scope'] === 'string' ? (claims['scope'] as string) : null;
+    const scp = Array.isArray(claims['scp']) ? (claims['scp'] as unknown[]) : null;
+    const entitlements = claims['entitlements'] ?? null;
+    payload.scope = scope;
+    payload.scp = scp;
+    payload.entitlements = entitlements;
+    payload.exp = getTokenExpiryMs(token);
+    payload.tokenPrefix = token.slice(0, 12);
+  }
+  try {
+    console.info('[rewrite-2][auth] manager-token', JSON.stringify(payload));
+  } catch {
+    console.info('[rewrite-2][auth] manager-token', payload);
+  }
+}
+
 export function useManagerToken(): ManagerTokenState {
   const { isLoaded, isSignedIn } = useAuth();
   const { initialToken } = useInitialManagerToken();
@@ -32,16 +97,19 @@ export function useManagerToken(): ManagerTokenState {
   const [token, setToken] = useState<string | null>(fallbackToken);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [lastRefreshId, setLastRefreshId] = useState<number>(0);
 
   const refresh = useCallback(async () => {
     if (!isLoaded) {
       setToken(null);
       setError('Authentication is still loading.');
+      logTokenDiagnostics(null, { phase: 'refresh-skipped', reason: 'auth-loading' });
       return null;
     }
     if (!isSignedIn) {
       setToken(null);
       setError('Sign in to manage sessions.');
+      logTokenDiagnostics(null, { phase: 'refresh-skipped', reason: 'signed-out' });
       return null;
     }
 
@@ -60,11 +128,14 @@ export function useManagerToken(): ManagerTokenState {
       const data = (await response.json()) as { token?: string | null };
       const nextToken = data.token?.trim() ?? null;
       setToken(nextToken);
+      setLastRefreshId((current) => current + 1);
+      logTokenDiagnostics(nextToken, { phase: 'refresh-success', source: 'api/manager-token' });
       return nextToken;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setToken(null);
       setError(message);
+      logTokenDiagnostics(null, { phase: 'refresh-error', error: message });
       return null;
     } finally {
       setLoading(false);
@@ -75,6 +146,8 @@ export function useManagerToken(): ManagerTokenState {
     if (fallbackToken) {
       setToken(fallbackToken);
       setError(null);
+      setLastRefreshId((current) => current + 1);
+      logTokenDiagnostics(fallbackToken, { phase: 'fallback-init' });
       return;
     }
     if (!isLoaded) {
@@ -82,6 +155,28 @@ export function useManagerToken(): ManagerTokenState {
     }
     void refresh();
   }, [fallbackToken, isLoaded, refresh]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    if (!token) {
+      return;
+    }
+    const expiryMs = getTokenExpiryMs(token);
+    if (!expiryMs) {
+      return;
+    }
+    const delay = Math.max(1_000, expiryMs - TOKEN_REFRESH_SKEW_MS - Date.now());
+    if (delay <= 0) {
+      void refresh();
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void refresh();
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [token, refresh, lastRefreshId]);
 
   return useMemo(
     () => ({

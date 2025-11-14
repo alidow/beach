@@ -3,11 +3,21 @@ use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+const DEFAULT_SCOPES: [&str; 2] = ["pb:sessions.write", "pb:harness.publish"];
+
 #[derive(Clone)]
 pub struct PublishTokenManager {
     enc: EncodingKey,
     dec: DecodingKey,
     ttl: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct SignedPublishToken {
+    pub token: String,
+    /// Expiration timestamp (seconds since epoch)
+    pub expires_at: i64,
+    pub scopes: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -50,16 +60,21 @@ impl PublishTokenManager {
         self
     }
 
-    pub fn sign_for_session(&self, session_id: &str) -> (String, i64) {
+    pub fn sign_for_session(&self, session_id: &str) -> SignedPublishToken {
         let exp = (Utc::now() + self.ttl).timestamp();
+        let scopes: Vec<String> = DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect();
         let claims = PublishClaims {
             sid: session_id.to_string(),
             exp,
-            scp: Some(vec!["state_publish".into()]),
+            scp: Some(scopes.clone()),
         };
         let header = Header::new(Algorithm::HS256);
         let token = jsonwebtoken::encode(&header, &claims, &self.enc).expect("sign publish token");
-        (token, exp)
+        SignedPublishToken {
+            token,
+            expires_at: exp,
+            scopes,
+        }
     }
 
     pub fn verify_for_session(
@@ -90,17 +105,22 @@ mod tests {
     #[test]
     fn sign_and_verify_round_trip() {
         let mgr = PublishTokenManager::from_env().with_ttl(Duration::minutes(1));
-        let (token, exp) = mgr.sign_for_session("sess-123");
-        assert!(exp > 0);
-        let claims = mgr.verify_for_session(&token, "sess-123").expect("verify");
+        let signed = mgr.sign_for_session("sess-123");
+        assert!(signed.expires_at > 0);
+        assert_eq!(signed.scopes, DEFAULT_SCOPES);
+        let claims = mgr
+            .verify_for_session(&signed.token, "sess-123")
+            .expect("verify");
         assert_eq!(claims.sid, "sess-123");
     }
 
     #[test]
     fn sid_mismatch_rejected() {
         let mgr = PublishTokenManager::from_env().with_ttl(Duration::minutes(1));
-        let (token, _exp) = mgr.sign_for_session("sess-abc");
-        let err = mgr.verify_for_session(&token, "sess-def").unwrap_err();
+        let signed = mgr.sign_for_session("sess-abc");
+        let err = mgr
+            .verify_for_session(&signed.token, "sess-def")
+            .unwrap_err();
         matches!(err, PublishTokenError::SidMismatch);
     }
 }

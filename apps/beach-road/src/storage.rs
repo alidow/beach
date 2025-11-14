@@ -302,7 +302,8 @@ impl Storage {
         use redis::AsyncCommands;
 
         let mut conn = self.redis.clone();
-        let present: std::collections::HashSet<&str> = present_peers.iter().map(|s| s.as_str()).collect();
+        let present: std::collections::HashSet<&str> =
+            present_peers.iter().map(|s| s.as_str()).collect();
 
         let pattern = format!("session:{}:webrtc:offers:*", session_id);
         let keys: Vec<String> = conn.keys(&pattern).await.unwrap_or_default();
@@ -320,7 +321,9 @@ impl Storage {
 
             // Pop one handshake from the orphaned queue
             let handshake_id: Option<String> = conn.lpop(&queue_key, None).await?;
-            let Some(handshake_id) = handshake_id else { continue };
+            let Some(handshake_id) = handshake_id else {
+                continue;
+            };
 
             // Load payload and retarget it
             let payload_key = offer_payload_key(session_id, &handshake_id);

@@ -17,7 +17,9 @@ import json
 import os
 import queue
 import random
+import shutil
 import socket
+import subprocess
 import threading
 import time
 import uuid
@@ -924,6 +926,10 @@ class MCPClient:
                         "message": f"failed to connect to action sink {self._target}: {exc}",
                     }
                 )
+        self._ipc_socket = os.environ.get("BEACH_MCP_SOCKET")
+        self._beach_bin = (
+            os.environ.get("BEACH_BIN") or shutil.which("beach")
+        )
 
     def set_session_token(self, session_id: str, token: str) -> None:
         self._session_tokens[session_id] = token
@@ -962,7 +968,14 @@ class MCPClient:
         status = "recorded"
 
         result = CommandDispatchResult(True, "recorded")
-        if self._base_url:
+        used_ipc = False
+        if self._ipc_socket and self._beach_bin:
+            if self._dispatch_via_cli(session_id, action_payload, trace_id):
+                transport_label = "ipc"
+                status = "queued"
+                used_ipc = True
+                result = CommandDispatchResult(True, "ipc")
+        if not used_ipc and self._base_url:
             transport_label = "http"
             result = self._send_http(session_id, action_payload)
             status = result.status
@@ -1090,6 +1103,52 @@ class MCPClient:
                 }
             )
             return CommandDispatchResult(False, "transport_error", detail=str(message))
+
+    def _dispatch_via_cli(
+        self,
+        session_id: str,
+        action_payload: Dict[str, object],
+        trace_id: Optional[str],
+    ) -> bool:
+        if not self._beach_bin or not self._ipc_socket:
+            return False
+        command = [
+            self._beach_bin,
+            "action",
+            "--session",
+            session_id,
+            "--socket",
+            self._ipc_socket,
+            "--bytes",
+            json.dumps(action_payload, separators=(",", ":")),
+        ]
+        if trace_id:
+            command.extend(["--trace-id", trace_id])
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=5,
+            )
+            return True
+        except subprocess.CalledProcessError as exc:
+            detail = exc.stderr.decode("utf-8", "ignore") if exc.stderr else str(exc)
+            self._callback(
+                {
+                    "level": "warn",
+                    "message": f"beach action via MCP failed for {session_id}: {detail.strip()}",
+                }
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._callback(
+                {
+                    "level": "warn",
+                    "message": f"beach action via MCP errored ({exc}); falling back to HTTP",
+                }
+            )
+        return False
 
     def close(self) -> None:
         if self._socket:  # pragma: no cover - cleanup path

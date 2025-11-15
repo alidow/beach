@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use crate::server::terminal::host::ControllerBridge;
 use crate::server::terminal::{PtyProcess, PtyWriter};
 use crate::sync::terminal::TerminalSync;
 
@@ -10,6 +11,7 @@ pub struct TerminalSession {
     pub sync: Arc<TerminalSync>,
     pub writer: PtyWriter,
     pub process: Arc<PtyProcess>,
+    pub controller_bridge: Option<Arc<ControllerBridge>>,
 }
 
 impl TerminalSession {
@@ -18,12 +20,14 @@ impl TerminalSession {
         sync: Arc<TerminalSync>,
         writer: PtyWriter,
         process: Arc<PtyProcess>,
+        controller_bridge: Option<Arc<ControllerBridge>>,
     ) -> Self {
         Self {
             session_id: session_id.into(),
             sync,
             writer,
             process,
+            controller_bridge,
         }
     }
 }

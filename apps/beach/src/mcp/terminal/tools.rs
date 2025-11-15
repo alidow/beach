@@ -18,6 +18,9 @@ pub const RESIZE: &str = "beach.terminal.resize";
 pub const SET_VIEWPORT: &str = "beach.terminal.setViewport";
 pub const REQUEST_HISTORY: &str = "beach.terminal.requestHistory";
 pub const LIST_SESSIONS: &str = "beach.sessions.list";
+pub const CONTROLLER_ACQUIRE: &str = "beach.controller.acquire";
+pub const CONTROLLER_RELEASE: &str = "beach.controller.release";
+pub const CONTROLLER_QUEUE_ACTIONS: &str = "beach.controller.queueActions";
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct TerminalToolDescriptor {
@@ -26,7 +29,7 @@ pub struct TerminalToolDescriptor {
     pub requires_lease: bool,
 }
 
-pub fn list_tools(read_only: bool) -> Vec<TerminalToolDescriptor> {
+pub fn list_tools(read_only: bool, controller_available: bool) -> Vec<TerminalToolDescriptor> {
     let mut tools = vec![TerminalToolDescriptor {
         name: LIST_SESSIONS.to_string(),
         description: "List active beach sessions".to_string(),
@@ -74,6 +77,26 @@ pub fn list_tools(read_only: bool) -> Vec<TerminalToolDescriptor> {
             requires_lease: false,
         },
     ]);
+
+    if controller_available {
+        tools.extend([
+            TerminalToolDescriptor {
+                name: CONTROLLER_ACQUIRE.to_string(),
+                description: "Acquire a controller lease".to_string(),
+                requires_lease: false,
+            },
+            TerminalToolDescriptor {
+                name: CONTROLLER_RELEASE.to_string(),
+                description: "Release the active controller lease".to_string(),
+                requires_lease: false,
+            },
+            TerminalToolDescriptor {
+                name: CONTROLLER_QUEUE_ACTIONS.to_string(),
+                description: "Queue controller actions via the host".to_string(),
+                requires_lease: true,
+            },
+        ]);
+    }
 
     tools
 }
@@ -268,7 +291,7 @@ pub fn handle_acquire_lease(
         Some(other) => return Err(anyhow!("unsupported lease scope: {other}")),
     };
     let ttl = Duration::from_millis(helper.ttl_ms.clamp(1000, 120_000));
-    Ok(leases.acquire(session_id, scope, ttl)?)
+    Ok(leases.acquire(session_id, scope, ttl, None)?)
 }
 
 pub fn handle_release_lease(leases: &LeaseManager, params: &Value) -> Result<()> {

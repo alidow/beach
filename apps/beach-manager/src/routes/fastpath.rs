@@ -1,5 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
+    http::HeaderMap,
     Json,
 };
 use serde::Deserialize;
@@ -7,8 +8,9 @@ use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 use crate::fastpath::FastPathSession;
+use crate::routes::sessions::{claims_has_scope, extract_bearer};
 use crate::{
-    routes::{ApiError, ApiResult, AuthToken},
+    routes::{ApiError, ApiResult},
     state::AppState,
 };
 
@@ -20,12 +22,12 @@ pub struct OfferBody {
 
 pub async fn answer_offer(
     State(state): State<AppState>,
-    token: AuthToken,
+    headers: HeaderMap,
     Path(session_id): Path<String>,
     Json(body): Json<OfferBody>,
 ) -> ApiResult<serde_json::Value> {
+    authorize_fast_path(&state, &headers, &session_id).await?;
     // Harness publishes; require publish scope
-    crate::routes::sessions::ensure_scope(&token, "pb:harness.publish").map_err(|e| e)?;
     if !body.r#type.eq_ignore_ascii_case("offer") {
         return Err(ApiError::BadRequest(format!(
             "expected SDP type 'offer', got '{}'",
@@ -61,11 +63,11 @@ pub struct AnswerQuery {
 
 pub async fn add_remote_ice(
     State(state): State<AppState>,
-    token: AuthToken,
+    headers: HeaderMap,
     Path(session_id): Path<String>,
     Json(body): Json<IceBody>,
 ) -> ApiResult<serde_json::Value> {
-    crate::routes::sessions::ensure_scope(&token, "pb:harness.publish").map_err(|e| e)?;
+    authorize_fast_path(&state, &headers, &session_id).await?;
     let fps = state
         .fast_path_for(&session_id)
         .await
@@ -84,10 +86,10 @@ pub async fn add_remote_ice(
 
 pub async fn list_local_ice(
     State(state): State<AppState>,
-    token: AuthToken,
+    headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> ApiResult<serde_json::Value> {
-    crate::routes::sessions::ensure_scope(&token, "pb:harness.publish").map_err(|e| e)?;
+    authorize_fast_path(&state, &headers, &session_id).await?;
     let fps = state
         .fast_path_for(&session_id)
         .await
@@ -98,11 +100,11 @@ pub async fn list_local_ice(
 
 pub async fn get_local_answer(
     State(state): State<AppState>,
-    token: AuthToken,
+    headers: HeaderMap,
     Path(session_id): Path<String>,
     Query(query): Query<AnswerQuery>,
 ) -> ApiResult<serde_json::Value> {
-    crate::routes::sessions::ensure_scope(&token, "pb:harness.publish").map_err(|e| e)?;
+    authorize_fast_path(&state, &headers, &session_id).await?;
     let fps = state
         .fast_path_for(&session_id)
         .await
@@ -120,4 +122,31 @@ pub async fn get_local_answer(
         "to_peer": query.to_peer.unwrap_or_else(|| "fastpath-client".into())
     });
     Ok(Json(payload))
+}
+
+async fn authorize_fast_path(
+    state: &AppState,
+    headers: &HeaderMap,
+    session_id: &str,
+) -> Result<(), ApiError> {
+    let Some(bearer) = extract_bearer(headers) else {
+        return Err(ApiError::Unauthorized);
+    };
+    if state
+        .publish_token_manager()
+        .verify_for_session(&bearer, session_id)
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    let claims = state
+        .auth_context()
+        .verify_strict(&bearer)
+        .await
+        .map_err(|_| ApiError::Unauthorized)?;
+    if !claims_has_scope(&claims, "pb:harness.publish") {
+        return Err(ApiError::Forbidden("pb:harness.publish"));
+    }
+    Ok(())
 }

@@ -1,6 +1,7 @@
 use crate::auth;
 use crate::client::terminal::{debug, join};
 use crate::server::terminal::host;
+use crate::terminal::action as action_cli;
 use crate::terminal::auth as auth_cli;
 use crate::terminal::cli::{self, AuthCommand, Command, HostArgs};
 use crate::terminal::error::CliError;
@@ -9,7 +10,7 @@ use std::env;
 use tracing::info;
 
 pub async fn run(cli: cli::Cli) -> Result<(), CliError> {
-    let session_base = cli.session_server;
+    let session_base = cli.session_server.clone();
 
     auth::apply_profile_environment(cli.profile.as_deref())
         .map_err(|err| CliError::Auth(err.to_string()))?;
@@ -28,6 +29,7 @@ pub async fn run(cli: cli::Cli) -> Result<(), CliError> {
         Some(Command::Login(args)) => {
             auth_cli::run(AuthCommand::Login(args), cli.profile.clone()).await
         }
+        Some(Command::Action(args)) => action_cli::run(cli.profile.as_deref(), args).await,
         None => host::run(&session_base, HostArgs::default()).await,
     }
 }

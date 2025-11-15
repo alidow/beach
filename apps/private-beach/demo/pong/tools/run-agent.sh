@@ -45,6 +45,15 @@ export BEACH_AUTH_AUDIENCE=${BEACH_AUTH_AUDIENCE:-"private-beach"}
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/../../../../.." && pwd)
 CREDENTIALS_FILE="${BEACH_CREDENTIALS_FILE:-$HOME/.beach/credentials}"
+BEACH_BIN_DEFAULT="$REPO_ROOT/target/debug/beach"
+if [[ -x "$BEACH_BIN_DEFAULT" ]]; then
+  export BEACH_BIN="$BEACH_BIN_DEFAULT"
+else
+  BEACH_BIN_RESOLVED=$(command -v beach 2>/dev/null || true)
+  if [[ -n "$BEACH_BIN_RESOLVED" ]]; then
+    export BEACH_BIN="$BEACH_BIN_RESOLVED"
+  fi
+fi
 
 ensure_token() {
   python3 - "$BEACH_PROFILE" "$CREDENTIALS_FILE" <<'PY' || return 1

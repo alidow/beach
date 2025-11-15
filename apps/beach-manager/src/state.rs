@@ -1585,6 +1585,16 @@ impl AppState {
                 );
             }
         }
+        if let Some(fast_path_hint) = {
+            let sessions = self.fallback.sessions.read().await;
+            sessions
+                .get(session_id)
+                .and_then(|record| record.transport_hints.get("fast_path_webrtc").cloned())
+        } {
+            if let Some(obj) = handshake.as_object_mut() {
+                obj.insert("fast_path_webrtc".into(), fast_path_hint);
+            }
+        }
 
         // Throttled trace to help correlate manager-side handshake construction
         // with host/agent behavior without leaking credentials.
@@ -1698,6 +1708,43 @@ impl AppState {
 
     pub fn publish_token_manager(&self) -> Arc<PublishTokenManager> {
         self.publish_tokens.clone()
+    }
+
+    async fn clear_http_backlog_after_fast_path(&self, private_beach_id: &str, session_id: &str) {
+        if let Err(err) = self.clear_actions_redis(private_beach_id, session_id).await {
+            warn!(
+                target = "controller.delivery",
+                session_id = %session_id,
+                private_beach_id = %private_beach_id,
+                error = %err,
+                "failed to clear redis backlog after fast-path promotion"
+            );
+        } else {
+            debug!(
+                target = "controller.delivery",
+                session_id = %session_id,
+                private_beach_id = %private_beach_id,
+                "cleared redis controller backlog after fast-path promotion"
+            );
+        }
+        self.fallback.clear_pending_actions(session_id).await;
+    }
+
+    pub async fn fast_path_actions_online(&self, session_id: &str) {
+        let private_beach_id =
+            if let Some((pb_id, _)) = self.session_metrics_labels(session_id).await {
+                Some(pb_id)
+            } else {
+                let sessions = self.fallback.sessions.read().await;
+                sessions
+                    .get(session_id)
+                    .map(|record| record.private_beach_id.clone())
+            };
+
+        if let Some(pb_id) = private_beach_id {
+            self.clear_http_backlog_after_fast_path(&pb_id, session_id)
+                .await;
+        }
     }
 
     pub async fn attach_fast_path(&self, session_id: String, fps: FastPathSession) {
@@ -3137,6 +3184,31 @@ impl AppState {
                 let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
                 let private_beach_id_str = identifiers.private_beach_id.to_string();
                 let session_uuid_str = session_uuid.to_string();
+                let mut readiness_override = self
+                    .fallback
+                    .session_readiness_snapshot(&session_uuid_str)
+                    .await;
+                let needs_http_ready = readiness_override
+                    .as_ref()
+                    .map(|snapshot| snapshot.attached() && !snapshot.http_ready())
+                    .unwrap_or(false);
+                if needs_http_ready {
+                    let fast_path_ready = self.fast_path_ready(&session_uuid_str).await;
+                    if !fast_path_ready {
+                        self.mark_session_http_ready(&session_uuid_str).await;
+                        if let Some(snapshot) = readiness_override.as_mut() {
+                            snapshot.http_ready_since_ms = Some(now_ms());
+                        } else {
+                            readiness_override = self
+                                .fallback
+                                .session_readiness_snapshot(&session_uuid_str)
+                                .await;
+                            if let Some(snapshot) = readiness_override.as_mut() {
+                                snapshot.http_ready_since_ms = Some(now_ms());
+                            }
+                        }
+                    }
+                }
                 let lease = match self
                     .fetch_active_lease_for_token(pool, identifiers.session_id, token_uuid)
                     .await
@@ -3164,7 +3236,7 @@ impl AppState {
                         controller_token,
                         Some(lease.id),
                         actor_account_id,
-                        None,
+                        readiness_override.clone(),
                     )
                     .await?;
                 }
@@ -3201,6 +3273,12 @@ impl AppState {
                             metrics::FASTPATH_ACTIONS_SENT
                                 .with_label_values(&[label0.as_str(), label1.as_str()])
                                 .inc_by(actions.len() as u64);
+
+                            self.clear_http_backlog_after_fast_path(
+                                &identifiers.private_beach_id.to_string(),
+                                &session_uuid_str,
+                            )
+                            .await;
 
                             let mut tx = pool.begin().await?;
                             self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
@@ -3255,19 +3333,12 @@ impl AppState {
                         }
                         Ok(FastPathSendOutcome::SessionMissing)
                         | Ok(FastPathSendOutcome::ChannelMissing) => {
-                            let snapshot =
-                                self.fallback.session_readiness_snapshot(session_id).await;
-                            return Err(self
-                                .controller_command_rejection_with_snapshot(
-                                    &private_beach_id_str,
-                                    &session_uuid_str,
-                                    controller_token,
-                                    Some(lease.id),
-                                    actor_account_id,
-                                    ControllerCommandDropReason::FastPathNotReady,
-                                    snapshot,
-                                )
-                                .await);
+                            trace!(
+                                target = "controller.delivery",
+                                session_id = %session_uuid,
+                                private_beach_id = %identifiers.private_beach_id,
+                                "fast-path unavailable for session; falling back to HTTP transport"
+                            );
                         }
                         Err(err) => {
                             warn!(

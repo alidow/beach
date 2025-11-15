@@ -575,7 +575,7 @@ pub async fn push_state(
     Ok(Json(serde_json::json!({ "stored": true })))
 }
 
-fn extract_bearer(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -583,7 +583,7 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-fn claims_has_scope(claims: &Claims, scope: &str) -> bool {
+pub(crate) fn claims_has_scope(claims: &Claims, scope: &str) -> bool {
     fn matches_scope(candidate: &str, scope: &str) -> bool {
         candidate == "*"
             || candidate == scope

@@ -115,6 +115,8 @@ pub enum Command {
     /// Start a device login (alias for `beach auth login`)
     #[command(name = "login")]
     Login(AuthLoginArgs),
+    /// Queue controller actions for a session
+    Action(ActionArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -191,6 +193,82 @@ pub struct AuthSwitchArgs {
         help = "Clear the active profile"
     )]
     pub unset: bool,
+}
+
+#[derive(Args, Debug, Default, Clone)]
+pub struct ActionArgs {
+    #[arg(
+        long = "session",
+        value_name = "ID",
+        env = "BEACH_SESSION_ID",
+        help = "Child session id to target"
+    )]
+    pub session_id: Option<String>,
+
+    #[arg(
+        long = "controller-token",
+        value_name = "TOKEN",
+        env = "BEACH_CONTROLLER_TOKEN",
+        hide_env_values = true,
+        help = "Controller token to use for HTTP fallback"
+    )]
+    pub controller_token: Option<String>,
+
+    #[arg(
+        long = "bytes",
+        action = clap::ArgAction::Append,
+        value_name = "JSON",
+        help = "Serialized ActionCommand payload as JSON"
+    )]
+    pub bytes: Vec<String>,
+
+    #[arg(
+        long = "socket",
+        value_name = "PATH",
+        env = "BEACH_MCP_SOCKET",
+        help = "Override the MCP socket path"
+    )]
+    pub socket: Option<PathBuf>,
+
+    #[arg(
+        long = "no-ipc",
+        action = clap::ArgAction::SetTrue,
+        help = "Skip MCP IPC and use HTTP only"
+    )]
+    pub no_ipc: bool,
+
+    #[arg(
+        long = "manager-url",
+        value_name = "URL",
+        env = "PRIVATE_BEACH_MANAGER_URL",
+        help = "Beach Manager base URL for HTTP fallback"
+    )]
+    pub manager_url: Option<String>,
+
+    #[arg(
+        long = "manager-token",
+        value_name = "TOKEN",
+        env = "PRIVATE_BEACH_MANAGER_TOKEN",
+        hide_env_values = true,
+        help = "Bearer token for Beach Manager HTTP calls"
+    )]
+    pub manager_token: Option<String>,
+
+    #[arg(
+        long = "trace-id",
+        value_name = "TRACE",
+        env = "BEACH_TRACE_ID",
+        help = "Optional trace identifier to attach"
+    )]
+    pub trace_id: Option<String>,
+
+    #[arg(
+        long = "lease-reason",
+        value_name = "TEXT",
+        env = "BEACH_CONTROLLER_LEASE_REASON",
+        help = "Reason to include when acquiring controller lease over MCP"
+    )]
+    pub lease_reason: Option<String>,
 }
 
 #[derive(Args, Debug, Default)]

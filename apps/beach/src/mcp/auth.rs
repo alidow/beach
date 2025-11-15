@@ -9,6 +9,17 @@ use uuid::Uuid;
 #[serde(rename_all = "snake_case")]
 pub enum LeaseScope {
     Input,
+    Controller,
+}
+
+#[derive(Clone, Debug)]
+pub enum LeaseMetadata {
+    Controller(ControllerLeaseMetadata),
+}
+
+#[derive(Clone, Debug)]
+pub struct ControllerLeaseMetadata {
+    pub controller_token: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -27,6 +38,7 @@ pub struct LeaseInfo {
 struct LeaseRecord {
     info: LeaseInfo,
     deadline: Instant,
+    metadata: Option<LeaseMetadata>,
 }
 
 #[derive(Debug)]
@@ -76,6 +88,7 @@ impl LeaseManager {
         session_id: &str,
         scope: LeaseScope,
         ttl: Duration,
+        metadata: Option<LeaseMetadata>,
     ) -> Result<LeaseInfo, LeaseError> {
         if self.read_only {
             return Err(LeaseError::ReadOnly);
@@ -104,6 +117,7 @@ impl LeaseManager {
         let record = LeaseRecord {
             info: info.clone(),
             deadline,
+            metadata,
         };
 
         {
@@ -169,6 +183,14 @@ impl LeaseManager {
         Ok(record.info.clone())
     }
 
+    pub fn metadata(&self, lease_id: Uuid) -> Option<LeaseMetadata> {
+        self.prune_expired();
+        let leases = self.leases.read().unwrap();
+        leases
+            .get(&lease_id)
+            .and_then(|record| record.metadata.clone())
+    }
+
     fn prune_expired(&self) {
         let now = Instant::now();
         let mut expired = Vec::new();
@@ -190,6 +212,32 @@ impl LeaseManager {
                 by_session.remove(&(record.info.session_id, record.info.scope));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controller_metadata_roundtrip() {
+        let leases = LeaseManager::new(false);
+        let info = leases
+            .acquire(
+                "session-1",
+                LeaseScope::Controller,
+                Duration::from_secs(5),
+                Some(LeaseMetadata::Controller(ControllerLeaseMetadata {
+                    controller_token: "tok".into(),
+                })),
+            )
+            .expect("controller lease");
+        let stored = leases.metadata(info.lease_id).and_then(|meta| match meta {
+            LeaseMetadata::Controller(data) => Some(data.controller_token),
+        });
+        assert_eq!(stored.as_deref(), Some("tok"));
+        leases.release(info.lease_id).unwrap();
+        assert!(leases.metadata(info.lease_id).is_none());
     }
 }
 

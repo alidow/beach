@@ -50,7 +50,7 @@ use beach_buggy::{
     StaticTokenProvider, StyleDefinition, StyledCell, TerminalFrame, TransportMode,
 };
 use reqwest::{Client, StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt::{self, Write as _};
@@ -62,7 +62,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::runtime::Handle;
 use tokio::sync::{
-    Mutex as AsyncMutex, Notify,
+    Mutex as AsyncMutex, Notify, RwLock as AsyncRwLock,
     mpsc::{self, UnboundedSender},
     oneshot, watch,
 };
@@ -177,6 +177,9 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
 
     let hosted = manager.host().await?;
     let session_id = hosted.session_id().to_string();
+    unsafe {
+        std::env::set_var("BEACH_SESSION_ID", &session_id);
+    }
     let attach_state = Arc::new(ControllerAttachState::new());
     let controller_ctx = Arc::new(ControllerActionContext::new(
         session_id.clone(),
@@ -234,7 +237,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let raw_guard = RawModeGuard::new(interactive);
 
     let session_handle = hosted.handle().clone();
-    let transport_hints = Arc::new(session_handle.transport_hints().clone());
+    let transport_hints = Arc::new(AsyncRwLock::new(session_handle.transport_hints().clone()));
     let idle_snapshot_interval = parse_idle_snapshot_hint(session_handle.transport_hints());
     let join_code = hosted.join_code().to_string();
     let transports: Arc<Mutex<Vec<Arc<SharedTransport>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -310,6 +313,43 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         .map(|hint| hint.manager_url.clone())
         .or_else(|| env_manager_url.clone());
 
+    let mut controller_bridge: Option<Arc<ControllerBridge>> = None;
+    let mut controller_manager_token: Option<String> = None;
+    if let Some(manager_url) = manager_url_for_actions.as_ref() {
+        let env_token = std::env::var("PRIVATE_BEACH_MANAGER_TOKEN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let token = if let Some(token) = env_token {
+            Some(token)
+        } else {
+            auth::maybe_access_token(None, auth::manager_requires_access_token(manager_url))
+                .await
+                .ok()
+                .flatten()
+        };
+        if let Some(bearer) = token {
+            controller_manager_token = Some(bearer.clone());
+            match ControllerBridge::new(
+                session_id.clone(),
+                controller_ctx.clone(),
+                manager_url.clone(),
+                bearer,
+            ) {
+                Ok(bridge) => controller_bridge = Some(Arc::new(bridge)),
+                Err(err) => {
+                    warn!(
+                        target = "controller.actions",
+                        session_id = %session_id,
+                        manager = %manager_url,
+                        error = %err,
+                        "controller bridge initialization failed"
+                    );
+                }
+            }
+        }
+    }
+
     let publish_bearer = parse_idle_publish_bearer(session_handle.transport_hints())
         .or_else(|| access_token.clone());
     // Idle snapshot/state/health posts should go to the Manager, not the session broker.
@@ -344,6 +384,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
             terminal_sync.clone(),
             writer.clone(),
             process_handle.clone(),
+            controller_bridge.clone(),
         );
         let guard = mcp_global_registry().register_terminal(session);
         let resolved_socket = if args.mcp_stdio {
@@ -369,15 +410,25 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                 warn!(error = %err, "mcp server terminated");
             }
         }));
-        if let Some(path) = resolved_socket {
+        if let Some(path) = resolved_socket.as_ref() {
+            unsafe {
+                std::env::set_var("BEACH_MCP_SOCKET", path.display().to_string());
+            }
             if !bootstrap_mode {
                 println!("🔌 MCP socket listening at {}", path.display());
             } else {
                 info!(socket = %path.display(), "mcp socket ready");
             }
+        } else {
+            unsafe {
+                std::env::remove_var("BEACH_MCP_SOCKET");
+            }
         }
         Some(guard)
     } else {
+        unsafe {
+            std::env::remove_var("BEACH_MCP_SOCKET");
+        }
         None
     };
 
@@ -509,6 +560,13 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                                                 .set_token(Some(tok.clone()))
                                                 .await;
                                         }
+                                        if let Some(fast_path_hint) =
+                                            payload.get("fast_path_webrtc").cloned()
+                                        {
+                                            idle_snapshots_for_actions
+                                                .update_fast_path_hint(fast_path_hint)
+                                                .await;
+                                        }
                                         if let Some(auto_hint_value) =
                                             payload.get("controller_auto_attach")
                                         {
@@ -637,20 +695,8 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     // Spawn a lightweight controller action consumer so manager-queued terminal_write
     // actions can drive this host (used by the Pong demo agent). This is best-effort:
     // if the manager URL/token aren’t configured, the host runs normally.
-    if let Some(manager_url) = manager_url_for_actions {
-        let env_token = std::env::var("PRIVATE_BEACH_MANAGER_TOKEN")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-        let token = if let Some(token) = env_token {
-            Some(token)
-        } else {
-            auth::maybe_access_token(None, auth::manager_requires_access_token(&manager_url))
-                .await
-                .ok()
-                .flatten()
-        };
-        if let Some(bearer) = token {
+    if let Some(manager_url) = manager_url_for_actions.clone() {
+        if let Some(bearer) = controller_manager_token.clone() {
             let auth = ManagerActionAuth::Bearer(bearer.clone());
             if let Some(_handle) = spawn_action_consumer(
                 controller_ctx.clone(),
@@ -906,6 +952,29 @@ impl PendingStatus {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ControllerLeaseGrant {
+    controller_token: String,
+    expires_at_ms: u64,
+}
+
+impl ControllerLeaseGrant {
+    pub fn ttl_duration(&self) -> Option<Duration> {
+        let now = now_millis();
+        self.expires_at_ms
+            .checked_sub(now)
+            .map(|remaining| Duration::from_millis(remaining.max(1000)))
+    }
+
+    pub fn controller_token(&self) -> &str {
+        &self.controller_token
+    }
+
+    pub fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
+    }
+}
+
 struct ManagerActionClient {
     http: Client,
     base_url: String,
@@ -1013,6 +1082,78 @@ impl ManagerActionClient {
             .await
             .map(|_| ())
     }
+
+    async fn queue_actions(
+        &self,
+        session_id: &str,
+        controller_token: &str,
+        actions: &[CtrlActionCommand],
+        trace_id: Option<&str>,
+    ) -> Result<(), ManagerActionError> {
+        #[derive(Serialize)]
+        struct QueuePayload<'a> {
+            controller_token: &'a str,
+            actions: &'a [CtrlActionCommand],
+        }
+        let url = format!("{}/sessions/{session_id}/actions", self.base_url);
+        let body = QueuePayload {
+            controller_token,
+            actions,
+        };
+        let mut request = self.http.post(url).json(&body);
+        if let Some(trace) = trace_id {
+            request = request.header("X-Trace-Id", trace);
+        }
+        let request = self.apply_auth(request);
+        self.send(request).await.map(|_| ())
+    }
+
+    async fn acquire_controller_lease(
+        &self,
+        session_id: &str,
+        ttl_ms: Option<u64>,
+        reason: Option<String>,
+    ) -> Result<ControllerLeaseGrant, ManagerActionError> {
+        #[derive(Serialize)]
+        struct AcquirePayload {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            ttl_ms: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            reason: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct LeaseResponse {
+            controller_token: String,
+            expires_at_ms: u64,
+        }
+        let url = format!("{}/sessions/{session_id}/controller/lease", self.base_url);
+        let payload = AcquirePayload { ttl_ms, reason };
+        let request = self.apply_auth(self.http.post(url).json(&payload));
+        let response = self.send(request).await?;
+        let lease = response
+            .json::<LeaseResponse>()
+            .await
+            .map_err(|err| ManagerActionError::Decode(err.to_string()))?;
+        Ok(ControllerLeaseGrant {
+            controller_token: lease.controller_token,
+            expires_at_ms: lease.expires_at_ms,
+        })
+    }
+
+    async fn release_controller_lease(
+        &self,
+        session_id: &str,
+        controller_token: &str,
+    ) -> Result<(), ManagerActionError> {
+        #[derive(Serialize)]
+        struct ReleasePayload<'a> {
+            controller_token: &'a str,
+        }
+        let url = format!("{}/sessions/{session_id}/controller/lease", self.base_url);
+        let body = ReleasePayload { controller_token };
+        let request = self.apply_auth(self.http.delete(url).json(&body));
+        self.send(request).await.map(|_| ())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1077,7 +1218,6 @@ impl ControllerTransportSwitch {
         false
     }
 
-    #[cfg(test)]
     fn current_state(&self) -> ControllerTransportState {
         *self.tx.borrow()
     }
@@ -1183,6 +1323,13 @@ impl ControllerActionContext {
         Arc::clone(&self.attach_state)
     }
 
+    fn prefers_fast_path(&self) -> bool {
+        matches!(
+            self.switch.current_state(),
+            ControllerTransportState::FastPathPreferred
+        )
+    }
+
     fn fast_path_online(&self) {
         if self.switch.fast_path_online() {
             info!(
@@ -1207,6 +1354,86 @@ impl ControllerActionContext {
     fn current_state(&self) -> ControllerTransportState {
         self.switch.current_state()
     }
+}
+
+#[derive(Clone)]
+pub struct ControllerBridge {
+    session_id: String,
+    controller_ctx: Arc<ControllerActionContext>,
+    queue_client: Arc<ManagerActionClient>,
+}
+
+impl ControllerBridge {
+    pub(crate) fn new(
+        session_id: impl Into<String>,
+        controller_ctx: Arc<ControllerActionContext>,
+        manager_url: impl Into<String>,
+        bearer: impl Into<String>,
+    ) -> Result<Self, reqwest::Error> {
+        let client =
+            ManagerActionClient::new(manager_url.into(), ManagerActionAuth::Bearer(bearer.into()))?;
+        Ok(Self {
+            session_id: session_id.into(),
+            controller_ctx,
+            queue_client: Arc::new(client),
+        })
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub async fn acquire_controller_lease(
+        &self,
+        session_id: &str,
+        ttl_ms: Option<u64>,
+        reason: Option<String>,
+    ) -> Result<ControllerLeaseGrant, String> {
+        self.queue_client
+            .acquire_controller_lease(session_id, ttl_ms, reason)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    pub async fn release_controller_lease(
+        &self,
+        session_id: &str,
+        controller_token: &str,
+    ) -> Result<(), String> {
+        self.queue_client
+            .release_controller_lease(session_id, controller_token)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    pub async fn queue_actions(
+        &self,
+        child_session_id: &str,
+        controller_token: &str,
+        actions: Vec<CtrlActionCommand>,
+        trace_id: Option<String>,
+    ) -> Result<ControllerDispatchOutcome, String> {
+        let count = actions.len();
+        self.queue_client
+            .queue_actions(
+                child_session_id,
+                controller_token,
+                &actions,
+                trace_id.as_deref(),
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(ControllerDispatchOutcome {
+            via_fast_path: self.controller_ctx.prefers_fast_path(),
+            queued: count,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ControllerDispatchOutcome {
+    pub via_fast_path: bool,
+    pub queued: usize,
 }
 
 fn controller_action_bytes<'a>(action: &'a CtrlActionCommand) -> Result<&'a str, String> {
@@ -1793,7 +2020,7 @@ async fn spawn_idle_snapshot_worker(
     grid: Arc<TerminalGrid>,
     cursor_tracker: Arc<Mutex<Option<CursorState>>>,
     last_terminal_update: Arc<AtomicU64>,
-    transport_hints: Arc<HashMap<String, Value>>,
+    transport_hints: Arc<AsyncRwLock<HashMap<String, Value>>>,
 ) -> Option<(JoinHandle<()>, oneshot::Sender<()>)> {
     if interval.is_zero() {
         return None;
@@ -1809,7 +2036,8 @@ async fn spawn_idle_snapshot_worker(
             return None;
         }
     };
-    transport.apply_transport_hints(&transport_hints).await;
+    let hints_snapshot = { transport_hints.read().await.clone() };
+    transport.apply_transport_hints(&hints_snapshot).await;
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let worker = IdleSnapshotWorker::new(
         interval,
@@ -1985,7 +2213,7 @@ struct IdleSnapshotController {
     last_terminal_update: Arc<AtomicU64>,
     state: Arc<AsyncMutex<IdleSnapshotControllerState>>,
     health: Arc<AsyncMutex<HealthReporterState>>,
-    transport_hints: Arc<HashMap<String, Value>>,
+    transport_hints: Arc<AsyncRwLock<HashMap<String, Value>>>,
 }
 
 impl IdleSnapshotController {
@@ -1996,7 +2224,7 @@ impl IdleSnapshotController {
         grid: Arc<TerminalGrid>,
         cursor_tracker: Arc<Mutex<Option<CursorState>>>,
         last_terminal_update: Arc<AtomicU64>,
-        transport_hints: Arc<HashMap<String, Value>>,
+        transport_hints: Arc<AsyncRwLock<HashMap<String, Value>>>,
     ) -> Self {
         Self {
             base_url,
@@ -2030,6 +2258,19 @@ impl IdleSnapshotController {
         let health_interval = { self.health.lock().await.interval };
         if health_interval.is_some() {
             self.apply_health_interval(health_interval).await;
+        }
+    }
+
+    async fn update_fast_path_hint(&self, hint: Value) {
+        {
+            let mut guard = self.transport_hints.write().await;
+            guard.insert("fast_path_webrtc".into(), hint);
+        }
+        let current_interval = { self.state.lock().await.interval };
+        if let Some(interval) = current_interval {
+            // Restart the worker so the new hint is applied to the HttpTransport.
+            self.apply_hint(None).await;
+            self.apply_hint(Some(interval)).await;
         }
     }
 
@@ -3797,6 +4038,7 @@ mod tests {
             AutoAttachSource::Handshake,
             session_id,
             attach_state.clone(),
+            None,
         )
         .await;
         assert!(attach_state.is_attached(), "attach state should be marked");

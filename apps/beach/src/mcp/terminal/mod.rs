@@ -3,8 +3,9 @@ mod tools;
 
 pub use resources::{ResourceDescriptor, TerminalResource};
 pub use tools::{
-    ACQUIRE_LEASE, LIST_SESSIONS, REQUEST_HISTORY, RESIZE, SEND_KEYS, SEND_TEXT, SET_VIEWPORT,
-    TerminalToolDescriptor, handle_list_sessions,
+    ACQUIRE_LEASE, CONTROLLER_ACQUIRE, CONTROLLER_QUEUE_ACTIONS, CONTROLLER_RELEASE, LIST_SESSIONS,
+    REQUEST_HISTORY, RESIZE, SEND_KEYS, SEND_TEXT, SET_VIEWPORT, TerminalToolDescriptor,
+    handle_list_sessions,
 };
 
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use serde_json::{Value, json};
 
 use crate::mcp::auth::LeaseManager;
 use crate::mcp::registry::TerminalSession;
+use crate::server::terminal::host::ControllerBridge;
 
 use resources::{GridSnapshotRequest, HistoryReadRequest};
 use tools::{SendKeysRequest, SendTextRequest};
@@ -55,7 +57,7 @@ impl TerminalSurface {
     }
 
     pub fn list_tools(&self, read_only: bool) -> Vec<TerminalToolDescriptor> {
-        tools::list_tools(read_only)
+        tools::list_tools(read_only, self.session.controller_bridge.is_some())
     }
 
     pub fn call_tool(&self, name: &str, params: &Value, leases: &LeaseManager) -> Result<Value> {
@@ -96,6 +98,10 @@ impl TerminalSurface {
             }
             _ => Err(anyhow::anyhow!("unknown tool: {name}")),
         }
+    }
+
+    pub fn controller_bridge(&self) -> Option<Arc<ControllerBridge>> {
+        self.session.controller_bridge.as_ref().cloned()
     }
 
     pub fn start_subscription(

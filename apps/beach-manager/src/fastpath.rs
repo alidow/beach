@@ -366,6 +366,24 @@ impl FastPathSession {
                 );
             }
         });
+
+        let actions_session = Arc::clone(self);
+        let actions_state = state.clone();
+        tokio::spawn(async move {
+            if wait_for_channel(actions_session.clone(), ChannelKind::Actions)
+                .await
+                .is_some()
+            {
+                actions_state
+                    .fast_path_actions_online(&actions_session.session_id)
+                    .await;
+            } else {
+                warn!(
+                    session_id = %actions_session.session_id,
+                    "fast-path actions channel not established; continuing with HTTP fallback"
+                );
+            }
+        });
     }
 
     async fn clear_ack_channel(&self) {
@@ -495,6 +513,7 @@ async fn wait_for_channel(
 
     for attempt in 0..MAX_ATTEMPTS {
         let maybe = match kind {
+            ChannelKind::Actions => session.actions_tx.lock().await.clone(),
             ChannelKind::Acks => session.acks_rx.lock().await.clone(),
             ChannelKind::State => session.state_rx.lock().await.clone(),
         };
@@ -713,6 +732,7 @@ struct StateEnvelope {
 }
 
 enum ChannelKind {
+    Actions,
     Acks,
     State,
 }

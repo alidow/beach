@@ -7,6 +7,7 @@ import { TerminalGridStore } from '../../../beach-surfer/src/terminal/gridStore'
 import type { TerminalTransport } from '../../../beach-surfer/src/transport/terminalTransport';
 import type { SecureTransportSummary } from '../../../beach-surfer/src/transport/webrtc';
 import type { HostFrame } from '../../../beach-surfer/src/protocol/types';
+import { createConnectionTrace } from '../../../beach-surfer/src/lib/connectionTrace';
 import type { SessionCredentialOverride, TerminalViewerState, TerminalViewerStatus } from './terminalViewerTypes';
 
 export type NormalizedOverride = {
@@ -392,6 +393,10 @@ function ensureEntryConnection(entry: ManagerEntry) {
     status: entry.status,
   });
   entry.connectPromise = (async () => {
+    const connectionTrace = createConnectionTrace({
+      sessionId: entry.params.sessionId,
+      baseUrl: entry.params.managerUrl,
+    });
     try {
       entry.connecting = true;
       entry.error = null;
@@ -418,8 +423,10 @@ function ensureEntryConnection(entry: ManagerEntry) {
           entry.params.effectiveAuthToken.length > 0
             ? entry.params.effectiveAuthToken
             : undefined,
+        trace: connectionTrace ?? undefined,
       });
       if (entry.disposed) {
+        connectionTrace?.finish('cancelled', { reason: 'entry-disposed' });
         connection.close();
         return;
       }
@@ -443,6 +450,10 @@ function ensureEntryConnection(entry: ManagerEntry) {
       entry.reconnectAttempts = 0;
       entry.lastCloseReason = null;
       notifySubscribers(entry);
+      connectionTrace?.finish('success', {
+        remotePeerId: connection.remotePeerId ?? null,
+        secureMode: connection.secure?.mode ?? 'plaintext',
+      });
       debugLog('ensureEntryConnection.connected', {
         key: entry.key,
         sessionId: entry.params.sessionId,
@@ -458,6 +469,9 @@ function ensureEntryConnection(entry: ManagerEntry) {
       entry.reconnectAttempts = Math.min(entry.reconnectAttempts + 1, 8);
       entry.lastCloseReason = message;
       scheduleReconnect(entry, { immediate: false });
+      connectionTrace?.finish('error', {
+        error: message,
+      });
       debugLog('ensureEntryConnection.error', {
         key: entry.key,
         sessionId: entry.params.sessionId,

@@ -1,12 +1,14 @@
 LOG_DIR="$HOME/beach-debug"
 mkdir -p "$LOG_DIR"
+: > /tmp/beach-host.log
+PONG_LOG_LEVEL=${PONG_LOG_LEVEL:-info}  # export PONG_LOG_LEVEL=trace only when you need deep hexdumps
 
 # Rebuild the CLI host whenever fast_path/controller changes land.
 # This keeps the public hosts and mgr-actions controller channel in sync with manager queues.
 cargo build --bin beach >/dev/null
 
 ~/development/beach/target/debug/beach \
-  --log-level trace \
+  --log-level "$PONG_LOG_LEVEL" \
   --log-file /tmp/beach-host.log \
   --session-server http://localhost:4132/ \
   host \
@@ -21,10 +23,11 @@ cargo build --bin beach >/dev/null
 
 LOG_DIR="$HOME/beach-debug"
 mkdir -p "$LOG_DIR"
+: > /tmp/beach-host.log
 
 cd ~/development/beach/apps/beach
 cargo run  -- \
-  --log-level trace \
+  --log-level "$PONG_LOG_LEVEL" \
   --log-file /tmp/beach-host.log \
   --session-server http://localhost:4132/ \
   host \
@@ -48,32 +51,7 @@ http://localhost:3003/beaches
 ------------
 
 
-### Dockerized one-touch launcher (recommended)
-
-If you want to run the two players and the agent inside the `beach-manager` container, use the helper script instead of starting each process manually:
-
-```
-# Start LHS, RHS, and the agent (provide your private beach ID)
-./apps/private-beach/demo/pong/tools/pong-stack.sh start <private-beach-id>
-
-# Print session IDs + passcodes again later
-./apps/private-beach/demo/pong/tools/pong-stack.sh codes
-
-# Kill the three processes quickly
-./apps/private-beach/demo/pong/tools/pong-stack.sh stop
-```
-
-Environment knobs (optional):
-
-- `PONG_DOCKER_SERVICE` – docker compose service to exec into (default `beach-manager`).
-- `PONG_LOG_DIR` – log directory inside the container (default `/tmp/pong-stack`).
-- `PONG_SESSION_SERVER`, `PRIVATE_BEACH_MANAGER_URL` – override URLs if your stack differs from the defaults.
-
-The script uses `docker compose exec -T` so the repo root inside the container is `/app`. Logs (CLI stdout, bootstrap JSON, etc.) land in `${PONG_LOG_DIR}` within the container; inspect them with `docker compose exec beach-manager ls /tmp/pong-stack` or mount that path to the host if needed.
-
-### Manual commands (host processes)
-
-If you prefer the previous workflow (each host on the macOS side), here are the cargo-run commands for both players and the agent, matching your pattern and not relying on session-id env vars. Run each in its own terminal. With the controller auto-handshake in place the hosts no longer need `PRIVATE_BEACH_*` variables, but keeping `PRIVATE_BEACH_MANAGER_URL` exported provides a backwards-compatible fallback if Beach Road control delivery is unavailable. Once the rewrite-2 dashboard is in use, publish tokens flow automatically from the manager, so you no longer need to source `PB_MANAGER_TOKEN`/`PRIVATE_BEACH_MANAGER_TOKEN` for host heartbeats (the legacy `apps/private-beach` UI still requires its manual tokens).
+Here are cargo-run commands for both players and the agent, matching your pattern and not relying on session-id env vars. Run each in its own terminal. With the controller auto-handshake in place the hosts no longer need `PRIVATE_BEACH_*` variables, but keeping `PRIVATE_BEACH_MANAGER_URL` exported provides a backwards-compatible fallback if Beach Road control delivery is unavailable.
 
 
 
@@ -81,9 +59,14 @@ If you prefer the previous workflow (each host on the macOS side), here are the 
 LHS player (single line)
 
 export PRIVATE_BEACH_MANAGER_URL=http://localhost:8080
+export BEACH_ICE_PUBLIC_HOST=host.docker.internal
+export BEACH_ICE_PUBLIC_IP=127.0.0.1
+export PONG_LOG_LEVEL=trace
+export PONG_RUST_LOG=info,beach_client_core::transport::webrtc=trace,beach_client_core::transport::webrtc::signaling=trace
 LOG_DIR="$HOME/beach-debug"; mkdir -p "$LOG_DIR"
-cd ~/development/beach && cargo run --bin beach -- \
-  --log-level trace \
+: > "$LOG_DIR/beach-host-lhs.log"
+cd ~/development/beach && RUST_LOG=${PONG_RUST_LOG:-info} cargo run --bin beach -- \
+  --log-level "$PONG_LOG_LEVEL" \
   --log-file "$LOG_DIR/beach-host-lhs.log" \
   --session-server http://localhost:4132/ \
   host \
@@ -95,9 +78,14 @@ cd ~/development/beach && cargo run --bin beach -- \
 RHS player (single line)
 
 export PRIVATE_BEACH_MANAGER_URL=http://localhost:8080
+export BEACH_ICE_PUBLIC_HOST=host.docker.internal
+export BEACH_ICE_PUBLIC_IP=127.0.0.1
+export PONG_LOG_LEVEL=trace
+export PONG_RUST_LOG=info,beach_client_core::transport::webrtc=trace,beach_client_core::transport::webrtc::signaling=trace
 LOG_DIR="$HOME/beach-debug"; mkdir -p "$LOG_DIR"
-cd ~/development/beach && cargo run --bin beach -- \
-  --log-level trace \
+: > "$LOG_DIR/beach-host-rhs.log"
+cd ~/development/beach && RUST_LOG=${PONG_RUST_LOG:-info} cargo run --bin beach -- \
+  --log-level "$PONG_LOG_LEVEL" \
   --log-file "$LOG_DIR/beach-host-rhs.log" \
   --session-server http://localhost:4132/ \
   host \
@@ -110,6 +98,9 @@ Agent (single line; no session-id envs; just declare beach + manager)
 
 
 export PRIVATE_BEACH_MANAGER_URL=http://localhost:8080
+export BEACH_ICE_PUBLIC_HOST=host.docker.internal
+export BEACH_ICE_PUBLIC_IP=127.0.0.1
+export PONG_RUST_LOG=info,beach_client_core::transport::webrtc=trace,beach_client_core::transport::webrtc::signaling=trace
 cd ~/development/beach
 chmod +x apps/private-beach/demo/pong/tools/run-agent.sh
 apps/private-beach/demo/pong/tools/run-agent.sh 4185e6be-4c1a-40a0-b285-272f8b44265f
@@ -119,6 +110,11 @@ apps/private-beach/demo/pong/tools/run-agent.sh 4185e6be-4c1a-40a0-b285-272f8b44
 LOG_DIR="$HOME/beach-debug" \
 apps/private-beach/demo/pong/tools/print-session-codes.sh
 
+If you need the old firehose for a targeted investigation, temporarily export `PONG_LOG_LEVEL=trace`, set
+`BEACH_TRACE_DEPS=1`, and optionally add a custom `BEACH_LOG_FILTER="info,beach_client_core=trace"` so only the Beach modules
+stay at trace. You can also override `PONG_RUST_LOG` (e.g. `PONG_RUST_LOG="info,beach_client_core::transport::webrtc=trace"`) to
+capture specific Rust targets. Reset those vars afterwards so the log files stay under control during normal demos.
+
 Notes
 
 Start the two players and the agent in separate terminals.
@@ -126,3 +122,12 @@ In the dashboard, attach each session (you can read the JSON from the bootstrap 
 Draw edges from the agent tile to LHS and RHS tiles to declare roles; the agent will discover pairings via controller SSE and start controlling.
 Hosts automatically switch to the fast path `pb-controller` channel for controller actions; HTTP polling resumes only if that channel drops, so make sure Beach Road is reachable before testing. If you change the CLI, rebuild before launching hosts so the fast_path InputAck and HTTP fallback code stays in sync with the manager.
 > ⚠️ As of Nov 2025 the controller channel label changed to `mgr-actions`. Rebuild the CLI (`cargo build --bin beach`) and restart `beach-manager` / `beach-road` containers after pulling new code so hosts and manager agree on the label.
+
+
+
+----
+
+
+./apps/private-beach/demo/pong/tools/pong-stack.sh start <private-beach-id>
+./apps/private-beach/demo/pong/tools/pong-stack.sh codes
+./apps/private-beach/demo/pong/tools/pong-stack.sh stop

@@ -25,6 +25,8 @@ BEACH_PROFILE=${BEACH_PROFILE:-local}
 LOG_DIR=${LOG_DIR:-"$HOME/beach-debug"}
 echo "[run-agent] LOG_DIR=$LOG_DIR" >&2
 mkdir -p "$LOG_DIR"
+PONG_AGENT_LOG_LEVEL=${PONG_AGENT_LOG_LEVEL:-${RUN_AGENT_LOG_LEVEL:-info}}
+echo "[run-agent] log level=$PONG_AGENT_LOG_LEVEL" >&2
 
 MANAGER_URL_DEFAULT=${RUN_AGENT_MANAGER_URL:-"http://localhost:8080"}
 if [[ -z "${PRIVATE_BEACH_MANAGER_URL:-}" ]]; then
@@ -191,10 +193,12 @@ fi
 LOG_FILE="$LOG_DIR/beach-host-agent.log"
 BOOTSTRAP_FILE="$LOG_DIR/bootstrap-agent.json"
 
+: > "$LOG_FILE"
+
 cd "$REPO_ROOT"
 
 cargo run --bin beach -- \
-  --log-level trace \
+  --log-level "$PONG_AGENT_LOG_LEVEL" \
   --log-file "$LOG_FILE" \
   --session-server "$SESSION_SERVER" \
   host \

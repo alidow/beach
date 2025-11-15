@@ -200,7 +200,7 @@ pub mod logging {
     fn inner_init(config: &LogConfig) -> Result<(), InitError> {
         let level_filter = config.level.to_filter();
 
-        let env_filter = build_env_filter(level_filter);
+        let (env_filter, throttled_deps) = build_env_filter(level_filter);
 
         let (writer, guard) = match &config.file {
             Some(path) => {
@@ -231,22 +231,66 @@ pub mod logging {
             .map_err(|err| InitError::Configure(err.to_string()))?;
 
         let _ = GUARD.set(Some(guard));
+        if throttled_deps {
+            eprintln!(
+                "[beach-log] suppressing dependency trace noise; set BEACH_TRACE_DEPS=1 or BEACH_LOG_FILTER to override"
+            );
+        }
         Ok(())
     }
 
-    fn build_env_filter(level: LevelFilter) -> EnvFilter {
+    fn build_env_filter(level: LevelFilter) -> (EnvFilter, bool) {
         if let Ok(filter) = std::env::var("BEACH_LOG_FILTER") {
-            EnvFilter::new(filter)
-        } else {
-            EnvFilter::new(match level {
-                LevelFilter::TRACE => "trace",
-                LevelFilter::DEBUG => "debug",
-                LevelFilter::INFO => "info",
-                LevelFilter::WARN => "warn",
-                LevelFilter::ERROR => "error",
-                LevelFilter::OFF => "off",
-            })
+            return (EnvFilter::new(filter), false);
         }
+        let (filter, throttled) = default_filter_for(level);
+        (EnvFilter::new(filter), throttled)
+    }
+
+    const TRACE_DEP_TARGETS: &[&str] = &[
+        "hyper",
+        "hyper_util",
+        "tokio_tungstenite",
+        "tungstenite",
+        "reqwest",
+        "quinn_proto",
+        "rustls",
+        "mio",
+        "h2",
+    ];
+
+    fn default_filter_for(level: LevelFilter) -> (String, bool) {
+        let base = match level {
+            LevelFilter::TRACE => {
+                "info,beach_client_core=trace,beach=trace,beach_gate=trace,beach_surfer=trace"
+            }
+            LevelFilter::DEBUG => {
+                "info,beach_client_core=debug,beach=debug,beach_gate=debug,beach_surfer=debug"
+            }
+            LevelFilter::INFO => "info",
+            LevelFilter::WARN => "warn",
+            LevelFilter::ERROR => "error",
+            LevelFilter::OFF => "off",
+        };
+        if level == LevelFilter::TRACE && !allow_dependency_traces() {
+            (throttle_dependency_traces(base), true)
+        } else {
+            (base.to_owned(), false)
+        }
+    }
+
+    fn allow_dependency_traces() -> bool {
+        super::env_truthy("BEACH_TRACE_DEPS").unwrap_or(false)
+    }
+
+    fn throttle_dependency_traces(base: &str) -> String {
+        let mut filter = base.to_owned();
+        for target in TRACE_DEP_TARGETS {
+            filter.push(',');
+            filter.push_str(target);
+            filter.push_str("=info");
+        }
+        filter
     }
 
     pub fn hexdump(bytes: &[u8]) -> String {

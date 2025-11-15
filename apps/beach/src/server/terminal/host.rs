@@ -80,6 +80,20 @@ const IDLE_SNAPSHOT_HINT_KEY: &str = "idle_snapshot";
 const IDLE_PUBLISH_TOKEN_HINT_KEY: &str = "idlePublishToken";
 const IDLE_SNAPSHOT_INTERVAL_KEY: &str = "interval_ms";
 const DEFAULT_HEALTH_REPORT_INTERVAL: Duration = Duration::from_secs(15);
+const ATTACH_WAIT_TRACE_THRESHOLD: Duration = Duration::from_millis(50);
+
+fn trace_attach_wait_completion(session_id: &str, source: &'static str, started: Instant) {
+    let elapsed = started.elapsed();
+    if elapsed >= ATTACH_WAIT_TRACE_THRESHOLD {
+        trace!(
+            target = "controller.actions.attach",
+            session_id = %session_id,
+            source,
+            wait_ms = elapsed.as_millis() as u64,
+            "manager attach wait completed"
+        );
+    }
+}
 
 #[tracing::instrument(
     name = "beach::terminal::host::run",
@@ -385,6 +399,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
             };
             let mut consumer_started = false;
             let mut consumer_handle: Option<tokio::task::JoinHandle<()>> = None;
+            let mut poll_connected = false;
             loop {
                 let url = format!(
                     "{}/sessions/{}/control/poll",
@@ -398,6 +413,15 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                     .await;
                 match resp {
                     Ok(resp) if resp.status().is_success() => {
+                        if !poll_connected {
+                            info!(
+                                target = "controller.actions",
+                                session_id = %poll_session_id,
+                                url = %url,
+                                "control poll connected"
+                            );
+                            poll_connected = true;
+                        }
                         let body: serde_json::Value = match resp.json().await {
                             Ok(v) => v,
                             Err(err) => {
@@ -450,6 +474,38 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                                             );
                                             consumer_started = true;
                                         }
+                                        // Extract any per-session publish token up front so it
+                                        // can be reused for both idle snapshots and auto-attach.
+                                        let mut publish_token_for_session: Option<String> = None;
+                                        if let Some(token_hint) =
+                                            payload.get(IDLE_PUBLISH_TOKEN_HINT_KEY)
+                                        {
+                                            if let Some(tok) = parse_publish_token_value(token_hint)
+                                            {
+                                                publish_token_for_session = Some(tok);
+                                            }
+                                        }
+                                        if let Some(idle_hint) = payload.get(IDLE_SNAPSHOT_HINT_KEY)
+                                        {
+                                            let (interval, token) =
+                                                parse_idle_snapshot_payload(idle_hint);
+                                            if token.is_some()
+                                                && publish_token_for_session.is_none()
+                                            {
+                                                publish_token_for_session = token.clone();
+                                            }
+                                            if let Some(tok) = token {
+                                                idle_snapshots_for_actions
+                                                    .set_token(Some(tok))
+                                                    .await;
+                                            }
+                                            idle_snapshots_for_actions.apply_hint(interval).await;
+                                        }
+                                        if let Some(tok) = publish_token_for_session.as_ref() {
+                                            idle_snapshots_for_actions
+                                                .set_token(Some(tok.clone()))
+                                                .await;
+                                        }
                                         if let Some(auto_hint_value) =
                                             payload.get("controller_auto_attach")
                                         {
@@ -465,12 +521,21 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                                                         attach_state_for_actions.clone();
                                                     let session_for_attach =
                                                         poll_session_id.clone();
+                                                    let bearer = publish_token_for_session.clone();
+                                                    info!(
+                                                        target = "controller.handshake.attach",
+                                                        session_id = %poll_session_id,
+                                                        private_beach_id = %auto_hint.private_beach_id,
+                                                        bearer_override = bearer.is_some(),
+                                                        "triggering auto-attach"
+                                                    );
                                                     tokio::spawn(async move {
                                                         trigger_auto_attach(
                                                             auto_hint,
                                                             AutoAttachSource::Handshake,
                                                             session_for_attach,
                                                             attach_state,
+                                                            bearer,
                                                         )
                                                         .await;
                                                     });
@@ -483,27 +548,6 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                                                         "failed to parse auto-attach hint from handshake"
                                                     );
                                                 }
-                                            }
-                                        }
-                                        if let Some(idle_hint) = payload.get(IDLE_SNAPSHOT_HINT_KEY)
-                                        {
-                                            let (interval, token) =
-                                                parse_idle_snapshot_payload(idle_hint);
-                                            if let Some(tok) = token {
-                                                idle_snapshots_for_actions
-                                                    .set_token(Some(tok))
-                                                    .await;
-                                            }
-                                            idle_snapshots_for_actions.apply_hint(interval).await;
-                                        }
-                                        if let Some(token_hint) =
-                                            payload.get(IDLE_PUBLISH_TOKEN_HINT_KEY)
-                                        {
-                                            if let Some(tok) = parse_publish_token_value(token_hint)
-                                            {
-                                                idle_snapshots_for_actions
-                                                    .set_token(Some(tok))
-                                                    .await;
                                             }
                                         }
                                         if let Some(health_secs) = payload
@@ -546,14 +590,17 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                         }
                     }
                     Ok(resp) if resp.status().as_u16() == 403 => {
+                        poll_connected = false;
                         // Invalid code; back off more
                         sleep(Duration::from_secs(2)).await;
                     }
                     Ok(_) => {
+                        poll_connected = false;
                         sleep(Duration::from_millis(500)).await;
                     }
                     Err(err) => {
                         warn!(target = "controller.actions", error = %err, "control poll failed");
+                        poll_connected = false;
                         sleep(Duration::from_secs(1)).await;
                     }
                 }
@@ -567,7 +614,14 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         let session_for_attach = session_id.clone();
         let attach_state_for_hint = attach_state.clone();
         tokio::spawn(async move {
-            trigger_auto_attach(hint, source, session_for_attach, attach_state_for_hint).await;
+            trigger_auto_attach(
+                hint,
+                source,
+                session_for_attach,
+                attach_state_for_hint,
+                None,
+            )
+            .await;
         });
     } else {
         debug!(
@@ -1148,7 +1202,9 @@ fn run_fast_path_controller_channel(
             session_id = %session_id,
             "waiting for manager attach before accepting fast path controller channel"
         );
+        let wait_started = Instant::now();
         attach_state.wait_for_attach_blocking();
+        trace_attach_wait_completion(session_id, "fast_path_blocking", wait_started);
     }
     controller_ctx.fast_path_online();
     let transport_id = transport.id().0;
@@ -1281,6 +1337,14 @@ fn run_fast_path_controller_channel(
     }
 
     controller_ctx.fast_path_offline();
+    debug!(
+        target = "controller.actions.fast_path",
+        session_id = %session_id,
+        transport_id,
+        channel_closed,
+        fatal_error,
+        "fast path controller channel finished"
+    );
     ControllerChannelOutcome {
         channel_closed,
         fatal_error,
@@ -1362,7 +1426,9 @@ fn spawn_action_consumer(
                 session_id = %session_for_actions,
                 "waiting for manager attach before starting controller action consumer"
             );
+            let wait_started = Instant::now();
             attach_state.wait_for_attach().await;
+            trace_attach_wait_completion(&session_for_actions, "http_consumer", wait_started);
             info!(
                 target = "controller.actions",
                 session_id = %session_for_actions,
@@ -3208,6 +3274,7 @@ async fn trigger_auto_attach(
     source: AutoAttachSource,
     session_id: String,
     attach_state: Arc<ControllerAttachState>,
+    bearer_override: Option<String>,
 ) {
     if attach_state.is_attached() {
         return;
@@ -3219,8 +3286,19 @@ async fn trigger_auto_attach(
     let mut attempt = 1;
     let mut backoff = AUTO_ATTACH_INITIAL_BACKOFF;
     loop {
-        if maybe_auto_attach_session(&hint, &session_id, source, attempt).await {
+        if maybe_auto_attach_session(&hint, &session_id, source, attempt, bearer_override.clone())
+            .await
+        {
             attach_state.mark_attached();
+            trace!(
+                target = attach_log_target(source),
+                session_id = %session_id,
+                private_beach_id = %hint.private_beach_id,
+                manager = %hint.manager_url,
+                source = source.as_str(),
+                attempt,
+                "controller auto-attach state marked attached"
+            );
             break;
         }
         if attempt >= AUTO_ATTACH_MAX_ATTEMPTS {
@@ -3256,21 +3334,36 @@ async fn maybe_auto_attach_session(
     session_id: &str,
     source: AutoAttachSource,
     attempt: usize,
+    bearer_override: Option<String>,
 ) -> bool {
     let log_target = attach_log_target(source);
     let handshake = matches!(source, AutoAttachSource::Handshake);
-    let bearer = match resolve_manager_bearer(&hint.manager_url).await {
-        Some(token) => token,
-        None => {
-            debug!(
-                target = log_target,
-                manager = %hint.manager_url,
-                source = source.as_str(),
-                "skipping auto-attach; bearer token unavailable"
-            );
-            return false;
-        }
+    let bearer = match bearer_override {
+        Some(token) if !token.trim().is_empty() => token,
+        _ => match resolve_manager_bearer(&hint.manager_url).await {
+            Some(token) => token,
+            None => {
+                debug!(
+                    target = log_target,
+                    manager = %hint.manager_url,
+                    source = source.as_str(),
+                    "skipping auto-attach; bearer token unavailable"
+                );
+                return false;
+            }
+        },
     };
+
+    trace!(
+        target = log_target,
+        session_id = %session_id,
+        private_beach_id = %hint.private_beach_id,
+        manager = %hint.manager_url,
+        source = source.as_str(),
+        attempt,
+        handshake,
+        "auto-attach attempt starting"
+    );
     let client = match Client::builder().build() {
         Ok(c) => c,
         Err(err) => {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use axum::{
     extract::{Path, Query, State},
@@ -391,30 +391,53 @@ pub async fn queue_actions(
     if body.actions.is_empty() {
         return Err(ApiError::BadRequest("actions array required".into()));
     }
-    if let Some(trace_id) = headers
+    let trace_id = headers
         .get("x-trace-id")
         .and_then(|value| value.to_str().ok())
-    {
-        if should_log_queue_event(QueueLogKind::Request, &session_id) {
-            info!(
-                target: "controller.actions",
-                trace_id,
-                session_id,
-                action_count = body.actions.len(),
-                "queue_actions request"
-            );
-        }
-    }
+        .map(|value| value.to_string());
 
-    state
+    let started = Instant::now();
+    let action_count = body.actions.len();
+    let result = state
         .queue_actions(
             &session_id,
             &body.controller_token,
             body.actions,
             token.account_uuid(),
         )
-        .await
-        .map_err(map_state_err)?;
+        .await;
+    let elapsed_ms = started.elapsed().as_millis();
+
+    if let (Some(trace_id), true) = (
+        trace_id.as_deref(),
+        should_log_queue_event(QueueLogKind::Request, &session_id),
+    ) {
+        match &result {
+            Ok(()) => {
+                info!(
+                    target: "controller.actions",
+                    trace_id,
+                    session_id,
+                    action_count,
+                    elapsed_ms,
+                    "queue_actions completed"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    target: "controller.actions",
+                    trace_id,
+                    session_id,
+                    action_count,
+                    elapsed_ms,
+                    error = %err,
+                    "queue_actions failed"
+                );
+            }
+        }
+    }
+
+    result.map_err(map_state_err)?;
 
     Ok(Json(serde_json::json!({ "accepted": true })))
 }
@@ -568,7 +591,13 @@ async fn authorize_publish(
         .publish_token_manager()
         .verify_for_session(&bearer, session_id)
     {
-        Ok(_claims) => return Ok("publish_token"),
+        Ok(_claims) => {
+            info!(
+                session_id = %session_id,
+                "authorize_publish accepted via publish token"
+            );
+            return Ok("publish_token");
+        }
         Err(_err) => {
             // Fall back to normal Beach Auth token
         }
@@ -582,6 +611,7 @@ async fn authorize_publish(
     if !claims_has_scope(&claims, "pb:harness.publish") {
         return Err(ApiError::Forbidden("pb:harness.publish"));
     }
+    info!(session_id = %session_id, "authorize_publish accepted via bearer");
     Ok("bearer")
 }
 
@@ -675,20 +705,70 @@ pub async fn emergency_stop(
     Ok(Json(serde_json::json!({ "stopped": true })))
 }
 
+async fn authorize_attach(
+    state: &AppState,
+    headers: &HeaderMap,
+    session_id: &str,
+) -> Result<Option<Uuid>, ApiError> {
+    let Some(bearer) = extract_bearer(headers) else {
+        return Err(ApiError::Unauthorized);
+    };
+
+    // First try verifying as a per-session publish token (harness token).
+    match state
+        .publish_token_manager()
+        .verify_for_session(&bearer, session_id)
+    {
+        Ok(_claims) => {
+            info!(
+                session_id = %session_id,
+                "authorize_attach accepted via publish token"
+            );
+            // Attach initiated by a harness; no account id.
+            return Ok(None);
+        }
+        Err(_err) => {
+            // Fall back to normal Beach Auth token.
+        }
+    }
+
+    let claims = state
+        .auth_context()
+        .verify_strict(&bearer)
+        .await
+        .map_err(|_| ApiError::Unauthorized)?;
+    if !claims_has_scope(&claims, "pb:sessions.write") {
+        return Err(ApiError::Forbidden("pb:sessions.write"));
+    }
+    let account_uuid = claims
+        .account_id
+        .as_deref()
+        .and_then(|id| Uuid::parse_str(id).ok());
+    info!(session_id = %session_id, "authorize_attach accepted via bearer");
+    Ok(account_uuid)
+}
+
 pub async fn attach_by_code(
     State(state): State<AppState>,
-    token: AuthToken,
     Path(private_beach_id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<AttachByCodeRequest>,
 ) -> ApiResult<AttachByCodeResponse> {
-    ensure_scope(&token, "pb:sessions.write")?;
+    let requester = authorize_attach(&state, &headers, &body.session_id).await?;
+    if let Some(trace_id) = headers
+        .get("x-trace-id")
+        .and_then(|value| value.to_str().ok())
+    {
+        info!(
+            target = "private_beach.sessions",
+            private_beach_id = %private_beach_id,
+            session_id = %body.session_id,
+            trace_id,
+            "attach_by_code request"
+        );
+    }
     let session = match state
-        .attach_by_code(
-            &private_beach_id,
-            &body.session_id,
-            &body.code,
-            token.account_uuid(),
-        )
+        .attach_by_code(&private_beach_id, &body.session_id, &body.code, requester)
         .await
     {
         Ok(session) => session,

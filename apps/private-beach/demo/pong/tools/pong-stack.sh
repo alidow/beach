@@ -34,6 +34,8 @@ LOG_DIR=${PONG_LOG_DIR:-/tmp/pong-stack}
 CODES_WAIT=${PONG_CODES_WAIT:-8}
 REPO_ROOT=/app
 CARGO_BIN_DIR=${PONG_CARGO_BIN_DIR:-/usr/local/cargo/bin}
+PLAYER_LOG_LEVEL=${PONG_LOG_LEVEL:-info}
+AGENT_LOG_LEVEL=${PONG_AGENT_LOG_LEVEL:-$PLAYER_LOG_LEVEL}
 
 run_in_container() {
   local cmd="$1"
@@ -47,13 +49,13 @@ ensure_cli_login() {
 start_player() {
   local mode=$1
   local human=$2
-  run_in_container "set -euo pipefail; export PRIVATE_BEACH_MANAGER_URL='$MANAGER_URL'; cd $REPO_ROOT; mkdir -p '$LOG_DIR'; nohup setsid bash -c \"cargo run --bin beach -- --log-level trace --log-file '$LOG_DIR/beach-host-$mode.log' --session-server '$SESSION_SERVER' host --bootstrap-output json --wait -- /usr/bin/env python3 $REPO_ROOT/apps/private-beach/demo/pong/player/main.py --mode $mode 2>&1 | tee '$LOG_DIR/bootstrap-$mode.json' > '$LOG_DIR/player-$mode.log'\" >/dev/null 2>&1 & echo \$! > '$LOG_DIR/player-$mode.pid'"
+  run_in_container "set -euo pipefail; export PRIVATE_BEACH_MANAGER_URL='$MANAGER_URL'; cd $REPO_ROOT; mkdir -p '$LOG_DIR'; : > '$LOG_DIR/beach-host-$mode.log'; nohup setsid bash -c \"cargo run --bin beach -- --log-level '$PLAYER_LOG_LEVEL' --log-file '$LOG_DIR/beach-host-$mode.log' --session-server '$SESSION_SERVER' host --bootstrap-output json --wait -- /usr/bin/env python3 $REPO_ROOT/apps/private-beach/demo/pong/player/main.py --mode $mode 2>&1 | tee '$LOG_DIR/bootstrap-$mode.json' > '$LOG_DIR/player-$mode.log'\" >/dev/null 2>&1 & echo \$! > '$LOG_DIR/player-$mode.pid'"
   echo "launched $human player (logs in $LOG_DIR/player-$mode.log)"
 }
 
 start_agent() {
   local beach_id=$1
-  run_in_container "set -euo pipefail; export PRIVATE_BEACH_MANAGER_URL='$MANAGER_URL'; export RUN_AGENT_SESSION_SERVER='$SESSION_SERVER'; export BEACH_AUTH_GATEWAY='$AUTH_GATEWAY'; export LOG_DIR='$LOG_DIR'; cd $REPO_ROOT; mkdir -p '$LOG_DIR'; chmod +x apps/private-beach/demo/pong/tools/run-agent.sh; nohup setsid apps/private-beach/demo/pong/tools/run-agent.sh '$beach_id' > '$LOG_DIR/agent.log' 2>&1 & echo \$! > '$LOG_DIR/agent.pid'"
+  run_in_container "set -euo pipefail; export PRIVATE_BEACH_MANAGER_URL='$MANAGER_URL'; export RUN_AGENT_SESSION_SERVER='$SESSION_SERVER'; export BEACH_AUTH_GATEWAY='$AUTH_GATEWAY'; export LOG_DIR='$LOG_DIR'; export PONG_AGENT_LOG_LEVEL='$AGENT_LOG_LEVEL'; cd $REPO_ROOT; mkdir -p '$LOG_DIR'; : > '$LOG_DIR/agent.log'; chmod +x apps/private-beach/demo/pong/tools/run-agent.sh; nohup setsid apps/private-beach/demo/pong/tools/run-agent.sh '$beach_id' > '$LOG_DIR/agent.log' 2>&1 & echo \$! > '$LOG_DIR/agent.pid'"
   echo "launched pong agent (logs in $LOG_DIR/agent.log)"
 }
 

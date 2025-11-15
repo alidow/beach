@@ -1,15 +1,82 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+  cat <<'USAGE'
+Usage: scripts/dockerdown [--postgres-only]
+
+Stops all docker compose services. By default it deletes every beach* volume
+so the entire environment is cleared. Pass --postgres-only to keep other
+volumes intact and only reset the postgres-data volume (handy when you only
+need a clean DB).
+USAGE
+}
+
+MODE="full"
+if (($# > 1)); then
+  usage
+  exit 1
+fi
+
+if (($# == 1)); then
+  case "$1" in
+    --postgres-only)
+      MODE="postgres-only"
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+fi
+
 # Always run from repo root so docker-compose.yml is resolved correctly.
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+PROJECT_NAME="${COMPOSE_PROJECT_NAME:-$(basename "$ROOT_DIR")}"
+
+remove_postgres_volume() {
+  local project_name="$1"
+  local -a candidate_names=(
+    "postgres-data"
+    "${project_name}_postgres-data"
+    "${project_name}-postgres-data"
+  )
+
+  local -a existing=()
+  for volume in "${candidate_names[@]}"; do
+    if docker volume inspect "$volume" >/dev/null 2>&1; then
+      existing+=("$volume")
+    fi
+  done
+
+  if ((${#existing[@]})); then
+    echo "Removing postgres volume(s): ${existing[*]}"
+    docker volume rm "${existing[@]}" || true
+  else
+    echo "No postgres volumes found to remove."
+  fi
+}
+
+if [[ "$MODE" == "postgres-only" ]]; then
+  echo "Bringing down docker compose services (preserving non-postgres volumes)..."
+  docker compose down --remove-orphans
+
+  remove_postgres_volume "$PROJECT_NAME"
+  echo "Postgres data reset complete."
+  exit 0
+fi
 
 echo "Bringing down all docker compose services..."
 docker compose down --remove-orphans --volumes
 
 # Remove any lingering project-scoped volumes (Compose normally prefixes them
-# with \"$(basename "$ROOT_DIR")_\").
+# with "$(basename "$ROOT_DIR")_").
 echo "Removing dangling beach* volumes (if any)..."
 mapfile -t BEACH_VOLUMES < <(docker volume ls --format '{{.Name}}' | grep -E '^(beach[_-].+)' || true)
 if ((${#BEACH_VOLUMES[@]})); then

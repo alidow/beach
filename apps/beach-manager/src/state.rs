@@ -10,8 +10,8 @@ use std::{
     fmt,
     net::IpAddr,
     sync::{
-        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
     },
     thread,
     time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
@@ -20,8 +20,8 @@ use std::{
 use crate::auth::{AuthConfig, AuthContext};
 use crate::publish_token::{PublishTokenManager, SignedPublishToken};
 use crate::{
-    fastpath::{FastPathRegistry, FastPathSession, send_actions_over_fast_path},
-    log_throttle::{QueueLogKind, should_log_custom_event, should_log_queue_event},
+    fastpath::{send_actions_over_fast_path, FastPathRegistry, FastPathSession},
+    log_throttle::{should_log_custom_event, should_log_queue_event, QueueLogKind},
     metrics,
 };
 use beach_buggy::{
@@ -32,20 +32,21 @@ use beach_buggy::{
 use beach_client_core::cache::terminal::packed::unpack_cell;
 use beach_client_core::protocol::{ClientFrame, CursorFrame, Update as WireUpdate};
 use beach_client_core::{
-    CliError, HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell,
-    Payload, SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId,
-    TerminalGrid, Transport, TransportError, TransportOffer, WebRtcChannels,
-    decode_host_frame_binary, encode_client_frame_binary, negotiate_transport,
+    decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
+    HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell, Payload,
+    SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId, TerminalGrid,
+    Transport, TransportError, TransportOffer, WebRtcChannels,
 };
 use chrono::{DateTime, Duration, Utc};
 use prometheus::IntGauge;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, PgPool, Row, types::Json};
-use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
+use sqlx::{types::Json, FromRow, PgPool, Row};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
-use tracing::{Level, debug, info, trace, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, trace, warn, Level};
 use url::Url;
 use uuid::Uuid;
 
@@ -212,10 +213,12 @@ struct ControllerLeaseMemory {
 
 struct ViewerWorker {
     handle: JoinHandle<()>,
+    cancel: CancellationToken,
 }
 
 struct ControllerForwarderWorker {
     handle: JoinHandle<()>,
+    cancel: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -1565,6 +1568,28 @@ impl AppState {
             }
         }
 
+        // Throttled trace to help correlate manager-side handshake construction
+        // with host/agent behavior without leaking credentials.
+        if should_log_custom_event("manager_handshake", session_id, StdDuration::from_secs(30)) {
+            let has_auto_attach = handshake
+                .get("controller_auto_attach")
+                .and_then(|value| value.as_object())
+                .is_some();
+            let idle_snapshot_interval_ms = handshake
+                .get("idle_snapshot")
+                .and_then(|value| value.get("interval_ms"))
+                .and_then(|value| value.as_i64())
+                .unwrap_or(0);
+            trace!(
+                target = "controller.actions",
+                session_id = %session_id,
+                private_beach_id = %private_beach_id,
+                has_auto_attach,
+                idle_snapshot_interval_ms,
+                "manager handshake prepared"
+            );
+        }
+
         let url = format!(
             "{}/sessions/{}/control",
             self.road_base_url.trim_end_matches('/'),
@@ -1575,6 +1600,8 @@ impl AppState {
             "payload": handshake,
         });
 
+        let dispatch_started = Instant::now();
+
         match self.http.post(url).json(&body).send().await {
             Ok(resp) if resp.status().is_success() => {
                 info!(
@@ -1583,6 +1610,19 @@ impl AppState {
                     private_beach_id = %private_beach_id,
                     "manager handshake dispatched via control channel"
                 );
+                if should_log_custom_event(
+                    "manager_handshake_dispatch",
+                    session_id,
+                    StdDuration::from_secs(15),
+                ) {
+                    trace!(
+                        target = "controller.actions",
+                        session_id = %session_id,
+                        private_beach_id = %private_beach_id,
+                        wait_ms = dispatch_started.elapsed().as_millis() as u64,
+                        "manager handshake HTTP dispatch completed"
+                    );
+                }
             }
             Ok(resp) => {
                 let status = resp.status();
@@ -2810,6 +2850,12 @@ impl AppState {
         reason: Option<String>,
         requester: Option<Uuid>,
     ) -> Result<ControllerLeaseResponse, StateError> {
+        let backend_label = match &self.backend {
+            Backend::Memory => "memory",
+            Backend::Postgres(_) => "postgres",
+        };
+        let lease_timer = Instant::now();
+
         let response = match &self.backend {
             Backend::Memory => {
                 self.acquire_controller_memory(session_id, ttl_override, reason.clone())
@@ -2957,6 +3003,21 @@ impl AppState {
             }
         };
         self.refresh_idle_publish_token_hint(session_id).await?;
+        if should_log_custom_event(
+            "controller_lease_issued",
+            session_id,
+            StdDuration::from_secs(15),
+        ) {
+            trace!(
+                target = "controller.actions",
+                session_id = %session_id,
+                reason = reason.as_deref().unwrap_or(""),
+                backend = backend_label,
+                wait_ms = lease_timer.elapsed().as_millis() as u64,
+                "controller lease issued"
+            );
+        }
+
         Ok(response)
     }
 
@@ -3488,6 +3549,28 @@ impl AppState {
                         .and_then(|ack| {
                             ack.error_message.clone().or_else(|| ack.error_code.clone())
                         });
+                    if !acks.is_empty()
+                        && should_log_custom_event(
+                            "controller_acks",
+                            session_id,
+                            StdDuration::from_secs(10),
+                        )
+                    {
+                        let ok_count = acks
+                            .iter()
+                            .filter(|ack| matches!(ack.status, AckStatus::Ok))
+                            .count();
+                        let error_count = acks.len().saturating_sub(ok_count);
+                        info!(
+                            target = "controller.delivery",
+                            session_id = %session_id,
+                            via_fast_path,
+                            total = acks.len(),
+                            ok = ok_count,
+                            errors = error_count,
+                            "controller acks received"
+                        );
+                    }
                     let mut status = if via_fast_path {
                         PairingTransportStatus::fast_path(event_time)
                     } else {
@@ -3884,23 +3967,37 @@ impl AppState {
         };
 
         let base_url = self.road_base_url.clone();
-        let mut workers = self.viewer_workers.write().await;
-        if let Some(existing) = workers.remove(session_id) {
-            existing.handle.abort();
+        if let Some(existing) = {
+            let mut workers = self.viewer_workers.write().await;
+            workers.remove(session_id)
+        } {
+            existing.cancel.cancel();
+            let handle = existing.handle;
+            tokio::spawn(async move {
+                let _ = handle.await;
+            });
         }
+
+        let cancel = CancellationToken::new();
         let state_clone = self.clone();
         let session_id_owned = session_id.to_string();
+        let private_beach_id_owned = private_beach_id.clone();
+        let join_code_owned = join_code.clone();
+        let base_url_owned = base_url.clone();
+        let cancel_clone = cancel.clone();
         let handle = tokio::spawn(async move {
             run_viewer_worker(
                 state_clone,
                 session_id_owned,
-                private_beach_id,
-                join_code,
-                base_url,
+                private_beach_id_owned,
+                join_code_owned,
+                base_url_owned,
+                cancel_clone,
             )
             .await;
         });
-        workers.insert(session_id.to_string(), ViewerWorker { handle });
+        let mut workers = self.viewer_workers.write().await;
+        workers.insert(session_id.to_string(), ViewerWorker { handle, cancel });
         Ok(())
     }
 
@@ -3924,9 +4021,27 @@ impl AppState {
             (record.private_beach_id.clone(), passcode)
         };
 
-        let mut workers = self.controller_workers.write().await;
-        if let Some(existing) = workers.remove(session_id) {
-            existing.handle.abort();
+        let existing_worker = {
+            let mut workers = self.controller_workers.write().await;
+            if let Some(existing) = workers.get(session_id) {
+                if !existing.handle.is_finished() {
+                    debug!(
+                        target = "controller.forwarder",
+                        session_id = %session_id,
+                        private_beach_id = %private_beach_id,
+                        "controller forwarder already running; skipping spawn"
+                    );
+                    return Ok(());
+                }
+            }
+            workers.remove(session_id)
+        };
+        if let Some(existing) = existing_worker {
+            existing.cancel.cancel();
+            let handle = existing.handle;
+            tokio::spawn(async move {
+                let _ = handle.await;
+            });
         }
         let state_clone = self.clone();
         let session_id_owned = session_id.to_string();
@@ -3936,11 +4051,27 @@ impl AppState {
             private_beach_id = %private_beach_id,
             "starting controller forwarder worker"
         );
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let cancel_task = cancel.clone();
         let handle = tokio::spawn(async move {
-            run_controller_forwarder(state_clone, session_id_owned, private_beach_id, join_code)
-                .await;
+            run_controller_forwarder(
+                state_clone,
+                session_id_owned,
+                private_beach_id,
+                join_code,
+                cancel_task,
+            )
+            .await;
         });
-        workers.insert(session_id.to_string(), ControllerForwarderWorker { handle });
+        let mut workers = self.controller_workers.write().await;
+        workers.insert(
+            session_id.to_string(),
+            ControllerForwarderWorker {
+                handle,
+                cancel: cancel_clone,
+            },
+        );
         Ok(())
     }
 
@@ -3949,14 +4080,22 @@ impl AppState {
         {
             let mut controllers = self.controller_workers.write().await;
             if let Some(existing) = controllers.remove(session_id) {
-                existing.handle.abort();
+                existing.cancel.cancel();
+                let handle = existing.handle;
+                tokio::spawn(async move {
+                    let _ = handle.await;
+                });
                 removed = true;
             }
         }
         {
             let mut viewers = self.viewer_workers.write().await;
             if let Some(existing) = viewers.remove(session_id) {
-                existing.handle.abort();
+                existing.cancel.cancel();
+                let handle = existing.handle;
+                tokio::spawn(async move {
+                    let _ = handle.await;
+                });
                 removed = true;
             }
         }
@@ -6081,6 +6220,32 @@ impl AppState {
                 actions = parse_redis_action_stream(value)?;
             }
 
+            // If Redis reports a non-zero stream length but this consumer
+            // didn't receive any new entries, log a sampled diagnostic so
+            // we can tell whether messages are stuck in the pending set.
+            if actions.is_empty()
+                && should_log_custom_event(
+                    "redis_drain_empty",
+                    session_id,
+                    StdDuration::from_secs(15),
+                )
+            {
+                let depth = self
+                    .pending_actions_count(private_beach_id, session_id)
+                    .await
+                    .unwrap_or(0);
+                if depth > 0 {
+                    warn!(
+                        target = "controller.delivery",
+                        session_id = %session_id,
+                        private_beach_id = %private_beach_id,
+                        queue_depth = depth,
+                        consumer = %consumer,
+                        "drain_actions_redis returned no actions despite non-empty stream"
+                    );
+                }
+            }
+
             return Ok(actions);
         }
         let sessions = self.fallback.sessions.read().await;
@@ -6778,6 +6943,7 @@ async fn run_viewer_worker(
     private_beach_id: String,
     join_code: String,
     road_base_url: String,
+    cancel: CancellationToken,
 ) {
     #[cfg(test)]
     if let Some(override_fn) = test_support::viewer_worker_override() {
@@ -6800,6 +6966,15 @@ async fn run_viewer_worker(
         .set(0);
     let mut attempts: usize = 0;
     loop {
+        if cancel.is_cancelled() {
+            info!(
+                target = "private_beach",
+                session_id = %session_id,
+                private_beach_id = %private_beach_id,
+                "viewer worker cancelled"
+            );
+            break;
+        }
         if attempts > 0 {
             metrics::MANAGER_VIEWER_RECONNECTS
                 .with_label_values(&[label_private.as_str(), label_session.as_str()])
@@ -6813,6 +6988,7 @@ async fn run_viewer_worker(
             &join_code,
             &road_base_url,
             label,
+            cancel.clone(),
         )
         .await
         {
@@ -6837,7 +7013,14 @@ async fn run_viewer_worker(
         metrics::MANAGER_VIEWER_CONNECTED
             .with_label_values(&[label_private.as_str(), label_session.as_str()])
             .set(0);
-        sleep(StdDuration::from_secs(3)).await;
+        let backoff = sleep(StdDuration::from_secs(3));
+        tokio::pin!(backoff);
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                break;
+            }
+            _ = &mut backoff => {}
+        }
     }
 }
 
@@ -6848,6 +7031,7 @@ async fn viewer_connect_once(
     join_code: &str,
     road_base_url: &str,
     label: &str,
+    cancel: CancellationToken,
 ) -> Result<(), ViewerError> {
     let gauge =
         metrics::MANAGER_VIEWER_CONNECTED.with_label_values(&[private_beach_id, session_id]);
@@ -6855,6 +7039,10 @@ async fn viewer_connect_once(
     let gauge_guard = ViewerGaugeGuard::new(gauge.clone());
     let latency_hist =
         metrics::MANAGER_VIEWER_LATENCY_MS.with_label_values(&[private_beach_id, session_id]);
+
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
 
     let viewer_token = match state
         .viewer_token(session_id, private_beach_id, join_code)
@@ -6906,6 +7094,10 @@ async fn viewer_connect_once(
     );
     gauge_guard.mark_connected();
 
+    if cancel.is_cancelled() {
+        return Ok(());
+    }
+
     if let Err(err) = transport.send_text("__ready__") {
         debug!(
             target = "private_beach",
@@ -6921,6 +7113,14 @@ async fn viewer_connect_once(
     let mut idle_warned = false;
 
     loop {
+        if cancel.is_cancelled() {
+            debug!(
+                target = "private_beach",
+                session_id = %session_id,
+                "viewer worker cancellation requested; closing transport"
+            );
+            return Ok(());
+        }
         let now = Instant::now();
         if now >= next_keepalive {
             metrics::MANAGER_VIEWER_KEEPALIVE_SENT
@@ -7191,11 +7391,29 @@ async fn run_controller_forwarder(
     session_id: String,
     private_beach_id: String,
     join_code: String,
+    cancel: CancellationToken,
 ) {
     let mut attempts = 0usize;
     loop {
+        if cancel.is_cancelled() {
+            info!(
+                target = "controller.forwarder",
+                session_id = %session_id,
+                private_beach_id = %private_beach_id,
+                "controller forwarder cancelled"
+            );
+            break;
+        }
         attempts = attempts.saturating_add(1);
-        match controller_forwarder_once(&state, &session_id, &private_beach_id, &join_code).await {
+        match controller_forwarder_once(
+            &state,
+            &session_id,
+            &private_beach_id,
+            &join_code,
+            cancel.clone(),
+        )
+        .await
+        {
             Ok(()) => {
                 info!(
                     target = "controller.forwarder",
@@ -7203,7 +7421,7 @@ async fn run_controller_forwarder(
                     private_beach_id = %private_beach_id,
                     "controller forwarder stopped"
                 );
-                return;
+                break;
             }
             Err(err) => {
                 warn!(
@@ -7214,7 +7432,14 @@ async fn run_controller_forwarder(
                     attempts,
                     "controller forwarder failed; retrying"
                 );
-                sleep(StdDuration::from_secs(3)).await;
+                let backoff = sleep(StdDuration::from_secs(3));
+                tokio::pin!(backoff);
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        break;
+                    }
+                    _ = &mut backoff => {}
+                }
             }
         }
     }
@@ -7225,16 +7450,21 @@ async fn controller_forwarder_once(
     session_id: &str,
     private_beach_id: &str,
     join_code: &str,
+    cancel: CancellationToken,
 ) -> Result<(), ControllerForwarderError> {
     let labels = [CONTROLLER_CHANNEL_LABEL, LEGACY_CONTROLLER_CHANNEL_LABEL];
     let mut last_err: Option<ControllerForwarderError> = None;
     for label in labels {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
         match controller_forwarder_once_with_label(
             state,
             session_id,
             private_beach_id,
             join_code,
             label,
+            cancel.clone(),
         )
         .await
         {
@@ -7256,6 +7486,7 @@ async fn controller_forwarder_once_with_label(
     private_beach_id: &str,
     join_code: &str,
     label: &str,
+    cancel: CancellationToken,
 ) -> Result<(), ControllerForwarderError> {
     let config = SessionConfig::new(&state.road_base_url)
         .map_err(|err| ControllerForwarderError::Join(err.to_string()))?;
@@ -7289,15 +7520,29 @@ async fn controller_forwarder_once_with_label(
                 );
                 Some(label.to_string())
             });
-            drive_controller_forwarder(
+            match drive_controller_forwarder(
                 state,
                 private_beach_id,
                 session_id,
                 transport,
                 webrtc_channels,
-                connection_label,
+                connection_label.clone(),
+                cancel,
             )
             .await
+            {
+                Ok(()) => {
+                    debug!(
+                        target = "controller.forwarder",
+                        session_id = %session_id,
+                        private_beach_id = %private_beach_id,
+                        label = connection_label.as_deref(),
+                        "controller forwarder completed"
+                    );
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            }
         }
         NegotiatedTransport::WebRtcOfferer { .. } => {
             Err(ControllerForwarderError::UnsupportedTransport)
@@ -7521,6 +7766,7 @@ async fn drive_controller_forwarder(
     primary_transport: Arc<dyn Transport>,
     webrtc_channels: Option<WebRtcChannels>,
     metadata_label: Option<String>,
+    cancel: CancellationToken,
 ) -> Result<(), ControllerForwarderError> {
     let fast_path_enabled = state.controller_fast_path_enabled();
     let fast_path_channels = webrtc_channels.clone();
@@ -7581,6 +7827,44 @@ async fn drive_controller_forwarder(
 
     loop {
         tokio::select! {
+            _ = cancel.cancelled() => {
+                let inflight = pending.len();
+                let drained = std::mem::take(&mut pending);
+                fail_pending_actions(
+                    state,
+                    session_id,
+                    drained,
+                    via_fast_path,
+                    "controller forwarder cancelled",
+                )
+                .await;
+                let queue_depth = match state
+                    .pending_actions_count(private_beach_id, session_id)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(err) => {
+                        trace!(
+                            target = "controller.forwarder",
+                            session_id = %session_id,
+                            private_beach_id = %private_beach_id,
+                            error = %err,
+                            "failed to read queue depth after cancellation"
+                        );
+                        0
+                    }
+                };
+                info!(
+                    target = "controller.forwarder",
+                    session_id = %session_id,
+                    private_beach_id = %private_beach_id,
+                    inflight,
+                    queue_depth,
+                    transport = transport_label,
+                    "controller forwarder shutting down due to cancellation"
+                );
+                return Ok(());
+            }
             event = event_rx.recv() => {
                 match event {
                     Some(ForwarderEvent::Ack(seq)) => {
@@ -7623,6 +7907,22 @@ async fn drive_controller_forwarder(
                     Some(ForwarderEvent::Shutdown(reason)) => {
                         if via_fast_path {
                             let inflight = pending.len();
+                            let queue_depth = match state
+                                .pending_actions_count(private_beach_id, session_id)
+                                .await
+                            {
+                                Ok(value) => value,
+                                Err(err) => {
+                                    trace!(
+                                        target = "controller.forwarder",
+                                        session_id = %session_id,
+                                        private_beach_id = %private_beach_id,
+                                        error = %err,
+                                        "failed to read queue depth after fast-path shutdown"
+                                    );
+                                    0
+                                }
+                            };
                             let drained = std::mem::take(&mut pending);
                             fail_pending_actions(state, session_id, drained, true, &reason).await;
                             metrics::CONTROLLER_FAST_PATH_FALLBACKS
@@ -7634,6 +7934,7 @@ async fn drive_controller_forwarder(
                                 private_beach_id = %private_beach_id,
                                 inflight,
                                 reason = %reason,
+                                queue_depth,
                                 "fast-path transport closed; falling back to primary transport"
                             );
                             via_fast_path = false;
@@ -7661,8 +7962,35 @@ async fn drive_controller_forwarder(
                             );
                             continue;
                         }
+                        let inflight = pending.len();
+                        let queue_depth = match state
+                            .pending_actions_count(private_beach_id, session_id)
+                            .await
+                        {
+                            Ok(value) => value,
+                            Err(err) => {
+                                trace!(
+                                    target = "controller.forwarder",
+                                    session_id = %session_id,
+                                    private_beach_id = %private_beach_id,
+                                    error = %err,
+                                    "failed to read queue depth after controller shutdown"
+                                );
+                                0
+                            }
+                        };
                         let drained = std::mem::take(&mut pending);
                         fail_pending_actions(state, session_id, drained, via_fast_path, &reason).await;
+                        warn!(
+                            target = "controller.forwarder",
+                            session_id = %session_id,
+                            private_beach_id = %private_beach_id,
+                            inflight,
+                            queue_depth,
+                            transport = transport_label,
+                            reason = %reason,
+                            "controller transport closed; exiting"
+                        );
                         return Err(ControllerForwarderError::Transport(reason));
                     }
                     Some(ForwarderEvent::FastPathReady { transport: fast_transport, label }) => {
@@ -7709,8 +8037,41 @@ async fn drive_controller_forwarder(
                         );
                     }
                     None => {
+                        let inflight = pending.len();
+                        let queue_depth = match state
+                            .pending_actions_count(private_beach_id, session_id)
+                            .await
+                        {
+                            Ok(value) => value,
+                            Err(err) => {
+                                trace!(
+                                    target = "controller.forwarder",
+                                    session_id = %session_id,
+                                    private_beach_id = %private_beach_id,
+                                    error = %err,
+                                    "failed to read queue depth after ack listener closed"
+                                );
+                                0
+                            }
+                        };
                         let drained = std::mem::take(&mut pending);
-                        fail_pending_actions(state, session_id, drained, via_fast_path, "ack listener closed").await;
+                        fail_pending_actions(
+                            state,
+                            session_id,
+                            drained,
+                            via_fast_path,
+                            "ack listener closed",
+                        )
+                        .await;
+                        warn!(
+                            target = "controller.forwarder",
+                            session_id = %session_id,
+                            private_beach_id = %private_beach_id,
+                            inflight,
+                            queue_depth,
+                            transport = transport_label,
+                            "controller forwarder ack listener closed unexpectedly"
+                        );
                         return Err(ControllerForwarderError::Transport(
                             "ack listener closed".into(),
                         ));
@@ -8295,7 +8656,7 @@ mod tests {
     use super::*;
     use crate::state::test_support;
     use beach_buggy::{ActionCommand, HarnessType, RegisterSessionRequest};
-    use beach_client_core::cache::terminal::packed::{StyleId, pack_color_default, pack_color_rgb};
+    use beach_client_core::cache::terminal::packed::{pack_color_default, pack_color_rgb, StyleId};
     use beach_client_core::protocol::{
         HostFrame as WireHostFrame, Lane, LaneBudgetFrame, SyncConfigFrame, Update as WireUpdate,
     };
@@ -8303,11 +8664,11 @@ mod tests {
     use chrono::Utc;
     use serde_json::json;
     use std::sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     };
     use std::time::{Duration as StdDuration, SystemTime};
-    use tokio::time::{Duration, sleep, timeout};
+    use tokio::time::{sleep, timeout, Duration};
 
     #[test_timeout::tokio_timeout_test(10)]
     async fn spawn_viewer_worker_smoke_test_records_state_and_stream() {

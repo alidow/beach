@@ -1,23 +1,90 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, net::IpAddr, str::FromStr, sync::Arc};
 
 use beach_buggy::{ActionAck, ActionCommand, StateDiff};
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{Mutex, RwLock},
-    time::{sleep, Duration},
+    time::{Duration, sleep, timeout},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, trace, warn};
 
-use webrtc::data_channel::{data_channel_message::DataChannelMessage, RTCDataChannel};
+use webrtc::Error as WebRtcError;
+use webrtc::data_channel::{RTCDataChannel, data_channel_message::DataChannelMessage};
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
+use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
+use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::Error as WebRtcError;
-use webrtc_ice::udp_network::{EphemeralUDP, UDPNetwork};
+use webrtc_ice::{
+    network_type::NetworkType,
+    udp_network::{EphemeralUDP, UDPNetwork},
+};
 
-use crate::{metrics, state::AppState};
+use crate::{log_throttle::should_log_custom_event, metrics, state::AppState};
+
+#[derive(Debug)]
+struct IceCandidateMeta {
+    ip: IpAddr,
+    port: u16,
+    scope: &'static str,
+}
+
+fn classify_ip_scope(ip: &IpAddr) -> &'static str {
+    if is_loopback_ip(ip) {
+        "loopback"
+    } else if is_private_ip(ip) {
+        "private"
+    } else if is_link_local_ip(ip) {
+        "link_local"
+    } else if is_multicast_ip(ip) {
+        "multicast"
+    } else {
+        "public"
+    }
+}
+
+fn is_loopback_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(addr) => addr.is_loopback(),
+        IpAddr::V6(addr) => addr.is_loopback(),
+    }
+}
+
+fn is_private_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(addr) => addr.is_private(),
+        IpAddr::V6(addr) => addr.is_unique_local(),
+    }
+}
+
+fn is_link_local_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(addr) => addr.is_link_local(),
+        IpAddr::V6(addr) => addr.is_unicast_link_local(),
+    }
+}
+
+fn is_multicast_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(addr) => addr.is_multicast(),
+        IpAddr::V6(addr) => addr.is_multicast(),
+    }
+}
+
+fn parse_candidate_meta(candidate: &str) -> Option<IceCandidateMeta> {
+    let parts: Vec<_> = candidate.split_whitespace().collect();
+    if parts.len() < 6 {
+        return None;
+    }
+    // candidate line: candidate:<id> <component> <protocol> <priority> <ip> <port> typ ...
+    let ip_str = parts.get(4)?;
+    let port_str = parts.get(5)?;
+    let ip = IpAddr::from_str(ip_str).ok()?;
+    let port = port_str.parse::<u16>().ok()?;
+    let scope = classify_ip_scope(&ip);
+    Some(IceCandidateMeta { ip, port, scope })
+}
 
 #[derive(Clone)]
 pub struct FastPathSession {
@@ -28,6 +95,8 @@ pub struct FastPathSession {
     pub state_rx: Arc<Mutex<Option<Arc<RTCDataChannel>>>>,
     // local ICE candidates gathered before answer is delivered
     pub local_ice: Arc<RwLock<Vec<serde_json::Value>>>,
+    pub public_ip_hint: Option<String>,
+    pub host_hint_for_log: Option<String>,
 }
 
 impl FastPathSession {
@@ -36,6 +105,9 @@ impl FastPathSession {
         // This allows the manager (running in Docker) to advertise the host's LAN IP
         // and a published UDP range so external hosts can complete ICE.
         let mut setting = webrtc::api::setting_engine::SettingEngine::default();
+        // Force IPv4 transport since the Docker network doesn't provide IPv6 routes.
+        // Otherwise the ICE agent keeps trying udp6 candidates and logs noisy warnings.
+        setting.set_network_types(vec![NetworkType::Udp4]);
 
         // Configure ephemeral UDP port range if provided.
         if let (Ok(start_s), Ok(end_s)) = (
@@ -58,19 +130,36 @@ impl FastPathSession {
 
         // Optionally set a NAT 1:1 public IP so the container advertises a host-reachable
         // address (e.g., the Mac's 192.168.x.x) instead of the internal 172.20.x.x.
+        let host_hint = std::env::var("BEACH_ICE_PUBLIC_HOST")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let resolved_host = host_hint
+            .clone()
+            .unwrap_or_else(|| "host.docker.internal".to_string());
         // Prefer explicit IP via BEACH_ICE_PUBLIC_IP; otherwise try resolving a host name
         // (defaulting to host.docker.internal) to an IPv4 address.
-        let public_ip = std::env::var("BEACH_ICE_PUBLIC_IP").ok().or_else(|| {
-            let host = std::env::var("BEACH_ICE_PUBLIC_HOST")
-                .unwrap_or_else(|_| "host.docker.internal".to_string());
+        let explicit_public_ip = std::env::var("BEACH_ICE_PUBLIC_IP")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let public_ip = explicit_public_ip.or_else(|| {
             use std::net::ToSocketAddrs;
             // Resolve using an arbitrary port to trigger getaddrinfo.
-            (host.as_str(), 0)
+            (resolved_host.as_str(), 0)
                 .to_socket_addrs()
                 .ok()
                 .and_then(|mut it| it.find(|a| a.is_ipv4()).map(|a| a.ip().to_string()))
         });
-        if let Some(ip) = public_ip {
+        let host_hint_for_log = host_hint.clone().or_else(|| Some(resolved_host.clone()));
+        debug!(
+            target = "fast_path.ice",
+            session_id = %session_id,
+            public_ip_hint = public_ip.as_deref(),
+            host_hint = host_hint_for_log.as_deref(),
+            "configured fast-path ICE hints"
+        );
+        if let Some(ip) = public_ip.clone() {
             setting.set_nat_1to1_ips(vec![ip], RTCIceCandidateType::Host);
         }
 
@@ -88,6 +177,8 @@ impl FastPathSession {
             acks_rx: Arc::new(Mutex::new(None)),
             state_rx: Arc::new(Mutex::new(None)),
             local_ice: Arc::new(RwLock::new(Vec::new())),
+            public_ip_hint: public_ip.clone(),
+            host_hint_for_log,
         })
     }
 
@@ -131,10 +222,66 @@ impl FastPathSession {
                             "sdp_mline_index": json.sdp_mline_index,
                         });
                         this3.local_ice.write().await.push(val);
+                        let candidate_meta = parse_candidate_meta(&json.candidate);
+                        if should_log_custom_event(
+                            "fast_path_local_candidate",
+                            &this3.session_id,
+                            Duration::from_secs(30),
+                        ) {
+                            debug!(
+                                target = "fast_path.ice",
+                                session_id = %this3.session_id,
+                                candidate = %json.candidate,
+                                candidate_ip = candidate_meta.as_ref().map(|meta| meta.ip.to_string()),
+                                candidate_port = candidate_meta.as_ref().map(|meta| meta.port),
+                                candidate_scope = candidate_meta.as_ref().map(|meta| meta.scope),
+                                "local ICE candidate gathered"
+                            );
+                        }
+                        if let Some(meta) = candidate_meta {
+                            if meta.scope == "loopback" {
+                                warn!(
+                                    target = "fast_path.ice",
+                                    session_id = %this3.session_id,
+                                    ip = %meta.ip,
+                                    port = meta.port,
+                                    "local ICE candidate is loopback; hosts outside the container cannot reach it"
+                                );
+                            }
+                        }
                     }
                 }
             })
         }));
+
+        let ice_ip_hint = self.public_ip_hint.clone();
+        let ice_host_hint = self.host_hint_for_log.clone();
+        let session_for_state = self.session_id.clone();
+        self.pc
+            .on_ice_connection_state_change(Box::new(move |state: RTCIceConnectionState| {
+                let session = session_for_state.clone();
+                let ip_hint = ice_ip_hint.clone();
+                let host_hint = ice_host_hint.clone();
+                Box::pin(async move {
+                    debug!(
+                        target = "fast_path.ice",
+                        session_id = %session,
+                        ?state,
+                        public_ip_hint = ip_hint.as_deref(),
+                        host_hint = host_hint.as_deref(),
+                        "ice connection state change"
+                    );
+                    if state == RTCIceConnectionState::Failed {
+                        warn!(
+                            target = "fast_path.ice",
+                            session_id = %session,
+                            public_ip_hint = ip_hint.as_deref(),
+                            host_hint = host_hint.as_deref(),
+                            "ice connection reported failure"
+                        );
+                    }
+                })
+            }));
 
         let answer = self.pc.create_answer(None).await?;
         self.pc.set_local_description(answer.clone()).await?;
@@ -142,6 +289,33 @@ impl FastPathSession {
     }
 
     pub async fn add_remote_ice(&self, cand: RTCIceCandidateInit) -> Result<(), WebRtcError> {
+        let candidate_meta = parse_candidate_meta(&cand.candidate);
+        if should_log_custom_event(
+            "fast_path_remote_candidate",
+            &self.session_id,
+            Duration::from_secs(30),
+        ) {
+            debug!(
+                target = "fast_path.ice",
+                session_id = %self.session_id,
+                candidate = %cand.candidate,
+                candidate_ip = candidate_meta.as_ref().map(|meta| meta.ip.to_string()),
+                candidate_port = candidate_meta.as_ref().map(|meta| meta.port),
+                candidate_scope = candidate_meta.as_ref().map(|meta| meta.scope),
+                "applying remote ICE candidate"
+            );
+        }
+        if let Some(meta) = candidate_meta {
+            if meta.scope == "loopback" {
+                warn!(
+                    target = "fast_path.ice",
+                    session_id = %self.session_id,
+                    ip = %meta.ip,
+                    port = meta.port,
+                    "remote ICE candidate is loopback; external hosts will be unreachable"
+                );
+            }
+        }
         self.pc.add_ice_candidate(cand).await
     }
 
@@ -209,18 +383,77 @@ pub async fn send_actions_over_fast_path(
     session_id: &str,
     actions: &[ActionCommand],
 ) -> anyhow::Result<bool> {
+    // Bound the time spent on fast-path sends so controller callers are not
+    // indefinitely blocked if the data channel stalls. When the timeout
+    // elapses, the caller will fall back to HTTP/Redis delivery.
+    const FAST_PATH_SEND_TIMEOUT_MS: u64 = 1000;
+    const FAST_PATH_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
     if let Some(fps) = registry.get(session_id).await {
         let guard = fps.actions_tx.lock().await;
         if let Some(dc) = guard.as_ref() {
             for a in actions {
                 let text =
                     serde_json::to_string(&serde_json::json!({"type":"action","payload":a}))?;
-                dc.send_text(text)
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                let timeout_duration = Duration::from_millis(FAST_PATH_SEND_TIMEOUT_MS);
+                let send_result = timeout(timeout_duration, dc.send_text(text)).await;
+                match send_result {
+                    Ok(Ok(_)) => {
+                        // Normal fast-path delivery.
+                    }
+                    Ok(Err(err)) => {
+                        debug!(
+                            target = "fast_path",
+                            session_id = %session_id,
+                            error = %err,
+                            "fast-path send failed; propagating error to caller"
+                        );
+                        return Err(anyhow::anyhow!(err.to_string()));
+                    }
+                    Err(_) => {
+                        let message = format!(
+                            "fast-path send timed out after {}ms",
+                            FAST_PATH_SEND_TIMEOUT_MS
+                        );
+                        debug!(
+                            target = "fast_path",
+                            session_id = %session_id,
+                            "{}", message
+                        );
+                        return Err(anyhow::anyhow!(message));
+                    }
+                }
             }
+            debug!(
+                target = "fast_path.delivery",
+                session_id = %session_id,
+                action_count = actions.len(),
+                "fast-path actions delivered"
+            );
             return Ok(true);
+        } else if should_log_custom_event(
+            "fast_path_action_channel_missing",
+            session_id,
+            FAST_PATH_LOG_INTERVAL,
+        ) {
+            trace!(
+                target = "fast_path",
+                session_id = %session_id,
+                action_count = actions.len(),
+                "fast-path actions channel not ready; falling back to HTTP"
+            );
         }
+    } else if should_log_custom_event(
+        "fast_path_session_missing",
+        session_id,
+        FAST_PATH_LOG_INTERVAL,
+    ) {
+        trace!(
+            target = "fast_path",
+            session_id = %session_id,
+            action_count = actions.len(),
+            "fast-path session not registered; falling back to HTTP"
+        );
     }
     Ok(false)
 }

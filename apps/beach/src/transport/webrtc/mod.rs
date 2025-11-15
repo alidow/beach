@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -53,6 +54,58 @@ mod signaling;
 pub use signaling::SignalingClient;
 
 static OFFER_ENCRYPTION_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+struct IceCandidateInfo {
+    ip: IpAddr,
+    port: u16,
+    scope: &'static str,
+}
+
+fn classify_candidate_scope(ip: &IpAddr) -> &'static str {
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_loopback() {
+                "loopback"
+            } else if v4.is_private() {
+                "private"
+            } else if v4.is_link_local() {
+                "link_local"
+            } else if v4.is_multicast() {
+                "multicast"
+            } else {
+                "public"
+            }
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                "loopback"
+            } else if v6.is_unique_local() {
+                "private"
+            } else if v6.is_unicast_link_local() {
+                "link_local"
+            } else if v6.is_multicast() {
+                "multicast"
+            } else {
+                "public"
+            }
+        }
+    }
+}
+
+fn parse_candidate_info(candidate: &str) -> Option<IceCandidateInfo> {
+    let parts: Vec<_> = candidate.split_whitespace().collect();
+    if parts.len() < 6 {
+        return None;
+    }
+    let ip = parts.get(4)?.parse::<IpAddr>().ok()?;
+    let port = parts.get(5)?.parse::<u16>().ok()?;
+    Some(IceCandidateInfo {
+        scope: classify_candidate_scope(&ip),
+        ip,
+        port,
+    })
+}
 
 pub struct OfferEncryptionDelayGuard {
     previous: u64,
@@ -331,19 +384,62 @@ impl EncryptionManager {
         let mut counter_bytes = [0u8; 8];
         counter_bytes.copy_from_slice(&frame[1..9]);
         let counter = u64::from_be_bytes(counter_bytes);
-        let expected = state.recv_counter.load(Ordering::SeqCst);
-        if counter != expected {
-            tracing::warn!(
-                target = "beach::transport::webrtc::crypto",
-                direction = "recv",
-                expected_counter = expected,
-                received_counter = counter,
-                frame_len = frame.len(),
-                "secure transport counter mismatch"
-            );
-            return Err(TransportError::Setup(
-                "secure transport counter mismatch".into(),
-            ));
+        loop {
+            let expected = state.recv_counter.load(Ordering::SeqCst);
+            if counter == expected {
+                break;
+            }
+            if counter < expected {
+                tracing::warn!(
+                    target = "beach::transport::webrtc::crypto",
+                    direction = "recv",
+                    expected_counter = expected,
+                    received_counter = counter,
+                    frame_len = frame.len(),
+                    "secure transport counter mismatch"
+                );
+                return Err(TransportError::Setup(
+                    "secure transport counter mismatch".into(),
+                ));
+            }
+            // counter has advanced beyond what we expected (e.g., after a restart). Attempt to
+            // resynchronise exactly once by jumping the expected counter forward.
+            match state.recv_counter.compare_exchange(
+                expected,
+                counter,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    tracing::warn!(
+                        target = "beach::transport::webrtc::crypto",
+                        direction = "recv",
+                        expected_counter = expected,
+                        received_counter = counter,
+                        frame_len = frame.len(),
+                        "secure transport counter jump detected; resynchronising"
+                    );
+                    break;
+                }
+                Err(actual) => {
+                    if actual > counter {
+                        // Another consumer advanced beyond the received counter; treat as mismatch.
+                        tracing::warn!(
+                            target = "beach::transport::webrtc::crypto",
+                            direction = "recv",
+                            expected_counter = actual,
+                            received_counter = counter,
+                            frame_len = frame.len(),
+                            "secure transport counter mismatch"
+                        );
+                        return Err(TransportError::Setup(
+                            "secure transport counter mismatch".into(),
+                        ));
+                    }
+                    // Another thread moved the counter forward but not past our target; retry loop.
+                    continue;
+                }
+            }
         }
         let nonce_bytes = nonce_from_counter(counter);
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -1535,6 +1631,33 @@ async fn negotiate_offerer_peer(
                         sdp_mline_index: resolved.sdp_mline_index.map(|idx| idx as u16),
                         username_fragment: None,
                     };
+                    if let Some(meta) = parse_candidate_info(&init.candidate) {
+                        tracing::debug!(
+                            target = "beach::transport::webrtc",
+                            event = "remote_candidate_received",
+                            role = "offerer",
+                            handshake_id = %handshake_for_incoming,
+                            session_id = %session_id_for_signals,
+                            peer_id = %peer_id_for_incoming,
+                            ip = %meta.ip,
+                            port = meta.port,
+                            scope = meta.scope,
+                            "decoded remote ICE candidate"
+                        );
+                        if meta.scope == "loopback" {
+                            tracing::warn!(
+                                target = "beach::transport::webrtc",
+                                event = "remote_candidate_loopback",
+                                role = "offerer",
+                                handshake_id = %handshake_for_incoming,
+                                session_id = %session_id_for_signals,
+                                peer_id = %peer_id_for_incoming,
+                                ip = %meta.ip,
+                                port = meta.port,
+                                "remote ICE candidate uses loopback address; likely unreachable"
+                            );
+                        }
+                    }
                     let has_remote = pc_for_incoming.remote_description().await.is_some();
                     if !has_remote {
                         let mut queue = pending_for_incoming.lock().await;

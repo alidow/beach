@@ -8,6 +8,7 @@ import {
   updateSessionRoleById,
   issueControllerHandshake,
 } from '@/lib/api';
+import type { ControllerHandshakeResponse } from '@/lib/api';
 import type { TileSessionMeta, TileViewportSnapshot } from '@/features/tiles';
 import { buildSessionMetadataWithTile, sessionSummaryToTileMeta } from '@/features/tiles/sessionMeta';
 import type { SessionCredentialOverride } from '../../../private-beach/src/hooks/terminalViewerTypes';
@@ -15,6 +16,7 @@ import { useManagerToken, buildManagerUrl, buildRoadUrl } from '../hooks/useMana
 import { sendControlMessage } from '@/lib/road';
 import { useSessionConnection } from '../hooks/useSessionConnection';
 import { SessionViewer } from './SessionViewer';
+import { logConnectionEvent } from '@/features/logging/beachConnectionLogger';
 import {
   hydrateTerminalStoreFromDiff,
   type CellStylePayload,
@@ -209,6 +211,7 @@ export function ApplicationTile({
   const cachedDiffRef = useRef<TerminalStateDiff | null>(null);
   const restoringRef = useRef(false);
   const lastSessionIdRef = useRef<string | null>(sessionMeta?.sessionId ?? null);
+  const lastLoggedSessionIdRef = useRef<string | null>(sessionMeta?.sessionId ?? null);
   const lastViewportSnapshotRef = useRef<TileViewportSnapshot | null>(null);
   const hydrationRetryTimerRef = useRef<number | null>(null);
   const hydrationAttemptRef = useRef(0);
@@ -266,14 +269,57 @@ export function ApplicationTile({
         throw new Error('Unable to fetch manager token for controller handshake');
       }
 
-      const handshake = await issueControllerHandshake(
+      const logContext = {
+        tileId,
         sessionId,
-        passcode,
         privateBeachId,
-        token,
         managerUrl,
-      );
-      await sendControlMessage(sessionId, 'manager_handshake', handshake, token ?? null, resolvedRoadUrl);
+      };
+      logConnectionEvent('handshake:start', logContext, {
+        hasPasscode: Boolean(passcode && passcode.length > 0),
+      });
+      let handshake: ControllerHandshakeResponse;
+      try {
+        handshake = await issueControllerHandshake(
+          sessionId,
+          passcode,
+          privateBeachId,
+          token,
+          managerUrl,
+        );
+        logConnectionEvent('handshake:success', logContext, {
+          leaseExpiresAtMs: handshake.lease_expires_at_ms ?? null,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logConnectionEvent('handshake:error', logContext, { error: message }, 'error');
+        throw error;
+      }
+
+      try {
+        const control = await sendControlMessage(
+          sessionId,
+          'manager_handshake',
+          handshake,
+          token ?? null,
+          resolvedRoadUrl,
+        );
+        logConnectionEvent('hint:sent', logContext, {
+          roadUrl: resolvedRoadUrl,
+          controlId: control?.control_id ?? null,
+        });
+        logConnectionEvent('slow-path:ready', logContext, {
+          leaseExpiresAtMs: handshake.lease_expires_at_ms ?? null,
+          controlId: control?.control_id ?? null,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logConnectionEvent('hint:error', logContext, {
+          roadUrl: resolvedRoadUrl,
+          error: message,
+        }, 'error');
+        throw error;
+      }
 
       lastHandshakeContextRef.current = { sessionId, passcode };
 
@@ -290,11 +336,17 @@ export function ApplicationTile({
               sessionId,
               error,
             });
+            logConnectionEvent(
+              'handshake:renew-error',
+              logContext,
+              { error: error instanceof Error ? error.message : String(error) },
+              'warn',
+            );
           });
         }, delay);
       }
     },
-    [clearHandshakeRenewal, managerToken, managerUrl, privateBeachId, refresh, resolvedRoadUrl],
+    [clearHandshakeRenewal, managerToken, managerUrl, privateBeachId, refresh, resolvedRoadUrl, tileId],
   );
 
 useEffect(() => {
@@ -302,6 +354,32 @@ useEffect(() => {
     setSessionIdInput(sessionMeta.sessionId);
   }
 }, [sessionMeta?.sessionId, sessionIdInput]);
+
+  useEffect(() => {
+    const nextSessionId = sessionMeta?.sessionId?.trim() ?? null;
+    if (nextSessionId && lastLoggedSessionIdRef.current !== nextSessionId) {
+      lastLoggedSessionIdRef.current = nextSessionId;
+      logConnectionEvent('session:detected', {
+        tileId,
+        sessionId: nextSessionId,
+        privateBeachId,
+        managerUrl,
+      }, {
+        title: sessionMeta?.title ?? null,
+        harnessType: sessionMeta?.harnessType ?? null,
+      });
+      return;
+    }
+    if (!nextSessionId && lastLoggedSessionIdRef.current) {
+      logConnectionEvent('session:cleared', {
+        tileId,
+        sessionId: lastLoggedSessionIdRef.current,
+        privateBeachId,
+        managerUrl,
+      });
+      lastLoggedSessionIdRef.current = null;
+    }
+  }, [managerUrl, privateBeachId, sessionMeta?.harnessType, sessionMeta?.sessionId, sessionMeta?.title, tileId]);
 
   useEffect(() => () => clearHandshakeRenewal(), [clearHandshakeRenewal]);
 
@@ -324,8 +402,14 @@ useEffect(() => {
         sessionId,
         error,
       });
+      logConnectionEvent('handshake:auto-error', {
+        tileId,
+        sessionId,
+        privateBeachId,
+        managerUrl,
+      }, { error: message }, 'warn');
     });
-  }, [credentialOverride?.passcode, deliverHandshake, clearHandshakeRenewal, sessionMeta?.sessionId]);
+  }, [credentialOverride?.passcode, deliverHandshake, clearHandshakeRenewal, managerUrl, privateBeachId, sessionMeta?.sessionId, tileId]);
 
   useEffect(() => {
     lastViewportSnapshotRef.current = null;

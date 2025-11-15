@@ -27,7 +27,8 @@
     "react": "18.3.1",
     "react-dom": "18.3.1",
     "reactflow": "^11.11.4",
-    "tailwind-merge": "^2.5.4"
+    "tailwind-merge": "^2.5.4",
+    "toml": "^3.0.0"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.4.2",

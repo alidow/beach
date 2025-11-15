@@ -47,7 +47,7 @@
 3. [x] **CLI changes**
    - [x] In `host.rs`, parse `idle_snapshot.publish_token` from transport hints and prefer it over Beach Auth for HTTP publishing.
    - [x] Idle snapshot worker uses the chosen bearer; continues to fall back to Beach Auth if no publish token is present.
-   - [ ] Optionally parse the token from late `manager_handshake` payload to update a running worker (not required for initial rollout).
+   - [x] Parse the token from late `manager_handshake` payload to update a running worker **and** reuse it as the bearer override for auto-attach.
 4. [x] **Hint schema/documentation**
    - [x] Update `docs/private-beach/public-host-auto-attach.md` with the new `publish_token` field.
 5. [~] **Testing**

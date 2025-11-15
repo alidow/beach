@@ -93,6 +93,7 @@ const defaultEdgeOptions = {
 
 const CONTROLLER_LEASE_TTL_MS = 120_000;
 const CONTROLLER_LEASE_REFRESH_BUFFER_MS = 5_000;
+const CONTROLLER_LEASE_RENEW_FLOOR_MS = 5_000;
 const VIEWPORT_PAN_EPSILON = 0.5;
 const VIEWPORT_ZOOM_EPSILON = 0.0005;
 const PAIRING_STATUS_REFRESH_MS = 15_000;
@@ -177,6 +178,8 @@ function FlowCanvasInner({
   const [dragCount, setDragCount] = useState(0);
   const { token: managerToken, refresh: refreshManagerToken } = useManagerToken();
   const controllerLeaseExpiryRef = useRef<Record<string, number>>({});
+  const controllerLeaseTimersRef = useRef<Record<string, { timerId: number; targetExpiry: number }>>({});
+  const latestManagerTokenRef = useRef<string | null>(null);
   const state = useTileState();
   const { order, tiles, activeId, resizing, interactiveId, canvasViewport } = state;
   const {
@@ -281,15 +284,35 @@ function FlowCanvasInner({
     }
   }, [roadUrl]);
 
+  useEffect(() => {
+    latestManagerTokenRef.current = managerToken ?? null;
+  }, [managerToken]);
+
+  const clearControllerLeaseTimer = useCallback((sessionId: string) => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    const current = controllerLeaseTimersRef.current[sessionId];
+    if (current) {
+      window.clearTimeout(current.timerId);
+      delete controllerLeaseTimersRef.current[sessionId];
+      logControllerLeaseEvent({
+        phase: 'renew-cancelled',
+        sessionId,
+        expiresAtMs: current.targetExpiry,
+      });
+    }
+  }, []);
+
   const ensureControllerLease = useCallback(
-    async (controllerSessionId: string, authToken: string) => {
+    async (controllerSessionId: string, authToken: string, options?: { force?: boolean }) => {
       if (!controllerSessionId) {
         throw new Error('controller session id missing for lease acquisition');
       }
       const now = Date.now();
       const expiry = controllerLeaseExpiryRef.current[controllerSessionId];
-      if (expiry && expiry - now > CONTROLLER_LEASE_REFRESH_BUFFER_MS) {
-        return;
+      if (!options?.force && expiry && expiry - now > CONTROLLER_LEASE_REFRESH_BUFFER_MS) {
+        return expiry;
       }
       logControllerLeaseEvent({
         phase: 'request',
@@ -312,6 +335,7 @@ function FlowCanvasInner({
           token: authToken,
           expiresAtMs: nextExpiry,
         });
+        return nextExpiry;
       } catch (error) {
         // In dev, some manager builds return HTTP 409 (Conflict) when the DB
         // migrations for controller leases are out of date. Since pairing does
@@ -329,7 +353,7 @@ function FlowCanvasInner({
             token: authToken,
             expiresAtMs: fallbackExpiry,
           });
-          return;
+          return fallbackExpiry;
         }
         console.warn('[rewrite-2] failed to acquire controller lease', {
           controllerSessionId,
@@ -345,6 +369,159 @@ function FlowCanvasInner({
       }
     },
     [resolvedManagerUrl],
+  );
+
+  const scheduleControllerLeaseRenewal = useCallback(
+    (sessionId: string, expiresAtMs?: number | null) => {
+      if (typeof window === 'undefined') {
+        return;
+      }
+      const targetExpiry = expiresAtMs ?? Date.now() + CONTROLLER_LEASE_TTL_MS;
+      const now = Date.now();
+      const delay = Math.max(
+        CONTROLLER_LEASE_RENEW_FLOOR_MS,
+        targetExpiry - now - CONTROLLER_LEASE_REFRESH_BUFFER_MS,
+      );
+      const existing = controllerLeaseTimersRef.current[sessionId];
+      if (existing && Math.abs(existing.targetExpiry - targetExpiry) < 1_000) {
+        return;
+      }
+      if (existing) {
+        window.clearTimeout(existing.timerId);
+      }
+      logControllerLeaseEvent({
+        phase: 'renew-scheduled',
+        sessionId,
+        expiresAtMs: targetExpiry,
+        message: `delay=${delay}`,
+      });
+      const timerId = window.setTimeout(async () => {
+        clearControllerLeaseTimer(sessionId);
+        const ensureToken = async (): Promise<string | null> => {
+          const cached = latestManagerTokenRef.current;
+          if (cached && cached.trim().length > 0) {
+            return cached;
+          }
+          const refreshed = await refreshManagerToken();
+          latestManagerTokenRef.current = refreshed ?? null;
+          return refreshed;
+        };
+        const token = await ensureToken();
+        if (!token) {
+          logControllerLeaseEvent({
+            phase: 'renew-aborted',
+            sessionId,
+            message: 'manager token unavailable',
+          });
+          return;
+        }
+        logControllerLeaseEvent({
+          phase: 'renew-trigger',
+          sessionId,
+          token,
+        });
+        try {
+          const refreshedExpiry = await ensureControllerLease(sessionId, token, { force: true });
+          if (refreshedExpiry) {
+            scheduleControllerLeaseRenewal(sessionId, refreshedExpiry);
+          }
+        } catch (error) {
+          console.warn('[rewrite-2] controller lease renewal failed', {
+            sessionId,
+            error,
+          });
+          logControllerLeaseEvent({
+            phase: 'renew-error',
+            sessionId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }, delay);
+      controllerLeaseTimersRef.current[sessionId] = { timerId, targetExpiry };
+    },
+    [clearControllerLeaseTimer, ensureControllerLease, refreshManagerToken],
+  );
+
+  const ensureManagerAuthToken = useCallback(async () => {
+    const cached = latestManagerTokenRef.current;
+    if (cached && cached.trim().length > 0) {
+      return cached;
+    }
+    const refreshed = await refreshManagerToken();
+    latestManagerTokenRef.current = refreshed ?? null;
+    return refreshed;
+  }, [refreshManagerToken]);
+  const activeControllerSessionIds = useMemo(() => {
+    const sessions: string[] = [];
+    Object.values(state.tiles).forEach((tile) => {
+      if (tile.nodeType !== 'agent') {
+        return;
+      }
+      const sessionId = tile.sessionMeta?.sessionId?.trim();
+      if (sessionId) {
+        sessions.push(sessionId);
+      }
+    });
+    return sessions;
+  }, [state.tiles]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return undefined;
+    }
+    let cancelled = false;
+    const activeSet = new Set(activeControllerSessionIds);
+    Object.keys(controllerLeaseTimersRef.current).forEach((sessionId) => {
+      if (!activeSet.has(sessionId)) {
+        clearControllerLeaseTimer(sessionId);
+        delete controllerLeaseExpiryRef.current[sessionId];
+      }
+    });
+    activeControllerSessionIds.forEach((sessionId) => {
+      void (async () => {
+        const token = await ensureManagerAuthToken();
+        if (!token || cancelled) {
+          return;
+        }
+        try {
+          const expiresAt = await ensureControllerLease(sessionId, token);
+          if (cancelled) {
+            return;
+          }
+          if (expiresAt) {
+            scheduleControllerLeaseRenewal(sessionId, expiresAt);
+          }
+        } catch (error) {
+          console.warn('[rewrite-2] failed to refresh controller lease', {
+            sessionId,
+            error,
+          });
+          logControllerLeaseEvent({
+            phase: 'auto-refresh-error',
+            sessionId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      })();
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeControllerSessionIds,
+    clearControllerLeaseTimer,
+    ensureControllerLease,
+    ensureManagerAuthToken,
+    scheduleControllerLeaseRenewal,
+  ]);
+
+  useEffect(
+    () => () => {
+      Object.keys(controllerLeaseTimersRef.current).forEach((sessionId) => {
+        clearControllerLeaseTimer(sessionId);
+      });
+    },
+    [clearControllerLeaseTimer],
   );
 
   // Cache node objects: unchanged tiles keep stable references across drag frames.
@@ -522,7 +699,10 @@ function FlowCanvasInner({
             }));
             return;
           }
-          await ensureControllerLease(controllerSessionId, authToken);
+          const expiresAt = await ensureControllerLease(controllerSessionId, authToken);
+          if (expiresAt) {
+            scheduleControllerLeaseRenewal(controllerSessionId, expiresAt);
+          }
           await batchControllerAssignments(
             privateBeachId,
             [
@@ -562,6 +742,7 @@ function FlowCanvasInner({
     },
     [
       ensureControllerLease,
+      scheduleControllerLeaseRenewal,
       managerToken,
       privateBeachId,
       refreshManagerToken,
@@ -1175,7 +1356,10 @@ function FlowCanvasInner({
           return;
         }
         try {
-          await ensureControllerLease(controllerId, authToken);
+          const leaseExpiry = await ensureControllerLease(controllerId, authToken);
+          if (leaseExpiry) {
+            scheduleControllerLeaseRenewal(controllerId, leaseExpiry);
+          }
         } catch (error) {
           const message =
             error instanceof Error ? error.message : 'Controller lease acquisition failed';
@@ -1330,6 +1514,7 @@ function FlowCanvasInner({
   }, [
     managerToken,
     ensureControllerLease,
+    scheduleControllerLeaseRenewal,
     refreshManagerToken,
     privateBeachId,
     resolvedManagerUrl,

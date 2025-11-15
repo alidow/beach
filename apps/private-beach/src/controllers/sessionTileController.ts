@@ -623,15 +623,9 @@ class SessionTileController {
     const removed = [...prevTiles].filter((id) => !nextTiles.has(id));
 
     for (const removedId of removed) {
-      const handle = this.connectionHandles.get(removedId);
-      if (handle) {
-        handle();
-        this.connectionHandles.delete(removedId);
-      }
-      this.connectionStates.delete(removedId);
+      this.teardownConnectionHandle(removedId, 'layout-removed');
       this.tileSnapshots.delete(removedId);
       this.measurementSignatures.delete(removedId);
-      viewerConnectionService.disconnectTile(removedId);
       this.snapshotFetches.delete(removedId);
       this.emitTile(removedId);
     }
@@ -865,25 +859,17 @@ class SessionTileController {
     for (const [tileId, snapshot] of this.tileSnapshots) {
       const override = this.viewerStateOverrides.get(tileId) ?? null;
       if (override) {
-        const handle = this.connectionHandles.get(tileId);
-        if (handle) {
-          handle();
-          this.connectionHandles.delete(tileId);
-        }
-        this.connectionStates.delete(tileId);
+        this.teardownConnectionHandle(tileId, 'override');
         this.emitOverrideConnectionTelemetry(tileId, snapshot.session ?? this.sessions.get(tileId) ?? null, override);
-        viewerConnectionService.disconnectTile(tileId);
         continue;
       }
       const session = snapshot.session ?? this.sessions.get(tileId) ?? null;
       if (!session) {
-        viewerConnectionService.disconnectTile(tileId);
-        this.connectionStates.delete(tileId);
+        this.teardownConnectionHandle(tileId, 'no-session');
         continue;
       }
       if (!this.managerUrl || this.managerUrl.length === 0) {
-        viewerConnectionService.disconnectTile(tileId);
-        this.connectionStates.delete(tileId);
+        this.teardownConnectionHandle(tileId, 'no-manager-url');
         continue;
       }
       const connectionState = this.prepareConnectionState(tileId, session.session_id, session.private_beach_id ?? this.privateBeachId);
@@ -896,6 +882,7 @@ class SessionTileController {
       ) {
         continue;
       }
+      this.teardownConnectionHandle(tileId, 'state-change');
       const authToken = this.viewerToken ?? this.managerToken;
       this.scheduleSnapshotFetch(tileId, session.session_id);
       const handle = viewerConnectionService.connectTile(
@@ -912,6 +899,26 @@ class SessionTileController {
       this.connectionHandles.set(tileId, handle);
       this.connectionStates.set(tileId, connectionState);
     }
+  }
+
+  private teardownConnectionHandle(tileId: string, reason: string) {
+    const handle = this.connectionHandles.get(tileId);
+    const hasState = this.connectionStates.has(tileId);
+    if (!handle && !hasState) {
+      return;
+    }
+    if (handle) {
+      try {
+        handle();
+      } catch (error) {
+        console.warn('[tile-controller] disconnect handle error', { tileId, reason, error });
+        viewerConnectionService.disconnectTile(tileId);
+      }
+    } else {
+      viewerConnectionService.disconnectTile(tileId);
+    }
+    this.connectionHandles.delete(tileId);
+    this.connectionStates.delete(tileId);
   }
 
   private emitOverrideConnectionTelemetry(

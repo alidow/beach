@@ -50,6 +50,8 @@ DEFAULT_SERVE_INTERVAL = 3.0
 DEFAULT_MAX_STEP = 2.5
 DEFAULT_MIN_THRESHOLD = 0.4
 DEFAULT_COMMAND_INTERVAL = 0.08
+DEFAULT_FALLBACK_POLL_INTERVAL = 1.0
+ACTION_SUMMARY_INTERVAL = 5.0
 
 PADDLE_GLYPHS = frozenset(
     {
@@ -69,7 +71,15 @@ PADDLE_GLYPHS = frozenset(
 BALL_GLYPHS = frozenset({"o", ".", "*", "\u25cf"})  # supports ● plus ascii fallbacks
 # Controller-IO readiness states. Do not treat the state stream alone as ready,
 # since rendering readiness does not guarantee controller delivery is wired.
-TRANSPORT_READY_STATES = frozenset({"fast_path", "http_fallback", "http_poller"})
+TRANSPORT_READY_STATES = frozenset(
+    {
+        "fast_path",
+        "http_fallback",
+        "http_poller",
+        "transport",
+        "controller",
+    }
+)
 
 
 def normalize_transport_status(value: Optional[str]) -> str:
@@ -856,6 +866,15 @@ class CommandDispatchResult:
     detail: Optional[str] = None
 
 
+@dataclass
+class ActionSummary:
+    total: int = 0
+    per_command: Dict[str, int] = field(default_factory=dict)
+    per_status: Dict[str, int] = field(default_factory=dict)
+    transports: Set[str] = field(default_factory=set)
+    last_trace: Optional[str] = None
+
+
 class MCPClient:
     """Thin MCP client that can queue actions over HTTP and/or a local sink."""
 
@@ -1378,22 +1397,44 @@ class CommandScheduler:
             return
         if now - self._last_wait_log < self.wait_log_interval:
             return
+        summary = self._format_missing_summary(self._missing_reasons)
         self._log(
-            f"waiting for players ({self._format_missing_summary(self._missing_reasons)}) before sending commands",
+            f"waiting for players ({summary}) before sending commands",
             level="info",
         )
         self._last_wait_log = now
 
     def _readiness_blocker(self, session: SessionState, now: float) -> Optional[str]:
         if not session.lease_active:
-            return "lease"
+            reason = "lease"
+            self._log(
+                f"readiness blocked for {session.side or session.session_id}: {reason}",
+                level="debug",
+            )
+            return reason
         if not session.transport_ready:
             label = session.transport_status or "transport"
-            return f"transport:{label}"
+            reason = f"transport:{label}"
+            self._log(
+                f"readiness blocked for {session.side or session.session_id}: {reason}",
+                level="debug",
+            )
+            return reason
+        # For the Pong showcase, once a controller lease is active and the
+        # manager-side transport is ready, consider the player "ready" even
+        # if state snapshots are still sparse or slightly stale. We continue
+        # to log state-related issues for observability, but they do not
+        # block command dispatch.
         if session.height <= 0:
-            return "state"
-        if now - session.last_update > self.readiness_timeout:
-            return "stale"
+            self._log(
+                f"soft readiness warning for {session.side or session.session_id}: state",
+                level="debug",
+            )
+        elif now - session.last_update > self.readiness_timeout:
+            self._log(
+                f"soft readiness warning for {session.side or session.session_id}: stale",
+                level="debug",
+            )
         return None
 
     def _format_missing_summary(self, reasons: Dict[str, str]) -> str:
@@ -1471,6 +1512,8 @@ class AgentApp:
             self.log,
             enabled=self.safe_mode,
         )
+        self._action_summaries: Dict[str, ActionSummary] = {}
+        self._next_action_summary_emit = 0.0
 
     # ------------------------------------------------------------------ Logging
     def log(self, message: str, level: str = "info") -> None:
@@ -1496,6 +1539,8 @@ class AgentApp:
             trace_value = event.get("trace_id")
             if isinstance(trace_value, str) and trace_value.strip():
                 trace_note = f" trace={trace_value.strip()}"
+            if not self._record_action_event(event):
+                return
             self.log(
                 f"[{status}] {session_id} via {transport}: {command}{trace_note}",
                 level="action",
@@ -1503,6 +1548,79 @@ class AgentApp:
         else:
             message = event.get("message", "")
             self.log(str(message), level=level)
+
+    def _record_action_event(self, event: Dict[str, object]) -> bool:
+        command_raw = event.get("command")
+        command = str(command_raw or "").strip()
+        tokens = command.split()
+        command_name = tokens[0].lower() if tokens else ""
+        status = str(event.get("status") or "")
+        transport = event.get("transport")
+        session_id_raw = event.get("session_id")
+        session_id = str(session_id_raw or "?")
+        success = status in {"queued", "recorded"}
+        autopilot_command = (
+            self.autopilot_enabled and command_name in {"m", "b"}
+        )
+        if not (autopilot_command and success):
+            self._flush_action_summaries(force=True)
+            return True
+
+        summary = self._action_summaries.setdefault(session_id, ActionSummary())
+        summary.total += 1
+        if command_name:
+            summary.per_command[command_name] = summary.per_command.get(command_name, 0) + 1
+        if status:
+            summary.per_status[status] = summary.per_status.get(status, 0) + 1
+        if isinstance(transport, str) and transport:
+            summary.transports.add(transport)
+        trace_value = event.get("trace_id")
+        if isinstance(trace_value, str) and trace_value.strip():
+            summary.last_trace = trace_value.strip()
+        if self._next_action_summary_emit <= 0.0:
+            self._next_action_summary_emit = time.monotonic() + ACTION_SUMMARY_INTERVAL
+        self._flush_action_summaries()
+        return False
+
+    def _flush_action_summaries(
+        self,
+        now: Optional[float] = None,
+        *,
+        force: bool = False,
+    ) -> None:
+        if not self._action_summaries:
+            if force:
+                self._next_action_summary_emit = 0.0
+            return
+        if now is None:
+            now = time.monotonic()
+        if not force:
+            if self._next_action_summary_emit <= 0.0 or now < self._next_action_summary_emit:
+                return
+        for session_id, summary in sorted(self._action_summaries.items()):
+            if summary.total <= 0:
+                continue
+            label = self.session_roles.get(session_id) or session_id
+            label_desc = f"{label} ({session_id})" if label != session_id else session_id
+            command_bits = ", ".join(
+                f"{name}:{count}" for name, count in sorted(summary.per_command.items())
+            )
+            status_bits = ", ".join(
+                f"{name}:{count}" for name, count in sorted(summary.per_status.items())
+            )
+            if not command_bits:
+                command_bits = "none"
+            if not status_bits:
+                status_bits = "unknown"
+            transport_desc = "/".join(sorted(summary.transports)) if summary.transports else "n/a"
+            trace_note = f" trace={summary.last_trace}" if summary.last_trace else ""
+            self.log(
+                f"autopilot sent {summary.total} commands -> {label_desc} via {transport_desc} "
+                f"[commands: {command_bits}; status: {status_bits}]{trace_note}",
+                level="info",
+            )
+        self._action_summaries.clear()
+        self._next_action_summary_emit = 0.0
 
     # ----------------------------------------------------------- Prompt/Bridges
     def _normalize_bridges(
@@ -1620,12 +1738,14 @@ class AgentApp:
         while self.running:
             now = time.monotonic()
             self._drain_incoming(now)
+            self._flush_action_summaries(now)
             if self.autopilot_enabled:
                 self._autopilot_tick(now)
             if not self.headless:
                 self._draw(now)
                 self._handle_keys()
             time.sleep(0.03)
+        self._flush_action_summaries(force=True)
         self.mcp.close()
 
     # ---------------------------------------------------------- Event handling
@@ -2609,7 +2729,10 @@ def main() -> int:
         if isinstance(poll_freq, (int, float)) and poll_freq > 0:
             start_or_update_poller(child_session_id, float(poll_freq))
         else:
-            stop_state_poller(child_session_id)
+            # No explicit pollFrequency configured in layout; start a small
+            # fallback poller so readiness can progress without actions yet.
+            start_or_update_poller(child_session_id, float(DEFAULT_FALLBACK_POLL_INTERVAL))
+            diff_queue.put(("info", f"poller started (fallback) for {child_session_id}"))
         if action != "removed":
             start_state_stream(child_session_id, session_role_map.get(child_session_id))
             ensure_child_lease(child_session_id, session_role_map.get(child_session_id))
@@ -2624,6 +2747,9 @@ def main() -> int:
             transport_status = status_payload.get("transport")
         if action == "removed":
             transport_status = "detached"
+        # If a real controller transport is confirmed, stop the fallback poller.
+        if transport_status in {"fast_path", "http_fallback"}:
+            stop_state_poller(child_session_id)
         publish_transport_status(
             child_session_id, transport_status or "pending", action=action
         )
@@ -2661,6 +2787,10 @@ def main() -> int:
             for session_id in new_children:
                 start_state_stream(session_id, session_role_map.get(session_id))
                 ensure_child_lease(session_id, session_role_map.get(session_id), force=True)
+                # Proactively start a fallback poller so readiness can progress
+                # even before pairing events arrive or a fast-path is confirmed.
+                start_or_update_poller(session_id, float(DEFAULT_FALLBACK_POLL_INTERVAL))
+                diff_queue.put(("info", f"poller started (fallback) for {session_id} (autopair)"))
             for session_id in sorted(new_children - previous_children):
                 try:
                     snapshot = manager_client.fetch_state_snapshot(session_id)

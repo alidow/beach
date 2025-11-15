@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { viewerConnectionService } from '../../../private-beach/src/controllers/viewerConnectionService';
+import { logConnectionEvent } from '@/features/logging/beachConnectionLogger';
 import { recordTraceLog } from '@/features/trace/traceLogStore';
 import type {
   SessionCredentialOverride,
@@ -49,6 +50,8 @@ export function useSessionConnection({
 }: UseSessionConnectionParams) {
   const [viewer, setViewer] = useState<TerminalViewerState>(IDLE_VIEWER_STATE);
   const lastLogKeyRef = useRef<string | null>(null);
+  const lastViewerStatusRef = useRef<TerminalViewerStatus>('idle');
+  const connectedAtRef = useRef<number | null>(null);
 
   const overrideSignature = useMemo(() => {
     if (!credentialOverride) {
@@ -65,10 +68,17 @@ export function useSessionConnection({
   const traceId = normalizedTraceId && normalizedTraceId.length > 0 ? normalizedTraceId : null;
 
   useEffect(() => {
+    connectedAtRef.current = null;
+    lastViewerStatusRef.current = 'idle';
+  }, [sessionId]);
+
+  useEffect(() => {
     let disconnect: (() => void) | null = null;
 
     if (!sessionId || !managerUrl || !authToken) {
       setViewer(IDLE_VIEWER_STATE);
+      connectedAtRef.current = null;
+      lastViewerStatusRef.current = 'idle';
     } else {
       disconnect = viewerConnectionService.connectTile(
         tileId,
@@ -81,6 +91,74 @@ export function useSessionConnection({
           traceId,
         },
         (snapshot) => {
+          if (sessionId) {
+            const logContext = {
+              tileId,
+              sessionId,
+              privateBeachId: privateBeachId ?? null,
+              managerUrl: managerUrl ?? null,
+            };
+            const previousStatus = lastViewerStatusRef.current;
+            if (previousStatus === 'connected' && snapshot.status !== 'connected') {
+              const duration = connectedAtRef.current ? Math.max(0, Date.now() - connectedAtRef.current) : null;
+              connectedAtRef.current = null;
+              logConnectionEvent(
+                'fast-path:disconnect',
+                logContext,
+                {
+                  durationMs: duration,
+                  nextStatus: snapshot.status,
+                  reason: snapshot.error ?? null,
+                },
+                'warn',
+              );
+            }
+            if (snapshot.status !== previousStatus) {
+              switch (snapshot.status) {
+                case 'connecting':
+                  logConnectionEvent('fast-path:attempt', logContext, {
+                    reconnect: previousStatus === 'reconnecting' || previousStatus === 'error',
+                  });
+                  break;
+                case 'connected':
+                  connectedAtRef.current = Date.now();
+                  logConnectionEvent(
+                    previousStatus === 'reconnecting' ? 'fast-path:reconnect-success' : 'fast-path:success',
+                    logContext,
+                    {
+                      latencyMs: snapshot.latencyMs ?? null,
+                      secureMode: snapshot.secureSummary?.mode ?? null,
+                    },
+                  );
+                  break;
+                case 'reconnecting':
+                  logConnectionEvent(
+                    'fast-path:reconnect-start',
+                    logContext,
+                    { reason: snapshot.error ?? null },
+                    'warn',
+                  );
+                  break;
+                case 'error':
+                  logConnectionEvent(
+                    previousStatus === 'reconnecting' ? 'fast-path:reconnect-error' : 'fast-path:error',
+                    logContext,
+                    { error: snapshot.error ?? null },
+                    'error',
+                  );
+                  break;
+                case 'idle':
+                  logConnectionEvent('fast-path:idle', logContext);
+                  break;
+                default:
+                  break;
+              }
+              lastViewerStatusRef.current = snapshot.status;
+            }
+          } else {
+            connectedAtRef.current = null;
+            lastViewerStatusRef.current = snapshot.status;
+          }
           if (typeof window !== 'undefined') {
             const traceEnabled = isTerminalTraceEnabled();
             if (!traceEnabled && !traceId) {

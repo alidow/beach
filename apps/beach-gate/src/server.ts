@@ -1,6 +1,6 @@
 import { createHmac, type JsonWebKey } from 'node:crypto';
 import Fastify, { FastifyInstance, FastifyReply, FastifyRequest, FastifyServerOptions } from 'fastify';
-import { BeachGateConfig, TurnConfig, type SigningKeyMaterial } from './config.js';
+import { BeachGateConfig, TurnConfig, type SigningKeyMaterial, persistSigningKid } from './config.js';
 import { ClerkClient, createClerkClient } from './clerk.js';
 import { EntitlementStore } from './entitlements.js';
 import { RefreshTokenStore } from './refresh-store.js';
@@ -50,8 +50,14 @@ export async function buildServer(deps: ServerDependencies): Promise<FastifyInst
   const refreshTokens = deps.refreshTokens ?? new RefreshTokenStore(config.refreshTokenTtlSeconds);
   const tokens = deps.tokens ?? new TokenService(config);
   const jwksResponse = buildJwksResponse(config.signingKey);
+  fastify.log.info({ kid: config.signingKey.kid }, 'beach-gate signing key ready');
+  persistSigningKid(config.signingKey.kid, config.signingKidPath);
 
   fastify.get('/healthz', async () => ({ status: 'ok' }));
+  fastify.get('/signing-key', async (_request, reply) => {
+    reply.header('cache-control', 'public, max-age=60');
+    return { kid: config.signingKey.kid };
+  });
   fastify.get('/.well-known/jwks.json', async (_request, reply) => {
     reply.header('cache-control', 'public, max-age=60');
     return jwksResponse;

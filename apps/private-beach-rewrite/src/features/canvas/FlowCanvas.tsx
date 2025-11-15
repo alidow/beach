@@ -66,7 +66,7 @@ function FlowCanvasInner({
   const dragSnapshotRef = useRef<DragSnapshot | null>(null);
   const { screenToFlowPosition } = useReactFlow();
   const memoizedNodeTypes = useMemo(() => nodeTypes, []);
-  const state = useTileState();
+  const tileState = useTileState();
   const {
     setTilePosition,
     setTilePositionImmediate,
@@ -80,9 +80,9 @@ function FlowCanvasInner({
   const resolvedManagerUrl = useMemo(() => buildManagerUrl(managerUrl), [managerUrl]);
 
   const nodes = useMemo<Node[]>(() => {
-    const result = state.order
+    const result = tileState.order
       .map((tileId, index) => {
-        const tile = state.tiles[tileId];
+        const tile = tileState.tiles[tileId];
         if (!tile) return null;
         return {
           id: tile.id,
@@ -90,8 +90,8 @@ function FlowCanvasInner({
           data: {
             tile,
             orderIndex: index,
-            isActive: state.activeId === tile.id,
-            isResizing: Boolean(state.resizing[tile.id]),
+            isActive: tileState.activeId === tile.id,
+            isResizing: Boolean(tileState.resizing[tile.id]),
             privateBeachId,
             managerUrl: resolvedManagerUrl,
             rewriteEnabled,
@@ -109,13 +109,13 @@ function FlowCanvasInner({
       })
       .filter((node) => node !== null) as Node[];
     return result;
-  }, [privateBeachId, resolvedManagerUrl, rewriteEnabled, state]);
+  }, [privateBeachId, resolvedManagerUrl, rewriteEnabled, tileState]);
 
   const handleNodesChange = useCallback(
     (changes: NodeChange[]) => {
       changes.forEach((change) => {
         if (change.type === 'position' && change.position) {
-          const tile = state.tiles[change.id];
+          const tile = tileState.tiles[change.id];
           if (!tile) return;
           if (change.dragging) {
             setTilePositionImmediate(change.id, change.position);
@@ -129,7 +129,7 @@ function FlowCanvasInner({
           return;
         }
         if (change.type === 'dimensions' && change.dimensions) {
-          const tile = state.tiles[change.id];
+          const tile = tileState.tiles[change.id];
           if (!tile) return;
           const snapped = snapSize({
             width: change.dimensions.width ?? tile.size.width,
@@ -145,12 +145,12 @@ function FlowCanvasInner({
         }
       });
     },
-    [gridSize, resizeTile, setTilePosition, setTilePositionImmediate, state.tiles],
+    [gridSize, resizeTile, setTilePosition, setTilePositionImmediate, tileState.tiles],
   );
 
   const handleNodeDragStart: NodeDragHandler = useCallback(
     (_event, node) => {
-      const tile = state.tiles[node.id];
+      const tile = tileState.tiles[node.id];
       if (!tile) return;
       bringToFront(node.id);
       setActiveTile(node.id);
@@ -167,12 +167,12 @@ function FlowCanvasInner({
         rewriteEnabled,
       });
     },
-    [bringToFront, privateBeachId, rewriteEnabled, setActiveTile, state.tiles],
+    [bringToFront, privateBeachId, rewriteEnabled, setActiveTile, tileState.tiles],
   );
 
   const handleNodeDragStop: NodeDragHandler = useCallback(
     (_event, node) => {
-      const tile = state.tiles[node.id];
+      const tile = tileState.tiles[node.id];
       const snapshot = dragSnapshotRef.current;
       dragSnapshotRef.current = null;
       if (!tile || !snapshot || snapshot.tileId !== node.id) {
@@ -218,7 +218,7 @@ function FlowCanvasInner({
         rewriteEnabled,
       });
     },
-    [gridSize, onTileMove, privateBeachId, reportTileMove, rewriteEnabled, state.tiles],
+    [gridSize, onTileMove, privateBeachId, reportTileMove, rewriteEnabled, tileState.tiles],
   );
   const handleDrop = useCallback(
     (event: DragEvent) => {

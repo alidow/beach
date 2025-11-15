@@ -9,6 +9,7 @@ use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::RwLock;
+use tracing::{info, warn};
 
 #[derive(Clone, Debug)]
 pub struct AuthConfig {
@@ -191,6 +192,7 @@ impl AuthContext {
             }
         }
 
+        warn!(jwks_url = %jwks_url, kid = %kid, "jwks missing requested kid");
         Err(AuthError::UnknownKey(kid.to_string()))
     }
 
@@ -248,6 +250,7 @@ impl AuthContext {
         if keys.is_empty() {
             return Err(AuthError::JwksFetch("no usable keys returned".into()));
         }
+        info!(jwks_url = %url, key_count = keys.len(), "jwks refreshed");
         Ok(JwksCache {
             keys,
             fetched_at: Instant::now(),

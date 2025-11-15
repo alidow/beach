@@ -1,4 +1,5 @@
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, KeyObject } from 'node:crypto';
 
 export interface SigningKeyMaterial {
@@ -33,6 +34,7 @@ export interface BeachGateConfig {
   host: string;
   issuer: string;
   serviceAudience: string;
+  signingKidPath?: string;
   clerkIssuerUrl?: string;
   clerkClientId?: string;
   clerkClientSecret?: string;
@@ -149,6 +151,7 @@ export function loadConfig(env = process.env): BeachGateConfig {
   const host = env.BEACH_GATE_HOST ?? '0.0.0.0';
   const issuer = env.BEACH_GATE_TOKEN_ISSUER ?? 'beach-gate';
   const serviceAudience = env.BEACH_GATE_SERVICE_AUDIENCE ?? 'beach-services';
+  const signingKidPath = env.BEACH_GATE_SIGNING_KID_PATH;
 
   const mockClerk = env.CLERK_MOCK === '1' || (!env.CLERK_CLIENT_ID && !env.CLERK_CLIENT_SECRET);
   const defaultEntitlements = (env.BEACH_GATE_DEFAULT_ENTITLEMENTS ?? 'rescue:fallback')
@@ -161,6 +164,7 @@ export function loadConfig(env = process.env): BeachGateConfig {
     host,
     issuer,
     serviceAudience,
+    signingKidPath,
     clerkIssuerUrl: env.CLERK_ISSUER_URL ?? env.CLERK_BASE_URL,
     clerkClientId: env.CLERK_CLIENT_ID,
     clerkClientSecret: env.CLERK_CLIENT_SECRET,
@@ -178,4 +182,17 @@ export function loadConfig(env = process.env): BeachGateConfig {
   };
 
   return config;
+}
+
+export function persistSigningKid(kid: string, path?: string) {
+  if (!path) {
+    return;
+  }
+  try {
+    const dir = dirname(path);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path, kid, { encoding: 'utf8' });
+  } catch (error) {
+    console.warn(`[beach-gate] failed to write signing kid to ${path}: ${(error as Error).message}`);
+  }
 }

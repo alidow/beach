@@ -30,7 +30,7 @@ use crate::{
 use beach_buggy::{
     AckStatus, ActionAck, ActionCommand, CellStylePayload, CursorPosition, HarnessType,
     HealthHeartbeat, RegisterSessionRequest, RegisterSessionResponse, StateDiff, StyleDefinition,
-    StyledCell, TerminalFrame,
+    StyledCell, TerminalFrame, TransportMode,
 };
 use beach_client_core::cache::terminal::packed::unpack_cell;
 use beach_client_core::protocol::{ClientFrame, CursorFrame, Update as WireUpdate};
@@ -161,6 +161,7 @@ struct SessionRecord {
     last_state: Option<StateDiff>,
     attached_at_ms: Option<i64>,
     http_ready_since_ms: Option<i64>,
+    transport_mode: TransportMode,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1181,6 +1182,17 @@ impl AppState {
         self.fallback.mark_http_ready(session_id).await;
     }
 
+    pub async fn session_transport_mode(&self, session_id: &str) -> TransportMode {
+        self.fallback
+            .transport_mode(session_id)
+            .await
+            .unwrap_or(TransportMode::FastPath)
+    }
+
+    pub async fn is_fast_path_ready(&self, session_id: &str) -> bool {
+        self.fast_path_ready(session_id).await
+    }
+
     async fn fast_path_ready(&self, session_id: &str) -> bool {
         if let Some(fps) = self.fast_paths.get(session_id).await {
             let guard = fps.actions_tx.lock().await;
@@ -1518,14 +1530,17 @@ impl AppState {
     ) -> Result<HashMap<String, serde_json::Value>, StateError> {
         let mut sessions = self.fallback.sessions.write().await;
         let idle_interval = self.idle_snapshot_interval_ms;
+        let transport_mode = req.transport_mode.unwrap_or(TransportMode::FastPath);
         let entry = sessions.entry(req.session_id.clone()).or_insert_with(|| {
             SessionRecord::new(
                 &req.session_id,
                 &req.private_beach_id,
                 &req.harness_type,
                 idle_interval,
+                transport_mode,
             )
         });
+        entry.transport_mode = transport_mode;
         entry.viewer_passcode = req.viewer_passcode.clone();
         self.ensure_controller_auto_attach_hint(entry, &req.private_beach_id)?;
         // Attach a session-scoped publish token for idle snapshots and health.
@@ -1908,6 +1923,7 @@ impl AppState {
                             private_beach_id,
                             &HarnessType::Custom,
                             self.idle_snapshot_interval_ms,
+                            TransportMode::FastPath,
                         )
                     });
                 rec.viewer_passcode = Some(code.to_string());
@@ -1979,6 +1995,7 @@ impl AppState {
                                 private_beach_id,
                                 &HarnessType::Custom,
                                 self.idle_snapshot_interval_ms,
+                                TransportMode::FastPath,
                             )
                         });
                     rec.viewer_passcode = Some(code.to_string());
@@ -2059,6 +2076,7 @@ impl AppState {
                                 private_beach_id,
                                 &HarnessType::Custom,
                                 self.idle_snapshot_interval_ms,
+                                TransportMode::FastPath,
                             )
                         });
                     rec.viewer_passcode = Some(code.to_string());
@@ -2131,6 +2149,7 @@ impl AppState {
                             private_beach_id,
                             &HarnessType::Custom,
                             self.idle_snapshot_interval_ms,
+                            TransportMode::FastPath,
                         )
                     });
                     entry.mark_attached();
@@ -3163,96 +3182,108 @@ impl AppState {
                     .build_agent_trace_context(pool, &identifiers, &actions)
                     .await;
                 let mut fast_path_error: Option<String> = None;
-                match send_actions_over_fast_path(&self.fast_paths, &session_uuid_str, &actions)
-                    .await
-                {
-                    Ok(FastPathSendOutcome::Delivered) => {
-                        let now = now_ms();
-                        self.update_pairing_transport_status(
-                            &session_uuid_str,
-                            PairingTransportStatus::fast_path(now),
-                        )
-                        .await;
+                let transport_mode = self.session_transport_mode(session_id).await;
+                let prefer_fast_path = matches!(transport_mode, TransportMode::FastPath);
+                if prefer_fast_path {
+                    match send_actions_over_fast_path(&self.fast_paths, &session_uuid_str, &actions)
+                        .await
+                    {
+                        Ok(FastPathSendOutcome::Delivered) => {
+                            let now = now_ms();
+                            self.update_pairing_transport_status(
+                                &session_uuid_str,
+                                PairingTransportStatus::fast_path(now),
+                            )
+                            .await;
 
-                        let label0 = identifiers.private_beach_id.to_string();
-                        let label1 = session_uuid_str.clone();
-                        metrics::FASTPATH_ACTIONS_SENT
-                            .with_label_values(&[label0.as_str(), label1.as_str()])
-                            .inc_by(actions.len() as u64);
+                            let label0 = identifiers.private_beach_id.to_string();
+                            let label1 = session_uuid_str.clone();
+                            metrics::FASTPATH_ACTIONS_SENT
+                                .with_label_values(&[label0.as_str(), label1.as_str()])
+                                .inc_by(actions.len() as u64);
 
-                        let mut tx = pool.begin().await?;
-                        self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
+                            let mut tx = pool.begin().await?;
+                            self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
+                                .await?;
+                            self.insert_controller_event(
+                                &mut tx,
+                                identifiers.session_id,
+                                "actions_queued",
+                                Some(lease.id),
+                                lease.controller_account_id,
+                                actor_account_id,
+                                None,
+                            )
                             .await?;
-                        self.insert_controller_event(
-                            &mut tx,
-                            identifiers.session_id,
-                            "actions_queued",
-                            Some(lease.id),
-                            lease.controller_account_id,
-                            actor_account_id,
-                            None,
-                        )
-                        .await?;
-                        tx.commit().await?;
+                            tx.commit().await?;
 
-                        debug!(
-                            target = "controller.delivery",
-                            session_id = %session_uuid,
-                            private_beach_id = %identifiers.private_beach_id,
-                            action_count = actions.len(),
-                            transport = "fast_path",
-                            "dispatched actions via fast-path"
-                        );
-
-                        self.publish(
-                            session_id,
-                            StreamEvent::ControllerEvent(ControllerEvent {
-                                id: Uuid::new_v4().to_string(),
-                                event_type: ControllerEventType::ActionsQueued,
-                                controller_token: Some(token_uuid.to_string()),
-                                timestamp_ms: now,
-                                reason: None,
-                                controller_account_id: lease
-                                    .controller_account_id
-                                    .map(|u| u.to_string()),
-                                issued_by_account_id: actor_account_id.map(|u| u.to_string()),
-                            }),
-                        )
-                        .await;
-                        if let Some((agent_sessions, payload)) = trace_context.as_ref() {
-                            Self::log_agent_bridge_payload(
-                                agent_sessions,
-                                &session_uuid,
-                                &identifiers.private_beach_id,
-                                payload,
-                                "agent_to_child",
-                                "fast_path",
+                            debug!(
+                                target = "controller.delivery",
+                                session_id = %session_uuid,
+                                private_beach_id = %identifiers.private_beach_id,
+                                action_count = actions.len(),
+                                transport = "fast_path",
+                                "dispatched actions via fast-path"
                             );
+
+                            self.publish(
+                                session_id,
+                                StreamEvent::ControllerEvent(ControllerEvent {
+                                    id: Uuid::new_v4().to_string(),
+                                    event_type: ControllerEventType::ActionsQueued,
+                                    controller_token: Some(token_uuid.to_string()),
+                                    timestamp_ms: now,
+                                    reason: None,
+                                    controller_account_id: lease
+                                        .controller_account_id
+                                        .map(|u| u.to_string()),
+                                    issued_by_account_id: actor_account_id.map(|u| u.to_string()),
+                                }),
+                            )
+                            .await;
+                            if let Some((agent_sessions, payload)) = trace_context.as_ref() {
+                                Self::log_agent_bridge_payload(
+                                    agent_sessions,
+                                    &session_uuid,
+                                    &identifiers.private_beach_id,
+                                    payload,
+                                    "agent_to_child",
+                                    "fast_path",
+                                );
+                            }
+                            return Ok(());
                         }
-                        return Ok(());
-                    }
-                    Ok(FastPathSendOutcome::SessionMissing)
-                    | Ok(FastPathSendOutcome::ChannelMissing) => {
-                        // Fast-path is either not registered for this session
-                        // or the actions channel is not yet bound. Fall back to
-                        // the HTTP/Redis path without treating this as an error;
-                        // the legacy controller delivery path remains the source
-                        // of truth.
-                    }
-                    Err(err) => {
-                        warn!(
-                            target = "fast_path",
-                            session_id = %session_uuid,
-                            error = %err,
-                            "fast-path send failed; falling back to HTTP transport"
-                        );
-                        fast_path_error = Some(err.to_string());
-                        let now = now_ms();
-                        self.update_pairing_transport_status(
-                            &session_uuid_str,
-                            PairingTransportStatus::http_fallback(now, Some(err.to_string())),
-                        )
-                        .await;
+                        Ok(FastPathSendOutcome::SessionMissing)
+                        | Ok(FastPathSendOutcome::ChannelMissing) => {
+                            let snapshot =
+                                self.fallback.session_readiness_snapshot(session_id).await;
+                            return Err(self
+                                .controller_command_rejection_with_snapshot(
+                                    &private_beach_id_str,
+                                    &session_uuid_str,
+                                    controller_token,
+                                    Some(lease.id),
+                                    actor_account_id,
+                                    ControllerCommandDropReason::FastPathNotReady,
+                                    snapshot,
+                                )
+                                .await);
+                        }
+                        Err(err) => {
+                            warn!(
+                                target = "fast_path",
+                                session_id = %session_uuid,
+                                error = %err,
+                                "fast-path send failed; falling back to HTTP transport"
+                            );
+                            fast_path_error = Some(err.to_string());
+                            let now = now_ms();
+                            self.update_pairing_transport_status(
+                                &session_uuid_str,
+                                PairingTransportStatus::http_fallback(now, Some(err.to_string())),
+                            )
+                            .await;
+                        }
                     }
                 }
 
@@ -3398,6 +3429,43 @@ impl AppState {
                     )
                     .await?;
                 if actions.is_empty() {
+                    let transport_mode = self.session_transport_mode(session_id).await;
+                    if matches!(transport_mode, TransportMode::FastPath)
+                        && self.fast_path_ready(session_id).await
+                    {
+                        match self
+                            .reclaim_stuck_actions_redis(
+                                &identifiers.private_beach_id.to_string(),
+                                &session_uuid.to_string(),
+                            )
+                            .await
+                        {
+                            Ok(reclaimed) if reclaimed > 0 => {
+                                let label0 = identifiers.private_beach_id.to_string();
+                                let label1 = session_uuid.to_string();
+                                metrics::REDIS_PENDING_RECLAIMED
+                                    .with_label_values(&[label0.as_str(), label1.as_str()])
+                                    .inc_by(reclaimed as u64);
+                                debug!(
+                                    target = "controller.delivery",
+                                    session_id = %session_uuid,
+                                    private_beach_id = %identifiers.private_beach_id,
+                                    reclaimed,
+                                    "cleared pending redis actions for fast-path session"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                warn!(
+                                    target = "controller.delivery",
+                                    session_id = %session_uuid,
+                                    private_beach_id = %identifiers.private_beach_id,
+                                    error = %err,
+                                    "failed to reclaim pending redis actions"
+                                );
+                            }
+                        }
+                    }
                     return Ok(actions);
                 }
 
@@ -4603,6 +4671,11 @@ impl InnerState {
         }
     }
 
+    async fn transport_mode(&self, session_id: &str) -> Option<TransportMode> {
+        let sessions = self.sessions.read().await;
+        sessions.get(session_id).map(|record| record.transport_mode)
+    }
+
     async fn session_readiness_snapshot(
         &self,
         session_id: &str,
@@ -4621,12 +4694,14 @@ impl InnerState {
         idle_snapshot_interval_ms: Option<u64>,
     ) {
         let mut sessions = self.sessions.write().await;
+        let requested_mode = req.transport_mode.unwrap_or(TransportMode::FastPath);
         let entry = sessions.entry(req.session_id.clone()).or_insert_with(|| {
             SessionRecord::new(
                 &req.session_id,
                 &req.private_beach_id,
                 &req.harness_type,
                 idle_snapshot_interval_ms,
+                requested_mode,
             )
         });
         entry.capabilities = req.capabilities.clone();
@@ -4635,6 +4710,7 @@ impl InnerState {
         entry.version = req.version.clone();
         entry.harness_type = req.harness_type.clone();
         entry.harness_id = harness_id.to_string();
+        entry.transport_mode = requested_mode;
         entry.controller_leases.clear();
         if let Some((token, lease)) = controller_lease {
             entry.controller_leases.insert(token, lease);
@@ -4891,6 +4967,7 @@ impl SessionRecord {
         private_beach_id: &str,
         harness_type: &HarnessType,
         idle_snapshot_interval_ms: Option<u64>,
+        transport_mode: TransportMode,
     ) -> Self {
         let harness_id = Uuid::new_v4().to_string();
         let transport_hints = default_transport_hints(session_id, idle_snapshot_interval_ms);
@@ -4915,6 +4992,7 @@ impl SessionRecord {
             last_state: None,
             attached_at_ms: None,
             http_ready_since_ms: None,
+            transport_mode,
         }
     }
 
@@ -5272,21 +5350,62 @@ fn redis_action_index_key(private_beach_id: &str, session_id: &str) -> String {
     format!("pb:{private_beach_id}:sess:{session_id}:actions:index")
 }
 
+fn parse_pending_entries(value: redis::Value) -> Vec<String> {
+    if let redis::Value::Bulk(entries) = value {
+        entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                redis::Value::Bulk(fields) if !fields.is_empty() => {
+                    if let redis::Value::Data(id_bytes) = &fields[0] {
+                        String::from_utf8(id_bytes.clone()).ok()
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn invert_action_index(value: redis::Value) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if let redis::Value::Bulk(fields) = value {
+        let mut iter = fields.into_iter();
+        while let (Some(field), Some(entry)) = (iter.next(), iter.next()) {
+            if let (redis::Value::Data(action_bytes), redis::Value::Data(id_bytes)) = (field, entry)
+            {
+                if let (Ok(action_id), Ok(entry_id)) =
+                    (String::from_utf8(action_bytes), String::from_utf8(id_bytes))
+                {
+                    map.insert(entry_id, action_id);
+                }
+            }
+        }
+    }
+    map
+}
+
 impl AppState {
     async fn register_session_memory(
         &self,
         req: RegisterSessionRequest,
     ) -> Result<RegisterSessionResponse, StateError> {
         let mut sessions = self.fallback.sessions.write().await;
+        let transport_mode = req.transport_mode.unwrap_or(TransportMode::FastPath);
         let entry = sessions.entry(req.session_id.clone()).or_insert_with(|| {
             SessionRecord::new(
                 &req.session_id,
                 &req.private_beach_id,
                 &req.harness_type,
                 self.idle_snapshot_interval_ms,
+                transport_mode,
             )
         });
 
+        entry.transport_mode = transport_mode;
         entry.capabilities = req.capabilities.clone();
         entry.location_hint = req.location_hint.clone();
         entry.metadata = req.metadata.clone();
@@ -6492,6 +6611,64 @@ impl AppState {
                 .unwrap_or(());
         }
         Ok(())
+    }
+
+    async fn reclaim_stuck_actions_redis(
+        &self,
+        private_beach_id: &str,
+        session_id: &str,
+    ) -> Result<usize, StateError> {
+        if let Some(client) = &self.redis {
+            let mut conn = client.get_async_connection().await?;
+            let key = redis_actions_key(private_beach_id, session_id);
+            let pending_value = redis::cmd("XPENDING")
+                .arg(&key)
+                .arg(REDIS_ACTION_GROUP)
+                .arg("-")
+                .arg("+")
+                .arg(REDIS_ACTION_STREAM_MAXLEN as i64)
+                .query_async::<_, redis::Value>(&mut conn)
+                .await
+                .unwrap_or(redis::Value::Nil);
+            let entries = parse_pending_entries(pending_value);
+            if entries.is_empty() {
+                return Ok(0);
+            }
+            let index_key = redis_action_index_key(private_beach_id, session_id);
+            let index_map = redis::cmd("HGETALL")
+                .arg(&index_key)
+                .query_async::<_, redis::Value>(&mut conn)
+                .await
+                .unwrap_or(redis::Value::Nil);
+            let entry_to_action = invert_action_index(index_map);
+            let mut reclaimed = 0usize;
+            for entry in entries {
+                let _: i64 = redis::cmd("XACK")
+                    .arg(&key)
+                    .arg(REDIS_ACTION_GROUP)
+                    .arg(&entry)
+                    .query_async(&mut conn)
+                    .await
+                    .unwrap_or(0);
+                let _: i64 = redis::cmd("XDEL")
+                    .arg(&key)
+                    .arg(&entry)
+                    .query_async(&mut conn)
+                    .await
+                    .unwrap_or(0);
+                if let Some(action_id) = entry_to_action.get(&entry) {
+                    let _: i64 = redis::cmd("HDEL")
+                        .arg(&index_key)
+                        .arg(action_id)
+                        .query_async(&mut conn)
+                        .await
+                        .unwrap_or(0);
+                }
+                reclaimed += 1;
+            }
+            return Ok(reclaimed);
+        }
+        Ok(0)
     }
 }
 
@@ -8753,6 +8930,7 @@ mod tests {
             metadata: None,
             version: "1.0.0".into(),
             viewer_passcode: Some("secret".into()),
+            transport_mode: Some(TransportMode::FastPath),
         };
         state.register_session(register).await.unwrap();
 
@@ -8822,6 +9000,7 @@ mod tests {
             metadata: None,
             version: "1.0.0".into(),
             viewer_passcode: Some("code-123".into()),
+            transport_mode: Some(TransportMode::FastPath),
         };
         let resp = state.register_session(register).await.unwrap();
         let publish_hint = resp
@@ -9137,7 +9316,13 @@ mod tests {
 
     #[test]
     fn session_record_applies_controller_auto_attach_hint() {
-        let mut record = SessionRecord::new("sess-auto", "pb-auto", &HarnessType::Custom, None);
+        let mut record = SessionRecord::new(
+            "sess-auto",
+            "pb-auto",
+            &HarnessType::Custom,
+            None,
+            TransportMode::FastPath,
+        );
         let hint = ControllerAutoAttachHint {
             private_beach_id: "pb-auto".into(),
             attach_code: "ABC123".into(),
@@ -9233,12 +9418,66 @@ mod tests {
         }
     }
 
+    #[test_timeout::tokio_timeout_test(10)]
+    async fn fast_path_mode_rejects_when_session_missing() {
+        let state = AppState::new().with_controller_strict_gating(false);
+        let session_id = "sess-fast-path-only";
+        let token = insert_manual_session(&state, session_id, |record| {
+            record.mark_attached();
+            record.mark_http_ready();
+            record.last_health_at = Some(Instant::now());
+            record.transport_mode = TransportMode::FastPath;
+        })
+        .await;
+
+        let err = state
+            .queue_actions(session_id, &token, vec![new_action("cmd-fast")], None)
+            .await
+            .expect_err("fast-path sessions should reject when channel missing");
+
+        match err {
+            StateError::ControllerCommandRejected { reason } => {
+                assert_eq!(reason, ControllerCommandDropReason::FastPathNotReady);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test_timeout::tokio_timeout_test(10)]
+    async fn http_fallback_mode_enqueues_actions() {
+        let state = AppState::new().with_controller_strict_gating(false);
+        let session_id = "sess-http-fallback";
+        let token = insert_manual_session(&state, session_id, |record| {
+            record.mark_attached();
+            record.mark_http_ready();
+            record.transport_mode = TransportMode::HttpFallback;
+        })
+        .await;
+
+        state
+            .queue_actions(session_id, &token, vec![new_action("cmd-http")], None)
+            .await
+            .expect("http fallback mode should enqueue actions");
+
+        let sessions = state.fallback.sessions.read().await;
+        let record = sessions
+            .get(session_id)
+            .expect("session stored in fallback");
+        assert_eq!(record.pending_actions.len(), 1);
+    }
+
     async fn insert_manual_session<F>(state: &AppState, session_id: &str, configure: F) -> String
     where
         F: FnOnce(&mut SessionRecord),
     {
         let mut sessions = state.fallback.sessions.write().await;
-        let mut record = SessionRecord::new(session_id, "pb-test", &HarnessType::Custom, None);
+        let mut record = SessionRecord::new(
+            session_id,
+            "pb-test",
+            &HarnessType::Custom,
+            None,
+            TransportMode::FastPath,
+        );
         let token = Uuid::new_v4().to_string();
         record.ensure_lease(
             token.clone(),

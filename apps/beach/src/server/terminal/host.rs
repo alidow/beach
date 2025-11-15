@@ -47,7 +47,7 @@ use crate::transport::{Payload, Transport, TransportError, TransportKind};
 use beach_buggy::{
     AckStatus as CtrlAckStatus, ActionAck as CtrlActionAck, ActionCommand as CtrlActionCommand,
     CellStylePayload, CursorPosition, HealthHeartbeat, HttpTransport, ManagerTransport, StateDiff,
-    StaticTokenProvider, StyleDefinition, StyledCell, TerminalFrame,
+    StaticTokenProvider, StyleDefinition, StyledCell, TerminalFrame, TransportMode,
 };
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
@@ -81,6 +81,7 @@ const IDLE_PUBLISH_TOKEN_HINT_KEY: &str = "idlePublishToken";
 const IDLE_SNAPSHOT_INTERVAL_KEY: &str = "interval_ms";
 const DEFAULT_HEALTH_REPORT_INTERVAL: Duration = Duration::from_secs(15);
 const ATTACH_WAIT_TRACE_THRESHOLD: Duration = Duration::from_millis(50);
+const FAST_PATH_PAUSE_RECHECK_MS: u64 = 200;
 
 fn trace_attach_wait_completion(session_id: &str, source: &'static str, started: Instant) {
     let elapsed = started.elapsed();
@@ -233,6 +234,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let raw_guard = RawModeGuard::new(interactive);
 
     let session_handle = hosted.handle().clone();
+    let transport_hints = Arc::new(session_handle.transport_hints().clone());
     let idle_snapshot_interval = parse_idle_snapshot_hint(session_handle.transport_hints());
     let join_code = hosted.join_code().to_string();
     let transports: Arc<Mutex<Vec<Arc<SharedTransport>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -324,6 +326,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         grid.clone(),
         Arc::clone(&cursor_tracker),
         Arc::clone(&last_terminal_update),
+        transport_hints.clone(),
     ));
     idle_snapshot_controller
         .apply_hint(idle_snapshot_interval)
@@ -890,6 +893,19 @@ enum ManagerActionAuth {
     ControllerToken(String),
 }
 
+#[derive(Debug)]
+struct PendingStatus {
+    pending: usize,
+    fast_path_ready: bool,
+    transport: Option<TransportMode>,
+}
+
+impl PendingStatus {
+    fn prefers_fast_path(&self) -> bool {
+        matches!(self.transport, Some(TransportMode::FastPath)) && self.fast_path_ready
+    }
+}
+
 struct ManagerActionClient {
     http: Client,
     base_url: String,
@@ -960,16 +976,27 @@ impl ManagerActionClient {
             .map_err(|err| ManagerActionError::Decode(err.to_string()))
     }
 
-    async fn pending_actions_depth(&self, session_id: &str) -> Result<usize, ManagerActionError> {
+    async fn pending_actions_status(
+        &self,
+        session_id: &str,
+    ) -> Result<PendingStatus, ManagerActionError> {
         #[derive(serde::Deserialize)]
         struct PendingResponse {
             pending: usize,
+            #[serde(default)]
+            fast_path_ready: bool,
+            #[serde(default)]
+            transport: Option<TransportMode>,
         }
         let url = format!("{}/sessions/{session_id}/actions/pending", self.base_url);
         let resp = self.send(self.apply_auth(self.http.get(url))).await?;
         resp.json::<PendingResponse>()
             .await
-            .map(|body| body.pending)
+            .map(|body| PendingStatus {
+                pending: body.pending,
+                fast_path_ready: body.fast_path_ready,
+                transport: body.transport,
+            })
             .map_err(|err| ManagerActionError::Decode(err.to_string()))
     }
 
@@ -1455,33 +1482,48 @@ fn spawn_action_consumer(
                 ControllerTransportState::FastPathPreferred
             );
             if fast_path_active {
-                if paused_for_fast_path {
-                    if transport_state.changed().await.is_err() {
-                        break;
-                    }
-                    continue;
-                }
-                match client.pending_actions_depth(&session_for_actions).await {
-                    Ok(0) => {
-                        debug!(
-                            target = "controller.actions.fast_path",
-                            session_id = %session_for_actions,
-                            pending = 0,
-                            "http action poller paused (fast path active)"
-                        );
-                        paused_for_fast_path = true;
-                        if transport_state.changed().await.is_err() {
-                            break;
+                match client.pending_actions_status(&session_for_actions).await {
+                    Ok(status) => {
+                        let should_pause = status.pending == 0 && status.prefers_fast_path();
+                        if should_pause {
+                            if !paused_for_fast_path {
+                                debug!(
+                                    target = "controller.actions.fast_path",
+                                    session_id = %session_for_actions,
+                                    "http action poller paused (fast path active)"
+                                );
+                            }
+                            paused_for_fast_path = true;
+                            let state_change = transport_state.changed();
+                            let recheck = sleep(Duration::from_millis(FAST_PATH_PAUSE_RECHECK_MS));
+                            tokio::pin!(state_change);
+                            tokio::pin!(recheck);
+                            tokio::select! {
+                                changed = &mut state_change => {
+                                    if changed.is_err() {
+                                        break;
+                                    }
+                                }
+                                _ = &mut recheck => {}
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    Ok(pending) => {
-                        trace!(
-                            target = "controller.actions.fast_path",
-                            session_id = %session_for_actions,
-                            pending,
-                            "pending controller actions remain on HTTP queue; continuing poller"
-                        );
+                        if paused_for_fast_path {
+                            debug!(
+                                target = "controller.actions.fast_path",
+                                session_id = %session_for_actions,
+                                "http action poller resumed (manager requires HTTP fallback)"
+                            );
+                            paused_for_fast_path = false;
+                        }
+                        if status.pending > 0 {
+                            trace!(
+                                target = "controller.actions.fast_path",
+                                session_id = %session_for_actions,
+                                pending = status.pending,
+                                "pending controller actions remain on HTTP queue; continuing poller"
+                            );
+                        }
                     }
                     Err(err) => {
                         warn!(
@@ -1743,7 +1785,7 @@ fn capture_terminal_frame(
     }
 }
 
-fn spawn_idle_snapshot_worker(
+async fn spawn_idle_snapshot_worker(
     interval: Duration,
     token: String,
     base_url: String,
@@ -1751,6 +1793,7 @@ fn spawn_idle_snapshot_worker(
     grid: Arc<TerminalGrid>,
     cursor_tracker: Arc<Mutex<Option<CursorState>>>,
     last_terminal_update: Arc<AtomicU64>,
+    transport_hints: Arc<HashMap<String, Value>>,
 ) -> Option<(JoinHandle<()>, oneshot::Sender<()>)> {
     if interval.is_zero() {
         return None;
@@ -1766,6 +1809,7 @@ fn spawn_idle_snapshot_worker(
             return None;
         }
     };
+    transport.apply_transport_hints(&transport_hints).await;
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let worker = IdleSnapshotWorker::new(
         interval,
@@ -1941,6 +1985,7 @@ struct IdleSnapshotController {
     last_terminal_update: Arc<AtomicU64>,
     state: Arc<AsyncMutex<IdleSnapshotControllerState>>,
     health: Arc<AsyncMutex<HealthReporterState>>,
+    transport_hints: Arc<HashMap<String, Value>>,
 }
 
 impl IdleSnapshotController {
@@ -1951,6 +1996,7 @@ impl IdleSnapshotController {
         grid: Arc<TerminalGrid>,
         cursor_tracker: Arc<Mutex<Option<CursorState>>>,
         last_terminal_update: Arc<AtomicU64>,
+        transport_hints: Arc<HashMap<String, Value>>,
     ) -> Self {
         Self {
             base_url,
@@ -1961,6 +2007,7 @@ impl IdleSnapshotController {
             last_terminal_update,
             state: Arc::new(AsyncMutex::new(IdleSnapshotControllerState::default())),
             health: Arc::new(AsyncMutex::new(HealthReporterState::default())),
+            transport_hints,
         }
     }
 
@@ -2020,7 +2067,10 @@ impl IdleSnapshotController {
                 self.grid.clone(),
                 self.cursor_tracker.clone(),
                 self.last_terminal_update.clone(),
-            ) {
+                self.transport_hints.clone(),
+            )
+            .await
+            {
                 Some((handle, cancel)) => {
                     let mut state = self.state.lock().await;
                     state.interval = Some(interval);

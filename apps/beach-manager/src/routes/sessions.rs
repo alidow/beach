@@ -483,7 +483,14 @@ pub async fn pending_actions(
         .await
         .map_err(map_state_err)?;
 
-    Ok(Json(serde_json::json!({ "pending": pending })))
+    let fast_path_ready = state.is_fast_path_ready(&session_id).await;
+    let transport = state.session_transport_mode(&session_id).await;
+
+    Ok(Json(serde_json::json!({
+        "pending": pending,
+        "fast_path_ready": fast_path_ready,
+        "transport": transport,
+    })))
 }
 
 pub async fn ack_actions(

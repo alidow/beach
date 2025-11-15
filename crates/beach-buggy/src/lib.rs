@@ -62,6 +62,8 @@ pub struct RegisterSessionRequest {
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub viewer_passcode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_mode: Option<TransportMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +96,20 @@ pub enum HarnessType {
     RemoteWidget,
     ServiceProxy,
     Custom,
+}
+
+/// Declares the preferred controller transport for a session.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportMode {
+    FastPath,
+    HttpFallback,
+}
+
+impl Default for TransportMode {
+    fn default() -> Self {
+        TransportMode::FastPath
+    }
 }
 
 /// Diff payload emitted to the manager.
@@ -347,6 +363,7 @@ pub struct HarnessConfig {
     pub location_hint: Option<String>,
     pub version: String,
     pub viewer_passcode: Option<String>,
+    pub transport_mode: TransportMode,
 }
 
 impl HarnessConfig {
@@ -363,7 +380,13 @@ impl HarnessConfig {
             metadata,
             version: self.version,
             viewer_passcode: self.viewer_passcode,
+            transport_mode: Some(self.transport_mode),
         }
+    }
+
+    pub fn with_transport_mode(mut self, mode: TransportMode) -> Self {
+        self.transport_mode = mode;
+        self
     }
 }
 
@@ -1122,9 +1145,23 @@ impl<P: TokenProvider> HttpTransport<P> {
         })
     }
 
+    pub async fn apply_transport_hints(&self, hints: &HashMap<String, serde_json::Value>) {
+        self.configure_fast_path(hints).await;
+    }
+
     async fn configure_fast_path(&self, hints: &HashMap<String, serde_json::Value>) {
         match parse_fast_path_endpoints(self.base_url(), hints) {
             Ok(Some(endpoints)) => {
+                info!(
+                    target = "fast_path",
+                    status = ?endpoints.status,
+                    offer = %endpoints.offer_url,
+                    ice = %endpoints.ice_url,
+                    actions_channel = %endpoints.channels.actions,
+                    acks_channel = %endpoints.channels.acks,
+                    state_channel = %endpoints.channels.state,
+                    "applying fast-path transport hints"
+                );
                 let client = FastPathClient::new(endpoints.clone());
                 {
                     let mut state = self.fast_path.lock().await;
@@ -1139,6 +1176,10 @@ impl<P: TokenProvider> HttpTransport<P> {
                 }
             }
             Ok(None) => {
+                info!(
+                    target = "fast_path",
+                    "manager did not advertise fast-path endpoints; reverting to HTTP"
+                );
                 self.clear_fast_path().await;
             }
             Err(err) => {
@@ -1685,6 +1726,7 @@ mod tests {
                 location_hint: Some("us-east-1".into()),
                 version: "0.1.0".into(),
                 viewer_passcode: None,
+                transport_mode: TransportMode::FastPath,
             },
             transport.clone(),
         );
@@ -1721,6 +1763,7 @@ mod tests {
                 location_hint: None,
                 version: "0.1.0".into(),
                 viewer_passcode: None,
+                transport_mode: TransportMode::FastPath,
             },
             transport.clone(),
         );
@@ -1775,6 +1818,7 @@ mod tests {
                 location_hint: None,
                 version: "0.1.0".into(),
                 viewer_passcode: None,
+                transport_mode: TransportMode::FastPath,
             },
             transport.clone(),
         );
@@ -1810,6 +1854,7 @@ mod tests {
                 location_hint: Some("eu-west-1".into()),
                 version: "0.1.0".into(),
                 viewer_passcode: None,
+                transport_mode: TransportMode::FastPath,
             },
             transport.clone(),
         );
@@ -1863,6 +1908,7 @@ mod tests {
                 location_hint: None,
                 version: "0.1.0".into(),
                 viewer_passcode: None,
+                transport_mode: TransportMode::FastPath,
             },
             transport.clone(),
         );
@@ -1998,6 +2044,7 @@ mod tests {
                 location_hint: None,
                 version: "0.1.0".into(),
                 viewer_passcode: None,
+                transport_mode: TransportMode::FastPath,
             },
             transport,
         );

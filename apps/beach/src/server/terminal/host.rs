@@ -43,7 +43,7 @@ use crate::transport::terminal::negotiation::{
     HeartbeatPublisher, NegotiatedSingle, NegotiatedTransport, SharedTransport,
     TransportSupervisor, negotiate_transport,
 };
-use crate::transport::{Payload, Transport, TransportError, TransportKind};
+use crate::transport::{Payload, Transport, TransportError, TransportId, TransportKind};
 use beach_buggy::{
     AckStatus as CtrlAckStatus, ActionAck as CtrlActionAck, ActionCommand as CtrlActionCommand,
     CellStylePayload, CursorPosition, HealthHeartbeat, HttpTransport, ManagerTransport, StateDiff,
@@ -70,18 +70,20 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep, timeout};
 use tracing::field::display;
 use tracing::{Level, debug, error, info, trace, warn};
-use transport_mod::webrtc::{OffererAcceptedTransport, OffererSupervisor};
+use transport_mod::webrtc::{OffererAcceptedTransport, OffererSupervisor, WebRtcChannels};
 
 pub(crate) const MCP_CHANNEL_LABEL: &str = "mcp-jsonrpc";
 pub(crate) const MCP_CHANNEL_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const CONTROLLER_CHANNEL_LABEL: &str = "mgr-actions";
 pub(crate) const LEGACY_CONTROLLER_CHANNEL_LABEL: &str = "pb-controller";
+pub(crate) const CONTROLLER_STATE_CHANNEL_LABEL: &str = "mgr-state";
 const IDLE_SNAPSHOT_HINT_KEY: &str = "idle_snapshot";
 const IDLE_PUBLISH_TOKEN_HINT_KEY: &str = "idlePublishToken";
 const IDLE_SNAPSHOT_INTERVAL_KEY: &str = "interval_ms";
 const DEFAULT_HEALTH_REPORT_INTERVAL: Duration = Duration::from_secs(15);
 const ATTACH_WAIT_TRACE_THRESHOLD: Duration = Duration::from_millis(50);
 const FAST_PATH_PAUSE_RECHECK_MS: u64 = 200;
+const STATE_CHANNEL_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn trace_attach_wait_completion(session_id: &str, source: &'static str, started: Instant) {
     let elapsed = started.elapsed();
@@ -203,6 +205,11 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
             "terminal host starting"
         );
     }
+    // Debug marker so we can confirm the CLI build includes recent changes.
+    info!(
+        session_id = %session_id,
+        "PONG_DEBUG_MARKER: mgr-state build active"
+    );
     info!(session_id = %session_id, "session registered");
     // Surface the advertised WebRTC offer metadata to aid role/negotiation debugging.
     for offer in hosted.offers() {
@@ -238,6 +245,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
 
     let session_handle = hosted.handle().clone();
     let transport_hints = Arc::new(AsyncRwLock::new(session_handle.transport_hints().clone()));
+    let fast_path_state_channel = Arc::new(FastPathStateChannel::new());
     let idle_snapshot_interval = parse_idle_snapshot_hint(session_handle.transport_hints());
     let join_code = hosted.join_code().to_string();
     let transports: Arc<Mutex<Vec<Arc<SharedTransport>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -367,6 +375,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         Arc::clone(&cursor_tracker),
         Arc::clone(&last_terminal_update),
         transport_hints.clone(),
+        fast_path_state_channel.clone(),
     ));
     idle_snapshot_controller
         .apply_hint(idle_snapshot_interval)
@@ -827,6 +836,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         Arc::clone(&mcp_bridges),
         first_ready_tx,
         Arc::clone(&controller_ctx),
+        fast_path_state_channel.clone(),
     );
 
     if wait_for_peer {
@@ -2012,6 +2022,48 @@ fn capture_terminal_frame(
     }
 }
 
+#[derive(Clone)]
+struct ActiveStateChannel {
+    id: TransportId,
+    transport: Arc<dyn Transport>,
+}
+
+#[derive(Clone, Default)]
+struct FastPathStateChannel {
+    inner: Arc<AsyncRwLock<Option<ActiveStateChannel>>>,
+}
+
+impl FastPathStateChannel {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(AsyncRwLock::new(None)),
+        }
+    }
+
+    async fn activate(&self, transport: Arc<dyn Transport>) {
+        let mut guard = self.inner.write().await;
+        *guard = Some(ActiveStateChannel {
+            id: transport.id(),
+            transport,
+        });
+    }
+
+    async fn current(&self) -> Option<ActiveStateChannel> {
+        self.inner.read().await.clone()
+    }
+
+    async fn deactivate_if(&self, id: TransportId) {
+        let mut guard = self.inner.write().await;
+        if guard
+            .as_ref()
+            .map(|channel| channel.id == id)
+            .unwrap_or(false)
+        {
+            *guard = None;
+        }
+    }
+}
+
 async fn spawn_idle_snapshot_worker(
     interval: Duration,
     token: String,
@@ -2021,6 +2073,7 @@ async fn spawn_idle_snapshot_worker(
     cursor_tracker: Arc<Mutex<Option<CursorState>>>,
     last_terminal_update: Arc<AtomicU64>,
     transport_hints: Arc<AsyncRwLock<HashMap<String, Value>>>,
+    fast_path_channel: Arc<FastPathStateChannel>,
 ) -> Option<(JoinHandle<()>, oneshot::Sender<()>)> {
     if interval.is_zero() {
         return None;
@@ -2044,7 +2097,11 @@ async fn spawn_idle_snapshot_worker(
         grid,
         cursor_tracker,
         last_terminal_update,
-        Arc::new(StatePublisher::new(transport, session_id)),
+        Arc::new(StatePublisher::new(
+            transport,
+            session_id,
+            fast_path_channel,
+        )),
     );
     let handle = tokio::spawn(async move {
         worker.run(cancel_rx).await;
@@ -2107,14 +2164,20 @@ struct StatePublisher {
     transport: Arc<HttpTransport<StaticTokenProvider>>,
     session_id: String,
     seq: AtomicU64,
+    fast_path_channel: Arc<FastPathStateChannel>,
 }
 
 impl StatePublisher {
-    fn new(transport: Arc<HttpTransport<StaticTokenProvider>>, session_id: String) -> Self {
+    fn new(
+        transport: Arc<HttpTransport<StaticTokenProvider>>,
+        session_id: String,
+        fast_path_channel: Arc<FastPathStateChannel>,
+    ) -> Self {
         Self {
             transport,
             session_id,
             seq: AtomicU64::new(0),
+            fast_path_channel,
         }
     }
 
@@ -2125,6 +2188,47 @@ impl StatePublisher {
             emitted_at: SystemTime::now(),
             payload,
         };
+        if self.try_fast_path(&diff).await? {
+            return Ok(());
+        }
+        self.publish_via_http(diff).await
+    }
+
+    async fn try_fast_path(&self, diff: &StateDiff) -> Result<bool, String> {
+        let Some(channel) = self.fast_path_channel.current().await else {
+            return Ok(false);
+        };
+        let envelope = serde_json::json!({
+            "type": "state",
+            "payload": diff,
+        });
+        let text =
+            serde_json::to_string(&envelope).map_err(|err| format!("encode state diff: {err}"))?;
+        match channel.transport.send_text(&text) {
+            Ok(_) => {
+                trace!(
+                    target = "controller.state.fast_path",
+                    session_id = %self.session_id,
+                    transport_id = channel.id.0,
+                    "state diff sent via fast-path"
+                );
+                Ok(true)
+            }
+            Err(err) => {
+                warn!(
+                    target = "controller.state.fast_path",
+                    session_id = %self.session_id,
+                    transport_id = channel.id.0,
+                    error = %err,
+                    "fast-path state send failed; falling back to HTTP"
+                );
+                self.fast_path_channel.deactivate_if(channel.id).await;
+                Ok(false)
+            }
+        }
+    }
+
+    async fn publish_via_http(&self, diff: StateDiff) -> Result<(), String> {
         self.transport
             .send_state(&self.session_id, diff)
             .await
@@ -2214,6 +2318,7 @@ struct IdleSnapshotController {
     state: Arc<AsyncMutex<IdleSnapshotControllerState>>,
     health: Arc<AsyncMutex<HealthReporterState>>,
     transport_hints: Arc<AsyncRwLock<HashMap<String, Value>>>,
+    fast_path_channel: Arc<FastPathStateChannel>,
 }
 
 impl IdleSnapshotController {
@@ -2225,6 +2330,7 @@ impl IdleSnapshotController {
         cursor_tracker: Arc<Mutex<Option<CursorState>>>,
         last_terminal_update: Arc<AtomicU64>,
         transport_hints: Arc<AsyncRwLock<HashMap<String, Value>>>,
+        fast_path_channel: Arc<FastPathStateChannel>,
     ) -> Self {
         Self {
             base_url,
@@ -2236,6 +2342,7 @@ impl IdleSnapshotController {
             state: Arc::new(AsyncMutex::new(IdleSnapshotControllerState::default())),
             health: Arc::new(AsyncMutex::new(HealthReporterState::default())),
             transport_hints,
+            fast_path_channel,
         }
     }
 
@@ -2309,6 +2416,7 @@ impl IdleSnapshotController {
                 self.cursor_tracker.clone(),
                 self.last_terminal_update.clone(),
                 self.transport_hints.clone(),
+                self.fast_path_channel.clone(),
             )
             .await
             {
@@ -2848,10 +2956,12 @@ fn spawn_webrtc_acceptor(
     mcp_bridges: Arc<Mutex<Vec<JoinHandle<()>>>>,
     ready_tx: Option<oneshot::Sender<()>>,
     controller_ctx_handle: Arc<ControllerActionContext>,
+    fast_path_state_channel: Arc<FastPathStateChannel>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ready_tx = ready_tx;
         let controller_ctx_clone = controller_ctx_handle;
+        let fast_path_state = fast_path_state_channel;
         loop {
             let passphrase = join_code.as_deref();
             let negotiation_started = Instant::now();
@@ -2877,6 +2987,12 @@ fn spawn_webrtc_acceptor(
                         None,
                         Some("primary transport".to_string()),
                         single_metadata.clone(),
+                    );
+                    maybe_spawn_state_channel_listener(
+                        &session_id,
+                        metadata.label.clone(),
+                        webrtc_channels.clone(),
+                        fast_path_state.clone(),
                     );
                     let hint_pending = authorizer.should_emit_pending_hint();
                     let auto_grant = authorizer.should_emit_auto_granted();
@@ -3041,6 +3157,12 @@ fn spawn_webrtc_acceptor(
                         Some("offerer supervisor".to_string()),
                         extra_metadata,
                     );
+                    maybe_spawn_state_channel_listener(
+                        &session_id,
+                        metadata.label.clone(),
+                        Some(channels.clone()),
+                        fast_path_state.clone(),
+                    );
                     let hint_pending = authorizer.should_emit_pending_hint();
                     let auto_grant = authorizer.should_emit_auto_granted();
                     if hint_pending {
@@ -3187,6 +3309,7 @@ fn spawn_webrtc_acceptor(
                         mcp_handle.clone(),
                         Arc::clone(&mcp_bridges),
                         controller_ctx_clone.clone(),
+                        fast_path_state.clone(),
                     );
                     break;
                 }
@@ -3221,6 +3344,7 @@ fn spawn_viewer_accept_loop(
     mcp_handle: Option<McpServerHandle>,
     mcp_bridges: Arc<Mutex<Vec<JoinHandle<()>>>>,
     controller_ctx: Arc<ControllerActionContext>,
+    fast_path_state_channel: Arc<FastPathStateChannel>,
 ) {
     tokio::spawn(async move {
         while let Ok(accepted) = supervisor.next().await {
@@ -3239,6 +3363,12 @@ fn spawn_viewer_accept_loop(
                 Some(handshake_id.clone()),
                 Some("viewer".to_string()),
                 extra_metadata,
+            );
+            maybe_spawn_state_channel_listener(
+                &session_id,
+                auth_metadata.label.clone(),
+                Some(channels.clone()),
+                fast_path_state_channel.clone(),
             );
             let hint_pending = authorizer.should_emit_pending_hint();
             let auto_grant = authorizer.should_emit_auto_granted();
@@ -3375,6 +3505,63 @@ fn spawn_viewer_accept_loop(
                 handshake_id = %handshake_id,
                 "viewer transport registered"
             );
+        }
+    });
+}
+
+fn maybe_spawn_state_channel_listener(
+    session_id: &str,
+    label: Option<String>,
+    channels: Option<WebRtcChannels>,
+    fast_path_state_channel: Arc<FastPathStateChannel>,
+) {
+    if !matches!(
+        label.as_deref(),
+        Some(CONTROLLER_CHANNEL_LABEL) | Some(LEGACY_CONTROLLER_CHANNEL_LABEL)
+    ) {
+        return;
+    }
+    let Some(channels) = channels else {
+        debug!(
+            target = "controller.state.fast_path",
+            session_id = %session_id,
+            "controller transport missing WebRTC channel registry"
+        );
+        return;
+    };
+    let session = session_id.to_string();
+    tokio::spawn(async move {
+        match timeout(
+            STATE_CHANNEL_WAIT_TIMEOUT,
+            channels.wait_for(CONTROLLER_STATE_CHANNEL_LABEL),
+        )
+        .await
+        {
+            Ok(Ok(channel)) => {
+                info!(
+                    target = "controller.state.fast_path",
+                    session_id = %session,
+                    transport_id = channel.id().0,
+                    "fast-path state channel established"
+                );
+                fast_path_state_channel.activate(channel).await;
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    target = "controller.state.fast_path",
+                    session_id = %session,
+                    error = %err,
+                    "failed to acquire fast-path state channel"
+                );
+            }
+            Err(_) => {
+                debug!(
+                    target = "controller.state.fast_path",
+                    session_id = %session,
+                    timeout_secs = STATE_CHANNEL_WAIT_TIMEOUT.as_secs(),
+                    "timed out waiting for fast-path state channel"
+                );
+            }
         }
     });
 }

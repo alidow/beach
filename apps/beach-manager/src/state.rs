@@ -56,6 +56,8 @@ use uuid::Uuid;
 const DEFAULT_LEASE_TTL_MS: u64 = 30_000;
 const REDIS_ACTION_STREAM_MAXLEN: usize = 2_048;
 const REDIS_TTL_SECONDS: usize = 120;
+const REDIS_PENDING_RECLAIM_MAX: usize = 64;
+const REDIS_PENDING_RECLAIM_MIN_IDLE_MS: i64 = 5_000;
 const REDIS_ACTION_GROUP: &str = "controllers";
 const REDIS_ACTION_CONSUMER_PREFIX: &str = "poller";
 const VIEWER_KEEPALIVE_INTERVAL: StdDuration = StdDuration::from_secs(20);
@@ -3184,31 +3186,10 @@ impl AppState {
                 let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
                 let private_beach_id_str = identifiers.private_beach_id.to_string();
                 let session_uuid_str = session_uuid.to_string();
-                let mut readiness_override = self
+                let readiness_override = self
                     .fallback
                     .session_readiness_snapshot(&session_uuid_str)
                     .await;
-                let needs_http_ready = readiness_override
-                    .as_ref()
-                    .map(|snapshot| snapshot.attached() && !snapshot.http_ready())
-                    .unwrap_or(false);
-                if needs_http_ready {
-                    let fast_path_ready = self.fast_path_ready(&session_uuid_str).await;
-                    if !fast_path_ready {
-                        self.mark_session_http_ready(&session_uuid_str).await;
-                        if let Some(snapshot) = readiness_override.as_mut() {
-                            snapshot.http_ready_since_ms = Some(now_ms());
-                        } else {
-                            readiness_override = self
-                                .fallback
-                                .session_readiness_snapshot(&session_uuid_str)
-                                .await;
-                            if let Some(snapshot) = readiness_override.as_mut() {
-                                snapshot.http_ready_since_ms = Some(now_ms());
-                            }
-                        }
-                    }
-                }
                 let lease = match self
                     .fetch_active_lease_for_token(pool, identifiers.session_id, token_uuid)
                     .await
@@ -3500,43 +3481,6 @@ impl AppState {
                     )
                     .await?;
                 if actions.is_empty() {
-                    let transport_mode = self.session_transport_mode(session_id).await;
-                    if matches!(transport_mode, TransportMode::FastPath)
-                        && self.fast_path_ready(session_id).await
-                    {
-                        match self
-                            .reclaim_stuck_actions_redis(
-                                &identifiers.private_beach_id.to_string(),
-                                &session_uuid.to_string(),
-                            )
-                            .await
-                        {
-                            Ok(reclaimed) if reclaimed > 0 => {
-                                let label0 = identifiers.private_beach_id.to_string();
-                                let label1 = session_uuid.to_string();
-                                metrics::REDIS_PENDING_RECLAIMED
-                                    .with_label_values(&[label0.as_str(), label1.as_str()])
-                                    .inc_by(reclaimed as u64);
-                                debug!(
-                                    target = "controller.delivery",
-                                    session_id = %session_uuid,
-                                    private_beach_id = %identifiers.private_beach_id,
-                                    reclaimed,
-                                    "cleared pending redis actions for fast-path session"
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(err) => {
-                                warn!(
-                                    target = "controller.delivery",
-                                    session_id = %session_uuid,
-                                    private_beach_id = %identifiers.private_beach_id,
-                                    error = %err,
-                                    "failed to reclaim pending redis actions"
-                                );
-                            }
-                        }
-                    }
                     return Ok(actions);
                 }
 
@@ -4580,29 +4524,40 @@ fn parse_redis_action_stream(value: redis::Value) -> Result<Vec<ActionCommand>, 
         let mut idx = 0;
         while idx + 1 < streams.len() {
             if let redis::Value::Bulk(entries) = &streams[idx + 1] {
-                for entry in entries {
-                    if let redis::Value::Bulk(entry_parts) = entry {
-                        if entry_parts.len() < 2 {
-                            continue;
-                        }
-                        if let redis::Value::Bulk(fields) = &entry_parts[1] {
-                            let mut field_idx = 0;
-                            while field_idx + 1 < fields.len() {
-                                let field_name =
-                                    redis::from_redis_value::<String>(&fields[field_idx])?;
-                                if field_name == "payload" {
-                                    let payload_str: String =
-                                        redis::from_redis_value(&fields[field_idx + 1])?;
-                                    let action: ActionCommand = serde_json::from_str(&payload_str)?;
-                                    actions.push(action);
-                                }
-                                field_idx += 2;
-                            }
-                        }
-                    }
-                }
+                actions.extend(decode_action_entries(entries)?);
             }
             idx += 2;
+        }
+    }
+    Ok(actions)
+}
+
+fn parse_redis_action_entries(value: redis::Value) -> Result<Vec<ActionCommand>, StateError> {
+    if let redis::Value::Bulk(entries) = value {
+        return decode_action_entries(&entries);
+    }
+    Ok(Vec::new())
+}
+
+fn decode_action_entries(entries: &[redis::Value]) -> Result<Vec<ActionCommand>, StateError> {
+    let mut actions = Vec::new();
+    for entry in entries {
+        if let redis::Value::Bulk(entry_parts) = entry {
+            if entry_parts.len() < 2 {
+                continue;
+            }
+            if let redis::Value::Bulk(fields) = &entry_parts[1] {
+                let mut field_idx = 0;
+                while field_idx + 1 < fields.len() {
+                    let field_name = redis::from_redis_value::<String>(&fields[field_idx])?;
+                    if field_name == "payload" {
+                        let payload_str: String = redis::from_redis_value(&fields[field_idx + 1])?;
+                        let action: ActionCommand = serde_json::from_str(&payload_str)?;
+                        actions.push(action);
+                    }
+                    field_idx += 2;
+                }
+            }
         }
     }
     Ok(actions)
@@ -5439,24 +5394,6 @@ fn parse_pending_entries(value: redis::Value) -> Vec<String> {
     } else {
         Vec::new()
     }
-}
-
-fn invert_action_index(value: redis::Value) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    if let redis::Value::Bulk(fields) = value {
-        let mut iter = fields.into_iter();
-        while let (Some(field), Some(entry)) = (iter.next(), iter.next()) {
-            if let (redis::Value::Data(action_bytes), redis::Value::Data(id_bytes)) = (field, entry)
-            {
-                if let (Ok(action_id), Ok(entry_id)) =
-                    (String::from_utf8(action_bytes), String::from_utf8(id_bytes))
-                {
-                    map.insert(entry_id, action_id);
-                }
-            }
-        }
-    }
-    map
 }
 
 impl AppState {
@@ -6462,6 +6399,27 @@ impl AppState {
                 actions = parse_redis_action_stream(value)?;
             }
 
+            if actions.is_empty() {
+                let reclaimed = self
+                    .reclaim_pending_actions(&mut conn, &key, &consumer)
+                    .await?;
+                if !reclaimed.is_empty() {
+                    let label0 = private_beach_id.to_string();
+                    let label1 = session_id.to_string();
+                    metrics::REDIS_PENDING_RECLAIMED
+                        .with_label_values(&[label0.as_str(), label1.as_str()])
+                        .inc_by(reclaimed.len() as u64);
+                    debug!(
+                        target = "controller.delivery",
+                        session_id = %session_id,
+                        private_beach_id = %private_beach_id,
+                        reclaimed = reclaimed.len(),
+                        "reclaimed pending redis controller actions"
+                    );
+                    return Ok(reclaimed);
+                }
+            }
+
             // If Redis reports a non-zero stream length but this consumer
             // didn't receive any new entries, log a sampled diagnostic so
             // we can tell whether messages are stuck in the pending set.
@@ -6497,6 +6455,38 @@ impl AppState {
             .get(session_id)
             .map(|record| record.pending_actions.iter().cloned().collect())
             .unwrap_or_default())
+    }
+
+    async fn reclaim_pending_actions(
+        &self,
+        conn: &mut redis::aio::Connection,
+        key: &str,
+        consumer: &str,
+    ) -> Result<Vec<ActionCommand>, StateError> {
+        let pending_value = redis::cmd("XPENDING")
+            .arg(key)
+            .arg(REDIS_ACTION_GROUP)
+            .arg("-")
+            .arg("+")
+            .arg(REDIS_PENDING_RECLAIM_MAX as i64)
+            .query_async::<_, redis::Value>(conn)
+            .await?;
+        let entry_ids = parse_pending_entries(pending_value);
+        if entry_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut cmd = redis::cmd("XCLAIM");
+        cmd.arg(key)
+            .arg(REDIS_ACTION_GROUP)
+            .arg(consumer)
+            .arg(REDIS_PENDING_RECLAIM_MIN_IDLE_MS);
+        for entry in entry_ids.into_iter().take(REDIS_PENDING_RECLAIM_MAX) {
+            cmd.arg(entry);
+        }
+
+        let claimed = cmd.query_async::<_, redis::Value>(conn).await?;
+        parse_redis_action_entries(claimed)
     }
 
     async fn pending_actions_count(
@@ -6682,64 +6672,6 @@ impl AppState {
                 .unwrap_or(());
         }
         Ok(())
-    }
-
-    async fn reclaim_stuck_actions_redis(
-        &self,
-        private_beach_id: &str,
-        session_id: &str,
-    ) -> Result<usize, StateError> {
-        if let Some(client) = &self.redis {
-            let mut conn = client.get_async_connection().await?;
-            let key = redis_actions_key(private_beach_id, session_id);
-            let pending_value = redis::cmd("XPENDING")
-                .arg(&key)
-                .arg(REDIS_ACTION_GROUP)
-                .arg("-")
-                .arg("+")
-                .arg(REDIS_ACTION_STREAM_MAXLEN as i64)
-                .query_async::<_, redis::Value>(&mut conn)
-                .await
-                .unwrap_or(redis::Value::Nil);
-            let entries = parse_pending_entries(pending_value);
-            if entries.is_empty() {
-                return Ok(0);
-            }
-            let index_key = redis_action_index_key(private_beach_id, session_id);
-            let index_map = redis::cmd("HGETALL")
-                .arg(&index_key)
-                .query_async::<_, redis::Value>(&mut conn)
-                .await
-                .unwrap_or(redis::Value::Nil);
-            let entry_to_action = invert_action_index(index_map);
-            let mut reclaimed = 0usize;
-            for entry in entries {
-                let _: i64 = redis::cmd("XACK")
-                    .arg(&key)
-                    .arg(REDIS_ACTION_GROUP)
-                    .arg(&entry)
-                    .query_async(&mut conn)
-                    .await
-                    .unwrap_or(0);
-                let _: i64 = redis::cmd("XDEL")
-                    .arg(&key)
-                    .arg(&entry)
-                    .query_async(&mut conn)
-                    .await
-                    .unwrap_or(0);
-                if let Some(action_id) = entry_to_action.get(&entry) {
-                    let _: i64 = redis::cmd("HDEL")
-                        .arg(&index_key)
-                        .arg(action_id)
-                        .query_async(&mut conn)
-                        .await
-                        .unwrap_or(0);
-                }
-                reclaimed += 1;
-            }
-            return Ok(reclaimed);
-        }
-        Ok(0)
     }
 }
 

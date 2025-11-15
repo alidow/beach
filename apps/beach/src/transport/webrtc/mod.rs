@@ -39,6 +39,7 @@ use webrtc::util::vnet::router::{Router, RouterConfig};
 
 use crate::auth;
 use crate::auth::error::AuthError;
+use crate::auth::gate::TurnIceServer;
 use crate::transport::{
     Transport, TransportError, TransportId, TransportKind, TransportMessage, TransportPair,
     decode_message, encode_message, next_transport_id,
@@ -203,11 +204,146 @@ impl WebRtcChannels {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum IceServerSource {
+    LocalOverride,
+    BeachGateTurn,
+    HostOnly,
+}
+
+impl IceServerSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            IceServerSource::LocalOverride => "env_override",
+            IceServerSource::BeachGateTurn => "beach_gate_turn",
+            IceServerSource::HostOnly => "host_only",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IceServerSelection {
+    source: IceServerSource,
+    servers: Option<Vec<webrtc::ice_transport::ice_server::RTCIceServer>>,
+}
+
+impl IceServerSelection {
+    fn with_source(
+        source: IceServerSource,
+        servers: Option<Vec<webrtc::ice_transport::ice_server::RTCIceServer>>,
+    ) -> Self {
+        Self { source, servers }
+    }
+
+    fn server_count(&self) -> usize {
+        self.servers
+            .as_ref()
+            .map(|servers| servers.len())
+            .unwrap_or(0)
+    }
+}
+
 const TRANSPORT_ENCRYPTION_VERSION: u8 = 1;
 const TRANSPORT_ENCRYPTION_AAD: &[u8] = b"beach:secure-transport:v1";
 
-async fn load_turn_ice_servers()
+fn default_stun_server() -> webrtc::ice_transport::ice_server::RTCIceServer {
+    webrtc::ice_transport::ice_server::RTCIceServer {
+        urls: vec!["stun:stun.l.google.com:19302".to_string()],
+        ..Default::default()
+    }
+}
+
+fn log_ice_configuration(role: &'static str, selection: &IceServerSelection, stun_added: bool) {
+    let mode = if auth::is_public_mode() {
+        "public"
+    } else {
+        "managed"
+    };
+    tracing::info!(
+        target = "beach::transport::webrtc",
+        peer_role = role,
+        cli_mode = mode,
+        ice_source = selection.source.as_str(),
+        configured_servers = selection.server_count(),
+        default_stun_appended = stun_added,
+        "configuring WebRTC peer connection"
+    );
+}
+
+fn local_ice_servers_from_env()
 -> Result<Option<Vec<webrtc::ice_transport::ice_server::RTCIceServer>>, AuthError> {
+    let raw = match std::env::var("BEACH_ICE_SERVERS") {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let overrides: Vec<TurnIceServer> = match serde_json::from_str(trimmed) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::error!(
+                target: "beach::transport::webrtc",
+                error = %err,
+                "failed to parse BEACH_ICE_SERVERS"
+            );
+            return Err(AuthError::Other(format!(
+                "invalid BEACH_ICE_SERVERS value: {err}"
+            )));
+        }
+    };
+
+    let mut servers = Vec::new();
+    for server in overrides.into_iter() {
+        if server.urls.is_empty() {
+            continue;
+        }
+        servers.push(webrtc::ice_transport::ice_server::RTCIceServer {
+            urls: server.urls,
+            username: server.username.unwrap_or_default(),
+            credential: server.credential.unwrap_or_default(),
+            ..Default::default()
+        });
+    }
+
+    if servers.is_empty() {
+        tracing::error!(
+            target: "beach::transport::webrtc",
+            "BEACH_ICE_SERVERS was set but did not include any urls"
+        );
+        return Err(AuthError::Other(
+            "BEACH_ICE_SERVERS did not include any urls".into(),
+        ));
+    }
+
+    tracing::info!(
+        target: "beach::transport::webrtc",
+        server_count = servers.len(),
+        "using ICE servers from BEACH_ICE_SERVERS"
+    );
+    Ok(Some(servers))
+}
+
+async fn load_turn_ice_servers() -> Result<IceServerSelection, AuthError> {
+    if let Some(servers) = local_ice_servers_from_env()? {
+        return Ok(IceServerSelection::with_source(
+            IceServerSource::LocalOverride,
+            Some(servers),
+        ));
+    }
+
+    if auth::is_public_mode() {
+        tracing::info!(
+            target: "beach::transport::webrtc",
+            "public mode: no remote ICE servers configured; using host/prflx candidates only"
+        );
+        return Ok(IceServerSelection::with_source(
+            IceServerSource::HostOnly,
+            None,
+        ));
+    }
+
     match auth::resolve_turn_credentials(None).await {
         Ok(credentials) => {
             let realm = credentials.realm.clone();
@@ -235,7 +371,10 @@ async fn load_turn_ice_servers()
                     realm = %realm,
                     "TURN credentials returned no ICE servers"
                 );
-                Ok(None)
+                Ok(IceServerSelection::with_source(
+                    IceServerSource::HostOnly,
+                    None,
+                ))
             } else {
                 tracing::debug!(
                     target: "beach::transport::webrtc",
@@ -244,7 +383,10 @@ async fn load_turn_ice_servers()
                     server_count = servers.len(),
                     "using TURN credentials from Beach Gate"
                 );
-                Ok(Some(servers))
+                Ok(IceServerSelection::with_source(
+                    IceServerSource::BeachGateTurn,
+                    Some(servers),
+                ))
             }
         }
         Err(err @ AuthError::TurnNotEntitled) => Err(err),
@@ -265,7 +407,10 @@ async fn load_turn_ice_servers()
                     );
                 }
             }
-            Ok(None)
+            Ok(IceServerSelection::with_source(
+                IceServerSource::HostOnly,
+                None,
+            ))
         }
     }
 }
@@ -1418,38 +1563,42 @@ async fn negotiate_offerer_peer(
     let api = build_api(setting)?;
     let disable_stun = std::env::var("BEACH_WEBRTC_DISABLE_STUN").is_ok();
     let mut config = RTCConfiguration::default();
-    match load_turn_ice_servers().await {
-        Ok(Some(mut turn_servers)) => {
-            if !disable_stun {
-                turn_servers.push(webrtc::ice_transport::ice_server::RTCIceServer {
-                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
-                    ..Default::default()
-                });
-            }
-            config.ice_servers = turn_servers;
-        }
-        Ok(None) => {
-            if !disable_stun {
-                config.ice_servers = vec![webrtc::ice_transport::ice_server::RTCIceServer {
-                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
-                    ..Default::default()
-                }];
-            }
-        }
+    let selection = match load_turn_ice_servers().await {
+        Ok(selection) => selection,
         Err(AuthError::TurnNotEntitled) => {
             return Err(TransportError::Setup(
                 "TURN transport requires pb:transport.turn entitlement".into(),
             ));
         }
-        Err(_) => {
+        Err(err) => {
+            tracing::debug!(
+                target = "beach::transport::webrtc",
+                error = %err,
+                "invalid ICE override; falling back to host candidates"
+            );
+            IceServerSelection::with_source(IceServerSource::HostOnly, None)
+        }
+    };
+
+    let appended_stun = match selection.servers.as_ref() {
+        Some(servers) => {
+            let mut combined = servers.clone();
             if !disable_stun {
-                config.ice_servers = vec![webrtc::ice_transport::ice_server::RTCIceServer {
-                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
-                    ..Default::default()
-                }];
+                combined.push(default_stun_server());
+            }
+            config.ice_servers = combined;
+            !disable_stun
+        }
+        None => {
+            if !disable_stun {
+                config.ice_servers = vec![default_stun_server()];
+                true
+            } else {
+                false
             }
         }
-    }
+    };
+    log_ice_configuration("offerer", &selection, appended_stun);
 
     let pc = Arc::new(
         api.new_peer_connection(config)
@@ -2403,38 +2552,42 @@ async fn connect_answerer(
     // browser uses mDNS/srflx and the offerer has no reflexive candidates.
     let disable_stun = std::env::var("BEACH_WEBRTC_DISABLE_STUN").is_ok();
     let mut config = RTCConfiguration::default();
-    match load_turn_ice_servers().await {
-        Ok(Some(mut turn_servers)) => {
-            if !disable_stun {
-                turn_servers.push(webrtc::ice_transport::ice_server::RTCIceServer {
-                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
-                    ..Default::default()
-                });
-            }
-            config.ice_servers = turn_servers;
-        }
-        Ok(None) => {
-            if !disable_stun {
-                config.ice_servers = vec![webrtc::ice_transport::ice_server::RTCIceServer {
-                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
-                    ..Default::default()
-                }];
-            }
-        }
+    let selection = match load_turn_ice_servers().await {
+        Ok(selection) => selection,
         Err(AuthError::TurnNotEntitled) => {
             return Err(TransportError::Setup(
                 "TURN transport requires pb:transport.turn entitlement".into(),
             ));
         }
-        Err(_) => {
+        Err(err) => {
+            tracing::debug!(
+                target = "beach::transport::webrtc",
+                error = %err,
+                "invalid ICE override; falling back to host candidates"
+            );
+            IceServerSelection::with_source(IceServerSource::HostOnly, None)
+        }
+    };
+
+    let appended_stun = match selection.servers.as_ref() {
+        Some(servers) => {
+            let mut combined = servers.clone();
             if !disable_stun {
-                config.ice_servers = vec![webrtc::ice_transport::ice_server::RTCIceServer {
-                    urls: vec!["stun:stun.l.google.com:19302".to_string()],
-                    ..Default::default()
-                }];
+                combined.push(default_stun_server());
+            }
+            config.ice_servers = combined;
+            !disable_stun
+        }
+        None => {
+            if !disable_stun {
+                config.ice_servers = vec![default_stun_server()];
+                true
+            } else {
+                false
             }
         }
-    }
+    };
+    log_ice_configuration("answerer", &selection, appended_stun);
 
     tracing::debug!(
         target = "beach::transport::webrtc",

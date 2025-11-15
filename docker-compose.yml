@@ -67,7 +67,7 @@ services:
       BEACH_ICE_PUBLIC_HOST: ${BEACH_ICE_PUBLIC_HOST:-host.docker.internal}
       BEACH_ICE_PORT_START: ${BEACH_ICE_PORT_START:-62000}
       BEACH_ICE_PORT_END: ${BEACH_ICE_PORT_END:-62100}
-      RUST_LOG: info,controller=debug
+      RUST_LOG: info,controller=debug,webrtc=trace,webrtc::ice_transport=trace,webrtc::peer_connection=trace
     volumes:
       - .:/app
       - ./config/dev-secrets:/secrets:ro

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{sync::broadcast, time::sleep};
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 use url::Url;
 use webrtc::{
     api::APIBuilder,
@@ -223,6 +223,13 @@ impl FastPathClient {
             Box::pin(async move {
                 if let Some(cand) = candidate {
                     if let Ok(json) = cand.to_json() {
+                        trace!(
+                            target = "fast_path.ice",
+                            candidate = %json.candidate,
+                            sdp_mid = json.sdp_mid.as_deref(),
+                            sdp_mline_index = json.sdp_mline_index,
+                            "local ICE candidate gathered"
+                        );
                         let body = IcePostBody {
                             candidate: json.candidate,
                             sdp_mid: json.sdp_mid,
@@ -239,6 +246,11 @@ impl FastPathClient {
                                 target = "fast_path",
                                 error = %error,
                                 "failed to post local ICE candidate"
+                            );
+                        } else {
+                            trace!(
+                                target = "fast_path.ice",
+                                "posted local ICE candidate to manager"
                             );
                         }
                     }
@@ -370,6 +382,13 @@ async fn gather_remote_ice(
                 sdp_mline_index: cand.sdp_mline_index,
                 ..Default::default()
             };
+            trace!(
+                target = "fast_path.ice",
+                candidate = %init.candidate,
+                sdp_mid = init.sdp_mid.as_deref(),
+                sdp_mline_index = init.sdp_mline_index,
+                "applying remote ICE candidate from manager"
+            );
             pc.add_ice_candidate(init).await.map_err(to_harness_error)?;
             added += 1;
         }

@@ -48,6 +48,46 @@ fn env_truthy(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn env_bool(name: &str) -> Option<bool> {
+    match env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        },
+        Err(_) => None,
+    }
+}
+
+pub fn has_valid_profile() -> bool {
+    let store = match load_store() {
+        Ok(store) => store,
+        Err(_) => return false,
+    };
+
+    if let Ok(env_profile) = env::var("BEACH_PROFILE") {
+        let trimmed = env_profile.trim();
+        if !trimmed.is_empty() && store.profile(trimmed).is_some() {
+            return true;
+        }
+    }
+
+    if let Some(current) = store.current_profile.as_deref() {
+        if store.profile(current).is_some() {
+            return true;
+        }
+    }
+
+    !store.profiles.is_empty()
+}
+
+pub fn is_public_mode() -> bool {
+    if let Some(force) = env_bool("BEACH_PUBLIC_MODE") {
+        return force;
+    }
+    !has_valid_profile()
+}
+
 pub fn manager_requires_access_token(base_url: &str) -> bool {
     if env_truthy("BEACH_MANAGER_AUTH_OPTIONAL") {
         return false;

@@ -121,10 +121,9 @@ impl FastPathSession {
         setting.set_network_types(vec![NetworkType::Udp4]);
 
         // Configure ephemeral UDP port range if provided.
-        if let (Ok(start_s), Ok(end_s)) = (
-            std::env::var("BEACH_ICE_PORT_START"),
-            std::env::var("BEACH_ICE_PORT_END"),
-        ) {
+        let port_start_env = std::env::var("BEACH_ICE_PORT_START").ok();
+        let port_end_env = std::env::var("BEACH_ICE_PORT_END").ok();
+        if let (Some(start_s), Some(end_s)) = (port_start_env.as_deref(), port_end_env.as_deref()) {
             if let (Ok(start), Ok(end)) = (start_s.parse::<u16>(), end_s.parse::<u16>()) {
                 match EphemeralUDP::new(start, end) {
                     Ok(ephemeral) => setting.set_udp_network(UDPNetwork::Ephemeral(ephemeral)),
@@ -168,6 +167,9 @@ impl FastPathSession {
             session_id = %session_id,
             public_ip_hint = public_ip.as_deref(),
             host_hint = host_hint_for_log.as_deref(),
+            port_start = port_start_env.as_deref(),
+            port_end = port_end_env.as_deref(),
+            resolved_host = resolved_host.as_str(),
             "configured fast-path ICE hints"
         );
         if let Some(ip) = public_ip.clone() {
@@ -234,6 +236,14 @@ impl FastPathSession {
             Box::pin(async move {
                 if let Some(cand) = c {
                     if let Ok(json) = cand.to_json() {
+                        trace!(
+                            target = "fast_path.ice",
+                            session_id = %this3.session_id,
+                            candidate = %json.candidate,
+                            sdp_mid = json.sdp_mid.as_deref(),
+                            sdp_mline_index = json.sdp_mline_index,
+                            "local ICE candidate gathered"
+                        );
                         let val = serde_json::json!({
                             "candidate": json.candidate,
                             "sdp_mid": json.sdp_mid,
@@ -275,11 +285,13 @@ impl FastPathSession {
         let ice_ip_hint = self.public_ip_hint.clone();
         let ice_host_hint = self.host_hint_for_log.clone();
         let session_for_state = self.session_id.clone();
+        let local_candidates_for_state = Arc::clone(&self.local_ice);
         self.pc
             .on_ice_connection_state_change(Box::new(move |state: RTCIceConnectionState| {
                 let session = session_for_state.clone();
                 let ip_hint = ice_ip_hint.clone();
                 let host_hint = ice_host_hint.clone();
+                let candidate_snapshot = Arc::clone(&local_candidates_for_state);
                 Box::pin(async move {
                     debug!(
                         target = "fast_path.ice",
@@ -290,11 +302,34 @@ impl FastPathSession {
                         "ice connection state change"
                     );
                     if state == RTCIceConnectionState::Failed {
+                        let (recent_candidates, total_candidates) = {
+                            let guard = candidate_snapshot.read().await;
+                            let total = guard.len();
+                            let mut preview = Vec::new();
+                            for value in guard.iter().rev() {
+                                if let Some(candidate) =
+                                    value.get("candidate").and_then(|v| v.as_str())
+                                {
+                                    if let Some(meta) = parse_candidate_meta(candidate) {
+                                        preview.push(format!(
+                                            "{}:{} ({})",
+                                            meta.ip, meta.port, meta.scope
+                                        ));
+                                    }
+                                }
+                                if preview.len() >= 5 {
+                                    break;
+                                }
+                            }
+                            (preview, total)
+                        };
                         warn!(
                             target = "fast_path.ice",
                             session_id = %session,
                             public_ip_hint = ip_hint.as_deref(),
                             host_hint = host_hint.as_deref(),
+                            candidate_count = total_candidates,
+                            recent_candidates = ?recent_candidates,
                             "ice connection reported failure"
                         );
                     }
@@ -307,6 +342,14 @@ impl FastPathSession {
     }
 
     pub async fn add_remote_ice(&self, cand: RTCIceCandidateInit) -> Result<(), WebRtcError> {
+        trace!(
+            target = "fast_path.ice",
+            session_id = %self.session_id,
+            candidate = %cand.candidate,
+            sdp_mid = cand.sdp_mid.as_deref(),
+            sdp_mline_index = cand.sdp_mline_index,
+            "received remote ICE candidate"
+        );
         let candidate_meta = parse_candidate_meta(&cand.candidate);
         if should_log_custom_event(
             "fast_path_remote_candidate",
@@ -344,6 +387,8 @@ impl FastPathSession {
     pub fn spawn_receivers(self: &Arc<Self>, state: AppState) {
         let ack_session = Arc::clone(self);
         let ack_state = state.clone();
+        let state_channel_state = state.clone();
+        let actions_state = state;
         tokio::spawn(async move {
             if let Some(dc) = wait_for_channel(ack_session.clone(), ChannelKind::Acks).await {
                 install_ack_handler(dc, ack_session.clone(), ack_state.clone());
@@ -358,7 +403,7 @@ impl FastPathSession {
         let state_session = Arc::clone(self);
         tokio::spawn(async move {
             if let Some(dc) = wait_for_channel(state_session.clone(), ChannelKind::State).await {
-                install_state_handler(dc, state_session.clone(), state.clone());
+                install_state_handler(dc, state_session.clone(), state_channel_state.clone());
             } else {
                 warn!(
                     session_id = %state_session.session_id,
@@ -368,7 +413,6 @@ impl FastPathSession {
         });
 
         let actions_session = Arc::clone(self);
-        let actions_state = state.clone();
         tokio::spawn(async move {
             if wait_for_channel(actions_session.clone(), ChannelKind::Actions)
                 .await

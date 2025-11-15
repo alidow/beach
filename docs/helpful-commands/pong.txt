@@ -53,6 +53,19 @@ http://localhost:3003/beaches
 
 Here are cargo-run commands for both players and the agent, matching your pattern and not relying on session-id env vars. Run each in its own terminal. With the controller auto-handshake in place the hosts no longer need `PRIVATE_BEACH_*` variables, but keeping `PRIVATE_BEACH_MANAGER_URL` exported provides a backwards-compatible fallback if Beach Road control delivery is unavailable.
 
+When you are developing entirely on localhost and do **not** want to hit Beach Gate for ICE credentials,
+set `BEACH_PUBLIC_MODE=1` to force the CLI into public-mode semantics and configure STUN servers via
+`BEACH_ICE_SERVERS` (the shape matches the `iceServers` block returned by the WebRTC API). For example:
+
+```
+export BEACH_PUBLIC_MODE=1
+export BEACH_ICE_SERVERS='[{"urls":["stun:host.docker.internal:3478","stun:127.0.0.1:3478"]}]'
+```
+
+When these variables are present the CLI skips Beach Gate entirely and only uses the local STUN list.
+If you later need full TURN support, unset `BEACH_PUBLIC_MODE` (or set it to `0`), remove
+`BEACH_ICE_SERVERS`, and log in so the CLI can fetch credentials from Beach Gate.
+
 
 
 
@@ -62,7 +75,7 @@ export PRIVATE_BEACH_MANAGER_URL=http://localhost:8080
 export BEACH_ICE_PUBLIC_HOST=host.docker.internal
 export BEACH_ICE_PUBLIC_IP=127.0.0.1
 export PONG_LOG_LEVEL=trace
-export PONG_RUST_LOG=info,beach_client_core::transport::webrtc=trace,beach_client_core::transport::webrtc::signaling=trace
+export PONG_RUST_LOG=info,webrtc=trace,webrtc::ice_transport=trace,webrtc::peer_connection=trace,beach_client_core::transport::webrtc=trace,beach_client_core::transport::webrtc::signaling=trace
 LOG_DIR="$HOME/beach-debug"; mkdir -p "$LOG_DIR"
 : > "$LOG_DIR/beach-host-lhs.log"
 cd ~/development/beach && RUST_LOG=${PONG_RUST_LOG:-info} cargo run --bin beach -- \
@@ -81,7 +94,7 @@ export PRIVATE_BEACH_MANAGER_URL=http://localhost:8080
 export BEACH_ICE_PUBLIC_HOST=host.docker.internal
 export BEACH_ICE_PUBLIC_IP=127.0.0.1
 export PONG_LOG_LEVEL=trace
-export PONG_RUST_LOG=info,beach_client_core::transport::webrtc=trace,beach_client_core::transport::webrtc::signaling=trace
+export PONG_RUST_LOG=info,webrtc=trace,webrtc::ice_transport=trace,webrtc::peer_connection=trace,beach_client_core::transport::webrtc=trace,beach_client_core::transport::webrtc::signaling=trace
 LOG_DIR="$HOME/beach-debug"; mkdir -p "$LOG_DIR"
 : > "$LOG_DIR/beach-host-rhs.log"
 cd ~/development/beach && RUST_LOG=${PONG_RUST_LOG:-info} cargo run --bin beach -- \
@@ -100,7 +113,7 @@ Agent (single line; no session-id envs; just declare beach + manager)
 export PRIVATE_BEACH_MANAGER_URL=http://localhost:8080
 export BEACH_ICE_PUBLIC_HOST=host.docker.internal
 export BEACH_ICE_PUBLIC_IP=127.0.0.1
-export PONG_RUST_LOG=info,beach_client_core::transport::webrtc=trace,beach_client_core::transport::webrtc::signaling=trace
+export PONG_RUST_LOG=info,webrtc=trace,webrtc::ice_transport=trace,webrtc::peer_connection=trace,beach_client_core::transport::webrtc=trace,beach_client_core::transport::webrtc::signaling=trace
 cd ~/development/beach
 chmod +x apps/private-beach/demo/pong/tools/run-agent.sh
 apps/private-beach/demo/pong/tools/run-agent.sh 4185e6be-4c1a-40a0-b285-272f8b44265f
@@ -114,6 +127,9 @@ If you need the old firehose for a targeted investigation, temporarily export `P
 `BEACH_TRACE_DEPS=1`, and optionally add a custom `BEACH_LOG_FILTER="info,beach_client_core=trace"` so only the Beach modules
 stay at trace. You can also override `PONG_RUST_LOG` (e.g. `PONG_RUST_LOG="info,beach_client_core::transport::webrtc=trace"`) to
 capture specific Rust targets. Reset those vars afterwards so the log files stay under control during normal demos.
+
+> ℹ️ The snippets below crank `PONG_RUST_LOG` up to include `webrtc`, `webrtc::ice_transport`, and `webrtc::peer_connection` at `trace`
+> so ICE candidate exchange is visible in both hosts and the agent. Trim those targets back once we understand the failures.
 
 Notes
 

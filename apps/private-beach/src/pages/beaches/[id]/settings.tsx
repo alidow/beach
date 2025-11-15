@@ -6,6 +6,7 @@ import { Button } from '../../../components/ui/button';
 import { Card, CardContent, CardHeader } from '../../../components/ui/card';
 import { Input } from '../../../components/ui/input';
 import { getBeachMeta, updateBeach } from '../../../lib/api';
+import { useManagerToken } from '../../../hooks/useManagerToken';
 
 export default function BeachSettings() {
   const router = useRouter();
@@ -13,19 +14,20 @@ export default function BeachSettings() {
   const [beachId, setBeachId] = useState<string>('');
   const [name, setName] = useState('');
   const [saving, setSaving] = useState(false);
-  const { isLoaded, isSignedIn, getToken } = useAuth();
-  const tokenTemplate = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
+  const { isLoaded, isSignedIn } = useAuth();
+  const { token: managerToken, refresh: refreshManagerToken } = useManagerToken(isLoaded && isSignedIn);
 
   useEffect(() => {
     if (!id || !isLoaded || !isSignedIn) return;
+    if (!managerToken || managerToken.trim().length === 0) {
+      setBeachId('');
+      setName('');
+      return;
+    }
     let active = true;
     (async () => {
       try {
-        const token = await getToken(
-          tokenTemplate ? { template: tokenTemplate } : undefined,
-        );
-        if (!token || !active) return;
-        const meta = await getBeachMeta(id, token);
+        const meta = await getBeachMeta(id, managerToken);
         if (!active) return;
         setBeachId(meta.id);
         setName(meta.name);
@@ -33,23 +35,23 @@ export default function BeachSettings() {
         if (active) {
           setBeachId('');
           setName('');
+          await refreshManagerToken().catch(() => {});
         }
       }
     })();
     return () => {
       active = false;
     };
-  }, [id, isLoaded, isSignedIn, getToken, tokenTemplate]);
+  }, [id, isLoaded, isSignedIn, managerToken, refreshManagerToken]);
 
   function onSave() {
     if (!beachId) return;
     if (!isLoaded || !isSignedIn) return;
+    if (!managerToken || managerToken.trim().length === 0) return;
     setSaving(true);
     (async () => {
       try {
-        const token = await getToken(
-          tokenTemplate ? { template: tokenTemplate } : undefined,
-        );
+        const token = managerToken ?? (await refreshManagerToken().catch(() => null));
         if (!token) throw new Error('Missing manager auth token');
         await updateBeach(beachId, { name: name.trim() || name }, token);
         alert('Saved');

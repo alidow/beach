@@ -3231,37 +3231,13 @@ impl AppState {
                         }
                         return Ok(());
                     }
-                    Ok(FastPathSendOutcome::SessionMissing) => {
-                        self.log_fast_path_wait_state(
-                            &private_beach_id_str,
-                            &session_uuid_str,
-                            &lease,
-                            "session_missing",
-                            actions.len(),
-                        )
-                        .await;
-                        let now = now_ms();
-                        self.update_pairing_transport_status(
-                            &session_uuid_str,
-                            PairingTransportStatus::http_fallback(now, None),
-                        )
-                        .await;
-                    }
-                    Ok(FastPathSendOutcome::ChannelMissing) => {
-                        self.log_fast_path_wait_state(
-                            &private_beach_id_str,
-                            &session_uuid_str,
-                            &lease,
-                            "channel_missing",
-                            actions.len(),
-                        )
-                        .await;
-                        let now = now_ms();
-                        self.update_pairing_transport_status(
-                            &session_uuid_str,
-                            PairingTransportStatus::http_fallback(now, None),
-                        )
-                        .await;
+                    Ok(FastPathSendOutcome::SessionMissing)
+                    | Ok(FastPathSendOutcome::ChannelMissing) => {
+                        // Fast-path is either not registered for this session
+                        // or the actions channel is not yet bound. Fall back to
+                        // the HTTP/Redis path without treating this as an error;
+                        // the legacy controller delivery path remains the source
+                        // of truth.
                     }
                     Err(err) => {
                         warn!(

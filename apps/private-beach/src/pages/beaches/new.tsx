@@ -6,22 +6,21 @@ import { Button } from '../../components/ui/button';
 import { Card, CardContent, CardHeader } from '../../components/ui/card';
 import { Input } from '../../components/ui/input';
 import { createBeach } from '../../lib/api';
+import { useManagerToken } from '../../hooks/useManagerToken';
 
 export default function NewBeach() {
   const router = useRouter();
   const [name, setName] = useState('My Private Beach');
   const [slug, setSlug] = useState('');
   const [creating, setCreating] = useState(false);
-  const { isLoaded, isSignedIn, getToken } = useAuth();
-  const tokenTemplate = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
+  const { isLoaded, isSignedIn } = useAuth();
+  const { token: managerToken, refresh: refreshManagerToken } = useManagerToken(isLoaded && isSignedIn);
 
   async function onCreate() {
     if (!isLoaded || !isSignedIn) return;
     setCreating(true);
     try {
-      const token = await getToken(
-        tokenTemplate ? { template: tokenTemplate } : undefined,
-      );
+      const token = managerToken ?? (await refreshManagerToken().catch(() => null));
       if (!token) throw new Error('Missing manager auth token');
       const created = await createBeach(name.trim() || 'Private Beach', slug.trim() || undefined, token);
       router.push(`/beaches/${created.id}`);

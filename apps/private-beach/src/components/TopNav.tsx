@@ -4,36 +4,40 @@ import { SignedIn, SignedOut, SignInButton, UserButton, useAuth } from '@clerk/n
 import { BeachSummary, listBeaches } from '../lib/api';
 import { Select } from './ui/select';
 import { Button } from './ui/button';
+import { useManagerToken } from '../hooks/useManagerToken';
 
 type Props = { currentId?: string; onSwitch?: (id: string) => void; right?: React.ReactNode };
 
 export default function TopNav({ currentId, onSwitch, right }: Props) {
   const [beaches, setBeaches] = useState<BeachSummary[]>([]);
-  const { isLoaded, isSignedIn, getToken } = useAuth();
-  const tokenTemplate = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
+  const { isLoaded, isSignedIn } = useAuth();
+  const { token: managerToken, refresh: refreshManagerToken } = useManagerToken(isLoaded && isSignedIn);
 
   useEffect(() => {
     if (!isLoaded || !isSignedIn) {
       setBeaches([]);
       return;
     }
+    if (!managerToken || managerToken.trim().length === 0) {
+      setBeaches([]);
+      return;
+    }
     let active = true;
     (async () => {
       try {
-        const token = await getToken(
-          tokenTemplate ? { template: tokenTemplate } : undefined,
-        );
-        if (!token || !active) return;
-        const data = await listBeaches(token);
+        const data = await listBeaches(managerToken);
         if (active) setBeaches(data);
       } catch {
-        if (active) setBeaches([]);
+        if (active) {
+          setBeaches([]);
+          await refreshManagerToken().catch(() => {});
+        }
       }
     })();
     return () => {
       active = false;
     };
-  }, [isLoaded, isSignedIn, getToken, tokenTemplate]);
+  }, [isLoaded, isSignedIn, managerToken, refreshManagerToken]);
 
   const value = useMemo(() => currentId || '', [currentId]);
   return (

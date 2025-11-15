@@ -38,6 +38,7 @@ import { debugLog, debugStack } from '../../../lib/debug';
 import { emitTelemetry } from '../../../lib/telemetry';
 import { isPrivateBeachRewriteEnabled, resolvePrivateBeachRewriteEnabled } from '../../../lib/featureFlags';
 import { useControllerPairingStreams } from '../../../hooks/useControllerPairingStreams';
+import { useManagerToken } from '../../../hooks/useManagerToken';
 import { buildAssignmentModel } from '../../../lib/assignments';
 
 const DEFAULT_CANVAS_TILE_WIDTH = 448;
@@ -231,11 +232,7 @@ export default function BeachDashboard() {
     'https://api.beach.sh';
   const [settingsJson, setSettingsJson] = useState<any>({});
   const [savingSettings, setSavingSettings] = useState(false);
-  const { isLoaded, isSignedIn, getToken } = useAuth();
-  const tokenTemplate = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
-  if (typeof window !== 'undefined') {
-    console.info('[auth] token-template', tokenTemplate ?? '<unset>');
-  }
+  const { isLoaded, isSignedIn } = useAuth();
   const [managerToken, setManagerToken] = useState<string | null>(null);
   const [viewerToken, setViewerToken] = useState<string | null>(null);
   const [assignments, setAssignments] = useState<ControllerPairing[]>([]);
@@ -246,6 +243,7 @@ export default function BeachDashboard() {
   const [assignmentSaving, setAssignmentSaving] = useState(false);
   const [assignmentError, setAssignmentError] = useState<string | null>(null);
   const [rewriteEnabled, setRewriteEnabled] = useState(() => resolvePrivateBeachRewriteEnabled());
+  const { token: resolvedManagerToken, refresh: refreshManagerToken } = useManagerToken(isLoaded && isSignedIn);
   const canvasLayoutRef = useRef<CanvasLayout | null>(null);
   const formatAssignmentError = useCallback((message: string) => {
     if (message === 'controller_pairing_api_unavailable') {
@@ -290,93 +288,24 @@ export default function BeachDashboard() {
     });
   }, [id, rewriteEnabled]);
 
-  const refreshManagerToken = useCallback(async (options?: { forceFresh?: boolean }) => {
+  useEffect(() => {
     if (!isLoaded || !isSignedIn) {
-      debugLog(
-        'auth',
-        'manager token refresh skipped (auth not ready)',
-        {
-          isLoaded,
-          isSignedIn,
-        },
-      );
       setManagerToken(null);
       setViewerToken(null);
-      if (typeof window !== 'undefined') {
-        console.info('[auth] manager-token-state', {
-          source: 'refresh-skip',
-          reason: 'auth-not-ready',
-        });
-      }
-      return null;
+      return;
     }
-    try {
-      const token = await getToken({
-        template: tokenTemplate || undefined,
-        skipCache: options?.forceFresh ?? true,
-      });
-      debugLog(
-        'auth',
-        'manager token refresh resolved',
-        {
-          hasToken: Boolean(token),
-        },
-      );
-      const normalizedToken = token ?? null;
-      setManagerToken(normalizedToken);
-      if (typeof window !== 'undefined') {
-        console.info('[auth] manager-token-state', {
-          source: 'refresh-success',
-          hasToken: Boolean(normalizedToken && normalizedToken.trim().length > 0),
-        });
-      }
-      logTokenClaims(normalizedToken, { phase: 'refresh-success' });
-      if (normalizedToken && normalizedToken.trim().length > 0) {
-        setViewerToken((prev) => {
-          const reuseExisting = Boolean(prev && prev.trim().length > 0);
-          if (typeof window !== 'undefined') {
-            console.info('[auth] viewer-token-state', {
-              source: 'refresh-success',
-              reusedPrevious: reuseExisting,
-            });
-          }
-          if (reuseExisting) {
-            return prev;
-          }
-          return normalizedToken;
-        });
-      } else {
-        setViewerToken(null);
-        if (typeof window !== 'undefined') {
-          console.info('[auth] viewer-token-state', {
-            source: 'refresh-success',
-            cleared: true,
-          });
-        }
-      }
-      return normalizedToken;
-    } catch (err: any) {
-      const message = err?.message ?? String(err);
-      debugLog(
-        'auth',
-        'manager token refresh failed',
-        {
-          error: message,
-        },
-        'warn',
-      );
+    if (!resolvedManagerToken || resolvedManagerToken.trim().length === 0) {
       setManagerToken(null);
       setViewerToken(null);
-      if (typeof window !== 'undefined') {
-        console.info('[auth] manager-token-state', {
-          source: 'refresh-failure',
-          error: message,
-        });
-      }
-      logTokenClaims(null, { phase: 'refresh-failure', error: message });
-      return null;
+      return;
     }
-  }, [getToken, isLoaded, isSignedIn, tokenTemplate]);
+    setManagerToken(resolvedManagerToken);
+    setViewerToken((prev) => {
+      const reuseExisting = Boolean(prev && prev.trim().length > 0);
+      return reuseExisting ? prev : resolvedManagerToken;
+    });
+    logTokenClaims(resolvedManagerToken, { phase: 'hook-refresh' });
+  }, [isLoaded, isSignedIn, resolvedManagerToken]);
 
   const ensureManagerToken = useCallback(async () => {
     if (managerToken && managerToken.trim().length > 0) {
@@ -388,7 +317,18 @@ export default function BeachDashboard() {
         phase: 'ensure-refresh',
       });
     }
-    return await refreshManagerToken({ forceFresh: true });
+    const refreshed = await refreshManagerToken({ force: true });
+    if (refreshed && refreshed.trim().length > 0) {
+      logTokenClaims(refreshed, { phase: 'ensure-refresh-success' });
+      setManagerToken(refreshed);
+      setViewerToken((prev) => {
+        const reuseExisting = Boolean(prev && prev.trim().length > 0);
+        return reuseExisting ? prev : refreshed;
+      });
+      return refreshed;
+    }
+    setViewerToken(null);
+    return null;
   }, [managerToken, refreshManagerToken]);
 
   useEffect(() => {
@@ -399,21 +339,11 @@ export default function BeachDashboard() {
   }, [isLoaded, isSignedIn, router]);
 
   useEffect(() => {
-    if (!isLoaded) return;
-    refreshManagerToken().catch(() => {});
-  }, [isLoaded, refreshManagerToken]);
-
-  useEffect(() => {
     if (!isLoaded || !isSignedIn) {
       setManagerToken(null);
       setViewerToken(null);
-      return;
     }
-    const interval = setInterval(() => {
-      refreshManagerToken().catch(() => {});
-    }, 60_000);
-    return () => clearInterval(interval);
-  }, [isLoaded, isSignedIn, refreshManagerToken]);
+  }, [isLoaded, isSignedIn]);
 
   useEffect(() => {
     if (!id) return;

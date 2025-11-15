@@ -6,35 +6,39 @@ import { Card, CardContent, CardHeader } from '../../components/ui/card';
 import { Button } from '../../components/ui/button';
 import { Input } from '../../components/ui/input';
 import { BeachSummary, listBeaches } from '../../lib/api';
+import { useManagerToken } from '../../hooks/useManagerToken';
 
 export default function BeachesIndex() {
   const [beaches, setBeaches] = useState<BeachSummary[]>([]);
   const [query, setQuery] = useState('');
-  const { isLoaded, isSignedIn, getToken } = useAuth();
-  const tokenTemplate = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
+  const { isLoaded, isSignedIn } = useAuth();
+  const { token: managerToken, refresh: refreshManagerToken } = useManagerToken(isLoaded && isSignedIn);
 
   useEffect(() => {
     if (!isLoaded || !isSignedIn) {
       setBeaches([]);
       return;
     }
+    if (!managerToken || managerToken.trim().length === 0) {
+      setBeaches([]);
+      return;
+    }
     let active = true;
     (async () => {
       try {
-        const token = await getToken(
-          tokenTemplate ? { template: tokenTemplate } : undefined,
-        );
-        if (!token || !active) return;
-        const data = await listBeaches(token);
+        const data = await listBeaches(managerToken);
         if (active) setBeaches(data);
       } catch {
-        if (active) setBeaches([]);
+        if (active) {
+          setBeaches([]);
+          await refreshManagerToken().catch(() => {});
+        }
       }
     })();
     return () => {
       active = false;
     };
-  }, [isLoaded, isSignedIn, getToken, tokenTemplate]);
+  }, [isLoaded, isSignedIn, managerToken, refreshManagerToken]);
 
   const filtered = beaches.filter((b) => b.name.toLowerCase().includes(query.toLowerCase()) || b.id.startsWith(query));
 

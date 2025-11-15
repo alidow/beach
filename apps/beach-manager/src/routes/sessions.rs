@@ -463,6 +463,29 @@ pub async fn poll_actions(
     Ok(Json(commands))
 }
 
+pub async fn pending_actions(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<ControllerConsumeQuery>,
+    token: Option<AuthToken>,
+) -> ApiResult<serde_json::Value> {
+    resolve_control_consumer(
+        &state,
+        &session_id,
+        query.controller_token.as_deref(),
+        token.as_ref(),
+        "pb:control.consume",
+    )
+    .await?;
+
+    let pending = state
+        .pending_actions_depth(&session_id)
+        .await
+        .map_err(map_state_err)?;
+
+    Ok(Json(serde_json::json!({ "pending": pending })))
+}
+
 pub async fn ack_actions(
     State(state): State<AppState>,
     Path(session_id): Path<String>,

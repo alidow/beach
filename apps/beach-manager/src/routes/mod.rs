@@ -34,6 +34,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/sessions/:session_id/state/stream", get(sse::stream_state))
         .route("/sessions/:session_id/actions", post(queue_actions))
         .route("/sessions/:session_id/actions/poll", get(poll_actions))
+        .route(
+            "/sessions/:session_id/actions/pending",
+            get(pending_actions),
+        )
         .route("/sessions/:session_id/actions/ack", post(ack_actions))
         .route(
             "/sessions/:session_id/controller/lease",

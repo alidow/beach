@@ -1,21 +1,31 @@
-use std::{collections::HashMap, net::IpAddr, str::FromStr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use beach_buggy::{ActionAck, ActionCommand, StateDiff};
+use beach_client_core::protocol::{encode_client_frame_binary, ClientFrame};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{Mutex, RwLock},
-    time::{Duration, sleep, timeout},
+    time::{sleep, timeout, Duration},
 };
 use tracing::{debug, info, trace, warn};
 
-use webrtc::Error as WebRtcError;
-use webrtc::data_channel::{RTCDataChannel, data_channel_message::DataChannelMessage};
+use webrtc::data_channel::{data_channel_message::DataChannelMessage, RTCDataChannel};
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
-use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::Error as WebRtcError;
 use webrtc_ice::{
     network_type::NetworkType,
     udp_network::{EphemeralUDP, UDPNetwork},
@@ -97,6 +107,7 @@ pub struct FastPathSession {
     pub local_ice: Arc<RwLock<Vec<serde_json::Value>>>,
     pub public_ip_hint: Option<String>,
     pub host_hint_for_log: Option<String>,
+    next_seq: Arc<AtomicU64>,
 }
 
 impl FastPathSession {
@@ -179,7 +190,14 @@ impl FastPathSession {
             local_ice: Arc::new(RwLock::new(Vec::new())),
             public_ip_hint: public_ip.clone(),
             host_hint_for_log,
+            next_seq: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    fn next_sequence(&self) -> u64 {
+        self.next_seq
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1)
     }
 
     pub async fn set_remote_offer(
@@ -378,11 +396,18 @@ impl FastPathRegistry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastPathSendOutcome {
+    Delivered,
+    SessionMissing,
+    ChannelMissing,
+}
+
 pub async fn send_actions_over_fast_path(
     registry: &FastPathRegistry,
     session_id: &str,
     actions: &[ActionCommand],
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<FastPathSendOutcome> {
     // Bound the time spent on fast-path sends so controller callers are not
     // indefinitely blocked if the data channel stalls. When the timeout
     // elapses, the caller will fall back to HTTP/Redis delivery.
@@ -393,10 +418,12 @@ pub async fn send_actions_over_fast_path(
         let guard = fps.actions_tx.lock().await;
         if let Some(dc) = guard.as_ref() {
             for a in actions {
-                let text =
-                    serde_json::to_string(&serde_json::json!({"type":"action","payload":a}))?;
+                let data = fast_path_action_bytes(a).map_err(anyhow::Error::msg)?;
+                let seq = fps.next_sequence();
+                let frame = ClientFrame::Input { seq, data };
+                let payload = Bytes::from(encode_client_frame_binary(&frame));
                 let timeout_duration = Duration::from_millis(FAST_PATH_SEND_TIMEOUT_MS);
-                let send_result = timeout(timeout_duration, dc.send_text(text)).await;
+                let send_result = timeout(timeout_duration, dc.send(&payload)).await;
                 match send_result {
                     Ok(Ok(_)) => {
                         // Normal fast-path delivery.
@@ -430,7 +457,7 @@ pub async fn send_actions_over_fast_path(
                 action_count = actions.len(),
                 "fast-path actions delivered"
             );
-            return Ok(true);
+            return Ok(FastPathSendOutcome::Delivered);
         } else if should_log_custom_event(
             "fast_path_action_channel_missing",
             session_id,
@@ -443,6 +470,7 @@ pub async fn send_actions_over_fast_path(
                 "fast-path actions channel not ready; falling back to HTTP"
             );
         }
+        return Ok(FastPathSendOutcome::ChannelMissing);
     } else if should_log_custom_event(
         "fast_path_session_missing",
         session_id,
@@ -455,7 +483,7 @@ pub async fn send_actions_over_fast_path(
             "fast-path session not registered; falling back to HTTP"
         );
     }
-    Ok(false)
+    Ok(FastPathSendOutcome::SessionMissing)
 }
 
 async fn wait_for_channel(
@@ -656,6 +684,18 @@ fn parse_state_diff(msg: &DataChannelMessage) -> anyhow::Result<StateDiff> {
         anyhow::bail!("unexpected message type {}", envelope.kind);
     }
     Ok(envelope.payload)
+}
+
+pub fn fast_path_action_bytes(action: &ActionCommand) -> Result<Vec<u8>, String> {
+    if action.action_type.as_str() != "terminal_write" {
+        return Err(format!("unsupported action type {}", action.action_type));
+    }
+    let bytes = action
+        .payload
+        .get("bytes")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "terminal_write payload missing bytes".to_string())?;
+    Ok(bytes.as_bytes().to_vec())
 }
 
 #[derive(Deserialize, Serialize)]

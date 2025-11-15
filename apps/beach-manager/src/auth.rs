@@ -136,6 +136,10 @@ impl AuthContext {
         self.verify_with_mode(token, false).await
     }
 
+    pub fn bypass_enabled(&self) -> bool {
+        self.config.bypass
+    }
+
     async fn verify_with_mode(&self, token: &str, allow_bypass: bool) -> Result<Claims, AuthError> {
         if token.is_empty() {
             return Err(AuthError::MissingToken);

@@ -20,7 +20,10 @@ use std::{
 use crate::auth::{AuthConfig, AuthContext};
 use crate::publish_token::{PublishTokenManager, SignedPublishToken};
 use crate::{
-    fastpath::{send_actions_over_fast_path, FastPathRegistry, FastPathSession},
+    fastpath::{
+        fast_path_action_bytes, send_actions_over_fast_path, FastPathRegistry, FastPathSendOutcome,
+        FastPathSession,
+    },
     log_throttle::{should_log_custom_event, should_log_queue_event, QueueLogKind},
     metrics,
 };
@@ -3163,7 +3166,7 @@ impl AppState {
                 match send_actions_over_fast_path(&self.fast_paths, &session_uuid_str, &actions)
                     .await
                 {
-                    Ok(true) => {
+                    Ok(FastPathSendOutcome::Delivered) => {
                         let now = now_ms();
                         self.update_pairing_transport_status(
                             &session_uuid_str,
@@ -3228,7 +3231,31 @@ impl AppState {
                         }
                         return Ok(());
                     }
-                    Ok(false) => {
+                    Ok(FastPathSendOutcome::SessionMissing) => {
+                        self.log_fast_path_wait_state(
+                            &private_beach_id_str,
+                            &session_uuid_str,
+                            &lease,
+                            "session_missing",
+                            actions.len(),
+                        )
+                        .await;
+                        let now = now_ms();
+                        self.update_pairing_transport_status(
+                            &session_uuid_str,
+                            PairingTransportStatus::http_fallback(now, None),
+                        )
+                        .await;
+                    }
+                    Ok(FastPathSendOutcome::ChannelMissing) => {
+                        self.log_fast_path_wait_state(
+                            &private_beach_id_str,
+                            &session_uuid_str,
+                            &lease,
+                            "channel_missing",
+                            actions.len(),
+                        )
+                        .await;
                         let now = now_ms();
                         self.update_pairing_transport_status(
                             &session_uuid_str,
@@ -3253,7 +3280,6 @@ impl AppState {
                     }
                 }
 
-                let private_beach_id_str = identifiers.private_beach_id.to_string();
                 let queue_depth = self
                     .pending_actions_count(&private_beach_id_str, &session_uuid_str)
                     .await?;
@@ -3470,6 +3496,27 @@ impl AppState {
                 }
 
                 Ok(actions)
+            }
+        }
+    }
+
+    pub async fn pending_actions_depth(&self, session_id: &str) -> Result<usize, StateError> {
+        match &self.backend {
+            Backend::Memory => {
+                let sessions = self.fallback.sessions.read().await;
+                Ok(sessions
+                    .get(session_id)
+                    .map(|record| record.pending_actions.len())
+                    .unwrap_or(0))
+            }
+            Backend::Postgres(pool) => {
+                let session_uuid = parse_uuid(session_id, "session_id")?;
+                let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
+                self.pending_actions_count(
+                    &identifiers.private_beach_id.to_string(),
+                    &session_uuid.to_string(),
+                )
+                .await
             }
         }
     }
@@ -6015,6 +6062,35 @@ impl AppState {
         );
     }
 
+    async fn log_fast_path_wait_state(
+        &self,
+        private_beach_id: &str,
+        session_id: &str,
+        lease: &LeaseRow,
+        reason: &str,
+        action_count: usize,
+    ) {
+        let remaining_ms = lease
+            .expires_at
+            .map(|ts| (ts - Utc::now()).num_milliseconds())
+            .unwrap_or(0);
+        let lease_age_ms = (DEFAULT_LEASE_TTL_MS as i64 - remaining_ms).max(0);
+        let queue_depth = self
+            .pending_actions_count(private_beach_id, session_id)
+            .await
+            .unwrap_or(0);
+        warn!(
+            target = "controller.delivery",
+            session_id = %session_id,
+            private_beach_id = %private_beach_id,
+            lease_age_ms,
+            queue_depth,
+            action_count,
+            reason,
+            "fast-path not yet ready; queuing controller actions via HTTP"
+        );
+    }
+
     fn log_memory_leases(&self, event: &str, record: &SessionRecord) {
         if !tracing::enabled!(Level::INFO) {
             return;
@@ -6235,12 +6311,14 @@ impl AppState {
                     .await
                     .unwrap_or(0);
                 if depth > 0 {
+                    let fast_path_ready = self.fast_path_ready(session_id).await;
                     warn!(
                         target = "controller.delivery",
                         session_id = %session_id,
                         private_beach_id = %private_beach_id,
                         queue_depth = depth,
                         consumer = %consumer,
+                        fast_path_ready,
                         "drain_actions_redis returned no actions despite non-empty stream"
                     );
                 }
@@ -8162,7 +8240,7 @@ async fn drive_controller_forwarder(
                     );
                 }
                 for action in actions {
-                    match serialize_terminal_write(&action) {
+                    match fast_path_action_bytes(&action) {
                         Ok(bytes) => {
                             next_seq = next_seq.saturating_add(1);
                             let frame = ClientFrame::Input {
@@ -8378,18 +8456,6 @@ async fn fail_pending_actions(
             "failed to ack pending actions after disconnect"
         );
     }
-}
-
-fn serialize_terminal_write(action: &ActionCommand) -> Result<Vec<u8>, String> {
-    if action.action_type.as_str() != "terminal_write" {
-        return Err(format!("unsupported action type {}", action.action_type));
-    }
-    let bytes = action
-        .payload
-        .get("bytes")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "terminal_write payload missing bytes".to_string())?;
-    Ok(bytes.as_bytes().to_vec())
 }
 
 fn rewrite_webrtc_offer(

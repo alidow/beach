@@ -960,6 +960,19 @@ impl ManagerActionClient {
             .map_err(|err| ManagerActionError::Decode(err.to_string()))
     }
 
+    async fn pending_actions_depth(&self, session_id: &str) -> Result<usize, ManagerActionError> {
+        #[derive(serde::Deserialize)]
+        struct PendingResponse {
+            pending: usize,
+        }
+        let url = format!("{}/sessions/{session_id}/actions/pending", self.base_url);
+        let resp = self.send(self.apply_auth(self.http.get(url))).await?;
+        resp.json::<PendingResponse>()
+            .await
+            .map(|body| body.pending)
+            .map_err(|err| ManagerActionError::Decode(err.to_string()))
+    }
+
     async fn ack_actions(
         &self,
         session_id: &str,
@@ -1437,24 +1450,56 @@ fn spawn_action_consumer(
         }
         let mut paused_for_fast_path = false;
         loop {
-            if matches!(
+            let fast_path_active = matches!(
                 *transport_state.borrow(),
                 ControllerTransportState::FastPathPreferred
-            ) {
-                if !paused_for_fast_path {
-                    debug!(
-                        target = "controller.actions.fast_path",
-                        session_id = %session_for_actions,
-                        "http action poller paused (fast path active)"
-                    );
-                    paused_for_fast_path = true;
+            );
+            if fast_path_active {
+                if paused_for_fast_path {
+                    if transport_state.changed().await.is_err() {
+                        break;
+                    }
+                    continue;
                 }
-                if transport_state.changed().await.is_err() {
-                    break;
+                match client.pending_actions_depth(&session_for_actions).await {
+                    Ok(0) => {
+                        debug!(
+                            target = "controller.actions.fast_path",
+                            session_id = %session_for_actions,
+                            pending = 0,
+                            "http action poller paused (fast path active)"
+                        );
+                        paused_for_fast_path = true;
+                        if transport_state.changed().await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    Ok(pending) => {
+                        trace!(
+                            target = "controller.actions.fast_path",
+                            session_id = %session_for_actions,
+                            pending,
+                            "pending controller actions remain on HTTP queue; continuing poller"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            target = "controller.actions.fast_path",
+                            session_id = %session_for_actions,
+                            error = %err,
+                            "failed to query pending controller actions; keeping HTTP poller active"
+                        );
+                    }
                 }
-                continue;
+            } else if paused_for_fast_path {
+                debug!(
+                    target = "controller.actions.fast_path",
+                    session_id = %session_for_actions,
+                    "http action poller resumed (fast path inactive)"
+                );
+                paused_for_fast_path = false;
             }
-            paused_for_fast_path = false;
             match client.receive_actions(&session_for_actions).await {
                 Ok(received) if !received.is_empty() => {
                     let commands: Vec<CtrlActionCommand> = received;

@@ -139,6 +139,8 @@ services:
       BEACH_GATE_PORT: 4133
       BEACH_GATE_TOKEN_ISSUER: beach-gate
       BEACH_GATE_SERVICE_AUDIENCE: private-beach-manager
+      # Extend dev access-token lifetime (default is 300s). 24h = 86400s.
+      BEACH_GATE_ACCESS_TTL: 86400
       BEACH_GATE_DEFAULT_ENTITLEMENTS: "rescue:fallback,private-beach:turn,pb:beaches.read,pb:beaches.write,pb:sessions.read,pb:sessions.write,pb:control.read,pb:control.write,pb:control.consume,pb:agents.onboard,pb:harness.publish"
       BEACH_GATE_SIGNING_KEY_PATH: /secrets/beach-gate-ec256.pem
       BEACH_GATE_SIGNING_KID_PATH: /secrets/beach-gate-signing.kid

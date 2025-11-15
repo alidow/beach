@@ -30,10 +30,11 @@ impl FromRequestParts<AppState> for AuthToken {
             .ok_or(ApiError::Unauthorized)?;
         let path = parts.uri.path().to_string();
         let strict = requires_strict_session_auth(&path);
-        let result = if strict {
-            state.auth_context().verify_strict(&token).await
+        let ctx = state.auth_context();
+        let result = if strict && !ctx.bypass_enabled() {
+            ctx.verify_strict(&token).await
         } else {
-            state.auth_context().verify(&token).await
+            ctx.verify(&token).await
         };
         let claims = result.map_err(|err| {
             warn!(error = ?err, path = path, "token verification failed");

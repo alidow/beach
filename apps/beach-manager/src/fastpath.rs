@@ -937,7 +937,9 @@ enum ChannelKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use serde::Deserialize;
+    use tokio::runtime::Runtime;
 
     #[test]
     fn parses_ack_envelope() {
@@ -1007,5 +1009,31 @@ mod tests {
             expires_at: None,
         };
         assert!(fast_path_action_payload(&action).is_err());
+    }
+
+    #[test]
+    fn decode_chunked_text_reassembles_payload() {
+        let runtime = Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let payload = "A".repeat(64 * 1024);
+            let frames =
+                frame_fast_path_payload(FastPathPayloadKind::Acks, &payload).expect("chunk");
+            assert!(frames.len() > 1);
+            let reassembler =
+                Arc::new(Mutex::new(FastPathChunkReassembler::new(FastPathPayloadKind::Acks)));
+            let mut decoded = None;
+            for frame in frames {
+                let msg = DataChannelMessage {
+                    is_string: true,
+                    data: Bytes::from(frame),
+                };
+                if let Some(text) =
+                    decode_chunked_text(&reassembler, &msg).await.expect("decode chunk")
+                {
+                    decoded = Some(text);
+                }
+            }
+            assert_eq!(decoded.expect("assembled payload"), payload);
+        });
     }
 }

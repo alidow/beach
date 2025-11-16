@@ -30,6 +30,7 @@ use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
+use webrtc_ice::network_type::NetworkType;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -1668,6 +1669,9 @@ async fn negotiate_offerer_peer(
     let RemotePeerJoined { peer, signals, .. } = joined;
 
     let mut setting = SettingEngine::default();
+    // Force IPv4 so Dockerized managers do not attempt unreachable udp6 STUN
+    // candidates (they produce noisy logs and stall ICE when the bridge lacks v6).
+    setting.set_network_types(vec![NetworkType::Udp4]);
     apply_nat_hint(&mut setting);
     setting.set_ice_timeouts(
         Some(Duration::from_secs(3)),
@@ -2655,6 +2659,9 @@ async fn connect_answerer(
     let _answerer_span_guard = answerer_span.enter();
 
     let mut setting = SettingEngine::default();
+    // Keep the answerer on IPv4-only transports for the same reason as the offerer:
+    // IPv6 candidates from Docker are unroutable and make STUN gathering hang.
+    setting.set_network_types(vec![NetworkType::Udp4]);
     apply_nat_hint(&mut setting);
     setting.set_ice_timeouts(
         Some(Duration::from_secs(3)),

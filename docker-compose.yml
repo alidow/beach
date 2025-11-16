@@ -131,6 +131,9 @@ services:
     container_name: beach-gate
     working_dir: /app/apps/beach-gate
     command: sh -c "npm ci || npm install; npm run dev"
+    env_file:
+      - .env
+      - .env.local
     environment:
       CLERK_MOCK: "1"
       BEACH_GATE_PORT: 4133

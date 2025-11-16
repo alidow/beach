@@ -5,7 +5,7 @@
 - **Unify framing:** Route every fast-path payload (actions, acks, state diffs, health, future telemetry) through a single chunked frame format so no write exceeds SCTP’s ~64 KiB ceiling.
 - **Transparency for callers:** Controllers and hosts still hand opaque JSON/binary blobs to the transport helpers; the chunker handles segmentation/reassembly behind the scenes.
 - **Bidirectional safety:** Both the host (`apps/beach`) and manager (`apps/beach-manager`) must chunk outbound messages and reassemble inbound frames before JSON decoding, eliminating asymmetric failures.
-- **Feature-flagged rollout:** Introduce a capability bit in the fast-path hints so chunk-aware binaries interoperate with legacy peers until the entire fleet is upgraded.
+- **Single-phase cutover:** Since this is greenfield, we can ship chunked framing everywhere without feature flags or partial rollouts.
 - **Observability:** Emit logs/metrics that show when chunking is active, frame counts per message, and any reassembly failures so regressions are obvious.
 
 ## Regression Tests (Should Fail Before the Work Lands)
@@ -53,22 +53,24 @@ Document these tests in CI (or at least as manual scripts) so we can confirm the
    - For ack/state listeners, replace `parse_*` callers with a reassembly step. When the decoder yields a full payload, run the existing JSON parsing logic.
    - Emit metrics for reassembly failures (missing chunk, duplicate id, timeout) tagged with the channel label (`mgr-actions`, `mgr-acks`, `mgr-state`).
 
-5. **Capability negotiation**
-   - Extend the fast-path hint payload (e.g., `transport_hints.fast_path_webrtc.features = ["chunked_v1"]`).
-   - Hosts advertise support via a new query param or ICE hint; managers only send chunked frames when both peers set the flag. Keep legacy single-frame behavior as a temporary fallback.
-
-6. **Testing & validation**
+5. **Testing & validation**
    - Add unit tests for encoder/decoder round trips and corruption cases in `crates/beach-buggy`.
    - Add manager-side tests that confirm `record_state`/`ack_actions` receive reconstructed payloads.
    - Update `scripts/fastpath-smoke.sh` (or add a variant) to inflate terminal payloads and assert fast-path stays connected.
 
-7. **Rollout**
-   - Deploy chunk-aware hosts first (they can decode chunked frames but still transmit legacy frames until the flag flips).
-   - Once a majority of hosts advertise `chunked_v1`, enable chunked sends on the manager via a config toggle.
-   - Remove the legacy one-shot path once metrics show 100 % chunk-capable peers. Document the migration timeline in `docs/private-beach/fast-path-unification-plan.md`.
-
-8. **Documentation & follow-ups**
+6. **Documentation & follow-ups**
    - Update `docs/helpful-commands/pong.txt` and `docs/private-beach/pong-controller-queue-incident.md` with a troubleshooting blurb referencing chunked framing.
    - Consider switching to binary DataChannel messages later; the new framing already supports raw bytes, so the follow-up becomes trivial.
+
+## Next Work Chunk
+
+Focus the remaining effort on a single sprint-sized chunk:
+1. Finish regression coverage (large state diff integration test, manager chunk reassembly unit test, controller loopback test, backward-compatibility guardrail).
+2. Land the end-to-end tests/smoke script updates outlined in Step 5.
+3. Update the troubleshooting docs listed in Step 6.
+
+✅ All three bullets above are now implemented (tests merged in `crates/beach-buggy`, `apps/beach-manager`, and the fast-path smoke/doc updates).
+
+Once those tasks close, the chunked framing work is fully implemented.
 
 This plan ensures every fast-path message respects SCTP limits, keeps callers unaware of the underlying complexity, and bakes in the tests and rollout steps we need to deploy safely.

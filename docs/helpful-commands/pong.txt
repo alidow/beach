@@ -149,6 +149,7 @@ In the dashboard, attach each session (you can read the JSON from the bootstrap 
 Draw edges from the agent tile to LHS and RHS tiles to declare roles; the agent will discover pairings via controller SSE and start controlling.
 Hosts automatically switch to the fast path `pb-controller` channel for controller actions; HTTP polling resumes only if that channel drops, so make sure Beach Road is reachable before testing. If you change the CLI, rebuild before launching hosts so the fast_path InputAck and HTTP fallback code stays in sync with the manager.
 > ⚠️ As of Nov 2025 the controller channel label changed to `mgr-actions`. Rebuild the CLI (`cargo build --bin beach`) and restart `beach-manager` / `beach-road` containers after pulling new code so hosts and manager agree on the label.
+- After each host boots, run `rg 'payload_type="chunk"' $LOG_DIR/beach-host-*.log` to verify the chunked fast-path framing is active; if that pattern never shows up, rebuild the CLI/manager before rerunning Pong so the 16 KB SCTP ceiling doesn’t tear down your sessions mid-game.
 
 
 

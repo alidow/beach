@@ -932,4 +932,28 @@ mod tests {
         }
         assert_eq!(assembled.expect("assembled payload"), payload);
     }
+
+    #[test]
+    fn chunk_round_trip_actions() {
+        let payload = "y".repeat(FAST_PATH_CHUNK_PAYLOAD_BYTES + 256);
+        let frames =
+            frame_fast_path_payload(FastPathPayloadKind::Actions, &payload).expect("framed");
+        assert!(frames.len() > 1);
+        let mut reassembler = FastPathChunkReassembler::new(FastPathPayloadKind::Actions);
+        let mut assembled = None;
+        for frame in frames {
+            if let Some(text) = reassembler.ingest(&frame).expect("ingest chunk") {
+                assembled = Some(text);
+            }
+        }
+        assert_eq!(assembled.expect("assembled payload"), payload);
+    }
+
+    #[test]
+    fn non_chunk_payload_passes_through() {
+        let mut reassembler = FastPathChunkReassembler::new(FastPathPayloadKind::State);
+        let payload = r#"{"type":"state","payload":{"ops":[]}}"#.to_string();
+        let result = reassembler.ingest(&payload).expect("ingest");
+        assert_eq!(result.expect("pass through"), payload);
+    }
 }

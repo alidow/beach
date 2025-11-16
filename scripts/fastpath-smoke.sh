@@ -21,6 +21,8 @@ FASTPATH_SMOKE_MODES=${FASTPATH_SMOKE_MODES:-"public,managed"}
 FASTPATH_SMOKE_LOCAL_ICE=${FASTPATH_SMOKE_LOCAL_ICE:-'[{"urls":["stun:host.docker.internal:3478","stun:127.0.0.1:3478"]}]'}
 FASTPATH_SMOKE_GATE_PROFILE=${FASTPATH_SMOKE_GATE_PROFILE:-default}
 FASTPATH_SMOKE_GATE_SKIP_LOGIN=${FASTPATH_SMOKE_GATE_SKIP_LOGIN:-0}
+FASTPATH_SMOKE_PAYLOAD_LINES=${FASTPATH_SMOKE_PAYLOAD_LINES:-512}
+FASTPATH_SMOKE_PAYLOAD_WIDTH=${FASTPATH_SMOKE_PAYLOAD_WIDTH:-128}
 
 mkdir -p "$LOG_DIR"
 
@@ -109,7 +111,7 @@ run_mode() {
       host \
       --bootstrap-output json \
       --wait \
-      -- /bin/sh -c 'echo fastpath-smoke; sleep 120'
+      -- /bin/sh -c "python3 -c \"import sys; line='fastpath-smoke-' * ${FASTPATH_SMOKE_PAYLOAD_WIDTH}; print('\\n'.join(line for _ in range(${FASTPATH_SMOKE_PAYLOAD_LINES})))\"; sleep 120"
   ) | tee "$bootstrap" &
   HOST_PID=$!
 
@@ -162,6 +164,11 @@ run_mode() {
       fi
       ;;
   esac
+
+  if ! rg -q 'payload_type="chunk"' "$host_log"; then
+    echo "❌ Host never emitted chunked fast-path frames; inspect $host_log for controller/state publishing failures." >&2
+    exit 1
+  fi
 
   cleanup
   HOST_PID=""

@@ -56,3 +56,8 @@
   1. Standardize on `mgr-actions` for new builds (host + manager) while still accepting the legacy label for backward compatibility.
   2. Manager now attempts the modern label first and automatically retries with `pb-controller` if the remote host has not been upgraded.
   3. Update docs/helpful-commands to remind folks to rebuild the CLI/containers so the new label propagates everywhere.
+
+## Jan 2026 Update: Chunked Fast-Path Framing
+- The original incident also reproduced whenever the terminal snapshot exceeded ~16 KB: SCTP rejected the single-frame payload, stalled the data channel, and controller queues backed up even after the label fix.
+- We now route every fast-path payload through the chunked framing layer (`crates/beach-buggy/src/fast_path.rs`), so large state diffs (and controller acks) are split into ≤14 KB envelopes before hitting WebRTC.
+- Smoke tests (`scripts/fastpath-smoke.sh`) and Pong docs now enforce `rg 'payload_type="chunk"' beach-host-*.log` as part of validation. If that pattern never appears, rebuild the CLI + manager images before launching demo hosts to avoid reviving this incident.

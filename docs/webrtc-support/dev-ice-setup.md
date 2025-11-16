@@ -16,22 +16,13 @@ Manager / Docker configuration
 ------------------------------
 
 1. Ensure the manager container publishes a UDP range (already wired in `docker-compose.yml`).
-   The defaults expose `62000-62100/udp` and resolve `host.docker.internal` so hosts on the
-   laptop can reach the container via NAT 1:1.
-2. Set the public IP and port range in the repo’s `.env.local` (already committed):
-
-   ```bash
-   BEACH_ICE_PUBLIC_IP=127.0.0.1
-   BEACH_ICE_PORT_START=62000
-   BEACH_ICE_PORT_END=62100
-   ```
-
-   `scripts/docker/beach-manager-entry.sh` will automatically resolve
-   `BEACH_ICE_PUBLIC_HOST` (default `host.docker.internal`) if you do not provide an
-   explicit IP.
-
-3. Keep `docker compose`’s `extra_hosts` entry for `host.docker.internal` so the containers
-   can route back to the host.
+   The defaults expose `62000-62100/udp`.
+2. Keep `docker compose`’s `extra_hosts` entry for `host.docker.internal` so containers can
+   resolve the host gateway.
+3. The manager always talks to STUN (Google + the dev coturn on `host.docker.internal:3478`) so it
+   advertises a reflexive/relay address automatically. Laptop devs no longer need to export
+   `BEACH_ICE_PUBLIC_IP`; those overrides are only necessary when you want to pin a specific
+   NAT mapping (e.g., a remote VM).
 
 Local CLI / host configuration
 ------------------------------

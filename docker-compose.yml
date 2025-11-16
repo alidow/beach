@@ -52,6 +52,8 @@ services:
       BEACH_GATE_ISSUER: beach-gate
       BEACH_GATE_AUDIENCE: private-beach-manager
       BEACH_GATE_SIGNING_KID_PATH: /secrets/beach-gate-signing.kid
+      BEACH_ICE_PUBLIC_IP: ${BEACH_ICE_PUBLIC_IP:?Set BEACH_ICE_PUBLIC_IP (run direnv allow). See docs/helpful-commands/direnv-setup.md}
+      BEACH_ICE_PUBLIC_HOST: ${BEACH_ICE_PUBLIC_HOST:?Set BEACH_ICE_PUBLIC_HOST (run direnv allow). See docs/helpful-commands/direnv-setup.md}
       CLERK_JWKS_URL: ${CLERK_JWKS_URL:-}
       CLERK_ISSUER: ${CLERK_ISSUER:-}
       CLERK_AUDIENCE: ${CLERK_AUDIENCE:-}
@@ -59,12 +61,7 @@ services:
       STDOUT_LOG: ${BEACH_MANAGER_STDOUT_LOG:-info}
       BEACH_MANAGER_FILE_LOG: ${BEACH_MANAGER_FILE_LOG:-info,beach_manager=trace}
       LOG_PATH: /var/log/beach-manager/beach-manager.log
-      # Expose host-reachable ICE candidates for WebRTC fast-path.
-      # Set BEACH_ICE_PUBLIC_IP to your host's LAN IP (e.g., 192.168.68.51) so
-      # the container advertises an address the hosts can reach. Alternatively,
-      # set BEACH_ICE_PUBLIC_HOST to a resolvable hostname (defaults to host.docker.internal).
-      BEACH_ICE_PUBLIC_IP: ${BEACH_ICE_PUBLIC_IP:-}
-      BEACH_ICE_PUBLIC_HOST: ${BEACH_ICE_PUBLIC_HOST:-host.docker.internal}
+      # Optional: override the ICE port range when you need something other than 62000-62100.
       BEACH_ICE_PORT_START: ${BEACH_ICE_PORT_START:-62000}
       BEACH_ICE_PORT_END: ${BEACH_ICE_PORT_END:-62100}
       RUST_LOG: info,controller=debug,webrtc=trace,webrtc::ice_transport=trace,webrtc::peer_connection=trace

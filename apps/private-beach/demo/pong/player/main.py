@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import curses
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -86,6 +87,14 @@ class PongView:
         self.last_frame_time = time.monotonic()
         self._last_hud_rows: Set[int] = set()
         self._last_paddle_cells: Set[Tuple[int, int]] = set()
+        self._last_ball_cell: Optional[Tuple[int, int]] = None
+        self.frame_dump_path = os.environ.get("PONG_FRAME_DUMP_PATH")
+        interval_env = os.environ.get("PONG_FRAME_DUMP_INTERVAL")
+        try:
+            self.frame_dump_interval = float(interval_env) if interval_env else 0.0
+        except ValueError:
+            self.frame_dump_interval = 0.0
+        self._next_frame_dump_time = 0.0
 
         self._colors_initialized = False
         self.color_border = curses.A_BOLD
@@ -338,11 +347,21 @@ class PongView:
             self._clear_line(row)
 
         self._draw_frame(play_top, play_bottom)
+        self._clear_play_area(inner_top, inner_bottom, inner_left, inner_right)
         self._draw_centerline(inner_top, inner_bottom)
         self._draw_paddle(inner_top, inner_bottom, inner_left, inner_right)
         self._draw_ball(inner_top, inner_bottom, inner_left, inner_right)
         self._draw_hud(play_bottom)
 
+        self._maybe_dump_frame()
+
+        # Force the entire window to be considered dirty so every refresh
+        # emits a complete frame. This helps environments that fall out of
+        # sync when incremental terminal escape sequences are dropped.
+        try:
+            self.stdscr.touchwin()
+        except curses.error:
+            pass
         self.stdscr.refresh()
 
     def _render_resize_hint(self, message: str) -> None:
@@ -477,6 +496,12 @@ class PongView:
         inner_left: int,
         inner_right: int,
     ) -> None:
+        if self._last_ball_cell:
+            last_y, last_x = self._last_ball_cell
+            if inner_top <= last_y <= inner_bottom and inner_left <= last_x <= inner_right:
+                self._addch_safe(last_y, last_x, " ")
+            self._last_ball_cell = None
+
         if not self.ball:
             return
 
@@ -484,6 +509,7 @@ class PongView:
         by = int(round(self.ball.y))
         if inner_left <= bx <= inner_right and inner_top <= by <= inner_bottom:
             self._addch_safe(by, bx, BALL_GLYPH, self.color_ball)
+            self._last_ball_cell = (by, bx)
 
     def _draw_hud(self, play_bottom: int) -> None:
         status_y = play_bottom + 1
@@ -526,6 +552,54 @@ class PongView:
 
         self._last_hud_rows = hud_rows
 
+    def _maybe_dump_frame(self) -> None:
+        if not self.frame_dump_path or self.frame_dump_interval <= 0:
+            return
+
+        now = time.monotonic()
+        if now < self._next_frame_dump_time:
+            return
+        self._next_frame_dump_time = now + self.frame_dump_interval
+
+        lines: list[str] = []
+        for row in range(self.height):
+            try:
+                raw = self.stdscr.instr(row, 0, self.width)
+            except curses.error:
+                continue
+            if not raw:
+                lines.append("")
+                continue
+            try:
+                text = raw.decode("utf-8", errors="ignore")
+            except Exception:
+                text = "".join(chr(b) if 32 <= b <= 126 else " " for b in raw)
+            lines.append(text.rstrip("\n\r"))
+
+        snapshot = "\n".join(lines)
+        try:
+            dump_dir = os.path.dirname(self.frame_dump_path)
+            if dump_dir:
+                os.makedirs(dump_dir, exist_ok=True)
+            with open(self.frame_dump_path, "w", encoding="utf-8") as fp:
+                fp.write(snapshot)
+        except OSError:
+            pass
+
+    def _clear_play_area(
+        self,
+        inner_top: int,
+        inner_bottom: int,
+        inner_left: int,
+        inner_right: int,
+    ) -> None:
+        width = inner_right - inner_left + 1
+        if width <= 0 or inner_top > inner_bottom:
+            return
+        blank_line = " " * width
+        for row in range(inner_top, inner_bottom + 1):
+            self._addstr_safe(row, inner_left, blank_line)
+
     def _addstr_safe(self, y: int, x: int, text: str, attr: int = 0) -> None:
         if y < 0 or y >= self.height:
             return
@@ -560,6 +634,7 @@ class PongView:
     def run(self) -> None:
         curses.curs_set(0)
         self.stdscr.nodelay(True)
+        self._disable_insert_delete_sequences()
         self._init_colors()
         frame_delay = FRAME_DELAY_SECONDS
 
@@ -577,6 +652,25 @@ class PongView:
 
             if frame_delay > 0:
                 time.sleep(frame_delay)
+
+    def _disable_insert_delete_sequences(self) -> None:
+        def _invoke(name: str) -> None:
+            target = getattr(self.stdscr, name, None)
+            if callable(target):
+                try:
+                    target(False)
+                except curses.error:
+                    return
+                return
+            func = getattr(curses, name, None)
+            if callable(func):
+                try:
+                    func(self.stdscr, False)
+                except curses.error:
+                    return
+
+        for method_name in ("idlok", "idcok"):
+            _invoke(method_name)
 
 
 def parse_args(argv: Tuple[str, ...]) -> argparse.Namespace:

@@ -1,16 +1,9 @@
-use std::{
-    collections::HashMap,
-    net::IpAddr,
-    str::FromStr,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-};
+use std::{collections::HashMap, net::IpAddr, str::FromStr, sync::Arc};
 
-use beach_buggy::{ActionAck, ActionCommand, StateDiff};
-use beach_client_core::protocol::{encode_client_frame_binary, ClientFrame};
-use bytes::Bytes;
+use beach_buggy::{
+    fast_path::{FastPathChunkReassembler, FastPathPayloadKind, frame_fast_path_payload},
+    ActionAck, ActionCommand, StateDiff,
+};
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{Mutex, RwLock},
@@ -22,6 +15,7 @@ use webrtc::data_channel::{data_channel_message::DataChannelMessage, RTCDataChan
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
+use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -96,6 +90,95 @@ fn parse_candidate_meta(candidate: &str) -> Option<IceCandidateMeta> {
     Some(IceCandidateMeta { ip, port, scope })
 }
 
+#[derive(Debug, Deserialize)]
+struct IceServerOverride {
+    urls: Vec<String>,
+    username: Option<String>,
+    credential: Option<String>,
+}
+
+fn default_manager_ice_servers() -> Vec<RTCIceServer> {
+    let mut servers = Vec::new();
+    servers.push(RTCIceServer {
+        urls: vec!["stun:host.docker.internal:3478".to_string()],
+        ..Default::default()
+    });
+    servers.push(RTCIceServer {
+        urls: vec!["stun:stun.l.google.com:19302".to_string()],
+        ..Default::default()
+    });
+    servers
+}
+
+fn raw_ice_override_env() -> Option<(String, &'static str)> {
+    if let Ok(value) = std::env::var("BEACH_MANAGER_ICE_SERVERS") {
+        return Some((value, "BEACH_MANAGER_ICE_SERVERS"));
+    }
+    if let Ok(value) = std::env::var("BEACH_ICE_SERVERS") {
+        return Some((value, "BEACH_ICE_SERVERS"));
+    }
+    None
+}
+
+fn manager_ice_servers_from_env() -> Option<(Vec<RTCIceServer>, &'static str)> {
+    let (raw, env_name) = raw_ice_override_env()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let overrides: Vec<IceServerOverride> = match serde_json::from_str(trimmed) {
+        Ok(value) => value,
+        Err(err) => {
+            warn!(
+                target = "fast_path.ice",
+                error = %err,
+                env = env_name,
+                "failed to parse ICE override"
+            );
+            return None;
+        }
+    };
+
+    let mut servers = Vec::new();
+    for server in overrides.into_iter() {
+        if server.urls.is_empty() {
+            continue;
+        }
+        servers.push(RTCIceServer {
+            urls: server.urls,
+            username: server.username.unwrap_or_default(),
+            credential: server.credential.unwrap_or_default(),
+            ..Default::default()
+        });
+    }
+
+    if servers.is_empty() {
+        warn!(
+            target = "fast_path.ice",
+            env = env_name,
+            "ICE override did not include usable urls"
+        );
+        return None;
+    }
+
+    info!(
+        target = "fast_path.ice",
+        env = env_name,
+        server_count = servers.len(),
+        "using ICE servers from override env"
+    );
+    Some((servers, env_name))
+}
+
+fn resolve_manager_ice_servers() -> (Vec<RTCIceServer>, &'static str) {
+    if let Some((servers, env)) = manager_ice_servers_from_env() {
+        return (servers, env);
+    }
+
+    (default_manager_ice_servers(), "default_public_stun")
+}
+
 #[derive(Clone)]
 pub struct FastPathSession {
     pub session_id: String,
@@ -107,7 +190,6 @@ pub struct FastPathSession {
     pub local_ice: Arc<RwLock<Vec<serde_json::Value>>>,
     pub public_ip_hint: Option<String>,
     pub host_hint_for_log: Option<String>,
-    next_seq: Arc<AtomicU64>,
 }
 
 impl FastPathSession {
@@ -144,43 +226,50 @@ impl FastPathSession {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        let resolved_host = host_hint
-            .clone()
-            .unwrap_or_else(|| "host.docker.internal".to_string());
-        // Prefer explicit IP via BEACH_ICE_PUBLIC_IP; otherwise try resolving a host name
-        // (defaulting to host.docker.internal) to an IPv4 address.
+        // Prefer explicit IP via BEACH_ICE_PUBLIC_IP; otherwise resolve BEACH_ICE_PUBLIC_HOST.
         let explicit_public_ip = std::env::var("BEACH_ICE_PUBLIC_IP")
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        let public_ip = explicit_public_ip.or_else(|| {
-            use std::net::ToSocketAddrs;
-            // Resolve using an arbitrary port to trigger getaddrinfo.
-            (resolved_host.as_str(), 0)
-                .to_socket_addrs()
-                .ok()
-                .and_then(|mut it| it.find(|a| a.is_ipv4()).map(|a| a.ip().to_string()))
+        let nat_ip = explicit_public_ip.or_else(|| {
+            host_hint.as_deref().and_then(|host| {
+                use std::net::ToSocketAddrs;
+                (host, 0)
+                    .to_socket_addrs()
+                    .ok()
+                    .and_then(|mut it| it.find(|a| a.is_ipv4()).map(|a| a.ip().to_string()))
+            })
         });
-        let host_hint_for_log = host_hint.clone().or_else(|| Some(resolved_host.clone()));
+        let host_hint_for_log = host_hint.clone();
         debug!(
             target = "fast_path.ice",
             session_id = %session_id,
-            public_ip_hint = public_ip.as_deref(),
+            public_ip_hint = nat_ip.as_deref(),
             host_hint = host_hint_for_log.as_deref(),
             port_start = port_start_env.as_deref(),
             port_end = port_end_env.as_deref(),
-            resolved_host = resolved_host.as_str(),
+            nat_hint_enabled = nat_ip.is_some(),
             "configured fast-path ICE hints"
         );
-        if let Some(ip) = public_ip.clone() {
+        if let Some(ip) = nat_ip.clone() {
             setting.set_nat_1to1_ips(vec![ip], RTCIceCandidateType::Host);
         }
+
+        let (ice_servers, ice_source) = resolve_manager_ice_servers();
+        debug!(
+            target = "fast_path.ice",
+            session_id = %session_id,
+            ice_source,
+            server_count = ice_servers.len(),
+            "configured manager ICE servers"
+        );
 
         let api = webrtc::api::APIBuilder::new()
             .with_setting_engine(setting)
             .build();
 
-        let cfg = RTCConfiguration::default();
+        let mut cfg = RTCConfiguration::default();
+        cfg.ice_servers = ice_servers;
         let pc = api.new_peer_connection(cfg).await?;
 
         Ok(FastPathSession {
@@ -190,16 +279,9 @@ impl FastPathSession {
             acks_rx: Arc::new(Mutex::new(None)),
             state_rx: Arc::new(Mutex::new(None)),
             local_ice: Arc::new(RwLock::new(Vec::new())),
-            public_ip_hint: public_ip.clone(),
+            public_ip_hint: nat_ip.clone(),
             host_hint_for_log,
-            next_seq: Arc::new(AtomicU64::new(0)),
         })
-    }
-
-    fn next_sequence(&self) -> u64 {
-        self.next_seq
-            .fetch_add(1, Ordering::SeqCst)
-            .saturating_add(1)
     }
 
     pub async fn set_remote_offer(
@@ -286,12 +368,14 @@ impl FastPathSession {
         let ice_host_hint = self.host_hint_for_log.clone();
         let session_for_state = self.session_id.clone();
         let local_candidates_for_state = Arc::clone(&self.local_ice);
+        let pc_for_close = Arc::clone(&self.pc);
         self.pc
             .on_ice_connection_state_change(Box::new(move |state: RTCIceConnectionState| {
                 let session = session_for_state.clone();
                 let ip_hint = ice_ip_hint.clone();
                 let host_hint = ice_host_hint.clone();
                 let candidate_snapshot = Arc::clone(&local_candidates_for_state);
+                let pc_close = Arc::clone(&pc_for_close);
                 Box::pin(async move {
                     debug!(
                         target = "fast_path.ice",
@@ -332,6 +416,16 @@ impl FastPathSession {
                             recent_candidates = ?recent_candidates,
                             "ice connection reported failure"
                         );
+                        // Stop the underlying agent so it does not spin forever trying to
+                        // ping unreachable candidates (which also spams warnings/CPU).
+                        if let Err(err) = pc_close.close().await {
+                            trace!(
+                                target = "fast_path.ice",
+                                session_id = %session,
+                                error = %err,
+                                "failed to close peer connection after ICE failure"
+                            );
+                        }
                     }
                 })
             }));
@@ -480,36 +574,37 @@ pub async fn send_actions_over_fast_path(
         let guard = fps.actions_tx.lock().await;
         if let Some(dc) = guard.as_ref() {
             for a in actions {
-                let data = fast_path_action_bytes(a).map_err(anyhow::Error::msg)?;
-                let seq = fps.next_sequence();
-                let frame = ClientFrame::Input { seq, data };
-                let payload = Bytes::from(encode_client_frame_binary(&frame));
-                let timeout_duration = Duration::from_millis(FAST_PATH_SEND_TIMEOUT_MS);
-                let send_result = timeout(timeout_duration, dc.send(&payload)).await;
-                match send_result {
-                    Ok(Ok(_)) => {
-                        // Normal fast-path delivery.
-                    }
-                    Ok(Err(err)) => {
-                        debug!(
-                            target = "fast_path",
-                            session_id = %session_id,
-                            error = %err,
-                            "fast-path send failed; propagating error to caller"
-                        );
-                        return Err(anyhow::anyhow!(err.to_string()));
-                    }
-                    Err(_) => {
-                        let message = format!(
-                            "fast-path send timed out after {}ms",
-                            FAST_PATH_SEND_TIMEOUT_MS
-                        );
-                        debug!(
-                            target = "fast_path",
-                            session_id = %session_id,
-                            "{}", message
-                        );
-                        return Err(anyhow::anyhow!(message));
+                let payload = fast_path_action_payload(a).map_err(anyhow::Error::msg)?;
+                let frames = frame_fast_path_payload(FastPathPayloadKind::Actions, &payload)
+                    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+                for frame in frames {
+                    let timeout_duration = Duration::from_millis(FAST_PATH_SEND_TIMEOUT_MS);
+                    let send_result = timeout(timeout_duration, dc.send_text(frame)).await;
+                    match send_result {
+                        Ok(Ok(_)) => {
+                            // Normal fast-path delivery.
+                        }
+                        Ok(Err(err)) => {
+                            debug!(
+                                target = "fast_path",
+                                session_id = %session_id,
+                                error = %err,
+                                "fast-path send failed; propagating error to caller"
+                            );
+                            return Err(anyhow::anyhow!(err.to_string()));
+                        }
+                        Err(_) => {
+                            let message = format!(
+                                "fast-path send timed out after {}ms",
+                                FAST_PATH_SEND_TIMEOUT_MS
+                            );
+                            debug!(
+                                target = "fast_path",
+                                session_id = %session_id,
+                                "{}", message
+                            );
+                            return Err(anyhow::anyhow!(message));
+                        }
                     }
                 }
             }
@@ -580,33 +675,49 @@ fn install_ack_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>, s
     let state_clone = state.clone();
     let state_for_close = state.clone();
     let state_for_error = state.clone();
+    let reassembler =
+        Arc::new(Mutex::new(FastPathChunkReassembler::new(FastPathPayloadKind::Acks)));
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let state = state_clone.clone();
         let session_id = session_id.clone();
+        let reassembler = reassembler.clone();
         Box::pin(async move {
-            match parse_action_ack(&msg) {
-                Ok(ack) => {
-                    if let Err(err) = state.ack_actions(&session_id, vec![ack], None, true).await {
+            match decode_chunked_text(&reassembler, &msg).await {
+                Ok(Some(text)) => match parse_action_ack(&text) {
+                    Ok(ack) => {
+                        if let Err(err) =
+                            state.ack_actions(&session_id, vec![ack], None, true).await
+                        {
+                            warn!(
+                                target = "fast_path",
+                                session_id = %session_id,
+                                error = %err,
+                                "failed to persist ack from fast-path"
+                            );
+                        }
+                    }
+                    Err(err) => {
                         warn!(
                             target = "fast_path",
                             session_id = %session_id,
                             error = %err,
-                            "failed to persist ack from fast-path"
+                            "failed to parse ack message from fast-path channel"
                         );
+                        if let Some((pb, sess)) = state.session_metrics_labels(&session_id).await {
+                            metrics::FASTPATH_CHANNEL_ERRORS
+                                .with_label_values(&[pb.as_str(), sess.as_str(), "mgr-acks"])
+                                .inc();
+                        }
                     }
-                }
+                },
+                Ok(None) => {}
                 Err(err) => {
                     warn!(
                         target = "fast_path",
                         session_id = %session_id,
                         error = %err,
-                        "failed to parse ack message from fast-path channel"
+                        "failed to decode chunked ack message"
                     );
-                    if let Some((pb, sess)) = state.session_metrics_labels(&session_id).await {
-                        metrics::FASTPATH_CHANNEL_ERRORS
-                            .with_label_values(&[pb.as_str(), sess.as_str(), "mgr-acks"])
-                            .inc();
-                    }
                 }
             }
         })
@@ -655,33 +766,47 @@ fn install_state_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>,
     let state_clone = state.clone();
     let state_for_close = state.clone();
     let state_for_error = state.clone();
+    let reassembler =
+        Arc::new(Mutex::new(FastPathChunkReassembler::new(FastPathPayloadKind::State)));
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let state = state_clone.clone();
         let session_id = session_id.clone();
+        let reassembler = reassembler.clone();
         Box::pin(async move {
-            match parse_state_diff(&msg) {
-                Ok(diff) => {
-                    if let Err(err) = state.record_state(&session_id, diff, true).await {
+            match decode_chunked_text(&reassembler, &msg).await {
+                Ok(Some(text)) => match parse_state_diff(&text) {
+                    Ok(diff) => {
+                        if let Err(err) = state.record_state(&session_id, diff, true).await {
+                            warn!(
+                                target = "fast_path",
+                                session_id = %session_id,
+                                error = %err,
+                                "failed to persist state diff from fast-path"
+                            );
+                        }
+                    }
+                    Err(err) => {
                         warn!(
                             target = "fast_path",
                             session_id = %session_id,
                             error = %err,
-                            "failed to persist state diff from fast-path"
+                            "failed to parse state message from fast-path channel"
                         );
+                        if let Some((pb, sess)) = state.session_metrics_labels(&session_id).await {
+                            metrics::FASTPATH_CHANNEL_ERRORS
+                                .with_label_values(&[pb.as_str(), sess.as_str(), "mgr-state"])
+                                .inc();
+                        }
                     }
-                }
+                },
+                Ok(None) => {}
                 Err(err) => {
                     warn!(
                         target = "fast_path",
                         session_id = %session_id,
                         error = %err,
-                        "failed to parse state message from fast-path channel"
+                        "failed to decode chunked state message"
                     );
-                    if let Some((pb, sess)) = state.session_metrics_labels(&session_id).await {
-                        metrics::FASTPATH_CHANNEL_ERRORS
-                            .with_label_values(&[pb.as_str(), sess.as_str(), "mgr-state"])
-                            .inc();
-                    }
                 }
             }
         })
@@ -725,40 +850,68 @@ fn install_state_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>,
     }));
 }
 
-fn parse_action_ack(msg: &DataChannelMessage) -> anyhow::Result<ActionAck> {
+async fn decode_chunked_text(
+    reassembler: &Arc<Mutex<FastPathChunkReassembler>>,
+    msg: &DataChannelMessage,
+) -> anyhow::Result<Option<String>> {
     if !msg.is_string {
-        anyhow::bail!("expected text ack payload");
+        anyhow::bail!("expected text payload");
     }
     let text = String::from_utf8(msg.data.to_vec())?;
-    let envelope: AckEnvelope = serde_json::from_str(&text)?;
+    let mut guard = reassembler.lock().await;
+    guard
+        .ingest(&text)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))
+}
+
+fn parse_action_ack(text: &str) -> anyhow::Result<ActionAck> {
+    let envelope: AckEnvelope = serde_json::from_str(text)?;
     if envelope.kind != "ack" {
         anyhow::bail!("unexpected message type {}", envelope.kind);
     }
     Ok(envelope.payload)
 }
 
-fn parse_state_diff(msg: &DataChannelMessage) -> anyhow::Result<StateDiff> {
-    if !msg.is_string {
-        anyhow::bail!("expected text state payload");
-    }
-    let text = String::from_utf8(msg.data.to_vec())?;
-    let envelope: StateEnvelope = serde_json::from_str(&text)?;
+fn parse_state_diff(text: &str) -> anyhow::Result<StateDiff> {
+    let envelope: StateEnvelope = serde_json::from_str(text)?;
     if envelope.kind != "state" {
         anyhow::bail!("unexpected message type {}", envelope.kind);
     }
     Ok(envelope.payload)
 }
 
-pub fn fast_path_action_bytes(action: &ActionCommand) -> Result<Vec<u8>, String> {
+fn terminal_write_bytes(action: &ActionCommand) -> Result<&str, String> {
     if action.action_type.as_str() != "terminal_write" {
         return Err(format!("unsupported action type {}", action.action_type));
     }
-    let bytes = action
+    action
         .payload
         .get("bytes")
         .and_then(|value| value.as_str())
-        .ok_or_else(|| "terminal_write payload missing bytes".to_string())?;
+        .ok_or_else(|| "terminal_write payload missing bytes".to_string())
+}
+
+pub fn fast_path_action_bytes(action: &ActionCommand) -> Result<Vec<u8>, String> {
+    let bytes = terminal_write_bytes(action)?;
     Ok(bytes.as_bytes().to_vec())
+}
+
+fn fast_path_action_payload(action: &ActionCommand) -> Result<String, String> {
+    // Ensure we only forward actions the host transport understands.
+    let _ = terminal_write_bytes(action)?;
+    let envelope = OutboundActionEnvelope {
+        kind: "action",
+        payload: action,
+    };
+    serde_json::to_string(&envelope)
+        .map_err(|err| format!("failed to serialize action for fast-path: {err}"))
+}
+
+#[derive(Serialize)]
+struct OutboundActionEnvelope<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    payload: &'a ActionCommand,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -784,7 +937,7 @@ enum ChannelKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
+    use serde::Deserialize;
 
     #[test]
     fn parses_ack_envelope() {
@@ -796,17 +949,12 @@ mod tests {
             error_code: None,
             error_message: None,
         };
-        let msg = DataChannelMessage {
-            is_string: true,
-            data: Bytes::from(
-                serde_json::to_string(&AckEnvelope {
-                    kind: "ack".into(),
-                    payload: base_ack.clone(),
-                })
-                .unwrap(),
-            ),
-        };
-        let ack = parse_action_ack(&msg).expect("parsed ack");
+        let text = serde_json::to_string(&AckEnvelope {
+            kind: "ack".into(),
+            payload: base_ack.clone(),
+        })
+        .unwrap();
+        let ack = parse_action_ack(&text).expect("parsed ack");
         assert_eq!(ack.id, "a1");
     }
 
@@ -817,17 +965,47 @@ mod tests {
             emitted_at: std::time::SystemTime::now(),
             payload: serde_json::json!({"ops": []}),
         };
-        let msg = DataChannelMessage {
-            is_string: true,
-            data: Bytes::from(
-                serde_json::to_string(&StateEnvelope {
-                    kind: "state".into(),
-                    payload: base_diff.clone(),
-                })
-                .unwrap(),
-            ),
-        };
-        let diff = parse_state_diff(&msg).expect("parsed state");
+        let text = serde_json::to_string(&StateEnvelope {
+            kind: "state".into(),
+            payload: base_diff.clone(),
+        })
+        .unwrap();
+        let diff = parse_state_diff(&text).expect("parsed state");
         assert_eq!(diff.sequence, 7);
+    }
+
+    #[test]
+    fn action_payload_serializes_envelope() {
+        let action = ActionCommand {
+            id: "a1".into(),
+            action_type: "terminal_write".into(),
+            payload: serde_json::json!({ "bytes": "hello" }),
+            expires_at: None,
+        };
+        let payload = fast_path_action_payload(&action).expect("payload serialized");
+        #[derive(Deserialize)]
+        struct ParsedEnvelope {
+            #[serde(rename = "type")]
+            kind: String,
+            payload: ActionCommand,
+        }
+        let parsed: ParsedEnvelope = serde_json::from_str(&payload).expect("parsed envelope");
+        assert_eq!(parsed.kind, "action");
+        assert_eq!(parsed.payload.id, action.id);
+        assert_eq!(
+            parsed.payload.payload.get("bytes").and_then(|v| v.as_str()),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn action_payload_rejects_non_terminal() {
+        let action = ActionCommand {
+            id: "a1".into(),
+            action_type: "resize".into(),
+            payload: serde_json::json!({ "rows": 10, "cols": 20 }),
+            expires_at: None,
+        };
+        assert!(fast_path_action_payload(&action).is_err());
     }
 }

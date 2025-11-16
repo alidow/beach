@@ -1,4 +1,7 @@
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::HashMap,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 use axum::{
     extract::{Path, Query, State},
@@ -19,7 +22,8 @@ use crate::{
     state::{
         AgentOnboardResponse, AppState, ControllerCommandDropReason, ControllerEvent,
         ControllerLeaseResponse, ControllerPairing, ControllerUpdateCadence,
-        JoinSessionResponsePayload, SessionSummary, StateError,
+        JoinSessionResponsePayload, PairingTransportKind, PairingTransportStatus, SessionSummary,
+        StateError,
     },
 };
 
@@ -126,6 +130,15 @@ pub struct ControllerHandshakeResponse {
 pub struct ControllerConsumeQuery {
     #[serde(default)]
     pub controller_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TransportStatusUpdateRequest {
+    pub transport: PairingTransportKind,
+    #[serde(default)]
+    pub latency_ms: Option<u64>,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -513,6 +526,55 @@ pub async fn ack_actions(
         .await
         .map_err(map_state_err)?;
     Ok(Json(serde_json::json!({ "acknowledged": true })))
+}
+
+pub async fn update_transport_status(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<ControllerConsumeQuery>,
+    token: Option<AuthToken>,
+    Json(body): Json<TransportStatusUpdateRequest>,
+) -> ApiResult<serde_json::Value> {
+    // Allow either:
+    // - a controller_token (used by hosts/agents via controller leases), or
+    // - a standard manager access token with pb:sessions.write scope.
+    if let Some(controller_token) = query.controller_token.as_deref() {
+        state
+            .validate_controller_consumer_token(&session_id, controller_token)
+            .await
+            .map_err(map_state_err)?;
+    } else {
+        let auth = token.ok_or(ApiError::Unauthorized)?;
+        ensure_scope(&auth, "pb:sessions.write")?;
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let mut status = match body.transport {
+        PairingTransportKind::FastPath => PairingTransportStatus::fast_path(now),
+        PairingTransportKind::HttpFallback => {
+            PairingTransportStatus::http_fallback(now, body.last_error.clone())
+        }
+        PairingTransportKind::Pending => PairingTransportStatus::pending(),
+    };
+    status = status.with_latency(body.latency_ms);
+    if !matches!(body.transport, PairingTransportKind::HttpFallback) {
+        status = status.with_error(body.last_error.clone());
+    }
+
+    state
+        .update_pairing_transport_status(&session_id, status)
+        .await;
+    info!(
+        target = "controller.transport_status",
+        session_id = %session_id,
+        transport = ?body.transport,
+        latency_ms = body.latency_ms,
+        "transport status updated via API"
+    );
+    Ok(Json(serde_json::json!({ "updated": true })))
 }
 
 async fn resolve_control_consumer(

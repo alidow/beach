@@ -208,6 +208,8 @@ function BeachCanvasShellInner({
   }, [tileState.tiles]);
 
   const sessionMetaPersistRef = useRef<string>(sessionMetaSignature);
+  const relationshipsRef = useRef(tileState.relationships);
+  const relationshipOrderRef = useRef(tileState.relationshipOrder);
 
   useEffect(() => {
     if (sessionMetaSignature === sessionMetaPersistRef.current) {
@@ -216,6 +218,17 @@ function BeachCanvasShellInner({
     sessionMetaPersistRef.current = sessionMetaSignature;
     requestImmediatePersist();
   }, [requestImmediatePersist, sessionMetaSignature]);
+
+  useEffect(() => {
+    const relationshipsChanged = relationshipsRef.current !== tileState.relationships;
+    const relationshipOrderChanged = relationshipOrderRef.current !== tileState.relationshipOrder;
+    if (!relationshipsChanged && !relationshipOrderChanged) {
+      return;
+    }
+    relationshipsRef.current = tileState.relationships;
+    relationshipOrderRef.current = tileState.relationshipOrder;
+    requestImmediatePersist();
+  }, [requestImmediatePersist, tileState.relationshipOrder, tileState.relationships]);
 
   const interactiveTileId = tileState.interactiveId;
   const interactiveTile = interactiveTileId ? tileState.tiles[interactiveTileId] : null;

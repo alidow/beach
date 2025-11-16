@@ -18,6 +18,8 @@ reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 reqwest-eventsource = "0.5"
 url = "2"
 webrtc = { version = "0.14", default-features = true }
+base64 = "0.21"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 axum = { version = "0.7", features = ["macros"] }

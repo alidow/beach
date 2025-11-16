@@ -23,6 +23,7 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls", "native-tls-ve
 futures-util = "0.3"
 url = "2"
 once_cell = "1.19"
+if-addrs = "0.10"
 bytes = "1"
 bincode = "1"
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }

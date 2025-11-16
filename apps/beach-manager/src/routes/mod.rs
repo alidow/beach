@@ -40,6 +40,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/sessions/:session_id/actions/ack", post(ack_actions))
         .route(
+            "/sessions/:session_id/transport-status",
+            post(update_transport_status),
+        )
+        .route(
             "/sessions/:session_id/controller/lease",
             post(acquire_controller).delete(release_controller),
         )
@@ -595,6 +599,41 @@ mod tests {
         assert_eq!(pairings.len(), 1);
         assert_eq!(pairings[0]["child_session_id"], "child-1");
         assert_eq!(pairings[0]["transport_status"]["transport"], "pending");
+
+        let update_body = json!({"transport": "fast_path"});
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/controller-1/transport-status")
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(update_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/sessions/controller-1/controllers")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let pairings: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(pairings[0]["transport_status"]["transport"], "fast_path");
 
         let response = app
             .clone()

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,7 +12,8 @@ use crossbeam_channel::{
     Sender as CrossbeamSender, TryRecvError as CrossbeamTryRecvError,
     unbounded as crossbeam_unbounded,
 };
-use once_cell::sync::Lazy;
+use if_addrs::get_if_addrs;
+use once_cell::sync::{Lazy, OnceCell as SyncOnceCell};
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -28,6 +29,7 @@ use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
+use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -106,6 +108,115 @@ fn parse_candidate_info(candidate: &str) -> Option<IceCandidateInfo> {
         ip,
         port,
     })
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NatHintSource {
+    EnvIp,
+    EnvHost,
+    AutoDetect,
+}
+
+static NAT_HINT: SyncOnceCell<Option<(String, NatHintSource)>> = SyncOnceCell::new();
+
+fn nat_ip_hint() -> Option<&'static (String, NatHintSource)> {
+    NAT_HINT
+        .get_or_init(|| {
+            let hint = detect_nat_ip_hint();
+            match &hint {
+                Some((ip, source)) => {
+                    tracing::info!(
+                        target = "beach::transport::webrtc",
+                        nat_ip = %ip,
+                        nat_hint_source = ?source,
+                        "using NAT 1:1 hint for WebRTC"
+                    );
+                }
+                None => {
+                    tracing::debug!(
+                        target = "beach::transport::webrtc",
+                        "no NAT hint detected for WebRTC"
+                    );
+                }
+            }
+            hint
+        })
+        .as_ref()
+}
+
+fn detect_nat_ip_hint() -> Option<(String, NatHintSource)> {
+    if let Some(ip) = env_nat_ip() {
+        return Some((ip, NatHintSource::EnvIp));
+    }
+    if let Some(ip) = env_nat_host() {
+        return Some((ip, NatHintSource::EnvHost));
+    }
+    if !auth::is_public_mode() {
+        return None;
+    }
+    detect_lan_ipv4().map(|ip| (ip.to_string(), NatHintSource::AutoDetect))
+}
+
+fn env_nat_ip() -> Option<String> {
+    std::env::var("BEACH_ICE_PUBLIC_IP")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_nat_host() -> Option<String> {
+    let host = std::env::var("BEACH_ICE_PUBLIC_HOST")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    (host.as_str(), 0)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.find(|addr| matches!(addr, std::net::SocketAddr::V4(_))))
+        .map(|addr| addr.ip().to_string())
+}
+
+fn detect_lan_ipv4() -> Option<Ipv4Addr> {
+    let addrs = get_if_addrs().ok()?;
+    let mut fallback = None;
+    for iface in addrs {
+        if iface.is_loopback() {
+            continue;
+        }
+        if let IpAddr::V4(addr) = iface.ip() {
+            if should_skip_addr(&addr) {
+                continue;
+            }
+            if addr.is_private() {
+                return Some(addr);
+            }
+            fallback.get_or_insert(addr);
+        }
+    }
+    fallback
+}
+
+fn should_skip_addr(addr: &Ipv4Addr) -> bool {
+    let octets = addr.octets();
+    if octets[0] == 0 || octets[0] == 127 {
+        return true;
+    }
+    if octets[0] == 169 && octets[1] == 254 {
+        return true;
+    }
+    if octets[0] == 192 && octets[1] == 168 && octets[2] == 65 {
+        return true;
+    }
+    if octets[0] == 172 && (10..20).contains(&octets[1]) {
+        return true;
+    }
+    false
+}
+
+fn apply_nat_hint(setting: &mut SettingEngine) {
+    if let Some((ip, _source)) = nat_ip_hint() {
+        setting.set_nat_1to1_ips(vec![ip.clone()], RTCIceCandidateType::Host);
+    }
 }
 
 pub struct OfferEncryptionDelayGuard {
@@ -208,6 +319,7 @@ impl WebRtcChannels {
 enum IceServerSource {
     LocalOverride,
     BeachGateTurn,
+    PublicStun,
     HostOnly,
 }
 
@@ -216,6 +328,7 @@ impl IceServerSource {
         match self {
             IceServerSource::LocalOverride => "env_override",
             IceServerSource::BeachGateTurn => "beach_gate_turn",
+            IceServerSource::PublicStun => "public_stun",
             IceServerSource::HostOnly => "host_only",
         }
     }
@@ -336,11 +449,11 @@ async fn load_turn_ice_servers() -> Result<IceServerSelection, AuthError> {
     if auth::is_public_mode() {
         tracing::info!(
             target: "beach::transport::webrtc",
-            "public mode: no remote ICE servers configured; using host/prflx candidates only"
+            "public mode: using default public STUN server"
         );
         return Ok(IceServerSelection::with_source(
-            IceServerSource::HostOnly,
-            None,
+            IceServerSource::PublicStun,
+            Some(vec![default_stun_server()]),
         ));
     }
 
@@ -1555,6 +1668,7 @@ async fn negotiate_offerer_peer(
     let RemotePeerJoined { peer, signals, .. } = joined;
 
     let mut setting = SettingEngine::default();
+    apply_nat_hint(&mut setting);
     setting.set_ice_timeouts(
         Some(Duration::from_secs(3)),
         Some(Duration::from_secs(10)),
@@ -2541,6 +2655,7 @@ async fn connect_answerer(
     let _answerer_span_guard = answerer_span.enter();
 
     let mut setting = SettingEngine::default();
+    apply_nat_hint(&mut setting);
     setting.set_ice_timeouts(
         Some(Duration::from_secs(3)),
         Some(Duration::from_secs(10)),

@@ -220,8 +220,10 @@ function FlowCanvasInner({
     flow.setViewport({ x: desired.pan.x, y: desired.pan.y, zoom: desired.zoom }, { duration: applied ? 160 : 0 });
     appliedViewportRef.current = desired;
   }, [canvasViewport, flow]);
-  const memoizedNodeTypes = useMemo(() => NODE_TYPES, []);
-  const memoizedEdgeTypes = useMemo(() => EDGE_TYPES, []);
+  const nodeTypesRef = useRef(NODE_TYPES);
+  const edgeTypesRef = useRef(EDGE_TYPES);
+  const memoizedNodeTypes = nodeTypesRef.current;
+  const memoizedEdgeTypes = edgeTypesRef.current;
   // Runtime guard to surface accidental remount causes during dev
   if (process.env.NODE_ENV !== 'production') {
     try {

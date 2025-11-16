@@ -23,7 +23,7 @@ import type { CanvasNodeDefinition, CanvasPoint, NodePlacementPayload, TileMoveP
 
 const APPLICATION_MIME = 'application/reactflow';
 const OFFSET_MIME = 'application/reactflow-offset';
-const nodeTypes = { tile: TileFlowNode };
+const NODE_TYPES = Object.freeze({ tile: TileFlowNode });
 
 type FlowCanvasProps = {
   onNodePlacement: (payload: NodePlacementPayload) => void;
@@ -65,7 +65,8 @@ function FlowCanvasInner({
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const dragSnapshotRef = useRef<DragSnapshot | null>(null);
   const { screenToFlowPosition } = useReactFlow();
-  const memoizedNodeTypes = useMemo(() => nodeTypes, []);
+  const nodeTypesRef = useRef(NODE_TYPES);
+  const memoizedNodeTypes = nodeTypesRef.current;
   const tileState = useTileState();
   const {
     setTilePosition,

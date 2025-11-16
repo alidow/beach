@@ -493,11 +493,11 @@ function GroupNodeComponent({ data, selected }: NodeProps<GroupNodeData>) {
   );
 }
 
-const nodeTypes: NodeTypes = {
+const NODE_TYPES: NodeTypes = Object.freeze({
   tile: TileNodeComponent,
   agent: AgentNodeComponent,
   group: GroupNodeComponent,
-};
+});
 
 function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
   const {
@@ -516,7 +516,8 @@ function CanvasSurfaceInner(props: Omit<CanvasSurfaceProps, 'handlers'>) {
     viewerStateOverrides: viewerStateOverridesProp,
   } = props;
   const reactFlow = useReactFlow();
-  const memoizedNodeTypes = useMemo(() => nodeTypes, []);
+  const nodeTypesRef = useRef<NodeTypes>(NODE_TYPES);
+  const memoizedNodeTypes = nodeTypesRef.current;
   const { load, setNodes: setCanvasNodes, updateNode, setViewport, setSelection } = useCanvasActions();
   const { selection, nodes: canvasNodes } = useCanvasState();
   const { onDropNode, onCreateGroup, onAssignAgent, onAssignmentError } = useCanvasHandlers();

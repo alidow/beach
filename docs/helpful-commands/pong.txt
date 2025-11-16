@@ -1,3 +1,10 @@
+# Clerk auth for manager requests.
+# Manager verifies every API call with Clerk and lets Beach Gate handle controller tokens.
+# These defaults match the dev Clerk instance tied to the publishable key used below.
+export CLERK_JWKS_URL=${CLERK_JWKS_URL:-https://shining-sunbird-15.clerk.accounts.dev/.well-known/jwks.json}
+export CLERK_ISSUER=${CLERK_ISSUER:-https://shining-sunbird-15.clerk.accounts.dev}
+export CLERK_AUDIENCE=${CLERK_AUDIENCE:-private-beach-manager}
+
 LOG_DIR="$HOME/beach-debug"
 mkdir -p "$LOG_DIR"
 : > /tmp/beach-host.log
@@ -71,9 +78,10 @@ If you later need full TURN support, unset `BEACH_PUBLIC_MODE` (or set it to `0`
 
 LHS player (single line)
 
+export PONG_FRAME_DUMP_PATH="$HOME/beach-debug/pong-lhs-screen.txt"
+export PONG_FRAME_DUMP_INTERVAL=1.0
+export BEACH_PUBLIC_MODE=1
 export PRIVATE_BEACH_MANAGER_URL=http://localhost:8080
-export BEACH_ICE_PUBLIC_HOST=host.docker.internal
-export BEACH_ICE_PUBLIC_IP=127.0.0.1
 export PONG_LOG_LEVEL=trace
 export PONG_RUST_LOG=info,webrtc=trace,webrtc::ice_transport=trace,webrtc::peer_connection=trace,beach_client_core::transport::webrtc=trace,beach_client_core::transport::webrtc::signaling=trace
 LOG_DIR="$HOME/beach-debug"; mkdir -p "$LOG_DIR"
@@ -90,9 +98,10 @@ cd ~/development/beach && RUST_LOG=${PONG_RUST_LOG:-info} cargo run --bin beach 
 
 RHS player (single line)
 
+export PONG_FRAME_DUMP_PATH="$HOME/beach-debug/pong-rhs-screen.txt"
+export PONG_FRAME_DUMP_INTERVAL=1.0
+export BEACH_PUBLIC_MODE=1
 export PRIVATE_BEACH_MANAGER_URL=http://localhost:8080
-export BEACH_ICE_PUBLIC_HOST=host.docker.internal
-export BEACH_ICE_PUBLIC_IP=127.0.0.1
 export PONG_LOG_LEVEL=trace
 export PONG_RUST_LOG=info,webrtc=trace,webrtc::ice_transport=trace,webrtc::peer_connection=trace,beach_client_core::transport::webrtc=trace,beach_client_core::transport::webrtc::signaling=trace
 LOG_DIR="$HOME/beach-debug"; mkdir -p "$LOG_DIR"
@@ -110,10 +119,10 @@ cd ~/development/beach && RUST_LOG=${PONG_RUST_LOG:-info} cargo run --bin beach 
 Agent (single line; no session-id envs; just declare beach + manager)
 
 
+export BEACH_PUBLIC_MODE=0
 export PRIVATE_BEACH_MANAGER_URL=http://localhost:8080
-export BEACH_ICE_PUBLIC_HOST=host.docker.internal
-export BEACH_ICE_PUBLIC_IP=127.0.0.1
 export PONG_RUST_LOG=info,webrtc=trace,webrtc::ice_transport=trace,webrtc::peer_connection=trace,beach_client_core::transport::webrtc=trace,beach_client_core::transport::webrtc::signaling=trace
+export PONG_AGENT_STDOUT_LEVEL=warn  # optional: keep the mock agent quiet while still surfacing problems
 cd ~/development/beach
 chmod +x apps/private-beach/demo/pong/tools/run-agent.sh
 apps/private-beach/demo/pong/tools/run-agent.sh 4185e6be-4c1a-40a0-b285-272f8b44265f
@@ -123,6 +132,8 @@ apps/private-beach/demo/pong/tools/run-agent.sh 4185e6be-4c1a-40a0-b285-272f8b44
 LOG_DIR="$HOME/beach-debug" \
 apps/private-beach/demo/pong/tools/print-session-codes.sh
 
+The CLI automatically falls back to Google’s public STUN server (`stun:stun.l.google.com:19302`) in
+public mode, so you no longer have to set `BEACH_ICE_SERVERS` or figure out your LAN IP for the hosts.
 If you need the old firehose for a targeted investigation, temporarily export `PONG_LOG_LEVEL=trace`, set
 `BEACH_TRACE_DEPS=1`, and optionally add a custom `BEACH_LOG_FILTER="info,beach_client_core=trace"` so only the Beach modules
 stay at trace. You can also override `PONG_RUST_LOG` (e.g. `PONG_RUST_LOG="info,beach_client_core::transport::webrtc=trace"`) to

@@ -79,6 +79,12 @@ const CONTROLLER_FAST_PATH_WAIT: StdDuration = StdDuration::from_secs(15);
 const CONTROLLER_FAST_PATH_WAIT_LOG_KIND: &str = "controller_fast_path_wait";
 const CONTROLLER_FAST_PATH_READY_LOG_KIND: &str = "controller_fast_path_ready";
 const CONTROLLER_FAST_PATH_LOG_INTERVAL: StdDuration = StdDuration::from_secs(5);
+/// Enables exponential retry backoff for controller fast-path upgrades. Disable
+/// via env if we need to fall back to the legacy eager retry strategy.
+const CONTROLLER_FAST_PATH_BACKOFF_ENV: &str = "CONTROLLER_FAST_PATH_BACKOFF";
+const CONTROLLER_FAST_PATH_BACKOFF_DEFAULT_ENABLED: bool = true;
+const CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY: StdDuration = StdDuration::from_secs(1);
+const CONTROLLER_FAST_PATH_BACKOFF_MAX_DELAY: StdDuration = StdDuration::from_secs(30);
 const CONTROLLER_STRICT_GATING_ENV: &str = "CONTROLLER_STRICT_GATING";
 const CONTROLLER_STRICT_GATING_DEFAULT_ENABLED: bool = true;
 const IDLE_PUBLISH_TOKEN_HINT_KEY: &str = "idlePublishToken";
@@ -124,6 +130,7 @@ pub struct AppState {
     road_base_url: String,
     public_manager_url: String,
     controller_fast_path_enabled: bool,
+    controller_fast_path_backoff_enabled: bool,
     controller_strict_gating: bool,
     idle_snapshot_interval_ms: Option<u64>,
     state_keepalive: StateKeepaliveManager,
@@ -1080,6 +1087,10 @@ impl AppState {
                 CONTROLLER_FAST_PATH_FLAG_ENV,
                 CONTROLLER_FAST_PATH_DEFAULT_ENABLED,
             ),
+            controller_fast_path_backoff_enabled: env_flag_enabled(
+                CONTROLLER_FAST_PATH_BACKOFF_ENV,
+                CONTROLLER_FAST_PATH_BACKOFF_DEFAULT_ENABLED,
+            ),
             controller_strict_gating: env_flag_enabled(
                 CONTROLLER_STRICT_GATING_ENV,
                 CONTROLLER_STRICT_GATING_DEFAULT_ENABLED,
@@ -1113,6 +1124,10 @@ impl AppState {
             controller_fast_path_enabled: env_flag_enabled(
                 CONTROLLER_FAST_PATH_FLAG_ENV,
                 CONTROLLER_FAST_PATH_DEFAULT_ENABLED,
+            ),
+            controller_fast_path_backoff_enabled: env_flag_enabled(
+                CONTROLLER_FAST_PATH_BACKOFF_ENV,
+                CONTROLLER_FAST_PATH_BACKOFF_DEFAULT_ENABLED,
             ),
             controller_strict_gating: env_flag_enabled(
                 CONTROLLER_STRICT_GATING_ENV,
@@ -1166,12 +1181,21 @@ impl AppState {
         self.controller_fast_path_enabled
     }
 
+    pub fn controller_fast_path_backoff_enabled(&self) -> bool {
+        self.controller_fast_path_backoff_enabled
+    }
+
     pub fn controller_strict_gating(&self) -> bool {
         self.controller_strict_gating
     }
 
     pub fn with_controller_strict_gating(mut self, enabled: bool) -> Self {
         self.controller_strict_gating = enabled;
+        self
+    }
+
+    pub fn with_controller_fast_path_backoff(mut self, enabled: bool) -> Self {
+        self.controller_fast_path_backoff_enabled = enabled;
         self
     }
 
@@ -1874,7 +1898,7 @@ impl AppState {
         .await;
     }
 
-    async fn update_pairing_transport_status(
+    pub async fn update_pairing_transport_status(
         &self,
         child_session_id: &str,
         status: PairingTransportStatus,
@@ -7878,6 +7902,7 @@ impl FastPathUpgradeHandle {
         session_id: String,
         private_beach_id: String,
         event_tx: mpsc::UnboundedSender<ForwarderEvent>,
+        initial_delay: StdDuration,
     ) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::new();
@@ -7888,7 +7913,11 @@ impl FastPathUpgradeHandle {
             let cancel_flag = cancel.clone();
             let session_id = session_id.clone();
             let private_beach_id = private_beach_id.clone();
+            let delay = initial_delay;
             handles.push(tokio::spawn(async move {
+                if !delay.is_zero() {
+                    sleep(delay).await;
+                }
                 loop {
                     if cancel_flag.load(Ordering::SeqCst) {
                         break;
@@ -7966,6 +7995,49 @@ impl Drop for FastPathUpgradeHandle {
     }
 }
 
+#[derive(Debug, Clone)]
+struct FastPathUpgradeBackoff {
+    enabled: bool,
+    current_delay: Option<StdDuration>,
+}
+
+impl FastPathUpgradeBackoff {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            current_delay: None,
+        }
+    }
+
+    fn record_failure(&mut self) -> StdDuration {
+        if !self.enabled {
+            return StdDuration::from_secs(0);
+        }
+        let next = match self.current_delay {
+            None => CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY,
+            Some(delay) => {
+                let doubled = delay.saturating_mul(2);
+                if doubled > CONTROLLER_FAST_PATH_BACKOFF_MAX_DELAY {
+                    CONTROLLER_FAST_PATH_BACKOFF_MAX_DELAY
+                } else {
+                    doubled
+                }
+            }
+        };
+        self.current_delay = Some(next);
+        next
+    }
+
+    fn reset(&mut self) {
+        self.current_delay = None;
+    }
+
+    #[cfg(test)]
+    fn current_delay(&self) -> Option<StdDuration> {
+        self.current_delay
+    }
+}
+
 fn ensure_fast_path_probe(
     watchers: &mut Option<FastPathUpgradeHandle>,
     channels: &Option<WebRtcChannels>,
@@ -7975,6 +8047,8 @@ fn ensure_fast_path_probe(
     session_id: &str,
     private_beach_id: &str,
     event_tx: &mpsc::UnboundedSender<ForwarderEvent>,
+    backoff: &mut FastPathUpgradeBackoff,
+    apply_backoff: bool,
 ) {
     if !fast_path_enabled || watchers.is_some() {
         return;
@@ -7984,11 +8058,26 @@ fn ensure_fast_path_probe(
         return;
     }
     if let Some(channels) = channels {
+        let delay = if apply_backoff {
+            backoff.record_failure()
+        } else {
+            StdDuration::from_secs(0)
+        };
+        if delay > StdDuration::from_secs(0) {
+            info!(
+                target = "controller.forwarder",
+                session_id = %session_id,
+                private_beach_id = %private_beach_id,
+                delay_ms = delay.as_millis() as u64,
+                "fast_path_upgrade_backoff"
+            );
+        }
         watchers.replace(FastPathUpgradeHandle::spawn(
             channels.clone(),
             session_id.to_string(),
             private_beach_id.to_string(),
             event_tx.clone(),
+            delay,
         ));
     }
 }
@@ -8004,6 +8093,8 @@ async fn drive_controller_forwarder(
 ) -> Result<(), ControllerForwarderError> {
     let fast_path_enabled = state.controller_fast_path_enabled();
     let fast_path_channels = webrtc_channels.clone();
+    let mut fast_path_backoff =
+        FastPathUpgradeBackoff::new(state.controller_fast_path_backoff_enabled());
     let (mut transport, mut transport_label, mut via_fast_path) = select_controller_transport(
         primary_transport.clone(),
         fast_path_channels.clone(),
@@ -8026,6 +8117,7 @@ async fn drive_controller_forwarder(
     );
 
     if via_fast_path {
+        fast_path_backoff.reset();
         let now = now_ms();
         state
             .update_pairing_transport_status(session_id, PairingTransportStatus::fast_path(now))
@@ -8044,6 +8136,8 @@ async fn drive_controller_forwarder(
         session_id,
         private_beach_id,
         &event_tx,
+        &mut fast_path_backoff,
+        false,
     );
     let mut pending: HashMap<u64, PendingControllerAction> = HashMap::new();
     let mut next_seq: u64 = 0;
@@ -8193,6 +8287,8 @@ async fn drive_controller_forwarder(
                                 session_id,
                                 private_beach_id,
                                 &event_tx,
+                                &mut fast_path_backoff,
+                                true,
                             );
                             continue;
                         }
@@ -8243,6 +8339,7 @@ async fn drive_controller_forwarder(
                         transport_label = "fast_path";
                         transport = fast_transport;
                         transport_is_primary = false;
+                        fast_path_backoff.reset();
                         drop(reader_guard);
                         reader_guard = ForwarderReader::spawn(transport.clone(), event_tx.clone());
                         let now = now_ms();
@@ -8268,6 +8365,8 @@ async fn drive_controller_forwarder(
                             session_id,
                             private_beach_id,
                             &event_tx,
+                            &mut fast_path_backoff,
+                            false,
                         );
                     }
                     None => {
@@ -8353,6 +8452,8 @@ async fn drive_controller_forwarder(
                                     session_id,
                                     private_beach_id,
                                     &event_tx,
+                                    &mut fast_path_backoff,
+                                    true,
                                 );
                                 continue;
                             }
@@ -8456,6 +8557,8 @@ async fn drive_controller_forwarder(
                                             session_id,
                                             private_beach_id,
                                             &event_tx,
+                                            &mut fast_path_backoff,
+                                            true,
                                         );
                                         continue;
                                     }
@@ -8890,7 +8993,7 @@ mod tests {
         Arc,
     };
     use std::time::{Duration as StdDuration, SystemTime};
-    use tokio::time::{sleep, timeout, Duration};
+    use tokio::time::{advance, sleep, timeout, Duration};
 
     #[test_timeout::tokio_timeout_test(10)]
     async fn spawn_viewer_worker_smoke_test_records_state_and_stream() {
@@ -9272,6 +9375,7 @@ mod tests {
             "sess-fast".into(),
             "pb-fast".into(),
             tx.clone(),
+            StdDuration::from_secs(0),
         );
 
         let fast = Arc::new(TestTransport::new(9, TransportKind::WebRtc));
@@ -9296,11 +9400,99 @@ mod tests {
         assert_eq!(label, CONTROLLER_CHANNEL_LABEL);
     }
 
+    #[test]
+    fn fast_path_upgrade_backoff_increases_and_caps() {
+        let mut backoff = FastPathUpgradeBackoff::new(true);
+        assert_eq!(
+            backoff.record_failure(),
+            CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY
+        );
+        assert_eq!(
+            backoff.record_failure(),
+            CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY.saturating_mul(2)
+        );
+        assert_eq!(
+            backoff.record_failure(),
+            CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY.saturating_mul(4)
+        );
+        assert_eq!(
+            backoff.record_failure(),
+            CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY.saturating_mul(8)
+        );
+        assert_eq!(
+            backoff.record_failure(),
+            CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY.saturating_mul(16)
+        );
+        assert_eq!(
+            backoff.record_failure(),
+            CONTROLLER_FAST_PATH_BACKOFF_MAX_DELAY
+        );
+        assert_eq!(
+            backoff.record_failure(),
+            CONTROLLER_FAST_PATH_BACKOFF_MAX_DELAY
+        );
+    }
+
+    #[test]
+    fn fast_path_upgrade_backoff_resets_after_success() {
+        let mut backoff = FastPathUpgradeBackoff::new(true);
+        backoff.record_failure();
+        backoff.record_failure();
+        assert!(backoff.current_delay().is_some());
+        backoff.reset();
+        assert!(backoff.current_delay().is_none());
+        assert_eq!(
+            backoff.record_failure(),
+            CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ensure_fast_path_probe_applies_backoff_delay() {
+        let channels = WebRtcChannels::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut watchers: Option<FastPathUpgradeHandle> = None;
+        let mut backoff = FastPathUpgradeBackoff::new(true);
+
+        ensure_fast_path_probe(
+            &mut watchers,
+            &Some(channels.clone()),
+            true,
+            false,
+            true,
+            "sess-probe-delay",
+            "pb-probe-delay",
+            &tx,
+            &mut backoff,
+            true,
+        );
+
+        let fast = Arc::new(TestTransport::new(11, TransportKind::WebRtc));
+        channels.publish(CONTROLLER_CHANNEL_LABEL.to_string(), fast);
+
+        let almost_delay =
+            CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY.saturating_sub(StdDuration::from_millis(100));
+        advance(almost_delay).await;
+        assert!(rx.try_recv().is_err());
+
+        advance(StdDuration::from_millis(200)).await;
+        let label = loop {
+            if let Some(event) = rx.recv().await {
+                if let ForwarderEvent::FastPathReady { label, .. } = event {
+                    break label;
+                }
+            }
+        };
+        assert_eq!(label, CONTROLLER_CHANNEL_LABEL);
+        drop(watchers);
+    }
+
     #[tokio::test]
     async fn ensure_fast_path_probe_runs_when_primary_marked_fast_path() {
         let channels = WebRtcChannels::new();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut watchers: Option<FastPathUpgradeHandle> = None;
+        let mut backoff = FastPathUpgradeBackoff::new(true);
 
         ensure_fast_path_probe(
             &mut watchers,
@@ -9311,6 +9503,8 @@ mod tests {
             "sess-probe",
             "pb-probe",
             &tx,
+            &mut backoff,
+            false,
         );
 
         assert!(watchers.is_some());

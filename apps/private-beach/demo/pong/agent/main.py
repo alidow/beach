@@ -48,12 +48,13 @@ from manager_client import (  # type: ignore
 
 LOG_LIMIT = 200
 PROMPT_BOX_HEIGHT = 3
-DEFAULT_SERVE_INTERVAL = 3.0
+DEFAULT_SERVE_INTERVAL = 4.0
 DEFAULT_MAX_STEP = 2.5
-DEFAULT_MIN_THRESHOLD = 0.4
+DEFAULT_MIN_THRESHOLD = 0.25
 DEFAULT_COMMAND_INTERVAL = 0.08
 DEFAULT_FALLBACK_POLL_INTERVAL = 1.0
 ACTION_SUMMARY_INTERVAL = 5.0
+BALL_LOSS_GRACE_SECONDS = 0.75
 
 PADDLE_GLYPHS = frozenset(
     {
@@ -73,15 +74,56 @@ PADDLE_GLYPHS = frozenset(
 BALL_GLYPHS = frozenset({"o", ".", "*", "\u25cf"})  # supports ● plus ascii fallbacks
 # Controller-IO readiness states. Do not treat the state stream alone as ready,
 # since rendering readiness does not guarantee controller delivery is wired.
-TRANSPORT_READY_STATES = frozenset(
-    {
-        "fast_path",
-        "http_fallback",
-        "http_poller",
-        "transport",
-        "controller",
-    }
-)
+FAST_PATH_READY_STATES = frozenset({"fast_path"})
+# HTTP transport events that indicate a usable (but degraded) controller path.
+HTTP_READY_STATES = frozenset({"http_fallback", "controller", "transport"})
+# Poller states mean we're still draining the HTTP queue; keep waiting until
+# fast-path is available (or we've previously promoted to fast-path and need
+# to fall back).
+HTTP_POLLER_STATES = frozenset({"http_poller"})
+
+LOG_LEVEL_PRIORITIES = {
+    "trace": 10,
+    "debug": 20,
+    "info": 30,
+    "warn": 40,
+    "error": 50,
+}
+LOG_LEVEL_ALIASES = {
+    "warning": "warn",
+    "err": "error",
+    "fatal": "error",
+    "critical": "error",
+    "prompt": "info",
+    "action": "info",
+}
+
+
+def _normalize_log_level_value(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    normalized = LOG_LEVEL_ALIASES.get(normalized, normalized)
+    if normalized in LOG_LEVEL_PRIORITIES:
+        return normalized
+    return None
+
+
+def _default_agent_log_level() -> str:
+    for env_key in ("PONG_AGENT_STDOUT_LEVEL", "PONG_AGENT_LOG_LEVEL", "RUN_AGENT_LOG_LEVEL"):
+        normalized = _normalize_log_level_value(os.environ.get(env_key))
+        if normalized:
+            return normalized
+    return "info"
+
+
+def _log_level_arg(value: str) -> str:
+    normalized = _normalize_log_level_value(value)
+    if not normalized:
+        raise argparse.ArgumentTypeError(f"invalid log level: {value}")
+    return normalized
 
 
 def normalize_transport_status(value: Optional[str]) -> str:
@@ -1172,6 +1214,7 @@ class SessionState:
     paddle_center: Optional[float] = None
     paddle_column: Optional[int] = None
     ball_position: Optional[Tuple[float, float]] = None
+    ball_position_time: Optional[float] = None
     previous_ball_position: Optional[Tuple[float, float]] = None
     previous_ball_time: Optional[float] = None
     ball_velocity: Optional[Tuple[float, float]] = None
@@ -1180,6 +1223,7 @@ class SessionState:
     last_move_time: float = 0.0
     ball_exit: Optional[str] = None
     ball_exit_time: float = 0.0
+    ball_exit_position: Optional[Tuple[float, float]] = None
     last_velocity: Optional[Tuple[float, float]] = None
     action_failures: int = 0
     action_backoff_until: float = 0.0
@@ -1187,6 +1231,8 @@ class SessionState:
     transport_ready: bool = False
     transport_status: Optional[str] = None
     transport_last_update: float = 0.0
+    fast_path_established: bool = False
+    active_transport: Optional[str] = None
 
     def touch(self, now: float) -> None:
         self.last_update = now
@@ -1211,7 +1257,16 @@ class SessionState:
     def _detect_paddle(self) -> None:
         rows: List[int] = []
         cols: List[int] = []
+        height = self.height
+        if height <= 0:
+            self.paddle_center = None
+            self.paddle_column = None
+            return
+        hud_rows = 3
+        max_play_row = max(height - hud_rows, 1)
         for row_idx, line in enumerate(self.lines):
+            if row_idx >= max_play_row:
+                break
             for col_idx, char in enumerate(line):
                 if char in PADDLE_GLYPHS:
                     rows.append(row_idx)
@@ -1226,7 +1281,21 @@ class SessionState:
 
     def _detect_ball(self, now: float) -> None:
         found: Optional[Tuple[float, float]] = None
+        # Heuristics: restrict detection to the playfield area and avoid
+        # HUD/status rows at the bottom, which often contain glyphs like "●"
+        # or "." that are not the ball. The paddle TUI reserves a small
+        # number of rows for HUD; skip those here.
+        height = self.height
+        width = self.width
+        if height <= 0 or width <= 0:
+            return
+        # Treat the last three rows as HUD/prompt area; clamp to >= 1.
+        hud_rows = 3
+        max_play_row = max(height - hud_rows, 1)
+
         for row_idx, line in enumerate(self.lines):
+            if row_idx >= max_play_row:
+                break
             for col_idx, char in enumerate(line):
                 if char in BALL_GLYPHS:
                     found = (float(row_idx), float(col_idx))
@@ -1234,10 +1303,15 @@ class SessionState:
             if found:
                 break
         if found:
-            if self.ball_position is not None:
+            if self.ball_position is not None and self.ball_position_time is not None:
                 self.previous_ball_position = self.ball_position
-                self.previous_ball_time = self.last_update
+                self.previous_ball_time = self.ball_position_time
+            else:
+                self.previous_ball_position = None
+                self.previous_ball_time = None
             self.ball_position = found
+            self.ball_position_time = now
+            self.ball_exit_position = found
             if (
                 self.previous_ball_position
                 and self.previous_ball_time is not None
@@ -1251,12 +1325,16 @@ class SessionState:
             self.ball_exit = None
         else:
             if self.ball_position is not None:
+                self.ball_exit_position = self.ball_position
                 self.ball_exit = "miss"
                 self.ball_exit_time = now
                 if self.ball_velocity is not None:
                     self.last_velocity = self.ball_velocity
             self.ball_position = None
+            self.ball_position_time = None
             self.ball_velocity = None
+            self.previous_ball_position = None
+            self.previous_ball_time = None
 
     @property
     def height(self) -> int:
@@ -1521,6 +1599,7 @@ class AgentApp:
         mcp_bridges: Optional[List[Dict[str, object]]] = None,
         headless: bool = False,
         safe_mode: bool = True,
+        log_level: str = "info",
     ) -> None:
         self.stdscr = stdscr
         self.session_roles = session_roles
@@ -1558,7 +1637,13 @@ class AgentApp:
         self._serve_preference: str = "random"
         self._next_forced_side: Optional[str] = None
         self._last_serve_side: Optional[str] = None
+        self._active_ball_session_id: Optional[str] = None
+        self._ball_lost_since: float = 0.0
+        self.ball_loss_grace = BALL_LOSS_GRACE_SECONDS
         self._apply_prompt_pack()
+        normalized_level = _normalize_log_level_value(log_level) or "info"
+        self._log_threshold = LOG_LEVEL_PRIORITIES.get(normalized_level, LOG_LEVEL_PRIORITIES["info"])
+        self.log_level = normalized_level
         for bridge in self.bridge_defs:
             bridge_id = bridge["id"]
             state = "pending"
@@ -1573,11 +1658,17 @@ class AgentApp:
         )
         self._action_summaries: Dict[str, ActionSummary] = {}
         self._next_action_summary_emit = 0.0
+        self._last_ball_seen = 0.0
 
     # ------------------------------------------------------------------ Logging
     def log(self, message: str, level: str = "info") -> None:
+        raw_level = str(level or "info").strip() or "info"
+        normalized = _normalize_log_level_value(raw_level) or "info"
+        priority = LOG_LEVEL_PRIORITIES.get(normalized, LOG_LEVEL_PRIORITIES["info"])
+        if priority < self._log_threshold:
+            return
         timestamp = time.strftime("%H:%M:%S", time.localtime())
-        entry = f"[{timestamp}] {level.upper():<6} {message}"
+        entry = f"[{timestamp}] {raw_level.upper():<6} {message}"
         self.logs.append(entry)
         if len(self.logs) > LOG_LIMIT:
             self.logs = self.logs[-LOG_LIMIT:]
@@ -1905,21 +1996,57 @@ class AgentApp:
         if not isinstance(session_id, str):
             return
         status = normalize_transport_status(payload.get("status"))
+        action = payload.get("action")
         session = self.ensure_session(session_id)
         previous_ready = session.transport_ready
+        previous_mode = session.active_transport
         session.transport_status = status if status != "pending" else None
         session.transport_last_update = now
-        session.transport_ready = status in TRANSPORT_READY_STATES
+        label = session.side or session.session_id
+
+        is_fast_path = status in FAST_PATH_READY_STATES
+        is_http_ready = status in HTTP_READY_STATES
+        is_http_poller = status in HTTP_POLLER_STATES
+
+        if is_fast_path:
+            if not session.fast_path_established:
+                self.log(f"fast-path ready for {label}", level="info")
+            elif previous_mode != "fast_path":
+                self.log(f"fast-path restored for {label}", level="info")
+            session.fast_path_established = True
+            session.transport_ready = True
+            session.active_transport = "fast_path"
+        elif (is_http_ready or (is_http_poller and session.fast_path_established)) and session.fast_path_established:
+            if previous_mode != "http":
+                self.log(
+                    f"fast-path unavailable for {label}; falling back to HTTP ({status})",
+                    level="warn",
+                )
+            session.transport_ready = True
+            session.active_transport = "http"
+        else:
+            if status in {"detached", "removed"} or action == "removed":
+                session.fast_path_established = False
+            if is_http_ready and not session.fast_path_established:
+                # HTTP is technically reachable, but we require fast-path
+                # before issuing any commands.
+                self.log(
+                    f"waiting for fast-path before enabling commands for {label} (current={status})",
+                    level="debug",
+                )
+            session.transport_ready = False
+            session.active_transport = None
+
         if session.transport_ready and not previous_ready:
-            via = status or "transport"
+            via = session.active_transport or status or "transport"
             self.log(
                 f"transport ready for {session.session_id} via {via}",
                 level="info",
             )
         elif previous_ready and not session.transport_ready:
-            label = status or "pending"
+            label_status = status or "pending"
             self.log(
-                f"transport unavailable for {session.session_id} ({label})",
+                f"transport unavailable for {session.session_id} ({label_status})",
                 level="warn",
             )
 
@@ -1952,6 +2079,8 @@ class AgentApp:
                 self._handle_ball_exit(session, now)
                 session.ball_exit = None
         self._maybe_spawn_ball(now)
+        self._ensure_ball_present(now)
+        self._track_ball_carrier(now)
         for session in self.sessions.values():
             self._drive_paddle(session, now)
 
@@ -1986,6 +2115,68 @@ class AgentApp:
         command = f"b {spawn_y:.1f} {dx_mag:.1f} {dy_mag:.1f}"
         self._send_command(target, command)
         self.last_spawn_time = now
+        self._last_ball_seen = now
+        self._active_ball_session_id = target.session_id
+        self._ball_lost_since = 0.0
+
+    def _ensure_ball_present(self, now: float) -> None:
+        if any(session.ball_position for session in self.sessions.values()):
+            self._last_ball_seen = now
+            return
+        watchdog_interval = max(self.serve_interval * 1.5, 3.0)
+        if now - self._last_ball_seen < watchdog_interval:
+            return
+        candidates = [
+            session
+            for session in self.sessions.values()
+            if session.height > 0 and session.side in {"lhs", "rhs"}
+        ]
+        if not candidates:
+            return
+        target = self._select_serve_target(candidates) or candidates[0]
+        self._maybe_spawn_ball(now, force_session=target)
+
+    def _track_ball_carrier(self, now: float) -> None:
+        holder: Optional[SessionState] = None
+        for session in self.sessions.values():
+            if session.side in {"lhs", "rhs"} and session.ball_position is not None:
+                holder = session
+                break
+        if holder:
+            self._active_ball_session_id = holder.session_id
+            self._ball_lost_since = 0.0
+            return
+        if not self._active_ball_session_id:
+            return
+        if self._ball_lost_since == 0.0:
+            self._ball_lost_since = now
+            return
+        if now - self._ball_lost_since < self.ball_loss_grace:
+            return
+        source = self.sessions.get(self._active_ball_session_id)
+        self._ball_lost_since = 0.0
+        if not source or source.side not in {"lhs", "rhs"}:
+            self._active_ball_session_id = None
+            return
+        target_side = "rhs" if source.side == "lhs" else "lhs"
+        target = self.find_session_by_side(target_side)
+        if not target:
+            self._active_ball_session_id = None
+            return
+        served = self._serve_ball_to_session(
+            target,
+            now,
+            reference=source,
+            award_side=None,
+            reason="watchdog",
+        )
+        if served:
+            self.log(
+                f"ball watchdog forced serve to {target.side or target.session_id}",
+                level="warn",
+            )
+        else:
+            self._active_ball_session_id = None
 
     def _random_spawn_row(self, session: SessionState) -> float:
         height = max(session.height, 12)
@@ -2027,43 +2218,118 @@ class AgentApp:
             )
             return
 
-        if session.previous_ball_position:
-            spawn_y = session.previous_ball_position[0]
-        elif target.paddle_center is not None:
-            spawn_y = target.paddle_center
-        else:
-            spawn_y = max(target.height / 2.0, 3.0)
-
-        spawn_y = max(3.0, min(spawn_y, max(target.height - 3, 3)))
-
-        dx_mag = random.uniform(*self.serve_dx)
-        dx = dx_mag if target_side == "rhs" else -dx_mag
-        dy = random.uniform(*self.serve_dy)
-        if session.last_velocity:
-            vy = session.last_velocity[1]
-            if vy < 0:
-                dy = -abs(dy)
-            elif vy > 0:
-                dy = abs(dy)
-
-        command = f"b {spawn_y:.1f} {dx:.1f} {dy:.1f}"
-        self._send_command(target, command)
-        self.last_spawn_time = now
-        self.score[target_side] = self.score.get(target_side, 0) + 1
+        served = self._serve_ball_to_session(
+            target,
+            now,
+            reference=session,
+            award_side=target_side,
+            reason="exit",
+        )
+        if not served:
+            return
         self.log(
             f"score update - LHS {self.score.get('lhs', 0)} | RHS {self.score.get('rhs', 0)}",
             level="info",
         )
 
+    def _serve_ball_to_session(
+        self,
+        target: SessionState,
+        now: float,
+        *,
+        reference: Optional[SessionState],
+        award_side: Optional[str],
+        reason: str,
+    ) -> bool:
+        spawn_y = self._choose_spawn_row(target, reference)
+        dx, dy = self._choose_spawn_velocity(target, reference)
+        command = f"b {spawn_y:.1f} {dx:.1f} {dy:.1f}"
+        self._send_command(target, command)
+        self.last_spawn_time = now
+        self._last_ball_seen = now
+        self._active_ball_session_id = target.session_id
+        self._ball_lost_since = 0.0
+        if award_side:
+            self.score[award_side] = self.score.get(award_side, 0) + 1
+        self.log(
+            f"served ball to {target.side or target.session_id} ({reason})",
+            level="debug",
+        )
+        return True
+
+    def _choose_spawn_row(
+        self, target: SessionState, reference: Optional[SessionState]
+    ) -> float:
+        if reference and reference.ball_exit_position:
+            spawn_y = reference.ball_exit_position[0]
+        elif target.paddle_center is not None:
+            spawn_y = target.paddle_center
+        else:
+            spawn_y = max(target.height / 2.0, 3.0)
+        upper = max(target.height - 3, 3)
+        return max(3.0, min(spawn_y, upper))
+
+    def _choose_spawn_velocity(
+        self, target: SessionState, reference: Optional[SessionState]
+    ) -> Tuple[float, float]:
+        dx_bounds = tuple(sorted(self.serve_dx))
+        dy_bounds = tuple(sorted(self.serve_dy))
+        vx_last = (
+            reference.last_velocity[0]
+            if reference and reference.last_velocity
+            else None
+        )
+        vy_last = (
+            reference.last_velocity[1]
+            if reference and reference.last_velocity
+            else None
+        )
+        if vx_last is not None and abs(vx_last) >= 0.05:
+            dx_mag = max(dx_bounds[0], min(dx_bounds[1], abs(vx_last)))
+        else:
+            dx_mag = random.uniform(dx_bounds[0], dx_bounds[1])
+        side = target.side or "rhs"
+        dx = dx_mag if side == "rhs" else -dx_mag
+
+        if vy_last is not None and abs(vy_last) >= 0.05:
+            dy = max(dy_bounds[0], min(dy_bounds[1], vy_last))
+        else:
+            dy = random.uniform(dy_bounds[0], dy_bounds[1])
+        return dx, dy
+
     def _target_row(self, session: SessionState) -> float:
         if session.ball_position is None:
             return max(session.height / 2.0, 1.0)
-        row, _ = session.ball_position
-        if session.ball_velocity:
-            _, vy = session.ball_velocity
-            lead = vy * 0.25
-            return row + lead
-        return row
+        if session.paddle_column is None:
+            return session.ball_position[0]
+        if session.ball_velocity is None:
+            return session.ball_position[0]
+        vx, vy = session.ball_velocity
+        if abs(vx) < 1e-3:
+            return session.ball_position[0]
+
+        _, ball_col = session.ball_position
+        delta_cols = session.paddle_column - ball_col
+        travel_time = delta_cols / vx
+        if travel_time <= 0:
+            return session.ball_position[0]
+
+        predicted_row = session.ball_position[0] + vy * travel_time
+        reflected = self._reflect_vertical(predicted_row, session.height)
+        return reflected
+
+    @staticmethod
+    def _reflect_vertical(position: float, height: int) -> float:
+        if height <= 1:
+            return max(0.0, position)
+        upper = max(height - 1, 1)
+        period = upper * 2
+        pos = position % period
+        if pos < 0:
+            pos += period
+        if pos > upper:
+            pos = period - pos
+        return max(0.0, min(pos, upper))
 
     def _select_session_by_side(
         self, candidates: List[SessionState], side: str
@@ -2450,6 +2716,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Run without the curses UI (automation/test mode).",
     )
+    default_agent_log_level = _default_agent_log_level()
+    parser.add_argument(
+        "--log-level",
+        default=default_agent_log_level,
+        type=_log_level_arg,
+        help=(
+            "Minimum log level to display (trace/debug/info/warn/error). "
+            f"Defaults to {default_agent_log_level!r} or $PONG_AGENT_STDOUT_LEVEL."
+        ),
+    )
     parser.add_argument(
         "--pair-template",
         help="Prompt template to associate with controller pairings.",
@@ -2504,7 +2780,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=float,
         nargs=2,
         metavar=("MIN", "MAX"),
-        default=(18.0, 26.0),
+        default=(6.0, 8.5),
         help="Range for horizontal velocity magnitude when serving.",
     )
     parser.add_argument(
@@ -2512,7 +2788,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         type=float,
         nargs=2,
         metavar=("MIN", "MAX"),
-        default=(-8.0, 8.0),
+        default=(-2.0, 2.0),
         help="Range for vertical velocity component when serving.",
     )
     parser.add_argument(
@@ -2998,6 +3274,7 @@ def main() -> int:
             mcp_bridges=getattr(autopair_ctx, "mcp_bridges", None) if autopair_ctx else None,
             headless=args.headless,
             safe_mode=safe_mode_enabled,
+            log_level=args.log_level,
         )
         try:
             app.log("agent ready", level="info")

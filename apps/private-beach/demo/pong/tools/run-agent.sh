@@ -12,6 +12,7 @@ Environment variables:
   BEACH_AUTH_SCOPE     Auth scope (default: pb.full)
   BEACH_AUTH_AUDIENCE  Auth audience (default: private-beach)
   RUN_AGENT_MANAGER_URL Manager URL override (default: http://localhost:8080)
+  PONG_AGENT_STDOUT_LEVEL Minimum log level printed by the mock agent (default: $PONG_AGENT_LOG_LEVEL)
 USAGE
 }
 
@@ -27,6 +28,10 @@ echo "[run-agent] LOG_DIR=$LOG_DIR" >&2
 mkdir -p "$LOG_DIR"
 PONG_AGENT_LOG_LEVEL=${PONG_AGENT_LOG_LEVEL:-${RUN_AGENT_LOG_LEVEL:-info}}
 echo "[run-agent] log level=$PONG_AGENT_LOG_LEVEL" >&2
+PONG_AGENT_STDOUT_LEVEL=${PONG_AGENT_STDOUT_LEVEL:-$PONG_AGENT_LOG_LEVEL}
+if [[ "$PONG_AGENT_STDOUT_LEVEL" != "$PONG_AGENT_LOG_LEVEL" ]]; then
+  echo "[run-agent] agent stdout log level=$PONG_AGENT_STDOUT_LEVEL" >&2
+fi
 
 MANAGER_URL_DEFAULT=${RUN_AGENT_MANAGER_URL:-"http://localhost:8080"}
 if [[ -z "${PRIVATE_BEACH_MANAGER_URL:-}" ]]; then
@@ -218,5 +223,6 @@ cargo run --bin beach -- \
        --mcp-base-url "http://localhost:8080" \
        --mcp-token "$PB_MCP_TOKEN" \
        --default-controller-token "$PB_CONTROLLER_TOKEN" \
+       --log-level "$PONG_AGENT_STDOUT_LEVEL" \
        --lease-reason "pong_showcase" \
   | tee "$BOOTSTRAP_FILE"

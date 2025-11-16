@@ -1,11 +1,20 @@
 use crate::{ActionAck, ActionCommand, HarnessError, HarnessResult, StateDiff};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc, time::Duration};
-use tokio::{sync::broadcast, time::sleep};
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::{
+    sync::{broadcast, Mutex as TokioMutex},
+    time::sleep,
+};
 use tracing::{info, trace, warn};
 use url::Url;
+use uuid::Uuid;
 use webrtc::{
     api::APIBuilder,
     data_channel::{
@@ -60,6 +69,197 @@ impl FastPathStatus {
             _ => FastPathStatus::Experimental,
         }
     }
+}
+
+const FAST_PATH_CHUNK_VERSION: u8 = 1;
+const FAST_PATH_CHUNK_PAYLOAD_BYTES: usize = 14 * 1024;
+const FAST_PATH_CHUNK_TTL: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FastPathPayloadKind {
+    Actions,
+    Acks,
+    State,
+    Health,
+}
+
+impl FastPathPayloadKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            FastPathPayloadKind::Actions => "actions",
+            FastPathPayloadKind::Acks => "acks",
+            FastPathPayloadKind::State => "state",
+            FastPathPayloadKind::Health => "health",
+        }
+    }
+}
+
+pub fn frame_fast_path_payload(
+    kind: FastPathPayloadKind,
+    payload: &str,
+) -> HarnessResult<Vec<String>> {
+    if payload.len() <= FAST_PATH_CHUNK_PAYLOAD_BYTES {
+        return Ok(vec![payload.to_string()]);
+    }
+    chunk_payload(kind, payload.as_bytes())
+}
+
+fn chunk_payload(kind: FastPathPayloadKind, payload: &[u8]) -> HarnessResult<Vec<String>> {
+    if payload.is_empty() {
+        return Ok(vec!["".into()]);
+    }
+    let id = format!("{}-{}", kind.as_str(), Uuid::new_v4());
+    let total_chunks =
+        ((payload.len() + FAST_PATH_CHUNK_PAYLOAD_BYTES - 1) / FAST_PATH_CHUNK_PAYLOAD_BYTES)
+            as u32;
+    let mut frames = Vec::with_capacity(total_chunks as usize);
+    for (index, chunk) in payload.chunks(FAST_PATH_CHUNK_PAYLOAD_BYTES).enumerate() {
+        let encoded = BASE64.encode(chunk);
+        let envelope = serde_json::json!({
+            "type": "chunk",
+            "version": FAST_PATH_CHUNK_VERSION,
+            "scope": kind.as_str(),
+            "id": id,
+            "index": index,
+            "count": total_chunks,
+            "payload": encoded,
+        });
+        frames.push(
+            serde_json::to_string(&envelope)
+                .map_err(|err| HarnessError::Transport(format!("encode chunk failed: {err}")))?,
+        );
+    }
+    Ok(frames)
+}
+
+#[derive(Debug)]
+struct PendingChunk {
+    parts: Vec<Option<Vec<u8>>>,
+    expected: u32,
+    received: u32,
+    expires_at: Instant,
+}
+
+impl PendingChunk {
+    fn new(count: u32) -> HarnessResult<Self> {
+        if count == 0 {
+            return Err(HarnessError::Transport(
+                "chunk envelope missing chunk count".into(),
+            ));
+        }
+        Ok(Self {
+            parts: vec![None; count as usize],
+            expected: count,
+            received: 0,
+            expires_at: Instant::now() + FAST_PATH_CHUNK_TTL,
+        })
+    }
+
+    fn insert(&mut self, index: u32, payload: Vec<u8>) -> HarnessResult<bool> {
+        let idx = index as usize;
+        if idx >= self.parts.len() {
+            return Err(HarnessError::Transport(
+                "chunk envelope index exceeds count".into(),
+            ));
+        }
+        if self.parts[idx].is_none() {
+            self.parts[idx] = Some(payload);
+            self.received += 1;
+        }
+        self.expires_at = Instant::now() + FAST_PATH_CHUNK_TTL;
+        Ok(self.received == self.expected)
+    }
+
+    fn into_payload(self) -> HarnessResult<Vec<u8>> {
+        let mut merged = Vec::new();
+        for part in self.parts.into_iter() {
+            let chunk = part.ok_or_else(|| {
+                HarnessError::Transport("chunk assembly missing fragment".into())
+            })?;
+            merged.extend_from_slice(&chunk);
+        }
+        Ok(merged)
+    }
+}
+
+#[derive(Debug)]
+pub struct FastPathChunkReassembler {
+    kind: FastPathPayloadKind,
+    pending: HashMap<String, PendingChunk>,
+}
+
+impl FastPathChunkReassembler {
+    pub fn new(kind: FastPathPayloadKind) -> Self {
+        Self {
+            kind,
+            pending: HashMap::new(),
+        }
+    }
+
+    pub fn ingest(&mut self, text: &str) -> HarnessResult<Option<String>> {
+        match serde_json::from_str::<OwnedChunkEnvelope>(text) {
+            Ok(envelope) => {
+                if envelope.kind != "chunk" {
+                    return Ok(Some(text.to_string()));
+                }
+                if envelope.scope != self.kind.as_str() {
+                    return Err(HarnessError::Transport(format!(
+                        "chunk scope mismatch: expected {}, got {}",
+                        self.kind.as_str(),
+                        envelope.scope
+                    )));
+                }
+                if envelope.version != 0 && envelope.version != FAST_PATH_CHUNK_VERSION {
+                    return Err(HarnessError::Transport(format!(
+                        "unsupported chunk version {}",
+                        envelope.version
+                    )));
+                }
+                let decoded = BASE64
+                    .decode(envelope.payload.as_bytes())
+                    .map_err(|err| HarnessError::Transport(format!("decode chunk payload: {err}")))?;
+                let message_id = envelope.id.clone();
+                let entry = match self.pending.entry(message_id.clone()) {
+                    Entry::Occupied(entry) => entry.into_mut(),
+                    Entry::Vacant(vacant) => vacant.insert(PendingChunk::new(envelope.count)?),
+                };
+                let complete = entry.insert(envelope.index, decoded)?;
+                if complete {
+                    let payload = self
+                        .pending
+                        .remove(&message_id)
+                        .expect("pending chunk missing")
+                        .into_payload()?;
+                    let text = String::from_utf8(payload).map_err(|err| {
+                        HarnessError::Transport(format!("chunk payload utf8 error: {err}"))
+                    })?;
+                    return Ok(Some(text));
+                }
+                self.cleanup_expired();
+                Ok(None)
+            }
+            Err(_) => Ok(Some(text.to_string())),
+        }
+    }
+
+    fn cleanup_expired(&mut self) {
+        let now = Instant::now();
+        self.pending
+            .retain(|_, pending| pending.expires_at > now);
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OwnedChunkEnvelope {
+    #[serde(rename = "type")]
+    kind: String,
+    scope: String,
+    #[serde(default)]
+    version: u8,
+    id: String,
+    index: u32,
+    count: u32,
+    payload: String,
 }
 
 /// Parsed subset of `transport_hints.fast_path_webrtc`.
@@ -330,10 +530,13 @@ impl FastPathConnection {
             });
             let text = serde_json::to_string(&payload)
                 .map_err(|err| HarnessError::Transport(format!("serialize ack failed: {err}")))?;
-            self.acks_dc
-                .send_text(text)
-                .await
-                .map_err(to_harness_error)?;
+            let frames = frame_fast_path_payload(FastPathPayloadKind::Acks, &text)?;
+            for frame in frames {
+                self.acks_dc
+                    .send_text(frame)
+                    .await
+                    .map_err(to_harness_error)?;
+            }
         }
         Ok(())
     }
@@ -345,10 +548,13 @@ impl FastPathConnection {
         });
         let text = serde_json::to_string(&payload)
             .map_err(|err| HarnessError::Transport(format!("serialize state failed: {err}")))?;
-        self.state_dc
-            .send_text(text)
-            .await
-            .map_err(to_harness_error)?;
+        let frames = frame_fast_path_payload(FastPathPayloadKind::State, &text)?;
+        for frame in frames {
+            self.state_dc
+                .send_text(frame)
+                .await
+                .map_err(to_harness_error)?;
+        }
         Ok(())
     }
 }
@@ -433,19 +639,49 @@ fn wire_action_handler(dc: Arc<RTCDataChannel>, sender: broadcast::Sender<Action
         })
     }));
 
+    let reassembler =
+        Arc::new(TokioMutex::new(FastPathChunkReassembler::new(FastPathPayloadKind::Actions)));
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let sender = sender.clone();
+        let reassembler = reassembler.clone();
         Box::pin(async move {
-            match parse_action_message(&msg) {
-                Ok(action) => {
-                    let _ = sender.send(action);
+            match decode_fast_path_payload(&reassembler, &msg).await {
+                Ok(Some(text)) => match parse_action_payload(&text) {
+                    Ok(action) => {
+                        let _ = sender.send(action);
+                    }
+                    Err(err) => {
+                        warn!(target = "fast_path", error = %err, "failed to parse action message");
+                    }
+                },
+                Ok(None) => {
+                    // awaiting more chunks
                 }
                 Err(err) => {
-                    warn!(target = "fast_path", error = %err, "failed to parse action message");
+                    warn!(
+                        target = "fast_path",
+                        error = %err,
+                        "failed to decode chunked action message"
+                    );
                 }
             }
         })
     }));
+}
+
+async fn decode_fast_path_payload(
+    reassembler: &TokioMutex<FastPathChunkReassembler>,
+    msg: &DataChannelMessage,
+) -> HarnessResult<Option<String>> {
+    if !msg.is_string {
+        return Err(HarnessError::Transport(
+            "expected text payload for action message".into(),
+        ));
+    }
+    let text = String::from_utf8(msg.data.to_vec())
+        .map_err(|err| HarnessError::Transport(format!("invalid utf8 payload: {err}")))?;
+    let mut guard = reassembler.lock().await;
+    guard.ingest(&text)
 }
 
 async fn create_channel(
@@ -491,8 +727,12 @@ fn parse_action_message(msg: &DataChannelMessage) -> HarnessResult<ActionCommand
     }
     let text = String::from_utf8(msg.data.to_vec())
         .map_err(|err| HarnessError::Transport(format!("invalid utf8 payload: {err}")))?;
+    parse_action_payload(&text)
+}
+
+fn parse_action_payload(text: &str) -> HarnessResult<ActionCommand> {
     let envelope: ActionEnvelope =
-        serde_json::from_str(&text).map_err(|err| HarnessError::Transport(format!("{err}")))?;
+        serde_json::from_str(text).map_err(|err| HarnessError::Transport(format!("{err}")))?;
     if envelope.r#type != "action" {
         return Err(HarnessError::Transport(format!(
             "unexpected message type {}",
@@ -657,5 +897,39 @@ mod tests {
             data: Bytes::from(serde_json::to_string(&envelope).unwrap()),
         };
         assert!(parse_action_message(&msg).is_err());
+    }
+
+    #[test]
+    fn rejects_binary_action_message() {
+        let msg = DataChannelMessage {
+            is_string: false,
+            data: Bytes::from_static(b"\x01\x02\x03"),
+        };
+        assert!(parse_action_message(&msg).is_err());
+    }
+
+    #[test]
+    fn frame_payload_passthrough_when_small() {
+        let frames =
+            frame_fast_path_payload(FastPathPayloadKind::Actions, "hello").expect("framed");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0], "hello");
+    }
+
+    #[test]
+    fn chunk_round_trip_reassembles() {
+        let payload = "x".repeat(FAST_PATH_CHUNK_PAYLOAD_BYTES * 2 + 128);
+        let frames =
+            frame_fast_path_payload(FastPathPayloadKind::State, &payload).expect("framed");
+        assert!(frames.len() > 1, "payload should be chunked");
+        let mut reassembler = FastPathChunkReassembler::new(FastPathPayloadKind::State);
+        let mut assembled = None;
+        for frame in frames {
+            let result = reassembler.ingest(&frame).expect("ingest chunk");
+            if result.is_some() {
+                assembled = result;
+            }
+        }
+        assert_eq!(assembled.expect("assembled payload"), payload);
     }
 }

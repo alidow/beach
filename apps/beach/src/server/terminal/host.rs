@@ -46,8 +46,9 @@ use crate::transport::terminal::negotiation::{
 use crate::transport::{Payload, Transport, TransportError, TransportId, TransportKind};
 use beach_buggy::{
     AckStatus as CtrlAckStatus, ActionAck as CtrlActionAck, ActionCommand as CtrlActionCommand,
-    CellStylePayload, CursorPosition, HealthHeartbeat, HttpTransport, ManagerTransport, StateDiff,
-    StaticTokenProvider, StyleDefinition, StyledCell, TerminalFrame, TransportMode,
+    CellStylePayload, CursorPosition, HealthHeartbeat, HttpTransport, ManagerTransport,
+    PairingTransportKind, StateDiff, StaticTokenProvider, StyleDefinition, StyledCell,
+    TerminalFrame, TransportMode,
 };
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -516,6 +517,11 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                                             .and_then(|v| v.as_str())
                                             .unwrap_or("")
                                             .to_string();
+                                        if !manager_url.is_empty() {
+                                            idle_snapshots_for_actions
+                                                .update_base_url(manager_url.clone())
+                                                .await;
+                                        }
                                         if !consumer_started
                                             && !manager_url.is_empty()
                                             && !controller_token.is_empty()
@@ -1164,6 +1170,32 @@ impl ManagerActionClient {
         let request = self.apply_auth(self.http.delete(url).json(&body));
         self.send(request).await.map(|_| ())
     }
+
+    async fn update_transport_status(
+        &self,
+        session_id: &str,
+        transport: PairingTransportKind,
+        latency_ms: Option<u64>,
+        last_error: Option<String>,
+    ) -> Result<(), ManagerActionError> {
+        #[derive(Serialize)]
+        struct StatusPayload {
+            transport: PairingTransportKind,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            latency_ms: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            last_error: Option<String>,
+        }
+
+        let url = format!("{}/sessions/{session_id}/transport-status", self.base_url);
+        let payload = StatusPayload {
+            transport,
+            latency_ms,
+            last_error,
+        };
+        let request = self.apply_auth(self.http.post(url).json(&payload));
+        self.send(request).await.map(|_| ())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1295,7 +1327,7 @@ impl ControllerAttachState {
 }
 
 #[derive(Clone)]
-struct ControllerActionContext {
+pub(crate) struct ControllerActionContext {
     session_id: String,
     client: Arc<RwLock<Option<Arc<ManagerActionClient>>>>,
     switch: Arc<ControllerTransportSwitch>,
@@ -1357,6 +1389,35 @@ impl ControllerActionContext {
                 session_id = %self.session_id,
                 "fast_path controller channel inactive; resuming http poller"
             );
+        }
+    }
+
+    fn notify_fast_path_ready(&self, runtime: &Handle) {
+        if let Some(client) = self.manager_client() {
+            let session_id = self.session_id.clone();
+            runtime.spawn(async move {
+                match client
+                    .update_transport_status(
+                        &session_id,
+                        PairingTransportKind::FastPath,
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(()) => trace!(
+                        target = "controller.actions.fast_path",
+                        session_id = %session_id,
+                        "reported fast-path readiness to manager"
+                    ),
+                    Err(err) => warn!(
+                        target = "controller.actions.fast_path",
+                        session_id = %session_id,
+                        error = %err,
+                        "failed to report fast-path readiness"
+                    ),
+                }
+            });
         }
     }
 
@@ -1484,6 +1545,7 @@ fn run_fast_path_controller_channel(
         trace_attach_wait_completion(session_id, "fast_path_blocking", wait_started);
     }
     controller_ctx.fast_path_online();
+    controller_ctx.notify_fast_path_ready(&runtime);
     let transport_id = transport.id().0;
     info!(
         target = "controller.actions.fast_path",
@@ -2309,7 +2371,7 @@ struct HealthReporterState {
 
 #[derive(Clone)]
 struct IdleSnapshotController {
-    base_url: String,
+    base_url: Arc<AsyncMutex<String>>,
     session_id: String,
     token: Arc<AsyncMutex<Option<String>>>,
     grid: Arc<TerminalGrid>,
@@ -2322,6 +2384,35 @@ struct IdleSnapshotController {
 }
 
 impl IdleSnapshotController {
+    async fn update_base_url(&self, base_url: String) {
+        let trimmed = base_url.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        {
+            let mut guard = self.base_url.lock().await;
+            if *guard != trimmed {
+                *guard = trimmed.to_string();
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        info!(target = "private_beach", session_id = %self.session_id, base = %trimmed, "idle snapshot controller base_url updated");
+        let current_interval = { self.state.lock().await.interval };
+        if current_interval.is_some() {
+            self.apply_hint(None).await;
+            self.apply_hint(current_interval).await;
+        }
+        let health_interval = { self.health.lock().await.interval };
+        if health_interval.is_some() {
+            self.apply_health_interval(None).await;
+            self.apply_health_interval(health_interval).await;
+        }
+    }
+
     fn new(
         base_url: String,
         token: Option<String>,
@@ -2333,7 +2424,7 @@ impl IdleSnapshotController {
         fast_path_channel: Arc<FastPathStateChannel>,
     ) -> Self {
         Self {
-            base_url,
+            base_url: Arc::new(AsyncMutex::new(base_url)),
             session_id,
             token: Arc::new(AsyncMutex::new(token)),
             grid,
@@ -2407,10 +2498,11 @@ impl IdleSnapshotController {
                 );
                 return;
             };
+            let base_url = { self.base_url.lock().await.clone() };
             match spawn_idle_snapshot_worker(
                 interval,
                 token,
-                self.base_url.clone(),
+                base_url,
                 self.session_id.clone(),
                 self.grid.clone(),
                 self.cursor_tracker.clone(),
@@ -2480,12 +2572,8 @@ impl IdleSnapshotController {
                 );
                 return;
             };
-            match spawn_health_reporter(
-                interval,
-                token,
-                self.base_url.clone(),
-                self.session_id.clone(),
-            ) {
+            let base_url = { self.base_url.lock().await.clone() };
+            match spawn_health_reporter(interval, token, base_url, self.session_id.clone()) {
                 Some((handle, cancel)) => {
                     let mut state = self.health.lock().await;
                     state.interval = Some(interval);

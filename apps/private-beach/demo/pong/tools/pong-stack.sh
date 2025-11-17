@@ -31,7 +31,7 @@ shift
 SERVICE=${PONG_DOCKER_SERVICE:-beach-manager}
 MANAGER_URL=${PRIVATE_BEACH_MANAGER_URL:-http://localhost:8080}
 SESSION_SERVER=${PONG_SESSION_SERVER:-http://beach-road:4132/}
-AUTH_GATEWAY=${PONG_AUTH_GATEWAY:-http://host.docker.internal:4133}
+AUTH_GATEWAY=${PONG_AUTH_GATEWAY:-http://beach-gate:4133}
 CLI_PROFILE=${PONG_BEACH_PROFILE:-local}
 LOG_DIR=${PONG_LOG_DIR:-/tmp/pong-stack}
 CODES_WAIT=${PONG_CODES_WAIT:-8}
@@ -52,7 +52,7 @@ ensure_cli_login() {
 start_player() {
   local mode=$1
   local human=$2
-  run_in_container "set -euo pipefail; export PRIVATE_BEACH_MANAGER_URL='$MANAGER_URL'; cd $REPO_ROOT; mkdir -p '$LOG_DIR'; : > '$LOG_DIR/beach-host-$mode.log'; nohup setsid bash -c \"cargo run --bin beach -- --log-level '$PLAYER_LOG_LEVEL' --log-file '$LOG_DIR/beach-host-$mode.log' --session-server '$SESSION_SERVER' host --bootstrap-output json --wait -- /usr/bin/env python3 $REPO_ROOT/apps/private-beach/demo/pong/player/main.py --mode $mode 2>&1 | tee '$LOG_DIR/bootstrap-$mode.json' > '$LOG_DIR/player-$mode.log'\" >/dev/null 2>&1 & echo \$! > '$LOG_DIR/player-$mode.pid'"
+  run_in_container "set -euo pipefail; export PRIVATE_BEACH_MANAGER_URL='$MANAGER_URL'; export BEACH_AUTH_GATEWAY='$AUTH_GATEWAY'; cd $REPO_ROOT; mkdir -p '$LOG_DIR'; : > '$LOG_DIR/beach-host-$mode.log'; nohup setsid bash -c \"cargo run --bin beach -- --log-level '$PLAYER_LOG_LEVEL' --log-file '$LOG_DIR/beach-host-$mode.log' --session-server '$SESSION_SERVER' host --bootstrap-output json --wait -- /usr/bin/env python3 $REPO_ROOT/apps/private-beach/demo/pong/player/main.py --mode $mode 2>&1 | tee '$LOG_DIR/bootstrap-$mode.json' > '$LOG_DIR/player-$mode.log'\" >/dev/null 2>&1 & echo \$! > '$LOG_DIR/player-$mode.pid'"
   echo "launched $human player (logs in $LOG_DIR/player-$mode.log)"
 }
 

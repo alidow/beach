@@ -33,6 +33,16 @@ const HANDSHAKE_RENEW_BUFFER_MS = 5_000;
 const HANDSHAKE_RENEW_MIN_MS = 5_000;
 const HANDSHAKE_RENEW_FALLBACK_MS = 20_000;
 
+function resolveHandshakeRenewMinMs(): number {
+  if (typeof globalThis !== 'undefined') {
+    const override = (globalThis as Record<string, unknown>).__BEACH_HANDSHAKE_RENEW_MIN_MS__;
+    if (typeof override === 'number' && Number.isFinite(override) && override >= 0) {
+      return override;
+    }
+  }
+  return HANDSHAKE_RENEW_MIN_MS;
+}
+
 function logHydration(event: string, detail: Record<string, unknown>) {
   if (typeof window === 'undefined') {
     return;
@@ -217,6 +227,8 @@ export function ApplicationTile({
   const hydrationAttemptRef = useRef(0);
   const handshakeRenewTimerRef = useRef<number | null>(null);
   const lastHandshakeContextRef = useRef<{ sessionId: string; passcode: string } | null>(null);
+  const handshakeInFlightRef = useRef<{ key: string; promise: Promise<void> } | null>(null);
+  const hasDeliveredControlRef = useRef(false);
 
   const {
     token: managerToken,
@@ -247,46 +259,54 @@ export function ApplicationTile({
   }, []);
 
   const deliverHandshake = useCallback(
-    async (sessionId: string, passcode: string) => {
-      if (!privateBeachId) {
-        throw new Error('Missing private beach identifier for handshake');
-      }
-      if (!resolvedRoadUrl) {
-        throw new Error(
-          'Beach Road URL is not configured. Set NEXT_PUBLIC_PRIVATE_BEACH_ROAD_URL or define road_url in Private Beach settings.',
-        );
+    async (sessionId: string, passcode: string, options?: { skipControlMessage?: boolean }) => {
+      const key = `${sessionId}::${passcode}`;
+      if (handshakeInFlightRef.current?.key === key) {
+        return handshakeInFlightRef.current.promise;
       }
 
-      const ensureToken = async () => {
-        if (managerToken && managerToken.trim().length > 0) {
-          return managerToken;
+      const run = (async () => {
+        if (!privateBeachId) {
+          throw new Error('Missing private beach identifier for handshake');
         }
-        return await refresh();
-      };
+        if (!resolvedRoadUrl) {
+          throw new Error(
+            'Beach Road URL is not configured. Set NEXT_PUBLIC_PRIVATE_BEACH_ROAD_URL or define road_url in Private Beach settings.',
+          );
+        }
 
-      const token = await ensureToken();
-      if (!token) {
-        throw new Error('Unable to fetch manager token for controller handshake');
-      }
+        const ensureToken = async () => {
+          if (managerToken && managerToken.trim().length > 0) {
+            return managerToken;
+          }
+          return await refresh();
+        };
 
-      const logContext = {
-        tileId,
-        sessionId,
-        privateBeachId,
-        managerUrl,
-      };
-      logConnectionEvent('handshake:start', logContext, {
-        hasPasscode: Boolean(passcode && passcode.length > 0),
-      });
+        const token = await ensureToken();
+        if (!token) {
+          throw new Error('Unable to fetch manager token for controller handshake');
+        }
+
+        const logContext = {
+          tileId,
+          sessionId,
+          privateBeachId,
+          managerUrl,
+        };
+        const isRenewal = Boolean(options?.skipControlMessage);
+        const startStep = isRenewal ? 'handshake:renew-start' : 'handshake:start';
+        logConnectionEvent(startStep, logContext, {
+          hasPasscode: Boolean(passcode && passcode.length > 0),
+        });
       let handshake: ControllerHandshakeResponse;
       try {
         handshake = await issueControllerHandshake(
           sessionId,
           passcode,
-          privateBeachId,
-          token,
-          managerUrl,
-        );
+            privateBeachId,
+            token,
+            managerUrl,
+          );
         logConnectionEvent('handshake:success', logContext, {
           leaseExpiresAtMs: handshake.lease_expires_at_ms ?? null,
         });
@@ -296,29 +316,37 @@ export function ApplicationTile({
         throw error;
       }
 
-      try {
-        const control = await sendControlMessage(
-          sessionId,
-          'manager_handshake',
-          handshake,
-          token ?? null,
-          resolvedRoadUrl,
-        );
-        logConnectionEvent('hint:sent', logContext, {
-          roadUrl: resolvedRoadUrl,
-          controlId: control?.control_id ?? null,
-        });
-        logConnectionEvent('slow-path:ready', logContext, {
+      const shouldSendControl = !(options?.skipControlMessage ?? false);
+      if (shouldSendControl) {
+        try {
+          const control = await sendControlMessage(
+            sessionId,
+            'manager_handshake',
+            handshake,
+            token ?? null,
+            resolvedRoadUrl,
+          );
+          logConnectionEvent('hint:sent', logContext, {
+            roadUrl: resolvedRoadUrl,
+            controlId: control?.control_id ?? null,
+          });
+          logConnectionEvent('slow-path:ready', logContext, {
+            leaseExpiresAtMs: handshake.lease_expires_at_ms ?? null,
+            controlId: control?.control_id ?? null,
+          });
+          hasDeliveredControlRef.current = true;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          logConnectionEvent('hint:error', logContext, {
+            roadUrl: resolvedRoadUrl,
+            error: message,
+          }, 'error');
+          throw error;
+        }
+      } else {
+        logConnectionEvent('handshake:renew', logContext, {
           leaseExpiresAtMs: handshake.lease_expires_at_ms ?? null,
-          controlId: control?.control_id ?? null,
         });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        logConnectionEvent('hint:error', logContext, {
-          roadUrl: resolvedRoadUrl,
-          error: message,
-        }, 'error');
-        throw error;
       }
 
       lastHandshakeContextRef.current = { sessionId, passcode };
@@ -326,34 +354,42 @@ export function ApplicationTile({
       if (typeof window !== 'undefined') {
         clearHandshakeRenewal();
         const targetExpiry = handshake.lease_expires_at_ms ?? Date.now() + HANDSHAKE_RENEW_FALLBACK_MS;
-        const delay = Math.max(
-          HANDSHAKE_RENEW_MIN_MS,
-          targetExpiry - Date.now() - HANDSHAKE_RENEW_BUFFER_MS,
-        );
+        const delay = Math.max(resolveHandshakeRenewMinMs(), targetExpiry - Date.now() - HANDSHAKE_RENEW_BUFFER_MS);
+        const skipControlOnRenewal = hasDeliveredControlRef.current;
         handshakeRenewTimerRef.current = window.setTimeout(() => {
-          void deliverHandshake(sessionId, passcode).catch((error) => {
+          void deliverHandshake(sessionId, passcode, { skipControlMessage: skipControlOnRenewal }).catch((error) => {
             console.warn('[application-tile] handshake renewal failed', {
               sessionId,
               error,
             });
-            logConnectionEvent(
-              'handshake:renew-error',
-              logContext,
-              { error: error instanceof Error ? error.message : String(error) },
-              'warn',
-            );
-          });
-        }, delay);
+              logConnectionEvent(
+                'handshake:renew-error',
+                logContext,
+                { error: error instanceof Error ? error.message : String(error) },
+                'warn',
+              );
+            });
+          }, delay);
+        }
+      })();
+
+      handshakeInFlightRef.current = { key, promise: run };
+      try {
+        await run;
+      } finally {
+        if (handshakeInFlightRef.current?.key === key) {
+          handshakeInFlightRef.current = null;
+        }
       }
     },
     [clearHandshakeRenewal, managerToken, managerUrl, privateBeachId, refresh, resolvedRoadUrl, tileId],
   );
 
-useEffect(() => {
-  if (sessionMeta?.sessionId && sessionMeta.sessionId !== sessionIdInput) {
-    setSessionIdInput(sessionMeta.sessionId);
-  }
-}, [sessionMeta?.sessionId, sessionIdInput]);
+  useEffect(() => {
+    if (sessionMeta?.sessionId && sessionMeta.sessionId !== sessionIdInput) {
+      setSessionIdInput(sessionMeta.sessionId);
+    }
+  }, [sessionMeta?.sessionId, sessionIdInput]);
 
   useEffect(() => {
     const nextSessionId = sessionMeta?.sessionId?.trim() ?? null;
@@ -571,6 +607,16 @@ useEffect(() => {
     credentialOverride: credentialOverride ?? undefined,
     traceContext: traceContext ?? undefined,
   });
+
+  useEffect(() => {
+    hasDeliveredControlRef.current = false;
+  }, [sessionMeta?.sessionId]);
+
+  useEffect(() => {
+    if (viewer.status === 'idle' || viewer.status === 'error') {
+      hasDeliveredControlRef.current = false;
+    }
+  }, [viewer.status]);
 
   useEffect(() => {
     const currentSessionId = sessionMeta?.sessionId ?? null;

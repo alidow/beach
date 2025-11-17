@@ -528,6 +528,24 @@ function FlowCanvasInner({
 
   // Cache node objects: unchanged tiles keep stable references across drag frames.
   const nodeCacheRef = useRef<Map<string, { node: Node; sig: string }>>(new Map());
+  const relationshipIdsByTile = useMemo(() => {
+    const map: Record<string, string[]> = {};
+    for (const relId of state.relationshipOrder) {
+      const relationship = state.relationships[relId];
+      if (!relationship) {
+        continue;
+      }
+      if (!map[relationship.sourceId]) {
+        map[relationship.sourceId] = [];
+      }
+      map[relationship.sourceId].push(relId);
+      if (!map[relationship.targetId]) {
+        map[relationship.targetId] = [];
+      }
+      map[relationship.targetId].push(relId);
+    }
+    return map;
+  }, [state.relationshipOrder, state.relationships]);
   const nodes: Node[] = useMemo(() => {
     const next: Node[] = [];
     const cache = nodeCacheRef.current;
@@ -537,6 +555,7 @@ function FlowCanvasInner({
       const tile = tiles[tileId];
       if (!tile) continue;
       const isInteractive = interactiveId === tile.id;
+      const connectedRelationshipIds = relationshipIdsByTile[tile.id] ?? [];
       const sessionMetaSig = tile.sessionMeta
         ? [
             tile.sessionMeta.sessionId ?? '',
@@ -555,6 +574,8 @@ function FlowCanvasInner({
             tile.agentMeta.trace?.trace_id ?? '',
           ].join('~')
         : 'agent:none';
+      const relationshipSig =
+        connectedRelationshipIds.length > 0 ? connectedRelationshipIds.join('~') : 'relationships:none';
       const sig = [
         tile.id,
         tile.position.x,
@@ -571,6 +592,7 @@ function FlowCanvasInner({
         rewriteEnabled ? 1 : 0,
         sessionMetaSig,
         agentMetaSig,
+        relationshipSig,
       ].join('|');
       const cached = cache.get(tile.id);
       if (cached && cached.sig === sig) {
@@ -592,6 +614,7 @@ function FlowCanvasInner({
           roadUrl: resolvedRoadUrl,
           rewriteEnabled,
           interactiveTileId: interactiveId,
+          connectedRelationshipIds,
         },
         position: tile.position,
         draggable: true,
@@ -623,6 +646,7 @@ function FlowCanvasInner({
     resolvedRoadUrl,
     resizing,
     rewriteEnabled,
+    relationshipIdsByTile,
     tiles,
   ]);
 

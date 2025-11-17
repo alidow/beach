@@ -38,6 +38,24 @@ export interface ConnectBrowserTransportOptions {
 }
 
 const HOST_DOCKER_HOSTNAME = 'host.docker.internal';
+const sessionLocks = new Map<string, Promise<void>>();
+
+async function acquireSessionLock(sessionId: string): Promise<() => void> {
+  const previous = sessionLocks.get(sessionId) ?? Promise.resolve();
+  let resolveCurrent: () => void = () => {};
+  const currentReady = new Promise<void>((resolve) => {
+    resolveCurrent = resolve;
+  });
+  const chained = previous.then(() => currentReady);
+  sessionLocks.set(sessionId, chained);
+  await previous;
+  return () => {
+    resolveCurrent();
+    if (sessionLocks.get(sessionId) === chained) {
+      sessionLocks.delete(sessionId);
+    }
+  };
+}
 
 function normalizeConnectorUrl(url: string | undefined): string | undefined {
   if (!url) return url;
@@ -57,129 +75,141 @@ function normalizeConnectorUrl(url: string | undefined): string | undefined {
 export async function connectBrowserTransport(
   options: ConnectBrowserTransportOptions,
 ): Promise<BrowserTransportConnection> {
-  const trace = options.trace ?? null;
-  trace?.mark('connect_browser_transport:start', {
-    hasPasscode: Boolean(options.passcode),
-    hasViewerToken: Boolean(options.viewerToken),
-  });
-  if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
-    // eslint-disable-next-line no-console
-    console.info('[connectBrowserTransport][rewrite] start', {
-      sessionId: options.sessionId,
-      baseUrl: options.baseUrl,
+  const releaseLock = await acquireSessionLock(options.sessionId);
+  try {
+    const trace = options.trace ?? null;
+    trace?.mark('connect_browser_transport:start', {
       hasPasscode: Boolean(options.passcode),
       hasViewerToken: Boolean(options.viewerToken),
-      hasAuthorization: Boolean(options.authorizationToken && options.authorizationToken.trim().length > 0),
     });
-  }
+    if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+      // eslint-disable-next-line no-console
+      console.info('[connectBrowserTransport][rewrite] start', {
+        sessionId: options.sessionId,
+        baseUrl: options.baseUrl,
+        hasPasscode: Boolean(options.passcode),
+        hasViewerToken: Boolean(options.viewerToken),
+        hasAuthorization: Boolean(
+          options.authorizationToken && options.authorizationToken.trim().length > 0,
+        ),
+      });
+    }
 
-  const join = await fetchJoinMetadata(options);
-  trace?.mark('join_metadata:received', {
-    role: join.role,
-    pollIntervalMs: join.pollIntervalMs,
-    signalingUrl: join.signalingUrl,
-  });
-  if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
-    // eslint-disable-next-line no-console
-    console.info('[connectBrowserTransport][rewrite] joinMetadata.received', {
-      sessionId: options.sessionId,
+    const join = await fetchJoinMetadata(options);
+    trace?.mark('join_metadata:received', {
       role: join.role,
       pollIntervalMs: join.pollIntervalMs,
       signalingUrl: join.signalingUrl,
     });
-  }
-  const normalizedSignalingUrl = normalizeConnectorUrl(join.signalingUrl) ?? join.signalingUrl;
-  const websocketUrl =
-    normalizeConnectorUrl(join.websocketUrl) ??
-    deriveWebsocketUrl(options.baseUrl, options.sessionId);
-  trace?.mark('signaling:connect_start', { websocketUrl });
-  const signaling = await SignalingClient.connect({
-    url: websocketUrl,
-    passphrase: options.passcode,
-    viewerToken: options.viewerToken ?? undefined,
-    supportedTransports: ['webrtc'],
-    createSocket: options.createSocket,
-    label: options.clientLabel,
-    trace,
-  });
-  trace?.mark('signaling:ready', { peerId: signaling.peerId });
-  if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
-    // eslint-disable-next-line no-console
-    console.info('[connectBrowserTransport][rewrite] signaling.connected', {
-      sessionId: options.sessionId,
-      peerId: signaling.peerId,
-    });
-  }
-  let webrtcResult: Awaited<ReturnType<typeof connectWebRtcTransport>>;
-  try {
-    webrtcResult = await connectWebRtcTransport({
-      signaling,
-      signalingUrl: normalizedSignalingUrl,
-      role: join.role,
-      pollIntervalMs: join.pollIntervalMs,
-      iceServers: options.iceServers,
-      logger: options.logger,
-      passphrase: options.passcode,
-      viewerToken: options.viewerToken ?? undefined,
-    telemetryBaseUrl: options.baseUrl,
-    sessionId: options.sessionId,
-    trace,
-  });
-  } catch (error) {
-    trace?.mark('webrtc:connect_error', {
-      message: error instanceof Error ? error.message : String(error),
-    });
     if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
       // eslint-disable-next-line no-console
-      console.error('[connectBrowserTransport][rewrite] webrtc.connect_error', {
+      console.info('[connectBrowserTransport][rewrite] joinMetadata.received', {
         sessionId: options.sessionId,
-        message: error instanceof Error ? error.message : String(error),
+        role: join.role,
+        pollIntervalMs: join.pollIntervalMs,
+        signalingUrl: join.signalingUrl,
       });
     }
-    throw error;
-  }
-  const { transport: webRtcTransport, remotePeerId, secure } = webrtcResult;
-  trace?.mark('webrtc:connected', {
-    remotePeerId,
-    secureMode: secure?.mode ?? 'plaintext',
-  });
-  if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
-    // eslint-disable-next-line no-console
-    console.info('[connectBrowserTransport][rewrite] webrtc.connected', {
-      sessionId: options.sessionId,
+
+    const normalizedSignalingUrl = normalizeConnectorUrl(join.signalingUrl) ?? join.signalingUrl;
+    const websocketUrl =
+      normalizeConnectorUrl(join.websocketUrl) ??
+      deriveWebsocketUrl(options.baseUrl, options.sessionId);
+    trace?.mark('signaling:connect_start', { websocketUrl });
+    const signaling = await SignalingClient.connect({
+      url: websocketUrl,
+      passphrase: options.passcode,
+      viewerToken: options.viewerToken ?? undefined,
+      supportedTransports: ['webrtc'],
+      createSocket: options.createSocket,
+      label: options.clientLabel,
+      trace,
+    });
+    trace?.mark('signaling:ready', { peerId: signaling.peerId });
+    if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+      // eslint-disable-next-line no-console
+      console.info('[connectBrowserTransport][rewrite] signaling.connected', {
+        sessionId: options.sessionId,
+        peerId: signaling.peerId,
+      });
+    }
+
+    let webrtcResult: Awaited<ReturnType<typeof connectWebRtcTransport>>;
+    try {
+      webrtcResult = await connectWebRtcTransport({
+        signaling,
+        signalingUrl: normalizedSignalingUrl,
+        role: join.role,
+        pollIntervalMs: join.pollIntervalMs,
+        iceServers: options.iceServers,
+        logger: options.logger,
+        passphrase: options.passcode,
+        viewerToken: options.viewerToken ?? undefined,
+        telemetryBaseUrl: options.baseUrl,
+        sessionId: options.sessionId,
+        trace,
+      });
+    } catch (error) {
+      trace?.mark('webrtc:connect_error', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+        // eslint-disable-next-line no-console
+        console.error('[connectBrowserTransport][rewrite] webrtc.connect_error', {
+          sessionId: options.sessionId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+      throw error;
+    }
+
+    const { transport: webRtcTransport, remotePeerId, secure } = webrtcResult;
+    trace?.mark('webrtc:connected', {
       remotePeerId,
       secureMode: secure?.mode ?? 'plaintext',
     });
+    if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+      // eslint-disable-next-line no-console
+      console.info('[connectBrowserTransport][rewrite] webrtc.connected', {
+        sessionId: options.sessionId,
+        remotePeerId,
+        secureMode: secure?.mode ?? 'plaintext',
+      });
+    }
+
+    const transport = new DataChannelTerminalTransport(webRtcTransport, {
+      logger: options.logger,
+      secureContext: secure,
+    });
+    if (options.fallbackOverrides && options.logger) {
+      const { cohort, entitlementProof, telemetryOptIn } = options.fallbackOverrides;
+      options.logger(
+        `[fallback overrides] cohort=${cohort ?? '—'} proof=${entitlementProof ? 'present' : 'none'} telemetry=${
+          telemetryOptIn ? 'on' : 'off'
+        }`,
+      );
+    }
+
+    return {
+      transport,
+      signaling,
+      remotePeerId,
+      secure,
+      fallbackOverrides: options.fallbackOverrides,
+      close: () => {
+        transport.close();
+        signaling.close();
+        if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
+          // eslint-disable-next-line no-console
+          console.info('[connectBrowserTransport][rewrite] connection.closed', {
+            sessionId: options.sessionId,
+          });
+        }
+      },
+    };
+  } finally {
+    releaseLock();
   }
-  const transport = new DataChannelTerminalTransport(webRtcTransport, {
-    logger: options.logger,
-    secureContext: secure,
-  });
-  if (options.fallbackOverrides && options.logger) {
-    const { cohort, entitlementProof, telemetryOptIn } = options.fallbackOverrides;
-    options.logger(
-      `[fallback overrides] cohort=${cohort ?? '—'} proof=${entitlementProof ? 'present' : 'none'} telemetry=${
-        telemetryOptIn ? 'on' : 'off'
-      }`,
-    );
-  }
-  return {
-    transport,
-    signaling,
-    remotePeerId,
-    secure,
-    fallbackOverrides: options.fallbackOverrides,
-    close: () => {
-      transport.close();
-      signaling.close();
-      if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'production') {
-        // eslint-disable-next-line no-console
-        console.info('[connectBrowserTransport][rewrite] connection.closed', {
-          sessionId: options.sessionId,
-        });
-      }
-    },
-  };
 }
 
 export function deriveWebsocketUrl(baseUrl: string, sessionId: string): string {

@@ -1,16 +1,7 @@
 'use client';
 
-type ConnectionLogLevel = 'info' | 'warn' | 'error';
-
-export type ConnectionLogContext = {
-  tileId?: string | null;
-  sessionId?: string | null;
-  privateBeachId?: string | null;
-  managerUrl?: string | null;
-  beachUrl?: string | null;
-};
-
-export type ConnectionLogDetail = Record<string, unknown> | null | undefined;
+import type { ConnectionLogContext, ConnectionLogDetail, ConnectionLogLevel } from './types';
+import { recordConnectionTimelineEvent } from '@/features/devtools/connectionTimelineStore';
 
 const LOG_PREFIX = '[beach-connection]';
 const CONNECTION_TRACE_ENV = 'NEXT_PUBLIC_BEACH_CONNECTION_TRACE';
@@ -111,6 +102,7 @@ export function logConnectionEvent(
   }
   const logger = level === 'error' ? console.error : level === 'warn' ? console.warn : console.info;
   logger(LOG_PREFIX, step, safeSerialize(payload));
+  recordConnectionTimelineEvent(step, context, normalizedDetail ?? null, level);
   if (isConnectionTraceEnabled()) {
     console.debug(`${LOG_PREFIX}[trace] ${step}`, payload);
   }

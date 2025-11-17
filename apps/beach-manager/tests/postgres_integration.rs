@@ -13,9 +13,9 @@ use axum::{
 };
 use beach_buggy::{
     AckStatus, ActionAck, ActionCommand, HarnessType, HealthHeartbeat, RegisterSessionRequest,
-    StateDiff,
+    StateDiff, TransportMode,
 };
-use hyper::body::to_bytes;
+use http_body_util::BodyExt;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
@@ -58,6 +58,7 @@ async fn postgres_sqlx_e2e() {
         metadata: Some(serde_json::json!({ "tag": "pg-e2e" })),
         version: "0.1.0".into(),
         viewer_passcode: Some("PGPASS".into()),
+        transport_mode: Some(TransportMode::FastPath),
     };
     let register_resp = state
         .register_session(register)
@@ -238,6 +239,7 @@ async fn postgres_viewer_credentials_for_multi_beach_session() {
         metadata: None,
         version: "1.0.0".into(),
         viewer_passcode: Some("PASS-A".into()),
+        transport_mode: Some(TransportMode::FastPath),
     };
     state
         .register_session(register_a)
@@ -253,6 +255,7 @@ async fn postgres_viewer_credentials_for_multi_beach_session() {
         metadata: None,
         version: "1.0.0".into(),
         viewer_passcode: Some("PASS-B".into()),
+        transport_mode: Some(TransportMode::FastPath),
     };
     state
         .register_session(register_b)
@@ -289,7 +292,12 @@ async fn postgres_viewer_credentials_for_multi_beach_session() {
         .await
         .expect("send viewer credential request A");
     assert_eq!(response_a.status(), StatusCode::OK);
-    let body_a = to_bytes(response_a.into_body()).await.expect("read body A");
+    let body_a = response_a
+        .into_body()
+        .collect()
+        .await
+        .expect("read body A")
+        .to_bytes();
     let json_a: Value = serde_json::from_slice(&body_a).expect("parse body A");
     assert_eq!(json_a["credential_type"], "viewer_passcode");
     assert_eq!(json_a["credential"], "PASS-A");
@@ -312,7 +320,12 @@ async fn postgres_viewer_credentials_for_multi_beach_session() {
         .await
         .expect("send viewer credential request B");
     assert_eq!(response_b.status(), StatusCode::OK);
-    let body_b = to_bytes(response_b.into_body()).await.expect("read body B");
+    let body_b = response_b
+        .into_body()
+        .collect()
+        .await
+        .expect("read body B")
+        .to_bytes();
     let json_b: Value = serde_json::from_slice(&body_b).expect("parse body B");
     assert_eq!(json_b["credential_type"], "viewer_passcode");
     assert_eq!(json_b["credential"], "PASS-B");

@@ -45,6 +45,7 @@ type TileEntry = {
   lastStatus: TerminalViewerStatus;
   metrics: ViewerTileCounters;
   traceId?: string | null;
+  pendingDisconnectTimer: number | null;
 };
 
 function debugLog(message: string, detail?: Record<string, unknown>) {
@@ -155,6 +156,14 @@ export class ViewerConnectionService {
       typeof input.traceId === 'string' && input.traceId.trim().length > 0 ? input.traceId.trim() : null;
     const preparation = toPreparedConnection(input);
     const existing = this.tiles.get(tileId);
+    if (
+      existing &&
+      existing.pendingDisconnectTimer != null &&
+      typeof window !== 'undefined'
+    ) {
+      window.clearTimeout(existing.pendingDisconnectTimer);
+      existing.pendingDisconnectTimer = null;
+    }
     debugLog('connectTile.request', {
       trace_id: normalizedTraceId,
       tileId,
@@ -185,11 +194,11 @@ export class ViewerConnectionService {
       this.disposeTile(tileId, existing, 'replacement');
       const idle = cloneViewerState(IDLE_STATE);
       subscriber(idle);
-      const entry: TileEntry = {
-        tileId,
-        subscriber,
-        key: null,
-        unsubscribe: null,
+    const entry: TileEntry = {
+      tileId,
+      subscriber,
+      key: null,
+      unsubscribe: null,
         preparation,
         sessionId: baseSessionId,
         privateBeachId: basePrivateBeachId,
@@ -265,6 +274,7 @@ export class ViewerConnectionService {
           failures: 0,
           disposed: 0,
         },
+      pendingDisconnectTimer: existing?.pendingDisconnectTimer ?? null,
     };
     debugLog('connectTile.start_connection', {
       trace_id: normalizedTraceId,
@@ -285,10 +295,23 @@ export class ViewerConnectionService {
 
   disconnectTile(tileId: string) {
     const entry = this.tiles.get(tileId);
-    this.disposeTile(tileId, entry, 'disconnect');
-    if (entry) {
-      this.tiles.delete(tileId);
+    if (!entry) {
+      return;
     }
+    if (entry.pendingDisconnectTimer != null && typeof window !== 'undefined') {
+      window.clearTimeout(entry.pendingDisconnectTimer);
+      entry.pendingDisconnectTimer = null;
+    }
+    const performDispose = () => {
+      entry.pendingDisconnectTimer = null;
+      this.disposeTile(tileId, entry, 'disconnect');
+      this.tiles.delete(tileId);
+    };
+    if (typeof window === 'undefined') {
+      performDispose();
+      return;
+    }
+    entry.pendingDisconnectTimer = window.setTimeout(performDispose, 0);
   }
 
   resetMetrics() {

@@ -45,6 +45,7 @@ type TileFlowNodeData = {
   rewriteEnabled: boolean;
   isInteractive: boolean;
   interactiveTileId: string | null;
+  connectedRelationshipIds: string[];
 };
 
 type ResizeState = {
@@ -182,6 +183,7 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
     isResizing,
     isInteractive,
     interactiveTileId,
+    connectedRelationshipIds,
     privateBeachId,
     managerUrl,
     roadUrl,
@@ -200,6 +202,7 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
     setInteractiveTile,
     createTile,
     updateTileViewport,
+    removeRelationship,
   } = useTileActions();
   const nodeRef = useRef<HTMLElement | null>(null);
   const viewportMetricsRef = useRef<TileViewportSnapshot | null>(null);
@@ -209,6 +212,9 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
   const [hovered, setHovered] = useState(false);
   const [terminalHover, setTerminalHover] = useState(false);
   const [dragPerfMode, setDragPerfMode] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const connectedRelationshipCount = connectedRelationshipIds.length;
+  const hasConnectedRelationships = connectedRelationshipCount > 0;
   const isAgent = tile.nodeType === 'agent';
   const agentMeta = useMemo(() => normalizeAgentMeta(tile.agentMeta ?? null), [tile.agentMeta]);
   const hasSession = Boolean(tile.sessionMeta?.sessionId);
@@ -220,6 +226,12 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
   const [agentSaveState, setAgentSaveState] = useState<'idle' | 'saving'>('idle');
   const [agentSaveNotice, setAgentSaveNotice] = useState<string | null>(null);
   const zoom = useStore(zoomSelector);
+
+  useEffect(() => {
+    if (!hasConnectedRelationships) {
+      setShowDeleteConfirm(false);
+    }
+  }, [hasConnectedRelationships]);
 
   useEffect(() => {
     autoInteractLockedRef.current = false;
@@ -319,51 +331,75 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
     return { enabled: true, traceId: id };
   }, [agentTraceEnabled, agentTraceId]);
 
+  const removeTileWithDetach = useCallback(() => {
+    emitTelemetry('canvas.tile.remove', {
+      privateBeachId,
+      tileId: tile.id,
+      rewriteEnabled,
+    });
+    // Best-effort: issue a detach control message to the host so it tears down
+    // any active controller consumer. Road URL comes from the beach settings.
+    const sessionId = tile.sessionMeta?.sessionId?.trim();
+    const controlUrl = roadUrl?.trim();
+    if (sessionId && sessionId.length > 0 && controlUrl) {
+      (async () => {
+        try {
+          const token = managerToken ?? (await refreshManagerToken());
+          await sendControlMessage(
+            sessionId,
+            'manager_detach',
+            { reason: 'tile_removed' },
+            token ?? null,
+            controlUrl,
+          );
+        } catch (err) {
+          try {
+            console.warn('[tile] detach control send failed', err);
+          } catch {}
+        }
+      })();
+    } else if (sessionId && !controlUrl) {
+      console.warn('[tile] detach skipped; road url missing');
+    }
+    removeTile(tile.id);
+  }, [
+    privateBeachId,
+    managerToken,
+    refreshManagerToken,
+    roadUrl,
+    removeTile,
+    rewriteEnabled,
+    tile.id,
+    tile.sessionMeta?.sessionId,
+  ]);
+
+  const removeTileAndRelationships = useCallback(() => {
+    connectedRelationshipIds.forEach((relationshipId) => {
+      removeRelationship(relationshipId);
+    });
+    removeTileWithDetach();
+    setShowDeleteConfirm(false);
+  }, [connectedRelationshipIds, removeRelationship, removeTileWithDetach]);
+
   const handleRemove = useCallback(
     (event: MouseEvent<HTMLButtonElement>) => {
       event.stopPropagation();
-      emitTelemetry('canvas.tile.remove', {
-        privateBeachId,
-        tileId: tile.id,
-        rewriteEnabled,
-      });
-// Best-effort: issue a detach control message to the host so it tears down
-      // any active controller consumer. Road URL comes from the beach settings.
-      const sessionId = tile.sessionMeta?.sessionId?.trim();
-      const controlUrl = roadUrl?.trim();
-      if (sessionId && sessionId.length > 0 && controlUrl) {
-        (async () => {
-          try {
-            const token = managerToken ?? (await refreshManagerToken());
-            await sendControlMessage(
-              sessionId,
-              'manager_detach',
-              { reason: 'tile_removed' },
-              token ?? null,
-              controlUrl,
-            );
-          } catch (err) {
-            try {
-              console.warn('[tile] detach control send failed', err);
-            } catch {}
-          }
-        })();
-      } else if (sessionId && !controlUrl) {
-        console.warn('[tile] detach skipped; road url missing');
+      if (hasConnectedRelationships) {
+        setShowDeleteConfirm(true);
+        return;
       }
-      removeTile(tile.id);
+      removeTileAndRelationships();
     },
-    [
-      privateBeachId,
-      managerToken,
-      refreshManagerToken,
-      roadUrl,
-      removeTile,
-      rewriteEnabled,
-      tile.id,
-      tile.sessionMeta?.sessionId,
-    ],
+    [hasConnectedRelationships, removeTileAndRelationships],
   );
+
+  const handleDeleteConfirm = useCallback(() => {
+    removeTileAndRelationships();
+  }, [removeTileAndRelationships]);
+
+  const handleDeleteCancel = useCallback(() => {
+    setShowDeleteConfirm(false);
+  }, []);
 
   const runAgentOnboarding = useCallback(
     async (metaPayload: AgentMetadata) => {
@@ -933,6 +969,7 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
   );
 
   const showInteractOverlay = !isAgent && !isInteractive && terminalHover && !dragging;
+  const connectionLabel = connectedRelationshipCount === 1 ? 'connection' : 'connections';
 
   useEffect(() => {
     if (!isAgent) {
@@ -1018,6 +1055,45 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
     >
       <span className={interactHaloClass} aria-hidden="true" />
       <div className="relative flex h-full flex-1 flex-col overflow-hidden rounded-[inherit]">
+        {showDeleteConfirm ? (
+          <div
+            className="pointer-events-auto absolute inset-0 z-40 flex items-center justify-center rounded-[inherit] bg-slate-950/70 px-4 py-6 text-white"
+            data-tile-drag-ignore="true"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Delete tile and connections"
+            onClick={handleDeleteCancel}
+          >
+            <div
+              className="w-full max-w-[320px] rounded-2xl border border-white/20 bg-slate-950/95 px-5 py-4 text-left shadow-[0_24px_70px_rgba(2,6,23,0.65)]"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <p className="text-sm font-semibold text-white">Delete tile + {connectedRelationshipCount} {connectionLabel}?</p>
+              <p className="mt-2 text-[13px] text-slate-200">
+                We&apos;ll tear down every controller pairing linked to this tile so you don&apos;t have to detach them one by one.
+              </p>
+              <div className="mt-4 flex flex-col gap-2 text-xs sm:flex-row">
+                <Button
+                  type="button"
+                  onClick={handleDeleteConfirm}
+                  className="flex-1 whitespace-normal break-words px-3 py-3 text-center text-[10px] font-semibold uppercase tracking-[0.16em] leading-[1.2] text-white shadow bg-red-500/90 hover:bg-red-500"
+                  data-tile-drag-ignore="true"
+                >
+                  Delete tile &amp; links
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={handleDeleteCancel}
+                  className="flex-1 text-[11px] font-semibold uppercase tracking-[0.16em]"
+                  data-tile-drag-ignore="true"
+                >
+                  Keep tile
+                </Button>
+              </div>
+            </div>
+          </div>
+        ) : null}
         <div
           className={cn(
             'pointer-events-none absolute inset-0 z-30 flex items-center justify-center rounded-[inherit] bg-white/60 dark:bg-slate-950/40 transition-opacity duration-150',
@@ -1322,6 +1398,14 @@ function propsAreEqual(prev: Props, next: Props) {
   if (pd.managerUrl !== nd.managerUrl) return false;
   if (pd.roadUrl !== nd.roadUrl) return false;
   if (pd.rewriteEnabled !== nd.rewriteEnabled) return false;
+  const prevRelIds = pd.connectedRelationshipIds ?? [];
+  const nextRelIds = nd.connectedRelationshipIds ?? [];
+  if (prevRelIds.length !== nextRelIds.length) return false;
+  for (let index = 0; index < prevRelIds.length; index += 1) {
+    if (prevRelIds[index] !== nextRelIds[index]) {
+      return false;
+    }
+  }
   // Allow changes in session meta or viewport to propagate when present.
   if (!shallowEqual(pd.tile.sessionMeta ?? null, nd.tile.sessionMeta ?? null)) return false;
   if (!shallowEqual(pd.tile.agentMeta ?? null, nd.tile.agentMeta ?? null)) return false;

@@ -259,15 +259,18 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::SessionSummary;
+    use crate::state::{test_support, SessionSummary};
     use axum::{
         body::{self, Body},
         http::{Request, StatusCode},
     };
     use beach_buggy::{AckStatus, ActionAck, ActionCommand, HarnessType, RegisterSessionResponse};
+    use once_cell::sync::Lazy;
     use serde_json::json;
-    use std::time::SystemTime;
+    use std::{sync::Mutex, time::SystemTime};
     use tower::util::ServiceExt;
+
+    static HANDSHAKE_TEST_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     #[tokio::test]
     async fn harness_register_and_action_flow() {
@@ -846,9 +849,12 @@ mod tests {
 
     #[tokio::test]
     async fn controller_handshake_endpoint_happy_path() {
+        let _guard = HANDSHAKE_TEST_GUARD.lock().unwrap();
         // Skip external verify for tests
         unsafe {
             std::env::set_var("BEACH_SKIP_ROAD_VERIFY", "1");
+            std::env::set_var("BEACH_TEST_DISABLE_HANDSHAKE_HTTP", "1");
+            std::env::set_var("BEACH_TEST_DISABLE_SESSION_WORKERS", "1");
         }
         let state = AppState::new();
         let app = build_router(state.clone());
@@ -878,9 +884,84 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(payload["private_beach_id"], beach_id);
         assert!(payload["controller_token"].as_str().unwrap().len() > 0);
+        assert_eq!(payload["handshake_kind"], "renegotiate");
         // Clean up env var
         unsafe {
             std::env::remove_var("BEACH_SKIP_ROAD_VERIFY");
+            std::env::remove_var("BEACH_TEST_DISABLE_HANDSHAKE_HTTP");
+            std::env::remove_var("BEACH_TEST_DISABLE_SESSION_WORKERS");
+        }
+    }
+
+    #[tokio::test]
+    async fn controller_handshake_endpoint_refreshes_when_fast_path_ready() {
+        let _guard = HANDSHAKE_TEST_GUARD.lock().unwrap();
+        test_support::clear_fast_path_ready_override();
+        unsafe {
+            std::env::set_var("BEACH_SKIP_ROAD_VERIFY", "1");
+            std::env::set_var("BEACH_TEST_DISABLE_HANDSHAKE_HTTP", "1");
+            std::env::set_var("BEACH_TEST_DISABLE_SESSION_WORKERS", "1");
+        }
+        let state = AppState::new();
+        let app = build_router(state.clone());
+        let session_id = "sess-refresh";
+        let beach_id = "pb-refresh";
+        let body = json!({
+            "passcode": "999999",
+            "requester_private_beach_id": beach_id,
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{}/controller-handshake", session_id))
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["handshake_kind"], "renegotiate");
+        let controller_token = payload["controller_token"]
+            .as_str()
+            .expect("controller token present")
+            .to_string();
+
+        test_support::set_fast_path_ready_override(session_id, true);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{}/controller-handshake", session_id))
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let refresh_payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(refresh_payload["handshake_kind"], "refresh");
+        assert_eq!(refresh_payload["controller_token"], controller_token);
+
+        test_support::clear_fast_path_ready_override();
+        unsafe {
+            std::env::remove_var("BEACH_SKIP_ROAD_VERIFY");
+            std::env::remove_var("BEACH_TEST_DISABLE_HANDSHAKE_HTTP");
+            std::env::remove_var("BEACH_TEST_DISABLE_SESSION_WORKERS");
         }
     }
 }

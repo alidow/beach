@@ -63,6 +63,7 @@ export type ControllerHandshakeResponse = {
   lease_expires_at_ms?: number | null;
   stale_session_idle_secs: number;
   viewer_health_interval_secs: number;
+  handshake_kind?: 'refresh' | 'renegotiate';
 };
 
 export type ControllerEvent = {

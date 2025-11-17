@@ -20,8 +20,8 @@ use uuid::Uuid;
 use crate::{
     log_throttle::{should_log_queue_event, QueueLogKind},
     state::{
-        AgentOnboardResponse, AppState, ControllerCommandDropReason, ControllerEvent,
-        ControllerLeaseResponse, ControllerPairing, ControllerUpdateCadence,
+        AgentOnboardResponse, AppState, AttachHandshakeDisposition, ControllerCommandDropReason,
+        ControllerEvent, ControllerLeaseResponse, ControllerPairing, ControllerUpdateCadence,
         JoinSessionResponsePayload, PairingTransportKind, PairingTransportStatus, SessionSummary,
         StateError,
     },
@@ -111,6 +111,13 @@ pub struct ControllerHandshakeRequest {
     pub requester_private_beach_id: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerHandshakeKind {
+    Refresh,
+    Renegotiate,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct ControllerHandshakeResponse {
     pub private_beach_id: String,
@@ -124,6 +131,7 @@ pub struct ControllerHandshakeResponse {
     pub controller_auto_attach: Option<crate::state::ControllerAutoAttachHint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_publish_token: Option<crate::state::IdlePublishTokenHint>,
+    pub handshake_kind: ControllerHandshakeKind,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,18 +266,25 @@ pub async fn issue_controller_handshake(
     let target_beach = body
         .requester_private_beach_id
         .unwrap_or_else(|| "pb-unknown".into());
+    let fast_path_ready = state.is_fast_path_ready(&session_id).await;
+    let attach_disposition = if fast_path_ready {
+        AttachHandshakeDisposition::Skip
+    } else {
+        AttachHandshakeDisposition::Dispatch
+    };
 
     // Attach (or re-attach) the session via code to ensure the manager tracks it for this beach.
-    let session_summary = match state
+    let attach = match state
         .attach_by_code(
             &target_beach,
             &session_id,
             &body.passcode,
             token.account_uuid(),
+            attach_disposition,
         )
         .await
     {
-        Ok(summary) => summary,
+        Ok(result) => result,
         Err(StateError::InvalidIdentifier(_)) => {
             return Err(ApiError::Forbidden("invalid_passcode"));
         }
@@ -278,6 +293,12 @@ pub async fn issue_controller_handshake(
         }
         Err(StateError::SessionNotFound) => return Err(ApiError::NotFound("session not found")),
         Err(err) => return Err(map_state_err(err)),
+    };
+    let session_summary = attach.session;
+    let handshake_kind = if attach.handshake_dispatched {
+        ControllerHandshakeKind::Renegotiate
+    } else {
+        ControllerHandshakeKind::Refresh
     };
 
     // Acquire (or renew) a controller lease for this host session
@@ -309,6 +330,7 @@ pub async fn issue_controller_handshake(
         viewer_health_interval_secs: crate::state::viewer_health_report_interval().as_secs(),
         controller_auto_attach,
         idle_publish_token,
+        handshake_kind,
     };
 
     Ok(Json(response))
@@ -860,10 +882,16 @@ pub async fn attach_by_code(
         );
     }
     let session = match state
-        .attach_by_code(&private_beach_id, &body.session_id, &body.code, requester)
+        .attach_by_code(
+            &private_beach_id,
+            &body.session_id,
+            &body.code,
+            requester,
+            AttachHandshakeDisposition::Dispatch,
+        )
         .await
     {
-        Ok(session) => session,
+        Ok(outcome) => outcome.session,
         Err(err) => {
             warn!(
                 target = "private_beach.sessions",

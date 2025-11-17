@@ -920,6 +920,24 @@ pub struct ControllerPairing {
     pub updated_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachHandshakeDisposition {
+    Dispatch,
+    Skip,
+}
+
+impl AttachHandshakeDisposition {
+    fn dispatching(self) -> bool {
+        matches!(self, AttachHandshakeDisposition::Dispatch)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AttachByCodeOutcome {
+    pub session: SessionSummary,
+    pub handshake_dispatched: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControllerPairingAction {
@@ -1220,12 +1238,29 @@ impl AppState {
     }
 
     async fn fast_path_ready(&self, session_id: &str) -> bool {
-        if let Some(fps) = self.fast_paths.get(session_id).await {
+        #[cfg(test)]
+        if let Some(value) = test_support::fast_path_ready_override(session_id) {
+            return value;
+        }
+        let ready = if let Some(fps) = self.fast_paths.get(session_id).await {
             let guard = fps.actions_tx.lock().await;
             guard.is_some()
         } else {
             false
+        };
+        if should_log_custom_event(
+            "fast_path_ready_check",
+            session_id,
+            StdDuration::from_secs(5),
+        ) {
+            trace!(
+                target = "controller.fast_path_state",
+                session_id = %session_id,
+                ready,
+                "fast-path readiness evaluated"
+            );
         }
+        ready
     }
 
     async fn enforce_controller_gate(
@@ -1655,6 +1690,23 @@ impl AppState {
         });
 
         let dispatch_started = Instant::now();
+        let skip_http = std::env::var("BEACH_TEST_DISABLE_HANDSHAKE_HTTP")
+            .ok()
+            .map(|value| {
+                let trimmed = value.trim().to_ascii_lowercase();
+                trimmed == "1" || trimmed == "true"
+            })
+            .unwrap_or(false);
+
+        if skip_http {
+            info!(
+                target = "controller.actions",
+                session_id = %session_id,
+                private_beach_id = %private_beach_id,
+                "skipping manager handshake HTTP dispatch via test override"
+            );
+            return Ok(());
+        }
 
         match self.http.post(url).json(&body).send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -1767,7 +1819,13 @@ impl AppState {
                     .map(|record| record.private_beach_id.clone())
             };
 
-        if let Some(pb_id) = private_beach_id {
+        if let Some(pb_id) = private_beach_id.clone() {
+            info!(
+                target = "controller.fast_path_state",
+                session_id = %session_id,
+                private_beach_id = %pb_id,
+                "fast-path actions channel online"
+            );
             self.clear_http_backlog_after_fast_path(&pb_id, session_id)
                 .await;
         }
@@ -1949,8 +2007,13 @@ impl AppState {
         origin_session_id: &str,
         code: &str,
         requester: Option<Uuid>,
-    ) -> Result<SessionSummary, StateError> {
+        handshake: AttachHandshakeDisposition,
+    ) -> Result<AttachByCodeOutcome, StateError> {
         let skip_verify = std::env::var("BEACH_SKIP_ROAD_VERIFY")
+            .ok()
+            .map(|v| v.trim().eq_ignore_ascii_case("1") || v.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let skip_workers = std::env::var("BEACH_TEST_DISABLE_SESSION_WORKERS")
             .ok()
             .map(|v| v.trim().eq_ignore_ascii_case("1") || v.trim().eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -1986,55 +2049,81 @@ impl AppState {
         // Create mapping if not exists
         match &self.backend {
             Backend::Memory => {
-                let mut sessions = self.fallback.sessions.write().await;
-                let existed = sessions.contains_key(origin_session_id);
-                let rec = sessions
-                    .entry(origin_session_id.to_string())
-                    .or_insert_with(|| {
-                        SessionRecord::new(
-                            origin_session_id,
-                            private_beach_id,
-                            &HarnessType::Custom,
-                            self.idle_snapshot_interval_ms,
-                            TransportMode::FastPath,
-                        )
-                    });
-                rec.viewer_passcode = Some(code.to_string());
-                rec.mark_attached();
-                let hint = self.build_controller_auto_attach_hint(private_beach_id, code);
-                rec.upsert_controller_auto_attach_hint(&hint)?;
-                let token = rec.first_lease_token();
-                rec.append_event(
-                    ControllerEventType::Registered,
-                    token,
-                    Some("attach_by_code".into()),
-                );
-                if let Err(err) = self.spawn_viewer_worker(origin_session_id).await {
-                    warn!(
-                        target = "private_beach",
-                        session_id = %origin_session_id,
-                        error = %err,
-                        "failed to start viewer worker after attach_by_code (memory backend)"
+                let (summary, existed) = {
+                    let mut sessions = self.fallback.sessions.write().await;
+                    let existed = sessions.contains_key(origin_session_id);
+                    let rec = sessions
+                        .entry(origin_session_id.to_string())
+                        .or_insert_with(|| {
+                            SessionRecord::new(
+                                origin_session_id,
+                                private_beach_id,
+                                &HarnessType::Custom,
+                                self.idle_snapshot_interval_ms,
+                                TransportMode::FastPath,
+                            )
+                        });
+                    rec.viewer_passcode = Some(code.to_string());
+                    rec.mark_attached();
+                    let hint = self.build_controller_auto_attach_hint(private_beach_id, code);
+                    rec.upsert_controller_auto_attach_hint(&hint)?;
+                    let token = rec.first_lease_token();
+                    rec.append_event(
+                        ControllerEventType::Registered,
+                        token,
+                        Some("attach_by_code".into()),
                     );
-                }
-                if let Err(err) = self.spawn_controller_forwarder(origin_session_id).await {
-                    warn!(
-                        target = "controller.forwarder",
+                    (SessionSummary::from_record(rec), existed)
+                };
+                if skip_workers {
+                    debug!(
+                        target = "private_beach.sessions",
                         session_id = %origin_session_id,
-                        error = %err,
-                        "failed to start controller forwarder (memory backend)"
+                        "skipping session worker spawn via test override"
                     );
+                } else {
+                    if let Err(err) = self.spawn_viewer_worker(origin_session_id).await {
+                        warn!(
+                            target = "private_beach",
+                            session_id = %origin_session_id,
+                            error = %err,
+                            "failed to start viewer worker after attach_by_code (memory backend)"
+                        );
+                    }
+                    if let Err(err) = self.spawn_controller_forwarder(origin_session_id).await {
+                        warn!(
+                            target = "controller.forwarder",
+                            session_id = %origin_session_id,
+                            error = %err,
+                            "failed to start controller forwarder (memory backend)"
+                        );
+                    }
                 }
-                if let Err(err) = self
-                    .send_manager_handshake(origin_session_id, private_beach_id, code)
-                    .await
-                {
-                    warn!(
+                let mut dispatched_handshake = false;
+                if handshake.dispatching() {
+                    match self
+                        .send_manager_handshake(origin_session_id, private_beach_id, code)
+                        .await
+                    {
+                        Ok(_) => {
+                            dispatched_handshake = true;
+                        }
+                        Err(err) => {
+                            warn!(
+                                target = "controller.actions",
+                                session_id = %origin_session_id,
+                                private_beach_id = %private_beach_id,
+                                error = %err,
+                                "failed to dispatch manager handshake after attach_by_code"
+                            );
+                        }
+                    }
+                } else {
+                    debug!(
                         target = "controller.actions",
                         session_id = %origin_session_id,
                         private_beach_id = %private_beach_id,
-                        error = %err,
-                        "failed to dispatch manager handshake after attach_by_code"
+                        "skipping manager handshake dispatch for attach_by_code"
                     );
                 }
                 log_session_attachment(
@@ -2043,11 +2132,12 @@ impl AppState {
                     "code",
                     if existed { "updated" } else { "attached" },
                 );
-                let summary = SessionSummary::from_record(rec);
-                drop(sessions);
                 self.refresh_idle_publish_token_hint(origin_session_id)
                     .await?;
-                Ok(summary)
+                Ok(AttachByCodeOutcome {
+                    session: summary,
+                    handshake_dispatched: dispatched_handshake,
+                })
             }
             Backend::Postgres(pool) => {
                 let beach_uuid = parse_uuid(private_beach_id, "private_beach_id")?;
@@ -2162,32 +2252,55 @@ impl AppState {
                     if inserted { "attached" } else { "updated" },
                 );
 
-                if let Err(err) = self.spawn_viewer_worker(origin_session_id).await {
-                    warn!(
-                        target = "private_beach",
+                if skip_workers {
+                    debug!(
+                        target = "private_beach.sessions",
                         session_id = %origin_session_id,
-                        error = %err,
-                        "failed to start viewer worker after attach_by_code"
+                        "skipping session worker spawn via test override"
                     );
+                } else {
+                    if let Err(err) = self.spawn_viewer_worker(origin_session_id).await {
+                        warn!(
+                            target = "private_beach",
+                            session_id = %origin_session_id,
+                            error = %err,
+                            "failed to start viewer worker after attach_by_code"
+                        );
+                    }
+                    if let Err(err) = self.spawn_controller_forwarder(origin_session_id).await {
+                        warn!(
+                            target = "controller.forwarder",
+                            session_id = %origin_session_id,
+                            error = %err,
+                            "failed to start controller forwarder"
+                        );
+                    }
                 }
-                if let Err(err) = self.spawn_controller_forwarder(origin_session_id).await {
-                    warn!(
-                        target = "controller.forwarder",
-                        session_id = %origin_session_id,
-                        error = %err,
-                        "failed to start controller forwarder"
-                    );
-                }
-                if let Err(err) = self
-                    .send_manager_handshake(origin_session_id, private_beach_id, code)
-                    .await
-                {
-                    warn!(
+                let mut dispatched_handshake = false;
+                if handshake.dispatching() {
+                    match self
+                        .send_manager_handshake(origin_session_id, private_beach_id, code)
+                        .await
+                    {
+                        Ok(_) => {
+                            dispatched_handshake = true;
+                        }
+                        Err(err) => {
+                            warn!(
+                                target = "controller.actions",
+                                session_id = %origin_session_id,
+                                private_beach_id = %private_beach_id,
+                                error = %err,
+                                "failed to dispatch manager handshake after attach_by_code"
+                            );
+                        }
+                    }
+                } else {
+                    debug!(
                         target = "controller.actions",
                         session_id = %origin_session_id,
                         private_beach_id = %private_beach_id,
-                        error = %err,
-                        "failed to dispatch manager handshake after attach_by_code"
+                        "skipping manager handshake dispatch for attach_by_code"
                     );
                 }
 
@@ -2196,7 +2309,10 @@ impl AppState {
                 if let Some(found) = list.iter().find(|s| s.session_id == origin_session_id) {
                     self.refresh_idle_publish_token_hint(origin_session_id)
                         .await?;
-                    return Ok(found.clone());
+                    return Ok(AttachByCodeOutcome {
+                        session: found.clone(),
+                        handshake_dispatched: dispatched_handshake,
+                    });
                 }
                 Err(StateError::SessionNotFound)
             }
@@ -3952,7 +4068,7 @@ impl AppState {
             }
             Backend::Postgres(pool) => {
                 let cutoff_secs = STALE_SESSION_MAX_IDLE.as_secs() as f64;
-                match sqlx::query!(
+                match sqlx::query(
                     r#"
                     SELECT s.origin_session_id::text AS session_id
                     FROM session s
@@ -3962,12 +4078,15 @@ impl AppState {
                         OR
                         (r.last_health_at IS NULL AND s.created_at < NOW() - ($1 * INTERVAL '1 second'))
                     "#,
-                    cutoff_secs
                 )
+                .bind(cutoff_secs)
                 .fetch_all(pool)
                 .await
                 {
-                    Ok(rows) => rows.into_iter().filter_map(|row| row.session_id).collect(),
+                    Ok(rows) => rows
+                        .into_iter()
+                        .filter_map(|row| row.try_get::<String, _>("session_id").ok())
+                        .collect(),
                     Err(err) => {
                         warn!(
                             target = "private_beach.sessions",
@@ -8973,6 +9092,28 @@ pub(crate) mod test_support {
         let mut out = Vec::new();
         mem::swap(&mut *guard, &mut out);
         out
+    }
+
+    static FAST_PATH_READY_OVERRIDES: Lazy<RwLock<HashMap<String, bool>>> =
+        Lazy::new(|| RwLock::new(HashMap::new()));
+
+    pub fn set_fast_path_ready_override(session_id: &str, ready: bool) {
+        FAST_PATH_READY_OVERRIDES
+            .write()
+            .unwrap()
+            .insert(session_id.to_string(), ready);
+    }
+
+    pub fn fast_path_ready_override(session_id: &str) -> Option<bool> {
+        FAST_PATH_READY_OVERRIDES
+            .read()
+            .unwrap()
+            .get(session_id)
+            .copied()
+    }
+
+    pub fn clear_fast_path_ready_override() {
+        FAST_PATH_READY_OVERRIDES.write().unwrap().clear();
     }
 }
 

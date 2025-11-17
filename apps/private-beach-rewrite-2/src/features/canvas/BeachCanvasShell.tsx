@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useCallback, useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CanvasWorkspace } from './CanvasWorkspace';
 import { ThemeToggleButton } from '@/components/ThemeToggleButton';
 import type { CanvasNodeDefinition, NodePlacementPayload, TileMovePayload } from './types';
@@ -16,6 +16,8 @@ import { buildManagerUrl } from '@/hooks/useManagerToken';
 import { emitTelemetry } from '../../../../private-beach/src/lib/telemetry';
 import { useTileLayoutPersistence } from './useTileLayoutPersistence';
 import { CANVAS_CENTER_TILE_EVENT, type CanvasCenterTileEventDetail } from './events';
+import { Activity } from 'lucide-react';
+import { ConnectionDevToolsPanel } from '@/features/devtools/ConnectionDevToolsPanel';
 
 type BeachCanvasShellProps = {
   beachId: string;
@@ -114,6 +116,7 @@ function BeachCanvasShellInner({
 }: BeachCanvasShellInnerProps) {
   const { createTile, updateTileMeta, setInteractiveTile } = useTileActions();
   const tileState = useTileState();
+  const [devtoolsOpen, setDevtoolsOpen] = useState(false);
 
   const requestImmediatePersist = useTileLayoutPersistence({
     beachId,
@@ -250,6 +253,12 @@ function BeachCanvasShellInner({
     const detail: CanvasCenterTileEventDetail = { tileId: interactiveTileId };
     window.dispatchEvent(new CustomEvent(CANVAS_CENTER_TILE_EVENT, { detail }));
   }, [interactiveTileId]);
+  const handleToggleDevtools = useCallback(() => {
+    setDevtoolsOpen((value) => !value);
+  }, []);
+  const handleCloseDevtools = useCallback(() => {
+    setDevtoolsOpen(false);
+  }, []);
 
   useEffect(() => {
     if (typeof window === 'undefined') {
@@ -312,6 +321,16 @@ function BeachCanvasShellInner({
           </div>
         </div>
         <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={handleToggleDevtools}
+            className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/5 text-slate-300 transition hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/30"
+            aria-pressed={devtoolsOpen}
+            aria-label="Toggle connection dev tools"
+            title="Connection dev tools"
+          >
+            <Activity className="h-4 w-4" />
+          </button>
           {showInteractiveBadge ? (
             <div
               className="inline-flex items-center gap-1.5 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold text-slate-950 shadow-[0_12px_28px_rgba(249,115,22,0.35)] transition hover:brightness-110"
@@ -342,17 +361,27 @@ function BeachCanvasShellInner({
         </div>
       </header>
       <div className="relative flex flex-1 min-h-0 flex-col overflow-hidden">
-        <CanvasWorkspace
-          nodes={catalog}
-          onNodePlacement={handlePlacement}
-          onTileMove={handleTileMove}
-          onViewportChange={handleViewportChange}
-          privateBeachId={beachId}
-          managerUrl={managerUrl}
-          roadUrl={roadUrl}
-          rewriteEnabled={rewriteEnabled}
-          initialDrawerOpen
-        />
+        <div
+          className={[
+            'relative flex flex-1 min-h-0 flex-col overflow-hidden transition-[margin] duration-200',
+            devtoolsOpen ? 'mr-[340px]' : '',
+          ]
+            .filter(Boolean)
+            .join(' ')}
+        >
+          <CanvasWorkspace
+            nodes={catalog}
+            onNodePlacement={handlePlacement}
+            onTileMove={handleTileMove}
+            onViewportChange={handleViewportChange}
+            privateBeachId={beachId}
+            managerUrl={managerUrl}
+            roadUrl={roadUrl}
+            rewriteEnabled={rewriteEnabled}
+            initialDrawerOpen
+          />
+        </div>
+        <ConnectionDevToolsPanel open={devtoolsOpen} onClose={handleCloseDevtools} />
       </div>
     </div>
   );

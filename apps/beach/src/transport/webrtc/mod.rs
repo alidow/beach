@@ -30,7 +30,6 @@ use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
-use webrtc_ice::network_type::NetworkType;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -39,6 +38,10 @@ use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::util::vnet::net::{Net, NetConfig};
 use webrtc::util::vnet::router::{Router, RouterConfig};
+use webrtc_ice::{
+    network_type::NetworkType,
+    udp_network::{EphemeralUDP, UDPNetwork},
+};
 
 use crate::auth;
 use crate::auth::error::AuthError;
@@ -218,6 +221,68 @@ fn apply_nat_hint(setting: &mut SettingEngine) {
     if let Some((ip, _source)) = nat_ip_hint() {
         setting.set_nat_1to1_ips(vec![ip.clone()], RTCIceCandidateType::Host);
     }
+
+    if let Some((start, end)) = ice_port_range_hint() {
+        match EphemeralUDP::new(start, end) {
+            Ok(range) => {
+                tracing::info!(
+                    target = "beach::transport::webrtc",
+                    port_start = start,
+                    port_end = end,
+                    "using ICE UDP port range from env"
+                );
+                setting.set_udp_network(UDPNetwork::Ephemeral(range));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target = "beach::transport::webrtc",
+                    port_start = start,
+                    port_end = end,
+                    error = %err,
+                    "invalid ICE UDP port range; falling back to defaults"
+                );
+            }
+        }
+    }
+}
+
+fn ice_port_range_hint() -> Option<(u16, u16)> {
+    let start = std::env::var("BEACH_ICE_PORT_START").ok()?;
+    let end = std::env::var("BEACH_ICE_PORT_END").ok()?;
+    let start = match start.trim().parse::<u16>() {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                target = "beach::transport::webrtc",
+                error = %err,
+                value = %start,
+                "failed to parse BEACH_ICE_PORT_START"
+            );
+            return None;
+        }
+    };
+    let end = match end.trim().parse::<u16>() {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                target = "beach::transport::webrtc",
+                error = %err,
+                value = %end,
+                "failed to parse BEACH_ICE_PORT_END"
+            );
+            return None;
+        }
+    };
+    if start > end {
+        tracing::warn!(
+            target = "beach::transport::webrtc",
+            port_start = start,
+            port_end = end,
+            "ignoring ICE port range because start > end"
+        );
+        return None;
+    }
+    Some((start, end))
 }
 
 pub struct OfferEncryptionDelayGuard {

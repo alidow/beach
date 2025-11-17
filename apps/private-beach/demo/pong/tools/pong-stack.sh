@@ -5,6 +5,9 @@ usage() {
   cat <<'USAGE'
 Usage:
   pong-stack.sh start <private-beach-id>  Start LHS, RHS, and agent inside docker compose service.
+  pong-stack.sh start lhs                 Start only the LHS player.
+  pong-stack.sh start rhs                 Start only the RHS player.
+  pong-stack.sh start agent <pb-id>       Start only the mock agent.
   pong-stack.sh stop                      Stop all pong demo processes running in the service.
   pong-stack.sh codes                     Print current session IDs and passcodes from logs.
 
@@ -27,7 +30,7 @@ shift
 
 SERVICE=${PONG_DOCKER_SERVICE:-beach-manager}
 MANAGER_URL=${PRIVATE_BEACH_MANAGER_URL:-http://localhost:8080}
-SESSION_SERVER=${PONG_SESSION_SERVER:-http://host.docker.internal:4132/}
+SESSION_SERVER=${PONG_SESSION_SERVER:-http://beach-road:4132/}
 AUTH_GATEWAY=${PONG_AUTH_GATEWAY:-http://host.docker.internal:4133}
 CLI_PROFILE=${PONG_BEACH_PROFILE:-local}
 LOG_DIR=${PONG_LOG_DIR:-/tmp/pong-stack}
@@ -71,18 +74,39 @@ stop_stack() {
 case "$COMMAND" in
   start)
     if [[ $# -lt 1 ]]; then
-      echo "error: missing <private-beach-id>" >&2
+      echo "error: missing start target" >&2
       usage
       exit 1
     fi
-    beach_id=$1
-    ensure_cli_login
-    start_player lhs "LHS"
-    start_player rhs "RHS"
-    start_agent "$beach_id"
-    echo "waiting $CODES_WAIT seconds for sessions to register..."
-    sleep "$CODES_WAIT"
-    print_codes
+    target=$1
+    shift || true
+    case "$target" in
+      lhs)
+        start_player lhs "LHS"
+        ;;
+      rhs)
+        start_player rhs "RHS"
+        ;;
+      agent)
+        if [[ $# -lt 1 ]]; then
+          echo "error: start agent requires <private-beach-id>" >&2
+          exit 1
+        fi
+        beach_id=$1
+        ensure_cli_login
+        start_agent "$beach_id"
+        ;;
+      *)
+        beach_id=$target
+        ensure_cli_login
+        start_player lhs "LHS"
+        start_player rhs "RHS"
+        start_agent "$beach_id"
+        echo "waiting $CODES_WAIT seconds for sessions to register..."
+        sleep "$CODES_WAIT"
+        print_codes
+        ;;
+    esac
     ;;
   stop)
     stop_stack

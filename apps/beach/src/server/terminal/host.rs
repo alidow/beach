@@ -113,7 +113,14 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     }
     let _encryption_delay_guard =
         transport_mod::webrtc::install_offer_encryption_delay(delay_ms.map(Duration::from_millis));
-    let requires_token = auth::manager_requires_access_token(base_url);
+    let mut requires_token = auth::manager_requires_access_token(base_url);
+    if auth::is_public_mode() {
+        trace!(
+            target = "controller.actions",
+            "public mode: skipping session-server auth requirement"
+        );
+        requires_token = false;
+    }
     let access_token = auth::maybe_access_token(None, requires_token)
         .await
         .map_err(|err| CliError::Auth(err.to_string()))?;
@@ -317,10 +324,23 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         };
     let env_manager_url = manager_url_from_env();
     let env_auto_attach = env_auto_attach_hint(env_manager_url.as_deref());
+    let public_mode = auth::is_public_mode();
+    if public_mode && env_auto_attach.is_none() && env_manager_url.is_some() {
+        trace!(
+            target = "controller.actions",
+            "public mode: deferring manager bridge until auto-attach hint arrives"
+        );
+    }
     let manager_url_for_actions = metadata_auto_attach
         .as_ref()
         .map(|hint| hint.manager_url.clone())
-        .or_else(|| env_manager_url.clone());
+        .or_else(|| {
+            if env_auto_attach.is_some() || !public_mode {
+                env_manager_url.clone()
+            } else {
+                None
+            }
+        });
 
     let mut controller_bridge: Option<Arc<ControllerBridge>> = None;
     let mut controller_manager_token: Option<String> = None;

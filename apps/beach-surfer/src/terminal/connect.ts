@@ -37,6 +37,23 @@ export interface ConnectBrowserTransportOptions {
   authorizationToken?: string;
 }
 
+const HOST_DOCKER_HOSTNAME = 'host.docker.internal';
+
+function normalizeConnectorUrl(url: string | undefined): string | undefined {
+  if (!url) return url;
+  if (typeof window === 'undefined') return url;
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname === HOST_DOCKER_HOSTNAME) {
+      const replacementHost = window.location.hostname || 'localhost';
+      parsed.hostname = replacementHost;
+    }
+    return parsed.toString();
+  } catch {
+    return url;
+  }
+}
+
 export async function connectBrowserTransport(
   options: ConnectBrowserTransportOptions,
 ): Promise<BrowserTransportConnection> {
@@ -71,7 +88,10 @@ export async function connectBrowserTransport(
       signalingUrl: join.signalingUrl,
     });
   }
-  const websocketUrl = join.websocketUrl ?? deriveWebsocketUrl(options.baseUrl, options.sessionId);
+  const normalizedSignalingUrl = normalizeConnectorUrl(join.signalingUrl) ?? join.signalingUrl;
+  const websocketUrl =
+    normalizeConnectorUrl(join.websocketUrl) ??
+    deriveWebsocketUrl(options.baseUrl, options.sessionId);
   trace?.mark('signaling:connect_start', { websocketUrl });
   const signaling = await SignalingClient.connect({
     url: websocketUrl,
@@ -94,7 +114,7 @@ export async function connectBrowserTransport(
   try {
     webrtcResult = await connectWebRtcTransport({
       signaling,
-      signalingUrl: join.signalingUrl,
+      signalingUrl: normalizedSignalingUrl,
       role: join.role,
       pollIntervalMs: join.pollIntervalMs,
       iceServers: options.iceServers,

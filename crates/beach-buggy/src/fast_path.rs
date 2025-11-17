@@ -109,9 +109,8 @@ fn chunk_payload(kind: FastPathPayloadKind, payload: &[u8]) -> HarnessResult<Vec
         return Ok(vec!["".into()]);
     }
     let id = format!("{}-{}", kind.as_str(), Uuid::new_v4());
-    let total_chunks =
-        ((payload.len() + FAST_PATH_CHUNK_PAYLOAD_BYTES - 1) / FAST_PATH_CHUNK_PAYLOAD_BYTES)
-            as u32;
+    let total_chunks = ((payload.len() + FAST_PATH_CHUNK_PAYLOAD_BYTES - 1)
+        / FAST_PATH_CHUNK_PAYLOAD_BYTES) as u32;
     let mut frames = Vec::with_capacity(total_chunks as usize);
     for (index, chunk) in payload.chunks(FAST_PATH_CHUNK_PAYLOAD_BYTES).enumerate() {
         let encoded = BASE64.encode(chunk);
@@ -173,9 +172,8 @@ impl PendingChunk {
     fn into_payload(self) -> HarnessResult<Vec<u8>> {
         let mut merged = Vec::new();
         for part in self.parts.into_iter() {
-            let chunk = part.ok_or_else(|| {
-                HarnessError::Transport("chunk assembly missing fragment".into())
-            })?;
+            let chunk = part
+                .ok_or_else(|| HarnessError::Transport("chunk assembly missing fragment".into()))?;
             merged.extend_from_slice(&chunk);
         }
         Ok(merged)
@@ -215,9 +213,9 @@ impl FastPathChunkReassembler {
                         envelope.version
                     )));
                 }
-                let decoded = BASE64
-                    .decode(envelope.payload.as_bytes())
-                    .map_err(|err| HarnessError::Transport(format!("decode chunk payload: {err}")))?;
+                let decoded = BASE64.decode(envelope.payload.as_bytes()).map_err(|err| {
+                    HarnessError::Transport(format!("decode chunk payload: {err}"))
+                })?;
                 let message_id = envelope.id.clone();
                 let entry = match self.pending.entry(message_id.clone()) {
                     Entry::Occupied(entry) => entry.into_mut(),
@@ -244,8 +242,7 @@ impl FastPathChunkReassembler {
 
     fn cleanup_expired(&mut self) {
         let now = Instant::now();
-        self.pending
-            .retain(|_, pending| pending.expires_at > now);
+        self.pending.retain(|_, pending| pending.expires_at > now);
     }
 }
 
@@ -639,8 +636,9 @@ fn wire_action_handler(dc: Arc<RTCDataChannel>, sender: broadcast::Sender<Action
         })
     }));
 
-    let reassembler =
-        Arc::new(TokioMutex::new(FastPathChunkReassembler::new(FastPathPayloadKind::Actions)));
+    let reassembler = Arc::new(TokioMutex::new(FastPathChunkReassembler::new(
+        FastPathPayloadKind::Actions,
+    )));
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let sender = sender.clone();
         let reassembler = reassembler.clone();
@@ -919,8 +917,7 @@ mod tests {
     #[test]
     fn chunk_round_trip_reassembles() {
         let payload = "x".repeat(FAST_PATH_CHUNK_PAYLOAD_BYTES * 2 + 128);
-        let frames =
-            frame_fast_path_payload(FastPathPayloadKind::State, &payload).expect("framed");
+        let frames = frame_fast_path_payload(FastPathPayloadKind::State, &payload).expect("framed");
         assert!(frames.len() > 1, "payload should be chunked");
         let mut reassembler = FastPathChunkReassembler::new(FastPathPayloadKind::State);
         let mut assembled = None;

@@ -1,6 +1,10 @@
 import { Buffer } from 'buffer';
 import type { TerminalStateDiff } from './terminalHydrator';
 
+type BeachWindow = Window & {
+  __BEACH_TRACE?: boolean;
+};
+
 export type SessionSummary = {
   session_id: string;
   private_beach_id: string;
@@ -92,6 +96,12 @@ export type AgentOnboardResponse = {
   agent_token: string;
   prompt_pack: any;
   mcp_bridges: McpBridge[];
+};
+
+export type AttachByCodeResponse = {
+  ok: boolean;
+  attach_method: 'code';
+  session: SessionSummary;
 };
 
 function base(baseUrl?: string) {
@@ -261,14 +271,66 @@ export async function fetchViewerCredential(
   return res.json();
 }
 
+type ApiErrorPayload = {
+  error?: string;
+  message?: string;
+  error_code?: string;
+};
+
 export async function attachByCode(privateBeachId: string, sessionId: string, code: string, token: string | null, baseUrl?: string) {
-  const res = await fetch(`${base(baseUrl)}/private-beaches/${privateBeachId}/sessions/attach-by-code`, {
+  const requestUrl = `${base(baseUrl)}/private-beaches/${privateBeachId}/sessions/attach-by-code`;
+  const res = await fetch(requestUrl, {
     method: 'POST',
     headers: authHeaders(token),
     body: JSON.stringify({ session_id: sessionId, code }),
   });
-  if (!res.ok) throw new Error(`attachByCode failed ${res.status}`);
-  return res.json();
+  const rawBody = await res.text();
+  let parsedBody: ApiErrorPayload | Record<string, unknown> | string | null = null;
+  if (rawBody && rawBody.length > 0) {
+    try {
+      parsedBody = JSON.parse(rawBody);
+    } catch {
+      parsedBody = rawBody;
+    }
+  }
+  if (!res.ok) {
+    const payload = parsedBody as ApiErrorPayload | string | null;
+    const traceInfo = {
+      privateBeachId,
+      sessionId,
+      status: res.status,
+      codeSuffix: code.length > 2 ? code.slice(-2) : code,
+      body: payload,
+      url: requestUrl,
+    };
+    if (typeof window !== 'undefined') {
+      console.warn('[api] attachByCode error', traceInfo);
+    }
+    const messageParts = [`attachByCode failed status=${res.status}`];
+    if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+      const candidate = payload as ApiErrorPayload;
+      if (candidate.message) {
+        messageParts.push(`message=${candidate.message}`);
+      }
+      if (candidate.error_code) {
+        messageParts.push(`error_code=${candidate.error_code}`);
+      }
+    } else if (typeof payload === 'string') {
+      messageParts.push(`body=${payload.slice(0, 120)}`);
+    }
+    const error: Error & { status?: number; responseBody?: unknown } = new Error(messageParts.join(' '));
+    error.status = res.status;
+    error.responseBody = payload;
+    throw error;
+  }
+  if (typeof window !== 'undefined' && (window as BeachWindow | undefined)?.__BEACH_TRACE) {
+    console.debug('[api] attachByCode success', {
+      privateBeachId,
+      sessionId,
+      status: res.status,
+    });
+  }
+  return (parsedBody ?? {}) as AttachByCodeResponse;
 }
 
 export async function issueControllerHandshake(

@@ -1,7 +1,7 @@
 use std::{collections::HashMap, net::IpAddr, str::FromStr, sync::Arc};
 
 use beach_buggy::{
-    fast_path::{FastPathChunkReassembler, FastPathPayloadKind, frame_fast_path_payload},
+    fast_path::{frame_fast_path_payload, FastPathChunkReassembler, FastPathPayloadKind},
     ActionAck, ActionCommand, StateDiff,
 };
 use serde::{Deserialize, Serialize};
@@ -675,8 +675,9 @@ fn install_ack_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>, s
     let state_clone = state.clone();
     let state_for_close = state.clone();
     let state_for_error = state.clone();
-    let reassembler =
-        Arc::new(Mutex::new(FastPathChunkReassembler::new(FastPathPayloadKind::Acks)));
+    let reassembler = Arc::new(Mutex::new(FastPathChunkReassembler::new(
+        FastPathPayloadKind::Acks,
+    )));
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let state = state_clone.clone();
         let session_id = session_id.clone();
@@ -766,8 +767,9 @@ fn install_state_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>,
     let state_clone = state.clone();
     let state_for_close = state.clone();
     let state_for_error = state.clone();
-    let reassembler =
-        Arc::new(Mutex::new(FastPathChunkReassembler::new(FastPathPayloadKind::State)));
+    let reassembler = Arc::new(Mutex::new(FastPathChunkReassembler::new(
+        FastPathPayloadKind::State,
+    )));
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let state = state_clone.clone();
         let session_id = session_id.clone();
@@ -1019,16 +1021,18 @@ mod tests {
             let frames =
                 frame_fast_path_payload(FastPathPayloadKind::Acks, &payload).expect("chunk");
             assert!(frames.len() > 1);
-            let reassembler =
-                Arc::new(Mutex::new(FastPathChunkReassembler::new(FastPathPayloadKind::Acks)));
+            let reassembler = Arc::new(Mutex::new(FastPathChunkReassembler::new(
+                FastPathPayloadKind::Acks,
+            )));
             let mut decoded = None;
             for frame in frames {
                 let msg = DataChannelMessage {
                     is_string: true,
                     data: Bytes::from(frame),
                 };
-                if let Some(text) =
-                    decode_chunked_text(&reassembler, &msg).await.expect("decode chunk")
+                if let Some(text) = decode_chunked_text(&reassembler, &msg)
+                    .await
+                    .expect("decode chunk")
                 {
                     decoded = Some(text);
                 }

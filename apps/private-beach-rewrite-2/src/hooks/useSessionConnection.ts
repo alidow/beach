@@ -19,6 +19,81 @@ const IDLE_VIEWER_STATE: TerminalViewerState = {
   latencyMs: null,
 };
 
+type SerializableError =
+  | {
+      type?: string;
+      message?: string;
+      filename?: string;
+      lineno?: number;
+      colno?: number;
+      code?: number | string;
+      reason?: string | null;
+      target?: string | null;
+    }
+  | {
+      name: string;
+      message: string;
+      stack?: string;
+    }
+  | Record<string, unknown>
+  | string
+  | number
+  | null;
+
+function describeErrorDetail(error: unknown): SerializableError {
+  if (!error) {
+    return null;
+  }
+
+  if (typeof ErrorEvent !== 'undefined' && error instanceof ErrorEvent) {
+    return {
+      type: error.type,
+      message: error.message,
+      filename: error.filename,
+      lineno: error.lineno,
+      colno: error.colno,
+    };
+  }
+
+  if (typeof CloseEvent !== 'undefined' && error instanceof CloseEvent) {
+    return {
+      type: error.type,
+      code: error.code,
+      reason: error.reason,
+      target: error.target && 'constructor' in error.target ? error.target.constructor?.name ?? null : null,
+    };
+  }
+
+  if (typeof RTCErrorEvent !== 'undefined' && error instanceof RTCErrorEvent) {
+    return {
+      type: error.type,
+      message: error.error?.message,
+      code: error.error?.errorDetail,
+    };
+  }
+
+  if (typeof Event !== 'undefined' && error instanceof Event) {
+    return {
+      type: error.type,
+      target: error.target && 'constructor' in error.target ? error.target.constructor?.name ?? null : null,
+    };
+  }
+
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+  }
+
+  if (typeof error === 'object') {
+    return error as Record<string, unknown>;
+  }
+
+  return error as string | number;
+}
+
 function isTerminalTraceEnabled(): boolean {
   if (typeof globalThis !== 'undefined' && (globalThis as Record<string, any>).__BEACH_TILE_TRACE) {
     return true;
@@ -91,6 +166,7 @@ export function useSessionConnection({
           traceId,
         },
         (snapshot) => {
+          const serializedError = describeErrorDetail(snapshot.error);
           if (sessionId) {
             const logContext = {
               tileId,
@@ -108,7 +184,7 @@ export function useSessionConnection({
                 {
                   durationMs: duration,
                   nextStatus: snapshot.status,
-                  reason: snapshot.error ?? null,
+                  reason: serializedError,
                 },
                 'warn',
               );
@@ -135,7 +211,7 @@ export function useSessionConnection({
                   logConnectionEvent(
                     'fast-path:reconnect-start',
                     logContext,
-                    { reason: snapshot.error ?? null },
+                    { reason: serializedError },
                     'warn',
                   );
                   break;
@@ -143,7 +219,7 @@ export function useSessionConnection({
                   logConnectionEvent(
                     previousStatus === 'reconnecting' ? 'fast-path:reconnect-error' : 'fast-path:error',
                     logContext,
-                    { error: snapshot.error ?? null },
+                    { error: serializedError },
                     'error',
                   );
                   break;
@@ -200,7 +276,7 @@ export function useSessionConnection({
                 grid: gridSummary,
                 latencyMs: snapshot.latencyMs ?? null,
                 secureMode: snapshot.secureSummary?.mode ?? null,
-                error: snapshot.error ?? null,
+                error: serializedError,
               };
               if (traceEnabled) {
                 // eslint-disable-next-line no-console

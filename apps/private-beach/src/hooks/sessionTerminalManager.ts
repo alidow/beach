@@ -92,6 +92,53 @@ function debugLog(message: string, detail?: Record<string, unknown>) {
   console.info(`[terminal-manager][rewrite] ${message}${payload ? ` ${payload}` : ''}`);
 }
 
+function isSignalingTraceEnabled(): boolean {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+  const host = window as typeof window & {
+    __BEACH_TRACE?: boolean;
+    BEACH_TRACE?: boolean;
+    __BEACH_SIGNAL_TRACE?: boolean;
+    BEACH_SIGNAL_TRACE?: boolean;
+  };
+  return Boolean(
+    host.__BEACH_TRACE ||
+      host.BEACH_TRACE ||
+      host.__BEACH_SIGNAL_TRACE ||
+      host.BEACH_SIGNAL_TRACE,
+  );
+}
+
+function describeEventError(value: unknown, fallback: string): string {
+  if (!value) {
+    return fallback;
+  }
+  if (typeof Error !== 'undefined' && value instanceof Error) {
+    return `${value.name}: ${value.message}`;
+  }
+  if (typeof CloseEvent !== 'undefined' && value instanceof CloseEvent) {
+    const code = value.code ?? 0;
+    const reason = value.reason && value.reason.length > 0 ? value.reason : 'no-reason';
+    return `CloseEvent(code=${code}, reason="${reason}", type=${value.type ?? 'close'})`;
+  }
+  if (typeof ErrorEvent !== 'undefined' && value instanceof ErrorEvent) {
+    return `ErrorEvent(type=${value.type}, message=${value.message || 'unknown'})`;
+  }
+  if (typeof Event !== 'undefined' && value instanceof Event) {
+    const targetName = (value.target as { constructor?: { name?: string } } | null)?.constructor?.name;
+    return `Event(type=${value.type}${targetName ? `, target=${targetName}` : ''})`;
+  }
+  if (typeof value === 'object') {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      // fall through
+    }
+  }
+  return String(value);
+}
+
 async function ensureSessionAttached(entry: ManagerEntry, passcode: string | null): Promise<void> {
   const trimmedPasscode = passcode?.trim();
   if (!trimmedPasscode || trimmedPasscode.length === 0) {
@@ -132,7 +179,7 @@ async function ensureSessionAttached(entry: ManagerEntry, passcode: string | nul
         privateBeachId,
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = describeEventError(error, 'attach error');
       // Treat duplicate attaches as success; the mapping already exists.
       if (message.includes('409')) {
         entry.lastAttachKey = attachKey;
@@ -168,9 +215,9 @@ function summarizeStoreSnapshot(store: TerminalGridStore): SnapshotSummary | nul
       rowCount: snapshot.rows.length,
     };
   } catch (error) {
-    debugLog('followTail.snapshot_error', {
-      message: error instanceof Error ? error.message : String(error),
-    });
+      debugLog('followTail.snapshot_error', {
+        message: describeEventError(error, 'grid snapshot error'),
+      });
     return null;
   }
 }
@@ -459,7 +506,7 @@ function ensureEntryConnection(entry: ManagerEntry) {
         sessionId: entry.params.sessionId,
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = describeEventError(err, 'connection error');
       entry.connecting = false;
       entry.status = 'error';
       entry.error = message;
@@ -610,15 +657,15 @@ function attachListeners(entry: ManagerEntry, connection: BrowserTransportConnec
       typeof (event as any)?.reason === 'string'
         ? String((event as any).reason)
         : typeof (event as any)?.detail?.reason === 'string'
-          ? String((event as any).detail.reason)
-          : null;
+            ? String((event as any).detail.reason)
+            : null;
     detachListeners(entry);
     entry.connection = null;
     entry.transport = null;
     entry.connecting = true;
     entry.status = 'reconnecting';
     entry.reconnectAttempts = Math.min(entry.reconnectAttempts + 1, 8);
-    entry.lastCloseReason = eventReason ?? 'transport-close';
+    entry.lastCloseReason = describeEventError(eventReason ?? event, 'transport-close');
     notifySubscribers(entry);
     scheduleReconnect(entry, { reason: entry.lastCloseReason ?? undefined });
     debugLog('transport.close', {
@@ -631,8 +678,8 @@ function attachListeners(entry: ManagerEntry, connection: BrowserTransportConnec
   detachFns.push(() => transport.removeEventListener('close', closeHandler as EventListener));
 
   const errorHandler = (event: Event) => {
-    const err = (event as any).error;
-    entry.error = err instanceof Error ? err.message : String(err ?? 'transport error');
+    const err = (event as any).error ?? event;
+    entry.error = describeEventError(err, 'transport error');
     entry.status = 'error';
     entry.secureSummary = null;
     entry.transport = null;
@@ -665,7 +712,7 @@ function attachListeners(entry: ManagerEntry, connection: BrowserTransportConnec
   );
 
   const signalingErrorHandler = (event: Event) => {
-    const detail = (event as ErrorEvent).message ?? 'unknown';
+    const detail = describeEventError(event, 'signaling error');
     entry.error = detail;
     notifySubscribers(entry);
   };
@@ -673,6 +720,49 @@ function attachListeners(entry: ManagerEntry, connection: BrowserTransportConnec
   detachFns.push(() =>
     connection.signaling.removeEventListener('error', signalingErrorHandler as EventListener),
   );
+
+  if (isSignalingTraceEnabled()) {
+    const baseContext = {
+      key: entry.key,
+      sessionId: entry.params.sessionId,
+      signalingUrl: (connection.signaling as { url?: string }).url ?? null,
+    };
+    const trace = (label: string, extra?: Record<string, unknown>) => {
+      try {
+        console.info('[terminal-manager][signaling]', label, {
+          ...baseContext,
+          ...(extra ?? {}),
+        });
+      } catch (err) {
+        console.warn('[terminal-manager][signaling] trace error', err);
+      }
+    };
+    const onOpen = () => trace('open');
+    const onMessage = (event: MessageEvent) => {
+      const data = typeof event.data === 'string' ? event.data : '[binary]';
+      trace('message', {
+        bytes: typeof event.data === 'string' ? event.data.length : null,
+        preview: typeof data === 'string' ? data.slice(0, 200) : data,
+      });
+    };
+    const onError = (event: Event) => trace('error', { detail: describeEventError(event, 'ws error') });
+    const onClose = (event: CloseEvent) =>
+      trace('close', {
+        code: event.code,
+        reason: event.reason,
+        wasClean: event.wasClean,
+      });
+    connection.signaling.addEventListener('open', onOpen as EventListener);
+    connection.signaling.addEventListener('message', onMessage as EventListener);
+    connection.signaling.addEventListener('error', onError as EventListener);
+    connection.signaling.addEventListener('close', onClose as EventListener);
+    detachFns.push(() => {
+      connection.signaling.removeEventListener('open', onOpen as EventListener);
+      connection.signaling.removeEventListener('message', onMessage as EventListener);
+      connection.signaling.removeEventListener('error', onError as EventListener);
+      connection.signaling.removeEventListener('close', onClose as EventListener);
+    });
+  }
 
   return {
     connection,

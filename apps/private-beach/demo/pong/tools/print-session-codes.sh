@@ -1,8 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LOG_DIR=${LOG_DIR:-"$HOME/beach-debug"}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/../../../../.." && pwd)
+if [[ -z "${LOG_DIR:-}" ]]; then
+  if [[ -f "/.dockerenv" && -d "/app/beach-debug" ]]; then
+    LOG_DIR="/app/beach-debug"
+  elif [[ -d "$REPO_ROOT/beach-debug" ]]; then
+    LOG_DIR="$REPO_ROOT/beach-debug"
+  else
+    LOG_DIR="$HOME/beach-debug"
+  fi
+fi
 roles=(lhs rhs agent)
+
+if [[ "${1:-}" == "--docker" ]]; then
+  shift
+  SERVICE=${PONG_DOCKER_SERVICE:-beach-manager}
+  CONTAINER_REPO_ROOT=${PONG_CONTAINER_REPO_ROOT:-/app}
+  direnv exec . docker compose exec "$SERVICE" bash -lc \
+    "LOG_DIR='/app/beach-debug' \"$CONTAINER_REPO_ROOT/apps/private-beach/demo/pong/tools/print-session-codes.sh\" \"$@\""
+  exit $?
+fi
 
 USE_JQ=false
 

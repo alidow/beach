@@ -1,13 +1,21 @@
-use std::{collections::HashMap, net::IpAddr, str::FromStr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    str::FromStr,
+    sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use beach_buggy::{
     fast_path::{frame_fast_path_payload, FastPathChunkReassembler, FastPathPayloadKind},
     ActionAck, ActionCommand, StateDiff,
 };
+use beach_client_core::protocol::{self, ClientFrame as WireClientFrame};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{Mutex, RwLock},
-    time::{sleep, timeout, Duration},
+    time::{sleep, timeout, Duration, Instant},
 };
 use tracing::{debug, info, trace, warn};
 
@@ -190,6 +198,7 @@ pub struct FastPathSession {
     pub local_ice: Arc<RwLock<Vec<serde_json::Value>>>,
     pub public_ip_hint: Option<String>,
     pub host_hint_for_log: Option<String>,
+    next_seq: Arc<AtomicU64>,
 }
 
 impl FastPathSession {
@@ -281,7 +290,12 @@ impl FastPathSession {
             local_ice: Arc::new(RwLock::new(Vec::new())),
             public_ip_hint: nat_ip.clone(),
             host_hint_for_log,
+            next_seq: Arc::new(AtomicU64::new(1)),
         })
+    }
+
+    fn next_sequence(&self) -> u64 {
+        self.next_seq.fetch_add(1, Ordering::SeqCst)
     }
 
     pub async fn set_remote_offer(
@@ -574,37 +588,39 @@ pub async fn send_actions_over_fast_path(
         let guard = fps.actions_tx.lock().await;
         if let Some(dc) = guard.as_ref() {
             for a in actions {
-                let payload = fast_path_action_payload(a).map_err(anyhow::Error::msg)?;
-                let frames = frame_fast_path_payload(FastPathPayloadKind::Actions, &payload)
-                    .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-                for frame in frames {
-                    let timeout_duration = Duration::from_millis(FAST_PATH_SEND_TIMEOUT_MS);
-                    let send_result = timeout(timeout_duration, dc.send_text(frame)).await;
-                    match send_result {
-                        Ok(Ok(_)) => {
-                            // Normal fast-path delivery.
-                        }
-                        Ok(Err(err)) => {
-                            debug!(
-                                target = "fast_path",
-                                session_id = %session_id,
-                                error = %err,
-                                "fast-path send failed; propagating error to caller"
-                            );
-                            return Err(anyhow::anyhow!(err.to_string()));
-                        }
-                        Err(_) => {
-                            let message = format!(
-                                "fast-path send timed out after {}ms",
-                                FAST_PATH_SEND_TIMEOUT_MS
-                            );
-                            debug!(
-                                target = "fast_path",
-                                session_id = %session_id,
-                                "{}", message
-                            );
-                            return Err(anyhow::anyhow!(message));
-                        }
+                let bytes = fast_path_action_bytes(a).map_err(anyhow::Error::msg)?;
+                let seq = fps.next_sequence();
+                let frame = WireClientFrame::Input {
+                    seq,
+                    data: bytes,
+                };
+                let encoded = protocol::encode_client_frame_binary(&frame);
+                let timeout_duration = Duration::from_millis(FAST_PATH_SEND_TIMEOUT_MS);
+                let send_result = timeout(timeout_duration, dc.send(&Bytes::from(encoded))).await;
+                match send_result {
+                    Ok(Ok(_)) => {
+                        // Normal fast-path delivery.
+                    }
+                    Ok(Err(err)) => {
+                        debug!(
+                            target = "fast_path",
+                            session_id = %session_id,
+                            error = %err,
+                            "fast-path send failed; propagating error to caller"
+                        );
+                        return Err(anyhow::anyhow!(err.to_string()));
+                    }
+                    Err(_) => {
+                        let message = format!(
+                            "fast-path send timed out after {}ms",
+                            FAST_PATH_SEND_TIMEOUT_MS
+                        );
+                        debug!(
+                            target = "fast_path",
+                            session_id = %session_id,
+                            "{}", message
+                        );
+                        return Err(anyhow::anyhow!(message));
                     }
                 }
             }
@@ -647,27 +663,36 @@ async fn wait_for_channel(
     session: Arc<FastPathSession>,
     kind: ChannelKind,
 ) -> Option<Arc<RTCDataChannel>> {
-    const MAX_ATTEMPTS: usize = 40;
-    const INTERVAL: Duration = Duration::from_millis(50);
-
-    for attempt in 0..MAX_ATTEMPTS {
-        let maybe = match kind {
+    wait_for_channel_with_timeout(|| async {
+        match kind {
             ChannelKind::Actions => session.actions_tx.lock().await.clone(),
             ChannelKind::Acks => session.acks_rx.lock().await.clone(),
             ChannelKind::State => session.state_rx.lock().await.clone(),
-        };
-        if let Some(dc) = maybe {
-            info!(
-                session_id = %session.session_id,
-                channel = %dc.label(),
-                attempt,
-                "fast-path data channel ready"
-            );
-            return Some(dc);
         }
-        sleep(INTERVAL).await;
+    })
+    .await
+}
+
+const FAST_PATH_CHANNEL_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+const FAST_PATH_CHANNEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+async fn wait_for_channel_with_timeout<F, Fut, T>(
+    mut fetch: F,
+) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = Instant::now() + FAST_PATH_CHANNEL_WAIT_TIMEOUT;
+    loop {
+        if let Some(value) = fetch().await {
+            return Some(value);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        sleep(FAST_PATH_CHANNEL_POLL_INTERVAL).await;
     }
-    None
 }
 
 fn install_ack_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>, state: AppState) {
@@ -898,24 +923,6 @@ pub fn fast_path_action_bytes(action: &ActionCommand) -> Result<Vec<u8>, String>
     Ok(bytes.as_bytes().to_vec())
 }
 
-fn fast_path_action_payload(action: &ActionCommand) -> Result<String, String> {
-    // Ensure we only forward actions the host transport understands.
-    let _ = terminal_write_bytes(action)?;
-    let envelope = OutboundActionEnvelope {
-        kind: "action",
-        payload: action,
-    };
-    serde_json::to_string(&envelope)
-        .map_err(|err| format!("failed to serialize action for fast-path: {err}"))
-}
-
-#[derive(Serialize)]
-struct OutboundActionEnvelope<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    payload: &'a ActionCommand,
-}
-
 #[derive(Deserialize, Serialize)]
 struct AckEnvelope {
     #[serde(rename = "type")]
@@ -940,8 +947,57 @@ enum ChannelKind {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use serde::Deserialize;
+    use std::sync::Arc;
     use tokio::runtime::Runtime;
+    use tokio::sync::Mutex;
+    use tokio::time;
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_channel_with_timeout_respects_extended_deadline() {
+        let attempts = Arc::new(Mutex::new(0usize));
+        let fut = wait_for_channel_with_timeout({
+            let attempts = attempts.clone();
+            move || {
+                let attempts = attempts.clone();
+                async move {
+                    *attempts.lock().await += 1;
+                    None::<Arc<()>>
+                }
+            }
+        });
+        tokio::pin!(fut);
+        time::advance(FAST_PATH_CHANNEL_WAIT_TIMEOUT).await;
+        assert!(fut.await.is_none(), "channel lookup should respect timeout");
+        let attempt_count = *attempts.lock().await;
+        let expected = FAST_PATH_CHANNEL_WAIT_TIMEOUT.as_millis()
+            / FAST_PATH_CHANNEL_POLL_INTERVAL.as_millis()
+            + 1;
+        assert!(attempt_count as u128 >= expected, "attempts should continue until timeout");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_channel_with_timeout_returns_value_once_available() {
+        let attempts = Arc::new(Mutex::new(0usize));
+        let fut = wait_for_channel_with_timeout({
+            let attempts = attempts.clone();
+            move || {
+                let attempts = attempts.clone();
+                async move {
+                    let mut guard = attempts.lock().await;
+                    *guard += 1;
+                    if *guard == 5 {
+                        Some("ready".to_string())
+                    } else {
+                        None
+                    }
+                }
+            }
+        });
+        tokio::pin!(fut);
+        let advance = FAST_PATH_CHANNEL_POLL_INTERVAL * 5;
+        time::advance(advance).await;
+        assert_eq!(fut.await, Some("ready".to_string()));
+    }
 
     #[test]
     fn parses_ack_envelope() {
@@ -979,38 +1035,26 @@ mod tests {
     }
 
     #[test]
-    fn action_payload_serializes_envelope() {
+    fn action_bytes_extracts_payload() {
         let action = ActionCommand {
             id: "a1".into(),
             action_type: "terminal_write".into(),
             payload: serde_json::json!({ "bytes": "hello" }),
             expires_at: None,
         };
-        let payload = fast_path_action_payload(&action).expect("payload serialized");
-        #[derive(Deserialize)]
-        struct ParsedEnvelope {
-            #[serde(rename = "type")]
-            kind: String,
-            payload: ActionCommand,
-        }
-        let parsed: ParsedEnvelope = serde_json::from_str(&payload).expect("parsed envelope");
-        assert_eq!(parsed.kind, "action");
-        assert_eq!(parsed.payload.id, action.id);
-        assert_eq!(
-            parsed.payload.payload.get("bytes").and_then(|v| v.as_str()),
-            Some("hello")
-        );
+        let bytes = fast_path_action_bytes(&action).expect("bytes extracted");
+        assert_eq!(bytes, b"hello");
     }
 
     #[test]
-    fn action_payload_rejects_non_terminal() {
+    fn action_bytes_rejects_non_terminal() {
         let action = ActionCommand {
             id: "a1".into(),
             action_type: "resize".into(),
             payload: serde_json::json!({ "rows": 10, "cols": 20 }),
             expires_at: None,
         };
-        assert!(fast_path_action_payload(&action).is_err());
+        assert!(fast_path_action_bytes(&action).is_err());
     }
 
     #[test]

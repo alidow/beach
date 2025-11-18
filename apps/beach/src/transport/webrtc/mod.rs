@@ -46,10 +46,14 @@ use webrtc_ice::{
 use crate::auth;
 use crate::auth::error::AuthError;
 use crate::auth::gate::TurnIceServer;
+use crate::server::terminal::host::{
+    CONTROLLER_CHANNEL_LABEL, LEGACY_CONTROLLER_CHANNEL_LABEL,
+};
 use crate::transport::{
     Transport, TransportError, TransportId, TransportKind, TransportMessage, TransportPair,
     decode_message, encode_message, next_transport_id,
 };
+use crate::transport::webrtc::signaling::PeerInfo;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_ACK_POLL_ATTEMPTS: usize = 200;
@@ -1390,12 +1394,54 @@ struct OffererInner {
     peer_tasks: AsyncMutex<HashMap<String, PeerNegotiatorHandle>>,
     peer_states: AsyncMutex<HashMap<String, PeerLifecycleState>>,
     max_negotiators: usize,
+    controller_tracker: AsyncMutex<ControllerPeerTracker>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PeerLifecycleState {
-    Negotiating,
-    Established,
+    Negotiating { controller: bool },
+    Established { controller: bool },
+}
+
+impl PeerLifecycleState {
+    fn is_controller(&self) -> bool {
+        match self {
+            PeerLifecycleState::Negotiating { controller }
+            | PeerLifecycleState::Established { controller } => *controller,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ControllerPeerTracker {
+    inflight: Option<String>,
+    active: Option<String>,
+}
+
+impl ControllerPeerTracker {
+    pub(crate) fn reserve(&mut self, peer_id: &str) -> bool {
+        if self.inflight.is_some() || self.active.is_some() {
+            return false;
+        }
+        self.inflight = Some(peer_id.to_string());
+        true
+    }
+
+    pub(crate) fn promote(&mut self, peer_id: &str) {
+        if self.inflight.as_deref() == Some(peer_id) {
+            self.inflight = None;
+            self.active = Some(peer_id.to_string());
+        }
+    }
+
+    pub(crate) fn release(&mut self, peer_id: &str) {
+        if self.inflight.as_deref() == Some(peer_id) {
+            self.inflight = None;
+        }
+        if self.active.as_deref() == Some(peer_id) {
+            self.active = None;
+        }
+    }
 }
 
 struct PeerNegotiatorHandle {
@@ -1435,6 +1481,7 @@ impl OffererSupervisor {
             peer_tasks: AsyncMutex::new(HashMap::new()),
             peer_states: AsyncMutex::new(HashMap::new()),
             max_negotiators: OFFERER_MAX_NEGOTIATORS,
+            controller_tracker: AsyncMutex::new(ControllerPeerTracker::default()),
         });
 
         prime_session_key(
@@ -1470,6 +1517,31 @@ impl OffererSupervisor {
 }
 
 impl OffererInner {
+    fn peer_is_controller(peer: &PeerInfo) -> bool {
+        peer.metadata
+            .as_ref()
+            .and_then(|meta| meta.get("label"))
+            .map(|label| {
+                matches!(label.as_str(), CONTROLLER_CHANNEL_LABEL | LEGACY_CONTROLLER_CHANNEL_LABEL)
+            })
+            .unwrap_or(false)
+    }
+
+    async fn reserve_controller_slot(&self, peer_id: &str) -> bool {
+        let mut tracker = self.controller_tracker.lock().await;
+        tracker.reserve(peer_id)
+    }
+
+    async fn promote_controller_slot(&self, peer_id: &str) {
+        let mut tracker = self.controller_tracker.lock().await;
+        tracker.promote(peer_id);
+    }
+
+    async fn release_controller_slot(&self, peer_id: &str) {
+        let mut tracker = self.controller_tracker.lock().await;
+        tracker.release(peer_id);
+    }
+
     fn start_event_loop(
         inner: Arc<Self>,
         mut remote_events: tokio_mpsc::UnboundedReceiver<RemotePeerEvent>,
@@ -1517,11 +1589,26 @@ impl OffererInner {
             return;
         }
 
+        let peer_id = joined.peer.id.clone();
+        let controller_peer = Self::peer_is_controller(&joined.peer);
+        let mut controller_reserved = false;
+        if controller_peer {
+            if !self.reserve_controller_slot(&peer_id).await {
+                tracing::debug!(
+                    target = "beach::transport::webrtc",
+                    peer_id = %peer_id,
+                    "controller negotiation already active; throttling join"
+                );
+                return;
+            }
+            controller_reserved = true;
+        }
+
         {
             let mut states = self.peer_states.lock().await;
             if let Some(state) = states.get(&joined.peer.id) {
                 match state {
-                    PeerLifecycleState::Negotiating => {
+                    PeerLifecycleState::Negotiating { .. } => {
                         tracing::trace!(
 
                             peer_id = %joined.peer.id,
@@ -1532,9 +1619,12 @@ impl OffererInner {
                             peer_id = %joined.peer.id,
                             "peer negotiator already active"
                         );
+                        if controller_reserved {
+                            self.release_controller_slot(&peer_id).await;
+                        }
                         return;
                     }
-                    PeerLifecycleState::Established => {
+                    PeerLifecycleState::Established { .. } => {
                         tracing::trace!(
 
                             peer_id = %joined.peer.id,
@@ -1545,11 +1635,19 @@ impl OffererInner {
                             peer_id = %joined.peer.id,
                             "peer already has established transport"
                         );
+                        if controller_reserved {
+                            self.release_controller_slot(&peer_id).await;
+                        }
                         return;
                     }
                 }
             }
-            states.insert(joined.peer.id.clone(), PeerLifecycleState::Negotiating);
+            states.insert(
+                joined.peer.id.clone(),
+                PeerLifecycleState::Negotiating {
+                    controller: controller_peer,
+                },
+            );
             tracing::trace!(
 
                 peer_id = %joined.peer.id,
@@ -1564,6 +1662,9 @@ impl OffererInner {
                 peer_id = %joined.peer.id,
                 "peer negotiator already active"
             );
+            if controller_reserved {
+                self.release_controller_slot(&peer_id).await;
+            }
             return;
         }
         if tasks.len() >= self.max_negotiators {
@@ -1574,6 +1675,9 @@ impl OffererInner {
                 max = self.max_negotiators,
                 "dropping peer join due to negotiator capacity"
             );
+            if controller_reserved {
+                self.release_controller_slot(&peer_id).await;
+            }
             return;
         }
 
@@ -1590,7 +1694,6 @@ impl OffererInner {
         );
 
         let cancel = Arc::new(AtomicBool::new(false));
-        let peer_id = joined.peer.id.clone();
         let inner_for_task = Arc::clone(self);
         let cancel_for_task = cancel.clone();
         let peer_id_for_task = peer_id.clone();
@@ -1626,6 +1729,7 @@ impl OffererInner {
             peer_id = %peer_id,
             "handling peer left event"
         );
+        let mut controller_peer = false;
         let mut tasks = self.peer_tasks.lock().await;
         if let Some(handle) = tasks.remove(peer_id) {
             tracing::debug!(
@@ -1644,7 +1748,13 @@ impl OffererInner {
         }
 
         let mut states = self.peer_states.lock().await;
-        states.remove(peer_id);
+        if let Some(state) = states.remove(peer_id) {
+            controller_peer = state.is_controller();
+        }
+        drop(states);
+        if controller_peer {
+            self.release_controller_slot(peer_id).await;
+        }
     }
 
     async fn finalize_peer(
@@ -1658,21 +1768,32 @@ impl OffererInner {
             tasks.remove(peer_id);
         }
 
-        match result {
+        let mut controller_promoted = false;
+        let controller_peer = match result {
             Ok(Some(accepted)) => {
-                {
+                let is_controller = {
                     let mut states = self.peer_states.lock().await;
-                    if let Some(entry) = states.get_mut(peer_id) {
-                        *entry = PeerLifecycleState::Established;
-                    } else {
-                        states.insert(peer_id.to_string(), PeerLifecycleState::Established);
-                    }
+                    let value = states
+                        .get(peer_id)
+                        .map(PeerLifecycleState::is_controller)
+                        .unwrap_or(false);
+                    states.insert(
+                        peer_id.to_string(),
+                        PeerLifecycleState::Established {
+                            controller: value,
+                        },
+                    );
                     tracing::trace!(
 
                         peer_id = %peer_id,
                         state = ?states.get(peer_id),
                         "peer lifecycle updated to established"
                     );
+                    value
+                };
+                if is_controller {
+                    self.promote_controller_slot(peer_id).await;
+                    controller_promoted = true;
                 }
                 if self.accepted_tx.send(accepted).is_err() {
                     tracing::debug!(
@@ -1681,34 +1802,46 @@ impl OffererInner {
                         "dropping accepted transport because receiver closed"
                     );
                 }
+                is_controller
             }
             Ok(None) => {
-                {
+                let is_controller = {
                     let mut states = self.peer_states.lock().await;
+                    let value = states
+                        .get(peer_id)
+                        .map(PeerLifecycleState::is_controller)
+                        .unwrap_or(false);
                     states.remove(peer_id);
                     tracing::trace!(
 
                         peer_id = %peer_id,
                         "peer lifecycle entry removed after negotiator concluded without transport"
                     );
-                }
+                    value
+                };
                 tracing::debug!(
 
                     peer_id = %peer_id,
                     cancelled = cancel_flag.load(Ordering::SeqCst),
                     "peer negotiation concluded without establishing transport"
                 );
+                is_controller
             }
             Err(err) => {
-                {
+                let is_controller = {
                     let mut states = self.peer_states.lock().await;
+                    let value = states
+                        .get(peer_id)
+                        .map(PeerLifecycleState::is_controller)
+                        .unwrap_or(false);
                     states.remove(peer_id);
                     tracing::trace!(
 
                         peer_id = %peer_id,
                         "peer lifecycle entry removed after negotiator error"
                     );
-                }
+                    value
+                };
                 tracing::warn!(
 
                     peer_id = %peer_id,
@@ -1716,7 +1849,12 @@ impl OffererInner {
                     error = %err,
                     "peer negotiation ended with error"
                 );
+                is_controller
             }
+        };
+
+        if controller_peer && !controller_promoted {
+            self.release_controller_slot(peer_id).await;
         }
     }
 }

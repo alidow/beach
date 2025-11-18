@@ -14,7 +14,7 @@ use beach_buggy::{
 };
 use reqwest::StatusCode;
 use serde::Deserialize;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -29,6 +29,8 @@ use crate::{
 
 use super::{ApiError, ApiResult, AuthToken};
 use crate::auth::Claims;
+
+pub const CONTROLLER_HANDSHAKE_HEADER: &str = "x-beach-handshake-id";
 
 pub(crate) fn ensure_scope(token: &AuthToken, scope: &'static str) -> Result<(), ApiError> {
     if token.has_scope(scope) {
@@ -316,6 +318,7 @@ pub async fn issue_controller_handshake(
     let controller_auto_attach = Some(state.build_controller_auto_attach_hint(
         &session_summary.private_beach_id,
         body.passcode.trim(),
+        None,
     ));
     let idle_publish_token = state
         .load_idle_publish_token_hint(&session_id)
@@ -881,13 +884,45 @@ pub async fn attach_by_code(
             "attach_by_code request"
         );
     }
+    let handshake_header = headers
+        .get(CONTROLLER_HANDSHAKE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    let skip_for_handshake = if let Some(handshake_id) = handshake_header.as_deref() {
+        if state
+            .controller_handshake_matches(&body.session_id, handshake_id)
+            .await
+        {
+            true
+        } else {
+            debug!(
+                target = "controller.actions",
+                session_id = %body.session_id,
+                handshake_id,
+                "controller auto-attach supplied stale handshake id"
+            );
+            false
+        }
+    } else {
+        false
+    };
+
+    let handshake = if skip_for_handshake || requester.is_none() {
+        AttachHandshakeDisposition::Skip
+    } else {
+        AttachHandshakeDisposition::Dispatch
+    };
+
     let session = match state
         .attach_by_code(
             &private_beach_id,
             &body.session_id,
             &body.code,
             requester,
-            AttachHandshakeDisposition::Dispatch,
+            handshake,
         )
         .await
     {

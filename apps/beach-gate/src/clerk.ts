@@ -40,6 +40,7 @@ export interface ClerkClient {
 const DEVICE_PATH = '/oauth/device_authorization';
 const TOKEN_PATH = '/oauth/token';
 const USERINFO_PATH = '/oauth/userinfo';
+const MOCK_USER_ID = '00000000-0000-0000-0000-000000000001';
 
 export function createClerkClient(config: BeachGateConfig): ClerkClient {
   if (config.mockClerk) {
@@ -167,7 +168,7 @@ class MockClerkClient implements ClerkClient {
     const record: MockDeviceRecord = {
       deviceCode,
       userCode,
-      userId: 'mock-user',
+      userId: MOCK_USER_ID,
       email: 'mock-user@beach.test',
       expiresAt: Date.now() + 5 * 60 * 1000,
     };

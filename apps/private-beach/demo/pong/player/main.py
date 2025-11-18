@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import curses
+import json
 import os
 import sys
 import time
@@ -95,6 +96,8 @@ class PongView:
         except ValueError:
             self.frame_dump_interval = 0.0
         self._next_frame_dump_time = 0.0
+        self.ball_trace_path = os.environ.get("PONG_BALL_TRACE_PATH")
+        self.command_trace_path = os.environ.get("PONG_COMMAND_TRACE_PATH")
 
         self._colors_initialized = False
         self.color_border = curses.A_BOLD
@@ -174,6 +177,7 @@ class PongView:
         )
 
     def _process_command(self, command: str) -> None:
+        self._trace_command(command)
         if not command:
             return
         if command in {"quit", "exit"}:
@@ -316,6 +320,7 @@ class PongView:
                 ball.x = self.paddle.x - 1 - (ball.x - (self.paddle.x - 1))
                 ball.vx = -abs(ball.vx)
 
+        self._trace_ball_position()
         # Out of bounds
         if ball.x < 1 or ball.x > self.width - 2:
             self.ball = None
@@ -583,6 +588,37 @@ class PongView:
                 os.makedirs(dump_dir, exist_ok=True)
             with open(self.frame_dump_path, "w", encoding="utf-8") as fp:
                 fp.write(snapshot)
+        except OSError:
+            pass
+
+    def _trace_ball_position(self) -> None:
+        if not self.ball_trace_path or not self.ball:
+            return
+        record = {
+            "time": time.time(),
+            "x": self.ball.x,
+            "y": self.ball.y,
+        }
+        trace_dir = os.path.dirname(self.ball_trace_path)
+        try:
+            if trace_dir:
+                os.makedirs(trace_dir, exist_ok=True)
+            with open(self.ball_trace_path, "a", encoding="utf-8") as fp:
+                fp.write(json.dumps(record))
+                fp.write("\n")
+        except OSError:
+            pass
+
+    def _trace_command(self, command: str) -> None:
+        if not self.command_trace_path:
+            return
+        trace_dir = os.path.dirname(self.command_trace_path)
+        try:
+            if trace_dir:
+                os.makedirs(trace_dir, exist_ok=True)
+            with open(self.command_trace_path, "a", encoding="utf-8") as fp:
+                fp.write(json.dumps({"time": time.time(), "command": command}))
+                fp.write("\n")
         except OSError:
             pass
 

@@ -10,7 +10,10 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tracing::info;
 
-use crate::{metrics, state::AppState};
+use crate::{
+    metrics,
+    state::{AppState, DevtoolsTimelineEvent},
+};
 
 use super::{ApiError, AuthToken};
 
@@ -111,10 +114,30 @@ pub async fn stream_controller_pairings(
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
+pub async fn stream_devtools(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(session_id): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    ensure_scope(&token, "pb:sessions.read")?;
+    let stream = BroadcastStream::new(state.subscribe_devtools(&session_id).await).filter_map(
+        |msg| match msg {
+            Ok(event) => Some(Ok(to_sse_event("devtools_event", &event))),
+            Err(_) => None,
+        },
+    );
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
 fn ensure_scope(token: &AuthToken, scope: &'static str) -> Result<(), ApiError> {
     if token.has_scope(scope) {
         Ok(())
     } else {
         Err(ApiError::Forbidden(scope))
     }
+}
+
+fn to_sse_event(name: &'static str, event: &DevtoolsTimelineEvent) -> Event {
+    let data = serde_json::to_string(event).unwrap_or_else(|_| "{}".to_string());
+    Event::default().event(name).data(data)
 }

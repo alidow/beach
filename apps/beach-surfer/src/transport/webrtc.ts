@@ -21,6 +21,30 @@ import type { SignalingClient, ServerMessage } from './signaling';
 import { reportSecureTransportEvent } from '../lib/telemetry';
 import type { ConnectionTrace } from '../lib/connectionTrace';
 
+type ViewerRtcEventPayload = {
+  sessionId: string;
+  event: string;
+  level: 'info' | 'warn' | 'error';
+  detail?: Record<string, unknown>;
+};
+
+function emitViewerRtcEvent(payload: ViewerRtcEventPayload) {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  window.dispatchEvent(
+    new CustomEvent('private-beach:viewer-rtc', {
+      detail: {
+        sessionId: payload.sessionId,
+        channel: 'viewer.webrtc',
+        event: payload.event,
+        level: payload.level,
+        detail: payload.detail ?? {},
+      },
+    }),
+  );
+}
+
 export interface SecureTransportSummary {
   mode: 'secure' | 'plaintext';
   verificationCode?: string;
@@ -315,6 +339,21 @@ export async function connectWebRtcTransport(
         ? options.iceServers
         : [{ urls: 'stun:stun.l.google.com:19302' }],
   });
+  const emitRtcState = (
+    event: string,
+    state: string | null,
+    level: ViewerRtcEventPayload['level'] = 'info',
+  ) => {
+    if (!sessionId) {
+      return;
+    }
+    emitViewerRtcEvent({
+      sessionId,
+      event,
+      level,
+      detail: { state },
+    });
+  };
   // Queue remote ICE candidates until the remote description is set.
   let remoteDescriptionSet = false;
   const pendingRemoteCandidates: RTCIceCandidateInit[] = [];
@@ -408,13 +447,22 @@ export async function connectWebRtcTransport(
   const disposeGeneralListener = attachGeneralListener(signaling, remotePeerId, logger);
 
   pc.onconnectionstatechange = () => {
-    log(logger, `peer connection state: ${pc.connectionState}`);
+    const state = pc.connectionState ?? null;
+    const level = state === 'failed' ? 'error' : state === 'disconnected' ? 'warn' : 'info';
+    emitRtcState('connection-state', state, level);
+    log(logger, `peer connection state: ${state}`);
   };
   pc.onsignalingstatechange = () => {
-    log(logger, `signaling state: ${pc.signalingState}`);
+    const state = pc.signalingState ?? null;
+    emitRtcState('signaling-state', state);
+    log(logger, `signaling state: ${state}`);
   };
   pc.oniceconnectionstatechange = () => {
-    log(logger, `ice connection state: ${pc.iceConnectionState}`);
+    const state = pc.iceConnectionState ?? null;
+    const level =
+      state === 'failed' || state === 'disconnected' || state === 'closed' ? 'warn' : 'info';
+    emitRtcState('ice-state', state, level);
+    log(logger, `ice connection state: ${state}`);
   };
   const pendingLocalCandidates: RTCIceCandidateInit[] = [];
   const allLocalCandidates: RTCIceCandidateInit[] = [];

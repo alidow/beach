@@ -32,6 +32,10 @@ pub fn build_router(state: AppState) -> Router {
             get(fetch_state_snapshot).post(push_state),
         )
         .route("/sessions/:session_id/state/stream", get(sse::stream_state))
+        .route(
+            "/sessions/:session_id/devtools/stream",
+            get(sse::stream_devtools),
+        )
         .route("/sessions/:session_id/actions", post(queue_actions))
         .route("/sessions/:session_id/actions/poll", get(poll_actions))
         .route(
@@ -958,6 +962,91 @@ mod tests {
         assert_eq!(refresh_payload["controller_token"], controller_token);
 
         test_support::clear_fast_path_ready_override();
+        unsafe {
+            std::env::remove_var("BEACH_SKIP_ROAD_VERIFY");
+            std::env::remove_var("BEACH_TEST_DISABLE_HANDSHAKE_HTTP");
+            std::env::remove_var("BEACH_TEST_DISABLE_SESSION_WORKERS");
+        }
+    }
+
+    #[tokio::test]
+    async fn controller_auto_attach_handshake_header_prevents_renegotiation() {
+        let _guard = HANDSHAKE_TEST_GUARD.lock().unwrap();
+        unsafe {
+            std::env::set_var("BEACH_SKIP_ROAD_VERIFY", "1");
+            std::env::set_var("BEACH_TEST_DISABLE_HANDSHAKE_HTTP", "1");
+            std::env::set_var("BEACH_TEST_DISABLE_SESSION_WORKERS", "1");
+        }
+        let state = AppState::new();
+        let app = build_router(state.clone());
+        let session_id = "sess-handshake-tag";
+        let beach_id = "pb-handshake-tag";
+        let passcode = "135790";
+
+        let body = json!({
+            "passcode": passcode,
+            "requester_private_beach_id": beach_id,
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{}/controller-handshake", session_id))
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let handshake_id = state
+            .active_handshake_id_for_test(session_id)
+            .await
+            .expect("handshake tracked");
+
+        let publish_token = state.publish_token_manager().sign_for_session(session_id);
+
+        let attach_body = json!({
+            "session_id": session_id,
+            "code": passcode,
+        });
+        let attach = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/private-beaches/{}/sessions/attach-by-code",
+                        beach_id
+                    ))
+                    .header("authorization", format!("Bearer {}", publish_token.token))
+                    .header("content-type", "application/json")
+                    .header(CONTROLLER_HANDSHAKE_HEADER, handshake_id.as_str())
+                    .body(Body::from(attach_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let attach_status = attach.status();
+        let attach_body = body::to_bytes(attach.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        if attach_status != StatusCode::OK {
+            panic!(
+                "attach_by_code failed: {}",
+                String::from_utf8_lossy(&attach_body)
+            );
+        }
+
+        let refreshed = state
+            .active_handshake_id_for_test(session_id)
+            .await
+            .expect("handshake still tracked");
+        assert_eq!(refreshed, handshake_id);
+
         unsafe {
             std::env::remove_var("BEACH_SKIP_ROAD_VERIFY");
             std::env::remove_var("BEACH_TEST_DISABLE_HANDSHAKE_HTTP");

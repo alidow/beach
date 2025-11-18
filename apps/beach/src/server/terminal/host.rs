@@ -1292,6 +1292,7 @@ struct ControllerAttachState {
     notify: Arc<Notify>,
     blocking_flag: Arc<Mutex<bool>>,
     blocking_cv: Arc<Condvar>,
+    fast_path_gate: Arc<Mutex<()>>,
 }
 
 impl ControllerAttachState {
@@ -1302,6 +1303,7 @@ impl ControllerAttachState {
             notify: Arc::new(Notify::new()),
             blocking_flag: Arc::new(Mutex::new(false)),
             blocking_cv: Arc::new(Condvar::new()),
+            fast_path_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1344,6 +1346,24 @@ impl ControllerAttachState {
     async fn acquire_attempt_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.attempt_lock.lock().await
     }
+
+    fn acquire_fast_path_permit(&self) -> (ControllerFastPathPermit<'_>, bool) {
+        match self.fast_path_gate.try_lock() {
+            Ok(guard) => (ControllerFastPathPermit { _guard: guard }, false),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let guard = self.fast_path_gate.lock().unwrap();
+                (ControllerFastPathPermit { _guard: guard }, true)
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let guard = poisoned.into_inner();
+                (ControllerFastPathPermit { _guard: guard }, true)
+            }
+        }
+    }
+}
+
+struct ControllerFastPathPermit<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
 }
 
 #[derive(Clone)]
@@ -1554,6 +1574,17 @@ fn run_fast_path_controller_channel(
     runtime: Handle,
 ) -> ControllerChannelOutcome {
     let attach_state = controller_ctx.attach_state();
+    let gate_wait_started = Instant::now();
+    let (fast_path_permit, waited_for_gate) = attach_state.acquire_fast_path_permit();
+    if waited_for_gate {
+        trace!(
+            target = "controller.actions.fast_path",
+            session_id = %session_id,
+            wait_ms = gate_wait_started.elapsed().as_millis() as u64,
+            "controller fast path channel waiting for concurrent negotiation to finish"
+        );
+    }
+    let _fast_path_permit = fast_path_permit;
     if !attach_state.is_attached() {
         info!(
             target = "controller.actions.fast_path",
@@ -3733,6 +3764,8 @@ fn display_cmd(cmd: &[String]) -> String {
     rendered
 }
 
+const CONTROLLER_HANDSHAKE_HEADER: &str = "x-beach-handshake-id";
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct ControllerAutoAttachHint {
     manager_url: String,
@@ -3740,6 +3773,7 @@ struct ControllerAutoAttachHint {
     attach_code: String,
     issued_at: Option<String>,
     expires_at: Option<String>,
+    handshake_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3751,6 +3785,8 @@ struct RawAutoAttachHint {
     issued_at: Option<String>,
     #[serde(default)]
     expires_at: Option<String>,
+    #[serde(default)]
+    handshake_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -3821,6 +3857,7 @@ fn parse_auto_attach_hint_value(
         attach_code: attach_code.to_string(),
         issued_at: payload.issued_at,
         expires_at: payload.expires_at,
+        handshake_id: payload.handshake_id,
     })
 }
 
@@ -3855,6 +3892,7 @@ fn env_auto_attach_hint(manager_url: Option<&str>) -> Option<ControllerAutoAttac
         attach_code,
         issued_at: None,
         expires_at: None,
+        handshake_id: None,
     })
 }
 
@@ -4034,13 +4072,15 @@ async fn maybe_auto_attach_session(
         );
     }
 
-    match client
+    let mut request = client
         .post(&endpoint)
         .bearer_auth(bearer)
-        .json(&json!({ "session_id": session_id, "code": hint.attach_code }))
-        .send()
-        .await
-    {
+        .json(&json!({ "session_id": session_id, "code": hint.attach_code }));
+    if let Some(handshake_id) = hint.handshake_id.as_deref() {
+        request = request.header(CONTROLLER_HANDSHAKE_HEADER, handshake_id);
+    }
+
+    match request.send().await {
         Ok(response) if response.status().is_success() => {
             if handshake {
                 info!(
@@ -4145,6 +4185,7 @@ mod tests {
     };
     use crate::sync::{ServerSynchronizer, SubscriptionId};
     use crate::transport::{Payload, TransportKind, TransportPair};
+    use transport_mod::webrtc::ControllerPeerTracker;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -4243,6 +4284,17 @@ mod tests {
     }
 
     #[test]
+    fn controller_peer_tracker_limits_parallel_negotiations() {
+        let mut tracker = ControllerPeerTracker::default();
+        assert!(tracker.reserve("peer-a"));
+        assert!(!tracker.reserve("peer-b"), "second controller should be throttled");
+        tracker.promote("peer-a");
+        assert!(!tracker.reserve("peer-b"), "active controller should block new joins");
+        tracker.release("peer-a");
+        assert!(tracker.reserve("peer-b"), "slot should reopen after release");
+    }
+
+    #[test]
     fn controller_attach_state_wakes_blocking_waiters() {
         let state = Arc::new(ControllerAttachState::new());
         let wait_state = state.clone();
@@ -4257,6 +4309,25 @@ mod tests {
         rx.recv_timeout(StdDuration::from_secs(1))
             .expect("waiter should resume once attached");
         handle.join().expect("waiter thread joined");
+    }
+
+    #[test]
+    fn controller_attach_state_limits_fast_path_channels() {
+        let state = Arc::new(ControllerAttachState::new());
+        let (first_guard, waited_first) = state.acquire_fast_path_permit();
+        assert!(!waited_first, "first permit should not block");
+
+        let state_for_thread = state.clone();
+        let handle = thread::spawn(move || {
+            let (_second_guard, waited_second) = state_for_thread.acquire_fast_path_permit();
+            waited_second
+        });
+
+        // Give the spawned thread time to contend for the permit.
+        thread::sleep(StdDuration::from_millis(50));
+        drop(first_guard);
+
+        assert!(handle.join().expect("second waiter joined"), "second permit should block until released");
     }
 
     #[tokio::test]
@@ -4325,6 +4396,7 @@ mod tests {
             attach_code: "CODE-42".into(),
             issued_at: None,
             expires_at: None,
+            handshake_id: None,
         };
         let attach_state = Arc::new(ControllerAttachState::new());
         let session_id = "sess-1".to_string();
@@ -4354,6 +4426,7 @@ mod tests {
             attach_code: "META".into(),
             issued_at: None,
             expires_at: None,
+            handshake_id: None,
         });
         let env = Some(ControllerAutoAttachHint {
             manager_url: "http://env".into(),
@@ -4361,6 +4434,7 @@ mod tests {
             attach_code: "ENV".into(),
             issued_at: None,
             expires_at: None,
+            handshake_id: None,
         });
         let (selected, source) = select_auto_attach_hint(metadata.clone(), env.clone())
             .expect("a hint should be selected");

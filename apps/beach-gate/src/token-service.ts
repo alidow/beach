@@ -52,6 +52,7 @@ export class TokenService {
       tier: context.tier,
       profile: context.profile,
       email: context.email,
+      account_id: context.userId,
       scope,
       scp: context.entitlements,
     };

@@ -52,7 +52,20 @@ ensure_cli_login() {
 start_player() {
   local mode=$1
   local human=$2
-  run_in_container "set -euo pipefail; export PRIVATE_BEACH_MANAGER_URL='$MANAGER_URL'; export BEACH_AUTH_GATEWAY='$AUTH_GATEWAY'; cd $REPO_ROOT; mkdir -p '$LOG_DIR'; : > '$LOG_DIR/beach-host-$mode.log'; nohup setsid bash -c \"cargo run --bin beach -- --log-level '$PLAYER_LOG_LEVEL' --log-file '$LOG_DIR/beach-host-$mode.log' --session-server '$SESSION_SERVER' host --bootstrap-output json --wait -- /usr/bin/env python3 $REPO_ROOT/apps/private-beach/demo/pong/player/main.py --mode $mode 2>&1 | tee '$LOG_DIR/bootstrap-$mode.json' > '$LOG_DIR/player-$mode.log'\" >/dev/null 2>&1 & echo \$! > '$LOG_DIR/player-$mode.pid'"
+  local frame_env=""
+  if [[ -n "${PONG_FRAME_DUMP_DIR:-}" ]]; then
+    frame_env+="mkdir -p '$PONG_FRAME_DUMP_DIR'; export PONG_FRAME_DUMP_PATH='$PONG_FRAME_DUMP_DIR/frame-$mode.txt'; "
+  fi
+  if [[ -n "${PONG_FRAME_DUMP_INTERVAL:-}" ]]; then
+    frame_env+="export PONG_FRAME_DUMP_INTERVAL='${PONG_FRAME_DUMP_INTERVAL}'; "
+  fi
+  if [[ -n "${PONG_BALL_TRACE_DIR:-}" ]]; then
+    frame_env+="mkdir -p '$PONG_BALL_TRACE_DIR'; : > '$PONG_BALL_TRACE_DIR/ball-trace-$mode.jsonl'; export PONG_BALL_TRACE_PATH='$PONG_BALL_TRACE_DIR/ball-trace-$mode.jsonl'; "
+  fi
+  if [[ -n "${PONG_COMMAND_TRACE_DIR:-}" ]]; then
+    frame_env+="mkdir -p '$PONG_COMMAND_TRACE_DIR'; : > '$PONG_COMMAND_TRACE_DIR/command-$mode.log'; export PONG_COMMAND_TRACE_PATH='$PONG_COMMAND_TRACE_DIR/command-$mode.log'; "
+  fi
+  run_in_container "set -euo pipefail; export PRIVATE_BEACH_MANAGER_URL='$MANAGER_URL'; export BEACH_AUTH_GATEWAY='$AUTH_GATEWAY'; ${frame_env}cd $REPO_ROOT; mkdir -p '$LOG_DIR'; : > '$LOG_DIR/beach-host-$mode.log'; nohup setsid bash -c \"cargo run --bin beach -- --log-level '$PLAYER_LOG_LEVEL' --log-file '$LOG_DIR/beach-host-$mode.log' --session-server '$SESSION_SERVER' host --bootstrap-output json --wait -- /usr/bin/env python3 $REPO_ROOT/apps/private-beach/demo/pong/player/main.py --mode $mode 2>&1 | tee '$LOG_DIR/bootstrap-$mode.json' > '$LOG_DIR/player-$mode.log'\" >/dev/null 2>&1 & echo \$! > '$LOG_DIR/player-$mode.pid'"
   echo "launched $human player (logs in $LOG_DIR/player-$mode.log)"
 }
 

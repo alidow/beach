@@ -1,7 +1,12 @@
 'use client';
 
 import { useSyncExternalStore } from 'react';
-import type { ConnectionLogContext, ConnectionLogDetail, ConnectionLogLevel } from '@/features/logging/types';
+import type {
+  ConnectionLogContext,
+  ConnectionLogDetail,
+  ConnectionLogLevel,
+  ConnectionTimelineScope,
+} from '@/features/logging/types';
 
 export type ConnectionTimelineEvent = {
   id: string;
@@ -12,23 +17,32 @@ export type ConnectionTimelineEvent = {
   detail: ConnectionLogDetail;
 };
 
-export type ConnectionTimelineRecord = {
+export type ConnectionTimelineTrack = {
   key: string;
   label: string;
+  kind: ConnectionTimelineScope;
+  groupKey: string;
+  groupLabel: string;
   context: ConnectionLogContext;
   events: ConnectionTimelineEvent[];
   lastTimestamp: number;
 };
 
-type TimelineBucket = {
+export type ConnectionTimelineGroupKind = 'session' | 'connector' | 'global';
+
+export type ConnectionTimelineRecord = {
+  key: string;
+  label: string;
+  kind: ConnectionTimelineGroupKind;
   context: ConnectionLogContext;
-  events: ConnectionTimelineEvent[];
+  tracks: ConnectionTimelineTrack[];
+  lastTimestamp: number;
 };
 
 type Listener = () => void;
 
 const MAX_EVENTS_PER_KEY = 120;
-const buckets = new Map<string, TimelineBucket>();
+const tracks = new Map<string, ConnectionTimelineTrack>();
 let cachedSnapshot: ConnectionTimelineRecord[] | null = null;
 const listeners = new Set<Listener>();
 
@@ -42,12 +56,30 @@ function emit() {
   });
 }
 
-function deriveKey(context: ConnectionLogContext): string {
-  if (context.tileId && context.tileId.length > 0) {
-    return `tile:${context.tileId}`;
+function deriveTimelineScope(context: ConnectionLogContext): ConnectionTimelineScope {
+  if (context.timelineScope) {
+    return context.timelineScope;
+  }
+  if (context.controllerSessionId || context.childSessionId) {
+    return 'connector';
+  }
+  return 'viewer';
+}
+
+function deriveGroupKey(context: ConnectionLogContext, scope: ConnectionTimelineScope): string {
+  if (context.timelineGroupId && context.timelineGroupId.length > 0) {
+    return context.timelineGroupId;
+  }
+  if (scope === 'connector') {
+    const controller = context.controllerSessionId ?? 'controller:unknown';
+    const child = context.childSessionId ?? context.sessionId ?? 'child:unknown';
+    return `connector:${controller}:${child}`;
   }
   if (context.sessionId && context.sessionId.length > 0) {
     return `session:${context.sessionId}`;
+  }
+  if (context.tileId && context.tileId.length > 0) {
+    return `tile:${context.tileId}`;
   }
   if (context.privateBeachId && context.privateBeachId.length > 0) {
     return `beach:${context.privateBeachId}`;
@@ -55,17 +87,79 @@ function deriveKey(context: ConnectionLogContext): string {
   return 'global';
 }
 
-function deriveLabel(context: ConnectionLogContext, key: string): string {
-  if (context.tileId) {
-    return context.tileId;
+function deriveGroupLabel(
+  context: ConnectionLogContext,
+  scope: ConnectionTimelineScope,
+  key: string,
+): string {
+  if (context.timelineGroupLabel && context.timelineGroupLabel.length > 0) {
+    return context.timelineGroupLabel;
+  }
+  if (scope === 'connector') {
+    const controller = context.controllerSessionId ?? 'controller';
+    const child = context.childSessionId ?? context.sessionId ?? 'child';
+    return `${controller} → ${child}`;
   }
   if (context.sessionId) {
     return context.sessionId;
   }
+  if (context.tileId) {
+    return context.tileId;
+  }
   if (context.privateBeachId) {
     return `beach:${context.privateBeachId}`;
   }
-  return key;
+  if (key.startsWith('connector:')) {
+    return key.replace('connector:', '');
+  }
+  return 'Global';
+}
+
+function deriveTrackKey(
+  groupKey: string,
+  scope: ConnectionTimelineScope,
+  context: ConnectionLogContext,
+): string {
+  if (context.timelineTrackId && context.timelineTrackId.length > 0) {
+    return context.timelineTrackId;
+  }
+  switch (scope) {
+    case 'viewer':
+      return `${groupKey}:viewer`;
+    case 'host':
+      return `${groupKey}:host`;
+    default:
+      return groupKey;
+  }
+}
+
+function deriveTrackLabel(scope: ConnectionTimelineScope, context: ConnectionLogContext): string {
+  if (context.timelineTrackLabel && context.timelineTrackLabel.length > 0) {
+    return context.timelineTrackLabel;
+  }
+  switch (scope) {
+    case 'viewer':
+      return 'Viewer↔Manager';
+    case 'host':
+      return 'Manager↔Host';
+    case 'connector':
+      return 'Connector';
+    default:
+      return 'Events';
+  }
+}
+
+function deriveGroupKind(
+  scope: ConnectionTimelineScope,
+  groupKey: string,
+): ConnectionTimelineGroupKind {
+  if (scope === 'connector' || groupKey.startsWith('connector:')) {
+    return 'connector';
+  }
+  if (groupKey === 'global') {
+    return 'global';
+  }
+  return 'session';
 }
 
 export function recordConnectionTimelineEvent(
@@ -85,15 +179,30 @@ export function recordConnectionTimelineEvent(
       detail,
     },
   );
-  const key = deriveKey(context);
-  const bucket = buckets.get(key) ?? {
+  const scope = deriveTimelineScope(context);
+  const groupKey = deriveGroupKey(context, scope);
+  const groupLabel = deriveGroupLabel(context, scope, groupKey);
+  const trackKey = deriveTrackKey(groupKey, scope, context);
+  const trackLabel = deriveTrackLabel(scope, context);
+  const currentTrack = tracks.get(trackKey) ?? {
+    key: trackKey,
+    label: trackLabel,
+    kind: scope,
+    groupKey,
+    groupLabel,
     context,
     events: [],
+    lastTimestamp: 0,
   };
-  bucket.context = {
-    ...bucket.context,
+  currentTrack.context = {
+    ...currentTrack.context,
     ...context,
   };
+  currentTrack.label = context.timelineTrackLabel ?? currentTrack.label;
+  currentTrack.groupLabel =
+    context.timelineGroupLabel && context.timelineGroupLabel.length > 0
+      ? context.timelineGroupLabel
+      : currentTrack.groupLabel;
   const entry: ConnectionTimelineEvent = {
     id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
     timestamp: Date.now(),
@@ -102,12 +211,13 @@ export function recordConnectionTimelineEvent(
     context,
     detail,
   };
-  const nextEvents = bucket.events.concat(entry);
+  const nextEvents = currentTrack.events.concat(entry);
   if (nextEvents.length > MAX_EVENTS_PER_KEY) {
     nextEvents.splice(0, nextEvents.length - MAX_EVENTS_PER_KEY);
   }
-  bucket.events = nextEvents;
-  buckets.set(key, bucket);
+  currentTrack.events = nextEvents;
+  currentTrack.lastTimestamp = entry.timestamp;
+  tracks.set(trackKey, currentTrack);
   cachedSnapshot = null;
   emit();
 }
@@ -116,13 +226,32 @@ function getSnapshot(): ConnectionTimelineRecord[] {
   if (cachedSnapshot) {
     return cachedSnapshot;
   }
-  cachedSnapshot = Array.from(buckets.entries())
-    .map(([key, bucket]) => ({
-      key,
-      label: deriveLabel(bucket.context, key),
-      context: bucket.context,
-      events: bucket.events,
-      lastTimestamp: bucket.events[bucket.events.length - 1]?.timestamp ?? 0,
+  const grouped = new Map<string, ConnectionTimelineRecord>();
+  for (const track of tracks.values()) {
+    const kind = deriveGroupKind(track.kind, track.groupKey);
+    const existing = grouped.get(track.groupKey) ?? {
+      key: track.groupKey,
+      label: track.groupLabel,
+      kind,
+      context: track.context,
+      tracks: [],
+      lastTimestamp: 0,
+    };
+    existing.label = track.groupLabel;
+    existing.context = {
+      ...existing.context,
+      ...track.context,
+    };
+    existing.tracks = existing.tracks.concat(track);
+    existing.lastTimestamp = Math.max(existing.lastTimestamp, track.lastTimestamp);
+    grouped.set(track.groupKey, existing);
+  }
+  cachedSnapshot = Array.from(grouped.values())
+    .map((group) => ({
+      ...group,
+      tracks: group.tracks
+        .slice()
+        .sort((a, b) => b.lastTimestamp - a.lastTimestamp || a.label.localeCompare(b.label)),
     }))
     .sort((a, b) => b.lastTimestamp - a.lastTimestamp);
   return cachedSnapshot;
@@ -140,7 +269,7 @@ export function useConnectionTimelines(): ConnectionTimelineRecord[] {
 }
 
 export function clearConnectionTimelines() {
-  buckets.clear();
+  tracks.clear();
   cachedSnapshot = null;
   emit();
 }

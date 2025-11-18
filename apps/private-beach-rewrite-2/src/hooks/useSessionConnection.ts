@@ -4,6 +4,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { viewerConnectionService } from '../../../private-beach/src/controllers/viewerConnectionService';
 import { logConnectionEvent } from '@/features/logging/beachConnectionLogger';
 import { recordTraceLog } from '@/features/trace/traceLogStore';
+import type { ConnectionLogLevel } from '@/features/logging/types';
+import { useDevtoolsEventStream } from './useDevtoolsEventStream';
 import type {
   SessionCredentialOverride,
   TerminalViewerState,
@@ -114,6 +116,14 @@ type UseSessionConnectionParams = {
   traceContext?: { traceId?: string | null };
 };
 
+type ViewerRtcDiagnosticsEvent = {
+  sessionId: string;
+  channel: 'viewer.webrtc';
+  event: string;
+  level: ConnectionLogLevel;
+  detail?: Record<string, unknown> | null;
+};
+
 export function useSessionConnection({
   tileId,
   sessionId,
@@ -142,10 +152,50 @@ export function useSessionConnection({
   const normalizedTraceId = traceContext?.traceId?.trim();
   const traceId = normalizedTraceId && normalizedTraceId.length > 0 ? normalizedTraceId : null;
 
+  useDevtoolsEventStream({
+    sessionId,
+    managerUrl,
+    authToken,
+  });
+
   useEffect(() => {
     connectedAtRef.current = null;
     lastViewerStatusRef.current = 'idle';
   }, [sessionId]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+    if (!sessionId) {
+      return;
+    }
+    const handleDiagnostics = (event: Event) => {
+      const payload = (event as CustomEvent<ViewerRtcDiagnosticsEvent>).detail;
+      if (!payload) {
+        return;
+      }
+      if (payload.sessionId !== sessionId) {
+        return;
+      }
+      const detail = payload.detail ?? null;
+      logConnectionEvent(
+        `viewer.webrtc:${payload.event}`,
+        {
+          tileId,
+          sessionId,
+          privateBeachId: privateBeachId ?? null,
+          managerUrl: managerUrl ?? null,
+          timelineScope: 'viewer',
+          timelineTrackLabel: 'Viewer↔Manager',
+        },
+        detail ?? undefined,
+        payload.level,
+      );
+    };
+    window.addEventListener('private-beach:viewer-rtc', handleDiagnostics as EventListener);
+    return () => window.removeEventListener('private-beach:viewer-rtc', handleDiagnostics as EventListener);
+  }, [managerUrl, privateBeachId, sessionId, tileId]);
 
   useEffect(() => {
     let disconnect: (() => void) | null = null;

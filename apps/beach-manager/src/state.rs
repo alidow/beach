@@ -87,6 +87,7 @@ const CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY: StdDuration = StdDuration::from_se
 const CONTROLLER_FAST_PATH_BACKOFF_MAX_DELAY: StdDuration = StdDuration::from_secs(30);
 const CONTROLLER_STRICT_GATING_ENV: &str = "CONTROLLER_STRICT_GATING";
 const CONTROLLER_STRICT_GATING_DEFAULT_ENABLED: bool = true;
+const CONTROLLER_HANDSHAKE_STALE_AFTER: StdDuration = StdDuration::from_secs(20);
 const IDLE_PUBLISH_TOKEN_HINT_KEY: &str = "idlePublishToken";
 
 pub fn viewer_health_report_interval() -> StdDuration {
@@ -122,6 +123,7 @@ pub struct AppState {
     auth: Arc<AuthContext>,
     publish_tokens: Arc<PublishTokenManager>,
     events: Arc<RwLock<HashMap<String, broadcast::Sender<StreamEvent>>>>,
+    devtools_events: Arc<RwLock<HashMap<String, broadcast::Sender<DevtoolsTimelineEvent>>>>,
     fast_paths: FastPathRegistry,
     viewer_workers: Arc<RwLock<HashMap<String, ViewerWorker>>>,
     controller_workers: Arc<RwLock<HashMap<String, ControllerForwarderWorker>>>,
@@ -133,7 +135,13 @@ pub struct AppState {
     controller_fast_path_backoff_enabled: bool,
     controller_strict_gating: bool,
     idle_snapshot_interval_ms: Option<u64>,
+    controller_handshakes: Arc<RwLock<HashMap<String, ControllerHandshakeInfo>>>,
     state_keepalive: StateKeepaliveManager,
+}
+
+struct ControllerHandshakeInfo {
+    control_id: String,
+    dispatched_at: Instant,
 }
 
 #[derive(Clone)]
@@ -146,6 +154,7 @@ struct InnerState {
     sessions: RwLock<HashMap<String, SessionRecord>>,
     pairings: RwLock<HashMap<String, Vec<ControllerPairing>>>,
     canvas_layouts: RwLock<HashMap<String, crate::routes::CanvasLayout>>,
+    pending_transport: RwLock<HashMap<String, PairingTransportStatus>>,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +197,8 @@ pub struct ControllerAutoAttachHint {
     issued_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     expires_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    handshake_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -904,6 +915,12 @@ impl PairingTransportStatus {
         self.last_error = last_error;
         self
     }
+
+    pub fn semantically_equals(&self, other: &Self) -> bool {
+        self.transport == other.transport
+            && self.latency_ms == other.latency_ms
+            && self.last_error == other.last_error
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -961,6 +978,7 @@ pub enum StreamEvent {
     State(StateDiff),
     Health(HealthHeartbeat),
     ControllerPairing(ControllerPairingEvent),
+    Devtools(DevtoolsTimelineEvent),
 }
 
 impl StreamEvent {
@@ -974,8 +992,83 @@ impl StreamEvent {
             StreamEvent::ControllerPairing(event) => {
                 ("controller_pairing", serde_json::to_string(event).ok())
             }
+            StreamEvent::Devtools(event) => ("devtools_event", serde_json::to_string(event).ok()),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DevtoolsTimelineEvent {
+    pub id: String,
+    pub timestamp_ms: i64,
+    pub timeline: DevtoolsTimelineKind,
+    pub step: String,
+    pub level: DevtoolsEventLevel,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<serde_json::Value>,
+}
+
+impl DevtoolsTimelineEvent {
+    fn host(
+        session_id: &str,
+        step: &str,
+        level: DevtoolsEventLevel,
+        detail: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            timestamp_ms: now_ms(),
+            timeline: DevtoolsTimelineKind::Host,
+            step: step.to_string(),
+            level,
+            session_id: Some(session_id.to_string()),
+            controller_session_id: None,
+            child_session_id: None,
+            detail,
+        }
+    }
+
+    fn connector(
+        controller_session_id: &str,
+        child_session_id: &str,
+        step: &str,
+        level: DevtoolsEventLevel,
+        detail: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            timestamp_ms: now_ms(),
+            timeline: DevtoolsTimelineKind::Connector,
+            step: step.to_string(),
+            level,
+            session_id: Some(child_session_id.to_string()),
+            controller_session_id: Some(controller_session_id.to_string()),
+            child_session_id: Some(child_session_id.to_string()),
+            detail,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DevtoolsTimelineKind {
+    Viewer,
+    Host,
+    Connector,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DevtoolsEventLevel {
+    Info,
+    Warn,
+    Error,
 }
 
 /// Payload returned to a controller session when the manager grants (or renews) a lease.
@@ -1092,6 +1185,7 @@ impl AppState {
             auth: Arc::new(AuthContext::new(auth_config)),
             publish_tokens: Arc::new(PublishTokenManager::from_env()),
             events: Arc::new(RwLock::new(HashMap::new())),
+            devtools_events: Arc::new(RwLock::new(HashMap::new())),
             fast_paths: FastPathRegistry::new(),
             viewer_workers: Arc::new(RwLock::new(HashMap::new())),
             controller_workers: Arc::new(RwLock::new(HashMap::new())),
@@ -1114,6 +1208,7 @@ impl AppState {
                 CONTROLLER_STRICT_GATING_DEFAULT_ENABLED,
             ),
             idle_snapshot_interval_ms: None,
+            controller_handshakes: Arc::new(RwLock::new(HashMap::new())),
             state_keepalive: StateKeepaliveManager::new(),
         }
     }
@@ -1130,6 +1225,7 @@ impl AppState {
             auth: Arc::new(AuthContext::new(auth_config)),
             publish_tokens: Arc::new(PublishTokenManager::from_env()),
             events: Arc::new(RwLock::new(HashMap::new())),
+            devtools_events: Arc::new(RwLock::new(HashMap::new())),
             fast_paths: FastPathRegistry::new(),
             viewer_workers: Arc::new(RwLock::new(HashMap::new())),
             controller_workers: Arc::new(RwLock::new(HashMap::new())),
@@ -1152,6 +1248,7 @@ impl AppState {
                 CONTROLLER_STRICT_GATING_DEFAULT_ENABLED,
             ),
             idle_snapshot_interval_ms: None,
+            controller_handshakes: Arc::new(RwLock::new(HashMap::new())),
             state_keepalive: StateKeepaliveManager::new(),
         }
     }
@@ -1261,6 +1358,68 @@ impl AppState {
             );
         }
         ready
+    }
+
+    pub async fn controller_handshake_pending(&self, session_id: &str) -> bool {
+        self.handshake_matches(session_id, None).await
+    }
+
+    async fn handshake_matches(&self, session_id: &str, expected_id: Option<&str>) -> bool {
+        let mut map = self.controller_handshakes.write().await;
+        if let Some(info) = map.get(session_id) {
+            if info.dispatched_at.elapsed() >= CONTROLLER_HANDSHAKE_STALE_AFTER {
+                trace!(
+                    target = "controller.fast_path_state",
+                    session_id = %session_id,
+                    elapsed_ms = info.dispatched_at.elapsed().as_millis() as u64,
+                    "controller handshake tracker expired"
+                );
+                map.remove(session_id);
+                return false;
+            }
+            if let Some(handshake_id) = expected_id {
+                return info.control_id == handshake_id;
+            }
+            return true;
+        }
+        false
+    }
+
+    pub async fn controller_handshake_matches(&self, session_id: &str, handshake_id: &str) -> bool {
+        self.handshake_matches(session_id, Some(handshake_id)).await
+    }
+
+    async fn mark_controller_handshake_dispatched(&self, session_id: &str, control_id: String) {
+        let mut map = self.controller_handshakes.write().await;
+        map.insert(
+            session_id.to_string(),
+            ControllerHandshakeInfo {
+                control_id,
+                dispatched_at: Instant::now(),
+            },
+        );
+        trace!(
+            target = "controller.fast_path_state",
+            session_id = %session_id,
+            "controller handshake marked in-progress"
+        );
+    }
+
+    async fn clear_controller_handshake(&self, session_id: &str) {
+        let mut map = self.controller_handshakes.write().await;
+        if map.remove(session_id).is_some() {
+            trace!(
+                target = "controller.fast_path_state",
+                session_id = %session_id,
+                "controller handshake tracker cleared"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn active_handshake_id_for_test(&self, session_id: &str) -> Option<String> {
+        let map = self.controller_handshakes.read().await;
+        map.get(session_id).map(|info| info.control_id.clone())
     }
 
     async fn enforce_controller_gate(
@@ -1397,6 +1556,7 @@ impl AppState {
         &self,
         private_beach_id: &str,
         attach_code: &str,
+        handshake_id: Option<String>,
     ) -> ControllerAutoAttachHint {
         ControllerAutoAttachHint {
             private_beach_id: private_beach_id.to_string(),
@@ -1404,6 +1564,7 @@ impl AppState {
             manager_url: self.public_manager_url.clone(),
             issued_at: Utc::now(),
             expires_at: None,
+            handshake_id,
         }
     }
 
@@ -1418,7 +1579,7 @@ impl AppState {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            let hint = self.build_controller_auto_attach_hint(private_beach_id, code);
+            let hint = self.build_controller_auto_attach_hint(private_beach_id, code, None);
             record.upsert_controller_auto_attach_hint(&hint)?;
         }
         Ok(())
@@ -1618,6 +1779,7 @@ impl AppState {
         private_beach_id: &str,
         passcode: &str,
     ) -> Result<(), StateError> {
+        let handshake_control_id = Uuid::new_v4().to_string();
         let lease = self
             .acquire_controller(session_id, None, Some("auto_handshake".into()), None)
             .await?;
@@ -1629,8 +1791,12 @@ impl AppState {
             "lease_expires_at_ms": lease.expires_at_ms,
             "stale_session_idle_secs": STALE_SESSION_MAX_IDLE.as_secs(),
             "viewer_health_interval_secs": viewer_health_report_interval().as_secs(),
-            "controller_auto_attach": self
-                .build_controller_auto_attach_hint(private_beach_id, passcode),
+            "controller_auto_attach": self.build_controller_auto_attach_hint(
+                private_beach_id,
+                passcode,
+                Some(handshake_control_id.clone()),
+            ),
+            "handshake_control_id": handshake_control_id,
         });
         let publish_hint = self.refresh_idle_publish_token_hint(session_id).await?;
         if let Some(obj) = handshake.as_object_mut() {
@@ -1705,6 +1871,8 @@ impl AppState {
                 private_beach_id = %private_beach_id,
                 "skipping manager handshake HTTP dispatch via test override"
             );
+            self.mark_controller_handshake_dispatched(session_id, handshake_control_id)
+                .await;
             return Ok(());
         }
 
@@ -1716,6 +1884,8 @@ impl AppState {
                     private_beach_id = %private_beach_id,
                     "manager handshake dispatched via control channel"
                 );
+                self.mark_controller_handshake_dispatched(session_id, handshake_control_id)
+                    .await;
                 if should_log_custom_event(
                     "manager_handshake_dispatch",
                     session_id,
@@ -1829,6 +1999,7 @@ impl AppState {
             self.clear_http_backlog_after_fast_path(&pb_id, session_id)
                 .await;
         }
+        self.clear_controller_handshake(session_id).await;
     }
 
     pub async fn attach_fast_path(&self, session_id: String, fps: FastPathSession) {
@@ -1877,6 +2048,18 @@ impl AppState {
         tx.subscribe()
     }
 
+    pub async fn subscribe_devtools(
+        &self,
+        session_id: &str,
+    ) -> broadcast::Receiver<DevtoolsTimelineEvent> {
+        let mut map = self.devtools_events.write().await;
+        let tx = map
+            .entry(session_id.to_string())
+            .or_insert_with(|| broadcast::channel(256).0)
+            .clone();
+        tx.subscribe()
+    }
+
     async fn clear_session_stream(&self, session_id: &str) {
         let mut map = self.events.write().await;
         if map.remove(session_id).is_some() {
@@ -1896,6 +2079,60 @@ impl AppState {
             if tx.send(event).is_err() {
                 self.log_no_stream_subscribers(session_id, event_kind);
             }
+        }
+    }
+
+    async fn publish_devtools_event(&self, session_id: &str, event: DevtoolsTimelineEvent) {
+        let tx_opt = { self.devtools_events.read().await.get(session_id).cloned() };
+        if let Some(tx) = tx_opt {
+            if tx.receiver_count() == 0 {
+                return;
+            }
+            if tx.send(event).is_err() {
+                // drop silently when no listeners
+            }
+        }
+    }
+
+    async fn emit_host_devtools_event(
+        &self,
+        session_id: &str,
+        step: &str,
+        level: DevtoolsEventLevel,
+        detail: Option<serde_json::Value>,
+    ) {
+        let event = DevtoolsTimelineEvent::host(session_id, step, level, detail);
+        self.publish_devtools_event(session_id, event).await;
+    }
+
+    async fn emit_connector_events_for_child(
+        &self,
+        child_session_id: &str,
+        step: &str,
+        level: DevtoolsEventLevel,
+        detail: Option<serde_json::Value>,
+    ) {
+        let controllers = self.fallback.controllers_for_child(child_session_id).await;
+        if controllers.is_empty() {
+            debug!(
+                target = "devtools.connector",
+                child_session_id = %child_session_id,
+                step,
+                "no controller pairings registered; skipping connector event"
+            );
+            return;
+        }
+        for controller_session_id in controllers {
+            let event = DevtoolsTimelineEvent::connector(
+                &controller_session_id,
+                child_session_id,
+                step,
+                level,
+                detail.clone(),
+            );
+            self.publish_devtools_event(&controller_session_id, event.clone())
+                .await;
+            self.publish_devtools_event(child_session_id, event).await;
         }
     }
 
@@ -1963,8 +2200,23 @@ impl AppState {
     ) {
         let controllers = self.fallback.controllers_for_child(child_session_id).await;
         if controllers.is_empty() {
+            self.fallback
+                .record_pending_transport_status(child_session_id, status.clone())
+                .await;
+            trace!(
+                target = "controller.transport_status",
+                child_session_id = %child_session_id,
+                transport = ?status.transport,
+                "no controller pairing; cached transport status for replay"
+            );
             return;
         }
+
+        // Drop any stale cached status now that a pairing is available.
+        let _ = self
+            .fallback
+            .take_pending_transport_status(child_session_id)
+            .await;
 
         for controller_session_id in controllers {
             if let Some(updated) = self
@@ -1984,6 +2236,18 @@ impl AppState {
                     child_session_id,
                     ControllerPairingAction::Updated,
                     Some(updated),
+                )
+                .await;
+                self.emit_connector_events_for_child(
+                    child_session_id,
+                    "connector.transport:update",
+                    DevtoolsEventLevel::Info,
+                    Some(serde_json::json!({
+                        "controllerSessionId": controller_session_id,
+                        "transport": status.transport,
+                        "latencyMs": status.latency_ms,
+                        "error": status.last_error,
+                    })),
                 )
                 .await;
             }
@@ -2065,7 +2329,7 @@ impl AppState {
                         });
                     rec.viewer_passcode = Some(code.to_string());
                     rec.mark_attached();
-                    let hint = self.build_controller_auto_attach_hint(private_beach_id, code);
+                    let hint = self.build_controller_auto_attach_hint(private_beach_id, code, None);
                     rec.upsert_controller_auto_attach_hint(&hint)?;
                     let token = rec.first_lease_token();
                     rec.append_event(
@@ -2163,7 +2427,7 @@ impl AppState {
                         });
                     rec.viewer_passcode = Some(code.to_string());
                     rec.upsert_controller_auto_attach_hint(
-                        &self.build_controller_auto_attach_hint(private_beach_id, code),
+                        &self.build_controller_auto_attach_hint(private_beach_id, code, None),
                     )?;
                     serde_json::to_value(&rec.transport_hints)?
                 };
@@ -2743,7 +3007,14 @@ impl AppState {
                     updated_at_ms: now,
                 };
 
-                let pairing = self.fallback.upsert_pairing(pairing).await;
+                let mut pairing = self.fallback.upsert_pairing(pairing).await;
+                let pending_status = self
+                    .fallback
+                    .take_pending_transport_status(child_session_id)
+                    .await;
+                if let Some(status) = pending_status.clone() {
+                    pairing.transport_status = Some(status.clone());
+                }
                 {
                     let mut sessions = self.fallback.sessions.write().await;
                     if let Some(record) = sessions.get_mut(controller_session_id) {
@@ -2778,6 +3049,10 @@ impl AppState {
                     Some(pairing.clone()),
                 )
                 .await;
+                if let Some(status) = pending_status {
+                    self.update_pairing_transport_status(child_session_id, status)
+                        .await;
+                }
 
                 Ok(pairing)
             }
@@ -2880,7 +3155,14 @@ impl AppState {
                     ])
                     .inc();
 
-                let pairing = row.into_pairing(&controller_identifiers.private_beach_id);
+                let mut pairing = row.into_pairing(&controller_identifiers.private_beach_id);
+                let pending_status = self
+                    .fallback
+                    .take_pending_transport_status(child_session_id)
+                    .await;
+                if let Some(status) = pending_status.clone() {
+                    pairing.transport_status = Some(status.clone());
+                }
                 let pairing = self.fallback.upsert_pairing(pairing).await;
                 self.publish_pairing_event(
                     controller_session_id,
@@ -2889,6 +3171,10 @@ impl AppState {
                     Some(pairing.clone()),
                 )
                 .await;
+                if let Some(status) = pending_status {
+                    self.update_pairing_transport_status(child_session_id, status)
+                        .await;
+                }
                 Ok(pairing)
             }
         }
@@ -3326,6 +3612,7 @@ impl AppState {
                 let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
                 let private_beach_id_str = identifiers.private_beach_id.to_string();
                 let session_uuid_str = session_uuid.to_string();
+                let action_count = actions.len();
                 let readiness_override = self
                     .fallback
                     .session_readiness_snapshot(&session_uuid_str)
@@ -3377,6 +3664,22 @@ impl AppState {
                 let mut fast_path_error: Option<String> = None;
                 let transport_mode = self.session_transport_mode(session_id).await;
                 let prefer_fast_path = matches!(transport_mode, TransportMode::FastPath);
+                if matches!(transport_mode, TransportMode::FastPath)
+                    && !self.fast_path_ready(&session_uuid_str).await
+                {
+                    return Err(
+                        self.controller_command_rejection_with_snapshot(
+                            &private_beach_id_str,
+                            &session_uuid_str,
+                            controller_token,
+                            Some(lease.id),
+                            actor_account_id,
+                            ControllerCommandDropReason::FastPathNotReady,
+                            readiness_override.clone(),
+                        )
+                        .await,
+                    );
+                }
                 if prefer_fast_path {
                     match send_actions_over_fast_path(&self.fast_paths, &session_uuid_str, &actions)
                         .await
@@ -3450,10 +3753,34 @@ impl AppState {
                                     "fast_path",
                                 );
                             }
+                            self.emit_connector_events_for_child(
+                                session_id,
+                                "connector.action:forwarded",
+                                DevtoolsEventLevel::Info,
+                                Some(serde_json::json!({
+                                    "count": action_count,
+                                    "transport": "fast_path",
+                                })),
+                            )
+                            .await;
                             return Ok(());
                         }
                         Ok(FastPathSendOutcome::SessionMissing)
                         | Ok(FastPathSendOutcome::ChannelMissing) => {
+                            if matches!(transport_mode, TransportMode::FastPath) {
+                                return Err(
+                                    self.controller_command_rejection_with_snapshot(
+                                        &private_beach_id_str,
+                                        &session_uuid_str,
+                                        controller_token,
+                                        Some(lease.id),
+                                        actor_account_id,
+                                        ControllerCommandDropReason::FastPathNotReady,
+                                        readiness_override.clone(),
+                                    )
+                                    .await,
+                                );
+                            }
                             trace!(
                                 target = "controller.delivery",
                                 session_id = %session_uuid,
@@ -3477,6 +3804,21 @@ impl AppState {
                             .await;
                         }
                     }
+                }
+
+                if matches!(transport_mode, TransportMode::FastPath) {
+                    return Err(
+                        self.controller_command_rejection_with_snapshot(
+                            &private_beach_id_str,
+                            &session_uuid_str,
+                            controller_token,
+                            Some(lease.id),
+                            actor_account_id,
+                            ControllerCommandDropReason::FastPathNotReady,
+                            readiness_override.clone(),
+                        )
+                        .await,
+                    );
                 }
 
                 let queue_depth = self
@@ -3568,6 +3910,7 @@ impl AppState {
 
                 self.fallback.enqueue_actions(session_id, actions).await;
 
+                let fast_path_error_detail = fast_path_error.clone();
                 if let Some(error) = fast_path_error {
                     debug!(
                         target = "controller_pairing",
@@ -3576,7 +3919,6 @@ impl AppState {
                         "fast-path unavailable; actions queued via fallback"
                     );
                 }
-
                 self.publish(
                     session_id,
                     StreamEvent::ControllerEvent(ControllerEvent {
@@ -3601,7 +3943,17 @@ impl AppState {
                         "http_fallback",
                     );
                 }
-
+                self.emit_connector_events_for_child(
+                    session_id,
+                    "connector.action:queued",
+                    DevtoolsEventLevel::Info,
+                    Some(serde_json::json!({
+                        "count": action_count,
+                        "transport": "http_fallback",
+                        "fastPathError": fast_path_error_detail,
+                    })),
+                )
+                .await;
                 Ok(())
             }
         }
@@ -3826,8 +4178,13 @@ impl AppState {
                     if let Some(err) = error_message {
                         status = status.with_error(Some(err));
                     }
-                    self.update_pairing_transport_status(session_id, status)
+                    self.update_pairing_transport_status(session_id, status.clone())
                         .await;
+                    let ok_count = acks
+                        .iter()
+                        .filter(|ack| matches!(ack.status, AckStatus::Ok))
+                        .count();
+                    let error_count = acks.len().saturating_sub(ok_count);
                     debug!(
                         target = "controller.delivery",
                         session_id,
@@ -3835,6 +4192,24 @@ impl AppState {
                         via_fast_path,
                         "controller acks recorded (memory backend)"
                     );
+                    self.emit_connector_events_for_child(
+                        session_id,
+                        "connector.action:ack",
+                        if error_count > 0 {
+                            DevtoolsEventLevel::Warn
+                        } else {
+                            DevtoolsEventLevel::Info
+                        },
+                        Some(serde_json::json!({
+                            "count": acks.len(),
+                            "ok": ok_count,
+                            "errors": error_count,
+                            "viaFastPath": via_fast_path,
+                            "latencyMs": latency,
+                            "status": status.transport,
+                        })),
+                    )
+                    .await;
                 }
                 Ok(())
             }
@@ -3897,6 +4272,7 @@ impl AppState {
                     if let Some(err) = error_message {
                         status = status.with_error(Some(err));
                     }
+                    let status_snapshot = status.clone();
                     self.update_pairing_transport_status(&session_uuid_str, status)
                         .await;
                     debug!(
@@ -3907,6 +4283,29 @@ impl AppState {
                         via_fast_path,
                         "controller acks persisted"
                     );
+                    let ok_count = acks
+                        .iter()
+                        .filter(|ack| matches!(ack.status, AckStatus::Ok))
+                        .count();
+                    let error_count = acks.len().saturating_sub(ok_count);
+                    self.emit_connector_events_for_child(
+                        session_id,
+                        "connector.action:ack",
+                        if error_count > 0 {
+                            DevtoolsEventLevel::Warn
+                        } else {
+                            DevtoolsEventLevel::Info
+                        },
+                        Some(serde_json::json!({
+                            "count": acks.len(),
+                            "ok": ok_count,
+                            "errors": error_count,
+                            "viaFastPath": via_fast_path,
+                            "latencyMs": latency,
+                            "status": status_snapshot.transport,
+                        })),
+                    )
+                    .await;
                 }
                 Ok(())
             }
@@ -4806,6 +5205,7 @@ impl InnerState {
             sessions: RwLock::new(HashMap::new()),
             pairings: RwLock::new(HashMap::new()),
             canvas_layouts: RwLock::new(HashMap::new()),
+            pending_transport: RwLock::new(HashMap::new()),
         }
     }
 
@@ -4824,6 +5224,23 @@ impl InnerState {
     ) {
         let mut layouts = self.canvas_layouts.write().await;
         layouts.insert(beach_id.into(), layout);
+    }
+
+    async fn record_pending_transport_status(
+        &self,
+        child_session_id: &str,
+        status: PairingTransportStatus,
+    ) {
+        let mut pending = self.pending_transport.write().await;
+        pending.insert(child_session_id.to_string(), status);
+    }
+
+    async fn take_pending_transport_status(
+        &self,
+        child_session_id: &str,
+    ) -> Option<PairingTransportStatus> {
+        let mut pending = self.pending_transport.write().await;
+        pending.remove(child_session_id)
     }
 
     async fn mark_attached(&self, session_id: &str) {
@@ -5119,7 +5536,12 @@ impl InnerState {
                 .iter_mut()
                 .find(|p| p.child_session_id == child_session_id)
             {
-                if pairing.transport_status.as_ref() == Some(&status) {
+                if pairing
+                    .transport_status
+                    .as_ref()
+                    .map(|existing| existing.semantically_equals(&status))
+                    .unwrap_or(false)
+                {
                     return None;
                 }
                 pairing.transport_status = Some(status);
@@ -5933,6 +6355,7 @@ impl AppState {
         let record = sessions
             .get_mut(session_id)
             .ok_or(StateError::SessionNotFound)?;
+        let action_count = actions.len();
         for action in actions {
             record.pending_actions.push_back(action);
         }
@@ -5962,6 +6385,17 @@ impl AppState {
         .await;
 
         self.publish(session_id, event).await;
+        self.emit_connector_events_for_child(
+            session_id,
+            "connector.action:queued",
+            DevtoolsEventLevel::Info,
+            Some(serde_json::json!({
+                "count": action_count,
+                "transport": "http_fallback",
+                "controllerToken": controller_token,
+            })),
+        )
+        .await;
         Ok(())
     }
 
@@ -6046,11 +6480,40 @@ impl AppState {
         record.last_state = Some(diff);
         let token = record.first_lease_token();
         record.append_event(ControllerEventType::StateUpdated, token, None);
+        let payload_summary = diff_clone
+            .payload
+            .as_object()
+            .map(|object| {
+                let keys = object
+                    .keys()
+                    .take(6)
+                    .map(|key| key.to_string())
+                    .collect::<Vec<_>>();
+                let line_count = object
+                    .get("lines")
+                    .and_then(|value| value.as_array())
+                    .map(|rows| rows.len());
+                (keys, line_count)
+            })
+            .unwrap_or_default();
+        drop(sessions);
         self.publish(session_id, StreamEvent::State(diff_clone))
             .await;
         self.state_keepalive
             .schedule(self.clone(), session_id.to_string(), diff_sequence)
             .await;
+        let (payload_keys, line_count) = payload_summary;
+        self.emit_connector_events_for_child(
+            session_id,
+            "connector.child:update",
+            DevtoolsEventLevel::Info,
+            Some(serde_json::json!({
+                "sequence": diff_sequence,
+                "keys": payload_keys,
+                "lineCount": line_count,
+            })),
+        )
+        .await;
         Ok(())
     }
 
@@ -8172,7 +8635,7 @@ fn ensure_fast_path_probe(
     if !fast_path_enabled || watchers.is_some() {
         return;
     }
-    let needs_probe = !via_fast_path || transport_is_primary;
+    let needs_probe = !via_fast_path && transport_is_primary;
     if !needs_probe {
         return;
     }
@@ -8219,6 +8682,8 @@ async fn drive_controller_forwarder(
         fast_path_channels.clone(),
         metadata_label.as_deref(),
         fast_path_enabled,
+        session_id,
+        private_beach_id,
     )
     .await;
     let mut transport_is_primary = Arc::ptr_eq(&transport, &primary_transport);
@@ -8234,6 +8699,20 @@ async fn drive_controller_forwarder(
         peer_id = %t_peer.0,
         "controller forwarder connected"
     );
+    state
+        .emit_host_devtools_event(
+            session_id,
+            "host.transport:connected",
+            DevtoolsEventLevel::Info,
+            Some(serde_json::json!({
+                "privateBeachId": private_beach_id,
+                "transport": transport_label,
+                "viaFastPath": via_fast_path,
+                "transportId": t_id.0,
+                "peerId": t_peer.0,
+            })),
+        )
+        .await;
 
     if via_fast_path {
         fast_path_backoff.reset();
@@ -8310,6 +8789,19 @@ async fn drive_controller_forwarder(
                     transport = transport_label,
                     "controller forwarder shutting down due to cancellation"
                 );
+                state
+                    .emit_host_devtools_event(
+                        session_id,
+                        "host.transport:stopped",
+                        DevtoolsEventLevel::Info,
+                        Some(serde_json::json!({
+                            "reason": "cancelled",
+                            "inflight": inflight,
+                            "queueDepth": queue_depth,
+                            "transport": transport_label,
+                        })),
+                    )
+                    .await;
                 return Ok(());
             }
             event = event_rx.recv() => {
@@ -8375,6 +8867,7 @@ async fn drive_controller_forwarder(
                             metrics::CONTROLLER_FAST_PATH_FALLBACKS
                                 .with_label_values(&labels)
                                 .inc();
+                            let reason_detail = reason.clone();
                             warn!(
                                 target = "controller.forwarder",
                                 session_id = %session_id,
@@ -8384,6 +8877,18 @@ async fn drive_controller_forwarder(
                                 queue_depth,
                                 "fast-path transport closed; falling back to primary transport"
                             );
+                            state
+                                .emit_host_devtools_event(
+                                    session_id,
+                                    "host.transport:fallback",
+                                    DevtoolsEventLevel::Warn,
+                                    Some(serde_json::json!({
+                                        "reason": reason_detail,
+                                        "queueDepth": queue_depth,
+                                        "inflight": inflight,
+                                    })),
+                                )
+                                .await;
                             via_fast_path = false;
                             transport_label = "http_fallback";
                             transport = primary_transport.clone();
@@ -8430,6 +8935,7 @@ async fn drive_controller_forwarder(
                         };
                         let drained = std::mem::take(&mut pending);
                         fail_pending_actions(state, session_id, drained, via_fast_path, &reason).await;
+                        let reason_detail = reason.clone();
                         warn!(
                             target = "controller.forwarder",
                             session_id = %session_id,
@@ -8440,6 +8946,19 @@ async fn drive_controller_forwarder(
                             reason = %reason,
                             "controller transport closed; exiting"
                         );
+                        state
+                            .emit_host_devtools_event(
+                                session_id,
+                                "host.transport:closed",
+                                DevtoolsEventLevel::Error,
+                                Some(serde_json::json!({
+                                    "reason": reason_detail,
+                                    "queueDepth": queue_depth,
+                                    "inflight": inflight,
+                                    "transport": transport_label,
+                                })),
+                            )
+                            .await;
                         return Err(ControllerForwarderError::Transport(reason));
                     }
                     Some(ForwarderEvent::FastPathReady { transport: fast_transport, label }) => {
@@ -8466,6 +8985,16 @@ async fn drive_controller_forwarder(
                             .update_pairing_transport_status(
                                 session_id,
                                 PairingTransportStatus::fast_path(now),
+                            )
+                            .await;
+                        state
+                            .emit_host_devtools_event(
+                                session_id,
+                                "host.transport:fast-path-ready",
+                                DevtoolsEventLevel::Info,
+                                Some(serde_json::json!({
+                                    "label": label,
+                                })),
                             )
                             .await;
                         info!(
@@ -8524,6 +9053,19 @@ async fn drive_controller_forwarder(
                             transport = transport_label,
                             "controller forwarder ack listener closed unexpectedly"
                         );
+                        state
+                            .emit_host_devtools_event(
+                                session_id,
+                                "host.transport:closed",
+                                DevtoolsEventLevel::Error,
+                                Some(serde_json::json!({
+                                    "reason": "ack_listener_closed",
+                                    "queueDepth": queue_depth,
+                                    "inflight": inflight,
+                                    "transport": transport_label,
+                                })),
+                            )
+                            .await;
                         return Err(ControllerForwarderError::Transport(
                             "ack listener closed".into(),
                         ));
@@ -8556,6 +9098,18 @@ async fn drive_controller_forwarder(
                                     transport = transport_label,
                                     "ack stall detected; falling back to primary transport"
                                 );
+                                state
+                                    .emit_host_devtools_event(
+                                        session_id,
+                                        "host.transport:ack-stall",
+                                        DevtoolsEventLevel::Warn,
+                                        Some(serde_json::json!({
+                                            "inflight": inflight,
+                                            "transport": transport_label,
+                                            "deadlineMs": ACK_STALL_DEADLINE.as_millis(),
+                                        })),
+                                    )
+                                    .await;
                                 via_fast_path = false;
                                 transport_label = "http_fallback";
                                 transport = primary_transport.clone();
@@ -8654,6 +9208,17 @@ async fn drive_controller_forwarder(
                                             error = %err,
                                             "fast-path send failed; falling back to primary transport"
                                         );
+                                        state
+                                            .emit_host_devtools_event(
+                                                session_id,
+                                                "host.transport:fallback",
+                                                DevtoolsEventLevel::Warn,
+                                                Some(serde_json::json!({
+                                                    "reason": format!("fast_path_send_error:{err}"),
+                                                    "inflight": inflight,
+                                                })),
+                                            )
+                                            .await;
                                         via_fast_path = false;
                                         transport_label = "http_fallback";
                                         transport = primary_transport.clone();
@@ -8685,6 +9250,17 @@ async fn drive_controller_forwarder(
                                         let drained = std::mem::take(&mut pending);
                                         let reason = err.to_string();
                                         fail_pending_actions(state, session_id, drained, via_fast_path, &reason).await;
+                                        state
+                                            .emit_host_devtools_event(
+                                                session_id,
+                                                "host.transport:error",
+                                                DevtoolsEventLevel::Error,
+                                                Some(serde_json::json!({
+                                                    "reason": reason,
+                                                    "transport": transport_label,
+                                                })),
+                                            )
+                                            .await;
                                         return Err(ControllerForwarderError::Transport(reason));
                                     }
                                 }
@@ -8698,6 +9274,7 @@ async fn drive_controller_forwarder(
                                 transport = transport_label,
                                 "forwarded controller action"
                             );
+                            let action_id = action.id.clone();
                             pending.insert(
                                 next_seq,
                                 PendingControllerAction {
@@ -8705,6 +9282,19 @@ async fn drive_controller_forwarder(
                                     sent_at,
                                 },
                             );
+                            state
+                                .emit_connector_events_for_child(
+                                    session_id,
+                                    "connector.action:forwarded",
+                                    DevtoolsEventLevel::Info,
+                                    Some(serde_json::json!({
+                                        "actionId": action_id,
+                                        "transport": transport_label,
+                                        "viaFastPath": via_fast_path,
+                                        "sequence": next_seq,
+                                    })),
+                                )
+                                .await;
                         }
                         Err(err_msg) => {
                             warn!(
@@ -8714,6 +9304,17 @@ async fn drive_controller_forwarder(
                                 error = %err_msg,
                                 "rejecting unsupported action"
                             );
+                            state
+                                .emit_connector_events_for_child(
+                                    session_id,
+                                    "connector.action:rejected",
+                                    DevtoolsEventLevel::Warn,
+                                    Some(serde_json::json!({
+                                        "reason": err_msg,
+                                        "actionId": action.id,
+                                    })),
+                                )
+                                .await;
                             let ack = ActionAck {
                                 id: action.id.clone(),
                                 status: AckStatus::Rejected,
@@ -8741,54 +9342,51 @@ async fn drive_controller_forwarder(
     }
 }
 
+const CONTROLLER_DATA_CHANNEL_LABELS: [&str; 2] = [
+    CONTROLLER_CHANNEL_LABEL,
+    LEGACY_CONTROLLER_CHANNEL_LABEL,
+];
+
 async fn select_controller_transport(
     primary_transport: Arc<dyn Transport>,
     webrtc_channels: Option<WebRtcChannels>,
     metadata_label: Option<&str>,
     fast_path_enabled: bool,
+    session_id: &str,
+    private_beach_id: &str,
 ) -> (Arc<dyn Transport>, &'static str, bool) {
-    const LABELS: [&str; 2] = [CONTROLLER_CHANNEL_LABEL, LEGACY_CONTROLLER_CHANNEL_LABEL];
-
     if fast_path_enabled {
-        if let Some(channels) = webrtc_channels {
-            for label in LABELS {
-                match timeout(CONTROLLER_FAST_PATH_WAIT, channels.wait_for(label)).await {
-                    Ok(Ok(channel)) => {
-                        let peer = channel.peer();
-                        trace!(
-                            target = "controller.forwarder",
-                            label,
-                            peer_id = %peer.0,
-                            "selected fast-path data channel"
-                        );
-                        return (channel, "fast_path", true);
-                    }
-                    Ok(Err(err)) => {
-                        debug!(
-                            target = "controller.forwarder",
-                            label,
-                            error = %err,
-                            "failed to wait for controller data channel; falling back"
-                        );
-                    }
-                    Err(_) => {
-                        debug!(
-                            target = "controller.forwarder",
-                            label, "timed out waiting for controller data channel; falling back"
-                        );
-                    }
-                }
-            }
-        }
-
         if let Some(label) = metadata_label {
-            if LABELS.iter().any(|candidate| *candidate == label) {
+            if CONTROLLER_DATA_CHANNEL_LABELS
+                .iter()
+                .any(|candidate| *candidate == label)
+            {
                 debug!(
                     target = "controller.forwarder",
                     label,
                     "metadata label indicates controller channel; using primary transport as fast-path"
                 );
                 return (primary_transport, "fast_path", true);
+            }
+        }
+        if let Some(ref channels) = webrtc_channels {
+            trace!(
+                target = "controller.forwarder",
+                session_id = %session_id,
+                private_beach_id = %private_beach_id,
+                "waiting for controller fast-path channels"
+            );
+            if let Some((channel, label)) =
+                wait_for_controller_data_channel(channels, session_id, private_beach_id).await
+            {
+                let peer = channel.peer();
+                trace!(
+                    target = "controller.forwarder",
+                    label,
+                    peer_id = %peer.0,
+                    "selected fast-path data channel"
+                );
+                return (channel, "fast_path", true);
             }
         }
     } else {
@@ -8799,6 +9397,98 @@ async fn select_controller_transport(
     }
 
     (primary_transport, "http_fallback", false)
+}
+
+async fn wait_for_controller_data_channel(
+    channels: &WebRtcChannels,
+    session_id: &str,
+    private_beach_id: &str,
+) -> Option<(Arc<dyn Transport>, &'static str)> {
+    if let Some(existing) = channels.try_get(CONTROLLER_CHANNEL_LABEL) {
+        trace!(
+            target = "controller.forwarder",
+            session_id = %session_id,
+            private_beach_id = %private_beach_id,
+            label = CONTROLLER_CHANNEL_LABEL,
+            "controller data channel already registered"
+        );
+        return Some((existing, CONTROLLER_CHANNEL_LABEL));
+    }
+    if let Some(existing) = channels.try_get(LEGACY_CONTROLLER_CHANNEL_LABEL) {
+        trace!(
+            target = "controller.forwarder",
+            session_id = %session_id,
+            private_beach_id = %private_beach_id,
+            label = LEGACY_CONTROLLER_CHANNEL_LABEL,
+            "legacy controller data channel already registered"
+        );
+        return Some((existing, LEGACY_CONTROLLER_CHANNEL_LABEL));
+    }
+
+    let wait_primary = channels.wait_for(CONTROLLER_CHANNEL_LABEL);
+    let wait_legacy = channels.wait_for(LEGACY_CONTROLLER_CHANNEL_LABEL);
+    tokio::pin!(wait_primary);
+    tokio::pin!(wait_legacy);
+    let mut primary_done = false;
+    let mut legacy_done = false;
+
+    match timeout(
+        CONTROLLER_FAST_PATH_WAIT,
+        async {
+            loop {
+                tokio::select! {
+                    res = &mut wait_primary, if !primary_done => {
+                        primary_done = true;
+                        match res {
+                            Ok(channel) => break Some((channel, CONTROLLER_CHANNEL_LABEL)),
+                            Err(err) => {
+                                warn!(
+                                    target = "controller.forwarder",
+                                    label = CONTROLLER_CHANNEL_LABEL,
+                                    session_id = %session_id,
+                                    private_beach_id = %private_beach_id,
+                                    error = %err,
+                                    "failed waiting for controller data channel"
+                                );
+                            }
+                        }
+                    }
+                    res = &mut wait_legacy, if !legacy_done => {
+                        legacy_done = true;
+                        match res {
+                            Ok(channel) => break Some((channel, LEGACY_CONTROLLER_CHANNEL_LABEL)),
+                            Err(err) => {
+                                warn!(
+                                    target = "controller.forwarder",
+                                    label = LEGACY_CONTROLLER_CHANNEL_LABEL,
+                                    session_id = %session_id,
+                                    private_beach_id = %private_beach_id,
+                                    error = %err,
+                                    "failed waiting for legacy controller data channel"
+                                );
+                            }
+                        }
+                    }
+                    else => break None,
+                }
+            }
+        },
+    )
+    .await
+    {
+        Ok(Some(result)) => Some(result),
+        Ok(None) => None,
+        Err(_) => {
+            warn!(
+                target = "controller.forwarder",
+                timeout_ms = CONTROLLER_FAST_PATH_WAIT.as_millis(),
+                session_id = %session_id,
+                private_beach_id = %private_beach_id,
+                "timed out waiting for controller data channel"
+            );
+            None
+        }
+    }
 }
 
 async fn fail_pending_actions(
@@ -9484,10 +10174,59 @@ mod tests {
         let channels = WebRtcChannels::new();
         channels.publish(CONTROLLER_CHANNEL_LABEL.to_string(), fast.clone());
 
-        let (selected, label, via_fast_path) =
-            select_controller_transport(primary.clone(), Some(channels), None, true).await;
+        let (selected, label, via_fast_path) = select_controller_transport(
+            primary.clone(),
+            Some(channels),
+            None,
+            true,
+            "test-session",
+            "test-pb",
+        )
+        .await;
 
         assert_eq!(selected.id(), fast.id());
+        assert_eq!(label, "fast_path");
+        assert!(via_fast_path);
+    }
+
+    #[tokio::test]
+    async fn select_controller_transport_accepts_legacy_channel_immediately() {
+        let primary = Arc::new(TestTransport::new(3, TransportKind::WebSocket));
+        let legacy = Arc::new(TestTransport::new(4, TransportKind::WebRtc));
+        let channels = WebRtcChannels::new();
+        channels.publish(LEGACY_CONTROLLER_CHANNEL_LABEL.to_string(), legacy.clone());
+
+        let (selected, label, via_fast_path) = select_controller_transport(
+            primary.clone(),
+            Some(channels),
+            None,
+            true,
+            "test-session",
+            "test-pb",
+        )
+        .await;
+
+        assert_eq!(selected.id(), legacy.id());
+        assert_eq!(label, "fast_path");
+        assert!(via_fast_path);
+    }
+
+    #[tokio::test]
+    async fn select_controller_transport_short_circuits_metadata() {
+        let primary = Arc::new(TestTransport::new(5, TransportKind::WebSocket));
+        let channels = WebRtcChannels::new();
+
+        let (selected, label, via_fast_path) = select_controller_transport(
+            primary.clone(),
+            Some(channels),
+            Some(CONTROLLER_CHANNEL_LABEL),
+            true,
+            "sess-meta",
+            "pb-meta",
+        )
+        .await;
+
+        assert_eq!(selected.id(), primary.id());
         assert_eq!(label, "fast_path");
         assert!(via_fast_path);
     }
@@ -9497,7 +10236,14 @@ mod tests {
         let primary = Arc::new(TestTransport::new(5, TransportKind::WebSocket));
         let channels = WebRtcChannels::new();
 
-        let fut = select_controller_transport(primary.clone(), Some(channels), None, true);
+        let fut = select_controller_transport(
+            primary.clone(),
+            Some(channels),
+            None,
+            true,
+            "test-session",
+            "test-pb",
+        );
         tokio::pin!(fut);
         tokio::time::advance(CONTROLLER_FAST_PATH_WAIT + StdDuration::from_secs(1)).await;
         let (selected, label, via_fast_path) = fut.await;
@@ -9539,6 +10285,127 @@ mod tests {
         .expect("fast-path ready event timed out");
 
         assert_eq!(label, CONTROLLER_CHANNEL_LABEL);
+    }
+
+    #[tokio::test]
+    async fn fast_path_watchers_dedupe_back_to_back_channels() {
+        let channels = WebRtcChannels::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut watchers: Option<FastPathUpgradeHandle> = None;
+        let mut backoff = FastPathUpgradeBackoff::new(true);
+
+        ensure_fast_path_probe(
+            &mut watchers,
+            &Some(channels.clone()),
+            true,
+            false,
+            true,
+            "sess-fast-dedupe",
+            "pb-fast-dedupe",
+            &tx,
+            &mut backoff,
+            false,
+        );
+
+        let first = Arc::new(TestTransport::new(50, TransportKind::WebRtc));
+        let second = Arc::new(TestTransport::new(52, TransportKind::WebRtc));
+        channels.publish(CONTROLLER_CHANNEL_LABEL.to_string(), first.clone());
+        channels.publish(CONTROLLER_CHANNEL_LABEL.to_string(), second.clone());
+
+        let event = tokio::time::timeout(StdDuration::from_secs(1), rx.recv())
+            .await
+            .expect("expected fast-path ready event")
+            .expect("channel closed");
+        match event {
+            ForwarderEvent::FastPathReady { transport, label } => {
+                assert_eq!(label, CONTROLLER_CHANNEL_LABEL);
+                assert!(
+                    transport.id() == first.id() || transport.id() == second.id(),
+                    "unexpected transport published"
+                );
+            }
+            _ => panic!("unexpected forwarder event"),
+        }
+
+        assert!(tokio::time::timeout(StdDuration::from_millis(200), rx.recv())
+            .await
+            .is_err(), "no second fast-path event expected");
+        drop(watchers);
+    }
+
+    #[tokio::test]
+    async fn pending_transport_status_replayed_after_pairing() {
+        let state = AppState::new();
+        let controller = RegisterSessionRequest {
+            session_id: "controller-sess".into(),
+            private_beach_id: "pb-pair".into(),
+            harness_type: HarnessType::TerminalShim,
+            capabilities: vec![],
+            location_hint: None,
+            metadata: None,
+            version: "1.0.0".into(),
+            viewer_passcode: Some("PASS".into()),
+            transport_mode: Some(TransportMode::FastPath),
+        };
+        let lhs = RegisterSessionRequest {
+            session_id: "lhs-sess".into(),
+            private_beach_id: "pb-pair".into(),
+            harness_type: HarnessType::TerminalShim,
+            capabilities: vec![],
+            location_hint: None,
+            metadata: None,
+            version: "1.0.0".into(),
+            viewer_passcode: Some("PASS".into()),
+            transport_mode: Some(TransportMode::FastPath),
+        };
+        state.register_session(controller).await.unwrap();
+        state.register_session(lhs).await.unwrap();
+
+        // Acquire a controller lease so pairings can be created.
+        state
+            .acquire_controller("controller-sess", Some(30_000), Some("test".into()), None)
+            .await
+            .unwrap();
+
+        let now = now_ms();
+        let status = PairingTransportStatus::fast_path(now);
+        state
+            .update_pairing_transport_status("lhs-sess", status.clone())
+            .await;
+
+        // Status should be cached while we wait for the pairing to exist.
+        let cached = state
+            .fallback
+            .take_pending_transport_status("lhs-sess")
+            .await
+            .expect("transport status should be cached");
+        assert_eq!(cached.transport, PairingTransportKind::FastPath);
+        // Reinsert so the pairing replay can observe it.
+        state
+            .fallback
+            .record_pending_transport_status("lhs-sess", cached.clone())
+            .await;
+
+        let pairing = state
+            .upsert_controller_pairing("controller-sess", "lhs-sess", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            pairing
+                .transport_status
+                .as_ref()
+                .map(|s| s.transport),
+            Some(PairingTransportKind::FastPath)
+        );
+
+        // Pending cache should be cleared once the replay succeeds.
+        assert!(
+            state
+                .fallback
+                .take_pending_transport_status("lhs-sess")
+                .await
+                .is_none()
+        );
     }
 
     #[test]
@@ -9648,7 +10515,7 @@ mod tests {
             false,
         );
 
-        assert!(watchers.is_some());
+        assert!(watchers.is_none());
         drop(watchers);
     }
 
@@ -9667,6 +10534,7 @@ mod tests {
             manager_url: "http://localhost:8080".into(),
             issued_at: Utc::now(),
             expires_at: None,
+            handshake_id: None,
         };
         record
             .upsert_controller_auto_attach_hint(&hint)
@@ -9767,6 +10635,11 @@ mod tests {
             record.transport_mode = TransportMode::FastPath;
         })
         .await;
+
+        assert!(matches!(
+            state.session_transport_mode(session_id).await,
+            TransportMode::FastPath
+        ));
 
         let err = state
             .queue_actions(session_id, &token, vec![new_action("cmd-fast")], None)

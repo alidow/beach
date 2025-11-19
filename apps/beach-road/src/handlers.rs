@@ -16,7 +16,7 @@ use serde_json::json;
 use std::env;
 use std::sync::Arc;
 use time::Duration;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use metrics::counter;
@@ -717,6 +717,11 @@ pub async fn get_webrtc_offer(
         Some(payload) => {
             // Activity observed: refresh session TTL
             let _ = storage.update_session_ttl(&session_id).await;
+            info!(
+                session = %session_id,
+                peer = %params.peer_id,
+                "served webrtc offer"
+            );
             Ok(Json(payload))
         }
         None => {
@@ -729,6 +734,11 @@ pub async fn get_webrtc_offer(
             {
                 // Activity observed: refresh session TTL
                 let _ = storage.update_session_ttl(&session_id).await;
+                info!(
+                    session = %session_id,
+                    peer = %params.peer_id,
+                    "retargeted orphaned webrtc offer"
+                );
                 return Ok(Json(payload));
             }
 
@@ -804,6 +814,13 @@ pub async fn get_webrtc_answer(
         Some(payload) => {
             // Activity observed: refresh session TTL
             let _ = storage.update_session_ttl(&session_id).await;
+            info!(
+                session = %session_id,
+                handshake_id = %payload.handshake_id,
+                from_peer = %payload.from_peer,
+                to_peer = %payload.to_peer,
+                "served webrtc answer"
+            );
             Ok(Json(payload))
         }
         None => {
@@ -814,6 +831,11 @@ pub async fn get_webrtc_answer(
             if !exists {
                 return Err(StatusCode::NOT_FOUND);
             }
+            warn!(
+                session = %session_id,
+                handshake_id = %params.handshake_id,
+                "webrtc answer unavailable (404)"
+            );
             // Align answer polling semantics with offer polling.
             Err(StatusCode::NOT_FOUND)
         }

@@ -40,6 +40,8 @@ SERVICES = [
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PONG_STACK_SCRIPT = str(REPO_ROOT / "apps/private-beach/demo/pong/tools/pong-stack.sh")
 MANAGER_BASE_URL = os.environ.get("FASTPATH_MANAGER_URL", "http://127.0.0.1:8080").rstrip("/")
+HARNESS_LEASE_REASON = os.environ.get("FASTPATH_LEASE_REASON", "fastpath-integration")
+AGENT_LEASE_REASON = os.environ.get("FASTPATH_AGENT_LEASE_REASON", "pong_showcase")
 AUTH_GATEWAY_URL = os.environ.get(
     "FASTPATH_AUTH_GATEWAY",
     os.environ.get("BEACH_AUTH_GATEWAY", "http://127.0.0.1:4133"),
@@ -71,11 +73,17 @@ BALL_TRACE_SPAN_THRESHOLD = float(
 BALL_TRACE_DIRECTION_EPSILON = float(
     os.environ.get("FASTPATH_BALL_TRACE_DIRECTION_EPS", "0.25")
 )
-BALL_TRACE_GAP_MAX = float(os.environ.get("FASTPATH_BALL_TRACE_GAP", "4"))
+BALL_TRACE_GAP_MAX = float(os.environ.get("FASTPATH_BALL_TRACE_GAP", "8"))
+BALL_TRACE_SEGMENT_GAP = float(
+    os.environ.get("FASTPATH_BALL_TRACE_SEGMENT_GAP", "1.5")
+)
 COMMAND_TRACE_REMOTE_DIR = os.environ.get(
     "FASTPATH_COMMAND_TRACE_DIR", "/tmp/pong-stack/command-trace"
 )
-RALLY_DELAY_SECONDS = float(os.environ.get("FASTPATH_RALLY_DELAY", "1.0"))
+RALLY_DELAY_SECONDS = float(os.environ.get("FASTPATH_RALLY_DELAY", "6.0"))
+COMMAND_READY_WAIT_SECONDS = float(os.environ.get("FASTPATH_COMMAND_READY_WAIT", "25"))
+CONTROLLER_LEASE_TTL_MS = int(os.environ.get("FASTPATH_LEASE_TTL_MS", "120000"))
+MANAGER_READY_TIMEOUT = int(os.environ.get("FASTPATH_MANAGER_WAIT", "600"))
 
 
 def run(cmd: list[str], *, capture: bool = False, check: bool = True, env=None) -> subprocess.CompletedProcess:
@@ -381,6 +389,14 @@ def load_ball_trace(temp_dir: Path, role: str) -> list[tuple[float, float, float
             continue
         entries.append((timestamp, x, y))
     entries.sort(key=lambda item: item[0])
+    if not entries:
+        return entries
+    last_start = 0
+    for idx in range(1, len(entries)):
+        if entries[idx][0] - entries[idx - 1][0] > BALL_TRACE_SEGMENT_GAP:
+            last_start = idx
+    if last_start > 0:
+        entries = entries[last_start:]
     return entries
 
 
@@ -587,8 +603,15 @@ def attach_sessions(private_beach_id: str, sessions: dict[str, dict[str, str]], 
     return errors
 
 
-def acquire_controller_token(session_id: str, manager_token: str) -> str | None:
-    payload = json.dumps({"reason": "fastpath-integration"}).encode()
+def acquire_controller_token(
+    session_id: str,
+    manager_token: str,
+    reason: str = HARNESS_LEASE_REASON,
+) -> str | None:
+    body = {"reason": reason}
+    if CONTROLLER_LEASE_TTL_MS > 0:
+        body["ttl_ms"] = CONTROLLER_LEASE_TTL_MS
+    payload = json.dumps(body).encode()
     req = urlrequest.Request(
         f"{MANAGER_BASE_URL}/sessions/{session_id}/controller/lease",
         data=payload,
@@ -605,6 +628,64 @@ def acquire_controller_token(session_id: str, manager_token: str) -> str | None:
     except (urlerror.URLError, json.JSONDecodeError) as exc:
         print(f"[fastpath] failed to acquire controller lease for {session_id}: {exc}")
         return None
+
+
+def verify_agent_lease_inside_container(session_id: str) -> tuple[bool, str]:
+    """Attempt to acquire a controller lease from inside beach-manager."""
+
+    lease_body = {"reason": AGENT_LEASE_REASON}
+    if CONTROLLER_LEASE_TTL_MS > 0:
+        lease_body["ttl_ms"] = CONTROLLER_LEASE_TTL_MS
+    script = f"""
+import json
+import sys
+from pathlib import Path
+try:
+    import tomllib as toml
+except ModuleNotFoundError:  # py<3.11
+    import tomli as toml  # type: ignore
+import urllib.request
+import urllib.error
+
+profile = {AUTH_PROFILE!r}
+path = Path('/root/.beach/credentials')
+data = toml.loads(path.read_text())
+token = data.get('profiles', {{}}).get(profile, {{}}).get('access_token', {{}}).get('token')
+if not token:
+    print('error:no_token')
+    sys.exit(2)
+payload = json.dumps({lease_body!r}).encode()
+req = urllib.request.Request(
+    'http://localhost:8080/sessions/{session_id}/controller/lease',
+    data=payload,
+    method='POST',
+    headers={{'Content-Type': 'application/json', 'Authorization': f'Bearer {{token}}'}},
+)
+try:
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        print(f'ok:{{resp.status}}')
+        sys.exit(0)
+except urllib.error.HTTPError as exc:  # pragma: no cover - network conditions
+    detail = exc.read().decode('utf-8', errors='ignore')
+    print(f'error:{{exc.code}}:{{detail}}')
+    sys.exit(exc.code or 1)
+except Exception as exc:  # pragma: no cover - defensive
+    print(f'error:0:{{exc}}')
+    sys.exit(1)
+"""
+    proc = docker_compose(
+        "exec",
+        "-T",
+        "beach-manager",
+        "python3",
+        "-c",
+        script,
+        capture=True,
+    )
+    output = (proc.stdout or proc.stderr).strip()
+    if proc.returncode == 0:
+        return True, output
+    return False, output or f"exit code {proc.returncode}"
 
 
 def queue_terminal_write(
@@ -671,11 +752,11 @@ def trigger_ball_rally(
 
 
 def wait_for_manager() -> None:
-    for _ in range(60):
+    for _ in range(MANAGER_READY_TIMEOUT):
         try:
             with urlrequest.urlopen(f"{MANAGER_BASE_URL}/healthz", timeout=2):
                 return
-        except urlerror.URLError:
+        except (urlerror.URLError, ConnectionResetError):
             time.sleep(1)
     print("error: manager never became ready", file=sys.stderr)
     sys.exit(1)
@@ -780,7 +861,40 @@ def main() -> tuple[int, str | None]:
             controller_tokens[role] = token
         else:
             attach_errors.append(f"{role} host: failed to acquire controller lease")
+
+    agent_session_id = sessions.get("agent", {}).get("session_id")
+    if agent_session_id:
+        agent_token = acquire_controller_token(
+            agent_session_id,
+            manager_token,
+            reason=AGENT_LEASE_REASON,
+        )
+        if agent_token:
+            print(
+                "[fastpath] verified agent controller lease via "
+                f"reason='{AGENT_LEASE_REASON}'"
+            )
+        else:
+            attach_errors.append(
+                "agent: failed to acquire controller lease via manager API"
+            )
+        ok, detail = verify_agent_lease_inside_container(agent_session_id)
+        if ok:
+            print("[fastpath] agent controller lease succeeded from beach-manager container")
+        else:
+            attach_errors.append(
+                "agent: controller lease failed inside beach-manager container "
+                f"({detail or 'no details'})"
+            )
+    else:
+        attach_errors.append("agent: session id missing; cannot verify controller lease")
     time.sleep(5)
+    if COMMAND_READY_WAIT_SECONDS > 0:
+        print(
+            f"[fastpath] waiting {COMMAND_READY_WAIT_SECONDS:.1f}s for controllers to become ready..."
+        )
+        time.sleep(COMMAND_READY_WAIT_SECONDS)
+
     trigger_ball_rally(sessions, controller_tokens, manager_token)
 
     print("[fastpath] waiting for sessions to settle and capturing gameplay...")

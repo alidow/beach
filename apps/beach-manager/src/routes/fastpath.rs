@@ -4,6 +4,7 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
+use tracing::info;
 use webrtc::ice_transport::ice_candidate::RTCIceCandidateInit;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
@@ -43,6 +44,12 @@ pub async fn answer_offer(
         .set_remote_offer(offer)
         .await
         .map_err(|e| ApiError::BadRequest(format!("webrtc error: {e}")))?;
+    info!(
+        target = "controller.fast_path_state",
+        session_id = %session_id,
+        fast_path_id = fps.instance_id(),
+        "fast-path offer answered"
+    );
     state.attach_fast_path(session_id, fps).await;
     Ok(Json(serde_json::json!({ "sdp": answer.sdp })))
 }
@@ -72,15 +79,28 @@ pub async fn add_remote_ice(
         .fast_path_for(&session_id)
         .await
         .ok_or(ApiError::NotFound("fast path not found"))?;
+    let IceBody {
+        candidate,
+        sdp_mid,
+        sdp_mline_index,
+    } = body;
     let init = RTCIceCandidateInit {
-        candidate: body.candidate,
-        sdp_mid: body.sdp_mid,
-        sdp_mline_index: body.sdp_mline_index,
+        candidate: candidate.clone(),
+        sdp_mid: sdp_mid.clone(),
+        sdp_mline_index,
         ..Default::default()
     };
     fps.add_remote_ice(init)
         .await
         .map_err(|e| ApiError::BadRequest(format!("webrtc error: {e}")))?;
+    info!(
+        target = "controller.fast_path_state",
+        session_id = %session_id,
+        fast_path_id = fps.instance_id(),
+        sdp_mid = sdp_mid.as_deref(),
+        sdp_mline_index,
+        "fast-path remote ICE candidate applied"
+    );
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -121,6 +141,15 @@ pub async fn get_local_answer(
         "from_peer": query.from_peer.unwrap_or_else(|| "private-beach-manager".into()),
         "to_peer": query.to_peer.unwrap_or_else(|| "fastpath-client".into())
     });
+    info!(
+        target = "controller.fast_path_state",
+        session_id = %session_id,
+        fast_path_id = fps.instance_id(),
+        handshake_id = payload["handshake_id"].as_str(),
+        from_peer = payload["from_peer"].as_str(),
+        to_peer = payload["to_peer"].as_str(),
+        "fast-path answer served"
+    );
     Ok(Json(payload))
 }
 

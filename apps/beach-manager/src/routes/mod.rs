@@ -110,11 +110,17 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/private-beaches/:id",
-            get(get_private_beach).patch(update_private_beach),
+            get(get_private_beach)
+                .patch(update_private_beach)
+                .delete(delete_private_beach),
         )
         .route(
             "/private-beaches/:id/layout",
             get(get_private_beach_layout).put(put_private_beach_layout),
+        )
+        .route(
+            "/private-beaches/:id/session-graph",
+            post(private_beaches::install_session_graph),
         )
         .route(
             "/private-beaches/:id/controller-assignments/batch",
@@ -1050,6 +1056,112 @@ mod tests {
         unsafe {
             std::env::remove_var("BEACH_SKIP_ROAD_VERIFY");
             std::env::remove_var("BEACH_TEST_DISABLE_HANDSHAKE_HTTP");
+            std::env::remove_var("BEACH_TEST_DISABLE_SESSION_WORKERS");
+        }
+    }
+
+    #[tokio::test]
+    async fn session_graph_install_bootstraps_layout_and_pairings() {
+        let _guard = HANDSHAKE_TEST_GUARD.lock().unwrap();
+        unsafe {
+            std::env::set_var("BEACH_SKIP_ROAD_VERIFY", "1");
+            std::env::set_var("BEACH_TEST_DISABLE_SESSION_WORKERS", "1");
+        }
+        let state = AppState::new();
+        let app = build_router(state.clone());
+        let beach_id = "pb-stack";
+
+        let body = json!({
+            "clearExisting": true,
+            "viewport": { "zoom": 0.9, "pan": { "x": 12.0, "y": 18.0 } },
+            "tiles": [
+                {
+                    "id": "pong-lhs",
+                    "nodeType": "application",
+                    "position": { "x": 0.0, "y": 0.0 },
+                    "size": { "width": 400.0, "height": 320.0 },
+                    "session": { "sessionId": "sess-lhs", "code": "111111", "title": "LHS" }
+                },
+                {
+                    "id": "pong-rhs",
+                    "nodeType": "application",
+                    "position": { "x": 480.0, "y": 0.0 },
+                    "size": { "width": 400.0, "height": 320.0 },
+                    "session": { "sessionId": "sess-rhs", "code": "222222", "title": "RHS" }
+                },
+                {
+                    "id": "pong-agent",
+                    "nodeType": "agent",
+                    "position": { "x": 240.0, "y": 360.0 },
+                    "size": { "width": 420.0, "height": 360.0 },
+                    "session": { "sessionId": "sess-agent", "code": "333333", "title": "Agent" },
+                    "agent": {
+                        "role": "Pong Agent",
+                        "responsibility": "Keep the ball in motion",
+                        "trace": { "enabled": true, "traceId": "trace-123" }
+                    }
+                }
+            ],
+            "relationships": [
+                {
+                    "id": "agent-lhs",
+                    "sourceId": "pong-agent",
+                    "targetId": "pong-lhs",
+                    "updateMode": "poll",
+                    "pollFrequency": 1,
+                    "promptTemplate": "guard lhs paddle"
+                },
+                {
+                    "id": "agent-rhs",
+                    "sourceId": "pong-agent",
+                    "targetId": "pong-rhs",
+                    "updateMode": "poll",
+                    "pollFrequency": 1,
+                    "promptTemplate": "guard rhs paddle"
+                }
+            ]
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/private-beaches/{}/session-graph", beach_id))
+                    .header("authorization", "Bearer test-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            payload["attachments"].as_array().unwrap().len(),
+            3,
+            "three sessions attached"
+        );
+        assert_eq!(
+            payload["pairings"].as_array().unwrap().len(),
+            2,
+            "two controller pairings created"
+        );
+        let layout = &payload["layout"];
+        assert!(layout["tiles"]["pong-agent"].is_object());
+        assert_eq!(
+            layout["metadata"]["agentRelationships"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        unsafe {
+            std::env::remove_var("BEACH_SKIP_ROAD_VERIFY");
             std::env::remove_var("BEACH_TEST_DISABLE_SESSION_WORKERS");
         }
     }

@@ -2089,8 +2089,16 @@ class AgentApp:
             target = force_session
         else:
             if now - self.last_spawn_time < self.serve_interval:
+                self.log(
+                    f"skipping ball spawn; serve interval not elapsed (delta={now - self.last_spawn_time:.2f}s, interval={self.serve_interval:.2f}s)",
+                    level="trace",
+                )
                 return
             if any(session.ball_position for session in self.sessions.values()):
+                self.log(
+                    "skipping ball spawn; ball already present on at least one side",
+                    level="trace",
+                )
                 return
             candidates = [
                 session
@@ -2098,6 +2106,10 @@ class AgentApp:
                 if session.height > 0 and session.side in {"lhs", "rhs"}
             ]
             if not candidates:
+                self.log(
+                    "skipping ball spawn; no eligible lhs/rhs sessions discovered",
+                    level="debug",
+                )
                 return
             target: Optional[SessionState] = None
             if self._next_forced_side:
@@ -2108,11 +2120,19 @@ class AgentApp:
             if target is None:
                 target = self._select_serve_target(candidates)
             if target is None:
+                self.log(
+                    "skipping ball spawn; unable to select serve target from candidates",
+                    level="debug",
+                )
                 return
         spawn_y = self._random_spawn_row(target)
         dx_mag = random.uniform(*self.serve_dx)
         dy_mag = random.uniform(*self.serve_dy)
         command = f"b {spawn_y:.1f} {dx_mag:.1f} {dy_mag:.1f}"
+        self.log(
+            f"autopilot spawning ball via command='{command}' session={target.session_id} side={target.side}",
+            level="info",
+        )
         self._send_command(target, command)
         self.last_spawn_time = now
         self._last_ball_seen = now
@@ -2439,13 +2459,32 @@ class AgentApp:
             self._set_bridge_state_for_endpoint("private_beach.queue_action", "waiting")
             return
         if not self.scheduler.allow_command(session, now):
+            self.log(
+                f"controller scheduler denied command for {session.session_id} (side={session.side}); waiting for next window",
+                level="trace",
+            )
             self._set_bridge_state_for_endpoint("private_beach.queue_action", "waiting")
             return
         payload = f"{command}\n"
+        token_source = (
+            "session" if self.mcp.current_session_token(session.session_id) else "default"
+        )
+        self.log(
+            f"sending controller command session={session.session_id} side={session.side} command='{command}' token_source={token_source}",
+            level="debug",
+        )
         result = self.mcp.queue_terminal_write(session.session_id, payload)
         if result.success:
+            self.log(
+                f"queue_action success session={session.session_id} side={session.side} command='{command}'",
+                level="action",
+            )
             self._set_bridge_state_for_endpoint("private_beach.queue_action", "sent")
         else:
+            self.log(
+                f"queue_action failure session={session.session_id} side={session.side} command='{command}' status={result.status} detail={result.detail}",
+                level="warn",
+            )
             self._set_bridge_state_for_endpoint("private_beach.queue_action", "error")
         self.scheduler.handle_result(session, result, now)
 

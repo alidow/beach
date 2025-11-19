@@ -5,10 +5,13 @@ use axum::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{error, info, warn};
 
-use crate::state::{AppState, ControllerCommandDropReason, StateError, ViewerTokenError};
+use crate::state::{
+    AppState, AttachHandshakeDisposition, ControllerCommandDropReason, ControllerPairing,
+    ControllerUpdateCadence, SessionSummary, StateError, ViewerTokenError,
+};
 
 use super::{sessions::ensure_scope, ApiError, ApiResult, AuthToken};
 
@@ -349,6 +352,138 @@ pub struct BatchAssignmentsResponse {
     pub results: Vec<BatchAssignmentResultItem>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionGraphRequest {
+    pub tiles: Vec<SessionGraphTile>,
+    #[serde(default)]
+    pub relationships: Vec<SessionGraphRelationship>,
+    #[serde(default)]
+    pub viewport: Option<CanvasViewport>,
+    #[serde(default)]
+    pub clear_existing: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionGraphTile {
+    pub id: String,
+    #[serde(default)]
+    pub node_type: SessionGraphNodeType,
+    pub position: CanvasPoint,
+    pub size: CanvasSize,
+    #[serde(default)]
+    pub z_index: Option<i32>,
+    #[serde(default)]
+    pub group_id: Option<String>,
+    #[serde(default)]
+    pub zoom: Option<f64>,
+    #[serde(default)]
+    pub locked: Option<bool>,
+    #[serde(default)]
+    pub toolbar_pinned: Option<bool>,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub session: Option<SessionGraphTileSession>,
+    #[serde(default)]
+    pub agent: Option<SessionGraphAgentSpec>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionGraphNodeType {
+    Application,
+    Agent,
+}
+
+impl Default for SessionGraphNodeType {
+    fn default() -> Self {
+        SessionGraphNodeType::Application
+    }
+}
+
+impl SessionGraphNodeType {
+    fn as_str(&self) -> &'static str {
+        match self {
+            SessionGraphNodeType::Application => "application",
+            SessionGraphNodeType::Agent => "agent",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionGraphTileSession {
+    pub session_id: String,
+    pub code: String,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionGraphAgentSpec {
+    pub role: String,
+    #[serde(default)]
+    pub responsibility: Option<String>,
+    #[serde(default)]
+    pub trace: Option<SessionGraphAgentTrace>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionGraphAgentTrace {
+    pub enabled: bool,
+    #[serde(default)]
+    pub trace_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionGraphRelationship {
+    pub id: String,
+    pub source_id: String,
+    pub target_id: String,
+    #[serde(default)]
+    pub source_handle_id: Option<String>,
+    #[serde(default)]
+    pub target_handle_id: Option<String>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub update_mode: Option<CanvasAgentUpdateMode>,
+    #[serde(default)]
+    pub poll_frequency: Option<i64>,
+    #[serde(default)]
+    pub prompt_template: Option<String>,
+    #[serde(default)]
+    pub update_cadence: Option<ControllerUpdateCadence>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionGraphAttachmentResult {
+    pub tile_id: String,
+    pub session_id: String,
+    pub method: &'static str,
+    pub handshake_dispatched: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionGraphPairingResult {
+    pub relationship_id: String,
+    pub controller_session_id: String,
+    pub child_session_id: String,
+    pub pairing: ControllerPairing,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionGraphResponse {
+    pub layout: CanvasLayout,
+    pub attachments: Vec<SessionGraphAttachmentResult>,
+    pub pairings: Vec<SessionGraphPairingResult>,
+}
+
 pub async fn batch_controller_assignments(
     State(state): State<AppState>,
     token: AuthToken,
@@ -401,6 +536,279 @@ pub async fn batch_controller_assignments(
         results.push(res);
     }
     Ok(Json(BatchAssignmentsResponse { results }))
+}
+
+pub async fn install_session_graph(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(id): Path<String>,
+    Json(body): Json<SessionGraphRequest>,
+) -> ApiResult<SessionGraphResponse> {
+    ensure_scope(&token, "pb:beaches.write")?;
+    ensure_scope(&token, "pb:sessions.write")?;
+    ensure_scope(&token, "pb:control.write")?;
+    if body.tiles.is_empty() {
+        return Err(ApiError::BadRequest("tiles array required".into()));
+    }
+    let SessionGraphRequest {
+        tiles,
+        relationships,
+        viewport,
+        clear_existing,
+    } = body;
+    let account = token.account_uuid();
+    let mut request_tile_ids = HashSet::new();
+    for tile in &tiles {
+        if tile.id.trim().is_empty() {
+            return Err(ApiError::BadRequest("tile id is required".into()));
+        }
+        if !request_tile_ids.insert(tile.id.clone()) {
+            return Err(ApiError::BadRequest(format!(
+                "duplicate tile id {}",
+                tile.id
+            )));
+        }
+        if matches!(tile.node_type, SessionGraphNodeType::Agent) && tile.agent.is_none() {
+            return Err(ApiError::BadRequest(format!(
+                "agent tile {} requires agent metadata",
+                tile.id
+            )));
+        }
+    }
+    let now_ms = Utc::now().timestamp_millis();
+    let mut layout = if clear_existing {
+        CanvasLayout::empty(now_ms)
+    } else {
+        state
+            .get_private_beach_layout(&id, account)
+            .await
+            .map_err(map_state_err)?
+    };
+    let mut session_lookup: HashMap<String, String> = if clear_existing {
+        HashMap::new()
+    } else {
+        layout
+            .tiles
+            .iter()
+            .filter_map(|(tile_id, node)| {
+                extract_session_id_from_tile(node).map(|session_id| (tile_id.clone(), session_id))
+            })
+            .collect()
+    };
+    let mut known_tiles: HashSet<String> = if clear_existing {
+        HashSet::new()
+    } else {
+        layout.tiles.keys().cloned().collect()
+    };
+    known_tiles.extend(request_tile_ids.iter().cloned());
+
+    let mut attachments = Vec::new();
+    let mut attached_summaries: HashMap<String, SessionSummary> = HashMap::new();
+    for tile in &tiles {
+        if let Some(session_spec) = &tile.session {
+            let session_id = session_spec.session_id.trim();
+            if session_id.is_empty() {
+                return Err(ApiError::BadRequest(format!(
+                    "tile {} session_id is required",
+                    tile.id
+                )));
+            }
+            let code = session_spec.code.trim();
+            if code.is_empty() {
+                return Err(ApiError::BadRequest(format!(
+                    "tile {} code is required",
+                    tile.id
+                )));
+            }
+            let outcome = state
+                .attach_by_code(
+                    &id,
+                    session_id,
+                    code,
+                    account,
+                    AttachHandshakeDisposition::Dispatch,
+                )
+                .await
+                .map_err(map_state_err)?;
+            session_lookup.insert(tile.id.clone(), outcome.session.session_id.clone());
+            attached_summaries.insert(tile.id.clone(), outcome.session.clone());
+            attachments.push(SessionGraphAttachmentResult {
+                tile_id: tile.id.clone(),
+                session_id: outcome.session.session_id.clone(),
+                method: "code",
+                handshake_dispatched: outcome.handshake_dispatched,
+            });
+        }
+    }
+
+    let mut max_z = layout
+        .tiles
+        .values()
+        .map(|node| node.z_index)
+        .max()
+        .unwrap_or(0);
+    for tile in &tiles {
+        let base = layout.tiles.get(&tile.id);
+        let mut metadata_map = metadata_map_from(
+            base.and_then(|node| node.metadata.as_ref()),
+            tile.metadata.clone(),
+        )?;
+        metadata_map.insert(
+            "nodeType".into(),
+            serde_json::Value::String(tile.node_type.as_str().into()),
+        );
+        if let Some(summary) = attached_summaries.get(&tile.id) {
+            let meta = session_meta_from_summary(summary, tile.session.as_ref());
+            metadata_map.insert("sessionMeta".into(), meta);
+        }
+        match tile.node_type {
+            SessionGraphNodeType::Agent => {
+                if let Some(agent_spec) = tile.agent.as_ref() {
+                    metadata_map.insert("agentMeta".into(), agent_meta_from_spec(agent_spec));
+                }
+            }
+            SessionGraphNodeType::Application => {
+                metadata_map.remove("agentMeta");
+            }
+        }
+        let metadata_value = if metadata_map.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(metadata_map))
+        };
+        let z_index = tile.z_index.unwrap_or_else(|| {
+            max_z += 1;
+            max_z
+        });
+        layout.tiles.insert(
+            tile.id.clone(),
+            CanvasTileNode {
+                id: tile.id.clone(),
+                position: tile.position.clone(),
+                size: tile.size.clone(),
+                z_index,
+                group_id: tile
+                    .group_id
+                    .clone()
+                    .or_else(|| base.and_then(|node| node.group_id.clone())),
+                zoom: tile.zoom.or_else(|| base.and_then(|node| node.zoom)),
+                locked: tile.locked.or_else(|| base.and_then(|node| node.locked)),
+                toolbar_pinned: tile
+                    .toolbar_pinned
+                    .or_else(|| base.and_then(|node| node.toolbar_pinned)),
+                metadata: metadata_value,
+            },
+        );
+    }
+
+    if let Some(viewport) = viewport {
+        layout.viewport = viewport;
+    }
+
+    let mut relationships_map = if clear_existing {
+        HashMap::new()
+    } else {
+        layout.metadata.agent_relationships.clone()
+    };
+    let mut relationship_order = if clear_existing {
+        Vec::new()
+    } else {
+        layout.metadata.agent_relationship_order.clone()
+    };
+    let mut seen_relationships = HashSet::new();
+    let mut pairings = Vec::new();
+
+    for relationship in &relationships {
+        if relationship.id.trim().is_empty() {
+            return Err(ApiError::BadRequest("relationship id is required".into()));
+        }
+        if !seen_relationships.insert(relationship.id.clone()) {
+            return Err(ApiError::BadRequest(format!(
+                "duplicate relationship id {}",
+                relationship.id
+            )));
+        }
+        if !known_tiles.contains(&relationship.source_id) {
+            return Err(ApiError::BadRequest(format!(
+                "relationship {} references unknown source tile {}",
+                relationship.id, relationship.source_id
+            )));
+        }
+        if !known_tiles.contains(&relationship.target_id) {
+            return Err(ApiError::BadRequest(format!(
+                "relationship {} references unknown target tile {}",
+                relationship.id, relationship.target_id
+            )));
+        }
+        let controller_session_id = session_lookup
+            .get(&relationship.source_id)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "relationship {} source {} does not have an attached session",
+                    relationship.id, relationship.source_id
+                ))
+            })?;
+        let child_session_id = session_lookup
+            .get(&relationship.target_id)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "relationship {} target {} does not have an attached session",
+                    relationship.id, relationship.target_id
+                ))
+            })?;
+        let poll_frequency = sanitize_poll_frequency(relationship.poll_frequency)?;
+        relationships_map.insert(
+            relationship.id.clone(),
+            CanvasAgentRelationship {
+                id: relationship.id.clone(),
+                source_id: relationship.source_id.clone(),
+                target_id: relationship.target_id.clone(),
+                source_handle_id: relationship.source_handle_id.clone(),
+                target_handle_id: relationship.target_handle_id.clone(),
+                instructions: relationship.instructions.clone(),
+                update_mode: relationship.update_mode.clone(),
+                poll_frequency,
+            },
+        );
+        relationship_order.retain(|entry| entry != &relationship.id);
+        relationship_order.push(relationship.id.clone());
+
+        let cadence = relationship
+            .update_cadence
+            .or_else(|| cadence_from_update_mode(&relationship.update_mode));
+        let pairing = state
+            .upsert_controller_pairing(
+                &controller_session_id,
+                &child_session_id,
+                relationship.prompt_template.clone(),
+                cadence,
+                account,
+            )
+            .await
+            .map_err(map_state_err)?;
+        pairings.push(SessionGraphPairingResult {
+            relationship_id: relationship.id.clone(),
+            controller_session_id,
+            child_session_id,
+            pairing,
+        });
+    }
+
+    layout.metadata.agent_relationships = relationships_map;
+    layout.metadata.agent_relationship_order = relationship_order;
+
+    let layout = state
+        .put_private_beach_layout(&id, layout, account)
+        .await
+        .map_err(map_state_err)?;
+
+    Ok(Json(SessionGraphResponse {
+        layout,
+        attachments,
+        pairings,
+    }))
 }
 
 pub async fn create_private_beach(
@@ -460,6 +868,19 @@ pub async fn update_private_beach(
         .await
         .map_err(map_state_err)?;
     Ok(Json(updated))
+}
+
+pub async fn delete_private_beach(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(id): Path<String>,
+) -> ApiResult<serde_json::Value> {
+    ensure_scope(&token, "pb:beaches.write")?;
+    state
+        .delete_private_beach(&id, token.account_uuid())
+        .await
+        .map_err(map_state_err)?;
+    Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
 pub async fn get_private_beach_layout(
@@ -581,5 +1002,130 @@ fn map_state_err(err: StateError) -> ApiError {
                 code: reason.code(),
             },
         },
+    }
+}
+
+fn metadata_map_from(
+    existing: Option<&serde_json::Value>,
+    overrides: Option<serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>, ApiError> {
+    let mut base = existing
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_else(serde_json::Map::new);
+    if let Some(payload) = overrides {
+        match payload {
+            serde_json::Value::Null => base.clear(),
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    base.insert(key, value);
+                }
+            }
+            _ => {
+                return Err(ApiError::BadRequest(
+                    "tile metadata must be an object".into(),
+                ))
+            }
+        }
+    }
+    Ok(base)
+}
+
+fn session_meta_from_summary(
+    summary: &SessionSummary,
+    overrides: Option<&SessionGraphTileSession>,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    let override_title = overrides
+        .and_then(|spec| spec.title.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let derived_title = summary
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.as_object())
+        .and_then(|obj| {
+            obj.get("title")
+                .or_else(|| obj.get("name"))
+                .and_then(|value| value.as_str())
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let title = override_title
+        .or(derived_title)
+        .unwrap_or_else(|| summary.session_id.clone());
+    map.insert("sessionId".into(), serde_json::json!(summary.session_id));
+    map.insert("title".into(), serde_json::json!(title));
+    map.insert("status".into(), serde_json::json!("attached"));
+    if let Some(harness) = serde_json::to_value(&summary.harness_type)
+        .ok()
+        .and_then(|value| value.as_str().map(|s| s.to_string()))
+    {
+        map.insert("harnessType".into(), serde_json::json!(harness));
+    }
+    map.insert(
+        "pendingActions".into(),
+        serde_json::json!(summary.pending_actions as i64),
+    );
+    serde_json::Value::Object(map)
+}
+
+fn agent_meta_from_spec(spec: &SessionGraphAgentSpec) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert("role".into(), serde_json::json!(spec.role.clone()));
+    map.insert(
+        "responsibility".into(),
+        serde_json::json!(spec.responsibility.clone().unwrap_or_default()),
+    );
+    map.insert("isEditing".into(), serde_json::json!(false));
+    if let Some(trace) = spec.trace.as_ref() {
+        let mut trace_map = serde_json::Map::new();
+        trace_map.insert("enabled".into(), serde_json::json!(trace.enabled));
+        if let Some(id) = trace
+            .trace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            trace_map.insert("trace_id".into(), serde_json::json!(id));
+        }
+        map.insert("trace".into(), serde_json::Value::Object(trace_map));
+    }
+    serde_json::Value::Object(map)
+}
+
+fn extract_session_id_from_tile(node: &CanvasTileNode) -> Option<String> {
+    let metadata = node.metadata.as_ref()?.as_object()?;
+    let session_meta = metadata.get("sessionMeta")?.as_object()?;
+    session_meta
+        .get("sessionId")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+}
+
+fn cadence_from_update_mode(
+    mode: &Option<CanvasAgentUpdateMode>,
+) -> Option<ControllerUpdateCadence> {
+    match mode {
+        Some(CanvasAgentUpdateMode::Push) => Some(ControllerUpdateCadence::Fast),
+        Some(CanvasAgentUpdateMode::Poll) => Some(ControllerUpdateCadence::Slow),
+        Some(CanvasAgentUpdateMode::IdleSummary) => Some(ControllerUpdateCadence::Slow),
+        None => None,
+    }
+}
+
+fn sanitize_poll_frequency(value: Option<i64>) -> Result<Option<i64>, ApiError> {
+    const MIN_POLL_SECS: i64 = 1;
+    const MAX_POLL_SECS: i64 = 86_400;
+    if let Some(freq) = value {
+        if freq < MIN_POLL_SECS || freq > MAX_POLL_SECS {
+            return Err(ApiError::BadRequest(
+                "pollFrequency must be between 1 and 86400 seconds".into(),
+            ));
+        }
+        Ok(Some(freq))
+    } else {
+        Ok(None)
     }
 }

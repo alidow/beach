@@ -20,10 +20,7 @@ use std::{
 use crate::auth::{AuthConfig, AuthContext};
 use crate::publish_token::{PublishTokenManager, SignedPublishToken};
 use crate::{
-    fastpath::{
-        fast_path_action_bytes, send_actions_over_fast_path, FastPathRegistry, FastPathSendOutcome,
-        FastPathSession,
-    },
+    fastpath::{fast_path_action_bytes, FastPathRegistry, FastPathSession},
     log_throttle::{should_log_custom_event, should_log_queue_event, QueueLogKind},
     metrics,
 };
@@ -2005,6 +2002,12 @@ impl AppState {
     pub async fn attach_fast_path(&self, session_id: String, fps: FastPathSession) {
         let arc = Arc::new(fps);
         arc.spawn_receivers(self.clone());
+        info!(
+            target = "controller.fast_path_state",
+            session_id = %session_id,
+            fast_path_id = arc.instance_id(),
+            "attaching fast-path session"
+        );
         self.fast_paths.insert(session_id, arc).await;
     }
 
@@ -2064,6 +2067,12 @@ impl AppState {
         let mut map = self.events.write().await;
         if map.remove(session_id).is_some() {
             debug!(session_id = %session_id, "session stream cleared");
+        }
+        {
+            let mut devtools = self.devtools_events.write().await;
+            if devtools.remove(session_id).is_some() {
+                debug!(session_id = %session_id, "devtools stream cleared");
+            }
         }
         self.state_keepalive.cancel(session_id).await;
     }
@@ -3617,6 +3626,10 @@ impl AppState {
                     .fallback
                     .session_readiness_snapshot(&session_uuid_str)
                     .await;
+                let http_ready = readiness_override
+                    .as_ref()
+                    .map(|snapshot| snapshot.http_ready())
+                    .unwrap_or(false);
                 let lease = match self
                     .fetch_active_lease_for_token(pool, identifiers.session_id, token_uuid)
                     .await
@@ -3661,165 +3674,9 @@ impl AppState {
                 let trace_context = self
                     .build_agent_trace_context(pool, &identifiers, &actions)
                     .await;
-                let mut fast_path_error: Option<String> = None;
-                let transport_mode = self.session_transport_mode(session_id).await;
-                let prefer_fast_path = matches!(transport_mode, TransportMode::FastPath);
-                if matches!(transport_mode, TransportMode::FastPath)
-                    && !self.fast_path_ready(&session_uuid_str).await
-                {
-                    return Err(
-                        self.controller_command_rejection_with_snapshot(
-                            &private_beach_id_str,
-                            &session_uuid_str,
-                            controller_token,
-                            Some(lease.id),
-                            actor_account_id,
-                            ControllerCommandDropReason::FastPathNotReady,
-                            readiness_override.clone(),
-                        )
-                        .await,
-                    );
-                }
-                if prefer_fast_path {
-                    match send_actions_over_fast_path(&self.fast_paths, &session_uuid_str, &actions)
-                        .await
-                    {
-                        Ok(FastPathSendOutcome::Delivered) => {
-                            let now = now_ms();
-                            self.update_pairing_transport_status(
-                                &session_uuid_str,
-                                PairingTransportStatus::fast_path(now),
-                            )
-                            .await;
-
-                            let label0 = identifiers.private_beach_id.to_string();
-                            let label1 = session_uuid_str.clone();
-                            metrics::FASTPATH_ACTIONS_SENT
-                                .with_label_values(&[label0.as_str(), label1.as_str()])
-                                .inc_by(actions.len() as u64);
-
-                            self.clear_http_backlog_after_fast_path(
-                                &identifiers.private_beach_id.to_string(),
-                                &session_uuid_str,
-                            )
-                            .await;
-
-                            let mut tx = pool.begin().await?;
-                            self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
-                                .await?;
-                            self.insert_controller_event(
-                                &mut tx,
-                                identifiers.session_id,
-                                "actions_queued",
-                                Some(lease.id),
-                                lease.controller_account_id,
-                                actor_account_id,
-                                None,
-                            )
-                            .await?;
-                            tx.commit().await?;
-
-                            debug!(
-                                target = "controller.delivery",
-                                session_id = %session_uuid,
-                                private_beach_id = %identifiers.private_beach_id,
-                                action_count = actions.len(),
-                                transport = "fast_path",
-                                "dispatched actions via fast-path"
-                            );
-
-                            self.publish(
-                                session_id,
-                                StreamEvent::ControllerEvent(ControllerEvent {
-                                    id: Uuid::new_v4().to_string(),
-                                    event_type: ControllerEventType::ActionsQueued,
-                                    controller_token: Some(token_uuid.to_string()),
-                                    timestamp_ms: now,
-                                    reason: None,
-                                    controller_account_id: lease
-                                        .controller_account_id
-                                        .map(|u| u.to_string()),
-                                    issued_by_account_id: actor_account_id.map(|u| u.to_string()),
-                                }),
-                            )
-                            .await;
-                            if let Some((agent_sessions, payload)) = trace_context.as_ref() {
-                                Self::log_agent_bridge_payload(
-                                    agent_sessions,
-                                    &session_uuid,
-                                    &identifiers.private_beach_id,
-                                    payload,
-                                    "agent_to_child",
-                                    "fast_path",
-                                );
-                            }
-                            self.emit_connector_events_for_child(
-                                session_id,
-                                "connector.action:forwarded",
-                                DevtoolsEventLevel::Info,
-                                Some(serde_json::json!({
-                                    "count": action_count,
-                                    "transport": "fast_path",
-                                })),
-                            )
-                            .await;
-                            return Ok(());
-                        }
-                        Ok(FastPathSendOutcome::SessionMissing)
-                        | Ok(FastPathSendOutcome::ChannelMissing) => {
-                            if matches!(transport_mode, TransportMode::FastPath) {
-                                return Err(
-                                    self.controller_command_rejection_with_snapshot(
-                                        &private_beach_id_str,
-                                        &session_uuid_str,
-                                        controller_token,
-                                        Some(lease.id),
-                                        actor_account_id,
-                                        ControllerCommandDropReason::FastPathNotReady,
-                                        readiness_override.clone(),
-                                    )
-                                    .await,
-                                );
-                            }
-                            trace!(
-                                target = "controller.delivery",
-                                session_id = %session_uuid,
-                                private_beach_id = %identifiers.private_beach_id,
-                                "fast-path unavailable for session; falling back to HTTP transport"
-                            );
-                        }
-                        Err(err) => {
-                            warn!(
-                                target = "fast_path",
-                                session_id = %session_uuid,
-                                error = %err,
-                                "fast-path send failed; falling back to HTTP transport"
-                            );
-                            fast_path_error = Some(err.to_string());
-                            let now = now_ms();
-                            self.update_pairing_transport_status(
-                                &session_uuid_str,
-                                PairingTransportStatus::http_fallback(now, Some(err.to_string())),
-                            )
-                            .await;
-                        }
-                    }
-                }
-
-                if matches!(transport_mode, TransportMode::FastPath) {
-                    return Err(
-                        self.controller_command_rejection_with_snapshot(
-                            &private_beach_id_str,
-                            &session_uuid_str,
-                            controller_token,
-                            Some(lease.id),
-                            actor_account_id,
-                            ControllerCommandDropReason::FastPathNotReady,
-                            readiness_override.clone(),
-                        )
-                        .await,
-                    );
-                }
+                let trace_context = self
+                    .build_agent_trace_context(pool, &identifiers, &actions)
+                    .await;
 
                 let queue_depth = self
                     .pending_actions_count(&private_beach_id_str, &session_uuid_str)
@@ -3850,7 +3707,6 @@ impl AppState {
                     private_beach_id = %identifiers.private_beach_id,
                     action_count = actions.len(),
                     transport = "http_fallback",
-                    fast_path_error = fast_path_error.as_deref(),
                     "queuing actions via Redis fallback"
                 );
 
@@ -3910,15 +3766,6 @@ impl AppState {
 
                 self.fallback.enqueue_actions(session_id, actions).await;
 
-                let fast_path_error_detail = fast_path_error.clone();
-                if let Some(error) = fast_path_error {
-                    debug!(
-                        target = "controller_pairing",
-                        session_id = %session_uuid,
-                        error = %error,
-                        "fast-path unavailable; actions queued via fallback"
-                    );
-                }
                 self.publish(
                     session_id,
                     StreamEvent::ControllerEvent(ControllerEvent {
@@ -3950,7 +3797,6 @@ impl AppState {
                     Some(serde_json::json!({
                         "count": action_count,
                         "transport": "http_fallback",
-                        "fastPathError": fast_path_error_detail,
                     })),
                 )
                 .await;
@@ -6283,6 +6129,7 @@ impl AppState {
             Valid {
                 private_beach_id: String,
                 readiness: Option<SessionReadinessSnapshot>,
+                http_ready: bool,
             },
             Missing {
                 private_beach_id: String,
@@ -6295,16 +6142,19 @@ impl AppState {
             let record = sessions
                 .get_mut(session_id)
                 .ok_or(StateError::SessionNotFound)?;
+            let snapshot = record.readiness_snapshot();
             let readiness = if self.controller_strict_gating() {
-                Some(record.readiness_snapshot())
+                Some(snapshot.clone())
             } else {
                 None
             };
+            let http_ready = snapshot.http_ready();
             let private_beach_id = record.private_beach_id.clone();
             match record.lease(controller_token).cloned() {
                 Some(lease) if lease.expires_at_ms > now_ms() => LeaseState::Valid {
                     private_beach_id,
                     readiness,
+                    http_ready,
                 },
                 _ => LeaseState::Missing {
                     private_beach_id,
@@ -6313,11 +6163,12 @@ impl AppState {
             }
         };
 
-        let (private_beach_id, readiness) = match lease_state {
+        let (private_beach_id, readiness, http_ready_flag) = match lease_state {
             LeaseState::Valid {
                 private_beach_id,
                 readiness,
-            } => (private_beach_id, readiness),
+                http_ready,
+            } => (private_beach_id, readiness, http_ready),
             LeaseState::Missing {
                 private_beach_id,
                 readiness,
@@ -6339,6 +6190,11 @@ impl AppState {
             }
         };
 
+        let readiness_snapshot = readiness.clone();
+        let http_ready = readiness_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.http_ready())
+            .unwrap_or(http_ready_flag);
         if self.controller_strict_gating() {
             self.enforce_controller_gate(
                 &private_beach_id,
@@ -6349,6 +6205,24 @@ impl AppState {
                 readiness,
             )
             .await?;
+        }
+
+        let transport_mode = self.session_transport_mode(session_id).await;
+        let fast_path_ready = self.fast_path_ready(session_id).await;
+        let fast_path_required =
+            matches!(transport_mode, TransportMode::FastPath) && !http_ready && fast_path_ready;
+        if fast_path_required && self.fast_path_for(session_id).await.is_none() {
+            return Err(self
+                .controller_command_rejection_with_snapshot(
+                    &private_beach_id,
+                    session_id,
+                    controller_token,
+                    None,
+                    None,
+                    ControllerCommandDropReason::FastPathNotReady,
+                    readiness_snapshot,
+                )
+                .await);
         }
 
         let mut sessions = self.fallback.sessions.write().await;
@@ -7533,6 +7407,174 @@ impl AppState {
             settings: row.3,
             created_at: row.4.timestamp_millis(),
         })
+    }
+
+    pub async fn delete_private_beach(
+        &self,
+        id_str: &str,
+        account: Option<Uuid>,
+    ) -> Result<(), StateError> {
+        match &self.backend {
+            Backend::Memory => {
+                let session_ids = {
+                    let sessions = self.fallback.sessions.read().await;
+                    sessions
+                        .iter()
+                        .filter_map(|(session_id, record)| {
+                            if record.private_beach_id == id_str {
+                                Some(session_id.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<String>>()
+                };
+                for session_id in &session_ids {
+                    self.stop_session_workers(session_id, "private_beach_deleted")
+                        .await;
+                    self.clear_session_stream(session_id).await;
+                    self.fast_paths.remove(session_id).await;
+                }
+                self.purge_private_beach_state(id_str, &session_ids).await;
+                info!(
+                    target = "private_beach",
+                    private_beach_id = %id_str,
+                    session_count = session_ids.len(),
+                    "private beach deleted (memory backend)"
+                );
+                Ok(())
+            }
+            Backend::Postgres(pool) => {
+                let id = parse_uuid(id_str, "id")?;
+                let private_beach_id = id.to_string();
+                let mut tx = pool.begin().await?;
+                if let Some(owner) = account {
+                    self.set_account_context_tx(&mut tx, Some(&owner)).await?;
+                } else {
+                    self.set_account_context_tx(&mut tx, None).await?;
+                }
+                self.set_rls_context_tx(&mut tx, &id).await?;
+
+                if account.is_none() {
+                    let ok: Option<(Uuid,)> = sqlx::query_as(
+                        "SELECT id FROM private_beach WHERE id = $1 AND owner_account_id IS NULL",
+                    )
+                    .bind(id)
+                    .fetch_optional(tx.as_mut())
+                    .await?;
+                    if ok.is_none() {
+                        return Err(StateError::PrivateBeachNotFound);
+                    }
+                } else {
+                    let exists: Option<(Uuid,)> =
+                        sqlx::query_as("SELECT id FROM private_beach WHERE id = $1")
+                            .bind(id)
+                            .fetch_optional(tx.as_mut())
+                            .await?;
+                    if exists.is_none() {
+                        return Err(StateError::PrivateBeachNotFound);
+                    }
+                }
+
+                let session_rows: Vec<Uuid> = sqlx::query_scalar(
+                    "SELECT origin_session_id FROM session WHERE private_beach_id = $1",
+                )
+                .bind(id)
+                .fetch_all(tx.as_mut())
+                .await?;
+
+                let deleted: Option<Uuid> =
+                    sqlx::query_scalar("DELETE FROM private_beach WHERE id = $1 RETURNING id")
+                        .bind(id)
+                        .fetch_optional(tx.as_mut())
+                        .await?;
+
+                if deleted.is_none() {
+                    return Err(StateError::PrivateBeachNotFound);
+                }
+
+                tx.commit().await?;
+
+                let mut session_ids: Vec<String> = session_rows
+                    .into_iter()
+                    .map(|row| row.to_string())
+                    .collect();
+                let fallback_sessions = {
+                    let sessions = self.fallback.sessions.read().await;
+                    sessions
+                        .iter()
+                        .filter_map(|(session_id, record)| {
+                            if record.private_beach_id == private_beach_id {
+                                Some(session_id.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<String>>()
+                };
+                for id in fallback_sessions {
+                    if !session_ids.contains(&id) {
+                        session_ids.push(id);
+                    }
+                }
+
+                for session_id in &session_ids {
+                    self.stop_session_workers(session_id, "private_beach_deleted")
+                        .await;
+                    self.clear_session_stream(session_id).await;
+                    self.fast_paths.remove(session_id).await;
+                }
+
+                self.purge_private_beach_state(&private_beach_id, &session_ids)
+                    .await;
+                info!(
+                    target = "private_beach",
+                    private_beach_id = %private_beach_id,
+                    session_count = session_ids.len(),
+                    "private beach deleted"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    async fn purge_private_beach_state(&self, private_beach_id: &str, session_ids: &[String]) {
+        let session_set: HashSet<String> = session_ids.iter().cloned().collect();
+        {
+            let mut sessions = self.fallback.sessions.write().await;
+            sessions.retain(|session_id, record| {
+                if record.private_beach_id == private_beach_id {
+                    return false;
+                }
+                !session_set.contains(session_id)
+            });
+        }
+        {
+            let mut pairings = self.fallback.pairings.write().await;
+            pairings.retain(|controller_id, list| {
+                if session_set.contains(controller_id) {
+                    return false;
+                }
+                list.retain(|pairing| !session_set.contains(&pairing.child_session_id));
+                !list.is_empty()
+            });
+        }
+        {
+            let mut pending = self.fallback.pending_transport.write().await;
+            for session_id in &session_set {
+                pending.remove(session_id);
+            }
+        }
+        {
+            let mut layouts = self.fallback.canvas_layouts.write().await;
+            layouts.remove(private_beach_id);
+        }
+        {
+            let mut handshakes = self.controller_handshakes.write().await;
+            for session_id in &session_set {
+                handshakes.remove(session_id);
+            }
+        }
     }
 
     pub async fn get_private_beach_layout(
@@ -9342,10 +9384,8 @@ async fn drive_controller_forwarder(
     }
 }
 
-const CONTROLLER_DATA_CHANNEL_LABELS: [&str; 2] = [
-    CONTROLLER_CHANNEL_LABEL,
-    LEGACY_CONTROLLER_CHANNEL_LABEL,
-];
+const CONTROLLER_DATA_CHANNEL_LABELS: [&str; 2] =
+    [CONTROLLER_CHANNEL_LABEL, LEGACY_CONTROLLER_CHANNEL_LABEL];
 
 async fn select_controller_transport(
     primary_transport: Arc<dyn Transport>,
@@ -9355,6 +9395,7 @@ async fn select_controller_transport(
     session_id: &str,
     private_beach_id: &str,
 ) -> (Arc<dyn Transport>, &'static str, bool) {
+    let _ = metadata_label;
     if fast_path_enabled {
         if let Some(label) = metadata_label {
             if CONTROLLER_DATA_CHANNEL_LABELS
@@ -9388,6 +9429,13 @@ async fn select_controller_transport(
                 );
                 return (channel, "fast_path", true);
             }
+        } else {
+            trace!(
+                target = "controller.forwarder",
+                session_id = %session_id,
+                private_beach_id = %private_beach_id,
+                "fast-path enabled but no WebRTC channels available; using HTTP fallback"
+            );
         }
     } else {
         debug!(
@@ -9432,48 +9480,45 @@ async fn wait_for_controller_data_channel(
     let mut primary_done = false;
     let mut legacy_done = false;
 
-    match timeout(
-        CONTROLLER_FAST_PATH_WAIT,
-        async {
-            loop {
-                tokio::select! {
-                    res = &mut wait_primary, if !primary_done => {
-                        primary_done = true;
-                        match res {
-                            Ok(channel) => break Some((channel, CONTROLLER_CHANNEL_LABEL)),
-                            Err(err) => {
-                                warn!(
-                                    target = "controller.forwarder",
-                                    label = CONTROLLER_CHANNEL_LABEL,
-                                    session_id = %session_id,
-                                    private_beach_id = %private_beach_id,
-                                    error = %err,
-                                    "failed waiting for controller data channel"
-                                );
-                            }
+    match timeout(CONTROLLER_FAST_PATH_WAIT, async {
+        loop {
+            tokio::select! {
+                res = &mut wait_primary, if !primary_done => {
+                    primary_done = true;
+                    match res {
+                        Ok(channel) => break Some((channel, CONTROLLER_CHANNEL_LABEL)),
+                        Err(err) => {
+                            warn!(
+                                target = "controller.forwarder",
+                                label = CONTROLLER_CHANNEL_LABEL,
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                error = %err,
+                                "failed waiting for controller data channel"
+                            );
                         }
                     }
-                    res = &mut wait_legacy, if !legacy_done => {
-                        legacy_done = true;
-                        match res {
-                            Ok(channel) => break Some((channel, LEGACY_CONTROLLER_CHANNEL_LABEL)),
-                            Err(err) => {
-                                warn!(
-                                    target = "controller.forwarder",
-                                    label = LEGACY_CONTROLLER_CHANNEL_LABEL,
-                                    session_id = %session_id,
-                                    private_beach_id = %private_beach_id,
-                                    error = %err,
-                                    "failed waiting for legacy controller data channel"
-                                );
-                            }
-                        }
-                    }
-                    else => break None,
                 }
+                res = &mut wait_legacy, if !legacy_done => {
+                    legacy_done = true;
+                    match res {
+                        Ok(channel) => break Some((channel, LEGACY_CONTROLLER_CHANNEL_LABEL)),
+                        Err(err) => {
+                            warn!(
+                                target = "controller.forwarder",
+                                label = LEGACY_CONTROLLER_CHANNEL_LABEL,
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                error = %err,
+                                "failed waiting for legacy controller data channel"
+                            );
+                        }
+                    }
+                }
+                else => break None,
             }
-        },
-    )
+        }
+    })
     .await
     {
         Ok(Some(result)) => Some(result),
@@ -10327,9 +10372,12 @@ mod tests {
             _ => panic!("unexpected forwarder event"),
         }
 
-        assert!(tokio::time::timeout(StdDuration::from_millis(200), rx.recv())
-            .await
-            .is_err(), "no second fast-path event expected");
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(200), rx.recv())
+                .await
+                .is_err(),
+            "no second fast-path event expected"
+        );
         drop(watchers);
     }
 
@@ -10391,21 +10439,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            pairing
-                .transport_status
-                .as_ref()
-                .map(|s| s.transport),
+            pairing.transport_status.as_ref().map(|s| s.transport),
             Some(PairingTransportKind::FastPath)
         );
 
         // Pending cache should be cleared once the replay succeeds.
-        assert!(
-            state
-                .fallback
-                .take_pending_transport_status("lhs-sess")
-                .await
-                .is_none()
-        );
+        assert!(state
+            .fallback
+            .take_pending_transport_status("lhs-sess")
+            .await
+            .is_none());
     }
 
     #[test]
@@ -10625,13 +10668,11 @@ mod tests {
     }
 
     #[test_timeout::tokio_timeout_test(10)]
-    async fn fast_path_mode_rejects_when_session_missing() {
+    async fn fast_path_mode_rejects_until_http_ready() {
         let state = AppState::new().with_controller_strict_gating(false);
         let session_id = "sess-fast-path-only";
         let token = insert_manual_session(&state, session_id, |record| {
             record.mark_attached();
-            record.mark_http_ready();
-            record.last_health_at = Some(Instant::now());
             record.transport_mode = TransportMode::FastPath;
         })
         .await;
@@ -10640,6 +10681,8 @@ mod tests {
             state.session_transport_mode(session_id).await,
             TransportMode::FastPath
         ));
+
+        test_support::set_fast_path_ready_override(session_id, true);
 
         let err = state
             .queue_actions(session_id, &token, vec![new_action("cmd-fast")], None)
@@ -10652,6 +10695,21 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+
+        {
+            let mut sessions = state.fallback.sessions.write().await;
+            if let Some(record) = sessions.get_mut(session_id) {
+                record.mark_http_ready();
+                record.last_health_at = Some(Instant::now());
+            }
+        }
+
+        test_support::clear_fast_path_ready_override();
+
+        state
+            .queue_actions(session_id, &token, vec![new_action("cmd-fast-2")], None)
+            .await
+            .expect("fast-path sessions fall back to HTTP once ready");
     }
 
     #[test_timeout::tokio_timeout_test(10)]

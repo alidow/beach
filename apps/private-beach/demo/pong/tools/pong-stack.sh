@@ -39,6 +39,94 @@ REPO_ROOT=/app
 CARGO_BIN_DIR=${PONG_CARGO_BIN_DIR:-/usr/local/cargo/bin}
 PLAYER_LOG_LEVEL=${PONG_LOG_LEVEL:-info}
 AGENT_LOG_LEVEL=${PONG_AGENT_LOG_LEVEL:-$PLAYER_LOG_LEVEL}
+HOST_MANAGER_TOKEN=""
+HOST_TOKEN_EXPORT=""
+
+resolve_host_token() {
+  local profile="$1"
+  python3 - "$profile" <<'PY'
+import os, sys
+profile = sys.argv[1]
+path = os.path.expanduser('~/.beach/credentials')
+target_section = f"profiles.{profile}.access_token"
+section = None
+token = None
+try:
+    with open(path, 'r', encoding='utf-8') as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+            if line.startswith('[') and line.endswith(']'):
+                section = line[1:-1].strip()
+                continue
+            if section == target_section and line.startswith('token'):
+                try:
+                    _, value = line.split('=', 1)
+                    token = value.strip().strip('"')
+                    break
+                except ValueError:
+                    pass
+except FileNotFoundError:
+    pass
+if not token:
+    sys.exit(1)
+sys.stdout.write(token)
+PY
+}
+
+if [[ -z "${PONG_DISABLE_HOST_TOKEN:-}" ]]; then
+  if HOST_MANAGER_TOKEN=$(resolve_host_token "$CLI_PROFILE" 2>/dev/null); then
+    if [[ -n "$HOST_MANAGER_TOKEN" ]]; then
+      export HOST_MANAGER_TOKEN
+      HOST_TOKEN_EXPORT="export PB_MANAGER_TOKEN='$HOST_MANAGER_TOKEN'; export PB_MCP_TOKEN='$HOST_MANAGER_TOKEN'; export PB_CONTROLLER_TOKEN='$HOST_MANAGER_TOKEN'; "
+      echo "[pong-stack] using host Beach Auth token for profile '$CLI_PROFILE'" >&2
+    fi
+  else
+    HOST_MANAGER_TOKEN=""
+  fi
+fi
+
+HOST_ACCOUNT_ID=""
+HOST_ACCOUNT_SUBJECT=""
+HOST_ACCOUNT_EMAIL=""
+
+if [[ -n "$HOST_MANAGER_TOKEN" ]]; then
+  account_info=$(python3 - <<'PY'
+import os, sys, json, base64
+token = os.environ.get('HOST_MANAGER_TOKEN')
+if not token:
+    sys.exit(1)
+parts = token.split('.')
+if len(parts) != 3:
+    sys.exit(1)
+padding = '=' * (-len(parts[1]) % 4)
+try:
+    payload = json.loads(base64.urlsafe_b64decode(parts[1] + padding).decode('utf-8'))
+except Exception:
+    sys.exit(1)
+account_id = payload.get('account_id') or payload.get('sub')
+subject = payload.get('sub') or ''
+email = payload.get('email') or 'host-user@beach.test'
+if not account_id:
+    sys.exit(1)
+print(f"{account_id}::{subject}::{email}")
+PY
+  ) || account_info=""
+  if [[ -n "$account_info" ]]; then
+    IFS='::' read -r HOST_ACCOUNT_ID HOST_ACCOUNT_SUBJECT HOST_ACCOUNT_EMAIL <<<"$account_info"
+  fi
+fi
+
+ensure_host_account() {
+  if [[ -z "$HOST_ACCOUNT_ID" ]]; then
+    return
+  fi
+  local subject="$HOST_ACCOUNT_SUBJECT"
+  local email="$HOST_ACCOUNT_EMAIL"
+  local display_name="Host User"
+  docker compose exec -T postgres psql -U postgres -d beach_manager -c "INSERT INTO account (id, type, status, beach_gate_subject, display_name, email) VALUES ('$HOST_ACCOUNT_ID', 'user', 'active', '$subject', '$display_name', '$email') ON CONFLICT (id) DO UPDATE SET status='active', beach_gate_subject=EXCLUDED.beach_gate_subject, email=EXCLUDED.email" >/dev/null 2>&1 || true
+}
 
 run_in_container() {
   local cmd="$1"
@@ -46,6 +134,9 @@ run_in_container() {
 }
 
 ensure_cli_login() {
+  if [[ -n "$HOST_MANAGER_TOKEN" ]]; then
+    return
+  fi
   run_in_container "set -euo pipefail; if [[ ! -s \$HOME/.beach/credentials ]]; then echo '[pong-stack] no beach CLI credentials found; launching beach login...' >&2; cd $REPO_ROOT; BEACH_AUTH_GATEWAY='$AUTH_GATEWAY' cargo run --bin beach -- login --name '$CLI_PROFILE' --force; fi"
 }
 
@@ -71,7 +162,10 @@ start_player() {
 
 start_agent() {
   local beach_id=$1
-  run_in_container "set -euo pipefail; export PRIVATE_BEACH_MANAGER_URL='$MANAGER_URL'; export RUN_AGENT_SESSION_SERVER='$SESSION_SERVER'; export BEACH_AUTH_GATEWAY='$AUTH_GATEWAY'; export LOG_DIR='$LOG_DIR'; export PONG_AGENT_LOG_LEVEL='$AGENT_LOG_LEVEL'; cd $REPO_ROOT; mkdir -p '$LOG_DIR'; : > '$LOG_DIR/agent.log'; chmod +x apps/private-beach/demo/pong/tools/run-agent.sh; nohup setsid apps/private-beach/demo/pong/tools/run-agent.sh '$beach_id' > '$LOG_DIR/agent.log' 2>&1 & echo \$! > '$LOG_DIR/agent.pid'"
+  if [[ -n "$HOST_MANAGER_TOKEN" ]]; then
+    ensure_host_account
+  fi
+  run_in_container "set -euo pipefail; export PRIVATE_BEACH_MANAGER_URL='$MANAGER_URL'; export RUN_AGENT_SESSION_SERVER='$SESSION_SERVER'; export BEACH_AUTH_GATEWAY='$AUTH_GATEWAY'; ${HOST_TOKEN_EXPORT}export LOG_DIR='$LOG_DIR'; export PONG_AGENT_LOG_LEVEL='$AGENT_LOG_LEVEL'; cd $REPO_ROOT; mkdir -p '$LOG_DIR'; : > '$LOG_DIR/agent.log'; chmod +x apps/private-beach/demo/pong/tools/run-agent.sh; nohup setsid apps/private-beach/demo/pong/tools/run-agent.sh '$beach_id' > '$LOG_DIR/agent.log' 2>&1 & echo \$! > '$LOG_DIR/agent.pid'"
   echo "launched pong agent (logs in $LOG_DIR/agent.log)"
 }
 
@@ -106,12 +200,20 @@ case "$COMMAND" in
           exit 1
         fi
         beach_id=$1
-        ensure_cli_login
+        if [[ -z "$HOST_MANAGER_TOKEN" ]]; then
+          ensure_cli_login
+        else
+          echo "[pong-stack] skipping beach login inside container (forwarding host token)" >&2
+        fi
         start_agent "$beach_id"
         ;;
       *)
         beach_id=$target
-        ensure_cli_login
+        if [[ -z "$HOST_MANAGER_TOKEN" ]]; then
+          ensure_cli_login
+        else
+          echo "[pong-stack] skipping beach login inside container (forwarding host token)" >&2
+        fi
         start_player lhs "LHS"
         start_player rhs "RHS"
         start_agent "$beach_id"

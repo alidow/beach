@@ -1423,16 +1423,44 @@ impl<P: TokenProvider> ManagerTransport for HttpTransport<P> {
                 }
 
                 if !commands.is_empty() {
+                    tracing::info!(
+                        target: "fast_path",
+                        session_id = %session_id,
+                        count = commands.len(),
+                        "fast-path actions received from mgr-actions"
+                    );
                     return Ok(commands);
+                } else {
+                    tracing::trace!(
+                        target: "fast_path",
+                        session_id = %session_id,
+                        "no fast-path actions available from mgr-actions; falling back to HTTP poll"
+                    );
                 }
             }
         }
 
         let url = self.url(&format!("sessions/{session_id}/actions/poll"))?;
         let resp = self.request_with_token(self.client.get(url)).await?;
-        resp.json::<Vec<ActionCommand>>()
+        let actions = resp
+            .json::<Vec<ActionCommand>>()
             .await
-            .map_err(|e| HarnessError::Transport(format!("decode actions: {e}")))
+            .map_err(|e| HarnessError::Transport(format!("decode actions: {e}")))?;
+        if !actions.is_empty() {
+            tracing::debug!(
+                target: "fast_path",
+                session_id = %session_id,
+                count = actions.len(),
+                "http actions received via /actions/poll"
+            );
+        } else {
+            tracing::trace!(
+                target: "fast_path",
+                session_id = %session_id,
+                "http /actions/poll returned no actions"
+            );
+        }
+        Ok(actions)
     }
 
     async fn ack_actions(&self, session_id: &str, acks: Vec<ActionAck>) -> HarnessResult<()> {

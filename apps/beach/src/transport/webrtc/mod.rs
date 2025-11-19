@@ -46,14 +46,12 @@ use webrtc_ice::{
 use crate::auth;
 use crate::auth::error::AuthError;
 use crate::auth::gate::TurnIceServer;
-use crate::server::terminal::host::{
-    CONTROLLER_CHANNEL_LABEL, LEGACY_CONTROLLER_CHANNEL_LABEL,
-};
+use crate::server::terminal::host::{CONTROLLER_CHANNEL_LABEL, LEGACY_CONTROLLER_CHANNEL_LABEL};
+use crate::transport::webrtc::signaling::PeerInfo;
 use crate::transport::{
     Transport, TransportError, TransportId, TransportKind, TransportMessage, TransportPair,
     decode_message, encode_message, next_transport_id,
 };
-use crate::transport::webrtc::signaling::PeerInfo;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_ACK_POLL_ATTEMPTS: usize = 200;
@@ -1522,7 +1520,10 @@ impl OffererInner {
             .as_ref()
             .and_then(|meta| meta.get("label"))
             .map(|label| {
-                matches!(label.as_str(), CONTROLLER_CHANNEL_LABEL | LEGACY_CONTROLLER_CHANNEL_LABEL)
+                matches!(
+                    label.as_str(),
+                    CONTROLLER_CHANNEL_LABEL | LEGACY_CONTROLLER_CHANNEL_LABEL
+                )
             })
             .unwrap_or(false)
     }
@@ -1779,9 +1780,7 @@ impl OffererInner {
                         .unwrap_or(false);
                     states.insert(
                         peer_id.to_string(),
-                        PeerLifecycleState::Established {
-                            controller: value,
-                        },
+                        PeerLifecycleState::Established { controller: value },
                     );
                     tracing::trace!(
 
@@ -4056,6 +4055,8 @@ async fn fetch_sdp(
         StatusCode::NO_CONTENT | StatusCode::NOT_FOUND => {
             if let Some(alt_base) = rewrite_signaling_base(base) {
                 let alt_is_fastpath = alt_base.contains("/fastpath/sessions/");
+                /* FIXME: This comment is incorrect; the manager *does* expose a fastpath answer
+                 * endpoint, and we should be retrying it.
                 // Skip useless fastpath retry for answers; manager doesn't expose answer endpoint
                 if alt_is_fastpath && suffix == "answer" {
                     tracing::debug!(
@@ -4068,6 +4069,7 @@ async fn fetch_sdp(
                     );
                     return Ok(None);
                 }
+                */
 
                 let alt_url = endpoint_with_params(&alt_base, suffix, params)?;
                 let alt_url_string = alt_url.as_str().to_string();

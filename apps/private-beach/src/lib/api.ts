@@ -793,6 +793,28 @@ export async function createBeach(name: string, slug: string | undefined, token:
   return res.json();
 }
 
+export async function deleteBeach(id: string, token: string | null, baseUrl?: string): Promise<void> {
+  const res = await fetch(`${base(baseUrl)}/private-beaches/${id}`, {
+    method: 'DELETE',
+    headers: authHeaders(token),
+  });
+  if (res.status === 404) {
+    throw new Error('deleteBeach failed 404');
+  }
+  if (!res.ok) {
+    let detail: string | null = null;
+    try {
+      detail = await res.text();
+    } catch {
+      // ignore body parse failures; surface status code instead
+    }
+    if (detail && detail.trim().length > 0) {
+      throw new Error(`deleteBeach failed ${res.status}: ${detail}`);
+    }
+    throw new Error(`deleteBeach failed ${res.status}`);
+  }
+}
+
 export async function getBeachMeta(id: string, token: string | null, baseUrl?: string): Promise<BeachMeta> {
   const res = await fetch(`${base(baseUrl)}/private-beaches/${id}`, {
     headers: authHeaders(token),

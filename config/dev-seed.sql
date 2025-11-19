@@ -18,6 +18,14 @@ VALUES (
 )
 ON CONFLICT (beach_gate_subject) DO NOTHING;
 
+-- Host CLI profile used by pong-stack.sh / harness
+INSERT INTO account (id, type, status, beach_gate_subject, display_name, email, default_organization_id)
+VALUES (
+  '00000000-0000-0000-0000-000000000001', 'user', 'active', '00000000-0000-0000-0000-000000000001',
+  'Host User', 'mock-user@beach.test', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+)
+ON CONFLICT (id) DO NOTHING;
+
 INSERT INTO organization_membership (organization_id, account_id, role)
 VALUES ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'owner')
 ON CONFLICT (organization_id, account_id) DO NOTHING;

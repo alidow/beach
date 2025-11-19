@@ -1076,9 +1076,25 @@ impl ManagerActionClient {
     ) -> Result<Vec<CtrlActionCommand>, ManagerActionError> {
         let url = format!("{}/sessions/{session_id}/actions/poll", self.base_url);
         let resp = self.send(self.apply_auth(self.http.get(url))).await?;
-        resp.json::<Vec<CtrlActionCommand>>()
+        let actions = resp
+            .json::<Vec<CtrlActionCommand>>()
             .await
-            .map_err(|err| ManagerActionError::Decode(err.to_string()))
+            .map_err(|err| ManagerActionError::Decode(err.to_string()))?;
+        if !actions.is_empty() {
+            debug!(
+                target = "controller.actions",
+                session_id = %session_id,
+                count = actions.len(),
+                "http actions polled from manager"
+            );
+        } else {
+            trace!(
+                target = "controller.actions",
+                session_id = %session_id,
+                "http /actions/poll returned no actions"
+            );
+        }
+        Ok(actions)
     }
 
     async fn pending_actions_status(
@@ -1614,85 +1630,106 @@ fn run_fast_path_controller_channel(
     loop {
         match transport.recv(Duration::from_millis(250)) {
             Ok(message) => match message.payload {
-                Payload::Binary(bytes) => match protocol::decode_client_frame_binary(&bytes) {
-                    Ok(WireClientFrame::Input { seq, data }) => {
-                        if seq <= last_seq {
+                Payload::Binary(bytes) => {
+                    trace!(
+                        target = "controller.actions.fast_path",
+                        session_id = %session_id,
+                        transport_id,
+                        bytes = bytes.len(),
+                        "fast path binary payload received"
+                    );
+                    match protocol::decode_client_frame_binary(&bytes) {
+                        Ok(WireClientFrame::Input { seq, data }) => {
+                            debug!(
+                                target = "controller.actions.fast_path",
+                                session_id = %session_id,
+                                transport_id,
+                                seq,
+                                bytes = data.len(),
+                                "received fast path input frame"
+                            );
+                            if seq <= last_seq {
+                                trace!(
+                                    target = "controller.actions.fast_path",
+                                    session_id = %session_id,
+                                    transport_id,
+                                    seq,
+                                    "duplicate fast path input detected"
+                                );
+                                send_host_frame(&transport, HostFrame::InputAck { seq }).ok();
+                                continue;
+                            }
+
+                            if let Err(err) = writer.write(&data) {
+                                error!(
+                                    target = "controller.actions.fast_path",
+                                    session_id = %session_id,
+                                    transport_id,
+                                    seq,
+                                    error = %err,
+                                    "failed to write fast path input to PTY"
+                                );
+                                fatal_error = true;
+                                break;
+                            }
+
+                            debug!(
+                                target = "controller.actions.fast_path.apply",
+                                session_id = %session_id,
+                                transport_id,
+                                seq,
+                                bytes = data.len(),
+                                "applied fast path controller bytes"
+                            );
+                            last_seq = seq;
+
+                            if let Err(err) =
+                                send_host_frame(&transport, HostFrame::InputAck { seq })
+                            {
+                                warn!(
+                                    target = "controller.actions.fast_path",
+                                    session_id = %session_id,
+                                    transport_id,
+                                    seq,
+                                    error = %err,
+                                    "failed to send fast path input ack"
+                                );
+                            }
+
+                            if let Some((client, action_id)) =
+                                controller_ctx.manager_client().and_then(|client| {
+                                    fast_path_action_id(&data).map(|id| (client, id))
+                                })
+                            {
+                                spawn_optional_http_ack(
+                                    runtime.clone(),
+                                    client,
+                                    session_id.to_string(),
+                                    action_id,
+                                    seq,
+                                );
+                            }
+                        }
+                        Ok(_) => {
                             trace!(
                                 target = "controller.actions.fast_path",
                                 session_id = %session_id,
                                 transport_id,
-                                seq,
-                                "duplicate fast path input detected"
+                                "ignoring non-input fast path frame"
                             );
-                            send_host_frame(&transport, HostFrame::InputAck { seq }).ok();
-                            continue;
                         }
-
-                        if let Err(err) = writer.write(&data) {
-                            error!(
-                                target = "controller.actions.fast_path",
-                                session_id = %session_id,
-                                transport_id,
-                                seq,
-                                error = %err,
-                                "failed to write fast path input to PTY"
-                            );
-                            fatal_error = true;
-                            break;
-                        }
-
-                        debug!(
-                            target = "controller.actions.fast_path.apply",
-                            session_id = %session_id,
-                            transport_id,
-                            seq,
-                            bytes = data.len(),
-                            "applied fast path controller bytes"
-                        );
-                        last_seq = seq;
-
-                        if let Err(err) = send_host_frame(&transport, HostFrame::InputAck { seq }) {
+                        Err(err) => {
                             warn!(
                                 target = "controller.actions.fast_path",
                                 session_id = %session_id,
                                 transport_id,
-                                seq,
+                                bytes = bytes.len(),
                                 error = %err,
-                                "failed to send fast path input ack"
-                            );
-                        }
-
-                        if let Some((client, action_id)) = controller_ctx
-                            .manager_client()
-                            .and_then(|client| fast_path_action_id(&data).map(|id| (client, id)))
-                        {
-                            spawn_optional_http_ack(
-                                runtime.clone(),
-                                client,
-                                session_id.to_string(),
-                                action_id,
-                                seq,
+                                "failed to decode fast path frame"
                             );
                         }
                     }
-                    Ok(_) => {
-                        trace!(
-                            target = "controller.actions.fast_path",
-                            session_id = %session_id,
-                            transport_id,
-                            "ignoring non-input fast path frame"
-                        );
-                    }
-                    Err(err) => {
-                        warn!(
-                            target = "controller.actions.fast_path",
-                            session_id = %session_id,
-                            transport_id,
-                            error = %err,
-                            "failed to decode fast path frame"
-                        );
-                    }
-                },
+                }
                 Payload::Text(text) => {
                     let trimmed = text.trim();
                     if trimmed == "__ready__" || trimmed == "__offer_ready__" {
@@ -4185,7 +4222,6 @@ mod tests {
     };
     use crate::sync::{ServerSynchronizer, SubscriptionId};
     use crate::transport::{Payload, TransportKind, TransportPair};
-    use transport_mod::webrtc::ControllerPeerTracker;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -4195,6 +4231,7 @@ mod tests {
     use tokio::io::{AsyncWriteExt, duplex};
     use tokio::runtime::Runtime;
     use tokio::time::{Instant as TokioInstant, sleep, timeout};
+    use transport_mod::webrtc::ControllerPeerTracker;
     use uuid::Uuid;
 
     #[derive(Clone)]
@@ -4287,11 +4324,20 @@ mod tests {
     fn controller_peer_tracker_limits_parallel_negotiations() {
         let mut tracker = ControllerPeerTracker::default();
         assert!(tracker.reserve("peer-a"));
-        assert!(!tracker.reserve("peer-b"), "second controller should be throttled");
+        assert!(
+            !tracker.reserve("peer-b"),
+            "second controller should be throttled"
+        );
         tracker.promote("peer-a");
-        assert!(!tracker.reserve("peer-b"), "active controller should block new joins");
+        assert!(
+            !tracker.reserve("peer-b"),
+            "active controller should block new joins"
+        );
         tracker.release("peer-a");
-        assert!(tracker.reserve("peer-b"), "slot should reopen after release");
+        assert!(
+            tracker.reserve("peer-b"),
+            "slot should reopen after release"
+        );
     }
 
     #[test]
@@ -4327,7 +4373,10 @@ mod tests {
         thread::sleep(StdDuration::from_millis(50));
         drop(first_guard);
 
-        assert!(handle.join().expect("second waiter joined"), "second permit should block until released");
+        assert!(
+            handle.join().expect("second waiter joined"),
+            "second permit should block until released"
+        );
     }
 
     #[tokio::test]

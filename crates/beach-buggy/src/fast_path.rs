@@ -2,7 +2,7 @@ use crate::{ActionAck, ActionCommand, HarnessError, HarnessResult, StateDiff};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     collections::{hash_map::Entry, HashMap},
     sync::Arc,
@@ -643,28 +643,144 @@ fn wire_action_handler(dc: Arc<RTCDataChannel>, sender: broadcast::Sender<Action
         let sender = sender.clone();
         let reassembler = reassembler.clone();
         Box::pin(async move {
-            match decode_fast_path_payload(&reassembler, &msg).await {
-                Ok(Some(text)) => match parse_action_payload(&text) {
+            if msg.is_string {
+                match decode_fast_path_payload(&reassembler, &msg).await {
+                    Ok(Some(text)) => match parse_action_payload(&text) {
+                        Ok(action) => {
+                            let _ = sender.send(action);
+                        }
+                        Err(err) => {
+                            warn!(target = "fast_path", error = %err, "failed to parse action message");
+                        }
+                    },
+                    Ok(None) => {
+                        // awaiting more chunks
+                    }
+                    Err(err) => {
+                        warn!(
+                            target = "fast_path",
+                            error = %err,
+                            "failed to decode chunked action message"
+                        );
+                    }
+                }
+            } else {
+                match decode_binary_action_message(&msg.data) {
                     Ok(action) => {
                         let _ = sender.send(action);
                     }
                     Err(err) => {
-                        warn!(target = "fast_path", error = %err, "failed to parse action message");
+                        warn!(
+                            target = "fast_path",
+                            error = %err,
+                            "failed to decode binary action message"
+                        );
                     }
-                },
-                Ok(None) => {
-                    // awaiting more chunks
-                }
-                Err(err) => {
-                    warn!(
-                        target = "fast_path",
-                        error = %err,
-                        "failed to decode chunked action message"
-                    );
                 }
             }
         })
     }));
+}
+
+const WIRE_PROTOCOL_VERSION: u8 = 2;
+const CLIENT_KIND_INPUT: u8 = 0;
+
+fn decode_binary_action_message(data: &[u8]) -> HarnessResult<ActionCommand> {
+    let mut cursor = BinaryCursor::new(data);
+    let header = cursor.read_u8().map_err(|err| {
+        HarnessError::Transport(format!("failed to read fast-path header: {err}"))
+    })?;
+    let version = header >> 5;
+    if version != WIRE_PROTOCOL_VERSION {
+        return Err(HarnessError::Transport(format!(
+            "unsupported fast-path frame version {version}"
+        )));
+    }
+    let frame_type = header & 0x1f;
+    if frame_type != CLIENT_KIND_INPUT {
+        return Err(HarnessError::Transport(format!(
+            "unexpected fast-path frame type {frame_type}"
+        )));
+    }
+    let seq = cursor.read_var_u64()?;
+    let len = cursor.read_var_u32()? as usize;
+    let payload = cursor.read_bytes(len)?.to_vec();
+    let text = String::from_utf8_lossy(&payload).to_string();
+    Ok(ActionCommand {
+        id: format!("fastpath-seq-{seq}"),
+        action_type: "terminal_write".into(),
+        payload: json!({ "bytes": text }),
+        expires_at: None,
+    })
+}
+
+struct BinaryCursor<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> BinaryCursor<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn read_u8(&mut self) -> Result<u8, &'static str> {
+        if self.pos >= self.buf.len() {
+            return Err("unexpected end of fast-path frame");
+        }
+        let byte = self.buf[self.pos];
+        self.pos += 1;
+        Ok(byte)
+    }
+
+    fn read_var_u64(&mut self) -> HarnessResult<u64> {
+        self.read_var_int::<u64>()
+    }
+
+    fn read_var_u32(&mut self) -> HarnessResult<u32> {
+        self.read_var_int::<u32>()
+    }
+
+    fn read_var_int<T>(&mut self) -> HarnessResult<T>
+    where
+        T: TryFrom<u64> + Default,
+    {
+        let mut value: u64 = 0;
+        let mut shift = 0u32;
+        loop {
+            let byte = self
+                .read_u8()
+                .map_err(|err| HarnessError::Transport(err.into()))?;
+            let slice = (byte & 0x7f) as u64;
+            value |= slice << shift;
+            if (byte & 0x80) == 0 {
+                return T::try_from(value).map_err(|_| {
+                    HarnessError::Transport("varint overflow in fast-path frame".into())
+                });
+            }
+            shift += 7;
+            if shift > 63 {
+                return Err(HarnessError::Transport(
+                    "varint overflow in fast-path frame".into(),
+                ));
+            }
+        }
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], HarnessError> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or_else(|| HarnessError::Transport("fast-path frame length overflow".into()))?;
+        if end > self.buf.len() {
+            return Err(HarnessError::Transport(
+                "fast-path frame truncated before payload end".into(),
+            ));
+        }
+        let slice = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(slice)
+    }
 }
 
 async fn decode_fast_path_payload(

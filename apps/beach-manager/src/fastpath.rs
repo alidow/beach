@@ -2,12 +2,12 @@ use std::{
     collections::HashMap,
     net::IpAddr,
     str::FromStr,
-    sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
+    sync::Arc,
 };
 
 use beach_buggy::{
-    fast_path::{frame_fast_path_payload, FastPathChunkReassembler, FastPathPayloadKind},
+    fast_path::{FastPathChunkReassembler, FastPathPayloadKind},
     ActionAck, ActionCommand, StateDiff,
 };
 use beach_client_core::protocol::{self, ClientFrame as WireClientFrame};
@@ -187,6 +187,8 @@ fn resolve_manager_ice_servers() -> (Vec<RTCIceServer>, &'static str) {
     (default_manager_ice_servers(), "default_public_stun")
 }
 
+static FAST_PATH_SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Clone)]
 pub struct FastPathSession {
     pub session_id: String,
@@ -199,6 +201,7 @@ pub struct FastPathSession {
     pub public_ip_hint: Option<String>,
     pub host_hint_for_log: Option<String>,
     next_seq: Arc<AtomicU64>,
+    instance_id: u64,
 }
 
 impl FastPathSession {
@@ -281,6 +284,8 @@ impl FastPathSession {
         cfg.ice_servers = ice_servers;
         let pc = api.new_peer_connection(cfg).await?;
 
+        let instance_id = FAST_PATH_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+
         Ok(FastPathSession {
             session_id,
             pc: Arc::new(pc),
@@ -291,11 +296,16 @@ impl FastPathSession {
             public_ip_hint: nat_ip.clone(),
             host_hint_for_log,
             next_seq: Arc::new(AtomicU64::new(1)),
+            instance_id,
         })
     }
 
     fn next_sequence(&self) -> u64 {
         self.next_seq.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
     }
 
     pub async fn set_remote_offer(
@@ -310,7 +320,11 @@ impl FastPathSession {
                 let label = dc.label().to_string();
                 let this2 = this.clone();
                 Box::pin(async move {
-                    info!(label = %label, "fast-path data channel opened");
+                    info!(
+                        label = %label,
+                        fast_path_id = this.instance_id,
+                        "fast-path data channel opened"
+                    );
                     match label.as_str() {
                         "mgr-actions" => {
                             *this2.actions_tx.lock().await = Some(dc.clone());
@@ -564,6 +578,19 @@ impl FastPathRegistry {
     pub async fn get(&self, session_id: &str) -> Option<Arc<FastPathSession>> {
         self.inner.read().await.get(session_id).cloned()
     }
+
+    pub async fn remove(&self, session_id: &str) -> Option<Arc<FastPathSession>> {
+        let mut guard = self.inner.write().await;
+        guard.remove(session_id).map(|fps| {
+            info!(
+                target = "fast_path",
+                session_id = %session_id,
+                fast_path_id = fps.instance_id(),
+                "fast-path session removed from registry"
+            );
+            fps
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -585,15 +612,20 @@ pub async fn send_actions_over_fast_path(
     const FAST_PATH_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
     if let Some(fps) = registry.get(session_id).await {
+        let fast_path_id = fps.instance_id();
         let guard = fps.actions_tx.lock().await;
         if let Some(dc) = guard.as_ref() {
+            trace!(
+                target = "controller.fast_path_state",
+                session_id = %session_id,
+                fast_path_id,
+                action_count = actions.len(),
+                "sending actions over fast-path channel"
+            );
             for a in actions {
                 let bytes = fast_path_action_bytes(a).map_err(anyhow::Error::msg)?;
                 let seq = fps.next_sequence();
-                let frame = WireClientFrame::Input {
-                    seq,
-                    data: bytes,
-                };
+                let frame = WireClientFrame::Input { seq, data: bytes };
                 let encoded = protocol::encode_client_frame_binary(&frame);
                 let timeout_duration = Duration::from_millis(FAST_PATH_SEND_TIMEOUT_MS);
                 let send_result = timeout(timeout_duration, dc.send(&Bytes::from(encoded))).await;
@@ -628,6 +660,7 @@ pub async fn send_actions_over_fast_path(
                 target = "fast_path.delivery",
                 session_id = %session_id,
                 action_count = actions.len(),
+                fast_path_id,
                 "fast-path actions delivered"
             );
             return Ok(FastPathSendOutcome::Delivered);
@@ -640,6 +673,7 @@ pub async fn send_actions_over_fast_path(
                 target = "fast_path",
                 session_id = %session_id,
                 action_count = actions.len(),
+                fast_path_id,
                 "fast-path actions channel not ready; falling back to HTTP"
             );
         }
@@ -676,9 +710,7 @@ async fn wait_for_channel(
 const FAST_PATH_CHANNEL_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const FAST_PATH_CHANNEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-async fn wait_for_channel_with_timeout<F, Fut, T>(
-    mut fetch: F,
-) -> Option<T>
+async fn wait_for_channel_with_timeout<F, Fut, T>(mut fetch: F) -> Option<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Option<T>>,
@@ -946,6 +978,7 @@ enum ChannelKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beach_buggy::fast_path::frame_fast_path_payload;
     use bytes::Bytes;
     use std::sync::Arc;
     use tokio::runtime::Runtime;
@@ -972,7 +1005,10 @@ mod tests {
         let expected = FAST_PATH_CHANNEL_WAIT_TIMEOUT.as_millis()
             / FAST_PATH_CHANNEL_POLL_INTERVAL.as_millis()
             + 1;
-        assert!(attempt_count as u128 >= expected, "attempts should continue until timeout");
+        assert!(
+            attempt_count as u128 >= expected,
+            "attempts should continue until timeout"
+        );
     }
 
     #[tokio::test(start_paused = true)]

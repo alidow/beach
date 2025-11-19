@@ -475,6 +475,15 @@ pub async fn queue_actions(
         }
     }
 
+    if let Err(err) = &result {
+        warn!(
+            target = "controller.actions",
+            session_id = %session_id,
+            error = %err,
+            "queue_actions rejected"
+        );
+    }
+
     result.map_err(map_state_err)?;
 
     Ok(Json(serde_json::json!({ "accepted": true })))
@@ -1042,6 +1051,13 @@ fn map_state_err(err: StateError) -> ApiError {
             ApiError::BadRequest("sessions must belong to the same private beach".into())
         }
         StateError::PrivateBeachNotFound => ApiError::NotFound("private beach not found"),
+        StateError::AccountMissing(account) => ApiError::ConflictWithCode {
+            message: format!(
+                "controller account {} is not registered in this cluster",
+                account
+            ),
+            code: "account_missing",
+        },
         StateError::InvalidIdentifier(msg) => ApiError::BadRequest(msg),
         StateError::InvalidLayout(msg) => ApiError::BadRequest(msg),
         StateError::Database(e) => {
@@ -1069,11 +1085,11 @@ fn map_state_err(err: StateError) -> ApiError {
         }
         StateError::ControllerCommandRejected { reason } => match reason {
             ControllerCommandDropReason::FastPathNotReady => ApiError::PreconditionFailed {
-                message: reason.default_message(),
+                message: reason.default_message().to_string(),
                 code: reason.code(),
             },
             _ => ApiError::ConflictWithCode {
-                message: reason.default_message(),
+                message: reason.default_message().to_string(),
                 code: reason.code(),
             },
         },

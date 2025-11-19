@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd "$script_dir/.." && pwd)
+
+usage() {
+  cat <<'USAGE'
+Usage: dockerup [--enable-trace]
+
+Runs the full compose setup after loading .envrc via direnv. Run it through `direnv exec .` so the ICE envs actually load (e.g., `direnv exec . ./scripts/dockerup --enable-trace`).
+Pass --enable-trace to set BEACH_MANAGER_STDOUT_LOG/FILE_LOG/TRACE_DEPS=trace.
+USAGE
+}
+
+TRACE=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --enable-trace)
+      TRACE=true
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+direnv allow >/dev/null 2>&1 || true
+
+./scripts/dockerdown --postgres-only
+docker compose down
+docker compose build beach-manager
+
+if [[ "$TRACE" == "true" ]]; then
+  sh -c 'BEACH_MANAGER_STDOUT_LOG=trace BEACH_MANAGER_FILE_LOG=trace BEACH_MANAGER_TRACE_DEPS=1 docker compose up -d'
+else
+  docker compose up -d
+fi

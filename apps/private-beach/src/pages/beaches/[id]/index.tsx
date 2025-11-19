@@ -11,6 +11,7 @@ const CanvasSurface = dynamic(() => import('../../../components/CanvasSurface'),
 import SessionDrawer from '../../../components/SessionDrawer';
 import { Button } from '../../../components/ui/button';
 import AddSessionModal from '../../../components/AddSessionModal';
+import PongShowcaseDrawer from '../../../components/PongShowcaseDrawer';
 import {
   SessionSummary,
   listSessions,
@@ -222,6 +223,7 @@ export default function BeachDashboard() {
   const [error, setError] = useState<string | null>(null);
   const [canvasLayout, setCanvasLayout] = useState<CanvasLayout | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [showcaseOpen, setShowcaseOpen] = useState(false);
   const [selected, setSelected] = useState<SessionSummary | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -1250,6 +1252,9 @@ export default function BeachDashboard() {
               >
                 {sidebarOpen ? 'Hide Explorer' : 'Show Explorer'}
               </Button>
+              <Button variant="outline" onClick={() => setShowcaseOpen(true)}>
+                Showcase
+              </Button>
               <Button variant="outline" onClick={() => setAddOpen(true)}>Add</Button>
               <Button
                 onClick={() => {
@@ -1356,6 +1361,13 @@ export default function BeachDashboard() {
           onRemove={handleRemoveAssignment}
           saving={assignmentSaving}
           error={assignmentError}
+        />
+        <PongShowcaseDrawer
+          open={showcaseOpen}
+          onOpenChange={setShowcaseOpen}
+          privateBeachId={id ?? ''}
+          token={managerToken}
+          managerUrl={managerUrl}
         />
       </div>
     </BeachSettingsProvider>

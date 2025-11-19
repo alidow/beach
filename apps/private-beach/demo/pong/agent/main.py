@@ -2143,9 +2143,17 @@ class AgentApp:
         if any(session.ball_position for session in self.sessions.values()):
             self._last_ball_seen = now
             return
-        watchdog_interval = max(self.serve_interval * 1.5, 3.0)
+
+        # Allow configuration via env var, default to existing logic (max of serve_interval*1.5 or 3.0)
+        default_interval = max(self.serve_interval * 1.5, 3.0)
+        try:
+            watchdog_interval = float(os.environ.get("PONG_WATCHDOG_INTERVAL", default_interval))
+        except (ValueError, TypeError):
+            watchdog_interval = default_interval
+
         if now - self._last_ball_seen < watchdog_interval:
             return
+
         candidates = [
             session
             for session in self.sessions.values()
@@ -2153,7 +2161,20 @@ class AgentApp:
         ]
         if not candidates:
             return
-        target = self._select_serve_target(candidates) or candidates[0]
+
+        # Don't spawn if we don't have a healthy connection to at least one candidate
+        # This prevents "double ball" issues during fast-path fallback/instability
+        healthy_candidates = [
+            s for s in candidates
+            if s.transport_status in {"ready", "streaming"}
+        ]
+        if not healthy_candidates:
+            # If no one is healthy, we can't reliably spawn anyway.
+            # Resetting the timer prevents a spawn storm when connection returns.
+            self._last_ball_seen = now
+            return
+
+        target = self._select_serve_target(healthy_candidates) or healthy_candidates[0]
         self._maybe_spawn_ball(now, force_session=target)
 
     def _track_ball_carrier(self, now: float) -> None:

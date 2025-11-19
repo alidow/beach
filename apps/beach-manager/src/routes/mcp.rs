@@ -347,6 +347,13 @@ fn state_error(id: Option<Value>, err: StateError) -> JsonRpcResponse {
             "sessions must belong to the same private beach".into(),
         ),
         StateError::PrivateBeachNotFound => (-32006, "private beach not found".into()),
+        StateError::AccountMissing(account) => (
+            -32015,
+            format!(
+                "controller account {} is not registered in this cluster",
+                account
+            ),
+        ),
         StateError::InvalidIdentifier(reason) => (-32602, reason.clone()),
         StateError::InvalidLayout(reason) => (-32602, reason.clone()),
         StateError::Database(db_err) => {

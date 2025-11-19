@@ -41,6 +41,9 @@ Prevent silent failures in the Pong showcase (no ball motion, fast-path "counter
   }
   ```
 - **Blocking logic**: `status = "blocked"` whenever an issue has severity `error`. Warnings keep `status = "ok"`.
+- The list of accounts checked can be overridden via the `PONG_SHOWCASE_REQUIRED_ACCOUNTS`
+  environment variable (comma-separated UUIDs). It defaults to the seed host CLI account
+  `00000000-0000-0000-0000-000000000001`.
 
 ### 3. Seed data update
 

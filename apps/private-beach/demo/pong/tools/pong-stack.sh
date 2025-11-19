@@ -4,12 +4,17 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  pong-stack.sh start <private-beach-id>  Start LHS, RHS, and agent inside docker compose service.
-  pong-stack.sh start lhs                 Start only the LHS player.
-  pong-stack.sh start rhs                 Start only the RHS player.
-  pong-stack.sh start agent <pb-id>       Start only the mock agent.
-  pong-stack.sh stop                      Stop all pong demo processes running in the service.
-  pong-stack.sh codes                     Print current session IDs and passcodes from logs.
+  pong-stack.sh [--setup-beach] start <private-beach-id>  Start LHS, RHS, agent, and optionally auto-configure the beach layout.
+  pong-stack.sh start lhs                                   Start only the LHS player.
+  pong-stack.sh start rhs                                   Start only the RHS player.
+  pong-stack.sh start agent <pb-id>                         Start only the mock agent.
+  pong-stack.sh stop                                        Stop all pong demo processes running in the service.
+  pong-stack.sh codes                                       Print current session IDs and passcodes from logs.
+
+Options:
+  --setup-beach         After launching lhs/rhs/agent, configure the private beach layout
+                        via the manager session-graph API and verify that the attachments
+                        and controller pairings succeeded.
 
 Environment variables:
   PONG_DOCKER_SERVICE   Docker compose service name (default: beach-manager)
@@ -19,6 +24,38 @@ Environment variables:
   PONG_CODES_WAIT       Seconds to wait before printing session codes (default: 8)
 USAGE
 }
+
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 1
+fi
+
+SETUP_BEACH=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --setup-beach)
+      SETUP_BEACH=true
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "unknown option: $1" >&2
+      usage
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
 
 if [[ $# -lt 1 ]]; then
   usage
@@ -41,6 +78,9 @@ PLAYER_LOG_LEVEL=${PONG_LOG_LEVEL:-info}
 AGENT_LOG_LEVEL=${PONG_AGENT_LOG_LEVEL:-$PLAYER_LOG_LEVEL}
 HOST_MANAGER_TOKEN=""
 HOST_TOKEN_EXPORT=""
+STACK_MANAGER_TOKEN=""
+API_RESPONSE=""
+API_STATUS=""
 
 resolve_host_token() {
   local profile="$1"
@@ -165,7 +205,7 @@ start_agent() {
   if [[ -n "$HOST_MANAGER_TOKEN" ]]; then
     ensure_host_account
   fi
-  run_in_container "set -euo pipefail; export PRIVATE_BEACH_MANAGER_URL='$MANAGER_URL'; export RUN_AGENT_SESSION_SERVER='$SESSION_SERVER'; export BEACH_AUTH_GATEWAY='$AUTH_GATEWAY'; ${HOST_TOKEN_EXPORT}export LOG_DIR='$LOG_DIR'; export PONG_AGENT_LOG_LEVEL='$AGENT_LOG_LEVEL'; cd $REPO_ROOT; mkdir -p '$LOG_DIR'; : > '$LOG_DIR/agent.log'; chmod +x apps/private-beach/demo/pong/tools/run-agent.sh; nohup setsid apps/private-beach/demo/pong/tools/run-agent.sh '$beach_id' > '$LOG_DIR/agent.log' 2>&1 & echo \$! > '$LOG_DIR/agent.pid'"
+  run_in_container "set -euo pipefail; export PRIVATE_BEACH_MANAGER_URL='$MANAGER_URL'; export RUN_AGENT_SESSION_SERVER='$SESSION_SERVER'; export BEACH_AUTH_GATEWAY='$AUTH_GATEWAY'; ${HOST_TOKEN_EXPORT}export LOG_DIR='$LOG_DIR'; export PONG_AGENT_LOG_LEVEL='$AGENT_LOG_LEVEL'; export PONG_WATCHDOG_INTERVAL='${PONG_WATCHDOG_INTERVAL:-}'; cd $REPO_ROOT; mkdir -p '$LOG_DIR'; : > '$LOG_DIR/agent.log'; chmod +x apps/private-beach/demo/pong/tools/run-agent.sh; nohup setsid apps/private-beach/demo/pong/tools/run-agent.sh '$beach_id' > '$LOG_DIR/agent.log' 2>&1 & echo \$! > '$LOG_DIR/agent.pid'"
   echo "launched pong agent (logs in $LOG_DIR/agent.log)"
 }
 
@@ -178,6 +218,482 @@ stop_stack() {
   echo "terminated pong demo processes in $SERVICE"
 }
 
+resolve_container_manager_token() {
+  local py_script cmd
+  read -r -d '' py_script <<'PY'
+import os
+import sys
+
+profile = os.environ.get("CLI_PROFILE") or "local"
+path = os.path.expanduser("~/.beach/credentials")
+target_section = f"profiles.{profile}.access_token"
+section = None
+token = None
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1].strip()
+                continue
+            if section == target_section and line.startswith("token"):
+                parts = line.split("=", 1)
+                if len(parts) == 2:
+                    candidate = parts[1].strip().strip('"')
+                    if candidate:
+                        token = candidate
+                        break
+except FileNotFoundError:
+    pass
+if not token:
+    sys.exit(1)
+print(token)
+PY
+  printf -v cmd $'set -euo pipefail;\nexport CLI_PROFILE=%q;\npython3 - <<\'PY\'\n%s\nPY\n' "$CLI_PROFILE" "$py_script"
+  run_in_container "$cmd"
+}
+
+get_stack_manager_token() {
+  if [[ -n "$STACK_MANAGER_TOKEN" ]]; then
+    printf '%s\n' "$STACK_MANAGER_TOKEN"
+    return 0
+  fi
+  if [[ -n "$HOST_MANAGER_TOKEN" ]]; then
+    STACK_MANAGER_TOKEN="$HOST_MANAGER_TOKEN"
+    printf '%s\n' "$STACK_MANAGER_TOKEN"
+    return 0
+  fi
+  ensure_cli_login
+  local container_token
+  if ! container_token=$(resolve_container_manager_token); then
+    echo "[pong-stack] unable to resolve manager token inside container" >&2
+    return 1
+  fi
+  STACK_MANAGER_TOKEN="$container_token"
+  printf '%s\n' "$STACK_MANAGER_TOKEN"
+}
+
+manager_api_request() {
+  local method=$1
+  local path=$2
+  local body_file=${3:-}
+  local token
+  if ! token=$(get_stack_manager_token); then
+    return 1
+  fi
+  local base="${MANAGER_URL%/}"
+  local url="${base}${path}"
+  local response_file http_code
+  response_file=$(mktemp 2>/dev/null || mktemp -t pong-stack-resp)
+  local -a curl_args
+  curl_args=(-sS -o "$response_file" -w '%{http_code}' -X "$method" -H "authorization: Bearer $token")
+  if [[ -n "$body_file" ]]; then
+    curl_args+=(-H "content-type: application/json" "--data-binary" "@$body_file")
+  fi
+  local attempt=0
+  while [[ $attempt -lt 5 ]]; do
+    attempt=$((attempt + 1))
+    if http_code=$(curl "${curl_args[@]}" "$url"); then
+      break
+    fi
+    sleep 1
+  done
+  if [[ -z "$http_code" ]]; then
+    rm -f "$response_file"
+    echo "[pong-stack] failed to reach manager at $url" >&2
+    return 1
+  fi
+  API_RESPONSE=$(cat "$response_file")
+  rm -f "$response_file"
+  API_STATUS="$http_code"
+  if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]]; then
+    return 0
+  fi
+  echo "[pong-stack] manager API ${method} ${path} failed (status ${http_code})" >&2
+  return 1
+}
+
+wait_for_manager() {
+  local attempt=0
+  while [[ $attempt -lt 15 ]]; do
+    attempt=$((attempt + 1))
+    if curl -sS -o /dev/null "http://localhost:8080/healthz"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+run_showcase_preflight() {
+  local beach_id="$1"
+  if [[ -z "$beach_id" ]]; then
+    return 0
+  fi
+  if ! manager_api_request "GET" "/private-beaches/$beach_id/showcase-preflight?refresh=1"; then
+    echo "[pong-stack] unable to fetch showcase preflight diagnostics; continuing without preflight" >&2
+    return 0
+  fi
+  if printf '%s' "$API_RESPONSE" | python3 - <<'PY'; then
+import json
+import sys
+
+raw = sys.stdin.read()
+if not raw.strip():
+    print("[pong-stack] showcase preflight returned empty payload; continuing.")
+    sys.exit(0)
+
+try:
+    payload = json.loads(raw)
+except Exception as exc:
+    print(f"[pong-stack] invalid showcase preflight response: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+status = str(payload.get("status") or "unknown").lower()
+issues = payload.get("issues") or []
+print(f"[pong-stack] showcase preflight status: {status}")
+if not issues:
+    print("[pong-stack] no blocking issues detected.")
+allowed_codes = {
+    "tile_missing",
+    "agent_missing",
+    "pairing_missing",
+    "session_missing",
+    "session_invalid",
+    "tile_missing_session",
+}
+blocking = []
+for issue in issues:
+    severity = str(issue.get("severity") or "error")
+    code = str(issue.get("code") or "issue")
+    detail = str(issue.get("detail") or "")
+    print(f"  - [{severity}] {code}: {detail}")
+    remediation = issue.get("remediation")
+    if isinstance(remediation, str) and remediation.strip():
+        print(f"    fix: {remediation.strip()}")
+    if severity == "error" and code not in allowed_codes:
+        blocking.append(code)
+
+if status == "blocked" and not blocking:
+    print("[pong-stack] layout prerequisites missing; continuing with automatic seeding.")
+    sys.exit(0)
+
+sys.exit(2 if status == "blocked" else 0)
+PY
+    return 0
+  else
+    local status=$?
+    if [[ $status -eq 2 ]]; then
+      echo "[pong-stack] showcase preflight reported blocking issues; aborting launch" >&2
+    else
+      echo "[pong-stack] unable to parse showcase preflight response" >&2
+    fi
+    return "$status"
+  fi
+}
+
+collect_session_bootstrap() {
+  local py_script cmd output attempt
+  read -r -d '' py_script <<'PY'
+import json
+import os
+import sys
+
+roles = ["lhs", "rhs", "agent"]
+log_dir = os.environ.get("LOG_DIR", "/tmp/pong-stack")
+
+def iter_json_objects(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return
+
+def find_bootstrap(payloads):
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("schema") != 2:
+            continue
+        session = payload.get("session_id") or payload.get("sessionId")
+        code = payload.get("join_code") or payload.get("verify_code") or payload.get("code") or payload.get("passcode")
+        if session and code:
+            return str(session).strip(), str(code).strip()
+    return None, None
+
+result = {}
+missing = []
+for role in roles:
+    path = os.path.join(log_dir, f"bootstrap-{role}.json")
+    session, code = find_bootstrap(iter_json_objects(path))
+    if not session or not code:
+        missing.append(role)
+        continue
+    result[role] = {"session_id": session, "code": code}
+if missing:
+    raise SystemExit("missing bootstrap data for: " + ", ".join(missing))
+print(json.dumps(result))
+PY
+  printf -v cmd $'set -euo pipefail;\nexport LOG_DIR=%q;\npython3 - <<\'PY\'\n%s\nPY\n' "$LOG_DIR" "$py_script"
+  for ((attempt = 1; attempt <= 5; attempt++)); do
+    if output=$(run_in_container "$cmd"); then
+      printf '%s\n' "$output"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "[pong-stack] unable to collect session bootstrap metadata from $LOG_DIR" >&2
+  return 1
+}
+
+build_session_graph_payload() {
+  local sessions_file="$1"
+  python3 - "$sessions_file" <<'PY'
+import json
+import sys
+
+sessions_path = sys.argv[1]
+with open(sessions_path, "r", encoding="utf-8") as fh:
+    sessions = json.load(fh)
+
+required_roles = ["lhs", "rhs", "agent"]
+for role in required_roles:
+    if role not in sessions:
+        raise SystemExit(f"missing session data for {role}")
+    entry = sessions[role]
+    if not entry.get("session_id") or not entry.get("code"):
+        raise SystemExit(f"incomplete bootstrap data for {role}")
+
+def normalize(role: str):
+    entry = sessions[role]
+    return str(entry["session_id"]).strip(), str(entry["code"]).strip()
+
+lhs_session, lhs_code = normalize("lhs")
+rhs_session, rhs_code = normalize("rhs")
+agent_session, agent_code = normalize("agent")
+
+tile_specs = {
+    "lhs": {
+        "tile_id": "pong-lhs",
+        "node_type": "application",
+        "title": "Pong LHS",
+        "position": {"x": -540.0, "y": -40.0},
+        "size": {"width": 440.0, "height": 320.0},
+        "z_index": 1,
+    },
+    "rhs": {
+        "tile_id": "pong-rhs",
+        "node_type": "application",
+        "title": "Pong RHS",
+        "position": {"x": 200.0, "y": -40.0},
+        "size": {"width": 440.0, "height": 320.0},
+        "z_index": 2,
+    },
+    "agent": {
+        "tile_id": "pong-agent",
+        "node_type": "agent",
+        "title": "Pong Agent",
+        "position": {"x": -170.0, "y": 360.0},
+        "size": {"width": 520.0, "height": 360.0},
+        "z_index": 3,
+    },
+}
+
+role_session_map = {
+    "lhs": (lhs_session, lhs_code),
+    "rhs": (rhs_session, rhs_code),
+    "agent": (agent_session, agent_code),
+}
+
+tiles = []
+for role, spec in tile_specs.items():
+    session_id, code = role_session_map[role]
+    entry = {
+        "id": spec["tile_id"],
+        "nodeType": spec["node_type"],
+        "position": spec["position"],
+        "size": spec["size"],
+        "zIndex": spec["z_index"],
+        "session": {
+            "sessionId": session_id,
+            "code": code,
+            "title": spec["title"],
+        },
+    }
+    if role == "agent":
+        entry["agent"] = {
+            "role": "Pong Agent",
+            "responsibility": "Coordinate paddle movement for the Pong showcase.",
+            "trace": {"enabled": True, "traceId": "pong-auto-setup"},
+        }
+    tiles.append(entry)
+
+relationships = [
+    {
+        "id": "agent-to-lhs",
+        "sourceId": "pong-agent",
+        "targetId": "pong-lhs",
+        "instructions": "Drive the left paddle to keep the volley alive.",
+        "updateMode": "poll",
+        "pollFrequency": 1,
+        "promptTemplate": "Focus on keeping the ball away from the left wall.",
+        "updateCadence": "slow",
+    },
+    {
+        "id": "agent-to-rhs",
+        "sourceId": "pong-agent",
+        "targetId": "pong-rhs",
+        "instructions": "Mirror positioning to cover the right side.",
+        "updateMode": "poll",
+        "pollFrequency": 1,
+        "promptTemplate": "Maintain control of the right paddle and track the ball closely.",
+        "updateCadence": "slow",
+    },
+]
+
+body = {
+    "clearExisting": True,
+    "viewport": {"zoom": 0.9, "pan": {"x": -80.0, "y": 40.0}},
+    "tiles": tiles,
+    "relationships": relationships,
+}
+
+print(json.dumps(body))
+PY
+}
+
+validate_session_graph_response() {
+  local response_file="$1"
+  local sessions_file="$2"
+  python3 - "$response_file" "$sessions_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    response = json.load(fh)
+with open(sys.argv[2], "r", encoding="utf-8") as fh:
+    sessions = json.load(fh)
+
+tile_lookup = {"lhs": "pong-lhs", "rhs": "pong-rhs", "agent": "pong-agent"}
+attachments = response.get("attachments") or []
+attached_ids = {entry.get("tile_id") for entry in attachments if isinstance(entry, dict)}
+missing = [tid for tid in tile_lookup.values() if tid not in attached_ids]
+if missing:
+    print("missing attachments for tiles: " + ", ".join(missing), file=sys.stderr)
+    sys.exit(1)
+
+pairings = response.get("pairings") or []
+if len(pairings) < 2:
+    print("expected at least two controller pairings", file=sys.stderr)
+    sys.exit(1)
+
+agent_session = sessions["agent"]["session_id"]
+expected_children = {sessions["lhs"]["session_id"], sessions["rhs"]["session_id"]}
+seen = set()
+for pairing in pairings:
+    if pairing.get("controller_session_id") != agent_session:
+        continue
+    child = pairing.get("child_session_id")
+    if child in expected_children:
+        seen.add(child)
+if seen != expected_children:
+    print("pairings missing child sessions: " + ", ".join(sorted(expected_children - seen)), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+verify_sessions_attached() {
+  local sessions_response_file="$1"
+  local sessions_file="$2"
+  python3 - "$sessions_response_file" "$sessions_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    payload = json.load(fh)
+if not isinstance(payload, list):
+    print("unexpected sessions payload format", file=sys.stderr)
+    sys.exit(1)
+with open(sys.argv[2], "r", encoding="utf-8") as fh:
+    sessions = json.load(fh)
+
+expected = {str(entry["session_id"]) for entry in sessions.values()}
+found = {entry.get("session_id") for entry in payload if isinstance(entry, dict)}
+missing = expected - found
+if missing:
+    print("sessions missing from manager: " + ", ".join(sorted(missing)), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+setup_private_beach() {
+  local beach_id="$1"
+  if [[ -z "$beach_id" ]]; then
+    echo "[pong-stack] --setup-beach requires a private beach id" >&2
+    return 1
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "[pong-stack] curl is required for --setup-beach" >&2
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "[pong-stack] python3 is required for --setup-beach" >&2
+    return 1
+  fi
+  echo "[pong-stack] configuring private beach $beach_id via session-graph API" >&2
+  if ! wait_for_manager; then
+    echo "[pong-stack] manager health endpoint unreachable; aborting setup" >&2
+    return 1
+  fi
+  local sessions_json
+  if ! sessions_json=$(collect_session_bootstrap); then
+    return 1
+  fi
+  local tmp_dir
+  tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t pong-stack-setup)
+  local sessions_file="$tmp_dir/sessions.json"
+  local payload_file="$tmp_dir/session-graph.json"
+  local response_file="$tmp_dir/graph-response.json"
+  local session_list_file="$tmp_dir/session-list.json"
+  printf '%s' "$sessions_json" >"$sessions_file"
+  local payload
+  if ! payload=$(build_session_graph_payload "$sessions_file"); then
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  printf '%s' "$payload" >"$payload_file"
+  if ! manager_api_request "POST" "/private-beaches/$beach_id/session-graph" "$payload_file"; then
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  printf '%s' "$API_RESPONSE" >"$response_file"
+  if ! validate_session_graph_response "$response_file" "$sessions_file"; then
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  echo "[pong-stack] installed layout + controller pairings for $beach_id" >&2
+  if ! manager_api_request "GET" "/private-beaches/$beach_id/sessions"; then
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  printf '%s' "$API_RESPONSE" >"$session_list_file"
+  if ! verify_sessions_attached "$session_list_file" "$sessions_file"; then
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  echo "[pong-stack] verified all sessions attached to $beach_id" >&2
+  rm -rf "$tmp_dir"
+}
+
 case "$COMMAND" in
   start)
     if [[ $# -lt 1 ]]; then
@@ -187,12 +703,28 @@ case "$COMMAND" in
     fi
     target=$1
     shift || true
+    while [[ "$target" == "--setup-beach" ]]; do
+      SETUP_BEACH=true
+      if [[ $# -lt 1 ]]; then
+        echo "error: missing start target" >&2
+        usage
+        exit 1
+      fi
+      target=$1
+      shift || true
+    done
     case "$target" in
       lhs)
         start_player lhs "LHS"
+        if [[ "$SETUP_BEACH" == true ]]; then
+          echo "[pong-stack] --setup-beach requires starting the full stack; ignoring flag for 'start lhs'" >&2
+        fi
         ;;
       rhs)
         start_player rhs "RHS"
+        if [[ "$SETUP_BEACH" == true ]]; then
+          echo "[pong-stack] --setup-beach requires starting the full stack; ignoring flag for 'start rhs'" >&2
+        fi
         ;;
       agent)
         if [[ $# -lt 1 ]]; then
@@ -206,6 +738,9 @@ case "$COMMAND" in
           echo "[pong-stack] skipping beach login inside container (forwarding host token)" >&2
         fi
         start_agent "$beach_id"
+        if [[ "$SETUP_BEACH" == true ]]; then
+          echo "[pong-stack] --setup-beach requires starting lhs + rhs + agent together; ignoring flag for agent-only start" >&2
+        fi
         ;;
       *)
         beach_id=$target
@@ -214,12 +749,18 @@ case "$COMMAND" in
         else
           echo "[pong-stack] skipping beach login inside container (forwarding host token)" >&2
         fi
+        if ! run_showcase_preflight "$beach_id"; then
+          exit $?
+        fi
         start_player lhs "LHS"
         start_player rhs "RHS"
         start_agent "$beach_id"
         echo "waiting $CODES_WAIT seconds for sessions to register..."
         sleep "$CODES_WAIT"
         print_codes
+        if [[ "$SETUP_BEACH" == true ]]; then
+          setup_private_beach "$beach_id"
+        fi
         ;;
     esac
     ;;

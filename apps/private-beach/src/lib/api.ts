@@ -86,6 +86,19 @@ export type ViewerCredential = {
   passcode?: string | null;
 };
 
+export type ShowcasePreflightIssue = {
+  code: string;
+  severity: 'error' | 'warning';
+  detail: string;
+  remediation?: string | null;
+};
+
+export type ShowcasePreflightResponse = {
+  status: 'ok' | 'blocked';
+  issues: ShowcasePreflightIssue[];
+  cached?: boolean;
+};
+
 export type McpBridge = {
   id: string;
   name: string;
@@ -346,7 +359,40 @@ export async function issueControllerHandshake(
     headers: authHeaders(token),
     body: JSON.stringify({ passcode, requester_private_beach_id: privateBeachId }),
   });
-  if (!res.ok) throw new Error(`issueControllerHandshake failed ${res.status}`);
+  if (!res.ok) {
+    const rawBody = await res.text();
+    let payload: ApiErrorPayload | Record<string, unknown> | string | null = null;
+    if (rawBody && rawBody.length > 0) {
+      try {
+        payload = JSON.parse(rawBody) as ApiErrorPayload;
+      } catch {
+        payload = rawBody;
+      }
+    }
+    const messageParts = [`issueControllerHandshake failed status=${res.status}`];
+    let errorCode: string | undefined;
+    if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+      const candidate = payload as ApiErrorPayload;
+      if (candidate.message) {
+        messageParts.push(candidate.message);
+      }
+      if (candidate.error_code) {
+        errorCode = candidate.error_code;
+        messageParts.push(`error_code=${candidate.error_code}`);
+      }
+    } else if (typeof payload === 'string' && payload.trim().length > 0) {
+      messageParts.push(`body=${payload.trim().slice(0, 160)}`);
+    }
+    const error: Error & { status?: number; responseBody?: unknown; errorCode?: string } = new Error(
+      messageParts.join(' '),
+    );
+    error.status = res.status;
+    error.responseBody = payload;
+    if (errorCode) {
+      error.errorCode = errorCode;
+    }
+    throw error;
+  }
   return res.json();
 }
 
@@ -362,6 +408,30 @@ export async function revokeControllerHandshake(
     body: JSON.stringify({ controller_token: controllerToken }),
   });
   if (!res.ok) throw new Error(`revokeControllerHandshake failed ${res.status}`);
+}
+
+export async function getShowcasePreflight(
+  privateBeachId: string,
+  token: string | null,
+  baseUrl?: string,
+  refresh?: boolean,
+): Promise<ShowcasePreflightResponse> {
+  if (!token) {
+    throw new Error('Missing manager token for showcase preflight');
+  }
+  const suffix = refresh ? '?refresh=1' : '';
+  const res = await fetch(
+    `${base(baseUrl)}/private-beaches/${privateBeachId}/showcase-preflight${suffix}`,
+    {
+      headers: authHeaders(token),
+    },
+  );
+  if (!res.ok) {
+    const body = await res.text();
+    const snippet = body ? ` body=${body.trim().slice(0, 160)}` : '';
+    throw new Error(`getShowcasePreflight failed ${res.status}${snippet}`);
+  }
+  return res.json();
 }
 
 export async function attachOwned(privateBeachId: string, ids: string[], token: string | null, baseUrl?: string) {

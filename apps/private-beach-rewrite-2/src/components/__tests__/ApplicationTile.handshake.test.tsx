@@ -155,4 +155,40 @@ describe('ApplicationTile controller handshakes', () => {
     });
     expect(mockedSendControlMessage).toHaveBeenCalledTimes(1);
   });
+
+  it('shows a friendly message when the controller account is missing', async () => {
+    const sessionSummary: SessionSummary = {
+      session_id: 'sess-err',
+      metadata: {},
+      harness_type: null,
+      pending_actions: 0,
+    };
+    mockedAttachByCode.mockResolvedValue({ session: sessionSummary });
+    const err = new Error('account missing');
+    (err as Record<string, unknown>).errorCode = 'account_missing';
+    mockedIssueControllerHandshake.mockRejectedValue(err);
+
+    render(
+      <ApplicationTile
+        tileId="tile-err"
+        privateBeachId="pb-err"
+        managerUrl="http://manager.test"
+        roadUrl="http://road.test"
+        sessionMeta={null}
+        onSessionMetaChange={() => {}}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText(/Session ID/i), { target: { value: 'sess-err' } });
+    fireEvent.change(screen.getByLabelText(/Passcode/i), { target: { value: 'ABCDEF' } });
+    const submitButton = screen.getByRole('button', { name: /connect/i });
+    fireEvent.submit(submitButton.closest('form')!);
+
+    await waitFor(() => {
+      expect(mockedAttachByCode).toHaveBeenCalled();
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/controller account is missing/i)).toBeInTheDocument();
+    });
+  });
 });

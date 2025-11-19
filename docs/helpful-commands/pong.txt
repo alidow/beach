@@ -159,6 +159,11 @@ Hosts automatically switch to the fast path `pb-controller` channel for controll
 ./apps/private-beach/demo/pong/tools/pong-stack.sh codes
 ./apps/private-beach/demo/pong/tools/pong-stack.sh stop
 
+The `start` command now runs the manager's `/private-beaches/<id>/showcase-preflight` API before
+launching the hosts. It prints the collected issues (missing accounts, tiles, or controller pairings)
+and aborts immediately when the status is `blocked`. Fix the reported problems (e.g., rerun `docker
+compose run db-seed` or `--setup-beach`) and re-run the command once the checklist clears.
+
 
 
 
@@ -215,5 +220,4 @@ direnv exec . docker compose exec beach-manager bash -lc '
 
   cd /app && ./apps/private-beach/demo/pong/tools/run-agent.sh <private-beach-id>
 '
-
 

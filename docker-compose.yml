@@ -57,7 +57,7 @@ services:
       CLERK_JWKS_URL: ${CLERK_JWKS_URL:-}
       CLERK_ISSUER: ${CLERK_ISSUER:-}
       CLERK_AUDIENCE: ${CLERK_AUDIENCE:-}
-      BEACH_SESSION_SERVER: http://localhost:4132
+      BEACH_SESSION_SERVER: ${BEACH_SESSION_SERVER:-http://localhost:4132}
       STDOUT_LOG: ${BEACH_MANAGER_STDOUT_LOG:-info}
       BEACH_MANAGER_FILE_LOG: ${BEACH_MANAGER_FILE_LOG:-info,beach_manager=trace}
       LOG_PATH: /var/log/beach-manager/beach-manager.log

@@ -46,6 +46,7 @@ SESSION_SERVER=${RUN_AGENT_SESSION_SERVER:-${PONG_SESSION_SERVER:-http://localho
 export BEACH_AUTH_GATEWAY=${BEACH_AUTH_GATEWAY:-"http://localhost:4133"}
 export BEACH_AUTH_SCOPE=${BEACH_AUTH_SCOPE:-"pb.full"}
 export BEACH_AUTH_AUDIENCE=${BEACH_AUTH_AUDIENCE:-"private-beach"}
+export PONG_WATCHDOG_INTERVAL=${PONG_WATCHDOG_INTERVAL:-}
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/../../../../.." && pwd)

@@ -19,6 +19,7 @@ use std::{
 
 use crate::auth::{AuthConfig, AuthContext};
 use crate::publish_token::{PublishTokenManager, SignedPublishToken};
+use crate::routes::ShowcasePreflightResponse;
 use crate::{
     fastpath::{fast_path_action_bytes, FastPathRegistry, FastPathSession},
     log_throttle::{should_log_custom_event, should_log_queue_event, QueueLogKind},
@@ -86,6 +87,7 @@ const CONTROLLER_STRICT_GATING_ENV: &str = "CONTROLLER_STRICT_GATING";
 const CONTROLLER_STRICT_GATING_DEFAULT_ENABLED: bool = true;
 const CONTROLLER_HANDSHAKE_STALE_AFTER: StdDuration = StdDuration::from_secs(20);
 const IDLE_PUBLISH_TOKEN_HINT_KEY: &str = "idlePublishToken";
+const SHOWCASE_PREFLIGHT_CACHE_TTL: StdDuration = StdDuration::from_secs(30);
 
 pub fn viewer_health_report_interval() -> StdDuration {
     VIEWER_HEALTH_REPORT_INTERVAL
@@ -134,11 +136,17 @@ pub struct AppState {
     idle_snapshot_interval_ms: Option<u64>,
     controller_handshakes: Arc<RwLock<HashMap<String, ControllerHandshakeInfo>>>,
     state_keepalive: StateKeepaliveManager,
+    showcase_preflight_cache: Arc<RwLock<HashMap<String, ShowcasePreflightCacheEntry>>>,
 }
 
 struct ControllerHandshakeInfo {
     control_id: String,
     dispatched_at: Instant,
+}
+
+struct ShowcasePreflightCacheEntry {
+    response: ShowcasePreflightResponse,
+    expires_at: Instant,
 }
 
 #[derive(Clone)]
@@ -772,6 +780,8 @@ pub enum StateError {
     CrossBeachPairing,
     #[error("private beach not found")]
     PrivateBeachNotFound,
+    #[error("controller account missing or inactive")]
+    AccountMissing(Uuid),
     #[error("invalid identifier: {0}")]
     InvalidIdentifier(String),
     #[error("invalid layout: {0}")]
@@ -1207,6 +1217,7 @@ impl AppState {
             idle_snapshot_interval_ms: None,
             controller_handshakes: Arc::new(RwLock::new(HashMap::new())),
             state_keepalive: StateKeepaliveManager::new(),
+            showcase_preflight_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1247,6 +1258,7 @@ impl AppState {
             idle_snapshot_interval_ms: None,
             controller_handshakes: Arc::new(RwLock::new(HashMap::new())),
             state_keepalive: StateKeepaliveManager::new(),
+            showcase_preflight_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1314,6 +1326,63 @@ impl AppState {
     pub fn with_idle_snapshot_interval(mut self, interval_ms: Option<u64>) -> Self {
         self.idle_snapshot_interval_ms = interval_ms;
         self
+    }
+
+    async fn ensure_controller_account_active(
+        &self,
+        account_id: &Uuid,
+        context: &'static str,
+        session_id: Option<&str>,
+    ) -> Result<(), StateError> {
+        if let Backend::Memory = self.backend {
+            return Ok(());
+        }
+        let account = *account_id;
+        let active = self.account_active(account).await?;
+        if !active {
+            warn!(
+                target: "controller.leases",
+                context,
+                account_id = %account_id,
+                session_id = session_id.unwrap_or("unknown"),
+                "controller account missing or inactive"
+            );
+            return Err(StateError::AccountMissing(account));
+        }
+        Ok(())
+    }
+
+    pub async fn cached_showcase_preflight(
+        &self,
+        private_beach_id: &str,
+        refresh: bool,
+    ) -> Option<ShowcasePreflightResponse> {
+        if refresh {
+            return None;
+        }
+        let mut cache = self.showcase_preflight_cache.write().await;
+        if let Some(entry) = cache.get(private_beach_id) {
+            if entry.expires_at > Instant::now() {
+                return Some(entry.response.clone());
+            }
+            cache.remove(private_beach_id);
+        }
+        None
+    }
+
+    pub async fn store_showcase_preflight(
+        &self,
+        private_beach_id: &str,
+        response: ShowcasePreflightResponse,
+    ) {
+        let mut cache = self.showcase_preflight_cache.write().await;
+        cache.insert(
+            private_beach_id.to_string(),
+            ShowcasePreflightCacheEntry {
+                response,
+                expires_at: Instant::now() + SHOWCASE_PREFLIGHT_CACHE_TTL,
+            },
+        );
     }
 
     async fn mark_session_http_ready(&self, session_id: &str) {
@@ -2209,6 +2278,24 @@ impl AppState {
     ) {
         let controllers = self.fallback.controllers_for_child(child_session_id).await;
         if controllers.is_empty() {
+            if let Some(children) = self
+                .fallback
+                .children_for_controller(child_session_id)
+                .await
+            {
+                for child in children {
+                    let controllers = self.fallback.controllers_for_child(&child).await;
+                    if controllers.is_empty() {
+                        self.fallback
+                            .record_pending_transport_status(&child, status.clone())
+                            .await;
+                        continue;
+                    }
+                    self.apply_transport_status_for_child(&child, controllers, status.clone())
+                        .await;
+                }
+                return;
+            }
             self.fallback
                 .record_pending_transport_status(child_session_id, status.clone())
                 .await;
@@ -2220,6 +2307,17 @@ impl AppState {
             );
             return;
         }
+        self.apply_transport_status_for_child(child_session_id, controllers, status)
+            .await;
+    }
+
+    async fn apply_transport_status_for_child(
+        &self,
+        child_session_id: &str,
+        controllers: Vec<String>,
+        status: PairingTransportStatus,
+    ) {
+        let status_clone = status.clone();
 
         // Drop any stale cached status now that a pairing is available.
         let _ = self
@@ -2230,7 +2328,11 @@ impl AppState {
         for controller_session_id in controllers {
             if let Some(updated) = self
                 .fallback
-                .update_pairing_status(&controller_session_id, child_session_id, status.clone())
+                .update_pairing_status(
+                    &controller_session_id,
+                    child_session_id,
+                    status_clone.clone(),
+                )
                 .await
             {
                 metrics::CONTROLLER_PAIRINGS_EVENTS
@@ -2253,9 +2355,9 @@ impl AppState {
                     DevtoolsEventLevel::Info,
                     Some(serde_json::json!({
                         "controllerSessionId": controller_session_id,
-                        "transport": status.transport,
-                        "latencyMs": status.latency_ms,
-                        "error": status.last_error,
+                        "transport": status_clone.transport,
+                        "latencyMs": status_clone.latency_ms,
+                        "error": status_clone.last_error,
                     })),
                 )
                 .await;
@@ -2973,6 +3075,14 @@ impl AppState {
         update_cadence: Option<ControllerUpdateCadence>,
         actor_account_id: Option<Uuid>,
     ) -> Result<ControllerPairing, StateError> {
+        if let Some(account_id) = actor_account_id.as_ref() {
+            self.ensure_controller_account_active(
+                account_id,
+                "controller_pairing_upsert",
+                Some(controller_session_id),
+            )
+            .await?;
+        }
         match &self.backend {
             Backend::Memory => {
                 let (controller, child) = {
@@ -3195,6 +3305,14 @@ impl AppState {
         child_session_id: &str,
         actor_account_id: Option<Uuid>,
     ) -> Result<(), StateError> {
+        if let Some(account_id) = actor_account_id.as_ref() {
+            self.ensure_controller_account_active(
+                account_id,
+                "controller_pairing_delete",
+                Some(controller_session_id),
+            )
+            .await?;
+        }
         match &self.backend {
             Backend::Memory => {
                 let controller = {
@@ -3361,6 +3479,15 @@ impl AppState {
             Backend::Postgres(_) => "postgres",
         };
         let lease_timer = Instant::now();
+        let requester_uuid = requester;
+        if let Some(account_id) = requester_uuid.as_ref() {
+            self.ensure_controller_account_active(
+                account_id,
+                "acquire_controller",
+                Some(session_id),
+            )
+            .await?;
+        }
 
         let response = match &self.backend {
             Backend::Memory => {
@@ -3372,7 +3499,7 @@ impl AppState {
                 let identifiers = self.fetch_session_identifiers(pool, &session_uuid).await?;
                 let ttl = ttl_override.unwrap_or(DEFAULT_LEASE_TTL_MS).max(1_000);
                 let expires_at = Utc::now() + Duration::milliseconds(ttl as i64);
-                let requester_uuid = requester;
+                let requester_uuid = requester_uuid;
 
                 let mut tx = pool.begin().await?;
                 self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
@@ -3533,6 +3660,14 @@ impl AppState {
         controller_token: &str,
         actor_account_id: Option<Uuid>,
     ) -> Result<(), StateError> {
+        if let Some(account_id) = actor_account_id.as_ref() {
+            self.ensure_controller_account_active(
+                account_id,
+                "release_controller",
+                Some(session_id),
+            )
+            .await?;
+        }
         match &self.backend {
             Backend::Memory => {
                 self.release_controller_memory(session_id, controller_token)
@@ -4851,6 +4986,40 @@ impl AppState {
             }
         }
     }
+
+    pub async fn account_active(&self, account_id: Uuid) -> Result<bool, StateError> {
+        match &self.backend {
+            Backend::Memory => Ok(true),
+            Backend::Postgres(pool) => {
+                let active: Option<(i32,)> =
+                    sqlx::query_as("SELECT 1 FROM account WHERE id = $1 AND status = 'active'")
+                        .bind(account_id)
+                        .fetch_optional(pool)
+                        .await?;
+                Ok(active.is_some())
+            }
+        }
+    }
+
+    pub async fn session_attached_to_beach(
+        &self,
+        session_id: &Uuid,
+        private_beach_id: &Uuid,
+    ) -> Result<bool, StateError> {
+        match &self.backend {
+            Backend::Memory => Ok(true),
+            Backend::Postgres(pool) => {
+                let exists: Option<(Uuid,)> = sqlx::query_as(
+                    "SELECT id FROM session WHERE id = $1 AND private_beach_id = $2",
+                )
+                .bind(*session_id)
+                .bind(*private_beach_id)
+                .fetch_optional(pool)
+                .await?;
+                Ok(exists.is_some())
+            }
+        }
+    }
 }
 
 impl StateKeepaliveManager {
@@ -5370,6 +5539,15 @@ impl InnerState {
             .collect()
     }
 
+    async fn children_for_controller(&self, controller_session_id: &str) -> Option<Vec<String>> {
+        let guard = self.pairings.read().await;
+        guard.get(controller_session_id).map(|list| {
+            list.iter()
+                .map(|pairing| pairing.child_session_id.clone())
+                .collect()
+        })
+    }
+
     async fn update_pairing_status(
         &self,
         controller_session_id: &str,
@@ -5843,6 +6021,11 @@ impl AppState {
             entry.ensure_lease(token, expires_at_ms, None, None, None);
         }
 
+        // Memory backend bypasses controller gating to keep test harnesses simple by
+        // treating freshly registered sessions as attached + HTTP-ready.
+        entry.mark_attached();
+        entry.mark_http_ready();
+
         let controller_token = entry.first_lease_token();
         entry.append_event(
             ControllerEventType::Registered,
@@ -6173,6 +6356,13 @@ impl AppState {
                 private_beach_id,
                 readiness,
             } => {
+                warn!(
+                    target = "controller.leases",
+                    private_beach_id = %private_beach_id,
+                    session_id = %session_id,
+                    controller_token = %redact_controller_token(controller_token),
+                    "queue_actions missing lease"
+                );
                 if self.controller_strict_gating() {
                     return Err(self
                         .controller_command_rejection_with_snapshot(

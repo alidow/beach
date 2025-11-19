@@ -321,16 +321,6 @@ function BeachCanvasShellInner({
           </div>
         </div>
         <div className="flex items-center gap-3">
-          <button
-            type="button"
-            onClick={handleToggleDevtools}
-            className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/5 text-slate-300 transition hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/30"
-            aria-pressed={devtoolsOpen}
-            aria-label="Toggle connection dev tools"
-            title="Connection dev tools"
-          >
-            <Activity className="h-4 w-4" />
-          </button>
           {showInteractiveBadge ? (
             <div
               className="inline-flex items-center gap-1.5 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold text-slate-950 shadow-[0_12px_28px_rgba(249,115,22,0.35)] transition hover:brightness-110"
@@ -357,6 +347,16 @@ function BeachCanvasShellInner({
               </button>
             </div>
           ) : null}
+          <button
+            type="button"
+            onClick={handleToggleDevtools}
+            className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-white/10 bg-white/5 text-slate-300 transition hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/30"
+            aria-pressed={devtoolsOpen}
+            aria-label="Toggle connection dev tools"
+            title="Connection dev tools"
+          >
+            <Activity className="h-4 w-4" />
+          </button>
           <ThemeToggleButton />
         </div>
       </header>

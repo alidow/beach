@@ -215,6 +215,20 @@ export function ApplicationTile({
   const [submitState, setSubmitState] = useState<SubmitState>('idle');
   const [attachError, setAttachError] = useState<string | null>(null);
   const [roleWarning, setRoleWarning] = useState<string | null>(null);
+
+  const resolveHandshakeMessage = useCallback((error: unknown): string | null => {
+    if (!error || typeof error !== 'object') {
+      return null;
+    }
+    const payload = error as { errorCode?: string };
+    if (payload.errorCode === 'account_missing') {
+      return 'Controller account is missing or inactive. Run `docker compose run db-seed` (or re-seed dev data) and rerun the showcase preflight checks.';
+    }
+    if (payload.errorCode === 'pairing_missing') {
+      return 'Controller pairings are missing. Reinstall the Pong layout (`pong-stack.sh --setup-beach <id>`) so the agent is paired with each player.';
+    }
+    return null;
+  }, []);
   const [credentialOverride, setCredentialOverride] = useState<SessionCredentialOverride | null>(null);
   const prehydratedSequenceRef = useRef<string | null>(null);
   const cachedStyleUpdatesRef = useRef<Update[] | null>(null);
@@ -303,16 +317,23 @@ export function ApplicationTile({
         handshake = await issueControllerHandshake(
           sessionId,
           passcode,
-            privateBeachId,
-            token,
-            managerUrl,
-          );
+          privateBeachId,
+          token,
+          managerUrl,
+        );
         logConnectionEvent('handshake:success', logContext, {
           leaseExpiresAtMs: handshake.lease_expires_at_ms ?? null,
         });
+        setAttachError((prev) => (prev ? null : prev));
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const friendly = resolveHandshakeMessage(error);
+        const message = friendly ?? (error instanceof Error ? error.message : String(error));
         logConnectionEvent('handshake:error', logContext, { error: message }, 'error');
+        if (friendly) {
+          const wrapped = new Error(message);
+          (wrapped as Record<string, unknown>).errorCode = (error as Record<string, unknown>)?.errorCode;
+          throw wrapped;
+        }
         throw error;
       }
 
@@ -382,7 +403,17 @@ export function ApplicationTile({
         }
       }
     },
-    [clearHandshakeRenewal, managerToken, managerUrl, privateBeachId, refresh, resolvedRoadUrl, tileId],
+    [
+      clearHandshakeRenewal,
+      managerToken,
+      managerUrl,
+      privateBeachId,
+      refresh,
+      resolvedRoadUrl,
+      resolveHandshakeMessage,
+      setAttachError,
+      tileId,
+    ],
   );
 
   useEffect(() => {
@@ -432,7 +463,8 @@ export function ApplicationTile({
     }
     lastHandshakeContextRef.current = { sessionId, passcode };
     void deliverHandshake(sessionId, passcode).catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
+      const friendly = resolveHandshakeMessage(error);
+      const message = friendly ?? (error instanceof Error ? error.message : String(error));
       setAttachError(message);
       console.warn('[application-tile] automatic handshake failed', {
         sessionId,
@@ -445,7 +477,16 @@ export function ApplicationTile({
         managerUrl,
       }, { error: message }, 'warn');
     });
-  }, [credentialOverride?.passcode, deliverHandshake, clearHandshakeRenewal, managerUrl, privateBeachId, sessionMeta?.sessionId, tileId]);
+  }, [
+    credentialOverride?.passcode,
+    deliverHandshake,
+    clearHandshakeRenewal,
+    managerUrl,
+    privateBeachId,
+    resolveHandshakeMessage,
+    sessionMeta?.sessionId,
+    tileId,
+  ]);
 
   useEffect(() => {
     lastViewportSnapshotRef.current = null;
@@ -911,7 +952,8 @@ export function ApplicationTile({
         try {
           await deliverHandshake(session.session_id, trimmedCode);
         } catch (handshakeErr) {
-          const message = handshakeErr instanceof Error ? handshakeErr.message : String(handshakeErr);
+          const friendly = resolveHandshakeMessage(handshakeErr);
+          const message = friendly ?? (handshakeErr instanceof Error ? handshakeErr.message : String(handshakeErr));
           setAttachError(message);
           try {
             console.warn('[application-tile] handshake delivery failed', {
@@ -952,6 +994,7 @@ export function ApplicationTile({
       onSessionMetaChange,
       privateBeachId,
       refresh,
+      resolveHandshakeMessage,
       sessionIdInput,
       tileId,
     ],

@@ -1,12 +1,16 @@
 use axum::{
-    extract::{Path, State},
+    async_trait,
+    extract::{Path, Query, State},
     http::HeaderMap,
     Json,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::env;
+use std::sync::Arc;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::state::{
     AppState, AttachHandshakeDisposition, ControllerCommandDropReason, ControllerPairing,
@@ -484,6 +488,29 @@ pub struct SessionGraphResponse {
     pub pairings: Vec<SessionGraphPairingResult>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ShowcasePreflightQuery {
+    #[serde(default)]
+    pub refresh: Option<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ShowcasePreflightIssue {
+    pub code: String,
+    pub severity: String,
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ShowcasePreflightResponse {
+    pub status: String,
+    pub issues: Vec<ShowcasePreflightIssue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached: Option<bool>,
+}
+
 pub async fn batch_controller_assignments(
     State(state): State<AppState>,
     token: AuthToken,
@@ -811,6 +838,355 @@ pub async fn install_session_graph(
     }))
 }
 
+const DEFAULT_SHOWCASE_ACCOUNT: &str = "00000000-0000-0000-0000-000000000001";
+
+struct ShowcaseTileRequirement {
+    role: &'static str,
+    tile_id: &'static str,
+}
+
+const SHOWCASE_TILE_REQUIREMENTS: &[ShowcaseTileRequirement] = &[
+    ShowcaseTileRequirement {
+        role: "agent",
+        tile_id: "pong-agent",
+    },
+    ShowcaseTileRequirement {
+        role: "lhs",
+        tile_id: "pong-lhs",
+    },
+    ShowcaseTileRequirement {
+        role: "rhs",
+        tile_id: "pong-rhs",
+    },
+];
+
+#[derive(Debug, Clone)]
+struct ShowcaseTileSession {
+    session_id: String,
+}
+
+struct ShowcasePreflightContext<'a> {
+    state: &'a AppState,
+    private_beach_id: Uuid,
+    private_beach_id_str: String,
+    account: Option<Uuid>,
+    layout: Option<Arc<CanvasLayout>>,
+    resolved_tiles: HashMap<&'static str, ShowcaseTileSession>,
+}
+
+impl<'a> ShowcasePreflightContext<'a> {
+    fn new(state: &'a AppState, private_beach_id: Uuid, account: Option<Uuid>) -> Self {
+        Self {
+            state,
+            private_beach_id,
+            private_beach_id_str: private_beach_id.to_string(),
+            account,
+            layout: None,
+            resolved_tiles: HashMap::new(),
+        }
+    }
+
+    fn state(&self) -> &AppState {
+        self.state
+    }
+
+    fn private_beach_id(&self) -> &Uuid {
+        &self.private_beach_id
+    }
+
+    async fn layout(&mut self) -> Result<Arc<CanvasLayout>, StateError> {
+        if self.layout.is_none() {
+            let layout = self
+                .state
+                .get_private_beach_layout(&self.private_beach_id_str, self.account)
+                .await?;
+            self.layout = Some(Arc::new(layout));
+        }
+        Ok(self.layout.as_ref().expect("layout populated").clone())
+    }
+
+    fn set_resolved_tiles(&mut self, map: HashMap<&'static str, ShowcaseTileSession>) {
+        self.resolved_tiles = map;
+    }
+
+    fn tile_for_role(&self, role: &'static str) -> Option<&ShowcaseTileSession> {
+        self.resolved_tiles.get(role)
+    }
+}
+
+#[async_trait]
+trait ShowcasePreflightCheck {
+    async fn run(
+        &self,
+        ctx: &mut ShowcasePreflightContext<'_>,
+    ) -> Result<Vec<ShowcasePreflightIssue>, StateError>;
+}
+
+struct RequiredAccountCheck {
+    accounts: Vec<Uuid>,
+}
+
+#[async_trait]
+impl ShowcasePreflightCheck for RequiredAccountCheck {
+    async fn run(
+        &self,
+        ctx: &mut ShowcasePreflightContext<'_>,
+    ) -> Result<Vec<ShowcasePreflightIssue>, StateError> {
+        let mut issues = Vec::new();
+        for account_id in &self.accounts {
+            if !ctx.state().account_active(*account_id).await? {
+                issues.push(ShowcasePreflightIssue {
+                    code: "missing_account".into(),
+                    severity: "error".into(),
+                    detail: format!("required host account {} is not active", account_id),
+                    remediation: Some(
+                        "run scripts/db-seed to create the host user and retry".into(),
+                    ),
+                });
+            }
+        }
+        Ok(issues)
+    }
+}
+
+struct TileAttachmentCheck {
+    requirements: &'static [ShowcaseTileRequirement],
+}
+
+#[async_trait]
+impl ShowcasePreflightCheck for TileAttachmentCheck {
+    async fn run(
+        &self,
+        ctx: &mut ShowcasePreflightContext<'_>,
+    ) -> Result<Vec<ShowcasePreflightIssue>, StateError> {
+        let mut issues = Vec::new();
+        let layout = ctx.layout().await?;
+        let mut resolved = HashMap::new();
+        for req in self.requirements {
+            match layout.tiles.get(req.tile_id) {
+                Some(tile) => {
+                    if let Some(session_id) = session_id_from_tile(tile) {
+                        match Uuid::parse_str(&session_id) {
+                            Ok(session_uuid) => {
+                                if ctx
+                                    .state()
+                                    .session_attached_to_beach(
+                                        &session_uuid,
+                                        ctx.private_beach_id(),
+                                    )
+                                    .await?
+                                {
+                                    let resolved_id = session_id.clone();
+                                    resolved.insert(
+                                        req.role,
+                                        ShowcaseTileSession {
+                                            session_id: resolved_id,
+                                        },
+                                    );
+                                } else {
+                                    issues.push(ShowcasePreflightIssue {
+                                        code: "session_missing".into(),
+                                        severity: "error".into(),
+                                        detail: format!(
+                                            "session {} from tile '{}' is not attached to this beach",
+                                            session_id, req.tile_id
+                                        ),
+                                        remediation: Some(
+                                            "attach the Tile via the dashboard or rerun pong-stack".
+                                                into(),
+                                        ),
+                                    });
+                                }
+                            }
+                            Err(_) => {
+                                issues.push(ShowcasePreflightIssue {
+                                    code: "session_invalid".into(),
+                                    severity: "error".into(),
+                                    detail: format!(
+                                        "tile '{}' contains invalid session identifier",
+                                        req.tile_id
+                                    ),
+                                    remediation: Some(
+                                        "ensure the tile metadata contains a valid sessionId"
+                                            .into(),
+                                    ),
+                                });
+                            }
+                        }
+                    } else {
+                        issues.push(ShowcasePreflightIssue {
+                            code: "tile_missing_session".into(),
+                            severity: "error".into(),
+                            detail: format!("tile '{}' lacks session metadata", req.tile_id),
+                            remediation: Some(
+                                "attach a session to the tile before starting the showcase".into(),
+                            ),
+                        });
+                    }
+                }
+                None => {
+                    issues.push(ShowcasePreflightIssue {
+                        code: "tile_missing".into(),
+                        severity: "error".into(),
+                        detail: format!("required tile '{}' is not present", req.tile_id),
+                        remediation: Some(
+                            "drop the tile from the catalog and persist the layout".into(),
+                        ),
+                    });
+                }
+            }
+        }
+        ctx.set_resolved_tiles(resolved);
+        Ok(issues)
+    }
+}
+
+struct PairingHealthCheck {
+    requirements: &'static [ShowcaseTileRequirement],
+}
+
+#[async_trait]
+impl ShowcasePreflightCheck for PairingHealthCheck {
+    async fn run(
+        &self,
+        ctx: &mut ShowcasePreflightContext<'_>,
+    ) -> Result<Vec<ShowcasePreflightIssue>, StateError> {
+        let mut issues = Vec::new();
+        let Some(agent) = ctx.tile_for_role("agent") else {
+            issues.push(ShowcasePreflightIssue {
+                code: "agent_missing".into(),
+                severity: "error".into(),
+                detail: "agent session is unavailable; ensure the agent tile is attached".into(),
+                remediation: Some("re-attach the agent tile or restart the showcase stack".into()),
+            });
+            return Ok(issues);
+        };
+        let pairings = ctx
+            .state()
+            .list_controller_pairings(&agent.session_id)
+            .await?
+            .into_iter()
+            .map(|pair| pair.child_session_id)
+            .collect::<HashSet<_>>();
+        let mut missing = Vec::new();
+        for req in self.requirements {
+            if req.role == "agent" {
+                continue;
+            }
+            if let Some(child) = ctx.tile_for_role(req.role) {
+                if !pairings.contains(&child.session_id) {
+                    missing.push(child.session_id.clone());
+                }
+            }
+        }
+        if !missing.is_empty() {
+            issues.push(ShowcasePreflightIssue {
+                code: "pairing_missing".into(),
+                severity: "error".into(),
+                detail: format!(
+                    "agent session is not paired with child sessions: {}",
+                    missing.join(", ")
+                ),
+                remediation: Some(
+                    "create the Agent→Player connections from the canvas and re-save".into(),
+                ),
+            });
+        }
+        Ok(issues)
+    }
+}
+
+struct FastPathWarningCheck;
+
+#[async_trait]
+impl ShowcasePreflightCheck for FastPathWarningCheck {
+    async fn run(
+        &self,
+        ctx: &mut ShowcasePreflightContext<'_>,
+    ) -> Result<Vec<ShowcasePreflightIssue>, StateError> {
+        let mut issues = Vec::new();
+        if let Some(agent) = ctx.tile_for_role("agent") {
+            if !ctx.state().is_fast_path_ready(&agent.session_id).await {
+                issues.push(ShowcasePreflightIssue {
+                    code: "fast_path_pending".into(),
+                    severity: "warning".into(),
+                    detail: format!(
+                        "controller session {} has not connected via fast-path yet",
+                        agent.session_id
+                    ),
+                    remediation: Some(
+                        "wait for the agent harness to complete fast-path upgrade or restart it"
+                            .into(),
+                    ),
+                });
+            }
+        }
+        Ok(issues)
+    }
+}
+
+pub async fn showcase_preflight(
+    State(state): State<AppState>,
+    token: AuthToken,
+    Path(id): Path<String>,
+    Query(query): Query<ShowcasePreflightQuery>,
+) -> ApiResult<ShowcasePreflightResponse> {
+    ensure_scope(&token, "pb:beaches.read")?;
+    let beach_uuid = match Uuid::parse_str(&id) {
+        Ok(uuid) => uuid,
+        Err(_) => {
+            return Err(ApiError::BadRequest("invalid private beach id".into()));
+        }
+    };
+    let refresh = query.refresh.unwrap_or_default() > 0;
+    if let Some(mut cached) = state.cached_showcase_preflight(&id, refresh).await {
+        cached.cached = Some(true);
+        return Ok(Json(cached));
+    }
+
+    let mut ctx = ShowcasePreflightContext::new(&state, beach_uuid, token.account_uuid());
+    let mut checks: Vec<Box<dyn ShowcasePreflightCheck + Send + Sync>> = Vec::new();
+    checks.push(Box::new(RequiredAccountCheck {
+        accounts: parse_showcase_required_accounts(),
+    }));
+    checks.push(Box::new(TileAttachmentCheck {
+        requirements: SHOWCASE_TILE_REQUIREMENTS,
+    }));
+    checks.push(Box::new(PairingHealthCheck {
+        requirements: SHOWCASE_TILE_REQUIREMENTS,
+    }));
+    checks.push(Box::new(FastPathWarningCheck));
+
+    let mut issues = Vec::new();
+    for check in checks {
+        let mut result = check.run(&mut ctx).await.map_err(map_state_err)?;
+        issues.append(&mut result);
+    }
+
+    let status = if issues.iter().any(|issue| issue.severity == "error") {
+        "blocked".to_string()
+    } else {
+        "ok".to_string()
+    };
+    if status == "blocked" {
+        warn!(
+            target = "controller.leases",
+            private_beach_id = %id,
+            issue_count = issues.len(),
+            "showcase preflight blocked"
+        );
+    }
+    let response = ShowcasePreflightResponse {
+        status,
+        issues,
+        cached: None,
+    };
+    let mut cacheable = response.clone();
+    cacheable.cached = None;
+    state.store_showcase_preflight(&id, cacheable).await;
+    Ok(Json(response))
+}
+
 pub async fn create_private_beach(
     State(state): State<AppState>,
     token: AuthToken,
@@ -967,6 +1343,13 @@ fn map_state_err(err: StateError) -> ApiError {
             ApiError::BadRequest("sessions must belong to the same private beach".into())
         }
         StateError::PrivateBeachNotFound => ApiError::NotFound("private beach not found"),
+        StateError::AccountMissing(account) => ApiError::ConflictWithCode {
+            message: format!(
+                "controller account {} is not registered in this cluster",
+                account
+            ),
+            code: "account_missing",
+        },
         StateError::InvalidIdentifier(msg) => ApiError::BadRequest(msg),
         StateError::InvalidLayout(msg) => ApiError::BadRequest(msg),
         StateError::Database(e) => {
@@ -994,11 +1377,11 @@ fn map_state_err(err: StateError) -> ApiError {
         }
         StateError::ControllerCommandRejected { reason } => match reason {
             ControllerCommandDropReason::FastPathNotReady => ApiError::PreconditionFailed {
-                message: reason.default_message(),
+                message: reason.default_message().to_string(),
                 code: reason.code(),
             },
             _ => ApiError::ConflictWithCode {
-                message: reason.default_message(),
+                message: reason.default_message().to_string(),
                 code: reason.code(),
             },
         },
@@ -1127,5 +1510,173 @@ fn sanitize_poll_frequency(value: Option<i64>) -> Result<Option<i64>, ApiError> 
         Ok(Some(freq))
     } else {
         Ok(None)
+    }
+}
+
+fn parse_showcase_required_accounts() -> Vec<Uuid> {
+    let mut ids = Vec::new();
+    if let Ok(raw) = env::var("PONG_SHOWCASE_REQUIRED_ACCOUNTS") {
+        for token in raw.split(',').map(|value| value.trim()) {
+            if token.is_empty() {
+                continue;
+            }
+            if let Ok(uuid) = Uuid::parse_str(token) {
+                ids.push(uuid);
+            }
+        }
+    }
+    if ids.is_empty() {
+        if let Ok(uuid) = Uuid::parse_str(DEFAULT_SHOWCASE_ACCOUNT) {
+            ids.push(uuid);
+        }
+    }
+    ids
+}
+
+fn session_id_from_tile(node: &CanvasTileNode) -> Option<String> {
+    let metadata = node.metadata.as_ref()?.as_object()?;
+    let session_meta = metadata.get("sessionMeta")?.as_object()?;
+    session_meta
+        .get("sessionId")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+}
+
+#[cfg(test)]
+mod showcase_preflight_tests {
+    use super::*;
+    use crate::routes::build_router;
+    use axum::{body::Body, http::Request};
+    use beach_buggy::{HarnessType, RegisterSessionRequest, TransportMode};
+    use http_body_util::BodyExt;
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    fn session_tile(id: &str, session_id: &str) -> CanvasTileNode {
+        CanvasTileNode {
+            id: id.into(),
+            position: CanvasPoint { x: 0.0, y: 0.0 },
+            size: CanvasSize {
+                width: 100.0,
+                height: 80.0,
+            },
+            z_index: 0,
+            group_id: None,
+            zoom: None,
+            locked: None,
+            toolbar_pinned: None,
+            metadata: Some(json!({
+                "sessionMeta": {
+                    "sessionId": session_id,
+                    "title": id,
+                    "status": "attached"
+                }
+            })),
+        }
+    }
+
+    async fn build_showcase_state(state: &AppState, beach_id: &str) -> (String, String, String) {
+        let agent = Uuid::new_v4().to_string();
+        let lhs = Uuid::new_v4().to_string();
+        let rhs = Uuid::new_v4().to_string();
+        for session in [&agent, &lhs, &rhs] {
+            let req = RegisterSessionRequest {
+                session_id: session.clone(),
+                private_beach_id: beach_id.to_string(),
+                harness_type: HarnessType::TerminalShim,
+                capabilities: vec![],
+                location_hint: None,
+                metadata: None,
+                version: "test".into(),
+                viewer_passcode: None,
+                transport_mode: Some(TransportMode::FastPath),
+            };
+            state.register_session(req).await.unwrap();
+        }
+        state
+            .acquire_controller(&agent, Some(30_000), Some("test".into()), None)
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp_millis();
+        let mut layout = CanvasLayout::empty(now);
+        layout
+            .tiles
+            .insert("pong-agent".into(), session_tile("pong-agent", &agent));
+        layout
+            .tiles
+            .insert("pong-lhs".into(), session_tile("pong-lhs", &lhs));
+        layout
+            .tiles
+            .insert("pong-rhs".into(), session_tile("pong-rhs", &rhs));
+        state
+            .put_private_beach_layout(beach_id, layout, None)
+            .await
+            .unwrap();
+        (agent, lhs, rhs)
+    }
+
+    #[tokio::test]
+    async fn showcase_preflight_reports_ok_with_valid_setup() {
+        let state = AppState::new();
+        let beach_id = Uuid::new_v4().to_string();
+        let (agent, lhs, rhs) = build_showcase_state(&state, &beach_id).await;
+        state
+            .upsert_controller_pairing(&agent, &lhs, None, None, None)
+            .await
+            .unwrap();
+        state
+            .upsert_controller_pairing(&agent, &rhs, None, None, None)
+            .await
+            .unwrap();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/private-beaches/{}/showcase-preflight", beach_id))
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let payload: ShowcasePreflightResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload.status, "ok");
+        assert!(payload.issues.iter().all(|issue| issue.severity != "error"));
+    }
+
+    #[tokio::test]
+    async fn showcase_preflight_blocks_when_pairings_missing() {
+        let state = AppState::new();
+        let beach_id = Uuid::new_v4().to_string();
+        let (_agent, _lhs, _rhs) = build_showcase_state(&state, &beach_id).await;
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/private-beaches/{}/showcase-preflight", beach_id))
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let payload: ShowcasePreflightResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload.status, "blocked");
+        assert!(payload
+            .issues
+            .iter()
+            .any(|issue| issue.code == "pairing_missing" && issue.severity == "error"));
     }
 }

@@ -119,6 +119,10 @@ pub fn build_router(state: AppState) -> Router {
             get(get_private_beach_layout).put(put_private_beach_layout),
         )
         .route(
+            "/private-beaches/:id/showcase-preflight",
+            get(showcase_preflight),
+        )
+        .route(
             "/private-beaches/:id/session-graph",
             post(private_beaches::install_session_graph),
         )
@@ -147,14 +151,8 @@ pub enum ApiError {
     Forbidden(&'static str),
     NotFound(&'static str),
     Conflict(&'static str),
-    ConflictWithCode {
-        message: &'static str,
-        code: &'static str,
-    },
-    PreconditionFailed {
-        message: &'static str,
-        code: &'static str,
-    },
+    ConflictWithCode { message: String, code: &'static str },
+    PreconditionFailed { message: String, code: &'static str },
     TooManyRequests(&'static str),
     BadRequest(String),
     Upstream(&'static str),
@@ -221,7 +219,7 @@ impl IntoResponse for ApiError {
                 axum::http::StatusCode::CONFLICT,
                 Json(ApiErrorBody {
                     error: "conflict",
-                    message: Some(message.to_string()),
+                    message: Some(message),
                     error_code: Some(code.to_string()),
                 }),
             )
@@ -230,7 +228,7 @@ impl IntoResponse for ApiError {
                 axum::http::StatusCode::PRECONDITION_FAILED,
                 Json(ApiErrorBody {
                     error: "precondition_failed",
-                    message: Some(message.to_string()),
+                    message: Some(message),
                     error_code: Some(code.to_string()),
                 }),
             )
@@ -339,7 +337,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(queue_resp.status(), StatusCode::OK);
+        let queue_status = queue_resp.status();
+        let queue_body_bytes = body::to_bytes(queue_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            queue_status,
+            StatusCode::OK,
+            "queue_actions failed: {}",
+            String::from_utf8_lossy(&queue_body_bytes)
+        );
 
         let poll_resp = app
             .clone()
@@ -465,7 +472,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(queue_resp.status(), StatusCode::OK);
+        let queue_status = queue_resp.status();
+        let queue_body_bytes = body::to_bytes(queue_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            queue_status,
+            StatusCode::OK,
+            "queue_actions failed: {}",
+            String::from_utf8_lossy(&queue_body_bytes)
+        );
 
         let poll_resp = app
             .clone()

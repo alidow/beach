@@ -46,7 +46,10 @@ use webrtc_ice::{
 use crate::auth;
 use crate::auth::error::AuthError;
 use crate::auth::gate::TurnIceServer;
-use crate::server::terminal::host::{CONTROLLER_CHANNEL_LABEL, LEGACY_CONTROLLER_CHANNEL_LABEL};
+use crate::server::terminal::host::{
+    CONTROLLER_ACK_CHANNEL_LABEL, CONTROLLER_CHANNEL_LABEL, CONTROLLER_STATE_CHANNEL_LABEL,
+    LEGACY_CONTROLLER_CHANNEL_LABEL,
+};
 use crate::transport::webrtc::signaling::PeerInfo;
 use crate::transport::{
     Transport, TransportError, TransportId, TransportKind, TransportMessage, TransportPair,
@@ -959,18 +962,7 @@ impl WebRtcTransport {
             let pending = Arc::clone(&pending_for_handler);
             Box::pin(async move {
                 let bytes = msg.data.to_vec();
-                if !encryption.is_enabled() && looks_like_encrypted_frame(&bytes) {
-                    let mut queue = pending.lock().unwrap();
-                    queue.push_back(bytes);
-                    tracing::debug!(
-                        target = "beach::transport::webrtc::crypto",
-                        transport_id = ?log_id,
-                        queued_frames = queue.len(),
-                        "queued encrypted frame until transport keys are installed"
-                    );
-                    return;
-                }
-                Self::process_incoming_frame(&encryption, bytes, &sender, log_id);
+                Self::handle_incoming_bytes(&encryption, &pending, bytes, &sender, log_id);
             })
         }));
         let pc_for_close = pc.clone();
@@ -1172,19 +1164,54 @@ impl WebRtcTransport {
     }
 
     fn flush_pending_encrypted(&self) {
-        let mut pending = self.pending_encrypted.lock().unwrap();
+        Self::flush_pending_encrypted_internal(
+            &self.encryption,
+            &self.pending_encrypted,
+            &self.inbound_tx,
+            self.id,
+        );
+    }
+
+    fn flush_pending_encrypted_internal(
+        encryption: &Arc<EncryptionManager>,
+        pending: &Arc<Mutex<VecDeque<Vec<u8>>>>,
+        sender: &CrossbeamSender<TransportMessage>,
+        log_id: TransportId,
+    ) {
+        let mut pending = pending.lock().unwrap();
         if pending.is_empty() {
             return;
         }
         tracing::debug!(
             target = "beach::transport::webrtc::crypto",
-            transport_id = ?self.id,
+            transport_id = ?log_id,
             frames = pending.len(),
             "flushing encrypted frames queued before enable"
         );
         while let Some(bytes) = pending.pop_front() {
-            Self::process_incoming_frame(&self.encryption, bytes, &self.inbound_tx, self.id);
+            Self::process_incoming_frame(encryption, bytes, sender, log_id);
         }
+    }
+
+    fn handle_incoming_bytes(
+        encryption: &Arc<EncryptionManager>,
+        pending: &Arc<Mutex<VecDeque<Vec<u8>>>>,
+        bytes: Vec<u8>,
+        sender: &CrossbeamSender<TransportMessage>,
+        log_id: TransportId,
+    ) {
+        if !encryption.is_enabled() && looks_like_encrypted_frame(&bytes) {
+            let mut queue = pending.lock().unwrap();
+            queue.push_back(bytes);
+            tracing::debug!(
+                target = "beach::transport::webrtc::crypto",
+                transport_id = ?log_id,
+                queued_frames = queue.len(),
+                "queued encrypted frame until transport keys are installed"
+            );
+            return;
+        }
+        Self::process_incoming_frame(encryption, bytes, sender, log_id);
     }
 
     fn process_incoming_frame(
@@ -1515,10 +1542,15 @@ impl OffererSupervisor {
 }
 
 impl OffererInner {
-    fn peer_is_controller(peer: &PeerInfo) -> bool {
+    fn peer_label(peer: &PeerInfo) -> Option<String> {
         peer.metadata
             .as_ref()
-            .and_then(|meta| meta.get("label"))
+            .and_then(|meta| meta.get("label").cloned())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn peer_is_controller(peer: &PeerInfo) -> bool {
+        Self::peer_label(peer)
             .map(|label| {
                 matches!(
                     label.as_str(),
@@ -1526,6 +1558,43 @@ impl OffererInner {
                 )
             })
             .unwrap_or(false)
+    }
+
+    fn peer_uses_fastpath_signaling(peer: &PeerInfo) -> bool {
+        Self::peer_label(peer)
+            .map(|label| {
+                matches!(
+                    label.as_str(),
+                    CONTROLLER_CHANNEL_LABEL
+                        | CONTROLLER_ACK_CHANNEL_LABEL
+                        | CONTROLLER_STATE_CHANNEL_LABEL
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    fn peer_supports_secure_transport(peer: &PeerInfo) -> bool {
+        let supports = Self::peer_label(peer)
+            .map(|label| {
+                matches!(
+                    label.as_str(),
+                    CONTROLLER_CHANNEL_LABEL
+                        | LEGACY_CONTROLLER_CHANNEL_LABEL
+                        | CONTROLLER_ACK_CHANNEL_LABEL
+                        | CONTROLLER_STATE_CHANNEL_LABEL
+                        | "private-beach-dashboard"
+                        | "beach-manager"
+                )
+            })
+            .unwrap_or(false);
+        tracing::trace!(
+            target = "beach::transport::webrtc",
+            peer_id = %peer.id,
+            supports,
+            metadata = ?peer.metadata,
+            "evaluated secure transport capability for peer"
+        );
+        supports
     }
 
     async fn reserve_controller_slot(&self, peer_id: &str) -> bool {
@@ -1573,11 +1642,22 @@ impl OffererInner {
         joined: RemotePeerJoined,
         request_mcp_channel: bool,
     ) {
+        let peer_label = joined
+            .peer
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("label"))
+            .map(|label| label.as_str())
+            .unwrap_or("unknown");
+        let secure_supported = Self::peer_supports_secure_transport(&joined.peer);
         tracing::info!(
             target = "beach::transport::webrtc",
             event = "peer_joined",
             peer_id = %joined.peer.id,
             role = ?joined.peer.role,
+            label = peer_label,
+            secure_supported,
+            metadata = ?joined.peer.metadata,
             "offerer observed peer join"
         );
         if joined.peer.role != PeerRole::Client {
@@ -1869,6 +1949,13 @@ async fn negotiate_offerer_peer(
     }
 
     let RemotePeerJoined { peer, signals, .. } = joined;
+    let peer_label = OffererInner::peer_label(&peer);
+    let mut signaling_base = inner.signaling_base.clone();
+    if OffererInner::peer_uses_fastpath_signaling(&peer) {
+        if let Some(fastpath_base) = rewrite_signaling_base(&inner.signaling_base) {
+            signaling_base = fastpath_base;
+        }
+    }
 
     let mut setting = SettingEngine::default();
     // Force IPv4 so Dockerized managers do not attempt unreachable udp6 STUN
@@ -2154,19 +2241,52 @@ async fn negotiate_offerer_peer(
         ordered: Some(true),
         ..Default::default()
     };
+    let peer_label_for_logging = peer_label
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
     let dc = pc
         .create_data_channel("beach", Some(dc_init))
         .await
         .map_err(to_setup_error)?;
+    let peer_id_for_primary_open = peer.id.clone();
+    let handshake_for_primary_open = handshake_id.clone();
+    let label_for_primary_open = peer_label_for_logging.clone();
     dc.on_open(Box::new(move || {
         let notify = dc_open_notify.clone();
+        let peer_id = peer_id_for_primary_open.clone();
+        let handshake_for_log = handshake_for_primary_open.clone();
+        let label_for_log = label_for_primary_open.clone();
         Box::pin(async move {
+            tracing::info!(
+                peer_id = %peer_id,
+                %handshake_for_log,
+                label = %label_for_log,
+                "primary data channel opened"
+            );
             notify.notify_waiters();
             notify.notify_one();
         })
     }));
+    let peer_id_for_close = peer.id.clone();
+    let handshake_for_close = handshake_id.clone();
+    let label_for_close = peer_label_for_logging.clone();
+    dc.on_close(Box::new(move || {
+        let peer_id = peer_id_for_close.clone();
+        let handshake = handshake_for_close.clone();
+        let label = label_for_close.clone();
+        Box::pin(async move {
+            tracing::info!(
+                peer_id = %peer_id,
+                %handshake,
+                label = %label,
+                "primary data channel closed"
+            );
+        })
+    }));
 
     let secure_transport_active = secure_transport_enabled()
+        && OffererInner::peer_supports_secure_transport(&peer)
         && inner
             .passphrase
             .as_ref()
@@ -2202,6 +2322,34 @@ async fn negotiate_offerer_peer(
                     "secure handshake received raw datachannel message (offerer)"
                 );
                 inbox.push(msg.data.to_vec()).await;
+            })
+        }));
+        let peer_id_for_handshake_open = peer.id.clone();
+        let handshake_for_handshake_open = handshake_id.clone();
+        channel.on_open(Box::new(move || {
+            let peer_id = peer_id_for_handshake_open.clone();
+            let handshake = handshake_for_handshake_open.clone();
+            Box::pin(async move {
+                tracing::info!(
+                    peer_id = %peer_id,
+                    %handshake,
+                    label = HANDSHAKE_CHANNEL_LABEL,
+                    "handshake data channel opened"
+                );
+            })
+        }));
+        let peer_id_for_handshake_close = peer.id.clone();
+        let handshake_for_handshake_close = handshake_id.clone();
+        channel.on_close(Box::new(move || {
+            let peer_id = peer_id_for_handshake_close.clone();
+            let handshake = handshake_for_handshake_close.clone();
+            Box::pin(async move {
+                tracing::info!(
+                    peer_id = %peer_id,
+                    %handshake,
+                    label = HANDSHAKE_CHANNEL_LABEL,
+                    "handshake data channel closed"
+                );
             })
         }));
         Some((channel, inbox))
@@ -2272,7 +2420,7 @@ async fn negotiate_offerer_peer(
         return Ok(None);
     }
 
-    post_sdp(&inner.client, &inner.signaling_base, "offer", &[], &payload).await?;
+    post_sdp(&inner.client, &signaling_base, "offer", &[], &payload).await?;
     tracing::info!(
         target = "beach::transport::webrtc",
         role = "offerer",
@@ -2283,7 +2431,7 @@ async fn negotiate_offerer_peer(
 
     let answer = poll_answer_for_peer(
         &inner.client,
-        &inner.signaling_base,
+        &signaling_base,
         inner.poll_interval,
         &handshake_id,
     )
@@ -2320,6 +2468,8 @@ async fn negotiate_offerer_peer(
     tracing::debug!(
 
         peer_id = %peer.id,
+        %handshake_id,
+        label = %peer_label_for_logging,
         "waiting for datachannel to open (15s timeout)"
     );
     if tokio::time::timeout(Duration::from_secs(15), dc_notify.notified())
@@ -2327,7 +2477,8 @@ async fn negotiate_offerer_peer(
         .is_err()
     {
         tracing::warn!(
-
+            %handshake_id,
+            label = %peer_label_for_logging,
             peer_id = %peer.id,
             "datachannel open timeout, closing peer connection"
         );
@@ -2363,7 +2514,9 @@ async fn negotiate_offerer_peer(
         Some(Arc::clone(&handshake_complete)),
     ));
     let transport_dyn: Arc<dyn Transport> = transport.clone();
-    channels.publish("beach".to_string(), transport_dyn.clone());
+    let publish_label = peer_label.unwrap_or_else(|| "beach".to_string());
+
+    channels.publish(publish_label, transport_dyn.clone());
 
     // Run secure handshake BEFORE waiting for __ready__ sentinel
     // The answerer will send __ready__ only after completing the handshake,
@@ -3883,6 +4036,10 @@ fn endpoint_with_params(
     Ok(url)
 }
 
+fn signaling_base_is_fastpath(base: &str) -> bool {
+    base.contains("/fastpath/sessions/")
+}
+
 async fn post_sdp(
     client: &Client,
     base: &str,
@@ -3890,6 +4047,7 @@ async fn post_sdp(
     params: &[(&str, &str)],
     payload: &WebRtcSdpPayload,
 ) -> Result<(), TransportError> {
+    let base_is_fastpath = signaling_base_is_fastpath(base);
     let url = endpoint_with_params(base, suffix, params)?;
     let url_string = url.as_str().to_string();
     tracing::debug!(
@@ -3915,25 +4073,9 @@ async fn post_sdp(
     if response.status().is_success() {
         return Ok(());
     }
-    if response.status() == StatusCode::NOT_FOUND {
+    if response.status() == StatusCode::NOT_FOUND && !base_is_fastpath {
         if let Some(alt_base) = rewrite_signaling_base(base) {
-            // If switching to fastpath for answers, skip: manager doesn't expose answer endpoint.
-            let alt_is_fastpath = alt_base.contains("/fastpath/sessions/");
-            if alt_is_fastpath && suffix == "answer" {
-                tracing::debug!(
-                    target = "beach::transport::webrtc",
-                    phase = "post_sdp",
-                    suffix,
-                    url = %url_string,
-                    alt_base = %alt_base,
-                    "post 404; skipping fastpath alt for answer"
-                );
-                return Err(TransportError::Setup(format!(
-                    "unexpected signaling status {}",
-                    response.status()
-                )));
-            }
-
+            let alt_is_fastpath = signaling_base_is_fastpath(&alt_base);
             let alt_url = endpoint_with_params(&alt_base, suffix, params)?;
             let alt_url_string = alt_url.as_str().to_string();
             let level_is_warn = !alt_is_fastpath; // warn only when switching fastpath -> sessions
@@ -3975,6 +4117,14 @@ async fn post_sdp(
                 alt_resp.status()
             )));
         }
+    } else if response.status() == StatusCode::NOT_FOUND && base_is_fastpath {
+        tracing::debug!(
+            target = "beach::transport::webrtc",
+            phase = "post_sdp",
+            suffix,
+            url = %url_string,
+            "fastpath signaling returned 404; not retrying legacy endpoint"
+        );
     }
     Err(TransportError::Setup(format!(
         "unexpected signaling status {}",
@@ -4009,6 +4159,7 @@ async fn fetch_sdp(
     suffix: &str,
     params: &[(&str, &str)],
 ) -> Result<Option<WebRtcSdpPayload>, TransportError> {
+    let base_is_fastpath = signaling_base_is_fastpath(base);
     let url = endpoint_with_params(base, suffix, params)?;
     let url_string = url.as_str().to_string();
     tracing::debug!(
@@ -4053,24 +4204,18 @@ async fn fetch_sdp(
             Ok(Some(payload))
         }
         StatusCode::NO_CONTENT | StatusCode::NOT_FOUND => {
+            if base_is_fastpath {
+                tracing::debug!(
+                    target = "beach::transport::webrtc",
+                    phase = "fetch_sdp",
+                    suffix,
+                    url = %url_string,
+                    "fastpath signaling returned empty/404; waiting before retry"
+                );
+                return Ok(None);
+            }
             if let Some(alt_base) = rewrite_signaling_base(base) {
-                let alt_is_fastpath = alt_base.contains("/fastpath/sessions/");
-                /* FIXME: This comment is incorrect; the manager *does* expose a fastpath answer
-                 * endpoint, and we should be retrying it.
-                // Skip useless fastpath retry for answers; manager doesn't expose answer endpoint
-                if alt_is_fastpath && suffix == "answer" {
-                    tracing::debug!(
-                        target = "beach::transport::webrtc",
-                        phase = "fetch_sdp",
-                        suffix,
-                        url = %url_string,
-                        alt_base = %alt_base,
-                        "fetch 404; skipping fastpath alt for answer"
-                    );
-                    return Ok(None);
-                }
-                */
-
+                let alt_is_fastpath = signaling_base_is_fastpath(&alt_base);
                 let alt_url = endpoint_with_params(&alt_base, suffix, params)?;
                 let alt_url_string = alt_url.as_str().to_string();
                 let level_is_warn = !alt_is_fastpath; // warn when switching fastpath -> sessions
@@ -5203,6 +5348,7 @@ fn to_setup_error<E: std::fmt::Display>(err: E) -> TransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::webrtc::signaling::{PeerRole, TransportType};
 
     #[test_timeout::timeout]
     fn webrtc_pair_round_trip() {
@@ -5252,6 +5398,92 @@ mod tests {
         assert!(
             manager.is_enabled(),
             "encryption manager should report enabled once cipher state is installed"
+        );
+    }
+
+    #[test]
+    fn encrypted_frame_buffered_until_encryption_enabled() {
+        use crossbeam_channel::unbounded;
+
+        let encryption = Arc::new(EncryptionManager::new());
+        let pending = Arc::new(Mutex::new(VecDeque::new()));
+        let (sender, receiver) = unbounded();
+        let log_id = TransportId(7);
+
+        let plaintext_message = TransportMessage::text(1, "__ready__");
+        let plaintext_frame = encode_message(&plaintext_message);
+
+        WebRtcTransport::handle_incoming_bytes(
+            &encryption,
+            &pending,
+            plaintext_frame.clone(),
+            &sender,
+            log_id,
+        );
+        let received = receiver.try_recv().expect("plaintext should pass through");
+        assert_eq!(received.payload.as_text(), Some("__ready__"));
+
+        let mut offerer_send_key = [0u8; 32];
+        offerer_send_key[0] = 1;
+        let mut offerer_recv_key = [0u8; 32];
+        offerer_recv_key[0] = 2;
+        let offerer_result = HandshakeResult {
+            send_key: offerer_send_key,
+            recv_key: offerer_recv_key,
+            verification_code: "offerer".into(),
+        };
+        let answerer_result = HandshakeResult {
+            send_key: offerer_recv_key,
+            recv_key: offerer_send_key,
+            verification_code: "answerer".into(),
+        };
+        let remote_encryption = EncryptionManager::new();
+        remote_encryption
+            .enable(&answerer_result)
+            .expect("enable remote encryption");
+        let encrypted_frame = remote_encryption
+            .encrypt(&plaintext_frame)
+            .expect("encrypt frame");
+
+        WebRtcTransport::handle_incoming_bytes(
+            &encryption,
+            &pending,
+            encrypted_frame,
+            &sender,
+            log_id,
+        );
+        assert!(
+            matches!(receiver.try_recv(), Err(CrossbeamTryRecvError::Empty)),
+            "encrypted frame should be queued until encryption is enabled"
+        );
+        assert_eq!(pending.lock().unwrap().len(), 1);
+
+        encryption
+            .enable(&offerer_result)
+            .expect("enable local encryption");
+        WebRtcTransport::flush_pending_encrypted_internal(&encryption, &pending, &sender, log_id);
+
+        let received = receiver.try_recv().expect("flushed frame delivered");
+        assert_eq!(received.payload.as_text(), Some("__ready__"));
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn peer_supports_secure_transport_private_beach_dashboard_label() {
+        let mut metadata = HashMap::new();
+        metadata.insert("label".to_string(), "private-beach-dashboard".to_string());
+        let peer = PeerInfo {
+            id: "viewer-peer".to_string(),
+            role: PeerRole::Client,
+            joined_at: 0,
+            supported_transports: vec![TransportType::WebRTC],
+            preferred_transport: None,
+            metadata: Some(metadata),
+        };
+
+        assert!(
+            OffererInner::peer_supports_secure_transport(&peer),
+            "viewer peers should negotiate secure transport when labeled as private-beach-dashboard"
         );
     }
 }

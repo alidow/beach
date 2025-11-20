@@ -308,6 +308,10 @@ impl FastPathSession {
         self.instance_id
     }
 
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     pub async fn set_remote_offer(
         &self,
         offer: RTCSessionDescription,
@@ -318,22 +322,27 @@ impl FastPathSession {
         self.pc
             .on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
                 let label = dc.label().to_string();
-                let this2 = this.clone();
+                let session_arc = this.clone();
                 Box::pin(async move {
+                    let fast_path_id = session_arc.instance_id();
+                    let session_id = session_arc.session_id().to_string();
                     info!(
                         label = %label,
-                        fast_path_id = this.instance_id,
+                        fast_path_id,
                         "fast-path data channel opened"
                     );
                     match label.as_str() {
                         "mgr-actions" => {
-                            *this2.actions_tx.lock().await = Some(dc.clone());
+                            install_ready_sentinel(&dc, session_id.clone(), &label);
+                            *session_arc.actions_tx.lock().await = Some(dc.clone());
                         }
                         "mgr-acks" => {
-                            *this2.acks_rx.lock().await = Some(dc.clone());
+                            install_ready_sentinel(&dc, session_id.clone(), &label);
+                            *session_arc.acks_rx.lock().await = Some(dc.clone());
                         }
                         "mgr-state" => {
-                            *this2.state_rx.lock().await = Some(dc.clone());
+                            install_ready_sentinel(&dc, session_id.clone(), &label);
+                            *session_arc.state_rx.lock().await = Some(dc.clone());
                         }
                         _ => {}
                     }
@@ -709,6 +718,8 @@ async fn wait_for_channel(
 
 const FAST_PATH_CHANNEL_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const FAST_PATH_CHANNEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const READY_SENTINEL_MAX_RETRIES: usize = 8;
+const READY_SENTINEL_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 async fn wait_for_channel_with_timeout<F, Fut, T>(mut fetch: F) -> Option<T>
 where
@@ -817,6 +828,68 @@ fn install_ack_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>, s
             }
         })
     }));
+}
+
+fn install_ready_sentinel(dc: &Arc<RTCDataChannel>, session_id: String, channel_label: &str) {
+    let label = channel_label.to_string();
+    let dc_for_open = Arc::clone(dc);
+    dc.on_open(Box::new(move || {
+        let session_id = session_id.clone();
+        let label = label.clone();
+        let dc = Arc::clone(&dc_for_open);
+        Box::pin(async move {
+            if send_ready_sentinel(&dc, &session_id, &label, 0)
+                .await
+                .is_ok()
+            {
+                let retry_dc = Arc::clone(&dc);
+                let retry_session = session_id.clone();
+                let retry_label = label.clone();
+                tokio::spawn(async move {
+                    for attempt in 1..=READY_SENTINEL_MAX_RETRIES {
+                        sleep(READY_SENTINEL_RETRY_INTERVAL).await;
+                        if send_ready_sentinel(&retry_dc, &retry_session, &retry_label, attempt)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        })
+    }));
+}
+
+async fn send_ready_sentinel(
+    dc: &Arc<RTCDataChannel>,
+    session_id: &str,
+    label: &str,
+    attempt: usize,
+) -> Result<(), WebRtcError> {
+    match dc.send_text("__ready__".to_owned()).await {
+        Ok(_) => {
+            debug!(
+                target = "fast_path",
+                session_id = %session_id,
+                channel = %label,
+                attempt,
+                "sent fast-path ready sentinel"
+            );
+            Ok(())
+        }
+        Err(err) => {
+            warn!(
+                target = "fast_path",
+                session_id = %session_id,
+                channel = %label,
+                attempt,
+                error = %err,
+                "failed to send fast-path ready sentinel"
+            );
+            Err(err)
+        }
+    }
 }
 
 fn install_state_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>, state: AppState) {

@@ -77,6 +77,7 @@ pub(crate) const MCP_CHANNEL_LABEL: &str = "mcp-jsonrpc";
 pub(crate) const MCP_CHANNEL_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const CONTROLLER_CHANNEL_LABEL: &str = "mgr-actions";
 pub(crate) const LEGACY_CONTROLLER_CHANNEL_LABEL: &str = "pb-controller";
+pub(crate) const CONTROLLER_ACK_CHANNEL_LABEL: &str = "mgr-acks";
 pub(crate) const CONTROLLER_STATE_CHANNEL_LABEL: &str = "mgr-state";
 const IDLE_SNAPSHOT_HINT_KEY: &str = "idle_snapshot";
 const IDLE_PUBLISH_TOKEN_HINT_KEY: &str = "idlePublishToken";
@@ -1733,6 +1734,14 @@ fn run_fast_path_controller_channel(
                 Payload::Text(text) => {
                     let trimmed = text.trim();
                     if trimmed == "__ready__" || trimmed == "__offer_ready__" {
+                        debug!(
+                            target = "controller.fast_path_state",
+                            session_id = %session_id,
+                            transport_id,
+                            channel = CONTROLLER_CHANNEL_LABEL,
+                            sentinel = %trimmed,
+                            "received fast-path sentinel from manager"
+                        );
                         continue;
                     }
                     trace!(
@@ -3043,12 +3052,14 @@ fn spawn_input_listener(
                             Payload::Text(text) => {
                                 let trimmed = text.trim();
                                 if trimmed == "__ready__" || trimmed == "__offer_ready__" {
-                                    trace!(
+                                    debug!(
                                         target = "sync::incoming",
+                                        session_id = %session_id,
                                         transport_id,
                                         transport = ?transport_kind,
                                         transport_sequence,
-                                        "ignoring handshake sentinel"
+                                        sentinel = %trimmed,
+                                        "received fast-path sentinel from manager"
                                     );
                                 } else {
                                     debug!(

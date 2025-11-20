@@ -22,6 +22,10 @@ Environment variables:
   PONG_SESSION_SERVER   Beach session server URL (default: http://localhost:4132/)
   PONG_LOG_DIR          Log directory inside the container (default: /tmp/pong-stack)
   PONG_CODES_WAIT       Seconds to wait before printing session codes (default: 8)
+  PONG_STACK_CONTAINER_ICE_IP    Force BEACH_ICE_PUBLIC_IP inside the container (default: unset)
+  PONG_STACK_CONTAINER_ICE_HOST  Force BEACH_ICE_PUBLIC_HOST inside the container (default: unset)
+  PONG_STACK_MANAGER_HEALTH_ATTEMPTS  Attempts to poll manager /healthz before start (default: 30)
+  PONG_STACK_MANAGER_HEALTH_INTERVAL  Seconds between health polls (default: 2)
 USAGE
 }
 
@@ -72,10 +76,22 @@ AUTH_GATEWAY=${PONG_AUTH_GATEWAY:-http://beach-gate:4133}
 CLI_PROFILE=${PONG_BEACH_PROFILE:-local}
 LOG_DIR=${PONG_LOG_DIR:-/tmp/pong-stack}
 CODES_WAIT=${PONG_CODES_WAIT:-8}
+ROLE_BOOTSTRAP_TIMEOUT=${PONG_ROLE_BOOTSTRAP_TIMEOUT:-40}
+ROLE_BOOTSTRAP_INTERVAL=${PONG_ROLE_BOOTSTRAP_INTERVAL:-1}
 REPO_ROOT=/app
 CARGO_BIN_DIR=${PONG_CARGO_BIN_DIR:-/usr/local/cargo/bin}
 PLAYER_LOG_LEVEL=${PONG_LOG_LEVEL:-info}
 AGENT_LOG_LEVEL=${PONG_AGENT_LOG_LEVEL:-$PLAYER_LOG_LEVEL}
+PREBUILD_BEACH_BIN=${PONG_STACK_PREBUILD:-1}
+CONTAINER_ICE_IP=${PONG_STACK_CONTAINER_ICE_IP:-}
+CONTAINER_ICE_HOST=${PONG_STACK_CONTAINER_ICE_HOST:-}
+CONTAINER_ENV_PREFIX="unset BEACH_ICE_PUBLIC_IP BEACH_ICE_PUBLIC_HOST BEACH_HOST_LAN_IP;"
+if [[ -n "$CONTAINER_ICE_IP" ]]; then
+  CONTAINER_ENV_PREFIX+=" export BEACH_ICE_PUBLIC_IP='$CONTAINER_ICE_IP';"
+fi
+if [[ -n "$CONTAINER_ICE_HOST" ]]; then
+  CONTAINER_ENV_PREFIX+=" export BEACH_ICE_PUBLIC_HOST='$CONTAINER_ICE_HOST';"
+fi
 HOST_MANAGER_TOKEN=""
 HOST_TOKEN_EXPORT=""
 STACK_MANAGER_TOKEN=""
@@ -170,7 +186,31 @@ ensure_host_account() {
 
 run_in_container() {
   local cmd="$1"
-  docker compose exec -T "$SERVICE" bash -c "export PATH=\"$CARGO_BIN_DIR:\\$PATH\"; $cmd"
+  docker compose exec -T "$SERVICE" bash -c "$CONTAINER_ENV_PREFIX export PATH=\"$CARGO_BIN_DIR:\\$PATH\"; $cmd"
+}
+
+prebuild_beach_binary() {
+  if [[ "$PREBUILD_BEACH_BIN" -eq 0 ]]; then
+    return
+  fi
+  echo "[pong-stack] ensuring beach binary is built inside $SERVICE..." >&2
+  run_in_container "set -euo pipefail; cd $REPO_ROOT; cargo build --bin beach >/tmp/pong-stack-build.log 2>&1" || {
+    echo "[pong-stack] cargo build failed; inspect /tmp/pong-stack-build.log inside $SERVICE" >&2
+    exit 1
+  }
+}
+
+service_running() {
+  local state
+  state=$(docker compose ps --format '{{.Name}} {{.State}}' "$SERVICE" 2>/dev/null | awk '{print $2}' | head -n1)
+  [[ "$state" == "running" ]]
+}
+
+ensure_service_running() {
+  if ! service_running; then
+    echo "[pong-stack] docker compose service '$SERVICE' is not running; start the stack before invoking pong-stack.sh" >&2
+    exit 1
+  fi
 }
 
 ensure_cli_login() {
@@ -207,6 +247,130 @@ start_agent() {
   fi
   run_in_container "set -euo pipefail; export PRIVATE_BEACH_MANAGER_URL='$MANAGER_URL'; export RUN_AGENT_SESSION_SERVER='$SESSION_SERVER'; export BEACH_AUTH_GATEWAY='$AUTH_GATEWAY'; ${HOST_TOKEN_EXPORT}export LOG_DIR='$LOG_DIR'; export PONG_AGENT_LOG_LEVEL='$AGENT_LOG_LEVEL'; export PONG_WATCHDOG_INTERVAL='${PONG_WATCHDOG_INTERVAL:-}'; cd $REPO_ROOT; mkdir -p '$LOG_DIR'; : > '$LOG_DIR/agent.log'; chmod +x apps/private-beach/demo/pong/tools/run-agent.sh; nohup setsid apps/private-beach/demo/pong/tools/run-agent.sh '$beach_id' > '$LOG_DIR/agent.log' 2>&1 & echo \$! > '$LOG_DIR/agent.pid'"
   echo "launched pong agent (logs in $LOG_DIR/agent.log)"
+}
+
+role_pid_path() {
+  local role=$1
+  if [[ "$role" == "agent" ]]; then
+    printf '%s\n' "$LOG_DIR/agent.pid"
+  else
+    printf '%s\n' "$LOG_DIR/player-$role.pid"
+  fi
+}
+
+role_primary_log_path() {
+  local role=$1
+  if [[ "$role" == "agent" ]]; then
+    printf '%s\n' "$LOG_DIR/agent.log"
+  else
+    printf '%s\n' "$LOG_DIR/player-$role.log"
+  fi
+}
+
+role_host_log_path() {
+  local role=$1
+  if [[ "$role" == "agent" ]]; then
+    printf '%s\n' "$LOG_DIR/beach-host-agent.log"
+  else
+    printf '%s\n' "$LOG_DIR/beach-host-$role.log"
+  fi
+}
+
+check_role_bootstrap() {
+  local role=$1
+  local py_script
+  read -r -d '' py_script <<'PY'
+import json
+import os
+import sys
+
+role = os.environ["ROLE"]
+log_dir = os.environ.get("LOG_DIR", "/tmp/pong-stack")
+path = os.path.join(log_dir, f"bootstrap-{role}.json")
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("schema") != 2:
+                continue
+            session = payload.get("session_id") or payload.get("sessionId")
+            code = (
+                payload.get("join_code")
+                or payload.get("verify_code")
+                or payload.get("code")
+                or payload.get("passcode")
+            )
+            if session and code:
+                print(f"{session} {code}")
+                sys.exit(0)
+except OSError:
+    pass
+sys.exit(1)
+PY
+  local cmd
+  printf -v cmd $'set -euo pipefail; export LOG_DIR=%q; export ROLE=%q; python3 - <<\'PY\'\n%s\nPY\n' "$LOG_DIR" "$role" "$py_script"
+  run_in_container "$cmd"
+}
+
+role_process_alive() {
+  local role=$1
+  local pid_file
+  pid_file=$(role_pid_path "$role")
+  local cmd
+  printf -v cmd $'set -euo pipefail; pid_file=%q; if [[ ! -s "$pid_file" ]]; then exit 0; fi; pid=$(cat "$pid_file" 2>/dev/null || true); if [[ -z "$pid" ]]; then exit 0; fi; if kill -0 "$pid" 2>/dev/null; then exit 0; fi; exit 1\n' "$pid_file"
+  if run_in_container "$cmd"; then
+    return 0
+  fi
+  return 1
+}
+
+debug_role_bootstrap() {
+  local role=$1
+  local human=$2
+  local primary_log host_log bootstrap_file
+  primary_log=$(role_primary_log_path "$role")
+  host_log=$(role_host_log_path "$role")
+  bootstrap_file="$LOG_DIR/bootstrap-$role.json"
+  local cmd
+  printf -v cmd $'set -euo pipefail;\nprimary=%q;\nhost=%q;\nbootstrap=%q;\nlabel=%q;\nshow_file() {\n  local desc=$1\n  local file=$2\n  echo "[pong-stack] ${label} ${desc}:"\n  if [[ -f "$file" ]]; then\n    tail -n 80 "$file" || true\n  else\n    echo "  (missing $file)"\n  fi\n}\nshow_file "process log ($primary)" "$primary"\nshow_file "host log ($host)" "$host"\nif [[ -f "$bootstrap" ]]; then\n  echo "[pong-stack] ${label} bootstrap payload ($bootstrap):"\n  cat "$bootstrap"\nelse\n  echo "[pong-stack] ${label} bootstrap payload missing ($bootstrap)"\nfi\n' "$primary_log" "$host_log" "$bootstrap_file" "$human"
+  run_in_container "$cmd" || true
+}
+
+wait_for_role_bootstrap() {
+  local role=$1
+  local human=$2
+  local timeout=${3:-$ROLE_BOOTSTRAP_TIMEOUT}
+  local start_ts
+  start_ts=$(date +%s)
+  local session_info=""
+  while true; do
+    if session_info=$(check_role_bootstrap "$role" 2>/dev/null); then
+      local session code
+      read -r session code <<<"$session_info"
+      echo "[pong-stack] $human bootstrap ready session_id=$session code=$code"
+      return 0
+    fi
+    if ! role_process_alive "$role"; then
+      echo "[pong-stack] $human process exited before bootstrap was observed."
+      debug_role_bootstrap "$role" "$human"
+      return 1
+    fi
+    local now elapsed
+    now=$(date +%s)
+    elapsed=$((now - start_ts))
+    if [[ $elapsed -ge $timeout ]]; then
+      echo "[pong-stack] $human bootstrap not observed within ${timeout}s."
+      debug_role_bootstrap "$role" "$human"
+      return 1
+    fi
+    sleep "$ROLE_BOOTSTRAP_INTERVAL"
+  done
 }
 
 print_codes() {
@@ -295,10 +459,27 @@ manager_api_request() {
   local attempt=0
   while [[ $attempt -lt 5 ]]; do
     attempt=$((attempt + 1))
-    if http_code=$(curl "${curl_args[@]}" "$url"); then
-      break
+    http_code=$(curl "${curl_args[@]}" "$url") || http_code=""
+    if [[ -z "$http_code" ]]; then
+      sleep 1
+      continue
     fi
-    sleep 1
+    if [[ "$http_code" == "401" || "$http_code" == "403" ]]; then
+      if [[ -z "$HOST_MANAGER_TOKEN" ]]; then
+        echo "[pong-stack] manager API ${method} ${path} returned ${http_code}; refreshing CLI credentials..." >&2
+        STACK_MANAGER_TOKEN=""
+        ensure_cli_login
+        if ! token=$(get_stack_manager_token); then
+          break
+        fi
+        curl_args=(-sS -o "$response_file" -w '%{http_code}' -X "$method" -H "authorization: Bearer $token")
+        if [[ -n "$body_file" ]]; then
+          curl_args+=(-H "content-type: application/json" "--data-binary" "@$body_file")
+        fi
+        continue
+      fi
+    fi
+    break
   done
   if [[ -z "$http_code" ]]; then
     rm -f "$response_file"
@@ -317,12 +498,15 @@ manager_api_request() {
 
 wait_for_manager() {
   local attempt=0
-  while [[ $attempt -lt 15 ]]; do
+  local max_attempts=${PONG_STACK_MANAGER_HEALTH_ATTEMPTS:-30}
+  local interval=${PONG_STACK_MANAGER_HEALTH_INTERVAL:-2}
+  local url="${MANAGER_URL%/}/healthz"
+  while [[ $attempt -lt $max_attempts ]]; do
     attempt=$((attempt + 1))
-    if curl -sS -o /dev/null "http://localhost:8080/healthz"; then
+    if curl -fsS -o /dev/null "$url"; then
       return 0
     fi
-    sleep 1
+    sleep "$interval"
   done
   return 1
 }
@@ -696,6 +880,12 @@ setup_private_beach() {
 
 case "$COMMAND" in
   start)
+    ensure_service_running
+    if ! wait_for_manager; then
+      echo "[pong-stack] manager $MANAGER_URL did not become healthy; aborting start" >&2
+      exit 1
+    fi
+    prebuild_beach_binary
     if [[ $# -lt 1 ]]; then
       echo "error: missing start target" >&2
       usage
@@ -715,12 +905,18 @@ case "$COMMAND" in
     done
     case "$target" in
       lhs)
+        if [[ -z "$HOST_MANAGER_TOKEN" ]]; then
+          ensure_cli_login
+        fi
         start_player lhs "LHS"
         if [[ "$SETUP_BEACH" == true ]]; then
           echo "[pong-stack] --setup-beach requires starting the full stack; ignoring flag for 'start lhs'" >&2
         fi
         ;;
       rhs)
+        if [[ -z "$HOST_MANAGER_TOKEN" ]]; then
+          ensure_cli_login
+        fi
         start_player rhs "RHS"
         if [[ "$SETUP_BEACH" == true ]]; then
           echo "[pong-stack] --setup-beach requires starting the full stack; ignoring flag for 'start rhs'" >&2
@@ -755,6 +951,19 @@ case "$COMMAND" in
         start_player lhs "LHS"
         start_player rhs "RHS"
         start_agent "$beach_id"
+        echo "[pong-stack] waiting for session bootstrap data (timeout ${ROLE_BOOTSTRAP_TIMEOUT}s per role)..."
+        if ! wait_for_role_bootstrap lhs "LHS player"; then
+          stop_stack
+          exit 1
+        fi
+        if ! wait_for_role_bootstrap rhs "RHS player"; then
+          stop_stack
+          exit 1
+        fi
+        if ! wait_for_role_bootstrap agent "Pong agent"; then
+          stop_stack
+          exit 1
+        fi
         echo "waiting $CODES_WAIT seconds for sessions to register..."
         sleep "$CODES_WAIT"
         print_codes
@@ -765,9 +974,14 @@ case "$COMMAND" in
     esac
     ;;
   stop)
+    if ! service_running; then
+      echo "[pong-stack] service '$SERVICE' is not running; nothing to stop." >&2
+      exit 0
+    fi
     stop_stack
     ;;
   codes)
+    ensure_service_running
     print_codes
     ;;
   *)

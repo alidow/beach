@@ -30,6 +30,9 @@ cleanup() {
   if [[ -n "${HOST_PID:-}" ]]; then
     kill "$HOST_PID" 2>/dev/null || true
   fi
+  if [[ -n "${VIEWER_PID:-}" ]]; then
+    kill "$VIEWER_PID" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -69,6 +72,43 @@ ensure_gate_login() {
     cargo run --bin beach -- auth login --name "$profile" --set-current --force
   else
     echo "Using existing Beach Auth profile '$profile'."
+  fi
+}
+
+run_headless_viewer() {
+  local mode="$1"
+  local session_id="$2"
+  local passcode="$3"
+  local viewer_log="$LOG_DIR/fastpath-smoke-${mode}-viewer.log"
+  rm -f "$viewer_log"
+
+  echo "Launching headless viewer to validate controller handshake (logs: $viewer_log)"
+  (
+    cd "$(dirname "$0")/.."
+    RUST_LOG="$RUST_LOG" cargo run --bin beach -- \
+      --log-level info \
+      --log-file "$viewer_log" \
+      --session-server "$SESSION_SERVER" \
+      join "$session_id" \
+      --passcode "$passcode" \
+      --label "fastpath-smoke-viewer" \
+      --headless \
+      --headless-timeout 45
+  ) &
+  VIEWER_PID=$!
+  if ! wait "$VIEWER_PID"; then
+    echo "❌ Headless viewer failed for session $session_id (see $viewer_log)" >&2
+    exit 1
+  fi
+  VIEWER_PID=""
+
+  if rg -q "timed out waiting for data channel" "$viewer_log"; then
+    echo "❌ Viewer encountered WebRTC data channel timeout (see $viewer_log)" >&2
+    exit 1
+  fi
+  if rg -q "Invalid message format" "$viewer_log"; then
+    echo "❌ Viewer reported invalid message format while attaching (see $viewer_log)" >&2
+    exit 1
   fi
 }
 
@@ -138,6 +178,8 @@ run_mode() {
   echo "Session ID: $session_id"
   echo "Join Code: $join_code"
   echo "→ Attach this session to your Private Beach (dashboard or API) within the next $SMOKE_TIMEOUT seconds."
+
+  run_headless_viewer "$mode" "$session_id" "$join_code"
 
   if wait_for_fastpath "$host_log" "$session_id"; then
     echo "✅ Fast-path controller channel established for $session_id"

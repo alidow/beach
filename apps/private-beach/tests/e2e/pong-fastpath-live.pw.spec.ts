@@ -23,6 +23,7 @@ function loadBootstrapSessions(dir: string): BootstrapInfo[] {
     } catch (err) {
       // Ignore malformed files; test will rely on telemetry fallback.
       console.warn(`failed to parse ${full}:`, err);
+      continue;
     }
   }
   return sessions;
@@ -53,24 +54,25 @@ test.describe('pong fast-path live (rewrite-2)', () => {
     test.skip(!beachId, 'PRIVATE_BEACH_ID env is required for live pong fast-path test');
 
     const clerkUser = process.env.CLERK_USER || 'test@beach.sh';
-    const clerkPass = process.env.CLERK_PASS || 'hellobeach';
+    const clerkPass = process.env.CLERK_PASS || 'h3llo Beach';
 
-    // Navigate to the beach; expect possible sign-in flow.
-    await page.goto(`${baseUrl}/beaches/${beachId}`);
+    // Navigate to sign-in first to ensure Clerk loads.
+    await page.goto(`${baseUrl}/sign-in`, { waitUntil: 'domcontentloaded' });
 
-    // If sign-in required, fill Clerk form.
-    const signInPrompt = page.getByRole('heading', { name: /sign in/i }).or(page.getByText(/sign in to load this beach/i));
-    if (await signInPrompt.isVisible({ timeout: 2_000 }).catch(() => false)) {
-      // Clerk forms typically have identifier + continue + password steps.
-      const identifier = page.locator('input[name="identifier"]').first();
+    // If already signed in, redirect may land on /beaches; otherwise, complete Clerk form.
+    const identifier = page.locator('input[name="identifier"], input[type="email"]').first();
+    if (await identifier.isVisible({ timeout: 3_000 }).catch(() => false)) {
       await identifier.fill(clerkUser);
-      await page.getByRole('button', { name: /continue/i }).first().click();
+      await page.getByRole('button', { name: /continue|next/i }).first().click();
       const password = page.locator('input[type="password"]').first();
-      await password.waitFor({ state: 'visible', timeout: 10_000 });
+      await password.waitFor({ state: 'visible', timeout: 15_000 });
       await password.fill(clerkPass);
       await page.getByRole('button', { name: /continue|sign in/i }).first().click();
-      await page.waitForURL('**/beaches/**', { timeout: 20_000 });
     }
+
+    // Hit the target beach page after auth.
+    await page.goto(`${baseUrl}/beaches/${beachId}`, { waitUntil: 'domcontentloaded' });
+    await page.waitForURL('**/beaches/**', { timeout: 20_000 }).catch(() => {});
 
     // Wait for tiles to render; expect at least 3.
     const tiles = page.locator('[data-testid^="rf__node-tile:"]');

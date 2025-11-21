@@ -195,7 +195,7 @@ HOST_ARTIFACT_DIR=${HOST_ARTIFACTS:-"$REPO_ROOT/temp/pong-fastpath-smoke/$RUN_ID
 mkdir -p "$HOST_ARTIFACT_DIR"
 MANAGER_HEALTH_TIMEOUT=${PONG_SMOKE_MANAGER_HEALTH_SECS:-120}
 BOOTSTRAP_TIMEOUT=${PONG_SMOKE_BOOTSTRAP_TIMEOUT:-240}
-READY_TIMEOUT=${PONG_SMOKE_READY_TIMEOUT:-90}
+READY_TIMEOUT=${PONG_SMOKE_READY_TIMEOUT:-15}
 TAIL_TIMEOUT=${PONG_SMOKE_TAIL_TIMEOUT:-$READY_TIMEOUT}
 STACK_START_TIMEOUT=${PONG_SMOKE_STACK_TIMEOUT:-150}
 RUN_DURATION=${PONG_SMOKE_RUN_DURATION:-$RUN_DURATION}
@@ -599,6 +599,14 @@ fi
 
 echo "Collecting logs from container..."
 copy_artifacts "$HOST_ARTIFACT_DIR/container"
+echo "[pong-smoke] dumping beach-manager logs to $HOST_ARTIFACT_DIR/beach-manager.log"
+direnv exec . sh -c "docker logs beach-manager > \"$HOST_ARTIFACT_DIR/beach-manager.log\" 2>&1" || true
+
+# Also grab the manager runtime log files from inside the container for forwarder traces.
+direnv exec . sh -c "docker exec beach-manager sh -c 'tar -C /app/temp -cf - bm-run.log bm-run-*.log manager-latest.log manager-tail.log 2>/dev/null || true' | tar -xvf - -C \"$HOST_ARTIFACT_DIR\" >/dev/null 2>&1" || true
+if [[ -f "$REPO_ROOT/logs/beach-manager/beach-manager.log" ]]; then
+  cp "$REPO_ROOT/logs/beach-manager/beach-manager.log" "$HOST_ARTIFACT_DIR/beach-manager-file.log" || true
+fi
 
 AGENT_LOG="$HOST_ARTIFACT_DIR/container/agent-${RUN_ID}.log"
 BALL_TRACE_DIR="$HOST_ARTIFACT_DIR/container/ball-traces"

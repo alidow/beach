@@ -10,8 +10,8 @@ use std::{
     fmt,
     net::IpAddr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH},
@@ -21,8 +21,8 @@ use crate::auth::{AuthConfig, AuthContext};
 use crate::publish_token::{PublishTokenManager, SignedPublishToken};
 use crate::routes::ShowcasePreflightResponse;
 use crate::{
-    fastpath::{fast_path_action_bytes, FastPathRegistry, FastPathSession},
-    log_throttle::{should_log_custom_event, should_log_queue_event, QueueLogKind},
+    fastpath::fast_path_action_bytes,
+    log_throttle::{QueueLogKind, should_log_custom_event, should_log_queue_event},
     metrics,
 };
 use beach_buggy::{
@@ -32,22 +32,24 @@ use beach_buggy::{
 };
 use beach_client_core::cache::terminal::packed::unpack_cell;
 use beach_client_core::protocol::{ClientFrame, CursorFrame, Update as WireUpdate};
+use beach_client_core::transport::extensions;
+use beach_client_core::transport::webrtc::warm_session_key;
 use beach_client_core::{
-    decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
-    HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell, Payload,
-    SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId, TerminalGrid,
-    Transport, TransportError, TransportOffer, WebRtcChannels,
+    CliError, ExtensionFrame, HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport,
+    PackedCell, Payload, SessionConfig, SessionError, SessionHandle, SessionManager, Style,
+    StyleId, TerminalGrid, Transport, TransportError, TransportOffer, WebRtcChannels,
+    decode_host_frame_binary, encode_client_frame_binary, negotiate_transport,
 };
 use chrono::{DateTime, Duration, Utc};
 use prometheus::IntGauge;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use sqlx::{types::Json, FromRow, PgPool, Row};
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use sqlx::{FromRow, PgPool, Row, types::Json};
+use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, trace, warn, Level};
+use tracing::{Level, debug, info, trace, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -123,7 +125,6 @@ pub struct AppState {
     publish_tokens: Arc<PublishTokenManager>,
     events: Arc<RwLock<HashMap<String, broadcast::Sender<StreamEvent>>>>,
     devtools_events: Arc<RwLock<HashMap<String, broadcast::Sender<DevtoolsTimelineEvent>>>>,
-    fast_paths: FastPathRegistry,
     viewer_workers: Arc<RwLock<HashMap<String, ViewerWorker>>>,
     controller_workers: Arc<RwLock<HashMap<String, ControllerForwarderWorker>>>,
     viewer_tokens: Option<ViewerTokenClient>,
@@ -537,6 +538,7 @@ impl ManagerViewerState {
             WireHostFrame::SnapshotComplete { .. }
             | WireHostFrame::Heartbeat { .. }
             | WireHostFrame::InputAck { .. }
+            | WireHostFrame::Extension { .. }
             | WireHostFrame::Shutdown => None,
         }
     }
@@ -1193,7 +1195,6 @@ impl AppState {
             publish_tokens: Arc::new(PublishTokenManager::from_env()),
             events: Arc::new(RwLock::new(HashMap::new())),
             devtools_events: Arc::new(RwLock::new(HashMap::new())),
-            fast_paths: FastPathRegistry::new(),
             viewer_workers: Arc::new(RwLock::new(HashMap::new())),
             controller_workers: Arc::new(RwLock::new(HashMap::new())),
             viewer_tokens: None,
@@ -1234,7 +1235,6 @@ impl AppState {
             publish_tokens: Arc::new(PublishTokenManager::from_env()),
             events: Arc::new(RwLock::new(HashMap::new())),
             devtools_events: Arc::new(RwLock::new(HashMap::new())),
-            fast_paths: FastPathRegistry::new(),
             viewer_workers: Arc::new(RwLock::new(HashMap::new())),
             controller_workers: Arc::new(RwLock::new(HashMap::new())),
             viewer_tokens: None,
@@ -1405,11 +1405,29 @@ impl AppState {
         if let Some(value) = test_support::fast_path_ready_override(session_id) {
             return value;
         }
-        let ready = if let Some(fps) = self.fast_paths.get(session_id).await {
-            let guard = fps.actions_tx.lock().await;
-            guard.is_some()
+        let controllers = self.fallback.controllers_for_child(session_id).await;
+        let ready = if controllers.is_empty() {
+            self.fallback
+                .peek_pending_transport_status(session_id)
+                .await
+                .map(|status| matches!(status.transport, PairingTransportKind::FastPath))
+                .unwrap_or(false)
         } else {
-            false
+            let mut any_ready = false;
+            for controller in controllers {
+                let pairings = self.fallback.list_pairings(&controller).await;
+                if pairings.iter().any(|pairing| {
+                    pairing.child_session_id == session_id
+                        && matches!(
+                            pairing.transport_status.as_ref().map(|s| s.transport),
+                            Some(PairingTransportKind::FastPath)
+                        )
+                }) {
+                    any_ready = true;
+                    break;
+                }
+            }
+            any_ready
         };
         if should_log_custom_event(
             "fast_path_ready_check",
@@ -2024,66 +2042,6 @@ impl AppState {
         self.publish_tokens.clone()
     }
 
-    async fn clear_http_backlog_after_fast_path(&self, private_beach_id: &str, session_id: &str) {
-        if let Err(err) = self.clear_actions_redis(private_beach_id, session_id).await {
-            warn!(
-                target = "controller.delivery",
-                session_id = %session_id,
-                private_beach_id = %private_beach_id,
-                error = %err,
-                "failed to clear redis backlog after fast-path promotion"
-            );
-        } else {
-            debug!(
-                target = "controller.delivery",
-                session_id = %session_id,
-                private_beach_id = %private_beach_id,
-                "cleared redis controller backlog after fast-path promotion"
-            );
-        }
-        self.fallback.clear_pending_actions(session_id).await;
-    }
-
-    pub async fn fast_path_actions_online(&self, session_id: &str) {
-        let private_beach_id =
-            if let Some((pb_id, _)) = self.session_metrics_labels(session_id).await {
-                Some(pb_id)
-            } else {
-                let sessions = self.fallback.sessions.read().await;
-                sessions
-                    .get(session_id)
-                    .map(|record| record.private_beach_id.clone())
-            };
-
-        if let Some(pb_id) = private_beach_id.clone() {
-            info!(
-                target = "controller.fast_path_state",
-                session_id = %session_id,
-                private_beach_id = %pb_id,
-                "fast-path actions channel online"
-            );
-            self.clear_http_backlog_after_fast_path(&pb_id, session_id)
-                .await;
-        }
-        self.clear_controller_handshake(session_id).await;
-    }
-
-    pub async fn attach_fast_path(&self, session_id: String, fps: FastPathSession) {
-        let arc = Arc::new(fps);
-        arc.spawn_receivers(self.clone());
-        info!(
-            target = "controller.fast_path_state",
-            session_id = %session_id,
-            fast_path_id = arc.instance_id(),
-            "attaching fast-path session"
-        );
-        self.fast_paths.insert(session_id, arc).await;
-    }
-
-    pub async fn fast_path_for(&self, session_id: &str) -> Option<Arc<FastPathSession>> {
-        self.fast_paths.get(session_id).await
-    }
-
     pub async fn session_metrics_labels(&self, session_id: &str) -> Option<(String, String)> {
         {
             let sessions = self.fallback.sessions.read().await;
@@ -2276,6 +2234,19 @@ impl AppState {
         child_session_id: &str,
         status: PairingTransportStatus,
     ) {
+        let previous = self
+            .fallback
+            .peek_pending_transport_status(child_session_id)
+            .await;
+        trace!(
+            target = "controller.transport_status",
+            child_session_id = %child_session_id,
+            previous = ?previous.as_ref().map(|s| s.transport),
+            new_transport = ?status.transport,
+            new_latency = status.latency_ms,
+            new_error = status.last_error,
+            "update_pairing_transport_status"
+        );
         let controllers = self.fallback.controllers_for_child(child_session_id).await;
         if controllers.is_empty() {
             if let Some(children) = self
@@ -3127,10 +3098,28 @@ impl AppState {
                 };
 
                 let mut pairing = self.fallback.upsert_pairing(pairing).await;
-                let pending_status = self
+                let mut pending_status = self
                     .fallback
                     .take_pending_transport_status(child_session_id)
                     .await;
+                // If the controller advertised transport readiness before pairings existed,
+                // reuse its cached status for every child pairing.
+                if pending_status.is_none() {
+                    if let Some(controller_status) = self
+                        .fallback
+                        .take_pending_transport_status(controller_session_id)
+                        .await
+                    {
+                        pending_status = Some(controller_status.clone());
+                        // Reinsert so other children can also pick it up.
+                        self.fallback
+                            .record_pending_transport_status(
+                                controller_session_id,
+                                controller_status,
+                            )
+                            .await;
+                    }
+                }
                 if let Some(status) = pending_status.clone() {
                     pairing.transport_status = Some(status.clone());
                 }
@@ -5258,6 +5247,14 @@ impl InnerState {
         pending.remove(child_session_id)
     }
 
+    async fn peek_pending_transport_status(
+        &self,
+        child_session_id: &str,
+    ) -> Option<PairingTransportStatus> {
+        let pending = self.pending_transport.read().await;
+        pending.get(child_session_id).cloned()
+    }
+
     async fn mark_attached(&self, session_id: &str) {
         let mut sessions = self.sessions.write().await;
         if let Some(record) = sessions.get_mut(session_id) {
@@ -5862,16 +5859,10 @@ fn default_transport_hints(
         serde_json::json!({ "path": format!("/sessions/{session_id}/health") }),
     );
     hints.insert(
-        "fast_path_webrtc".into(),
+        "extensions".into(),
         serde_json::json!({
-            "offer_path": format!("/fastpath/sessions/{session_id}/webrtc/offer"),
-            "ice_path": format!("/fastpath/sessions/{session_id}/webrtc/ice"),
-            "channels": {
-                "actions": "mgr-actions",
-                "acks": "mgr-acks",
-                "state": "mgr-state"
-            },
-            "status": "experimental"
+            "namespaces": ["fastpath"],
+            "preferred": true
         }),
     );
     if let Some(interval) = idle_snapshot_interval_ms {
@@ -6401,7 +6392,7 @@ impl AppState {
         let fast_path_ready = self.fast_path_ready(session_id).await;
         let fast_path_required =
             matches!(transport_mode, TransportMode::FastPath) && !http_ready && fast_path_ready;
-        if fast_path_required && self.fast_path_for(session_id).await.is_none() {
+        if fast_path_required {
             return Err(self
                 .controller_command_rejection_with_snapshot(
                     &private_beach_id,
@@ -6442,11 +6433,21 @@ impl AppState {
         });
         drop(sessions);
 
-        self.update_pairing_transport_status(
-            session_id,
-            PairingTransportStatus::http_fallback(event_time, None),
-        )
-        .await;
+        if self.controller_fast_path_enabled() {
+            // Unified transport uses the primary channel for fast-path; keep transport
+            // status at fast_path so agents don't fall back to HTTP while actions queue.
+            self.update_pairing_transport_status(
+                session_id,
+                PairingTransportStatus::fast_path(event_time),
+            )
+            .await;
+        } else {
+            self.update_pairing_transport_status(
+                session_id,
+                PairingTransportStatus::http_fallback(event_time, None),
+            )
+            .await;
+        }
 
         self.publish(session_id, event).await;
         self.emit_connector_events_for_child(
@@ -6492,8 +6493,13 @@ impl AppState {
             .get_mut(session_id)
             .ok_or(StateError::SessionNotFound)?;
         let actions: Vec<ActionCommand> = record.pending_actions.drain(..).collect();
-        if !actions.is_empty() {
-            let token = record.first_lease_token();
+        let ack_token = if !actions.is_empty() {
+            Some(record.first_lease_token())
+        } else {
+            None
+        };
+        drop(sessions);
+        if let Some(token) = ack_token {
             self.publish(
                 session_id,
                 StreamEvent::ControllerEvent(ControllerEvent {
@@ -6523,6 +6529,7 @@ impl AppState {
         record.last_health = Some(heartbeat.clone());
         let token = record.first_lease_token();
         record.append_event(ControllerEventType::HealthReported, token, None);
+        drop(sessions);
         self.publish(session_id, StreamEvent::Health(heartbeat))
             .await;
         Ok(())
@@ -6533,34 +6540,38 @@ impl AppState {
         session_id: &str,
         diff: StateDiff,
     ) -> Result<(), StateError> {
-        let mut sessions = self.fallback.sessions.write().await;
-        let record = sessions
-            .get_mut(session_id)
-            .ok_or(StateError::SessionNotFound)?;
-        let diff_clone = diff.clone();
-        let diff_sequence = diff_clone.sequence;
-        self.store_state_redis(&record.private_beach_id, session_id, &diff_clone)
+        let (private_beach_id, diff_clone, diff_sequence, payload_summary) = {
+            let mut sessions = self.fallback.sessions.write().await;
+            let record = sessions
+                .get_mut(session_id)
+                .ok_or(StateError::SessionNotFound)?;
+            let diff_clone = diff.clone();
+            let diff_sequence = diff_clone.sequence;
+            let private_beach_id = record.private_beach_id.clone();
+            record.last_state = Some(diff);
+            let token = record.first_lease_token();
+            record.append_event(ControllerEventType::StateUpdated, token, None);
+            let payload_summary = diff_clone
+                .payload
+                .as_object()
+                .map(|object| {
+                    let keys = object
+                        .keys()
+                        .take(6)
+                        .map(|key| key.to_string())
+                        .collect::<Vec<_>>();
+                    let line_count = object
+                        .get("lines")
+                        .and_then(|value| value.as_array())
+                        .map(|rows| rows.len());
+                    (keys, line_count)
+                })
+                .unwrap_or_default();
+            drop(sessions);
+            (private_beach_id, diff_clone, diff_sequence, payload_summary)
+        };
+        self.store_state_redis(&private_beach_id, session_id, &diff_clone)
             .await?;
-        record.last_state = Some(diff);
-        let token = record.first_lease_token();
-        record.append_event(ControllerEventType::StateUpdated, token, None);
-        let payload_summary = diff_clone
-            .payload
-            .as_object()
-            .map(|object| {
-                let keys = object
-                    .keys()
-                    .take(6)
-                    .map(|key| key.to_string())
-                    .collect::<Vec<_>>();
-                let line_count = object
-                    .get("lines")
-                    .and_then(|value| value.as_array())
-                    .map(|rows| rows.len());
-                (keys, line_count)
-            })
-            .unwrap_or_default();
-        drop(sessions);
         self.publish(session_id, StreamEvent::State(diff_clone))
             .await;
         self.state_keepalive
@@ -7623,7 +7634,6 @@ impl AppState {
                     self.stop_session_workers(session_id, "private_beach_deleted")
                         .await;
                     self.clear_session_stream(session_id).await;
-                    self.fast_paths.remove(session_id).await;
                 }
                 self.purge_private_beach_state(id_str, &session_ids).await;
                 info!(
@@ -7712,7 +7722,6 @@ impl AppState {
                     self.stop_session_workers(session_id, "private_beach_deleted")
                         .await;
                     self.clear_session_stream(session_id).await;
-                    self.fast_paths.remove(session_id).await;
                 }
 
                 self.purge_private_beach_state(&private_beach_id, &session_ids)
@@ -8235,6 +8244,7 @@ async fn viewer_connect_once(
                                 WireHostFrame::InputAck { .. } => "input_ack",
                                 WireHostFrame::Cursor { .. } => "cursor",
                                 WireHostFrame::Heartbeat { .. } => "heartbeat",
+                                WireHostFrame::Extension { .. } => "extension",
                                 WireHostFrame::Shutdown => "shutdown",
                             };
                             debug!(
@@ -8477,6 +8487,13 @@ async fn run_controller_forwarder(
             break;
         }
         attempts = attempts.saturating_add(1);
+        info!(
+            target = "controller.forwarder",
+            session_id = %session_id,
+            private_beach_id = %private_beach_id,
+            attempts,
+            "controller forwarder attempt starting"
+        );
         match controller_forwarder_once(
             &state,
             &session_id,
@@ -8560,21 +8577,70 @@ async fn controller_forwarder_once_with_label(
     label: &str,
     cancel: CancellationToken,
 ) -> Result<(), ControllerForwarderError> {
+    let attempt_started = Instant::now();
     let config = SessionConfig::new(&state.road_base_url)
         .map_err(|err| ControllerForwarderError::Join(err.to_string()))?;
     let manager = SessionManager::new(config)
         .map_err(|err| ControllerForwarderError::Join(err.to_string()))?;
     let fallback_base = manager.config().base_url().clone();
+    info!(
+        target = "controller.forwarder",
+        session_id = %session_id,
+        private_beach_id = %private_beach_id,
+        label = %label,
+        "controller forwarder preparing join"
+    );
     let joined = manager
         .join(session_id, Some(join_code), None, Some(label), false)
         .await
-        .map_err(|err| ControllerForwarderError::Join(err.to_string()))?;
+        .map_err(|err| {
+            warn!(
+                target = "controller.forwarder",
+                session_id = %session_id,
+                private_beach_id = %private_beach_id,
+                label = %label,
+                wait_ms = attempt_started.elapsed().as_millis() as u64,
+                error = %err,
+                "controller forwarder join failed"
+            );
+            ControllerForwarderError::Join(err.to_string())
+        })?;
     let mut handle = joined.into_handle();
+    let join_elapsed_ms = attempt_started.elapsed().as_millis() as u64;
+    trace!(
+        target = "controller.forwarder",
+        session_id = %session_id,
+        private_beach_id = %private_beach_id,
+        label = %label,
+        wait_ms = join_elapsed_ms,
+        "controller forwarder joined session"
+    );
     rewrite_loopback_transports(&mut handle, &fallback_base)
         .map_err(|err| ControllerForwarderError::Join(err.to_string()))?;
+    // Pre-derive session keys so the WebRTC handshake does not spend time in Argon2 later.
+    warm_session_key(Some(join_code), session_id).await;
+    let negotiate_started = Instant::now();
+    info!(
+        target = "controller.forwarder",
+        session_id = %session_id,
+        private_beach_id = %private_beach_id,
+        requested_label = %label,
+        "controller forwarder negotiating transport"
+    );
     let negotiated = negotiate_transport(&handle, Some(join_code), Some(label), false)
         .await
-        .map_err(|err| ControllerForwarderError::Negotiation(err.to_string()))?;
+        .map_err(|err| {
+            warn!(
+                target = "controller.forwarder",
+                session_id = %session_id,
+                private_beach_id = %private_beach_id,
+                requested_label = %label,
+                wait_ms = negotiate_started.elapsed().as_millis() as u64,
+                error = %err,
+                "controller forwarder negotiation failed"
+            );
+            ControllerForwarderError::Negotiation(err.to_string())
+        })?;
     match negotiated {
         NegotiatedTransport::Single(NegotiatedSingle {
             transport,
@@ -8582,6 +8648,20 @@ async fn controller_forwarder_once_with_label(
             metadata,
             ..
         }) => {
+            info!(
+                target = "controller.forwarder",
+                session_id = %session_id,
+                private_beach_id = %private_beach_id,
+                requested_label = %label,
+                negotiated_label = metadata
+                    .get("label")
+                    .map(|v| v.to_string()),
+                transport = ?transport.kind(),
+                has_webrtc_channels = webrtc_channels.is_some(),
+                join_ms = join_elapsed_ms,
+                negotiate_ms = negotiate_started.elapsed().as_millis() as u64,
+                "controller forwarder negotiated transport"
+            );
             let connection_label = metadata.get("label").cloned().or_else(|| {
                 debug!(
                     target = "controller.forwarder",
@@ -8627,8 +8707,26 @@ struct PendingControllerAction {
     sent_at: Instant,
 }
 
+fn remove_pending_by_id(
+    pending: &mut HashMap<u64, PendingControllerAction>,
+    action_id: &str,
+) -> Option<u64> {
+    let seq = pending.iter().find_map(|(seq, pending)| {
+        if pending.action.id == action_id {
+            Some(*seq)
+        } else {
+            None
+        }
+    })?;
+    pending.remove(&seq);
+    Some(seq)
+}
+
 enum ForwarderEvent {
     Ack(u64),
+    AckById(ActionAck),
+    State(StateDiff),
+    Health(HealthHeartbeat),
     Shutdown(String),
     FastPathReady {
         transport: Arc<dyn Transport>,
@@ -8650,22 +8748,31 @@ impl ForwarderReader {
             while !stop_clone.load(Ordering::Relaxed) {
                 match transport.recv(timeout) {
                     Ok(message) => match message.payload {
-                        Payload::Binary(bytes) => {
-                            if let Ok(frame) = decode_host_frame_binary(&bytes) {
-                                match frame {
-                                    WireHostFrame::InputAck { seq } => {
-                                        let _ = tx.send(ForwarderEvent::Ack(seq));
-                                    }
-                                    WireHostFrame::Shutdown => {
-                                        let _ = tx.send(ForwarderEvent::Shutdown(
-                                            "host requested shutdown".into(),
-                                        ));
-                                        break;
-                                    }
-                                    _ => {}
+                        Payload::Binary(bytes) => match decode_host_frame_binary(&bytes) {
+                            Ok(frame) => match frame {
+                                WireHostFrame::InputAck { seq } => {
+                                    let _ = tx.send(ForwarderEvent::Ack(seq));
                                 }
+                                WireHostFrame::Extension { frame } => {
+                                    extensions::publish(transport.id(), frame);
+                                }
+                                WireHostFrame::Shutdown => {
+                                    let _ = tx.send(ForwarderEvent::Shutdown(
+                                        "host requested shutdown".into(),
+                                    ));
+                                    break;
+                                }
+                                _ => {}
+                            },
+                            Err(err) => {
+                                trace!(
+                                    target = "controller.forwarder",
+                                    transport_id = %transport.id().0,
+                                    error = %err,
+                                    "failed to decode host frame"
+                                );
                             }
-                        }
+                        },
                         Payload::Text(text) => {
                             let trimmed = text.trim();
                             if trimmed == "__ready__" || trimmed == "__offer_ready__" {
@@ -8681,6 +8788,12 @@ impl ForwarderReader {
                         break;
                     }
                     Err(err) => {
+                        trace!(
+                            target = "controller.forwarder",
+                            transport_id = %transport.id().0,
+                            error = %err,
+                            "controller transport recv error"
+                        );
                         let _ = tx.send(ForwarderEvent::Shutdown(format!(
                             "controller transport error: {err}"
                         )));
@@ -8702,6 +8815,89 @@ impl Drop for ForwarderReader {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+enum FastPathExtension {
+    Ack(ActionAck),
+    State(StateDiff),
+    Health(HealthHeartbeat),
+}
+
+fn parse_fastpath_extension(frame: &ExtensionFrame) -> Option<FastPathExtension> {
+    if frame.namespace != "fastpath" {
+        return None;
+    }
+    let text = match std::str::from_utf8(&frame.payload) {
+        Ok(text) => text,
+        Err(err) => {
+            trace!(
+                target = "controller.forwarder",
+                namespace = %frame.namespace,
+                kind = %frame.kind,
+                error = %err,
+                "invalid utf8 in fast-path extension payload"
+            );
+            return None;
+        }
+    };
+
+    let payload_value: serde_json::Value = match serde_json::from_str(text) {
+        Ok(val) => val,
+        Err(err) => {
+            trace!(
+                target = "controller.forwarder",
+                namespace = %frame.namespace,
+                kind = %frame.kind,
+                error = %err,
+                "failed to parse fast-path extension json"
+            );
+            return None;
+        }
+    };
+    let payload_field = payload_value
+        .get("payload")
+        .cloned()
+        .unwrap_or(payload_value);
+
+    match frame.kind.as_str() {
+        "ack" => serde_json::from_value(payload_field)
+            .map(FastPathExtension::Ack)
+            .map_err(|err| {
+                trace!(
+                    target = "controller.forwarder",
+                    namespace = %frame.namespace,
+                    kind = %frame.kind,
+                    error = %err,
+                    "failed to parse fast-path ack extension"
+                )
+            })
+            .ok(),
+        "state" => serde_json::from_value(payload_field)
+            .map(FastPathExtension::State)
+            .map_err(|err| {
+                trace!(
+                    target = "controller.forwarder",
+                    namespace = %frame.namespace,
+                    kind = %frame.kind,
+                    error = %err,
+                    "failed to parse fast-path state extension"
+                )
+            })
+            .ok(),
+        "health" => serde_json::from_value(payload_field)
+            .map(FastPathExtension::Health)
+            .map_err(|err| {
+                trace!(
+                    target = "controller.forwarder",
+                    namespace = %frame.namespace,
+                    kind = %frame.kind,
+                    error = %err,
+                    "failed to parse fast-path health extension"
+                )
+            })
+            .ok(),
+        _ => None,
     }
 }
 
@@ -8909,6 +9105,17 @@ async fn drive_controller_forwarder(
     let fast_path_channels = webrtc_channels.clone();
     let mut fast_path_backoff =
         FastPathUpgradeBackoff::new(state.controller_fast_path_backoff_enabled());
+    let unified_only = fast_path_enabled && fast_path_channels.is_none();
+    info!(
+        target = "controller.forwarder",
+        session_id = %session_id,
+        private_beach_id = %private_beach_id,
+        metadata_label = metadata_label.as_deref(),
+        fast_path_enabled,
+        has_fast_path_channels = fast_path_channels.is_some(),
+        unified_only,
+        "controller forwarder starting"
+    );
     let (mut transport, mut transport_label, mut via_fast_path) = select_controller_transport(
         primary_transport.clone(),
         fast_path_channels.clone(),
@@ -8919,6 +9126,13 @@ async fn drive_controller_forwarder(
     )
     .await;
     let mut transport_is_primary = Arc::ptr_eq(&transport, &primary_transport);
+    // Unified transport path: when fast-path is enabled but no legacy WebRTC
+    // channels are present, treat the primary transport as fast-path so we don't
+    // downgrade status back to HTTP on every ack/health/state event.
+    if unified_only {
+        transport_label = "fast_path";
+        via_fast_path = true;
+    }
     let t_id = transport.id();
     let t_peer = transport.peer();
     info!(
@@ -8952,10 +9166,52 @@ async fn drive_controller_forwarder(
         state
             .update_pairing_transport_status(session_id, PairingTransportStatus::fast_path(now))
             .await;
+    } else if fast_path_enabled {
+        let now = now_ms();
+        state
+            .update_pairing_transport_status(session_id, PairingTransportStatus::fast_path(now))
+            .await;
+        trace!(
+            target = "controller.forwarder",
+            session_id = %session_id,
+            private_beach_id = %private_beach_id,
+            "marking fast-path ready on primary transport (unified extensions)"
+        );
     }
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let mut reader_guard = ForwarderReader::spawn(transport.clone(), event_tx.clone());
+    let mut ext_rx = transport.subscribe_extensions("fastpath");
+    let event_tx_clone = event_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            match ext_rx.recv().await {
+                Ok(frame) => {
+                    if let Some(parsed) = parse_fastpath_extension(&frame) {
+                        match parsed {
+                            FastPathExtension::Ack(ack) => {
+                                let _ = event_tx_clone.send(ForwarderEvent::AckById(ack));
+                            }
+                            FastPathExtension::State(diff) => {
+                                let _ = event_tx_clone.send(ForwarderEvent::State(diff));
+                            }
+                            FastPathExtension::Health(heartbeat) => {
+                                let _ = event_tx_clone.send(ForwarderEvent::Health(heartbeat));
+                            }
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(
+                        target = "controller.forwarder",
+                        skipped, "fastpath extension subscriber lagged"
+                    );
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
     let mut fast_path_watchers: Option<FastPathUpgradeHandle> = None;
     ensure_fast_path_probe(
         &mut fast_path_watchers,
@@ -9075,6 +9331,53 @@ async fn drive_controller_forwarder(
                             );
                         }
                     }
+                    Some(ForwarderEvent::AckById(ack)) => {
+                        let removed_seq = remove_pending_by_id(&mut pending, &ack.id);
+                        if removed_seq.is_some() {
+                            metrics::ACTIONS_ACKED.with_label_values(&labels).inc();
+                        } else {
+                            trace!(
+                                target = "controller.forwarder",
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                action_id = %ack.id,
+                                "received action ack for unknown id"
+                            );
+                        }
+                        if let Err(err) =
+                            state.ack_actions(session_id, vec![ack.clone()], None, via_fast_path).await
+                        {
+                            warn!(
+                                target = "controller.forwarder",
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                error = %err,
+                                "failed to remove action after extension ack"
+                            );
+                        }
+                    }
+                    Some(ForwarderEvent::State(diff)) => {
+                        if let Err(err) = state.record_state(session_id, diff, via_fast_path).await {
+                            warn!(
+                                target = "controller.forwarder",
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                error = %err,
+                                "failed to record state from extension frame"
+                            );
+                        }
+                    }
+                    Some(ForwarderEvent::Health(heartbeat)) => {
+                        if let Err(err) = state.record_health(session_id, heartbeat).await {
+                            warn!(
+                                target = "controller.forwarder",
+                                session_id = %session_id,
+                                private_beach_id = %private_beach_id,
+                                error = %err,
+                                "failed to record health from extension frame"
+                            );
+                        }
+                    }
                     Some(ForwarderEvent::Shutdown(reason)) => {
                         if via_fast_path {
                             let inflight = pending.len();
@@ -9096,6 +9399,18 @@ async fn drive_controller_forwarder(
                             };
                             let drained = std::mem::take(&mut pending);
                             fail_pending_actions(state, session_id, drained, true, &reason).await;
+                            if unified_only {
+                                trace!(
+                                    target = "controller.forwarder",
+                                    session_id = %session_id,
+                                    private_beach_id = %private_beach_id,
+                                    reason = %reason,
+                                    queue_depth,
+                                    inflight,
+                                    "fast-path transport closed in unified mode; staying on primary transport"
+                                );
+                                continue;
+                            }
                             metrics::CONTROLLER_FAST_PATH_FALLBACKS
                                 .with_label_values(&labels)
                                 .inc();
@@ -9226,6 +9541,8 @@ async fn drive_controller_forwarder(
                                 DevtoolsEventLevel::Info,
                                 Some(serde_json::json!({
                                     "label": label,
+                                    "transportId": transport.id().0,
+                                    "peerId": transport.peer().0,
                                 })),
                             )
                             .await;
@@ -9234,6 +9551,8 @@ async fn drive_controller_forwarder(
                             session_id = %session_id,
                             private_beach_id = %private_beach_id,
                             label,
+                            transport_id = %transport.id().0,
+                            peer_id = %transport.peer().0,
                             "controller forwarder switched transport"
                         );
                         ensure_fast_path_probe(
@@ -9319,6 +9638,16 @@ async fn drive_controller_forwarder(
                             );
                             fail_pending_actions(state, session_id, drained, via_fast_path, &reason).await;
                             if via_fast_path {
+                                if unified_only {
+                                trace!(
+                                    target = "controller.forwarder",
+                                    session_id = %session_id,
+                                    private_beach_id = %private_beach_id,
+                                    inflight,
+                                    "ack stall detected in unified mode; staying on primary transport"
+                                );
+                                continue;
+                            }
                                 metrics::CONTROLLER_FAST_PATH_FALLBACKS
                                     .with_label_values(&labels)
                                     .inc();
@@ -9405,11 +9734,10 @@ async fn drive_controller_forwarder(
                     match fast_path_action_bytes(&action) {
                         Ok(bytes) => {
                             next_seq = next_seq.saturating_add(1);
-                            let frame = ClientFrame::Input {
+                            let encoded = encode_client_frame_binary(&ClientFrame::Input {
                                 seq: next_seq,
-                                data: bytes,
-                            };
-                            let encoded = encode_client_frame_binary(&frame);
+                                data: bytes.clone(),
+                            });
                             let sent_at = loop {
                                 match transport.send_bytes(&encoded) {
                                     Ok(_) => {
@@ -9419,6 +9747,16 @@ async fn drive_controller_forwarder(
                                                 .with_label_values(&labels)
                                                 .inc();
                                         }
+                                        trace!(
+                                            target = "controller.forwarder",
+                                            session_id = %session_id,
+                                            private_beach_id = %private_beach_id,
+                                            via_fast_path,
+                                            transport = transport_label,
+                                            action_id = %action.id,
+                                            payload_len = bytes.len(),
+                                            "sent controller action"
+                                        );
                                         break Instant::now();
                                     }
                                     Err(err)
@@ -9429,6 +9767,16 @@ async fn drive_controller_forwarder(
                                         let drained = std::mem::take(&mut pending);
                                         let reason = format!("fast-path send failed: {err}");
                                         fail_pending_actions(state, session_id, drained, true, &reason).await;
+                                        if unified_only {
+                                            trace!(
+                                                target = "controller.forwarder",
+                                                session_id = %session_id,
+                                                private_beach_id = %private_beach_id,
+                                                error = %err,
+                                                "fast-path send failed in unified mode; staying on primary transport"
+                                            );
+                                            break Instant::now();
+                                        }
                                         metrics::CONTROLLER_FAST_PATH_FALLBACKS
                                             .with_label_values(&labels)
                                             .inc();
@@ -9456,7 +9804,8 @@ async fn drive_controller_forwarder(
                                         transport = primary_transport.clone();
                                         transport_is_primary = true;
                                         drop(reader_guard);
-                                        reader_guard = ForwarderReader::spawn(transport.clone(), event_tx.clone());
+                                        reader_guard =
+                                            ForwarderReader::spawn(transport.clone(), event_tx.clone());
                                         info!(
                                             target = "controller.forwarder",
                                             session_id = %session_id,
@@ -10047,7 +10396,7 @@ mod tests {
     use super::*;
     use crate::state::test_support;
     use beach_buggy::{ActionCommand, HarnessType, RegisterSessionRequest};
-    use beach_client_core::cache::terminal::packed::{pack_color_default, pack_color_rgb, StyleId};
+    use beach_client_core::cache::terminal::packed::{StyleId, pack_color_default, pack_color_rgb};
     use beach_client_core::protocol::{
         HostFrame as WireHostFrame, Lane, LaneBudgetFrame, SyncConfigFrame, Update as WireUpdate,
     };
@@ -10055,11 +10404,11 @@ mod tests {
     use chrono::Utc;
     use serde_json::json;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use std::time::{Duration as StdDuration, SystemTime};
-    use tokio::time::{advance, sleep, timeout, Duration};
+    use tokio::time::{Duration, advance, sleep, timeout};
 
     #[test_timeout::tokio_timeout_test(10)]
     async fn spawn_viewer_worker_smoke_test_records_state_and_stream() {
@@ -10402,6 +10751,147 @@ mod tests {
         }
     }
 
+    /// Transport that accepts sends but never delivers acks (recv always times out).
+    #[derive(Clone)]
+    struct StallingTransport {
+        id: TransportId,
+        peer: TransportId,
+        kind: TransportKind,
+    }
+
+    impl StallingTransport {
+        fn new(id: u64, kind: TransportKind) -> Self {
+            Self {
+                id: TransportId(id),
+                peer: TransportId(id + 1),
+                kind,
+            }
+        }
+    }
+
+    /// Transport that fails immediately on send to simulate channel failures.
+    #[derive(Clone)]
+    struct FailingTransport {
+        id: TransportId,
+        peer: TransportId,
+        kind: TransportKind,
+        fail_on_send: bool,
+        closed: Arc<AtomicBool>,
+        close_on_recv: bool,
+    }
+
+    impl FailingTransport {
+        fn new(id: u64, kind: TransportKind) -> Self {
+            Self {
+                id: TransportId(id),
+                peer: TransportId(id + 1),
+                kind,
+                fail_on_send: true,
+                closed: Arc::new(AtomicBool::new(false)),
+                close_on_recv: false,
+            }
+        }
+
+        fn new_closed_on_recv(id: u64, kind: TransportKind) -> Self {
+            Self {
+                id: TransportId(id),
+                peer: TransportId(id + 1),
+                kind,
+                fail_on_send: false,
+                closed: Arc::new(AtomicBool::new(true)),
+                close_on_recv: true,
+            }
+        }
+    }
+
+    impl Transport for FailingTransport {
+        fn kind(&self) -> TransportKind {
+            self.kind
+        }
+
+        fn id(&self) -> TransportId {
+            self.id
+        }
+
+        fn peer(&self) -> TransportId {
+            self.peer
+        }
+
+        fn send(&self, _message: TransportMessage) -> Result<(), TransportError> {
+            if self.fail_on_send {
+                self.closed.store(true, Ordering::SeqCst);
+                Err(TransportError::ChannelClosed)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn send_text(&self, _text: &str) -> Result<u64, TransportError> {
+            if self.fail_on_send {
+                self.closed.store(true, Ordering::SeqCst);
+                Err(TransportError::ChannelClosed)
+            } else {
+                Ok(0)
+            }
+        }
+
+        fn send_bytes(&self, _bytes: &[u8]) -> Result<u64, TransportError> {
+            if self.fail_on_send {
+                self.closed.store(true, Ordering::SeqCst);
+                Err(TransportError::ChannelClosed)
+            } else {
+                Ok(0)
+            }
+        }
+
+        fn recv(&self, _timeout: StdDuration) -> Result<TransportMessage, TransportError> {
+            if self.closed.load(Ordering::SeqCst) || self.close_on_recv {
+                self.closed.store(true, Ordering::SeqCst);
+                Err(TransportError::ChannelClosed)
+            } else {
+                Err(TransportError::Timeout)
+            }
+        }
+
+        fn try_recv(&self) -> Result<Option<TransportMessage>, TransportError> {
+            Ok(None)
+        }
+    }
+
+    impl Transport for StallingTransport {
+        fn kind(&self) -> TransportKind {
+            self.kind
+        }
+
+        fn id(&self) -> TransportId {
+            self.id
+        }
+
+        fn peer(&self) -> TransportId {
+            self.peer
+        }
+
+        fn send(&self, _message: TransportMessage) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn send_text(&self, _text: &str) -> Result<u64, TransportError> {
+            Ok(0)
+        }
+
+        fn send_bytes(&self, _bytes: &[u8]) -> Result<u64, TransportError> {
+            Ok(0)
+        }
+
+        fn recv(&self, _timeout: StdDuration) -> Result<TransportMessage, TransportError> {
+            Err(TransportError::Timeout)
+        }
+
+        fn try_recv(&self) -> Result<Option<TransportMessage>, TransportError> {
+            Ok(None)
+        }
+    }
+
     #[tokio::test]
     async fn select_controller_transport_prefers_fast_path_channel() {
         let primary = Arc::new(TestTransport::new(1, TransportKind::WebSocket));
@@ -10486,6 +10976,27 @@ mod tests {
         assert_eq!(selected.id(), primary.id());
         assert_eq!(label, "http_fallback");
         assert!(!via_fast_path);
+    }
+
+    #[tokio::test]
+    async fn select_controller_transport_treats_unified_primary_as_fast_path() {
+        let primary = Arc::new(TestTransport::new(6, TransportKind::WebSocket));
+
+        // Fast-path enabled, no legacy fast-path channels available: unified should
+        // remain labeled fast_path so downstream readiness stays "fast_path".
+        let (selected, label, via_fast_path) = select_controller_transport(
+            primary.clone(),
+            None,
+            Some(CONTROLLER_CHANNEL_LABEL),
+            true,
+            "sess-unified",
+            "pb-unified",
+        )
+        .await;
+
+        assert_eq!(selected.id(), primary.id());
+        assert_eq!(label, "fast_path");
+        assert!(via_fast_path);
     }
 
     #[tokio::test]
@@ -10634,11 +11145,160 @@ mod tests {
         );
 
         // Pending cache should be cleared once the replay succeeds.
-        assert!(state
-            .fallback
-            .take_pending_transport_status("lhs-sess")
+        assert!(
+            state
+                .fallback
+                .take_pending_transport_status("lhs-sess")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_transport_status_from_controller_applies_to_children() {
+        let state = AppState::new();
+        let controller = RegisterSessionRequest {
+            session_id: "controller-sess".into(),
+            private_beach_id: "pb-pair".into(),
+            harness_type: HarnessType::TerminalShim,
+            capabilities: vec![],
+            location_hint: None,
+            metadata: None,
+            version: "1.0.0".into(),
+            viewer_passcode: Some("PASS".into()),
+            transport_mode: Some(TransportMode::FastPath),
+        };
+        let lhs = RegisterSessionRequest {
+            session_id: "lhs-sess".into(),
+            private_beach_id: "pb-pair".into(),
+            harness_type: HarnessType::TerminalShim,
+            capabilities: vec![],
+            location_hint: None,
+            metadata: None,
+            version: "1.0.0".into(),
+            viewer_passcode: Some("PASS".into()),
+            transport_mode: Some(TransportMode::FastPath),
+        };
+        let rhs = RegisterSessionRequest {
+            session_id: "rhs-sess".into(),
+            private_beach_id: "pb-pair".into(),
+            harness_type: HarnessType::TerminalShim,
+            capabilities: vec![],
+            location_hint: None,
+            metadata: None,
+            version: "1.0.0".into(),
+            viewer_passcode: Some("PASS".into()),
+            transport_mode: Some(TransportMode::FastPath),
+        };
+        state.register_session(controller).await.unwrap();
+        state.register_session(lhs).await.unwrap();
+        state.register_session(rhs).await.unwrap();
+
+        // Controller advertises fast-path readiness before pairings exist.
+        let now = now_ms();
+        let status = PairingTransportStatus::fast_path(now);
+        state
+            .update_pairing_transport_status("controller-sess", status.clone())
+            .await;
+
+        state
+            .acquire_controller("controller-sess", Some(30_000), Some("test".into()), None)
             .await
-            .is_none());
+            .unwrap();
+
+        // Later pairings should inherit the cached fast-path status for each child.
+        let lhs_pairing = state
+            .upsert_controller_pairing("controller-sess", "lhs-sess", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            lhs_pairing.transport_status.as_ref().map(|s| s.transport),
+            Some(PairingTransportKind::FastPath)
+        );
+
+        let rhs_pairing = state
+            .upsert_controller_pairing("controller-sess", "rhs-sess", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            rhs_pairing.transport_status.as_ref().map(|s| s.transport),
+            Some(PairingTransportKind::FastPath)
+        );
+    }
+
+    #[tokio::test]
+    async fn fast_path_ready_reflects_pairing_status() {
+        let state = AppState::new();
+        let controller = RegisterSessionRequest {
+            session_id: "controller-sess".into(),
+            private_beach_id: "pb-ready".into(),
+            harness_type: HarnessType::TerminalShim,
+            capabilities: vec![],
+            location_hint: None,
+            metadata: None,
+            version: "1.0.0".into(),
+            viewer_passcode: Some("PASS".into()),
+            transport_mode: Some(TransportMode::FastPath),
+        };
+        let child = RegisterSessionRequest {
+            session_id: "child-sess".into(),
+            private_beach_id: "pb-ready".into(),
+            harness_type: HarnessType::TerminalShim,
+            capabilities: vec![],
+            location_hint: None,
+            metadata: None,
+            version: "1.0.0".into(),
+            viewer_passcode: Some("PASS".into()),
+            transport_mode: Some(TransportMode::FastPath),
+        };
+        state.register_session(controller).await.unwrap();
+        state.register_session(child).await.unwrap();
+
+        state
+            .acquire_controller("controller-sess", Some(30_000), Some("test".into()), None)
+            .await
+            .unwrap();
+        state
+            .upsert_controller_pairing("controller-sess", "child-sess", None, None, None)
+            .await
+            .unwrap();
+
+        assert!(!state.is_fast_path_ready("child-sess").await);
+
+        let now = now_ms();
+        state
+            .update_pairing_transport_status("child-sess", PairingTransportStatus::fast_path(now))
+            .await;
+        assert!(state.is_fast_path_ready("child-sess").await);
+
+        state
+            .update_pairing_transport_status(
+                "child-sess",
+                PairingTransportStatus::http_fallback(now_ms(), Some("fallback".into())),
+            )
+            .await;
+        assert!(!state.is_fast_path_ready("child-sess").await);
+    }
+
+    #[test]
+    fn default_transport_hints_prefer_extensions_no_legacy_fastpath() {
+        let hints = default_transport_hints("sess-123", Some(100));
+        // Legacy fast-path WebRTC endpoints should no longer be advertised; unified
+        // extensions carry the fast-path namespace instead.
+        assert!(
+            !hints.contains_key("fast_path_webrtc"),
+            "unexpected legacy fast-path hint found: {hints:?}"
+        );
+        let ext = hints
+            .get("extensions")
+            .expect("extensions hint should be present");
+        let namespaces = ext
+            .get("namespaces")
+            .and_then(|v| v.as_array())
+            .expect("namespaces array missing on extensions hint");
+        let namespaces: Vec<&str> = namespaces.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(namespaces, vec!["fastpath"]);
+        assert_eq!(ext.get("preferred").and_then(|v| v.as_bool()), Some(true));
     }
 
     #[test]
@@ -10750,6 +11410,157 @@ mod tests {
 
         assert!(watchers.is_none());
         drop(watchers);
+    }
+
+    #[test_timeout::tokio_timeout_test(10)]
+    async fn unified_forwarder_ack_stall_does_not_downgrade_transport_status() {
+        let state = Arc::new(AppState::new().with_controller_strict_gating(false));
+        let session_id = "sess-unified-stall";
+        let token = insert_manual_session(&state, session_id, |record| {
+            record.mark_attached();
+            record.mark_http_ready();
+            record.transport_mode = TransportMode::FastPath;
+        })
+        .await;
+
+        // Unified-only: fast-path enabled, but no legacy WebRTC channels are present.
+        let primary = Arc::new(StallingTransport::new(200, TransportKind::WebSocket));
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let state_for_forwarder = Arc::clone(&state);
+        let forwarder = tokio::spawn(async move {
+            drive_controller_forwarder(
+                state_for_forwarder.as_ref(),
+                "pb-test",
+                session_id,
+                primary,
+                None,
+                None,
+                cancel_for_task,
+            )
+            .await
+            .ok();
+        });
+
+        state
+            .queue_actions(session_id, &token, vec![new_action("stall-1")], None)
+            .await
+            .expect("actions should queue in unified fast-path mode");
+
+        // Wait out the ack-stall deadline (1.5s) and ensure status stays fast_path.
+        tokio::time::sleep(StdDuration::from_millis(1800)).await;
+
+        let status = state
+            .fallback
+            .peek_pending_transport_status(session_id)
+            .await
+            .expect("transport status should be cached");
+        assert_eq!(status.transport, PairingTransportKind::FastPath);
+        assert!(state.is_fast_path_ready(session_id).await);
+
+        // Shutdown forwarder cleanly.
+        cancel.cancel();
+        let _ = forwarder.await;
+    }
+
+    #[test_timeout::tokio_timeout_test(10)]
+    async fn unified_forwarder_send_failure_stays_fast_path_status() {
+        let state = Arc::new(AppState::new().with_controller_strict_gating(false));
+        let session_id = "sess-unified-sendfail";
+        let token = insert_manual_session(&state, session_id, |record| {
+            record.mark_attached();
+            record.mark_http_ready();
+            record.transport_mode = TransportMode::FastPath;
+        })
+        .await;
+
+        // Unified-only transport that fails send calls with ChannelClosed.
+        let primary = Arc::new(FailingTransport::new(300, TransportKind::WebSocket));
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let state_for_forwarder = Arc::clone(&state);
+        let forwarder = tokio::spawn(async move {
+            drive_controller_forwarder(
+                state_for_forwarder.as_ref(),
+                "pb-test",
+                session_id,
+                primary,
+                None,
+                None,
+                cancel_for_task,
+            )
+            .await
+            .ok();
+        });
+
+        state
+            .queue_actions(session_id, &token, vec![new_action("fail-1")], None)
+            .await
+            .expect("actions should queue in unified fast-path mode");
+
+        // Allow dispatch loop to attempt send and handle the failure.
+        tokio::time::sleep(StdDuration::from_millis(300)).await;
+
+        let status = state
+            .fallback
+            .peek_pending_transport_status(session_id)
+            .await
+            .expect("transport status should be cached");
+        assert_eq!(status.transport, PairingTransportKind::FastPath);
+        assert!(state.is_fast_path_ready(session_id).await);
+
+        cancel.cancel();
+        let _ = forwarder.await;
+    }
+
+    #[test_timeout::tokio_timeout_test(10)]
+    async fn unified_forwarder_shutdown_does_not_downgrade_status() {
+        let state = Arc::new(AppState::new().with_controller_strict_gating(false));
+        let session_id = "sess-unified-shutdown";
+        let token = insert_manual_session(&state, session_id, |record| {
+            record.mark_attached();
+            record.mark_http_ready();
+            record.transport_mode = TransportMode::FastPath;
+        })
+        .await;
+
+        // Transport that will report ChannelClosed on recv after we simulate closure.
+        let primary = Arc::new(FailingTransport::new_closed_on_recv(400, TransportKind::WebSocket));
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let state_for_forwarder = Arc::clone(&state);
+        let forwarder = tokio::spawn(async move {
+            drive_controller_forwarder(
+                state_for_forwarder.as_ref(),
+                "pb-test",
+                session_id,
+                primary,
+                None,
+                None,
+                cancel_for_task,
+            )
+            .await
+            .ok();
+        });
+
+        state
+            .queue_actions(session_id, &token, vec![new_action("shutdown-1")], None)
+            .await
+            .expect("actions should queue in unified fast-path mode");
+
+        // Give the forwarder loop time to hit recv and observe closure.
+        tokio::time::sleep(StdDuration::from_millis(400)).await;
+
+        let status = state
+            .fallback
+            .peek_pending_transport_status(session_id)
+            .await
+            .expect("transport status should be cached");
+        assert_eq!(status.transport, PairingTransportKind::FastPath);
+        assert!(state.is_fast_path_ready(session_id).await);
+
+        cancel.cancel();
+        let _ = forwarder.await;
     }
 
     #[test]

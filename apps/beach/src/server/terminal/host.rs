@@ -14,6 +14,7 @@ use crate::mcp::{
     },
     server::{McpServer, McpServerHandle},
 };
+use crate::metrics;
 use crate::model::terminal::CursorState;
 use crate::model::terminal::diff::CacheUpdate;
 use crate::protocol::terminal::bootstrap;
@@ -39,10 +40,12 @@ use crate::terminal::cli::{BootstrapOutput, HostArgs};
 use crate::terminal::config::cursor_sync_enabled;
 use crate::terminal::error::CliError;
 use crate::transport as transport_mod;
+use crate::transport::extensions;
 use crate::transport::terminal::negotiation::{
     HeartbeatPublisher, NegotiatedSingle, NegotiatedTransport, SharedTransport,
     TransportSupervisor, negotiate_transport,
 };
+use crate::transport::unified_bridge::UnifiedBuggyTransport;
 use crate::transport::{Payload, Transport, TransportError, TransportId, TransportKind};
 use beach_buggy::{
     AckStatus as CtrlAckStatus, ActionAck as CtrlActionAck, ActionCommand as CtrlActionCommand,
@@ -256,6 +259,19 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let transport_hints = Arc::new(AsyncRwLock::new(session_handle.transport_hints().clone()));
     let fast_path_state_channel = Arc::new(FastPathStateChannel::new());
     let idle_snapshot_interval = parse_idle_snapshot_hint(session_handle.transport_hints());
+    let unified_manager = UnifiedManagerHandle::new(
+        manager_supports_extensions(session_handle.transport_hints()),
+        manager_has_legacy_fast_path(session_handle.transport_hints()),
+    );
+    let hint_keys: Vec<String> = session_handle.transport_hints().keys().cloned().collect();
+    info!(
+        target = "transport.extension",
+        session_id = %session_id,
+        hint_keys = ?hint_keys,
+        prefers_unified = unified_manager.prefers_unified(),
+        legacy_fastpath = unified_manager.supports_legacy_fastpath(),
+        "initialized unified transport preferences"
+    );
     let join_code = hosted.join_code().to_string();
     let transports: Arc<Mutex<Vec<Arc<SharedTransport>>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -398,6 +414,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         Arc::clone(&last_terminal_update),
         transport_hints.clone(),
         fast_path_state_channel.clone(),
+        unified_manager.clone(),
     ));
     idle_snapshot_controller
         .apply_hint(idle_snapshot_interval)
@@ -864,6 +881,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         first_ready_tx,
         Arc::clone(&controller_ctx),
         fast_path_state_channel.clone(),
+        unified_manager.clone(),
     );
 
     if wait_for_peer {
@@ -1880,12 +1898,15 @@ fn spawn_action_consumer(
             if fast_path_active {
                 match client.pending_actions_status(&session_for_actions).await {
                     Ok(status) => {
-                        let should_pause = status.pending == 0 && status.prefers_fast_path();
+                        let should_pause = status.prefers_fast_path();
                         if should_pause {
                             if !paused_for_fast_path {
                                 debug!(
                                     target = "controller.actions.fast_path",
                                     session_id = %session_for_actions,
+                                    pending = status.pending,
+                                    transport = ?status.transport,
+                                    fast_path_ready = status.fast_path_ready,
                                     "http action poller paused (fast path active)"
                                 );
                             }
@@ -1908,6 +1929,9 @@ fn spawn_action_consumer(
                             debug!(
                                 target = "controller.actions.fast_path",
                                 session_id = %session_for_actions,
+                                pending = status.pending,
+                                transport = ?status.transport,
+                                fast_path_ready = status.fast_path_ready,
                                 "http action poller resumed (manager requires HTTP fallback)"
                             );
                             paused_for_fast_path = false;
@@ -1917,6 +1941,8 @@ fn spawn_action_consumer(
                                 target = "controller.actions.fast_path",
                                 session_id = %session_for_actions,
                                 pending = status.pending,
+                                transport = ?status.transport,
+                                fast_path_ready = status.fast_path_ready,
                                 "pending controller actions remain on HTTP queue; continuing poller"
                             );
                         }
@@ -1995,6 +2021,144 @@ fn spawn_action_consumer(
     }))
 }
 
+fn spawn_unified_action_consumer(
+    ctx: Arc<ControllerActionContext>,
+    bridge: Arc<UnifiedBuggyTransport>,
+    writer_for_actions: PtyWriter,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let session_for_actions = ctx.session_id().to_string();
+        let attach_state = ctx.attach_state();
+        if !attach_state.is_attached() {
+            info!(
+                target = "controller.actions",
+                session_id = %session_for_actions,
+                "waiting for manager attach before starting unified action consumer"
+            );
+            let wait_started = Instant::now();
+            attach_state.wait_for_attach().await;
+            trace_attach_wait_completion(&session_for_actions, "unified_extension", wait_started);
+            info!(
+                target = "controller.actions",
+                session_id = %session_for_actions,
+                "manager attach confirmed; unified action consumer starting"
+            );
+        }
+        ctx.fast_path_online();
+        struct FastPathGuard(Arc<ControllerActionContext>);
+        impl Drop for FastPathGuard {
+            fn drop(&mut self) {
+                self.0.fast_path_offline();
+            }
+        }
+        let _guard = FastPathGuard(ctx.clone());
+        loop {
+            match bridge.receive_actions(&session_for_actions).await {
+                Ok(actions) if !actions.is_empty() => {
+                    let mut acks: Vec<CtrlActionAck> = Vec::with_capacity(actions.len());
+                    for cmd in actions {
+                        trace!(
+                            target = "transport.extension",
+                            session_id = %session_for_actions,
+                            kind = "action",
+                            action_id = %cmd.id,
+                            "received fastpath action via extension"
+                        );
+                        metrics::EXTENSION_RECEIVED
+                            .with_label_values(&["fastpath", "action", "host"])
+                            .inc();
+                        let mut status = CtrlAckStatus::Ok;
+                        let mut error_message = None;
+                        match controller_action_bytes(&cmd) {
+                            Ok(bytes) => match writer_for_actions.write(bytes.as_bytes()) {
+                                Ok(()) => {}
+                                Err(err) => {
+                                    warn!(
+                                        target = "controller.actions",
+                                        session_id = %session_for_actions,
+                                        command_id = %cmd.id,
+                                        error = %err,
+                                        "pty write failed for extension action"
+                                    );
+                                    status = CtrlAckStatus::Rejected;
+                                    error_message = Some(err.to_string());
+                                }
+                            },
+                            Err(err) => {
+                                warn!(
+                                    target = "controller.actions",
+                                    session_id = %session_for_actions,
+                                    command_id = %cmd.id,
+                                    error = %err,
+                                    "unsupported controller action via extension"
+                                );
+                                status = CtrlAckStatus::Rejected;
+                                error_message = Some(err);
+                            }
+                        }
+                        acks.push(CtrlActionAck {
+                            id: cmd.id.clone(),
+                            status,
+                            applied_at: SystemTime::now(),
+                            latency_ms: None,
+                            error_code: None,
+                            error_message,
+                        });
+                    }
+                    if !acks.is_empty() {
+                        if let Err(err) =
+                            bridge.ack_actions(&session_for_actions, acks.clone()).await
+                        {
+                            metrics::EXTENSION_FALLBACK
+                                .with_label_values(&[
+                                    "fastpath",
+                                    "ack",
+                                    "host",
+                                    "unified_send_error",
+                                ])
+                                .inc();
+                            warn!(
+                                target = "transport.extension",
+                                session_id = %session_for_actions,
+                                error = %err,
+                                "unified ack send failed; attempting http fallback"
+                            );
+                            if let Some(client) = ctx.manager_client() {
+                                if let Err(err) =
+                                    client.ack_actions(&session_for_actions, acks).await
+                                {
+                                    warn!(
+                                        target = "controller.actions",
+                                        session_id = %session_for_actions,
+                                        error = %err,
+                                        "http ack fallback after unified failure failed"
+                                    );
+                                }
+                            }
+                        } else {
+                            metrics::EXTENSION_SENT
+                                .with_label_values(&["fastpath", "ack", "host", "unified"])
+                                .inc_by(acks.len() as u64);
+                        }
+                    }
+                }
+                Ok(_) => {
+                    sleep(Duration::from_millis(50)).await;
+                }
+                Err(err) => {
+                    warn!(
+                        target = "controller.actions",
+                        session_id = %session_for_actions,
+                        error = %err,
+                        "receive_actions via unified transport failed"
+                    );
+                    sleep(Duration::from_millis(250)).await;
+                }
+            }
+        }
+    })
+}
+
 fn resolve_launch_command(args: &HostArgs) -> Result<Vec<String>, CliError> {
     if !args.command.is_empty() {
         return Ok(args.command.clone());
@@ -2020,6 +2184,85 @@ fn default_shell_command() -> Option<Vec<String>> {
         return Some(vec!["cmd.exe".into()]);
     }
     Some(vec!["/bin/sh".into()])
+}
+
+fn manager_supports_extensions(hints: &HashMap<String, Value>) -> bool {
+    if supports_extensions_namespace(hints) || manager_has_legacy_fast_path(hints) {
+        return true;
+    }
+    // Unified transport is the default; treat missing fast-path indicators as supported and
+    // rely on runtime fallbacks (legacy fast-path channel or HTTP) when extension sends fail.
+    true
+}
+
+fn manager_has_legacy_fast_path(hints: &HashMap<String, Value>) -> bool {
+    hints.contains_key("fast_path_webrtc")
+}
+
+fn supports_extensions_namespace(hints: &HashMap<String, Value>) -> bool {
+    hints
+        .get("extensions")
+        .and_then(|value| value.as_object())
+        .and_then(|obj| obj.get("namespaces"))
+        .map(|namespaces| match namespaces {
+            Value::Array(items) => items.iter().any(|ns| ns.as_str() == Some("fastpath")),
+            Value::String(single) => single == "fastpath",
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod manager_supports_extensions_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn hints_from_json(value: serde_json::Value) -> HashMap<String, Value> {
+        if let Value::Object(map) = value {
+            map.into_iter().collect()
+        } else {
+            HashMap::new()
+        }
+    }
+
+    #[test]
+    fn returns_true_when_extensions_namespace_includes_fastpath() {
+        let value = json!({
+            "extensions": {
+                "namespaces": ["fastpath", "other"]
+            }
+        });
+        let hints = hints_from_json(value);
+        assert!(manager_supports_extensions(&hints));
+    }
+
+    #[test]
+    fn returns_true_when_fast_path_webrtc_hint_exists() {
+        let value = json!({
+            "fast_path_webrtc": {
+                "status": "experimental"
+            }
+        });
+        let hints = hints_from_json(value);
+        assert!(manager_supports_extensions(&hints));
+    }
+
+    #[test]
+    fn defaults_to_true_when_no_fastpath_indicators_present() {
+        let value = json!({
+            "extensions": {
+                "namespaces": ["other"]
+            }
+        });
+        let hints = hints_from_json(value);
+        assert!(manager_supports_extensions(&hints));
+    }
+
+    #[test]
+    fn returns_true_when_hints_missing() {
+        let hints = HashMap::new();
+        assert!(manager_supports_extensions(&hints));
+    }
 }
 
 fn configure_bootstrap_signal_handling(bootstrap_mode: bool) {
@@ -2223,6 +2466,40 @@ impl FastPathStateChannel {
     }
 }
 
+#[derive(Clone, Default)]
+struct UnifiedManagerHandle {
+    preferred: Arc<AtomicBool>,
+    legacy_fastpath: bool,
+    bridge: Arc<AsyncRwLock<Option<Arc<UnifiedBuggyTransport>>>>,
+}
+
+impl UnifiedManagerHandle {
+    fn new(preferred: bool, legacy_fastpath: bool) -> Self {
+        Self {
+            preferred: Arc::new(AtomicBool::new(preferred)),
+            legacy_fastpath,
+            bridge: Arc::new(AsyncRwLock::new(None)),
+        }
+    }
+
+    fn prefers_unified(&self) -> bool {
+        self.preferred.load(Ordering::SeqCst)
+    }
+
+    fn supports_legacy_fastpath(&self) -> bool {
+        self.legacy_fastpath
+    }
+
+    async fn set_bridge(&self, bridge: Arc<UnifiedBuggyTransport>) {
+        let mut guard = self.bridge.write().await;
+        *guard = Some(bridge);
+    }
+
+    async fn bridge(&self) -> Option<Arc<UnifiedBuggyTransport>> {
+        self.bridge.read().await.clone()
+    }
+}
+
 async fn spawn_idle_snapshot_worker(
     interval: Duration,
     token: String,
@@ -2233,6 +2510,7 @@ async fn spawn_idle_snapshot_worker(
     last_terminal_update: Arc<AtomicU64>,
     transport_hints: Arc<AsyncRwLock<HashMap<String, Value>>>,
     fast_path_channel: Arc<FastPathStateChannel>,
+    unified_handle: UnifiedManagerHandle,
 ) -> Option<(JoinHandle<()>, oneshot::Sender<()>)> {
     if interval.is_zero() {
         return None;
@@ -2260,6 +2538,7 @@ async fn spawn_idle_snapshot_worker(
             transport,
             session_id,
             fast_path_channel,
+            unified_handle,
         )),
     );
     let handle = tokio::spawn(async move {
@@ -2273,6 +2552,7 @@ fn spawn_health_reporter(
     token: String,
     base_url: String,
     session_id: String,
+    unified_handle: UnifiedManagerHandle,
 ) -> Option<(JoinHandle<()>, oneshot::Sender<()>)> {
     if period.is_zero() {
         return None;
@@ -2289,6 +2569,7 @@ fn spawn_health_reporter(
         }
     };
     let (cancel_tx, mut cancel_rx) = oneshot::channel();
+    let unified = unified_handle.clone();
     let handle = tokio::spawn(async move {
         let mut ticker = interval(period);
         loop {
@@ -2301,13 +2582,46 @@ fn spawn_health_reporter(
                         degraded: false,
                         warnings: Vec::new(),
                     };
-                    if let Err(err) = transport.signal_health(&session_id, heartbeat).await {
-                        warn!(
-                            target = "private_beach",
-                            session_id = %session_id,
-                            error = %err,
-                            "health reporter publish failed"
-                        );
+                    let mut sent_unified = false;
+                    if unified.prefers_unified() {
+                        if let Some(bridge) = unified.bridge().await {
+                            match bridge.signal_health(&session_id, heartbeat.clone()).await {
+                                Ok(()) => {
+                                    metrics::EXTENSION_SENT
+                                        .with_label_values(&["fastpath", "health", "host", "unified"])
+                                        .inc();
+                                    trace!(
+                                        target = "transport.extension",
+                                        session_id = %session_id,
+                                        namespace = "fastpath",
+                                        kind = "health",
+                                        "health heartbeat sent via unified transport"
+                                    );
+                                    sent_unified = true;
+                                }
+                                Err(err) => {
+                                    metrics::EXTENSION_FALLBACK
+                                        .with_label_values(&["fastpath", "health", "host", "unified_send_error"])
+                                        .inc();
+                                    warn!(
+                                        target = "transport.extension",
+                                        session_id = %session_id,
+                                        error = %err,
+                                        "unified health send failed; falling back to http"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if !sent_unified {
+                        if let Err(err) = transport.signal_health(&session_id, heartbeat).await {
+                            warn!(
+                                target = "private_beach",
+                                session_id = %session_id,
+                                error = %err,
+                                "health reporter publish failed"
+                            );
+                        }
                     }
                 }
                 _ = &mut cancel_rx => {
@@ -2324,6 +2638,7 @@ struct StatePublisher {
     session_id: String,
     seq: AtomicU64,
     fast_path_channel: Arc<FastPathStateChannel>,
+    unified: UnifiedManagerHandle,
 }
 
 impl StatePublisher {
@@ -2331,12 +2646,14 @@ impl StatePublisher {
         transport: Arc<HttpTransport<StaticTokenProvider>>,
         session_id: String,
         fast_path_channel: Arc<FastPathStateChannel>,
+        unified: UnifiedManagerHandle,
     ) -> Self {
         Self {
             transport,
             session_id,
             seq: AtomicU64::new(0),
             fast_path_channel,
+            unified,
         }
     }
 
@@ -2348,6 +2665,9 @@ impl StatePublisher {
             payload,
         };
         if self.try_fast_path(&diff).await? {
+            return Ok(());
+        }
+        if self.try_unified_extension(&diff).await? {
             return Ok(());
         }
         self.publish_via_http(diff).await
@@ -2392,6 +2712,42 @@ impl StatePublisher {
             .send_state(&self.session_id, diff)
             .await
             .map_err(|err| err.to_string())
+    }
+
+    async fn try_unified_extension(&self, diff: &StateDiff) -> Result<bool, String> {
+        if !self.unified.prefers_unified() {
+            return Ok(false);
+        }
+        let Some(bridge) = self.unified.bridge().await else {
+            return Ok(false);
+        };
+        match bridge.send_state(&self.session_id, diff.clone()).await {
+            Ok(_) => {
+                metrics::EXTENSION_SENT
+                    .with_label_values(&["fastpath", "state", "host", "unified"])
+                    .inc();
+                trace!(
+                    target = "transport.extension",
+                    session_id = %self.session_id,
+                    namespace = "fastpath",
+                    kind = "state",
+                    "state diff sent via unified transport"
+                );
+                Ok(true)
+            }
+            Err(err) => {
+                metrics::EXTENSION_FALLBACK
+                    .with_label_values(&["fastpath", "state", "host", "unified_send_error"])
+                    .inc();
+                warn!(
+                    target = "transport.extension",
+                    session_id = %self.session_id,
+                    error = %err,
+                    "unified state send failed; falling back to http"
+                );
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -2478,6 +2834,7 @@ struct IdleSnapshotController {
     health: Arc<AsyncMutex<HealthReporterState>>,
     transport_hints: Arc<AsyncRwLock<HashMap<String, Value>>>,
     fast_path_channel: Arc<FastPathStateChannel>,
+    unified: UnifiedManagerHandle,
 }
 
 impl IdleSnapshotController {
@@ -2519,6 +2876,7 @@ impl IdleSnapshotController {
         last_terminal_update: Arc<AtomicU64>,
         transport_hints: Arc<AsyncRwLock<HashMap<String, Value>>>,
         fast_path_channel: Arc<FastPathStateChannel>,
+        unified: UnifiedManagerHandle,
     ) -> Self {
         Self {
             base_url: Arc::new(AsyncMutex::new(base_url)),
@@ -2531,6 +2889,7 @@ impl IdleSnapshotController {
             health: Arc::new(AsyncMutex::new(HealthReporterState::default())),
             transport_hints,
             fast_path_channel,
+            unified,
         }
     }
 
@@ -2606,6 +2965,7 @@ impl IdleSnapshotController {
                 self.last_terminal_update.clone(),
                 self.transport_hints.clone(),
                 self.fast_path_channel.clone(),
+                self.unified.clone(),
             )
             .await
             {
@@ -2670,7 +3030,13 @@ impl IdleSnapshotController {
                 return;
             };
             let base_url = { self.base_url.lock().await.clone() };
-            match spawn_health_reporter(interval, token, base_url, self.session_id.clone()) {
+            match spawn_health_reporter(
+                interval,
+                token,
+                base_url,
+                self.session_id.clone(),
+                self.unified.clone(),
+            ) {
                 Some((handle, cancel)) => {
                     let mut state = self.health.lock().await;
                     state.interval = Some(interval);
@@ -2993,6 +3359,40 @@ fn spawn_input_listener(
                                                     );
                                                 }
                                             }
+                                            WireClientFrame::Extension { frame } => {
+                                                let is_viewer = !is_controller_channel;
+                                                if is_viewer && frame.namespace == "fastpath" {
+                                                    trace!(
+                                                        target = "transport.extension",
+                                                        transport_id,
+                                                        namespace = %frame.namespace,
+                                                        kind = %frame.kind,
+                                                        "viewer extension ignored (fastpath not allowed)"
+                                                    );
+                                                    continue;
+                                                }
+                                                metrics::EXTENSION_RECEIVED
+                                                    .with_label_values(&[
+                                                        &frame.namespace,
+                                                        &frame.kind,
+                                                        if is_controller_channel {
+                                                            "controller"
+                                                        } else {
+                                                            "viewer"
+                                                        },
+                                                    ])
+                                                    .inc();
+                                                extensions::publish(transport.id(), frame.clone());
+                                                trace!(
+                                                    target = "sync::incoming",
+                                                    transport_id,
+                                                    transport = ?transport_kind,
+                                                    namespace = %frame.namespace,
+                                                    kind = %frame.kind,
+                                                    payload_len = frame.payload.len(),
+                                                    "received extension frame with no handler"
+                                                );
+                                            }
                                             WireClientFrame::RequestBackfill {
                                                 subscription,
                                                 request_id,
@@ -3038,6 +3438,44 @@ fn spawn_input_listener(
                                         }
                                     }
                                     Err(err) => {
+                                        if let Ok(host_frame) =
+                                            protocol::decode_host_frame_binary(&bytes)
+                                        {
+                                            if let HostFrame::Extension { frame } = host_frame {
+                                                let is_viewer = !is_controller_channel;
+                                                if is_viewer && frame.namespace == "fastpath" {
+                                                    trace!(
+                                                        target = "transport.extension",
+                                                        transport_id,
+                                                        namespace = %frame.namespace,
+                                                        kind = %frame.kind,
+                                                        "viewer host-encoded extension ignored (fastpath not allowed)"
+                                                    );
+                                                    continue;
+                                                }
+                                                metrics::EXTENSION_RECEIVED
+                                                    .with_label_values(&[
+                                                        &frame.namespace,
+                                                        &frame.kind,
+                                                        if is_controller_channel {
+                                                            "controller"
+                                                        } else {
+                                                            "viewer"
+                                                        },
+                                                    ])
+                                                    .inc();
+                                                extensions::publish(transport.id(), frame.clone());
+                                                trace!(
+                                                    target = "transport.extension",
+                                                    transport_id,
+                                                    transport = ?transport_kind,
+                                                    namespace = %frame.namespace,
+                                                    kind = %frame.kind,
+                                                    "received host-encoded extension frame"
+                                                );
+                                                continue;
+                                            }
+                                        }
                                         warn!(
                                             target = "sync::incoming",
                                             transport_id,
@@ -3144,6 +3582,7 @@ fn spawn_webrtc_acceptor(
     ready_tx: Option<oneshot::Sender<()>>,
     controller_ctx_handle: Arc<ControllerActionContext>,
     fast_path_state_channel: Arc<FastPathStateChannel>,
+    unified_manager: UnifiedManagerHandle,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ready_tx = ready_tx;
@@ -3180,6 +3619,7 @@ fn spawn_webrtc_acceptor(
                         metadata.label.clone(),
                         webrtc_channels.clone(),
                         fast_path_state.clone(),
+                        unified_manager.clone(),
                     );
                     let hint_pending = authorizer.should_emit_pending_hint();
                     let auto_grant = authorizer.should_emit_auto_granted();
@@ -3227,6 +3667,70 @@ fn spawn_webrtc_acceptor(
                         join_code.clone(),
                     ));
                     let primary_transport: Arc<dyn Transport> = shared_transport.clone();
+                    info!(
+                        target = "transport.extension",
+                        session_id = %session_id,
+                        transport_id = %primary_transport.id().0,
+                        prefers_unified = unified_manager.prefers_unified(),
+                        legacy_fastpath = unified_manager.supports_legacy_fastpath(),
+                        "evaluating unified fastpath bridge for negotiated transport"
+                    );
+
+                    if unified_manager.prefers_unified() {
+                        let unified_bridge = Arc::new(
+                            UnifiedBuggyTransport::new_with_subscription(primary_transport.clone()),
+                        );
+                        unified_manager.set_bridge(unified_bridge.clone()).await;
+                        info!(
+                            target = "transport.extension",
+                            session_id = %session_id,
+                            transport_id = %primary_transport.id().0,
+                            role = "host",
+                            "attached unified fastpath bridge to primary transport"
+                        );
+
+                        let mut ext_rx = primary_transport.subscribe_extensions("fastpath");
+                        let ingest_bridge = unified_bridge.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                match ext_rx.recv().await {
+                                    Ok(frame) => {
+                                        let kind = frame.kind.clone();
+                                        ingest_bridge.ingest_extension_frame(frame);
+                                        trace!(
+                                            target = "transport.extension",
+                                            namespace = "fastpath",
+                                            kind = %kind,
+                                            role = "host",
+                                            "received fastpath extension frame"
+                                        );
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                        skipped,
+                                    )) => {
+                                        warn!(
+                                            target = "transport.extension",
+                                            skipped, "fastpath extension subscriber lagged"
+                                        );
+                                        continue;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                }
+                            }
+                        });
+
+                        let _ = spawn_unified_action_consumer(
+                            controller_ctx_clone.clone(),
+                            unified_bridge,
+                            writer.clone(),
+                        );
+                    } else {
+                        trace!(
+                            target = "transport.extension",
+                            session_id = %session_id,
+                            "manager extensions unsupported or disabled; using legacy paths"
+                        );
+                    }
 
                     info!(
                         target = "sync::acceptor",
@@ -3349,6 +3853,7 @@ fn spawn_webrtc_acceptor(
                         metadata.label.clone(),
                         Some(channels.clone()),
                         fast_path_state.clone(),
+                        unified_manager.clone(),
                     );
                     let hint_pending = authorizer.should_emit_pending_hint();
                     let auto_grant = authorizer.should_emit_auto_granted();
@@ -3392,6 +3897,61 @@ fn spawn_webrtc_acceptor(
                         guard.push(shared_transport.clone());
                     }
                     let primary_transport: Arc<dyn Transport> = shared_transport.clone();
+
+                    if unified_manager.prefers_unified()
+                        && matches!(
+                            metadata.label.as_deref(),
+                            Some(CONTROLLER_CHANNEL_LABEL) | Some(LEGACY_CONTROLLER_CHANNEL_LABEL)
+                        )
+                    {
+                        let unified_bridge = Arc::new(
+                            UnifiedBuggyTransport::new_with_subscription(primary_transport.clone()),
+                        );
+                        unified_manager.set_bridge(unified_bridge.clone()).await;
+                        info!(
+                            target = "transport.extension",
+                            session_id = %session_id,
+                            transport_id = %primary_transport.id().0,
+                            role = "host",
+                            "attached unified fastpath bridge to offerer transport"
+                        );
+
+                        let mut ext_rx = primary_transport.subscribe_extensions("fastpath");
+                        let ingest_bridge = unified_bridge.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                match ext_rx.recv().await {
+                                    Ok(frame) => {
+                                        let kind = frame.kind.clone();
+                                        ingest_bridge.ingest_extension_frame(frame);
+                                        trace!(
+                                            target = "transport.extension",
+                                            namespace = "fastpath",
+                                            kind = %kind,
+                                            role = "host",
+                                            "received fastpath extension frame"
+                                        );
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(
+                                        skipped,
+                                    )) => {
+                                        warn!(
+                                            target = "transport.extension",
+                                            skipped, "fastpath extension subscriber lagged"
+                                        );
+                                        continue;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                }
+                            }
+                        });
+
+                        let _ = spawn_unified_action_consumer(
+                            controller_ctx_clone.clone(),
+                            unified_bridge,
+                            writer.clone(),
+                        );
+                    }
 
                     if let Some(handle) = mcp_handle.clone() {
                         let bridges = Arc::clone(&mcp_bridges);
@@ -3497,6 +4057,7 @@ fn spawn_webrtc_acceptor(
                         Arc::clone(&mcp_bridges),
                         controller_ctx_clone.clone(),
                         fast_path_state.clone(),
+                        unified_manager.clone(),
                     );
                     break;
                 }
@@ -3532,6 +4093,7 @@ fn spawn_viewer_accept_loop(
     mcp_bridges: Arc<Mutex<Vec<JoinHandle<()>>>>,
     controller_ctx: Arc<ControllerActionContext>,
     fast_path_state_channel: Arc<FastPathStateChannel>,
+    unified_manager: UnifiedManagerHandle,
 ) {
     tokio::spawn(async move {
         while let Ok(accepted) = supervisor.next().await {
@@ -3556,6 +4118,7 @@ fn spawn_viewer_accept_loop(
                 auth_metadata.label.clone(),
                 Some(channels.clone()),
                 fast_path_state_channel.clone(),
+                unified_manager.clone(),
             );
             let hint_pending = authorizer.should_emit_pending_hint();
             let auto_grant = authorizer.should_emit_auto_granted();
@@ -3603,6 +4166,73 @@ fn spawn_viewer_accept_loop(
                 guard.push(shared_transport.clone());
             }
             let shared_arc: Arc<dyn Transport> = shared_transport.clone();
+            let prefers_unified = unified_manager.prefers_unified();
+            let bridge_exists = unified_manager.bridge().await.is_some();
+
+            info!(
+                target = "webrtc",
+                session_id = %session_id,
+                peer_id = %peer_id,
+                label = ?auth_metadata.label,
+                prefers_unified,
+                bridge_exists,
+                "checking fastpath attachment conditions"
+            );
+
+            if prefers_unified
+                && matches!(
+                    auth_metadata.label.as_deref(),
+                    Some(CONTROLLER_CHANNEL_LABEL) | Some(LEGACY_CONTROLLER_CHANNEL_LABEL)
+                )
+            {
+                if unified_manager.bridge().await.is_none() {
+                    let unified_bridge = Arc::new(UnifiedBuggyTransport::new_with_subscription(
+                        shared_arc.clone(),
+                    ));
+                    unified_manager.set_bridge(unified_bridge.clone()).await;
+                    info!(
+                        target = "transport.extension",
+                        session_id = %session_id,
+                        transport_id = %shared_arc.id().0,
+                        role = "host",
+                        "attached unified fastpath bridge to viewer-offerer transport"
+                    );
+
+                    let mut ext_rx = shared_arc.subscribe_extensions("fastpath");
+                    let ingest_bridge = unified_bridge.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            match ext_rx.recv().await {
+                                Ok(frame) => {
+                                    let kind = frame.kind.clone();
+                                    ingest_bridge.ingest_extension_frame(frame);
+                                    trace!(
+                                        target = "transport.extension",
+                                        namespace = "fastpath",
+                                        kind = %kind,
+                                        role = "host",
+                                        "received fastpath extension frame"
+                                    );
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                    warn!(
+                                        target = "transport.extension",
+                                        skipped, "fastpath extension subscriber lagged"
+                                    );
+                                    continue;
+                                }
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            }
+                        }
+                    });
+
+                    let _ = spawn_unified_action_consumer(
+                        controller_ctx.clone(),
+                        unified_bridge,
+                        writer.clone(),
+                    );
+                }
+            }
 
             if let Some(handle) = mcp_handle.clone() {
                 let bridges = Arc::clone(&mcp_bridges);
@@ -3701,7 +4331,16 @@ fn maybe_spawn_state_channel_listener(
     label: Option<String>,
     channels: Option<WebRtcChannels>,
     fast_path_state_channel: Arc<FastPathStateChannel>,
+    unified_manager: UnifiedManagerHandle,
 ) {
+    if unified_manager.prefers_unified() || !unified_manager.supports_legacy_fastpath() {
+        trace!(
+            target = "controller.state.fast_path",
+            session_id = %session_id,
+            "skipping legacy fast-path state channel wait (unified preferred or legacy hint absent)"
+        );
+        return;
+    }
     if !matches!(
         label.as_deref(),
         Some(CONTROLLER_CHANNEL_LABEL) | Some(LEGACY_CONTROLLER_CHANNEL_LABEL)
@@ -5147,6 +5786,7 @@ mod tests {
                     | WireHostFrame::Grid { .. }
                     | WireHostFrame::InputAck { .. }
                     | WireHostFrame::Cursor { .. }
+                    | WireHostFrame::Extension { .. }
                     | WireHostFrame::Shutdown => {}
                 }
             }
@@ -5200,6 +5840,7 @@ mod tests {
                     | WireHostFrame::HistoryBackfill { .. }
                     | WireHostFrame::InputAck { .. }
                     | WireHostFrame::Cursor { .. }
+                    | WireHostFrame::Extension { .. }
                     | WireHostFrame::Shutdown => {}
                 }
             }
@@ -5375,6 +6016,7 @@ mod tests {
                             | WireHostFrame::Heartbeat { .. }
                             | WireHostFrame::InputAck { .. }
                             | WireHostFrame::Cursor { .. }
+                            | WireHostFrame::Extension { .. }
                             | WireHostFrame::Shutdown => {}
                         }
                     }
@@ -5549,7 +6191,8 @@ mod tests {
                 | WireHostFrame::HistoryBackfill { .. }
                 | WireHostFrame::Heartbeat { .. }
                 | WireHostFrame::InputAck { .. }
-                | WireHostFrame::Cursor { .. } => {
+                | WireHostFrame::Cursor { .. }
+                | WireHostFrame::Extension { .. } => {
                     continue;
                 }
                 WireHostFrame::Shutdown => break,

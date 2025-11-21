@@ -298,6 +298,7 @@ pub(crate) fn host_frame_label(frame: &HostFrame) -> &'static str {
         HostFrame::HistoryBackfill { .. } => "history_backfill",
         HostFrame::Cursor { .. } => "cursor",
         HostFrame::InputAck { .. } => "input_ack",
+        HostFrame::Extension { .. } => "extension",
         HostFrame::Shutdown => "shutdown",
     }
 }
@@ -308,6 +309,7 @@ pub(crate) fn client_frame_label(frame: &WireClientFrame) -> &'static str {
         WireClientFrame::Resize { .. } => "resize",
         WireClientFrame::RequestBackfill { .. } => "request_backfill",
         WireClientFrame::ViewportCommand { .. } => "viewport_command",
+        WireClientFrame::Extension { .. } => "extension",
         WireClientFrame::Unknown => "unknown",
     }
 }

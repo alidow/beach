@@ -3,6 +3,7 @@ pub mod cache;
 pub mod client;
 pub mod debug;
 pub mod mcp;
+pub mod metrics;
 pub mod model;
 pub mod protocol;
 pub mod server;
@@ -20,7 +21,7 @@ pub use crate::cache::{
     },
 };
 pub use crate::protocol::{
-    ClientFrame, HostFrame, decode_host_frame_binary, encode_client_frame_binary,
+    ClientFrame, ExtensionFrame, HostFrame, decode_host_frame_binary, encode_client_frame_binary,
 };
 pub use crate::session::{
     HostSession, JoinedSession, SessionConfig, SessionError, SessionHandle, SessionManager,

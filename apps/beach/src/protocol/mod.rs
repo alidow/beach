@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u8 = 2;
@@ -46,6 +47,13 @@ pub struct CursorFrame {
     pub seq: u64,
     pub visible: bool,
     pub blink: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionFrame {
+    pub namespace: String,
+    pub kind: String,
+    pub payload: Bytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +153,10 @@ pub enum HostFrame {
         subscription: u64,
         cursor: CursorFrame,
     },
+    Extension {
+        #[serde(flatten)]
+        frame: ExtensionFrame,
+    },
     Shutdown,
 }
 
@@ -186,6 +198,10 @@ pub enum ClientFrame {
     },
     ViewportCommand {
         command: ViewportCommand,
+    },
+    Extension {
+        #[serde(flatten)]
+        frame: ExtensionFrame,
     },
     #[serde(other)]
     Unknown,

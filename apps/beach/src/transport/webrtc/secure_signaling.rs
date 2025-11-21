@@ -164,7 +164,8 @@ pub fn derive_handshake_key_from_session(
 }
 
 fn stretch_passphrase(passphrase: &str, handshake_id: &str) -> Result<[u8; 32], TransportError> {
-    let params = Params::new(64 * 1024, 3, 1, Some(32))
+    // Keep the KDF cost low enough to avoid handshake delays while still stretching the passphrase.
+    let params = Params::new(32 * 1024, 1, 1, Some(32))
         .map_err(|err| TransportError::Setup(format!("invalid argon2 params: {err}")))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut output = [0u8; 32];

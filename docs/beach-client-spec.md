@@ -128,6 +128,33 @@ Notes:
 
 ---
 
+## Extension Frames
+
+Unified transport introduces a generic extension envelope so auxiliary channels
+can share the same negotiated transport instead of opening parallel peers. Both
+host → client and client → host frames now include an `extension` variant:
+
+```json
+{
+  "type": "extension",
+  "namespace": "fastpath",
+  "kind": "action",
+  "payload": "base64 bytes"
+}
+```
+
+- `namespace` scopes traffic (e.g., `fastpath`, `metrics`) and ties into the
+  manager’s ACL registry.
+- `kind` differentiates message families inside a namespace (`action`, `ack`,
+  `state`, etc.).
+- `payload` carries opaque bytes. JSON callers UTF‑8 encode before sending; the
+  binary codec uses a length‑prefixed byte slice.
+
+Callers that do not yet recognize a namespace must ignore the frame gracefully
+so new extensions do not break older builds.
+
+---
+
 ## Minimal Client (Phase 2a) – Exact Scope
 
 Must‑have:
@@ -188,4 +215,3 @@ Manual tests:
 - Horizontal panning UX defaults (step size, indicators).
 - Snapshot compression (zstd vs. none) and thresholds.
 - Theme/palette sync protocol.
-

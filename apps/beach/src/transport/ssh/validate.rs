@@ -59,6 +59,7 @@ impl ValidationReport {
             | HostFrame::HistoryBackfill { .. }
             | HostFrame::InputAck { .. }
             | HostFrame::Cursor { .. }
+            | HostFrame::Extension { .. }
             | HostFrame::Shutdown => {}
         }
     }

@@ -1,7 +1,9 @@
 use super::{
-    ClientFrame, CursorFrame, HostFrame, Lane, LaneBudgetFrame, PROTOCOL_VERSION, SyncConfigFrame,
-    Update, ViewportCommand,
+    ClientFrame, CursorFrame, ExtensionFrame, HostFrame, Lane, LaneBudgetFrame, PROTOCOL_VERSION,
+    SyncConfigFrame, Update, ViewportCommand,
 };
+use bytes::Bytes;
+use std::str;
 
 const VERSION_BITS: u8 = 3;
 const VERSION_MASK: u8 = 0b1110_0000;
@@ -17,6 +19,7 @@ const HOST_KIND_INPUT_ACK: u8 = 6;
 const HOST_KIND_SHUTDOWN: u8 = 7;
 const HOST_KIND_HISTORY_BACKFILL: u8 = 8;
 const HOST_KIND_CURSOR: u8 = 9;
+const HOST_KIND_EXTENSION: u8 = 10;
 
 const UPDATE_KIND_CELL: u8 = 0;
 const UPDATE_KIND_RECT: u8 = 1;
@@ -29,6 +32,7 @@ const CLIENT_KIND_INPUT: u8 = 0;
 const CLIENT_KIND_RESIZE: u8 = 1;
 const CLIENT_KIND_REQUEST_BACKFILL: u8 = 2;
 const CLIENT_KIND_VIEWPORT_COMMAND: u8 = 3;
+const CLIENT_KIND_EXTENSION: u8 = 4;
 const CLIENT_KIND_UNKNOWN: u8 = TYPE_MASK;
 
 const ENV_BINARY_PROTOCOL: &str = "BEACH_PROTO_BINARY";
@@ -173,6 +177,12 @@ pub fn encode_host_frame_binary(frame: &HostFrame) -> Vec<u8> {
             write_var_u64(&mut buf, *subscription);
             encode_cursor(&mut buf, cursor);
         }
+        HostFrame::Extension { frame } => {
+            write_header(&mut buf, HOST_KIND_EXTENSION);
+            write_string(&mut buf, &frame.namespace);
+            write_string(&mut buf, &frame.kind);
+            write_bytes(&mut buf, frame.payload.as_ref());
+        }
         HostFrame::Shutdown => {
             write_header(&mut buf, HOST_KIND_SHUTDOWN);
         }
@@ -309,6 +319,18 @@ pub fn decode_host_frame_binary(bytes: &[u8]) -> Result<HostFrame, WireError> {
                 cursor: cursor_frame,
             })
         }
+        HOST_KIND_EXTENSION => {
+            let namespace = read_string(&mut cursor)?;
+            let kind = read_string(&mut cursor)?;
+            let payload = read_payload(&mut cursor)?;
+            Ok(HostFrame::Extension {
+                frame: ExtensionFrame {
+                    namespace,
+                    kind,
+                    payload,
+                },
+            })
+        }
         HOST_KIND_SHUTDOWN => Ok(HostFrame::Shutdown),
         other => Err(WireError::UnknownFrameType(other)),
     }
@@ -343,6 +365,12 @@ pub fn encode_client_frame_binary(frame: &ClientFrame) -> Vec<u8> {
         ClientFrame::ViewportCommand { command } => {
             write_header(&mut buf, CLIENT_KIND_VIEWPORT_COMMAND);
             buf.push(command.as_u8());
+        }
+        ClientFrame::Extension { frame } => {
+            write_header(&mut buf, CLIENT_KIND_EXTENSION);
+            write_string(&mut buf, &frame.namespace);
+            write_string(&mut buf, &frame.kind);
+            write_bytes(&mut buf, frame.payload.as_ref());
         }
         ClientFrame::Unknown => {
             write_header(&mut buf, CLIENT_KIND_UNKNOWN);
@@ -383,6 +411,18 @@ pub fn decode_client_frame_binary(bytes: &[u8]) -> Result<ClientFrame, WireError
             let command = ViewportCommand::from_u8(code)
                 .ok_or(WireError::InvalidData("unknown viewport command"))?;
             Ok(ClientFrame::ViewportCommand { command })
+        }
+        CLIENT_KIND_EXTENSION => {
+            let namespace = read_string(&mut cursor)?;
+            let kind = read_string(&mut cursor)?;
+            let payload = read_payload(&mut cursor)?;
+            Ok(ClientFrame::Extension {
+                frame: ExtensionFrame {
+                    namespace,
+                    kind,
+                    payload,
+                },
+            })
         }
         CLIENT_KIND_UNKNOWN => Ok(ClientFrame::Unknown),
         other => Err(WireError::UnknownFrameType(other)),
@@ -632,6 +672,15 @@ fn write_var_u64(buf: &mut Vec<u8>, mut value: u64) {
     buf.push(value as u8);
 }
 
+fn write_string(buf: &mut Vec<u8>, value: &str) {
+    write_bytes(buf, value.as_bytes());
+}
+
+fn write_bytes(buf: &mut Vec<u8>, data: &[u8]) {
+    write_var_u32(buf, data.len() as u32);
+    buf.extend_from_slice(data);
+}
+
 #[derive(Clone, Copy)]
 struct Cursor<'a> {
     bytes: &'a [u8],
@@ -696,6 +745,20 @@ impl<'a> Cursor<'a> {
     }
 }
 
+fn read_string(cursor: &mut Cursor<'_>) -> Result<String, WireError> {
+    let len = cursor.read_var_u32()? as usize;
+    let bytes = cursor.read_bytes(len)?;
+    str::from_utf8(bytes)
+        .map(|s| s.to_owned())
+        .map_err(|_| WireError::InvalidData("invalid utf8 string"))
+}
+
+fn read_payload(cursor: &mut Cursor<'_>) -> Result<Bytes, WireError> {
+    let len = cursor.read_var_u32()? as usize;
+    let bytes = cursor.read_bytes(len)?;
+    Ok(Bytes::copy_from_slice(bytes))
+}
+
 fn decode_lane(cursor: &mut Cursor<'_>) -> Result<Lane, WireError> {
     match cursor.read_u8()? {
         0 => Ok(Lane::Foreground),
@@ -708,6 +771,7 @@ fn decode_lane(cursor: &mut Cursor<'_>) -> Result<Lane, WireError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[test_timeout::timeout]
     fn encode_decode_heartbeat() {
@@ -895,5 +959,25 @@ mod tests {
         let encoded = encode_host_frame_binary(&frame);
         let decoded = decode_host_frame_binary(&encoded).expect("decode cursor");
         assert_eq!(frame, decoded);
+    }
+
+    #[test_timeout::timeout]
+    fn encode_decode_extension_frames() {
+        let extension = ExtensionFrame {
+            namespace: "fastpath".to_string(),
+            kind: "action".to_string(),
+            payload: Bytes::from_static(b"{\"kind\":\"ping\"}"),
+        };
+        let host_frame = HostFrame::Extension {
+            frame: extension.clone(),
+        };
+        let encoded_host = encode_host_frame_binary(&host_frame);
+        let decoded_host = decode_host_frame_binary(&encoded_host).expect("host extension");
+        assert_eq!(host_frame, decoded_host);
+
+        let client_frame = ClientFrame::Extension { frame: extension };
+        let encoded_client = encode_client_frame_binary(&client_frame);
+        let decoded_client = decode_client_frame_binary(&encoded_client).expect("client extension");
+        assert_eq!(client_frame, decoded_client);
     }
 }

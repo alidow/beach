@@ -194,8 +194,8 @@ prebuild_beach_binary() {
     return
   fi
   echo "[pong-stack] ensuring beach binary is built inside $SERVICE..." >&2
-  run_in_container "set -euo pipefail; cd $REPO_ROOT; cargo build --bin beach >/tmp/pong-stack-build.log 2>&1" || {
-    echo "[pong-stack] cargo build failed; inspect /tmp/pong-stack-build.log inside $SERVICE" >&2
+  run_in_container "set -euo pipefail; cd $REPO_ROOT; cargo run --bin beach -- --version >/tmp/pong-stack-build.log 2>&1" || {
+    echo "[pong-stack] cargo run failed; inspect /tmp/pong-stack-build.log inside $SERVICE" >&2
     exit 1
   }
 }

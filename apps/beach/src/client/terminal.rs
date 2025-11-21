@@ -6,11 +6,11 @@ use crate::cache::terminal::{PackedCell, StyleId, unpack_cell};
 use crate::client::grid_renderer::{GridRenderer, SelectionMode, SelectionPosition};
 use crate::debug::server::DiagnosticServer;
 use crate::protocol::{
-    self, ClientFrame as WireClientFrame, CursorFrame, FEATURE_CURSOR_SYNC,
+    self, ClientFrame as WireClientFrame, CursorFrame, ExtensionFrame, FEATURE_CURSOR_SYNC,
     HostFrame as WireHostFrame, Update as WireUpdate, ViewportCommand,
 };
 use crate::telemetry::{self, PerfGuard};
-use crate::transport::{Payload, Transport, TransportError};
+use crate::transport::{Payload, Transport, TransportError, extensions};
 #[cfg(not(test))]
 use copypasta::{ClipboardContext, ClipboardProvider};
 use crossterm::{
@@ -843,6 +843,7 @@ impl TerminalClient {
                 WireHostFrame::HistoryBackfill { .. } => "history_backfill",
                 WireHostFrame::InputAck { .. } => "input_ack",
                 WireHostFrame::Cursor { .. } => "cursor",
+                WireHostFrame::Extension { .. } => "extension",
                 WireHostFrame::Shutdown => "shutdown",
             };
             debug!(
@@ -1050,6 +1051,9 @@ impl TerminalClient {
             WireHostFrame::Cursor { cursor, .. } => {
                 self.apply_wire_cursor(&cursor);
             }
+            WireHostFrame::Extension { frame } => {
+                self.handle_extension_frame(frame);
+            }
             WireHostFrame::SnapshotComplete { .. } => {
                 debug!(
                     authorization_state = ?self.authorization_state,
@@ -1066,6 +1070,17 @@ impl TerminalClient {
             WireHostFrame::Shutdown => return Err(ClientError::Shutdown),
         }
         Ok(())
+    }
+
+    fn handle_extension_frame(&mut self, frame: ExtensionFrame) {
+        let _ = extensions::publish(self.transport.id(), frame.clone());
+        trace!(
+            target = "client::frame",
+            namespace = %frame.namespace,
+            kind = %frame.kind,
+            payload_len = frame.payload.len(),
+            "ignoring unhandled extension frame"
+        );
     }
 
     fn observe_update_bounds(&mut self, update: &WireUpdate, authoritative: bool) {

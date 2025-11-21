@@ -278,6 +278,7 @@ fn late_joiner_receives_snapshot_and_roundtrips_input() {
             | HostFrame::SnapshotComplete { .. }
             | HostFrame::HistoryBackfill { .. }
             | HostFrame::Cursor { .. }
+            | HostFrame::Extension { .. }
             | HostFrame::Shutdown => {}
         }
         if view.contains_row("host% echo world") && view.contains_row("world") {

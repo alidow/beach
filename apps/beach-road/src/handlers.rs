@@ -137,6 +137,8 @@ pub struct JoinSessionRequest {
     pub mcp: bool,
     #[serde(default)]
     pub viewer_token: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -526,8 +528,9 @@ pub async fn join_session(
 
     let JoinSessionRequest {
         passphrase,
-        mcp,
+        mcp: _,
         viewer_token,
+        label,
     } = body;
 
     match storage.get_session(&session_id).await {
@@ -614,11 +617,14 @@ pub async fn join_session(
             let websocket_url = websocket_url(&base_http, &session_id);
             let signal_url = signaling_url(&base_http, &session_id);
 
-            let transport_metadata = json!({
-                "signaling_url": signal_url,
-                "role": "answerer",
-                "poll_interval_ms": 250u64,
-            });
+            let mut transport_metadata = serde_json::Map::new();
+            transport_metadata.insert("signaling_url".to_string(), json!(signal_url));
+            transport_metadata.insert("role".to_string(), json!("answerer"));
+            transport_metadata.insert("poll_interval_ms".to_string(), json!(250u64));
+            if let Some(l) = label {
+                transport_metadata.insert("label".to_string(), json!(l));
+            }
+            let transport_metadata = serde_json::Value::Object(transport_metadata);
 
             let transports = vec![
                 AdvertisedTransport::webrtc(transport_metadata.clone()),

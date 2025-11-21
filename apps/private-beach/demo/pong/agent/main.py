@@ -3142,9 +3142,9 @@ def main() -> int:
             transport_status = status_payload.get("transport")
         if action == "removed":
             transport_status = "detached"
-        # If a real controller transport is confirmed, stop the fallback poller.
-        if transport_status in {"fast_path", "http_fallback"}:
-            stop_state_poller(child_session_id)
+        # Keep the fallback poller alive until we have steady state updates; fast
+        # path readiness alone doesn’t guarantee the streams are flowing yet.
+        # This prevents us from dropping the only early-state source.
         publish_transport_status(
             child_session_id, transport_status or "pending", action=action
         )

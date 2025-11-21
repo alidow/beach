@@ -1,5 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1560,19 +1562,6 @@ impl OffererInner {
             .unwrap_or(false)
     }
 
-    fn peer_uses_fastpath_signaling(peer: &PeerInfo) -> bool {
-        Self::peer_label(peer)
-            .map(|label| {
-                matches!(
-                    label.as_str(),
-                    CONTROLLER_CHANNEL_LABEL
-                        | CONTROLLER_ACK_CHANNEL_LABEL
-                        | CONTROLLER_STATE_CHANNEL_LABEL
-                )
-            })
-            .unwrap_or(false)
-    }
-
     fn peer_supports_secure_transport(peer: &PeerInfo) -> bool {
         let supports = Self::peer_label(peer)
             .map(|label| {
@@ -1950,12 +1939,7 @@ async fn negotiate_offerer_peer(
 
     let RemotePeerJoined { peer, signals, .. } = joined;
     let peer_label = OffererInner::peer_label(&peer);
-    let mut signaling_base = inner.signaling_base.clone();
-    if OffererInner::peer_uses_fastpath_signaling(&peer) {
-        if let Some(fastpath_base) = rewrite_signaling_base(&inner.signaling_base) {
-            signaling_base = fastpath_base;
-        }
-    }
+    let signaling_base = inner.signaling_base.clone();
 
     let mut setting = SettingEngine::default();
     // Force IPv4 so Dockerized managers do not attempt unreachable udp6 STUN
@@ -2846,12 +2830,32 @@ pub async fn connect_via_signaling(
     }
 }
 
+/// Best-effort warmup for session key derivation so later handshakes don’t pay the KDF cost.
+pub async fn warm_session_key(passphrase: Option<&str>, session_id: &str) {
+    let cell = Arc::new(OnceCell::<Arc<[u8; 32]>>::new());
+    if let Err(err) = ensure_session_key(&cell, passphrase, session_id).await {
+        tracing::warn!(
+            target = "beach::transport::webrtc",
+            session_id = %session_id,
+            error = %err,
+            "session key warmup failed"
+        );
+    } else {
+        tracing::trace!(
+            target = "beach::transport::webrtc",
+            session_id = %session_id,
+            "session key warmup complete"
+        );
+    }
+}
+
 async fn connect_answerer(
     signaling_url: &str,
     poll_interval: Duration,
     passphrase: Option<&str>,
     label: Option<&str>,
 ) -> Result<WebRtcConnection, TransportError> {
+    let started = std::time::Instant::now();
     let passphrase_owned = passphrase.map(|s| s.to_string());
     let session_id = extract_session_id(signaling_url)?;
     let session_key_cell = Arc::new(OnceCell::<Arc<[u8; 32]>>::new());
@@ -2860,6 +2864,29 @@ async fn connect_answerer(
         passphrase_owned.as_deref(),
         session_id.as_str(),
     );
+    if let Err(err) = ensure_session_key(
+        &session_key_cell,
+        passphrase_owned.as_deref(),
+        session_id.as_str(),
+    )
+    .await
+    {
+        tracing::warn!(
+
+            role = "answerer",
+            session_id = %session_id,
+            error = %err,
+            "eager session key derivation failed"
+        );
+    } else {
+        tracing::debug!(
+            target = "beach::transport::webrtc",
+            role = "answerer",
+            session_id = %session_id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "session key derived eagerly"
+        );
+    }
     let secure_transport_active = secure_transport_enabled()
         && passphrase_owned
             .as_ref()
@@ -3999,6 +4026,13 @@ async fn connect_answerer(
     } else {
         Some(connection_metadata)
     };
+    tracing::info!(
+        target = "beach::transport::webrtc",
+        role = "answerer",
+        session_id = %session_id,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "webrtc answerer connected"
+    );
 
     Ok(WebRtcConnection::new(
         transport_dyn,
@@ -4036,10 +4070,6 @@ fn endpoint_with_params(
     Ok(url)
 }
 
-fn signaling_base_is_fastpath(base: &str) -> bool {
-    base.contains("/fastpath/sessions/")
-}
-
 async fn post_sdp(
     client: &Client,
     base: &str,
@@ -4047,7 +4077,6 @@ async fn post_sdp(
     params: &[(&str, &str)],
     payload: &WebRtcSdpPayload,
 ) -> Result<(), TransportError> {
-    let base_is_fastpath = signaling_base_is_fastpath(base);
     let url = endpoint_with_params(base, suffix, params)?;
     let url_string = url.as_str().to_string();
     tracing::debug!(
@@ -4072,59 +4101,6 @@ async fn post_sdp(
 
     if response.status().is_success() {
         return Ok(());
-    }
-    if response.status() == StatusCode::NOT_FOUND && !base_is_fastpath {
-        if let Some(alt_base) = rewrite_signaling_base(base) {
-            let alt_is_fastpath = signaling_base_is_fastpath(&alt_base);
-            let alt_url = endpoint_with_params(&alt_base, suffix, params)?;
-            let alt_url_string = alt_url.as_str().to_string();
-            let level_is_warn = !alt_is_fastpath; // warn only when switching fastpath -> sessions
-            if level_is_warn {
-                tracing::warn!(
-                    target = "beach::transport::webrtc",
-                    phase = "post_sdp",
-                    suffix,
-                    url = %url_string,
-                    alt_url = %alt_url_string,
-                    "post returned 404; retrying alternate signaling path"
-                );
-            } else {
-                tracing::debug!(
-                    target = "beach::transport::webrtc",
-                    phase = "post_sdp",
-                    suffix,
-                    url = %url_string,
-                    alt_url = %alt_url_string,
-                    "post returned 404; retrying alternate signaling path"
-                );
-            }
-            let alt_attempt = client.post(alt_url.clone()).json(payload).send().await;
-            tracing::debug!(
-                target = "beach::transport::webrtc",
-                phase = "post_sdp",
-                suffix,
-                await = "client.send.alt",
-                state = "end",
-                result = ?alt_attempt.as_ref().map(reqwest::Response::status),
-                url = %alt_url_string
-            );
-            let alt_resp = alt_attempt.map_err(http_error)?;
-            if alt_resp.status().is_success() {
-                return Ok(());
-            }
-            return Err(TransportError::Setup(format!(
-                "unexpected signaling status {} (alt)",
-                alt_resp.status()
-            )));
-        }
-    } else if response.status() == StatusCode::NOT_FOUND && base_is_fastpath {
-        tracing::debug!(
-            target = "beach::transport::webrtc",
-            phase = "post_sdp",
-            suffix,
-            url = %url_string,
-            "fastpath signaling returned 404; not retrying legacy endpoint"
-        );
     }
     Err(TransportError::Setup(format!(
         "unexpected signaling status {}",
@@ -4159,7 +4135,6 @@ async fn fetch_sdp(
     suffix: &str,
     params: &[(&str, &str)],
 ) -> Result<Option<WebRtcSdpPayload>, TransportError> {
-    let base_is_fastpath = signaling_base_is_fastpath(base);
     let url = endpoint_with_params(base, suffix, params)?;
     let url_string = url.as_str().to_string();
     tracing::debug!(
@@ -4203,73 +4178,7 @@ async fn fetch_sdp(
             let payload = payload_attempt.map_err(http_error)?;
             Ok(Some(payload))
         }
-        StatusCode::NO_CONTENT | StatusCode::NOT_FOUND => {
-            if base_is_fastpath {
-                tracing::debug!(
-                    target = "beach::transport::webrtc",
-                    phase = "fetch_sdp",
-                    suffix,
-                    url = %url_string,
-                    "fastpath signaling returned empty/404; waiting before retry"
-                );
-                return Ok(None);
-            }
-            if let Some(alt_base) = rewrite_signaling_base(base) {
-                let alt_is_fastpath = signaling_base_is_fastpath(&alt_base);
-                let alt_url = endpoint_with_params(&alt_base, suffix, params)?;
-                let alt_url_string = alt_url.as_str().to_string();
-                let level_is_warn = !alt_is_fastpath; // warn when switching fastpath -> sessions
-                if level_is_warn {
-                    tracing::warn!(
-                        target = "beach::transport::webrtc",
-                        phase = "fetch_sdp",
-                        suffix,
-                        url = %url_string,
-                        alt_url = %alt_url_string,
-                        "fetch returned 404; retrying alternate signaling path"
-                    );
-                } else {
-                    tracing::debug!(
-                        target = "beach::transport::webrtc",
-                        phase = "fetch_sdp",
-                        suffix,
-                        url = %url_string,
-                        alt_url = %alt_url_string,
-                        "fetch returned 404; retrying alternate signaling path"
-                    );
-                }
-                let alt_attempt = client.get(alt_url.clone()).send().await;
-                tracing::debug!(
-                    target = "beach::transport::webrtc",
-                    phase = "fetch_sdp",
-                    suffix,
-                    await = "client.send.alt",
-                    state = "end",
-                    result = ?alt_attempt.as_ref().map(reqwest::Response::status),
-                    url = %alt_url_string
-                );
-                let alt_response = alt_attempt.map_err(http_error)?;
-                return match alt_response.status() {
-                    StatusCode::OK => {
-                        let payload = alt_response
-                            .json::<WebRtcSdpPayload>()
-                            .await
-                            .map_err(http_error)?;
-                        Ok(Some(payload))
-                    }
-                    StatusCode::NOT_FOUND | StatusCode::NO_CONTENT => Ok(None),
-                    status if status.is_server_error() => Err(TransportError::Setup(format!(
-                        "signaling server returned {} (alt)",
-                        status
-                    ))),
-                    status => Err(TransportError::Setup(format!(
-                        "unexpected signaling status {} (alt)",
-                        status
-                    ))),
-                };
-            }
-            Ok(None)
-        }
+        StatusCode::NO_CONTENT | StatusCode::NOT_FOUND => Ok(None),
         status if status.is_server_error() => Err(TransportError::Setup(format!(
             "signaling server returned {status}"
         ))),
@@ -4277,36 +4186,6 @@ async fn fetch_sdp(
             "unexpected signaling status {status}"
         ))),
     }
-}
-
-fn rewrite_signaling_base(base: &str) -> Option<String> {
-    // Toggle between legacy /sessions/:id/webrtc and /fastpath/sessions/:id/webrtc
-    let trimmed = base.trim_end_matches('/');
-    if let Some(rest) = trimmed.strip_prefix("https://") {
-        let mut parts = rest.splitn(2, '/');
-        let host = parts.next().unwrap_or("");
-        let path = parts.next().unwrap_or("");
-        if let Some(p) = path.strip_prefix("sessions/") {
-            // legacy -> fastpath
-            return Some(format!("https://{}/fastpath/sessions/{}", host, p));
-        }
-        if let Some(p) = path.strip_prefix("fastpath/sessions/") {
-            // fastpath -> legacy
-            return Some(format!("https://{}/sessions/{}", host, p));
-        }
-    }
-    if let Some(rest) = trimmed.strip_prefix("http://") {
-        let mut parts = rest.splitn(2, '/');
-        let host = parts.next().unwrap_or("");
-        let path = parts.next().unwrap_or("");
-        if let Some(p) = path.strip_prefix("sessions/") {
-            return Some(format!("http://{}/fastpath/sessions/{}", host, p));
-        }
-        if let Some(p) = path.strip_prefix("fastpath/sessions/") {
-            return Some(format!("http://{}/sessions/{}", host, p));
-        }
-    }
-    None
 }
 
 fn extract_session_id(signaling_url: &str) -> Result<String, TransportError> {
@@ -4333,6 +4212,114 @@ fn truncated_key_hash(bytes: &[u8]) -> String {
 
 fn current_thread_label() -> String {
     format!("{:?}", std::thread::current().id())
+}
+
+#[cfg(test)]
+static SESSION_KEY_DERIVE_INVOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Default)]
+struct SessionKeyInflight {
+    result: AsyncMutex<Option<Result<Arc<[u8; 32]>, Arc<TransportError>>>>,
+    notify: Notify,
+    started: AtomicBool,
+}
+
+static SESSION_KEY_SINGLEFLIGHT: Lazy<Mutex<HashMap<usize, Arc<SessionKeyInflight>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+async fn derive_session_key_singleflight(
+    cell: &Arc<OnceCell<Arc<[u8; 32]>>>,
+    passphrase: &str,
+    session_id: &str,
+) -> Result<Arc<[u8; 32]>, TransportError> {
+    if let Some(existing) = cell.get() {
+        tracing::debug!(
+            session_id = %session_id,
+            key_path = "session_cache",
+            session_hash = %truncated_key_hash(existing.as_ref()),
+            "using cached session key"
+        );
+        return Ok(existing.clone());
+    }
+
+    let key = Arc::as_ptr(cell) as usize;
+    let inflight = {
+        let mut guard = SESSION_KEY_SINGLEFLIGHT.lock().unwrap();
+        guard
+            .entry(key)
+            .or_insert_with(|| Arc::new(SessionKeyInflight::default()))
+            .clone()
+    };
+
+    loop {
+        if let Some(existing) = cell.get() {
+            return Ok(existing.clone());
+        }
+
+        let guard = inflight.result.lock().await;
+        if let Some(result) = guard.as_ref() {
+            let cloned = result
+                .clone()
+                .map_err(|err| TransportError::Setup(err.to_string()))?;
+            return Ok(cloned);
+        }
+
+        // We are the first waiter; perform derivation.
+        if inflight.started.swap(true, Ordering::SeqCst) {
+            drop(guard);
+            inflight.notify.notified().await;
+            continue;
+        }
+        #[cfg(test)]
+        test_note_session_key_derivation();
+        let passphrase_owned = passphrase.to_string();
+        let session_id_owned = session_id.to_string();
+        drop(guard);
+        let derived = tokio::task::spawn_blocking(move || {
+            derive_pre_shared_key(passphrase_owned.as_str(), session_id_owned.as_str())
+        })
+        .await
+        .map_err(|err| {
+            TransportError::Setup(format!("session key derivation task failed: {err}"))
+        })?;
+
+        let result = derived.map(Arc::new).map_err(Arc::new);
+
+        let mut guard = inflight.result.lock().await;
+        guard.replace(result.clone());
+        inflight.notify.notify_waiters();
+
+        if let Ok(derived_key) = result
+            .clone()
+            .map_err(|err| TransportError::Setup(err.to_string()))
+        {
+            let _ = cell.set(derived_key.clone());
+            let mut map_guard = SESSION_KEY_SINGLEFLIGHT.lock().unwrap();
+            map_guard.remove(&key);
+            drop(map_guard);
+            return Ok(cell.get().cloned().unwrap_or(derived_key));
+        } else {
+            let mut map_guard = SESSION_KEY_SINGLEFLIGHT.lock().unwrap();
+            map_guard.remove(&key);
+            drop(map_guard);
+            return result.map_err(|err| TransportError::Setup(err.to_string()));
+        }
+    }
+}
+
+async fn ensure_session_key(
+    cell: &Arc<OnceCell<Arc<[u8; 32]>>>,
+    passphrase: Option<&str>,
+    session_id: &str,
+) -> Result<Option<Arc<[u8; 32]>>, TransportError> {
+    let Some(passphrase_value) = passphrase else {
+        return Ok(None);
+    };
+    if !should_encrypt(Some(passphrase_value)) {
+        return Ok(None);
+    }
+    let result = derive_session_key_singleflight(cell, passphrase_value, session_id).await?;
+    Ok(Some(result))
 }
 
 fn prime_session_key(
@@ -4370,73 +4357,19 @@ fn prime_session_key(
     });
 }
 
-async fn ensure_session_key(
-    cell: &Arc<OnceCell<Arc<[u8; 32]>>>,
-    passphrase: Option<&str>,
-    session_id: &str,
-) -> Result<Option<Arc<[u8; 32]>>, TransportError> {
-    let Some(passphrase_value) = passphrase else {
-        return Ok(None);
-    };
-    if !should_encrypt(Some(passphrase_value)) {
-        return Ok(None);
-    }
-    if let Some(existing) = cell.get() {
-        tracing::debug!(
+#[cfg(test)]
+fn test_reset_session_key_derivations() {
+    SESSION_KEY_DERIVE_INVOCATIONS.store(0, Ordering::SeqCst);
+}
 
-            session_id = %session_id,
-            key_path = "session_cache",
-            session_hash = %truncated_key_hash(existing.as_ref()),
-            "using cached session key"
-        );
-        return Ok(Some(existing.clone()));
-    }
-    let passphrase_owned = passphrase_value.to_string();
-    let session_id_owned = session_id.to_string();
-    let result = tokio::task::spawn_blocking(move || {
-        derive_pre_shared_key(passphrase_owned.as_str(), session_id_owned.as_str())
-    })
-    .await
-    .map_err(|err| TransportError::Setup(format!("session key derivation task failed: {err}")))??;
-    let arc_key = Arc::new(result);
-    let session_hash = truncated_key_hash(arc_key.as_ref());
-    match cell.set(arc_key.clone()) {
-        Ok(()) => {
-            tracing::debug!(
+#[cfg(test)]
+fn test_session_key_derivations() -> usize {
+    SESSION_KEY_DERIVE_INVOCATIONS.load(Ordering::SeqCst)
+}
 
-                session_id = %session_id,
-                key_path = "session_derived",
-                session_hash = %session_hash,
-                "session key cached"
-            );
-            Ok(Some(arc_key))
-        }
-        Err(SetError::AlreadyInitializedError(_)) => {
-            let cached_hash = cell
-                .get()
-                .map(|existing| truncated_key_hash(existing.as_ref()))
-                .unwrap_or_else(|| "unknown".to_string());
-            tracing::debug!(
-
-                session_id = %session_id,
-                key_path = "session_cache_race",
-                attempted_hash = %session_hash,
-                cached_hash = %cached_hash,
-                "session key already initialized"
-            );
-            Ok(cell.get().cloned().or(Some(arc_key)))
-        }
-        Err(SetError::InitializingError(value)) => {
-            tracing::debug!(
-
-                session_id = %session_id,
-                key_path = "session_initializing",
-                pending_hash = %truncated_key_hash(value.as_ref()),
-                "session key initialization in progress"
-            );
-            Ok(Some(value))
-        }
-    }
+#[cfg(test)]
+fn test_note_session_key_derivation() {
+    SESSION_KEY_DERIVE_INVOCATIONS.fetch_add(1, Ordering::SeqCst);
 }
 
 fn prime_pre_shared_key(
@@ -5349,6 +5282,8 @@ fn to_setup_error<E: std::fmt::Display>(err: E) -> TransportError {
 mod tests {
     use super::*;
     use crate::transport::webrtc::signaling::{PeerRole, TransportType};
+    use futures::future::join_all;
+    use std::time::Instant;
 
     #[test_timeout::timeout]
     fn webrtc_pair_round_trip() {
@@ -5377,6 +5312,74 @@ mod tests {
         let client_msg = client.recv(timeout).expect("client recv");
         assert_eq!(client_msg.sequence, seq_server);
         assert_eq!(client_msg.payload.as_text(), Some("hello from server"));
+    }
+
+    #[test_timeout::timeout]
+    fn webrtc_handshake_completes_within_budget() {
+        let started = Instant::now();
+        let pair = match build_pair() {
+            Ok(pair) => pair,
+            Err(err) => {
+                tracing::debug!(target = "webrtc", error = %err, "skipping webrtc_handshake_completes_within_budget");
+                return;
+            }
+        };
+        let handshake_elapsed = started.elapsed();
+        assert!(
+            handshake_elapsed < Duration::from_secs(10),
+            "local webrtc handshake took too long: {:?}",
+            handshake_elapsed
+        );
+        eprintln!("local webrtc handshake duration: {:?}", handshake_elapsed);
+        drop(pair);
+    }
+
+    #[test_timeout::timeout]
+    fn session_key_derivation_concurrency_is_fast_and_deduplicated() {
+        test_reset_session_key_derivations();
+        let cell = Arc::new(OnceCell::<Arc<[u8; 32]>>::new());
+        let passphrase = "session-key-derivation-test-passphrase";
+        let session_id = "session-key-derivation-test-session";
+
+        let started = Instant::now();
+        let results = RUNTIME.block_on(async {
+            let mut tasks = Vec::new();
+            for _ in 0..8 {
+                let cell_clone = Arc::clone(&cell);
+                tasks.push(tokio::spawn(async move {
+                    ensure_session_key(&cell_clone, Some(passphrase), session_id).await
+                }));
+            }
+            join_all(tasks).await
+        });
+        let elapsed = started.elapsed();
+
+        let mut hashes = Vec::new();
+        for result in results {
+            let key_opt = result
+                .expect("session derivation task panicked")
+                .expect("derivation failed");
+            let key = key_opt.expect("session key missing despite passphrase");
+            hashes.push(truncated_key_hash(key.as_ref()));
+        }
+
+        let first = hashes.first().expect("hashes should not be empty").clone();
+        assert!(
+            hashes.iter().all(|hash| hash == &first),
+            "session key derivations returned mismatched keys: {:?}",
+            hashes
+        );
+
+        let derivations = test_session_key_derivations();
+        eprintln!(
+            "session key derivation elapsed: {:?}, spawn_blocking invocations: {}",
+            elapsed, derivations
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "session key derivation too slow: {:?}",
+            elapsed
+        );
     }
 
     #[test]

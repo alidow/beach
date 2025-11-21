@@ -2,9 +2,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
+use tokio::sync::broadcast;
+
+use crate::protocol::{
+    ClientFrame, ExtensionFrame, HostFrame, encode_client_frame_binary, encode_host_frame_binary,
+};
+
+pub mod extensions;
 pub mod ipc;
 pub mod ssh;
 pub mod terminal;
+pub mod unified_bridge;
 pub mod webrtc;
 pub mod websocket;
 
@@ -106,6 +114,18 @@ pub enum TransportError {
     Setup(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionLane {
+    ControlOrdered,
+    StateUnordered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionDirection {
+    HostToClient,
+    ClientToHost,
+}
+
 pub trait Transport: Send + Sync {
     fn kind(&self) -> TransportKind;
     fn id(&self) -> TransportId;
@@ -115,6 +135,28 @@ pub trait Transport: Send + Sync {
     fn send_bytes(&self, bytes: &[u8]) -> Result<u64, TransportError>;
     fn recv(&self, timeout: Duration) -> Result<TransportMessage, TransportError>;
     fn try_recv(&self) -> Result<Option<TransportMessage>, TransportError>;
+
+    fn send_extension(
+        &self,
+        direction: ExtensionDirection,
+        frame: ExtensionFrame,
+        _lane: ExtensionLane,
+    ) -> Result<u64, TransportError> {
+        match direction {
+            ExtensionDirection::HostToClient => {
+                let bytes = encode_host_frame_binary(&HostFrame::Extension { frame });
+                self.send_bytes(&bytes)
+            }
+            ExtensionDirection::ClientToHost => {
+                let bytes = encode_client_frame_binary(&ClientFrame::Extension { frame });
+                self.send_bytes(&bytes)
+            }
+        }
+    }
+
+    fn subscribe_extensions(&self, namespace: &str) -> broadcast::Receiver<ExtensionFrame> {
+        extensions::subscribe(self.id(), namespace)
+    }
 }
 
 pub(crate) fn next_transport_id() -> TransportId {

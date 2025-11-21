@@ -583,7 +583,8 @@ where
                 | HostFrame::Hello { .. }
                 | HostFrame::Grid { .. }
                 | HostFrame::Heartbeat { .. }
-                | HostFrame::InputAck { .. } => {}
+                | HostFrame::InputAck { .. }
+                | HostFrame::Extension { .. } => {}
             }
         }
     });

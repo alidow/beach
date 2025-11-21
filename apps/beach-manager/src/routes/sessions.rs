@@ -104,6 +104,8 @@ pub struct JoinSessionRequestBody {
     pub mcp: bool,
     #[serde(default)]
     pub viewer_token: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

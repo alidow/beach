@@ -289,6 +289,7 @@ pub static ACTION_LATENCY_MS: Lazy<HistogramVec> = Lazy::new(|| {
     h
 });
 
+#[allow(dead_code)]
 pub static FASTPATH_ACTIONS_SENT: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new(
@@ -341,6 +342,7 @@ pub static FASTPATH_STATE_RECEIVED: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+#[allow(dead_code)]
 pub static FASTPATH_CHANNEL_CLOSED: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new(
@@ -354,6 +356,7 @@ pub static FASTPATH_CHANNEL_CLOSED: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+#[allow(dead_code)]
 pub static FASTPATH_CHANNEL_ERRORS: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new(

@@ -844,7 +844,7 @@ fn parse_action_message(msg: &DataChannelMessage) -> HarnessResult<ActionCommand
     parse_action_payload(&text)
 }
 
-fn parse_action_payload(text: &str) -> HarnessResult<ActionCommand> {
+pub fn parse_action_payload(text: &str) -> HarnessResult<ActionCommand> {
     let envelope: ActionEnvelope =
         serde_json::from_str(text).map_err(|err| HarnessError::Transport(format!("{err}")))?;
     if envelope.r#type != "action" {

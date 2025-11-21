@@ -1,5 +1,4 @@
 mod auth;
-pub mod fastpath;
 mod mcp;
 mod private_beaches;
 mod sessions;
@@ -90,18 +89,6 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/sessions/:session_id/emergency-stop", post(emergency_stop))
         .route("/agents/onboard", post(onboard_agent))
-        .route(
-            "/fastpath/sessions/:session_id/webrtc/offer",
-            post(fastpath::answer_offer),
-        )
-        .route(
-            "/fastpath/sessions/:session_id/webrtc/answer",
-            get(fastpath::get_local_answer),
-        )
-        .route(
-            "/fastpath/sessions/:session_id/webrtc/ice",
-            post(fastpath::add_remote_ice).get(fastpath::list_local_ice),
-        )
         .route("/mcp", post(mcp::handle_mcp))
         // Private Beaches CRUD + layout
         .route(

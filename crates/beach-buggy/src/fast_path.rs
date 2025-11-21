@@ -972,6 +972,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_hint_with_default_channels() {
+        let base = Url::parse("https://manager.local/").unwrap();
+        let mut hints = HashMap::new();
+        hints.insert(
+            "fast_path_webrtc".into(),
+            serde_json::json!({
+                "offer_path": "/fastpath/sessions/abc/offer",
+                "ice_path": "/fastpath/sessions/abc/ice"
+            }),
+        );
+
+        let parsed = parse_fast_path_endpoints(&base, &hints)
+            .expect("parse ok")
+            .expect("hint present");
+        assert_eq!(parsed.channels, FastPathChannels::default());
+    }
+
+    #[test]
     fn invalid_hint_shape_errors() {
         let base = Url::parse("https://manager.local/").unwrap();
         let mut hints = HashMap::new();

@@ -1167,6 +1167,13 @@ impl<P: TokenProvider> HttpTransport<P> {
                     let mut state = self.fast_path.lock().await;
                     state.client = Some(client.clone());
                 }
+                #[cfg(test)]
+                if std::env::var("BEACH_TEST_SKIP_FAST_PATH_CONNECT")
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+                {
+                    return;
+                }
                 if let Err(err) = self.establish_fast_path(client).await {
                     warn!(
                         target = "fast_path",
@@ -1963,6 +1970,40 @@ mod tests {
         diffs: Vec<StateDiff>,
         acks: Vec<Vec<ActionAck>>,
         health: Vec<HealthHeartbeat>,
+    }
+
+    #[tokio::test]
+    async fn default_fast_path_hint_configures_client() {
+        let key = "BEACH_TEST_SKIP_FAST_PATH_CONNECT";
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, "1");
+        let transport = HttpTransport::new(
+            "https://manager.local",
+            StaticTokenProvider::new("test-token"),
+        )
+        .expect("transport init");
+
+        let mut hints = HashMap::new();
+        hints.insert(
+            "fast_path_webrtc".into(),
+            serde_json::json!({
+                "offer_path": "/fastpath/sessions/abc/offer",
+                "ice_path": "/fastpath/sessions/abc/ice"
+            }),
+        );
+
+        transport.apply_transport_hints(&hints).await;
+        {
+            let state = transport.fast_path.lock().await;
+            assert!(
+                state.client.is_some(),
+                "fast-path client should be configured from default hint"
+            );
+        }
+        match prev {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
     }
 
     #[tokio::test]

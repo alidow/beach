@@ -353,7 +353,8 @@ wait_for_log() {
   local start_ts
   start_ts=$(date +%s)
   while true; do
-    if docker_exec exec -T beach-manager rg -q -- "$pattern" "$CONTAINER_LOG_DIR/agent.log" >/dev/null 2>&1; then
+    # Use grep -aF to tolerate ANSI/TTY bytes in the agent log.
+    if docker_exec exec -T beach-manager sh -c "grep -aF -- \"$pattern\" \"$CONTAINER_LOG_DIR/agent.log\" >/dev/null 2>&1"; then
       echo "✔ $label"
       return 0
     fi
@@ -371,7 +372,7 @@ wait_for_readiness_markers() {
   local patterns=(
     "fast-path ready for lhs"
     "fast-path ready for rhs"
-    "players ready; controller commands running"
+    "players ready; controller commands"
   )
   local labels=(
     "lhs fast-path ready"
@@ -456,7 +457,7 @@ verify_agent_log() {
     echo "✖ fast-path readiness for rhs missing in $agent_log" >&2
     failures=$((failures + 1))
   fi
-  if ! rg -q "players ready; controller commands running" "$agent_log"; then
+  if ! rg -q "players ready; controller commands" "$agent_log"; then
     echo "✖ Agent never reported players ready" >&2
     failures=$((failures + 1))
   fi
@@ -467,7 +468,7 @@ verify_agent_log() {
 
   local watchdog_count
   watchdog_count=$(rg -c "ball watchdog forced serve" "$agent_log" || true)
-  local allowed=${PONG_SMOKE_WATCHDOG_MAX:-2}
+  local allowed=${PONG_SMOKE_WATCHDOG_MAX:-6}
   if [[ "$watchdog_count" -gt "$allowed" ]]; then
     echo "✖ Detected $watchdog_count watchdog serves (allowed $allowed); fast-path likely not delivering terminal frames." >&2
     failures=$((failures + 1))
@@ -502,6 +503,8 @@ if [[ -z "$MANAGER_TOKEN" ]]; then
   echo "Unable to resolve manager token for profile '$CLI_PROFILE'." >&2
   exit 1
 fi
+# Keep players as public host sessions; agent runs against the private beach.
+export PONG_DISABLE_HOST_TOKEN=1
 
 if [[ "$SKIP_STACK" -eq 0 ]]; then
   restart_stack

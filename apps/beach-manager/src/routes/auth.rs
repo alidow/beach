@@ -10,6 +10,37 @@ use crate::{auth::Claims, state::AppState};
 
 use super::ApiError;
 
+fn dev_insecure_enabled() -> bool {
+    std::env::var("DEV_ALLOW_INSECURE_MANAGER_TOKEN").unwrap_or_default() == "1"
+        && std::env::var("NODE_ENV").unwrap_or_default() != "production"
+}
+
+fn dev_insecure_token() -> String {
+    std::env::var("DEV_MANAGER_INSECURE_TOKEN").unwrap_or_else(|_| "DEV-MANAGER-TOKEN".to_string())
+}
+
+fn dev_bypass_token() -> Option<String> {
+    if dev_insecure_enabled() {
+        return Some(dev_insecure_token());
+    }
+    None
+}
+
+fn dev_bypass_claims() -> Claims {
+    Claims {
+        sub: "dev-bypass".to_string(),
+        iss: Some("beach-manager-dev".to_string()),
+        aud: None,
+        scope: Some("*".to_string()),
+        scp: Some(vec!["*".to_string()]),
+        account_id: Some("dev".to_string()),
+        organization_id: None,
+        private_beach_id: None,
+        roles: vec!["dev".to_string()],
+        exp: None,
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct AuthToken {
@@ -28,6 +59,23 @@ impl FromRequestParts<AppState> for AuthToken {
         let token = extract_token(&parts.headers)
             .or_else(|| extract_token_from_query(parts))
             .ok_or(ApiError::Unauthorized)?;
+
+        if dev_insecure_enabled() {
+            if let Some(dev_token) = dev_bypass_token() {
+                if token == dev_token || dev_token.is_empty() {
+                    return Ok(AuthToken {
+                        raw: token,
+                        claims: dev_bypass_claims(),
+                    });
+                }
+            }
+            // Accept any bearer token in dev insecure mode with wildcard scopes.
+            return Ok(AuthToken {
+                raw: token,
+                claims: dev_bypass_claims(),
+            });
+        }
+
         let path = parts.uri.path().to_string();
         let strict = requires_strict_session_auth(&path);
         let ctx = state.auth_context();

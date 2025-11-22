@@ -29,6 +29,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/sessions/:session_id/join", post(join_session))
         .route(
             "/sessions/:session_id/state",
+            // Allow dev insecure token to hit state snapshot/push.
             get(fetch_state_snapshot).post(push_state),
         )
         .route("/sessions/:session_id/state/stream", get(sse::stream_state))

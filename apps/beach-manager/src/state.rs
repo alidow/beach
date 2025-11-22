@@ -23,8 +23,7 @@ use crate::routes::ShowcasePreflightResponse;
 use crate::{
     fastpath::{
         action_terminal_bytes, fast_path_action_payload, send_actions_over_fast_path,
-        FastPathRegistry, FastPathSendOutcome,
-        FastPathSession,
+        FastPathRegistry, FastPathSendOutcome, FastPathSession,
     },
     log_throttle::{should_log_custom_event, should_log_queue_event, QueueLogKind},
     metrics,
@@ -1930,25 +1929,25 @@ impl AppState {
 
         // Throttled trace to help correlate manager-side handshake construction
         // with host/agent behavior without leaking credentials.
-        if should_log_custom_event("manager_handshake", session_id, StdDuration::from_secs(30)) {
-            let has_auto_attach = handshake
-                .get("controller_auto_attach")
-                .and_then(|value| value.as_object())
-                .is_some();
-            let idle_snapshot_interval_ms = handshake
-                .get("idle_snapshot")
-                .and_then(|value| value.get("interval_ms"))
-                .and_then(|value| value.as_i64())
-                .unwrap_or(0);
-            trace!(
-                target = "controller.actions",
-                session_id = %session_id,
-                private_beach_id = %private_beach_id,
-                has_auto_attach,
-                idle_snapshot_interval_ms,
-                "manager handshake prepared"
-            );
-        }
+        let has_auto_attach = handshake
+            .get("controller_auto_attach")
+            .and_then(|value| value.as_object())
+            .is_some();
+        let fast_path_hint = handshake.get("fast_path_webrtc");
+        let idle_snapshot_interval_ms = handshake
+            .get("idle_snapshot")
+            .and_then(|value| value.get("interval_ms"))
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0);
+        info!(
+            target = "controller.actions",
+            session_id = %session_id,
+            private_beach_id = %private_beach_id,
+            has_auto_attach,
+            fast_path_hint = ?fast_path_hint,
+            idle_snapshot_interval_ms,
+            "manager handshake prepared"
+        );
 
         let url = format!(
             "{}/sessions/{}/control",

@@ -1,5 +1,17 @@
 import { resolvePrivateBeachRewriteEnabled } from '../../../private-beach/src/lib/featureFlags';
 
+function devAuthBypassEnabled(): boolean {
+  if (process.env.NODE_ENV === 'production') return false;
+  // Default to enabled in dev unless explicitly disabled.
+  const flag = process.env.PRIVATE_BEACH_BYPASS_AUTH;
+  if (flag === '0' || flag === 'false') return false;
+  return true;
+}
+
+function devInsecureToken(): string {
+  return process.env.DEV_MANAGER_INSECURE_TOKEN?.trim() || 'DEV-MANAGER-TOKEN';
+}
+
 type ClerkGetTokenFn =
   | ((options?: { template?: string; skipCache?: boolean }) => Promise<string | null>)
   | undefined;
@@ -88,6 +100,10 @@ export async function resolveManagerToken(
   template: string | undefined,
   options?: ResolveOptions,
 ): Promise<ManagerTokenResolution> {
+  if (devAuthBypassEnabled()) {
+    return { token: devInsecureToken(), source: 'dev_bypass' };
+  }
+
   const envToken = resolveEnvToken();
   if (envToken) {
     return { token: envToken, source: 'env' };

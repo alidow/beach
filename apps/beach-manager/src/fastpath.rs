@@ -1,14 +1,17 @@
 use std::{
-    collections::HashMap,
+    collections::{hash_map::Entry, HashMap},
     net::IpAddr,
     str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
+    time::{Duration as StdDuration, Instant},
 };
 
-use beach_buggy::{ActionAck, ActionCommand, StateDiff};
+use anyhow::Context;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use beach_buggy::{fast_path::FastPathPayloadKind, ActionAck, ActionCommand, StateDiff};
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{Mutex, RwLock},
@@ -38,6 +41,135 @@ struct IceCandidateMeta {
     ip: IpAddr,
     port: u16,
     scope: &'static str,
+}
+
+const FAST_PATH_CHUNK_VERSION: u8 = 1;
+const FAST_PATH_CHUNK_TTL: StdDuration = StdDuration::from_secs(15);
+
+#[derive(Debug)]
+struct PendingChunk {
+    parts: Vec<Option<Vec<u8>>>,
+    expected: u32,
+    received: u32,
+    expires_at: Instant,
+}
+
+impl PendingChunk {
+    fn new(count: u32) -> anyhow::Result<Self> {
+        if count == 0 {
+            anyhow::bail!("chunk envelope missing chunk count");
+        }
+        Ok(Self {
+            parts: vec![None; count as usize],
+            expected: count,
+            received: 0,
+            expires_at: Instant::now() + FAST_PATH_CHUNK_TTL,
+        })
+    }
+
+    fn insert(&mut self, index: u32, payload: Vec<u8>) -> anyhow::Result<bool> {
+        let idx = index as usize;
+        if idx >= self.parts.len() {
+            anyhow::bail!("chunk envelope index exceeds count");
+        }
+        if self.parts[idx].is_none() {
+            self.parts[idx] = Some(payload);
+            self.received += 1;
+        }
+        self.expires_at = Instant::now() + FAST_PATH_CHUNK_TTL;
+        Ok(self.received == self.expected)
+    }
+
+    fn into_payload(self) -> anyhow::Result<Vec<u8>> {
+        let mut merged = Vec::new();
+        for part in self.parts.into_iter() {
+            let chunk = part.ok_or_else(|| anyhow::anyhow!("chunk assembly missing fragment"))?;
+            merged.extend_from_slice(&chunk);
+        }
+        Ok(merged)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FastPathChunkEnvelope {
+    #[serde(rename = "type")]
+    kind: String,
+    scope: String,
+    #[serde(default)]
+    version: u8,
+    id: String,
+    index: u32,
+    count: u32,
+    payload: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct FastPathChunkReassembler {
+    kind: FastPathPayloadKind,
+    pending: HashMap<String, PendingChunk>,
+}
+
+fn chunk_scope(kind: &FastPathPayloadKind) -> &'static str {
+    match kind {
+        FastPathPayloadKind::Actions => "actions",
+        FastPathPayloadKind::Acks => "acks",
+        FastPathPayloadKind::State => "state",
+        FastPathPayloadKind::Health => "health",
+    }
+}
+
+impl FastPathChunkReassembler {
+    fn new(kind: FastPathPayloadKind) -> Self {
+        Self {
+            kind,
+            pending: HashMap::new(),
+        }
+    }
+
+    fn ingest(&mut self, text: &str) -> anyhow::Result<Option<String>> {
+        match serde_json::from_str::<FastPathChunkEnvelope>(text) {
+            Ok(envelope) => {
+                if envelope.kind != "chunk" {
+                    return Ok(Some(text.to_string()));
+                }
+                if envelope.scope != chunk_scope(&self.kind) {
+                    anyhow::bail!(
+                        "chunk scope mismatch: expected {}, got {}",
+                        chunk_scope(&self.kind),
+                        envelope.scope
+                    );
+                }
+                if envelope.version != 0 && envelope.version != FAST_PATH_CHUNK_VERSION {
+                    anyhow::bail!("unsupported chunk version {}", envelope.version);
+                }
+                let decoded = BASE64
+                    .decode(envelope.payload.as_bytes())
+                    .context("decode chunk payload")?;
+                let entry = match self.pending.entry(envelope.id.clone()) {
+                    Entry::Occupied(existing) => existing.into_mut(),
+                    Entry::Vacant(vacant) => vacant.insert(PendingChunk::new(envelope.count)?),
+                };
+                let complete = entry.insert(envelope.index, decoded)?;
+                if complete {
+                    let payload = self
+                        .pending
+                        .remove(&envelope.id)
+                        .expect("pending chunk missing")
+                        .into_payload()?;
+                    let text = String::from_utf8(payload).context("chunk payload utf8 error")?;
+                    return Ok(Some(text));
+                }
+                self.cleanup_expired();
+                Ok(None)
+            }
+            Err(_) => Ok(Some(text.to_string())),
+        }
+    }
+
+    fn cleanup_expired(&mut self) {
+        let now = Instant::now();
+        self.pending.retain(|_, pending| pending.expires_at > now);
+    }
 }
 
 fn classify_ip_scope(ip: &IpAddr) -> &'static str {
@@ -107,6 +239,8 @@ pub struct FastPathSession {
     pub local_ice: Arc<RwLock<Vec<serde_json::Value>>>,
     pub public_ip_hint: Option<String>,
     pub host_hint_for_log: Option<String>,
+    ack_chunks: Arc<Mutex<FastPathChunkReassembler>>,
+    state_chunks: Arc<Mutex<FastPathChunkReassembler>>,
     state: Arc<Mutex<Option<AppState>>>,
     ack_handler_installed: Arc<AtomicBool>,
     state_handler_installed: Arc<AtomicBool>,
@@ -194,6 +328,12 @@ impl FastPathSession {
             local_ice: Arc::new(RwLock::new(Vec::new())),
             public_ip_hint: public_ip.clone(),
             host_hint_for_log,
+            ack_chunks: Arc::new(Mutex::new(FastPathChunkReassembler::new(
+                FastPathPayloadKind::Acks,
+            ))),
+            state_chunks: Arc::new(Mutex::new(FastPathChunkReassembler::new(
+                FastPathPayloadKind::State,
+            ))),
             state: Arc::new(Mutex::new(None)),
             ack_handler_installed: Arc::new(AtomicBool::new(false)),
             state_handler_installed: Arc::new(AtomicBool::new(false)),
@@ -204,6 +344,12 @@ impl FastPathSession {
 
     pub fn instance_id(&self) -> u64 {
         self.instance_id
+    }
+
+    /// Pre-bind state so early data channel events (on the offer/answer path)
+    /// can install handlers without racing the async receiver spawn.
+    pub async fn preload_state(&self, state: AppState) {
+        self.bind_state(state).await;
     }
 
     pub async fn set_remote_offer(
@@ -650,12 +796,16 @@ fn install_ack_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>, s
     let state_clone = state.clone();
     let state_for_close = state.clone();
     let state_for_error = state.clone();
+    let session_for_message = session.clone();
+    let session_for_close = session.clone();
+    let session_for_error = session;
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let state = state_clone.clone();
         let session_id = session_id.clone();
+        let session = session_for_message.clone();
         Box::pin(async move {
-            match parse_action_ack(&msg) {
-                Ok(ack) => {
+            match parse_action_ack(&msg, &session.ack_chunks).await {
+                Ok(Some(ack)) => {
                     if let Err(err) = state.ack_actions(&session_id, vec![ack], None, true).await {
                         warn!(
                             target = "fast_path",
@@ -664,6 +814,13 @@ fn install_ack_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>, s
                             "failed to persist ack from fast-path"
                         );
                     }
+                }
+                Ok(None) => {
+                    trace!(
+                        target = "fast_path",
+                        session_id = %session_id,
+                        "received partial fast-path ack chunk; waiting for completion"
+                    );
                 }
                 Err(err) => {
                     warn!(
@@ -682,9 +839,8 @@ fn install_ack_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>, s
         })
     }));
 
-    let session_close = session.clone();
     dc.on_close(Box::new(move || {
-        let session = session_close.clone();
+        let session = session_for_close.clone();
         let state = state_for_close.clone();
         Box::pin(async move {
             session.clear_ack_channel().await;
@@ -700,9 +856,8 @@ fn install_ack_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>, s
         })
     }));
 
-    let session_error = session.clone();
     dc.on_error(Box::new(move |err| {
-        let session = session_error.clone();
+        let session = session_for_error.clone();
         let state = state_for_error.clone();
         Box::pin(async move {
             warn!(
@@ -725,12 +880,16 @@ fn install_state_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>,
     let state_clone = state.clone();
     let state_for_close = state.clone();
     let state_for_error = state.clone();
+    let session_for_message = session.clone();
+    let session_for_close = session.clone();
+    let session_for_error = session;
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let state = state_clone.clone();
         let session_id = session_id.clone();
+        let session = session_for_message.clone();
         Box::pin(async move {
-            match parse_state_diff(&msg) {
-                Ok(diff) => {
+            match parse_state_diff(&msg, &session.state_chunks).await {
+                Ok(Some(diff)) => {
                     if let Err(err) = state.record_state(&session_id, diff, true).await {
                         warn!(
                             target = "fast_path",
@@ -739,6 +898,13 @@ fn install_state_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>,
                             "failed to persist state diff from fast-path"
                         );
                     }
+                }
+                Ok(None) => {
+                    trace!(
+                        target = "fast_path",
+                        session_id = %session_id,
+                        "received partial fast-path state chunk; waiting for completion"
+                    );
                 }
                 Err(err) => {
                     warn!(
@@ -757,9 +923,8 @@ fn install_state_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>,
         })
     }));
 
-    let session_close = session.clone();
     dc.on_close(Box::new(move || {
-        let session = session_close.clone();
+        let session = session_for_close.clone();
         let state = state_for_close.clone();
         Box::pin(async move {
             session.clear_state_channel().await;
@@ -775,9 +940,8 @@ fn install_state_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>,
         })
     }));
 
-    let session_error = session.clone();
     dc.on_error(Box::new(move |err| {
-        let session = session_error.clone();
+        let session = session_for_error.clone();
         let state = state_for_error.clone();
         Box::pin(async move {
             warn!(
@@ -795,28 +959,44 @@ fn install_state_handler(dc: Arc<RTCDataChannel>, session: Arc<FastPathSession>,
     }));
 }
 
-fn parse_action_ack(msg: &DataChannelMessage) -> anyhow::Result<ActionAck> {
+async fn assemble_fast_path_payload(
+    msg: &DataChannelMessage,
+    chunks: &Arc<Mutex<FastPathChunkReassembler>>,
+) -> anyhow::Result<Option<String>> {
     if !msg.is_string {
-        anyhow::bail!("expected text ack payload");
+        anyhow::bail!("expected text payload");
     }
     let text = String::from_utf8(msg.data.to_vec())?;
+    let mut guard = chunks.lock().await;
+    guard.ingest(&text)
+}
+
+async fn parse_action_ack(
+    msg: &DataChannelMessage,
+    chunks: &Arc<Mutex<FastPathChunkReassembler>>,
+) -> anyhow::Result<Option<ActionAck>> {
+    let Some(text) = assemble_fast_path_payload(msg, chunks).await? else {
+        return Ok(None);
+    };
     let envelope: AckEnvelope = serde_json::from_str(&text)?;
     if envelope.kind != "ack" {
         anyhow::bail!("unexpected message type {}", envelope.kind);
     }
-    Ok(envelope.payload)
+    Ok(Some(envelope.payload))
 }
 
-fn parse_state_diff(msg: &DataChannelMessage) -> anyhow::Result<StateDiff> {
-    if !msg.is_string {
-        anyhow::bail!("expected text state payload");
-    }
-    let text = String::from_utf8(msg.data.to_vec())?;
+async fn parse_state_diff(
+    msg: &DataChannelMessage,
+    chunks: &Arc<Mutex<FastPathChunkReassembler>>,
+) -> anyhow::Result<Option<StateDiff>> {
+    let Some(text) = assemble_fast_path_payload(msg, chunks).await? else {
+        return Ok(None);
+    };
     let envelope: StateEnvelope = serde_json::from_str(&text)?;
     if envelope.kind != "state" {
         anyhow::bail!("unexpected message type {}", envelope.kind);
     }
-    Ok(envelope.payload)
+    Ok(Some(envelope.payload))
 }
 
 pub fn fast_path_action_payload(action: &ActionCommand) -> Result<String, String> {
@@ -873,8 +1053,8 @@ mod tests {
     use bytes::Bytes;
     use serde_json::json;
 
-    #[test]
-    fn parses_ack_envelope() {
+    #[tokio::test]
+    async fn parses_ack_envelope() {
         let base_ack = ActionAck {
             id: "a1".into(),
             status: beach_buggy::AckStatus::Ok,
@@ -883,6 +1063,9 @@ mod tests {
             error_code: None,
             error_message: None,
         };
+        let chunks = Arc::new(Mutex::new(FastPathChunkReassembler::new(
+            FastPathPayloadKind::Acks,
+        )));
         let msg = DataChannelMessage {
             is_string: true,
             data: Bytes::from(
@@ -893,17 +1076,23 @@ mod tests {
                 .unwrap(),
             ),
         };
-        let ack = parse_action_ack(&msg).expect("parsed ack");
+        let ack = parse_action_ack(&msg, &chunks)
+            .await
+            .expect("parsed ack")
+            .expect("complete ack payload");
         assert_eq!(ack.id, "a1");
     }
 
-    #[test]
-    fn parses_state_envelope() {
+    #[tokio::test]
+    async fn parses_state_envelope() {
         let base_diff = StateDiff {
             sequence: 7,
             emitted_at: std::time::SystemTime::now(),
             payload: serde_json::json!({"ops": []}),
         };
+        let chunks = Arc::new(Mutex::new(FastPathChunkReassembler::new(
+            FastPathPayloadKind::State,
+        )));
         let msg = DataChannelMessage {
             is_string: true,
             data: Bytes::from(
@@ -914,8 +1103,51 @@ mod tests {
                 .unwrap(),
             ),
         };
-        let diff = parse_state_diff(&msg).expect("parsed state");
+        let diff = parse_state_diff(&msg, &chunks)
+            .await
+            .expect("parsed state")
+            .expect("complete state payload");
         assert_eq!(diff.sequence, 7);
+    }
+
+    #[tokio::test]
+    async fn reassembles_chunked_state_envelope() {
+        let base_diff = StateDiff {
+            sequence: 9,
+            emitted_at: std::time::SystemTime::now(),
+            payload: serde_json::json!({"ops": [{"insert": "x".repeat(40_000)}]}),
+        };
+        let payload = serde_json::to_string(&StateEnvelope {
+            kind: "state".into(),
+            payload: base_diff.clone(),
+        })
+        .unwrap();
+        let frames =
+            beach_buggy::fast_path::frame_fast_path_payload(FastPathPayloadKind::State, &payload)
+                .expect("framed payload");
+        assert!(frames.len() > 1, "chunking should produce multiple frames");
+
+        let chunks = Arc::new(Mutex::new(FastPathChunkReassembler::new(
+            FastPathPayloadKind::State,
+        )));
+        for (idx, frame) in frames.iter().enumerate() {
+            let msg = DataChannelMessage {
+                is_string: true,
+                data: Bytes::from(frame.clone()),
+            };
+            let parsed = parse_state_diff(&msg, &chunks)
+                .await
+                .expect("parse attempt");
+            if idx < frames.len() - 1 {
+                assert!(
+                    parsed.is_none(),
+                    "intermediate chunk should not yield payload"
+                );
+            } else {
+                let diff = parsed.expect("final chunk delivers payload");
+                assert_eq!(diff.sequence, base_diff.sequence);
+            }
+        }
     }
 
     #[test]

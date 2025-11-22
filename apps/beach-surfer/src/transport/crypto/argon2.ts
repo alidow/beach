@@ -9,8 +9,10 @@
  */
 
 const HASH_LEN_BYTES = 32;
-const TIME_COST = 3;
-const MEMORY_COST_KIB = 64 * 1024;
+// Match the Rust toolchain parameters in secure_signaling.rs:
+// Argon2id, time_cost=1, mem_cost=32KiB, parallelism=1.
+const TIME_COST = 1;
+const MEMORY_COST_KIB = 32 * 1024;
 const PARALLELISM = 1;
 
 function traceEnabled(): boolean {

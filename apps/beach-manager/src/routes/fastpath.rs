@@ -40,6 +40,9 @@ pub async fn answer_offer(
     let fps = FastPathSession::new(session_id.clone())
         .await
         .map_err(|e| ApiError::BadRequest(format!("webrtc error: {e}")))?;
+    // Bind state before answering the offer so early data channel events
+    // (which may fire before we spawn the receivers) can install handlers.
+    fps.preload_state(state.clone()).await;
     let answer = fps
         .set_remote_offer(offer)
         .await

@@ -731,23 +731,6 @@ pub async fn get_webrtc_offer(
             Ok(Json(payload))
         }
         None => {
-            // Fallback: if no offer queued for this peer, try retargeting from orphaned queues
-            let peers = signaling.get_peers(&session_id);
-            let present_peer_ids: Vec<String> = peers.into_iter().map(|p| p.id).collect();
-            if let Ok(Some(payload)) = storage
-                .retarget_orphaned_offer_for_peer(&session_id, &present_peer_ids, &params.peer_id)
-                .await
-            {
-                // Activity observed: refresh session TTL
-                let _ = storage.update_session_ttl(&session_id).await;
-                info!(
-                    session = %session_id,
-                    peer = %params.peer_id,
-                    "retargeted orphaned webrtc offer"
-                );
-                return Ok(Json(payload));
-            }
-
             let exists = storage
                 .session_exists(&session_id)
                 .await

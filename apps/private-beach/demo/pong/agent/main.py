@@ -2103,7 +2103,7 @@ class AgentApp:
             candidates = [
                 session
                 for session in self.sessions.values()
-                if session.height > 0 and session.side in {"lhs", "rhs"}
+                if session.side in {"lhs", "rhs"}
             ]
             if not candidates:
                 self.log(
@@ -2125,6 +2125,11 @@ class AgentApp:
                     level="debug",
                 )
                 return
+        if target.height <= 0:
+            self.log(
+                f"serving with unknown height for {target.side or target.session_id}; using fallback bounds",
+                level="debug",
+            )
         spawn_y = self._random_spawn_row(target)
         dx_mag = random.uniform(*self.serve_dx)
         dy_mag = random.uniform(*self.serve_dy)

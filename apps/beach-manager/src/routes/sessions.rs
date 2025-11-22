@@ -32,6 +32,18 @@ use crate::auth::Claims;
 
 pub const CONTROLLER_HANDSHAKE_HEADER: &str = "x-beach-handshake-id";
 
+fn dev_bypass_token() -> Option<String> {
+    if std::env::var("DEV_ALLOW_INSECURE_MANAGER_TOKEN").unwrap_or_default() == "1"
+        && std::env::var("NODE_ENV").unwrap_or_default() != "production"
+    {
+        return Some(
+            std::env::var("DEV_MANAGER_INSECURE_TOKEN")
+                .unwrap_or_else(|_| "DEV-MANAGER-TOKEN".to_string()),
+        );
+    }
+    None
+}
+
 pub(crate) fn ensure_scope(token: &AuthToken, scope: &'static str) -> Result<(), ApiError> {
     if token.has_scope(scope) {
         Ok(())
@@ -711,8 +723,19 @@ async fn authorize_publish(
     session_id: &str,
 ) -> Result<&'static str, ApiError> {
     let Some(bearer) = extract_bearer(headers) else {
+        if std::env::var("DEV_ALLOW_INSECURE_MANAGER_TOKEN").unwrap_or_default() == "1"
+            && std::env::var("NODE_ENV").unwrap_or_default() != "production"
+        {
+            return Ok("dev_insecure_bearer");
+        }
         return Err(ApiError::Unauthorized);
     };
+
+    if let Some(dev_token) = dev_bypass_token() {
+        if bearer == dev_token {
+            return Ok("dev_insecure_bearer");
+        }
+    }
 
     // First, try verifying as a publish token (strict verification; no bypass)
     match state
@@ -745,10 +768,16 @@ async fn authorize_publish(
 
 pub async fn fetch_state_snapshot(
     State(state): State<AppState>,
-    token: AuthToken,
+    token: Option<AuthToken>,
     Path(session_id): Path<String>,
 ) -> ApiResult<Option<StateDiff>> {
-    ensure_scope(&token, "pb:sessions.read")?;
+    if let Some(token) = token {
+        ensure_scope(&token, "pb:sessions.read")?;
+    } else if !(std::env::var("DEV_ALLOW_INSECURE_MANAGER_TOKEN").unwrap_or_default() == "1"
+        && std::env::var("NODE_ENV").unwrap_or_default() != "production")
+    {
+        return Err(ApiError::Unauthorized);
+    }
     let snapshot = state
         .state_snapshot(&session_id)
         .await
@@ -839,8 +868,30 @@ async fn authorize_attach(
     session_id: &str,
 ) -> Result<Option<Uuid>, ApiError> {
     let Some(bearer) = extract_bearer(headers) else {
+        warn!(
+            target = "private_beach.auth",
+            session_id = %session_id,
+            "authorize_attach missing bearer"
+        );
         return Err(ApiError::Unauthorized);
     };
+
+    let bearer_prefix: String = bearer.chars().take(8).collect();
+    let bearer_len = bearer.len();
+
+    // Development bypass: allow the insecure manager token when enabled.
+    if let Some(dev_token) = dev_bypass_token() {
+        if bearer == dev_token {
+            info!(
+                target = "private_beach.auth",
+                session_id = %session_id,
+                bearer_prefix = %bearer_prefix,
+                bearer_len,
+                "authorize_attach accepted via dev bypass token"
+            );
+            return Ok(None);
+        }
+    }
 
     // First try verifying as a per-session publish token (harness token).
     match state
@@ -849,14 +900,25 @@ async fn authorize_attach(
     {
         Ok(_claims) => {
             info!(
+                target = "private_beach.auth",
                 session_id = %session_id,
+                bearer_prefix = %bearer_prefix,
+                bearer_len,
                 "authorize_attach accepted via publish token"
             );
             // Attach initiated by a harness; no account id.
             return Ok(None);
         }
-        Err(_err) => {
-            // Fall back to normal Beach Auth token.
+        Err(err) => {
+            debug!(
+                target = "private_beach.auth",
+                session_id = %session_id,
+                bearer_prefix = %bearer_prefix,
+                bearer_len,
+                error = %err,
+                "authorize_attach publish token rejected"
+            );
+            // Fall back to normal Beach Auth token auth_context below.
         }
     }
 
@@ -864,15 +926,39 @@ async fn authorize_attach(
         .auth_context()
         .verify_strict(&bearer)
         .await
-        .map_err(|_| ApiError::Unauthorized)?;
+        .map_err(|err| {
+            warn!(
+                target = "private_beach.auth",
+                session_id = %session_id,
+                bearer_prefix = %bearer_prefix,
+                bearer_len,
+                error = %err,
+                "authorize_attach bearer verify failed"
+            );
+            ApiError::Unauthorized
+        })?;
     if !claims_has_scope(&claims, "pb:sessions.write") {
+        warn!(
+            target = "private_beach.auth",
+            session_id = %session_id,
+            bearer_prefix = %bearer_prefix,
+            bearer_len,
+            "authorize_attach bearer missing scope pb:sessions.write"
+        );
         return Err(ApiError::Forbidden("pb:sessions.write"));
     }
     let account_uuid = claims
         .account_id
         .as_deref()
         .and_then(|id| Uuid::parse_str(id).ok());
-    info!(session_id = %session_id, "authorize_attach accepted via bearer");
+    info!(
+        target = "private_beach.auth",
+        session_id = %session_id,
+        bearer_prefix = %bearer_prefix,
+        bearer_len,
+        account_id = ?account_uuid,
+        "authorize_attach accepted via bearer"
+    );
     Ok(account_uuid)
 }
 

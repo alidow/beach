@@ -32,7 +32,12 @@ export default async function BeachesPage() {
       beaches = [];
     }
   } else if (source === 'unauthenticated') {
-    loadError = 'Sign in to view your private beaches.';
+    // In dev, when auth bypass is enabled, allow BeachesList to render with an unauthenticated token.
+    if (process.env.PRIVATE_BEACH_BYPASS_AUTH === '1') {
+      loadError = null;
+    } else {
+      loadError = 'Sign in to view your private beaches.';
+    }
   } else if (source === 'exchange_error') {
     loadError =
       'Unable to mint a Beach Gate token. Ensure Clerk sessions are valid and Beach Gate is reachable (PRIVATE_BEACH_GATE_URL).';

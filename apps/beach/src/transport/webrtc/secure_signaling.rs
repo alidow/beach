@@ -5,7 +5,8 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
 use rand::RngCore;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
+use tracing::warn;
 
 use crate::transport::TransportError;
 
@@ -127,7 +128,20 @@ pub fn open_message_with_psk(
                 aad: &aad,
             },
         )
-        .map_err(|err| TransportError::Setup(format!("secure signaling decrypt failed: {err}")))?;
+        .map_err(|err| {
+            warn!(
+                target = "fast_path.crypto",
+                label = ?label,
+                handshake_id,
+                nonce = %BASE64_STANDARD.encode(&nonce_bytes),
+                ciphertext_len = ciphertext.len(),
+                aad_len = aad.len(),
+                key_fingerprint = %fingerprint(&msg_key),
+                error = %err,
+                "secure signaling decrypt failed"
+            );
+            TransportError::Setup(format!("secure signaling decrypt failed: {err}"))
+        })?;
     Ok(plaintext)
 }
 
@@ -193,6 +207,17 @@ fn build_aad(handshake_id: &str, label: &MessageLabel, associated: &[&str]) -> V
         aad.extend_from_slice(component.as_bytes());
     }
     aad
+}
+
+fn fingerprint(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    digest
+        .into_iter()
+        .take(8)
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 fn insecure_signaling_override() -> bool {

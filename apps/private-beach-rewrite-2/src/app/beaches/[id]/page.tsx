@@ -28,6 +28,7 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
   const beachId = params.id;
   const { userId, getToken } = await safeAuth();
   const template = process.env.NEXT_PUBLIC_CLERK_MANAGER_TOKEN_TEMPLATE;
+  const bypassAuth = process.env.PRIVATE_BEACH_BYPASS_AUTH === '1';
 
   const allowedGetToken = typeof getToken === 'function' ? getToken : undefined;
   const isSignedIn = Boolean(userId);
@@ -37,7 +38,7 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
   const managerBaseUrl = resolveManagerBaseUrl();
   const rewriteEnabled = resolveRewriteFlag(searchParams);
 
-  if (!token) {
+  if (!token && !bypassAuth) {
     return (
       <div className="flex min-h-screen flex-col bg-background">
         <AppShellTopNav
@@ -67,62 +68,159 @@ export default async function BeachPage({ params, searchParams }: PageProps) {
   let beach: BeachMeta | null = null;
   let layout: CanvasLayout | null = null;
   let sessions: SessionSummary[] = [];
-  try {
-    beach = await getBeachMeta(beachId, token, managerBaseUrl);
-  } catch (error) {
-    if (error instanceof Error) {
-      const status = (error as any).status ?? null;
-      if (error.message === 'not_found') {
-        notFound();
+
+  if (bypassAuth || source === 'dev_bypass') {
+    beach = {
+      id: beachId,
+      name: 'Dev Beach (bypass)',
+      slug: beachId.slice(0, 8),
+      settings: {},
+      created_at: Date.now(),
+    };
+    const now = Date.now();
+    layout = {
+      version: 3 as const,
+      viewport: { zoom: 0.8, pan: { x: 0, y: 0 } },
+      tiles: {
+        lhs: {
+          id: 'lhs',
+          kind: 'application',
+          position: { x: -200, y: -50 },
+          size: { width: 320, height: 240 },
+          zIndex: 1,
+          metadata: { role: 'lhs', session_id: 'dev-lhs' },
+        },
+        rhs: {
+          id: 'rhs',
+          kind: 'application',
+          position: { x: 200, y: -50 },
+          size: { width: 320, height: 240 },
+          zIndex: 1,
+          metadata: { role: 'rhs', session_id: 'dev-rhs' },
+        },
+      },
+      agents: {
+        agent: {
+          id: 'agent',
+          position: { x: 0, y: 200 },
+          size: { width: 200, height: 120 },
+          zIndex: 2,
+          icon: '🤖',
+          status: 'idle',
+        },
+      },
+      groups: {},
+      controlAssignments: {},
+      metadata: {
+        createdAt: now,
+        updatedAt: now,
+        agentRelationships: {
+          agent: { controls: ['lhs', 'rhs'] },
+        },
+        agentRelationshipOrder: ['agent'],
+      },
+    };
+    sessions = [
+      {
+        session_id: 'dev-lhs',
+        private_beach_id: beachId,
+        harness_type: 'host',
+        capabilities: [],
+        metadata: { role: 'lhs' },
+        version: 'dev',
+        harness_id: 'dev-lhs',
+        pending_actions: 0,
+        pending_unacked: 0,
+      },
+      {
+        session_id: 'dev-rhs',
+        private_beach_id: beachId,
+        harness_type: 'host',
+        capabilities: [],
+        metadata: { role: 'rhs' },
+        version: 'dev',
+        harness_id: 'dev-rhs',
+        pending_actions: 0,
+        pending_unacked: 0,
+      },
+      {
+        session_id: 'dev-agent',
+        private_beach_id: beachId,
+        harness_type: 'agent',
+        capabilities: [],
+        metadata: { role: 'agent' },
+        version: 'dev',
+        harness_id: 'dev-agent',
+        pending_actions: 0,
+        pending_unacked: 0,
+        last_health: {
+          queue_depth: 0,
+          degraded: false,
+          warnings: [],
+        },
+      },
+    ];
+  } else {
+    try {
+      beach = await getBeachMeta(beachId, token, managerBaseUrl);
+    } catch (error) {
+      if (error instanceof Error) {
+        const status = (error as any).status ?? null;
+        if (error.message === 'not_found') {
+          notFound();
+        }
+        if (status === 409) {
+          return (
+            <div className="flex h-screen flex-col overflow-hidden bg-transparent">
+              <AppShellTopNav backHref="/beaches" title="Private Beach" subtitle={beachId} />
+              <main className="flex flex-1 items-center justify-center px-6 text-center text-sm text-slate-400">
+                This beach is currently updating its layout. Please wait a moment and try again.
+              </main>
+            </div>
+          );
+        }
       }
-      if (status === 409) {
-        return (
-          <div className="flex h-screen flex-col overflow-hidden bg-transparent">
-            <AppShellTopNav backHref="/beaches" title="Private Beach" subtitle={beachId} />
-            <main className="flex flex-1 items-center justify-center px-6 text-center text-sm text-slate-400">
-              This beach is currently updating its layout. Please wait a moment and try again.
-            </main>
-          </div>
-        );
-      }
+      throw error;
     }
-    throw error;
+
+    if (!beach) {
+      throw new Error('Unable to load beach metadata.');
+    }
+
+    const [loadedLayout, loadedSessions] = await Promise.all([
+      (async () => {
+        try {
+          const nextLayout = await getCanvasLayout(beach.id, token, managerBaseUrl);
+          console.info('[rewrite-2] loaded layout', {
+            beachId: beach.id,
+            tileCount: Object.keys(nextLayout?.tiles ?? {}).length,
+          });
+          return nextLayout;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn('[rewrite-2] getCanvasLayout failed', { beachId: beach.id, error: message });
+          return null;
+        }
+      })(),
+      (async () => {
+        try {
+          return await listSessions(beach.id, token, managerBaseUrl);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn('[rewrite-2] listSessions failed', { beachId: beach.id, error: message });
+          return [];
+        }
+      })(),
+    ]);
+
+    layout = loadedLayout;
+    sessions = loadedSessions;
   }
-
-  if (!beach) {
-    throw new Error('Unable to load beach metadata.');
-  }
-
-  const [loadedLayout, loadedSessions] = await Promise.all([
-    (async () => {
-      try {
-        const nextLayout = await getCanvasLayout(beach.id, token, managerBaseUrl);
-        console.info('[rewrite-2] loaded layout', {
-          beachId: beach.id,
-          tileCount: Object.keys(nextLayout?.tiles ?? {}).length,
-        });
-        return nextLayout;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.warn('[rewrite-2] getCanvasLayout failed', { beachId: beach.id, error: message });
-        return null;
-      }
-    })(),
-    (async () => {
-      try {
-        return await listSessions(beach.id, token, managerBaseUrl);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.warn('[rewrite-2] listSessions failed', { beachId: beach.id, error: message });
-        return [];
-      }
-    })(),
-  ]);
-
-  layout = loadedLayout;
-  sessions = loadedSessions;
 
   const managerRoadUrl = (() => {
+    if (bypassAuth || source === 'dev_bypass') {
+      return process.env.PRIVATE_BEACH_ROAD_URL || 'http://localhost:4132';
+    }
     const settings = beach.settings && typeof beach.settings === 'object' ? (beach.settings as any) : null;
     const managerSettings = settings && typeof settings.manager === 'object' ? (settings.manager as any) : null;
     const fromSettings =

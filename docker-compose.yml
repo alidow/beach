@@ -45,6 +45,8 @@ services:
       DATABASE_URL: postgres://postgres:postgres@beach-postgres:5432/beach_manager
       REDIS_URL: redis://beach-redis:6379
       AUTH_BYPASS: "0"
+      DEV_ALLOW_INSECURE_MANAGER_TOKEN: ${DEV_ALLOW_INSECURE_MANAGER_TOKEN:-0}
+      DEV_MANAGER_INSECURE_TOKEN: ${DEV_MANAGER_INSECURE_TOKEN:-}
       BEACH_ROAD_URL: http://beach-road:4132
       PUBLIC_MANAGER_URL: http://127.0.0.1:8080
       BEACH_GATE_URL: http://beach-gate:4133
@@ -65,6 +67,8 @@ services:
       BEACH_ICE_PORT_START: ${BEACH_ICE_PORT_START:-62000}
       BEACH_ICE_PORT_END: ${BEACH_ICE_PORT_END:-62100}
       RUST_LOG: info,controller=debug,webrtc=trace,webrtc::ice_transport=trace,webrtc::peer_connection=trace
+      PRIVATE_BEACH_MANAGER_TOKEN: ${PRIVATE_BEACH_MANAGER_TOKEN:-}
+      PRIVATE_BEACH_BYPASS_AUTH: ${PRIVATE_BEACH_BYPASS_AUTH:-0}
     volumes:
       - .:/app
       - ./config/dev-secrets:/secrets:ro
@@ -177,6 +181,7 @@ services:
       BEACH_TEST_MODE: ${BEACH_TEST_MODE:-true}
       TAILWIND_MODE: watch
       CHOKIDAR_USEPOLLING: "true"
+      PRIVATE_BEACH_BYPASS_AUTH: ${PRIVATE_BEACH_BYPASS_AUTH:-1}
     volumes:
       - .:/app
     depends_on:

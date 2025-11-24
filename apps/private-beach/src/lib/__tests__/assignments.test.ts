@@ -28,7 +28,7 @@ function makePairing(overrides: Partial<ControllerPairing>): ControllerPairing {
     child_session_id: 'app-1',
     prompt_template: '',
     update_cadence: 'balanced',
-    transport_status: { transport: 'fast_path' },
+    transport_status: { transport: 'webrtc' },
     created_at_ms: Date.now(),
     updated_at_ms: Date.now(),
     ...overrides,
@@ -65,4 +65,3 @@ describe('buildAssignmentModel', () => {
     expect(model.roles.get('app-2')).toBeDefined();
   });
 });
-

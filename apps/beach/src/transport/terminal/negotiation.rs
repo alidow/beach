@@ -54,6 +54,10 @@ pub async fn negotiate_transport(
     metadata: Option<HashMap<String, String>>,
 ) -> Result<NegotiatedTransport, CliError> {
     let mut errors = Vec::new();
+    let mut metadata = metadata.unwrap_or_default();
+    metadata
+        .entry("host_session_id".to_string())
+        .or_insert_with(|| handle.session_id().to_string());
 
     let offers: Vec<TransportOffer> = handle.offers().to_vec();
 
@@ -123,7 +127,7 @@ pub async fn negotiate_transport(
                     Duration::from_millis(poll_ms),
                     passphrase,
                     request_mcp_channel,
-                    metadata.clone(),
+                    Some(metadata.clone()),
                 )
                 .await
                 {
@@ -162,7 +166,7 @@ pub async fn negotiate_transport(
                     passphrase,
                     client_label,
                     request_mcp_channel,
-                    metadata.clone(),
+                    Some(metadata.clone()),
                 )
                 .await
                 {

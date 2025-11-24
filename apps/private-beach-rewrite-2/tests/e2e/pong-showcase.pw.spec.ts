@@ -83,6 +83,24 @@ async function assertTileMovement(tileBody: Locator) {
 async function waitForBallMotion(logPath: string, minPositions = 3, timeoutMs = 180_000) {
   await expect
     .poll(() => {
+      const tracePath = logPath.replace(/player-(lhs|rhs)\.log$/, 'ball-trace/ball-trace-$1.jsonl');
+      if (fs.existsSync(tracePath)) {
+        const coords = new Set<string>();
+        const contents = fs.readFileSync(tracePath, 'utf8');
+        for (const line of contents.split('\n')) {
+          if (!line.trim()) continue;
+          try {
+            const entry = JSON.parse(line);
+            if (typeof entry.x === 'number' && typeof entry.y === 'number') {
+              // Normalize to integer buckets to avoid noise.
+              coords.add(`${Math.round(entry.x)},${Math.round(entry.y)}`);
+            }
+          } catch {
+            continue;
+          }
+        }
+        return coords.size;
+      }
       if (!fs.existsSync(logPath)) return 0;
       const lines = fs.readFileSync(logPath, 'utf8').split('\n');
       const coords = new Set<string>();

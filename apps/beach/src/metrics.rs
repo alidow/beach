@@ -107,6 +107,58 @@ pub static WEBRTC_CHUNK_OVERSIZED_DROPPED: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+pub static WEBRTC_SIGNALING_ATTEMPTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "webrtc_signaling_attempts_total",
+            "Attempts to call signaling endpoints (attach/offer/answer)",
+        ),
+        &["kind", "peer_session_id"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+pub static WEBRTC_SIGNALING_RESULTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "webrtc_signaling_results_total",
+            "Outcomes of signaling requests by kind",
+        ),
+        &["kind", "peer_session_id", "result"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+pub static WEBRTC_SIGNALING_RETRIES: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "webrtc_signaling_retries_total",
+            "Retries triggered by retryable signaling statuses",
+        ),
+        &["kind", "peer_session_id", "status"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+pub static CONTROLLER_PEER_SESSION_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "controller_peer_session_events_total",
+            "Controller channel lifecycle events keyed by peer_session_id",
+        ),
+        &["peer_session_id", "event"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
 pub static WEBRTC_CHUNK_REASSEMBLY_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
     let mut opts = HistogramOpts::new(
         "webrtc_chunk_reassembly_latency_ms",

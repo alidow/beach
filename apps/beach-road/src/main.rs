@@ -185,12 +185,13 @@ async fn main() {
         .route("/sessions/:id/control", post(handlers::post_control))
         .route("/sessions/:id/control/poll", post(handlers::poll_control))
         .route("/sessions/:id/control/ack", post(handlers::ack_control))
+        .route("/peer-sessions/attach", post(handlers::attach_peer_session))
         .route(
-            "/sessions/:id/webrtc/offer",
+            "/peer-sessions/:id/webrtc/offer",
             get(get_webrtc_offer).post(post_webrtc_offer),
         )
         .route(
-            "/sessions/:id/webrtc/answer",
+            "/peer-sessions/:id/webrtc/answer",
             get(get_webrtc_answer).post(post_webrtc_answer),
         )
         .with_state(shared_storage.clone())

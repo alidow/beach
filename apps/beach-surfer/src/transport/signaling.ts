@@ -315,7 +315,7 @@ function normaliseServerMessage(raw: any): ServerMessage {
   }
 }
 
-function generatePeerId(): string {
+export function generatePeerId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID();
   }

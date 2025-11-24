@@ -34,7 +34,7 @@ export const CONTROLLER_UPDATE_CADENCE_OPTIONS = ['fast', 'balanced', 'slow'] as
 export type ControllerUpdateCadence = (typeof CONTROLLER_UPDATE_CADENCE_OPTIONS)[number];
 
 export type PairingTransportStatus = {
-  transport: 'fast_path' | 'http_fallback' | 'pending';
+  transport: 'webrtc' | 'http_fallback' | 'pending';
   last_event_ms?: number | null;
   last_error?: string | null;
   latency_ms?: number | null;
@@ -567,14 +567,16 @@ function normalizeTransportStatus(raw: any): PairingTransportStatus | null {
   if (!raw || typeof raw !== 'object') {
     return null;
   }
-  const transport = typeof raw.transport === 'string' ? raw.transport : null;
-  if (transport !== 'fast_path' && transport !== 'http_fallback' && transport !== 'pending') {
+  const rawTransport = typeof raw.transport === 'string' ? raw.transport : null;
+  const normalizedTransport = rawTransport === 'rtc' ? 'webrtc' : rawTransport;
+  const allowedTransports = new Set(['http_fallback', 'pending', 'webrtc']);
+  if (!normalizedTransport || !allowedTransports.has(normalizedTransport)) {
     return null;
   }
   const lastEventMs = Number((raw as any).last_event_ms);
   const latencyMs = Number((raw as any).latency_ms);
   const status: PairingTransportStatus = {
-    transport,
+    transport: normalizedTransport as PairingTransportStatus['transport'],
   };
   if (Number.isFinite(lastEventMs)) {
     status.last_event_ms = lastEventMs;

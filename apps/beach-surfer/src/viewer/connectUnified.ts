@@ -1,6 +1,10 @@
-import { SignalingClient } from '../transport/signaling';
+import { SignalingClient, generatePeerId } from '../transport/signaling';
 import type { SignalingClientOptions } from '../transport/signaling';
-import { connectWebRtcTransport, type ConnectedWebRtcTransport } from '../transport/webrtc';
+import {
+  attachPeerSession,
+  connectWebRtcTransport,
+  type ConnectedWebRtcTransport,
+} from '../transport/webrtc';
 
 export interface ConnectUnifiedOptions {
   sessionId: string;
@@ -21,9 +25,19 @@ export interface UnifiedConnection {
 
 export async function connectUnified(options: ConnectUnifiedOptions): Promise<UnifiedConnection> {
   const join = await fetchJoinMetadataUnified(options);
-  const websocketUrl = join.websocketUrl ?? deriveWebsocketUrl(options.baseUrl, options.sessionId);
+  const peerId = generatePeerId();
+  const attached = await attachPeerSession({
+    signalingUrl: join.signalingUrl,
+    role: join.role,
+    peerId,
+    passphrase: options.passcode,
+  });
+  const websocketUrl =
+    join.websocketUrl ??
+    deriveWebsocketUrlFromSignaling(attached.websocketUrl ?? deriveWebsocketUrl(options.baseUrl, options.sessionId));
   const signaling = await SignalingClient.connect({
     url: websocketUrl,
+    peerId,
     passphrase: options.passcode,
     viewerToken: options.viewerToken,
     supportedTransports: ['webrtc'],
@@ -41,7 +55,9 @@ export async function connectUnified(options: ConnectUnifiedOptions): Promise<Un
     passphrase: options.passcode,
     viewerToken: options.viewerToken,
     telemetryBaseUrl: options.baseUrl,
-    sessionId: options.sessionId,
+    sessionId: attached.hostSessionId ?? options.sessionId,
+    signalingUrl: attached.signalingUrl,
+    peerSessionId: attached.peerSessionId,
   });
 
   return {
@@ -65,6 +81,31 @@ function deriveWebsocketUrl(baseUrl: string, sessionId: string): string {
   normalised.search = '';
   normalised.hash = '';
   return normalised.toString();
+}
+
+function deriveWebsocketUrlFromSignaling(signalingUrl: string): string {
+  const url = new URL(signalingUrl);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : url.protocol === 'http:' ? 'ws:' : url.protocol;
+  const segments = url.pathname.split('/').filter(Boolean);
+  const peerIdx = segments.indexOf('peer-sessions');
+  const sessionId =
+    peerIdx !== -1 && segments.length > peerIdx + 1 ? segments[peerIdx + 1] : segments.pop() ?? '';
+  url.pathname = `/ws/${sessionId}`;
+  url.search = '';
+  url.hash = '';
+  return url.toString();
+}
+
+function generateFallbackPeerId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  const template = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx';
+  return template.replace(/[xy]/g, (char) => {
+    const random = (Math.random() * 16) | 0;
+    const value = char === 'x' ? random : (random & 0x3) | 0x8;
+    return value.toString(16);
+  });
 }
 
 function normaliseBase(input: string): URL {

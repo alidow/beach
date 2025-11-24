@@ -617,7 +617,7 @@ mod tests {
         assert_eq!(pairings[0]["child_session_id"], "child-1");
         assert_eq!(pairings[0]["transport_status"]["transport"], "pending");
 
-        let update_body = json!({"transport": "fast_path"});
+        let update_body = json!({"transport": "webrtc"});
         let response = app
             .clone()
             .oneshot(
@@ -650,7 +650,7 @@ mod tests {
             .await
             .unwrap();
         let pairings: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(pairings[0]["transport_status"]["transport"], "fast_path");
+        assert_eq!(pairings[0]["transport_status"]["transport"], "webrtc");
 
         let response = app
             .clone()
@@ -908,9 +908,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn controller_handshake_endpoint_refreshes_when_fast_path_ready() {
+    async fn controller_handshake_endpoint_refreshes_when_webrtc_ready() {
         let _guard = HANDSHAKE_TEST_GUARD.lock().unwrap();
-        test_support::clear_fast_path_ready_override();
+        test_support::clear_rtc_ready_override();
         unsafe {
             std::env::set_var("BEACH_SKIP_ROAD_VERIFY", "1");
             std::env::set_var("BEACH_TEST_DISABLE_HANDSHAKE_HTTP", "1");
@@ -949,7 +949,7 @@ mod tests {
             .expect("controller token present")
             .to_string();
 
-        test_support::set_fast_path_ready_override(session_id, true);
+        test_support::set_rtc_ready_override(session_id, true);
         let response = app
             .clone()
             .oneshot(
@@ -971,7 +971,7 @@ mod tests {
         assert_eq!(refresh_payload["handshake_kind"], "refresh");
         assert_eq!(refresh_payload["controller_token"], controller_token);
 
-        test_support::clear_fast_path_ready_override();
+        test_support::clear_rtc_ready_override();
         unsafe {
             std::env::remove_var("BEACH_SKIP_ROAD_VERIFY");
             std::env::remove_var("BEACH_TEST_DISABLE_HANDSHAKE_HTTP");

@@ -1,10 +1,12 @@
+import { Suspense } from 'react';
 import { AppShellTopNav } from '@/components/AppShellTopNav';
 import { BeachesList } from '@/components/BeachesList';
 import type { BeachSummary } from '@/lib/api';
 import { listBeaches } from '@/lib/api';
 import { resolveManagerBaseUrl, resolveManagerToken } from '@/lib/serverSecrets';
 import { safeAuth } from '@/lib/serverAuth';
-import { CreateBeachButton } from '@/components/CreateBeachButton';
+import { cookies } from 'next/headers';
+import { BeachesActions } from '@/components/BeachesActions';
 
 export const metadata = {
   title: 'Private Beach Rewrite · Beaches',
@@ -24,6 +26,7 @@ export default async function BeachesPage() {
 
   let beaches: BeachSummary[] = [];
   let loadError: string | null = null;
+  const hasProvidedToken = Boolean(token) || cookies().get('pb-manager-token');
   if (token) {
     try {
       beaches = await listBeaches(token, managerBaseUrl);
@@ -41,7 +44,7 @@ export default async function BeachesPage() {
   } else if (source === 'exchange_error') {
     loadError =
       'Unable to mint a Beach Gate token. Ensure Clerk sessions are valid and Beach Gate is reachable (PRIVATE_BEACH_GATE_URL).';
-  } else if (source === 'none') {
+  } else if (source === 'none' && !hasProvidedToken) {
     loadError = 'Missing PRIVATE_BEACH_MANAGER_TOKEN. See secret-distribution.md for setup details.';
   } else {
     loadError = 'Unable to resolve manager auth token. Please sign in again or verify Clerk configuration.';
@@ -52,7 +55,7 @@ export default async function BeachesPage() {
       <AppShellTopNav
         title="Private Beach"
         subtitle="Select a beach to launch the new canvas shell."
-        actions={<CreateBeachButton />}
+        actions={<BeachesActions />}
       />
       <main className="flex-1">
         <div className="mx-auto w-full max-w-5xl px-4 pb-12 pt-6 sm:px-6 lg:px-8">

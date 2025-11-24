@@ -61,6 +61,8 @@ const HANDLE_BASE_CLASS =
   'pointer-events-auto h-7 w-7 rounded-full border-[1.5px] transition shadow-[0_0_12px_rgba(15,23,42,0.5)] flex items-center justify-center text-[10px] font-semibold';
 const TARGET_HANDLE_CLASS = `${HANDLE_BASE_CLASS} border-white/70 bg-slate-900/90 text-white hover:border-white hover:bg-slate-900`;
 const SOURCE_HANDLE_CLASS = `${HANDLE_BASE_CLASS} border-indigo-300/80 bg-indigo-500/90 text-white hover:border-indigo-100 hover:bg-indigo-400`;
+const HANDLE_WEBRTC_CLASS = `${HANDLE_BASE_CLASS} border-pink-300/80 bg-pink-500/90 text-white hover:border-pink-100 hover:bg-pink-400`;
+const HANDLE_HTTP_CLASS = `${HANDLE_BASE_CLASS} border-emerald-300/80 bg-emerald-500/90 text-white hover:border-emerald-100 hover:bg-emerald-400`;
 
 type HandleDef = { key: 'top' | 'right' | 'bottom' | 'left'; pos: Position; style: CSSProperties };
 
@@ -220,12 +222,19 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
   const hasSession = Boolean(tile.sessionMeta?.sessionId);
   const [agentRole, setAgentRole] = useState(agentMeta.role);
   const [agentResponsibility, setAgentResponsibility] = useState(agentMeta.responsibility);
-  
+
   const [agentTraceEnabled, setAgentTraceEnabled] = useState(Boolean(agentMeta.trace?.enabled));
   const [agentTraceId, setAgentTraceId] = useState<string | null>(agentMeta.trace?.trace_id ?? null);
   const [agentSaveState, setAgentSaveState] = useState<'idle' | 'saving'>('idle');
   const [agentSaveNotice, setAgentSaveNotice] = useState<string | null>(null);
   const zoom = useStore(zoomSelector);
+
+  const transport = tile.sessionMeta?.transport;
+  const getHandleClass = useCallback((baseClass: string) => {
+    if (transport === 'webrtc') return HANDLE_WEBRTC_CLASS;
+    if (transport === 'http') return HANDLE_HTTP_CLASS;
+    return baseClass;
+  }, [transport]);
 
   useEffect(() => {
     if (!hasConnectedRelationships) {
@@ -355,7 +364,7 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
         } catch (err) {
           try {
             console.warn('[tile] detach control send failed', err);
-          } catch {}
+          } catch { }
         }
       })();
     } else if (sessionId && !controlUrl) {
@@ -1324,8 +1333,8 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
             traceContext={
               isAgent && agentMeta.trace?.enabled
                 ? {
-                    traceId: agentMeta.trace?.trace_id ?? null,
-                  }
+                  traceId: agentMeta.trace?.trace_id ?? null,
+                }
                 : undefined
             }
           />
@@ -1349,23 +1358,23 @@ function TileFlowNodeImpl({ data, dragging }: Props) {
           type="target"
           position={pos}
           id={`target-${key}`}
-          className={TARGET_HANDLE_CLASS}
+          className={getHandleClass(TARGET_HANDLE_CLASS)}
           style={style}
           onPointerDown={(event) => event.stopPropagation()}
         />
       ))}
       {isAgent
         ? HANDLE_DEFS.map(({ key, pos, style }) => (
-            <Handle
-              key={`source-${key}`}
-              type="source"
-              position={pos}
-              id={`source-${key}`}
-              className={SOURCE_HANDLE_CLASS}
-              style={style}
-              onPointerDown={(event) => event.stopPropagation()}
-            />
-          ))
+          <Handle
+            key={`source-${key}`}
+            type="source"
+            position={pos}
+            id={`source-${key}`}
+            className={getHandleClass(SOURCE_HANDLE_CLASS)}
+            style={style}
+            onPointerDown={(event) => event.stopPropagation()}
+          />
+        ))
         : null}
     </article>
   );

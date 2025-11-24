@@ -98,7 +98,7 @@ pub static REDIS_PENDING_RECLAIMED: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new(
             "redis_pending_reclaimed_total",
-            "Redis XPENDING entries reclaimed when fast-path is primary",
+            "Redis XPENDING entries reclaimed when WebRTC is primary",
         ),
         &["private_beach_id", "session_id"],
     )

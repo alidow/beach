@@ -24,6 +24,7 @@ import {
   type DataChannelLike,
 } from './crypto/secureDataChannel';
 import type { SignalingClient, ServerMessage } from './signaling';
+import { generatePeerId } from './signaling';
 import { reportSecureTransportEvent } from '../lib/telemetry';
 import type { ConnectionTrace } from '../lib/connectionTrace';
 
@@ -259,6 +260,7 @@ export interface ConnectWebRtcTransportOptions {
   viewerToken?: string;
   telemetryBaseUrl?: string;
   sessionId?: string;
+  peerSessionId?: string;
   trace?: ConnectionTrace | null;
 }
 
@@ -267,11 +269,87 @@ export interface ConnectedWebRtcTransport {
   peerConnection: RTCPeerConnection;
   dataChannel: RTCDataChannel;
   remotePeerId: string;
+  peerSessionId?: string;
   secure?: SecureTransportSummary;
 }
 
 const ANSWER_FLUSH_DELAY_MS = 400;
 const HANDSHAKE_CHANNEL_LABEL = 'beach-secure-handshake';
+
+export type AttachPeerSessionResult = {
+  signalingUrl: string;
+  websocketUrl: string;
+  peerSessionId: string;
+  hostSessionId: string;
+};
+
+export async function attachPeerSession(options: {
+  signalingUrl: string;
+  role: string;
+  peerId: string;
+  passphrase?: string;
+}): Promise<AttachPeerSessionResult> {
+  const { signalingUrl, role, peerId, passphrase } = options;
+  const url = new URL(signalingUrl);
+  const segments = url.pathname.split('/').filter(Boolean);
+  const sessionIndex = segments.indexOf('sessions');
+  const peerSessionIndex = segments.indexOf('peer-sessions');
+  // If already peer-session scoped, reuse.
+  if (peerSessionIndex !== -1 && segments.length > peerSessionIndex + 1) {
+    const peerSessionId = segments[peerSessionIndex + 1]!;
+    const rewritten = new URL(url.toString());
+    rewritten.pathname = `/peer-sessions/${peerSessionId}/webrtc`;
+    const websocketUrl = buildWebsocketUrl(rewritten, peerSessionId);
+    return {
+      signalingUrl: rewritten.toString(),
+      websocketUrl,
+      peerSessionId,
+      hostSessionId: peerSessionId,
+    };
+  }
+  if (sessionIndex === -1 || segments.length <= sessionIndex + 1) {
+    throw new Error(`unexpected signaling url path: ${url.pathname}`);
+  }
+  const hostSessionId = segments[sessionIndex + 1]!;
+  const attachUrl = new URL('/peer-sessions/attach', url.origin).toString();
+  const body: Record<string, unknown> = {
+    host_session_id: hostSessionId,
+    role,
+    peer_id: peerId,
+  };
+  if (passphrase && passphrase.trim().length > 0) {
+    body.passphrase = passphrase;
+  }
+  const response = await fetch(attachUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(`peer attach failed: ${response.status} ${response.statusText}`);
+  }
+  const payload = (await response.json()) as { peer_session_id: string; host_session_id: string };
+  const peerSessionId = payload.peer_session_id;
+  const rewritten = new URL(url.toString());
+  rewritten.pathname = `/peer-sessions/${peerSessionId}/webrtc`;
+  rewritten.search = '';
+  const websocketUrl = buildWebsocketUrl(rewritten, peerSessionId);
+  return {
+    signalingUrl: rewritten.toString(),
+    websocketUrl,
+    peerSessionId,
+    hostSessionId: payload.host_session_id ?? hostSessionId,
+  };
+}
+
+function buildWebsocketUrl(signaling: URL, peerSessionId: string): string {
+  const ws = new URL(signaling.toString());
+  ws.protocol = ws.protocol === 'https:' ? 'wss:' : ws.protocol === 'http:' ? 'ws:' : ws.protocol;
+  ws.pathname = `/ws/${peerSessionId}`;
+  ws.search = '';
+  ws.hash = '';
+  return ws.toString();
+}
 
 interface HandshakeOptions {
   role: BrowserHandshakeRole;
@@ -375,6 +453,16 @@ export async function connectWebRtcTransport(
     ensureKey: ensureSealingKey,
     getKey: getSealingKey,
   } as const;
+
+  // Attach to get a peer_session_id and peer-scoped signaling URL.
+  const attachResult = await attachPeerSession({
+    signalingUrl: options.signalingUrl,
+    role: options.role,
+    peerId: assignedPeerId,
+    passphrase,
+  });
+  const signalingUrl = attachResult.signalingUrl;
+  const peerSessionId = attachResult.peerSessionId;
 
   try {
     trace?.mark('webrtc:negotiate_send_start', { remotePeerId });
@@ -654,15 +742,16 @@ export async function connectWebRtcTransport(
     if (options.role !== 'answerer') {
       throw new Error(`webrtc role ${options.role} not supported in browser client yet`);
     }
-    trace?.mark('webrtc:answerer_connect_enter', { signalingUrl: options.signalingUrl });
+    trace?.mark('webrtc:answerer_connect_enter', { signalingUrl });
     const connected = await connectAsAnswerer({
       pc,
       signaling,
-      signalingUrl: options.signalingUrl,
+      signalingUrl,
       pollIntervalMs: options.pollIntervalMs,
       remotePeerId,
       logger,
       localPeerId: assignedPeerId,
+      peerSessionId,
       secure: {
         enabled: secureState.enabled,
         passphrase,
@@ -714,8 +803,9 @@ export async function connectWebRtcTransport(
       remotePeerId: connected.remotePeerId,
       dataChannelLabel: connected.dataChannel.label,
       secureMode: connected.secure?.mode ?? 'plaintext',
+      peerSessionId,
     });
-    return connected;
+    return { ...connected, peerSessionId };
   } finally {
     disposeSignalListener();
     disposeGeneralListener();
@@ -877,6 +967,7 @@ async function connectAsAnswerer(options: {
   localPeerId: string;
   telemetryBaseUrl?: string;
   sessionId?: string;
+  peerSessionId?: string;
   trace?: ConnectionTrace | null;
   secure: {
     enabled: boolean;
@@ -963,6 +1054,7 @@ async function connectAsAnswerer(options: {
   const channelPromise = waitForDataChannel(pc, {
     remotePeerId,
     logger,
+    peerSessionId: options.peerSessionId,
     handshake: secure.enabled
       ? {
           role: 'responder',
@@ -1034,6 +1126,7 @@ async function waitForDataChannel(
     handshake?: HandshakeOptions;
     telemetryBaseUrl?: string;
     sessionId?: string;
+    peerSessionId?: string;
     trace?: ConnectionTrace | null;
   },
 ): Promise<ConnectedWebRtcTransport> {
@@ -1188,6 +1281,7 @@ async function waitForDataChannel(
               peerConnection: pc,
               dataChannel: channel,
               remotePeerId: options.remotePeerId,
+              peerSessionId: options.peerSessionId,
               secure: secureSummary,
             });
           };
@@ -1227,7 +1321,7 @@ async function waitForDataChannel(
   });
 }
 
-async function pollSdp(
+export async function pollSdp(
   url: string,
   pollIntervalMs: number,
   params: Record<string, string> | undefined,
@@ -1235,12 +1329,13 @@ async function pollSdp(
 ): Promise<WebRtcSdpPayload> {
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
-    const payload = await fetchSdp(url, params);
-    if (payload) {
+    const result = await fetchSdp(url, params);
+    if (result.payload) {
       log(logger, `polled SDP at ${url}`);
-      return payload;
+      return result.payload;
     }
-    await delay(pollIntervalMs);
+    const waitMs = typeof result.retryAfterMs === 'number' ? result.retryAfterMs : pollIntervalMs;
+    await delay(waitMs);
   }
   throw new Error('timed out waiting for SDP payload');
 }
@@ -1248,27 +1343,49 @@ async function pollSdp(
 async function fetchSdp(
   url: string,
   params?: Record<string, string>,
-): Promise<WebRtcSdpPayload | null> {
+): Promise<{ payload: WebRtcSdpPayload | null; retryAfterMs?: number }> {
   const target = appendParams(url, params);
   const response = await fetch(target, { cache: 'no-cache' });
-  if (response.status === 404) {
-    return null;
+  if (response.status === 404 || response.status === 409) {
+    const retryAfter = parseRetryAfter(response);
+    return { payload: null, retryAfterMs: retryAfter };
   }
   if (!response.ok) {
     throw new Error(`signaling fetch failed: ${response.status} ${response.statusText}`);
   }
-  return await response.json();
+  const payload = (await response.json()) as WebRtcSdpPayload;
+  return { payload };
 }
 
-async function postSdp(url: string, payload: WebRtcSdpPayload): Promise<void> {
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  if (!response.ok && response.status !== 204) {
+export async function postSdp(url: string, payload: WebRtcSdpPayload): Promise<void> {
+  const maxAttempts = 40;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (response.ok || response.status === 204) {
+      return;
+    }
+    if (response.status === 404 || response.status === 409) {
+      const retryAfter = parseRetryAfter(response) ?? 50;
+      await delay(retryAfter);
+      continue;
+    }
     throw new Error(`signaling post failed: ${response.status} ${response.statusText}`);
   }
+  throw new Error('timed out posting SDP');
+}
+
+function parseRetryAfter(response: Response): number | undefined {
+  const header = response.headers.get('Retry-After');
+  if (!header) return undefined;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return seconds * 1000;
+  }
+  return undefined;
 }
 
 async function sealSdpWithKey(options: {

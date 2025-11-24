@@ -176,10 +176,12 @@ pub enum ControllerUpdateCadence {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum PairingTransportKind {
-    FastPath,
+    #[serde(rename = "webrtc")]
+    Rtc,
+    #[serde(rename = "http_fallback")]
     HttpFallback,
+    #[serde(rename = "pending")]
     Pending,
 }
 
@@ -1033,7 +1035,7 @@ mod controller_runtime {
         fn apply_snapshot_persists_transport_status() {
             let mut known = HashMap::new();
             let status = PairingTransportStatus {
-                transport: PairingTransportKind::FastPath,
+                transport: PairingTransportKind::Rtc,
                 last_event_ms: Some(42),
                 latency_ms: Some(7),
                 last_error: None,

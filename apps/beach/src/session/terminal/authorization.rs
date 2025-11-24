@@ -69,6 +69,9 @@ impl JoinAuthorizationMetadata {
                 parts.push("mcp:yes".to_string());
             }
         }
+        if let Some(peer_session) = self.metadata.get("peer_session_id") {
+            parts.push(format!("peer_session: {peer_session}"));
+        }
         parts.join(", ")
     }
 }
@@ -123,6 +126,31 @@ impl JoinAuthorizer {
             JoinAuthorizerInner::AllowAll => true,
             JoinAuthorizerInner::Interactive(inner) => inner.authorize(metadata).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::TransportKind;
+
+    #[test]
+    fn synopsis_includes_peer_session_id_when_present() {
+        let mut metadata = HashMap::new();
+        metadata.insert("peer_session_id".to_string(), "peer-123".to_string());
+        let summary = JoinAuthorizationMetadata::from_parts(
+            TransportKind::WebRtc,
+            Some("peer-a".into()),
+            Some("handshake-1".into()),
+            None,
+            metadata,
+        )
+        .synopsis();
+        assert!(
+            summary.contains("peer_session: peer-123"),
+            "peer_session_id should be included in synopsis: {}",
+            summary
+        );
     }
 }
 

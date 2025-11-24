@@ -18,10 +18,9 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::state::{
-    AgentOnboardResponse, AppState, AttachHandshakeDisposition, ControllerCommandDropReason,
-    ControllerEvent, ControllerLeaseResponse, ControllerPairing, ControllerUpdateCadence,
-    JoinSessionResponsePayload, PairingTransportKind, PairingTransportStatus, SessionSummary,
-    StateError,
+    AgentOnboardResponse, AppState, AttachHandshakeDisposition, ControllerEvent,
+    ControllerLeaseResponse, ControllerPairing, ControllerUpdateCadence, JoinSessionResponsePayload,
+    PairingTransportKind, PairingTransportStatus, SessionSummary, StateError,
 };
 
 use super::{ApiError, ApiResult, AuthToken};
@@ -279,8 +278,8 @@ pub async fn issue_controller_handshake(
     let target_beach = body
         .requester_private_beach_id
         .unwrap_or_else(|| "pb-unknown".into());
-    let fast_path_ready = state.is_fast_path_ready(&session_id).await;
-    let attach_disposition = if fast_path_ready {
+    let webrtc_ready = state.is_rtc_ready(&session_id).await;
+    let attach_disposition = if webrtc_ready {
         AttachHandshakeDisposition::Skip
     } else {
         AttachHandshakeDisposition::Dispatch
@@ -536,12 +535,12 @@ pub async fn pending_actions(
         .await
         .map_err(map_state_err)?;
 
-    let fast_path_ready = state.is_fast_path_ready(&session_id).await;
+    let webrtc_ready = state.is_rtc_ready(&session_id).await;
     let transport = state.session_transport_mode(&session_id).await;
 
     Ok(Json(serde_json::json!({
         "pending": pending,
-        "fast_path_ready": fast_path_ready,
+        "webrtc_ready": webrtc_ready,
         "transport": transport,
     })))
 }
@@ -593,7 +592,7 @@ pub async fn update_transport_status(
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     let mut status = match body.transport {
-        PairingTransportKind::FastPath => PairingTransportStatus::fast_path(now),
+        PairingTransportKind::Rtc => PairingTransportStatus::webrtc(now),
         PairingTransportKind::HttpFallback => {
             PairingTransportStatus::http_fallback(now, body.last_error.clone())
         }

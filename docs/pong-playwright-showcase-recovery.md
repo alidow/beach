@@ -39,16 +39,17 @@
 - Do not reintroduce fast-path peers/hints or multi-channel routing.
 - Keep FlowCanvas props tests skipped unless you can refactor them without touching transport.
 
-## Latest recovery run (auth on, passing)
+## Latest recovery runs (auth on, passing)
 - Stack reset and rebuild (no auth bypass):  
   `direnv allow && direnv exec . ./scripts/dockerdown --postgres-only && direnv exec . docker compose down`  
   `direnv exec . env BEACH_SESSION_SERVER='http://beach-road:4132' PONG_WATCHDOG_INTERVAL=10.0 docker compose build beach-manager`  
   `DEV_ALLOW_INSECURE_MANAGER_TOKEN=1 DEV_MANAGER_INSECURE_TOKEN=DEV-MANAGER-TOKEN PRIVATE_BEACH_MANAGER_TOKEN=DEV-MANAGER-TOKEN PRIVATE_BEACH_BYPASS_AUTH=0 direnv exec . sh -c 'BEACH_SESSION_SERVER=\"http://beach-road:4132\" PONG_WATCHDOG_INTERVAL=10.0 BEACH_MANAGER_STDOUT_LOG=trace BEACH_MANAGER_FILE_LOG=trace BEACH_MANAGER_TRACE_DEPS=1 docker compose up -d'`
-- Bootstrap + beach creation with auth:  
-  `direnv exec . apps/private-beach/demo/pong/tools/pong-stack.sh --setup-beach start -- create-beach` → created beach `af6d2214-7423-4ef4-a1b9-0bf4e97b440c`, attached sessions/pairings automatically.
-- Playwright showcase (auth enforced):  
-  `cd apps/private-beach-rewrite-2 && set -a && source .env.local && set +a && RUN_PONG_SHOWCASE=1 DEV_ALLOW_INSECURE_MANAGER_TOKEN=1 DEV_MANAGER_INSECURE_TOKEN=DEV-MANAGER-TOKEN PRIVATE_BEACH_MANAGER_TOKEN=DEV-MANAGER-TOKEN NEXT_PUBLIC_PRIVATE_BEACH_MANAGER_TOKEN=DEV-MANAGER-TOKEN PRIVATE_BEACH_BYPASS_AUTH=0 BEACH_SESSION_SERVER=http://beach-road:4132 PONG_WATCHDOG_INTERVAL=10.0 npx playwright test --config playwright.config.ts --project=chromium tests/e2e/pong-showcase.pw.spec.ts`  
-  Result: PASS. Tiles connected, ball motion detected via log scraping (`temp/pong-showcase/player-*.log`), telemetry failures empty. Bootstrap/log artifacts persisted under `temp/pong-showcase/`.
-- Fixes applied during run: showcase spec now strips ANSI + matches multiple `Ball x,y` occurrences per line to count motion; log root bind-mounted so host sees `/app/temp/pong-showcase` files.
-- Reliability re-runs: after tightening the spec, ran twice more with fresh beaches (`b8356177-2de8-47e3-a99a-9693fe57262b` and `0323a21e-b0c5-4f73-b2d8-44d059f75dba`), both PASS. One earlier retry flaked on LHS tile staying hidden at 60s; resolved by extending tile connect timeout to 120s. Added paddle-motion check via agent log (`paddle=` values) to ensure controller movement, not just ball logs.
+- Bootstrap + beach creation with auth (auto seeding/layout install):  
+  `direnv exec . apps/private-beach/demo/pong/tools/pong-stack.sh --setup-beach start -- create-beach` (uses host CLI token; handles missing tiles/relationships/sessions automatically).
+- Playwright showcase (auth enforced, log-root bind-mount):  
+  `RUN_PONG_SHOWCASE=1 PRIVATE_BEACH_MANAGER_TOKEN=DEV-MANAGER-TOKEN NEXT_PUBLIC_PRIVATE_BEACH_MANAGER_TOKEN=DEV-MANAGER-TOKEN NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_c2hpbmluZy1zdW5iaXJkLTE1LmNsZXJrLmFjY291bnRzLmRldiQ CLERK_SECRET_KEY=sk_test_254wHGG9vuO87RJiHJrLQsMOe1O8YuNK7dcEOKnZzm BEACH_SESSION_SERVER=http://beach-road:4132 PONG_WATCHDOG_INTERVAL=10.0 direnv exec . sh -c 'cd apps/private-beach-rewrite-2 && npx playwright test --config playwright.config.ts --project=chromium tests/e2e/pong-showcase.pw.spec.ts'`
+- Back-to-back passing runs (auth ON, single-channel):  
+  - Beach `7648899a-5d15-4c24-bd0a-87efd3d1026e` (1st run) and `c3454b39-1cef-44c2-99cc-c393ed87b306` (2nd run). Ball traces show motion on both sides (`temp/pong-showcase/ball-trace/ball-trace-lhs.jsonl` unique coords: 274; rhs: 405) and agent log shows paddle movement (`temp/pong-showcase/agent.log` paddle positions: 15).  
+  - Repeated runs tear down/rebuild the stack each time per spec `beforeAll`; Clerk login succeeds via secrets in `.env.local`; no auth bypass. Road logs still emit transient `webrtc answer unavailable (404)` while the rewrite retries early offers during session-graph seeding, but the re-offer succeeds and the channel stays on the primary path (no fast-path).
+- Fixes applied during these runs: showcase spec now consumes ball-trace JSONL before falling back to ANSI logs and asserts paddle motion via agent log; `pong-stack.sh` auto-seeds layout when tiles/relationships or session attachments are missing, avoiding manual catalog steps that previously led to HTTP fallback/dual balls.
 - Fast-path smoke: `direnv exec . ./scripts/pong-fastpath-smoke.sh --duration 20 --profile local` — PASS (artifacts in `temp/pong-fastpath-smoke/20251123-222828`). Needed to refresh the local Beach CLI token against Gate (`BEACH_AUTH_GATEWAY=http://localhost:4133 cargo run --bin beach -- login --name local --force`) because the old token was expired, and to extend runtime (10s run produced ball traces but no score update).

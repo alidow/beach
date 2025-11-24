@@ -1591,13 +1591,19 @@ function FlowCanvasInner({
           connectionState = 'error';
           connectionMessage = relationshipErrors[rel.id] ?? null;
         } else if (transport) {
-          if (transport.last_error) {
-            connectionState = 'error';
-            connectionMessage = transport.last_error;
-          } else if (transport.transport === 'fast_path') {
-            connectionState = 'fast';
+          const transportError = transport.last_error?.trim() || null;
+          if (transport.transport === 'webrtc') {
+            if (transportError) {
+              connectionState = 'error';
+              connectionMessage = transportError;
+            } else {
+              connectionState = 'fast';
+            }
           } else if (transport.transport === 'http_fallback') {
             connectionState = 'slow';
+          } else if (transportError) {
+            connectionState = 'error';
+            connectionMessage = transportError;
           }
         }
         return {

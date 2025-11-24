@@ -37,7 +37,7 @@ use beach_client_core::{
     decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
     HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell, Payload,
     SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId, TerminalGrid,
-    Transport, TransportError, TransportOffer, WebRtcChannels,
+    Transport, TransportError, TransportKind, TransportOffer, WebRtcChannels,
 };
 use chrono::{DateTime, Duration, Utc};
 use prometheus::IntGauge;
@@ -867,10 +867,12 @@ impl Default for ControllerUpdateCadence {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum PairingTransportKind {
-    FastPath,
+    #[serde(rename = "webrtc")]
+    Rtc,
+    #[serde(rename = "http_fallback")]
     HttpFallback,
+    #[serde(rename = "pending")]
     Pending,
 }
 
@@ -895,9 +897,9 @@ impl PairingTransportStatus {
         }
     }
 
-    pub fn fast_path(now_ms: i64) -> Self {
+    pub fn webrtc(now_ms: i64) -> Self {
         Self {
-            transport: PairingTransportKind::FastPath,
+            transport: PairingTransportKind::Rtc,
             last_event_ms: Some(now_ms),
             latency_ms: None,
             last_error: None,
@@ -1365,13 +1367,13 @@ impl AppState {
             .unwrap_or(TransportMode::FastPath)
     }
 
-    pub async fn is_fast_path_ready(&self, session_id: &str) -> bool {
-        self.fast_path_ready(session_id).await
+    pub async fn is_rtc_ready(&self, session_id: &str) -> bool {
+        self.rtc_ready(session_id).await
     }
 
-    async fn fast_path_ready(&self, session_id: &str) -> bool {
+    async fn rtc_ready(&self, session_id: &str) -> bool {
         #[cfg(test)]
-        if let Some(value) = test_support::fast_path_ready_override(session_id) {
+        if let Some(value) = test_support::rtc_ready_override(session_id) {
             return value;
         }
         let controllers = self.fallback.controllers_for_child(session_id).await;
@@ -1379,7 +1381,7 @@ impl AppState {
             self.fallback
                 .peek_pending_transport_status(session_id)
                 .await
-                .map(|status| matches!(status.transport, PairingTransportKind::FastPath))
+                .map(|status| matches!(status.transport, PairingTransportKind::Rtc))
                 .unwrap_or(false)
         } else {
             let mut any_ready = false;
@@ -1389,7 +1391,7 @@ impl AppState {
                     pairing.child_session_id == session_id
                         && matches!(
                             pairing.transport_status.as_ref().map(|s| s.transport),
-                            Some(PairingTransportKind::FastPath)
+                            Some(PairingTransportKind::Rtc)
                         )
                 }) {
                     any_ready = true;
@@ -1398,16 +1400,12 @@ impl AppState {
             }
             any_ready
         };
-        if should_log_custom_event(
-            "fast_path_ready_check",
-            session_id,
-            StdDuration::from_secs(5),
-        ) {
+        if should_log_custom_event("rtc_ready_check", session_id, StdDuration::from_secs(5)) {
             trace!(
-                target = "controller.fast_path_state",
+                target = "controller.transport_state",
                 session_id = %session_id,
                 ready,
-                "fast-path readiness evaluated"
+                "WebRTC transport readiness evaluated"
             );
         }
         ready
@@ -1509,7 +1507,7 @@ impl AppState {
 
     async fn evaluate_controller_gate(
         &self,
-        session_id: &str,
+        _session_id: &str,
         readiness: Option<SessionReadinessSnapshot>,
     ) -> Result<(), ControllerCommandDropReason> {
         let Some(snapshot) = readiness else {
@@ -1575,7 +1573,7 @@ impl AppState {
 
         let lease_label = lease_id.map(|id| truncate_uuid(&id));
         let actor_label = actor_account_id.map(|id| id.to_string());
-        let fast_path_ready = self.fast_path_ready(session_id).await;
+        let rtc_ready = self.rtc_ready(session_id).await;
         let attached = readiness.map(|s| s.attached()).unwrap_or(false);
         let http_ready = readiness.map(|s| s.http_ready()).unwrap_or(false);
         let child_online = readiness.map(|s| s.child_online()).unwrap_or(true);
@@ -1593,7 +1591,7 @@ impl AppState {
             reason = reason.code(),
             attached,
             http_ready,
-            fast_path_ready,
+            rtc_ready,
             child_online,
             attach_age_secs = attach_age,
             strict_gating = self.controller_strict_gating(),
@@ -4086,7 +4084,7 @@ impl AppState {
                         );
                     }
                     let mut status = if via_fast_path {
-                        PairingTransportStatus::fast_path(event_time)
+                        PairingTransportStatus::webrtc(event_time)
                     } else {
                         PairingTransportStatus::http_fallback(event_time, None)
                     };
@@ -4175,7 +4173,7 @@ impl AppState {
                             ack.error_message.clone().or_else(|| ack.error_code.clone())
                         });
                     let mut status = if via_fast_path {
-                        PairingTransportStatus::fast_path(event_time)
+                        PairingTransportStatus::webrtc(event_time)
                     } else {
                         PairingTransportStatus::http_fallback(event_time, None)
                     };
@@ -6301,7 +6299,7 @@ impl AppState {
         };
 
         let readiness_snapshot = readiness.clone();
-        let http_ready = readiness_snapshot
+        let _http_ready = readiness_snapshot
             .as_ref()
             .map(|snapshot| snapshot.http_ready())
             .unwrap_or(http_ready_flag);
@@ -6344,11 +6342,11 @@ impl AppState {
         });
         drop(sessions);
 
-        // Unified transport uses the primary channel; keep transport status at fast_path so
+        // Unified transport uses the primary channel; keep transport status at webrtc so
         // agents don't fall back to HTTP while actions queue.
         self.update_pairing_transport_status(
             session_id,
-            PairingTransportStatus::fast_path(event_time),
+            PairingTransportStatus::webrtc(event_time),
         )
         .await;
 
@@ -6990,14 +6988,14 @@ impl AppState {
                     .await
                     .unwrap_or(0);
                 if depth > 0 {
-                    let fast_path_ready = self.fast_path_ready(session_id).await;
+                    let rtc_ready = self.rtc_ready(session_id).await;
                     warn!(
                         target = "controller.delivery",
                         session_id = %session_id,
                         private_beach_id = %private_beach_id,
                         queue_depth = depth,
                         consumer = %consumer,
-                        fast_path_ready,
+                        rtc_ready,
                         "drain_actions_redis returned no actions despite non-empty stream"
                     );
                 }
@@ -8031,9 +8029,18 @@ async fn viewer_connect_once(
         .map_err(ViewerError::Join)?;
     let mut handle = joined.into_handle();
     rewrite_loopback_transports(&mut handle, &fallback_base)?;
-    let negotiated = negotiate_transport(&handle, Some(join_code), Some(label), false, None)
-        .await
-        .map_err(ViewerError::Negotiation)?;
+    let mut attach_metadata = HashMap::new();
+    attach_metadata.insert("role".into(), "viewer".into());
+    attach_metadata.insert("peer_id".into(), Uuid::new_v4().to_string());
+    let negotiated = negotiate_transport(
+        &handle,
+        Some(join_code),
+        Some(label),
+        false,
+        Some(attach_metadata),
+    )
+    .await
+    .map_err(ViewerError::Negotiation)?;
     let transport = match negotiated {
         NegotiatedTransport::Single(NegotiatedSingle { transport, .. }) => transport,
         NegotiatedTransport::WebRtcOfferer { .. } => {
@@ -8493,9 +8500,18 @@ async fn controller_forwarder_once_with_label(
         .map_err(|err| ControllerForwarderError::Join(err.to_string()))?;
     // Pre-derive session keys so the WebRTC handshake does not spend time in Argon2 later.
     warm_session_key(Some(join_code), session_id).await;
+    let negotiate_started = Instant::now();
+    info!(
+        target = "controller.forwarder",
+        session_id = %session_id,
+        private_beach_id = %private_beach_id,
+        requested_label = %label,
+        "controller forwarder negotiating transport"
+    );
     let mut forwarder_metadata = HashMap::new();
     forwarder_metadata.insert("role".into(), "manager".into());
     forwarder_metadata.insert("session_id".into(), session_id.to_string());
+    forwarder_metadata.insert("peer_id".into(), Uuid::new_v4().to_string());
     if let Some(token) = manager_bearer_token() {
         forwarder_metadata.insert("bearer".into(), token);
     } else {
@@ -8505,14 +8521,6 @@ async fn controller_forwarder_once_with_label(
             "manager bearer token missing; WebRTC peer auth may fail"
         );
     }
-    let negotiate_started = Instant::now();
-    info!(
-        target = "controller.forwarder",
-        session_id = %session_id,
-        private_beach_id = %private_beach_id,
-        requested_label = %label,
-        "controller forwarder negotiating transport"
-    );
     let negotiated = negotiate_transport(
         &handle,
         Some(join_code),
@@ -8540,6 +8548,7 @@ async fn controller_forwarder_once_with_label(
             metadata,
             ..
         }) => {
+            let peer_session_id = metadata.get("peer_session_id").cloned();
             info!(
                 target = "controller.forwarder",
                 session_id = %session_id,
@@ -8548,6 +8557,7 @@ async fn controller_forwarder_once_with_label(
                 negotiated_label = metadata
                     .get("label")
                     .map(|v| v.to_string()),
+                peer_session_id = peer_session_id.as_deref(),
                 transport = ?transport.kind(),
                 has_webrtc_channels = webrtc_channels.is_some(),
                 join_ms = join_elapsed_ms,
@@ -8571,6 +8581,7 @@ async fn controller_forwarder_once_with_label(
                 transport,
                 webrtc_channels,
                 connection_label.clone(),
+                peer_session_id.clone(),
                 cancel,
             )
             .await
@@ -8713,6 +8724,7 @@ async fn drive_controller_forwarder(
     primary_transport: Arc<dyn Transport>,
     _webrtc_channels: Option<WebRtcChannels>,
     metadata_label: Option<String>,
+    peer_session_id: Option<String>,
     cancel: CancellationToken,
 ) -> Result<(), ControllerForwarderError> {
     info!(
@@ -8720,6 +8732,7 @@ async fn drive_controller_forwarder(
         session_id = %session_id,
         private_beach_id = %private_beach_id,
         metadata_label = metadata_label.as_deref(),
+        peer_session_id = peer_session_id.as_deref(),
         "controller forwarder starting"
     );
     let (mut transport, mut transport_label, mut via_fast_path) = select_controller_transport(
@@ -8754,11 +8767,19 @@ async fn drive_controller_forwarder(
                 "viaFastPath": via_fast_path,
                 "transportId": t_id.0,
                 "peerId": t_peer.0,
+                "peerSessionId": peer_session_id,
             })),
         )
         .await;
 
-    // Fast-path disabled; skip pairing status updates.
+    let initial_status = if via_fast_path {
+        PairingTransportStatus::webrtc(now_ms())
+    } else {
+        PairingTransportStatus::http_fallback(now_ms(), None)
+    };
+    state
+        .update_pairing_transport_status(session_id, initial_status)
+        .await;
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let mut reader_guard = ForwarderReader::spawn(transport.clone(), event_tx.clone());
@@ -9092,8 +9113,17 @@ async fn drive_controller_forwarder(
                                 transport = primary_transport.clone();
                                 drop(reader_guard);
                                 reader_guard = ForwarderReader::spawn(transport.clone(), event_tx.clone());
-                            continue;
-                        }
+                                state
+                                    .update_pairing_transport_status(
+                                        session_id,
+                                        PairingTransportStatus::http_fallback(
+                                            now_ms(),
+                                            Some("ack_stall".into()),
+                                        ),
+                                    )
+                                    .await;
+                                continue;
+                            }
                         }
                     }
                 }
@@ -9216,6 +9246,15 @@ async fn drive_controller_forwarder(
                                         drop(reader_guard);
                                         reader_guard =
                                             ForwarderReader::spawn(transport.clone(), event_tx.clone());
+                                        state
+                                            .update_pairing_transport_status(
+                                                session_id,
+                                                PairingTransportStatus::http_fallback(
+                                                    now_ms(),
+                                                    Some(format!("send_error:{err}")),
+                                                ),
+                                            )
+                                            .await;
                                         info!(
                                             target = "controller.forwarder",
                                             session_id = %session_id,
@@ -9329,7 +9368,14 @@ async fn select_controller_transport(
     _session_id: &str,
     _private_beach_id: &str,
 ) -> (Arc<dyn Transport>, &'static str, bool) {
-    (primary_transport, "primary", true)
+    let kind = primary_transport.kind();
+    let via_fast_path = matches!(kind, TransportKind::WebRtc | TransportKind::WebSocket);
+    let label = match kind {
+        TransportKind::WebRtc => "webrtc",
+        TransportKind::WebSocket => "websocket",
+        TransportKind::Ipc => "ipc",
+    };
+    (primary_transport, label, via_fast_path)
 }
 
 fn action_terminal_bytes(action: &ActionCommand) -> Result<Vec<u8>, String> {
@@ -9653,26 +9699,26 @@ pub(crate) mod test_support {
         out
     }
 
-    static FAST_PATH_READY_OVERRIDES: Lazy<RwLock<HashMap<String, bool>>> =
+    static RTC_READY_OVERRIDES: Lazy<RwLock<HashMap<String, bool>>> =
         Lazy::new(|| RwLock::new(HashMap::new()));
 
-    pub fn set_fast_path_ready_override(session_id: &str, ready: bool) {
-        FAST_PATH_READY_OVERRIDES
+    pub fn set_rtc_ready_override(session_id: &str, ready: bool) {
+        RTC_READY_OVERRIDES
             .write()
             .unwrap()
             .insert(session_id.to_string(), ready);
     }
 
-    pub fn fast_path_ready_override(session_id: &str) -> Option<bool> {
-        FAST_PATH_READY_OVERRIDES
+    pub fn rtc_ready_override(session_id: &str) -> Option<bool> {
+        RTC_READY_OVERRIDES
             .read()
             .unwrap()
             .get(session_id)
             .copied()
     }
 
-    pub fn clear_fast_path_ready_override() {
-        FAST_PATH_READY_OVERRIDES.write().unwrap().clear();
+    pub fn clear_rtc_ready_override() {
+        RTC_READY_OVERRIDES.write().unwrap().clear();
     }
 }
 
@@ -10211,6 +10257,7 @@ mod tests {
                 primary,
                 None,
                 None,
+                None,
                 cancel_for_task,
             )
             .await
@@ -10230,8 +10277,8 @@ mod tests {
             .peek_pending_transport_status(session_id)
             .await
             .expect("transport status should be cached");
-        assert_eq!(status.transport, PairingTransportKind::FastPath);
-        assert!(state.is_fast_path_ready(session_id).await);
+        assert_eq!(status.transport, PairingTransportKind::Rtc);
+        assert!(state.is_rtc_ready(session_id).await);
 
         // Shutdown forwarder cleanly.
         cancel.cancel();
@@ -10262,6 +10309,7 @@ mod tests {
                 primary,
                 None,
                 None,
+                None,
                 cancel_for_task,
             )
             .await
@@ -10281,8 +10329,8 @@ mod tests {
             .peek_pending_transport_status(session_id)
             .await
             .expect("transport status should be cached");
-        assert_eq!(status.transport, PairingTransportKind::FastPath);
-        assert!(state.is_fast_path_ready(session_id).await);
+        assert_eq!(status.transport, PairingTransportKind::Rtc);
+        assert!(state.is_rtc_ready(session_id).await);
 
         cancel.cancel();
         let _ = forwarder.await;
@@ -10315,6 +10363,7 @@ mod tests {
                 primary,
                 None,
                 None,
+                None,
                 cancel_for_task,
             )
             .await
@@ -10334,8 +10383,8 @@ mod tests {
             .peek_pending_transport_status(session_id)
             .await
             .expect("transport status should be cached");
-        assert_eq!(status.transport, PairingTransportKind::FastPath);
-        assert!(state.is_fast_path_ready(session_id).await);
+        assert_eq!(status.transport, PairingTransportKind::Rtc);
+        assert!(state.is_rtc_ready(session_id).await);
 
         cancel.cancel();
         let _ = forwarder.await;

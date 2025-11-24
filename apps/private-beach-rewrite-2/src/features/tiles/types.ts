@@ -18,6 +18,7 @@ export type TileSessionMeta = {
   status?: string | null;
   harnessType?: string | null;
   pendingActions?: number | null;
+  transport?: 'webrtc' | 'http' | null;
 };
 
 export type AgentTraceMetadata = {

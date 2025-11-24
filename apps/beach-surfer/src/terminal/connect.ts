@@ -2,8 +2,8 @@ import {
   DataChannelTerminalTransport,
   type TerminalTransport,
 } from '../transport/terminalTransport';
-import { connectWebRtcTransport } from '../transport/webrtc';
-import { SignalingClient } from '../transport/signaling';
+import { attachPeerSession, connectWebRtcTransport } from '../transport/webrtc';
+import { SignalingClient, generatePeerId } from '../transport/signaling';
 import type { SignalingClientOptions } from '../transport/signaling';
 import type { SecureTransportSummary } from '../transport/webrtc';
 import type { ConnectionTrace } from '../lib/connectionTrace';
@@ -112,12 +112,19 @@ export async function connectBrowserTransport(
     }
 
     const normalizedSignalingUrl = normalizeConnectorUrl(join.signalingUrl) ?? join.signalingUrl;
+    const peerId = generatePeerId();
+    const attached = await attachPeerSession({
+      signalingUrl: normalizedSignalingUrl,
+      role: join.role,
+      peerId,
+      passphrase: options.passcode ?? undefined,
+    });
     const websocketUrl =
-      normalizeConnectorUrl(join.websocketUrl) ??
-      deriveWebsocketUrl(options.baseUrl, options.sessionId);
+      normalizeConnectorUrl(join.websocketUrl) ?? attached.websocketUrl ?? deriveWebsocketUrl(options.baseUrl, options.sessionId);
     trace?.mark('signaling:connect_start', { websocketUrl });
     const signaling = await SignalingClient.connect({
       url: websocketUrl,
+      peerId,
       passphrase: options.passcode,
       viewerToken: options.viewerToken ?? undefined,
       supportedTransports: ['webrtc'],
@@ -146,7 +153,9 @@ export async function connectBrowserTransport(
         passphrase: options.passcode,
         viewerToken: options.viewerToken ?? undefined,
         telemetryBaseUrl: options.baseUrl,
-        sessionId: options.sessionId,
+        sessionId: attached.hostSessionId ?? options.sessionId,
+        signalingUrl: attached.signalingUrl,
+        peerSessionId: attached.peerSessionId,
         trace,
       });
     } catch (error) {

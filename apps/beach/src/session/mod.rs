@@ -248,7 +248,7 @@ fn infer_scheme(base: &str) -> &'static str {
         .next()
         .unwrap_or(base);
     let host_lower = host_part.to_ascii_lowercase();
-    if host_lower == "localhost"
+    if host_lower.starts_with("localhost")
         || host_lower == "0.0.0.0"
         || host_lower.starts_with("127.")
         || host_lower == "::1"

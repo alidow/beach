@@ -1,6 +1,17 @@
-import { describe, expect, it } from 'vitest';
-import { decodeTransportMessage } from './envelope';
-import { WebRtcTransport, appendParams } from './webrtc';
+import { describe, expect, it, vi } from 'vitest';
+import { decodeTransportMessage, encodeTransportMessage } from './envelope';
+import {
+  WebRtcTransport,
+  appendParams,
+  pollSdp,
+  postSdp,
+} from './webrtc';
+import {
+  encodeFramedMessage,
+  decodeFramedMessage,
+  FramedReassembler,
+  runtimeFramingConfig,
+} from './chunk';
 
 describe('WebRtcTransport', () => {
   it('encodes outgoing text payloads with transport envelope', () => {
@@ -12,7 +23,17 @@ describe('WebRtcTransport', () => {
     expect(seq).toBe(7);
     expect(channel.sent.length).toBe(1);
 
-    const message = decodeTransportMessage(channel.sent[0]!);
+    const framed = channel.sent[0]!;
+    const decodedFrame = decodeFramedMessage(
+      new Uint8Array(framed as ArrayBufferLike),
+      new FramedReassembler(),
+      runtimeFramingConfig(),
+      Date.now(),
+    );
+    if (decodedFrame.kind !== 'complete') {
+      throw new Error('expected complete frame');
+    }
+    const message = decodeTransportMessage(decodedFrame.frame.payload);
     expect(message.sequence).toBe(7);
     expect(message.payload).toEqual({ kind: 'text', text: 'hello' });
   });
@@ -24,14 +45,15 @@ describe('WebRtcTransport', () => {
     const events: unknown[] = [];
     transport.addEventListener('message', (event) => events.push(event.detail));
 
-    const encoded = new Uint8Array([
-      1, // payload type binary
-      0, 0, 0, 0, 0, 0, 0, 1, // sequence 1
-      0, 0, 0, 2, // length 2
-      0xde,
-      0xad,
-    ]);
-    channel.simulateMessage(encoded.buffer);
+    const envelope = encodeTransportMessage({ sequence: 1, payload: { kind: 'binary', data: new Uint8Array([0xde, 0xad]) } });
+    const framed = encodeFramedMessage(
+      'sync',
+      'binary',
+      1,
+      envelope,
+      runtimeFramingConfig(),
+    )[0];
+    channel.simulateMessage(framed);
 
     expect(events).toHaveLength(1);
     const [detail] = events as any[];
@@ -65,6 +87,63 @@ describe('appendParams helper', () => {
       expect(result).toBe(base);
     },
     60_000,
+  );
+});
+
+describe('signaling helpers', () => {
+  it(
+    'pollSdp retries on 409 with Retry-After',
+    async () => {
+      const fetchMock = vi.fn();
+      let calls = 0;
+      (global as any).fetch = fetchMock;
+      fetchMock.mockImplementation(async () => {
+        calls += 1;
+        if (calls === 1) {
+          return new Response(null, {
+            status: 409,
+            headers: new Headers({ 'Retry-After': '0.01' }),
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            sdp: 'v=0',
+            type: 'offer',
+            handshake_id: 'h1',
+            from_peer: 'a',
+            to_peer: 'b',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      });
+      vi.useFakeTimers();
+      const promise = pollSdp('http://example.invalid/offer', 5, undefined);
+      await vi.runAllTimersAsync();
+      const payload = await promise;
+      expect(payload.handshake_id).toBe('h1');
+      vi.useRealTimers();
+    },
+    10_000,
+  );
+
+  it(
+    'postSdp retries on 409',
+    async () => {
+      const fetchMock = vi.fn();
+      (global as any).fetch = fetchMock;
+      fetchMock
+        .mockResolvedValueOnce(new Response(null, { status: 409 }))
+        .mockResolvedValueOnce(new Response(null, { status: 204 }));
+      await postSdp('http://example.invalid/answer', {
+        sdp: 'v=0',
+        type: 'answer',
+        handshake_id: 'h2',
+        from_peer: 'a',
+        to_peer: 'b',
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    },
+    10_000,
   );
 });
 

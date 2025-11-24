@@ -312,77 +312,77 @@ export function ApplicationTile({
         logConnectionEvent(startStep, logContext, {
           hasPasscode: Boolean(passcode && passcode.length > 0),
         });
-      let handshake: ControllerHandshakeResponse;
-      try {
-        handshake = await issueControllerHandshake(
-          sessionId,
-          passcode,
-          privateBeachId,
-          token,
-          managerUrl,
-        );
-        logConnectionEvent('handshake:success', logContext, {
-          leaseExpiresAtMs: handshake.lease_expires_at_ms ?? null,
-        });
-        setAttachError((prev) => (prev ? null : prev));
-      } catch (error) {
-        const friendly = resolveHandshakeMessage(error);
-        const message = friendly ?? (error instanceof Error ? error.message : String(error));
-        logConnectionEvent('handshake:error', logContext, { error: message }, 'error');
-        if (friendly) {
-          const wrapped = new Error(message);
-          (wrapped as Record<string, unknown>).errorCode = (error as Record<string, unknown>)?.errorCode;
-          throw wrapped;
-        }
-        throw error;
-      }
-
-      const shouldSendControl = !(options?.skipControlMessage ?? false);
-      if (shouldSendControl) {
+        let handshake: ControllerHandshakeResponse;
         try {
-          const control = await sendControlMessage(
+          handshake = await issueControllerHandshake(
             sessionId,
-            'manager_handshake',
-            handshake,
-            token ?? null,
-            resolvedRoadUrl,
+            passcode,
+            privateBeachId,
+            token,
+            managerUrl,
           );
-          logConnectionEvent('hint:sent', logContext, {
-            roadUrl: resolvedRoadUrl,
-            controlId: control?.control_id ?? null,
-          });
-          logConnectionEvent('slow-path:ready', logContext, {
+          logConnectionEvent('handshake:success', logContext, {
             leaseExpiresAtMs: handshake.lease_expires_at_ms ?? null,
-            controlId: control?.control_id ?? null,
           });
-          hasDeliveredControlRef.current = true;
+          setAttachError((prev) => (prev ? null : prev));
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          logConnectionEvent('hint:error', logContext, {
-            roadUrl: resolvedRoadUrl,
-            error: message,
-          }, 'error');
+          const friendly = resolveHandshakeMessage(error);
+          const message = friendly ?? (error instanceof Error ? error.message : String(error));
+          logConnectionEvent('handshake:error', logContext, { error: message }, 'error');
+          if (friendly) {
+            const wrapped = new Error(message);
+            (wrapped as Record<string, unknown>).errorCode = (error as Record<string, unknown>)?.errorCode;
+            throw wrapped;
+          }
           throw error;
         }
-      } else {
-        logConnectionEvent('handshake:renew', logContext, {
-          leaseExpiresAtMs: handshake.lease_expires_at_ms ?? null,
-        });
-      }
 
-      lastHandshakeContextRef.current = { sessionId, passcode };
-
-      if (typeof window !== 'undefined') {
-        clearHandshakeRenewal();
-        const targetExpiry = handshake.lease_expires_at_ms ?? Date.now() + HANDSHAKE_RENEW_FALLBACK_MS;
-        const delay = Math.max(resolveHandshakeRenewMinMs(), targetExpiry - Date.now() - HANDSHAKE_RENEW_BUFFER_MS);
-        const skipControlOnRenewal = hasDeliveredControlRef.current;
-        handshakeRenewTimerRef.current = window.setTimeout(() => {
-          void deliverHandshake(sessionId, passcode, { skipControlMessage: skipControlOnRenewal }).catch((error) => {
-            console.warn('[application-tile] handshake renewal failed', {
+        const shouldSendControl = !(options?.skipControlMessage ?? false);
+        if (shouldSendControl) {
+          try {
+            const control = await sendControlMessage(
               sessionId,
-              error,
+              'manager_handshake',
+              handshake,
+              token ?? null,
+              resolvedRoadUrl,
+            );
+            logConnectionEvent('hint:sent', logContext, {
+              roadUrl: resolvedRoadUrl,
+              controlId: control?.control_id ?? null,
             });
+            logConnectionEvent('slow-path:ready', logContext, {
+              leaseExpiresAtMs: handshake.lease_expires_at_ms ?? null,
+              controlId: control?.control_id ?? null,
+            });
+            hasDeliveredControlRef.current = true;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            logConnectionEvent('hint:error', logContext, {
+              roadUrl: resolvedRoadUrl,
+              error: message,
+            }, 'error');
+            throw error;
+          }
+        } else {
+          logConnectionEvent('handshake:renew', logContext, {
+            leaseExpiresAtMs: handshake.lease_expires_at_ms ?? null,
+          });
+        }
+
+        lastHandshakeContextRef.current = { sessionId, passcode };
+
+        if (typeof window !== 'undefined') {
+          clearHandshakeRenewal();
+          const targetExpiry = handshake.lease_expires_at_ms ?? Date.now() + HANDSHAKE_RENEW_FALLBACK_MS;
+          const delay = Math.max(resolveHandshakeRenewMinMs(), targetExpiry - Date.now() - HANDSHAKE_RENEW_BUFFER_MS);
+          const skipControlOnRenewal = hasDeliveredControlRef.current;
+          handshakeRenewTimerRef.current = window.setTimeout(() => {
+            void deliverHandshake(sessionId, passcode, { skipControlMessage: skipControlOnRenewal }).catch((error) => {
+              console.warn('[application-tile] handshake renewal failed', {
+                sessionId,
+                error,
+              });
               logConnectionEvent(
                 'handshake:renew-error',
                 logContext,
@@ -658,6 +658,23 @@ export function ApplicationTile({
       hasDeliveredControlRef.current = false;
     }
   }, [viewer.status]);
+
+  useEffect(() => {
+    if (!onSessionMetaChange || !sessionMeta) return;
+
+    const currentTransport = sessionMeta.transport;
+    let nextTransport: 'webrtc' | 'http' | null = currentTransport ?? null;
+
+    if (viewer.status === 'connected') {
+      nextTransport = 'webrtc';
+    } else if (viewer.status === 'idle' || viewer.status === 'error') {
+      nextTransport = null;
+    }
+
+    if (nextTransport !== currentTransport) {
+      onSessionMetaChange({ ...sessionMeta, transport: nextTransport });
+    }
+  }, [viewer.status, sessionMeta, onSessionMetaChange]);
 
   useEffect(() => {
     const currentSessionId = sessionMeta?.sessionId ?? null;

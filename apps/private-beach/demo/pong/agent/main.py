@@ -74,7 +74,7 @@ PADDLE_GLYPHS = frozenset(
 BALL_GLYPHS = frozenset({"o", ".", "*", "\u25cf"})  # supports ● plus ascii fallbacks
 # Controller-IO readiness states. Do not treat the state stream alone as ready,
 # since rendering readiness does not guarantee controller delivery is wired.
-FAST_PATH_READY_STATES = frozenset({"fast_path"})
+RTC_READY_STATES = frozenset({"webrtc"})
 # HTTP transport events that indicate a usable (but degraded) controller path.
 HTTP_READY_STATES = frozenset({"http_fallback", "controller", "transport"})
 # Poller states mean we're still draining the HTTP queue; keep waiting until
@@ -138,8 +138,8 @@ def normalize_transport_status(value: Optional[str]) -> str:
     )
     if not normalized:
         return "pending"
-    if normalized in {"fastpath", "pb_controller", "mgr_actions", "pbcontroller"}:
-        return "fast_path"
+    if normalized == "webrtc":
+        return "webrtc"
     if normalized in {"httpfallback", "http_fallback"}:
         return "http_fallback"
     if normalized in {"http", "http_poll", "http_polling", "http_poller"}:
@@ -241,9 +241,22 @@ class StateSubscriber(threading.Thread):
         while not self.stop_event.is_set() and not self._local_stop.is_set():
             try:
                 self.output.put(("info", f"state stream opening ({label} {self.session_id})"))
+                first_payload = True
                 for payload in self.client.subscribe_state(self.session_id):
                     if self.stop_event.is_set() or self._local_stop.is_set():
                         return
+                    if first_payload:
+                        self.output.put(
+                            (
+                                "state_stream_ready",
+                                {
+                                    "session_id": self.session_id,
+                                    "source": "stream",
+                                    "role": label,
+                                },
+                            )
+                        )
+                        first_payload = False
                     event = {
                         "session_id": self.session_id,
                         "payload": payload,
@@ -417,13 +430,20 @@ class StatePoller(threading.Thread):
         while not self._global_stop.is_set() and not self._local_stop.is_set():
             try:
                 payload = self.client.fetch_state_snapshot(self.session_id)
+                event_payload: Optional[Dict[str, object]] = None
                 if payload:
-                    event = {
-                        "session_id": self.session_id,
-                        "payload": payload,
-                        "received_at": time.time(),
-                    }
-                    self.output.put(("diff", event))
+                    event_payload = payload
+                else:
+                    # A 204/no-op response still proves the stream is alive; emit
+                    # a heartbeat so readiness doesn't stall while waiting for
+                    # the next full frame.
+                    event_payload = {"type": "terminal_heartbeat"}
+                event = {
+                    "session_id": self.session_id,
+                    "payload": event_payload,
+                    "received_at": time.time(),
+                }
+                self.output.put(("diff", event))
             except ManagerRequestError as exc:
                 self.output.put(
                     ("error", f"state poll error ({self.session_id}): {exc}")
@@ -1236,6 +1256,7 @@ class SessionState:
     previous_ball_time: Optional[float] = None
     ball_velocity: Optional[Tuple[float, float]] = None
     last_update: float = 0.0
+    has_state: bool = False
     last_update_label: str = "pending"
     last_move_time: float = 0.0
     ball_exit: Optional[str] = None
@@ -1248,7 +1269,7 @@ class SessionState:
     transport_ready: bool = False
     transport_status: Optional[str] = None
     transport_last_update: float = 0.0
-    fast_path_established: bool = False
+    rtc_established: bool = False
     active_transport: Optional[str] = None
 
     def touch(self, now: float) -> None:
@@ -1268,6 +1289,7 @@ class SessionState:
         self.lines = lines
         self.cursor = cursor
         self.touch(now)
+        self.has_state = True
         self._detect_paddle()
         self._detect_ball(now)
 
@@ -1584,11 +1606,18 @@ class CommandScheduler:
                 f"soft readiness warning for {session.side or session.session_id}: state",
                 level="debug",
             )
-        elif now - session.last_update > self.readiness_timeout:
+        if not session.has_state or session.height <= 0:
             self._log(
-                f"soft readiness warning for {session.side or session.session_id}: stale",
-                level="debug",
+                f"readiness blocked for {session.side or session.session_id}: state",
+                level="info",
             )
+            return "state"
+        if now - session.last_update > max(self.readiness_timeout, 5.0):
+            self._log(
+                f"readiness blocked for {session.side or session.session_id}: state_stale",
+                level="info",
+            )
+            return "state_stale"
         return None
 
     def _format_missing_summary(self, reasons: Dict[str, str]) -> str:
@@ -1617,6 +1646,7 @@ class AgentApp:
         headless: bool = False,
         safe_mode: bool = True,
         log_level: str = "info",
+        on_state_stream_ready: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.stdscr = stdscr
         self.session_roles = session_roles
@@ -1631,6 +1661,7 @@ class AgentApp:
         self.prompt_pack = prompt_pack or {}
         self.headless = headless
         self.safe_mode = safe_mode
+        self._on_state_stream_ready = on_state_stream_ready
 
         self.sessions: Dict[str, SessionState] = {}
         self.logs: List[str] = []
@@ -1656,6 +1687,7 @@ class AgentApp:
         self._last_serve_side: Optional[str] = None
         self._active_ball_session_id: Optional[str] = None
         self._ball_lost_since: float = 0.0
+        self._stream_ready_sessions: Set[str] = set()
         self.ball_loss_grace = BALL_LOSS_GRACE_SECONDS
         self._apply_prompt_pack()
         normalized_level = _normalize_log_level_value(log_level) or "info"
@@ -1946,6 +1978,24 @@ class AgentApp:
                         self.log_event(event)
                 elif isinstance(payload, dict):
                     self.log_event(payload)
+            elif kind == "state_stream_ready":
+                session_id = None
+                if isinstance(payload, dict):
+                    session_id = payload.get("session_id")
+                if isinstance(session_id, str):
+                    session = self.ensure_session(session_id)
+                    session.transport_status = session.transport_status or "state_stream"
+                    session.transport_last_update = now
+                    if session_id not in self._stream_ready_sessions:
+                        self._stream_ready_sessions.add(session_id)
+                        if self._on_state_stream_ready:
+                            try:
+                                self._on_state_stream_ready(session_id)
+                            except Exception as exc:  # pragma: no cover - defensive logging
+                                self.log(
+                                    f"state stream ready handler failed for {session_id}: {exc}",
+                                    level="warn",
+                                )
             elif kind == "transport":
                 self._handle_transport_event(payload, now)
             elif kind == "lease":
@@ -2021,34 +2071,38 @@ class AgentApp:
         session.transport_last_update = now
         label = session.side or session.session_id
 
-        is_fast_path = status in FAST_PATH_READY_STATES
+        if status == "poller_inactive":
+            # Poller shutdown is informational; do not drop readiness based on this event alone.
+            return
+
+        is_rtc = status in RTC_READY_STATES
         is_http_ready = status in HTTP_READY_STATES
         is_http_poller = status in HTTP_POLLER_STATES
 
-        if is_fast_path:
-            if not session.fast_path_established:
-                self.log(f"fast-path ready for {label}", level="info")
-            elif previous_mode != "fast_path":
-                self.log(f"fast-path restored for {label}", level="info")
-            session.fast_path_established = True
-            session.transport_ready = True
-            session.active_transport = "fast_path"
-        elif (is_http_ready or (is_http_poller and session.fast_path_established)) and session.fast_path_established:
+        if is_rtc:
+            if not session.rtc_established:
+                self.log(f"WebRTC ready for {label}", level="info")
+            elif previous_mode != "webrtc":
+                self.log(f"WebRTC restored for {label}", level="info")
+            session.rtc_established = True
+            session.transport_ready = session.has_state
+            session.active_transport = "webrtc"
+        elif (is_http_ready or (is_http_poller and session.rtc_established)) and session.rtc_established:
             if previous_mode != "http":
                 self.log(
-                    f"fast-path unavailable for {label}; falling back to HTTP ({status})",
+                    f"WebRTC unavailable for {label}; falling back to HTTP ({status})",
                     level="warn",
                 )
-            session.transport_ready = True
+            session.transport_ready = session.has_state
             session.active_transport = "http"
         else:
             if status in {"detached", "removed"} or action == "removed":
-                session.fast_path_established = False
-            if is_http_ready and not session.fast_path_established:
-                # HTTP is technically reachable, but we require fast-path
+                session.rtc_established = False
+            if is_http_ready and not session.rtc_established:
+                # HTTP is technically reachable, but we require WebRTC
                 # before issuing any commands.
                 self.log(
-                    f"waiting for fast-path before enabling commands for {label} (current={status})",
+                    f"waiting for WebRTC before enabling commands for {label} (current={status})",
                     level="debug",
                 )
             session.transport_ready = False
@@ -2121,6 +2175,8 @@ class AgentApp:
                 session
                 for session in self.sessions.values()
                 if session.side in {"lhs", "rhs"}
+                and session.transport_ready
+                and session.has_state
             ]
             if not candidates:
                 self.log(
@@ -2180,6 +2236,8 @@ class AgentApp:
             session
             for session in self.sessions.values()
             if session.height > 0 and session.side in {"lhs", "rhs"}
+            and session.transport_ready
+            and session.has_state
         ]
         if not candidates:
             return
@@ -2188,10 +2246,15 @@ class AgentApp:
         # This prevents "double ball" issues during fast-path fallback/instability
         healthy_candidates = [
             s for s in candidates
-            if s.transport_status in {"ready", "streaming"}
+            if s.transport_status in {"ready", "streaming"} or s.transport_ready
         ]
-        if not healthy_candidates:
-            # If no one is healthy, we can't reliably spawn anyway.
+        
+        # FIX: Require BOTH sides to be present and healthy before starting the game
+        # to prevent the ball from being served to a single player.
+        lhs_ready = any(s.side == "lhs" for s in healthy_candidates)
+        rhs_ready = any(s.side == "rhs" for s in healthy_candidates)
+        
+        if not (lhs_ready and rhs_ready):
             # Resetting the timer prevents a spawn storm when connection returns.
             self._last_ball_seen = now
             return
@@ -3357,6 +3420,7 @@ def main() -> int:
             headless=args.headless,
             safe_mode=safe_mode_enabled,
             log_level=args.log_level,
+            on_state_stream_ready=stop_state_poller,
         )
         try:
             app.log("agent ready", level="info")

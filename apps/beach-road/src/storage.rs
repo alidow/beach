@@ -33,6 +33,17 @@ pub struct SessionInfo {
     pub location_hint: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerSessionInfo {
+    pub peer_session_id: String,
+    pub host_session_id: String,
+    pub created_at: u64,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub peer_id: Option<String>,
+}
+
 impl SessionInfo {
     pub fn new(session_id: String, passphrase_hash: String, join_code: String) -> Self {
         let created_at = SystemTime::now()
@@ -204,6 +215,49 @@ impl Storage {
         Ok(exists)
     }
 
+    pub async fn register_peer_session(&self, session: PeerSessionInfo) -> Result<()> {
+        let mut conn = self.redis.clone();
+        let key = format!("peer-session:{}", session.peer_session_id);
+        let value = serde_json::to_string(&session)?;
+        conn.set_ex::<_, _, ()>(&key, value, self.ttl_seconds)
+            .await?;
+        // Track a host->peer mapping so both peers can reuse the same peer_session_id.
+        let map_key = format!("host-peer-session:{}", session.host_session_id);
+        conn.set_ex::<_, _, ()>(&map_key, session.peer_session_id, self.ttl_seconds)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn lookup_peer_session_for_host(
+        &self,
+        host_session_id: &str,
+    ) -> Result<Option<String>> {
+        let mut conn = self.redis.clone();
+        let key = format!("host-peer-session:{}", host_session_id);
+        let value: Option<String> = conn.get(&key).await?;
+        Ok(value)
+    }
+
+    pub async fn get_peer_session(&self, peer_session_id: &str) -> Result<Option<PeerSessionInfo>> {
+        let mut conn = self.redis.clone();
+        let key = format!("peer-session:{}", peer_session_id);
+        let value: Option<String> = conn.get(&key).await?;
+        match value {
+            Some(json) => {
+                let session = serde_json::from_str(&json)?;
+                Ok(Some(session))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn peer_session_exists(&self, peer_session_id: &str) -> Result<bool> {
+        let mut conn = self.redis.clone();
+        let key = format!("peer-session:{}", peer_session_id);
+        let exists: bool = conn.exists(&key).await?;
+        Ok(exists)
+    }
+
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
         let mut conn = self.redis.clone();
         let key = format!("session:{}", session_id);
@@ -215,6 +269,29 @@ impl Storage {
         let mut conn = self.redis.clone();
         let key = format!("session:{}", session_id);
         conn.expire::<_, ()>(&key, self.ttl_seconds as i64).await?;
+        Ok(())
+    }
+
+    pub async fn update_peer_session_ttl(&self, peer_session_id: &str) -> Result<()> {
+        let mut conn = self.redis.clone();
+        let peer_key = format!("peer-session:{}", peer_session_id);
+        let info: Option<String> = conn.get(&peer_key).await?;
+        if info.is_none() {
+            return Ok(());
+        }
+
+        conn.expire::<_, ()>(&peer_key, self.ttl_seconds as i64)
+            .await?;
+
+        if let Some(info) = info {
+            if let Ok(parsed) = serde_json::from_str::<PeerSessionInfo>(&info) {
+                let map_key = format!("host-peer-session:{}", parsed.host_session_id);
+                let _ = conn
+                    .expire::<_, ()>(&map_key, self.ttl_seconds as i64)
+                    .await;
+            }
+        }
+
         Ok(())
     }
 

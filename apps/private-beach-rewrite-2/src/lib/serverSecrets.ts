@@ -1,4 +1,5 @@
 import { resolvePrivateBeachRewriteEnabled } from '../../../private-beach/src/lib/featureFlags';
+import { cookies, headers } from 'next/headers';
 
 function devAuthBypassEnabled(): boolean {
   if (process.env.NODE_ENV === 'production') return false;
@@ -87,7 +88,7 @@ async function exchangeClerkTokenForGateToken(clerkToken: string): Promise<strin
 
 export type ManagerTokenResolution = {
   token: string | null;
-  source: 'env' | 'exchange' | 'unauthenticated' | 'exchange_error' | 'none';
+  source: 'env' | 'cookie' | 'exchange' | 'unauthenticated' | 'exchange_error' | 'none' | 'dev_bypass';
   detail?: string;
 };
 
@@ -100,6 +101,16 @@ export async function resolveManagerToken(
   template: string | undefined,
   options?: ResolveOptions,
 ): Promise<ManagerTokenResolution> {
+  const cookieToken = cookies().get('pb-manager-token')?.value?.trim();
+  const headerToken = headers().get('x-pb-manager-token')?.trim();
+  const providedToken = cookieToken || headerToken;
+  if (providedToken) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.warn('[private-beach-rewrite-2] using provided manager token (cookie/header)');
+    }
+    return { token: providedToken, source: 'cookie' };
+  }
+
   if (devAuthBypassEnabled()) {
     return { token: devInsecureToken(), source: 'dev_bypass' };
   }

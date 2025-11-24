@@ -832,7 +832,9 @@ impl EncryptionManager {
             })?;
         state
             .recv_counter
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |_| counter.checked_add(1))
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |_| {
+                counter.checked_add(1)
+            })
             .ok();
         tracing::trace!(
             target = "beach::transport::webrtc::crypto",
@@ -1768,6 +1770,7 @@ struct OffererInner {
     signaling_client: Arc<SignalingClient>,
     signaling_base: String,
     session_id: String,
+    peer_session_id: String,
     poll_interval: Duration,
     passphrase: Option<String>,
     session_key: Arc<OnceCell<Arc<[u8; 32]>>>,
@@ -1838,18 +1841,41 @@ impl OffererSupervisor {
         request_mcp_channel: bool,
         metadata: Option<HashMap<String, String>>,
     ) -> Result<(Arc<Self>, OffererAcceptedTransport), TransportError> {
+        let mut enriched_metadata = metadata.unwrap_or_default();
+        enriched_metadata
+            .entry("role".to_string())
+            .or_insert_with(|| "offerer".to_string());
+        let peer_id = enriched_metadata
+            .entry("peer_id".to_string())
+            .or_insert_with(|| Uuid::new_v4().to_string())
+            .clone();
+        let attached =
+            attach_and_rewrite_signaling_url(signaling_url, passphrase, Some(&enriched_metadata))
+                .await?;
+        let signaling_url_owned = attached.signaling_url.clone();
+        let signaling_url = signaling_url_owned.as_str();
+        let peer_session_id = attached.peer_session_id.clone();
+        if let Some(host_session_id) = attached.host_session_id.clone() {
+            enriched_metadata
+                .entry("host_session_id".to_string())
+                .or_insert(host_session_id);
+        }
+        enriched_metadata.insert("peer_session_id".to_string(), peer_session_id.clone());
         let signaling_client = SignalingClient::connect(
             signaling_url,
+            Some(peer_id.clone()),
             WebRtcRole::Offerer,
             passphrase,
             None,
             request_mcp_channel,
-            metadata,
+            Some(enriched_metadata.clone()),
         )
         .await?;
         let client = Client::new();
         let signaling_base = signaling_url.trim_end_matches('/').to_string();
-        let session_id = extract_session_id(signaling_url)?;
+        let session_id = attached.host_session_id.clone().unwrap_or_else(|| {
+            extract_session_id(signaling_url).unwrap_or_else(|_| peer_session_id.clone())
+        });
         let (accepted_tx, accepted_rx) = tokio_mpsc::unbounded_channel();
 
         let inner = Arc::new(OffererInner {
@@ -1857,6 +1883,7 @@ impl OffererSupervisor {
             signaling_client,
             signaling_base,
             session_id: session_id.clone(),
+            peer_session_id: peer_session_id.clone(),
             poll_interval,
             passphrase: passphrase.map(|p| p.to_string()),
             session_key: Arc::new(OnceCell::new()),
@@ -2760,7 +2787,15 @@ async fn negotiate_offerer_peer(
         return Ok(None);
     }
 
-    post_sdp(&inner.client, &signaling_base, "offer", &[], &payload).await?;
+    post_sdp(
+        &inner.client,
+        &signaling_base,
+        "offer",
+        &[],
+        &payload,
+        &inner.peer_session_id,
+    )
+    .await?;
     tracing::info!(
         target = "beach::transport::webrtc",
         role = "offerer",
@@ -2774,6 +2809,7 @@ async fn negotiate_offerer_peer(
         &signaling_base,
         inner.poll_interval,
         &handshake_id,
+        &inner.peer_session_id,
     )
     .await?;
 
@@ -3147,6 +3183,12 @@ async fn negotiate_offerer_peer(
             .entry("secure_verification".to_string())
             .or_insert(result.verification_code.clone());
     }
+    peer_metadata
+        .entry("peer_session_id".to_string())
+        .or_insert(inner.peer_session_id.clone());
+    peer_metadata
+        .entry("host_session_id".to_string())
+        .or_insert(inner.session_id.clone());
 
     let connection_metadata = peer_metadata.clone();
     Ok(Some(OffererAcceptedTransport {
@@ -3172,6 +3214,34 @@ pub async fn connect_via_signaling(
     request_mcp_channel: bool,
     metadata: Option<HashMap<String, String>>,
 ) -> Result<WebRtcConnection, TransportError> {
+    let mut enriched_metadata = metadata.clone().unwrap_or_default();
+    let _peer_id = enriched_metadata
+        .entry("peer_id".to_string())
+        .or_insert_with(|| Uuid::new_v4().to_string())
+        .clone();
+    enriched_metadata
+        .entry("role".to_string())
+        .or_insert_with(|| match role {
+            WebRtcRole::Offerer => "offerer".to_string(),
+            WebRtcRole::Answerer => "answerer".to_string(),
+        });
+    let attached =
+        attach_and_rewrite_signaling_url(signaling_url, passphrase, Some(&enriched_metadata))
+            .await?;
+    let peer_session_id = attached.peer_session_id.clone();
+    let host_session_id = attached
+        .host_session_id
+        .clone()
+        .or_else(|| enriched_metadata.get("host_session_id").cloned())
+        .unwrap_or_else(|| {
+            extract_session_id(signaling_url).unwrap_or_else(|_| peer_session_id.clone())
+        });
+    enriched_metadata
+        .entry("host_session_id".to_string())
+        .or_insert(host_session_id.clone());
+    enriched_metadata.insert("peer_session_id".to_string(), peer_session_id.clone());
+    let signaling_url = attached.signaling_url.as_str();
+    let metadata_for_answer = Some(enriched_metadata.clone());
     match role {
         WebRtcRole::Offerer => {
             let (_supervisor, accepted) = OffererSupervisor::connect(
@@ -3179,13 +3249,22 @@ pub async fn connect_via_signaling(
                 poll_interval,
                 passphrase,
                 request_mcp_channel,
-                metadata,
+                Some(enriched_metadata),
             )
             .await?;
             Ok(accepted.connection)
         }
         WebRtcRole::Answerer => {
-            connect_answerer(signaling_url, poll_interval, passphrase, label, metadata).await
+            connect_answerer(
+                signaling_url,
+                poll_interval,
+                passphrase,
+                label,
+                metadata_for_answer,
+                host_session_id,
+                peer_session_id,
+            )
+            .await
         }
     }
 }
@@ -3209,16 +3288,148 @@ pub async fn warm_session_key(passphrase: Option<&str>, session_id: &str) {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct AttachPeerSessionResponse {
+    peer_session_id: String,
+    host_session_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct AttachedSignaling {
+    signaling_url: String,
+    peer_session_id: String,
+    host_session_id: Option<String>,
+}
+
+async fn attach_and_rewrite_signaling_url(
+    signaling_url: &str,
+    passphrase: Option<&str>,
+    metadata: Option<&HashMap<String, String>>,
+) -> Result<AttachedSignaling, TransportError> {
+    let url = Url::parse(signaling_url).map_err(|err| {
+        TransportError::Setup(format!("invalid signaling url {signaling_url}: {err}"))
+    })?;
+    let segments = url
+        .path_segments()
+        .map(|s| s.collect::<Vec<_>>())
+        .unwrap_or_default();
+    let session_pos = segments.iter().position(|s| *s == "sessions");
+    if segments
+        .first()
+        .is_some_and(|prefix| *prefix == "peer-sessions")
+    {
+        let peer_session_id = segments
+            .get(1)
+            .ok_or_else(|| {
+                TransportError::Setup(format!("unexpected signaling url path: {}", url.path()))
+            })?
+            .to_string();
+        return Ok(AttachedSignaling {
+            signaling_url: signaling_url.to_string(),
+            peer_session_id,
+            host_session_id: metadata.and_then(|m| m.get("host_session_id").cloned()),
+        });
+    }
+
+    let host_session_id = match session_pos.and_then(|idx| segments.get(idx + 1)) {
+        Some(id) => id.to_string(),
+        None => {
+            return Ok(AttachedSignaling {
+                signaling_url: signaling_url.to_string(),
+                peer_session_id: extract_session_id(signaling_url)?,
+                host_session_id: None,
+            });
+        }
+    };
+    let mut attach_url = url.clone();
+    attach_url.set_path("/peer-sessions/attach");
+
+    let mut body = serde_json::json!({
+        "host_session_id": host_session_id,
+    });
+    if let Some(pass) = passphrase {
+        body["passphrase"] = serde_json::json!(pass);
+    }
+    if let Some(meta) = metadata {
+        if let Some(role) = meta.get("role") {
+            body["role"] = serde_json::json!(role);
+        }
+        if let Some(peer_id) = meta.get("peer_id") {
+            body["peer_id"] = serde_json::json!(peer_id);
+        }
+    }
+
+    tracing::debug!(
+        target = "beach::transport::webrtc",
+        phase = "peer_attach",
+        host_session_id = %host_session_id,
+        role = %body
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown"),
+        peer_id = %body
+            .get("peer_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown"),
+        url = %attach_url,
+        "posting peer-sessions attach"
+    );
+    metrics::WEBRTC_SIGNALING_ATTEMPTS
+        .with_label_values(&["attach", host_session_id.as_str()])
+        .inc();
+
+    let client = Client::new();
+    let resp = client
+        .post(attach_url.clone())
+        .json(&body)
+        .send()
+        .await
+        .map_err(http_error)?;
+    tracing::debug!(
+        target = "beach::transport::webrtc",
+        phase = "peer_attach",
+        host_session_id = %host_session_id,
+        status = %resp.status(),
+        url = %attach_url,
+        "peer-sessions attach response"
+    );
+    if !resp.status().is_success() {
+        metrics::WEBRTC_SIGNALING_RESULTS
+            .with_label_values(&["attach", host_session_id.as_str(), "failure"])
+            .inc();
+        return Err(TransportError::Setup(format!(
+            "peer attach failed: {}",
+            resp.status()
+        )));
+    }
+    let attach: AttachPeerSessionResponse = resp
+        .json()
+        .await
+        .map_err(|err| TransportError::Setup(format!("peer attach parse failed: {err}")))?;
+    metrics::WEBRTC_SIGNALING_RESULTS
+        .with_label_values(&["attach", attach.peer_session_id.as_str(), "success"])
+        .inc();
+    let mut rewritten = url.clone();
+    rewritten.set_path(&format!("/peer-sessions/{}/webrtc", attach.peer_session_id));
+    Ok(AttachedSignaling {
+        signaling_url: rewritten.to_string(),
+        peer_session_id: attach.peer_session_id,
+        host_session_id: Some(attach.host_session_id),
+    })
+}
+
 async fn connect_answerer(
     signaling_url: &str,
     poll_interval: Duration,
     passphrase: Option<&str>,
     label: Option<&str>,
     metadata: Option<HashMap<String, String>>,
+    host_session_id: String,
+    peer_session_id: String,
 ) -> Result<WebRtcConnection, TransportError> {
     let started = std::time::Instant::now();
     let passphrase_owned = passphrase.map(|s| s.to_string());
-    let session_id = extract_session_id(signaling_url)?;
+    let session_id = host_session_id;
     let session_key_cell = Arc::new(OnceCell::<Arc<[u8; 32]>>::new());
     prime_session_key(
         &session_key_cell,
@@ -3283,13 +3494,25 @@ async fn connect_answerer(
         url = %signaling_url,
         "connecting signaling client"
     );
+    let mut metadata_owned = metadata.unwrap_or_default();
+    metadata_owned
+        .entry("peer_session_id".to_string())
+        .or_insert(peer_session_id.clone());
+    metadata_owned
+        .entry("host_session_id".to_string())
+        .or_insert(session_id.clone());
+    let peer_id = metadata_owned
+        .get("peer_id")
+        .cloned()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let signaling_client = SignalingClient::connect(
         signaling_url,
+        Some(peer_id.clone()),
         WebRtcRole::Answerer,
         passphrase,
         label.map(|s| s.to_string()),
         false,
-        metadata,
+        Some(metadata_owned.clone()),
     )
     .await?;
     tracing::debug!(
@@ -3322,12 +3545,19 @@ async fn connect_answerer(
             state = "start"
         );
         let peer_param = [("peer_id", assigned_peer_id.as_str())];
-        let fetch_attempt = fetch_sdp(&client, signaling_url, "offer", &peer_param).await;
+        let fetch_attempt = fetch_sdp(
+            &client,
+            signaling_url,
+            "offer",
+            &peer_param,
+            &peer_session_id,
+        )
+        .await;
         tracing::debug!(
-            target = "beach::transport::webrtc",
-            role = "answerer",
-            await = "fetch_sdp.offer",
-            state = "end",
+        target = "beach::transport::webrtc",
+        role = "answerer",
+        await = "fetch_sdp.offer",
+        state = "end",
             result = ?fetch_attempt
         );
         match fetch_attempt? {
@@ -3666,8 +3896,12 @@ async fn connect_answerer(
     let notify_clone = dc_open_notify.clone();
     let slot_clone = transport_slot.clone();
     let client_id = next_transport_id();
-    let peer_id = next_transport_id();
-    tracing::debug!(?client_id, ?peer_id, "answerer allocating transport ids");
+    let peer_transport_id = next_transport_id();
+    tracing::debug!(
+        ?client_id,
+        ?peer_transport_id,
+        "answerer allocating transport ids"
+    );
     install_peer_connection_tracing(
         &pc,
         "answerer",
@@ -4052,7 +4286,7 @@ async fn connect_answerer(
             let transport = Arc::new(WebRtcTransport::new(
                 TransportKind::WebRtc,
                 client_id,
-                peer_id,
+                peer_transport_id,
                 pc.clone(),
                 dc,
                 None,
@@ -4196,7 +4430,15 @@ async fn connect_answerer(
         await = "post_sdp.answer",
         state = "start"
     );
-    let post_result = post_sdp(&client, signaling_url, "answer", &[], &answer_payload).await;
+    let post_result = post_sdp(
+        &client,
+        signaling_url,
+        "answer",
+        &[],
+        &answer_payload,
+        &peer_session_id,
+    )
+    .await;
     tracing::debug!(
         target = "beach::transport::webrtc",
         role = "answerer",
@@ -4380,6 +4622,15 @@ async fn connect_answerer(
     }
     let transport_dyn: Arc<dyn Transport> = transport.clone();
     let mut connection_metadata = signaling_client.remote_metadata().await.unwrap_or_default();
+    connection_metadata
+        .entry("peer_session_id".to_string())
+        .or_insert(peer_session_id.clone());
+    connection_metadata
+        .entry("host_session_id".to_string())
+        .or_insert(session_id.clone());
+    connection_metadata
+        .entry("peer_id".to_string())
+        .or_insert(peer_id);
     validate_manager_peer(&connection_metadata, &session_id).await?;
     if let Some(local_meta) = build_label_metadata(label) {
         for (key, value) in local_meta {
@@ -4395,6 +4646,7 @@ async fn connect_answerer(
         target = "beach::transport::webrtc",
         role = "answerer",
         session_id = %session_id,
+        peer_session_id = %peer_session_id,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "webrtc answerer connected"
     );
@@ -4666,36 +4918,76 @@ async fn post_sdp(
     suffix: &str,
     params: &[(&str, &str)],
     payload: &WebRtcSdpPayload,
+    peer_session_id: &str,
 ) -> Result<(), TransportError> {
     let url = endpoint_with_params(base, suffix, params)?;
     let url_string = url.as_str().to_string();
-    tracing::debug!(
-        target = "beach::transport::webrtc",
-        phase = "post_sdp",
-        suffix,
-        await = "client.send",
-        state = "start",
-        url = %url_string
-    );
-    let send_attempt = client.post(url.clone()).json(payload).send().await;
-    tracing::debug!(
-        target = "beach::transport::webrtc",
-        phase = "post_sdp",
-        suffix,
-        await = "client.send",
-        state = "end",
-        result = ?send_attempt.as_ref().map(reqwest::Response::status),
-        url = %url_string
-    );
-    let response = send_attempt.map_err(http_error)?;
+    for _attempt in 0..40 {
+        let attempt_kind = format!("{suffix}_post");
+        metrics::WEBRTC_SIGNALING_ATTEMPTS
+            .with_label_values(&[attempt_kind.as_str(), peer_session_id])
+            .inc();
+        tracing::debug!(
+            target = "beach::transport::webrtc",
+            phase = "post_sdp",
+            suffix,
+            await = "client.send",
+            state = "start",
+            url = %url_string
+        );
+        let send_attempt = client.post(url.clone()).json(payload).send().await;
+        tracing::debug!(
+            target = "beach::transport::webrtc",
+            phase = "post_sdp",
+            suffix,
+            await = "client.send",
+            state = "end",
+            result = ?send_attempt.as_ref().map(reqwest::Response::status),
+            url = %url_string
+        );
+        let response = send_attempt.map_err(http_error)?;
 
-    if response.status().is_success() {
-        return Ok(());
+        if response.status().is_success() {
+            metrics::WEBRTC_SIGNALING_RESULTS
+                .with_label_values(&[attempt_kind.as_str(), peer_session_id, "success"])
+                .inc();
+            return Ok(());
+        }
+        if response.status() == StatusCode::CONFLICT || response.status() == StatusCode::NOT_FOUND {
+            let status_label = response.status().as_str().to_string();
+            let retry_after = retry_after_delay(&response).unwrap_or(Duration::from_millis(50));
+            tracing::debug!(
+                target = "beach::transport::webrtc",
+                phase = "post_sdp",
+                suffix,
+                status = %response.status(),
+                retry_after_ms = retry_after.as_millis(),
+                url = %url_string,
+                peer_session_id = %peer_session_id,
+                "post_sdp retrying after server status"
+            );
+            metrics::WEBRTC_SIGNALING_RETRIES
+                .with_label_values(&[
+                    attempt_kind.as_str(),
+                    peer_session_id,
+                    status_label.as_str(),
+                ])
+                .inc();
+            tokio::time::sleep(retry_after).await;
+            continue;
+        }
+        metrics::WEBRTC_SIGNALING_RESULTS
+            .with_label_values(&[attempt_kind.as_str(), peer_session_id, "failure"])
+            .inc();
+        return Err(TransportError::Setup(format!(
+            "unexpected signaling status {}",
+            response.status()
+        )));
     }
-    Err(TransportError::Setup(format!(
-        "unexpected signaling status {}",
-        response.status()
-    )))
+    metrics::WEBRTC_SIGNALING_RESULTS
+        .with_label_values(&["post_timeout", peer_session_id, "failure"])
+        .inc();
+    Err(TransportError::Timeout)
 }
 
 async fn poll_answer_for_peer(
@@ -4703,6 +4995,7 @@ async fn poll_answer_for_peer(
     signaling_base: &str,
     poll_interval: Duration,
     handshake_id: &str,
+    peer_session_id: &str,
 ) -> Result<WebRtcSdpPayload, TransportError> {
     loop {
         let attempt = fetch_sdp(
@@ -4710,6 +5003,7 @@ async fn poll_answer_for_peer(
             signaling_base,
             "answer",
             &[("handshake_id", handshake_id)],
+            peer_session_id,
         )
         .await?;
         if let Some(payload) = attempt {
@@ -4724,9 +5018,14 @@ async fn fetch_sdp(
     base: &str,
     suffix: &str,
     params: &[(&str, &str)],
+    peer_session_id: &str,
 ) -> Result<Option<WebRtcSdpPayload>, TransportError> {
     let url = endpoint_with_params(base, suffix, params)?;
     let url_string = url.as_str().to_string();
+    let attempt_kind = format!("{suffix}_get");
+    metrics::WEBRTC_SIGNALING_ATTEMPTS
+        .with_label_values(&[attempt_kind.as_str(), peer_session_id])
+        .inc();
     tracing::debug!(
         target = "beach::transport::webrtc",
         phase = "fetch_sdp",
@@ -4766,16 +5065,64 @@ async fn fetch_sdp(
                 success = payload_attempt.is_ok()
             );
             let payload = payload_attempt.map_err(http_error)?;
+            metrics::WEBRTC_SIGNALING_RESULTS
+                .with_label_values(&[attempt_kind.as_str(), peer_session_id, "success"])
+                .inc();
             Ok(Some(payload))
         }
-        StatusCode::NO_CONTENT | StatusCode::NOT_FOUND => Ok(None),
-        status if status.is_server_error() => Err(TransportError::Setup(format!(
-            "signaling server returned {status}"
-        ))),
-        status => Err(TransportError::Setup(format!(
-            "unexpected signaling status {status}"
-        ))),
+        StatusCode::NO_CONTENT | StatusCode::NOT_FOUND | StatusCode::CONFLICT => {
+            let status_label = response.status().as_str().to_string();
+            let retry_after = retry_after_delay(&response);
+            tracing::trace!(
+                target = "beach::transport::webrtc",
+                phase = "fetch_sdp",
+                suffix,
+                status = %response.status(),
+                retry_after_secs = retry_after.map(|d| d.as_secs()),
+                url = %url_string,
+                peer_session_id = %peer_session_id,
+                "fetch_sdp retryable status"
+            );
+            metrics::WEBRTC_SIGNALING_RETRIES
+                .with_label_values(&[
+                    attempt_kind.as_str(),
+                    peer_session_id,
+                    status_label.as_str(),
+                ])
+                .inc();
+            if response.status() == StatusCode::CONFLICT {
+                if let Some(delay) = retry_after {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+            Ok(None)
+        }
+        status if status.is_server_error() => {
+            metrics::WEBRTC_SIGNALING_RESULTS
+                .with_label_values(&[attempt_kind.as_str(), peer_session_id, "failure"])
+                .inc();
+            Err(TransportError::Setup(format!(
+                "signaling server returned {status}"
+            )))
+        }
+        status => {
+            metrics::WEBRTC_SIGNALING_RESULTS
+                .with_label_values(&[attempt_kind.as_str(), peer_session_id, "failure"])
+                .inc();
+            Err(TransportError::Setup(format!(
+                "unexpected signaling status {status}"
+            )))
+        }
     }
+}
+
+fn retry_after_delay(response: &reqwest::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
 }
 
 fn extract_session_id(signaling_url: &str) -> Result<String, TransportError> {
@@ -4786,13 +5133,19 @@ fn extract_session_id(signaling_url: &str) -> Result<String, TransportError> {
         .path_segments()
         .ok_or_else(|| TransportError::Setup("signaling url missing path segments".into()))?
         .collect::<Vec<_>>();
-    if segments.len() < 2 || segments[0] != "sessions" {
+    if segments.len() < 2 {
         return Err(TransportError::Setup(format!(
             "unexpected signaling url path: {}",
             url.path()
         )));
     }
-    Ok(segments[1].to_string())
+    match segments[0] {
+        "sessions" | "peer-sessions" => Ok(segments[1].to_string()),
+        _ => Err(TransportError::Setup(format!(
+            "unexpected signaling url path: {}",
+            url.path()
+        ))),
+    }
 }
 
 fn truncated_key_hash(bytes: &[u8]) -> String {
@@ -5413,7 +5766,14 @@ fn resolve_ice_candidate(
     }
 }
 
-async fn create_webrtc_pair() -> Result<TransportPair, TransportError> {
+async fn create_webrtc_pair_internal() -> Result<
+    (
+        TransportPair,
+        Arc<RTCPeerConnection>,
+        Arc<RTCPeerConnection>,
+    ),
+    TransportError,
+> {
     // Set up virtual network so tests can run without OS networking access.
     let wan = Arc::new(AsyncMutex::new(
         Router::new(RouterConfig {
@@ -5655,15 +6015,36 @@ async fn create_webrtc_pair() -> Result<TransportPair, TransportError> {
         false,
     );
 
-    Ok(TransportPair {
-        client: Box::new(client_transport),
-        server: Box::new(server_transport),
-    })
+    Ok((
+        TransportPair {
+            client: Box::new(client_transport),
+            server: Box::new(server_transport),
+        },
+        offer_pc,
+        answer_pc,
+    ))
+}
+
+async fn create_webrtc_pair() -> Result<TransportPair, TransportError> {
+    let (pair, _, _) = create_webrtc_pair_internal().await?;
+    Ok(pair)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn create_test_pair() -> Result<TransportPair, TransportError> {
     create_webrtc_pair().await
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn create_test_pair_with_handles() -> Result<
+    (
+        TransportPair,
+        Arc<RTCPeerConnection>,
+        Arc<RTCPeerConnection>,
+    ),
+    TransportError,
+> {
+    create_webrtc_pair_internal().await
 }
 
 #[derive(Debug)]

@@ -24,9 +24,9 @@ use metrics_exporter_prometheus::PrometheusHandle;
 
 use crate::{
     entitlement::{EntitlementError, EntitlementVerifier},
-    session::{hash_passphrase, verify_passphrase},
+    session::{generate_session_id, hash_passphrase, verify_passphrase},
     signaling::WebRtcSdpPayload,
-    storage::{ControlMessage, SessionInfo, Storage},
+    storage::{ControlMessage, PeerSessionInfo, SessionInfo, Storage},
     viewer_token::{ViewerTokenError, ViewerTokenVerifier},
     websocket::SignalingState,
 };
@@ -62,6 +62,107 @@ pub(crate) async fn verify_viewer_token(
             Err(ViewerAuthError::TokenInvalid)
         }
     }
+}
+
+// Peer session attach (host mapping)
+
+#[derive(Debug, Deserialize)]
+pub struct AttachPeerSessionRequest {
+    pub host_session_id: String,
+    #[serde(default)]
+    pub passphrase: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub peer_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AttachPeerSessionResponse {
+    pub peer_session_id: String,
+    pub host_session_id: String,
+}
+
+pub async fn attach_peer_session(
+    State(storage): State<SharedStorage>,
+    Json(body): Json<AttachPeerSessionRequest>,
+) -> Result<Json<AttachPeerSessionResponse>, StatusCode> {
+    let storage = (*storage).clone();
+    tracing::debug!(
+        host_session_id = %body.host_session_id,
+        role = ?body.role,
+        peer_id = ?body.peer_id,
+        "peer-session attach requested"
+    );
+    let host_session = storage
+        .get_session(&body.host_session_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let host_session = match host_session {
+        Some(s) => s,
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+
+    if !host_session.passphrase_hash.is_empty() {
+        let provided = body
+            .passphrase
+            .as_ref()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .ok_or(StatusCode::UNAUTHORIZED)?;
+        if !verify_passphrase(provided, &host_session.passphrase_hash) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    // Reuse any existing peer_session_id for this host to avoid split-offer scenarios
+    // where each peer gets a different session id and sits in 409/404 loops.
+    if let Ok(Some(existing)) = storage
+        .lookup_peer_session_for_host(&host_session.session_id)
+        .await
+    {
+        tracing::debug!(
+            peer_session_id = %existing,
+            host_session_id = %host_session.session_id,
+            role = ?body.role,
+            peer_id = ?body.peer_id,
+            "peer-session attach reused existing mapping"
+        );
+        let _ = storage.update_peer_session_ttl(&existing).await;
+        return Ok(Json(AttachPeerSessionResponse {
+            peer_session_id: existing,
+            host_session_id: host_session.session_id,
+        }));
+    }
+
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let peer_session_id = generate_session_id();
+    let info = PeerSessionInfo {
+        peer_session_id: peer_session_id.clone(),
+        host_session_id: host_session.session_id.clone(),
+        created_at,
+        role: body.role.clone(),
+        peer_id: body.peer_id.clone(),
+    };
+    storage
+        .register_peer_session(info)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    tracing::debug!(
+        peer_session_id = %peer_session_id,
+        host_session_id = %host_session.session_id,
+        role = ?body.role,
+        peer_id = ?body.peer_id,
+        "peer-session attached"
+    );
+    Ok(Json(AttachPeerSessionResponse {
+        peer_session_id,
+        host_session_id: host_session.session_id,
+    }))
 }
 
 #[derive(Clone)]
@@ -670,7 +771,7 @@ pub struct AnswerQuery {
 
 pub async fn post_webrtc_offer(
     State(storage): State<SharedStorage>,
-    Path(session_id): Path<String>,
+    Path(peer_session_id): Path<String>,
     Json(payload): Json<WebRtcSdpPayload>,
 ) -> Result<StatusCode, StatusCode> {
     if payload.handshake_id.trim().is_empty()
@@ -682,23 +783,30 @@ pub async fn post_webrtc_offer(
 
     let storage = (*storage).clone();
     if !storage
-        .session_exists(&session_id)
+        .peer_session_exists(&peer_session_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
-        return Ok(StatusCode::NOT_FOUND);
+        tracing::debug!(
+            session = %peer_session_id,
+            %payload.handshake_id,
+            %payload.from_peer,
+            %payload.to_peer,
+            "peer-session missing while posting webrtc offer"
+        );
+        return Ok(StatusCode::CONFLICT);
     }
 
     storage
-        .push_webrtc_offer(&session_id, &payload)
+        .push_webrtc_offer(&peer_session_id, &payload)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Activity observed: refresh session TTL
-    let _ = storage.update_session_ttl(&session_id).await;
+    let _ = storage.update_peer_session_ttl(&peer_session_id).await;
 
     debug!(
-        session = %session_id,
+        session = %peer_session_id,
         %payload.handshake_id,
         %payload.from_peer,
         %payload.to_peer,
@@ -710,21 +818,21 @@ pub async fn post_webrtc_offer(
 
 pub async fn get_webrtc_offer(
     State(storage): State<SharedStorage>,
-    Path(session_id): Path<String>,
+    Path(peer_session_id): Path<String>,
     Query(params): Query<OfferQuery>,
-    Extension(signaling): Extension<SignalingState>,
+    Extension(_signaling): Extension<SignalingState>,
 ) -> Result<Json<WebRtcSdpPayload>, StatusCode> {
     let storage = (*storage).clone();
     match storage
-        .pop_webrtc_offer_for_peer(&session_id, &params.peer_id)
+        .pop_webrtc_offer_for_peer(&peer_session_id, &params.peer_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
         Some(payload) => {
             // Activity observed: refresh session TTL
-            let _ = storage.update_session_ttl(&session_id).await;
+            let _ = storage.update_peer_session_ttl(&peer_session_id).await;
             info!(
-                session = %session_id,
+                session = %peer_session_id,
                 peer = %params.peer_id,
                 "served webrtc offer"
             );
@@ -732,27 +840,30 @@ pub async fn get_webrtc_offer(
         }
         None => {
             let exists = storage
-                .session_exists(&session_id)
+                .peer_session_exists(&peer_session_id)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             if !exists {
-                return Err(StatusCode::NOT_FOUND);
+                tracing::debug!(
+                    session = %peer_session_id,
+                    peer = %params.peer_id,
+                    "peer-session missing while fetching offer"
+                );
+                return Err(StatusCode::CONFLICT);
             }
             tracing::trace!(
-                session = %session_id,
+                session = %peer_session_id,
                 peer = %params.peer_id,
-                "no webrtc offer available for peer (404)"
+                "no webrtc offer available for peer (retryable)"
             );
-            // Maintain legacy semantics so existing clients keep polling instead of parsing
-            // an empty body from a 204/200 response.
-            Err(StatusCode::NOT_FOUND)
+            Err(StatusCode::CONFLICT)
         }
     }
 }
 
 pub async fn post_webrtc_answer(
     State(storage): State<SharedStorage>,
-    Path(session_id): Path<String>,
+    Path(peer_session_id): Path<String>,
     Json(payload): Json<WebRtcSdpPayload>,
 ) -> Result<StatusCode, StatusCode> {
     if payload.handshake_id.trim().is_empty()
@@ -764,47 +875,47 @@ pub async fn post_webrtc_answer(
 
     let storage = (*storage).clone();
     if !storage
-        .session_exists(&session_id)
+        .peer_session_exists(&peer_session_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
-        return Ok(StatusCode::NOT_FOUND);
+        return Ok(StatusCode::CONFLICT);
     }
 
     storage
-        .store_webrtc_answer(&session_id, &payload)
+        .store_webrtc_answer(&peer_session_id, &payload)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     debug!(
-        session = %session_id,
+        session = %peer_session_id,
         %payload.handshake_id,
         %payload.from_peer,
         %payload.to_peer,
         "stored webrtc answer"
     );
     // Activity observed: refresh session TTL
-    let _ = storage.update_session_ttl(&session_id).await;
+    let _ = storage.update_peer_session_ttl(&peer_session_id).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn get_webrtc_answer(
     State(storage): State<SharedStorage>,
-    Path(session_id): Path<String>,
+    Path(peer_session_id): Path<String>,
     Query(params): Query<AnswerQuery>,
 ) -> Result<Json<WebRtcSdpPayload>, StatusCode> {
     let storage = (*storage).clone();
     match storage
-        .take_webrtc_answer(&session_id, &params.handshake_id)
+        .take_webrtc_answer(&peer_session_id, &params.handshake_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
         Some(payload) => {
             // Activity observed: refresh session TTL
-            let _ = storage.update_session_ttl(&session_id).await;
+            let _ = storage.update_peer_session_ttl(&peer_session_id).await;
             info!(
-                session = %session_id,
+                session = %peer_session_id,
                 handshake_id = %payload.handshake_id,
                 from_peer = %payload.from_peer,
                 to_peer = %payload.to_peer,
@@ -814,19 +925,18 @@ pub async fn get_webrtc_answer(
         }
         None => {
             let exists = storage
-                .session_exists(&session_id)
+                .peer_session_exists(&peer_session_id)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             if !exists {
-                return Err(StatusCode::NOT_FOUND);
+                return Err(StatusCode::CONFLICT);
             }
             warn!(
-                session = %session_id,
+                session = %peer_session_id,
                 handshake_id = %params.handshake_id,
-                "webrtc answer unavailable (404)"
+                "webrtc answer unavailable (retryable)"
             );
-            // Align answer polling semantics with offer polling.
-            Err(StatusCode::NOT_FOUND)
+            Err(StatusCode::CONFLICT)
         }
     }
 }

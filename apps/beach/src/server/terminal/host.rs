@@ -87,6 +87,7 @@ const IDLE_SNAPSHOT_HINT_KEY: &str = "idle_snapshot";
 const IDLE_PUBLISH_TOKEN_HINT_KEY: &str = "idlePublishToken";
 const IDLE_SNAPSHOT_INTERVAL_KEY: &str = "interval_ms";
 const DEFAULT_HEALTH_REPORT_INTERVAL: Duration = Duration::from_secs(15);
+const HTTP_STATE_STREAM_INTERVAL_MS: u64 = 200;
 const ATTACH_WAIT_TRACE_THRESHOLD: Duration = Duration::from_millis(50);
 
 fn trace_attach_wait_completion(session_id: &str, source: &'static str, started: Instant) {
@@ -308,22 +309,6 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
     let (forwarder_updates_tx, forwarder_updates_rx) = mpsc::unbounded_channel();
     let cursor_tracker: Arc<Mutex<Option<CursorState>>> = Arc::new(Mutex::new(None));
     let last_terminal_update = Arc::new(AtomicU64::new(now_millis()));
-    let updates_forward_task = {
-        let mut updates = updates;
-        let cursor_tracker = Arc::clone(&cursor_tracker);
-        let last_terminal_update = Arc::clone(&last_terminal_update);
-        tokio::spawn(async move {
-            while let Some(update) = updates.recv().await {
-                if let CacheUpdate::Cursor(cursor) = &update {
-                    *cursor_tracker.lock().unwrap() = Some(*cursor);
-                }
-                last_terminal_update.store(now_millis(), Ordering::Relaxed);
-                if forwarder_updates_tx.send(update).is_err() {
-                    break;
-                }
-            }
-        })
-    };
 
     let metadata_auto_attach =
         match parse_controller_auto_attach_hint(session_handle.transport_hints()) {
@@ -415,12 +400,40 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         fast_path_state_channel.clone(),
         unified_manager.clone(),
     ));
+    idle_snapshot_controller.rebuild_publisher().await;
     idle_snapshot_controller
         .apply_hint(idle_snapshot_interval)
         .await;
     idle_snapshot_controller
         .apply_health_interval(Some(DEFAULT_HEALTH_REPORT_INTERVAL))
         .await;
+
+    let http_state_streamer = Arc::new(HttpStateStreamer::new(
+        idle_snapshot_controller.clone(),
+        grid.clone(),
+        Arc::clone(&cursor_tracker),
+        Arc::clone(&last_terminal_update),
+        unified_manager.clone(),
+    ));
+
+    let updates_forward_task = {
+        let mut updates = updates;
+        let cursor_tracker = Arc::clone(&cursor_tracker);
+        let last_terminal_update = Arc::clone(&last_terminal_update);
+        let http_state_streamer = http_state_streamer.clone();
+        tokio::spawn(async move {
+            while let Some(update) = updates.recv().await {
+                if let CacheUpdate::Cursor(cursor) = &update {
+                    *cursor_tracker.lock().unwrap() = Some(*cursor);
+                }
+                last_terminal_update.store(now_millis(), Ordering::Relaxed);
+                http_state_streamer.maybe_publish().await;
+                if forwarder_updates_tx.send(update).is_err() {
+                    break;
+                }
+            }
+        })
+    };
 
     let mut mcp_task: Option<JoinHandle<()>> = None;
     let mut mcp_handle: Option<McpServerHandle> = None;
@@ -811,6 +824,7 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                 emulator_handle.clone(),
                 grid.clone(),
                 backfill_tx.clone(),
+                None,
                 None,
                 None,
                 None,
@@ -1399,7 +1413,7 @@ impl ControllerActionContext {
                 match client
                     .update_transport_status(
                         &session_id,
-                        PairingTransportKind::FastPath,
+                        PairingTransportKind::Rtc,
                         None,
                         None,
                     )
@@ -1546,6 +1560,7 @@ fn run_controller_channel(
     session_id: &str,
     client_label: Option<String>,
     client_peer_id: Option<String>,
+    peer_session_id: Option<String>,
     controller_ctx: Arc<ControllerActionContext>,
     runtime: Handle,
 ) -> ControllerChannelOutcome {
@@ -1565,6 +1580,7 @@ fn run_controller_channel(
         info!(
             target = "controller.actions",
             session_id = %session_id,
+            peer_session_id = peer_session_id.as_deref(),
             "waiting for manager attach before accepting controller channel"
         );
         let wait_started = Instant::now();
@@ -1581,8 +1597,14 @@ fn run_controller_channel(
         transport = ?transport_kind,
         client_label = client_label.as_deref(),
         client_peer_id = client_peer_id.as_deref(),
+        peer_session_id = peer_session_id.as_deref(),
         "controller channel ready on primary transport"
     );
+    if let Some(peer_session) = &peer_session_id {
+        metrics::CONTROLLER_PEER_SESSION_EVENTS
+            .with_label_values(&[peer_session.as_str(), "ready"])
+            .inc();
+    }
     let mut channel_closed = false;
     let mut fatal_error = false;
     let mut seen_actions: HashSet<String> = HashSet::new();
@@ -1604,6 +1626,7 @@ fn run_controller_channel(
                         session_id = %session_id,
                         transport_id,
                         kind = %frame.kind,
+                        peer_session_id = peer_session_id.as_deref(),
                         "ignoring non-input controller frame"
                     );
                     continue;
@@ -1622,6 +1645,7 @@ fn run_controller_channel(
                                 session_id = %session_id,
                                 transport_id,
                                 action_id = %input.action_id,
+                                peer_session_id = peer_session_id.as_deref(),
                                 "duplicate controller input detected"
                             );
                             continue;
@@ -1633,6 +1657,7 @@ fn run_controller_channel(
                                 transport_id,
                                 action_id = %input.action_id,
                                 error = %err,
+                                peer_session_id = peer_session_id.as_deref(),
                                 "failed to write controller input to PTY"
                             );
                             fatal_error = true;
@@ -1647,6 +1672,7 @@ fn run_controller_channel(
                             transport_id,
                             action_id = %input.action_id,
                             bytes = input.bytes.len(),
+                            peer_session_id = peer_session_id.as_deref(),
                             "applied controller bytes"
                         );
                         if let Err(err) =
@@ -1722,6 +1748,16 @@ fn run_controller_channel(
         fatal_error,
         "controller channel finished"
     );
+    if let Some(peer_session) = &peer_session_id {
+        metrics::CONTROLLER_PEER_SESSION_EVENTS
+            .with_label_values(&[peer_session.as_str(), "closed"])
+            .inc();
+        if fatal_error {
+            metrics::CONTROLLER_PEER_SESSION_EVENTS
+                .with_label_values(&[peer_session.as_str(), "error"])
+                .inc();
+        }
+    }
     ControllerChannelOutcome {
         channel_closed,
         fatal_error,
@@ -2147,7 +2183,15 @@ fn default_shell_command() -> Option<Vec<String>> {
 }
 
 fn manager_supports_extensions(hints: &HashMap<String, Value>) -> bool {
-    supports_extensions_namespace(hints)
+    if supports_extensions_namespace(hints) {
+        return true;
+    }
+    // Honor fast_path_webrtc presence as an affirmative signal.
+    if hints.get("fast_path_webrtc").is_some() {
+        return true;
+    }
+    // Default to true when hints are absent/unclear to preserve legacy behavior.
+    true
 }
 
 fn supports_extensions_namespace(hints: &HashMap<String, Value>) -> bool {
@@ -2659,11 +2703,16 @@ struct IdleSnapshotController {
     state: Arc<AsyncMutex<IdleSnapshotControllerState>>,
     health: Arc<AsyncMutex<HealthReporterState>>,
     transport_hints: Arc<AsyncRwLock<HashMap<String, Value>>>,
+    publisher: Arc<AsyncMutex<Option<Arc<StatePublisher>>>>,
     _fast_path_channel: Arc<FastPathStateChannel>,
     _unified: UnifiedManagerHandle,
 }
 
 impl IdleSnapshotController {
+    fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     async fn update_base_url(&self, base_url: String) {
         let trimmed = base_url.trim();
         if trimmed.is_empty() {
@@ -2681,6 +2730,7 @@ impl IdleSnapshotController {
             return;
         }
         info!(target = "private_beach", session_id = %self.session_id, base = %trimmed, "idle snapshot controller base_url updated");
+        self.rebuild_publisher().await;
         let current_interval = { self.state.lock().await.interval };
         if current_interval.is_some() {
             self.apply_hint(None).await;
@@ -2714,8 +2764,46 @@ impl IdleSnapshotController {
             state: Arc::new(AsyncMutex::new(IdleSnapshotControllerState::default())),
             health: Arc::new(AsyncMutex::new(HealthReporterState::default())),
             transport_hints,
+            publisher: Arc::new(AsyncMutex::new(None)),
             _fast_path_channel: fast_path_channel,
             _unified: unified,
+        }
+    }
+
+    async fn publisher(&self) -> Option<Arc<StatePublisher>> {
+        if let Some(publisher) = self.publisher.lock().await.as_ref() {
+            return Some(publisher.clone());
+        }
+        self.rebuild_publisher().await
+    }
+
+    async fn rebuild_publisher(&self) -> Option<Arc<StatePublisher>> {
+        let base_url = { self.base_url.lock().await.clone() };
+        let token_opt = { self.token.lock().await.clone() };
+        let mut slot = self.publisher.lock().await;
+        let Some(token) = token_opt else {
+            *slot = None;
+            return None;
+        };
+        match HttpTransport::new(base_url.clone(), StaticTokenProvider::new(token.clone())) {
+            Ok(transport) => {
+                let transport = Arc::new(transport);
+                let hints_snapshot = { self.transport_hints.read().await.clone() };
+                transport.apply_transport_hints(&hints_snapshot).await;
+                let publisher = Arc::new(StatePublisher::new(transport, self.session_id.clone()));
+                *slot = Some(publisher.clone());
+                Some(publisher)
+            }
+            Err(err) => {
+                warn!(
+                    target = "private_beach",
+                    session_id = %self.session_id,
+                    error = %err,
+                    "failed to rebuild http state publisher"
+                );
+                *slot = None;
+                None
+            }
         }
     }
 
@@ -2731,6 +2819,7 @@ impl IdleSnapshotController {
                 "publish token cleared; idle snapshots will rely on beach auth"
             );
         }
+        self.rebuild_publisher().await;
         let active_interval = { self.state.lock().await.interval };
         if active_interval.is_some() {
             self.apply_hint(active_interval).await;
@@ -2893,6 +2982,92 @@ impl IdleSnapshotController {
     }
 }
 
+#[derive(Clone)]
+struct HttpStateStreamer {
+    controller: Arc<IdleSnapshotController>,
+    grid: Arc<TerminalGrid>,
+    cursor_tracker: Arc<Mutex<Option<CursorState>>>,
+    last_terminal_update: Arc<AtomicU64>,
+    last_published: Arc<AtomicU64>,
+    in_flight: Arc<AtomicBool>,
+    min_interval_ms: u64,
+    unified_manager: UnifiedManagerHandle,
+}
+
+impl HttpStateStreamer {
+    fn new(
+        controller: Arc<IdleSnapshotController>,
+        grid: Arc<TerminalGrid>,
+        cursor_tracker: Arc<Mutex<Option<CursorState>>>,
+        last_terminal_update: Arc<AtomicU64>,
+        unified_manager: UnifiedManagerHandle,
+    ) -> Self {
+        Self {
+            controller,
+            grid,
+            cursor_tracker,
+            last_terminal_update,
+            last_published: Arc::new(AtomicU64::new(0)),
+            in_flight: Arc::new(AtomicBool::new(false)),
+            min_interval_ms: HTTP_STATE_STREAM_INTERVAL_MS,
+            unified_manager,
+        }
+    }
+
+    async fn maybe_publish(&self) {
+        if self.unified_manager.bridge().await.is_some() {
+            return;
+        }
+        let last_update = self.last_terminal_update.load(Ordering::Relaxed);
+        let last_sent = self.last_published.load(Ordering::Relaxed);
+        let now = now_millis();
+        if last_update == 0 || last_update <= last_sent {
+            return;
+        }
+        if now.saturating_sub(last_sent) < self.min_interval_ms {
+            return;
+        }
+        if self
+            .in_flight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let Some(publisher) = self.controller.publisher().await else {
+            self.in_flight.store(false, Ordering::SeqCst);
+            return;
+        };
+        let frame = capture_terminal_frame(&self.grid, &self.cursor_tracker);
+        let last_published = self.last_published.clone();
+        let in_flight = self.in_flight.clone();
+        let session_id = self.controller.session_id().to_string();
+        tokio::spawn(async move {
+            let sent_at = now_millis();
+            match publisher.publish(frame).await {
+                Ok(()) => {
+                    last_published.store(sent_at.max(last_update), Ordering::Relaxed);
+                    trace!(
+                        target = "private_beach.state",
+                        session_id = %session_id,
+                        transport = "http_fallback",
+                        "mirrored state to manager via http"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        target = "private_beach.state",
+                        session_id = %session_id,
+                        error = %err,
+                        "http state mirror publish failed"
+                    );
+                }
+            }
+            in_flight.store(false, Ordering::SeqCst);
+        });
+    }
+}
+
 fn build_terminal_payload(frame: &TerminalFrame) -> serde_json::Value {
     let mut payload = serde_json::Map::new();
     payload.insert(
@@ -3014,6 +3189,7 @@ fn spawn_input_listener(
     forwarder_tx: Option<UnboundedSender<ForwarderCommand>>,
     client_label: Option<String>,
     client_peer_id: Option<String>,
+    peer_session_id: Option<String>,
     gate: Option<Arc<HostInputGate>>,
     session_id: String,
     controller_ctx: Option<Arc<ControllerActionContext>>,
@@ -3029,6 +3205,7 @@ fn spawn_input_listener(
             transport = ?transport_kind,
             client_label = client_label.as_deref(),
             client_peer_id = client_peer_id.as_deref(),
+            peer_session_id = peer_session_id.as_deref(),
             "input listener started"
         );
         let mut channel_closed = false;
@@ -3045,6 +3222,7 @@ fn spawn_input_listener(
                         &session_id,
                         client_label.clone(),
                         client_peer_id.clone(),
+                        peer_session_id.clone(),
                         ctx,
                         handle,
                     );
@@ -3611,6 +3789,7 @@ fn spawn_webrtc_acceptor(
 
                     HeartbeatPublisher::new(primary_transport.clone(), Some(supervisor.clone()))
                         .spawn(Duration::from_secs(10), None);
+                    let peer_session_id = metadata.metadata.get("peer_session_id").cloned();
                     let listener = spawn_input_listener(
                         primary_transport.clone(),
                         writer.clone(),
@@ -3621,6 +3800,7 @@ fn spawn_webrtc_acceptor(
                         Some(forwarder_tx.clone()),
                         metadata.label.clone(),
                         metadata.peer_id.clone(),
+                        peer_session_id,
                         authorizer.gate(),
                         session_id.clone(),
                         Some(controller_ctx_clone.clone()),
@@ -3827,6 +4007,7 @@ fn spawn_webrtc_acceptor(
 
                     HeartbeatPublisher::new(primary_transport.clone(), None)
                         .spawn(Duration::from_secs(10), None);
+                    let peer_session_id = metadata.metadata.get("peer_session_id").cloned();
                     let listener = spawn_input_listener(
                         primary_transport.clone(),
                         writer.clone(),
@@ -3837,6 +4018,7 @@ fn spawn_webrtc_acceptor(
                         Some(forwarder_tx.clone()),
                         metadata.label.clone(),
                         metadata.peer_id.clone(),
+                        peer_session_id,
                         authorizer.gate(),
                         session_id.clone(),
                         Some(controller_ctx_clone.clone()),
@@ -4108,6 +4290,7 @@ fn spawn_viewer_accept_loop(
             }
             HeartbeatPublisher::new(shared_arc.clone(), None).spawn(Duration::from_secs(10), None);
 
+            let peer_session_id = auth_metadata.metadata.get("peer_session_id").cloned();
             let listener = spawn_input_listener(
                 shared_arc.clone(),
                 writer.clone(),
@@ -4118,6 +4301,7 @@ fn spawn_viewer_accept_loop(
                 Some(forwarder_tx.clone()),
                 auth_metadata.label.clone(),
                 auth_metadata.peer_id.clone(),
+                peer_session_id,
                 authorizer.gate(),
                 session_id.clone(),
                 Some(controller_ctx.clone()),
@@ -4639,7 +4823,12 @@ mod tests {
         sync_config_to_wire, transmit_initial_snapshots,
     };
     use crate::sync::{ServerSynchronizer, SubscriptionId};
+    use crate::transport::framed::FramedMessage;
     use crate::transport::{Payload, TransportKind, TransportPair};
+    use axum::extract::{Path, State as AxumState};
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::post;
+    use axum::{Json, Router};
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicUsize;
@@ -4648,7 +4837,9 @@ mod tests {
     use std::time::{Duration as StdDuration, Instant};
     use tokio::io::BufReader;
     use tokio::io::{AsyncWriteExt, duplex};
+    use tokio::net::TcpListener;
     use tokio::runtime::Runtime;
+    use tokio::sync::Notify;
     use tokio::time::{Instant as TokioInstant, sleep, timeout};
     use transport_mod::webrtc::ControllerPeerTracker;
     use uuid::Uuid;
@@ -4667,6 +4858,13 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct MockHttpState {
+        diffs: Mutex<Vec<StateDiff>>,
+        auth_headers: Mutex<Vec<Option<String>>>,
+        notify: Notify,
     }
 
     #[test]
@@ -4941,6 +5139,7 @@ mod tests {
                 "sess-fast-path",
                 Some(CONTROLLER_CHANNEL_LABEL.to_string()),
                 Some("peer-1".to_string()),
+                None,
                 host_ctx,
                 handle,
             )
@@ -5005,6 +5204,7 @@ mod tests {
                 "sess-drop",
                 Some(CONTROLLER_CHANNEL_LABEL.to_string()),
                 Some("peer-2".to_string()),
+                None,
                 host_ctx,
                 handle,
             )
@@ -5812,6 +6012,90 @@ mod tests {
 
         drop(update_tx);
         forwarder.await.expect("forwarder join");
+    }
+
+    #[test_timeout::tokio_timeout_test]
+    async fn http_state_streamer_mirrors_state_when_unified_is_absent() {
+        let shared_state = Arc::new(MockHttpState::default());
+        let router = Router::new()
+            .route(
+                "/sessions/:id/state",
+                post(
+                    |AxumState(state): AxumState<Arc<MockHttpState>>,
+                     Path(session_id): Path<String>,
+                     headers: HeaderMap,
+                     Json(diff): Json<StateDiff>| async move {
+                        let auth = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
+                        state.auth_headers.lock().unwrap().push(auth);
+                        state.diffs.lock().unwrap().push(diff);
+                        state.notify.notify_waiters();
+                        assert!(
+                            !session_id.is_empty(),
+                            "session path parameter should not be empty"
+                        );
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(shared_state.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock http listener");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, router).await {
+                panic!("mock http server failed: {err}");
+            }
+        });
+
+        let base_url = format!("http://{}", addr);
+        let session_id = "sess-http-fallback";
+        let grid = Arc::new(TerminalGrid::new(4, 8));
+        let cursor_tracker: Arc<Mutex<Option<CursorState>>> = Arc::new(Mutex::new(None));
+        let last_terminal_update = Arc::new(AtomicU64::new(now_millis()));
+        let transport_hints = Arc::new(AsyncRwLock::new(HashMap::new()));
+        let unified_manager = UnifiedManagerHandle::new(false, false);
+        let controller = Arc::new(IdleSnapshotController::new(
+            base_url,
+            Some("test-token".into()),
+            session_id.to_string(),
+            grid.clone(),
+            cursor_tracker.clone(),
+            last_terminal_update.clone(),
+            transport_hints,
+            Arc::new(FastPathStateChannel::default()),
+            unified_manager.clone(),
+        ));
+        controller.rebuild_publisher().await;
+
+        let streamer = HttpStateStreamer::new(
+            controller.clone(),
+            grid.clone(),
+            cursor_tracker.clone(),
+            last_terminal_update.clone(),
+            unified_manager.clone(),
+        );
+
+        // Mark a fresh terminal update so the streamer sees new content.
+        last_terminal_update.store(now_millis(), Ordering::Relaxed);
+        streamer.maybe_publish().await;
+
+        timeout(StdDuration::from_secs(2), shared_state.notify.notified())
+            .await
+            .expect("state publish notification");
+
+        let diffs = shared_state.diffs.lock().unwrap();
+        assert_eq!(diffs.len(), 1, "expected exactly one state publish");
+        let auth = shared_state.auth_headers.lock().unwrap();
+        assert_eq!(
+            auth.as_slice(),
+            &[Some("Bearer test-token".into())],
+            "authorization header should be forwarded"
+        );
     }
 
     #[test_timeout::tokio_timeout_test]

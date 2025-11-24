@@ -409,6 +409,84 @@ print_codes() {
   run_in_container "set -euo pipefail; cd $REPO_ROOT; LOG_DIR='$LOG_DIR' apps/private-beach/demo/pong/tools/print-session-codes.sh"
 }
 
+sessions_attached_to_manager() {
+  local beach_id="$1"
+  local tmp_dir
+  tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t pong-stack-sessions)
+  local sessions_file="$tmp_dir/sessions.json"
+  local session_list_file="$tmp_dir/session-list.json"
+  local ok=1
+  if ! sessions_json=$(collect_session_bootstrap 2>/dev/null); then
+    ok=1
+  else
+    printf '%s' "$sessions_json" >"$sessions_file"
+    if manager_api_request "GET" "/private-beaches/$beach_id/sessions"; then
+      printf '%s' "$API_RESPONSE" >"$session_list_file"
+      if verify_sessions_attached "$session_list_file" "$sessions_file"; then
+        ok=0
+      fi
+    fi
+  fi
+  rm -rf "$tmp_dir"
+  return "$ok"
+}
+
+layout_missing() {
+  local beach_id=$1
+  if ! manager_api_request "GET" "/private-beaches/$beach_id/layout"; then
+    return 0
+  fi
+  # Treat non-200 or empty payload as missing.
+  if [[ -z "${API_STATUS:-}" || "$API_STATUS" -lt 200 || "$API_STATUS" -ge 300 ]]; then
+    return 0
+  fi
+  if [[ -z "${API_RESPONSE:-}" ]]; then
+    return 0
+  fi
+  if API_RESPONSE="$API_RESPONSE" python3 - <<'PY'
+import json
+import os
+
+raw = os.environ.get("API_RESPONSE", "")
+try:
+    payload = json.loads(raw)
+except Exception:
+    raise SystemExit(1)
+
+required_tiles = {"pong-lhs", "pong-rhs", "pong-agent"}
+tiles = payload.get("tiles") or payload.get("nodes") or {}
+if isinstance(tiles, dict):
+    present_tiles = set(tiles.keys())
+elif isinstance(tiles, list):
+    present_tiles = {entry.get("id") for entry in tiles if isinstance(entry, dict)}
+else:
+    present_tiles = set()
+
+missing = required_tiles - {t for t in present_tiles if t}
+if missing:
+    raise SystemExit(1)
+
+# Require at least two relationships/edges so we do not treat a bare layout as valid.
+relationships = payload.get("relationships") or payload.get("edges")
+if relationships is None:
+    relationships = (
+        payload.get("metadata", {}).get("agentRelationships", {}).values()
+    )
+if not isinstance(relationships, (list, tuple, set)) and not hasattr(relationships, "__iter__"):
+    raise SystemExit(1)
+if len(list(relationships)) < 2:
+    raise SystemExit(1)
+
+raise SystemExit(0)
+PY
+  then
+    # Layout is present and contains the expected nodes + relationships.
+    return 1
+  fi
+  # Missing or incomplete layout.
+  return 0
+}
+
 stop_stack() {
   run_in_container "pkill -f '[p]ong/player/main.py --mode lhs' 2>/dev/null || true; pkill -f '[p]ong/player/main.py --mode rhs' 2>/dev/null || true; pkill -f '[p]ong_showcase' 2>/dev/null || true; pkill -f '[r]un-agent.sh' 2>/dev/null || true; rm -f '$LOG_DIR'/player-*.pid '$LOG_DIR'/agent.pid"
   echo "terminated pong demo processes in $SERVICE"
@@ -1096,7 +1174,19 @@ case "$COMMAND" in
         echo "waiting $CODES_WAIT seconds for sessions to register..."
         sleep "$CODES_WAIT"
         print_codes
+        needs_setup=false
+        if layout_missing "$beach_id"; then
+          needs_setup=true
+          echo "[pong-stack] detected missing or incomplete layout for $beach_id; auto-installing showcase graph..." >&2
+        fi
+        if ! sessions_attached_to_manager "$beach_id"; then
+          needs_setup=true
+          echo "[pong-stack] detected missing session attachments for $beach_id; auto-installing showcase graph..." >&2
+        fi
         if [[ "$SETUP_BEACH" == true ]]; then
+          needs_setup=true
+        fi
+        if [[ "$needs_setup" == true ]]; then
           setup_private_beach "$beach_id"
         fi
         ;;

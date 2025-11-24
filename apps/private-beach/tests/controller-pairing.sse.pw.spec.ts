@@ -37,7 +37,7 @@ test('applyControllerPairingEvent merges SSE pairing updates', () => {
       child_session_id: 'child-1',
       update_cadence: 'fast',
       prompt_template: 'Assist beachgoer',
-      transport_status: { transport: 'fast_path', latency_ms: 25 },
+      transport_status: { transport: 'webrtc', latency_ms: 25 },
       created_at_ms: 1000,
       updated_at_ms: 1500,
     },
@@ -45,7 +45,7 @@ test('applyControllerPairingEvent merges SSE pairing updates', () => {
   expect(updated).toHaveLength(1);
   expect(updated[0]).toMatchObject({
     update_cadence: 'fast',
-    transport_status: { transport: 'fast_path', latency_ms: 25 },
+    transport_status: { transport: 'webrtc', latency_ms: 25 },
   });
 
   const removed = applyControllerPairingEvent(updated, {

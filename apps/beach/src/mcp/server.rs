@@ -697,7 +697,7 @@ impl McpService {
             .map_err(McpError::internal)?;
         Ok(serde_json::json!({
             "status": "queued",
-            "transport": if outcome.via_fast_path { "fast_path" } else { "http" },
+            "transport": if outcome.via_fast_path { "webrtc" } else { "http" },
             "queued": outcome.queued,
         }))
     }

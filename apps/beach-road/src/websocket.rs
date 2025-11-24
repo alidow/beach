@@ -357,7 +357,7 @@ async fn handle_socket(
                             "Successfully parsed ClientMessage from Text frame: {:?}",
                             client_msg
                         );
-                        if let Err(e) = handle_client_message(
+                        if let Err(e) = handle_client_message_with_peer_sessions(
                             client_msg,
                             &peer_id,
                             &session_id,
@@ -795,4 +795,21 @@ async fn handle_client_message(
     }
 
     Ok(())
+}
+
+async fn handle_client_message_with_peer_sessions(
+    message: ClientMessage,
+    peer_id: &str,
+    session_id: &str,
+    state: &SignalingState,
+    tx: &mpsc::UnboundedSender<ServerMessage>,
+    remote_addr: Option<SocketAddr>,
+) -> Result<()> {
+    if let Ok(None) = state.storage.get_session(session_id).await {
+        if let Ok(Some(peer)) = state.storage.get_peer_session(session_id).await {
+            let host_id = peer.host_session_id.clone();
+            return handle_client_message(message, peer_id, &host_id, state, tx, remote_addr).await;
+        }
+    }
+    handle_client_message(message, peer_id, session_id, state, tx, remote_addr).await
 }

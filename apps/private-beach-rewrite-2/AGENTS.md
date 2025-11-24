@@ -9,6 +9,9 @@ Context
 - This app renders a React Flow–based canvas with draggable tiles (applications/agents).
 - We’ve hardened drag behavior to avoid flicker/disappearing nodes. Please keep the invariants below.
 
+Beach creation intent
+- Creating a private beach must yield an empty canvas. No auto-applied templates/layouts (including Pong); any bootstrap is explicit opt-in (e.g., via a setup script or “load template” action).
+
 Private Beach controller / agent integration
 - Public sessions (e.g., CLI `beach host … host` players) never need to know about Private Beach credentials. They only point at:
   - `--session-server http://localhost:4132/` (Beach Road)

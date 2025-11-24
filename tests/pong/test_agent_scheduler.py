@@ -55,7 +55,7 @@ class CommandSchedulerTests(unittest.TestCase):
         session.last_update = now
         session.lease_active = lease
         session.transport_ready = transport
-        session.transport_status = "fast_path" if transport else "pending"
+        session.transport_status = "webrtc" if transport else "pending"
 
     def test_waits_until_both_players_ready(self) -> None:
         now = 10.0
@@ -107,10 +107,10 @@ class CommandSchedulerTests(unittest.TestCase):
         self.assertIn("transport", summary_logs)
 
     def test_normalizes_transport_status_variants(self) -> None:
-        self.assertEqual(normalize_transport_status("FastPath"), "fast_path")
+        self.assertEqual(normalize_transport_status("FastPath"), "webrtc")
         self.assertEqual(normalize_transport_status("httpfallback"), "http_fallback")
         self.assertEqual(normalize_transport_status("HTTP"), "http_poller")
-        self.assertEqual(normalize_transport_status("pb-controller"), "fast_path")
+        self.assertEqual(normalize_transport_status("pb-controller"), "webrtc")
         self.assertEqual(normalize_transport_status(None), "pending")
         self.assertEqual(self.scheduler.state, RunState.WAITING)
 

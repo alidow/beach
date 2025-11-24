@@ -33,8 +33,8 @@ function transportLabel(status: PairingTransportStatus | null | undefined): Tran
   const latency = Number.isFinite(status.latency_ms) ? Math.round(status.latency_ms ?? 0) : null;
   const latencySuffix = latency !== null ? ` · ${latency} ms` : '';
   switch (status.transport) {
-    case 'fast_path':
-      return { label: `Fast-path${latencySuffix}`, variant: 'success' };
+    case 'webrtc':
+      return { label: `WebRTC${latencySuffix}`, variant: 'success' };
     case 'http_fallback':
       return { label: `HTTP fallback${latencySuffix}`, variant: 'warning' };
     case 'pending':

@@ -13,8 +13,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::state::{
-    AppState, AttachHandshakeDisposition, ControllerCommandDropReason, ControllerPairing,
-    ControllerUpdateCadence, SessionSummary, StateError, ViewerTokenError,
+    AppState, AttachHandshakeDisposition, ControllerPairing, ControllerUpdateCadence,
+    SessionSummary, StateError, ViewerTokenError,
 };
 
 use super::{sessions::ensure_scope, ApiError, ApiResult, AuthToken};
@@ -1096,26 +1096,26 @@ impl ShowcasePreflightCheck for PairingHealthCheck {
     }
 }
 
-struct FastPathWarningCheck;
+struct TransportWarningCheck;
 
 #[async_trait]
-impl ShowcasePreflightCheck for FastPathWarningCheck {
+impl ShowcasePreflightCheck for TransportWarningCheck {
     async fn run(
         &self,
         ctx: &mut ShowcasePreflightContext<'_>,
     ) -> Result<Vec<ShowcasePreflightIssue>, StateError> {
         let mut issues = Vec::new();
         if let Some(agent) = ctx.tile_for_role("agent") {
-            if !ctx.state().is_fast_path_ready(&agent.session_id).await {
+            if !ctx.state().is_rtc_ready(&agent.session_id).await {
                 issues.push(ShowcasePreflightIssue {
-                    code: "fast_path_pending".into(),
+                    code: "webrtc_transport_pending".into(),
                     severity: "warning".into(),
                     detail: format!(
-                        "controller session {} has not connected via fast-path yet",
+                        "controller session {} has not connected via WebRTC yet",
                         agent.session_id
                     ),
                     remediation: Some(
-                        "wait for the agent harness to complete fast-path upgrade or restart it"
+                        "wait for the agent harness to finish establishing WebRTC or restart it"
                             .into(),
                     ),
                 });
@@ -1155,7 +1155,7 @@ pub async fn showcase_preflight(
     checks.push(Box::new(PairingHealthCheck {
         requirements: SHOWCASE_TILE_REQUIREMENTS,
     }));
-    checks.push(Box::new(FastPathWarningCheck));
+    checks.push(Box::new(TransportWarningCheck));
 
     let mut issues = Vec::new();
     for check in checks {

@@ -193,6 +193,7 @@ struct PeerChannelEntry {
 impl SignalingClient {
     pub async fn connect(
         signaling_url: &str,
+        peer_id: Option<String>,
         role: WebRtcRole,
         passphrase: Option<&str>,
         label: Option<String>,
@@ -214,9 +215,10 @@ impl SignalingClient {
         let (signal_tx, signal_rx) = mpsc::unbounded_channel::<WebRTCSignal>();
         let (remote_events_tx, remote_events_rx) = mpsc::unbounded_channel::<RemotePeerEvent>();
         let passphrase_owned = passphrase.map(|s| s.to_string());
+        let assigned_peer_id = peer_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
         let client = Arc::new(SignalingClient {
-            peer_id: Uuid::new_v4().to_string(),
+            peer_id: assigned_peer_id,
             expected_remote_role: expected_remote_role(role),
             send_tx,
             signal_rx: AsyncMutex::new(signal_rx),
@@ -850,13 +852,16 @@ fn derive_websocket_url(signaling_url: &str) -> Result<Url, TransportError> {
         .path_segments()
         .ok_or_else(|| TransportError::Setup("signaling url missing path segments".into()))?
         .collect::<Vec<_>>();
-    if segments.len() < 3 || segments[0] != "sessions" {
+    let session_id = if segments.len() >= 3 && segments[0] == "sessions" {
+        segments[1]
+    } else if segments.len() >= 3 && segments[0] == "peer-sessions" {
+        segments[1]
+    } else {
         return Err(TransportError::Setup(format!(
             "unexpected signaling url path: {}",
             base.path()
         )));
-    }
-    let session_id = segments[1];
+    };
 
     let mut ws = base.clone();
     ws.set_scheme(if base.scheme() == "https" {

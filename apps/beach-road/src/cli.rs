@@ -99,6 +99,7 @@ pub async fn run_debug_client(url: String, session: String, command: DebugComman
         preferred_transport: Some(TransportType::Direct),
         label: None,
         mcp: false,
+        metadata: None,
     };
 
     let join_text = serde_json::to_string(&join_msg)?;

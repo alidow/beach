@@ -7,7 +7,10 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:components": "vitest run src/components",
+    "test:features": "vitest run src/features",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@clerk/nextjs": "^6.33.7",
@@ -31,6 +34,8 @@
     "toml": "^3.0.0"
   },
   "devDependencies": {
+    "@clerk/testing": "^1.13.18",
+    "@playwright/test": "^1.55.1",
     "@rollup/rollup-darwin-arm64": "^4.53.2",
     "@testing-library/jest-dom": "^6.4.2",
     "@testing-library/react": "^14.3.1",

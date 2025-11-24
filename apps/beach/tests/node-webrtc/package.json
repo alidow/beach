@@ -1,0 +1,12 @@
+{
+  "name": "@beach/node-webrtc-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --experimental-vm-modules run.js"
+  },
+  "dependencies": {
+    "crc-32": "^1.2.2",
+    "werift": "^0.15.11"
+  }
+}

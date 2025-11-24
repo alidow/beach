@@ -15,6 +15,12 @@ export default defineConfig({
       ...(isCI ? [] : e2ePatterns),
     ],
     css: false,
+    poolOptions: {
+      threads: {
+        minThreads: 1,
+        maxThreads: 2,
+      },
+    },
   },
   resolve: {
     alias: {

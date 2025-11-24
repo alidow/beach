@@ -64,6 +64,7 @@ import {
 import { recordTraceLog, useTraceLogs, clearTraceLogs } from '@/features/trace/traceLogStore';
 import { buildManagerUrl, buildRoadUrl, useManagerToken } from '@/hooks/useManagerToken';
 import { useCanvasEvents } from './CanvasEventsContext';
+import { computeReactFlowProps } from './flowCanvasProps';
 import { snapPointToGrid } from './positioning';
 import { AssignmentEdge, type AssignmentEdgeConnectionState, type AssignmentEdgeData } from './AssignmentEdge';
 import { TraceMonitorPanel } from './TraceMonitorPanel';
@@ -1657,7 +1658,7 @@ function FlowCanvasInner({
   }, [relationshipSyncHistory, state.relationships, state.tiles, traceLogs, traceOverlay]);
 
   const isDragging = dragCount > 0;
-  const zoomOnScrollEnabled = !interactiveId;
+  const flowProps = computeReactFlowProps(Boolean(interactiveId));
 
   // Canvas wrapper uses theme background tokens (light: soft neutral, dark: deep neutral).
   // Keep backdrop blur off during drag to avoid overdraw.
@@ -1684,21 +1685,22 @@ function FlowCanvasInner({
           connectionRadius={36}
           // Always allow node dragging; we restrict the drag start area via
           // `nodeDragHandle` so interactive content does not interfere.
-          nodesDraggable
+          nodeDragHandle={flowProps.nodeDragHandle}
+          nodesDraggable={flowProps.nodesDraggable}
           nodesConnectable
           elementsSelectable={false}
           // Keep nodes rendered during drag to avoid viewport-culling flicker
-          onlyRenderVisibleElements={false}
-          selectNodesOnDrag={false}
+          onlyRenderVisibleElements={flowProps.onlyRenderVisibleElements}
+          selectNodesOnDrag={flowProps.selectNodesOnDrag}
           panOnScroll={false}
           // Allow panning with left-drag on the pane (not on nodes)
           panOnDrag
           // Enable wheel-driven zoom unless a tile is in interactive mode so scrolling stays scoped to that tile.
-          zoomOnScroll={zoomOnScrollEnabled}
+          zoomOnScroll={flowProps.zoomOnScroll}
           zoomOnPinch
           zoomOnDoubleClick={false}
           fitView={false}
-          elevateNodesOnSelect={false}
+          elevateNodesOnSelect={flowProps.elevateNodesOnSelect}
           proOptions={{ hideAttribution: true }}
           className="h-full w-full"
           minZoom={0.2}

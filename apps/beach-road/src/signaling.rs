@@ -108,6 +108,8 @@ pub enum ClientMessage {
         label: Option<String>,
         #[serde(default)]
         mcp: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<HashMap<String, String>>,
     },
     /// Negotiate transport to use with a peer
     NegotiateTransport {

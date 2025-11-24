@@ -1115,6 +1115,7 @@ pub struct HttpTransport<P: TokenProvider> {
     base_url: Url,
     token_provider: P,
     fast_path: Arc<Mutex<FastPathState>>,
+    id: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1137,11 +1138,14 @@ impl<P: TokenProvider> HttpTransport<P> {
         if !base.path().ends_with('/') {
             base.set_path(&format!("{}/", base.path()));
         }
+        static HTTP_TRANSPORT_IDS: AtomicU64 = AtomicU64::new(1);
+        let id = HTTP_TRANSPORT_IDS.fetch_add(1, Ordering::SeqCst);
         Ok(Self {
             client: reqwest::Client::new(),
             base_url: base,
             token_provider,
             fast_path: Arc::new(Mutex::new(FastPathState::default())),
+            id,
         })
     }
 
@@ -1154,6 +1158,7 @@ impl<P: TokenProvider> HttpTransport<P> {
             Ok(Some(endpoints)) => {
                 info!(
                     target = "fast_path",
+                    http_id = self.id,
                     status = ?endpoints.status,
                     offer = %endpoints.offer_url,
                     ice = %endpoints.ice_url,
@@ -1210,9 +1215,18 @@ impl<P: TokenProvider> HttpTransport<P> {
             let mut state = self.fast_path.lock().await;
             state.connection = Some(connection.clone());
             state.actions_rx = Some(receiver);
-            state.client = Some(client);
+            state.client = Some(client.clone());
         }
-        info!(target = "fast_path", "fast-path connection established");
+        info!(
+            target = "fast_path",
+            http_id = self.id,
+            offer_url = %client.endpoints.offer_url,
+            ice_url = %client.endpoints.ice_url,
+            actions_channel = %client.endpoints.channels.actions,
+            acks_channel = %client.endpoints.channels.acks,
+            state_channel = %client.endpoints.channels.state,
+            "fast-path connection established and stored"
+        );
         Ok(connection)
     }
 
@@ -1280,7 +1294,14 @@ impl<P: TokenProvider> HttpTransport<P> {
     async fn take_actions_receiver(&self) -> Option<broadcast::Receiver<ActionCommand>> {
         let mut state = self.fast_path.lock().await;
         if state.connection.is_some() {
-            state.actions_rx.take()
+            let rx = state.actions_rx.take();
+            if rx.is_none() {
+                info!(
+                    target = "fast_path",
+                    "fast-path connection active but actions_rx missing"
+                );
+            }
+            rx
         } else {
             None
         }
@@ -1290,6 +1311,11 @@ impl<P: TokenProvider> HttpTransport<P> {
         let mut state = self.fast_path.lock().await;
         if state.connection.is_some() {
             state.actions_rx = Some(rx);
+        } else {
+            info!(
+                target = "fast_path",
+                "attempted to store fast-path receiver but connection missing"
+            );
         }
     }
 
@@ -1371,8 +1397,21 @@ impl<P: TokenProvider> ManagerTransport for HttpTransport<P> {
     }
 
     async fn receive_actions(&self, session_id: &str) -> HarnessResult<Vec<ActionCommand>> {
-        if self.ensure_fast_path_connection().await.is_some() {
+        let has_fast_path = self.ensure_fast_path_connection().await.is_some();
+        if has_fast_path {
+            debug!(
+                target: "fast_path",
+                session_id = %session_id,
+                http_id = self.id,
+                "attempting to receive actions via fast-path broadcast"
+            );
             if let Some(mut rx) = self.take_actions_receiver().await {
+                debug!(
+                    target: "fast_path",
+                    session_id = %session_id,
+                    http_id = self.id,
+                    "fast-path receiver acquired"
+                );
                 let mut commands = Vec::new();
                 let mut keep_receiver = true;
 
@@ -1433,18 +1472,35 @@ impl<P: TokenProvider> ManagerTransport for HttpTransport<P> {
                     tracing::info!(
                         target: "fast_path",
                         session_id = %session_id,
+                        http_id = self.id,
                         count = commands.len(),
                         "fast-path actions received from mgr-actions"
                     );
                     return Ok(commands);
                 } else {
-                    tracing::trace!(
+                    tracing::info!(
                         target: "fast_path",
                         session_id = %session_id,
-                        "no fast-path actions available from mgr-actions; falling back to HTTP poll"
+                        fast_path_connected = true,
+                        http_id = self.id,
+                        "fast-path receive returned no actions; falling back to HTTP poll"
                     );
                 }
+            } else {
+                tracing::info!(
+                    target: "fast_path",
+                    session_id = %session_id,
+                    fast_path_connected = true,
+                    http_id = self.id,
+                    "fast-path connection up but actions receiver missing; falling back to HTTP poll"
+                );
             }
+        } else {
+            tracing::debug!(
+                target: "fast_path",
+                session_id = %session_id,
+                "fast-path connection unavailable; using HTTP poll"
+            );
         }
 
         let url = self.url(&format!("sessions/{session_id}/actions/poll"))?;

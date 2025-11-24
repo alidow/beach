@@ -41,26 +41,27 @@ use crate::terminal::config::cursor_sync_enabled;
 use crate::terminal::error::CliError;
 use crate::transport as transport_mod;
 use crate::transport::extensions;
+use crate::transport::framed;
 use crate::transport::terminal::negotiation::{
     HeartbeatPublisher, NegotiatedSingle, NegotiatedTransport, SharedTransport,
     TransportSupervisor, negotiate_transport,
 };
 use crate::transport::unified_bridge::UnifiedBuggyTransport;
-use crate::transport::{Payload, Transport, TransportError, TransportId, TransportKind};
+use crate::transport::{Payload, Transport, TransportError, TransportKind};
 use beach_buggy::{
     AckStatus as CtrlAckStatus, ActionAck as CtrlActionAck, ActionCommand as CtrlActionCommand,
     CellStylePayload, CursorPosition, HealthHeartbeat, HttpTransport, ManagerTransport,
     PairingTransportKind, StateDiff, StaticTokenProvider, StyleDefinition, StyledCell,
-    TerminalFrame, TransportMode,
+    TerminalFrame,
 };
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::io::{self, IsTerminal, Read, Write};
 use std::process;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -87,8 +88,6 @@ const IDLE_PUBLISH_TOKEN_HINT_KEY: &str = "idlePublishToken";
 const IDLE_SNAPSHOT_INTERVAL_KEY: &str = "interval_ms";
 const DEFAULT_HEALTH_REPORT_INTERVAL: Duration = Duration::from_secs(15);
 const ATTACH_WAIT_TRACE_THRESHOLD: Duration = Duration::from_millis(50);
-const FAST_PATH_PAUSE_RECHECK_MS: u64 = 200;
-const STATE_CHANNEL_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn trace_attach_wait_completion(session_id: &str, source: &'static str, started: Instant) {
     let elapsed = started.elapsed();
@@ -257,11 +256,11 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
 
     let session_handle = hosted.handle().clone();
     let transport_hints = Arc::new(AsyncRwLock::new(session_handle.transport_hints().clone()));
-    let fast_path_state_channel = Arc::new(FastPathStateChannel::new());
+    let fast_path_state_channel = Arc::new(FastPathStateChannel::default());
     let idle_snapshot_interval = parse_idle_snapshot_hint(session_handle.transport_hints());
     let unified_manager = UnifiedManagerHandle::new(
         manager_supports_extensions(session_handle.transport_hints()),
-        manager_has_legacy_fast_path(session_handle.transport_hints()),
+        false,
     );
     let hint_keys: Vec<String> = session_handle.transport_hints().keys().cloned().collect();
     info!(
@@ -491,6 +490,8 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
         let controller_ctx_for_actions = controller_ctx.clone();
         let attach_state_for_actions = attach_state.clone();
         let idle_snapshots_for_actions = idle_snapshot_controller.clone();
+        let transport_hints_for_actions = transport_hints.clone();
+        let fast_path_bearer_for_actions = controller_manager_token.clone();
         tokio::spawn(async move {
             let http = match Client::builder().build() {
                 Ok(c) => c,
@@ -545,6 +546,17 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                                         "manager handshake control message received"
                                     );
                                     if let Some(payload) = item.get("payload") {
+                                        // Extract any per-session publish token up front so it
+                                        // can be reused for both idle snapshots and auto-attach.
+                                        let mut publish_token_for_session: Option<String> = None;
+                                        if let Some(token_hint) =
+                                            payload.get(IDLE_PUBLISH_TOKEN_HINT_KEY)
+                                        {
+                                            if let Some(tok) = parse_publish_token_value(token_hint)
+                                            {
+                                                publish_token_for_session = Some(tok);
+                                            }
+                                        }
                                         let manager_url = payload
                                             .get("manager_url")
                                             .and_then(|v| v.as_str())
@@ -559,38 +571,6 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                                             idle_snapshots_for_actions
                                                 .update_base_url(manager_url.clone())
                                                 .await;
-                                        }
-                                        if !consumer_started
-                                            && !manager_url.is_empty()
-                                            && !controller_token.is_empty()
-                                        {
-                                            info!(
-                                                target = "controller.handshake",
-                                                session_id = %poll_session_id,
-                                                manager = %manager_url,
-                                                "manager handshake received; starting action consumer"
-                                            );
-                                            let auth = ManagerActionAuth::ControllerToken(
-                                                controller_token.clone(),
-                                            );
-                                            consumer_handle = spawn_action_consumer(
-                                                controller_ctx_for_actions.clone(),
-                                                manager_url.clone(),
-                                                auth,
-                                                writer_for_actions.clone(),
-                                            );
-                                            consumer_started = true;
-                                        }
-                                        // Extract any per-session publish token up front so it
-                                        // can be reused for both idle snapshots and auto-attach.
-                                        let mut publish_token_for_session: Option<String> = None;
-                                        if let Some(token_hint) =
-                                            payload.get(IDLE_PUBLISH_TOKEN_HINT_KEY)
-                                        {
-                                            if let Some(tok) = parse_publish_token_value(token_hint)
-                                            {
-                                                publish_token_for_session = Some(tok);
-                                            }
                                         }
                                         if let Some(idle_hint) = payload.get(IDLE_SNAPSHOT_HINT_KEY)
                                         {
@@ -612,6 +592,31 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                                             idle_snapshots_for_actions
                                                 .set_token(Some(tok.clone()))
                                                 .await;
+                                        }
+                                        if !consumer_started
+                                            && !manager_url.is_empty()
+                                            && !controller_token.is_empty()
+                                        {
+                                            info!(
+                                                target = "controller.handshake",
+                                                session_id = %poll_session_id,
+                                                manager = %manager_url,
+                                                "manager handshake received; starting action consumer"
+                                            );
+                                            let auth = ManagerActionAuth::ControllerToken(
+                                                controller_token.clone(),
+                                            );
+                                            consumer_handle = spawn_action_consumer(
+                                                controller_ctx_for_actions.clone(),
+                                                manager_url.clone(),
+                                                auth,
+                                                writer_for_actions.clone(),
+                                                transport_hints_for_actions.clone(),
+                                                publish_token_for_session
+                                                    .clone()
+                                                    .or(fast_path_bearer_for_actions.clone()),
+                                            );
+                                            consumer_started = true;
                                         }
                                         if let Some(fast_path_hint) =
                                             payload.get("fast_path_webrtc").cloned()
@@ -756,11 +761,13 @@ pub async fn run(base_url: &str, args: HostArgs) -> Result<(), CliError> {
                 manager_url.clone(),
                 auth,
                 writer.clone(),
+                transport_hints.clone(),
+                Some(bearer.clone()),
             ) {
                 info!(
-                    target = "controller.actions",
-                    session_id = %session_id,
-                    manager = %manager_url,
+                            target = "controller.actions",
+                            session_id = %session_id,
+                            manager = %manager_url,
                     "controller action consumer started"
                 );
             } else {
@@ -994,19 +1001,6 @@ enum ManagerActionAuth {
     ControllerToken(String),
 }
 
-#[derive(Debug)]
-struct PendingStatus {
-    pending: usize,
-    fast_path_ready: bool,
-    transport: Option<TransportMode>,
-}
-
-impl PendingStatus {
-    fn prefers_fast_path(&self) -> bool {
-        matches!(self.transport, Some(TransportMode::FastPath)) && self.fast_path_ready
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct ControllerLeaseGrant {
     controller_token: String,
@@ -1114,30 +1108,6 @@ impl ManagerActionClient {
             );
         }
         Ok(actions)
-    }
-
-    async fn pending_actions_status(
-        &self,
-        session_id: &str,
-    ) -> Result<PendingStatus, ManagerActionError> {
-        #[derive(serde::Deserialize)]
-        struct PendingResponse {
-            pending: usize,
-            #[serde(default)]
-            fast_path_ready: bool,
-            #[serde(default)]
-            transport: Option<TransportMode>,
-        }
-        let url = format!("{}/sessions/{session_id}/actions/pending", self.base_url);
-        let resp = self.send(self.apply_auth(self.http.get(url))).await?;
-        resp.json::<PendingResponse>()
-            .await
-            .map(|body| PendingStatus {
-                pending: body.pending,
-                fast_path_ready: body.fast_path_ready,
-                transport: body.transport,
-            })
-            .map_err(|err| ManagerActionError::Decode(err.to_string()))
     }
 
     async fn ack_actions(
@@ -1267,51 +1237,26 @@ impl Default for ControllerTransportState {
 
 struct ControllerTransportSwitch {
     tx: watch::Sender<ControllerTransportState>,
-    active_fast_paths: AtomicUsize,
 }
 
 impl ControllerTransportSwitch {
     fn new() -> Self {
         let (tx, _) = watch::channel(ControllerTransportState::HttpOnly);
-        Self {
-            tx,
-            active_fast_paths: AtomicUsize::new(0),
-        }
+        Self { tx }
     }
 
+    #[allow(dead_code)]
     fn subscribe(&self) -> watch::Receiver<ControllerTransportState> {
         self.tx.subscribe()
     }
 
     fn fast_path_online(&self) -> bool {
-        let previous = self.active_fast_paths.fetch_add(1, Ordering::SeqCst);
-        if previous == 0 {
-            let _ = self.tx.send(ControllerTransportState::FastPathPreferred);
-            true
-        } else {
-            false
-        }
+        let _ = self.tx.send(ControllerTransportState::FastPathPreferred);
+        false
     }
 
     fn fast_path_offline(&self) -> bool {
-        let mut current = self.active_fast_paths.load(Ordering::SeqCst);
-        while current > 0 {
-            match self.active_fast_paths.compare_exchange(
-                current,
-                current - 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => {
-                    if current == 1 {
-                        let _ = self.tx.send(ControllerTransportState::HttpOnly);
-                        return true;
-                    }
-                    return false;
-                }
-                Err(actual) => current = actual,
-            }
-        }
+        let _ = self.tx.send(ControllerTransportState::HttpOnly);
         false
     }
 
@@ -1327,7 +1272,6 @@ struct ControllerAttachState {
     notify: Arc<Notify>,
     blocking_flag: Arc<Mutex<bool>>,
     blocking_cv: Arc<Condvar>,
-    fast_path_gate: Arc<Mutex<()>>,
 }
 
 impl ControllerAttachState {
@@ -1338,7 +1282,6 @@ impl ControllerAttachState {
             notify: Arc::new(Notify::new()),
             blocking_flag: Arc::new(Mutex::new(false)),
             blocking_cv: Arc::new(Condvar::new()),
-            fast_path_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1383,17 +1326,9 @@ impl ControllerAttachState {
     }
 
     fn acquire_fast_path_permit(&self) -> (ControllerFastPathPermit<'_>, bool) {
-        match self.fast_path_gate.try_lock() {
-            Ok(guard) => (ControllerFastPathPermit { _guard: guard }, false),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                let guard = self.fast_path_gate.lock().unwrap();
-                (ControllerFastPathPermit { _guard: guard }, true)
-            }
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                let guard = poisoned.into_inner();
-                (ControllerFastPathPermit { _guard: guard }, true)
-            }
-        }
+        static GLOBAL_GATE: Mutex<()> = Mutex::new(());
+        let guard = GLOBAL_GATE.lock().unwrap();
+        (ControllerFastPathPermit { _guard: guard }, false)
     }
 }
 
@@ -1428,10 +1363,12 @@ impl ControllerActionContext {
         *guard = Some(client);
     }
 
+    #[allow(dead_code)]
     fn manager_client(&self) -> Option<Arc<ManagerActionClient>> {
         self.client.read().unwrap().clone()
     }
 
+    #[allow(dead_code)]
     fn subscribe(&self) -> watch::Receiver<ControllerTransportState> {
         self.switch.subscribe()
     }
@@ -1448,23 +1385,11 @@ impl ControllerActionContext {
     }
 
     fn fast_path_online(&self) {
-        if self.switch.fast_path_online() {
-            info!(
-                target = "controller.actions.fast_path",
-                session_id = %self.session_id,
-                "fast_path controller channel active"
-            );
-        }
+        self.switch.fast_path_online();
     }
 
     fn fast_path_offline(&self) {
-        if self.switch.fast_path_offline() {
-            info!(
-                target = "controller.actions.fast_path",
-                session_id = %self.session_id,
-                "fast_path controller channel inactive; resuming http poller"
-            );
-        }
+        self.switch.fast_path_offline();
     }
 
     fn notify_fast_path_ready(&self, runtime: &Handle) {
@@ -1593,12 +1518,28 @@ fn controller_action_bytes<'a>(action: &'a CtrlActionCommand) -> Result<&'a str,
         .ok_or_else(|| "terminal_write payload missing bytes".to_string())
 }
 
+fn action_preview(payload: &str) -> String {
+    const MAX_PREVIEW: usize = 64;
+    let mut clean = payload.replace('\n', "\\n");
+    if clean.len() > MAX_PREVIEW {
+        clean.truncate(MAX_PREVIEW);
+        clean.push('…');
+    }
+    clean
+}
+
 struct ControllerChannelOutcome {
     channel_closed: bool,
     fatal_error: bool,
 }
 
-fn run_fast_path_controller_channel(
+#[derive(Debug, Deserialize)]
+struct ControllerInputFrame {
+    action_id: String,
+    bytes: Vec<u8>,
+}
+
+fn run_controller_channel(
     transport: Arc<dyn Transport>,
     transport_kind: TransportKind,
     writer: PtyWriter,
@@ -1610,21 +1551,21 @@ fn run_fast_path_controller_channel(
 ) -> ControllerChannelOutcome {
     let attach_state = controller_ctx.attach_state();
     let gate_wait_started = Instant::now();
-    let (fast_path_permit, waited_for_gate) = attach_state.acquire_fast_path_permit();
+    let (permit, waited_for_gate) = attach_state.acquire_fast_path_permit();
     if waited_for_gate {
         trace!(
-            target = "controller.actions.fast_path",
+            target = "controller.actions",
             session_id = %session_id,
             wait_ms = gate_wait_started.elapsed().as_millis() as u64,
-            "controller fast path channel waiting for concurrent negotiation to finish"
+            "controller channel waiting for concurrent negotiation to finish"
         );
     }
-    let _fast_path_permit = fast_path_permit;
+    let _permit = permit;
     if !attach_state.is_attached() {
         info!(
-            target = "controller.actions.fast_path",
+            target = "controller.actions",
             session_id = %session_id,
-            "waiting for manager attach before accepting fast path controller channel"
+            "waiting for manager attach before accepting controller channel"
         );
         let wait_started = Instant::now();
         attach_state.wait_for_attach_blocking();
@@ -1634,181 +1575,157 @@ fn run_fast_path_controller_channel(
     controller_ctx.notify_fast_path_ready(&runtime);
     let transport_id = transport.id().0;
     info!(
-        target = "controller.actions.fast_path",
+        target = "controller.actions",
         session_id = %session_id,
         transport_id,
         transport = ?transport_kind,
         client_label = client_label.as_deref(),
         client_peer_id = client_peer_id.as_deref(),
-        "fast path controller channel ready"
+        "controller channel ready on primary transport"
     );
     let mut channel_closed = false;
     let mut fatal_error = false;
-    let mut last_seq: Seq = 0;
+    let mut seen_actions: HashSet<String> = HashSet::new();
+    let mut rx = framed::subscribe(transport.id(), "controller");
+    let mut last_received = Instant::now();
 
     loop {
-        match transport.recv(Duration::from_millis(250)) {
-            Ok(message) => match message.payload {
-                Payload::Binary(bytes) => {
+        let recv_result = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_millis(500), rx.recv()).await });
+        match recv_result {
+            Ok(Ok(frame)) => {
+                last_received = Instant::now();
+                if frame.kind != "input" {
+                    metrics::CONTROLLER_FRAMES
+                        .with_label_values(&["recv", frame.kind.as_str()])
+                        .inc();
                     trace!(
-                        target = "controller.actions.fast_path",
+                        target = "controller.actions",
                         session_id = %session_id,
                         transport_id,
-                        bytes = bytes.len(),
-                        "fast path binary payload received"
+                        kind = %frame.kind,
+                        "ignoring non-input controller frame"
                     );
-                    match protocol::decode_client_frame_binary(&bytes) {
-                        Ok(WireClientFrame::Input { seq, data }) => {
-                            debug!(
-                                target = "controller.actions.fast_path",
-                                session_id = %session_id,
-                                transport_id,
-                                seq,
-                                bytes = data.len(),
-                                "received fast path input frame"
-                            );
-                            if seq <= last_seq {
-                                trace!(
-                                    target = "controller.actions.fast_path",
-                                    session_id = %session_id,
-                                    transport_id,
-                                    seq,
-                                    "duplicate fast path input detected"
-                                );
-                                send_host_frame(&transport, HostFrame::InputAck { seq }).ok();
-                                continue;
-                            }
-
-                            if let Err(err) = writer.write(&data) {
-                                error!(
-                                    target = "controller.actions.fast_path",
-                                    session_id = %session_id,
-                                    transport_id,
-                                    seq,
-                                    error = %err,
-                                    "failed to write fast path input to PTY"
-                                );
-                                fatal_error = true;
-                                break;
-                            }
-
-                            debug!(
-                                target = "controller.actions.fast_path.apply",
-                                session_id = %session_id,
-                                transport_id,
-                                seq,
-                                bytes = data.len(),
-                                "applied fast path controller bytes"
-                            );
-                            last_seq = seq;
-
-                            if let Err(err) =
-                                send_host_frame(&transport, HostFrame::InputAck { seq })
-                            {
-                                warn!(
-                                    target = "controller.actions.fast_path",
-                                    session_id = %session_id,
-                                    transport_id,
-                                    seq,
-                                    error = %err,
-                                    "failed to send fast path input ack"
-                                );
-                            }
-
-                            if let Some((client, action_id)) =
-                                controller_ctx.manager_client().and_then(|client| {
-                                    fast_path_action_id(&data).map(|id| (client, id))
-                                })
-                            {
-                                spawn_optional_http_ack(
-                                    runtime.clone(),
-                                    client,
-                                    session_id.to_string(),
-                                    action_id,
-                                    seq,
-                                );
-                            }
-                        }
-                        Ok(_) => {
-                            trace!(
-                                target = "controller.actions.fast_path",
-                                session_id = %session_id,
-                                transport_id,
-                                "ignoring non-input fast path frame"
-                            );
-                        }
-                        Err(err) => {
-                            warn!(
-                                target = "controller.actions.fast_path",
-                                session_id = %session_id,
-                                transport_id,
-                                bytes = bytes.len(),
-                                error = %err,
-                                "failed to decode fast path frame"
-                            );
-                        }
-                    }
+                    continue;
                 }
-                Payload::Text(text) => {
-                    let trimmed = text.trim();
-                    if trimmed == "__ready__" || trimmed == "__offer_ready__" {
-                        debug!(
-                            target = "controller.fast_path_state",
+                metrics::CONTROLLER_FRAMES
+                    .with_label_values(&["recv", "input"])
+                    .inc();
+                metrics::CONTROLLER_QUEUE
+                    .with_label_values(&["depth"])
+                    .set(seen_actions.len() as i64);
+                match serde_json::from_slice::<ControllerInputFrame>(&frame.payload) {
+                    Ok(input) => {
+                        if !seen_actions.insert(input.action_id.clone()) {
+                            trace!(
+                                target = "controller.actions",
+                                session_id = %session_id,
+                                transport_id,
+                                action_id = %input.action_id,
+                                "duplicate controller input detected"
+                            );
+                            continue;
+                        }
+                        if let Err(err) = writer.write(&input.bytes) {
+                            error!(
+                                target = "controller.actions",
+                                session_id = %session_id,
+                                transport_id,
+                                action_id = %input.action_id,
+                                error = %err,
+                                "failed to write controller input to PTY"
+                            );
+                            fatal_error = true;
+                            break;
+                        }
+                        metrics::CONTROLLER_FRAMES
+                            .with_label_values(&["apply", "input"])
+                            .inc();
+                        info!(
+                            target = "controller.actions.apply",
                             session_id = %session_id,
                             transport_id,
-                            channel = CONTROLLER_CHANNEL_LABEL,
-                            sentinel = %trimmed,
-                            "received fast-path sentinel from manager"
+                            action_id = %input.action_id,
+                            bytes = input.bytes.len(),
+                            "applied controller bytes"
                         );
-                        continue;
+                        if let Err(err) =
+                            send_controller_ack(&transport, &input.action_id, SystemTime::now())
+                        {
+                            warn!(
+                                target = "controller.actions",
+                                session_id = %session_id,
+                                transport_id,
+                                action_id = %input.action_id,
+                                error = %err,
+                                "failed to send controller ack"
+                            );
+                        } else {
+                            metrics::CONTROLLER_FRAMES
+                                .with_label_values(&["send", "ack"])
+                                .inc();
+                        }
+                        if let Some(client) = controller_ctx.manager_client() {
+                            spawn_optional_http_ack(
+                                runtime.clone(),
+                                client,
+                                session_id.to_string(),
+                                input.action_id.clone(),
+                                0,
+                            );
+                        }
+                        metrics::CONTROLLER_QUEUE
+                            .with_label_values(&["depth"])
+                            .set(seen_actions.len() as i64);
                     }
-                    trace!(
-                        target = "controller.actions.fast_path",
-                        session_id = %session_id,
-                        transport_id,
-                        payload = %trimmed,
-                        "ignoring fast path text payload"
-                    );
+                    Err(err) => {
+                        warn!(
+                            target = "controller.actions",
+                            session_id = %session_id,
+                            transport_id,
+                            error = %err,
+                            "failed to decode controller input frame"
+                        );
+                    }
                 }
-            },
-            Err(TransportError::Timeout) => continue,
-            Err(TransportError::ChannelClosed) => {
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                 channel_closed = true;
                 break;
             }
-            Err(err) => {
-                fatal_error = true;
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => {
                 warn!(
-                    target = "controller.actions.fast_path",
+                    target = "controller.actions",
                     session_id = %session_id,
                     transport_id,
-                    error = %err,
-                    "fast path controller channel error"
+                    skipped,
+                    "controller channel lagged; dropping frames"
                 );
-                break;
+                continue;
+            }
+            Err(_) => {
+                let idle_ms = last_received.elapsed().as_millis() as f64;
+                metrics::CONTROLLER_LATENCY
+                    .with_label_values(&["idle_gap"])
+                    .observe(idle_ms);
+                continue;
             }
         }
     }
 
     controller_ctx.fast_path_offline();
     debug!(
-        target = "controller.actions.fast_path",
+        target = "controller.actions",
         session_id = %session_id,
         transport_id,
         channel_closed,
         fatal_error,
-        "fast path controller channel finished"
+        "controller channel finished"
     );
     ControllerChannelOutcome {
         channel_closed,
         fatal_error,
     }
-}
-
-fn fast_path_action_id(data: &[u8]) -> Option<String> {
-    serde_json::from_slice::<CtrlActionCommand>(data)
-        .ok()
-        .map(|cmd| cmd.id)
 }
 
 fn spawn_optional_http_ack(
@@ -1848,13 +1765,42 @@ fn spawn_optional_http_ack(
     });
 }
 
+fn send_controller_ack(
+    transport: &Arc<dyn Transport>,
+    action_id: &str,
+    applied_at: SystemTime,
+) -> Result<(), TransportError> {
+    let ack = CtrlActionAck {
+        id: action_id.to_string(),
+        status: CtrlAckStatus::Ok,
+        applied_at,
+        latency_ms: None,
+        error_code: None,
+        error_message: None,
+    };
+    let payload = serde_json::to_vec(&ack).map_err(|err| {
+        TransportError::Setup(format!("failed to serialize controller ack: {err}"))
+    })?;
+    match transport.send_namespaced("controller", "ack", &payload) {
+        Ok(_) => Ok(()),
+        Err(TransportError::Setup(_)) => {
+            // Fallback for transports that do not support namespaced framing.
+            send_host_frame(transport, HostFrame::InputAck { seq: 0 }).map(|_| ())
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn spawn_action_consumer(
     ctx: Arc<ControllerActionContext>,
     manager_url: String,
     auth: ManagerActionAuth,
     writer_for_actions: PtyWriter,
+    transport_hints: Arc<AsyncRwLock<HashMap<String, Value>>>,
+    fast_path_bearer: Option<String>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let client = match ManagerActionClient::new(manager_url.clone(), auth) {
+    let auth_for_client = auth.clone();
+    let client = match ManagerActionClient::new(manager_url.clone(), auth_for_client) {
         Ok(c) => c,
         Err(err) => {
             warn!(
@@ -1867,9 +1813,28 @@ fn spawn_action_consumer(
         }
     };
 
+    let fast_path_token = fast_path_bearer.unwrap_or_else(|| match &auth {
+        ManagerActionAuth::Bearer(token) => token.clone(),
+        ManagerActionAuth::ControllerToken(token) => token.clone(),
+    });
+    let fast_path_transport = match HttpTransport::new(
+        manager_url.clone(),
+        StaticTokenProvider::new(fast_path_token.clone()),
+    ) {
+        Ok(t) => Some(Arc::new(t)),
+        Err(err) => {
+            warn!(
+                target = "controller.actions.fast_path",
+                error = %err,
+                manager = %manager_url,
+                "fast-path action transport init failed; using http only"
+            );
+            None
+        }
+    };
+
     let client = Arc::new(client);
     ctx.set_client(client.clone());
-    let mut transport_state = ctx.subscribe();
     let session_for_actions = ctx.session_id().to_string();
     let attach_state = ctx.attach_state();
 
@@ -1889,133 +1854,127 @@ fn spawn_action_consumer(
                 "manager attach confirmed; controller action consumer starting"
             );
         }
-        let mut paused_for_fast_path = false;
-        loop {
-            let fast_path_active = matches!(
-                *transport_state.borrow(),
-                ControllerTransportState::FastPathPreferred
+        debug!(
+            target = "controller.actions",
+            session_id = %session_for_actions,
+            "controller action consumer loop running"
+        );
+        if let Some(tp) = fast_path_transport.as_ref() {
+            let hints_snapshot = { transport_hints.read().await.clone() };
+            tp.apply_transport_hints(&hints_snapshot).await;
+            ctx.fast_path_online();
+            info!(
+                target = "controller.actions.fast_path",
+                session_id = %session_for_actions,
+                "fast-path action transport configured"
             );
-            if fast_path_active {
-                match client.pending_actions_status(&session_for_actions).await {
-                    Ok(status) => {
-                        let should_pause = status.prefers_fast_path();
-                        if should_pause {
-                            if !paused_for_fast_path {
-                                debug!(
-                                    target = "controller.actions.fast_path",
-                                    session_id = %session_for_actions,
-                                    pending = status.pending,
-                                    transport = ?status.transport,
-                                    fast_path_ready = status.fast_path_ready,
-                                    "http action poller paused (fast path active)"
-                                );
-                            }
-                            paused_for_fast_path = true;
-                            let state_change = transport_state.changed();
-                            let recheck = sleep(Duration::from_millis(FAST_PATH_PAUSE_RECHECK_MS));
-                            tokio::pin!(state_change);
-                            tokio::pin!(recheck);
-                            tokio::select! {
-                                changed = &mut state_change => {
-                                    if changed.is_err() {
-                                        break;
-                                    }
-                                }
-                                _ = &mut recheck => {}
-                            }
-                            continue;
-                        }
-                        if paused_for_fast_path {
-                            debug!(
-                                target = "controller.actions.fast_path",
-                                session_id = %session_for_actions,
-                                pending = status.pending,
-                                transport = ?status.transport,
-                                fast_path_ready = status.fast_path_ready,
-                                "http action poller resumed (manager requires HTTP fallback)"
-                            );
-                            paused_for_fast_path = false;
-                        }
-                        if status.pending > 0 {
-                            trace!(
-                                target = "controller.actions.fast_path",
-                                session_id = %session_for_actions,
-                                pending = status.pending,
-                                transport = ?status.transport,
-                                fast_path_ready = status.fast_path_ready,
-                                "pending controller actions remain on HTTP queue; continuing poller"
-                            );
-                        }
+        }
+        loop {
+            let mut actions: Vec<CtrlActionCommand> = Vec::new();
+            let mut used_fast_path = false;
+            if let Some(tp) = fast_path_transport.as_ref() {
+                match tp.receive_actions(&session_for_actions).await {
+                    Ok(received) => {
+                        used_fast_path = true;
+                        actions = received;
                     }
                     Err(err) => {
                         warn!(
                             target = "controller.actions.fast_path",
                             session_id = %session_for_actions,
                             error = %err,
-                            "failed to query pending controller actions; keeping HTTP poller active"
+                            "fast-path receive failed; falling back to manager http poll"
                         );
                     }
                 }
-            } else if paused_for_fast_path {
-                debug!(
-                    target = "controller.actions.fast_path",
-                    session_id = %session_for_actions,
-                    "http action poller resumed (fast path inactive)"
-                );
-                paused_for_fast_path = false;
             }
-            match client.receive_actions(&session_for_actions).await {
-                Ok(received) if !received.is_empty() => {
-                    let commands: Vec<CtrlActionCommand> = received;
-                    for cmd in commands.iter() {
-                        match controller_action_bytes(cmd) {
-                            Ok(bytes) => match writer_for_actions.write(bytes.as_bytes()) {
-                                Ok(()) => {
-                                    debug!(
-                                        target = "controller.actions",
-                                        session_id = %session_for_actions,
-                                        command_id = %cmd.id,
-                                        bytes = bytes.len(),
-                                        "applied terminal_write action"
-                                    );
-                                }
-                                Err(err) => {
-                                    warn!(target = "controller.actions", error = %err, "pty write failed for action");
-                                }
-                            },
-                            Err(err) => {
-                                warn!(
+            if !used_fast_path {
+                match client.receive_actions(&session_for_actions).await {
+                    Ok(received) => actions = received,
+                    Err(err) => {
+                        warn!(
+                            target = "controller.actions",
+                            session_id = %session_for_actions,
+                            error = %err,
+                            "receive_actions failed; retrying"
+                        );
+                        sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                }
+            }
+            if !actions.is_empty() {
+                info!(
+                target = "controller.actions",
+                    session_id = %session_for_actions,
+                    count = actions.len(),
+                    "received controller actions"
+                );
+                for cmd in actions.iter() {
+                    match controller_action_bytes(cmd) {
+                        Ok(bytes) => match writer_for_actions.write(bytes.as_bytes()) {
+                            Ok(()) => {
+                                debug!(
                                     target = "controller.actions",
                                     session_id = %session_for_actions,
                                     command_id = %cmd.id,
-                                    error = %err,
-                                    "unsupported controller action"
+                                    bytes = bytes.len(),
+                                    preview = %action_preview(bytes),
+                                    "applied terminal_write action"
                                 );
                             }
+                            Err(err) => {
+                                warn!(target = "controller.actions", error = %err, "pty write failed for action");
+                            }
+                        },
+                        Err(err) => {
+                            warn!(
+                                target = "controller.actions",
+                                session_id = %session_for_actions,
+                                command_id = %cmd.id,
+                                error = %err,
+                                "unsupported controller action"
+                            );
                         }
                     }
-                    let acks: Vec<CtrlActionAck> = commands
-                        .iter()
-                        .map(|c| CtrlActionAck {
-                            id: c.id.clone(),
-                            status: CtrlAckStatus::Ok,
-                            applied_at: std::time::SystemTime::now(),
-                            latency_ms: None,
-                            error_code: None,
-                            error_message: None,
-                        })
-                        .collect();
-                    if let Err(err) = client.ack_actions(&session_for_actions, acks).await {
-                        warn!(target = "controller.actions", error = %err, "ack failed");
+                }
+                let acks: Vec<CtrlActionAck> = actions
+                    .iter()
+                    .map(|c| CtrlActionAck {
+                        id: c.id.clone(),
+                        status: CtrlAckStatus::Ok,
+                        applied_at: std::time::SystemTime::now(),
+                        latency_ms: None,
+                        error_code: None,
+                        error_message: None,
+                    })
+                    .collect();
+                if used_fast_path {
+                    if let Some(tp) = fast_path_transport.as_ref() {
+                        if let Err(err) = tp.ack_actions(&session_for_actions, acks).await {
+                            warn!(
+                                target = "controller.actions.fast_path",
+                                session_id = %session_for_actions,
+                                error = %err,
+                                "ack failed via fast-path transport"
+                            );
+                        }
                     }
+                } else if let Err(err) = client.ack_actions(&session_for_actions, acks).await {
+                    warn!(
+                        target = "controller.actions",
+                        session_id = %session_for_actions,
+                        error = %err,
+                        "ack failed"
+                    );
                 }
-                Ok(_) => {
-                    sleep(Duration::from_millis(50)).await;
-                }
-                Err(err) => {
-                    warn!(target = "controller.actions", error = %err, "receive_actions failed; retrying");
-                    sleep(Duration::from_secs(1)).await;
-                }
+            } else {
+                debug!(
+                    target = "controller.actions",
+                    session_id = %session_for_actions,
+                    "controller action poll returned empty set"
+                );
+                sleep(Duration::from_millis(50)).await;
             }
         }
     }))
@@ -2062,6 +2021,7 @@ fn spawn_unified_action_consumer(
                             session_id = %session_for_actions,
                             kind = "action",
                             action_id = %cmd.id,
+                            preview = %controller_action_bytes(&cmd).ok().map(action_preview).unwrap_or_else(|| "<invalid>".into()),
                             "received fastpath action via extension"
                         );
                         metrics::EXTENSION_RECEIVED
@@ -2187,16 +2147,7 @@ fn default_shell_command() -> Option<Vec<String>> {
 }
 
 fn manager_supports_extensions(hints: &HashMap<String, Value>) -> bool {
-    if supports_extensions_namespace(hints) || manager_has_legacy_fast_path(hints) {
-        return true;
-    }
-    // Unified transport is the default; treat missing fast-path indicators as supported and
-    // rely on runtime fallbacks (legacy fast-path channel or HTTP) when extension sends fail.
-    true
-}
-
-fn manager_has_legacy_fast_path(hints: &HashMap<String, Value>) -> bool {
-    hints.contains_key("fast_path_webrtc")
+    supports_extensions_namespace(hints)
 }
 
 fn supports_extensions_namespace(hints: &HashMap<String, Value>) -> bool {
@@ -2425,46 +2376,11 @@ fn capture_terminal_frame(
 }
 
 #[derive(Clone)]
-struct ActiveStateChannel {
-    id: TransportId,
-    transport: Arc<dyn Transport>,
-}
+#[allow(dead_code)]
+struct ActiveStateChannel;
 
 #[derive(Clone, Default)]
-struct FastPathStateChannel {
-    inner: Arc<AsyncRwLock<Option<ActiveStateChannel>>>,
-}
-
-impl FastPathStateChannel {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(AsyncRwLock::new(None)),
-        }
-    }
-
-    async fn activate(&self, transport: Arc<dyn Transport>) {
-        let mut guard = self.inner.write().await;
-        *guard = Some(ActiveStateChannel {
-            id: transport.id(),
-            transport,
-        });
-    }
-
-    async fn current(&self) -> Option<ActiveStateChannel> {
-        self.inner.read().await.clone()
-    }
-
-    async fn deactivate_if(&self, id: TransportId) {
-        let mut guard = self.inner.write().await;
-        if guard
-            .as_ref()
-            .map(|channel| channel.id == id)
-            .unwrap_or(false)
-        {
-            *guard = None;
-        }
-    }
-}
+struct FastPathStateChannel;
 
 #[derive(Clone, Default)]
 struct UnifiedManagerHandle {
@@ -2474,10 +2390,10 @@ struct UnifiedManagerHandle {
 }
 
 impl UnifiedManagerHandle {
-    fn new(preferred: bool, legacy_fastpath: bool) -> Self {
+    fn new(_preferred: bool, legacy_fastpath: bool) -> Self {
         Self {
-            preferred: Arc::new(AtomicBool::new(preferred)),
-            legacy_fastpath,
+            preferred: Arc::new(AtomicBool::new(false)),
+            legacy_fastpath: legacy_fastpath && false,
             bridge: Arc::new(AsyncRwLock::new(None)),
         }
     }
@@ -2509,8 +2425,8 @@ async fn spawn_idle_snapshot_worker(
     cursor_tracker: Arc<Mutex<Option<CursorState>>>,
     last_terminal_update: Arc<AtomicU64>,
     transport_hints: Arc<AsyncRwLock<HashMap<String, Value>>>,
-    fast_path_channel: Arc<FastPathStateChannel>,
-    unified_handle: UnifiedManagerHandle,
+    _fast_path_channel: Arc<FastPathStateChannel>,
+    _unified_handle: UnifiedManagerHandle,
 ) -> Option<(JoinHandle<()>, oneshot::Sender<()>)> {
     if interval.is_zero() {
         return None;
@@ -2534,12 +2450,7 @@ async fn spawn_idle_snapshot_worker(
         grid,
         cursor_tracker,
         last_terminal_update,
-        Arc::new(StatePublisher::new(
-            transport,
-            session_id,
-            fast_path_channel,
-            unified_handle,
-        )),
+        Arc::new(StatePublisher::new(transport, session_id)),
     );
     let handle = tokio::spawn(async move {
         worker.run(cancel_rx).await;
@@ -2637,23 +2548,14 @@ struct StatePublisher {
     transport: Arc<HttpTransport<StaticTokenProvider>>,
     session_id: String,
     seq: AtomicU64,
-    fast_path_channel: Arc<FastPathStateChannel>,
-    unified: UnifiedManagerHandle,
 }
 
 impl StatePublisher {
-    fn new(
-        transport: Arc<HttpTransport<StaticTokenProvider>>,
-        session_id: String,
-        fast_path_channel: Arc<FastPathStateChannel>,
-        unified: UnifiedManagerHandle,
-    ) -> Self {
+    fn new(transport: Arc<HttpTransport<StaticTokenProvider>>, session_id: String) -> Self {
         Self {
             transport,
             session_id,
             seq: AtomicU64::new(0),
-            fast_path_channel,
-            unified,
         }
     }
 
@@ -2664,47 +2566,7 @@ impl StatePublisher {
             emitted_at: SystemTime::now(),
             payload,
         };
-        if self.try_fast_path(&diff).await? {
-            return Ok(());
-        }
-        if self.try_unified_extension(&diff).await? {
-            return Ok(());
-        }
         self.publish_via_http(diff).await
-    }
-
-    async fn try_fast_path(&self, diff: &StateDiff) -> Result<bool, String> {
-        let Some(channel) = self.fast_path_channel.current().await else {
-            return Ok(false);
-        };
-        let envelope = serde_json::json!({
-            "type": "state",
-            "payload": diff,
-        });
-        let text =
-            serde_json::to_string(&envelope).map_err(|err| format!("encode state diff: {err}"))?;
-        match channel.transport.send_text(&text) {
-            Ok(_) => {
-                trace!(
-                    target = "controller.state.fast_path",
-                    session_id = %self.session_id,
-                    transport_id = channel.id.0,
-                    "state diff sent via fast-path"
-                );
-                Ok(true)
-            }
-            Err(err) => {
-                warn!(
-                    target = "controller.state.fast_path",
-                    session_id = %self.session_id,
-                    transport_id = channel.id.0,
-                    error = %err,
-                    "fast-path state send failed; falling back to HTTP"
-                );
-                self.fast_path_channel.deactivate_if(channel.id).await;
-                Ok(false)
-            }
-        }
     }
 
     async fn publish_via_http(&self, diff: StateDiff) -> Result<(), String> {
@@ -2712,42 +2574,6 @@ impl StatePublisher {
             .send_state(&self.session_id, diff)
             .await
             .map_err(|err| err.to_string())
-    }
-
-    async fn try_unified_extension(&self, diff: &StateDiff) -> Result<bool, String> {
-        if !self.unified.prefers_unified() {
-            return Ok(false);
-        }
-        let Some(bridge) = self.unified.bridge().await else {
-            return Ok(false);
-        };
-        match bridge.send_state(&self.session_id, diff.clone()).await {
-            Ok(_) => {
-                metrics::EXTENSION_SENT
-                    .with_label_values(&["fastpath", "state", "host", "unified"])
-                    .inc();
-                trace!(
-                    target = "transport.extension",
-                    session_id = %self.session_id,
-                    namespace = "fastpath",
-                    kind = "state",
-                    "state diff sent via unified transport"
-                );
-                Ok(true)
-            }
-            Err(err) => {
-                metrics::EXTENSION_FALLBACK
-                    .with_label_values(&["fastpath", "state", "host", "unified_send_error"])
-                    .inc();
-                warn!(
-                    target = "transport.extension",
-                    session_id = %self.session_id,
-                    error = %err,
-                    "unified state send failed; falling back to http"
-                );
-                Ok(false)
-            }
-        }
     }
 }
 
@@ -2833,8 +2659,8 @@ struct IdleSnapshotController {
     state: Arc<AsyncMutex<IdleSnapshotControllerState>>,
     health: Arc<AsyncMutex<HealthReporterState>>,
     transport_hints: Arc<AsyncRwLock<HashMap<String, Value>>>,
-    fast_path_channel: Arc<FastPathStateChannel>,
-    unified: UnifiedManagerHandle,
+    _fast_path_channel: Arc<FastPathStateChannel>,
+    _unified: UnifiedManagerHandle,
 }
 
 impl IdleSnapshotController {
@@ -2888,8 +2714,8 @@ impl IdleSnapshotController {
             state: Arc::new(AsyncMutex::new(IdleSnapshotControllerState::default())),
             health: Arc::new(AsyncMutex::new(HealthReporterState::default())),
             transport_hints,
-            fast_path_channel,
-            unified,
+            _fast_path_channel: fast_path_channel,
+            _unified: unified,
         }
     }
 
@@ -2964,8 +2790,8 @@ impl IdleSnapshotController {
                 self.cursor_tracker.clone(),
                 self.last_terminal_update.clone(),
                 self.transport_hints.clone(),
-                self.fast_path_channel.clone(),
-                self.unified.clone(),
+                self._fast_path_channel.clone(),
+                self._unified.clone(),
             )
             .await
             {
@@ -3035,7 +2861,7 @@ impl IdleSnapshotController {
                 token,
                 base_url,
                 self.session_id.clone(),
-                self.unified.clone(),
+                self._unified.clone(),
             ) {
                 Some((handle, cancel)) => {
                     let mut state = self.health.lock().await;
@@ -3207,20 +3033,12 @@ fn spawn_input_listener(
         );
         let mut channel_closed = false;
         let mut fatal_error = false;
-        let is_controller_channel = controller_ctx
-            .as_ref()
-            .map(|_| {
-                matches!(
-                    client_label.as_deref(),
-                    Some(CONTROLLER_CHANNEL_LABEL) | Some(LEGACY_CONTROLLER_CHANNEL_LABEL)
-                )
-            })
-            .unwrap_or(false);
+        let is_controller_channel = controller_ctx.is_some();
 
         if is_controller_channel {
             match (controller_ctx, runtime_handle) {
                 (Some(ctx), Some(handle)) => {
-                    let outcome = run_fast_path_controller_channel(
+                    let outcome = run_controller_channel(
                         Arc::clone(&transport),
                         transport_kind,
                         writer.clone(),
@@ -3592,7 +3410,7 @@ fn spawn_webrtc_acceptor(
             let passphrase = join_code.as_deref();
             let negotiation_started = Instant::now();
             debug!(session_id = %session_id, "negotiating transport");
-            match negotiate_transport(&session_handle, passphrase, None, false).await {
+            match negotiate_transport(&session_handle, passphrase, None, false, None).await {
                 Ok(NegotiatedTransport::Single(NegotiatedSingle {
                     transport,
                     webrtc_channels,
@@ -4333,63 +4151,13 @@ fn maybe_spawn_state_channel_listener(
     fast_path_state_channel: Arc<FastPathStateChannel>,
     unified_manager: UnifiedManagerHandle,
 ) {
-    if unified_manager.prefers_unified() || !unified_manager.supports_legacy_fastpath() {
-        trace!(
-            target = "controller.state.fast_path",
-            session_id = %session_id,
-            "skipping legacy fast-path state channel wait (unified preferred or legacy hint absent)"
-        );
-        return;
-    }
-    if !matches!(
-        label.as_deref(),
-        Some(CONTROLLER_CHANNEL_LABEL) | Some(LEGACY_CONTROLLER_CHANNEL_LABEL)
-    ) {
-        return;
-    }
-    let Some(channels) = channels else {
-        debug!(
-            target = "controller.state.fast_path",
-            session_id = %session_id,
-            "controller transport missing WebRTC channel registry"
-        );
-        return;
-    };
-    let session = session_id.to_string();
-    tokio::spawn(async move {
-        match timeout(
-            STATE_CHANNEL_WAIT_TIMEOUT,
-            channels.wait_for(CONTROLLER_STATE_CHANNEL_LABEL),
-        )
-        .await
-        {
-            Ok(Ok(channel)) => {
-                info!(
-                    target = "controller.state.fast_path",
-                    session_id = %session,
-                    transport_id = channel.id().0,
-                    "fast-path state channel established"
-                );
-                fast_path_state_channel.activate(channel).await;
-            }
-            Ok(Err(err)) => {
-                warn!(
-                    target = "controller.state.fast_path",
-                    session_id = %session,
-                    error = %err,
-                    "failed to acquire fast-path state channel"
-                );
-            }
-            Err(_) => {
-                debug!(
-                    target = "controller.state.fast_path",
-                    session_id = %session,
-                    timeout_secs = STATE_CHANNEL_WAIT_TIMEOUT.as_secs(),
-                    "timed out waiting for fast-path state channel"
-                );
-            }
-        }
-    });
+    let _ = (
+        session_id,
+        label,
+        channels,
+        fast_path_state_channel,
+        unified_manager,
+    );
 }
 
 fn spawn_local_stdin_forwarder(
@@ -4874,6 +4642,7 @@ mod tests {
     use crate::transport::{Payload, TransportKind, TransportPair};
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration as StdDuration, Instant};
@@ -5165,7 +4934,7 @@ mod tests {
         let transport_clone = host_transport.clone();
         let writer_clone = writer.clone();
         let join = thread::spawn(move || {
-            run_fast_path_controller_channel(
+            run_controller_channel(
                 transport_clone,
                 TransportKind::Ipc,
                 writer_clone,
@@ -5229,7 +4998,7 @@ mod tests {
         let transport_clone = host_transport.clone();
         let writer_clone = writer.clone();
         let join = thread::spawn(move || {
-            run_fast_path_controller_channel(
+            run_controller_channel(
                 transport_clone,
                 TransportKind::Ipc,
                 writer_clone,

@@ -51,6 +51,7 @@ pub async fn negotiate_transport(
     passphrase: Option<&str>,
     client_label: Option<&str>,
     request_mcp_channel: bool,
+    metadata: Option<HashMap<String, String>>,
 ) -> Result<NegotiatedTransport, CliError> {
     let mut errors = Vec::new();
 
@@ -122,6 +123,7 @@ pub async fn negotiate_transport(
                     Duration::from_millis(poll_ms),
                     passphrase,
                     request_mcp_channel,
+                    metadata.clone(),
                 )
                 .await
                 {
@@ -160,6 +162,7 @@ pub async fn negotiate_transport(
                     passphrase,
                     client_label,
                     request_mcp_channel,
+                    metadata.clone(),
                 )
                 .await
                 {
@@ -597,6 +600,7 @@ impl TransportSupervisor {
                     this.passphrase.as_deref(),
                     None,
                     false,
+                    None,
                 )
                 .await
                 {

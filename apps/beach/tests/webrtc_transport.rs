@@ -17,7 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot};
 use tokio::time::{Instant, sleep, timeout};
 use tracing::debug;
 use tracing_subscriber::{EnvFilter, fmt::SubscriberBuilder};
@@ -28,6 +28,9 @@ use beach_client_core::transport::webrtc::{
 };
 use beach_client_core::transport::{
     Payload, Transport, TransportError, TransportKind, TransportMessage,
+};
+use beach_client_core::transport::{
+    framed,
 };
 
 const HANDSHAKE_SENTINELS: [&str; 2] = ["__ready__", "__offer_ready__"];
@@ -98,6 +101,16 @@ async fn recv_via_blocking(transport: &Arc<dyn Transport>, timeout: Duration) ->
         .expect("transport recv")
 }
 
+async fn recv_frame_with_timeout(
+    mut rx: broadcast::Receiver<framed::FramedMessage>,
+    timeout: Duration,
+) -> Option<framed::FramedMessage> {
+    match tokio::time::timeout(timeout, rx.recv()).await {
+        Ok(Ok(msg)) => Some(msg),
+        _ => None,
+    }
+}
+
 #[test_timeout::tokio_timeout_test]
 async fn webrtc_bidirectional_transport_delivers_messages() {
     disable_public_stun();
@@ -146,6 +159,46 @@ async fn webrtc_bidirectional_transport_delivers_messages() {
         let received = recv_with_timeout(server.as_ref(), Duration::from_secs(5)).await;
         assert_eq!(payload_text(&received), Some(expected.as_str()));
     }
+}
+
+#[test_timeout::tokio_timeout_test]
+async fn webrtc_namespaced_controller_round_trip() {
+    disable_public_stun();
+    let _ = SubscriberBuilder::default()
+        .with_test_writer()
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
+    let pair = create_test_pair().await.expect("create webrtc pair");
+    let client = pair.client;
+    let server = pair.server;
+
+    let server_rx = framed::subscribe(server.id(), "controller");
+    let client_rx = framed::subscribe(client.id(), "controller");
+
+    let payload = br#"{"action":"ping","id":1}"#;
+    let seq = client
+        .send_namespaced("controller", "input", payload)
+        .expect("send controller input");
+
+    let received = recv_frame_with_timeout(server_rx, Duration::from_secs(2))
+        .await
+        .expect("controller frame from client");
+    assert_eq!(received.namespace, "controller");
+    assert_eq!(received.kind, "input");
+    assert_eq!(received.seq, seq);
+    assert_eq!(received.payload.as_ref(), payload);
+
+    let ack_payload = br#"{"ack":1}"#;
+    let ack_seq = server
+        .send_namespaced("controller", "ack", ack_payload)
+        .expect("send controller ack");
+    let ack = recv_frame_with_timeout(client_rx, Duration::from_secs(2))
+        .await
+        .expect("controller ack from server");
+    assert_eq!(ack.namespace, "controller");
+    assert_eq!(ack.kind, "ack");
+    assert_eq!(ack.seq, ack_seq);
+    assert_eq!(ack.payload.as_ref(), ack_payload);
 }
 
 const SESSION_ID: &str = "test-session";
@@ -522,7 +575,8 @@ async fn webrtc_signaling_end_to_end() {
     let base_url = format!("http://{addr}/sessions/{SESSION_ID}/webrtc");
     let offer_fut = async {
         let (supervisor, accepted) =
-            OffererSupervisor::connect(&base_url, Duration::from_millis(50), None, false).await?;
+            OffererSupervisor::connect(&base_url, Duration::from_millis(50), None, false, None)
+                .await?;
         Ok::<(Arc<OffererSupervisor>, Arc<dyn Transport>), TransportError>((
             supervisor,
             accepted.connection.transport(),
@@ -536,6 +590,7 @@ async fn webrtc_signaling_end_to_end() {
         None,
         None,
         false,
+        None,
     );
 
     let (offer_res, answer_res) = tokio::join!(

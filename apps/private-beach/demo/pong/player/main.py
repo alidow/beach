@@ -90,6 +90,7 @@ class PongView:
         self._last_paddle_cells: Set[Tuple[int, int]] = set()
         self._last_ball_cell: Optional[Tuple[int, int]] = None
         self.frame_dump_path = os.environ.get("PONG_FRAME_DUMP_PATH")
+        self.verbose_diag = os.environ.get("PONG_VERBOSE_DIAG") not in (None, "", "0", "false", "False", "no")
         interval_env = os.environ.get("PONG_FRAME_DUMP_INTERVAL")
         try:
             self.frame_dump_interval = float(interval_env) if interval_env else 0.0
@@ -98,6 +99,16 @@ class PongView:
         self._next_frame_dump_time = 0.0
         self.ball_trace_path = os.environ.get("PONG_BALL_TRACE_PATH")
         self.command_trace_path = os.environ.get("PONG_COMMAND_TRACE_PATH")
+        if self.verbose_diag and self.command_trace_path:
+            self._trace_diag(
+                "init",
+                {
+                    "mode": self.mode,
+                    "frame_dump_path": self.frame_dump_path,
+                    "ball_trace_path": self.ball_trace_path,
+                    "command_trace_path": self.command_trace_path,
+                },
+            )
 
         self._colors_initialized = False
         self.color_border = curses.A_BOLD
@@ -148,6 +159,8 @@ class PongView:
     def spawn_ball(self, y: float, vx: float, vy: float) -> None:
         if self.width <= 0 or self.height <= INSTRUCTION_LINES:
             self.log_status("Cannot spawn ball: screen too small.")
+            if self.verbose_diag:
+                self._trace_diag("spawn_ball_blocked", {"width": self.width, "height": self.height})
             return
 
         play_top = 1
@@ -211,6 +224,16 @@ class PongView:
             self.spawn_ball(y_val, dx, dy)
             return
         self.log_status(f"Unknown command: {command}")
+        if self.verbose_diag:
+            self._trace_diag(
+                "command_applied",
+                {
+                    "command": command,
+                    "ball": bool(self.ball),
+                    "width": self.width,
+                    "height": self.height,
+                },
+            )
 
     def _read_input(self) -> None:
         while True:
@@ -593,6 +616,17 @@ class PongView:
 
     def _trace_ball_position(self) -> None:
         if not self.ball_trace_path or not self.ball:
+            if not self.ball and self.ball_trace_path:
+                # Diagnostic: note that we expected to trace but ball is missing.
+                try:
+                    trace_dir = os.path.dirname(self.ball_trace_path)
+                    if trace_dir:
+                        os.makedirs(trace_dir, exist_ok=True)
+                    with open(self.ball_trace_path, "a", encoding="utf-8") as fp:
+                        fp.write(json.dumps({"time": time.time(), "missing": True}))
+                        fp.write("\n")
+                except OSError:
+                    pass
             return
         record = {
             "time": time.time(),
@@ -618,6 +652,19 @@ class PongView:
                 os.makedirs(trace_dir, exist_ok=True)
             with open(self.command_trace_path, "a", encoding="utf-8") as fp:
                 fp.write(json.dumps({"time": time.time(), "command": command}))
+                fp.write("\n")
+        except OSError:
+            pass
+
+    def _trace_diag(self, kind: str, payload: Dict[str, Any]) -> None:
+        if not self.command_trace_path:
+            return
+        trace_dir = os.path.dirname(self.command_trace_path)
+        try:
+            if trace_dir:
+                os.makedirs(trace_dir, exist_ok=True)
+            with open(self.command_trace_path, "a", encoding="utf-8") as fp:
+                fp.write(json.dumps({"time": time.time(), "diag": kind, **payload}))
                 fp.write("\n")
         except OSError:
             pass

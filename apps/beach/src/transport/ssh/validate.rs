@@ -156,6 +156,7 @@ pub async fn run_headless_validation(
         Some(passcode),
         Some("headless-validator"),
         false,
+        None,
     )
     .await?;
 

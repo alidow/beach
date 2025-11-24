@@ -17,14 +17,11 @@ use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::{
-    log_throttle::{should_log_queue_event, QueueLogKind},
-    state::{
-        AgentOnboardResponse, AppState, AttachHandshakeDisposition, ControllerCommandDropReason,
-        ControllerEvent, ControllerLeaseResponse, ControllerPairing, ControllerUpdateCadence,
-        JoinSessionResponsePayload, PairingTransportKind, PairingTransportStatus, SessionSummary,
-        StateError,
-    },
+use crate::state::{
+    AgentOnboardResponse, AppState, AttachHandshakeDisposition, ControllerCommandDropReason,
+    ControllerEvent, ControllerLeaseResponse, ControllerPairing, ControllerUpdateCadence,
+    JoinSessionResponsePayload, PairingTransportKind, PairingTransportStatus, SessionSummary,
+    StateError,
 };
 
 use super::{ApiError, ApiResult, AuthToken};
@@ -459,33 +456,28 @@ pub async fn queue_actions(
         )
         .await;
     let elapsed_ms = started.elapsed().as_millis();
-
-    if let (Some(trace_id), true) = (
-        trace_id.as_deref(),
-        should_log_queue_event(QueueLogKind::Request, &session_id),
-    ) {
-        match &result {
-            Ok(()) => {
-                info!(
-                    target: "controller.actions",
-                    trace_id,
-                    session_id,
-                    action_count,
-                    elapsed_ms,
-                    "queue_actions completed"
-                );
-            }
-            Err(err) => {
-                warn!(
-                    target: "controller.actions",
-                    trace_id,
-                    session_id,
-                    action_count,
-                    elapsed_ms,
-                    error = %err,
-                    "queue_actions failed"
-                );
-            }
+    // Structured logging for every controller submission.
+    match &result {
+        Ok(()) => {
+            info!(
+                target: "controller.actions",
+                session_id,
+                action_count,
+                elapsed_ms,
+                trace_id = trace_id.as_deref(),
+                "queue_actions completed"
+            );
+        }
+        Err(err) => {
+            warn!(
+                target: "controller.actions",
+                session_id,
+                action_count,
+                elapsed_ms,
+                error = %err,
+                trace_id = trace_id.as_deref(),
+                "queue_actions failed"
+            );
         }
     }
 
@@ -1171,15 +1163,9 @@ fn map_state_err(err: StateError) -> ApiError {
         StateError::ActionQueueFull { .. } => {
             ApiError::TooManyRequests("pending controller action queue full")
         }
-        StateError::ControllerCommandRejected { reason } => match reason {
-            ControllerCommandDropReason::FastPathNotReady => ApiError::PreconditionFailed {
-                message: reason.default_message().to_string(),
-                code: reason.code(),
-            },
-            _ => ApiError::ConflictWithCode {
-                message: reason.default_message().to_string(),
-                code: reason.code(),
-            },
+        StateError::ControllerCommandRejected { reason } => ApiError::ConflictWithCode {
+            message: reason.default_message().to_string(),
+            code: reason.code(),
         },
     }
 }

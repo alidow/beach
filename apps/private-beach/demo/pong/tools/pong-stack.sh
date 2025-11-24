@@ -4,7 +4,8 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  pong-stack.sh [--setup-beach] start <private-beach-id>  Start LHS, RHS, agent, and optionally auto-configure the beach layout.
+  pong-stack.sh [--setup-beach] [--create-beach] start [private-beach-id]
+                                                        Start LHS, RHS, agent, and optionally auto-create/configure the beach layout.
   pong-stack.sh start lhs                                   Start only the LHS player.
   pong-stack.sh start rhs                                   Start only the RHS player.
   pong-stack.sh start agent <pb-id>                         Start only the mock agent.
@@ -15,6 +16,8 @@ Options:
   --setup-beach         After launching lhs/rhs/agent, configure the private beach layout
                         via the manager session-graph API and verify that the attachments
                         and controller pairings succeeded.
+  --create-beach        When starting the full stack, create a new private beach via manager
+                        if no beach id is provided. Requires manager token scopes.
 
 Environment variables:
   PONG_DOCKER_SERVICE   Docker compose service name (default: beach-manager)
@@ -35,11 +38,16 @@ if [[ $# -lt 1 ]]; then
 fi
 
 SETUP_BEACH=false
+CREATE_BEACH=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --setup-beach)
       SETUP_BEACH=true
+      shift
+      ;;
+    --create-beach)
+      CREATE_BEACH=true
       shift
       ;;
     --help|-h)
@@ -74,7 +82,8 @@ MANAGER_URL=${PRIVATE_BEACH_MANAGER_URL:-http://localhost:8080}
 SESSION_SERVER=${PONG_SESSION_SERVER:-http://beach-road:4132/}
 AUTH_GATEWAY=${PONG_AUTH_GATEWAY:-http://beach-gate:4133}
 CLI_PROFILE=${PONG_BEACH_PROFILE:-local}
-LOG_DIR=${PONG_LOG_DIR:-/tmp/pong-stack}
+LOG_ROOT=${PONG_LOG_ROOT:-/tmp/pong-stack}
+LOG_DIR=${PONG_LOG_DIR:-$LOG_ROOT}
 CODES_WAIT=${PONG_CODES_WAIT:-8}
 ROLE_BOOTSTRAP_TIMEOUT=${PONG_ROLE_BOOTSTRAP_TIMEOUT:-40}
 ROLE_BOOTSTRAP_INTERVAL=${PONG_ROLE_BOOTSTRAP_INTERVAL:-1}
@@ -85,6 +94,9 @@ AGENT_LOG_LEVEL=${PONG_AGENT_LOG_LEVEL:-$PLAYER_LOG_LEVEL}
 PREBUILD_BEACH_BIN=${PONG_STACK_PREBUILD:-1}
 CONTAINER_ICE_IP=${PONG_STACK_CONTAINER_ICE_IP:-}
 CONTAINER_ICE_HOST=${PONG_STACK_CONTAINER_ICE_HOST:-}
+PONG_FRAME_DUMP_DIR=${PONG_FRAME_DUMP_DIR:-$LOG_DIR/frame-dumps}
+PONG_BALL_TRACE_DIR=${PONG_BALL_TRACE_DIR:-$LOG_DIR/ball-trace}
+PONG_COMMAND_TRACE_DIR=${PONG_COMMAND_TRACE_DIR:-$LOG_DIR/command-trace}
 CONTAINER_ENV_PREFIX=""
 # Preserve NAT hints by default so hosts advertise a reachable address; allow explicit overrides.
 if [[ -n "$CONTAINER_ICE_IP" ]]; then
@@ -93,9 +105,9 @@ fi
 if [[ -n "$CONTAINER_ICE_HOST" ]]; then
   CONTAINER_ENV_PREFIX+=" export BEACH_ICE_PUBLIC_HOST='$CONTAINER_ICE_HOST';"
 fi
-HOST_MANAGER_TOKEN=""
-HOST_TOKEN_EXPORT=""
-STACK_MANAGER_TOKEN=""
+HOST_MANAGER_TOKEN=${HOST_MANAGER_TOKEN:-""}
+HOST_TOKEN_EXPORT=${HOST_TOKEN_EXPORT:-""}
+STACK_MANAGER_TOKEN=${STACK_MANAGER_TOKEN:-""}
 API_RESPONSE=""
 API_STATUS=""
 
@@ -190,6 +202,24 @@ run_in_container() {
   docker compose exec -T "$SERVICE" bash -c "$CONTAINER_ENV_PREFIX export PATH=\"$CARGO_BIN_DIR:\\$PATH\"; $cmd"
 }
 
+# Fresh per-run log directory: timestamped by default, with a stable "latest" symlink.
+if [[ "$COMMAND" == start* ]]; then
+  if [[ -z "${PONG_LOG_DIR:-}" ]]; then
+    LOG_DIR="$LOG_ROOT/$(date +%Y%m%d-%H%M%S)"
+  fi
+  run_in_container "set -euo pipefail; mkdir -p '$LOG_ROOT'; rm -rf '$LOG_DIR'; mkdir -p '$LOG_DIR'; ln -sfn '$LOG_DIR' '$LOG_ROOT/latest'"
+  # Recompute trace dirs after LOG_DIR is finalized.
+  if [[ -z "${PONG_FRAME_DUMP_DIR+set}" ]]; then
+    PONG_FRAME_DUMP_DIR="$LOG_DIR/frame-dumps"
+  fi
+  if [[ -z "${PONG_BALL_TRACE_DIR+set}" ]]; then
+    PONG_BALL_TRACE_DIR="$LOG_DIR/ball-trace"
+  fi
+  if [[ -z "${PONG_COMMAND_TRACE_DIR+set}" ]]; then
+    PONG_COMMAND_TRACE_DIR="$LOG_DIR/command-trace"
+  fi
+fi
+
 prebuild_beach_binary() {
   if [[ "$PREBUILD_BEACH_BIN" -eq 0 ]]; then
     return
@@ -225,6 +255,7 @@ start_player() {
   local mode=$1
   local human=$2
   local frame_env=""
+  frame_env+="export PONG_VERBOSE_DIAG=1; "
   if [[ -n "${PONG_FRAME_DUMP_DIR:-}" ]]; then
     frame_env+="mkdir -p '$PONG_FRAME_DUMP_DIR'; export PONG_FRAME_DUMP_PATH='$PONG_FRAME_DUMP_DIR/frame-$mode.txt'; "
   fi
@@ -440,6 +471,50 @@ get_stack_manager_token() {
   printf '%s\n' "$STACK_MANAGER_TOKEN"
 }
 
+create_private_beach() {
+  local name slug payload_file id
+  name=${PONG_BEACH_NAME:-"Pong Showcase"}
+  slug=${PONG_BEACH_SLUG:-}
+  payload_file=$(mktemp 2>/dev/null || mktemp -t pong-beach-payload)
+  python3 - "$name" "$slug" >"$payload_file" <<'PY'
+import json, sys
+name = sys.argv[1]
+slug = sys.argv[2] if len(sys.argv) > 2 else ""
+payload = {"name": name}
+if slug.strip():
+    payload["slug"] = slug.strip()
+print(json.dumps(payload))
+PY
+  if ! manager_api_request "POST" "/private-beaches" "$payload_file"; then
+    rm -f "$payload_file"
+    return 1
+  fi
+  rm -f "$payload_file"
+  id=$(API_RESPONSE="$API_RESPONSE" python3 - <<'PY'
+import json
+import os
+
+raw = os.environ.get("API_RESPONSE", "")
+try:
+    data = json.loads(raw)
+except Exception:
+    data = {}
+beach_id = data.get("id") or ""
+print(beach_id)
+PY
+)
+  if [[ -z "$id" ]]; then
+    echo "[pong-stack] failed to parse beach id from create response (status ${API_STATUS:-unknown}): $API_RESPONSE" >&2
+    return 1
+  fi
+  echo "[pong-stack] created private beach $id" >&2
+  if [[ -n "${PONG_CREATED_BEACH_ID_FILE:-}" ]]; then
+    mkdir -p "$(dirname "$PONG_CREATED_BEACH_ID_FILE")"
+    printf '%s\n' "$id" >"$PONG_CREATED_BEACH_ID_FILE"
+  fi
+  printf '%s\n' "$id"
+}
+
 manager_api_request() {
   local method=$1
   local path=$2
@@ -521,11 +596,12 @@ run_showcase_preflight() {
     echo "[pong-stack] unable to fetch showcase preflight diagnostics; continuing without preflight" >&2
     return 0
   fi
-  if printf '%s' "$API_RESPONSE" | python3 - <<'PY'; then
+  if API_RESPONSE="$API_RESPONSE" python3 - <<'PY'; then
 import json
+import os
 import sys
 
-raw = sys.stdin.read()
+raw = os.environ.get("API_RESPONSE", "")
 if not raw.strip():
     print("[pong-stack] showcase preflight returned empty payload; continuing.")
     sys.exit(0)
@@ -888,15 +964,45 @@ case "$COMMAND" in
     fi
     prebuild_beach_binary
     if [[ $# -lt 1 ]]; then
-      echo "error: missing start target" >&2
-      usage
-      exit 1
+      if [[ "$CREATE_BEACH" == true ]]; then
+        target="__auto_beach__"
+      else
+        echo "error: missing start target" >&2
+        usage
+        exit 1
+      fi
+    else
+      target=$1
+      shift || true
     fi
-    target=$1
-    shift || true
-    while [[ "$target" == "--setup-beach" ]]; do
-      SETUP_BEACH=true
+    while [[ "$target" == "--setup-beach" || "$target" == "--create-beach" ]]; do
+      if [[ "$target" == "--setup-beach" ]]; then
+        SETUP_BEACH=true
+      fi
+      if [[ "$target" == "--create-beach" ]]; then
+        CREATE_BEACH=true
+      fi
       if [[ $# -lt 1 ]]; then
+        if [[ "$CREATE_BEACH" == true ]]; then
+          target="__auto_beach__"
+          break
+        else
+          echo "error: missing start target" >&2
+          usage
+          exit 1
+        fi
+      fi
+      target=$1
+      shift || true
+    done
+    # Accept "start -- create-beach" CLI form by treating the post-terminator token
+    # as the start target/flag.
+    while [[ "$target" == "--" ]]; do
+      if [[ $# -lt 1 ]]; then
+        if [[ "$CREATE_BEACH" == true ]]; then
+          target="__auto_beach__"
+          break
+        fi
         echo "error: missing start target" >&2
         usage
         exit 1
@@ -904,6 +1010,16 @@ case "$COMMAND" in
       target=$1
       shift || true
     done
+    # Allow "create-beach" as a target alias that implies --create-beach with no id.
+    if [[ "$target" == "create-beach" ]]; then
+      CREATE_BEACH=true
+      if [[ $# -gt 0 ]]; then
+        target=$1
+        shift || true
+      else
+        target="__auto_beach__"
+      fi
+    fi
     case "$target" in
       lhs)
         if [[ -z "$HOST_MANAGER_TOKEN" ]]; then
@@ -941,6 +1057,18 @@ case "$COMMAND" in
         ;;
       *)
         beach_id=$target
+        if [[ "$beach_id" == "__auto_beach__" ]]; then
+          beach_id=""
+        fi
+        if [[ -z "$beach_id" && "$CREATE_BEACH" == true ]]; then
+          if ! beach_id=$(create_private_beach); then
+            exit 1
+          fi
+        fi
+        if [[ -z "$beach_id" ]]; then
+          echo "error: missing private beach id; provide one or use --create-beach" >&2
+          exit 1
+        fi
         if [[ -z "$HOST_MANAGER_TOKEN" ]]; then
           ensure_cli_login
         else

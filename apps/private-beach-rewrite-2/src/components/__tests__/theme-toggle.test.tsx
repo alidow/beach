@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { act, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ThemeToggleButton } from '../ThemeToggleButton';
 
@@ -36,12 +36,15 @@ describe('ThemeToggleButton', () => {
     // Button mounts after hydration
     const btn = await screen.findByRole('button', { name: /dark mode|light mode/i });
     expect(document.documentElement.classList.contains('dark')).toBe(false);
-    await user.click(btn);
+    await act(async () => {
+      await user.click(btn);
+    });
     expect(document.documentElement.classList.contains('dark')).toBe(true);
     expect(window.localStorage.getItem('pb-theme')).toBe('dark');
-    await user.click(btn);
+    await act(async () => {
+      await user.click(btn);
+    });
     expect(document.documentElement.classList.contains('dark')).toBe(false);
     expect(window.localStorage.getItem('pb-theme')).toBe('light');
   });
 });
-

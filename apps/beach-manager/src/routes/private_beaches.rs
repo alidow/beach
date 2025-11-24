@@ -1375,15 +1375,9 @@ fn map_state_err(err: StateError) -> ApiError {
         StateError::ActionQueueFull { .. } => {
             ApiError::TooManyRequests("pending controller action queue full")
         }
-        StateError::ControllerCommandRejected { reason } => match reason {
-            ControllerCommandDropReason::FastPathNotReady => ApiError::PreconditionFailed {
-                message: reason.default_message().to_string(),
-                code: reason.code(),
-            },
-            _ => ApiError::ConflictWithCode {
-                message: reason.default_message().to_string(),
-                code: reason.code(),
-            },
+        StateError::ControllerCommandRejected { reason } => ApiError::ConflictWithCode {
+            message: reason.default_message().to_string(),
+            code: reason.code(),
         },
     }
 }

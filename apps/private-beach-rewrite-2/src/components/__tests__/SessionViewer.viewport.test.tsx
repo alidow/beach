@@ -68,6 +68,12 @@ describe('SessionViewer viewport metrics', () => {
       viewportCols: 120,
       pixelsPerRow: 18,
       pixelsPerCol: 9,
+      hostWidthPx: null,
+      hostHeightPx: null,
+      cellWidthPx: 9,
+      cellHeightPx: 18,
+      quantizedCellWidthPx: null,
+      quantizedCellHeightPx: null,
     });
   });
 

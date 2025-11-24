@@ -1,20 +1,29 @@
 import { act, render } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { describe, expect, it, beforeEach, vi } from 'vitest';
-import { FlowCanvas } from '../FlowCanvas';
 import { CanvasEventsProvider } from '../CanvasEventsContext';
 import { TileStoreProvider, useTileActions } from '@/features/tiles/store';
 import type { TileState, TileViewportSnapshot } from '@/features/tiles/types';
 
-const nodesCapture = vi.hoisted(() => ({
-  log: [] as unknown[][],
+vi.mock('@/hooks/useManagerToken', () => ({
+  useManagerToken: () => ({
+    token: 'manager-token',
+    loading: false,
+    error: null,
+    isLoaded: true,
+    isSignedIn: true,
+    refresh: vi.fn(),
+  }),
+  buildManagerUrl: () => 'http://manager.test',
+  buildRoadUrl: () => 'http://road.test',
 }));
+
+let lastNodes: unknown[] | null = null;
 
 vi.mock('reactflow', () => {
   const React = require('react');
-  const { log } = nodesCapture;
   const ReactFlow = ({ nodes, children }: { nodes: unknown[]; children?: ReactNode }) => {
-    log.push(nodes);
+    lastNodes = nodes;
     return <div data-testid="reactflow-mock">{children}</div>;
   };
   const Background = () => null;
@@ -25,9 +34,12 @@ vi.mock('reactflow', () => {
     zoomIn: () => {},
     zoomOut: () => {},
     fitView: () => {},
+    setViewport: () => {},
   });
   const useStore = () => 1;
   return {
+    __esModule: true,
+    default: ReactFlow,
     ReactFlow,
     Background,
     ReactFlowProvider,
@@ -35,14 +47,23 @@ vi.mock('reactflow', () => {
     useReactFlow,
     useStore,
     Position: { Left: 'left', Right: 'right', Top: 'top', Bottom: 'bottom' },
+    MarkerType: { ArrowClosed: 'arrow-closed' },
+    ConnectionMode: { Loose: 'loose', Strict: 'strict' },
     addEdge: (_edge: unknown, edges: unknown[]) => edges,
     applyEdgeChanges: (_changes: unknown, edges: unknown[]) => edges,
+    useStoreApi: () => ({ getState: () => ({}) }),
   };
 });
 
 describe('FlowCanvas viewport updates', () => {
+  let FlowCanvas: typeof import('../FlowCanvas')['FlowCanvas'];
+
+  beforeAll(async () => {
+    ({ FlowCanvas } = await import('../FlowCanvas'));
+  });
+
   beforeEach(() => {
-    nodesCapture.log.length = 0;
+    lastNodes = null;
   });
 
   it('keeps node references stable when only viewport snapshots change', () => {
@@ -92,8 +113,8 @@ describe('FlowCanvas viewport updates', () => {
       </TileStoreProvider>,
     );
 
-    expect(nodesCapture.log.length).toBeGreaterThan(0);
-    const initialNodesRef = nodesCapture.log.at(-1);
+    expect(lastNodes).toBeTruthy();
+    const initialNodesRef = lastNodes;
     expect(initialNodesRef).toBeDefined();
     const snapshot: TileViewportSnapshot = {
       tileId: 'tile-1',
@@ -113,7 +134,7 @@ describe('FlowCanvas viewport updates', () => {
       actions?.updateTileViewport('tile-1', snapshot);
     });
 
-    const nextNodesRef = nodesCapture.log.at(-1);
+    const nextNodesRef = lastNodes;
     expect(nextNodesRef).toBe(initialNodesRef);
   });
 });

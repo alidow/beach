@@ -21,10 +21,6 @@ use crate::auth::{AuthConfig, AuthContext};
 use crate::publish_token::{PublishTokenManager, SignedPublishToken};
 use crate::routes::ShowcasePreflightResponse;
 use crate::{
-    fastpath::{
-        action_terminal_bytes, fast_path_action_payload, send_actions_over_fast_path,
-        FastPathRegistry, FastPathSendOutcome, FastPathSession,
-    },
     log_throttle::{should_log_custom_event, should_log_queue_event, QueueLogKind},
     metrics,
 };
@@ -35,13 +31,13 @@ use beach_buggy::{
 };
 use beach_client_core::cache::terminal::packed::unpack_cell;
 use beach_client_core::protocol::{ClientFrame, CursorFrame, Update as WireUpdate};
-use beach_client_core::transport::extensions;
 use beach_client_core::transport::webrtc::warm_session_key;
+use beach_client_core::transport::{extensions, framed};
 use beach_client_core::{
     decode_host_frame_binary, encode_client_frame_binary, negotiate_transport, CliError,
-    ExtensionFrame, HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell,
-    Payload, SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId,
-    TerminalGrid, Transport, TransportError, TransportOffer, WebRtcChannels,
+    HostFrame as WireHostFrame, NegotiatedSingle, NegotiatedTransport, PackedCell, Payload,
+    SessionConfig, SessionError, SessionHandle, SessionManager, Style, StyleId, TerminalGrid,
+    Transport, TransportError, TransportOffer, WebRtcChannels,
 };
 use chrono::{DateTime, Duration, Utc};
 use prometheus::IntGauge;
@@ -50,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{types::Json, FromRow, PgPool, Row};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn, Level};
 use url::Url;
@@ -76,18 +72,6 @@ const VIEWER_HEALTH_REPORT_INTERVAL: StdDuration = StdDuration::from_secs(15);
 const MAX_PENDING_ACTIONS_PER_SESSION: usize = 500;
 const STREAM_EVENT_NO_SUBSCRIBERS_LOG_KIND: &str = "stream_event_no_subscribers";
 const STREAM_EVENT_NO_SUBSCRIBERS_LOG_SECS: u64 = 30;
-const CONTROLLER_FAST_PATH_FLAG_ENV: &str = "CONTROLLER_FAST_PATH_ENABLED";
-const CONTROLLER_FAST_PATH_DEFAULT_ENABLED: bool = true;
-const CONTROLLER_FAST_PATH_WAIT: StdDuration = StdDuration::from_secs(15);
-const CONTROLLER_FAST_PATH_WAIT_LOG_KIND: &str = "controller_fast_path_wait";
-const CONTROLLER_FAST_PATH_READY_LOG_KIND: &str = "controller_fast_path_ready";
-const CONTROLLER_FAST_PATH_LOG_INTERVAL: StdDuration = StdDuration::from_secs(5);
-/// Enables exponential retry backoff for controller fast-path upgrades. Disable
-/// via env if we need to fall back to the legacy eager retry strategy.
-const CONTROLLER_FAST_PATH_BACKOFF_ENV: &str = "CONTROLLER_FAST_PATH_BACKOFF";
-const CONTROLLER_FAST_PATH_BACKOFF_DEFAULT_ENABLED: bool = true;
-const CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY: StdDuration = StdDuration::from_secs(1);
-const CONTROLLER_FAST_PATH_BACKOFF_MAX_DELAY: StdDuration = StdDuration::from_secs(30);
 const CONTROLLER_STRICT_GATING_ENV: &str = "CONTROLLER_STRICT_GATING";
 const CONTROLLER_STRICT_GATING_DEFAULT_ENABLED: bool = true;
 const CONTROLLER_HANDSHAKE_STALE_AFTER: StdDuration = StdDuration::from_secs(20);
@@ -109,6 +93,24 @@ fn env_flag_enabled(name: &str, default: bool) -> bool {
     }
 }
 
+fn manager_bearer_token() -> Option<String> {
+    for key in [
+        "MANAGER_JWT",
+        "BEACH_MANAGER_JWT",
+        "BEACH_MANAGER_BEARER",
+        "CLERK_MANAGER_JWT",
+        "BEACH_GATE_VIEWER_TOKEN",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[derive(Clone)]
 struct StateKeepaliveManager {
     tasks: Arc<RwLock<HashMap<String, StateHeartbeatHandle>>>,
@@ -128,15 +130,12 @@ pub struct AppState {
     publish_tokens: Arc<PublishTokenManager>,
     events: Arc<RwLock<HashMap<String, broadcast::Sender<StreamEvent>>>>,
     devtools_events: Arc<RwLock<HashMap<String, broadcast::Sender<DevtoolsTimelineEvent>>>>,
-    fast_paths: FastPathRegistry,
     viewer_workers: Arc<RwLock<HashMap<String, ViewerWorker>>>,
     controller_workers: Arc<RwLock<HashMap<String, ControllerForwarderWorker>>>,
     viewer_tokens: Option<ViewerTokenClient>,
     http: reqwest::Client,
     road_base_url: String,
     public_manager_url: String,
-    controller_fast_path_enabled: bool,
-    controller_fast_path_backoff_enabled: bool,
     controller_strict_gating: bool,
     idle_snapshot_interval_ms: Option<u64>,
     controller_handshakes: Arc<RwLock<HashMap<String, ControllerHandshakeInfo>>>,
@@ -737,7 +736,6 @@ pub enum ControllerCommandDropReason {
     SessionNotBound,
     ChildNotAttached,
     ChildOffline,
-    FastPathNotReady,
 }
 
 impl ControllerCommandDropReason {
@@ -747,15 +745,11 @@ impl ControllerCommandDropReason {
             ControllerCommandDropReason::SessionNotBound => "session_not_bound",
             ControllerCommandDropReason::ChildNotAttached => "child_not_attached",
             ControllerCommandDropReason::ChildOffline => "child_offline",
-            ControllerCommandDropReason::FastPathNotReady => "fast_path_not_ready",
         }
     }
 
     pub fn default_message(&self) -> &'static str {
         match self {
-            ControllerCommandDropReason::FastPathNotReady => {
-                "child session is not ready to consume commands"
-            }
             ControllerCommandDropReason::ChildNotAttached => {
                 "child session has not attached to the private beach"
             }
@@ -1199,7 +1193,6 @@ impl AppState {
             publish_tokens: Arc::new(PublishTokenManager::from_env()),
             events: Arc::new(RwLock::new(HashMap::new())),
             devtools_events: Arc::new(RwLock::new(HashMap::new())),
-            fast_paths: FastPathRegistry::new(),
             viewer_workers: Arc::new(RwLock::new(HashMap::new())),
             controller_workers: Arc::new(RwLock::new(HashMap::new())),
             viewer_tokens: None,
@@ -1208,14 +1201,6 @@ impl AppState {
                 .unwrap_or_else(|_| "https://api.beach.sh".into()),
             public_manager_url: std::env::var("PUBLIC_MANAGER_URL")
                 .unwrap_or_else(|_| "http://localhost:8080".into()),
-            controller_fast_path_enabled: env_flag_enabled(
-                CONTROLLER_FAST_PATH_FLAG_ENV,
-                CONTROLLER_FAST_PATH_DEFAULT_ENABLED,
-            ),
-            controller_fast_path_backoff_enabled: env_flag_enabled(
-                CONTROLLER_FAST_PATH_BACKOFF_ENV,
-                CONTROLLER_FAST_PATH_BACKOFF_DEFAULT_ENABLED,
-            ),
             controller_strict_gating: env_flag_enabled(
                 CONTROLLER_STRICT_GATING_ENV,
                 CONTROLLER_STRICT_GATING_DEFAULT_ENABLED,
@@ -1240,7 +1225,6 @@ impl AppState {
             publish_tokens: Arc::new(PublishTokenManager::from_env()),
             events: Arc::new(RwLock::new(HashMap::new())),
             devtools_events: Arc::new(RwLock::new(HashMap::new())),
-            fast_paths: FastPathRegistry::new(),
             viewer_workers: Arc::new(RwLock::new(HashMap::new())),
             controller_workers: Arc::new(RwLock::new(HashMap::new())),
             viewer_tokens: None,
@@ -1249,14 +1233,6 @@ impl AppState {
                 .unwrap_or_else(|_| "https://api.beach.sh".into()),
             public_manager_url: std::env::var("PUBLIC_MANAGER_URL")
                 .unwrap_or_else(|_| "http://localhost:8080".into()),
-            controller_fast_path_enabled: env_flag_enabled(
-                CONTROLLER_FAST_PATH_FLAG_ENV,
-                CONTROLLER_FAST_PATH_DEFAULT_ENABLED,
-            ),
-            controller_fast_path_backoff_enabled: env_flag_enabled(
-                CONTROLLER_FAST_PATH_BACKOFF_ENV,
-                CONTROLLER_FAST_PATH_BACKOFF_DEFAULT_ENABLED,
-            ),
             controller_strict_gating: env_flag_enabled(
                 CONTROLLER_STRICT_GATING_ENV,
                 CONTROLLER_STRICT_GATING_DEFAULT_ENABLED,
@@ -1307,25 +1283,12 @@ impl AppState {
         &self.public_manager_url
     }
 
-    pub fn controller_fast_path_enabled(&self) -> bool {
-        self.controller_fast_path_enabled
-    }
-
-    pub fn controller_fast_path_backoff_enabled(&self) -> bool {
-        self.controller_fast_path_backoff_enabled
-    }
-
     pub fn controller_strict_gating(&self) -> bool {
         self.controller_strict_gating
     }
 
     pub fn with_controller_strict_gating(mut self, enabled: bool) -> Self {
         self.controller_strict_gating = enabled;
-        self
-    }
-
-    pub fn with_controller_fast_path_backoff(mut self, enabled: bool) -> Self {
-        self.controller_fast_path_backoff_enabled = enabled;
         self
     }
 
@@ -1410,12 +1373,6 @@ impl AppState {
         #[cfg(test)]
         if let Some(value) = test_support::fast_path_ready_override(session_id) {
             return value;
-        }
-        if let Some(fps) = self.fast_paths.get(session_id).await {
-            let guard = fps.actions_tx.lock().await;
-            if guard.is_some() {
-                return true;
-            }
         }
         let controllers = self.fallback.controllers_for_child(session_id).await;
         let ready = if controllers.is_empty() {
@@ -1563,10 +1520,6 @@ impl AppState {
         }
         if snapshot.ever_reported_health() && !snapshot.child_online() {
             return Err(ControllerCommandDropReason::ChildOffline);
-        }
-        let fast_path_ready = self.fast_path_ready(session_id).await;
-        if !snapshot.http_ready() && !fast_path_ready {
-            return Err(ControllerCommandDropReason::FastPathNotReady);
         }
         Ok(())
     }
@@ -1908,22 +1861,6 @@ impl AppState {
                 );
             }
         }
-        if let Some(fast_path_hint) = {
-            let sessions = self.fallback.sessions.read().await;
-            sessions
-                .get(session_id)
-                .and_then(|record| record.transport_hints.get("fast_path_webrtc").cloned())
-        } {
-            if let Some(obj) = handshake.as_object_mut() {
-                obj.insert("fast_path_webrtc".into(), fast_path_hint);
-            }
-        } else if let Some(obj) = handshake.as_object_mut() {
-            obj.insert(
-                "fast_path_webrtc".into(),
-                default_fast_path_hint(session_id),
-            );
-        }
-
         #[cfg(test)]
         test_support::record_manager_handshake(session_id, &handshake);
 
@@ -1933,7 +1870,6 @@ impl AppState {
             .get("controller_auto_attach")
             .and_then(|value| value.as_object())
             .is_some();
-        let fast_path_hint = handshake.get("fast_path_webrtc");
         let idle_snapshot_interval_ms = handshake
             .get("idle_snapshot")
             .and_then(|value| value.get("interval_ms"))
@@ -1944,7 +1880,6 @@ impl AppState {
             session_id = %session_id,
             private_beach_id = %private_beach_id,
             has_auto_attach,
-            fast_path_hint = ?fast_path_hint,
             idle_snapshot_interval_ms,
             "manager handshake prepared"
         );
@@ -2060,53 +1995,6 @@ impl AppState {
 
     pub fn publish_token_manager(&self) -> Arc<PublishTokenManager> {
         self.publish_tokens.clone()
-    }
-
-    async fn clear_http_backlog_after_fast_path(&self, private_beach_id: &str, session_id: &str) {
-        if let Err(err) = self.clear_actions_redis(private_beach_id, session_id).await {
-            warn!(
-                target = "controller.delivery",
-                session_id = %session_id,
-                private_beach_id = %private_beach_id,
-                error = %err,
-                "failed to clear redis backlog after fast-path promotion"
-            );
-        } else {
-            debug!(
-                target = "controller.delivery",
-                session_id = %session_id,
-                private_beach_id = %private_beach_id,
-                "cleared redis controller backlog after fast-path promotion"
-            );
-        }
-        self.fallback.clear_pending_actions(session_id).await;
-    }
-
-    pub async fn fast_path_actions_online(&self, session_id: &str) {
-        let private_beach_id =
-            if let Some((pb_id, _)) = self.session_metrics_labels(session_id).await {
-                Some(pb_id)
-            } else {
-                let sessions = self.fallback.sessions.read().await;
-                sessions
-                    .get(session_id)
-                    .map(|record| record.private_beach_id.clone())
-            };
-
-        if let Some(pb_id) = private_beach_id {
-            self.clear_http_backlog_after_fast_path(&pb_id, session_id)
-                .await;
-        }
-    }
-
-    pub async fn attach_fast_path(&self, session_id: String, fps: FastPathSession) {
-        let arc = Arc::new(fps);
-        arc.spawn_receivers(self.clone());
-        self.fast_paths.insert(session_id, arc).await;
-    }
-
-    pub async fn fast_path_for(&self, session_id: &str) -> Option<Arc<FastPathSession>> {
-        self.fast_paths.get(session_id).await
     }
 
     pub async fn session_metrics_labels(&self, session_id: &str) -> Option<(String, String)> {
@@ -3862,109 +3750,6 @@ impl AppState {
                     .build_agent_trace_context(pool, &identifiers, &actions)
                     .await;
 
-                let transport_mode = self.session_transport_mode(session_id).await;
-                let prefer_fast_path = matches!(transport_mode, TransportMode::FastPath);
-                if prefer_fast_path {
-                    match send_actions_over_fast_path(&self.fast_paths, &session_uuid_str, &actions)
-                        .await
-                    {
-                        Ok(FastPathSendOutcome::Delivered) => {
-                            let now = now_ms();
-                            self.update_pairing_transport_status(
-                                &session_uuid_str,
-                                PairingTransportStatus::fast_path(now),
-                            )
-                            .await;
-
-                            let label0 = identifiers.private_beach_id.to_string();
-                            let label1 = session_uuid_str.clone();
-                            metrics::FASTPATH_ACTIONS_SENT
-                                .with_label_values(&[label0.as_str(), label1.as_str()])
-                                .inc_by(actions.len() as u64);
-
-                            self.clear_http_backlog_after_fast_path(
-                                &identifiers.private_beach_id.to_string(),
-                                &session_uuid_str,
-                            )
-                            .await;
-
-                            let mut tx = pool.begin().await?;
-                            self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
-                                .await?;
-                            self.insert_controller_event(
-                                &mut tx,
-                                identifiers.session_id,
-                                "actions_queued",
-                                Some(lease.id),
-                                lease.controller_account_id,
-                                actor_account_id,
-                                None,
-                            )
-                            .await?;
-                            tx.commit().await?;
-
-                            debug!(
-                                target = "controller.delivery",
-                                session_id = %session_uuid,
-                                private_beach_id = %identifiers.private_beach_id,
-                                action_count = actions.len(),
-                                transport = "fast_path",
-                                "dispatched actions via fast-path"
-                            );
-
-                            self.publish(
-                                session_id,
-                                StreamEvent::ControllerEvent(ControllerEvent {
-                                    id: Uuid::new_v4().to_string(),
-                                    event_type: ControllerEventType::ActionsQueued,
-                                    controller_token: Some(token_uuid.to_string()),
-                                    timestamp_ms: now,
-                                    reason: None,
-                                    controller_account_id: lease
-                                        .controller_account_id
-                                        .map(|u| u.to_string()),
-                                    issued_by_account_id: actor_account_id.map(|u| u.to_string()),
-                                }),
-                            )
-                            .await;
-                            if let Some((agent_sessions, payload)) = trace_context.as_ref() {
-                                Self::log_agent_bridge_payload(
-                                    agent_sessions,
-                                    &session_uuid,
-                                    &identifiers.private_beach_id,
-                                    payload,
-                                    "agent_to_child",
-                                    "fast_path",
-                                );
-                            }
-                            return Ok(());
-                        }
-                        Ok(FastPathSendOutcome::SessionMissing)
-                        | Ok(FastPathSendOutcome::ChannelMissing) => {
-                            trace!(
-                                target = "controller.delivery",
-                                session_id = %session_uuid,
-                                private_beach_id = %identifiers.private_beach_id,
-                                "fast-path unavailable for session; falling back to HTTP transport"
-                            );
-                        }
-                        Err(err) => {
-                            warn!(
-                                target = "fast_path",
-                                session_id = %session_uuid,
-                                error = %err,
-                                "fast-path send failed; falling back to HTTP transport"
-                            );
-                            let now = now_ms();
-                            self.update_pairing_transport_status(
-                                &session_uuid_str,
-                                PairingTransportStatus::http_fallback(now, Some(err.to_string())),
-                            )
-                            .await;
-                        }
-                    }
-                }
-
                 let queue_depth = self
                     .pending_actions_count(&private_beach_id_str, &session_uuid_str)
                     .await?;
@@ -3994,6 +3779,7 @@ impl AppState {
                     private_beach_id = %identifiers.private_beach_id,
                     action_count = actions.len(),
                     transport = "http_fallback",
+                    queue_depth,
                     "queuing actions via Redis fallback"
                 );
 
@@ -4032,9 +3818,6 @@ impl AppState {
                 metrics::QUEUE_LAG
                     .with_label_values(&labels)
                     .set(pending as i64);
-                metrics::FASTPATH_ACTIONS_FALLBACK
-                    .with_label_values(&labels)
-                    .inc_by(actions.len() as u64);
 
                 let mut tx = pool.begin().await?;
                 self.set_rls_context_tx(&mut tx, &identifiers.private_beach_id)
@@ -4378,11 +4161,6 @@ impl AppState {
                 metrics::QUEUE_LAG
                     .with_label_values(&[label0.as_str(), label1.as_str()])
                     .set(pending as i64);
-                if via_fast_path {
-                    metrics::FASTPATH_ACKS_RECEIVED
-                        .with_label_values(&[label0.as_str(), label1.as_str()])
-                        .inc_by(acks.len() as u64);
-                }
                 self.fallback.remove_actions(session_id, &acks).await;
                 if !acks.is_empty() {
                     let event_time = now_ms();
@@ -4504,7 +4282,7 @@ impl AppState {
         &self,
         session_id: &str,
         diff: StateDiff,
-        via_fast_path: bool,
+        _via_fast_path: bool,
     ) -> Result<(), StateError> {
         match &self.backend {
             Backend::Memory => self.record_state_memory(session_id, diff).await,
@@ -4551,11 +4329,6 @@ impl AppState {
                 metrics::STATE_REPORTS
                     .with_label_values(&[label0.as_str(), label1.as_str()])
                     .inc();
-                if via_fast_path {
-                    metrics::FASTPATH_STATE_RECEIVED
-                        .with_label_values(&[label0.as_str(), label1.as_str()])
-                        .inc();
-                }
                 self.state_keepalive
                     .schedule(self.clone(), session_id.to_string(), diff_sequence)
                     .await;
@@ -6000,18 +5773,6 @@ fn harness_to_session_kind(value: &HarnessType) -> &'static str {
     }
 }
 
-fn default_fast_path_hint(session_id: &str) -> serde_json::Value {
-    serde_json::json!({
-        "offer_path": format!("/fastpath/sessions/{session_id}/offer"),
-        "ice_path": format!("/fastpath/sessions/{session_id}/ice"),
-        "channels": {
-            "actions": "mgr-actions",
-            "acks": "mgr-acks",
-            "state": "mgr-state"
-        }
-    })
-}
-
 fn default_transport_hints(
     session_id: &str,
     idle_snapshot_interval_ms: Option<u64>,
@@ -6032,13 +5793,6 @@ fn default_transport_hints(
     hints.insert(
         "health_post".into(),
         serde_json::json!({ "path": format!("/sessions/{session_id}/health") }),
-    );
-    hints.insert(
-        "extensions".into(),
-        serde_json::json!({
-            "namespaces": ["fastpath"],
-            "preferred": true
-        }),
     );
     if let Some(interval) = idle_snapshot_interval_ms {
         hints.insert(
@@ -6563,24 +6317,6 @@ impl AppState {
             .await?;
         }
 
-        let transport_mode = self.session_transport_mode(session_id).await;
-        let fast_path_ready = self.fast_path_ready(session_id).await;
-        let fast_path_required =
-            matches!(transport_mode, TransportMode::FastPath) && !http_ready && !fast_path_ready;
-        if fast_path_required {
-            return Err(self
-                .controller_command_rejection_with_snapshot(
-                    &private_beach_id,
-                    session_id,
-                    controller_token,
-                    None,
-                    None,
-                    ControllerCommandDropReason::FastPathNotReady,
-                    readiness_snapshot,
-                )
-                .await);
-        }
-
         let mut sessions = self.fallback.sessions.write().await;
         let record = sessions
             .get_mut(session_id)
@@ -6608,21 +6344,13 @@ impl AppState {
         });
         drop(sessions);
 
-        if self.controller_fast_path_enabled() {
-            // Unified transport uses the primary channel for fast-path; keep transport
-            // status at fast_path so agents don't fall back to HTTP while actions queue.
-            self.update_pairing_transport_status(
-                session_id,
-                PairingTransportStatus::fast_path(event_time),
-            )
-            .await;
-        } else {
-            self.update_pairing_transport_status(
-                session_id,
-                PairingTransportStatus::http_fallback(event_time, None),
-            )
-            .await;
-        }
+        // Unified transport uses the primary channel; keep transport status at fast_path so
+        // agents don't fall back to HTTP while actions queue.
+        self.update_pairing_transport_status(
+            session_id,
+            PairingTransportStatus::fast_path(event_time),
+        )
+        .await;
 
         self.publish(session_id, event).await;
         self.emit_connector_events_for_child(
@@ -7018,35 +6746,6 @@ impl AppState {
             private_beach_id = %private_beach_id,
             active = leases.len(),
             controllers = ?summary
-        );
-    }
-
-    async fn log_fast_path_wait_state(
-        &self,
-        private_beach_id: &str,
-        session_id: &str,
-        lease: &LeaseRow,
-        reason: &str,
-        action_count: usize,
-    ) {
-        let remaining_ms = lease
-            .expires_at
-            .map(|ts| (ts - Utc::now()).num_milliseconds())
-            .unwrap_or(0);
-        let lease_age_ms = (DEFAULT_LEASE_TTL_MS as i64 - remaining_ms).max(0);
-        let queue_depth = self
-            .pending_actions_count(private_beach_id, session_id)
-            .await
-            .unwrap_or(0);
-        warn!(
-            target = "controller.delivery",
-            session_id = %session_id,
-            private_beach_id = %private_beach_id,
-            lease_age_ms,
-            queue_depth,
-            action_count,
-            reason,
-            "fast-path not yet ready; queuing controller actions via HTTP"
         );
     }
 
@@ -8332,7 +8031,7 @@ async fn viewer_connect_once(
         .map_err(ViewerError::Join)?;
     let mut handle = joined.into_handle();
     rewrite_loopback_transports(&mut handle, &fallback_base)?;
-    let negotiated = negotiate_transport(&handle, Some(join_code), Some(label), false)
+    let negotiated = negotiate_transport(&handle, Some(join_code), Some(label), false, None)
         .await
         .map_err(ViewerError::Negotiation)?;
     let transport = match negotiated {
@@ -8794,6 +8493,18 @@ async fn controller_forwarder_once_with_label(
         .map_err(|err| ControllerForwarderError::Join(err.to_string()))?;
     // Pre-derive session keys so the WebRTC handshake does not spend time in Argon2 later.
     warm_session_key(Some(join_code), session_id).await;
+    let mut forwarder_metadata = HashMap::new();
+    forwarder_metadata.insert("role".into(), "manager".into());
+    forwarder_metadata.insert("session_id".into(), session_id.to_string());
+    if let Some(token) = manager_bearer_token() {
+        forwarder_metadata.insert("bearer".into(), token);
+    } else {
+        warn!(
+            target = "controller.forwarder",
+            session_id = %session_id,
+            "manager bearer token missing; WebRTC peer auth may fail"
+        );
+    }
     let negotiate_started = Instant::now();
     info!(
         target = "controller.forwarder",
@@ -8802,20 +8513,26 @@ async fn controller_forwarder_once_with_label(
         requested_label = %label,
         "controller forwarder negotiating transport"
     );
-    let negotiated = negotiate_transport(&handle, Some(join_code), Some(label), false)
-        .await
-        .map_err(|err| {
-            warn!(
-                target = "controller.forwarder",
-                session_id = %session_id,
-                private_beach_id = %private_beach_id,
-                requested_label = %label,
-                wait_ms = negotiate_started.elapsed().as_millis() as u64,
-                error = %err,
-                "controller forwarder negotiation failed"
-            );
-            ControllerForwarderError::Negotiation(err.to_string())
-        })?;
+    let negotiated = negotiate_transport(
+        &handle,
+        Some(join_code),
+        Some(label),
+        false,
+        Some(forwarder_metadata),
+    )
+    .await
+    .map_err(|err| {
+        warn!(
+            target = "controller.forwarder",
+            session_id = %session_id,
+            private_beach_id = %private_beach_id,
+            requested_label = %label,
+            wait_ms = negotiate_started.elapsed().as_millis() as u64,
+            error = %err,
+            "controller forwarder negotiation failed"
+        );
+        ControllerForwarderError::Negotiation(err.to_string())
+    })?;
     match negotiated {
         NegotiatedTransport::Single(NegotiatedSingle {
             transport,
@@ -8903,10 +8620,6 @@ enum ForwarderEvent {
     State(StateDiff),
     Health(HealthHeartbeat),
     Shutdown(String),
-    FastPathReady {
-        transport: Arc<dyn Transport>,
-        label: &'static str,
-    },
 }
 
 struct ForwarderReader {
@@ -8993,321 +8706,31 @@ impl Drop for ForwarderReader {
     }
 }
 
-enum FastPathExtension {
-    Ack(ActionAck),
-    State(StateDiff),
-    Health(HealthHeartbeat),
-}
-
-fn parse_fastpath_extension(frame: &ExtensionFrame) -> Option<FastPathExtension> {
-    if frame.namespace != "fastpath" {
-        return None;
-    }
-    let text = match std::str::from_utf8(&frame.payload) {
-        Ok(text) => text,
-        Err(err) => {
-            trace!(
-                target = "controller.forwarder",
-                namespace = %frame.namespace,
-                kind = %frame.kind,
-                error = %err,
-                "invalid utf8 in fast-path extension payload"
-            );
-            return None;
-        }
-    };
-
-    let payload_value: serde_json::Value = match serde_json::from_str(text) {
-        Ok(val) => val,
-        Err(err) => {
-            trace!(
-                target = "controller.forwarder",
-                namespace = %frame.namespace,
-                kind = %frame.kind,
-                error = %err,
-                "failed to parse fast-path extension json"
-            );
-            return None;
-        }
-    };
-    let payload_field = payload_value
-        .get("payload")
-        .cloned()
-        .unwrap_or(payload_value);
-
-    match frame.kind.as_str() {
-        "ack" => serde_json::from_value(payload_field)
-            .map(FastPathExtension::Ack)
-            .map_err(|err| {
-                trace!(
-                    target = "controller.forwarder",
-                    namespace = %frame.namespace,
-                    kind = %frame.kind,
-                    error = %err,
-                    "failed to parse fast-path ack extension"
-                )
-            })
-            .ok(),
-        "state" => serde_json::from_value(payload_field)
-            .map(FastPathExtension::State)
-            .map_err(|err| {
-                trace!(
-                    target = "controller.forwarder",
-                    namespace = %frame.namespace,
-                    kind = %frame.kind,
-                    error = %err,
-                    "failed to parse fast-path state extension"
-                )
-            })
-            .ok(),
-        "health" => serde_json::from_value(payload_field)
-            .map(FastPathExtension::Health)
-            .map_err(|err| {
-                trace!(
-                    target = "controller.forwarder",
-                    namespace = %frame.namespace,
-                    kind = %frame.kind,
-                    error = %err,
-                    "failed to parse fast-path health extension"
-                )
-            })
-            .ok(),
-        _ => None,
-    }
-}
-
-struct FastPathUpgradeHandle {
-    cancel: Arc<AtomicBool>,
-    handles: Vec<JoinHandle<()>>,
-}
-
-impl FastPathUpgradeHandle {
-    fn spawn(
-        channels: WebRtcChannels,
-        session_id: String,
-        private_beach_id: String,
-        event_tx: mpsc::UnboundedSender<ForwarderEvent>,
-        initial_delay: StdDuration,
-    ) -> Self {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let mut handles = Vec::new();
-
-        for label in [CONTROLLER_CHANNEL_LABEL, LEGACY_CONTROLLER_CHANNEL_LABEL] {
-            let channels = channels.clone();
-            let event_tx = event_tx.clone();
-            let cancel_flag = cancel.clone();
-            let session_id = session_id.clone();
-            let private_beach_id = private_beach_id.clone();
-            let delay = initial_delay;
-            handles.push(tokio::spawn(async move {
-                if !delay.is_zero() {
-                    sleep(delay).await;
-                }
-                loop {
-                    if cancel_flag.load(Ordering::SeqCst) {
-                        break;
-                    }
-
-                    if should_log_custom_event(
-                        CONTROLLER_FAST_PATH_WAIT_LOG_KIND,
-                        &session_id,
-                        CONTROLLER_FAST_PATH_LOG_INTERVAL,
-                    ) {
-                        trace!(
-                            target = "controller.forwarder",
-                            session_id = %session_id,
-                            private_beach_id = %private_beach_id,
-                            label,
-                            "waiting for fast-path data channel"
-                        );
-                    }
-
-                    match channels.wait_for(label).await {
-                        Ok(channel) => {
-                            if cancel_flag.load(Ordering::SeqCst) {
-                                break;
-                            }
-                            if should_log_custom_event(
-                                CONTROLLER_FAST_PATH_READY_LOG_KIND,
-                                &session_id,
-                                CONTROLLER_FAST_PATH_LOG_INTERVAL,
-                            ) {
-                                trace!(
-                                    target = "controller.forwarder",
-                                    session_id = %session_id,
-                                    private_beach_id = %private_beach_id,
-                                    label,
-                                    peer_id = %channel.peer().0,
-                                    transport_id = %channel.id().0,
-                                    "fast-path data channel detected"
-                                );
-                            }
-                            let _ = event_tx.send(ForwarderEvent::FastPathReady {
-                                transport: channel,
-                                label,
-                            });
-                            break;
-                        }
-                        Err(err) => {
-                            if cancel_flag.load(Ordering::SeqCst) {
-                                break;
-                            }
-                            warn!(
-                                target = "controller.forwarder",
-                                session_id = %session_id,
-                                private_beach_id = %private_beach_id,
-                                label,
-                                error = %err,
-                                "fast-path data channel wait failed; retrying"
-                            );
-                            sleep(StdDuration::from_secs(1)).await;
-                        }
-                    }
-                }
-            }));
-        }
-
-        Self { cancel, handles }
-    }
-}
-
-impl Drop for FastPathUpgradeHandle {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
-        for handle in self.handles.drain(..) {
-            handle.abort();
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct FastPathUpgradeBackoff {
-    enabled: bool,
-    current_delay: Option<StdDuration>,
-}
-
-impl FastPathUpgradeBackoff {
-    fn new(enabled: bool) -> Self {
-        Self {
-            enabled,
-            current_delay: None,
-        }
-    }
-
-    fn record_failure(&mut self) -> StdDuration {
-        if !self.enabled {
-            return StdDuration::from_secs(0);
-        }
-        let next = match self.current_delay {
-            None => CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY,
-            Some(delay) => {
-                let doubled = delay.saturating_mul(2);
-                if doubled > CONTROLLER_FAST_PATH_BACKOFF_MAX_DELAY {
-                    CONTROLLER_FAST_PATH_BACKOFF_MAX_DELAY
-                } else {
-                    doubled
-                }
-            }
-        };
-        self.current_delay = Some(next);
-        next
-    }
-
-    fn reset(&mut self) {
-        self.current_delay = None;
-    }
-
-    #[cfg(test)]
-    fn current_delay(&self) -> Option<StdDuration> {
-        self.current_delay
-    }
-}
-
-fn ensure_fast_path_probe(
-    watchers: &mut Option<FastPathUpgradeHandle>,
-    channels: &Option<WebRtcChannels>,
-    fast_path_enabled: bool,
-    via_fast_path: bool,
-    transport_is_primary: bool,
-    session_id: &str,
-    private_beach_id: &str,
-    event_tx: &mpsc::UnboundedSender<ForwarderEvent>,
-    backoff: &mut FastPathUpgradeBackoff,
-    apply_backoff: bool,
-) {
-    if !fast_path_enabled || watchers.is_some() {
-        return;
-    }
-    let needs_probe = !via_fast_path && transport_is_primary;
-    if !needs_probe {
-        return;
-    }
-    if let Some(channels) = channels {
-        let delay = if apply_backoff {
-            backoff.record_failure()
-        } else {
-            StdDuration::from_secs(0)
-        };
-        if delay > StdDuration::from_secs(0) {
-            info!(
-                target = "controller.forwarder",
-                session_id = %session_id,
-                private_beach_id = %private_beach_id,
-                delay_ms = delay.as_millis() as u64,
-                "fast_path_upgrade_backoff"
-            );
-        }
-        watchers.replace(FastPathUpgradeHandle::spawn(
-            channels.clone(),
-            session_id.to_string(),
-            private_beach_id.to_string(),
-            event_tx.clone(),
-            delay,
-        ));
-    }
-}
-
 async fn drive_controller_forwarder(
     state: &AppState,
     private_beach_id: &str,
     session_id: &str,
     primary_transport: Arc<dyn Transport>,
-    webrtc_channels: Option<WebRtcChannels>,
+    _webrtc_channels: Option<WebRtcChannels>,
     metadata_label: Option<String>,
     cancel: CancellationToken,
 ) -> Result<(), ControllerForwarderError> {
-    let fast_path_enabled = state.controller_fast_path_enabled();
-    let fast_path_channels = webrtc_channels.clone();
-    let mut fast_path_backoff =
-        FastPathUpgradeBackoff::new(state.controller_fast_path_backoff_enabled());
-    let unified_only = fast_path_enabled && fast_path_channels.is_none();
     info!(
         target = "controller.forwarder",
         session_id = %session_id,
         private_beach_id = %private_beach_id,
         metadata_label = metadata_label.as_deref(),
-        fast_path_enabled,
-        has_fast_path_channels = fast_path_channels.is_some(),
-        unified_only,
         "controller forwarder starting"
     );
     let (mut transport, mut transport_label, mut via_fast_path) = select_controller_transport(
         primary_transport.clone(),
-        fast_path_channels.clone(),
+        None,
         metadata_label.as_deref(),
-        fast_path_enabled,
+        false,
         session_id,
         private_beach_id,
     )
     .await;
-    let mut transport_is_primary = Arc::ptr_eq(&transport, &primary_transport);
-    // Unified transport path: when fast-path is enabled but no legacy WebRTC
-    // channels are present, treat the primary transport as fast-path so we don't
-    // downgrade status back to HTTP on every ack/health/state event.
-    if unified_only {
-        transport_label = "fast_path";
-        via_fast_path = true;
-    }
     let t_id = transport.id();
     let t_peer = transport.peer();
     info!(
@@ -9335,51 +8758,39 @@ async fn drive_controller_forwarder(
         )
         .await;
 
-    if via_fast_path {
-        fast_path_backoff.reset();
-        let now = now_ms();
-        state
-            .update_pairing_transport_status(session_id, PairingTransportStatus::fast_path(now))
-            .await;
-    } else if fast_path_enabled {
-        let now = now_ms();
-        state
-            .update_pairing_transport_status(session_id, PairingTransportStatus::fast_path(now))
-            .await;
-        trace!(
-            target = "controller.forwarder",
-            session_id = %session_id,
-            private_beach_id = %private_beach_id,
-            "marking fast-path ready on primary transport (unified extensions)"
-        );
-    }
+    // Fast-path disabled; skip pairing status updates.
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let mut reader_guard = ForwarderReader::spawn(transport.clone(), event_tx.clone());
-    let mut ext_rx = transport.subscribe_extensions("fastpath");
+    let mut framed_rx = framed::subscribe(transport.id(), "controller");
     let event_tx_clone = event_tx.clone();
     tokio::spawn(async move {
         loop {
-            match ext_rx.recv().await {
-                Ok(frame) => {
-                    if let Some(parsed) = parse_fastpath_extension(&frame) {
-                        match parsed {
-                            FastPathExtension::Ack(ack) => {
-                                let _ = event_tx_clone.send(ForwarderEvent::AckById(ack));
-                            }
-                            FastPathExtension::State(diff) => {
-                                let _ = event_tx_clone.send(ForwarderEvent::State(diff));
-                            }
-                            FastPathExtension::Health(heartbeat) => {
-                                let _ = event_tx_clone.send(ForwarderEvent::Health(heartbeat));
-                            }
+            match framed_rx.recv().await {
+                Ok(frame) => match frame.kind.as_str() {
+                    "ack" => {
+                        if let Ok(ack) = serde_json::from_slice::<ActionAck>(&frame.payload) {
+                            let _ = event_tx_clone.send(ForwarderEvent::AckById(ack));
                         }
                     }
-                }
+                    "state" => {
+                        if let Ok(diff) = serde_json::from_slice::<StateDiff>(&frame.payload) {
+                            let _ = event_tx_clone.send(ForwarderEvent::State(diff));
+                        }
+                    }
+                    "health" => {
+                        if let Ok(heartbeat) =
+                            serde_json::from_slice::<HealthHeartbeat>(&frame.payload)
+                        {
+                            let _ = event_tx_clone.send(ForwarderEvent::Health(heartbeat));
+                        }
+                    }
+                    _ => {}
+                },
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(
                         target = "controller.forwarder",
-                        skipped, "fastpath extension subscriber lagged"
+                        skipped, "controller framed subscriber lagged"
                     );
                     continue;
                 }
@@ -9387,19 +8798,6 @@ async fn drive_controller_forwarder(
             }
         }
     });
-    let mut fast_path_watchers: Option<FastPathUpgradeHandle> = None;
-    ensure_fast_path_probe(
-        &mut fast_path_watchers,
-        &fast_path_channels,
-        fast_path_enabled,
-        via_fast_path,
-        transport_is_primary,
-        session_id,
-        private_beach_id,
-        &event_tx,
-        &mut fast_path_backoff,
-        false,
-    );
     let mut pending: HashMap<u64, PendingControllerAction> = HashMap::new();
     let mut next_seq: u64 = 0;
     let mut idle_delay = tokio::time::interval(StdDuration::from_millis(200));
@@ -9554,90 +8952,6 @@ async fn drive_controller_forwarder(
                         }
                     }
                     Some(ForwarderEvent::Shutdown(reason)) => {
-                        if via_fast_path {
-                            let inflight = pending.len();
-                            let queue_depth = match state
-                                .pending_actions_count(private_beach_id, session_id)
-                                .await
-                            {
-                                Ok(value) => value,
-                                Err(err) => {
-                                    trace!(
-                                        target = "controller.forwarder",
-                                        session_id = %session_id,
-                                        private_beach_id = %private_beach_id,
-                                        error = %err,
-                                        "failed to read queue depth after fast-path shutdown"
-                                    );
-                                    0
-                                }
-                            };
-                            let drained = std::mem::take(&mut pending);
-                            fail_pending_actions(state, session_id, drained, true, &reason).await;
-                            if unified_only {
-                                trace!(
-                                    target = "controller.forwarder",
-                                    session_id = %session_id,
-                                    private_beach_id = %private_beach_id,
-                                    reason = %reason,
-                                    queue_depth,
-                                    inflight,
-                                    "fast-path transport closed in unified mode; staying on primary transport"
-                                );
-                                continue;
-                            }
-                            metrics::CONTROLLER_FAST_PATH_FALLBACKS
-                                .with_label_values(&labels)
-                                .inc();
-                            let reason_detail = reason.clone();
-                            warn!(
-                                target = "controller.forwarder",
-                                session_id = %session_id,
-                                private_beach_id = %private_beach_id,
-                                inflight,
-                                reason = %reason,
-                                queue_depth,
-                                "fast-path transport closed; falling back to primary transport"
-                            );
-                            state
-                                .emit_host_devtools_event(
-                                    session_id,
-                                    "host.transport:fallback",
-                                    DevtoolsEventLevel::Warn,
-                                    Some(serde_json::json!({
-                                        "reason": reason_detail,
-                                        "queueDepth": queue_depth,
-                                        "inflight": inflight,
-                                    })),
-                                )
-                                .await;
-                            via_fast_path = false;
-                            transport_label = "http_fallback";
-                            transport = primary_transport.clone();
-                            transport_is_primary = true;
-                            drop(reader_guard);
-                            reader_guard = ForwarderReader::spawn(transport.clone(), event_tx.clone());
-                            info!(
-                                target = "controller.forwarder",
-                                session_id = %session_id,
-                                private_beach_id = %private_beach_id,
-                                transport = transport_label,
-                                "controller forwarder switched transport"
-                            );
-                            ensure_fast_path_probe(
-                                &mut fast_path_watchers,
-                                &fast_path_channels,
-                                fast_path_enabled,
-                                via_fast_path,
-                                transport_is_primary,
-                                session_id,
-                                private_beach_id,
-                                &event_tx,
-                                &mut fast_path_backoff,
-                                true,
-                            );
-                            continue;
-                        }
                         let inflight = pending.len();
                         let queue_depth = match state
                             .pending_actions_count(private_beach_id, session_id)
@@ -9682,66 +8996,6 @@ async fn drive_controller_forwarder(
                             )
                             .await;
                         return Err(ControllerForwarderError::Transport(reason));
-                    }
-                    Some(ForwarderEvent::FastPathReady { transport: fast_transport, label }) => {
-                        if via_fast_path {
-                            trace!(
-                                target = "controller.forwarder",
-                                session_id = %session_id,
-                                private_beach_id = %private_beach_id,
-                                label,
-                                "fast-path ready signal received while already active; ignoring"
-                            );
-                            continue;
-                        }
-                        fast_path_watchers = None;
-                        via_fast_path = true;
-                        transport_label = "fast_path";
-                        transport = fast_transport;
-                        transport_is_primary = false;
-                        fast_path_backoff.reset();
-                        drop(reader_guard);
-                        reader_guard = ForwarderReader::spawn(transport.clone(), event_tx.clone());
-                        let now = now_ms();
-                        state
-                            .update_pairing_transport_status(
-                                session_id,
-                                PairingTransportStatus::fast_path(now),
-                            )
-                            .await;
-                        state
-                            .emit_host_devtools_event(
-                                session_id,
-                                "host.transport:fast-path-ready",
-                                DevtoolsEventLevel::Info,
-                                Some(serde_json::json!({
-                                    "label": label,
-                                    "transportId": transport.id().0,
-                                    "peerId": transport.peer().0,
-                                })),
-                            )
-                            .await;
-                        info!(
-                            target = "controller.forwarder",
-                            session_id = %session_id,
-                            private_beach_id = %private_beach_id,
-                            label,
-                            transport_id = %transport.id().0,
-                            peer_id = %transport.peer().0,
-                            "controller forwarder switched transport"
-                        );
-                        ensure_fast_path_probe(
-                            &mut fast_path_watchers,
-                            &fast_path_channels,
-                            fast_path_enabled,
-                            via_fast_path,
-                            transport_is_primary,
-                            session_id,
-                            private_beach_id,
-                            &event_tx,
-                            &mut fast_path_backoff,
-                            false,
-                        );
                     }
                     None => {
                         let inflight = pending.len();
@@ -9813,19 +9067,6 @@ async fn drive_controller_forwarder(
                             );
                             fail_pending_actions(state, session_id, drained, via_fast_path, &reason).await;
                             if via_fast_path {
-                                if unified_only {
-                                trace!(
-                                    target = "controller.forwarder",
-                                    session_id = %session_id,
-                                    private_beach_id = %private_beach_id,
-                                    inflight,
-                                    "ack stall detected in unified mode; staying on primary transport"
-                                );
-                                continue;
-                            }
-                                metrics::CONTROLLER_FAST_PATH_FALLBACKS
-                                    .with_label_values(&labels)
-                                    .inc();
                                 warn!(
                                     target = "controller.forwarder",
                                     session_id = %session_id,
@@ -9849,23 +9090,10 @@ async fn drive_controller_forwarder(
                                 via_fast_path = false;
                                 transport_label = "http_fallback";
                                 transport = primary_transport.clone();
-                                transport_is_primary = true;
                                 drop(reader_guard);
                                 reader_guard = ForwarderReader::spawn(transport.clone(), event_tx.clone());
-                                ensure_fast_path_probe(
-                                    &mut fast_path_watchers,
-                                    &fast_path_channels,
-                                    fast_path_enabled,
-                                    via_fast_path,
-                                    transport_is_primary,
-                                    session_id,
-                                    private_beach_id,
-                                    &event_tx,
-                                    &mut fast_path_backoff,
-                                    true,
-                                );
-                                continue;
-                            }
+                            continue;
+                        }
                         }
                     }
                 }
@@ -9906,66 +9134,51 @@ async fn drive_controller_forwarder(
                     );
                 }
                 for action in actions {
+                    let action_id = action.id.clone();
                     match action_terminal_bytes(&action) {
                         Ok(bytes) => {
                             next_seq = next_seq.saturating_add(1);
-                            let (payload, is_text) = if via_fast_path {
-                                match fast_path_action_payload(&action) {
-                                    Ok(payload) => (payload.into_bytes(), true),
-                                    Err(err_msg) => {
-                                        let ack = ActionAck {
-                                            id: action.id.clone(),
-                                            status: AckStatus::Rejected,
-                                            applied_at: SystemTime::now(),
-                                            latency_ms: None,
-                                            error_code: Some("unsupported_action".into()),
-                                            error_message: Some(err_msg),
-                                        };
-                                        if let Err(err) = state
-                                            .ack_actions(session_id, vec![ack], None, via_fast_path)
-                                            .await
-                                        {
-                                            warn!(
-                                                target = "controller.forwarder",
-                                                session_id = %session_id,
-                                                error = %err,
-                                                "failed to reject unsupported action"
-                                            );
-                                        }
-                                        continue;
-                                    }
+                            let controller_payload = match serde_json::to_vec(&serde_json::json!({
+                                "action_id": action_id.clone(),
+                                "bytes": bytes,
+                            })) {
+                                Ok(payload) => payload,
+                                Err(err) => {
+                                    warn!(
+                                        target = "controller.forwarder",
+                                        session_id = %session_id,
+                                        error = %err,
+                                        "failed to encode controller input payload"
+                                    );
+                                    continue;
                                 }
-                            } else {
-                                let encoded = encode_client_frame_binary(&ClientFrame::Input {
-                                    seq: next_seq,
-                                    data: bytes.clone(),
-                                });
-                                (encoded, false)
                             };
                             let sent_at = loop {
-                                let send_result = if is_text {
-                                    let text_payload =
-                                        String::from_utf8(payload.clone()).unwrap_or_default();
-                                    transport.send_text(&text_payload)
-                                } else {
-                                    transport.send_bytes(&payload)
+                                let send_result = match transport
+                                    .send_namespaced("controller", "input", &controller_payload)
+                                {
+                                    Ok(seq) => Ok(seq),
+                                    Err(TransportError::Setup(_)) => {
+                                        let encoded =
+                                            encode_client_frame_binary(&ClientFrame::Input {
+                                                seq: next_seq,
+                                                data: controller_payload.clone(),
+                                            });
+                                        transport.send_bytes(&encoded)
+                                    }
+                                    Err(err) => Err(err),
                                 };
                                 match send_result {
                                     Ok(_) => {
                                         metrics::ACTIONS_DELIVERED.with_label_values(&labels).inc();
-                                        if via_fast_path {
-                                            metrics::CONTROLLER_FAST_PATH_DELIVERIES
-                                                .with_label_values(&labels)
-                                                .inc();
-                                        }
                                         trace!(
                                             target = "controller.forwarder",
                                             session_id = %session_id,
                                             private_beach_id = %private_beach_id,
                                             via_fast_path,
                                             transport = transport_label,
-                                            action_id = %action.id,
-                                            payload_len = payload.len(),
+                                            action_id = %action_id,
+                                            payload_len = controller_payload.len(),
                                             "sent controller action"
                                         );
                                         break Instant::now();
@@ -9978,19 +9191,6 @@ async fn drive_controller_forwarder(
                                         let drained = std::mem::take(&mut pending);
                                         let reason = format!("fast-path send failed: {err}");
                                         fail_pending_actions(state, session_id, drained, true, &reason).await;
-                                        if unified_only {
-                                            trace!(
-                                                target = "controller.forwarder",
-                                                session_id = %session_id,
-                                                private_beach_id = %private_beach_id,
-                                                error = %err,
-                                                "fast-path send failed in unified mode; staying on primary transport"
-                                            );
-                                            break Instant::now();
-                                        }
-                                        metrics::CONTROLLER_FAST_PATH_FALLBACKS
-                                            .with_label_values(&labels)
-                                            .inc();
                                         warn!(
                                             target = "controller.forwarder",
                                             session_id = %session_id,
@@ -10013,7 +9213,6 @@ async fn drive_controller_forwarder(
                                         via_fast_path = false;
                                         transport_label = "http_fallback";
                                         transport = primary_transport.clone();
-                                        transport_is_primary = true;
                                         drop(reader_guard);
                                         reader_guard =
                                             ForwarderReader::spawn(transport.clone(), event_tx.clone());
@@ -10023,18 +9222,6 @@ async fn drive_controller_forwarder(
                                             private_beach_id = %private_beach_id,
                                             transport = transport_label,
                                             "controller forwarder switched transport"
-                                        );
-                                        ensure_fast_path_probe(
-                                            &mut fast_path_watchers,
-                                            &fast_path_channels,
-                                            fast_path_enabled,
-                                            via_fast_path,
-                                            transport_is_primary,
-                                            session_id,
-                                            private_beach_id,
-                                            &event_tx,
-                                            &mut fast_path_backoff,
-                                            true,
                                         );
                                         continue;
                                     }
@@ -10134,156 +9321,27 @@ async fn drive_controller_forwarder(
     }
 }
 
-const CONTROLLER_DATA_CHANNEL_LABELS: [&str; 2] =
-    [CONTROLLER_CHANNEL_LABEL, LEGACY_CONTROLLER_CHANNEL_LABEL];
-
 async fn select_controller_transport(
     primary_transport: Arc<dyn Transport>,
-    webrtc_channels: Option<WebRtcChannels>,
-    metadata_label: Option<&str>,
-    fast_path_enabled: bool,
-    session_id: &str,
-    private_beach_id: &str,
+    _webrtc_channels: Option<WebRtcChannels>,
+    _metadata_label: Option<&str>,
+    _fast_path_enabled: bool,
+    _session_id: &str,
+    _private_beach_id: &str,
 ) -> (Arc<dyn Transport>, &'static str, bool) {
-    let _ = metadata_label;
-    if fast_path_enabled {
-        if let Some(label) = metadata_label {
-            if CONTROLLER_DATA_CHANNEL_LABELS
-                .iter()
-                .any(|candidate| *candidate == label)
-            {
-                debug!(
-                    target = "controller.forwarder",
-                    label,
-                    "metadata label indicates controller channel; using primary transport as fast-path"
-                );
-                return (primary_transport, "fast_path", true);
-            }
-        }
-        if let Some(ref channels) = webrtc_channels {
-            trace!(
-                target = "controller.forwarder",
-                session_id = %session_id,
-                private_beach_id = %private_beach_id,
-                "waiting for controller fast-path channels"
-            );
-            if let Some((channel, label)) =
-                wait_for_controller_data_channel(channels, session_id, private_beach_id).await
-            {
-                let peer = channel.peer();
-                trace!(
-                    target = "controller.forwarder",
-                    label,
-                    peer_id = %peer.0,
-                    "selected fast-path data channel"
-                );
-                return (channel, "fast_path", true);
-            }
-        } else {
-            trace!(
-                target = "controller.forwarder",
-                session_id = %session_id,
-                private_beach_id = %private_beach_id,
-                "fast-path enabled but no WebRTC channels available; using HTTP fallback"
-            );
-        }
-    } else {
-        debug!(
-            target = "controller.forwarder",
-            "fast-path disabled via CONTROLLER_FAST_PATH_ENABLED"
-        );
-    }
-
-    (primary_transport, "http_fallback", false)
+    (primary_transport, "primary", true)
 }
 
-async fn wait_for_controller_data_channel(
-    channels: &WebRtcChannels,
-    session_id: &str,
-    private_beach_id: &str,
-) -> Option<(Arc<dyn Transport>, &'static str)> {
-    if let Some(existing) = channels.try_get(CONTROLLER_CHANNEL_LABEL) {
-        trace!(
-            target = "controller.forwarder",
-            session_id = %session_id,
-            private_beach_id = %private_beach_id,
-            label = CONTROLLER_CHANNEL_LABEL,
-            "controller data channel already registered"
-        );
-        return Some((existing, CONTROLLER_CHANNEL_LABEL));
+fn action_terminal_bytes(action: &ActionCommand) -> Result<Vec<u8>, String> {
+    if action.action_type.as_str() != "terminal_write" {
+        return Err(format!("unsupported action type {}", action.action_type));
     }
-    if let Some(existing) = channels.try_get(LEGACY_CONTROLLER_CHANNEL_LABEL) {
-        trace!(
-            target = "controller.forwarder",
-            session_id = %session_id,
-            private_beach_id = %private_beach_id,
-            label = LEGACY_CONTROLLER_CHANNEL_LABEL,
-            "legacy controller data channel already registered"
-        );
-        return Some((existing, LEGACY_CONTROLLER_CHANNEL_LABEL));
-    }
-
-    let wait_primary = channels.wait_for(CONTROLLER_CHANNEL_LABEL);
-    let wait_legacy = channels.wait_for(LEGACY_CONTROLLER_CHANNEL_LABEL);
-    tokio::pin!(wait_primary);
-    tokio::pin!(wait_legacy);
-    let mut primary_done = false;
-    let mut legacy_done = false;
-
-    match timeout(CONTROLLER_FAST_PATH_WAIT, async {
-        loop {
-            tokio::select! {
-                res = &mut wait_primary, if !primary_done => {
-                    primary_done = true;
-                    match res {
-                        Ok(channel) => break Some((channel, CONTROLLER_CHANNEL_LABEL)),
-                        Err(err) => {
-                            warn!(
-                                target = "controller.forwarder",
-                                label = CONTROLLER_CHANNEL_LABEL,
-                                session_id = %session_id,
-                                private_beach_id = %private_beach_id,
-                                error = %err,
-                                "failed waiting for controller data channel"
-                            );
-                        }
-                    }
-                }
-                res = &mut wait_legacy, if !legacy_done => {
-                    legacy_done = true;
-                    match res {
-                        Ok(channel) => break Some((channel, LEGACY_CONTROLLER_CHANNEL_LABEL)),
-                        Err(err) => {
-                            warn!(
-                                target = "controller.forwarder",
-                                label = LEGACY_CONTROLLER_CHANNEL_LABEL,
-                                session_id = %session_id,
-                                private_beach_id = %private_beach_id,
-                                error = %err,
-                                "failed waiting for legacy controller data channel"
-                            );
-                        }
-                    }
-                }
-                else => break None,
-            }
-        }
-    })
-    .await
-    {
-        Ok(Some(result)) => Some(result),
-        Ok(None) => None,
-        Err(_) => {
-            warn!(
-                target = "controller.forwarder",
-                timeout_ms = CONTROLLER_FAST_PATH_WAIT.as_millis(),
-                session_id = %session_id,
-                private_beach_id = %private_beach_id,
-                "timed out waiting for controller data channel"
-            );
-            None
-        }
-    }
+    let bytes = action
+        .payload
+        .get("bytes")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "terminal_write payload missing bytes".to_string())?;
+    Ok(bytes.as_bytes().to_vec())
 }
 
 async fn fail_pending_actions(
@@ -11130,620 +10188,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn select_controller_transport_prefers_fast_path_channel() {
-        let primary = Arc::new(TestTransport::new(1, TransportKind::WebSocket));
-        let fast = Arc::new(TestTransport::new(2, TransportKind::WebRtc));
-        let channels = WebRtcChannels::new();
-        channels.publish(CONTROLLER_CHANNEL_LABEL.to_string(), fast.clone());
-
-        let (selected, label, via_fast_path) = select_controller_transport(
-            primary.clone(),
-            Some(channels),
-            None,
-            true,
-            "test-session",
-            "test-pb",
-        )
-        .await;
-
-        assert_eq!(selected.id(), fast.id());
-        assert_eq!(label, "fast_path");
-        assert!(via_fast_path);
-    }
-
-    #[tokio::test]
-    async fn select_controller_transport_accepts_legacy_channel_immediately() {
-        let primary = Arc::new(TestTransport::new(3, TransportKind::WebSocket));
-        let legacy = Arc::new(TestTransport::new(4, TransportKind::WebRtc));
-        let channels = WebRtcChannels::new();
-        channels.publish(LEGACY_CONTROLLER_CHANNEL_LABEL.to_string(), legacy.clone());
-
-        let (selected, label, via_fast_path) = select_controller_transport(
-            primary.clone(),
-            Some(channels),
-            None,
-            true,
-            "test-session",
-            "test-pb",
-        )
-        .await;
-
-        assert_eq!(selected.id(), legacy.id());
-        assert_eq!(label, "fast_path");
-        assert!(via_fast_path);
-    }
-
-    #[tokio::test]
-    async fn select_controller_transport_short_circuits_metadata() {
-        let primary = Arc::new(TestTransport::new(5, TransportKind::WebSocket));
-        let channels = WebRtcChannels::new();
-
-        let (selected, label, via_fast_path) = select_controller_transport(
-            primary.clone(),
-            Some(channels),
-            Some(CONTROLLER_CHANNEL_LABEL),
-            true,
-            "sess-meta",
-            "pb-meta",
-        )
-        .await;
-
-        assert_eq!(selected.id(), primary.id());
-        assert_eq!(label, "fast_path");
-        assert!(via_fast_path);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn select_controller_transport_times_out_without_channel() {
-        let primary = Arc::new(TestTransport::new(5, TransportKind::WebSocket));
-        let channels = WebRtcChannels::new();
-
-        let fut = select_controller_transport(
-            primary.clone(),
-            Some(channels),
-            None,
-            true,
-            "test-session",
-            "test-pb",
-        );
-        tokio::pin!(fut);
-        tokio::time::advance(CONTROLLER_FAST_PATH_WAIT + StdDuration::from_secs(1)).await;
-        let (selected, label, via_fast_path) = fut.await;
-
-        assert_eq!(selected.id(), primary.id());
-        assert_eq!(label, "http_fallback");
-        assert!(!via_fast_path);
-    }
-
-    #[tokio::test]
-    async fn select_controller_transport_treats_unified_primary_as_fast_path() {
-        let primary = Arc::new(TestTransport::new(6, TransportKind::WebSocket));
-
-        // Fast-path enabled, no legacy fast-path channels available: unified should
-        // remain labeled fast_path so downstream readiness stays "fast_path".
-        let (selected, label, via_fast_path) = select_controller_transport(
-            primary.clone(),
-            None,
-            Some(CONTROLLER_CHANNEL_LABEL),
-            true,
-            "sess-unified",
-            "pb-unified",
-        )
-        .await;
-
-        assert_eq!(selected.id(), primary.id());
-        assert_eq!(label, "fast_path");
-        assert!(via_fast_path);
-    }
-
-    #[tokio::test]
-    async fn fast_path_watchers_emit_ready_event() {
-        let channels = WebRtcChannels::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let _watcher = FastPathUpgradeHandle::spawn(
-            channels.clone(),
-            "sess-fast".into(),
-            "pb-fast".into(),
-            tx.clone(),
-            StdDuration::from_secs(0),
-        );
-
-        let fast = Arc::new(TestTransport::new(9, TransportKind::WebRtc));
-        let channels_clone = channels.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(StdDuration::from_millis(50)).await;
-            channels_clone.publish(CONTROLLER_CHANNEL_LABEL.to_string(), fast);
-        });
-
-        let label = tokio::time::timeout(StdDuration::from_secs(1), async {
-            loop {
-                if let Some(event) = rx.recv().await {
-                    if let ForwarderEvent::FastPathReady { label, .. } = event {
-                        break label;
-                    }
-                }
-            }
-        })
-        .await
-        .expect("fast-path ready event timed out");
-
-        assert_eq!(label, CONTROLLER_CHANNEL_LABEL);
-    }
-
-    #[tokio::test]
-    async fn fast_path_watchers_dedupe_back_to_back_channels() {
-        let channels = WebRtcChannels::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut watchers: Option<FastPathUpgradeHandle> = None;
-        let mut backoff = FastPathUpgradeBackoff::new(true);
-
-        ensure_fast_path_probe(
-            &mut watchers,
-            &Some(channels.clone()),
-            true,
-            false,
-            true,
-            "sess-fast-dedupe",
-            "pb-fast-dedupe",
-            &tx,
-            &mut backoff,
-            false,
-        );
-
-        let first = Arc::new(TestTransport::new(50, TransportKind::WebRtc));
-        let second = Arc::new(TestTransport::new(52, TransportKind::WebRtc));
-        channels.publish(CONTROLLER_CHANNEL_LABEL.to_string(), first.clone());
-        channels.publish(CONTROLLER_CHANNEL_LABEL.to_string(), second.clone());
-
-        let event = tokio::time::timeout(StdDuration::from_secs(1), rx.recv())
-            .await
-            .expect("expected fast-path ready event")
-            .expect("channel closed");
-        match event {
-            ForwarderEvent::FastPathReady { transport, label } => {
-                assert_eq!(label, CONTROLLER_CHANNEL_LABEL);
-                assert!(
-                    transport.id() == first.id() || transport.id() == second.id(),
-                    "unexpected transport published"
-                );
-            }
-            _ => panic!("unexpected forwarder event"),
-        }
-
-        assert!(
-            tokio::time::timeout(StdDuration::from_millis(200), rx.recv())
-                .await
-                .is_err(),
-            "no second fast-path event expected"
-        );
-        drop(watchers);
-    }
-
-    #[tokio::test]
-    async fn pending_transport_status_replayed_after_pairing() {
-        let state = AppState::new();
-        let controller = RegisterSessionRequest {
-            session_id: "controller-sess".into(),
-            private_beach_id: "pb-pair".into(),
-            harness_type: HarnessType::TerminalShim,
-            capabilities: vec![],
-            location_hint: None,
-            metadata: None,
-            version: "1.0.0".into(),
-            viewer_passcode: Some("PASS".into()),
-            transport_mode: Some(TransportMode::FastPath),
-        };
-        let lhs = RegisterSessionRequest {
-            session_id: "lhs-sess".into(),
-            private_beach_id: "pb-pair".into(),
-            harness_type: HarnessType::TerminalShim,
-            capabilities: vec![],
-            location_hint: None,
-            metadata: None,
-            version: "1.0.0".into(),
-            viewer_passcode: Some("PASS".into()),
-            transport_mode: Some(TransportMode::FastPath),
-        };
-        state.register_session(controller).await.unwrap();
-        state.register_session(lhs).await.unwrap();
-
-        // Acquire a controller lease so pairings can be created.
-        state
-            .acquire_controller("controller-sess", Some(30_000), Some("test".into()), None)
-            .await
-            .unwrap();
-
-        let now = now_ms();
-        let status = PairingTransportStatus::fast_path(now);
-        state
-            .update_pairing_transport_status("lhs-sess", status.clone())
-            .await;
-
-        // Status should be cached while we wait for the pairing to exist.
-        let cached = state
-            .fallback
-            .take_pending_transport_status("lhs-sess")
-            .await
-            .expect("transport status should be cached");
-        assert_eq!(cached.transport, PairingTransportKind::FastPath);
-        // Reinsert so the pairing replay can observe it.
-        state
-            .fallback
-            .record_pending_transport_status("lhs-sess", cached.clone())
-            .await;
-
-        let pairing = state
-            .upsert_controller_pairing("controller-sess", "lhs-sess", None, None, None)
-            .await
-            .unwrap();
-        assert_eq!(
-            pairing.transport_status.as_ref().map(|s| s.transport),
-            Some(PairingTransportKind::FastPath)
-        );
-
-        // Pending cache should be cleared once the replay succeeds.
-        assert!(state
-            .fallback
-            .take_pending_transport_status("lhs-sess")
-            .await
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn pending_transport_status_from_controller_applies_to_children() {
-        let state = AppState::new();
-        let controller = RegisterSessionRequest {
-            session_id: "controller-sess".into(),
-            private_beach_id: "pb-pair".into(),
-            harness_type: HarnessType::TerminalShim,
-            capabilities: vec![],
-            location_hint: None,
-            metadata: None,
-            version: "1.0.0".into(),
-            viewer_passcode: Some("PASS".into()),
-            transport_mode: Some(TransportMode::FastPath),
-        };
-        let lhs = RegisterSessionRequest {
-            session_id: "lhs-sess".into(),
-            private_beach_id: "pb-pair".into(),
-            harness_type: HarnessType::TerminalShim,
-            capabilities: vec![],
-            location_hint: None,
-            metadata: None,
-            version: "1.0.0".into(),
-            viewer_passcode: Some("PASS".into()),
-            transport_mode: Some(TransportMode::FastPath),
-        };
-        let rhs = RegisterSessionRequest {
-            session_id: "rhs-sess".into(),
-            private_beach_id: "pb-pair".into(),
-            harness_type: HarnessType::TerminalShim,
-            capabilities: vec![],
-            location_hint: None,
-            metadata: None,
-            version: "1.0.0".into(),
-            viewer_passcode: Some("PASS".into()),
-            transport_mode: Some(TransportMode::FastPath),
-        };
-        state.register_session(controller).await.unwrap();
-        state.register_session(lhs).await.unwrap();
-        state.register_session(rhs).await.unwrap();
-
-        // Controller advertises fast-path readiness before pairings exist.
-        let now = now_ms();
-        let status = PairingTransportStatus::fast_path(now);
-        state
-            .update_pairing_transport_status("controller-sess", status.clone())
-            .await;
-
-        state
-            .acquire_controller("controller-sess", Some(30_000), Some("test".into()), None)
-            .await
-            .unwrap();
-
-        // Later pairings should inherit the cached fast-path status for each child.
-        let lhs_pairing = state
-            .upsert_controller_pairing("controller-sess", "lhs-sess", None, None, None)
-            .await
-            .unwrap();
-        assert_eq!(
-            lhs_pairing.transport_status.as_ref().map(|s| s.transport),
-            Some(PairingTransportKind::FastPath)
-        );
-
-        let rhs_pairing = state
-            .upsert_controller_pairing("controller-sess", "rhs-sess", None, None, None)
-            .await
-            .unwrap();
-        assert_eq!(
-            rhs_pairing.transport_status.as_ref().map(|s| s.transport),
-            Some(PairingTransportKind::FastPath)
-        );
-    }
-
-    #[tokio::test]
-    async fn fast_path_ready_reflects_pairing_status() {
-        let state = AppState::new();
-        let controller = RegisterSessionRequest {
-            session_id: "controller-sess".into(),
-            private_beach_id: "pb-ready".into(),
-            harness_type: HarnessType::TerminalShim,
-            capabilities: vec![],
-            location_hint: None,
-            metadata: None,
-            version: "1.0.0".into(),
-            viewer_passcode: Some("PASS".into()),
-            transport_mode: Some(TransportMode::FastPath),
-        };
-        let child = RegisterSessionRequest {
-            session_id: "child-sess".into(),
-            private_beach_id: "pb-ready".into(),
-            harness_type: HarnessType::TerminalShim,
-            capabilities: vec![],
-            location_hint: None,
-            metadata: None,
-            version: "1.0.0".into(),
-            viewer_passcode: Some("PASS".into()),
-            transport_mode: Some(TransportMode::FastPath),
-        };
-        state.register_session(controller).await.unwrap();
-        state.register_session(child).await.unwrap();
-
-        state
-            .acquire_controller("controller-sess", Some(30_000), Some("test".into()), None)
-            .await
-            .unwrap();
-        state
-            .upsert_controller_pairing("controller-sess", "child-sess", None, None, None)
-            .await
-            .unwrap();
-
-        assert!(!state.is_fast_path_ready("child-sess").await);
-
-        let now = now_ms();
-        state
-            .update_pairing_transport_status("child-sess", PairingTransportStatus::fast_path(now))
-            .await;
-        assert!(state.is_fast_path_ready("child-sess").await);
-
-        state
-            .update_pairing_transport_status(
-                "child-sess",
-                PairingTransportStatus::http_fallback(now_ms(), Some("fallback".into())),
-            )
-            .await;
-        assert!(!state.is_fast_path_ready("child-sess").await);
-    }
-
-    #[tokio::test]
-    async fn manager_handshake_includes_default_fast_path_hint() {
-        struct EnvGuard {
-            key: &'static str,
-            prev: Option<String>,
-        }
-
-        impl EnvGuard {
-            fn set(key: &'static str, value: &str) -> Self {
-                let prev = std::env::var(key).ok();
-                std::env::set_var(key, value);
-                Self { key, prev }
-            }
-        }
-
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                if let Some(value) = self.prev.take() {
-                    std::env::set_var(self.key, value);
-                } else {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-
-        let _handshake_guard = EnvGuard::set("BEACH_TEST_DISABLE_HANDSHAKE_HTTP", "1");
-        let _workers_guard = EnvGuard::set("BEACH_TEST_DISABLE_SESSION_WORKERS", "1");
-        let _verify_guard = EnvGuard::set("BEACH_SKIP_ROAD_VERIFY", "1");
-        test_support::take_manager_handshakes();
-
-        let state = AppState::new();
-        let session_id = "sess-fastpath-handshake";
-        let private_beach_id = "pb-fastpath-handshake";
-        let passcode = "CODE";
-        let req = RegisterSessionRequest {
-            session_id: session_id.into(),
-            private_beach_id: private_beach_id.into(),
-            harness_type: HarnessType::TerminalShim,
-            capabilities: vec![],
-            location_hint: None,
-            metadata: None,
-            version: "1.0.0".into(),
-            viewer_passcode: Some(passcode.into()),
-            transport_mode: Some(TransportMode::FastPath),
-        };
-        state.register_session(req).await.unwrap();
-
-        let outcome = state
-            .attach_by_code(
-                private_beach_id,
-                session_id,
-                passcode,
-                None,
-                AttachHandshakeDisposition::Dispatch,
-            )
-            .await
-            .unwrap();
-        assert!(outcome.handshake_dispatched);
-
-        let handshakes = test_support::take_manager_handshakes();
-        let (_, payload) = handshakes
-            .into_iter()
-            .find(|(id, _)| id == session_id)
-            .expect("handshake captured");
-
-        let fast_path = payload
-            .get("fast_path_webrtc")
-            .and_then(|v| v.as_object())
-            .expect("fast_path_webrtc hint missing");
-
-        assert_eq!(
-            fast_path.get("offer_path").and_then(|v| v.as_str()),
-            Some("/fastpath/sessions/sess-fastpath-handshake/offer")
-        );
-        assert_eq!(
-            fast_path.get("ice_path").and_then(|v| v.as_str()),
-            Some("/fastpath/sessions/sess-fastpath-handshake/ice")
-        );
-        let channels = fast_path
-            .get("channels")
-            .and_then(|v| v.as_object())
-            .expect("channels missing");
-        assert_eq!(
-            channels.get("actions").and_then(|v| v.as_str()),
-            Some("mgr-actions")
-        );
-        assert_eq!(
-            channels.get("acks").and_then(|v| v.as_str()),
-            Some("mgr-acks")
-        );
-        assert_eq!(
-            channels.get("state").and_then(|v| v.as_str()),
-            Some("mgr-state")
-        );
-    }
-
-    #[test]
-    fn default_transport_hints_prefer_extensions_no_legacy_fastpath() {
-        let hints = default_transport_hints("sess-123", Some(100));
-        // Legacy fast-path WebRTC endpoints should no longer be advertised; unified
-        // extensions carry the fast-path namespace instead.
-        assert!(
-            !hints.contains_key("fast_path_webrtc"),
-            "unexpected legacy fast-path hint found: {hints:?}"
-        );
-        let ext = hints
-            .get("extensions")
-            .expect("extensions hint should be present");
-        let namespaces = ext
-            .get("namespaces")
-            .and_then(|v| v.as_array())
-            .expect("namespaces array missing on extensions hint");
-        let namespaces: Vec<&str> = namespaces.iter().filter_map(|v| v.as_str()).collect();
-        assert_eq!(namespaces, vec!["fastpath"]);
-        assert_eq!(ext.get("preferred").and_then(|v| v.as_bool()), Some(true));
-    }
-
-    #[test]
-    fn fast_path_upgrade_backoff_increases_and_caps() {
-        let mut backoff = FastPathUpgradeBackoff::new(true);
-        assert_eq!(
-            backoff.record_failure(),
-            CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY
-        );
-        assert_eq!(
-            backoff.record_failure(),
-            CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY.saturating_mul(2)
-        );
-        assert_eq!(
-            backoff.record_failure(),
-            CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY.saturating_mul(4)
-        );
-        assert_eq!(
-            backoff.record_failure(),
-            CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY.saturating_mul(8)
-        );
-        assert_eq!(
-            backoff.record_failure(),
-            CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY.saturating_mul(16)
-        );
-        assert_eq!(
-            backoff.record_failure(),
-            CONTROLLER_FAST_PATH_BACKOFF_MAX_DELAY
-        );
-        assert_eq!(
-            backoff.record_failure(),
-            CONTROLLER_FAST_PATH_BACKOFF_MAX_DELAY
-        );
-    }
-
-    #[test]
-    fn fast_path_upgrade_backoff_resets_after_success() {
-        let mut backoff = FastPathUpgradeBackoff::new(true);
-        backoff.record_failure();
-        backoff.record_failure();
-        assert!(backoff.current_delay().is_some());
-        backoff.reset();
-        assert!(backoff.current_delay().is_none());
-        assert_eq!(
-            backoff.record_failure(),
-            CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn ensure_fast_path_probe_applies_backoff_delay() {
-        let channels = WebRtcChannels::new();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut watchers: Option<FastPathUpgradeHandle> = None;
-        let mut backoff = FastPathUpgradeBackoff::new(true);
-
-        ensure_fast_path_probe(
-            &mut watchers,
-            &Some(channels.clone()),
-            true,
-            false,
-            true,
-            "sess-probe-delay",
-            "pb-probe-delay",
-            &tx,
-            &mut backoff,
-            true,
-        );
-
-        let fast = Arc::new(TestTransport::new(11, TransportKind::WebRtc));
-        channels.publish(CONTROLLER_CHANNEL_LABEL.to_string(), fast);
-
-        let almost_delay =
-            CONTROLLER_FAST_PATH_BACKOFF_MIN_DELAY.saturating_sub(StdDuration::from_millis(100));
-        advance(almost_delay).await;
-        assert!(rx.try_recv().is_err());
-
-        advance(StdDuration::from_millis(200)).await;
-        let label = loop {
-            if let Some(event) = rx.recv().await {
-                if let ForwarderEvent::FastPathReady { label, .. } = event {
-                    break label;
-                }
-            }
-        };
-        assert_eq!(label, CONTROLLER_CHANNEL_LABEL);
-        drop(watchers);
-    }
-
-    #[tokio::test]
-    async fn ensure_fast_path_probe_runs_when_primary_marked_fast_path() {
-        let channels = WebRtcChannels::new();
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let mut watchers: Option<FastPathUpgradeHandle> = None;
-        let mut backoff = FastPathUpgradeBackoff::new(true);
-
-        ensure_fast_path_probe(
-            &mut watchers,
-            &Some(channels),
-            true,
-            true,
-            true,
-            "sess-probe",
-            "pb-probe",
-            &tx,
-            &mut backoff,
-            false,
-        );
-
-        assert!(watchers.is_none());
-        drop(watchers);
-    }
-
-    #[test_timeout::tokio_timeout_test(10)]
     async fn unified_forwarder_ack_stall_does_not_downgrade_transport_status() {
         let state = Arc::new(AppState::new().with_controller_strict_gating(false));
         let session_id = "sess-unified-stall";
@@ -11944,18 +10388,6 @@ mod tests {
         })
         .await;
 
-        let err = state
-            .queue_actions(session_id, &token, vec![new_action("cmd-ready-1")], None)
-            .await
-            .expect_err("gating should reject before readiness");
-
-        match err {
-            StateError::ControllerCommandRejected { reason } => {
-                assert_eq!(reason, ControllerCommandDropReason::FastPathNotReady);
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-
         {
             let mut sessions = state.fallback.sessions.write().await;
             if let Some(record) = sessions.get_mut(session_id) {
@@ -11999,51 +10431,6 @@ mod tests {
             }
             other => panic!("expected missing lease rejection, got {other:?}"),
         }
-    }
-
-    #[test_timeout::tokio_timeout_test(10)]
-    async fn fast_path_mode_rejects_until_http_ready() {
-        let state = AppState::new().with_controller_strict_gating(false);
-        let session_id = "sess-fast-path-only";
-        let token = insert_manual_session(&state, session_id, |record| {
-            record.mark_attached();
-            record.transport_mode = TransportMode::FastPath;
-        })
-        .await;
-
-        assert!(matches!(
-            state.session_transport_mode(session_id).await,
-            TransportMode::FastPath
-        ));
-
-        test_support::set_fast_path_ready_override(session_id, true);
-
-        let err = state
-            .queue_actions(session_id, &token, vec![new_action("cmd-fast")], None)
-            .await
-            .expect_err("fast-path sessions should reject when channel missing");
-
-        match err {
-            StateError::ControllerCommandRejected { reason } => {
-                assert_eq!(reason, ControllerCommandDropReason::FastPathNotReady);
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-
-        {
-            let mut sessions = state.fallback.sessions.write().await;
-            if let Some(record) = sessions.get_mut(session_id) {
-                record.mark_http_ready();
-                record.last_health_at = Some(Instant::now());
-            }
-        }
-
-        test_support::clear_fast_path_ready_override();
-
-        state
-            .queue_actions(session_id, &token, vec![new_action("cmd-fast-2")], None)
-            .await
-            .expect("fast-path sessions fall back to HTTP once ready");
     }
 
     #[test_timeout::tokio_timeout_test(10)]

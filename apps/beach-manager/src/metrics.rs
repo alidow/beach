@@ -32,32 +32,6 @@ pub static ACTIONS_DELIVERED: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
-pub static CONTROLLER_FAST_PATH_DELIVERIES: Lazy<IntCounterVec> = Lazy::new(|| {
-    let c = IntCounterVec::new(
-        Opts::new(
-            "controller_fast_path_deliveries_total",
-            "Controller actions delivered over fast-path transports",
-        ),
-        &["private_beach_id", "session_id"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(c.clone())).ok();
-    c
-});
-
-pub static CONTROLLER_FAST_PATH_FALLBACKS: Lazy<IntCounterVec> = Lazy::new(|| {
-    let c = IntCounterVec::new(
-        Opts::new(
-            "controller_fast_path_fallbacks_total",
-            "Fast-path controller transport fallbacks to HTTP",
-        ),
-        &["private_beach_id", "session_id"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(c.clone())).ok();
-    c
-});
-
 pub static ACTIONS_ACKED: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new("actions_acked_total", "Actions acked by harnesses"),
@@ -287,87 +261,6 @@ pub static ACTION_LATENCY_MS: Lazy<HistogramVec> = Lazy::new(|| {
     .unwrap();
     REGISTRY.register(Box::new(h.clone())).ok();
     h
-});
-
-#[allow(dead_code)]
-pub static FASTPATH_ACTIONS_SENT: Lazy<IntCounterVec> = Lazy::new(|| {
-    let c = IntCounterVec::new(
-        Opts::new(
-            "fastpath_actions_sent_total",
-            "Actions delivered over fast-path data channels",
-        ),
-        &["private_beach_id", "session_id"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(c.clone())).ok();
-    c
-});
-
-pub static FASTPATH_ACTIONS_FALLBACK: Lazy<IntCounterVec> = Lazy::new(|| {
-    let c = IntCounterVec::new(
-        Opts::new(
-            "fastpath_actions_fallback_total",
-            "Actions that attempted fast-path but fell back to brokered delivery",
-        ),
-        &["private_beach_id", "session_id"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(c.clone())).ok();
-    c
-});
-
-pub static FASTPATH_ACKS_RECEIVED: Lazy<IntCounterVec> = Lazy::new(|| {
-    let c = IntCounterVec::new(
-        Opts::new(
-            "fastpath_acks_received_total",
-            "Action acknowledgements received via fast-path",
-        ),
-        &["private_beach_id", "session_id"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(c.clone())).ok();
-    c
-});
-
-pub static FASTPATH_STATE_RECEIVED: Lazy<IntCounterVec> = Lazy::new(|| {
-    let c = IntCounterVec::new(
-        Opts::new(
-            "fastpath_state_received_total",
-            "State diffs received via fast-path",
-        ),
-        &["private_beach_id", "session_id"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(c.clone())).ok();
-    c
-});
-
-#[allow(dead_code)]
-pub static FASTPATH_CHANNEL_CLOSED: Lazy<IntCounterVec> = Lazy::new(|| {
-    let c = IntCounterVec::new(
-        Opts::new(
-            "fastpath_channel_closed_total",
-            "Fast-path data channel closures observed by the manager",
-        ),
-        &["private_beach_id", "session_id", "channel"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(c.clone())).ok();
-    c
-});
-
-#[allow(dead_code)]
-pub static FASTPATH_CHANNEL_ERRORS: Lazy<IntCounterVec> = Lazy::new(|| {
-    let c = IntCounterVec::new(
-        Opts::new(
-            "fastpath_channel_errors_total",
-            "Fast-path data channel errors / parse failures observed by the manager",
-        ),
-        &["private_beach_id", "session_id", "channel"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(c.clone())).ok();
-    c
 });
 
 pub fn export_prometheus() -> String {

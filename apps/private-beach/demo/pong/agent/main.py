@@ -240,6 +240,7 @@ class StateSubscriber(threading.Thread):
         label = self.role or "session"
         while not self.stop_event.is_set() and not self._local_stop.is_set():
             try:
+                self.output.put(("info", f"state stream opening ({label} {self.session_id})"))
                 for payload in self.client.subscribe_state(self.session_id):
                     if self.stop_event.is_set() or self._local_stop.is_set():
                         return
@@ -254,6 +255,15 @@ class StateSubscriber(threading.Thread):
                     (
                         "error",
                         f"state stream error ({label} {self.session_id}): {exc}",
+                    )
+                )
+                if self.stop_event.wait(2.0) or self._local_stop.wait(2.0):
+                    break
+            except Exception as exc:  # pragma: no cover - defensive
+                self.output.put(
+                    (
+                        "error",
+                        f"state stream failed ({label} {self.session_id}): {exc.__class__.__name__}: {exc}",
                     )
                 )
                 if self.stop_event.wait(2.0) or self._local_stop.wait(2.0):
@@ -289,6 +299,7 @@ class PairingSubscriber(threading.Thread):
     def run(self) -> None:  # pragma: no cover - network path
         while not self.stop_event.is_set() and not self._local_stop.is_set():
             try:
+                self.output.put(("info", "pairing stream opening"))
                 for payload in self.client.subscribe_controller_pairings(
                     self.controller_session_id
                 ):
@@ -297,6 +308,12 @@ class PairingSubscriber(threading.Thread):
                     self._handle_event(payload)
             except ManagerRequestError as exc:
                 self.output.put(("error", f"pairing stream error: {exc}"))
+                if self.stop_event.wait(2.0) or self._local_stop.wait(2.0):
+                    break
+            except Exception as exc:  # pragma: no cover - defensive
+                self.output.put(
+                    ("error", f"pairing stream failed: {exc.__class__.__name__}: {exc}")
+                )
                 if self.stop_event.wait(2.0) or self._local_stop.wait(2.0):
                     break
 

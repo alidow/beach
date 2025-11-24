@@ -13,13 +13,20 @@ use tracing::{debug, info, trace, warn};
 
 use crate::metrics;
 use crate::protocol::{ExtensionFrame, HostFrame, decode_host_frame_binary};
-use crate::transport::{ExtensionDirection, ExtensionLane, Transport, extensions};
+use crate::transport::{
+    ExtensionDirection, ExtensionLane, Transport, TransportError, extensions, framed,
+};
 
 const FASTPATH_NAMESPACE: &str = "fastpath";
 const KIND_ACTION: &str = "action";
 const KIND_ACK: &str = "ack";
 const KIND_STATE: &str = "state";
 const KIND_HEALTH: &str = "health";
+const CONTROLLER_NAMESPACE: &str = "controller";
+const CONTROLLER_KIND_INPUT: &str = "input";
+const CONTROLLER_KIND_ACK: &str = "ack";
+const CONTROLLER_KIND_STATE: &str = "state";
+const CONTROLLER_KIND_HEALTH: &str = "health";
 
 /// Bridge that adapts a negotiated [`Transport`] to Beach Buggy's `ManagerTransport` trait
 /// using unified transport extension frames.
@@ -29,6 +36,7 @@ pub struct UnifiedBuggyTransport {
     actions_tx: broadcast::Sender<ActionCommand>,
     actions_rx: Arc<Mutex<broadcast::Receiver<ActionCommand>>>,
     use_transport_pump: bool,
+    framed_rx: Option<Arc<Mutex<broadcast::Receiver<framed::FramedMessage>>>>,
 }
 
 impl UnifiedBuggyTransport {
@@ -53,11 +61,16 @@ impl UnifiedBuggyTransport {
         if use_transport_pump {
             pump_pending_extensions(&transport_clone, &actions_tx_clone);
         }
+        let framed_rx = Some(Arc::new(Mutex::new(framed::subscribe(
+            transport.id(),
+            CONTROLLER_NAMESPACE,
+        ))));
         Self {
             transport,
             actions_tx,
             actions_rx: Arc::new(Mutex::new(actions_rx)),
             use_transport_pump,
+            framed_rx,
         }
     }
 
@@ -73,6 +86,7 @@ impl UnifiedBuggyTransport {
         if self.use_transport_pump {
             pump_pending_extensions(&self.transport, &self.actions_tx);
         }
+        pump_pending_framed(&self.framed_rx, &self.actions_tx).await;
         let mut rx = self.actions_rx.lock().await;
         let mut actions = Vec::new();
         loop {
@@ -121,6 +135,25 @@ impl UnifiedBuggyTransport {
             .map_err(|err| HarnessError::Transport(format!("encode payload failed: {err}")))
     }
 
+    async fn send_controller_frame(&self, kind: &str, payload: Vec<u8>) -> HarnessResult<()> {
+        match self
+            .transport
+            .send_namespaced(CONTROLLER_NAMESPACE, kind, &payload)
+        {
+            Ok(_) => Ok(()),
+            Err(TransportError::Setup(_)) => {
+                // Fallback to unified extension path for transports that do not support
+                // namespaced framing (e.g., tests over IPC/WebSocket).
+                self.send_extension_frame(
+                    ExtensionDirection::ClientToHost,
+                    Self::make_frame(kind, payload),
+                )
+                .await
+            }
+            Err(err) => Err(HarnessError::Transport(err.to_string())),
+        }
+    }
+
     pub fn ingest_extension_frame(&self, frame: ExtensionFrame) {
         handle_extension_frame(&self.transport, &self.actions_tx, frame);
     }
@@ -157,11 +190,8 @@ impl ManagerTransport for UnifiedBuggyTransport {
 
     async fn send_state(&self, _session_id: &str, diff: StateDiff) -> HarnessResult<()> {
         let payload = Self::encode_payload(KIND_STATE, json!(diff))?;
-        self.send_extension_frame(
-            ExtensionDirection::ClientToHost,
-            Self::make_frame(KIND_STATE, payload),
-        )
-        .await
+        self.send_controller_frame(CONTROLLER_KIND_STATE, payload)
+            .await
     }
 
     async fn receive_actions(&self, _session_id: &str) -> HarnessResult<Vec<ActionCommand>> {
@@ -171,11 +201,8 @@ impl ManagerTransport for UnifiedBuggyTransport {
     async fn ack_actions(&self, _session_id: &str, acks: Vec<ActionAck>) -> HarnessResult<()> {
         for ack in acks {
             let payload = Self::encode_payload(KIND_ACK, json!(ack))?;
-            self.send_extension_frame(
-                ExtensionDirection::ClientToHost,
-                Self::make_frame(KIND_ACK, payload),
-            )
-            .await?;
+            self.send_controller_frame(CONTROLLER_KIND_ACK, payload)
+                .await?;
         }
         Ok(())
     }
@@ -186,11 +213,8 @@ impl ManagerTransport for UnifiedBuggyTransport {
         heartbeat: HealthHeartbeat,
     ) -> HarnessResult<()> {
         let payload = Self::encode_payload(KIND_HEALTH, json!(heartbeat))?;
-        self.send_extension_frame(
-            ExtensionDirection::ClientToHost,
-            Self::make_frame(KIND_HEALTH, payload),
-        )
-        .await
+        self.send_controller_frame(CONTROLLER_KIND_HEALTH, payload)
+            .await
     }
 }
 
@@ -299,6 +323,55 @@ fn handle_extension_frame(
             "extension frame ignored (namespace not handled)"
         );
         extensions::publish(transport.id(), frame);
+    }
+}
+
+async fn pump_pending_framed(
+    framed_rx: &Option<Arc<Mutex<broadcast::Receiver<framed::FramedMessage>>>>,
+    actions_tx: &broadcast::Sender<ActionCommand>,
+) {
+    if let Some(rx_arc) = framed_rx {
+        let mut rx = rx_arc.lock().await;
+        loop {
+            match rx.try_recv() {
+                Ok(frame) => handle_framed_frame(frame, actions_tx),
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    warn!(
+                        target = "unified_transport",
+                        skipped, "lagged receiving framed controller frames"
+                    );
+                    continue;
+                }
+                Err(broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+    }
+}
+
+fn handle_framed_frame(
+    frame: framed::FramedMessage,
+    actions_tx: &broadcast::Sender<ActionCommand>,
+) {
+    if frame.namespace != CONTROLLER_NAMESPACE || frame.kind != CONTROLLER_KIND_INPUT {
+        return;
+    }
+    match std::str::from_utf8(&frame.payload) {
+        Ok(text) => match parse_action_payload(text) {
+            Ok(action) => {
+                let _ = actions_tx.send(action);
+            }
+            Err(err) => warn!(
+                target = "unified_transport",
+                error = %err,
+                "failed to parse controller framed input"
+            ),
+        },
+        Err(err) => warn!(
+            target = "unified_transport",
+            error = %err,
+            "invalid utf8 in controller framed payload"
+        ),
     }
 }
 

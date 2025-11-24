@@ -174,6 +174,9 @@ impl SignalingState {
                             entry.label.as_ref(),
                             entry.remote_addr,
                             entry.mcp_requested,
+                            None,
+                            session_id,
+                            &entry.role,
                         ),
                     })
                     .collect()
@@ -252,8 +255,11 @@ fn build_metadata(
     label: Option<&String>,
     remote_addr: Option<SocketAddr>,
     mcp_requested: bool,
+    client_metadata: Option<HashMap<String, String>>,
+    session_id: &str,
+    role: &PeerRole,
 ) -> Option<HashMap<String, String>> {
-    let mut map = HashMap::new();
+    let mut map = client_metadata.unwrap_or_default();
     if let Some(label) = label {
         let trimmed = label.trim();
         if !trimmed.is_empty() {
@@ -266,6 +272,10 @@ fn build_metadata(
     if mcp_requested {
         map.insert("mcp".to_string(), "true".to_string());
     }
+    map.entry("session_id".into())
+        .or_insert_with(|| session_id.to_string());
+    map.entry("role".into())
+        .or_insert_with(|| format!("{role:?}").to_ascii_lowercase());
     if map.is_empty() {
         None
     } else {
@@ -474,6 +484,7 @@ async fn handle_client_message(
             preferred_transport,
             label,
             mcp,
+            metadata,
         } => {
             info!(
                 "📥 RECEIVED Join message from peer {} (client_peer_id: {:?}) for session {}",
@@ -633,6 +644,14 @@ async fn handle_client_message(
             tx.send(join_success)?;
             info!("  → JoinSuccess sent successfully to peer {}", peer_id);
 
+            let metadata = build_metadata(
+                label.as_ref(),
+                remote_addr,
+                mcp,
+                metadata,
+                session_id,
+                &role,
+            );
             // Notify other peers - use WebSocket connection's peer_id
             state
                 .broadcast_except(
@@ -641,11 +660,11 @@ async fn handle_client_message(
                     ServerMessage::PeerJoined {
                         peer: PeerInfo {
                             id: peer_id.to_string(), // Use WebSocket connection's peer_id
-                            role,
+                            role: role.clone(),
                             joined_at: chrono::Utc::now().timestamp(),
                             supported_transports,
                             preferred_transport,
-                            metadata: build_metadata(label.as_ref(), remote_addr, mcp),
+                            metadata,
                         },
                     },
                 )

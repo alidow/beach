@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{hash_map::Entry, HashMap},
+    sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -12,7 +13,7 @@ use tokio::{
     sync::{broadcast, Mutex as TokioMutex},
     time::sleep,
 };
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 use url::Url;
 use uuid::Uuid;
 use webrtc::{
@@ -402,7 +403,8 @@ impl FastPathClient {
         )
         .await?;
 
-        wire_action_handler(actions_dc.clone(), actions_tx.clone());
+        let counters = Arc::new(FastPathCounters::default());
+        wire_action_handler(actions_dc.clone(), actions_tx.clone(), counters.clone());
 
         pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
             Box::pin(async move {
@@ -497,6 +499,7 @@ impl FastPathClient {
             actions: actions_tx,
             acks_dc,
             state_dc,
+            counters,
         })
     }
 }
@@ -508,6 +511,13 @@ pub struct FastPathConnection {
     actions: broadcast::Sender<ActionCommand>,
     acks_dc: Arc<RTCDataChannel>,
     state_dc: Arc<RTCDataChannel>,
+    counters: Arc<FastPathCounters>,
+}
+
+#[derive(Default)]
+struct FastPathCounters {
+    frames_received: AtomicU64,
+    actions_decoded: AtomicU64,
 }
 
 impl FastPathConnection {
@@ -553,6 +563,19 @@ impl FastPathConnection {
                 .map_err(to_harness_error)?;
         }
         Ok(())
+    }
+}
+
+impl Drop for FastPathConnection {
+    fn drop(&mut self) {
+        let frames = self.counters.frames_received.load(Ordering::Relaxed);
+        let decoded = self.counters.actions_decoded.load(Ordering::Relaxed);
+        info!(
+            target = "fast_path",
+            frames_received = frames,
+            actions_decoded = decoded,
+            "fast-path connection dropped"
+        );
     }
 }
 
@@ -606,7 +629,11 @@ async fn gather_remote_ice(
     Ok(())
 }
 
-fn wire_action_handler(dc: Arc<RTCDataChannel>, sender: broadcast::Sender<ActionCommand>) {
+fn wire_action_handler(
+    dc: Arc<RTCDataChannel>,
+    sender: broadcast::Sender<ActionCommand>,
+    counters: Arc<FastPathCounters>,
+) {
     let open_label = dc.label().to_string();
     dc.on_open(Box::new(move || {
         let label = open_label.clone();
@@ -639,14 +666,37 @@ fn wire_action_handler(dc: Arc<RTCDataChannel>, sender: broadcast::Sender<Action
     let reassembler = Arc::new(TokioMutex::new(FastPathChunkReassembler::new(
         FastPathPayloadKind::Actions,
     )));
+    let message_label = dc.label().to_string();
     dc.on_message(Box::new(move |msg: DataChannelMessage| {
         let sender = sender.clone();
         let reassembler = reassembler.clone();
+        let label = message_label.clone();
+        let counters = counters.clone();
         Box::pin(async move {
+            counters
+                .frames_received
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                target = "fast_path",
+                channel = %label,
+                is_string = msg.is_string,
+                payload_len = msg.data.len(),
+                "fast-path frame received"
+            );
             if msg.is_string {
                 match decode_fast_path_payload(&reassembler, &msg).await {
                     Ok(Some(text)) => match parse_action_payload(&text) {
                         Ok(action) => {
+                            counters
+                                .actions_decoded
+                                .fetch_add(1, Ordering::Relaxed);
+                            debug!(
+                                target = "fast_path",
+                                channel = %label,
+                                action_id = %action.id,
+                                action_type = %action.action_type,
+                                "decoded fast-path text action"
+                            );
                             let _ = sender.send(action);
                         }
                         Err(err) => {
@@ -667,6 +717,16 @@ fn wire_action_handler(dc: Arc<RTCDataChannel>, sender: broadcast::Sender<Action
             } else {
                 match decode_binary_action_message(&msg.data) {
                     Ok(action) => {
+                        counters
+                            .actions_decoded
+                            .fetch_add(1, Ordering::Relaxed);
+                        debug!(
+                            target = "fast_path",
+                            channel = %label,
+                            action_id = %action.id,
+                            action_type = %action.action_type,
+                            "decoded fast-path binary action"
+                        );
                         let _ = sender.send(action);
                     }
                     Err(err) => {
@@ -809,13 +869,19 @@ async fn create_channel(
         .create_data_channel(label, Some(init))
         .await
         .map_err(to_harness_error)?;
+    let channel_id = dc.id();
 
     {
         let label = label_string.clone();
         dc.on_open(Box::new(move || {
             let label = label.clone();
             Box::pin(async move {
-                info!(target = "fast_path", channel = %label, "data channel created");
+                info!(
+                    target = "fast_path",
+                    channel = %label,
+                    channel_id,
+                    "data channel created"
+                );
             })
         }));
     }

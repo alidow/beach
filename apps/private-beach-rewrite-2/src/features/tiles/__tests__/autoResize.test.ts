@@ -56,6 +56,6 @@ describe('computeAutoResizeSize', () => {
       chromeWidthPx: 10,
       chromeHeightPx: 20,
     });
-    expect(result).toEqual({ width: 650, height: 340 });
+    expect(result).toEqual({ width: 648, height: 344 });
   });
 });

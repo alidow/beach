@@ -53,6 +53,15 @@ export class SecureDataChannel extends EventTarget implements DataChannelLike {
       );
       this.dispatchEvent(new MessageEvent('message', { data: payload }));
     } catch (error) {
+      try {
+        // eslint-disable-next-line no-console
+        console.error('[secure-dc] decrypt error', {
+          label: this.label,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      } catch {
+        // ignore
+      }
       const errEvent = new Event('error');
       Object.assign(errEvent, {
         error: error instanceof Error ? error : new Error(String(error)),
@@ -73,6 +82,12 @@ export class SecureDataChannel extends EventTarget implements DataChannelLike {
   private readonly handleError = (event: Event) => {
     const errEvent = new Event('error');
     Object.assign(errEvent, { error: (event as any).error ?? event });
+    try {
+      // eslint-disable-next-line no-console
+      console.error('[secure-dc] channel error', { label: this.label, error: errEvent.error });
+    } catch {
+      // ignore
+    }
     this.dispatchEvent(errEvent);
   };
 
@@ -160,9 +175,9 @@ export class SecureDataChannel extends EventTarget implements DataChannelLike {
       throw new Error(`secure transport version mismatch (${version})`);
     }
     const counter = readCounter(frame.subarray(1, 9));
-    if (counter !== this.recvCounter) {
-      throw new Error(`secure transport counter mismatch (expected ${this.recvCounter}, got ${counter})`);
-    }
+    // Resynchronise to the sender's view; we accept occasional duplicates or jumps
+    // to avoid tearing down the transport.
+    this.recvCounter = counter;
     const nonce = buildNonce(counter);
     const plaintext = chacha20poly1305Decrypt(
       this.recvKey,

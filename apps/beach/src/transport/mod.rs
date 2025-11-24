@@ -9,6 +9,7 @@ use crate::protocol::{
 };
 
 pub mod extensions;
+pub mod framed;
 pub mod ipc;
 pub mod ssh;
 pub mod terminal;
@@ -133,6 +134,16 @@ pub trait Transport: Send + Sync {
     fn send(&self, message: TransportMessage) -> Result<(), TransportError>;
     fn send_text(&self, text: &str) -> Result<u64, TransportError>;
     fn send_bytes(&self, bytes: &[u8]) -> Result<u64, TransportError>;
+    fn send_namespaced(
+        &self,
+        _namespace: &str,
+        _kind: &str,
+        _payload: &[u8],
+    ) -> Result<u64, TransportError> {
+        Err(TransportError::Setup(
+            "namespaced transport send unsupported".into(),
+        ))
+    }
     fn recv(&self, timeout: Duration) -> Result<TransportMessage, TransportError>;
     fn try_recv(&self) -> Result<Option<TransportMessage>, TransportError>;
 

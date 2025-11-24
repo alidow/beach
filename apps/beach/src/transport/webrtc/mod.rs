@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use chacha20poly1305::aead::{Aead, Payload};
@@ -15,6 +15,7 @@ use crossbeam_channel::{
     unbounded as crossbeam_unbounded,
 };
 use if_addrs::get_if_addrs;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use once_cell::sync::{Lazy, OnceCell as SyncOnceCell};
 use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
@@ -48,10 +49,12 @@ use webrtc_ice::{
 use crate::auth;
 use crate::auth::error::AuthError;
 use crate::auth::gate::TurnIceServer;
+use crate::metrics;
 use crate::server::terminal::host::{
     CONTROLLER_ACK_CHANNEL_LABEL, CONTROLLER_CHANNEL_LABEL, CONTROLLER_STATE_CHANNEL_LABEL,
     LEGACY_CONTROLLER_CHANNEL_LABEL,
 };
+use crate::transport::framed;
 use crate::transport::webrtc::signaling::PeerInfo;
 use crate::transport::{
     Transport, TransportError, TransportId, TransportKind, TransportMessage, TransportPair,
@@ -62,6 +65,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_ACK_POLL_ATTEMPTS: usize = 200;
 const READY_ACK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MCP_CHANNEL_LABEL: &str = "mcp-jsonrpc";
+const CONTROL_PRIORITY_NAMESPACES: &[&str] = &["controller"];
 mod secure_handshake;
 mod secure_signaling;
 mod signaling;
@@ -74,6 +78,80 @@ struct IceCandidateInfo {
     ip: IpAddr,
     port: u16,
     scope: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutboundPriority {
+    High,
+    Low,
+}
+
+impl OutboundPriority {
+    fn as_label(&self) -> &'static str {
+        match self {
+            OutboundPriority::High => "high",
+            OutboundPriority::Low => "low",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OutboundFrame {
+    bytes: Vec<u8>,
+    namespace: String,
+    priority: OutboundPriority,
+    enqueued_at: Instant,
+}
+
+fn classify_priority(namespace: &str, payload_len: usize) -> OutboundPriority {
+    if CONTROL_PRIORITY_NAMESPACES.contains(&namespace) || payload_len <= 512 {
+        OutboundPriority::High
+    } else {
+        OutboundPriority::Low
+    }
+}
+
+#[derive(Default)]
+struct OutboundQueueDepth {
+    per_namespace: HashMap<String, (usize, usize)>,
+}
+
+impl OutboundQueueDepth {
+    fn increment(&mut self, namespace: &str, priority: OutboundPriority) {
+        let snapshot = {
+            let entry = self
+                .per_namespace
+                .entry(namespace.to_string())
+                .or_insert((0, 0));
+            match priority {
+                OutboundPriority::High => entry.0 = entry.0.saturating_add(1),
+                OutboundPriority::Low => entry.1 = entry.1.saturating_add(1),
+            }
+            *entry
+        };
+        self.update_gauges(namespace, snapshot);
+    }
+
+    fn decrement(&mut self, namespace: &str, priority: OutboundPriority) {
+        if let Some(snapshot) = self.per_namespace.get_mut(namespace).map(|entry| {
+            match priority {
+                OutboundPriority::High => entry.0 = entry.0.saturating_sub(1),
+                OutboundPriority::Low => entry.1 = entry.1.saturating_sub(1),
+            }
+            *entry
+        }) {
+            self.update_gauges(namespace, snapshot);
+        }
+    }
+
+    fn update_gauges(&self, namespace: &str, entry: (usize, usize)) {
+        metrics::FRAMED_OUTBOUND_QUEUE_DEPTH
+            .with_label_values(&[namespace, "high"])
+            .set(entry.0 as i64);
+        metrics::FRAMED_OUTBOUND_QUEUE_DEPTH
+            .with_label_values(&[namespace, "low"])
+            .set(entry.1 as i64);
+    }
 }
 
 fn classify_candidate_scope(ip: &IpAddr) -> &'static str {
@@ -606,6 +684,8 @@ struct EncryptionState {
     recv_cipher: ChaCha20Poly1305,
     send_counter: AtomicU64,
     recv_counter: AtomicU64,
+    send_lock: Mutex<()>,
+    recv_lock: Mutex<()>,
 }
 
 struct EncryptionManager {
@@ -656,6 +736,8 @@ impl EncryptionManager {
             recv_cipher,
             send_counter: AtomicU64::new(0),
             recv_counter: AtomicU64::new(0),
+            send_lock: Mutex::new(()),
+            recv_lock: Mutex::new(()),
         });
         self.enabled.store(true, Ordering::SeqCst);
         Ok(())
@@ -666,6 +748,10 @@ impl EncryptionManager {
         let state = guard
             .as_ref()
             .ok_or_else(|| TransportError::Setup("secure transport not negotiated".into()))?;
+        let _lock = state
+            .send_lock
+            .lock()
+            .map_err(|_| TransportError::Setup("secure transport send lock poisoned".into()))?;
         let counter = state.send_counter.fetch_add(1, Ordering::SeqCst);
         let nonce_bytes = nonce_from_counter(counter);
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -712,65 +798,23 @@ impl EncryptionManager {
                 "secure transport version mismatch".into(),
             ));
         }
+        let _lock = state
+            .recv_lock
+            .lock()
+            .map_err(|_| TransportError::Setup("secure transport recv lock poisoned".into()))?;
         let mut counter_bytes = [0u8; 8];
         counter_bytes.copy_from_slice(&frame[1..9]);
         let counter = u64::from_be_bytes(counter_bytes);
-        loop {
-            let expected = state.recv_counter.load(Ordering::SeqCst);
-            if counter == expected {
-                break;
-            }
-            if counter < expected {
-                tracing::warn!(
-                    target = "beach::transport::webrtc::crypto",
-                    direction = "recv",
-                    expected_counter = expected,
-                    received_counter = counter,
-                    frame_len = frame.len(),
-                    "secure transport counter mismatch"
-                );
-                return Err(TransportError::Setup(
-                    "secure transport counter mismatch".into(),
-                ));
-            }
-            // counter has advanced beyond what we expected (e.g., after a restart). Attempt to
-            // resynchronise exactly once by jumping the expected counter forward.
-            match state.recv_counter.compare_exchange(
-                expected,
-                counter,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => {
-                    tracing::warn!(
-                        target = "beach::transport::webrtc::crypto",
-                        direction = "recv",
-                        expected_counter = expected,
-                        received_counter = counter,
-                        frame_len = frame.len(),
-                        "secure transport counter jump detected; resynchronising"
-                    );
-                    break;
-                }
-                Err(actual) => {
-                    if actual > counter {
-                        // Another consumer advanced beyond the received counter; treat as mismatch.
-                        tracing::warn!(
-                            target = "beach::transport::webrtc::crypto",
-                            direction = "recv",
-                            expected_counter = actual,
-                            received_counter = counter,
-                            frame_len = frame.len(),
-                            "secure transport counter mismatch"
-                        );
-                        return Err(TransportError::Setup(
-                            "secure transport counter mismatch".into(),
-                        ));
-                    }
-                    // Another thread moved the counter forward but not past our target; retry loop.
-                    continue;
-                }
-            }
+        let previous = state.recv_counter.swap(counter, Ordering::SeqCst);
+        if counter != previous {
+            tracing::debug!(
+                target = "beach::transport::webrtc::crypto",
+                direction = "recv",
+                expected_counter = previous,
+                received_counter = counter,
+                frame_len = frame.len(),
+                "secure transport counter resynchronised"
+            );
         }
         let nonce_bytes = nonce_from_counter(counter);
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -786,7 +830,10 @@ impl EncryptionManager {
             .map_err(|err| {
                 TransportError::Setup(format!("secure transport decrypt failed: {err}"))
             })?;
-        state.recv_counter.fetch_add(1, Ordering::SeqCst);
+        state
+            .recv_counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |_| counter.checked_add(1))
+            .ok();
         tracing::trace!(
             target = "beach::transport::webrtc::crypto",
             direction = "recv",
@@ -924,8 +971,9 @@ struct WebRtcTransport {
     kind: TransportKind,
     id: TransportId,
     peer: TransportId,
-    outbound_seq: AtomicU64,
-    outbound_tx: tokio_mpsc::UnboundedSender<Vec<u8>>,
+    outbound_seq: Mutex<HashMap<String, u64>>,
+    outbound_high_tx: tokio_mpsc::UnboundedSender<OutboundFrame>,
+    outbound_low_tx: tokio_mpsc::UnboundedSender<OutboundFrame>,
     inbound_tx: CrossbeamSender<TransportMessage>,
     inbound_rx: Mutex<CrossbeamReceiver<TransportMessage>>,
     _pc: Arc<RTCPeerConnection>,
@@ -934,6 +982,10 @@ struct WebRtcTransport {
     _signaling: Option<Arc<SignalingClient>>,
     encryption: Arc<EncryptionManager>,
     pending_encrypted: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    frame_config: framed::FramingConfig,
+    frame_reassembler: Arc<Mutex<framed::FramedDecoder>>,
+    chunk_log_once: AtomicBool,
+    raw_mode: bool,
 }
 
 impl WebRtcTransport {
@@ -948,6 +1000,7 @@ impl WebRtcTransport {
         dc_ready: Option<Arc<Notify>>,
         signaling: Option<Arc<SignalingClient>>,
         handshake_complete: Option<Arc<AtomicBool>>,
+        raw_mode: bool,
     ) -> Self {
         let (inbound_tx_raw, inbound_rx) = crossbeam_unbounded();
         let handler_id = id;
@@ -957,14 +1010,27 @@ impl WebRtcTransport {
         let encryption_clone_for_handler = Arc::clone(&encryption);
         let pending_encrypted = Arc::new(Mutex::new(VecDeque::new()));
         let pending_for_handler = Arc::clone(&pending_encrypted);
+        let frame_config = framed::runtime_config().clone();
+        let frame_reassembler =
+            Arc::new(Mutex::new(framed::FramedDecoder::new(frame_config.clone())));
+        let frame_reassembler_for_handler = Arc::clone(&frame_reassembler);
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
             let sender = inbound_tx_for_handler.clone();
             let log_id = handler_id;
             let encryption = Arc::clone(&encryption_clone_for_handler);
             let pending = Arc::clone(&pending_for_handler);
+            let frame_reassembler = Arc::clone(&frame_reassembler_for_handler);
             Box::pin(async move {
                 let bytes = msg.data.to_vec();
-                Self::handle_incoming_bytes(&encryption, &pending, bytes, &sender, log_id);
+                Self::handle_incoming_bytes(
+                    &encryption,
+                    &pending,
+                    &frame_reassembler,
+                    bytes,
+                    &sender,
+                    log_id,
+                    raw_mode,
+                );
             })
         }));
         let pc_for_close = pc.clone();
@@ -1004,10 +1070,14 @@ impl WebRtcTransport {
             })
         }));
 
-        let (outbound_tx, mut outbound_rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
+        let (outbound_high_tx, mut outbound_high_rx) =
+            tokio_mpsc::unbounded_channel::<OutboundFrame>();
+        let (outbound_low_tx, mut outbound_low_rx) =
+            tokio_mpsc::unbounded_channel::<OutboundFrame>();
         let dc_clone = dc.clone();
         let transport_id = id;
         let dc_ready_signal = dc_ready.clone();
+        let frame_config_for_sender = frame_config.clone();
         spawn_on_global(async move {
             if let Some(notify) = dc_ready_signal {
                 tracing::debug!(
@@ -1027,33 +1097,100 @@ impl WebRtcTransport {
             } else {
                 tracing::debug!(target = "webrtc", transport_id = ?transport_id, "dc ready immediate");
             }
+            tracing::info!(
+                target = "beach::transport::webrtc",
+                transport_id = ?transport_id,
+                label = %dc_clone.label(),
+                peer = ?peer,
+                "data channel created"
+            );
             tracing::debug!(target = "webrtc", transport_id = ?transport_id, "sender loop start");
+            let mut depth = OutboundQueueDepth::default();
+            let mut pending_high = VecDeque::new();
+            let mut pending_low = VecDeque::new();
+            let mut last_priority_log = Instant::now();
             loop {
-                tracing::debug!(
-                    target = "beach::transport::webrtc",
-                    transport_id = ?transport_id,
-                    await = "outbound_rx.recv",
-                    state = "start"
-                );
-                let maybe_bytes = outbound_rx.recv().await;
-                tracing::debug!(
-                    target = "beach::transport::webrtc",
-                    transport_id = ?transport_id,
-                    await = "outbound_rx.recv",
-                    state = "end",
-                    has_bytes = maybe_bytes.is_some()
-                );
-                let bytes = match maybe_bytes {
-                    Some(bytes) => bytes,
-                    None => break,
-                };
-                tracing::debug!(
+                if pending_high.is_empty() && pending_low.is_empty() {
+                    tracing::debug!(
+                        target = "beach::transport::webrtc",
+                        transport_id = ?transport_id,
+                        await = "outbound_rx.recv",
+                        state = "start"
+                    );
+                    tokio::select! {
+                        maybe_frame = outbound_high_rx.recv() => {
+                            tracing::debug!(
+                                target = "beach::transport::webrtc",
+                                transport_id = ?transport_id,
+                                await = "outbound_high_rx.recv",
+                                state = "end",
+                                has_bytes = maybe_frame.is_some()
+                            );
+                            if let Some(frame) = maybe_frame {
+                                depth.increment(&frame.namespace, frame.priority);
+                                pending_high.push_back(frame);
+                            }
+                        }
+                        maybe_frame = outbound_low_rx.recv() => {
+                            tracing::debug!(
+                                target = "beach::transport::webrtc",
+                                transport_id = ?transport_id,
+                                await = "outbound_low_rx.recv",
+                                state = "end",
+                                has_bytes = maybe_frame.is_some()
+                            );
+                            if let Some(frame) = maybe_frame {
+                                depth.increment(&frame.namespace, frame.priority);
+                                pending_low.push_back(frame);
+                            }
+                        }
+                    }
+                } else {
+                    while let Ok(frame) = outbound_high_rx.try_recv() {
+                        depth.increment(&frame.namespace, frame.priority);
+                        pending_high.push_back(frame);
+                    }
+                    while let Ok(frame) = outbound_low_rx.try_recv() {
+                        depth.increment(&frame.namespace, frame.priority);
+                        pending_low.push_back(frame);
+                    }
+                }
 
+                let next = if let Some(frame) = pending_high.pop_front() {
+                    if !pending_low.is_empty()
+                        && last_priority_log.elapsed() > Duration::from_secs(1)
+                    {
+                        tracing::info!(
+                            target = "beach::transport::webrtc",
+                            transport_id = ?transport_id,
+                            low_queue_depth = pending_low.len(),
+                            "prioritizing control frame over queued payloads"
+                        );
+                        last_priority_log = Instant::now();
+                    }
+                    frame
+                } else if let Some(frame) = pending_low.pop_front() {
+                    frame
+                } else {
+                    if outbound_high_rx.is_closed() && outbound_low_rx.is_closed() {
+                        break;
+                    }
+                    continue;
+                };
+
+                depth.decrement(&next.namespace, next.priority);
+                metrics::FRAMED_OUTBOUND_QUEUE_LATENCY
+                    .with_label_values(&[&next.namespace, next.priority.as_label()])
+                    .observe(next.enqueued_at.elapsed().as_secs_f64() * 1000.0);
+                tracing::debug!(
+                    target = "beach::transport::webrtc",
                     transport_id = ?transport_id,
-                    queued_len = bytes.len(),
+                    queued_len = next.bytes.len(),
+                    namespace = %next.namespace,
+                    priority = %next.priority.as_label(),
                     "dequeued outbound"
                 );
-                let data = Bytes::from(bytes);
+                let data = Bytes::from(next.bytes);
                 tracing::debug!(
                     target = "beach::transport::webrtc",
                     transport_id = ?transport_id,
@@ -1068,6 +1205,19 @@ impl WebRtcTransport {
                     state = "end",
                     buffered_before = before
                 );
+                let budget = frame_config_for_sender.backpressure_budget();
+                let mut buffered = before as u64;
+                while buffered > budget {
+                    tracing::debug!(
+                        target = "beach::transport::webrtc",
+                        transport_id = ?transport_id,
+                        buffered_amount = buffered,
+                        budget,
+                        "delaying send due to buffered amount"
+                    );
+                    sleep(Duration::from_millis(5)).await;
+                    buffered = dc_clone.buffered_amount().await as u64;
+                }
                 tracing::debug!(
                     target = "beach::transport::webrtc",
                     transport_id = ?transport_id,
@@ -1146,8 +1296,9 @@ impl WebRtcTransport {
             kind,
             id,
             peer,
-            outbound_seq: AtomicU64::new(0),
-            outbound_tx,
+            outbound_seq: Mutex::new(HashMap::new()),
+            outbound_high_tx,
+            outbound_low_tx,
             inbound_tx: inbound_tx_raw,
             inbound_rx: Mutex::new(inbound_rx),
             _pc: pc,
@@ -1156,7 +1307,19 @@ impl WebRtcTransport {
             _signaling: signaling,
             encryption,
             pending_encrypted,
+            frame_config,
+            frame_reassembler,
+            chunk_log_once: AtomicBool::new(false),
+            raw_mode,
         }
+    }
+
+    fn next_seq(&self, namespace: &str) -> u64 {
+        let mut guard = self.outbound_seq.lock().unwrap();
+        let entry = guard.entry(namespace.to_string()).or_insert(0);
+        let seq = *entry;
+        *entry = entry.saturating_add(1);
+        seq
     }
 
     fn enable_encryption(&self, result: &HandshakeResult) -> Result<(), TransportError> {
@@ -1168,17 +1331,21 @@ impl WebRtcTransport {
     fn flush_pending_encrypted(&self) {
         Self::flush_pending_encrypted_internal(
             &self.encryption,
+            &self.frame_reassembler,
             &self.pending_encrypted,
             &self.inbound_tx,
             self.id,
+            self.raw_mode,
         );
     }
 
     fn flush_pending_encrypted_internal(
         encryption: &Arc<EncryptionManager>,
+        frame_reassembler: &Arc<Mutex<framed::FramedDecoder>>,
         pending: &Arc<Mutex<VecDeque<Vec<u8>>>>,
         sender: &CrossbeamSender<TransportMessage>,
         log_id: TransportId,
+        raw_mode: bool,
     ) {
         let mut pending = pending.lock().unwrap();
         if pending.is_empty() {
@@ -1191,16 +1358,25 @@ impl WebRtcTransport {
             "flushing encrypted frames queued before enable"
         );
         while let Some(bytes) = pending.pop_front() {
-            Self::process_incoming_frame(encryption, bytes, sender, log_id);
+            Self::process_incoming_frame(
+                encryption,
+                frame_reassembler,
+                bytes,
+                sender,
+                log_id,
+                raw_mode,
+            );
         }
     }
 
     fn handle_incoming_bytes(
         encryption: &Arc<EncryptionManager>,
         pending: &Arc<Mutex<VecDeque<Vec<u8>>>>,
+        frame_reassembler: &Arc<Mutex<framed::FramedDecoder>>,
         bytes: Vec<u8>,
         sender: &CrossbeamSender<TransportMessage>,
         log_id: TransportId,
+        raw_mode: bool,
     ) {
         if !encryption.is_enabled() && looks_like_encrypted_frame(&bytes) {
             let mut queue = pending.lock().unwrap();
@@ -1213,14 +1389,23 @@ impl WebRtcTransport {
             );
             return;
         }
-        Self::process_incoming_frame(encryption, bytes, sender, log_id);
+        Self::process_incoming_frame(
+            encryption,
+            frame_reassembler,
+            bytes,
+            sender,
+            log_id,
+            raw_mode,
+        );
     }
 
     fn process_incoming_frame(
         encryption: &Arc<EncryptionManager>,
+        frame_reassembler: &Arc<Mutex<framed::FramedDecoder>>,
         bytes: Vec<u8>,
         sender: &CrossbeamSender<TransportMessage>,
         log_id: TransportId,
+        raw_mode: bool,
     ) {
         let payload = if encryption.is_enabled() {
             match encryption.decrypt(&bytes) {
@@ -1237,11 +1422,80 @@ impl WebRtcTransport {
         } else {
             bytes
         };
+        let now = Instant::now();
+        let mut reassembler = frame_reassembler.lock().unwrap();
+        match reassembler.ingest(&payload, now) {
+            Ok(Some(frame)) => {
+                drop(reassembler);
+                Self::forward_framed_payload(
+                    frame,
+                    sender,
+                    log_id,
+                    encryption.is_enabled(),
+                    encryption.counters(),
+                    raw_mode,
+                );
+            }
+            Ok(None) => {
+                drop(reassembler);
+            }
+            Err(err) => {
+                drop(reassembler);
+                Self::log_framed_error(err, "recv", log_id);
+            }
+        }
+    }
+
+    fn forward_framed_payload(
+        frame: framed::FramedMessage,
+        sender: &CrossbeamSender<TransportMessage>,
+        log_id: TransportId,
+        encryption_enabled: bool,
+        counters: Option<(u64, u64)>,
+        raw_mode: bool,
+    ) {
+        framed::publish(log_id, frame.clone());
+        if frame.namespace != "sync" {
+            tracing::debug!(
+                transport_id = ?log_id,
+                namespace = %frame.namespace,
+                kind = %frame.kind,
+                len = frame.payload.len(),
+                "delivered framed namespace message to subscribers"
+            );
+            return;
+        }
+        let payload = frame.payload.to_vec();
+        if raw_mode {
+            // In raw mode, we treat the payload as either text or binary without expecting
+            // the standard framing header.
+            let message = match String::from_utf8(payload.clone()) {
+                Ok(text) => TransportMessage::text(0, text),
+                Err(_) => TransportMessage::binary(0, payload.clone()),
+            };
+            tracing::debug!(
+                transport_id = ?log_id,
+                frame_len = payload.len(),
+                is_text = message.payload.as_text().is_some(),
+                "received raw frame"
+            );
+            if let Err(err) = sender.send(message) {
+                tracing::warn!(
+                    transport_id = ?log_id,
+                    error = %err,
+                    "failed to forward raw inbound frame"
+                );
+            }
+            return;
+        }
+
         if let Some(message) = decode_message(&payload) {
             tracing::debug!(
                 transport_id = ?log_id,
                 frame_len = payload.len(),
                 sequence = message.sequence,
+                namespace = %frame.namespace,
+                kind = %frame.kind,
                 "received frame"
             );
             if let Err(err) = sender.send(message) {
@@ -1253,13 +1507,13 @@ impl WebRtcTransport {
             }
         } else {
             if tracing::enabled!(tracing::Level::TRACE) {
-                let (send_counter, recv_counter) = encryption.counters().unwrap_or((0, 0));
                 let preview_len = payload.len().min(32);
                 let preview = hex::encode(&payload[..preview_len]);
+                let (send_counter, recv_counter) = counters.unwrap_or((0, 0));
                 tracing::trace!(
                     target = "beach::transport::webrtc::crypto",
                     transport_id = ?log_id,
-                    encryption_enabled = encryption.is_enabled(),
+                    encryption_enabled,
                     send_counter,
                     recv_counter,
                     frame_len = payload.len(),
@@ -1271,10 +1525,32 @@ impl WebRtcTransport {
             tracing::warn!(
                 transport_id = ?log_id,
                 frame_len = payload.len(),
-                encryption_enabled = encryption.is_enabled(),
+                encryption_enabled,
                 "failed to decode message"
             );
         }
+    }
+
+    fn log_framed_error(err: framed::FramingError, direction: &str, log_id: TransportId) {
+        let reason = match err {
+            framed::FramingError::NamespaceTooLong
+            | framed::FramingError::KindTooLong
+            | framed::FramingError::PayloadTooLarge(_) => "oversized",
+            framed::FramingError::UnsupportedVersion(_) | framed::FramingError::Malformed(_) => {
+                "malformed"
+            }
+            framed::FramingError::CrcMismatch => "crc_failures",
+            framed::FramingError::MacMissing
+            | framed::FramingError::UnknownMacKey(_)
+            | framed::FramingError::MacMismatch => "mac_failures",
+        };
+        metrics::FRAMED_ERRORS.with_label_values(&[reason]).inc();
+        tracing::warn!(
+            transport_id = ?log_id,
+            direction,
+            error = %err,
+            "framed transport error"
+        );
     }
 }
 
@@ -1290,31 +1566,109 @@ impl Transport for WebRtcTransport {
     }
 
     fn send(&self, message: TransportMessage) -> Result<(), TransportError> {
-        let mut bytes = encode_message(&message);
-        if self.encryption.is_enabled() {
-            bytes = self.encryption.encrypt(&bytes)?;
-        }
-        tracing::info!(
-
+        let encoded_payload = encode_message(&message);
+        let namespace = "sync";
+        let kind = match &message.payload {
+            crate::transport::Payload::Text(_) => "text",
+            crate::transport::Payload::Binary(_) => "binary",
+        };
+        let sequence = message.sequence;
+        let frames = framed::encode_message(
+            namespace,
+            kind,
+            sequence,
+            &encoded_payload,
+            &self.frame_config,
+        )
+        .map_err(|err| TransportError::Setup(format!("framing error: {err}")))?;
+        tracing::debug!(
             transport_id = ?self.id,
-            payload_len = bytes.len(),
+            payload_len = encoded_payload.len(),
             sequence = message.sequence,
-            "queueing outbound message"
+            frames = frames.len(),
+            "queueing outbound framed message"
         );
-        self.outbound_tx
-            .send(bytes)
-            .map_err(|_| TransportError::ChannelClosed)
+        if frames.len() > 1 && !self.chunk_log_once.swap(true, Ordering::SeqCst) {
+            tracing::info!(
+
+                transport_id = ?self.id,
+                sequence = message.sequence,
+                payload_len = encoded_payload.len(),
+                chunks = frames.len(),
+                max_chunk_bytes = self.frame_config.chunk_size,
+                "chunking outbound framed payload"
+            );
+        }
+
+        for frame in frames {
+            let mut bytes = frame.to_vec();
+            if self.encryption.is_enabled() {
+                bytes = self.encryption.encrypt(&bytes)?;
+            }
+            let priority = classify_priority(namespace, bytes.len());
+            let queued = OutboundFrame {
+                bytes,
+                namespace: namespace.to_string(),
+                priority,
+                enqueued_at: Instant::now(),
+            };
+            let tx = match priority {
+                OutboundPriority::High => &self.outbound_high_tx,
+                OutboundPriority::Low => &self.outbound_low_tx,
+            };
+            tx.send(queued).map_err(|_| TransportError::ChannelClosed)?;
+        }
+        Ok(())
     }
 
     fn send_text(&self, text: &str) -> Result<u64, TransportError> {
-        let sequence = self.outbound_seq.fetch_add(1, Ordering::Relaxed);
+        let sequence = self.next_seq("sync");
         self.send(TransportMessage::text(sequence, text.to_string()))?;
         Ok(sequence)
     }
 
     fn send_bytes(&self, bytes: &[u8]) -> Result<u64, TransportError> {
-        let sequence = self.outbound_seq.fetch_add(1, Ordering::Relaxed);
+        let sequence = self.next_seq("sync");
         self.send(TransportMessage::binary(sequence, bytes.to_vec()))?;
+        Ok(sequence)
+    }
+
+    fn send_namespaced(
+        &self,
+        namespace: &str,
+        kind: &str,
+        payload: &[u8],
+    ) -> Result<u64, TransportError> {
+        let sequence = self.next_seq(namespace);
+        let frames = framed::encode_message(namespace, kind, sequence, payload, &self.frame_config)
+            .map_err(|err| TransportError::Setup(format!("framing error: {err}")))?;
+        tracing::debug!(
+            transport_id = ?self.id,
+            namespace,
+            kind,
+            payload_len = payload.len(),
+            frames = frames.len(),
+            sequence,
+            "queueing outbound namespaced framed message"
+        );
+        for frame in frames {
+            let mut bytes = frame.to_vec();
+            if self.encryption.is_enabled() {
+                bytes = self.encryption.encrypt(&bytes)?;
+            }
+            let priority = classify_priority(namespace, bytes.len());
+            let queued = OutboundFrame {
+                bytes,
+                namespace: namespace.to_string(),
+                priority,
+                enqueued_at: Instant::now(),
+            };
+            let tx = match priority {
+                OutboundPriority::High => &self.outbound_high_tx,
+                OutboundPriority::Low => &self.outbound_low_tx,
+            };
+            tx.send(queued).map_err(|_| TransportError::ChannelClosed)?;
+        }
         Ok(sequence)
     }
 
@@ -1482,6 +1836,7 @@ impl OffererSupervisor {
         poll_interval: Duration,
         passphrase: Option<&str>,
         request_mcp_channel: bool,
+        metadata: Option<HashMap<String, String>>,
     ) -> Result<(Arc<Self>, OffererAcceptedTransport), TransportError> {
         let signaling_client = SignalingClient::connect(
             signaling_url,
@@ -1489,6 +1844,7 @@ impl OffererSupervisor {
             passphrase,
             None,
             request_mcp_channel,
+            metadata,
         )
         .await?;
         let client = Client::new();
@@ -2496,6 +2852,7 @@ async fn negotiate_offerer_peer(
         Some(dc_notify.clone()),
         Some(Arc::clone(&inner.signaling_client)),
         Some(Arc::clone(&handshake_complete)),
+        false,
     ));
     let transport_dyn: Arc<dyn Transport> = transport.clone();
     let publish_label = peer_label.unwrap_or_else(|| "beach".to_string());
@@ -2772,6 +3129,7 @@ async fn negotiate_offerer_peer(
             None,
             Some(Arc::clone(&inner.signaling_client)),
             Some(Arc::clone(&handshake_complete)),
+            false,
         ));
         let mcp_transport_dyn: Arc<dyn Transport> = mcp_transport;
         channels.publish(MCP_CHANNEL_LABEL.to_string(), mcp_transport_dyn);
@@ -2812,6 +3170,7 @@ pub async fn connect_via_signaling(
     passphrase: Option<&str>,
     label: Option<&str>,
     request_mcp_channel: bool,
+    metadata: Option<HashMap<String, String>>,
 ) -> Result<WebRtcConnection, TransportError> {
     match role {
         WebRtcRole::Offerer => {
@@ -2820,12 +3179,13 @@ pub async fn connect_via_signaling(
                 poll_interval,
                 passphrase,
                 request_mcp_channel,
+                metadata,
             )
             .await?;
             Ok(accepted.connection)
         }
         WebRtcRole::Answerer => {
-            connect_answerer(signaling_url, poll_interval, passphrase, label).await
+            connect_answerer(signaling_url, poll_interval, passphrase, label, metadata).await
         }
     }
 }
@@ -2854,6 +3214,7 @@ async fn connect_answerer(
     poll_interval: Duration,
     passphrase: Option<&str>,
     label: Option<&str>,
+    metadata: Option<HashMap<String, String>>,
 ) -> Result<WebRtcConnection, TransportError> {
     let started = std::time::Instant::now();
     let passphrase_owned = passphrase.map(|s| s.to_string());
@@ -2928,6 +3289,7 @@ async fn connect_answerer(
         passphrase,
         label.map(|s| s.to_string()),
         false,
+        metadata,
     )
     .await?;
     tracing::debug!(
@@ -3339,6 +3701,7 @@ async fn connect_answerer(
         let session_key_cell_value = Arc::clone(&session_key_for_secure);
         let pre_shared_key_cell_value = Arc::clone(&pre_shared_key_for_secure);
         let label = dc.label().to_string();
+        let raw_mode = label == CONTROLLER_CHANNEL_LABEL;
         let passphrase_setup = passphrase_value.clone();
         let preregistered_inbox = if label == HANDSHAKE_CHANNEL_LABEL
             && secure_transport_active
@@ -3696,6 +4059,7 @@ async fn connect_answerer(
                 Some(notify.clone()),
                 Some(signaling_for_transport),
                 None,
+                raw_mode,
             ));
             let transport_dyn: Arc<dyn Transport> = transport.clone();
 
@@ -4016,6 +4380,7 @@ async fn connect_answerer(
     }
     let transport_dyn: Arc<dyn Transport> = transport.clone();
     let mut connection_metadata = signaling_client.remote_metadata().await.unwrap_or_default();
+    validate_manager_peer(&connection_metadata, &session_id).await?;
     if let Some(local_meta) = build_label_metadata(label) {
         for (key, value) in local_meta {
             connection_metadata.entry(key).or_insert(value);
@@ -4050,7 +4415,232 @@ fn build_label_metadata(label: Option<&str>) -> Option<HashMap<String, String>> 
     }
     let mut map = HashMap::new();
     map.insert("label".to_string(), trimmed.to_string());
+    map.insert("role".to_string(), "manager".to_string());
     Some(map)
+}
+
+// Manager JWT validation ----------------------------------------------------
+
+#[derive(Clone)]
+struct ManagerAuthAuthority {
+    jwks_url: String,
+    issuer: String,
+    audience: String,
+}
+
+struct ManagerJwtVerifier {
+    authority: ManagerAuthAuthority,
+    cache: AsyncMutex<Option<JwksCache>>,
+    client: Client,
+}
+
+#[derive(Clone)]
+struct JwksCache {
+    keys: HashMap<String, CachedDecodingKey>,
+    fetched_at: Instant,
+}
+
+#[derive(Clone)]
+struct CachedDecodingKey {
+    key: DecodingKey,
+    algorithm: Algorithm,
+}
+
+#[derive(Debug, Deserialize)]
+struct Jwk {
+    kid: String,
+    kty: String,
+    #[serde(default)]
+    n: Option<String>,
+    #[serde(default)]
+    e: Option<String>,
+    #[serde(default)]
+    x: Option<String>,
+    #[serde(default)]
+    y: Option<String>,
+    #[serde(default)]
+    crv: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JwksResponse {
+    keys: Vec<Jwk>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagerClaims {
+    #[serde(default)]
+    iss: Option<String>,
+    #[serde(default)]
+    aud: Option<serde_json::Value>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    roles: Option<Vec<String>>,
+    #[serde(default)]
+    exp: Option<i64>,
+}
+
+static MANAGER_VERIFIER: SyncOnceCell<Option<ManagerJwtVerifier>> = SyncOnceCell::new();
+
+async fn validate_manager_peer(
+    metadata: &HashMap<String, String>,
+    expected_session_id: &str,
+) -> Result<(), TransportError> {
+    let role = metadata.get("role").map(|s| s.as_str()).unwrap_or_default();
+    if role != "manager" {
+        return Ok(());
+    }
+    let bearer = metadata
+        .get("bearer")
+        .ok_or_else(|| TransportError::Setup("missing bearer in manager metadata".into()))?;
+    let session_id = metadata
+        .get("session_id")
+        .ok_or_else(|| TransportError::Setup("missing session_id in manager metadata".into()))?;
+    if session_id != expected_session_id {
+        return Err(TransportError::Setup(format!(
+            "manager metadata session mismatch: expected {}, got {}",
+            expected_session_id, session_id
+        )));
+    }
+    let verifier = MANAGER_VERIFIER
+        .get_or_init(ManagerJwtVerifier::from_env)
+        .as_ref()
+        .ok_or_else(|| {
+            TransportError::Setup(
+                "manager JWT verifier unavailable (missing Clerk/Beach Gate config)".into(),
+            )
+        })?;
+    verifier.verify(bearer).await
+}
+
+impl ManagerJwtVerifier {
+    fn from_env() -> Option<Self> {
+        let jwks_url = std::env::var("CLERK_JWKS_URL")
+            .or_else(|_| std::env::var("BEACH_GATE_JWKS_URL"))
+            .ok()?;
+        let issuer = std::env::var("CLERK_ISSUER")
+            .or_else(|_| std::env::var("BEACH_GATE_ISSUER"))
+            .ok()?;
+        let audience = std::env::var("CLERK_AUDIENCE")
+            .or_else(|_| std::env::var("BEACH_GATE_AUDIENCE"))
+            .ok()?;
+        Some(Self {
+            authority: ManagerAuthAuthority {
+                jwks_url,
+                issuer,
+                audience,
+            },
+            cache: AsyncMutex::new(None),
+            client: Client::new(),
+        })
+    }
+
+    async fn verify(&self, token: &str) -> Result<(), TransportError> {
+        let header = decode_header(token)
+            .map_err(|err| TransportError::Setup(format!("invalid manager jwt header: {err}")))?;
+        let kid = header
+            .kid
+            .ok_or_else(|| TransportError::Setup("manager jwt missing kid".into()))?;
+        let key = self.decoding_key(&kid).await?;
+        let mut validation = Validation::new(key.algorithm);
+        validation.set_issuer(&[self.authority.issuer.clone()]);
+        validation.set_audience(&[self.authority.audience.clone()]);
+        decode::<ManagerClaims>(token, &key.key, &validation).map_err(|err| {
+            TransportError::Setup(format!("manager jwt validation failed: {err}"))
+        })?;
+        Ok(())
+    }
+
+    async fn decoding_key(&self, kid: &str) -> Result<CachedDecodingKey, TransportError> {
+        {
+            let cache = self.cache.lock().await;
+            if let Some(store) = cache.as_ref() {
+                if !store.fetched_at.elapsed().is_zero() {
+                    if let Some(key) = store.keys.get(kid) {
+                        return Ok(key.clone());
+                    }
+                }
+            }
+        }
+
+        let mut cache = self.cache.lock().await;
+        let fetched = self.fetch_jwks().await?;
+        *cache = Some(fetched);
+        let cache = cache.as_ref().expect("cache set");
+        cache
+            .keys
+            .get(kid)
+            .cloned()
+            .ok_or_else(|| TransportError::Setup(format!("jwks missing requested kid {kid}")))
+    }
+
+    async fn fetch_jwks(&self) -> Result<JwksCache, TransportError> {
+        let resp = self
+            .client
+            .get(&self.authority.jwks_url)
+            .send()
+            .await
+            .map_err(|err| TransportError::Setup(format!("jwks fetch failed: {err}")))?;
+        let resp = resp.error_for_status().map_err(|err| {
+            TransportError::Setup(format!(
+                "jwks http error: {}",
+                err.status().unwrap_or_default()
+            ))
+        })?;
+        let body: JwksResponse = resp
+            .json()
+            .await
+            .map_err(|err| TransportError::Setup(format!("jwks parse failed: {err}")))?;
+        let mut keys = HashMap::new();
+        for key in body.keys {
+            match key.kty.as_str() {
+                "RSA" => {
+                    let (Some(n), Some(e)) = (key.n, key.e) else {
+                        continue;
+                    };
+                    let decoding_key = DecodingKey::from_rsa_components(&n, &e).map_err(|err| {
+                        TransportError::Setup(format!("jwks rsa key error: {err}"))
+                    })?;
+                    keys.insert(
+                        key.kid,
+                        CachedDecodingKey {
+                            key: decoding_key,
+                            algorithm: Algorithm::RS256,
+                        },
+                    );
+                }
+                "EC" => {
+                    if key.crv.as_deref() != Some("P-256") {
+                        continue;
+                    }
+                    let (Some(x), Some(y)) = (key.x, key.y) else {
+                        continue;
+                    };
+                    let decoding_key = DecodingKey::from_ec_components(&x, &y).map_err(|err| {
+                        TransportError::Setup(format!("jwks ec key error: {err}"))
+                    })?;
+                    keys.insert(
+                        key.kid,
+                        CachedDecodingKey {
+                            key: decoding_key,
+                            algorithm: Algorithm::ES256,
+                        },
+                    );
+                }
+                _ => continue,
+            }
+        }
+        if keys.is_empty() {
+            return Err(TransportError::Setup(
+                "jwks fetch returned no usable keys".into(),
+            ));
+        }
+        Ok(JwksCache {
+            keys,
+            fetched_at: Instant::now(),
+        })
+    }
 }
 
 fn endpoint(base: &str, suffix: &str) -> Result<Url, TransportError> {
@@ -5049,6 +5639,7 @@ async fn create_webrtc_pair() -> Result<TransportPair, TransportError> {
         None,
         None,
         None,
+        false,
     );
 
     let server_transport = WebRtcTransport::new(
@@ -5061,6 +5652,7 @@ async fn create_webrtc_pair() -> Result<TransportPair, TransportError> {
         None,
         None,
         None,
+        false,
     );
 
     Ok(TransportPair {
@@ -5098,10 +5690,12 @@ fn install_peer_connection_tracing(
         remote_peer,
         transport_id,
     });
+    let role_label = role.to_string();
 
     let peer_ctx = context.clone();
     pc.on_peer_connection_state_change(Box::new(move |state| {
         let ctx = peer_ctx.clone();
+        let role = role_label.clone();
         Box::pin(async move {
             tracing::trace!(
                 target = "beach::transport::webrtc",
@@ -5113,6 +5707,11 @@ fn install_peer_connection_tracing(
                 new_state = ?state,
                 "peer connection state change"
             );
+            if state == RTCPeerConnectionState::Failed {
+                metrics::WEBRTC_DTLS_FAILURES
+                    .with_label_values(&[&role])
+                    .inc();
+            }
         })
     }));
 
@@ -5410,18 +6009,30 @@ mod tests {
 
         let encryption = Arc::new(EncryptionManager::new());
         let pending = Arc::new(Mutex::new(VecDeque::new()));
+        let frame_config = framed::runtime_config().clone();
+        let frame_reassembler =
+            Arc::new(Mutex::new(framed::FramedDecoder::new(frame_config.clone())));
         let (sender, receiver) = unbounded();
         let log_id = TransportId(7);
 
         let plaintext_message = TransportMessage::text(1, "__ready__");
-        let plaintext_frame = encode_message(&plaintext_message);
+        let encoded_payload = encode_message(&plaintext_message);
+        let plaintext_frames =
+            framed::encode_message("sync", "text", 1, &encoded_payload, &frame_config)
+                .expect("frame encode");
+        let plaintext_frame = plaintext_frames
+            .first()
+            .expect("single frame expected")
+            .to_vec();
 
         WebRtcTransport::handle_incoming_bytes(
             &encryption,
             &pending,
+            &frame_reassembler,
             plaintext_frame.clone(),
             &sender,
             log_id,
+            false,
         );
         let received = receiver.try_recv().expect("plaintext should pass through");
         assert_eq!(received.payload.as_text(), Some("__ready__"));
@@ -5444,16 +6055,28 @@ mod tests {
         remote_encryption
             .enable(&answerer_result)
             .expect("enable remote encryption");
+        let queued_message = TransportMessage::text(2, "__ready__");
+        let queued_payload = encode_message(&queued_message);
+        let queued_frames =
+            framed::encode_message("sync", "text", 2, &queued_payload, &frame_config)
+                .expect("frame encode");
         let encrypted_frame = remote_encryption
-            .encrypt(&plaintext_frame)
+            .encrypt(
+                queued_frames
+                    .first()
+                    .expect("single frame expected")
+                    .as_ref(),
+            )
             .expect("encrypt frame");
 
         WebRtcTransport::handle_incoming_bytes(
             &encryption,
             &pending,
+            &frame_reassembler,
             encrypted_frame,
             &sender,
             log_id,
+            false,
         );
         assert!(
             matches!(receiver.try_recv(), Err(CrossbeamTryRecvError::Empty)),
@@ -5464,7 +6087,14 @@ mod tests {
         encryption
             .enable(&offerer_result)
             .expect("enable local encryption");
-        WebRtcTransport::flush_pending_encrypted_internal(&encryption, &pending, &sender, log_id);
+        WebRtcTransport::flush_pending_encrypted_internal(
+            &encryption,
+            &frame_reassembler,
+            &pending,
+            &sender,
+            log_id,
+            false,
+        );
 
         let received = receiver.try_recv().expect("flushed frame delivered");
         assert_eq!(received.payload.as_text(), Some("__ready__"));

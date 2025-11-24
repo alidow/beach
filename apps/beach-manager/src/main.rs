@@ -1,6 +1,5 @@
 mod auth;
 mod config;
-mod fastpath;
 mod log_throttle;
 mod metrics;
 mod publish_token;

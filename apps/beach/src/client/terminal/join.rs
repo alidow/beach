@@ -131,6 +131,7 @@ pub async fn run_with_notify(
         Some(trimmed_pass.as_str()),
         label.as_deref(),
         mcp,
+        None,
     )
     .await?;
     let (transport, webrtc_channels) = match negotiated {

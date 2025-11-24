@@ -1,4 +1,10 @@
 import { decodeTransportMessage, encodeTransportMessage, type TransportMessage } from './envelope';
+import {
+  decodeFramedMessage,
+  encodeFramedMessage,
+  FramedReassembler,
+  runtimeFramingConfig,
+} from './chunk';
 import { deriveHandshakeKey, derivePreSharedKey, toHex } from './crypto/sharedKey';
 import {
   secureSignalingEnabled,
@@ -28,10 +34,25 @@ type ViewerRtcEventPayload = {
   detail?: Record<string, unknown>;
 };
 
+function emitDiag(event: string, payload: Record<string, unknown>) {
+  if (typeof window === 'undefined') return;
+  try {
+    const anyWindow = window as unknown as Record<string, any>;
+    if (typeof anyWindow.__BEACH_TELEMETRY__ === 'function') {
+      anyWindow.__BEACH_TELEMETRY__(event, payload);
+    }
+    // eslint-disable-next-line no-console
+    console.debug(`[webrtc:${event}]`, payload);
+  } catch {
+    // ignore logging failures
+  }
+}
+
 function emitViewerRtcEvent(payload: ViewerRtcEventPayload) {
   if (typeof window === 'undefined') {
     return;
   }
+  emitDiag('viewer-rtc', payload);
   window.dispatchEvent(
     new CustomEvent('private-beach:viewer-rtc', {
       detail: {
@@ -79,6 +100,8 @@ export class WebRtcTransport extends EventTarget {
   private disposed = false;
   private open: boolean;
   private readonly secureSummary: SecureTransportSummary;
+  private readonly frameReassembler: FramedReassembler;
+  private readonly frameConfig = runtimeFramingConfig();
 
   constructor(options: WebRtcTransportOptions) {
     super();
@@ -87,6 +110,7 @@ export class WebRtcTransport extends EventTarget {
     this.sequence = options.initialSequence ?? 0;
     this.open = this.channel.readyState === 'open';
     this.secureSummary = options.secureSummary ?? { mode: 'plaintext' };
+    this.frameReassembler = new FramedReassembler();
     this.attachChannelListeners();
     queueMicrotask(() => {
       this.dispatchEvent(new CustomEvent<SecureTransportSummary>('secure', { detail: this.secureSummary }));
@@ -118,7 +142,11 @@ export class WebRtcTransport extends EventTarget {
     }
     const message: TransportMessage = { sequence: this.sequence++, payload };
     const encoded = encodeTransportMessage(message);
-    this.channel.send(encoded);
+    const kind = message.payload.kind === 'text' ? 'text' : 'binary';
+    const frames = encodeFramedMessage('sync', kind, message.sequence, encoded, this.frameConfig);
+    for (const frame of frames) {
+      this.channel.send(frame);
+    }
     return message.sequence;
   }
 
@@ -135,11 +163,13 @@ export class WebRtcTransport extends EventTarget {
     // by the underlying RTCDataChannel — doing so can throw InvalidStateError.
     this.channel.addEventListener('open', () => {
       this.open = true;
+      emitDiag('dc-open', { label: this.channel.label, readyState: this.channel.readyState });
       this.dispatchEvent(new Event('open'));
     });
 
     this.channel.addEventListener('close', () => {
       this.open = false;
+      emitDiag('dc-close', { label: this.channel.label, readyState: this.channel.readyState });
       this.dispatchEvent(new Event('close'));
     });
 
@@ -147,33 +177,58 @@ export class WebRtcTransport extends EventTarget {
       const cloned = new Event('error');
       // Preserve error detail if present on the original event
       Object.assign(cloned, { error: (event as any).error ?? event });
+      emitDiag('dc-error', {
+        label: this.channel.label,
+        error: (event as any).error ?? event,
+      });
       this.dispatchEvent(cloned);
     });
 
     this.channel.addEventListener('message', (event) => {
       try {
-        const detail = decodeDataChannelPayload(event);
-        this.dispatchEvent(new CustomEvent<TransportMessage>('message', { detail }));
+        const detail = this.decodeDataChannelPayload(event);
+        if (detail) {
+          this.dispatchEvent(new CustomEvent<TransportMessage>('message', { detail }));
+        }
       } catch (error) {
+        emitDiag('dc-decode-error', {
+          label: this.channel.label,
+          error: error instanceof Error ? error.message : String(error),
+        });
         const errEvent = new Event('error');
         Object.assign(errEvent, { error });
         this.dispatchEvent(errEvent);
       }
     });
   }
+
+  private decodeDataChannelPayload(event: MessageEvent): TransportMessage | null {
+    const { data } = event;
+    if (typeof data === 'string') {
+      throw new Error('expected binary RTCDataChannel payload but received string');
+    }
+
+    const bytes = toUint8Array(data);
+    const now = Date.now();
+
+    const result = decodeFramedMessage(bytes, this.frameReassembler, this.frameConfig, now);
+    if (result.kind === 'incomplete') {
+      // Not ready yet; nothing to dispatch.
+      return null;
+    }
+    if (result.frame.namespace !== 'sync') {
+      return null;
+    }
+    return decodeTransportMessage(result.frame.payload);
+  }
 }
 
-function decodeDataChannelPayload(event: MessageEvent): TransportMessage {
-  const { data } = event;
-  if (typeof data === 'string') {
-    throw new Error('expected binary RTCDataChannel payload but received string');
-  }
+function toUint8Array(data: unknown): Uint8Array {
   if (data instanceof ArrayBuffer) {
-    return decodeTransportMessage(data);
+    return new Uint8Array(data);
   }
   if (ArrayBuffer.isView(data)) {
-    const view = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-    return decodeTransportMessage(view);
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
   }
   throw new Error('unsupported RTCDataChannel message payload');
 }
@@ -450,11 +505,13 @@ export async function connectWebRtcTransport(
     const state = pc.connectionState ?? null;
     const level = state === 'failed' ? 'error' : state === 'disconnected' ? 'warn' : 'info';
     emitRtcState('connection-state', state, level);
+    emitDiag('pc-state', { sessionId, state });
     log(logger, `peer connection state: ${state}`);
   };
   pc.onsignalingstatechange = () => {
     const state = pc.signalingState ?? null;
     emitRtcState('signaling-state', state);
+    emitDiag('pc-signaling', { sessionId, state });
     log(logger, `signaling state: ${state}`);
   };
   pc.oniceconnectionstatechange = () => {
@@ -462,6 +519,7 @@ export async function connectWebRtcTransport(
     const level =
       state === 'failed' || state === 'disconnected' || state === 'closed' ? 'warn' : 'info';
     emitRtcState('ice-state', state, level);
+    emitDiag('pc-ice', { sessionId, state });
     log(logger, `ice connection state: ${state}`);
   };
   const pendingLocalCandidates: RTCIceCandidateInit[] = [];

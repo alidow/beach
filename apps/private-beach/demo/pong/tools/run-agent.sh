@@ -47,6 +47,11 @@ export BEACH_AUTH_GATEWAY=${BEACH_AUTH_GATEWAY:-"http://localhost:4133"}
 export BEACH_AUTH_SCOPE=${BEACH_AUTH_SCOPE:-"pb.full"}
 export BEACH_AUTH_AUDIENCE=${BEACH_AUTH_AUDIENCE:-"private-beach"}
 export PONG_WATCHDOG_INTERVAL=${PONG_WATCHDOG_INTERVAL:-}
+export PONG_COMMAND_TRACE_DIR=${PONG_COMMAND_TRACE_DIR:-/tmp/pong-stack/command-trace}
+export PONG_BALL_TRACE_DIR=${PONG_BALL_TRACE_DIR:-/tmp/pong-stack/ball-trace}
+export PONG_COMMAND_TRACE_PATH="$PONG_COMMAND_TRACE_DIR/command-agent.log"
+export PONG_BALL_TRACE_PATH="$PONG_BALL_TRACE_DIR/ball-trace-agent.jsonl"
+export PONG_VERBOSE_DIAG=1
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/../../../../.." && pwd)

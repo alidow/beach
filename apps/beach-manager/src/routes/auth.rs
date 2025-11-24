@@ -165,7 +165,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 fn requires_strict_session_auth(path: &str) -> bool {
-    if path.starts_with("/sessions") || path.starts_with("/fastpath/sessions") {
+    if path.starts_with("/sessions") {
         return true;
     }
     if path.starts_with("/agents/") {
